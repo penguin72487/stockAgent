@@ -743,6 +743,64 @@ def test_data_monitor_preserves_shioaji_partial_freshness_evidence(
     assert row["eta"]["state"] == "waiting_upstream"
 
 
+def test_data_monitor_preserves_completed_shioaji_history_receipt(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "configs/data_sync/packed_datasets.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "dataset": "tw-shioaji-history",
+                        "source": "data_tw_shioaji_history",
+                        "role": "training",
+                        "publish": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = dashboard.build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 9, 1, 14, 18, tzinfo=UTC),
+        refresh_services={
+            "shioaji_historical_market_data": {"active": False, "state": "dead"}
+        },
+        shioaji_status={
+            "pipelines": [
+                {
+                    "id": "historical_market_data",
+                    "title": "週選／月選／實際月份期貨／指數歷史",
+                    "category": "historical",
+                    "status": "complete",
+                    "status_label": "Receipt 全部完成",
+                    "latest_at_utc": "2026-09-01T14:17:23Z",
+                    "coverage": {"current": 85284, "total": 85284, "ratio": 1.0},
+                    "eta": {"state": "complete", "remaining_seconds": 0},
+                }
+            ]
+        },
+        openbb_status={},
+    )
+
+    source = next(
+        row
+        for row in payload["sources"]
+        if row["id"] == "shioaji:historical_market_data"
+    )
+    group = next(
+        row for row in payload["groups"] if row["id"] == "group:tw-shioaji-history"
+    )
+    assert source["parent_id"] == "group:tw-shioaji-history"
+    assert source["status"] == "complete"
+    assert source["operation_state"] == "complete"
+    assert group["status"] == "complete"
+    assert group["operation_state"] == "complete"
+
+
 def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) -> None:
     now = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
     registry = tmp_path / "configs/data_sync/packed_datasets.json"

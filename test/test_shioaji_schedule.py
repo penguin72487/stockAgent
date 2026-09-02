@@ -132,6 +132,29 @@ def test_minute_runner_reserves_one_account_connection_for_futures_history() -> 
     assert "available=$((5 - fop_workers - history_workers))" in minute_runner
 
 
+def test_top200_terminal_connection_skip_unblocks_postclose_minute_backfill() -> None:
+    root = Path(__file__).resolve().parents[1]
+    top200_runner = (root / "scripts/run_shioaji_top200_stream.sh").read_text()
+    minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
+
+    assert 'write_capture_state "$trade_date" "skipped" "connection_budget"' in top200_runner
+    assert 'payload.get("status") == "skipped"' in minute_runner
+    assert 'payload.get("reason") == "connection_budget"' in minute_runner
+    assert 'print("0 top200_terminal_skip")' in minute_runner
+
+
+def test_minute_backfill_service_has_bounded_memory() -> None:
+    service = (
+        Path(__file__).resolve().parents[1]
+        / "deploy/systemd/stockagent-shioaji-minute-backfill.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert "MemoryAccounting=true" in service
+    assert "MemoryHigh=48G" in service
+    assert "MemoryMax=64G" in service
+    assert "MemorySwapMax=8G" in service
+
+
 def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
     root = Path(__file__).resolve().parents[1]
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()

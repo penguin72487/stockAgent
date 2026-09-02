@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Final, Mapping
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import ProxyHandler, build_opener
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -46,6 +47,8 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     build_data_monitor_public_status,
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
+    DEFAULT_MAX_SOURCE_AGE_SECONDS,
+    DEFAULT_OPENING_GATE_PATH,
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
@@ -561,6 +564,99 @@ def summarize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def build_compact_tw_overview_status(
+    state_dir: Path,
+    *,
+    opening_gate_path: Path = DEFAULT_OPENING_GATE_PATH,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Read only the atomic engine receipt needed by the landing card.
+
+    The complete TW status intentionally joins historical ledgers and benchmark
+    curves for the detail page. Making the landing card depend on that scan
+    caused a cold gateway to exceed the reverse-proxy timeout even though the
+    engine already maintained a small atomic status receipt.
+    """
+
+    status_path = Path(state_dir) / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if not isinstance(status, Mapping):
+        raise ValueError("TW status receipt root is not an object")
+    if status.get("simulation_only") is not True:
+        raise UnsafePublicDashboardPayload("simulation_only must be true")
+    if status.get("production_order_possible") is not False:
+        raise UnsafePublicDashboardPayload(
+            "production_order_possible must be false"
+        )
+
+    observed = (now or datetime.now(UTC)).astimezone(UTC)
+    source_updated_at = status.get("updated_at")
+    source_age_seconds: float | None = None
+    if source_updated_at:
+        parsed = datetime.fromisoformat(str(source_updated_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("TW status updated_at has no timezone")
+        source_age_seconds = max(
+            0.0,
+            (observed - parsed.astimezone(UTC)).total_seconds(),
+        )
+
+    health = str(status.get("health") or "unknown")
+    if (
+        source_age_seconds is None
+        or source_age_seconds > DEFAULT_MAX_SOURCE_AGE_SECONDS
+    ):
+        health = "stale"
+
+    local_session_date = (
+        observed.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat()
+    )
+    try:
+        opening_gate = json.loads(Path(opening_gate_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        opening_gate = {}
+    if not isinstance(opening_gate, Mapping):
+        raise ValueError("TW opening-gate receipt root is not an object")
+    if (
+        str(opening_gate.get("session_date") or "") == local_session_date
+        and opening_gate.get("status") == "failed"
+        and health not in {"stale", "critical"}
+    ):
+        health = "degraded"
+
+    modes: list[dict[str, Any]] = []
+    raw_modes = status.get("modes")
+    if isinstance(raw_modes, Mapping):
+        for market, raw_mode in raw_modes.items():
+            mode = raw_mode if isinstance(raw_mode, Mapping) else {}
+            modes.append(
+                {
+                    "market": str(market),
+                    "open_position_count": int(
+                        mode.get("open_position_count") or 0
+                    ),
+                    "stale_position_count": int(
+                        mode.get("stale_position_count") or 0
+                    ),
+                }
+            )
+
+    return {
+        "schema_version": 1,
+        "generated_at_utc": observed.isoformat(timespec="seconds"),
+        "health": health,
+        "source_updated_at": source_updated_at,
+        "source_age_seconds": (
+            round(source_age_seconds, 3)
+            if source_age_seconds is not None
+            else None
+        ),
+        "simulation_only": True,
+        "production_order_possible": False,
+        "modes": modes,
+    }
+
+
 def build_public_overview(
     taifex: Mapping[str, Any],
     tw: Mapping[str, Any],
@@ -976,6 +1072,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     maximum_event_rows=500,
                     maximum_mark_rows=32,
                     include_position_rows=False,
+                    # Completed-session position snapshots and immutable
+                    # benchmark history already enumerate the public date
+                    # selector. Avoid indexing multi-GB append-only ledgers on
+                    # a cold read merely to rediscover the same dates.
+                    include_ledger_session_dates=False,
                 )
             ),
         )
@@ -1109,7 +1210,16 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_status,
             )
-            tw_future = executor.submit(self.tw_status)
+            tw_future = executor.submit(
+                self.cached_local_json,
+                cache_key="tw-overview-status",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=OVERVIEW_STALE_GRACE_SECONDS,
+                builder=lambda: build_compact_tw_overview_status(
+                    self.repo_root / "artifacts/live/tw_day_trade_simulation"
+                ),
+            )
             shioaji_future = executor.submit(
                 self.cached_local_json,
                 cache_key="shioaji-status",
@@ -1165,8 +1275,29 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 sanitizer=sanitize_taifex_history,
             )
 
-        # Build the largest default payload first.  An immediate request joins
-        # this cache key's single flight, while unrelated prewarm work waits
+        # The landing page is the public readiness surface and aggregates the
+        # monitor snapshots.  Warm it before the large history scans so a cold
+        # gateway cannot make the first /api/overview request compete for disk
+        # and exceed the reverse proxy's timeout.
+        try:
+            self.prewarm_overview()
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard critical_overview_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+        # The detailed TW page still receives the complete source-backed
+        # snapshot. Warm it after the compact landing card is ready, so its
+        # historical joins cannot hold the public readiness surface hostage.
+        try:
+            self.tw_status()
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard critical_tw_status_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+        # Build the largest detail payload next.  An immediate request joins
+        # this cache key's single flight, while the remaining detail views wait
         # instead of competing for CPU and disk bandwidth.
         try:
             taifex_history_builder()
@@ -1182,7 +1313,6 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # 100-row result, so it is safe and useful to warm the laptop's first
         # visible detail table after the compact date index exists.
         builders: tuple[Callable[[], object], ...] = (
-            self.prewarm_overview,
             lambda: self.tw_history("1d"),
             lambda: self.openbb_history("1d"),
             lambda: build_dashboard_signal_page(

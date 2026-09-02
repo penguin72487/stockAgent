@@ -569,7 +569,12 @@ def test_minute_pipeline_separates_research_usability_from_latest_freshness(
         ),
         encoding="utf-8",
     )
-    minute_manifest.write_text(json.dumps({"research_ready": True}), encoding="utf-8")
+    minute_manifest.write_text(
+        json.dumps(
+            {"research_ready": True, "full_market_selected_symbols": 2747}
+        ),
+        encoding="utf-8",
+    )
     minute_audit.write_text(
         json.dumps(
             {
@@ -619,6 +624,13 @@ def test_minute_pipeline_separates_research_usability_from_latest_freshness(
     assert stock["data_through"] == "2026-08-20"
     assert stock["target_date"] == "2026-08-21"
     assert stock["eta"]["state"] == "waiting_quota"
+    assert stock["coverage"] == {
+        "current": 2621,
+        "total": 2747,
+        "ratio": pytest.approx(2621 / 2747),
+        "unit": "標的",
+        "label": "可研究標的",
+    }
     assert "89 檔" in stock["warnings"][0]
     assert "125 檔" in stock["warnings"][0]
     assert research["status"] == "partial"
@@ -704,6 +716,81 @@ def test_minute_pipeline_uses_rolling_target_and_ignores_stale_partial_run(
     assert stock["status"] == "ready"
     assert stock["target_date"] == "2026-08-26"
     assert stock["data_through"] == "2026-08-26"
+
+
+def test_minute_research_coverage_does_not_use_incremental_run_denominator(
+    tmp_path: Path,
+) -> None:
+    minute_summary = tmp_path / "download_summary.json"
+    minute_manifest = tmp_path / "research_manifest.json"
+    minute_audit = tmp_path / "full_audit.json"
+    minute_summary.write_text(
+        json.dumps(
+            {
+                "selected_symbols": 799,
+                "reported_symbols": 799,
+                "end_date": "2026-09-01",
+                "resumable_collection_complete": True,
+                "selected_coverage_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    minute_manifest.write_text(
+        json.dumps(
+            {
+                "research_ready": True,
+                "full_market_selected_symbols": 2749,
+            }
+        ),
+        encoding="utf-8",
+    )
+    minute_audit.write_text(
+        json.dumps(
+            {
+                "status": "research_ready",
+                "last_date": "2026-08-28",
+                "available_source_symbols": 2624,
+                "source_gap_symbols": 89,
+                "contract_unavailable_symbols": 125,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(args):
+        command = list(args)
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 9, 1, 15, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=missing,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=missing,
+            capture_root=missing,
+            minute_summary=minute_summary,
+            minute_manifest=minute_manifest,
+            minute_audit=minute_audit,
+        ),
+    )
+
+    for pipeline_id in ("stock_minute", "minute_research"):
+        pipeline = next(
+            item for item in payload["pipelines"] if item["id"] == pipeline_id
+        )
+        assert pipeline["coverage"]["current"] == 2624
+        assert pipeline["coverage"]["total"] == 2749
+        assert pipeline["coverage"]["ratio"] == pytest.approx(2624 / 2749)
 
 
 def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> None:

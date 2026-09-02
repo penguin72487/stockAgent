@@ -249,6 +249,7 @@ _SUMMARY_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
         "manifest_final_settlement.json",
     ),
     "tw-futures": ("shioaji_contracts/manifest.json",),
+    "tw-shioaji-history": ("summary.json",),
     "forex-frankfurter": ("download_summary.json",),
     "forex-pepperstone": ("download_summary.json",),
 }
@@ -301,6 +302,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
     },
     "shioaji_futures_history": {
         "service": "stockagent-shioaji-tx-history-backfill.service",
+        "timer": None,
+    },
+    "shioaji_historical_market_data": {
+        "service": "stockagent-shioaji-historical-market-data.service",
         "timer": None,
     },
     "openbb_archive": {
@@ -494,6 +499,11 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
         "mode": "quota_backfill",
         "service_keys": ("shioaji_futures_history",),
         "schedule_label": "常駐回補；依實測流量重置證據續跑",
+    },
+    "group:tw-shioaji-history": {
+        "mode": "quota_backfill",
+        "service_keys": ("shioaji_historical_market_data",),
+        "schedule_label": "常駐 receipt 回補；即時行情優先並受實測流量閘門保護",
     },
     "group:forex-frankfurter": {
         "mode": "timer",
@@ -1707,6 +1717,7 @@ def _shioaji_sources(
     status_map = {
         "active": "updating",
         "ready": "current",
+        "complete": "complete",
         "waiting": "waiting",
         "partial": "degraded",
         "attention": "degraded",
@@ -1723,9 +1734,13 @@ def _shioaji_sources(
         output.append(
             {
                 "id": f"shioaji:{pipeline.get('id')}",
-                "parent_id": "group:tw-futures"
-                if pipeline.get("id") == "futures_history"
-                else "group:tw-microstructure-captures-cold",
+                "parent_id": (
+                    "group:tw-futures"
+                    if pipeline.get("id") == "futures_history"
+                    else "group:tw-shioaji-history"
+                    if pipeline.get("id") == "historical_market_data"
+                    else "group:tw-microstructure-captures-cold"
+                ),
                 "scope": "logical_source",
                 "title": str(pipeline.get("title") or pipeline.get("id") or "Shioaji"),
                 "provider": "永豐 Shioaji",
@@ -3587,6 +3602,7 @@ def _specialize_groups(
         "group:tw-microstructure-train": "hft_dataset",
         "group:tw-microstructure-captures-cold": "fop_stream",
         "group:tw-futures": "futures_history",
+        "group:tw-shioaji-history": "historical_market_data",
     }.items():
         group = by_id.get(group_id)
         pipeline = pipeline_by_id.get(pipeline_id)
@@ -3596,6 +3612,7 @@ def _specialize_groups(
         group["status"] = {
             "active": "updating",
             "ready": "current",
+            "complete": "complete",
             "waiting": "waiting",
             "partial": "degraded",
             "attention": "degraded",
@@ -3857,6 +3874,9 @@ def _profile_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "shioaji:stock_daily": _AUTOMATION_PROFILES["group:tw-minute-train"],
         "shioaji:futures_history": _AUTOMATION_PROFILES["group:tw-futures"],
         "shioaji:contract_catalog": _AUTOMATION_PROFILES["group:tw-futures"],
+        "shioaji:historical_market_data": _AUTOMATION_PROFILES[
+            "group:tw-shioaji-history"
+        ],
         "shioaji:on_demand_snapshots": {
             "mode": "on_demand",
             "service_keys": (),

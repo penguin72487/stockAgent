@@ -1450,7 +1450,11 @@ def _operational_issues(
 
 
 def _available_session_dates(
-    *, root: Path, state: Mapping[str, Any], observed: datetime
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    observed: datetime,
+    include_ledger_dates: bool = True,
 ) -> list[str]:
     root = Path(root)
     mode_dates = tuple(
@@ -1463,12 +1467,18 @@ def _available_session_dates(
         )
     )
     tracked_filenames = (
-        "marks.jsonl",
-        "signals.jsonl",
-        "orders.jsonl",
-        "fills.jsonl",
-        "benchmark_marks.jsonl",
-        "events.jsonl",
+        *(
+            (
+                "marks.jsonl",
+                "signals.jsonl",
+                "orders.jsonl",
+                "fills.jsonl",
+                "benchmark_marks.jsonl",
+                "events.jsonl",
+            )
+            if include_ledger_dates
+            else ()
+        ),
         BENCHMARK_HISTORY_FILENAME,
     )
 
@@ -1500,25 +1510,26 @@ def _available_session_dates(
     for raw_mode in (state.get("modes") or {}).values():
         if isinstance(raw_mode, Mapping) and raw_mode.get("session_date"):
             dates.add(str(raw_mode["session_date"])[:10])
-    for filename in (
-        "marks.jsonl",
-        "signals.jsonl",
-        "orders.jsonl",
-        "fills.jsonl",
-        "benchmark_marks.jsonl",
-        "events.jsonl",
-    ):
-        # Core execution ledgers carry an explicit session_date and their
-        # detail readers use that exact contract. Reuse the same compact index
-        # instead of building a duplicate fallback index over every row.
-        # events.jsonl is the sole retained legacy stream whose date is derived
-        # from recorded_at in Taipei time.
-        index = _ledger_session_index(
-            root / filename,
-            recorded_at_fallback=filename == "events.jsonl",
-        )
-        if index is not None:
-            dates.update(index.spans)
+    if include_ledger_dates:
+        for filename in (
+            "marks.jsonl",
+            "signals.jsonl",
+            "orders.jsonl",
+            "fills.jsonl",
+            "benchmark_marks.jsonl",
+            "events.jsonl",
+        ):
+            # Core execution ledgers carry an explicit session_date and their
+            # detail readers use that exact contract. Reuse the same compact
+            # index instead of building a duplicate fallback index over every
+            # row. events.jsonl is the sole retained legacy stream whose date
+            # is derived from recorded_at in Taipei time.
+            index = _ledger_session_index(
+                root / filename,
+                recorded_at_fallback=filename == "events.jsonl",
+            )
+            if index is not None:
+                dates.update(index.spans)
     benchmark_history = _load_benchmark_history(root)
     for row in benchmark_history.get("marks") or ():
         if isinstance(row, Mapping) and row.get("session_date"):
@@ -2614,6 +2625,7 @@ def build_dashboard_snapshot(
     maximum_event_rows: int = 2_000,
     maximum_mark_rows: int = 4_000,
     include_position_rows: bool = True,
+    include_ledger_session_dates: bool = True,
     unattended_guardian_path: Path = DEFAULT_UNATTENDED_GUARDIAN_PATH,
 ) -> dict[str, Any]:
     root = Path(state_dir)
@@ -2637,6 +2649,7 @@ def build_dashboard_snapshot(
         root=root,
         state=state,
         observed=observed,
+        include_ledger_dates=include_ledger_session_dates,
     )
     selected_session_date = _select_session_date(
         session_date,

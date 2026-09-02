@@ -2392,6 +2392,7 @@ def _signal_kwargs(
     progress_callback: Any | None = None,
     progress_label: str | None = None,
     include_unconstrained_raw_scores: bool = False,
+    day_trade_model_observation: str | None = None,
     prepared_status: MarketRuntimeStatus | None = None,
 ) -> dict:
     cfg = _effective_market_config(_resolve_market(market))
@@ -2412,6 +2413,7 @@ def _signal_kwargs(
         "progress_callback": progress_callback,
         "progress_label": progress_label,
         "include_unconstrained_raw_scores": bool(include_unconstrained_raw_scores),
+        "day_trade_model_observation": day_trade_model_observation,
     }
     return cfg.signal_kwargs(**overrides)
 
@@ -4311,22 +4313,12 @@ def _day_trade_schedule_state(
         )
     ):
         return "completed"
-    published_at = _parse_time(
-        summary.get("artifact_published_at")
-        or summary.get("signal_ready_at")
-        or summary.get("generated_at")
-    )
-    if published_at is not None:
-        observed = datetime.now(
-            ZoneInfo(getattr(cfg, "timezone", None) or "Asia/Taipei")
-        )
-        age_seconds = max(
-            0.0,
-            (observed - published_at.astimezone(observed.tzinfo)).total_seconds(),
-        )
-        if age_seconds < _day_trade_confirmation_timeout_seconds():
-            return "pending_confirmation"
-    return "retry"
+    # A published opening signal is immutable for the session.  The paper
+    # engine owns durable consumption and restart recovery; recomputing after a
+    # short acknowledgement timeout changes the signal/price clock and can
+    # create an unbounded stream of competing latest pointers.  Keep waiting
+    # for the independent engine once today's complete artifact exists.
+    return "pending_confirmation"
 
 
 def _write_discord_service_status() -> dict[str, Any]:
@@ -4419,6 +4411,21 @@ def _can_reuse_latest_signal_now(
     requested = str(requested_price_source or "auto").strip().lower()
     summary_price = str(summary.get("price_source") or "").strip().lower()
     summary_date = _summary_data_date_key(summary)
+    observation = str(
+        (summary.get("signal_price_contract") or {}).get("model_observation") or ""
+    ).strip().lower()
+    if observation == "intraday_latest_quote":
+        return False, "day_trade_signal_now_requires_fresh_quote"
+    if (
+        bool(getattr(status, "market_open", False))
+        and str(summary.get("execution_mode") or "").strip().lower()
+        == "tw_day_trade"
+    ):
+        # "now" is an observation boundary, not a 60-second presentation
+        # cache.  Every interactive day-trade request must query a new price
+        # set and rerun inference; the immutable opening signal remains owned
+        # by the scheduled 09:00 path.
+        return False, "day_trade_signal_now_requires_fresh_quote"
     if status.market_open:
         market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
         frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
@@ -5629,6 +5636,13 @@ async def _run_signal_now_background_refresh(
                 min_abs_delta=min_abs_delta,
                 progress_label=f"{command_name}:bg:{cfg.market}",
                 include_unconstrained_raw_scores=include_raw_universe,
+                day_trade_model_observation=(
+                    "latest_quote"
+                    if bool(getattr(initial_status, "market_open", False))
+                    and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+                    and not completed_session
+                    else None
+                ),
             )
         result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
         sanity_issues = _signal_sanity_issues(cfg, result.summary)
@@ -5647,7 +5661,7 @@ async def _run_signal_now_background_refresh(
             f"`{cfg.market}` 背景更新完成，以下是最新 {command_name}。\n"
             f"auto_refreshed=`{bool(auto_refreshed)}` "
             f"price_source=`{resolved_price_source or 'config'}` "
-            f"valuation=`{'official_close' if completed_session else 'live_open'}`"
+            f"valuation=`{result.summary.get('signal_price_contract', {}).get('model_observation') or ('official_close' if completed_session else 'live')}`"
         )
         delivered: set[int] = set()
         for user_id in sorted(waiters):
@@ -7743,6 +7757,13 @@ async def _handle_signal_now_command(
             min_abs_delta=min_abs_delta,
             progress_label=f"{command_name}:{cfg.market}",
             include_unconstrained_raw_scores=include_raw_universe,
+            day_trade_model_observation=(
+                "latest_quote"
+                if bool(getattr(status, "market_open", False))
+                and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+                and not completed_session
+                else None
+            ),
         )
         result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
     except Exception as exc:

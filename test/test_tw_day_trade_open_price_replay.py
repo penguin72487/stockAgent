@@ -42,7 +42,13 @@ def test_live_missed_opening_retries_source_empty_during_settle_window(
 ) -> None:
     calls: list[list[str]] = []
 
-    def fake_fetch(symbols, *, trading_date, max_traffic_fraction):
+    def fake_fetch(
+        symbols,
+        *,
+        trading_date,
+        max_traffic_fraction,
+        progress_callback=None,
+    ):
         calls.append(list(symbols))
         resolved_symbol = symbols[0]
         return (
