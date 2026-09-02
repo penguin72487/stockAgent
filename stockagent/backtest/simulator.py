@@ -119,6 +119,9 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # v19 removes portfolio-level long/short fill balancing.  After each symbol is
 # independently constrained by permissions, capacity, turnover, and whole lots,
 # its remaining executable quantity is retained without cross-symbol reduction.
+# v22 makes the exact all-futures integer allocator account-wide funding-safe:
+# blocked carried positions reserve cash before new discrete target baskets, and
+# only an unavoidable minimum-cash state may enter funding default.
 # v20 makes unlimited day-trade conversion stateful and causal: a blocked close
 # leaves signed recurrent inventory, the next OPEN trades only the target delta
 # after the overnight mark, and unclosed long purchases create an explicit
@@ -127,7 +130,7 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # v11 added the former direction-balancing behavior.  v10 separated gross
 # commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 21
+CANONICAL_BACKTEST_CONTRACT_VERSION = 22
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -3256,6 +3259,7 @@ def run_backtest_torch(
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
+    return_turnovers: bool = True,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -3376,6 +3380,7 @@ def run_backtest_torch(
                     initial_equity_scale=initial_equity_scale,
                     initial_alive=initial_alive,
                     return_weights_history=return_weights_history,
+                    return_turnovers=return_turnovers,
                 )
             else:
                 result = run_tw_futures_portfolio_integer_torch(
@@ -3387,6 +3392,7 @@ def run_backtest_torch(
                     initial_equity_scale=initial_equity_scale,
                     initial_alive=initial_alive,
                     return_weights_history=return_weights_history,
+                    return_turnovers=return_turnovers,
                     recoverable_backward=futures_portfolio_recoverable_backward,
                 )
             return BacktestResultTensor(

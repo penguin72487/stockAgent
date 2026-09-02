@@ -83,6 +83,10 @@ from stockagent.backtest.tw_index_futures import (
 )
 from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.backtest.tw_continuous import get_tw_continuous_compile_stats
+from stockagent.backtest.tw_futures_portfolio import (
+    get_tw_futures_portfolio_integer_compile_stats,
+    resolve_tw_futures_portfolio_integer_compiled_block_rows,
+)
 from stockagent.backtest.tw_day_trade_minute import (
     COMPILED_BLOCK_ROWS as TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS,
     get_tw_day_trade_minute_compile_stats,
@@ -991,6 +995,104 @@ class _PretrainedInitialization:
     source_symbol_names: list[str] | None = None
 
 
+class _PretrainedEpochZeroAccountInvalid(RuntimeError):
+    """The transferred policy produced an invalid exact validation account."""
+
+
+def _reset_pretrained_futures_action_head_to_flat_(
+    model: nn.Module,
+) -> dict[str, Any]:
+    """Make a rejected futures warm start exactly flat but still trainable.
+
+    The transferred representation remains intact.  Zeroing only the final
+    action head yields zero target weights under projection-L1, so an empty
+    exact account cannot default during the replacement guard.  The head's
+    parameters remain in the already-created optimizer and retain gradients.
+    """
+
+    raw_model = _unwrap_model(model)
+    action_head = getattr(raw_model, "futures_action_head", None)
+    if not isinstance(action_head, nn.Module):
+        raise RuntimeError(
+            "pretrained exact-account fallback requires futures_action_head"
+        )
+    reset_names: list[str] = []
+    reset_parameter_count = 0
+    trainable_parameter_count = 0
+    with torch.no_grad():
+        for name, parameter in action_head.named_parameters(recurse=True):
+            parameter.zero_()
+            reset_names.append(f"futures_action_head.{name}")
+            reset_parameter_count += int(parameter.numel())
+            if parameter.requires_grad:
+                trainable_parameter_count += int(parameter.numel())
+    if not reset_names:
+        raise RuntimeError("futures_action_head has no parameters to reset")
+    if trainable_parameter_count <= 0:
+        raise RuntimeError(
+            "flat futures action-head fallback would be frozen and unable to learn"
+        )
+    return {
+        "schema_version": 1,
+        "method": "zero_futures_action_head_flat_portfolio_v1",
+        "reset_parameter_names": reset_names,
+        "reset_parameter_count": reset_parameter_count,
+        "trainable_parameter_count": trainable_parameter_count,
+        "preserved_pretrained_backbone": True,
+        "optimizer_state_imported": False,
+    }
+
+
+def _validate_pretrained_epoch_zero_account_segment(
+    *,
+    fold_id: int,
+    row_start: int,
+    row_end: int,
+    defaults: torch.Tensor | None,
+    default_reasons: torch.Tensor | None,
+    equity_scale: torch.Tensor | None,
+) -> tuple[int, float | None]:
+    """Reject a finite-but-dead pretrained exact-account trajectory."""
+
+    start = int(row_start)
+    end = int(row_end)
+    if start < 0 or end < start:
+        raise ValueError(
+            f"invalid epoch-zero account segment [{start},{end}) for fold {fold_id}"
+        )
+    segment_defaults = None if defaults is None else defaults[start:end]
+    default_count = (
+        0 if segment_defaults is None else int(segment_defaults.sum().item())
+    )
+    if default_count > 0:
+        relative_default = int(
+            torch.nonzero(segment_defaults, as_tuple=False)[0, 0].item()
+        )
+        default_reason = (
+            0
+            if default_reasons is None
+            else int(default_reasons[start + relative_default].item())
+        )
+        raise _PretrainedEpochZeroAccountInvalid(
+            "pretrained epoch-zero exact validation account defaulted for fold "
+            f"{fold_id}: row={relative_default} reason={default_reason}. "
+            "A finite ruin-clamped loss is not an acceptable initialization guard."
+        )
+    final_equity_scale = (
+        None
+        if equity_scale is None or end <= start
+        else float(equity_scale[end - 1].item())
+    )
+    if final_equity_scale is not None and (
+        not math.isfinite(final_equity_scale) or final_equity_scale <= 0.0
+    ):
+        raise _PretrainedEpochZeroAccountInvalid(
+            "pretrained epoch-zero exact validation account is not alive for fold "
+            f"{fold_id}: final_equity_scale={final_equity_scale}"
+        )
+    return default_count, final_equity_scale
+
+
 def _checkpoint_file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1251,6 +1353,92 @@ def _pretrained_temporal_basis(
                     fold_id=fold.fold_id,
                 )
     return overrides, metadata
+
+
+def _pretrained_temporal_basis_matches_target(
+    initialization: _PretrainedInitialization,
+    *,
+    config: ExperimentConfig,
+    target_feature_count: int,
+) -> bool:
+    """Prove that source basis columns have the target model's exact ABI.
+
+    Shape equality alone is insufficient because a different family ordering
+    with the same total component count assigns different meanings to linear
+    projection columns. Conversely, reusing a smaller source selection for a
+    target PCA/KLT family would bypass the required fold-training-only fit.
+    Fail closed and fit the target basis whenever the proof is incomplete.
+    """
+
+    model_config = _temporal_basis_runtime_config(config)
+    if model_config is None:
+        return True
+    metadata = initialization.checkpoint.get("temporal_basis_selection")
+    if not isinstance(metadata, Mapping):
+        return False
+
+    def normalize_family(value: object) -> str:
+        return str(value).strip().lower().replace("-", "_")
+
+    target_families = [
+        normalize_family(value)
+        for value in getattr(model_config, "temporal_basis_families")
+    ]
+    source_families = [
+        normalize_family(value) for value in metadata.get("families", [])
+    ]
+    if source_families != target_families:
+        return False
+    if int(metadata.get("lookback", -1)) != int(config.training.lookback):
+        return False
+
+    default_components = int(
+        getattr(model_config, "temporal_basis_components")
+    )
+    configured_counts = {
+        normalize_family(name): int(value)
+        for name, value in dict(
+            getattr(
+                model_config,
+                "temporal_basis_components_by_family",
+                {},
+            )
+            or {}
+        ).items()
+    }
+    target_counts = {
+        family: int(configured_counts.get(family, default_components))
+        for family in target_families
+    }
+    source_counts = {
+        normalize_family(name): int(value)
+        for name, value in dict(
+            metadata.get("selected_counts", {}) or {}
+        ).items()
+    }
+    if source_counts != target_counts:
+        return False
+
+    d_model = int(getattr(model_config, "d_model"))
+    source_dim = (
+        int(target_feature_count)
+        if str(getattr(model_config, "temporal_basis_input", "embedded"))
+        .strip()
+        .lower()
+        == "raw_features"
+        else d_model
+    )
+    expected_projection_shape = (
+        d_model,
+        d_model + source_dim * sum(target_counts.values()),
+    )
+    source_projection = initialization.checkpoint["model_state_dict"].get(
+        "temporal_basis_feature_encoder.feature_projection.weight"
+    )
+    return bool(
+        torch.is_tensor(source_projection)
+        and tuple(source_projection.shape) == expected_projection_shape
+    )
 
 
 def _transfer_pretrained_feature_identity(
@@ -1635,6 +1823,62 @@ def _transfer_pretrained_transformer_feature_projection(
     target_state["feature_proj.weight"] = adapted_projection
 
     zero_initialized_keys: list[str] = []
+
+    # A target can deliberately expand an older embedded-basis encoder into
+    # the current raw-feature, many-basis encoder.  Randomly initialized
+    # basis columns would destroy the pretrained stock representation before
+    # the target exact-account objective sees its first gradient.  Initialize
+    # the larger linear fusion as [W_z, 0], where W_z is the compatible
+    # original-path slice of the source encoder.  The target therefore keeps
+    # the source mapping of z_base while every incompatible raw-feature/basis
+    # coefficient starts as a genuine trainable zero residual.  This is an
+    # initialization rule only; it neither changes the target loss nor
+    # substitutes an execution proxy.
+    basis_projection_key = (
+        "temporal_basis_feature_encoder.feature_projection.weight"
+    )
+    target_basis_projection = target_state.get(basis_projection_key)
+    source_basis_projection = source_state.get(basis_projection_key)
+    if (
+        torch.is_tensor(target_basis_projection)
+        and target_basis_projection.ndim == 2
+        and (
+            not torch.is_tensor(source_basis_projection)
+            or tuple(source_basis_projection.shape)
+            != tuple(target_basis_projection.shape)
+        )
+        and int(target_basis_projection.size(1))
+        >= int(target_basis_projection.size(0))
+    ):
+        adapted_basis_projection = torch.zeros_like(target_basis_projection)
+        width = int(target_basis_projection.size(0))
+        if (
+            torch.is_tensor(source_basis_projection)
+            and source_basis_projection.ndim == 2
+            and int(source_basis_projection.size(0)) == width
+            and int(source_basis_projection.size(1)) >= width
+        ):
+            adapted_basis_projection[:, :width] = source_basis_projection[
+                :, :width
+            ].to(
+                device=adapted_basis_projection.device,
+                dtype=adapted_basis_projection.dtype,
+            )
+        else:
+            adapted_basis_projection[:, :width] = torch.eye(
+                width,
+                device=adapted_basis_projection.device,
+                dtype=adapted_basis_projection.dtype,
+            )
+        target_state[basis_projection_key] = adapted_basis_projection
+        zero_initialized_keys.append(basis_projection_key)
+        basis_bias_key = "temporal_basis_feature_encoder.feature_projection.bias"
+        basis_bias = target_state.get(basis_bias_key)
+        source_basis_bias = source_state.get(basis_bias_key)
+        if torch.is_tensor(basis_bias) and not torch.is_tensor(source_basis_bias):
+            target_state[basis_bias_key] = torch.zeros_like(basis_bias)
+            zero_initialized_keys.append(basis_bias_key)
+
     for key in (
         "futures_underlying_projection.weight",
         "futures_denomination_encoder.0.weight",
@@ -1813,6 +2057,7 @@ def _tw_settlement_compile_backend(
     execution_runtime: _ExecutionRuntime,
     *,
     day_trade_minute_compile: bool,
+    stock_context_integer_compile: bool = False,
 ) -> str:
     """Return the bounded executor whose compile counters are authoritative.
 
@@ -1824,6 +2069,8 @@ def _tw_settlement_compile_backend(
 
     if day_trade_minute_compile:
         return "day_trade_minute"
+    if stock_context_integer_compile:
+        return "stock_context_integer"
     if _is_stateful_security_carry(
         execution_runtime.mode,
         execution_runtime,
@@ -6038,6 +6285,76 @@ def _accumulate_gradient_norm_diagnostic_(
                 first_zero_batch.new_tensor(float(batch_index)),
                 first_zero_batch,
             )
+        )
+
+
+def _trajectory_valid_row_count(split: WindowedSplitTensors) -> int:
+    mask = split._default_sample_mask if split.sample_mask is None else split.sample_mask
+    return int(mask.detach().to(device="cpu", dtype=torch.int64).sum().item())
+
+
+def _finalize_trajectory_optimizer_step(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    grad_clip_norm: float,
+    timing: TimingBreakdown,
+    device: torch.device,
+    profile_timing: bool,
+    gradient_norm_stats: torch.Tensor,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler
+    | torch.optim.lr_scheduler.ReduceLROnPlateau
+    | None,
+    lr_scheduler_interval: str,
+    batch_index: int,
+) -> None:
+    """Apply one AdamW/scheduler update after a full chronological trajectory."""
+
+    gradient_total_norm = _run_gradient_clip_(
+        model,
+        optimizer,
+        scaler,
+        grad_clip_norm=grad_clip_norm,
+        timing=timing,
+        device=device,
+        profile_timing=profile_timing,
+    )
+    _accumulate_gradient_norm_diagnostic_(
+        gradient_total_norm,
+        norm_sum=gradient_norm_stats[0],
+        zero_count=gradient_norm_stats[1],
+        observation_count=gradient_norm_stats[2],
+        first_zero_batch=gradient_norm_stats[3],
+        batch_index=batch_index,
+    )
+    gradients_are_finite = (
+        _tensor_is_finite(gradient_total_norm)
+        if gradient_total_norm is not None
+        else _model_gradients_are_finite(model)
+    )
+    if not gradients_are_finite:
+        optimizer.zero_grad(set_to_none=True)
+        raise FloatingPointError(
+            "non-finite gradient after full-trajectory accumulation"
+        )
+
+    step_start = time.perf_counter()
+    with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+    _stabilize_model_parameters_after_step(model)
+    _maybe_sync_cuda(device, profile_timing)
+    timing.step_s += time.perf_counter() - step_start
+    if lr_scheduler is not None and lr_scheduler_interval == "step":
+        timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
+    if not _model_parameters_are_finite(model):
+        _raise_if_model_parameters_nonfinite(
+            model,
+            "Model parameters became non-finite after trajectory optimizer step",
         )
 
 
@@ -13093,6 +13410,7 @@ def _run_eval_backtest_from_weight_buffers(
     payables_history_out: torch.Tensor | None = None
     receivables_history_out: torch.Tensor | None = None
     settlement_default_out: torch.Tensor | None = None
+    default_reason_history_out: torch.Tensor | None = None
     equity_scale_history_out: torch.Tensor | None = None
     short_sale_collateral_history_out: torch.Tensor | None = None
     short_margin_collateral_history_out: torch.Tensor | None = None
@@ -13124,6 +13442,13 @@ def _run_eval_backtest_from_weight_buffers(
     if equity_scaled_execution:
         equity_scale_history_out = torch.empty(
             (total_rows,), device=device, dtype=output_dtype
+        )
+    if integer_stock_context_execution:
+        settlement_default_out = torch.empty(
+            (total_rows,), device=device, dtype=torch.bool
+        )
+        default_reason_history_out = torch.empty(
+            (total_rows,), device=device, dtype=torch.int64
         )
     if execution_mode in TW_STOCK_EXECUTION_MODES:
         lag = int(execution_runtime.settlement_lag_sessions) if execution_runtime is not None else 2
@@ -13832,6 +14157,21 @@ def _run_eval_backtest_from_weight_buffers(
                 long_margin_debt_history_out[start:end].copy_(
                     backtest_chunk.long_margin_debt_history[:valid_rows]
                 )
+        elif settlement_default_out is not None:
+            if (
+                backtest_chunk.settlement_default is None
+                or backtest_chunk.default_reason_history is None
+                or default_reason_history_out is None
+            ):
+                raise RuntimeError(
+                    f"{execution_mode} backtest omitted required default audit tensors"
+                )
+            settlement_default_out[start:end].copy_(
+                backtest_chunk.settlement_default[:valid_rows]
+            )
+            default_reason_history_out[start:end].copy_(
+                backtest_chunk.default_reason_history[:valid_rows]
+            )
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
         timing.backtest_s += time.perf_counter() - backtest_start
@@ -13874,6 +14214,7 @@ def _run_eval_backtest_from_weight_buffers(
         payables_history=payables_history_out,
         receivables_history=receivables_history_out,
         settlement_default=settlement_default_out,
+        default_reason_history=default_reason_history_out,
         equity_scale_history=equity_scale_history_out,
         final_cash=prev_cash,
         final_payables=prev_payables,
@@ -17541,6 +17882,7 @@ def _train_epoch_windowed_tensor(
     volume_participation_equity: float = 1_000_000.0,
     settlement_lag_sessions: int = 2,
     execution_runtime: _ExecutionRuntime | None = None,
+    optimizer_step_per_trajectory: bool = False,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     if panel_slab_model is not None:
@@ -17614,6 +17956,19 @@ def _train_epoch_windowed_tensor(
         else execution_runtime.short_capacity_limit_enabled
     )
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    trajectory_valid_rows = (
+        _trajectory_valid_row_count(split)
+        if optimizer_step_per_trajectory
+        else 0
+    )
+    if optimizer_step_per_trajectory:
+        if not sequential_return_objective:
+            raise RuntimeError(
+                "trajectory optimizer cadence requires a chronological return-series objective"
+            )
+        if trajectory_valid_rows <= 0:
+            raise RuntimeError("trajectory optimizer cadence requires valid training rows")
+        optimizer.zero_grad(set_to_none=True)
     gradient_norm_stats = torch.tensor(
         [0.0, 0.0, 0.0, -1.0, -1.0, 1.0, -1.0, 0.0],
         device=device,
@@ -17702,7 +18057,8 @@ def _train_epoch_windowed_tensor(
         timing.transfer_s += batch_prepare_elapsed + h2d_elapsed
 
         _maybe_cudagraph_step_begin()
-        optimizer.zero_grad(set_to_none=True)
+        if not optimizer_step_per_trajectory:
+            optimizer.zero_grad(set_to_none=True)
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
@@ -17992,7 +18348,17 @@ def _train_epoch_windowed_tensor(
             timing.finite_check_s += time.perf_counter() - finite_start
             if not loss_is_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite loss during full-trajectory gradient accumulation"
+                    )
                 continue
+        loss_for_backward = loss
+        if optimizer_step_per_trajectory:
+            batch_valid_rows = batch_sample_mask.to(dtype=torch.float32).sum()
+            loss_for_backward = loss * (
+                batch_valid_rows / float(trajectory_valid_rows)
+            )
         if sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
             next_alive = aux_outputs.get("_final_alive")
@@ -18117,12 +18483,12 @@ def _train_epoch_windowed_tensor(
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
-                scaler.scale(loss).backward()
+                scaler.scale(loss_for_backward).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
             gradient_total_norm: torch.Tensor | None = None
-            if grad_clip_norm > 0.0:
+            if grad_clip_norm > 0.0 and not optimizer_step_per_trajectory:
                 gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
@@ -18150,27 +18516,32 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite gradient during full-trajectory accumulation"
+                    )
                 continue
-            step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
-                scaler.step(optimizer)
-                scaler.update()
-            _stabilize_model_parameters_after_step(model)
-            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
-            _maybe_sync_cuda(device, profile_timing)
-            timing.step_s += time.perf_counter() - step_start
-            if lr_scheduler is not None and lr_scheduler_interval == "step":
-                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
+            if not optimizer_step_per_trajectory:
+                step_start = time.perf_counter()
+                with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
+                    scaler.step(optimizer)
+                    scaler.update()
+                _stabilize_model_parameters_after_step(model)
+                _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.step_s += time.perf_counter() - step_start
+                if lr_scheduler is not None and lr_scheduler_interval == "step":
+                    timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
-                loss.backward()
+                loss_for_backward.backward()
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
             gradient_total_norm = None
-            if grad_clip_norm > 0.0:
+            if grad_clip_norm > 0.0 and not optimizer_step_per_trajectory:
                 gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
@@ -18198,18 +18569,23 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite gradient during full-trajectory accumulation"
+                    )
                 continue
-            step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
-                optimizer.step()
-            _stabilize_model_parameters_after_step(model)
-            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
-            _maybe_sync_cuda(device, profile_timing)
-            timing.step_s += time.perf_counter() - step_start
-            if lr_scheduler is not None and lr_scheduler_interval == "step":
-                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
+            if not optimizer_step_per_trajectory:
+                step_start = time.perf_counter()
+                with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
+                    optimizer.step()
+                _stabilize_model_parameters_after_step(model)
+                _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.step_s += time.perf_counter() - step_start
+                if lr_scheduler is not None and lr_scheduler_interval == "step":
+                    timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
-        if should_check_finite:
+        if should_check_finite and not optimizer_step_per_trajectory:
             finite_start = time.perf_counter()
             parameters_are_finite = _model_parameters_are_finite(model)
             timing.finite_check_s += time.perf_counter() - finite_start
@@ -18219,7 +18595,11 @@ def _train_epoch_windowed_tensor(
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
 
-        total_loss_t.add_(loss.detach().to(dtype=torch.float32))
+        total_loss_t.add_(
+            loss_for_backward.detach().to(dtype=torch.float32)
+            if optimizer_step_per_trajectory
+            else loss.detach().to(dtype=torch.float32)
+        )
         steps += 1
         if progress_label:
             _progress(
@@ -18227,6 +18607,20 @@ def _train_epoch_windowed_tensor(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    if optimizer_step_per_trajectory and steps > 0:
+        _finalize_trajectory_optimizer_step(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            grad_clip_norm=grad_clip_norm,
+            timing=timing,
+            device=device,
+            profile_timing=profile_timing,
+            gradient_norm_stats=gradient_norm_stats,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_interval=lr_scheduler_interval,
+            batch_index=num_batches,
+        )
     gradient_norm_stats[5].copy_(portfolio_prev_alive.to(dtype=torch.float32))
     gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
     timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
@@ -18241,7 +18635,11 @@ def _train_epoch_windowed_tensor(
     timing.batches = steps
     if steps == 0:
         return total_loss_t.detach(), timing
-    return (total_loss_t / steps).detach(), timing
+    return (
+        total_loss_t.detach()
+        if optimizer_step_per_trajectory
+        else (total_loss_t / steps).detach()
+    ), timing
 
 
 def _train_epoch_windowed_tensor_ddp(
@@ -18296,6 +18694,7 @@ def _train_epoch_windowed_tensor_ddp(
     execution_runtime: _ExecutionRuntime | None = None,
     symbol_sharded_ledger: bool = False,
     replicated_ledger_local_metadata: bool = False,
+    optimizer_step_per_trajectory: bool = False,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -18398,6 +18797,15 @@ def _train_epoch_windowed_tensor_ddp(
     )
     portfolio_prev_long_margin_debt = torch.zeros_like(portfolio_prev_weights)
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    trajectory_valid_rows = (
+        _trajectory_valid_row_count(split)
+        if optimizer_step_per_trajectory
+        else 0
+    )
+    if optimizer_step_per_trajectory:
+        if trajectory_valid_rows <= 0:
+            raise RuntimeError("trajectory optimizer cadence requires valid training rows")
+        optimizer.zero_grad(set_to_none=True)
     gradient_norm_stats = torch.tensor(
         [0.0, 0.0, 0.0, -1.0, -1.0, 1.0, -1.0, 0.0],
         device=device,
@@ -18475,7 +18883,8 @@ def _train_epoch_windowed_tensor_ddp(
         timing.transfer_s += batch_prepare_elapsed + h2d_elapsed
 
         _maybe_cudagraph_step_begin()
-        optimizer.zero_grad(set_to_none=True)
+        if not optimizer_step_per_trajectory:
+            optimizer.zero_grad(set_to_none=True)
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
@@ -18744,7 +19153,18 @@ def _train_epoch_windowed_tensor_ddp(
             timing.finite_check_s += time.perf_counter() - finite_start
             if not loss_is_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite loss during full-trajectory gradient accumulation"
+                    )
                 continue
+
+        loss_for_backward = loss
+        if optimizer_step_per_trajectory:
+            batch_valid_rows = sample_mask.to(dtype=torch.float32).sum()
+            loss_for_backward = loss * (
+                batch_valid_rows / float(trajectory_valid_rows)
+            )
 
         next_prev = (aux_outputs or {}).get("_final_weights")
         next_alive = (aux_outputs or {}).get("_final_alive")
@@ -18857,12 +19277,12 @@ def _train_epoch_windowed_tensor_ddp(
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
-                scaler.scale(loss).backward()
+                scaler.scale(loss_for_backward).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
             gradient_total_norm: torch.Tensor | None = None
-            if float(grad_clip_norm) > 0.0:
+            if float(grad_clip_norm) > 0.0 and not optimizer_step_per_trajectory:
                 gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
@@ -18890,24 +19310,29 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite gradient during full-trajectory accumulation"
+                    )
                 continue
-            step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
-                scaler.step(optimizer)
-                scaler.update()
-            _stabilize_model_parameters_after_step(model)
-            _maybe_sync_cuda(device, profile_timing)
-            timing.step_s += time.perf_counter() - step_start
+            if not optimizer_step_per_trajectory:
+                step_start = time.perf_counter()
+                with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
+                    scaler.step(optimizer)
+                    scaler.update()
+                _stabilize_model_parameters_after_step(model)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.step_s += time.perf_counter() - step_start
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
-                loss.backward()
+                loss_for_backward.backward()
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
             gradient_total_norm = None
-            if float(grad_clip_norm) > 0.0:
+            if float(grad_clip_norm) > 0.0 and not optimizer_step_per_trajectory:
                 gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
@@ -18935,18 +19360,27 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if optimizer_step_per_trajectory:
+                    raise FloatingPointError(
+                        "non-finite gradient during full-trajectory accumulation"
+                    )
                 continue
-            step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
-                optimizer.step()
-            _stabilize_model_parameters_after_step(model)
-            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
-            _maybe_sync_cuda(device, profile_timing)
-            timing.step_s += time.perf_counter() - step_start
-        if lr_scheduler is not None and lr_scheduler_interval == "step":
+            if not optimizer_step_per_trajectory:
+                step_start = time.perf_counter()
+                with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
+                    optimizer.step()
+                _stabilize_model_parameters_after_step(model)
+                _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.step_s += time.perf_counter() - step_start
+        if (
+            not optimizer_step_per_trajectory
+            and lr_scheduler is not None
+            and lr_scheduler_interval == "step"
+        ):
             timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
-        if should_check_finite:
+        if should_check_finite and not optimizer_step_per_trajectory:
             finite_start = time.perf_counter()
             parameters_are_finite = _model_parameters_are_finite(model)
             timing.finite_check_s += time.perf_counter() - finite_start
@@ -18955,7 +19389,11 @@ def _train_epoch_windowed_tensor_ddp(
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
-        total_loss_t.add_(loss.detach().to(dtype=torch.float32))
+        total_loss_t.add_(
+            loss_for_backward.detach().to(dtype=torch.float32)
+            if optimizer_step_per_trajectory
+            else loss.detach().to(dtype=torch.float32)
+        )
         steps += 1
         if progress_label and _distributed_is_rank0():
             _progress(
@@ -18963,6 +19401,20 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    if optimizer_step_per_trajectory and steps > 0:
+        _finalize_trajectory_optimizer_step(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            grad_clip_norm=grad_clip_norm,
+            timing=timing,
+            device=device,
+            profile_timing=profile_timing,
+            gradient_norm_stats=gradient_norm_stats,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_interval=lr_scheduler_interval,
+            batch_index=num_batches,
+        )
     gradient_norm_stats[5].copy_(portfolio_prev_alive.to(dtype=torch.float32))
     gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
     timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
@@ -18977,7 +19429,11 @@ def _train_epoch_windowed_tensor_ddp(
     timing.batches = steps
     if steps == 0:
         return total_loss_t.detach(), timing
-    return (total_loss_t / steps).detach(), timing
+    return (
+        total_loss_t.detach()
+        if optimizer_step_per_trajectory
+        else (total_loss_t / steps).detach()
+    ), timing
 
 
 def _compute_metrics_from_tensors(
@@ -21762,7 +22218,14 @@ def _run_training_impl(
             config,
             group_folds,
         )
-        if pretrained_initialization is None:
+        if (
+            pretrained_initialization is None
+            or not _pretrained_temporal_basis_matches_target(
+                pretrained_initialization,
+                config=config,
+                target_feature_count=len(panel.feature_names),
+            )
+        ):
             temporal_basis_overrides, temporal_basis_metadata = (
                 _fit_group_temporal_basis(
                     config=config,
@@ -21772,6 +22235,12 @@ def _run_training_impl(
                     output_path=output_path,
                 )
             )
+            if pretrained_initialization is not None:
+                print(
+                    f"[Train {train_years}] pretrained temporal-basis ABI "
+                    "differs; fitted the target basis from fold-training "
+                    "windows only"
+                )
         else:
             temporal_basis_overrides, temporal_basis_metadata = (
                 _pretrained_temporal_basis(
@@ -22297,15 +22766,25 @@ def _run_training_impl(
             train_windowed=train_windowed,
             train_batch_size=train_batch_size,
         )
+        optimizer_step_per_trajectory = bool(
+            config.training.futures_portfolio_optimizer_step_per_trajectory
+            and execution_runtime.mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_integer_contracts
+        )
+        scheduler_steps_per_epoch = (
+            1 if optimizer_step_per_trajectory else train_steps_per_epoch
+        )
         scheduler, scheduler_name, scheduler_requires_metric, scheduler_step_interval = _create_lr_scheduler(
             optimizer,
             config,
-            steps_per_epoch=train_steps_per_epoch,
+            steps_per_epoch=scheduler_steps_per_epoch,
         )
         if scheduler is not None:
             print(
                 f"[Train {train_years}] lr_scheduler={scheduler_name} "
-                f"interval={scheduler_step_interval} steps_per_epoch={train_steps_per_epoch}"
+                f"interval={scheduler_step_interval} "
+                f"steps_per_epoch={scheduler_steps_per_epoch} "
+                f"optimizer_cadence={'trajectory' if optimizer_step_per_trajectory else 'batch'}"
             )
 
         start_epoch = 1
@@ -22541,10 +23020,6 @@ def _run_training_impl(
             and train_windowed.overnight_log_returns is not None
             and train_windowed.overnight_log_returns.dim() in {3, 4}
         )
-        tw_settlement_compile_backend = _tw_settlement_compile_backend(
-            execution_runtime,
-            day_trade_minute_compile=tw_day_trade_minute_compile,
-        )
         tw_index_futures_compile = bool(
             execution_runtime.mode == "tw_index_futures_day"
         )
@@ -22553,11 +23028,20 @@ def _run_training_impl(
             and _split_uses_recurrent_futures_equity_scale(train_windowed)
             and execution_runtime.mode == "tw_stock_context_futures_portfolio"
         )
+        tw_settlement_compile_backend = _tw_settlement_compile_backend(
+            execution_runtime,
+            day_trade_minute_compile=tw_day_trade_minute_compile,
+            stock_context_integer_compile=tw_stock_context_integer_loss,
+        )
         tw_settlement_compiled_rows = (
             int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
             if tw_settlement_compile_backend == "day_trade_minute"
             else int(TW_DUAL_SESSION_COMPILED_BLOCK_ROWS)
             if tw_settlement_compile_backend == "dual_session"
+            else int(
+                resolve_tw_futures_portfolio_integer_compiled_block_rows()
+            )
+            if tw_settlement_compile_backend == "stock_context_integer"
             else int(
                 getattr(
                     config.training,
@@ -22572,12 +23056,14 @@ def _run_training_impl(
                 execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
                 or execution_runtime.mode == "tw_day_trade"
                 or tw_index_futures_compile
+                or tw_stock_context_integer_loss
             )
             and device.type == "cuda"
             and bool(config.training.backtest_compile)
             and (
                 execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
                 or tw_index_futures_compile
+                or tw_stock_context_integer_loss
                 or tw_settlement_compiled_rows > 0
             )
         )
@@ -23184,6 +23670,12 @@ def _run_training_impl(
         tw_dual_stats_after = dict(tw_dual_stats_before)
         tw_futures_stats_before = get_tw_index_futures_compile_stats()
         tw_futures_stats_after = dict(tw_futures_stats_before)
+        tw_integer_futures_stats_before = (
+            get_tw_futures_portfolio_integer_compile_stats()
+        )
+        tw_integer_futures_stats_after = dict(
+            tw_integer_futures_stats_before
+        )
         tw_compiled_calls_delta = 0
         tw_compiled_day_calls_delta = 0
         tw_fallback_calls_delta = 0
@@ -23253,6 +23745,9 @@ def _run_training_impl(
             tw_minute_stats_after = get_tw_day_trade_minute_compile_stats()
             tw_dual_stats_after = get_tw_dual_session_compile_stats()
             tw_futures_stats_after = get_tw_index_futures_compile_stats()
+            tw_integer_futures_stats_after = (
+                get_tw_futures_portfolio_integer_compile_stats()
+            )
             if tw_settlement_chunk_compile:
                 if tw_settlement_compile_backend == "day_trade_minute":
                     chunk_calls = int(
@@ -23289,6 +23784,19 @@ def _run_training_impl(
                     chunk_fallbacks = int(
                         tw_futures_stats_after["eager_fallback_calls"]
                         - tw_futures_stats_before["eager_fallback_calls"]
+                    )
+                elif tw_settlement_compile_backend == "stock_context_integer":
+                    chunk_calls = int(
+                        tw_integer_futures_stats_after["compiled_block_calls"]
+                        - tw_integer_futures_stats_before["compiled_block_calls"]
+                    )
+                    tw_compiled_day_calls_delta = int(
+                        tw_integer_futures_stats_after["compiled_day_calls"]
+                        - tw_integer_futures_stats_before["compiled_day_calls"]
+                    )
+                    chunk_fallbacks = int(
+                        tw_integer_futures_stats_after["eager_fallback_calls"]
+                        - tw_integer_futures_stats_before["eager_fallback_calls"]
                     )
                 else:
                     chunk_calls = int(
@@ -23653,10 +24161,34 @@ def _run_training_impl(
                         "epoch-zero validation loss count does not match folds: "
                         f"losses={len(epoch_zero_values)} folds={len(fold_contexts)}"
                     )
-                for context, raw_loss in zip(
-                    fold_contexts.values(),
-                    epoch_zero_values,
-                    strict=True,
+                epoch_zero_defaults = (
+                    None
+                    if epoch_zero_backtest.settlement_default is None
+                    else epoch_zero_backtest.settlement_default.detach()
+                    .to(device="cpu", dtype=torch.bool)
+                    .reshape(-1)
+                )
+                epoch_zero_default_reasons = (
+                    None
+                    if epoch_zero_backtest.default_reason_history is None
+                    else epoch_zero_backtest.default_reason_history.detach()
+                    .to(device="cpu", dtype=torch.int64)
+                    .reshape(-1)
+                )
+                epoch_zero_equity = (
+                    None
+                    if epoch_zero_backtest.equity_scale_history is None
+                    else epoch_zero_backtest.equity_scale_history.detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1)
+                )
+                for index, (context, raw_loss) in enumerate(
+                    zip(
+                        fold_contexts.values(),
+                        epoch_zero_values,
+                        strict=True,
+                    )
                 ):
                     val_loss = float(raw_loss)
                     if not math.isfinite(val_loss):
@@ -23664,9 +24196,21 @@ def _run_training_impl(
                             "pretrained epoch-zero exact validation loss is not "
                             f"finite for fold {context.fold.fold_id}: {val_loss}"
                         )
+                    row_start = int(val_offsets[index])
+                    row_end = int(val_offsets[index + 1])
+                    default_count, final_equity_scale = (
+                        _validate_pretrained_epoch_zero_account_segment(
+                            fold_id=int(context.fold.fold_id),
+                            row_start=row_start,
+                            row_end=row_end,
+                            defaults=epoch_zero_defaults,
+                            default_reasons=epoch_zero_default_reasons,
+                            equity_scale=epoch_zero_equity,
+                        )
+                    )
                     context.best_val_loss = val_loss
                     guard_payload = {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "fold_id": int(context.fold.fold_id),
                         "epoch": 0,
                         "validation_loss": val_loss,
@@ -23681,6 +24225,9 @@ def _run_training_impl(
                             ]
                         ),
                         "test_split_used_for_selection": False,
+                        "settlement_default_count": default_count,
+                        "final_alive": True,
+                        "final_equity_scale": final_equity_scale,
                         "replacement_rule": (
                             "later checkpoint must improve target exact "
                             "validation loss"
@@ -23720,6 +24267,116 @@ def _run_training_impl(
                         f"validation loss={val_loss:.8f}; seeded checkpoint_best.pt"
                     )
                 del epoch_zero_backtest, epoch_zero_losses
+            except _PretrainedEpochZeroAccountInvalid as rejected:
+                try:
+                    # A transferred representation can remain useful even when
+                    # its old execution head ruins the target exact account.
+                    # Replace only that final head with the analytically flat
+                    # portfolio.  This imports no optimizer state, preserves
+                    # all causal backbone features, and provides a valid cash
+                    # checkpoint from which recoverable-backward training can
+                    # learn.  Do not weaken the account guard or accept the
+                    # finite ruin-clamped source loss.
+                    epoch_zero_backtest = None
+                    epoch_zero_losses = None
+                    fallback_receipt = (
+                        _reset_pretrained_futures_action_head_to_flat_(model)
+                    )
+                    fallback_receipt["trigger"] = str(rejected)
+                    fallback_receipt["validation_loss_source"] = (
+                        "analytical_flat_exact_account"
+                    )
+                    pretrained_initialization_report[
+                        "epoch_zero_guard_fallback"
+                    ] = deepcopy(fallback_receipt)
+                    _write_pretrained_initialization_metadata(
+                        output_path,
+                        train_years=train_years,
+                        group_folds=group_folds,
+                        report=pretrained_initialization_report,
+                    )
+                    print(
+                        f"[Train {train_years}] epoch 0 transferred account "
+                        f"rejected ({rejected}); applied "
+                        f"{fallback_receipt['method']}"
+                    )
+                    for context in fold_contexts.values():
+                        val_loss = 0.0
+                        context.best_val_loss = val_loss
+                        guard_payload = {
+                            "schema_version": 3,
+                            "fold_id": int(context.fold.fold_id),
+                            "epoch": 0,
+                            "validation_loss": val_loss,
+                            "validation_loss_source": (
+                                "analytical_flat_exact_account"
+                            ),
+                            "objective": str(loss_objective),
+                            "execution_mode": str(execution_runtime.mode),
+                            "source_checkpoint": (
+                                pretrained_initialization_report[
+                                    "source_checkpoint"
+                                ]
+                            ),
+                            "source_checkpoint_sha256": (
+                                pretrained_initialization_report[
+                                    "source_checkpoint_sha256"
+                                ]
+                            ),
+                            "test_split_used_for_selection": False,
+                            "settlement_default_count": 0,
+                            "final_alive": True,
+                            "final_equity_scale": 1.0,
+                            "initialization_fallback": deepcopy(
+                                fallback_receipt
+                            ),
+                            "replacement_rule": (
+                                "later checkpoint must improve target exact "
+                                "validation loss over flat cash"
+                            ),
+                        }
+                        _save_fold_checkpoint(
+                            context.checkpoint_best_path,
+                            fold=context.fold,
+                            epoch=0,
+                            best_val_loss=val_loss,
+                            model=model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            experiment_manifest=experiment_manifest,
+                            extra_payload={
+                                "pretrained_initialization": deepcopy(
+                                    pretrained_initialization_report
+                                ),
+                                "pretrained_epoch_zero_validation": (
+                                    guard_payload
+                                ),
+                            },
+                            check_finite=(
+                                config.training.checkpoint_finite_check
+                            ),
+                        )
+                        if _distributed_should_write():
+                            receipt_path = (
+                                context.fold_dir
+                                / "pretrained_epoch0_validation.json"
+                            )
+                            with receipt_path.open(
+                                "w", encoding="utf-8"
+                            ) as handle:
+                                json.dump(
+                                    guard_payload,
+                                    handle,
+                                    indent=2,
+                                    sort_keys=True,
+                                )
+                        print(
+                            f"[Fold {context.fold.fold_id}] epoch 0 exact "
+                            "validation fallback=flat cash loss=0.00000000; "
+                            "seeded checkpoint_best.pt"
+                        )
+                except BaseException as fallback_error:
+                    epoch_zero_error = fallback_error
             except BaseException as exc:
                 epoch_zero_error = exc
             _raise_if_distributed_phase_failed(
@@ -23785,6 +24442,7 @@ def _run_training_impl(
                         replicated_ledger_local_metadata=bool(
                             config.training.distributed_replicated_ledger_local_metadata
                         ),
+                        optimizer_step_per_trajectory=optimizer_step_per_trajectory,
                     )
                 return _train_epoch_windowed_tensor(
                     train_model,
@@ -23836,6 +24494,7 @@ def _run_training_impl(
                     volume_participation_equity=config.trading.volume_participation_equity,
                     settlement_lag_sessions=execution_runtime.settlement_lag_sessions,
                     execution_runtime=execution_runtime,
+                    optimizer_step_per_trajectory=optimizer_step_per_trajectory,
                 )
 
         def _save_best_val_complete_fold_artifacts(

@@ -311,6 +311,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     # through recursive mapping merge.
     if "temporal_basis_families" in override:
         merged["temporal_basis_components_by_family"] = {}
+        merged["temporal_basis_disabled_families"] = []
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)

@@ -8,6 +8,10 @@ cd "${REPO_ROOT}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export STOCKAGENT_DDP_CPU_AFFINITY="${STOCKAGENT_DDP_CPU_AFFINITY:-42-55,154-167;28-41,140-153}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Fixed 16-session exact-account blocks preserve both the integer forward
+# ledger and its differentiable shadow while amortizing 1,936-slot kernel
+# launch overhead. Keep this a power of two; re-benchmark before overriding.
+export STOCKAGENT_TW_FUTURES_PORTFOLIO_COMPILE_BLOCK_ROWS="${STOCKAGENT_TW_FUTURES_PORTFOLIO_COMPILE_BLOCK_ROWS:-16}"
 
 source scripts/runtime_env.sh
 run_fintech_python scripts/check_environment.py --require-cuda --strict
@@ -30,14 +34,15 @@ for path in "${required_data[@]}"; do
   fi
 done
 
-echo "[all-futures-carry-to-expiry] 99 stock features; 22 families/524 components; TWD 10M"
+echo "[all-futures-carry-to-expiry] v3 funding-safe exact account; one optimizer step per full trajectory"
+echo "[all-futures-carry-to-expiry] guarded fold-matched initialization; exact target loss; 99 stock features; 22 families/524 components; TWD 10M"
 echo "[all-futures-carry-to-expiry] exact whole contracts; prior-volume 50%; cross-session carry; settlement-valued expiry close"
 echo "[all-futures-carry-to-expiry] missing official expiry settlement quarantines the complete physical contract; no redistribution"
 echo "[all-futures-carry-to-expiry] full-notional collateral is a conservative research assumption; no stock T+3 ledger"
 
 # train.py owns fold isolation and DDP. Do not wrap this command in torchrun.
 run_fintech_python train.py \
-  --config configs/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_full_features_multi_basis_projection_l1_cash_capital10m.yaml \
+  --config configs/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_funding_safe_trajectory_full_features_multi_basis_projection_l1_cash_capital10m.yaml \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 56 \
   --torch-compile-threads 16 \

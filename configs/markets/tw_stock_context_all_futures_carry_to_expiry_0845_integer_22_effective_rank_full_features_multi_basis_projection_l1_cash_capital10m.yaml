@@ -35,7 +35,7 @@ training:
   model_name: cross_sectional_all_futures
   epochs: 1000
   lookback: 32
-  batch_size_train: 64
+  batch_size_train: 128
   batch_size_eval: 32
   auto_batch_size: false
   futures_portfolio_training_surrogate_only: false
@@ -68,6 +68,7 @@ training:
     # raw-feature contraction. It uses every one of the 99 features without
     # materializing [batch,symbol,524*99] coefficients.
     temporal_basis_input: raw_features
+    checkpoint_blocks: false
     temporal_basis_families:
       - haar
       - swt_db2

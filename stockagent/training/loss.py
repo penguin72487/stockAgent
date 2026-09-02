@@ -1835,6 +1835,15 @@ def risk_aware_loss(
         futures_portfolio_recoverable_backward=(
             futures_portfolio_recoverable_backward
         ),
+        # The exact carrying account does not use turnover to advance state.
+        # Its only supported objective is log utility, whose turnover branch
+        # is mathematically absent when gamma_turnover is zero.  Validation,
+        # inference, and any non-zero turnover objective retain the complete
+        # audited series through run_backtest_torch's default.
+        return_turnovers=not (
+            mode == "tw_stock_context_futures_portfolio"
+            and float(gamma_turnover) == 0.0
+        ),
     )
     _loss_timer_stop("backtest", backtest_start)
 

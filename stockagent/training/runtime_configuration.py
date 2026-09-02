@@ -109,6 +109,34 @@ def _configure_torch_compile_runtime() -> None:
     except Exception:
         pass
     try:
+        # PyTorch 2.11's SIMD tiler contains both ``raise CantSplit(expr,
+        # remaining)`` and a legacy no-argument ``raise CantSplit`` control
+        # path, while the packaged exception constructor requires both
+        # arguments.  Large valid panel-slab batches can therefore fail in
+        # compiler shape selection before any CUDA kernel runs.  Restore the
+        # intended control-flow exception ABI without changing tiling choices;
+        # the surrounding Inductor code catches CantSplit and tries another
+        # compatible tiling.
+        from torch._inductor.codegen.simd import CantSplit
+
+        try:
+            CantSplit()
+        except TypeError:
+            original_cant_split_init = CantSplit.__init__
+
+            def _compatible_cant_split_init(
+                self: Exception,
+                expr: object | None = None,
+                remaining: object | None = None,
+            ) -> None:
+                original_cant_split_init(self, expr, remaining)
+
+            CantSplit.__init__ = _compatible_cant_split_init  # type: ignore[method-assign]
+    except Exception:
+        # Inductor internals are optional and version-specific.  A future
+        # release with a consistent constructor needs no compatibility patch.
+        pass
+    try:
         from torch._dynamo.utils import CompileEventLogger
 
         CompileEventLogger.compilation_metric = staticmethod(

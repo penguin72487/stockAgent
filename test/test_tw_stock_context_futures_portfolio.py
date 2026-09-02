@@ -12,8 +12,10 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
+import stockagent.backtest.tw_futures_portfolio as futures_portfolio_module
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.backtest.tw_futures_portfolio import (
+    TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING,
     TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY,
     TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE,
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
@@ -925,6 +927,63 @@ def test_integer_carry_jointly_packs_standard_and_mini_and_closes_at_expiry() ->
     )
 
 
+def test_integer_account_reserves_locked_positions_before_new_targets() -> None:
+    execution = torch.zeros((1, 2, 11), dtype=torch.float32)
+    execution[..., 3:5] = 100_000.0
+    execution[..., 9] = torch.tensor([[0.0, 1.0]])
+    # Slot 0 is a blocked carried position. Slot 1 can trade, but its requested
+    # 90% sleeve must contract to the residual 50% account capacity.
+    execution[0, 1, 1] = 1.0
+    execution[0, 1, 8] = 100.0
+    result = run_tw_futures_portfolio_integer_torch(
+        torch.tensor([[0.0, 0.90]], dtype=torch.float32),
+        execution,
+        initial_capital=1_000_000.0,
+        initial_quantities=torch.tensor([5.0, 0.0]),
+    )
+    assert result.contract_quantities_history is not None
+    assert result.contract_quantities_history[0].tolist() == [5, 5]
+    assert bool(result.final_alive)
+    assert result.default_reason_history is not None
+    assert result.default_reason_history.tolist() == [0]
+
+
+def test_integer_account_defaults_only_when_minimum_locked_cash_is_impossible() -> None:
+    execution = torch.zeros((1, 1, 11), dtype=torch.float32)
+    execution[..., 3:5] = 100_000.0
+    result = run_tw_futures_portfolio_integer_torch(
+        torch.zeros((1, 1), dtype=torch.float32),
+        execution,
+        initial_capital=1_000_000.0,
+        initial_quantities=torch.tensor([11.0]),
+    )
+    assert not bool(result.final_alive)
+    assert result.default_reason_history is not None
+    assert result.default_reason_history.tolist() == [
+        TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING
+    ]
+
+
+def test_flat_action_head_portfolio_is_an_exact_cash_account() -> None:
+    execution = _integer_execution(
+        torch.tensor(
+            [[-0.20, 0.15], [0.25, -0.10], [-0.05, 0.08]],
+            dtype=torch.float32,
+        )
+    )
+    result = run_tw_futures_portfolio_integer_torch(
+        torch.zeros((3, 2), dtype=torch.float32),
+        execution,
+        initial_capital=10_000_000.0,
+    )
+    torch.testing.assert_close(result.strategy_returns, torch.zeros(3))
+    assert result.equity_scale_history is not None
+    torch.testing.assert_close(result.equity_scale_history, torch.ones(3))
+    assert result.default_history is not None
+    assert not bool(result.default_history.any())
+    assert bool(result.final_alive)
+
+
 def test_integer_surrogate_has_gradient_inside_hard_quantization_plateau() -> None:
     actions = torch.tensor(
         [[0.20, 0.10], [0.25, 0.05]],
@@ -1186,6 +1245,181 @@ def test_integer_executor_chunking_carries_quantities_and_equity_together() -> N
     )
 
 
+def test_integer_compiled_block_boundary_preserves_shadow_state_and_gradient() -> None:
+    raw_actions = torch.tensor(
+        [
+            [0.30, 0.10],
+            [0.35, 0.05],
+            [-0.20, 0.25],
+            [0.15, -0.30],
+        ],
+        dtype=torch.float32,
+    )
+    execution = _integer_execution(
+        torch.tensor(
+            [
+                [0.10, -0.02],
+                [0.03, 0.01],
+                [-0.04, 0.02],
+                [0.01, -0.03],
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    full_actions = raw_actions.clone().requires_grad_(True)
+    full = futures_portfolio_module._run_tw_futures_portfolio_integer_torch_impl(
+        full_actions,
+        execution,
+        initial_capital=1_000_000.0,
+        recoverable_backward=True,
+    )
+    full_loss = -full.strategy_returns.mean()
+    full_gradient = torch.autograd.grad(full_loss, full_actions)[0]
+
+    blocked_actions = raw_actions.clone().requires_grad_(True)
+    first = futures_portfolio_module._run_tw_futures_portfolio_integer_torch_impl(
+        blocked_actions[:2],
+        execution[:2],
+        initial_capital=1_000_000.0,
+        recoverable_backward=True,
+    )
+    assert first._surrogate_final_weights is not None
+    assert first._surrogate_final_equity_scale is not None
+    assert first._surrogate_final_alive is not None
+    second = futures_portfolio_module._run_tw_futures_portfolio_integer_torch_impl(
+        blocked_actions[2:],
+        execution[2:],
+        initial_capital=1_000_000.0,
+        initial_quantities=first.final_weights,
+        initial_equity_scale=first.final_equity_scale,
+        initial_alive=first.final_alive,
+        recoverable_backward=True,
+        _initial_surrogate_weights=first._surrogate_final_weights,
+        _initial_surrogate_equity_scale=first._surrogate_final_equity_scale,
+        _initial_surrogate_alive=first._surrogate_final_alive,
+    )
+    blocked_returns = torch.cat(
+        (first.strategy_returns, second.strategy_returns)
+    )
+    blocked_gradient = torch.autograd.grad(
+        -blocked_returns.mean(), blocked_actions
+    )[0]
+
+    torch.testing.assert_close(blocked_returns, full.strategy_returns)
+    torch.testing.assert_close(blocked_gradient, full_gradient)
+    assert torch.equal(second.final_weights, full.final_weights)
+    torch.testing.assert_close(
+        second.final_equity_scale,
+        full.final_equity_scale,
+    )
+
+
+def test_integer_compiled_tail_padding_is_an_inert_fixed_size_suffix() -> None:
+    actions = torch.tensor(
+        [[0.30, -0.10], [0.20, 0.05], [-0.15, 0.25]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    execution = _integer_execution(
+        torch.tensor(
+            [[0.01, -0.02], [0.03, 0.01], [-0.01, 0.02]],
+            dtype=torch.float32,
+        )
+    )
+    advance = torch.tensor([True, False, True])
+
+    padded_actions, padded_execution, padded_advance = (
+        futures_portfolio_module._pad_integer_compile_tail(
+            actions,
+            execution,
+            advance,
+            block_rows=4,
+        )
+    )
+
+    assert tuple(padded_actions.shape) == (4, 2)
+    assert tuple(padded_execution.shape) == (4, 2, 11)
+    assert tuple(padded_advance.shape) == (4,)
+    torch.testing.assert_close(padded_actions[:3], actions)
+    torch.testing.assert_close(padded_execution[:3], execution)
+    assert torch.equal(padded_advance[:3], advance)
+    assert torch.count_nonzero(padded_actions[3]).item() == 0
+    assert torch.count_nonzero(padded_execution[3]).item() == 0
+    assert padded_advance[3].item() is False
+
+    padded_actions.sum().backward()
+    torch.testing.assert_close(actions.grad, torch.ones_like(actions))
+
+
+def test_integer_compiled_block_rows_has_one_environment_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve = getattr(
+        futures_portfolio_module,
+        "resolve_tw_futures_portfolio_integer_compiled_block_rows",
+    )
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_FUTURES_PORTFOLIO_COMPILE_BLOCK_ROWS",
+        "64",
+    )
+    assert resolve() == 64
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_FUTURES_PORTFOLIO_COMPILE_BLOCK_ROWS",
+        "invalid",
+    )
+    assert resolve() == 0
+
+
+def test_integer_zero_turnover_objective_can_skip_unused_series_exactly() -> None:
+    actions = torch.tensor(
+        [[0.30, -0.10], [0.20, 0.05], [-0.15, 0.25]],
+        dtype=torch.float32,
+    )
+    execution = _integer_execution(
+        torch.tensor(
+            [[0.01, -0.02], [0.03, 0.01], [-0.01, 0.02]],
+            dtype=torch.float32,
+        )
+    )
+
+    complete_actions = actions.clone().requires_grad_(True)
+    complete = run_tw_futures_portfolio_integer_torch(
+        complete_actions,
+        execution,
+        initial_capital=1_000_000.0,
+        return_turnovers=True,
+        recoverable_backward=True,
+    )
+    complete_loss = -complete.strategy_returns.mean()
+    complete_gradient = torch.autograd.grad(
+        complete_loss,
+        complete_actions,
+    )[0]
+
+    skipped_actions = actions.clone().requires_grad_(True)
+    skipped = run_tw_futures_portfolio_integer_torch(
+        skipped_actions,
+        execution,
+        initial_capital=1_000_000.0,
+        return_turnovers=False,
+        recoverable_backward=True,
+    )
+    skipped_loss = -skipped.strategy_returns.mean()
+    skipped_gradient = torch.autograd.grad(skipped_loss, skipped_actions)[0]
+
+    torch.testing.assert_close(skipped.strategy_returns, complete.strategy_returns)
+    torch.testing.assert_close(skipped_loss, complete_loss)
+    torch.testing.assert_close(skipped_gradient, complete_gradient)
+    assert torch.count_nonzero(skipped.turnovers).item() == 0
+    assert torch.count_nonzero(complete.turnovers).item() > 0
+    assert torch.equal(skipped.final_weights, complete.final_weights)
+    torch.testing.assert_close(
+        skipped.final_equity_scale,
+        complete.final_equity_scale,
+    )
+
+
 def test_formal_config_preserves_full_contract_and_1000_epochs() -> None:
     config = load_config(
         "configs/markets/"
@@ -1275,7 +1509,7 @@ def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
     assert futures_contract["integer_training_surrogate"] == (
         TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
     )
-    assert futures_contract["integer_training_forward"] == "exact_integer_account_v1"
+    assert futures_contract["integer_training_forward"] == "exact_integer_account_v2"
     assert futures_contract["denomination_aware_model_output"] is True
     assert futures_contract["candidate_feature_columns"] == list(
         TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
@@ -1415,7 +1649,7 @@ def test_integer_0845_carry_to_expiry_22_basis_config_is_fresh_contract() -> Non
     assert config.trading.max_volume_participation == pytest.approx(0.5)
     assert config.training.epochs == 1000
     assert config.training.lookback == 32
-    assert config.training.batch_size_train == 64
+    assert config.training.batch_size_train == 128
     assert config.training.batch_size_eval == 32
     assert config.training.futures_portfolio_training_surrogate_only is False
     assert config.training.futures_portfolio_recoverable_backward is True
@@ -1459,6 +1693,84 @@ def test_integer_0845_carry_to_expiry_22_basis_config_is_fresh_contract() -> Non
     )
     assert futures_contract["missing_final_settlement_policy"] == (
         "quarantine_entire_physical_contract_no_redistribution"
+    )
+
+
+def test_integer_0845_carry_to_expiry_guard_matches_day_trade_training_stage() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_pretrained_guard_full_features_multi_basis_"
+        "projection_l1_cash_capital10m.yaml"
+    )
+    assert config.training.epochs == 1000
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert config.training.futures_portfolio_recoverable_backward is True
+    assert config.training.pretrained_initialization_root.endswith(
+        "tw_stock_context_all_futures_carry_multi_basis_projection_l1_"
+        "v3_full1000_batch96_chunk64"
+    )
+    assert config.training.pretrained_initialization_fold_policy == (
+        "matching_train_and_validation_years"
+    )
+    assert config.training.pretrained_initialization_feature_adapter == (
+        "transformer_feature_projection_by_name"
+    )
+    assert config.training.pretrained_initialization_require_exact_backbone is False
+    assert config.training.pretrained_initialization_validation_guard is True
+    assert config.training.pretrained_initialization_trainable_parameter_prefixes == [
+        "temporal_basis_feature_encoder.",
+        "futures_",
+    ]
+    assert config.training.batch_size_train == 256
+    assert config.training.batch_size_eval == 64
+    assert config.training.eval_model_chunk_rows == 64
+    assert config.training.eval_backtest_chunk_rows == 64
+    assert len(config.data.feature_include) == 99
+    assert sum(
+        config.training.transformer_base_portfolio.temporal_basis_components_by_family.values()
+    ) == 524
+    assert config.trading.tw_futures_portfolio_integer_contracts is True
+    assert config.data.tw_futures_expiry_settlement_valuation is True
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_pretrained_guard_cash_capital10m_v2"
+    )
+
+
+def test_integer_0845_funding_safe_trajectory_v3_is_a_fresh_contract() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_pretrained_guard_funding_safe_trajectory_full_features_"
+        "multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    basis = config.training.transformer_base_portfolio
+    assert config.training.epochs == 1000
+    assert config.training.batch_size_train == 256
+    assert config.training.batch_size_eval == 64
+    assert config.training.futures_portfolio_optimizer_step_per_trajectory is True
+    assert config.training.lr_scheduler_warmup_steps == 256
+    assert basis.futures_denomination_aware_output is True
+    assert basis.futures_denomination_hard_projection is False
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_pretrained_guard_funding_safe_trajectory_"
+        "cash_capital10m_v3"
+    )
+    manifest = build_checkpoint_manifest(
+        _stock_panel(), config, include_data_content=False
+    )
+    assert manifest["contracts"]["model"]["contract_version"] == 5
+    assert manifest["contracts"]["training"]["optimizer"]["step_cadence"] == (
+        "full_chronological_trajectory"
+    )
+    futures_contract = manifest["contracts"]["trading"][
+        "taiwan_stock_context_futures_portfolio"
+    ]
+    assert futures_contract["integer_training_forward"] == "exact_integer_account_v2"
+    assert futures_contract["denomination_hard_projection_owner"] == (
+        "exact_integer_executor_dynamic_equity"
     )
 
 

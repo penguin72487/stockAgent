@@ -177,6 +177,11 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if not projected.get("temporal_basis_disabled_families"):
+        # Empty is the historical all-paths-enabled forward and adds neither
+        # parameters nor behavior.  Keep completed pre-switch checkpoints
+        # loadable; non-empty ablations remain explicit semantic contracts.
+        projected.pop("temporal_basis_disabled_families", None)
     if bool(projected.get("use_execution_context_features", True)):
         # Learned execution-context conditioning predates its ablation switch.
         # Omit the enabled/default value so existing executable-transformer
@@ -217,6 +222,10 @@ def _project_temporal_basis_model_config(
             # pre-existing non-futures checkpoint.  Enabled branches remain
             # explicit and therefore keep their own strict fingerprints.
             projected.pop(field_name, None)
+    if projected.get("futures_denomination_hard_projection") is None:
+        # None preserves the historical behavior: hard model-side projection is
+        # active exactly when denomination-aware output is active.
+        projected.pop("futures_denomination_hard_projection", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -322,6 +331,7 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
     }:
         from stockagent.models.cross_sectional_all_futures import (
             CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION,
+            CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION,
         )
@@ -330,7 +340,14 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_all_futures",
             "contract_version": int(
-                CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION
+                CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION
+                if (
+                    config.training.transformer_base_portfolio
+                    .futures_current_open_feature
+                    and config.training.transformer_base_portfolio
+                    .futures_denomination_hard_projection is False
+                )
+                else CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION
                 if (
                     config.training.transformer_base_portfolio
                     .futures_current_open_feature
@@ -615,6 +632,11 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
+            **(
+                {"step_cadence": "full_chronological_trajectory"}
+                if training.futures_portfolio_optimizer_step_per_trajectory
+                else {}
+            ),
         },
         "scheduler": _active_scheduler_checkpoint_contract(config),
         "batching": batching_contract,
@@ -1110,6 +1132,12 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "denomination_aware_model_output": bool(
                 config.training.transformer_base_portfolio
                 .futures_denomination_aware_output
+            ),
+            "denomination_hard_projection_owner": (
+                "exact_integer_executor_dynamic_equity"
+                if config.training.transformer_base_portfolio
+                .futures_denomination_hard_projection is False
+                else "model_fixed_reference_capital_then_exact_integer_executor"
             ),
             "denomination_clock": (
                 "08:45_same_print_group_tier_and_open_notional_research_proxy"
@@ -2176,6 +2204,30 @@ def _checkpoint_manifest(
         schema_4_pre_projection_scale_fingerprints["model"] = (
             _stable_fingerprint(historical_model_contract)
         )
+    schema_4_with_inactive_futures_fields_fingerprints: dict[str, str] = {}
+    if (
+        "futures_denomination_aware_output" not in model_contract["model"]
+        and "futures_current_open_feature" not in model_contract["model"]
+    ):
+        # Some schema-4 cash-equity checkpoints were written after the generic
+        # Transformer config gained these futures switches but before inactive
+        # defaults were projected out.  Reconstruct only those two explicit
+        # false values.  Any enabled futures branch or any other model change
+        # still has a different fingerprint and fails closed.
+        historical_model_values = dict(model_contract["model"])
+        historical_model_values.update(
+            {
+                "futures_denomination_aware_output": False,
+                "futures_current_open_feature": False,
+            }
+        )
+        historical_model_contract = {
+            **model_contract,
+            "model": historical_model_values,
+        }
+        schema_4_with_inactive_futures_fields_fingerprints["model"] = (
+            _stable_fingerprint(historical_model_contract)
+        )
     schema_3_model_contract = {
         "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _schema_3_checkpoint_model_values(active_model),
@@ -2326,6 +2378,9 @@ def _checkpoint_manifest(
             ),
             "schema_4_pre_projection_l1_active_count_scale": (
                 schema_4_pre_projection_scale_fingerprints
+            ),
+            "schema_4_with_inactive_futures_fields": (
+                schema_4_with_inactive_futures_fields_fingerprints
             ),
             "schema_4_pre_minute_tape_fingerprint": (
                 schema_4_pre_minute_tape_fingerprints
@@ -2659,6 +2714,7 @@ def _validate_checkpoint_manifest(
                 ("data", "schema_4_pre_external_feature_source"),
                 ("data_schema", "schema_4_pre_external_feature_source"),
                 ("model", "schema_4_pre_projection_l1_active_count_scale"),
+                ("model", "schema_4_with_inactive_futures_fields"),
                 ("data", "schema_4_pre_minute_tape_fingerprint"),
                 (
                     "data",

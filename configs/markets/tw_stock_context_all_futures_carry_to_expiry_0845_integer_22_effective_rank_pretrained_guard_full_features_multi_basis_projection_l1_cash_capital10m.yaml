@@ -1,0 +1,38 @@
+# Throughput-oriented exact-account successor.  Each fold starts from the
+# completed fold with identical train/validation years in the old all-futures
+# v3 root, imports no optimizer state, and is selected only by this target's
+# exact whole-contract carry-to-expiry validation loss.
+base_config: tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-to-expiry-0845-integer-22-effective-rank-pretrained-guard-capital10m-v2
+
+runner:
+  # The initialization/trainability contract differs from the v1 from-scratch
+  # experiment, so preserving v1 and using a fresh root is mandatory.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_cash_capital10m_v2
+  resume: true
+  post_train_infer: false
+
+training:
+  epochs: 1000
+  batch_size_train: 256
+  batch_size_eval: 64
+  eval_model_chunk_rows: 64
+  eval_backtest_chunk_rows: 64
+  eval_backtest_chunk_rows_auto: false
+  eval_auto_chunk_rows_cap: 64
+  warm_start_from_previous_fold: false
+  pretrained_initialization_root: artifacts/markets/tw_stock_context_all_futures_carry_multi_basis_projection_l1_v3_full1000_batch96_chunk64
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: transformer_feature_projection_by_name
+  pretrained_initialization_require_exact_backbone: false
+  pretrained_initialization_validation_guard: true
+
+  # Freeze the completed causal stock/market backbone.  The expanded 22-family
+  # raw-feature basis starts as [source W_z, 0] and is trained as a residual. All
+  # futures-specific modules remain trainable under the exact integer account.
+  # This mirrors the day-trade guarded fine-tuning stage without changing this
+  # product's carry, expiry, fee, tax, capacity, or settlement semantics.
+  pretrained_initialization_trainable_parameter_prefixes:
+    - temporal_basis_feature_encoder.
+    - futures_

@@ -5,6 +5,7 @@ import yaml
 
 import scripts.run_ablation_experiments as ablation_module
 from stockagent.config import load_config
+from stockagent.training.checkpoint_contract import _active_model_config
 from scripts.run_ablation_experiments import (
     _build_configs,
     _deep_merge,
@@ -33,10 +34,11 @@ def test_deep_merge_replaces_basis_limits_when_family_set_changes() -> None:
         "training": {
             "model": {
                 "temporal_basis_families": ["haar", "learned"],
-                "temporal_basis_components_by_family": {
-                    "haar": 8,
-                    "learned": 4,
-                },
+            "temporal_basis_components_by_family": {
+                "haar": 8,
+                "learned": 4,
+            },
+            "temporal_basis_disabled_families": ["haar"],
             }
         }
     }
@@ -56,6 +58,7 @@ def test_deep_merge_replaces_basis_limits_when_family_set_changes() -> None:
     assert result["training"]["model"] == {
         "temporal_basis_families": ["learned"],
         "temporal_basis_components_by_family": {"learned": 7},
+        "temporal_basis_disabled_families": [],
     }
 
 
@@ -324,6 +327,78 @@ def test_executable_v5_model_performance_ofat_is_formal_and_semantic(
         .training.executable_portfolio_transformer.temporal_basis_components_by_family
         == {"learned": 31}
     )
+
+
+def test_hybrid_minute_v12_basis_ablation_preserves_full_checkpoint_abi(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/"
+        "tw_day_trade_hybrid_minute_v12_temporal_basis_checkpoint_ablation_v1.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    names = [row["name"] for row in experiments]
+
+    assert len(names) == 24
+    assert "baseline" not in names
+    assert names[:2] == ["no_temporal_basis_paths", "learned_basis_only"]
+    assert {f"without_{family}" for family in (
+        "haar",
+        "swt_db2",
+        "swt_sym4",
+        "wavelet_packet",
+        "walsh",
+        "fourier",
+        "dct",
+        "dpss",
+        "local_cosine",
+        "morlet",
+        "exponential",
+        "laguerre",
+        "difference",
+        "ar_innovation",
+        "bspline",
+        "legendre",
+        "chebyshev",
+        "learned",
+        "kautz",
+        "discrete_hermite",
+        "chirplet",
+        "pca_klt",
+    )}.issubset(names)
+    assert spec["expected_fold_count"] == 11
+    assert spec["require_complete_baseline_artifact"] is True
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    loaded = {run["name"]: load_config(run["config_path"]) for run in runs}
+    all_families = loaded["no_temporal_basis_paths"].training.financial_transformer.temporal_basis_families
+    assert len(all_families) == 22
+    assert set(
+        loaded["no_temporal_basis_paths"]
+        .training.financial_transformer.temporal_basis_disabled_families
+    ) == set(all_families)
+    assert loaded["without_haar"].training.financial_transformer.temporal_basis_disabled_families == ["haar"]
+    baseline_config = load_config(
+        "configs/markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml"
+    )
+    assert "temporal_basis_disabled_families" not in _active_model_config(
+        baseline_config
+    )["values"]
+    assert _active_model_config(loaded["without_haar"])["values"][
+        "temporal_basis_disabled_families"
+    ] == ["haar"]
+    for config in loaded.values():
+        model = config.training.financial_transformer
+        assert model.temporal_basis_families == all_families
+        assert sum(model.temporal_basis_components_by_family.values()) == 524
+        assert config.training.epochs == 1000
+        assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+        assert config.data.feature_exclude == []
+        assert config.training.pretrained_initialization_root.endswith(
+            "tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12"
+        )
 
 
 def test_inherited_experiment_override_renames_and_patches_one_row(

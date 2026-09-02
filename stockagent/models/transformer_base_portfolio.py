@@ -1121,6 +1121,7 @@ class TemporalBasisFeatureEncoder(nn.Module):
         source_dim: int | None = None,
         families: Sequence[str] | str,
         components: int,
+        disabled_families: Sequence[str] | str | None = None,
         components_by_family: Mapping[str, int] | None = None,
         novelty_threshold: float = DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
         sanitize_inputs: bool = True,
@@ -1138,6 +1139,17 @@ class TemporalBasisFeatureEncoder(nn.Module):
         self.family_names = _normalize_temporal_basis_families(families)
         if not self.family_names:
             raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
+        self.disabled_family_names = _normalize_temporal_basis_families(
+            disabled_families
+        )
+        unexpected_disabled = set(self.disabled_family_names).difference(
+            self.family_names
+        )
+        if unexpected_disabled:
+            raise ValueError(
+                "Disabled temporal basis families are not enabled: "
+                f"{sorted(unexpected_disabled)}"
+            )
 
         self.family_component_counts: dict[str, int] = {}
         normalized_component_limits = {
@@ -1228,7 +1240,13 @@ class TemporalBasisFeatureEncoder(nn.Module):
                 dim=-1,
                 eps=1e-6,
             ).to(dtype=basis_source.dtype)
-        return basis_source.to(device=source.device, dtype=source.dtype)
+        basis_source = basis_source.to(device=source.device, dtype=source.dtype)
+        if family in self.disabled_family_names:
+            # Preserve every parameter, buffer, projection column and RMS
+            # width while removing this family's signal.  The state_dict ABI
+            # is therefore identical to the completed baseline checkpoint.
+            return torch.zeros_like(basis_source)
+        return basis_source
 
     def _fused_projection(
         self,
@@ -1243,37 +1261,31 @@ class TemporalBasisFeatureEncoder(nn.Module):
             weight[:, : self.dim],
             self.feature_projection.bias,
         )
-        offset = self.dim
-        effective_kernel: torch.Tensor | None = None
-        for family in self.family_names:
-            component_count = self.family_component_counts[family]
-            width = component_count * self.source_dim
-            family_weight = weight[:, offset : offset + width].reshape(
-                self.dim,
-                component_count,
-                self.source_dim,
-            )
-            basis = self._basis(family, temporal_source)
-            # W[o,k,f] B[k,l] becomes one compact time-feature kernel.  This
-            # contraction is algebraically identical to W @ basis_coefficients.
-            family_kernel = torch.einsum(
-                "okf,kl->olf",
-                family_weight,
-                basis,
-            )
-            effective_kernel = (
-                family_kernel
-                if effective_kernel is None
-                else effective_kernel + family_kernel
-            )
-            offset += width
-        if effective_kernel is not None:
-            output = output + torch.einsum(
-                "olf,blsf->bso",
-                effective_kernel,
-                temporal_source,
-            )
-        return output
+        # The feature projection stores every family consecutively in exactly
+        # the same [component, source-feature] order used by the materialized
+        # coefficient path.  Contract the complete bank at once instead of
+        # launching one contraction and one accumulation per family.  The
+        # learned dictionary remains differentiable through ``torch.cat`` and
+        # ``_basis``; only the execution schedule changes.
+        basis_bank = torch.cat(
+            [self._basis(family, temporal_source) for family in self.family_names],
+            dim=0,
+        )
+        basis_weight = weight[:, self.dim :].reshape(
+            self.dim,
+            self.total_basis_components,
+            self.source_dim,
+        )
+        effective_kernel = torch.einsum(
+            "okf,kl->olf",
+            basis_weight,
+            basis_bank,
+        )
+        return output + torch.einsum(
+            "olf,blsf->bso",
+            effective_kernel,
+            temporal_source,
+        )
 
     def explainability_decomposition(
         self,
@@ -2006,6 +2018,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_pooling: str = "attention",
         temporal_query_mode: str = "full_then_last",
         temporal_basis_families: Sequence[str] | str | None = None,
+        temporal_basis_disabled_families: Sequence[str] | str | None = None,
         temporal_basis_components: int = 8,
         temporal_basis_components_by_family: Mapping[str, int] | None = None,
         temporal_basis_novelty_threshold: float = (
@@ -2075,6 +2088,19 @@ class TransformerBasePortfolioModel(nn.Module):
         self.temporal_basis_families = _normalize_temporal_basis_families(
             temporal_basis_families
         )
+        self.temporal_basis_disabled_families = (
+            _normalize_temporal_basis_families(
+                temporal_basis_disabled_families
+            )
+        )
+        unexpected_disabled_families = set(
+            self.temporal_basis_disabled_families
+        ).difference(self.temporal_basis_families)
+        if unexpected_disabled_families:
+            raise ValueError(
+                "Disabled temporal basis families are not enabled: "
+                f"{sorted(unexpected_disabled_families)}"
+            )
         self.temporal_basis_components = int(temporal_basis_components)
         self.temporal_basis_components_by_family = {
             _normalize_temporal_basis_families((name,))[0]: int(value)
@@ -2322,6 +2348,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     else self.d_model
                 ),
                 families=self.temporal_basis_families,
+                disabled_families=self.temporal_basis_disabled_families,
                 components=self.temporal_basis_components,
                 components_by_family=self.temporal_basis_components_by_family,
                 novelty_threshold=self.temporal_basis_novelty_threshold,

@@ -1514,6 +1514,25 @@ def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatib
         scope="resume",
     )
 
+    explicit_inactive_futures = copy.deepcopy(current)
+    explicit_inactive_futures["contracts"]["model"]["model"].update(
+        {
+            "futures_denomination_aware_output": False,
+            "futures_current_open_feature": False,
+        }
+    )
+    explicit_inactive_futures["fingerprints"]["model"] = (
+        trainer_module._stable_fingerprint(
+            explicit_inactive_futures["contracts"]["model"]
+        )
+    )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": explicit_inactive_futures},
+        current,
+        checkpoint_path=tmp_path / "schema_v4_with_inactive_futures_fields.pt",
+        scope="model",
+    )
+
     external_enabled = copy.deepcopy(config)
     external_enabled.data.use_external_features = True
     with pytest.raises(RuntimeError, match="data_schema"):

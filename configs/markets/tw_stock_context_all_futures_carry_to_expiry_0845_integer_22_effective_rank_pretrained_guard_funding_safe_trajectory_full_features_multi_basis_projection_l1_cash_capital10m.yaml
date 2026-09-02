@@ -1,0 +1,34 @@
+# First-principles v3 correction of the guarded carry-to-expiry experiment.
+# Exact whole-contract execution remains authoritative. The model retains the
+# causal denomination channels but no longer hard-rounds against a fixed TWD
+# 10M reference before the recurrent executor rounds against live account
+# equity. Account-wide funding is projected radially after blocked carried
+# positions reserve cash, and AdamW advances once per complete chronological
+# epoch so every fold uses the same policy and LR clock over its trajectory.
+base_config: tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-to-expiry-0845-integer-22-effective-rank-pretrained-guard-funding-safe-trajectory-capital10m-v3
+
+runner:
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_funding_safe_trajectory_cash_capital10m_v3
+  resume: true
+  post_train_infer: false
+
+training:
+  epochs: 1000
+  batch_size_train: 256
+  batch_size_eval: 64
+  futures_portfolio_training_surrogate_only: false
+  futures_portfolio_recoverable_backward: true
+  futures_portfolio_optimizer_step_per_trajectory: true
+
+  # With one optimizer step per epoch, warmup is now fold-invariant: 256 means
+  # 256 epochs for every fold, instead of 256 divided by a fold-dependent number
+  # of batches. All values remain powers of two.
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 256
+
+  transformer_base_portfolio:
+    futures_denomination_aware_output: true
+    futures_denomination_hard_projection: false
