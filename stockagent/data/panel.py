@@ -465,6 +465,18 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
     )
 
 
+def slice_panel_start(
+    panel: PanelData,
+    panel_start_date: str | date | np.datetime64 | None,
+) -> PanelData:
+    """Apply the canonical inclusive panel boundary to an existing panel."""
+
+    return _slice_panel_start(
+        panel,
+        _normalize_panel_start_date(panel_start_date),
+    )
+
+
 @dataclass(slots=True)
 class _SymbolPanelArrays:
     symbol: str
@@ -5163,6 +5175,47 @@ def _load_valid_panel_cache(
         print(f"[panel] loading legacy cache (valid): {cache_path}")
         return _load_panel_cache(cache_path)
     return None
+
+
+def load_panel_cache_v2_exact(
+    parquet_root: str | Path,
+    *,
+    source_hash: str,
+    backend_key: str,
+    source_paths: list[Path] | None = None,
+) -> PanelData | None:
+    """Load one exact v2 cache contract without invoking a panel rebuild.
+
+    This is the small public bridge used by latency-sensitive consumers that
+    already own a complete source identity.  It deliberately does not follow
+    the mutable ``meta.json`` pointer, a pinned-training manifest, or the
+    legacy cache: the caller-provided source/backend contract must match an
+    immutable v2 generation exactly.
+
+    ``source_paths`` may be empty when ``source_hash`` itself is a complete
+    receipt over every input (for example the live-tail cache).  Ordinary full
+    panel callers should continue to use :func:`load_cached_panel`, which owns
+    the canonical byte-hash construction for training data.
+    """
+
+    paths = list(source_paths or [])
+    if not panel_cache_v2_is_valid(
+        parquet_root,
+        source_hash=str(source_hash),
+        backend_key=str(backend_key),
+        version=PANEL_CACHE_VERSION,
+        source_paths=paths,
+    ):
+        return None
+    return _panel_from_cache_payload(
+        load_panel_cache_v2(
+            parquet_root,
+            mmap_mode="c",
+            source_hash=str(source_hash),
+            backend_key=str(backend_key),
+            version=PANEL_CACHE_VERSION,
+        )
+    )
 
 
 def build_panel(

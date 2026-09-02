@@ -2107,17 +2107,18 @@ def _preopen_progress(
         recovered_signal_id = str(mode.get("signal_id") or "")
         recovered_at = mode.get("entry_completed_at")
         recovered_late = bool(
-            status == "failed"
+            status in {"failed", "pending"}
             and str(mode.get("engine_status") or "") in {"active", "completed"}
             and str(mode.get("session_date") or "") == session_date
             and recovered_signal_id
             and _is_taipei_session_date(recovered_at, session_date)
         )
         if recovered_late:
-            # Preserve the failed preparation stage while reflecting the newer
-            # durable engine fact.  The separate opening gate still records a
-            # missed 09:00 SLO, so this never rewrites a late recovery as an
-            # on-time preopen success.
+            # Preserve the failed/pending preparation stage while reflecting
+            # the newer durable engine fact. A mode deployed after the morning
+            # receipt is necessarily pending there, but its same-session
+            # signal/entry is still a truthful late recovery. The separate
+            # opening gate keeps the missed 09:00 SLO visible.
             status = "recovered_late"
         if (
             final_arm_current_process_required

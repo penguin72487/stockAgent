@@ -403,8 +403,8 @@ def _tx_historical_day_books(
     history_root: Path,
     trading_date: date,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
-    receipt_path = history_root / "receipts" / (
-        f"trading_date={trading_date.isoformat()}.json"
+    receipt_path = (
+        history_root / "receipts" / (f"trading_date={trading_date.isoformat()}.json")
     )
     if not receipt_path.is_file():
         raise FileNotFoundError(receipt_path)
@@ -484,9 +484,7 @@ def _tx_complete_minute_books(
         if fresh:
             current = by_minute[_minute(observed)]
         if current is None:
-            raise RuntimeError(
-                f"TX first minute has no valid quote on {trading_date}"
-            )
+            raise RuntimeError(f"TX first minute has no valid quote on {trading_date}")
         output.append((observed, dict(current), fresh))
     return output
 
@@ -504,9 +502,7 @@ def _tx_engine_history_mark(
         observed=observed,
     )
     row.update(source)
-    entry_at = datetime.fromisoformat(str(source["origin_entry_at"])).astimezone(
-        TAIPEI
-    )
+    entry_at = datetime.fromisoformat(str(source["origin_entry_at"])).astimezone(TAIPEI)
     row.update(
         {
             "recorded_at": observed.isoformat(timespec="seconds"),
@@ -642,11 +638,34 @@ def _required_stock_adjustment(
     symbol: str,
     entry_at: datetime,
     mark_date: date,
+    current_session_reference: dict[str, Any] | None = None,
 ) -> tuple[float, list[dict[str, Any]]]:
+    current_kwargs: dict[str, Any] = {}
+    if (
+        isinstance(current_session_reference, dict)
+        and str(current_session_reference.get("corporate_action_coverage_end") or "")
+        == mark_date.isoformat()
+    ):
+        current_kwargs = {
+            "current_reference_price": current_session_reference.get(
+                "current_session_reference_price"
+            ),
+            "current_reference_source": current_session_reference.get(
+                "current_session_reference_source"
+            ),
+            "previous_close": current_session_reference.get("previous_official_close"),
+            "previous_close_date": current_session_reference.get(
+                "previous_official_close_date"
+            ),
+            "previous_close_source": current_session_reference.get(
+                "previous_official_close_source"
+            ),
+        }
     factor, actions, status = engine._stock_total_return_adjustment(
         symbol=symbol,
         entry_at=entry_at,
         mark_date=mark_date,
+        **current_kwargs,
     )
     if factor is None:
         raise RuntimeError(
@@ -672,8 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--corporate-action-reference",
         type=Path,
         default=Path(
-            "/srv/stockagent-live/data_tw_public/"
-            "tw_corporate_action_reference.parquet"
+            "/srv/stockagent-live/data_tw_public/tw_corporate_action_reference.parquet"
         ),
     )
     parser.add_argument(
@@ -689,9 +707,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fop-capture-root",
         type=Path,
-        default=Path(
-            "data_tw_index_derivatives_ticks/shioaji_fop_captures"
-        ),
+        default=Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
     )
     parser.add_argument(
         "--tx-history-root",
@@ -749,9 +765,9 @@ def main() -> None:
             f"{adjustment_engine._corporate_action_load_error}"
         )
     now = datetime.now(TAIPEI)
-    current_session_unclosed = (
-        end == now.date() and now.timetz().replace(tzinfo=None) < time(13, 30)
-    )
+    current_session_unclosed = end == now.date() and now.timetz().replace(
+        tzinfo=None
+    ) < time(13, 30)
     current_open_path = state_dir / "replay_open_data" / f"{end.isoformat()}.parquet"
     current_opens = (
         _current_open_rows(current_open_path, end) if current_session_unclosed else {}
@@ -900,6 +916,7 @@ def main() -> None:
                     symbol=symbol,
                     entry_at=entry_at,
                     mark_date=trading_date,
+                    current_session_reference=live,
                 )
                 marks.append(
                     _stock_mark(
@@ -941,6 +958,7 @@ def main() -> None:
                     symbol=symbol,
                     entry_at=entry_at,
                     mark_date=trading_date,
+                    current_session_reference=live,
                 )
                 marks.append(
                     _stock_mark(
@@ -962,18 +980,15 @@ def main() -> None:
                     )
                 )
 
-        live_entry_at = datetime.fromisoformat(str(live["entry_at"])).astimezone(
-            TAIPEI
-        )
+        live_entry_at = datetime.fromisoformat(str(live["entry_at"])).astimezone(TAIPEI)
         pre_live_factor, pre_live_actions = _required_stock_adjustment(
             adjustment_engine,
             symbol=symbol,
             entry_at=entry_at,
             mark_date=live_entry_at.date(),
+            current_session_reference=live,
         )
-        origins[benchmark_id]["corporate_action_factor_to_live_entry"] = (
-            pre_live_factor
-        )
+        origins[benchmark_id]["corporate_action_factor_to_live_entry"] = pre_live_factor
         origins[benchmark_id]["corporate_action_count_to_live_entry"] = len(
             pre_live_actions
         )
@@ -1012,9 +1027,7 @@ def main() -> None:
                     "contract": metadata,
                     "receipts": manifest_receipts,
                 }
-                end_at = datetime.combine(
-                    trading_date, time(13, 45), tzinfo=TAIPEI
-                )
+                end_at = datetime.combine(trading_date, time(13, 45), tzinfo=TAIPEI)
                 if trading_date == now.date() and current_session_unclosed:
                     end_at = now
                 books = _tx_day_books(
@@ -1054,9 +1067,7 @@ def main() -> None:
                         timestamp_column="event_ts",
                         epoch_utc=False,
                     )
-                    quote_source = (
-                        "receipt_backed_shioaji_txfr1_historical_tick_l1"
-                    )
+                    quote_source = "receipt_backed_shioaji_txfr1_historical_tick_l1"
             else:
                 metadata = _tx_historical_contract_metadata(
                     final_settlement_path=final_settlement_path,
@@ -1103,9 +1114,7 @@ def main() -> None:
                     )
                 marks.append(tx_mark)
                 tx_rows += 1
-        tx_replayed = dict(
-            tx_engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID]
-        )
+        tx_replayed = dict(tx_engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID])
 
     entry_at = datetime.fromisoformat(str(tx_replayed["origin_entry_at"])).astimezone(
         TAIPEI
@@ -1118,15 +1127,10 @@ def main() -> None:
     tx_multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"]
     live_initial_tax = _tx_tax(live_tx_entry_price, live_tx_entry_at.date())
     canonical_fixed_fees = float(tx_replayed.get("fixed_fees_twd") or 0.0)
-    canonical_transaction_tax = float(
-        tx_replayed.get("transaction_tax_twd") or 0.0
-    )
+    canonical_transaction_tax = float(tx_replayed.get("transaction_tax_twd") or 0.0)
     live_net_pnl_offset = (
         float(tx_replayed.get("realized_gross_pnl_twd") or 0.0)
-        + (
-            live_tx_entry_price
-            - float(tx_replayed["current_contract_entry_price"])
-        )
+        + (live_tx_entry_price - float(tx_replayed["current_contract_entry_price"]))
         * tx_multiplier
         - canonical_fixed_fees
         - canonical_transaction_tax
@@ -1144,9 +1148,7 @@ def main() -> None:
         "gross_pnl_multiplier": tx_multiplier,
         "source": "receipt_backed_shioaji_front_month_best_ask_at_day_open",
         "contract_code": (
-            provenance["tx_capture_manifests"][start.isoformat()]["contract"][
-                "code"
-            ]
+            provenance["tx_capture_manifests"][start.isoformat()]["contract"]["code"]
             if start.isoformat() in provenance["tx_capture_manifests"]
             else provenance["tx_history_receipts"][start.isoformat()]["contract"][
                 "code"

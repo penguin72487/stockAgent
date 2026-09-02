@@ -252,6 +252,42 @@ def test_engine_quarantines_interrupted_signal_commit_after_restart(
     assert sync["ledger_integrity_ready"] is False
 
 
+def test_appended_older_history_does_not_replace_latest_live_commit(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    engine._event(
+        "signal_commit_started",
+        recorded_at=datetime(2026, 8, 12, 9, 1, tzinfo=TAIPEI),
+        market=spec.market,
+        session_date="2026-08-12",
+        signal_id="historical-signal",
+    )
+    engine._event(
+        "signal_registered",
+        recorded_at=datetime(2026, 8, 12, 9, 1, 1, tzinfo=TAIPEI),
+        market=spec.market,
+        session_date="2026-08-12",
+        signal_id="historical-signal",
+    )
+
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+
+    mode = restarted.state["modes"][spec.market]
+    assert mode.get("ledger_state_divergence") is None
+    assert mode["signal_id"] == "signal-1"
+
+
 def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
     tmp_path: Path,
 ) -> None:
@@ -641,7 +677,7 @@ def _row(weight: float = 0.1) -> dict[str, object]:
     }
 
 
-def test_runner_loads_all_three_configured_day_trade_modes() -> None:
+def test_runner_loads_all_four_configured_day_trade_modes() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -652,6 +688,7 @@ def test_runner_loads_all_three_configured_day_trade_modes() -> None:
     active_expected = {
         "tw_day_trade_100m",
         "tw_day_trade_multi_basis",
+        "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }
 
@@ -660,6 +697,7 @@ def test_runner_loads_all_three_configured_day_trade_modes() -> None:
     assert set(live_configs) == active_expected
     assert by_market["tw_day_trade_100m"].initial_capital_twd == 100_000_000.0
     assert by_market["tw_day_trade_multi_basis"].initial_capital_twd == 10_000_000.0
+    assert by_market["tw_day_trade_multi_basis_22"].initial_capital_twd == 10_000_000.0
     assert (
         by_market["tw_day_trade_multi_basis_projection_l1_gelu"].initial_capital_twd
         == 10_000_000.0
@@ -3867,6 +3905,47 @@ def test_dashboard_marks_failed_preopen_as_late_recovery_after_engine_commit(
     assert row["preparation_status"] == "failed"
     assert row["preparation_error"] == "BotUserError: timeout"
     assert row["recovered_signal_id"] == "signal-recovered"
+    assert row["public_error_code"] == "preopen_recovered_late"
+
+
+def test_dashboard_marks_post_receipt_mode_as_late_recovery_after_engine_commit(
+    tmp_path: Path,
+) -> None:
+    readiness_path = tmp_path / "preopen_readiness.json"
+    readiness_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "updated_at": _now(8, 30).isoformat(),
+                "markets": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    modes = [
+        {
+            "market": "new_mode",
+            "label": "New mode",
+            "signal_market": "new_mode",
+            "engine_status": "active",
+            "session_date": "2026-08-13",
+            "signal_id": "signal-deployed-late",
+            "entry_completed_at": _now(9, 1).isoformat(),
+        }
+    ]
+
+    progress = dashboard_module._preopen_progress(
+        path=readiness_path,
+        modes=modes,
+        observed=_now(11, 0),
+    )
+
+    row = progress["markets"][0]
+    assert progress["status"] == "recovered_late"
+    assert row["status"] == "recovered_late"
+    assert row["preparation_status"] == "pending"
+    assert row["recovered_signal_id"] == "signal-deployed-late"
     assert row["public_error_code"] == "preopen_recovered_late"
 
 

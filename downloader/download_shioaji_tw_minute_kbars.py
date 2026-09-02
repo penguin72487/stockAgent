@@ -1222,6 +1222,61 @@ def _write_run_summary(
     return summary_path
 
 
+def _write_market_hours_stop(
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    selected: list[UniverseRow],
+    message: str,
+) -> Path:
+    """Persist a truthful zero-request receipt for a preflight schedule stop."""
+
+    counters = {
+        "processed_chunks": 0,
+        "queried_chunks": 0,
+        "skipped_empty_chunks": 0,
+    }
+    rate = {"total_requests": 0, "overall_rps": 0.0}
+    summary_path = _write_run_summary(
+        output_dir,
+        args=args,
+        selected=selected,
+        results=[],
+        traffic=None,
+        stopped_for_traffic=False,
+        stopped_for_market_hours=True,
+        counters=counters,
+        rate=rate,
+        fatal_error="",
+    )
+    _atomic_write_json(
+        output_dir / "progress.json",
+        {
+            "schema_version": 2,
+            "state": "stopped_for_market_hours",
+            "parallel_workers": int(args.workers),
+            "requests_per_second_limit": float(args.requests_per_second),
+            "selected_symbols": len(selected),
+            "reported_symbols": 0,
+            "processed_chunks_this_run": 0,
+            "queried_chunks_this_run": 0,
+            "skipped_empty_chunks_this_run": 0,
+            "api_requests_started_this_run": 0,
+            "observed_request_start_rps": 0.0,
+            "request_window_rps": 0.0,
+            "elapsed_seconds": 0.0,
+            "traffic_used_bytes": None,
+            "traffic_limit_bytes": None,
+            "fatal_error": None,
+            "stop_reason": message,
+            "updated_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+        },
+    )
+    return summary_path
+
+
 def _partial_symbol_result(
     row: UniverseRow,
     chunks: list[tuple[date, date]],
@@ -1706,10 +1761,22 @@ def main() -> None:
         )
         return
     if _taiwan_market_hours_now() and not args.allow_market_hours:
-        raise RuntimeError(
+        message = (
             "Refusing historical minute backfill during Taiwan market hours "
             "(07:45-14:31 live-priority window)."
         )
+        summary_path = _write_market_hours_stop(
+            args.output_dir,
+            args=args,
+            selected=selected,
+            message=message,
+        )
+        print(
+            f"[shioaji-minute] status=stopped_for_market_hours "
+            f"api_requests=0 summary={summary_path}",
+            flush=True,
+        )
+        raise RuntimeError(message)
     api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
     if not api_key or not secret_key:

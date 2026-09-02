@@ -246,7 +246,111 @@ def test_failed_rebuild_persists_partial_and_resume_only_requests_unresolved(
     assert summary["coverage_complete"] is True
     assert summary["baseline_established"] is True
     assert summary["failed_month_count"] == 0
-    assert summary["output_receipt"]["sha256"] == taiex._file_receipt(canonical_path)["sha256"]
+    assert (
+        summary["output_receipt"]["sha256"]
+        == taiex._file_receipt(canonical_path)["sha256"]
+    )
+
+
+def test_failed_daily_attempt_recovers_matching_canonical_from_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "public"
+    responses = {
+        "1999-01": _payload(
+            "1999-01",
+            [("1999-01-05", 10.0, 11.0, 9.0, 10.5)],
+        ),
+        "1999-02": _payload(
+            "1999-02",
+            [("1999-02-01", 10.5, 11.5, 10.0, 11.0)],
+        ),
+    }
+
+    def successful_request(url: str, _args: object) -> _Response:
+        month = "1999-01" if "date=19990101" in url else "1999-02"
+        return _Response(responses[month])
+
+    monkeypatch.setattr(taiex, "_request_once", successful_request)
+    assert taiex._run(_args(output_dir)) == 0
+    canonical_path = taiex._canonical_path(output_dir)
+    canonical_bytes = canonical_path.read_bytes()
+    accepted_summary_bytes = taiex._summary_path(output_dir).read_bytes()
+
+    def failed_request(_url: str, _args: object) -> _Response:
+        raise requests.ConnectionError("temporary failure")
+
+    monkeypatch.setattr(taiex, "_request_once", failed_request)
+    assert taiex._run(_args(output_dir, mode="daily")) == 0
+
+    assert canonical_path.read_bytes() == canonical_bytes
+    recovered = json.loads(taiex._summary_path(output_dir).read_text(encoding="utf-8"))
+    assert recovered["coverage_complete"] is True
+    assert recovered["replacement_promoted"] is True
+    assert recovered["canonical_recovered_from_journal"] is True
+    assert recovered["failed_month_count"] == 0
+    assert len(recovered["nonblocking_latest_refresh_failed_months"]) == 2
+    assert taiex._summary_path(output_dir).read_bytes() != accepted_summary_bytes
+    attempt = json.loads(
+        taiex._latest_attempt_summary_path(output_dir).read_text(encoding="utf-8")
+    )
+    assert attempt["coverage_complete"] is False
+    assert attempt["replacement_promoted"] is False
+    assert attempt["preserved_previous_canonical_summary"] is True
+    assert attempt["canonical_recovered_from_journal"] is True
+    assert attempt["failed_month_count"] == 2
+
+
+def test_failed_daily_attempt_preserves_older_summary_when_target_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "public"
+    responses = {
+        "1999-01": _payload(
+            "1999-01",
+            [("1999-01-05", 10.0, 11.0, 9.0, 10.5)],
+        ),
+        "1999-02": _payload(
+            "1999-02",
+            [("1999-02-01", 10.5, 11.5, 10.0, 11.0)],
+        ),
+    }
+
+    def successful_request(url: str, _args: object) -> _Response:
+        month = "1999-01" if "date=19990101" in url else "1999-02"
+        return _Response(responses[month])
+
+    monkeypatch.setattr(taiex, "_request_once", successful_request)
+    assert taiex._run(_args(output_dir)) == 0
+    canonical_path = taiex._canonical_path(output_dir)
+    canonical_bytes = canonical_path.read_bytes()
+    accepted_summary_bytes = taiex._summary_path(output_dir).read_bytes()
+
+    def failed_request(_url: str, _args: object) -> _Response:
+        raise requests.ConnectionError("temporary failure")
+
+    monkeypatch.setattr(taiex, "_request_once", failed_request)
+    assert (
+        taiex._run(
+            _args(
+                output_dir,
+                mode="daily",
+                end="1999-03-05",
+            )
+        )
+        == 1
+    )
+
+    assert canonical_path.read_bytes() == canonical_bytes
+    assert taiex._summary_path(output_dir).read_bytes() == accepted_summary_bytes
+    attempt = json.loads(
+        taiex._latest_attempt_summary_path(output_dir).read_text(encoding="utf-8")
+    )
+    assert attempt["coverage_complete"] is False
+    assert attempt["canonical_recovered_from_journal"] is False
+    assert attempt["preserved_previous_canonical_summary"] is True
 
 
 def test_no_resume_refetches_every_month(
@@ -485,13 +589,17 @@ def test_jsonl_loader_tolerates_only_torn_final_record(tmp_path: Path) -> None:
             fetched_at="t",
         ),
     )
-    taiex._append_jsonl(path, taiex._event_for_result(result, status="data", source="test"))
+    taiex._append_jsonl(
+        path, taiex._event_for_result(result, status="data", source="test")
+    )
     with path.open("ab") as handle:
         handle.write(b'{"torn":')
     assert set(taiex._load_journal_latest(path)) == {"1999-01"}
 
     path.write_text(
-        '{"broken":\n' + json.dumps(taiex._event_for_result(result, status="data", source="test")) + "\n",
+        '{"broken":\n'
+        + json.dumps(taiex._event_for_result(result, status="data", source="test"))
+        + "\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="non-terminal"):
@@ -510,7 +618,9 @@ def test_daily_requires_established_baseline(tmp_path: Path) -> None:
     assert "requires an established rebuild/repair" in summary["fatal_error"]
 
 
-def test_taiex_outer_command_and_partial_cleanup_are_source_scoped(tmp_path: Path) -> None:
+def test_taiex_outer_command_and_partial_cleanup_are_source_scoped(
+    tmp_path: Path,
+) -> None:
     args = SimpleNamespace(
         mode="daily",
         taiex_start_date="1999-01-05",
@@ -587,7 +697,9 @@ def test_outer_runs_taiex_before_strict_public_sources(tmp_path: Path) -> None:
     assert "--resume" in public
 
 
-def test_outer_skip_taiex_still_requires_existing_verified_calendar(tmp_path: Path) -> None:
+def test_outer_skip_taiex_still_requires_existing_verified_calendar(
+    tmp_path: Path,
+) -> None:
     args = SimpleNamespace(
         operation="repair",
         mode="repair",

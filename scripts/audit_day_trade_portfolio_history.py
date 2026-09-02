@@ -27,6 +27,7 @@ from services.discord_bot.bot import (
 DEFAULT_MARKETS = (
     "tw_day_trade_multi_basis",
     "tw_day_trade_100m",
+    "tw_day_trade_multi_basis_22",
     "tw_day_trade_multi_basis_projection_l1_gelu",
 )
 OPEN_PRICE_TOLERANCE = 1e-4

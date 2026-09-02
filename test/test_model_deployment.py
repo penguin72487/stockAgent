@@ -147,6 +147,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         "tw_cash",
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }.issubset(configs)
     naive = configs["tw"]
@@ -184,9 +185,25 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert projection.config_path == (
         "configs/deployments/tw_day_trade_multi_basis_projection_l1_gelu_fold11.yaml"
     )
+    multi_basis_22 = configs["tw_day_trade_multi_basis_22"]
+    multi_basis_22_root = (
+        "artifacts/markets/"
+        "tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_"
+        "tplus2_close_commission20_capital10m_v1"
+    )
+    assert multi_basis_22.fold_id == 11
+    assert multi_basis_22.initial_capital == 10_000_000.0
+    assert multi_basis_22.config_path == (
+        "configs/deployments/tw_day_trade_multi_basis_22_fold11.yaml"
+    )
+    assert multi_basis_22.output_dir == multi_basis_22_root
+    assert multi_basis_22.checkpoint_path == (
+        f"{multi_basis_22_root}/fold_11/checkpoint_best.pt"
+    )
     assert (
         multi_basis.live_output_dir
         == day_trade_100m.live_output_dir
+        == multi_basis_22.live_output_dir
         == projection.live_output_dir
         == "artifacts/live_signals"
     )
@@ -197,11 +214,29 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     )
     assert multi_basis.pre_signal_command == shared_refresh
     assert day_trade_100m.pre_signal_command == shared_refresh
+    assert multi_basis_22.pre_signal_command == shared_refresh
     assert projection.pre_signal_command == shared_refresh
     completed_close = ("scripts/finalize_tw_public_completed_session.py",)
     assert multi_basis.completed_session_command == completed_close
     assert day_trade_100m.completed_session_command == completed_close
+    assert multi_basis_22.completed_session_command == completed_close
     assert projection.completed_session_command == completed_close
+
+
+def test_repo_multi_basis_22_fold11_deployment_keeps_effective_rank_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        root / "configs/deployments/tw_day_trade_multi_basis_22_fold11.yaml"
+    )
+    model = config.training.financial_transformer
+
+    assert config.runner.resume is False
+    assert config.training.model_name == "financial_transformer"
+    assert model.portfolio_output_mode == "projection_l1"
+    assert model.temporal_basis_input == "input_features"
+    assert len(model.temporal_basis_families) == 22
+    assert sum(model.temporal_basis_components_by_family.values()) == 524
+    assert model.temporal_basis_novelty_threshold == pytest.approx(1e-4)
 
 
 def test_repo_multi_basis_fold11_deployment_keeps_checkpoint_model_contract() -> None:
