@@ -62,6 +62,17 @@ def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> N
         assert config.completed_session_timeout_seconds == 600
 
 
+def test_all_four_day_trade_modes_are_in_the_runtime_schedule() -> None:
+    scheduled = set(discord_bot._scheduled_markets())
+
+    assert {
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_22",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
+    }.issubset(scheduled)
+
+
 def test_day_trade_model_uses_shared_official_opening_snapshot() -> None:
     cfg = discord_bot._market_configs()["tw_day_trade_100m"]
 

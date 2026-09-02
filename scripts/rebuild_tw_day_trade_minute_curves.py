@@ -41,6 +41,7 @@ STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 DEFAULT_LOCAL_MINUTE_ROOTS = (
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
     Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
     Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
@@ -593,6 +594,36 @@ def fetch_missing_kbars(
     return result
 
 
+def historical_minute_mark_has_source(row: Mapping[str, Any]) -> bool:
+    """Return whether an interior strategy mark has auditable minute pricing.
+
+    Cardinality alone is insufficient: a live writer can emit every wall-clock
+    minute while repeatedly carrying an unproved snapshot.  Completed-session
+    replay rows therefore need the retained one-minute contract and explicit
+    price-quality fields.  The accepted 09:01 entry and 13:30 endpoint are
+    checked separately and intentionally do not use this predicate.
+    """
+
+    try:
+        coverage = float(row.get("fresh_trade_notional_coverage_ratio"))
+        fresh_positions = int(row.get("fresh_trade_position_count"))
+        carried_positions = int(row.get("last_trade_carried_position_count"))
+        missing_positions = int(row.get("missing_price_position_count"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        row.get("historical_minute_replay") is True
+        and str(row.get("minute_valuation_contract") or "") == MINUTE_CONTRACT
+        and str(row.get("valuation_source") or "")
+        and math.isfinite(coverage)
+        and 0.0 <= coverage <= 1.0
+        and fresh_positions >= 0
+        and carried_positions >= 0
+        and missing_positions == 0
+        and row.get("valuation_executable") is False
+    )
+
+
 def rebuild_strategy_marks(
     source_rows: list[dict[str, Any]],
     positions: Mapping[str, Mapping[str, list[dict[str, Any]]]],
@@ -601,14 +632,16 @@ def rebuild_strategy_marks(
     start: date,
     end: date,
     fill_rows: Sequence[Mapping[str, Any]] = (),
+    repair_unverified_existing: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fill exact minute holes without replacing observed strategy marks.
 
-    Existing marks are authoritative observations of the bracket/EOD-aware
-    paper engine. Only a missing minute is reconstructed from the retained
-    one-minute trade tape and the append-only exit-fill ledger. Rebuilding a
-    whole day as if every entry remained open until 13:30 would erase real
-    stop, take-profit, and partial-exit state from the displayed path.
+    Existing audited replay marks are authoritative observations of the
+    bracket/EOD-aware paper engine. Missing minutes, and optionally existing
+    interior minutes without auditable price provenance, are reconstructed
+    from the retained one-minute trade tape and append-only exit-fill ledger.
+    The fill ledger preserves real stop, take-profit, and partial-exit state;
+    the accepted 09:01 entry and 13:30 endpoint remain untouched.
     """
 
     outside = [
@@ -643,6 +676,7 @@ def rebuild_strategy_marks(
     markets = sorted({key[1] for key in by_key})
     generated: list[dict[str, Any]] = []
     inserted_rows = 0
+    replaced_unverified_rows = 0
     preserved_rows = 0
     carried_rows = 0
     fresh_ratios: list[float] = []
@@ -713,16 +747,26 @@ def rebuild_strategy_marks(
                     continue
                 minute_key = minute.isoformat(timespec="minutes")
                 existing = by_key.get((session_date, market, minute_key))
-                if existing is not None:
-                    generated.append(dict(existing))
-                    preserved_rows += 1
-                    continue
                 fresh_symbols: set[str] = set()
                 for symbol, prices in minute_prices.items():
                     value = prices.get(minute_key)
                     if value is not None:
                         current_prices[symbol] = value
                         fresh_symbols.add(symbol)
+                preserve_existing = bool(
+                    existing is not None
+                    and (
+                        clock in {"09:01", "13:30"}
+                        or not repair_unverified_existing
+                        or historical_minute_mark_has_source(existing)
+                    )
+                )
+                if preserve_existing:
+                    generated.append(dict(existing))
+                    preserved_rows += 1
+                    continue
+                if existing is not None:
+                    replaced_unverified_rows += 1
                 open_net = 0.0
                 total_notional = 0.0
                 fresh_notional = 0.0
@@ -814,7 +858,7 @@ def rebuild_strategy_marks(
                         "simulation_only": True,
                     }
                 )
-                inserted_rows += 1
+                inserted_rows += int(existing is None)
     rows = outside + generated
     rows.sort(
         key=lambda row: (str(row.get("minute") or ""), str(row.get("market") or ""))
@@ -830,6 +874,7 @@ def rebuild_strategy_marks(
         "generated_rows": len(generated),
         "preserved_observed_rows": preserved_rows,
         "inserted_missing_rows": inserted_rows,
+        "replaced_unverified_rows": replaced_unverified_rows,
         "duplicate_rows_removed": duplicate_rows_removed,
         "rows_with_carried_prices": carried_rows,
         "minimum_fresh_trade_notional_coverage_ratio": min(fresh_ratios, default=1.0),
@@ -1112,6 +1157,14 @@ def parse_args() -> argparse.Namespace:
             "strategy curve instead of replacing it with endpoint-derived marks."
         ),
     )
+    parser.add_argument(
+        "--repair-unverified-strategy-marks",
+        action="store_true",
+        help=(
+            "Replace completed-session interior marks that have no auditable "
+            "one-minute price provenance; preserve the 09:01 and 13:30 endpoints."
+        ),
+    )
     parser.add_argument("--fetch-workers", type=int, default=1)
     parser.add_argument("--requests-per-second", type=float, default=5.0)
     parser.add_argument(
@@ -1215,6 +1268,9 @@ def main() -> None:
             start=start,
             end=end,
             fill_rows=source_fills,
+            repair_unverified_existing=bool(
+                args.repair_unverified_strategy_marks
+            ),
         )
     source_benchmarks = _read_json(args.state_dir / "benchmark_history.json")
     rebuilt_benchmarks, benchmark_stats = rebuild_benchmark_history(

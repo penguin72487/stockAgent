@@ -1165,6 +1165,7 @@ def test_final_preopen_gate_requires_durable_engine_and_exact_discord_revision()
         "production_order_possible": False,
         "discord_connected": True,
         "day_trade_markets": [market],
+        "scheduled_day_trade_markets": [market],
     }
 
     result = evaluate_readiness(
@@ -1181,6 +1182,22 @@ def test_final_preopen_gate_requires_durable_engine_and_exact_discord_revision()
     )
     assert result["engine_runtime"]["ready"] is True
     assert result["runtime_sync"]["ready"] is True
+
+    discord_status["scheduled_day_trade_markets"] = []
+    unscheduled = evaluate_readiness(
+        observed=observed,
+        strict_after=datetime(2026, 8, 17, 8, 57, tzinfo=TAIPEI).time(),
+        market_names=(market,),
+        public_receipt={},
+        model_receipt={},
+        simulation_receipt={},
+        service_states={},
+        engine_status_receipt=engine_status,
+        engine_sync_receipt=engine_sync,
+        discord_status_receipt=discord_status,
+    )
+    assert unscheduled["runtime_sync"]["ready"] is False
+    discord_status["scheduled_day_trade_markets"] = [market]
 
     discord_status["engine_state_revision"] = 41
     failed = evaluate_readiness(

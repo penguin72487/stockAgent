@@ -9,6 +9,7 @@ const SIGNAL_PAGE_SIZE = 100;
 const POSITION_PAGE_SIZE = 100;
 const EVENT_PAGE_SIZE = 100;
 const DATA_MONITOR_STATUS_PATHS = [
+  "api/public-data-status",
   "/data-monitor/api/status",
   "../data-monitor/api/status",
 ];
@@ -71,6 +72,7 @@ let twPublicMonitorRefreshInFlight = false;
 let twPublicMonitorLastFetchMs = null;
 let twPublicMonitorLastUpdated = null;
 let twPublicMonitorAbortController = null;
+let twPublicMonitorActivated = false;
 
 try {
   const storedHiddenSeries = JSON.parse(localStorage.getItem(HIDDEN_EQUITY_SERIES_STORAGE_KEY) || "[]");
@@ -1035,7 +1037,7 @@ async function loadTwPublicMonitorWithFallback(controller) {
 }
 
 async function loadTwPublicMonitor() {
-  if (document.hidden) return;
+  if (document.hidden || !twPublicMonitorActivated) return;
   if (twPublicMonitorRefreshInFlight) return;
   twPublicMonitorRefreshInFlight = true;
   if (twPublicMonitorAbortController) twPublicMonitorAbortController.abort();
@@ -1596,12 +1598,16 @@ async function refresh({force = false} = {}) {
       }
     }
     syncFilters(snapshot);
-    await loadChartHistory({preferCache: !force});
     const positionsHydrated = hydrateDefaultPositions(snapshot);
     const revision = revisionOf(snapshot);
     const heavy = revision !== lastRenderedRevision;
     lastRenderedRevision = revision;
     render({heavy});
+    // First paint depends only on the compact status snapshot.  History and
+    // the three detail tables are independent read-only views; loading them
+    // after paint prevents a cold multi-session curve from holding the whole
+    // dashboard blank.
+    void loadChartHistory({preferCache: !force});
     const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
     const detailLoads = [];
     const shouldReloadSignals = force || signalRecordCount == null || currentSignalCount !== signalRecordCount;
@@ -1612,13 +1618,13 @@ async function refresh({force = false} = {}) {
     if (shouldReloadEvents) detailLoads.push(loadEvents({force: true}));
     const shouldReloadPositions = force || sourceHasChanged || !positionsHydrated;
     if (shouldReloadPositions) detailLoads.push(loadPositions());
-    await Promise.all(detailLoads);
+    if (detailLoads.length) void Promise.allSettled(detailLoads);
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
     $("health").textContent = "UNAVAILABLE"; $("health").className = "pill critical";
   } finally {
     refreshInFlight = false;
-    if (!document.hidden) void loadTwPublicMonitor();
+    if (!document.hidden && twPublicMonitorActivated) void loadTwPublicMonitor();
     if (refreshQueued) {
       const queuedForce = refreshForceQueued;
       refreshQueued = false;
@@ -1626,6 +1632,32 @@ async function refresh({force = false} = {}) {
       void refresh({force: queuedForce});
     }
   }
+}
+
+function activateTwPublicMonitor() {
+  if (twPublicMonitorActivated) return;
+  twPublicMonitorActivated = true;
+  const fetchState = $("tw-public-monitor-fetch-state");
+  if (fetchState) fetchState.textContent = "正在載入台股公開資料狀態…";
+  void loadTwPublicMonitor();
+}
+
+function installTwPublicMonitorActivation() {
+  const target = $("tw-public-status") || $("tw-public-monitor-list");
+  if (!target) return;
+  if (typeof IntersectionObserver === "function") {
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      activateTwPublicMonitor();
+    }, {rootMargin: "700px 0px"});
+    observer.observe(target);
+    return;
+  }
+  const defer = window.requestIdleCallback
+    ? (callback) => window.requestIdleCallback(callback, {timeout: 2500})
+    : (callback) => window.setTimeout(callback, 1500);
+  defer(activateTwPublicMonitor);
 }
 
 async function refreshServiceRevision() {
@@ -1736,3 +1768,4 @@ Dashboard.scheduleRefresh(() => {
 }, {intervalMs: PRICE_REFRESH_MS});
 Dashboard.scheduleRefresh(refreshServiceRevision, {intervalMs: SERVICE_REVISION_REFRESH_MS});
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
+installTwPublicMonitorActivation();

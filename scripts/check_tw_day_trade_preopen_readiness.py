@@ -401,6 +401,12 @@ def evaluate_readiness(
         discord_markets = sorted(
             str(value) for value in (discord_status.get("day_trade_markets") or ())
         )
+        discord_scheduled_markets = sorted(
+            str(value)
+            for value in (
+                discord_status.get("scheduled_day_trade_markets") or ()
+            )
+        )
         sync_ready = bool(
             engine_sync.get("simulation_only") is True
             and engine_sync.get("production_order_possible") is False
@@ -414,6 +420,7 @@ def evaluate_readiness(
             and engine_revision == discord_revision
             and engine_markets == expected_markets
             and discord_markets == expected_markets
+            and discord_scheduled_markets == expected_markets
             and engine_age is not None
             and -5.0 <= engine_age <= 30.0
             and discord_age is not None
@@ -431,6 +438,7 @@ def evaluate_readiness(
             "discord_connected": discord_status.get("discord_connected"),
             "engine_markets": engine_markets,
             "discord_markets": discord_markets,
+            "discord_scheduled_markets": discord_scheduled_markets,
         }
         if not sync_ready:
             failures.append("paper engine/Discord revision is not synchronized")

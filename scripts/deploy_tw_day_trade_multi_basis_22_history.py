@@ -45,6 +45,7 @@ PRIOR_HISTORY_RECEIPT = OPERATIONS_ROOT / "prior_history_import_receipt.json"
 SERVICE = "stockagent-tw-day-trade-simulation.service"
 DISCORD_SERVICE = "stockagent-discord-bot.service"
 PUBLIC_SERVICE = "stockagent-public-dashboards.service"
+DISCORD_STATUS_PATH = REPO_ROOT / "artifacts/discord_bot/service_status.json"
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -134,6 +135,57 @@ def _wait_active(service: str, *, timeout_seconds: float = 60.0) -> None:
     raise RuntimeError(f"service did not become active: {service}")
 
 
+def _restart_and_wait_active(
+    service: str, *, timeout_seconds: float = 90.0
+) -> dict[str, Any]:
+    """Restart a supervised service while tolerating its bounded self-retry."""
+
+    started = datetime.now(TAIPEI)
+    first = subprocess.run(["systemctl", "restart", service], check=False)
+    try:
+        _wait_active(service, timeout_seconds=timeout_seconds)
+    except RuntimeError:
+        subprocess.run(["systemctl", "start", service], check=False)
+        _wait_active(service, timeout_seconds=timeout_seconds)
+    return {
+        "service": service,
+        "requested_at": started.isoformat(timespec="seconds"),
+        "initial_restart_returncode": first.returncode,
+        "active": True,
+    }
+
+
+def _wait_discord_ready(
+    *,
+    expected_engine_run_id: str,
+    previous_run_id: str | None = None,
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    deadline = wall_time.monotonic() + timeout_seconds
+    while wall_time.monotonic() < deadline:
+        try:
+            status = _object(DISCORD_STATUS_PATH)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            wall_time.sleep(1.0)
+            continue
+        warmup = status.get("startup_inference_warmup") or {}
+        if (
+            str(status.get("run_id") or "")
+            and str(status.get("run_id") or "") != str(previous_run_id or "")
+            and bool(status.get("discord_connected"))
+            and str(status.get("core_health") or "") == "ready"
+            and set(status.get("scheduled_day_trade_markets") or ()) == set(MARKETS)
+            and str(status.get("engine_run_id") or "") == expected_engine_run_id
+            and str(warmup.get("status") or "") == "ready"
+            and int(warmup.get("ready_count") or 0) == len(MARKETS)
+        ):
+            return status
+        wall_time.sleep(1.0)
+    raise RuntimeError(
+        "Discord did not acknowledge the promoted four-mode engine and warmup"
+    )
+
+
 def _wait_engine_sync(*, timeout_seconds: float = 60.0) -> dict[str, Any]:
     deadline = wall_time.monotonic() + timeout_seconds
     while wall_time.monotonic() < deadline:
@@ -214,6 +266,62 @@ def _verify_dashboard_history(*, end_date: str) -> dict[str, Any]:
     return results
 
 
+def _resumable_replay_candidate(
+    status: Mapping[str, Any], *, session_date: str
+) -> Path | None:
+    """Reuse only a completed isolated replay after a later stage failed.
+
+    Promotion still revalidates every ledger and receipt before any swap.  This
+    checkpoint merely avoids recomputing 130 sessions when minute-curve repair
+    or promotion validation is the failed stage.
+    """
+
+    if (
+        str(status.get("status") or "") != "failed_retryable"
+        or str(status.get("session_date") or "") != session_date
+    ):
+        return None
+    stages = status.get("stages") or ()
+    if not any(
+        isinstance(stage, Mapping)
+        and stage.get("stage") == "replay"
+        and int(stage.get("returncode") or 0) == 0
+        for stage in stages
+    ):
+        return None
+    candidate = Path(str(status.get("candidate_dir") or ""))
+    required = (
+        "state.json",
+        "rebuild_receipt.json",
+        "positions.json",
+        "fills.jsonl",
+        "marks.jsonl",
+    )
+    if not candidate.is_dir() or any(
+        not (candidate / name).is_file() for name in required
+    ):
+        return None
+    try:
+        receipt = _object(candidate / "rebuild_receipt.json")
+        sessions = receipt.get("sessions") or ()
+        first = str(sessions[0].get("session_date") or "")
+        last = str(sessions[-1].get("session_date") or "")
+    except (IndexError, AttributeError, TypeError, ValueError, OSError):
+        return None
+    if first != START_DATE or last != session_date:
+        return None
+    return candidate
+
+
+def _stage_succeeded(status: Mapping[str, Any], stage_name: str) -> bool:
+    return any(
+        isinstance(stage, Mapping)
+        and str(stage.get("stage") or "") == stage_name
+        and int(stage.get("returncode") or 0) == 0
+        for stage in (status.get("stages") or ())
+    )
+
+
 def main() -> None:
     OPERATIONS_ROOT.mkdir(parents=True, exist_ok=True)
     lock_path = OPERATIONS_ROOT / "deploy.lock"
@@ -224,6 +332,7 @@ def main() -> None:
             print("[multi-basis-22-deploy] another deployment run is active")
             return
 
+        existing: dict[str, Any] = {}
         if STATUS_PATH.is_file():
             existing = _object(STATUS_PATH)
             if existing.get("status") == "complete":
@@ -293,13 +402,26 @@ def main() -> None:
         run_id = observed.strftime("%Y%m%dT%H%M%S%z")
         run_dir = OPERATIONS_ROOT / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        candidate = Path(
-            tempfile.mkdtemp(
-                prefix="tw_day_trade_multi_basis_22_postclose.",
-                dir=LIVE_DIR.parent,
-            )
+        resumed_post_promotion = _stage_succeeded(existing, "promote")
+        candidate = Path(str(existing.get("candidate_dir") or "")) if (
+            resumed_post_promotion
+        ) else _resumable_replay_candidate(
+            existing,
+            session_date=session_date,
         )
-        stages: list[dict[str, Any]] = []
+        resumed_replay = candidate is not None and not resumed_post_promotion
+        if not resumed_post_promotion and candidate is None:
+            candidate = Path(
+                tempfile.mkdtemp(
+                    prefix="tw_day_trade_multi_basis_22_postclose.",
+                    dir=LIVE_DIR.parent,
+                )
+            )
+        stages: list[dict[str, Any]] = (
+            [dict(stage) for stage in (existing.get("stages") or ())]
+            if resumed_post_promotion
+            else []
+        )
         running = {
             "schema_version": 1,
             "status": "running",
@@ -307,15 +429,46 @@ def main() -> None:
             "session_date": session_date,
             "run_dir": str(run_dir),
             "candidate_dir": str(candidate),
+            "resumed_replay_candidate": resumed_replay,
+            "resumed_post_promotion": resumed_post_promotion,
             "stages": stages,
         }
         _atomic_json(STATUS_PATH, running)
         python = sys.executable
         try:
-            stages.append(
-                _run(
-                    "replay",
-                    [
+            if resumed_post_promotion:
+                validate_promoted = [
+                    python,
+                    str(REPO_ROOT / "scripts/promote_tw_day_trade_replay.py"),
+                    "--live-dir",
+                    str(candidate),
+                    "--candidate-dir",
+                    str(LIVE_DIR),
+                ]
+                for market in MARKETS:
+                    validate_promoted.extend(("--expected-market", market))
+                stages.append(
+                    _run(
+                        "validate_promoted_live",
+                        [*validate_promoted, "--validate-only"],
+                        run_dir=run_dir,
+                    )
+                )
+            elif resumed_replay:
+                stages.append(
+                    {
+                        "stage": "replay",
+                        "status": "reused_completed_candidate",
+                        "returncode": 0,
+                        "candidate_dir": str(candidate),
+                        "source_run_dir": existing.get("run_dir"),
+                    }
+                )
+            else:
+                stages.append(
+                    _run(
+                        "replay",
+                        [
                         python,
                         str(REPO_ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py"),
                         "--markets-dir",
@@ -336,15 +489,16 @@ def main() -> None:
                         str(ENTRY_BOOK_ROOT),
                         "--reuse-retained-signal-open",
                         "--replay-intraday-kbars",
-                    ],
-                    run_dir=run_dir,
+                        ],
+                        run_dir=run_dir,
+                    )
                 )
-            )
-            minute_output = run_dir / "minute_curves"
-            stages.append(
-                _run(
-                    "minute_curves",
-                    [
+            if not resumed_post_promotion:
+                minute_output = run_dir / "minute_curves"
+                stages.append(
+                    _run(
+                        "minute_curves",
+                        [
                         python,
                         str(REPO_ROOT / "scripts/rebuild_tw_day_trade_minute_curves.py"),
                         "--state-dir",
@@ -357,42 +511,54 @@ def main() -> None:
                         str(minute_output),
                         "--simulation",
                         "--fetch-missing-kbars",
-                        "--validate-existing-strategy-marks",
+                        "--repair-unverified-strategy-marks",
                         "--publish",
-                    ],
-                    run_dir=run_dir,
+                        ],
+                        run_dir=run_dir,
+                    )
                 )
-            )
-            promote_base = [
-                python,
-                str(REPO_ROOT / "scripts/promote_tw_day_trade_replay.py"),
-                "--live-dir",
-                str(LIVE_DIR),
-                "--candidate-dir",
-                str(candidate),
-            ]
-            for market in MARKETS:
-                promote_base.extend(("--expected-market", market))
-            stages.append(
-                _run("validate_promotion", [*promote_base, "--validate-only"], run_dir=run_dir)
-            )
+                promote_base = [
+                    python,
+                    str(REPO_ROOT / "scripts/promote_tw_day_trade_replay.py"),
+                    "--live-dir",
+                    str(LIVE_DIR),
+                    "--candidate-dir",
+                    str(candidate),
+                ]
+                for market in MARKETS:
+                    promote_base.extend(("--expected-market", market))
+                stages.append(
+                    _run(
+                        "validate_promotion",
+                        [*promote_base, "--validate-only"],
+                        run_dir=run_dir,
+                    )
+                )
 
-            stopped = False
-            try:
-                subprocess.run(["systemctl", "stop", SERVICE], check=True)
-                stopped = True
-                stages.append(_run("promote", promote_base, run_dir=run_dir))
-            finally:
-                if stopped or subprocess.run(
-                    ["systemctl", "is-active", "--quiet", SERVICE], check=False
-                ).returncode != 0:
-                    subprocess.run(["systemctl", "start", SERVICE], check=True)
+                stopped = False
+                try:
+                    subprocess.run(["systemctl", "stop", SERVICE], check=True)
+                    stopped = True
+                    stages.append(_run("promote", promote_base, run_dir=run_dir))
+                finally:
+                    if stopped or subprocess.run(
+                        ["systemctl", "is-active", "--quiet", SERVICE], check=False
+                    ).returncode != 0:
+                        subprocess.run(["systemctl", "start", SERVICE], check=True)
             _wait_active(SERVICE)
             sync = _wait_engine_sync()
-            subprocess.run(["systemctl", "restart", DISCORD_SERVICE], check=True)
-            _wait_active(DISCORD_SERVICE)
-            subprocess.run(["systemctl", "restart", PUBLIC_SERVICE], check=True)
-            _wait_active(PUBLIC_SERVICE)
+            try:
+                previous_discord_run_id = str(
+                    _object(DISCORD_STATUS_PATH).get("run_id") or ""
+                )
+            except (FileNotFoundError, json.JSONDecodeError, ValueError):
+                previous_discord_run_id = ""
+            discord_restart = _restart_and_wait_active(DISCORD_SERVICE)
+            discord_status = _wait_discord_ready(
+                expected_engine_run_id=str(sync.get("engine_run_id") or ""),
+                previous_run_id=previous_discord_run_id,
+            )
+            public_restart = _restart_and_wait_active(PUBLIC_SERVICE)
             dashboard_acceptance = _verify_dashboard_history(end_date=session_date)
             complete = {
                 "schema_version": 1,
@@ -407,6 +573,9 @@ def main() -> None:
                 "engine_run_id": sync.get("engine_run_id"),
                 "engine_content_revision": sync.get("content_revision"),
                 "dashboard_acceptance": dashboard_acceptance,
+                "discord_restart": discord_restart,
+                "discord_run_id": discord_status.get("run_id"),
+                "public_restart": public_restart,
                 "discord_service_active": True,
                 "simulation_only": True,
                 "production_order_possible": False,
