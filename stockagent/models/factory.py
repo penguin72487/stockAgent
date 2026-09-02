@@ -655,6 +655,10 @@ def build_model(
             categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
             candle_dropout=fin_cfg.candle_dropout,
+            causal_feature_rms_normalization=(
+                fin_cfg.causal_feature_rms_normalization
+            ),
+            feature_bottleneck_dim=fin_cfg.feature_bottleneck_dim,
             temporal_basis_algebraic_contraction=(
                 fin_cfg.temporal_basis_algebraic_contraction
             ),

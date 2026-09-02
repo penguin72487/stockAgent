@@ -330,6 +330,7 @@ def _validate_executable_portfolio_transformer_contract(
     day_trade_unlimited_margin_conversion: object,
     short_capacity_limit_enabled: object,
     day_trade_minute_execution_root: object,
+    day_trade_minute_execution_allow_daily_proxy: object,
     trading_portfolio_activation: object,
     loss_portfolio_activation: object,
     model_config: dict[str, Any],
@@ -350,15 +351,23 @@ def _validate_executable_portfolio_transformer_contract(
         raise ValueError(
             "executable_portfolio_transformer currently requires daily decisions"
         )
-    if day_trade_minute_execution_root is not None:
+    minute_execution = day_trade_minute_execution_root is not None
+    if minute_execution:
+        if bool(day_trade_minute_execution_allow_daily_proxy):
+            raise ValueError(
+                "minute-executed executable_portfolio_transformer is a strict "
+                "minute objective and requires "
+                "data.day_trade_minute_execution_allow_daily_proxy=false"
+            )
+        if bool(day_trade_unlimited_margin_conversion):
+            raise ValueError(
+                "minute-executed executable_portfolio_transformer uses the "
+                "minute tape's terminal margin conversion; the separate daily "
+                "stateful-carry executor must remain disabled"
+            )
+    elif not bool(day_trade_unlimited_margin_conversion):
         raise ValueError(
-            "executable_portfolio_transformer uses the causal daily stateful "
-            "OPEN/CLOSE ledger; the legacy minute tape cannot preserve residual "
-            "financed or borrowed inventory"
-        )
-    if not bool(day_trade_unlimited_margin_conversion):
-        raise ValueError(
-            "executable_portfolio_transformer requires "
+            "daily OPEN/CLOSE executable_portfolio_transformer requires "
             "tw_day_trade_unlimited_margin_conversion=true"
         )
     if bool(short_capacity_limit_enabled):
@@ -671,6 +680,8 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     futures_current_open_feature: object,
     data_futures_current_open_feature: object,
     carry_valuation_max_abs_simple_return: object,
+    expiry_settlement_valuation: object,
+    final_settlement_path: object,
     day_trade_open_feature: object,
     feature_shift_next_session: object,
     feature_exclude: object,
@@ -771,6 +782,18 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
         raise ValueError(
             "tw_futures_carry_valuation_max_abs_simple_return is defined only "
             "for the 08:45 current futures OPEN contract"
+        )
+    if bool(expiry_settlement_valuation) and not bool(integer_contracts):
+        raise ValueError(
+            "tw_futures_expiry_settlement_valuation requires exact integer "
+            "all-futures execution metadata"
+        )
+    if bool(expiry_settlement_valuation) and not str(
+        final_settlement_path or ""
+    ).strip():
+        raise ValueError(
+            "tw_futures_expiry_settlement_valuation requires "
+            "trading.tw_futures_portfolio_final_settlement_path"
         )
     activations = {
         "trading.portfolio_activation": normalize_portfolio_activation(
@@ -1412,6 +1435,11 @@ class DataConfig:
     # Zero preserves historical contracts. A positive threshold fails the
     # entire affected physical contract closed instead of clipping its return.
     tw_futures_carry_valuation_max_abs_simple_return: float = 0.0
+    # When a physical TAIFEX contract reaches its own last-trading row, value
+    # the mandatory close with the observed exchange settlement column rather
+    # than an ordinary last-trade close. This is an executor-only label and is
+    # checkpoint-incompatible with the historical close-valued carry account.
+    tw_futures_expiry_settlement_valuation: bool = False
     # Features whose session-t value is not available early enough for a
     # session-t decision.  Panel construction exposes that value on the next
     # panel session while preserving the source's original dated archive.
@@ -1437,6 +1465,10 @@ class DataConfig:
     day_trade_minute_execution_cache_dir: str = (
         "artifacts/cache/tw_day_trade_minute_execution_v1"
     )
+    # Historical daily-bar proxies are an explicit research opt-in.  A strict
+    # minute experiment sets this false and therefore fails before training if
+    # any requested panel row predates the first canonical minute partition.
+    day_trade_minute_execution_allow_daily_proxy: bool = True
     minute_require_research_ready: bool = True
     minute_verify_partition_sha256: bool = True
     # Optional immutable daily-panel cache metadata used as causal context by
@@ -1646,6 +1678,10 @@ class TradingConfig:
     tw_futures_portfolio_data_path: str = (
         "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
     )
+    # Receipt-backed official TAIFEX final settlement prices.  This path is
+    # required only by the carry-to-expiry contract; the ordinary daily
+    # settlement/close column is not a valid substitute for final settlement.
+    tw_futures_portfolio_final_settlement_path: str | None = None
     # User/account-specific SinoPac network-order fixed commission, TWD per
     # contract per side. Product classification and notional multipliers are
     # owned by the receipt-backed futures data contract.
@@ -1959,6 +1995,21 @@ class TransformerBasePortfolioModelConfig:
 @dataclass(slots=True)
 class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     candle_dropout: float = 0.0
+    # Optional learned low-rank mixer over every continuous raw feature before
+    # the multi-basis expansion. Zero preserves historical checkpoints. A
+    # power-of-two width such as 32 keeps all features while avoiding an
+    # F-times-basis dense projection whose parameter count grows linearly with
+    # the raw feature ABI.
+    feature_bottleneck_dim: int = 0
+    # Fit one non-centering RMS scale per raw feature from this fold's causal
+    # training rows.  Zero remains zero (important because the panel uses zero
+    # for unavailable point-in-time values), while large log-level features no
+    # longer swamp return/flow features.  Columns absent from the training
+    # history remain disabled for that fold instead of activating later through
+    # random, never-trained projection weights.
+    causal_feature_rms_normalization: bool = False
+    causal_feature_min_active_dates: int = 1
+    causal_feature_scale_epsilon: float = 1e-6
     # Disabled by default so historical checkpoints retain their original AMP
     # operation order. New experiments may opt into the algebraically
     # equivalent rank-lookback contraction explicitly.
@@ -2170,6 +2221,17 @@ class TrainingConfig:
     loss_portfolio_activation: str = "auto"
     loss_min_trade_weight: float | None = None
     warm_start_from_previous_fold: bool = False
+    # Optional fold-matched initialization from a completed, older strategy.
+    # This is deliberately separate from resume/warm-start: optimizer state is
+    # never imported and the target run keeps its own execution/loss contract.
+    pretrained_initialization_root: str | None = None
+    pretrained_initialization_fold_policy: str = "matching_train_and_validation_years"
+    pretrained_initialization_feature_adapter: str = "none"
+    pretrained_initialization_require_exact_backbone: bool = True
+    pretrained_initialization_validation_guard: bool = False
+    pretrained_initialization_trainable_parameter_prefixes: list[str] = field(
+        default_factory=list
+    )
     chunk_rows: int = 0
     eval_model_chunk_rows: int | str = "auto"
     eval_backtest_chunk_rows: int = 512
@@ -3025,6 +3087,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["temporal_basis_algebraic_contraction"] = bool(
         financial_transformer["temporal_basis_algebraic_contraction"]
     )
+    financial_transformer["causal_feature_rms_normalization"] = bool(
+        financial_transformer["causal_feature_rms_normalization"]
+    )
+    financial_transformer["causal_feature_min_active_dates"] = max(
+        1, int(financial_transformer["causal_feature_min_active_dates"])
+    )
+    causal_feature_scale_epsilon = float(
+        financial_transformer["causal_feature_scale_epsilon"]
+    )
+    if (
+        not math.isfinite(causal_feature_scale_epsilon)
+        or causal_feature_scale_epsilon <= 0.0
+    ):
+        raise ValueError(
+            "training.financial_transformer."
+            "causal_feature_scale_epsilon must be finite and positive"
+        )
+    financial_transformer["causal_feature_scale_epsilon"] = (
+        causal_feature_scale_epsilon
+    )
+    financial_transformer["feature_bottleneck_dim"] = max(
+        0, int(financial_transformer["feature_bottleneck_dim"])
+    )
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])
     )
@@ -3125,6 +3210,34 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         executable_portfolio_transformer[
             "temporal_basis_algebraic_contraction"
         ]
+    )
+    executable_portfolio_transformer["causal_feature_rms_normalization"] = bool(
+        executable_portfolio_transformer["causal_feature_rms_normalization"]
+    )
+    executable_portfolio_transformer["causal_feature_min_active_dates"] = max(
+        1,
+        int(
+            executable_portfolio_transformer[
+                "causal_feature_min_active_dates"
+            ]
+        ),
+    )
+    executable_causal_epsilon = float(
+        executable_portfolio_transformer["causal_feature_scale_epsilon"]
+    )
+    if (
+        not math.isfinite(executable_causal_epsilon)
+        or executable_causal_epsilon <= 0.0
+    ):
+        raise ValueError(
+            "training.executable_portfolio_transformer."
+            "causal_feature_scale_epsilon must be finite and positive"
+        )
+    executable_portfolio_transformer["causal_feature_scale_epsilon"] = (
+        executable_causal_epsilon
+    )
+    executable_portfolio_transformer["feature_bottleneck_dim"] = max(
+        0, int(executable_portfolio_transformer["feature_bottleneck_dim"])
     )
     executable_portfolio_transformer["categorical_embedding_dim"] = max(
         1,
@@ -3443,6 +3556,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["tw_futures_current_open_feature"] = bool(
         data["tw_futures_current_open_feature"]
     )
+    data["tw_futures_expiry_settlement_valuation"] = bool(
+        data["tw_futures_expiry_settlement_valuation"]
+    )
     carry_guard = float(
         data["tw_futures_carry_valuation_max_abs_simple_return"]
     )
@@ -3676,6 +3792,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         day_trade_minute_execution_root=data[
             "day_trade_minute_execution_root"
         ],
+        day_trade_minute_execution_allow_daily_proxy=data[
+            "day_trade_minute_execution_allow_daily_proxy"
+        ],
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
         model_config=training["executable_portfolio_transformer"],
@@ -3752,6 +3871,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         ],
         carry_valuation_max_abs_simple_return=data[
             "tw_futures_carry_valuation_max_abs_simple_return"
+        ],
+        expiry_settlement_valuation=data[
+            "tw_futures_expiry_settlement_valuation"
+        ],
+        final_settlement_path=trading[
+            "tw_futures_portfolio_final_settlement_path"
         ],
         day_trade_open_feature=data["day_trade_open_feature"],
         feature_shift_next_session=data["feature_shift_next_session"],
@@ -3872,6 +3997,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         if raw_day_trade_execution_root is None
         or not str(raw_day_trade_execution_root).strip()
         else str(raw_day_trade_execution_root).strip()
+    )
+    data["day_trade_minute_execution_allow_daily_proxy"] = bool(
+        data["day_trade_minute_execution_allow_daily_proxy"]
     )
     data["day_trade_minute_execution_policy"] = (
         normalize_day_trade_minute_execution_policy(
@@ -4024,6 +4152,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if not futures_portfolio_data_path:
         raise ValueError("trading.tw_futures_portfolio_data_path must not be empty")
     trading["tw_futures_portfolio_data_path"] = futures_portfolio_data_path
+    raw_final_settlement_path = trading[
+        "tw_futures_portfolio_final_settlement_path"
+    ]
+    trading["tw_futures_portfolio_final_settlement_path"] = (
+        None
+        if raw_final_settlement_path is None
+        or not str(raw_final_settlement_path).strip()
+        else str(raw_final_settlement_path).strip()
+    )
     for fee_key in (
         "tw_futures_portfolio_fee_large_twd",
         "tw_futures_portfolio_fee_standard_twd",
@@ -4509,6 +4646,34 @@ def load_config(path: str | Path) -> ExperimentConfig:
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             loss_min_trade_weight=training_raw["loss_min_trade_weight"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
+            pretrained_initialization_root=training_raw.get(
+                "pretrained_initialization_root"
+            ),
+            pretrained_initialization_fold_policy=str(
+                training_raw.get(
+                    "pretrained_initialization_fold_policy",
+                    "matching_train_and_validation_years",
+                )
+            ),
+            pretrained_initialization_feature_adapter=str(
+                training_raw.get("pretrained_initialization_feature_adapter", "none")
+            ),
+            pretrained_initialization_require_exact_backbone=bool(
+                training_raw.get(
+                    "pretrained_initialization_require_exact_backbone", True
+                )
+            ),
+            pretrained_initialization_validation_guard=bool(
+                training_raw.get(
+                    "pretrained_initialization_validation_guard", False
+                )
+            ),
+            pretrained_initialization_trainable_parameter_prefixes=[
+                str(value)
+                for value in training_raw.get(
+                    "pretrained_initialization_trainable_parameter_prefixes", []
+                )
+            ],
             chunk_rows=training_raw["chunk_rows"],
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],
             eval_backtest_chunk_rows=training_raw["eval_backtest_chunk_rows"],

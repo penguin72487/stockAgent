@@ -57,6 +57,12 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   warm_start_from_previous_fold: false
+  pretrained_initialization_root: null
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: none
+  pretrained_initialization_require_exact_backbone: true
+  pretrained_initialization_validation_guard: false
+  pretrained_initialization_trainable_parameter_prefixes: []
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512

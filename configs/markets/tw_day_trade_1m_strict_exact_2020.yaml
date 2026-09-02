@@ -1,0 +1,110 @@
+base_config: tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m.yaml
+
+# Strict minute-loss experiment.  The model still makes one decision per day,
+# but train/validation/test all value that decision with the canonical minute
+# event tape.  There is no daily OPEN/CLOSE proxy in this contract.
+experiment_name: tw-day-trade-daily-executable-financial-transformer-strict-minute-2020-all-features-bottleneck32-v9
+
+runner:
+  # The minute label, all-feature bottleneck, cash-capable action head and
+  # checkpoint fingerprint are a new ABI.  Never resume the hybrid v8 root.
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_financial_transformer_strict_minute_2020_tplus2_close_commission20_capital10m_all_features_bottleneck32_v9
+  resume: true
+  post_train_infer: false
+
+data:
+  # The first receipt-backed canonical minute partition.  Starting here keeps
+  # every objective row out of the synthetic adverse daily-bar label domain;
+  # later source gaps remain explicitly fail-closed.
+  panel_start_date: '2020-03-02'
+  feature_exclude: []
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_execution_v4_strict_minute_only
+  day_trade_minute_execution_allow_daily_proxy: false
+
+walk_forward:
+  expected_first_year: 2020
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: true
+  require_contiguous_years: true
+  lookback_context: panel_history
+
+trading:
+  execution_mode: tw_day_trade
+  frequency: daily
+  long_only: false
+  min_trade_weight: 0.0
+  max_turnover_ratio: 0.0
+  portfolio_activation: pre_normalized
+  volume_participation_equity: 10000000.0
+  max_volume_participation: 0.5
+  tw_commission_discount: 0.2
+  tw_commission_rebate_timing: daily_close
+  # The minute executor owns 13:20/13:24/13:25/13:30 and any terminal
+  # financing/short conversion.  Do not stack the separate daily carry ledger.
+  tw_day_trade_unlimited_margin_conversion: false
+  # Unlimited quantity is not permission: point-in-time short eligibility and
+  # side masks remain hard rules in both the policy and exact executor.
+  tw_short_capacity_limit_enabled: false
+
+training:
+  model_name: executable_portfolio_transformer
+  epochs: 1000
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+
+  # The exact recurrent minute forward remains authoritative.  Whole lots use
+  # their exact forward value and the executor's straight-through derivative
+  # only for backward, so sub-lot requests do not create zero-gradient plateaus.
+  compile_loss: false
+  backtest_compile: true
+  backtest_compile_stateful: true
+  eval_backtest_compile: true
+
+  # Power-of-two, dual-GPU starting point.  The supplied benchmark command can
+  # measure 32/64/128 on the actual host without changing the economic contract.
+  multi_gpu_strategy: distributed_data_parallel
+  batch_size_train: 64
+  batch_size_eval: 32
+  auto_batch_size: false
+  save_integer_share_holdings_table: false
+
+  # Preserve per-epoch observability and refresh fold artifacts immediately.
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
+
+  executable_portfolio_transformer:
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    center_long_short_logits: false
+    # Scale the L1-ball radius by the causal active universe before projection.
+    # This prevents thousands of symbols from mechanically forcing gross=1 and
+    # leaves unused exposure as a learnable cash decision.
+    projection_l1_scale_by_active_count: true
+    use_execution_context_features: true
+    execution_context_hidden_dim: 32
+    execution_context_schema_version: 2
+    # Every causally available feature in the current 99-column numeric ABI
+    # enters this learned 32-wide mixer before all 22 temporal bases.  This is
+    # compression, not manual feature selection.
+    feature_bottleneck_dim: 32
+    causal_feature_rms_normalization: true
+    causal_feature_min_active_dates: 1
+    causal_feature_scale_epsilon: 1.0e-6
+    temporal_basis_algebraic_contraction: true
+
+  # No factor proxy, direction label, top-K, forced investment, or manually
+  # selected exposure target.  Net fee-adjusted exact minute log growth is the
+  # only optimized objective.
+  multitask_loss:
+    rank_ic_weight: 0.0
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0
+    net_exposure_weight: 0.0

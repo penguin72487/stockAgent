@@ -1,0 +1,115 @@
+base_config: tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_capital10m.yaml
+
+# Controlled successor to the completed 22-family daily baseline.  The model
+# starts from the causally matching old fold, preserves its 24-feature alpha
+# exactly through a learned 24x99 feature-name adapter, then trains and selects
+# checkpoints only with the canonical minute-event execution loss.
+experiment_name: tw-day-trade-hybrid-minute-22-effective-rank-pretrained-exact-guard-v11
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_guard_commission20_capital10m_all_features_v11
+  resume: true
+  post_train_infer: false
+
+data:
+  panel_start_date: '2014-01-06'
+  feature_exclude: []
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_execution_v5_pretrained_22_basis_guard
+  # This is the explicit historical contract requested by the user: before
+  # receipt-backed minute history, use direction-adverse open/close one-tick
+  # prices and daily volume/271 as the synthetic minute capacity.  Once minute
+  # history begins, any missing session fails closed rather than falling back.
+  day_trade_minute_execution_allow_daily_proxy: true
+
+walk_forward:
+  expected_first_year: 2014
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: true
+  require_contiguous_years: true
+  lookback_context: panel_history
+
+trading:
+  execution_mode: tw_day_trade
+  frequency: daily
+  long_only: false
+  min_trade_weight: 0.0
+  max_turnover_ratio: 0.0
+  portfolio_activation: pre_normalized
+  volume_participation_equity: 10000000.0
+  max_volume_participation: 0.5
+  tw_commission_discount: 0.2
+  tw_commission_rebate_timing: daily_close
+  # The minute executor itself owns 13:20/13:24/13:25/13:30 and converts any
+  # remaining inventory to financing/borrow at the configured highest rates.
+  tw_day_trade_unlimited_margin_conversion: false
+  tw_short_capacity_limit_enabled: false
+
+training:
+  model_name: financial_transformer
+  epochs: 1000
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  compile_loss: false
+  backtest_compile: true
+  backtest_compile_stateful: true
+  eval_backtest_compile: true
+  multi_gpu_strategy: distributed_data_parallel
+  batch_size_train: 64
+  batch_size_eval: 32
+  auto_batch_size: false
+  save_integer_share_holdings_table: false
+
+  # Every target fold uses the old fold with identical train and validation
+  # years.  No optimizer state, daily return, test metric, or source loss is
+  # imported.  Epoch 0 is replayed through the target minute ledger and saved
+  # as best; later epochs may replace it only by improving that same target
+  # validation objective.
+  warm_start_from_previous_fold: false
+  pretrained_initialization_root: artifacts/markets/tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_commission20_capital10m_v1
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: identity_by_feature_name
+  pretrained_initialization_require_exact_backbone: true
+  pretrained_initialization_validation_guard: true
+  pretrained_initialization_trainable_parameter_prefixes:
+    - candle_encoder.continuous_feature_bottleneck.
+    - score_head.
+
+  learning_rate: 1.0e-4
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 256
+  lr_scheduler_eta_min: 1.0e-6
+  early_stopping_no_improve_ratio: 0.1
+  # Do not replace the transferred control for float noise alone.
+  early_stopping_min_delta: 1.0e-4
+
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
+
+  financial_transformer:
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    center_long_short_logits: true
+    projection_l1_scale_by_active_count: false
+    # The old run had 24 inputs.  At initialization these 24 adapter outputs
+    # are the exact old inputs; the other 75 target inputs start at zero but
+    # are trainable and therefore all remain available to the exact loss.
+    feature_bottleneck_dim: 24
+    causal_feature_rms_normalization: true
+    causal_feature_min_active_dates: 1
+    causal_feature_scale_epsilon: 1.0e-6
+    temporal_basis_algebraic_contraction: true
+
+  multitask_loss:
+    rank_ic_weight: 0.0
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0
+    net_exposure_weight: 0.0

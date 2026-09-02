@@ -1,27 +1,40 @@
-base_config: tw_day_trade_1m.yaml
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
 
 # 真實「每日模型」：模型每個交易日只在開盤時輸出一次權重；訓練 loss
-# 本身依序執行 09:01 首分鐘 VWAP、13:20 限價、13:24 市價、13:25
-# Limit ROD / 13:30 收盤集合競價，並以每一分鐘 K 量 50% 作成交上限。
-experiment_name: tw-day-trade-daily-policy-minute-execution-tplus2-close-v3
+# 2014-01-06 至真實分鐘資料首日前使用明確標記的日 K 壓力代理：多單
+# open+1 tick / close-1 tick，空單 open-1 tick / close+1 tick；代理一分鐘量
+# 為日成交量 / 271，再由相同 executor 取 50%，避免誤用整天成交量。
+# 分鐘資料開始後仍依序執行 09:01 首分鐘 VWAP、13:20
+# 限價、13:24 市價、13:25 Limit ROD / 13:30 收盤集合競價，且每個
+# 分鐘 K 只取 50%，缺少分鐘 partition 時不准退回日 K 代理。
+experiment_name: tw-day-trade-daily-multi-basis-projection-l1-hybrid-minute-tplus2-close-commission20-capital10m-all-features-causal-rms-v8
 
 runner:
-  # execution contract v16：T 日只留下淨差額，T+2 收盤後入帳、T+3
-  # 開盤才能用於 sizing。與 v2 即時複利 checkpoint 不相容，使用新 root。
-  output_dir: artifacts/markets/tw_day_trade_1m_tplus2_close_v3
+  # execution contract v19：完成 OFAT baseline 的 10M、二折、多基底、
+  # projection-L1 與 panel-history 契約，加上方向別日 K/分鐘混合 tape
+  # 和 99-feature ABI。保留已完成一個 fold 的 24-feature v6；資金、
+  # 費率、模型輸入或 tape ABI 不同的 checkpoint 均不可續跑。
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_projection_l1_hybrid_minute_tplus2_close_commission20_capital10m_all_features_causal_rms_v8
   resume: true
   # 訓練的 final artifact pass 已直接保存同一個 compiled exact-minute
   # executor。避免完成後再以另一個模型執行 ABI 重播並覆寫結果。
   post_train_infer: false
 
 data:
-  # 完整市場、通過稽核的分鐘 K 首日是 2020-03-02；不可把缺失的
-  # 2014--2020 分鐘成交路徑補成 open-to-close proxy。
-  panel_start_date: '2020-03-02'
+  # 現股先買後賣當沖自 2014-01-06 開放；先賣後買由 point-in-time
+  # day_trade_can_short_open_mask 在 2014-06-30 前保持關閉。
+  panel_start_date: '2014-01-06'
+  # 使用上游明列的全部 99 個可因果對齊模型輸入：15 個
+  # OHLCV/蠟燭基礎特徵、83 個 TW-public 歷史特徵，以及 1 個
+  # 當日已觀察開盤 gap。不再繼承 deployment 為舊模型所作的特徵
+  # 排除。永久禁用的 snapshot-only 欄位本來就不在
+  # feature_include，且仍會被 config loader fail closed。
+  feature_exclude: []
   day_trade_minute_execution_root: data_tw_minute/research_dataset
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_execution_v3_hybrid_proxy_uniform_minute
 
 walk_forward:
-  expected_first_year: 2020
+  expected_first_year: 2014
   min_train_years: 1
   val_years: 1
   require_future_test_year: false
@@ -30,10 +43,18 @@ walk_forward:
 trading:
   execution_mode: tw_day_trade
   frequency: daily
-  volume_participation_equity: 1000000.0
+  # 明確重申完成 OFAT baseline 的 canonical 經濟契約；即使上游基底改名
+  # 也不能再退回舊 1M / 0.6 折扣實驗。
+  volume_participation_equity: 10000000.0
+  tw_commission_discount: 0.2
   max_volume_participation: 0.5
+  # 此旗標選擇的是另一套純日頻 recurrent executor，不能與 minute tape
+  # 疊加。混合 executor 自己仍會把 13:30 殘量依同一最高壓力費率轉為
+  # 融資／融券後當日結清，故關閉旗標不等於取消殘量轉換。
+  tw_day_trade_unlimited_margin_conversion: false
 
 training:
+  model_name: financial_transformer
   # 事件執行器保留逐日 recurrence；只編譯固定形狀的四日事件核心並在
   # 整段序列重用，避免把完整 batch 展開成無法排程的巨型 Triton kernel。
   # train/validation/test 都走同一個精確 forward 與同一條 STE backward。
@@ -42,22 +63,32 @@ training:
   backtest_compile_stateful: true
   eval_backtest_compile: true
 
-  # Dual RTX 5090 實測：四日核心的 Fold 6 batch 96/128/192 =
-  # 1.100/0.977/1.089 秒，故選 128。相同 batch 的 DDP-2 為 0.994 秒，
-  # 仍慢於單卡且冷編譯約 60.7 秒；兩 rank 都必須保留同一條全域 NAV
-  # recurrence，第二張卡應平行跑其他實驗。
-  multi_gpu_strategy: none
+  # 完成 OFAT 多基底 baseline 與 exact-minute DDP 測試都使用 128；這裡
+  # 保持 global train/eval batch 128。模型、混合 loss 與全域 T+2 recurrence
+  # 不變，validation 與 sampled-test 可分散至兩張卡。
+  multi_gpu_strategy: distributed_data_parallel
   batch_size_train: 128
-  batch_size_eval: 32
+  batch_size_eval: 128
   auto_batch_size: false
   # 分鐘事件 tensor forward 已是整張 forward；保留其 daily weights 表，
   # 但不再產生舊 open-to-close ledger 的逐股 holdings 偽稽核表。
   save_integer_share_holdings_table: false
 
-  # 100 萬資本無法對 2,700 多檔 dense L1 初始權重各買一張。
+  # 1,000 萬資本仍無法對 2,700 多檔 dense L1 權重各買一張。
   # L1-ball projection 是每日模型本身的可微稀疏多空 head；它保留 raw
   # score 正負方向並用 soft-threshold 產生精確零。train、infer、live 共用
   # 同一輸出，避免 action-sparsemax 的 long/short 對稱抵銷，也避免用
   # loss-only top-k 偷渡另一套策略。
   financial_transformer:
     portfolio_output_mode: projection_l1
+    # 99-feature v7 fed raw log-levels, returns and sparse future-source columns
+    # through one global RMSNorm.  In 2014 the extra 75 columns consumed 84.8%
+    # of input energy and 34 columns had never been observed, so validation
+    # could activate random weights.  Fit a non-centering RMS scale only from
+    # each expanding fold's causal feature rows. Zero remains the missing-value
+    # sentinel. Every feature with any causal training observation is used;
+    # only a column wholly absent from that fold's training history stays zero,
+    # because no model can learn a weight for information it has never seen.
+    causal_feature_rms_normalization: true
+    causal_feature_min_active_dates: 1
+    causal_feature_scale_epsilon: 1.0e-6

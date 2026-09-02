@@ -206,6 +206,21 @@ def _config():
     return load_config("configs/experiment_baseline.yaml")
 
 
+def _day_trade_minute_panel() -> PanelData:
+    panel = _panel()
+    rows, symbols = panel.tradable_mask.shape
+    panel.open_prices = np.full((rows, symbols), 99.0, dtype=np.float32)
+    panel.intraday_returns = np.zeros((rows, symbols), dtype=np.float32)
+    panel.day_trade_eligible_mask = panel.tradable_mask.copy()
+    panel.day_trade_can_short_open_mask = panel.tradable_mask.copy()
+    panel.day_trade_can_buy_open_mask = panel.tradable_mask.copy()
+    panel.day_trade_can_sell_open_mask = panel.tradable_mask.copy()
+    panel.day_trade_minute_execution = np.zeros(
+        (rows, symbols, 23), dtype=np.float32
+    )
+    return panel
+
+
 def _fold(*, val_year: int = 2025) -> WalkForwardFold:
     return WalkForwardFold(
         fold_id=7,
@@ -243,6 +258,62 @@ def test_checkpoint_data_fingerprint_hashes_actual_panel_content(field, mutate) 
     changed = _checkpoint_manifest(changed_panel, config)
 
     assert baseline["fingerprints"]["data"] != changed["fingerprints"]["data"]
+
+
+def test_strict_minute_tape_content_owns_resume_fingerprint() -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_strict_exact_2020.yaml")
+    baseline_panel = _day_trade_minute_panel()
+    changed_panel = copy.deepcopy(baseline_panel)
+    changed_panel.day_trade_minute_execution[2, 1, 4] = 101.25
+
+    baseline = _checkpoint_manifest(baseline_panel, config)
+    changed = _checkpoint_manifest(changed_panel, config)
+
+    assert baseline["fingerprints"]["data"] != changed["fingerprints"]["data"]
+    assert (
+        baseline["contracts"]["data"]["preprocessing"]
+        ["day_trade_minute_execution_allow_daily_proxy"]
+        is False
+    )
+
+
+def test_hybrid_minute_checkpoint_before_tape_hash_remains_compatible(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_realistic.yaml")
+    current = _checkpoint_manifest(_day_trade_minute_panel(), config)
+    historical = copy.deepcopy(current)
+    historical_arrays = historical["contracts"]["data"]["panel_arrays"]
+    historical_arrays.pop("day_trade_minute_execution")
+    historical["fingerprints"]["data"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["data"]
+    )
+
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": historical},
+        current,
+        checkpoint_path=tmp_path / "hybrid_pre_tape_hash.pt",
+        scope="resume",
+    )
+
+
+def test_strict_minute_checkpoint_cannot_omit_tape_hash(tmp_path: Path) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_strict_exact_2020.yaml")
+    current = _checkpoint_manifest(_day_trade_minute_panel(), config)
+    historical = copy.deepcopy(current)
+    historical_arrays = historical["contracts"]["data"]["panel_arrays"]
+    historical_arrays.pop("day_trade_minute_execution")
+    historical["fingerprints"]["data"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["data"]
+    )
+
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": historical},
+            current,
+            checkpoint_path=tmp_path / "strict_pre_tape_hash.pt",
+            scope="resume",
+        )
 
 
 @pytest.mark.parametrize(
@@ -323,6 +394,14 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
                 cfg.training,
                 "warm_start_from_previous_fold",
                 not cfg.training.warm_start_from_previous_fold,
+            ),
+        ),
+        (
+            "training",
+            lambda cfg: setattr(
+                cfg.training,
+                "pretrained_initialization_validation_guard",
+                not cfg.training.pretrained_initialization_validation_guard,
             ),
         ),
         (

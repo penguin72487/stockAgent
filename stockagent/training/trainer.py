@@ -982,6 +982,749 @@ class FoldRuntimeContext:
     best_val_loss: float = float("inf")
 
 
+@dataclass(slots=True)
+class _PretrainedInitialization:
+    checkpoint_path: Path
+    checkpoint: dict[str, Any]
+    source_feature_names: list[str]
+    provenance: dict[str, Any]
+    source_symbol_names: list[str] | None = None
+
+
+def _checkpoint_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_pretrained_initialization(
+    config: ExperimentConfig,
+    group_folds: Sequence[WalkForwardFold],
+) -> _PretrainedInitialization | None:
+    """Resolve one causally matching source fold for a fresh train group.
+
+    The source may have a different execution objective, so this is never a
+    resume and never imports optimizer state.  Exact train/validation-year
+    matching prevents a later source fold from leaking into an earlier target
+    fold and gives the target's epoch-zero validation guard the same temporal
+    information boundary as the source checkpoint selection.
+    """
+
+    raw_root = config.training.pretrained_initialization_root
+    if raw_root is None or not str(raw_root).strip():
+        return None
+    if bool(config.training.warm_start_from_previous_fold):
+        raise ValueError(
+            "pretrained_initialization_root and warm_start_from_previous_fold "
+            "are mutually exclusive"
+        )
+    if not bool(config.training.pretrained_initialization_validation_guard):
+        raise ValueError(
+            "pretrained initialization requires the exact-objective epoch-zero "
+            "validation guard"
+        )
+    if not group_folds:
+        raise ValueError("pretrained initialization requires at least one fold")
+
+    policy = (
+        str(config.training.pretrained_initialization_fold_policy)
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if policy not in {
+        "matching_train_and_validation_years",
+        "matching_train_val_years",
+    }:
+        raise ValueError(
+            "pretrained_initialization_fold_policy must be "
+            "'matching_train_and_validation_years'"
+        )
+
+    reference = group_folds[0]
+    target_train_years = [int(value) for value in reference.train_years]
+    target_val_years = [int(value) for value in reference.val_years]
+    for fold in group_folds[1:]:
+        if (
+            [int(value) for value in fold.train_years] != target_train_years
+            or [int(value) for value in fold.val_years] != target_val_years
+        ):
+            raise ValueError(
+                "one pretrained checkpoint cannot initialize a train group "
+                "whose folds have different train/validation years"
+            )
+
+    source_root = Path(str(raw_root)).expanduser()
+    manifest_path = source_root / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"pretrained initialization manifest is missing: {manifest_path}"
+        )
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        source_manifest = json.load(handle)
+    data_summary = source_manifest.get("data_summary")
+    if not isinstance(data_summary, Mapping):
+        raise RuntimeError(
+            f"pretrained initialization manifest has no data_summary: {manifest_path}"
+        )
+    raw_feature_names = data_summary.get("feature_names")
+    if not isinstance(raw_feature_names, list) or not raw_feature_names:
+        raise RuntimeError(
+            f"pretrained initialization manifest has no feature_names: {manifest_path}"
+        )
+    source_feature_names = [str(value) for value in raw_feature_names]
+    if len(set(source_feature_names)) != len(source_feature_names):
+        raise RuntimeError("pretrained source feature names are not unique")
+    raw_symbol_names = data_summary.get("symbol_names")
+    if not isinstance(raw_symbol_names, list) or not raw_symbol_names:
+        raise RuntimeError(
+            f"pretrained initialization manifest has no symbol_names: {manifest_path}"
+        )
+    source_symbol_names = [str(value) for value in raw_symbol_names]
+    if len(set(source_symbol_names)) != len(source_symbol_names):
+        raise RuntimeError("pretrained source symbol names are not unique")
+    source_model_name = (
+        str(source_manifest.get("model_name", ""))
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    feature_adapter = (
+        str(config.training.pretrained_initialization_feature_adapter)
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    financial_transformer_names = {
+        "financial_transformer",
+        "financial_transformer_model",
+        "financial_token_transformer",
+        "financial_tokenized_transformer",
+    }
+    transformer_projection_names = {
+        "transformer_base_portfolio",
+        "transformer_base_portfolio_model",
+        "cross_sectional_all_futures",
+        "cross_sectional_all_futures_model",
+    }
+    if feature_adapter == "identity_by_feature_name":
+        accepted_source_names = financial_transformer_names
+    elif feature_adapter == "transformer_feature_projection_by_name":
+        accepted_source_names = transformer_projection_names
+    else:
+        raise ValueError(
+            "pretrained_initialization_feature_adapter must be "
+            "'identity_by_feature_name' or "
+            "'transformer_feature_projection_by_name'"
+        )
+    if source_model_name not in accepted_source_names:
+        raise RuntimeError(
+            f"pretrained feature adapter {feature_adapter!r} is incompatible "
+            f"with source model {source_model_name!r}"
+        )
+
+    summary_path = source_root / "summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            f"pretrained initialization summary is missing: {summary_path}"
+        )
+    with summary_path.open("r", encoding="utf-8") as handle:
+        source_summary = json.load(handle)
+    if not isinstance(source_summary, list):
+        raise RuntimeError(
+            f"pretrained initialization summary must be a list: {summary_path}"
+        )
+    matching_rows = [
+        row
+        for row in source_summary
+        if isinstance(row, Mapping)
+        and [int(value) for value in row.get("train_years", [])]
+        == target_train_years
+        and [int(value) for value in row.get("val_years", [])]
+        == target_val_years
+    ]
+    if len(matching_rows) != 1:
+        raise RuntimeError(
+            "pretrained initialization requires exactly one source checkpoint "
+            "with identical train/validation years; "
+            f"train={target_train_years} val={target_val_years} "
+            f"matches={len(matching_rows)} "
+            f"root={source_root}"
+        )
+    source_fold_id = int(matching_rows[0]["fold_id"])
+    checkpoint_path = (
+        source_root / f"fold_{source_fold_id:02d}" / "checkpoint_best.pt"
+    )
+    checkpoint, read_error = _try_load_readable_checkpoint(checkpoint_path)
+    if checkpoint is None:
+        raise RuntimeError(
+            f"pretrained source checkpoint is unreadable: {checkpoint_path}: "
+            f"{read_error}"
+        )
+    if (
+        [int(value) for value in checkpoint.get("train_years", [])]
+        != target_train_years
+        or [int(value) for value in checkpoint.get("val_years", [])]
+        != target_val_years
+    ):
+        raise RuntimeError(
+            "pretrained summary/checkpoint year mismatch: "
+            f"{checkpoint_path}"
+        )
+    model_state = checkpoint.get("model_state_dict")
+    if not isinstance(model_state, Mapping):
+        raise RuntimeError(
+            f"pretrained source checkpoint has no model_state_dict: {checkpoint_path}"
+        )
+    provenance = {
+        "schema_version": 1,
+        "kind": "fold_matched_model_initialization_without_optimizer",
+        "source_root": str(source_root),
+        "source_checkpoint": str(checkpoint_path),
+        "source_checkpoint_sha256": _checkpoint_file_sha256(checkpoint_path),
+        "source_model_name": source_model_name,
+        "source_fold_id": int(checkpoint.get("fold_id", -1)),
+        "source_epoch": int(checkpoint.get("epoch", -1)),
+        "source_best_val_loss": float(
+            checkpoint.get("best_val_loss", float("nan"))
+        ),
+        "source_feature_count": len(source_feature_names),
+        "source_symbol_count": len(source_symbol_names),
+        "target_fold_ids": [int(fold.fold_id) for fold in group_folds],
+        "target_train_years": target_train_years,
+        "target_validation_years": target_val_years,
+        "fold_policy": "matching_train_and_validation_years",
+        "optimizer_state_imported": False,
+        "source_test_metrics_used": False,
+    }
+    return _PretrainedInitialization(
+        checkpoint_path=checkpoint_path,
+        checkpoint=checkpoint,
+        source_feature_names=source_feature_names,
+        provenance=provenance,
+        source_symbol_names=source_symbol_names,
+    )
+
+
+def _pretrained_temporal_basis(
+    initialization: _PretrainedInitialization,
+    *,
+    train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold],
+    output_path: Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None]:
+    state_dict = initialization.checkpoint["model_state_dict"]
+    overrides = temporal_basis_overrides_from_state_dict(state_dict)
+    raw_metadata = initialization.checkpoint.get("temporal_basis_selection")
+    metadata = (
+        deepcopy(dict(raw_metadata))
+        if isinstance(raw_metadata, Mapping)
+        else None
+    )
+    if metadata is not None:
+        metadata["target_train_years"] = [int(value) for value in train_years]
+        metadata["target_fold_ids"] = [int(fold.fold_id) for fold in group_folds]
+        metadata["initialization_source_checkpoint"] = str(
+            initialization.checkpoint_path
+        )
+        metadata["initialization_source_checkpoint_sha256"] = (
+            initialization.provenance["source_checkpoint_sha256"]
+        )
+        metadata["selection_reused_from_causal_matching_source_fold"] = True
+        metadata["selection_fingerprint"] = _stable_fingerprint(metadata)
+        if _distributed_should_write():
+            _write_temporal_basis_metadata(
+                _group_dir(output_path, list(train_years))
+                / "temporal_basis_selection.json",
+                metadata,
+            )
+            for fold in group_folds:
+                _write_temporal_basis_metadata(
+                    _fold_dir(output_path, fold.fold_id)
+                    / "temporal_basis_selection.json",
+                    metadata,
+                    fold_id=fold.fold_id,
+                )
+    return overrides, metadata
+
+
+def _transfer_pretrained_feature_identity(
+    model: nn.Module,
+    initialization: _PretrainedInitialization,
+    *,
+    target_feature_names: Sequence[str],
+    target_symbol_names: Sequence[str] | None = None,
+    require_exact_backbone: bool,
+    trainable_parameter_prefixes: Sequence[str],
+) -> dict[str, Any]:
+    """Load a FinancialTransformer through a feature-name-safe adapter.
+
+    Two ABI-safe cases are supported.  For an older model without a bottleneck,
+    the target adapter output width equals the old raw feature width and its
+    rows select the old features from an expanded target ABI.  For a completed
+    successor that already owns the same raw feature ABI and a learned
+    bottleneck, every checkpoint tensor is copied exactly instead of replacing
+    that learned bottleneck with a new identity projection.  Neither case
+    imports optimizer state.
+    """
+
+    raw_model = _unwrap_model(model)
+    candle_encoder = getattr(raw_model, "candle_encoder", None)
+    adapter_module = (
+        None
+        if candle_encoder is None
+        else getattr(candle_encoder, "continuous_feature_bottleneck", None)
+    )
+    if not isinstance(adapter_module, nn.Linear):
+        raise RuntimeError(
+            "pretrained feature identity requires a FinancialTransformer "
+            "continuous_feature_bottleneck"
+        )
+
+    source_features = list(initialization.source_feature_names)
+    target_features = [str(value) for value in target_feature_names]
+    if (
+        initialization.source_symbol_names is not None
+        and target_symbol_names is not None
+        and [str(value) for value in target_symbol_names]
+        != initialization.source_symbol_names
+    ):
+        raise RuntimeError(
+            "pretrained source and target symbol axes differ; exact policy "
+            "identity cannot be guaranteed"
+        )
+    if len(set(target_features)) != len(target_features):
+        raise RuntimeError("target feature names are not unique")
+    source_state = initialization.checkpoint["model_state_dict"]
+    adapter_key = "candle_encoder.continuous_feature_bottleneck.weight"
+    if int(adapter_module.out_features) != len(source_features):
+        # A successor checkpoint records the raw panel feature ABI in its run
+        # manifest, while its learned bottleneck can be narrower.  If source
+        # and target raw feature names are exactly identical, preserving the
+        # full checkpoint is the only transformation that preserves the
+        # already-learned policy.  Rebuilding an identity adapter here would
+        # both be dimensionally impossible and silently discard that policy.
+        if source_features != target_features:
+            raise RuntimeError(
+                "feature adapter output width must equal the pretrained feature "
+                "count unless source and target raw feature ABIs are identical: "
+                f"adapter={adapter_module.out_features} source={len(source_features)}"
+            )
+
+        target_state = raw_model.state_dict()
+        mismatches: list[str] = []
+        copied_keys: list[str] = []
+        for key, target_value in target_state.items():
+            source_value = source_state.get(key)
+            if not torch.is_tensor(source_value):
+                mismatches.append(f"{key}:missing")
+                continue
+            if tuple(source_value.shape) != tuple(target_value.shape):
+                mismatches.append(
+                    f"{key}:shape {tuple(source_value.shape)} != "
+                    f"{tuple(target_value.shape)}"
+                )
+                continue
+            target_state[key] = source_value.detach().to(
+                device=target_value.device,
+                dtype=target_value.dtype,
+            )
+            copied_keys.append(key)
+        unexpected_source_keys = sorted(set(source_state).difference(target_state))
+        mismatches.extend(f"{key}:unexpected" for key in unexpected_source_keys)
+        if mismatches and bool(require_exact_backbone):
+            raise RuntimeError(
+                "pretrained exact-feature checkpoint is not exactly compatible "
+                "with the target model: " + "; ".join(mismatches[:20])
+            )
+        raw_model.load_state_dict(target_state, strict=True)
+
+        prefixes = tuple(
+            str(value).strip()
+            for value in trainable_parameter_prefixes
+            if str(value).strip()
+        )
+        matched_prefixes: set[str] = set()
+        if prefixes:
+            for name, parameter in raw_model.named_parameters():
+                trainable = any(name.startswith(prefix) for prefix in prefixes)
+                parameter.requires_grad_(trainable)
+                for prefix in prefixes:
+                    if name.startswith(prefix):
+                        matched_prefixes.add(prefix)
+            missing_prefixes = sorted(set(prefixes).difference(matched_prefixes))
+            if missing_prefixes:
+                raise RuntimeError(
+                    "pretrained trainable parameter prefixes matched no "
+                    f"parameters: {missing_prefixes}"
+                )
+
+        trainable_parameters = sum(
+            parameter.numel()
+            for parameter in raw_model.parameters()
+            if parameter.requires_grad
+        )
+        total_parameters = sum(
+            parameter.numel() for parameter in raw_model.parameters()
+        )
+        report = deepcopy(initialization.provenance)
+        report.update(
+            {
+                "feature_adapter": "exact_state_by_feature_name",
+                "target_feature_count": len(target_features),
+                "adapter_output_features": int(adapter_module.out_features),
+                "adapter_new_feature_columns_initialized_zero": 0,
+                "causal_rms_identity_compensation": False,
+                "copied_backbone_tensor_count": len(copied_keys),
+                "incompatible_source_tensor_count": len(mismatches),
+                "incompatible_source_tensors": mismatches,
+                "require_exact_backbone": bool(require_exact_backbone),
+                "trainable_parameter_prefixes": list(prefixes),
+                "trainable_parameters": int(trainable_parameters),
+                "total_parameters": int(total_parameters),
+                "epoch_zero_validation_guard": True,
+            }
+        )
+        setattr(
+            raw_model,
+            "pretrained_initialization_provenance",
+            deepcopy(report),
+        )
+        return report
+
+    continuous_indices = [
+        int(value) for value in candle_encoder.continuous_feature_indices
+    ]
+    continuous_names = [target_features[index] for index in continuous_indices]
+    continuous_position = {
+        name: index for index, name in enumerate(continuous_names)
+    }
+    missing_features = [
+        name for name in source_features if name not in continuous_position
+    ]
+    if missing_features:
+        raise RuntimeError(
+            "pretrained source features are absent from the target continuous "
+            f"ABI: {missing_features}"
+        )
+
+    target_state = raw_model.state_dict()
+    mismatches: list[str] = []
+    copied_keys: list[str] = []
+    for key, source_value in source_state.items():
+        target_value = target_state.get(key)
+        if not torch.is_tensor(source_value) or target_value is None:
+            mismatches.append(f"{key}:missing")
+            continue
+        if tuple(source_value.shape) != tuple(target_value.shape):
+            mismatches.append(
+                f"{key}:shape {tuple(source_value.shape)} != {tuple(target_value.shape)}"
+            )
+            continue
+        target_state[key] = source_value.detach().to(
+            device=target_value.device,
+            dtype=target_value.dtype,
+        )
+        copied_keys.append(key)
+    if mismatches and bool(require_exact_backbone):
+        raise RuntimeError(
+            "pretrained backbone is not exactly compatible with the target "
+            "model after feature adaptation: " + "; ".join(mismatches[:20])
+        )
+
+    adapter_weight = target_state[adapter_key].new_zeros(
+        target_state[adapter_key].shape
+    )
+    rms_scale = getattr(candle_encoder, "causal_feature_rms_scale", None)
+    rms_active = getattr(candle_encoder, "causal_feature_active_mask", None)
+    for source_index, name in enumerate(source_features):
+        continuous_index = continuous_position[name]
+        raw_feature_index = continuous_indices[continuous_index]
+        coefficient = 1.0
+        if torch.is_tensor(rms_scale):
+            if torch.is_tensor(rms_active) and not bool(
+                rms_active[raw_feature_index].item()
+            ):
+                raise RuntimeError(
+                    f"pretrained feature {name!r} is inactive in target causal RMS"
+                )
+            coefficient = float(rms_scale[raw_feature_index].item())
+        adapter_weight[source_index, continuous_index] = coefficient
+    target_state[adapter_key] = adapter_weight
+    raw_model.load_state_dict(target_state, strict=True)
+
+    prefixes = tuple(
+        str(value).strip()
+        for value in trainable_parameter_prefixes
+        if str(value).strip()
+    )
+    matched_prefixes: set[str] = set()
+    if prefixes:
+        for name, parameter in raw_model.named_parameters():
+            trainable = any(name.startswith(prefix) for prefix in prefixes)
+            parameter.requires_grad_(trainable)
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    matched_prefixes.add(prefix)
+        missing_prefixes = sorted(set(prefixes).difference(matched_prefixes))
+        if missing_prefixes:
+            raise RuntimeError(
+                "pretrained trainable parameter prefixes matched no parameters: "
+                f"{missing_prefixes}"
+            )
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in raw_model.parameters()
+        if parameter.requires_grad
+    )
+    total_parameters = sum(parameter.numel() for parameter in raw_model.parameters())
+    report = deepcopy(initialization.provenance)
+    report.update(
+        {
+            "feature_adapter": "identity_by_feature_name",
+            "target_feature_count": len(target_features),
+            "adapter_output_features": len(source_features),
+            "adapter_new_feature_columns_initialized_zero": (
+                len(target_features) - len(source_features)
+            ),
+            "causal_rms_identity_compensation": bool(torch.is_tensor(rms_scale)),
+            "copied_backbone_tensor_count": len(copied_keys),
+            "incompatible_source_tensor_count": len(mismatches),
+            "incompatible_source_tensors": mismatches,
+            "require_exact_backbone": bool(require_exact_backbone),
+            "trainable_parameter_prefixes": list(prefixes),
+            "trainable_parameters": int(trainable_parameters),
+            "total_parameters": int(total_parameters),
+            "epoch_zero_validation_guard": True,
+        }
+    )
+    setattr(raw_model, "pretrained_initialization_provenance", deepcopy(report))
+    return report
+
+
+def _transfer_pretrained_transformer_feature_projection(
+    model: nn.Module,
+    initialization: _PretrainedInitialization,
+    *,
+    target_feature_names: Sequence[str],
+    target_symbol_names: Sequence[str] | None = None,
+    require_exact_backbone: bool,
+    trainable_parameter_prefixes: Sequence[str],
+) -> dict[str, Any]:
+    """Transfer a Transformer policy across an additive feature/execution ABI.
+
+    Common panel features are copied by name into ``feature_proj``. Target-only
+    panel columns start at zero, preserving the source stock embeddings while
+    remaining trainable. The all-futures 08:45 successor also adds causal
+    underlying, denomination, and current-open paths. Their residual-producing
+    linear layers are initialized to exact zero, so epoch zero is the old policy
+    passed through the new legal denomination/exact-integer executor rather than
+    an old policy corrupted by random new modules.
+    """
+
+    raw_model = _unwrap_model(model)
+    feature_projection = getattr(raw_model, "feature_proj", None)
+    if not isinstance(feature_projection, nn.Linear):
+        raise RuntimeError(
+            "transformer feature-name transfer requires a linear feature_proj"
+        )
+
+    source_features = [str(value) for value in initialization.source_feature_names]
+    target_features = [str(value) for value in target_feature_names]
+    if (
+        initialization.source_symbol_names is not None
+        and target_symbol_names is not None
+        and [str(value) for value in target_symbol_names]
+        != initialization.source_symbol_names
+    ):
+        raise RuntimeError(
+            "pretrained source and target symbol axes differ; exact policy "
+            "identity cannot be guaranteed"
+        )
+    if len(set(source_features)) != len(source_features):
+        raise RuntimeError("pretrained source feature names are not unique")
+    if len(set(target_features)) != len(target_features):
+        raise RuntimeError("target feature names are not unique")
+    target_position = {name: index for index, name in enumerate(target_features)}
+    missing_features = [name for name in source_features if name not in target_position]
+    if missing_features:
+        raise RuntimeError(
+            "pretrained source features are absent from the target Transformer "
+            f"ABI: {missing_features}"
+        )
+
+    source_state = initialization.checkpoint["model_state_dict"]
+    source_projection = source_state.get("feature_proj.weight")
+    if not torch.is_tensor(source_projection) or source_projection.ndim != 2:
+        raise RuntimeError(
+            "pretrained Transformer checkpoint has no 2D feature_proj.weight"
+        )
+    if int(source_projection.size(1)) != len(source_features):
+        raise RuntimeError(
+            "pretrained feature projection width does not match source feature "
+            f"manifest: projection={source_projection.size(1)} "
+            f"features={len(source_features)}"
+        )
+    if (
+        int(source_projection.size(0)) != int(feature_projection.out_features)
+        or int(feature_projection.in_features) != len(target_features)
+    ):
+        raise RuntimeError(
+            "pretrained and target Transformer feature projections have "
+            "incompatible embedding widths"
+        )
+
+    target_state = raw_model.state_dict()
+    allowed_target_only_prefixes = (
+        "futures_underlying_norm.",
+        "futures_underlying_projection.",
+        "futures_underlying_gate.",
+        "futures_denomination_encoder.",
+        "futures_current_open_encoder.",
+    )
+    mismatches: list[str] = []
+    copied_keys: list[str] = []
+    for key, source_value in source_state.items():
+        if key == "feature_proj.weight":
+            continue
+        target_value = target_state.get(key)
+        if not torch.is_tensor(source_value) or target_value is None:
+            mismatches.append(f"{key}:missing")
+            continue
+        if tuple(source_value.shape) != tuple(target_value.shape):
+            mismatches.append(
+                f"{key}:shape {tuple(source_value.shape)} != {tuple(target_value.shape)}"
+            )
+            continue
+        target_state[key] = source_value.detach().to(
+            device=target_value.device,
+            dtype=target_value.dtype,
+        )
+        copied_keys.append(key)
+
+    target_only_keys = sorted(set(target_state).difference(source_state))
+    unexpected_target_only = [
+        key
+        for key in target_only_keys
+        if not key.startswith(allowed_target_only_prefixes)
+    ]
+    if unexpected_target_only:
+        mismatches.extend(f"{key}:target_only" for key in unexpected_target_only)
+    if mismatches and bool(require_exact_backbone):
+        raise RuntimeError(
+            "pretrained Transformer backbone is not exactly compatible after "
+            "the declared additive adapters: " + "; ".join(mismatches[:20])
+        )
+
+    adapted_projection = target_state["feature_proj.weight"].new_zeros(
+        target_state["feature_proj.weight"].shape
+    )
+    for source_index, name in enumerate(source_features):
+        adapted_projection[:, target_position[name]] = source_projection[
+            :, source_index
+        ].to(
+            device=adapted_projection.device,
+            dtype=adapted_projection.dtype,
+        )
+    target_state["feature_proj.weight"] = adapted_projection
+
+    zero_initialized_keys: list[str] = []
+    for key in (
+        "futures_underlying_projection.weight",
+        "futures_denomination_encoder.0.weight",
+        "futures_denomination_encoder.0.bias",
+        "futures_current_open_encoder.0.weight",
+        "futures_current_open_encoder.0.bias",
+    ):
+        value = target_state.get(key)
+        if torch.is_tensor(value) and key not in source_state:
+            target_state[key] = torch.zeros_like(value)
+            zero_initialized_keys.append(key)
+    raw_model.load_state_dict(target_state, strict=True)
+
+    prefixes = tuple(
+        str(value).strip()
+        for value in trainable_parameter_prefixes
+        if str(value).strip()
+    )
+    matched_prefixes: set[str] = set()
+    if prefixes:
+        for name, parameter in raw_model.named_parameters():
+            trainable = any(name.startswith(prefix) for prefix in prefixes)
+            parameter.requires_grad_(trainable)
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    matched_prefixes.add(prefix)
+        missing_prefixes = sorted(set(prefixes).difference(matched_prefixes))
+        if missing_prefixes:
+            raise RuntimeError(
+                "pretrained trainable parameter prefixes matched no parameters: "
+                f"{missing_prefixes}"
+            )
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in raw_model.parameters()
+        if parameter.requires_grad
+    )
+    total_parameters = sum(parameter.numel() for parameter in raw_model.parameters())
+    report = deepcopy(initialization.provenance)
+    report.update(
+        {
+            "feature_adapter": "transformer_feature_projection_by_name",
+            "target_feature_count": len(target_features),
+            "adapter_output_features": int(feature_projection.out_features),
+            "adapter_new_feature_columns_initialized_zero": (
+                len(target_features) - len(source_features)
+            ),
+            "copied_backbone_tensor_count": len(copied_keys),
+            "target_only_additive_tensor_count": len(target_only_keys),
+            "target_only_additive_tensors": target_only_keys,
+            "zero_initialized_residual_tensor_count": len(zero_initialized_keys),
+            "zero_initialized_residual_tensors": zero_initialized_keys,
+            "incompatible_source_tensor_count": len(mismatches),
+            "incompatible_source_tensors": mismatches,
+            "require_exact_backbone": bool(require_exact_backbone),
+            "trainable_parameter_prefixes": list(prefixes),
+            "trainable_parameters": int(trainable_parameters),
+            "total_parameters": int(total_parameters),
+            "epoch_zero_validation_guard": True,
+        }
+    )
+    setattr(raw_model, "pretrained_initialization_provenance", deepcopy(report))
+    return report
+
+
+def _write_pretrained_initialization_metadata(
+    output_path: Path,
+    *,
+    train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold],
+    report: Mapping[str, Any],
+) -> None:
+    if not _distributed_should_write():
+        return
+    paths = [
+        _group_dir(output_path, list(train_years))
+        / "pretrained_initialization.json",
+        *[
+            _fold_dir(output_path, fold.fold_id)
+            / "pretrained_initialization.json"
+            for fold in group_folds
+        ],
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(dict(report), handle, indent=2, sort_keys=True)
+
+
 @dataclass(frozen=True, slots=True)
 class _ExecutionRuntime:
     mode: str
@@ -1638,6 +2381,50 @@ def _canonical_tensor_day_trade_enabled(
             or runtime.day_trade_unlimited_margin_conversion
         )
     )
+
+
+def _mode_artifact_contract_for_config(
+    config: ExperimentConfig,
+) -> dict[str, Any]:
+    """Return reporting semantics for the configured execution implementation.
+
+    ``tw_day_trade`` has two materially different implementations: the legacy
+    daily OPEN/CLOSE ledger and the exact board-lot minute-event ledger.  The
+    execution mode alone cannot distinguish them, so persisting only the
+    generic mode contract makes an exact-minute run look comparable with a
+    daily-bar replay.  Keep the product/mode stable while making the clock,
+    terminal state, weight snapshot, and turnover definitions explicit.
+    """
+
+    mode = normalize_execution_mode(config.trading.execution_mode)
+    payload = canonical_mode_artifact_contract(mode)
+    if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
+        return payload
+    payload.update(
+        {
+            "frequency": "daily_policy_exact_minute_execution",
+            "decision_clock": "observed_session_open",
+            "execution_clock": (
+                "official_open_sizing_then_0901_vwap_entry_1320_limit_"
+                "1324_market_1330_auction"
+            ),
+            "recurrent_state_scope": "cross_session_t_plus_2_net_claim_account",
+            "terminal_policy": (
+                "flat_after_1330_margin_conversion_with_t_plus_2_net_claim"
+            ),
+            "sample_order_contract": "strict_chronological_sessions",
+            "weight_snapshot_contract": "exact_filled_entry_notional_over_nav",
+            "turnover_contract": "sum_exact_minute_fill_notional_over_nav",
+            "mode_details": {
+                "execution_variant": "exact_board_lot_minute_event_tape_v1",
+                "daily_policy_decisions_per_session": 1,
+                "daily_proxy_allowed": bool(
+                    config.data.day_trade_minute_execution_allow_daily_proxy
+                ),
+            },
+        }
+    )
+    return payload
 
 
 def _tensor_day_trade_is_whole_lot_exact(
@@ -3975,6 +4762,213 @@ def _fit_group_temporal_basis(
     return overrides, metadata
 
 
+def _fit_group_causal_feature_rms(
+    *,
+    config: ExperimentConfig,
+    panel: PanelData,
+    train_ds: CrossSectionalDataset,
+    train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold],
+    output_path: Path,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None:
+    """Fit a zero-preserving raw-feature scale from training windows only.
+
+    The daily panel intentionally uses zero for unavailable point-in-time
+    values.  Centering would turn that sentinel into a nonzero signal, so the
+    normalizer divides by training RMS without subtracting a mean.  Features
+    unseen for enough distinct training dates are held at zero for the whole
+    fold; otherwise a future data-source launch would activate random,
+    never-trained projection weights.
+    """
+
+    model_name = str(config.training.model_name).strip().lower().replace("-", "_")
+    if model_name not in {
+        "financial_transformer",
+        "financial_transformer_model",
+        "financial_token_transformer",
+        "financial_tokenized_transformer",
+        "executable_portfolio_transformer",
+        "executable_portfolio_transformer_model",
+        "execution_aware_portfolio_transformer",
+    }:
+        return None
+    model_config = (
+        config.training.executable_portfolio_transformer
+        if model_name
+        in {
+            "executable_portfolio_transformer",
+            "executable_portfolio_transformer_model",
+            "execution_aware_portfolio_transformer",
+        }
+        else config.training.financial_transformer
+    )
+    if not bool(model_config.causal_feature_rms_normalization):
+        return None
+
+    epsilon = float(model_config.causal_feature_scale_epsilon)
+    minimum_dates = int(model_config.causal_feature_min_active_dates)
+    valid_indices = np.asarray(train_ds.valid_indices, dtype=np.int64).reshape(-1)
+    if valid_indices.size == 0:
+        raise ValueError("causal feature RMS normalization requires training rows")
+    feature_lag = int(execution_feature_lag(train_ds.execution_mode))
+    row_start = max(
+        0,
+        int(valid_indices.min()) - feature_lag - int(train_ds.lookback) + 1,
+    )
+    row_end = int(valid_indices.max()) - feature_lag
+    if row_end < row_start:
+        raise ValueError("causal feature RMS training window is empty")
+    feature_count = len(panel.feature_names)
+    payload: dict[str, Any] | None = None
+
+    def _fit_on_rank0() -> None:
+        nonlocal payload
+        squared_sum = np.zeros(feature_count, dtype=np.float64)
+        active_date_count = np.zeros(feature_count, dtype=np.int64)
+        alive_cell_count = 0
+        chunk_rows = 32
+        for start in range(row_start, row_end + 1, chunk_rows):
+            end = min(row_end + 1, start + chunk_rows)
+            values = np.nan_to_num(
+                np.asarray(panel.features[start:end], dtype=np.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            alive = np.asarray(panel.alive_mask[start:end], dtype=np.bool_)
+            alive_cell_count += int(alive.sum(dtype=np.int64))
+            squared_sum += np.einsum(
+                "tsf,tsf,ts->f",
+                values,
+                values,
+                alive,
+                dtype=np.float64,
+                optimize=True,
+            )
+            observed = (np.abs(values) > epsilon) & alive[..., None]
+            active_date_count += np.any(observed, axis=1).sum(
+                axis=0,
+                dtype=np.int64,
+            )
+        if alive_cell_count <= 0:
+            raise ValueError(
+                "causal feature RMS normalization found no alive training cells"
+            )
+        rms = np.sqrt(squared_sum / float(alive_cell_count))
+        active = (
+            np.isfinite(rms)
+            & (rms >= epsilon)
+            & (active_date_count >= minimum_dates)
+        )
+        scale = np.where(active, rms, 1.0).astype(np.float32)
+        categorical_names = {
+            str(name) for name in model_config.categorical_feature_names
+        }
+        categorical_indices = [
+            index
+            for index, name in enumerate(panel.feature_names)
+            if str(name) in categorical_names
+        ]
+        if categorical_names.difference(str(name) for name in panel.feature_names):
+            missing = sorted(
+                categorical_names.difference(
+                    str(name) for name in panel.feature_names
+                )
+            )
+            raise ValueError(
+                "causal feature RMS categorical columns are absent from the "
+                f"panel: {missing}"
+            )
+        if categorical_indices:
+            scale[categorical_indices] = 1.0
+            active[categorical_indices] = True
+        metadata = {
+            "schema_version": 1,
+            "normalization": "training_only_zero_preserving_rms",
+            "train_years": [int(year) for year in train_years],
+            "fold_ids": [int(fold.fold_id) for fold in group_folds],
+            "feature_row_start": int(row_start),
+            "feature_row_end_inclusive": int(row_end),
+            "feature_date_start": str(
+                np.asarray(panel.dates[row_start], dtype="datetime64[D]")
+            ),
+            "feature_date_end": str(
+                np.asarray(panel.dates[row_end], dtype="datetime64[D]")
+            ),
+            "feature_lag": feature_lag,
+            "lookback": int(train_ds.lookback),
+            "minimum_active_dates": minimum_dates,
+            "scale_epsilon": epsilon,
+            "alive_cell_count": int(alive_cell_count),
+            "active_feature_count": int(active.sum()),
+            "inactive_feature_count": int((~active).sum()),
+            "categorical_feature_names": sorted(categorical_names),
+            "features": [
+                {
+                    "name": str(name),
+                    "rms_scale": float(scale[index]),
+                    "active": bool(active[index]),
+                    "active_dates": int(active_date_count[index]),
+                }
+                for index, name in enumerate(panel.feature_names)
+            ],
+        }
+        metadata["normalizer_fingerprint"] = _stable_fingerprint(metadata)
+        payload = {
+            "scale": scale.tolist(),
+            "active": active.tolist(),
+            "metadata": metadata,
+        }
+
+    _run_rank0_store_synchronized_phase("causal_feature_rms_fit", _fit_on_rank0)
+    if _distributed_is_initialized() and _distributed_world_size() > 1:
+        objects: list[dict[str, Any] | None] = [payload]
+        dist.broadcast_object_list(objects, src=0)
+        payload = objects[0]
+    if payload is None:
+        raise RuntimeError("causal feature RMS fit produced no distributed payload")
+
+    scale = torch.tensor(payload["scale"], dtype=torch.float32)
+    active = torch.tensor(payload["active"], dtype=torch.bool)
+    metadata = dict(payload["metadata"])
+    if _distributed_should_write():
+        group_dir = _group_dir(output_path, list(train_years))
+        destinations = [
+            group_dir / "causal_feature_rms_normalization.json",
+            *[
+                _fold_dir(output_path, fold.fold_id)
+                / "causal_feature_rms_normalization.json"
+                for fold in group_folds
+            ],
+        ]
+        for destination in destinations:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2, sort_keys=True)
+    print(
+        f"[Train {list(train_years)}] causal feature RMS active="
+        f"{int(active.sum().item())}/{feature_count} "
+        f"dates={metadata['feature_date_start']}..{metadata['feature_date_end']}"
+    )
+    return scale, active, metadata
+
+
+def _apply_causal_feature_rms_to_model(
+    model: nn.Module,
+    fitted: tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None,
+) -> None:
+    if fitted is None:
+        return
+    scale, active, metadata = fitted
+    setter = getattr(model, "set_causal_feature_rms_normalizer", None)
+    if not callable(setter):
+        raise TypeError(
+            "causal feature RMS normalization requires a compatible model"
+        )
+    setter(scale, active)
+    setattr(model, "causal_feature_rms_metadata", deepcopy(metadata))
+
+
 def _write_loss_contract_metadata(
     path: Path,
     *,
@@ -5762,6 +6756,18 @@ def _save_fold_checkpoint(
                 f"{sorted(overlap)}"
             )
         payload.update(dict(extra_payload))
+    pretrained_metadata = getattr(
+        _unwrap_model(model),
+        "pretrained_initialization_provenance",
+        None,
+    )
+    if (
+        "pretrained_initialization" not in payload
+        and isinstance(pretrained_metadata, Mapping)
+    ):
+        payload["pretrained_initialization"] = deepcopy(
+            dict(pretrained_metadata)
+        )
     _atomic_torch_save(payload, checkpoint_path)
 
 
@@ -6213,6 +7219,18 @@ def _save_group_checkpoint(
                 f"{sorted(overlap)}"
             )
         payload.update(dict(extra_payload))
+    pretrained_metadata = getattr(
+        _unwrap_model(model),
+        "pretrained_initialization_provenance",
+        None,
+    )
+    if (
+        "pretrained_initialization" not in payload
+        and isinstance(pretrained_metadata, Mapping)
+    ):
+        payload["pretrained_initialization"] = deepcopy(
+            dict(pretrained_metadata)
+        )
     _atomic_torch_save(payload, checkpoint_path)
 
 
@@ -6224,10 +7242,15 @@ def _create_adamw_optimizer(
     label: str,
 ) -> torch.optim.AdamW:
     """Create the canonical neural-training optimizer for every executor."""
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise RuntimeError(f"[{label}] model has no trainable parameters")
     if device.type == "cuda":
         try:
             optimizer = torch.optim.AdamW(
-                model.parameters(),
+                trainable_parameters,
                 lr=config.training.learning_rate,
                 weight_decay=config.training.weight_decay,
                 fused=True,
@@ -6239,7 +7262,7 @@ def _create_adamw_optimizer(
                 f"[{label}] optimizer=AdamW(fused=False, unsupported by this torch build)"
             )
     return torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
@@ -8117,7 +9140,7 @@ def _save_fold_output_artifacts(
 
     write_training_json(
         fold_dir / "mode_artifact_contract.json",
-        canonical_mode_artifact_contract(requested_mode),
+        _mode_artifact_contract_for_config(config),
     )
     if mark_complete:
         _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
@@ -14285,7 +15308,9 @@ def _replay_taiwan_stitched_deployment(
     positions, settlement claims, and absorbing default must not reset.  Model
     requests are therefore expanded into the immutable full-panel symbol order
     and sent through one O(T*S) ledger pass.  Taiwan cash modes use the exact
-    integer/T+2 oracle; ``tw_futures_portfolio_day`` deliberately uses its
+    integer/T+2 oracle; minute-executed ``tw_day_trade`` must instead reuse the
+    same exact board-lot minute tensor ledger as train/validation/test;
+    ``tw_futures_portfolio_day`` deliberately uses its
     continuous-notional, cross-session futures ledger.  ``crypto_perpetual``
     likewise reuses its funding-aware continuous-notional ledger so positions,
     funding cash flow, fees, and absorbing ruin remain connected across model
@@ -14435,8 +15460,13 @@ def _replay_taiwan_stitched_deployment(
         and config.data.day_trade_minute_execution_root is None
         and config.trading.tw_day_trade_unlimited_margin_conversion
     )
-    continuous_stitched_replay = bool(
+    exact_minute_day_trade = bool(
+        mode == "tw_day_trade"
+        and config.data.day_trade_minute_execution_root is not None
+    )
+    tensor_stitched_replay = bool(
         canonical_daily_day_trade
+        or exact_minute_day_trade
         or mode in {
             "tw_futures_portfolio_day",
             "tw_stock_context_futures_portfolio",
@@ -14452,7 +15482,7 @@ def _replay_taiwan_stitched_deployment(
         lookback=1,
         allow_empty=True,
         include_volume_notional=(
-            continuous_stitched_replay
+            tensor_stitched_replay
             and _volume_participation_enabled(
                 config.trading.max_volume_participation,
                 config.trading.volume_participation_equity,
@@ -14492,7 +15522,7 @@ def _replay_taiwan_stitched_deployment(
         # Their exact integer continuation remains close[t] -> close[t+1];
         # the phase dataset's intraday leg is not that legacy forward label.
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
-    if continuous_stitched_replay:
+    if tensor_stitched_replay:
         request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
         volume_limit_weights = _volume_limit_weights_from_notional(
             (
@@ -14587,7 +15617,9 @@ def _replay_taiwan_stitched_deployment(
                 buy_fee_rates=runtime.buy_fee_rates,
                 sell_fee_rates=runtime.sell_fee_rates,
                 normal_sell_fee_rates=runtime.normal_sell_fee_rates,
-                day_trade_unlimited_margin_conversion=True,
+                day_trade_unlimited_margin_conversion=(
+                    runtime.day_trade_unlimited_margin_conversion
+                ),
                 day_trade_margin_financing_ratio=(
                     runtime.day_trade_margin_financing_ratio
                 ),
@@ -14621,7 +15653,7 @@ def _replay_taiwan_stitched_deployment(
                         selected(execution_dataset.day_trade_eligible_mask_t),
                         dtype=torch.bool,
                     )
-                    if canonical_daily_day_trade
+                    if canonical_daily_day_trade or exact_minute_day_trade
                     else None
                 ),
                 day_trade_can_buy_open_mask=(
@@ -14629,7 +15661,7 @@ def _replay_taiwan_stitched_deployment(
                         selected(execution_dataset.day_trade_can_buy_open_mask_t),
                         dtype=torch.bool,
                     )
-                    if canonical_daily_day_trade
+                    if canonical_daily_day_trade or exact_minute_day_trade
                     else None
                 ),
                 day_trade_can_sell_open_mask=(
@@ -14637,7 +15669,7 @@ def _replay_taiwan_stitched_deployment(
                         selected(execution_dataset.day_trade_can_sell_open_mask_t),
                         dtype=torch.bool,
                     )
-                    if canonical_daily_day_trade
+                    if canonical_daily_day_trade or exact_minute_day_trade
                     else None
                 ),
                 unresolved_corporate_action_mask=(
@@ -14656,6 +15688,17 @@ def _replay_taiwan_stitched_deployment(
                 ),
             )
         stitched = stitched_tensor.to_numpy()
+        if exact_minute_day_trade and (
+            normalize_execution_mode(stitched.execution_mode) != "tw_day_trade"
+            or stitched.settlement_ledger_unit != "nav_ratio"
+            or stitched.final_integer_state is not None
+            or stitched.shares_history is not None
+        ):
+            raise RuntimeError(
+                "exact-minute tw_day_trade stitched replay changed accounting "
+                "contracts: expected the native nav-ratio minute tensor ledger "
+                "without a legacy daily integer-share state"
+            )
     else:
         stitched, _ = run_backtest_integer_shares(
             weights=full_requests,
@@ -18682,6 +19725,23 @@ def _start_training_lifecycle(
         model_name=config.training.model_name,
         writer_enabled=_distributed_should_write(),
     )
+    mode_contract = _mode_artifact_contract_for_config(config)
+    base_mode_contract = canonical_mode_artifact_contract(
+        config.trading.execution_mode
+    )
+    overridable_contract_fields = {
+        "product_family",
+        "frequency",
+        "decision_clock",
+        "execution_clock",
+        "recurrent_state_scope",
+        "terminal_policy",
+        "split_ownership",
+        "sample_order_contract",
+        "benchmark_contract",
+        "weight_snapshot_contract",
+        "turnover_contract",
+    }
     lifecycle.start(
         fold_ids=[fold.fold_id for fold in folds],
         dataset_fingerprint=_stable_fingerprint(dataset_identity),
@@ -18693,7 +19753,15 @@ def _start_training_lifecycle(
         },
         data_summary=dataset_identity,
         configuration=configuration,
-        mode_details={"benchmark_name": str(config.data.benchmark_name)},
+        mode_details={
+            "benchmark_name": str(config.data.benchmark_name),
+            **dict(mode_contract.get("mode_details", {})),
+        },
+        mode_contract_overrides={
+            key: mode_contract[key]
+            for key in overridable_contract_fields
+            if mode_contract.get(key) != base_mode_contract.get(key)
+        },
     )
     return lifecycle
 
@@ -20690,14 +21758,41 @@ def _run_training_impl(
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
-        temporal_basis_overrides, temporal_basis_metadata = (
-            _fit_group_temporal_basis(
-                config=config,
-                train_ds=train_ds,
-                train_years=train_years,
-                group_folds=group_folds,
-                output_path=output_path,
+        pretrained_initialization = _resolve_pretrained_initialization(
+            config,
+            group_folds,
+        )
+        if pretrained_initialization is None:
+            temporal_basis_overrides, temporal_basis_metadata = (
+                _fit_group_temporal_basis(
+                    config=config,
+                    train_ds=train_ds,
+                    train_years=train_years,
+                    group_folds=group_folds,
+                    output_path=output_path,
+                )
             )
+        else:
+            temporal_basis_overrides, temporal_basis_metadata = (
+                _pretrained_temporal_basis(
+                    pretrained_initialization,
+                    train_years=train_years,
+                    group_folds=group_folds,
+                    output_path=output_path,
+                )
+            )
+            print(
+                f"[Train {train_years}] pretrained initialization source="
+                f"{pretrained_initialization.checkpoint_path} "
+                "(optimizer state is not imported)"
+            )
+        causal_feature_rms = _fit_group_causal_feature_rms(
+            config=config,
+            panel=panel,
+            train_ds=train_ds,
+            train_years=train_years,
+            group_folds=group_folds,
+            output_path=output_path,
         )
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
@@ -21026,11 +22121,69 @@ def _run_training_impl(
             feature_names=panel.feature_names,
             temporal_basis_overrides=temporal_basis_overrides,
         ).to(device)
+        _apply_causal_feature_rms_to_model(model, causal_feature_rms)
+        pretrained_initialization_report: dict[str, Any] | None = None
+        pretrained_initialization_applied = False
         if temporal_basis_metadata is not None:
             setattr(
                 model,
                 "temporal_basis_selection_metadata",
                 deepcopy(temporal_basis_metadata),
+            )
+        if pretrained_initialization is not None:
+            feature_adapter = (
+                str(config.training.pretrained_initialization_feature_adapter)
+                .strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if feature_adapter == "identity_by_feature_name":
+                pretrained_initialization_report = (
+                    _transfer_pretrained_feature_identity(
+                        model,
+                        pretrained_initialization,
+                        target_feature_names=panel.feature_names,
+                        target_symbol_names=panel.symbols,
+                        require_exact_backbone=bool(
+                            config.training.pretrained_initialization_require_exact_backbone
+                        ),
+                        trainable_parameter_prefixes=(
+                            config.training.pretrained_initialization_trainable_parameter_prefixes
+                        ),
+                    )
+                )
+            elif feature_adapter == "transformer_feature_projection_by_name":
+                pretrained_initialization_report = (
+                    _transfer_pretrained_transformer_feature_projection(
+                        model,
+                        pretrained_initialization,
+                        target_feature_names=panel.feature_names,
+                        target_symbol_names=panel.symbols,
+                        require_exact_backbone=bool(
+                            config.training.pretrained_initialization_require_exact_backbone
+                        ),
+                        trainable_parameter_prefixes=(
+                            config.training.pretrained_initialization_trainable_parameter_prefixes
+                        ),
+                    )
+                )
+            else:
+                raise ValueError(
+                    "unsupported pretrained_initialization_feature_adapter: "
+                    f"{feature_adapter!r}"
+                )
+            pretrained_initialization_applied = True
+            _write_pretrained_initialization_metadata(
+                output_path,
+                train_years=train_years,
+                group_folds=group_folds,
+                report=pretrained_initialization_report,
+            )
+            print(
+                f"[Train {train_years}] transferred pretrained backbone with "
+                f"{feature_adapter}; trainable="
+                f"{pretrained_initialization_report['trainable_parameters']}/"
+                f"{pretrained_initialization_report['total_parameters']}"
             )
         batch_coupled_modules = _batch_coupled_training_module_names(model)
         if _model_supports_panel_slab_forward(model):
@@ -21092,6 +22245,10 @@ def _run_training_impl(
                 )
                 if "model_state_dict" in warm_start_checkpoint:
                     _load_state_dict(model, warm_start_checkpoint["model_state_dict"])
+                    _apply_causal_feature_rms_to_model(
+                        model,
+                        causal_feature_rms,
+                    )
                     print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
@@ -21191,6 +22348,10 @@ def _run_training_impl(
                 )
                 if list(checkpoint.get("train_years", [])) == train_years:
                     _load_state_dict(model, checkpoint["model_state_dict"])
+                    _apply_causal_feature_rms_to_model(
+                        model,
+                        causal_feature_rms,
+                    )
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                     scaler_state = checkpoint.get("scaler_state_dict")
                     if scaler_state:
@@ -22410,6 +23571,161 @@ def _run_training_impl(
         get_backtest_prep_compile_stats(reset=True)
         get_backtest_runtime_stats(reset=True)
         get_loss_runtime_stats(reset=True)
+
+        if (
+            pretrained_initialization_applied
+            and bool(config.training.pretrained_initialization_validation_guard)
+            and int(start_epoch) == 1
+        ):
+            if pretrained_initialization_report is None:
+                raise RuntimeError(
+                    "pretrained initialization was applied without provenance"
+                )
+            print(
+                f"[Train {train_years}] epoch 0 guard: evaluating transferred "
+                "strategy with the target exact execution loss"
+            )
+            epoch_zero_error: BaseException | None = None
+            try:
+                epoch_zero_backtest, _, _ = _evaluate_windowed_tensor_batch(
+                    eval_model,
+                    eval_panel_slab_model,
+                    combined_val_windowed,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    1.0,
+                    config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
+                    chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
+                    compute_ic=False,
+                    compute_metrics_summary=False,
+                    return_weights_history=False,
+                    profile_timing=profile_timing,
+                    reset_at_rows=val_offsets,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=(
+                        config.trading.volume_participation_equity
+                    ),
+                    execution_runtime=execution_runtime,
+                )
+                epoch_zero_losses = _batched_loss_from_backtest_segments(
+                    epoch_zero_backtest.strategy_returns,
+                    epoch_zero_backtest.benchmark_returns,
+                    epoch_zero_backtest.turnovers,
+                    val_offsets,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                    objective=loss_objective,
+                    log_utility_pre_log_power=(
+                        config.evaluation.eval_log_utility_pre_log_power
+                    ),
+                    log_utility_periods_per_year=(
+                        config.evaluation.eval_log_utility_periods_per_year
+                    ),
+                    log_utility_log_shift=(
+                        config.evaluation.eval_log_utility_log_shift
+                    ),
+                )
+                epoch_zero_values = (
+                    epoch_zero_losses.detach().float().cpu().reshape(-1).tolist()
+                )
+                if len(epoch_zero_values) != len(fold_contexts):
+                    raise RuntimeError(
+                        "epoch-zero validation loss count does not match folds: "
+                        f"losses={len(epoch_zero_values)} folds={len(fold_contexts)}"
+                    )
+                for context, raw_loss in zip(
+                    fold_contexts.values(),
+                    epoch_zero_values,
+                    strict=True,
+                ):
+                    val_loss = float(raw_loss)
+                    if not math.isfinite(val_loss):
+                        raise RuntimeError(
+                            "pretrained epoch-zero exact validation loss is not "
+                            f"finite for fold {context.fold.fold_id}: {val_loss}"
+                        )
+                    context.best_val_loss = val_loss
+                    guard_payload = {
+                        "schema_version": 1,
+                        "fold_id": int(context.fold.fold_id),
+                        "epoch": 0,
+                        "validation_loss": val_loss,
+                        "objective": str(loss_objective),
+                        "execution_mode": str(execution_runtime.mode),
+                        "source_checkpoint": pretrained_initialization_report[
+                            "source_checkpoint"
+                        ],
+                        "source_checkpoint_sha256": (
+                            pretrained_initialization_report[
+                                "source_checkpoint_sha256"
+                            ]
+                        ),
+                        "test_split_used_for_selection": False,
+                        "replacement_rule": (
+                            "later checkpoint must improve target exact "
+                            "validation loss"
+                        ),
+                    }
+                    _save_fold_checkpoint(
+                        context.checkpoint_best_path,
+                        fold=context.fold,
+                        epoch=0,
+                        best_val_loss=val_loss,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        experiment_manifest=experiment_manifest,
+                        extra_payload={
+                            "pretrained_initialization": deepcopy(
+                                pretrained_initialization_report
+                            ),
+                            "pretrained_epoch_zero_validation": guard_payload,
+                        },
+                        check_finite=config.training.checkpoint_finite_check,
+                    )
+                    if _distributed_should_write():
+                        receipt_path = (
+                            context.fold_dir
+                            / "pretrained_epoch0_validation.json"
+                        )
+                        with receipt_path.open("w", encoding="utf-8") as handle:
+                            json.dump(
+                                guard_payload,
+                                handle,
+                                indent=2,
+                                sort_keys=True,
+                            )
+                    print(
+                        f"[Fold {context.fold.fold_id}] epoch 0 exact "
+                        f"validation loss={val_loss:.8f}; seeded checkpoint_best.pt"
+                    )
+                del epoch_zero_backtest, epoch_zero_losses
+            except BaseException as exc:
+                epoch_zero_error = exc
+            _raise_if_distributed_phase_failed(
+                "pretrained_epoch_zero_exact_validation_guard",
+                epoch_zero_error,
+            )
 
         def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
             if train_windowed is not None:

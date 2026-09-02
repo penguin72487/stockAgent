@@ -36,6 +36,8 @@ class CandleEncoder(nn.Module):
         categorical_embedding_dim: int = 4,
         categorical_embedding_cardinality: int = 512,
         extra_continuous_features: int = 0,
+        causal_feature_rms_normalization: bool = False,
+        feature_bottleneck_dim: int = 0,
     ) -> None:
         super().__init__()
         self.num_features = int(num_features)
@@ -53,6 +55,15 @@ class CandleEncoder(nn.Module):
         )
         self.categorical_feature_indices = categorical_indices
         self.continuous_feature_indices = continuous_indices
+        requested_bottleneck = max(0, int(feature_bottleneck_dim))
+        if requested_bottleneck > 0 and not continuous_indices:
+            raise ValueError(
+                "feature_bottleneck_dim requires at least one continuous feature"
+            )
+        self.feature_bottleneck_dim = requested_bottleneck
+        self.causal_feature_rms_normalization = bool(
+            causal_feature_rms_normalization
+        )
         self.register_buffer(
             "categorical_feature_index_tensor",
             torch.tensor(categorical_indices, dtype=torch.long),
@@ -73,7 +84,22 @@ class CandleEncoder(nn.Module):
             ]
         )
 
-        self.base_joint_input_dim = len(continuous_indices) + (
+        self.continuous_feature_bottleneck: nn.Linear | None = (
+            nn.Linear(
+                len(continuous_indices),
+                self.feature_bottleneck_dim,
+                bias=False,
+            )
+            if self.feature_bottleneck_dim > 0
+            else None
+        )
+
+        continuous_output_dim = (
+            self.feature_bottleneck_dim
+            if self.feature_bottleneck_dim > 0
+            else len(continuous_indices)
+        )
+        self.base_joint_input_dim = continuous_output_dim + (
             len(categorical_indices) * self.categorical_embedding_dim
         )
         self.extra_continuous_features = max(0, int(extra_continuous_features))
@@ -93,16 +119,87 @@ class CandleEncoder(nn.Module):
         self.candle_query = nn.Parameter(torch.randn(1, self.d_model) * 0.02)
         self.output_norm = _make_norm(self.d_model, norm_type)
 
-    def _base_joint_features(self, x: torch.Tensor) -> torch.Tensor:
+        if self.causal_feature_rms_normalization:
+            self.register_buffer(
+                "causal_feature_rms_scale",
+                torch.ones(self.num_features, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "causal_feature_active_mask",
+                torch.ones(self.num_features, dtype=torch.bool),
+            )
+
+    def set_causal_feature_rms_normalizer(
+        self,
+        scale: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> None:
+        """Install training-only scales without making categorical IDs numeric."""
+
+        if not self.causal_feature_rms_normalization:
+            raise RuntimeError(
+                "causal feature RMS normalization is disabled for this model"
+            )
+        normalized_scale = torch.as_tensor(
+            scale,
+            dtype=torch.float32,
+            device=self.causal_feature_rms_scale.device,
+        ).reshape(-1)
+        normalized_active = torch.as_tensor(
+            active_mask,
+            dtype=torch.bool,
+            device=self.causal_feature_active_mask.device,
+        ).reshape(-1)
+        if (
+            int(normalized_scale.numel()) != self.num_features
+            or int(normalized_active.numel()) != self.num_features
+        ):
+            raise ValueError(
+                "causal feature RMS scale/mask must match num_features"
+            )
+        if not bool(torch.isfinite(normalized_scale).all().item()) or bool(
+            (normalized_scale <= 0.0).any().item()
+        ):
+            raise ValueError("causal feature RMS scales must be finite and positive")
+        if self.categorical_feature_indices:
+            categorical = self.categorical_feature_index_tensor.to(
+                device=normalized_scale.device
+            )
+            normalized_scale = normalized_scale.clone()
+            normalized_active = normalized_active.clone()
+            normalized_scale.index_fill_(0, categorical, 1.0)
+            normalized_active.index_fill_(0, categorical, True)
+        self.causal_feature_rms_scale.copy_(normalized_scale)
+        self.causal_feature_active_mask.copy_(normalized_active)
+
+    def _normalize_raw_features(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.causal_feature_rms_normalization:
+            return x
+        scale = self.causal_feature_rms_scale.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+        active = self.causal_feature_active_mask.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+        return (x / scale) * active
+
+    def _base_joint_features(
+        self,
+        x: torch.Tensor,
+        *,
+        input_is_normalized: bool = False,
+    ) -> torch.Tensor:
         model_dtype = self.joint_projection.proj.weight.dtype
         model_device = self.joint_projection.proj.weight.device
         clean_fp32 = x.to(device=model_device, dtype=torch.float32)
         if self.sanitize_inputs:
             clean_fp32 = torch.nan_to_num(clean_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+        if not input_is_normalized:
+            clean_fp32 = self._normalize_raw_features(clean_fp32)
 
-        continuous = clean_fp32.index_select(
-            -1, self.continuous_feature_index_tensor
-        ).to(dtype=model_dtype)
+        continuous = self._continuous_features(clean_fp32)
         if not self.categorical_feature_indices:
             return continuous
 
@@ -122,6 +219,23 @@ class CandleEncoder(nn.Module):
             dim=-1,
         ).to(dtype=model_dtype)
         return torch.cat((continuous, categorical), dim=-1)
+
+    def _continuous_features(self, normalized_raw: torch.Tensor) -> torch.Tensor:
+        """Return every continuous raw feature or its learned low-rank mix.
+
+        The optional bottleneck is a parameter-efficient feature mixer, not a
+        selector: every causally active input column remains connected to every
+        bottleneck coordinate and receives gradient.  Categorical IDs stay on
+        their separate embedding path and are never interpreted numerically.
+        """
+
+        model_dtype = self.joint_projection.proj.weight.dtype
+        continuous = normalized_raw.index_select(
+            -1, self.continuous_feature_index_tensor
+        ).to(dtype=model_dtype)
+        if self.continuous_feature_bottleneck is None:
+            return continuous
+        return self.continuous_feature_bottleneck(continuous)
 
     def _joint_features(self, x: torch.Tensor) -> torch.Tensor:
         """Materialize the complete ordinary feature row for diagnostics only."""
@@ -307,10 +421,8 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 posinf=0.0,
                 neginf=0.0,
             )
-        basis_source = prepared.index_select(
-            -1,
-            candle_encoder.continuous_feature_index_tensor,
-        )
+        prepared = candle_encoder._normalize_raw_features(prepared)
+        basis_source = candle_encoder._continuous_features(prepared)
         if int(basis_source.size(-1)) != self.source_dim:
             raise RuntimeError(
                 "temporal basis continuous source width differs from its "
@@ -446,7 +558,9 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             )
 
         source, basis_source = self._prepare_source(raw_window, candle_encoder)
-        base = candle_encoder._base_joint_features(source[:, -1])
+        base = candle_encoder._base_joint_features(
+            source[:, -1], input_is_normalized=True
+        )
         norm = candle_encoder.input_norm
         projection = candle_encoder.joint_projection.proj
         norm_weight = norm.weight.to(device=base.device, dtype=base.dtype)
@@ -563,7 +677,9 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             )
 
         source, basis_source = self._prepare_source(raw_window, candle_encoder)
-        base = candle_encoder._base_joint_features(source[:, -1])
+        base = candle_encoder._base_joint_features(
+            source[:, -1], input_is_normalized=True
+        )
         norm = candle_encoder.input_norm
         projection = candle_encoder.joint_projection.proj
         norm_weight = norm.weight.to(device=base.device, dtype=base.dtype)
@@ -672,6 +788,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         self,
         *args,
         candle_dropout: float = 0.0,
+        causal_feature_rms_normalization: bool = False,
+        feature_bottleneck_dim: int = 0,
         temporal_basis_algebraic_contraction: bool = False,
         daily_context_num_features: int = 0,
         daily_context_categorical_feature_indices: Sequence[int] | None = None,
@@ -685,7 +803,10 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             TemporalBasisInputFeatureBuilder(
                 lookback=self.lookback,
                 source_dim=(
-                    self.num_features - len(self.categorical_feature_indices)
+                    int(feature_bottleneck_dim)
+                    if int(feature_bottleneck_dim) > 0
+                    else self.num_features
+                    - len(self.categorical_feature_indices)
                 ),
                 families=self.temporal_basis_families,
                 components=self.temporal_basis_components,
@@ -717,6 +838,10 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             categorical_embedding_dim=self.categorical_embedding_dim,
             categorical_embedding_cardinality=self.categorical_embedding_cardinality,
             extra_continuous_features=basis_input_width,
+            causal_feature_rms_normalization=(
+                causal_feature_rms_normalization
+            ),
+            feature_bottleneck_dim=feature_bottleneck_dim,
         )
         if basis_input_width > 0 and not isinstance(
             self.candle_encoder.input_norm,
@@ -831,6 +956,16 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             self.register_parameter("daily_context_time_position", None)
             self.daily_context_pool_score = None
             self.daily_context_output_norm = None
+
+    def set_causal_feature_rms_normalizer(
+        self,
+        scale: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> None:
+        self.candle_encoder.set_causal_feature_rms_normalizer(
+            scale,
+            active_mask,
+        )
 
     def _encode_daily_context_history(
         self,
@@ -1012,6 +1147,20 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     def _project_features(self, x: torch.Tensor) -> torch.Tensor:
         projected, _aux = self._candle_project_features(x, return_token_aux=False)
         return projected
+
+    def _prepare_raw_temporal_basis_source(
+        self,
+        source: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Keep the raw-basis path on the same normalized feature contract."""
+
+        if not self._raw_temporal_basis_enabled():
+            return None
+        encoder = self.temporal_basis_feature_encoder
+        if encoder is None:
+            raise RuntimeError("raw temporal basis encoder is unexpectedly missing")
+        prepared = encoder.prepare_source(source)
+        return self.candle_encoder._normalize_raw_features(prepared)
 
     def _embed_windowed_from_panel_slab(
         self,

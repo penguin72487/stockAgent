@@ -3441,7 +3441,16 @@ def build_dashboard_snapshot(
         preopen=preopen,
         observed=preopen_observed,
     )
-    raw_opening_gate = _object(DEFAULT_OPENING_GATE_PATH) if operational_view else {}
+    if operational_view:
+        try:
+            raw_opening_gate = _object(DEFAULT_OPENING_GATE_PATH)
+        except (OSError, ValueError, json.JSONDecodeError):
+            # The opening gate is an optional operational receipt.  A missing or
+            # partially replaced file must degrade the snapshot, not make the
+            # read-only dashboard endpoint fail.
+            raw_opening_gate = {}
+    else:
+        raw_opening_gate = {}
     opening_gate = (
         {
             key: raw_opening_gate.get(key)
