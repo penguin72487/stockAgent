@@ -8,6 +8,7 @@ import ctypes
 from dataclasses import replace
 from datetime import datetime, time as datetime_time, timedelta
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -71,6 +72,7 @@ _LEGACY_SIGNAL_SCAN_CACHE: dict[
     str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
 ] = {}
 _BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+_TX_BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 MISSED_OPENING_COMMIT_DEADLINE = datetime_time(9, 0, 15)
 MISSED_OPENING_REPLAY_AT = datetime_time(9, 1)
 MISSED_OPENING_SOURCE_SETTLE_DEADLINE = datetime_time(9, 3)
@@ -692,6 +694,148 @@ def _attach_benchmark_previous_close_context(
         quote["reference_price_source"] = str(
             quote.get("source") or "official_shioaji_or_mis_reference"
         )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _attach_tx_benchmark_previous_close_context(
+    quote: dict[str, Any],
+    *,
+    current_contract_code: str,
+    trading_date: datetime,
+    day_session_path: Path = REPO_ROOT
+    / "data_tw_index_futures/day_session_contracts.parquet",
+    history_root: Path = REPO_ROOT
+    / "data_tw_index_futures/shioaji_history/TXFR1",
+) -> None:
+    """Attach the latest receipt-backed close for the same physical TX month.
+
+    A continuous code's reference/settlement value is not assumed to be the
+    preceding closing trade. Prefer the canonical all-contract daily table;
+    allow a newer retained TXFR1 tick only when its receipt proves that the
+    query resolved to the exact current physical contract.
+    """
+
+    contract_code = str(current_contract_code or "").strip().upper()
+    if not contract_code or not isinstance(quote, dict):
+        return
+    day = trading_date.date()
+    cache_key = (str(Path(day_session_path).resolve()), day.isoformat(), contract_code)
+    cached = _TX_BENCHMARK_PREVIOUS_CLOSE_CACHE.get(cache_key)
+    if cached is not None:
+        quote.update(cached)
+        return
+
+    candidates: list[tuple[datetime, dict[str, Any]]] = []
+    delivery_month = str(quote.get("delivery_month") or "").strip()
+    daily_path = Path(day_session_path)
+    if daily_path.is_file() and delivery_month:
+        try:
+            frame = (
+                pl.scan_parquet(daily_path)
+                .filter(
+                    (pl.col("product") == "TX")
+                    & (pl.col("contract_month").cast(pl.String) == delivery_month)
+                    & (pl.col("date").cast(pl.Date) < day)
+                    & pl.col("close").cast(pl.Float64).is_finite()
+                    & (pl.col("close").cast(pl.Float64) > 0.0)
+                )
+                .select("date", "close", "source_file", "source_sha256")
+                .sort("date")
+                .tail(1)
+                .collect()
+            )
+            if frame.height == 1:
+                row = frame.row(0, named=True)
+                observed_day = row["date"]
+                candidates.append(
+                    (
+                        datetime.combine(observed_day, datetime_time(13, 45)),
+                        {
+                            "previous_close": float(row["close"]),
+                            "previous_close_date": observed_day.isoformat(),
+                            "previous_close_source": (
+                                f"official_taifex_all_contract_daily:{daily_path}:"
+                                f"{row.get('source_file') or ''}:"
+                                f"{row.get('source_sha256') or ''}"
+                            ),
+                        },
+                    )
+                )
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError):
+            pass
+
+    receipt_root = Path(history_root) / "receipts"
+    for receipt_path in sorted(receipt_root.glob("trading_date=*.json"), reverse=True):
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_day = datetime.fromisoformat(str(receipt["trading_date"])).date()
+            if receipt_day >= day:
+                continue
+            if (
+                receipt.get("status") != "complete"
+                or str(receipt.get("contract") or "").upper() != "TXFR1"
+                or str(receipt.get("resolved_target_code_at_query") or "").upper()
+                != contract_code
+            ):
+                continue
+            raw_path = Path(str(receipt.get("path") or ""))
+            data_path = raw_path if raw_path.is_absolute() else REPO_ROOT / raw_path
+            if (
+                not data_path.is_file()
+                or data_path.stat().st_size != int(receipt.get("size") or -1)
+                or _sha256_file(data_path) != str(receipt.get("sha256") or "")
+            ):
+                continue
+            frame = (
+                pl.scan_parquet(data_path)
+                .filter(
+                    pl.col("close").cast(pl.Float64).is_finite()
+                    & (pl.col("close").cast(pl.Float64) > 0.0)
+                )
+                .select("event_ts", "close")
+                .sort("event_ts")
+                .tail(1)
+                .collect()
+            )
+            if frame.height != 1:
+                continue
+            row = frame.row(0, named=True)
+            candidates.append(
+                (
+                    datetime.combine(receipt_day, datetime_time(13, 45)),
+                    {
+                        "previous_close": float(row["close"]),
+                        "previous_close_date": receipt_day.isoformat(),
+                        "previous_close_source": (
+                            "receipt_backed_shioaji_txfr1_last_day_trade:"
+                            f"{receipt_path.resolve()}:{receipt.get('sha256')}"
+                        ),
+                    },
+                )
+            )
+            break
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            pl.exceptions.PolarsError,
+        ):
+            continue
+
+    if not candidates:
+        return
+    context = max(candidates, key=lambda item: item[0])[1]
+    _TX_BENCHMARK_PREVIOUS_CLOSE_CACHE[cache_key] = context
+    quote.update(context)
 
 
 def _rule_data_dir(live: LiveMarketConfig, spec: ModeSpec) -> Path:
@@ -1391,21 +1535,28 @@ def main(argv: list[str] | None = None) -> int:
             <= broker_wall_time
             < MISSED_OPENING_COMMIT_DEADLINE
         )
-        if not broker_protected_open:
-            broker_results = serve_shared_day_trade_quote_requests(
-                state_dir=engine.state_dir,
-                max_requests=1,
+        # During the protected opening window, serve only the model's opening
+        # observation. This reuses the already-authenticated 08:55 session and
+        # cannot be displaced by an interactive/full-history request. Outside
+        # the window the broker retains its ordinary bounded FIFO behavior.
+        broker_results = serve_shared_day_trade_quote_requests(
+            state_dir=engine.state_dir,
+            max_requests=1,
+            allowed_purposes=(
+                {"opening_signal"} if broker_protected_open else None
+            ),
+        )
+        for broker_result in broker_results:
+            notify_systemd("WATCHDOG=1")
+            print(
+                "[tw-day-trade-sim] shared_quote_request "
+                f"id={broker_result.get('request_id')} "
+                f"purpose={broker_result.get('purpose')} "
+                f"available={broker_result.get('available_count', 0)}/"
+                f"{broker_result.get('requested_count', 0)} "
+                f"error={broker_result.get('error')}",
+                flush=True,
             )
-            for broker_result in broker_results:
-                notify_systemd("WATCHDOG=1")
-                print(
-                    "[tw-day-trade-sim] shared_quote_request "
-                    f"id={broker_result.get('request_id')} "
-                    f"available={broker_result.get('available_count', 0)}/"
-                    f"{broker_result.get('requested_count', 0)} "
-                    f"error={broker_result.get('error')}",
-                    flush=True,
-                )
 
         prewarm_wall_time = observed.timetz().replace(tzinfo=None)
         prewarm_session = observed.date().isoformat()
@@ -1961,12 +2112,19 @@ def main(argv: list[str] | None = None) -> int:
         if benchmark_due and specs:
             current_contract = str(future_snapshot.get("current_contract_code") or "")
             future_quotes = future_snapshot.get("quotes") or {}
+            current_future_quote = future_quotes.get(current_contract) or {}
+            if isinstance(current_future_quote, dict):
+                _attach_tx_benchmark_previous_close_context(
+                    current_future_quote,
+                    current_contract_code=current_contract,
+                    trading_date=datetime.now(TAIPEI),
+                )
             previous_contract = engine.benchmark_tx_contract()
             engine.process_benchmarks(
                 stock_quotes=quotes,
                 stock_fee_schedule=specs[0].fee_schedule,
                 current_future_contract_code=current_contract or None,
-                current_future_quote=future_quotes.get(current_contract) or {},
+                current_future_quote=current_future_quote,
                 previous_future_quote=future_quotes.get(previous_contract) or {},
                 corporate_action_reference_path=(
                     _rule_data_dir(live_configs[specs[0].market], specs[0])

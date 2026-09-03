@@ -787,6 +787,7 @@ def test_benchmark_stock_row_uses_same_official_aggregate_fallback(
 
     assert row == {
         "date": date(2026, 8, 20),
+        "adjclose": 1_210.0,
         "open": 1_200.0,
         "close": 1_210.0,
     }

@@ -100,6 +100,10 @@ FAST_TAGS = frozenset(
     }
 )
 MEDIUM_TAGS = frozenset({"fundamental", "ownership", "dividend", "valuation"})
+CLOSE_EVENT_DATASETS = frozenset({"twse_daily_ohlcv", "tpex_daily_ohlcv"})
+CLOSE_EVENT_PHASE = "close_event"
+CLOSE_PROBE_WINDOW_START = datetime_time(13, 25)
+CLOSE_PROBE_WINDOW_END = datetime_time(14, 10)
 _STOP = threading.Event()
 
 
@@ -140,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--fast-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--close-probe-interval-seconds", type=float, default=5.0)
     parser.add_argument("--medium-interval-seconds", type=float, default=300.0)
     parser.add_argument("--slow-interval-seconds", type=float, default=300.0)
     parser.add_argument("--once", action="store_true")
@@ -261,7 +266,27 @@ def _response_body_sha256(
     return _body_sha256(content, expected_json=True)
 
 
-def _probe_interval(spec: DatasetSpec, args: argparse.Namespace) -> float:
+def _in_close_probe_window(observed: datetime) -> bool:
+    local = observed.astimezone(TAIPEI)
+    clock = local.timetz().replace(tzinfo=None)
+    return bool(
+        local.weekday() < 5
+        and CLOSE_PROBE_WINDOW_START <= clock <= CLOSE_PROBE_WINDOW_END
+    )
+
+
+def _probe_interval(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    *,
+    observed: datetime | None = None,
+) -> float:
+    if (
+        spec.name in CLOSE_EVENT_DATASETS
+        and observed is not None
+        and _in_close_probe_window(observed)
+    ):
+        return float(getattr(args, "close_probe_interval_seconds", 5.0))
     tags = set(spec.tags)
     if spec.kind == "data_gov":
         return (
@@ -642,6 +667,13 @@ def _probe_specs(
     groups: dict[str, list[DatasetSpec]] = defaultdict(list)
     for spec in specs:
         groups[urlparse(_probe_url(spec, observed)).netloc].append(spec)
+    for group in groups.values():
+        group.sort(
+            key=lambda spec: (
+                spec.name not in CLOSE_EVENT_DATASETS,
+                spec.name,
+            )
+        )
 
     def run_group(group: list[DatasetSpec]) -> list[ProbeResult]:
         output: list[ProbeResult] = []
@@ -695,6 +727,11 @@ def _registry(specs: list[DatasetSpec], args: argparse.Namespace) -> tuple[str, 
             or spec.url_template
             or DATA_GOV_DATASET_API.format(dataset_id=spec.data_gov_id),
             "interval_seconds": _probe_interval(spec, args),
+            "close_probe_interval_seconds": (
+                float(getattr(args, "close_probe_interval_seconds", 5.0))
+                if spec.name in CLOSE_EVENT_DATASETS
+                else None
+            ),
         }
         for spec in specs
     ]
@@ -755,6 +792,12 @@ def _apply_probe_results(
     for result in results:
         row = rows.setdefault(result.dataset, {})
         prior_version = row.get("observed_version")
+        checked = _parse_timestamp(result.checked_at_taipei) or datetime.now(TAIPEI)
+        interval = _probe_interval(
+            specs_by_name[result.dataset],
+            args,
+            observed=checked,
+        )
         row.update(
             {
                 "dataset": result.dataset,
@@ -762,14 +805,11 @@ def _apply_probe_results(
                 "source": specs_by_name[result.dataset].source,
                 "tags": list(specs_by_name[result.dataset].tags),
                 "probe_url": result.url,
-                "interval_seconds": _probe_interval(
-                    specs_by_name[result.dataset], args
-                ),
+                "interval_seconds": interval,
                 "last_checked_at_taipei": result.checked_at_taipei,
                 "last_probe_status": result.status,
             }
         )
-        checked = _parse_timestamp(result.checked_at_taipei) or datetime.now(TAIPEI)
         if result.status == "ok" and result.version:
             for key in (
                 "http_status",
@@ -794,8 +834,7 @@ def _apply_probe_results(
             row["last_error"] = None
             row["consecutive_probe_failures"] = 0
             row["next_probe_at_taipei"] = (
-                checked
-                + timedelta(seconds=_probe_interval(specs_by_name[result.dataset], args))
+                checked + timedelta(seconds=interval)
             ).isoformat(timespec="seconds")
             if prior_version is not None and prior_version != result.version:
                 row["last_changed_at_taipei"] = result.checked_at_taipei
@@ -808,7 +847,7 @@ def _apply_probe_results(
             row["consecutive_probe_failures"] = failures
             row["last_error"] = result.error
             backoff = min(
-                _probe_interval(specs_by_name[result.dataset], args),
+                interval,
                 30.0 * (2 ** min(failures - 1, 4)),
             )
             row["next_probe_at_taipei"] = (
@@ -837,6 +876,18 @@ def _resilient_download_args(args: argparse.Namespace) -> argparse.Namespace:
     resolved.timeout = max(60, int(getattr(args, "timeout", 20)))
     resolved.retries = max(4, int(getattr(args, "retries", 2)))
     return resolved
+
+
+def _completed_calendar_is_current(live_root: Path, observed: datetime) -> bool:
+    """Avoid re-downloading a receipt-verified calendar on every close event."""
+
+    try:
+        return _latest_completed_taiex_session(
+            live_root,
+            observed=observed,
+        ) == observed.astimezone(TAIPEI).date().isoformat()
+    except Exception:
+        return False
 
 
 def _refresh_selector_names(names: list[str]) -> list[str]:
@@ -1005,7 +1056,11 @@ def _refresh_pending_serialized(
     else:
         end_date = "today"
     commands: list[list[str]] = []
-    if historical and started.timetz().replace(tzinfo=None) >= datetime_time(13, 30):
+    if (
+        historical
+        and started.timetz().replace(tzinfo=None) >= datetime_time(13, 30)
+        and not _completed_calendar_is_current(live_root, started)
+    ):
         commands.append(
             _taiex_calendar_command(live_root=live_root, args=download_args)
         )
@@ -1125,6 +1180,171 @@ def _refresh_pending_serialized(
     return payload
 
 
+def _parquet_max_date(path: Path) -> str | None:
+    try:
+        import polars as pl
+
+        value = (
+            pl.scan_parquet(path)
+            .select(pl.col("date").cast(pl.Date, strict=False).max())
+            .collect()
+            .item()
+        )
+    except Exception:
+        return None
+    return value.isoformat() if value is not None else None
+
+
+def _publish_event_close_receipt_if_ready(
+    *,
+    state: Mapping[str, Any],
+    live_root: Path,
+    state_root: Path,
+    triggered_datasets: list[str],
+    observed: datetime | None = None,
+) -> dict[str, Any]:
+    """Publish a close receipt from already accepted per-source event evidence.
+
+    The probe is only a change detector.  Readiness still requires both
+    downloader-applied source versions and both canonical parquet files to end
+    on today's receipt-verified completed session.
+    """
+
+    current = (observed or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    result: dict[str, Any] = {
+        "status": "not_applicable",
+        "phase": CLOSE_EVENT_PHASE,
+        "observed_at_taipei": current.isoformat(timespec="seconds"),
+        "triggered_datasets": sorted(set(triggered_datasets)),
+    }
+    if (
+        not set(triggered_datasets).intersection(CLOSE_EVENT_DATASETS)
+        or current.timetz().replace(tzinfo=None) < datetime_time(13, 30)
+    ):
+        return result
+    try:
+        expected_date = _latest_completed_taiex_session(
+            live_root,
+            observed=current,
+        )
+    except Exception as exc:
+        return {
+            **result,
+            "status": "waiting_source",
+            "reason": "session_calendar_unavailable",
+            "error": str(exc),
+        }
+    result["expected_date"] = expected_date
+    if expected_date != current.date().isoformat():
+        return {
+            **result,
+            "status": "waiting_source",
+            "reason": "today_is_not_a_completed_session",
+        }
+
+    rows = state.get("datasets")
+    rows = dict(rows) if isinstance(rows, Mapping) else {}
+    errors: list[str] = []
+    source_versions: dict[str, dict[str, Any]] = {}
+    close_dates: dict[str, str | None] = {}
+    for name in sorted(CLOSE_EVENT_DATASETS):
+        row = rows.get(name)
+        row = dict(row) if isinstance(row, Mapping) else {}
+        observed_version = str(row.get("observed_version") or "")
+        applied_version = str(row.get("applied_version") or "")
+        download_status = str(row.get("last_download_status") or "")
+        close_date = _parquet_max_date(live_root / f"{name}.parquet")
+        close_dates[name] = close_date
+        source_versions[name] = {
+            "observed_version": observed_version,
+            "applied_version": applied_version,
+            "last_checked_at_taipei": row.get("last_checked_at_taipei"),
+            "last_applied_at_taipei": row.get("last_applied_at_taipei"),
+            "last_download_status": download_status,
+            "effective_end_date": close_date,
+        }
+        if not observed_version or applied_version != observed_version:
+            errors.append(f"{name}: observed version is not downloader-applied")
+        if download_status in BLOCKING_DOWNLOAD_STATUSES or not download_status:
+            errors.append(f"{name}: download status {download_status!r} is not accepted")
+        if close_date != expected_date:
+            errors.append(
+                f"{name}: effective date {close_date!r} != {expected_date}"
+            )
+    if errors:
+        return {
+            **result,
+            "status": "waiting_source",
+            "reason": "official_close_incomplete",
+            "close_dates": close_dates,
+            "errors": errors,
+        }
+
+    identity_payload = {
+        "expected_date": expected_date,
+        "source_versions": {
+            name: source_versions[name]["applied_version"]
+            for name in sorted(source_versions)
+        },
+    }
+    content_fingerprint = hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt_root = state_root.parent / "publications" / CLOSE_EVENT_PHASE
+    latest_path = receipt_root / "latest.json"
+    previous = _read_json(latest_path)
+    if (
+        previous.get("status") == "ok"
+        and previous.get("content_fingerprint") == content_fingerprint
+    ):
+        return {
+            **result,
+            "status": "ok",
+            "expected_date": expected_date,
+            "receipt": str(latest_path),
+            "content_fingerprint": content_fingerprint,
+            "reused": True,
+        }
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "phase": CLOSE_EVENT_PHASE,
+        "official_basis": (
+            "event-observed official TWSE and TPEx daily close representations"
+        ),
+        "event_driven": True,
+        "started_at_taipei": current.isoformat(timespec="seconds"),
+        "completed_at_taipei": datetime.now(TAIPEI).isoformat(timespec="seconds"),
+        "selected_dataset_count": len(CLOSE_EVENT_DATASETS),
+        "selected_datasets": sorted(CLOSE_EVENT_DATASETS),
+        "triggered_datasets": sorted(set(triggered_datasets)),
+        "download_summary": {
+            "end_date": expected_date,
+            "daily_close_ready": True,
+            "blocking_failed_count": 0,
+            "incomplete_count": 0,
+            "coverage_complete": True,
+        },
+        "source_event_receipt": str(state_root / "latest.json"),
+        "source_versions": source_versions,
+        "close_dates": close_dates,
+        "content_fingerprint": content_fingerprint,
+        "live_root": str(live_root),
+    }
+    _atomic_json(latest_path, payload)
+    run_name = current.strftime("%Y%m%dT%H%M%S%f") + ".json"
+    _atomic_json(receipt_root / "runs" / run_name, payload)
+    return {
+        **result,
+        "status": "ok",
+        "expected_date": expected_date,
+        "receipt": str(latest_path),
+        "content_fingerprint": content_fingerprint,
+        "reused": False,
+    }
+
+
 def _summarize_state(
     state: dict[str, Any],
     *,
@@ -1235,6 +1455,47 @@ def _due_specs(
     return due
 
 
+def _prioritize_unpublished_close_event(
+    due: list[DatasetSpec],
+    *,
+    state: Mapping[str, Any],
+    state_root: Path,
+    observed: datetime,
+    close_probe_interval_seconds: float,
+) -> list[DatasetSpec]:
+    """Keep the two close probes out of a slow 156-source batch until ready."""
+
+    if not _in_close_probe_window(observed):
+        return due
+    receipt = _read_json(
+        state_root.parent / "publications" / CLOSE_EVENT_PHASE / "latest.json"
+    )
+    if (
+        receipt.get("status") == "ok"
+        and str(receipt.get("started_at_taipei") or "")[:10]
+        == observed.astimezone(TAIPEI).date().isoformat()
+    ):
+        return due
+    rows = state.get("datasets")
+    rows = dict(rows) if isinstance(rows, Mapping) else {}
+    critical: list[DatasetSpec] = []
+    for spec in due:
+        if spec.name in CLOSE_EVENT_DATASETS:
+            critical.append(spec)
+    # A pre-window probe may still carry its ordinary 60-second next-at value.
+    # Re-evaluate the last observation against the five-second close clock so
+    # the first event-window request is not delayed by that stale schedule.
+    due_names = {spec.name for spec in critical}
+    interval = timedelta(seconds=max(0.1, close_probe_interval_seconds))
+    for name in sorted(CLOSE_EVENT_DATASETS - due_names):
+        row = rows.get(name)
+        row = dict(row) if isinstance(row, Mapping) else {}
+        last_checked = _parse_timestamp(row.get("last_checked_at_taipei"))
+        if last_checked is None or last_checked + interval <= observed:
+            critical.append(DEFAULT_DATASETS[name])
+    return critical
+
+
 def _handle_stop(_signum: int, _frame: Any) -> None:
     _STOP.set()
 
@@ -1248,6 +1509,7 @@ def main() -> int:
         "timeout",
         "heartbeat_seconds",
         "fast_interval_seconds",
+        "close_probe_interval_seconds",
         "medium_interval_seconds",
         "slow_interval_seconds",
     ):
@@ -1280,6 +1542,13 @@ def main() -> int:
     while not _STOP.is_set():
         observed = datetime.now(TAIPEI)
         due = _due_specs(specs, state, observed)
+        due = _prioritize_unpublished_close_event(
+            due,
+            state=state,
+            state_root=state_root,
+            observed=observed,
+            close_probe_interval_seconds=float(args.close_probe_interval_seconds),
+        )
         notify_systemd(
             "WATCHDOG=1\n"
             f"STATUS=cycle due={len(due)} status={state.get('status', 'warming')}"
@@ -1382,6 +1651,15 @@ def main() -> int:
                         specs_by_name=specs_by_name,
                         args=args,
                     )
+                    close_event = _publish_event_close_receipt_if_ready(
+                        state=state,
+                        live_root=live_root,
+                        state_root=state_root,
+                        triggered_datasets=list(
+                            refresh.get("accepted_datasets") or ()
+                        ),
+                    )
+                    refresh["completed_session_close_event"] = close_event
                 state["last_refresh"] = refresh
                 if refresh["status"] == "deferred_opening_revision":
                     state["opening_apply_deferred_until_taipei"] = (

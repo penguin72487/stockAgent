@@ -1559,6 +1559,53 @@ def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatib
         )
 
 
+def test_schema_v4_inactive_causal_feature_normalizer_spelling_is_compatible(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    config = _config()
+    config.training.model_name = "financial_transformer"
+    active = config.training.financial_transformer
+    active.causal_feature_rms_normalization = False
+    active.causal_feature_min_active_dates = 1
+    active.causal_feature_scale_epsilon = 1e-6
+    current = _checkpoint_manifest(panel, config)
+    assert (
+        "causal_feature_rms_normalization"
+        not in current["contracts"]["model"]["model"]
+    )
+
+    explicit_inactive = copy.deepcopy(current)
+    explicit_inactive["contracts"]["model"]["model"].update(
+        {
+            "causal_feature_rms_normalization": False,
+            "causal_feature_min_active_dates": 1,
+            "causal_feature_scale_epsilon": 1e-6,
+        }
+    )
+    explicit_inactive["fingerprints"]["model"] = (
+        trainer_module._stable_fingerprint(
+            explicit_inactive["contracts"]["model"]
+        )
+    )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": explicit_inactive},
+        current,
+        checkpoint_path=tmp_path / "inactive_causal_normalizer.pt",
+        scope="model",
+    )
+
+    enabled = copy.deepcopy(config)
+    enabled.training.financial_transformer.causal_feature_rms_normalization = True
+    with pytest.raises(RuntimeError, match="model"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": current},
+            _checkpoint_manifest(panel, enabled),
+            checkpoint_path=tmp_path / "enabled_causal_normalizer.pt",
+            scope="model",
+        )
+
+
 def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path: Path) -> None:
     manifest = _checkpoint_manifest(_panel(), _config())
     for settings_fingerprint in manifest[

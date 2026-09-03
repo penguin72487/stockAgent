@@ -1166,7 +1166,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
     def tw_revision(self) -> PreparedResponse:
         return self.cached_local_json(
             cache_key="tw-revision",
-            ttl_seconds=0.25,
+            ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
             builder=lambda: build_dashboard_revision(
@@ -1453,6 +1453,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
             lambda: self.openbb_history("1d"),
             lambda: build_dashboard_signal_page(
                 state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                start_date=current_tw_session_date,
+                end_date=current_tw_session_date,
                 mode="all",
                 status="all",
                 limit=100,

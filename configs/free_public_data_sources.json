@@ -34,6 +34,19 @@
       "documentation": "https://sinotrade.github.io/"
     },
     {
+      "id": "taifex_public_history",
+      "provider": "Taiwan Futures Exchange",
+      "dataset_group": "taifex-public-history",
+      "category": "taiwan_derivatives_positioning_risk_and_statistics",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_resumable_backfill_and_point_in_time_snapshots",
+      "registry_alias": true,
+      "cadence": "daily_after_close",
+      "history_contract": "full put-call ratio history; rolling three-year positioning; rolling VIX files; content-addressed OpenAPI snapshots from first local observation",
+      "feature_status": "post-close rows shift to the next receipt-verified TAIFEX session; current snapshots are never projected backward",
+      "documentation": "https://openapi.taifex.com.tw/swagger.json"
+    },
+    {
       "id": "yahoo_finance",
       "provider": "Yahoo Finance / yfinance",
       "dataset_group": "yahoo-market",
@@ -56,6 +69,19 @@
       "history_contract": "provider-specific plans, receipts, cooldowns and authoritative unavailable states",
       "feature_status": "endpoint-specific",
       "documentation": "https://docs.openbb.co/"
+    },
+    {
+      "id": "cftc_legacy_pre2000",
+      "provider": "U.S. Commodity Futures Trading Commission",
+      "dataset_group": "cftc-legacy-pre2000",
+      "category": "global_futures_positioning",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_static_gap_backfill",
+      "registry_alias": true,
+      "cadence": "static_archive; current data delegated to OpenBB CFTC",
+      "history_contract": "futures-only 1986-1999 plus futures-and-options combined 1995-1999; no duplicated rows from 2000 onward",
+      "feature_status": "seven-calendar-day conservative availability because old archives omit exact release timestamps",
+      "documentation": "https://www.cftc.gov/MarketReports/CommitmentsofTraders/HistoricalCompressed/index.htm"
     },
     {
       "id": "okx_public_derivatives",

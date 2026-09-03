@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_dashboard import (
     _line_count,
+    _latest_contiguous_session_rows,
     _rebase_live_benchmark,
     _session_progress,
     _tail,
@@ -378,6 +380,15 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> N
     assert latency["max_ms"] == pytest.approx(300.0)
     assert latency["latest_bottleneck_stage"] == "executor_quote_fetch_ms"
     assert latency["not_external_order_or_venue_rtt"] is True
+    opening = payload["opening_signal_latency"]
+    assert opening["measurement_boundary"] == (
+        "09:00_trigger_to_immutable_signal_ready"
+    )
+    assert opening["observed_mode_count"] == 1
+    assert opening["expected_mode_count"] == 1
+    assert opening["complete"] is True
+    assert opening["first_ready_ms"] == pytest.approx(1_000.0)
+    assert opening["final_ready_ms"] == pytest.approx(1_000.0)
     latest_receipt = json.loads(
         (engine.state_dir / "latency.jsonl")
         .read_text(encoding="utf-8")
@@ -390,6 +401,40 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> N
         "single_causal_quote_request": True,
     }
     assert latest_receipt["stages"]["opening_signal_batch_wait_ms"] == 40.0
+
+
+def test_opening_latency_compares_only_the_same_mode_set() -> None:
+    def row(day: str, market: str, ready_second: int) -> dict[str, object]:
+        return {
+            "result": "registered",
+            "market": market,
+            "session_date": day,
+            "signal_started_at": f"{day}T09:00:00.100000+08:00",
+            "signal_ready_at": f"{day}T09:00:{ready_second:02d}+08:00",
+        }
+
+    rows = [
+        row("2026-08-12", "mode-a", 8),
+        row("2026-08-13", "mode-a", 7),
+        row("2026-08-13", "mode-b", 9),
+    ]
+    incomparable = dashboard_module._opening_signal_latency_summary(
+        rows,
+        expected_markets=["mode-a", "mode-b"],
+        session_date="2026-08-13",
+    )
+    assert incomparable["previous_session_date"] is None
+    assert incomparable["change_vs_previous_ms"] is None
+
+    rows.append(row("2026-08-12", "mode-b", 10))
+    comparable = dashboard_module._opening_signal_latency_summary(
+        rows,
+        expected_markets=["mode-a", "mode-b"],
+        session_date="2026-08-13",
+    )
+    assert comparable["previous_session_date"] == "2026-08-12"
+    assert comparable["change_vs_previous_ms"] == pytest.approx(-1_000.0)
+    assert comparable["improved_vs_previous"] is True
 
 
 def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
@@ -937,6 +982,68 @@ def test_benchmark_previous_close_context_uses_last_completed_official_row(
     assert quotes["2330"]["previous_close_date"] == "2026-08-14"
     assert "twse_official" in quotes["2330"]["previous_close_source"]
     assert quotes["2330"]["reference_price_source"].startswith("shioaji:")
+
+
+def test_tx_benchmark_previous_close_prefers_newer_exact_contract_receipt(
+    tmp_path: Path,
+) -> None:
+    from scripts import run_tw_day_trade_simulation as runner
+
+    daily_path = tmp_path / "day_session_contracts.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2026, 9, 1)],
+            "product": ["TX"],
+            "contract_month": ["202609"],
+            "close": [46_000.0],
+            "source_file": ["official.csv"],
+            "source_sha256": ["a" * 64],
+        }
+    ).write_parquet(daily_path)
+    history_root = tmp_path / "history"
+    data_path = history_root / "ticks/trading_date=2026-09-02/data.parquet"
+    data_path.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "event_ts": [
+                datetime(2026, 9, 2, 13, 44, 58),
+                datetime(2026, 9, 2, 13, 44, 59),
+            ],
+            "close": [46_188.0, 46_189.0],
+        }
+    ).write_parquet(data_path)
+    digest = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    receipt_path = history_root / "receipts/trading_date=2026-09-02.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "contract": "TXFR1",
+                "resolved_target_code_at_query": "TXFI6",
+                "trading_date": "2026-09-02",
+                "path": str(data_path),
+                "size": data_path.stat().st_size,
+                "sha256": digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    quote = {"delivery_month": "202609"}
+    runner._TX_BENCHMARK_PREVIOUS_CLOSE_CACHE.clear()
+    runner._attach_tx_benchmark_previous_close_context(
+        quote,
+        current_contract_code="TXFI6",
+        trading_date=datetime(2026, 9, 3, 9, 0, tzinfo=TAIPEI),
+        day_session_path=daily_path,
+        history_root=history_root,
+    )
+
+    assert quote["previous_close"] == 46_189.0
+    assert quote["previous_close_date"] == "2026-09-02"
+    assert str(quote["previous_close_source"]).startswith(
+        "receipt_backed_shioaji_txfr1_last_day_trade:"
+    )
 
 
 def _eligibility() -> dict[str, LiveEligibility]:
@@ -1568,6 +1675,22 @@ def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
     assert mode["signal_counts"] == {"skipped": 1}
     signal = json.loads(engine.signals_path.read_text().splitlines()[-1])
     assert signal["reason"] == "below_one_board_lot"
+    page = build_dashboard_signal_page(state_dir=engine.state_dir, limit=10)
+    assert page["total"] == 1
+    assert page["rows"][0]["target_weight"] == pytest.approx(0.00001)
+    assert page["rows"][0]["requested_shares"] == 0
+    assert page["rows"][0]["reason"] == "below_one_board_lot"
+    assert page["opening_execution_audit"][spec.market][
+        "model_signal_rows_complete"
+    ] is True
+    snapshot = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(9, 1, 11).astimezone(ZoneInfo("UTC")),
+    )
+    assert not any(
+        issue.get("code") == "below_one_board_lot"
+        for issue in snapshot["operational_issues"]
+    )
 
 
 def test_entry_sizes_at_open_and_caps_fill_at_half_minute_kbar(tmp_path: Path) -> None:
@@ -2791,7 +2914,7 @@ def test_quote_snapshot_exposes_bid_ask_and_computes_limits(tmp_path: Path) -> N
     assert quotes["2330"]["lower_limit"] == 90.0
 
 
-def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
+def test_market_benchmarks_are_gross_buy_hold_and_tx_is_fully_collateralized(
     tmp_path: Path,
 ) -> None:
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -2805,12 +2928,14 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         "0050": {
             "bid": 49.9,
             "ask": 50.0,
+            "reference_price": 49.0,
             "quote_at": _now(10, 0).isoformat(),
             "source": "fixture",
         },
         "2330": {
             "bid": 999.0,
             "ask": 1_000.0,
+            "reference_price": 990.0,
             "quote_at": _now(10, 0).isoformat(),
             "source": "fixture",
         },
@@ -2822,6 +2947,8 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         current_future_quote={
             "bid": 45_000.0,
             "ask": 45_001.0,
+            "previous_close": 44_900.0,
+            "previous_close_date": "2026-08-12",
             "quote_at": _now(10, 0).isoformat(),
             "source": "fixture",
         },
@@ -2829,13 +2956,20 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
     )
 
     benchmarks = engine.state["benchmarks"]
-    assert benchmarks["benchmark_0050"]["initial_capital_twd"] == 50_000.0
-    assert benchmarks["benchmark_0050"]["fixed_fees_twd"] == 20.0
-    assert benchmarks["benchmark_2330"]["initial_capital_twd"] == 1_000_000.0
+    assert benchmarks["benchmark_0050"]["initial_capital_twd"] == 49_000.0
+    assert benchmarks["benchmark_0050"]["fixed_fees_twd"] == 0.0
+    assert benchmarks["benchmark_0050"]["estimated_entry_cost_twd"] == 20.0
+    assert benchmarks["benchmark_2330"]["initial_capital_twd"] == 990_000.0
     tx = benchmarks["benchmark_tx_continuous"]
-    assert tx["initial_capital_twd"] == 701_000.0
+    assert tx["initial_capital_twd"] == 44_900.0 * 200.0
+    assert tx["capital_basis"] == "one_contract_full_notional_1x_no_leverage"
+    assert tx["collateral_coverage_ratio"] == 1.0
     assert tx["contract_code"] == "TXFH6"
-    assert tx["fixed_fees_twd"] == 60.0
+    assert tx["fixed_fees_twd"] == 0.0
+    assert tx["estimated_fixed_fees_twd"] == 60.0
+    assert tx["daily_return_pct"] == pytest.approx(
+        (45_000.0 / 44_900.0 - 1.0) * 100.0
+    )
     assert tx["return_pct"] == pytest.approx(
         tx["net_pnl_twd"] / tx["initial_capital_twd"] * 100.0
     )
@@ -2849,6 +2983,7 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         current_future_quote={
             "bid": 45_199.0,
             "ask": 45_200.0,
+            "previous_close": 45_180.0,
             "quote_at": _now(10, 1).isoformat(),
             "source": "fixture",
         },
@@ -2866,6 +3001,8 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         current_future_quote={
             "bid": 45_199.0,
             "ask": 45_200.0,
+            "previous_close": 45_180.0,
+            "previous_close_date": "2026-08-12",
             "quote_at": _now(10, 2).isoformat(),
             "source": "fixture",
         },
@@ -2874,7 +3011,8 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
     )
     assert tx["contract_code"] == "TXFI6"
     assert tx["roll_count"] == 1
-    assert tx["fixed_fees_twd"] == 180.0
+    assert tx["fixed_fees_twd"] == 0.0
+    assert tx["estimated_fixed_fees_twd"] == 180.0
     assert tx["last_roll_old_bid"] == 45_150.0
     assert tx["last_roll_new_ask"] == 45_200.0
     assert len(tx["roll_history"]) == 1
@@ -2889,6 +3027,10 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         "new_ask": 45_200.0,
         "old_exit_fee_twd": 60.0,
         "new_entry_fee_twd": 60.0,
+        "new_previous_close": 45_180.0,
+        "funding_flow_twd": 36_000.0,
+        "margin_top_up_twd": 36_000.0,
+        "margin_withdrawal_twd": 0.0,
     }
     payload = build_dashboard_snapshot(
         state_dir=engine.state_dir,
@@ -2904,7 +3046,7 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         for row in payload["benchmark_marks"]
         if row["total_equity_twd"] is not None
     )
-    assert "own capital basis" in payload["source_contract"]["comparison"]
+    assert "fully collateralized" in payload["source_contract"]["comparison"]
 
 
 def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
@@ -2953,6 +3095,8 @@ def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
         current_future_quote={
             "bid": 45_199.0,
             "ask": 45_200.0,
+            "previous_close": 45_180.0,
+            "previous_close_date": "2026-08-18",
             "delivery_month": "202609",
             "last_trading_date": "2026-09-16",
             "quote_at": roll_time.isoformat(),
@@ -2968,7 +3112,7 @@ def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
 
     row = engine.state["benchmarks"]["benchmark_tx_continuous"]
     assert row["contract_code"] == "TXFI6"
-    assert row["entry_price"] == 45_200.0
+    assert row["entry_price"] == 45_180.0
     assert row["roll_count"] == 1
     assert row["last_roll_old_bid"] is None
     assert row["last_roll_old_price"] == 45_123.0
@@ -2979,7 +3123,8 @@ def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
     assert row["realized_gross_pnl_twd"] == pytest.approx((45_123.0 - 45_001.0) * 200.0)
     # The expiry event has no fabricated sell fee; only the new-month entry
     # adds one side after the original entry fee.
-    assert row["fixed_fees_twd"] == 120.0
+    assert row["fixed_fees_twd"] == 0.0
+    assert row["estimated_fixed_fees_twd"] == 120.0
     assert row["roll_history"][0]["official_final_settlement"]["price"] == 45_123.0
     assert row["net_pnl_twd"] > -100_000.0
 
@@ -3112,6 +3257,37 @@ def test_tx_benchmark_rebase_uses_audited_roll_offset_without_calendar_gap() -> 
     assert row["total_equity_twd"] == 699_500.0
     assert row["fixed_fees_twd"] == 120.0
     assert row["transaction_tax_twd"] == 520.0
+
+
+def test_tx_benchmark_rebase_chain_links_schema2_buy_hold_wealth() -> None:
+    source = {
+        "benchmark_id": "benchmark_tx_continuous",
+        "instrument_type": "continuous_long_future",
+        "origin_entry_at": "2026-08-20T13:45:00+08:00",
+        "origin_entry_price": 45_000.0,
+        "entry_price": 46_000.0,
+        "buy_hold_wealth_index": 1.02,
+        "daily_return_pct": 0.5,
+    }
+    origin = {
+        "session_date": "2026-08-13",
+        "entry_at": "2026-08-12T13:45:00+08:00",
+        "entry_price": 44_000.0,
+        "initial_capital_twd": 8_800_000.0,
+        "canonical_buy_hold_wealth_at_live_origin": 1.10,
+        "live_origin": {
+            "entry_at": "2026-08-20T13:45:00+08:00",
+            "entry_price": 45_000.0,
+        },
+    }
+
+    row = _rebase_live_benchmark(source, origin)
+
+    assert row["buy_hold_wealth_index"] == pytest.approx(1.122)
+    assert row["return_pct"] == pytest.approx(12.2)
+    assert row["total_equity_twd"] == pytest.approx(9_873_600.0)
+    assert row["daily_return_pct"] == 0.5
+    assert row["counterfactual_open_replay"] is False
 
 
 def test_stock_benchmark_rebase_hides_incomplete_total_return_marks() -> None:
@@ -3643,11 +3819,11 @@ def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
     by_id = {row["benchmark_id"]: row for row in current["benchmarks"]}
     assert by_id["benchmark_0050"]["entry_price"] == 49.0
     assert by_id["benchmark_0050"]["net_pnl_twd"] == pytest.approx(
-        live["benchmark_0050"]["net_pnl_twd"] + 1_000.0
+        live["benchmark_0050"]["net_pnl_twd"] + 980.0
     )
     assert by_id["benchmark_tx_continuous"]["entry_price"] == 44_900.0
     assert by_id["benchmark_tx_continuous"]["net_pnl_twd"] == pytest.approx(
-        live["benchmark_tx_continuous"]["net_pnl_twd"] + 20_200.0
+        live["benchmark_tx_continuous"]["net_pnl_twd"] + 20_140.0
     )
     assert all(row["benchmark_origin_rebased"] for row in current["benchmark_marks"])
     assert current["record_counts"]["benchmark_history_marks"] == 3
@@ -4038,7 +4214,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="preopen-progress"' in html
     assert "fetchWithTimeout(`api/status" in javascript
     assert 'fetchWithTimeout("api/revision"' in javascript
-    assert "const SERVICE_REVISION_REFRESH_MS = 1000" in javascript
+    assert "const SERVICE_REVISION_REFRESH_MS = 250" in javascript
     assert "Dashboard.scheduleRefresh(refreshServiceRevision" in javascript
     assert "服務同步" in javascript
     assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
@@ -4078,6 +4254,12 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "maximumSignificantDigits" not in javascript
     assert javascript.count("maximumFractionDigits: 2") >= 5
     assert "const monetaryNumber" in javascript
+    assert "const replayTimingText" in javascript
+    assert "const signalTimingText" in javascript
+    assert "09-03 09:01:00 · 開盤價重建；原始訊號" not in javascript
+    assert "完整模型訊號已保留 · 0 股未成交" in javascript
+    assert "資金不足一張（完整訊號已保留）" in javascript
+    assert "所選交易日使用實際開盤價做反事實重建" not in javascript
     assert "maximumFractionDigits: 8" not in javascript
     assert "number(row.bid,2)" not in javascript
     assert "number(row.raw_score ?? row.score,5)" not in javascript
@@ -4125,7 +4307,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     )
     assert "Number(positionPnl.total) / modeTotalEquity * 100" in javascript
     assert "Number(positionPnl.total) / totalPortfolioPnl * 100" not in javascript
-    assert '未成交・${esc(row.reason || row.status || "受限")}' in javascript
+    assert "完整模型訊號已保留 · 0 股未成交" in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "原子指標由 inotify 事件即時喚醒" in javascript
@@ -4168,7 +4350,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "installTwPublicMonitorActivation()" in javascript
     assert "void loadChartHistory({preferCache: !force});" in javascript
     assert "Promise.allSettled(detailLoads)" in javascript
-    assert 'src="app.js?v=44"' in html
+    assert 'src="app.js?v=47"' in html
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
     assert "button[data-series-id]" in javascript
@@ -4469,10 +4651,12 @@ def test_counterfactual_best_quote_replay_records_every_entry_at_session_open(
     position = next(iter(mode["positions"].values()))
     assert mode["signal_at"] == open_at.isoformat()
     assert mode["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert mode["open_reconstructed_at"] == open_at.isoformat()
     assert mode["entry_completed_at"] == open_at.isoformat()
     assert position["entry_at"] == open_at.isoformat()
     assert position["entry_quote_at"] == open_at.isoformat()
     assert position["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert position["open_reconstructed_at"] == open_at.isoformat()
 
     for path in (engine.signals_path, engine.orders_path, engine.fills_path):
         rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -4483,12 +4667,14 @@ def test_counterfactual_best_quote_replay_records_every_entry_at_session_open(
     events = [json.loads(line) for line in engine.events_path.read_text().splitlines()]
     assert {row["recorded_at"] for row in events} == {open_at.isoformat()}
     assert events[-1]["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert events[-1]["open_reconstructed_at"] == open_at.isoformat()
     snapshot = build_dashboard_snapshot(
         state_dir=engine.state_dir,
         now=datetime(2026, 8, 13, 2, 0, tzinfo=ZoneInfo("UTC")),
     )
     assert snapshot["modes"][0]["signal_at"] == open_at.isoformat()
     assert snapshot["modes"][0]["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert snapshot["modes"][0]["open_reconstructed_at"] == open_at.isoformat()
     assert snapshot["modes"][0]["counterfactual_open_replay"] is True
     assert snapshot["positions"][0]["source_signal_at"] == _now(9, 43, 52).isoformat()
 
@@ -4556,6 +4742,77 @@ def test_session_tail_is_not_crowded_out_by_a_later_date(tmp_path: Path) -> None
     selected = _tail_for_session(path, 3, "2026-08-13")
 
     assert [row["index"] for row in selected] == [2, 3, 4]
+
+
+def test_latest_session_signal_page_skips_full_ledger_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "modes": {
+                    "mode_a": {
+                        "session_date": "2026-08-14",
+                        "target_symbol_count": 2,
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    signals_path = state_dir / "signals.jsonl"
+    rows = [
+        {
+            "session_date": "2026-08-13",
+            "market": "mode_a",
+            "symbol": "OLD",
+            "target_weight": 0.9,
+        },
+        {
+            "session_date": "2026-08-14",
+            "market": "mode_a",
+            "symbol": "2330",
+            "target_weight": 0.1,
+        },
+        {
+            "session_date": "2026-08-14",
+            "market": "mode_a",
+            "symbol": "2317",
+            "target_weight": 0.0,
+        },
+    ]
+    signals_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    assert [
+        row["symbol"]
+        for row in _latest_contiguous_session_rows(
+            signals_path, "2026-08-14", maximum_rows=10
+        )
+    ] == ["2330", "2317"]
+    monkeypatch.setattr(
+        dashboard_module,
+        "_ledger_session_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("latest-session fast path must not index full ledger")
+        ),
+    )
+
+    page = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-14",
+        end_date="2026-08-14",
+        limit=10,
+    )
+
+    assert page["source_rows_scanned"] == 2
+    assert {row["symbol"] for row in page["rows"]} == {"2330", "2317"}
+    assert page["opening_execution_audit"]["mode_a"][
+        "model_signal_rows_complete"
+    ] is True
 
 
 def test_available_session_date_cache_invalidates_when_ledger_grows(
@@ -4742,6 +4999,8 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
         "short_gross": pytest.approx(0.3),
     }
     assert first["opening_execution_audit"]["mode_a"] == {
+        "model_signal_row_count": 3,
+        "zero_target_row_count": 0,
         "nonzero_signal_count": 3,
         "opening_price_covered_count": 2,
         "opening_price_missing_count": 1,
@@ -4749,8 +5008,11 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
         "requested_signal_count": 2,
         "filled_signal_count": 2,
         "unfilled_signal_count": 1,
+        "below_one_board_lot_count": 0,
         "missing_open_symbols": ["2317"],
         "unfilled_reason_counts": {"missing_quote": 1},
+        "expected_model_signal_row_count": None,
+        "model_signal_rows_complete": None,
     }
 
     filtered = build_dashboard_signal_page(

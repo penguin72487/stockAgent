@@ -693,6 +693,9 @@ def main() -> int:
             changed
             or completed_receipt.get("status") != "ok"
             or completed_receipt.get("expected_date") != expected_date
+            or completed_receipt.get("source_publication_phase") != phase.name
+            or completed_receipt.get("source_publication_completed_at_taipei")
+            != payload.get("completed_at_taipei")
         )
         if expected_date and finalize_needed:
             finalize_started = time.perf_counter()

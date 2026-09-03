@@ -174,6 +174,13 @@ Operational files:
   - Interactive `/signal_now` jobs share this receipt under
     `signal_now_jobs`. A stale job is persisted as `waiting_source`, survives
     bot restarts, and resumes only after canonical source acceptance is fresh.
+    The resumer checks ready work every two seconds; requests for the same
+    target/configuration share one job rather than rebuilding the same panel.
+- Startup inference warm receipt:
+  `artifacts/discord_bot/startup_inference_warmup.json`
+  - Immutable checkpoint-contract failures stop retrying. Transient failures
+    retry with bounded exponential backoff, so one bad model cannot create a
+    permanent 15-second CPU and memory retry storm.
 - Live signal artifacts: each configured `live_output_dir`, usually
   `artifacts/live_signals/<market>/<asof_date>/<signal_id>/`
   - `summary.json`
@@ -207,11 +214,21 @@ switches an accepted release. Stale requests do not recompute an old preview.
 For a closed TW day-trade market, the persisted job instead runs the completed-
 session finalizer and calculates from `official_session_close`; this is an
 after-close calculation, not a claim that an order filled at the completed
-close. Formal-history maintenance is deferred while interactive signal work is
-pending.
+close. During the close-publication window, the two critical TWSE/TPEx daily
+sources are checked first at five-second intervals. Once both accepted receipts
+and exact parquet dates agree, a `close_event` receipt triggers the finalizer;
+the ordinary full-source sweep remains a slower reconciliation layer. The
+feature builder replaces a receipt-verified recent tail and reuses the older
+sorted prefix, while periodic full builds retain the historical-revision audit
+boundary. Formal-history maintenance is deferred while interactive signal work
+is pending.
 Requests for the same target/config share one persisted job, unexpected errors
 retry from 1 minute up to 15 minutes, and the 08:15–09:05 opening window defers
 interactive work to protect the execution engine.
+Live-tail panel reads cap inherited training worker counts to half of the CPUs
+visible to the Discord process by default. Override only after measuring with
+`STOCKAGENT_LIVE_PANEL_LOAD_WORKERS`; this tuning does not change panel or model
+semantics.
 If the updater is rate-limited or otherwise produces mostly failed rows, the
 backfill is treated as failed and no live signal artifact is written from stale
 data.
