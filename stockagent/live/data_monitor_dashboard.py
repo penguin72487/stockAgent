@@ -178,6 +178,20 @@ _GROUP_META: Final[dict[str, dict[str, Any]]] = {
         "owner": "TAIFEX 選擇權回補器",
         "window": 72 * 3600,
     },
+    "taifex-public-history": {
+        "title": "TAIFEX 籌碼、風險與統計歷史",
+        "provider": "TAIFEX",
+        "cadence": "歷史回補；交易日收盤後增量",
+        "owner": "TAIFEX 公開歷史更新器",
+        "window": 72 * 3600,
+    },
+    "cftc-legacy-pre2000": {
+        "title": "CFTC Legacy 2000 年前部位",
+        "provider": "CFTC",
+        "cadence": "官方靜態封存",
+        "owner": "CFTC Legacy 缺口回補器",
+        "window": None,
+    },
     "tw-futures": {
         "title": "永豐期貨歷史 Tick",
         "provider": "永豐 Shioaji / TAIFEX",
@@ -248,6 +262,13 @@ _SUMMARY_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
         "manifest_weekly.json",
         "manifest_final_settlement.json",
     ),
+    "taifex-public-history": (
+        "manifest.json",
+        "openapi_latest.json",
+        "vix_latest.json",
+        "progress.json",
+    ),
+    "cftc-legacy-pre2000": ("manifest.json",),
     "tw-futures": ("shioaji_contracts/manifest.json",),
     "tw-shioaji-history": ("summary.json",),
     "forex-frankfurter": ("download_summary.json",),
@@ -287,6 +308,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
     "taifex_auxiliary": {
         "service": "stockagent-taifex-auxiliary-daily.service",
         "timer": "stockagent-taifex-auxiliary-daily.timer",
+    },
+    "taifex_public_history": {
+        "service": "stockagent-taifex-public-history.service",
+        "timer": "stockagent-taifex-public-history.timer",
     },
     "shioaji_minute": {
         "service": "stockagent-shioaji-minute-backfill.service",
@@ -494,6 +519,19 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
         "schedule_label": "交易日 17:00（Asia/Taipei）",
         "calendar_weekdays": True,
         "calendar_time": "17:00",
+    },
+    "group:taifex-public-history": {
+        "mode": "timer",
+        "service_keys": ("taifex_public_history",),
+        "schedule_label": "歷史 receipt 續傳；交易日 17:30（Asia/Taipei）",
+        "calendar_weekdays": True,
+        "calendar_time": "17:30",
+    },
+    "group:cftc-legacy-pre2000": {
+        "mode": "frozen",
+        "service_keys": (),
+        "schedule_label": "1986–1999 官方靜態缺口已封存；2000 年後由 OpenBB 更新",
+        "active_means_running": False,
     },
     "group:tw-futures": {
         "mode": "quota_backfill",
@@ -1128,8 +1166,10 @@ def _extract_data_through(payloads: Iterable[Any]) -> str | None:
         for key in (
             "applied_end_date",
             "provider_end_date",
+            "effective_end_date",
             "end_date",
             "date_end",
+            "last_date",
         ):
             value = str(payload.get(key) or "").strip()
             if value:
@@ -1171,6 +1211,38 @@ def _extract_rows(payloads: Iterable[Any]) -> int | None:
             if value is not None:
                 candidates.append(value)
     return max(candidates) if candidates else None
+
+
+def _extract_group_rows(dataset: str, payloads: Iterable[Any]) -> int | None:
+    materialized = list(payloads)
+    if dataset != "taifex-public-history":
+        return _extract_rows(materialized)
+
+    total = 0
+    found = False
+    for payload in materialized:
+        if not isinstance(payload, Mapping):
+            continue
+        payload_dataset = str(payload.get("dataset") or "")
+        if payload_dataset in {
+            "taifex_public_history",
+            "taifex_openapi_point_in_time_catalog",
+        }:
+            datasets = payload.get("datasets")
+            if isinstance(datasets, list):
+                for item in datasets:
+                    if not isinstance(item, Mapping):
+                        continue
+                    rows = _integer(item.get("rows"))
+                    if rows is not None:
+                        total += rows
+                        found = True
+        elif payload_dataset == "taifex_vix_daily_recent":
+            rows = _integer(payload.get("rows"))
+            if rows is not None:
+                total += rows
+                found = True
+    return total if found else _extract_rows(materialized)
 
 
 def _generic_group(
@@ -1423,7 +1495,7 @@ def _generic_group(
         "freshness": fresh,
         "coverage": coverage,
         "eta": eta,
-        "rows": _extract_rows(payloads),
+        "rows": _extract_group_rows(dataset, payloads),
         "publishable": bool(config.get("publish")),
         "automation_eligible": dataset != "legacy-parquet",
         "detail": str(config.get("note") or "已登錄資料群組。"),
@@ -2949,7 +3021,10 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
         )
         fresh = _freshness(latest, now=now, window_seconds=26 * 3600)
         explicitly_deferred = implementation.startswith("deferred_by_user")
-        registry_alias = implementation.startswith("reused_existing")
+        registry_alias = (
+            source.get("registry_alias") is True
+            or implementation.startswith("reused_existing")
+        )
         if explicitly_deferred:
             status = "deferred"
             label = "依目前交易所範圍暫停"

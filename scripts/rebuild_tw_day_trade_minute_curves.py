@@ -33,6 +33,7 @@ from stockagent.live.tw_day_trade_simulation import (
     TAIPEI,
     position_net_liquidation_pnl,
 )
+from stockagent.live.benchmark_accounting import previous_close_return
 from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
 
 
@@ -95,10 +96,22 @@ def _atomic_text(path: Path, text: str) -> None:
             pass
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    compact: bool = False,
+) -> None:
     _atomic_text(
         path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+            sort_keys=True,
+        )
+        + "\n",
     )
 
 
@@ -971,17 +984,32 @@ def _benchmark_minute_row(
 ) -> dict[str, Any]:
     row = dict(template)
     quantity = float(row.get("adjusted_quantity") or row.get("quantity") or 0.0)
+    original_quantity = float(row.get("quantity") or 0.0)
     entry_price = float(row["entry_price"])
     initial_capital = float(row["initial_capital_twd"])
-    initial_fees = float(row.get("initial_fixed_fees_twd") or 0.0)
+    initial_fees = float(
+        row.get("estimated_entry_cost_twd")
+        or row.get("estimated_initial_fixed_fees_twd")
+        or row.get("initial_fixed_fees_twd")
+        or 0.0
+    )
     template_price = float(template["last_mark_price"])
-    template_cost = float(template.get("liquidation_cost_twd") or 0.0)
+    template_cost = float(
+        template.get("estimated_liquidation_cost_twd")
+        or template.get("liquidation_cost_twd")
+        or 0.0
+    )
     liquidation_rate = (
         template_cost / (quantity * template_price) if quantity > 0.0 else 0.0
     )
     liquidation_cost = quantity * price * liquidation_rate
-    net_pnl = quantity * (price - entry_price) - initial_fees - liquidation_cost
-    total_equity = initial_capital + net_pnl
+    gross_value = quantity * price
+    gross_pnl = gross_value - original_quantity * entry_price
+    total_equity = initial_capital + gross_pnl
+    daily_return_fraction, daily_return_pct = previous_close_return(
+        price,
+        row.get("daily_return_reference_price"),
+    )
     row.update(
         {
             "recorded_at": minute.isoformat(timespec="seconds"),
@@ -989,13 +1017,21 @@ def _benchmark_minute_row(
             "last_mark_at": minute.isoformat(timespec="seconds"),
             "last_quote_at": minute.isoformat(timespec="seconds"),
             "last_mark_price": price,
-            "liquidation_cost_twd": liquidation_cost,
-            "net_pnl_twd": net_pnl,
+            "liquidation_cost_twd": 0.0,
+            "estimated_entry_cost_twd": initial_fees,
+            "estimated_liquidation_cost_twd": liquidation_cost,
+            "estimated_tracking_cost_twd": initial_fees + liquidation_cost,
+            "performance_pnl_twd": gross_pnl,
+            "gross_pnl_twd": gross_pnl,
+            "net_pnl_twd": gross_pnl,
             "total_equity_twd": total_equity,
-            "return_fraction": net_pnl / initial_capital,
-            "return_pct": net_pnl / initial_capital * 100.0,
+            "return_fraction": gross_pnl / initial_capital,
+            "return_pct": gross_pnl / initial_capital * 100.0,
+            "buy_hold_wealth_index": total_equity / initial_capital,
+            "daily_return_fraction": daily_return_fraction,
+            "daily_return_pct": daily_return_pct,
             "source": "shioaji_historical_1m_close",
-            "valuation_source": "historical_last_trade_mark_after_tw_cash_costs_not_executable_bid",
+            "valuation_source": "gross_buy_hold_historical_last_trade_mark_not_executable_bid",
             "valuation_stale": not fresh,
             "historical_minute_replay": True,
             "minute_valuation_contract": MINUTE_CONTRACT,
@@ -1284,7 +1320,7 @@ def main() -> None:
     marks_path = args.output_dir / "marks.jsonl"
     benchmark_path = args.output_dir / "benchmark_history.json"
     _atomic_jsonl(marks_path, rebuilt_marks)
-    _atomic_json(benchmark_path, rebuilt_benchmarks)
+    _atomic_json(benchmark_path, rebuilt_benchmarks, compact=True)
     receipt = {
         "schema_version": 2,
         "created_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),

@@ -1,0 +1,20 @@
+[Unit]
+Description=StockAgent TAIFEX public positioning history and ratio archive
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target stockagent-taifex-futures-daily.service stockagent-taifex-auxiliary-daily.service
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart="@REPO_ROOT@/scripts/run_downloader_with_release.sh" taifex-public-history /srv/stockagent-packed -- /usr/bin/bash "@REPO_ROOT@/scripts/run_taifex_public_history.sh"
+Nice=15
+CPUWeight=10
+IOWeight=10
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=multi-user.target

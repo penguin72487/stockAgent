@@ -1,7 +1,7 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
-const SERVICE_REVISION_REFRESH_MS = 1000;
+const SERVICE_REVISION_REFRESH_MS = 250;
 const TW_PUBLIC_STATUS_REFRESH_MS = 30000;
 const Dashboard = window.StockAgentDashboard;
 const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
@@ -188,6 +188,36 @@ const displayPct = (value) => {
 const money = (value) => value == null ? "—" : `NT$ ${monetaryNumber(value)}`;
 const pct = (value) => value == null ? "—" : `${sourceNumber(Number(value) * 100)}%`;
 const shortTime = (value) => value ? String(value).replace("T", " ").slice(5, 19) : "—";
+const replayTimingText = (row = {}, fallbackAt = null) => {
+  const rebuiltAt = row.open_reconstructed_at || fallbackAt || row.signal_at;
+  const originalAt = row.source_signal_at;
+  return `${shortTime(rebuiltAt)} · 開盤價重建${originalAt ? `；原始訊號 ${shortTime(originalAt)}` : ""}`;
+};
+const signalTimingText = (row = {}, fallbackAt = null) => row.counterfactual_open_replay
+  ? replayTimingText(row, fallbackAt)
+  : shortTime(row.signal_at || fallbackAt);
+const SIGNAL_REASON_LABELS = {
+  below_one_board_lot: "資金不足一張（完整訊號已保留）",
+  zero_target_weight: "零權重，不下單",
+  model_tradable_mask_false: "模型交易遮罩不允許",
+  cannot_buy_open: "不可買進開倉",
+  cannot_sell_open: "不可賣出開倉",
+  exact_session_eligibility_missing: "當日當沖資格資料缺漏",
+  not_day_trade_eligible: "不具當日當沖資格",
+  sell_first_suspended: "暫停先賣後買",
+  official_session_no_trade_print: "官方當日無成交價",
+  official_open_price_unavailable: "官方開盤價不可用",
+  observed_09_01_minute_vwap_unavailable: "09:01 首分鐘成交價不可用",
+  price_limit_unavailable: "合法漲跌停價缺漏",
+  no_executable_best_quote: "最佳一檔報價不可用",
+  quote_not_after_signal: "報價未晚於訊號",
+  quote_after_local_observation: "報價時間超前本機觀測",
+  marketable_depth_unavailable: "可成交深度不足",
+  marketable_depth_exhausted: "可成交深度僅部分足夠",
+  counterfactual_official_open_price_fill_at_09_01: "09:01 開盤價重建",
+  counterfactual_observed_09_01_minute_vwap_fill: "09:01 首分鐘價重建",
+};
+const signalReasonLabel = (value) => SIGNAL_REASON_LABELS[String(value || "")] || String(value || "").replaceAll("_", " ") || "未提供原因";
 const shortDateTime = (value) => {
   const parsed = new Date(value || "");
   if (Number.isNaN(parsed.getTime())) return "—";
@@ -568,7 +598,6 @@ function renderHeader(data) {
   const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical") || String(mode.engine_status || "").startsWith("blocked"));
   const catchUps = data.modes.filter((mode) => mode.today_execution_status === "starting");
   const missed = data.modes.filter((mode) => mode.today_execution_status === "missed");
-  const hasReplay = data.modes.some((mode) => mode.counterfactual_open_replay || mode.simulation_replay);
   const hasBenchmarkReplay = (data.benchmarks || []).some((row) => row.counterfactual_open_replay);
   const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
   const signalMissingEligibility = new Map();
@@ -583,10 +612,9 @@ function renderHeader(data) {
       if (!coverage.covered && !currentMissingEligibility.has(venue)) currentMissingEligibility.set(venue, coverage);
     }
   }
-  if (operationalIssues.length || hasReplay || hasBenchmarkReplay || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+  if (operationalIssues.length || hasBenchmarkReplay || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
-      hasReplay ? "所選交易日使用實際開盤價做反事實重建；原始訊號時間保留，但這不是當時可成交報價、即時執行或券商成交。" : "",
-      hasBenchmarkReplay ? "0050、2330 與台指期基準已補到實際開盤起點；補登區段是明確標示的回放，後續估值使用 receipt 驗證的逐分鐘觀察價；缺分鐘只延續前一筆實際觀察值並明示，不插值。" : "",
+      hasBenchmarkReplay ? "舊版市場基準歷史仍含開盤起算資料；新版會計契約尚未完成原子替換，該區段暫不視為 Buy & Hold 正式結果。" : "",
       data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
       currentMissingEligibility.size ? `所選交易日當沖資格未完整覆蓋，後續訊號已停止執行：${[...currentMissingEligibility.entries()].map(([venue, row]) => `${venue.toUpperCase()} 需要 ${row.target_date || data.session_date || "所選日"}，最新僅到 ${row.latest_date || "無資料"}`).join("；")}` : "",
       !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 訊號產生時資格資料尚未到齊，因此已 fail-closed；較晚補齊的資料不會回填成假成交。" : "",
@@ -695,12 +723,13 @@ function renderModes(data) {
       <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
         <div><span>篩選區間報酬基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
-        <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
+        ${mode.counterfactual_open_replay
+          ? `<div class="wide"><span>訊號／重建時間</span><strong>${esc(replayTimingText(mode))}</strong></div>`
+          : `<div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>`}
         <div><span>要求／成交／未成交</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
         <div><span>13:24 市價重試後殘餘</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div><span>13:30 帳務強平</span><strong>${number(mode.terminal_flatten_count || 0)}</strong></div>
         <div><span>強平價替代值</span><strong class="${Number(mode.terminal_flatten_degraded_count || 0) ? "negative" : ""}">${number(mode.terminal_flatten_degraded_count || 0)}</strong></div>
-        ${mode.counterfactual_open_replay ? `<div class="wide"><span>開盤價重建</span><strong>實際開盤 ${shortTime(mode.signal_at)} · 原始訊號 ${shortTime(mode.source_signal_at)} · 非即時成交</strong></div>` : ""}
         <div class="wide"><span>進場成交契約</span><strong>${esc(entryPolicy)}</strong></div>
         <div class="wide"><span>訊號結果原因</span><strong>${esc(reasonCounts)}</strong></div>
         <div class="wide"><span>停利停損價位</span><strong>${esc(bracketPolicy)}</strong></div>
@@ -714,13 +743,14 @@ function renderBenchmarks(data) {
   $("benchmark-cards").innerHTML = rows.map((row) => {
     const rangeSummary = rangeSummaryFor(row.benchmark_id);
     const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
+    const dailyReturnPct = row.daily_return_pct == null ? null : Number(row.daily_return_pct);
     const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
     const netPnl = rangeSummary?.range_net_pnl_twd == null ? null : Number(rangeSummary.range_net_pnl_twd);
     const isTx = row.instrument_type === "continuous_long_future";
     const waitingRoll = String(row.valuation_source || "").includes("roll_waiting");
     const actionBlocked = !isTx && String(row.valuation_source || "").includes("corporate_action_reference_unavailable");
     const stale = Boolean(row.valuation_stale);
-    const status = returnPct == null
+    const status = dailyReturnPct == null
       ? {label:"等待有效價格", kind:"bad"}
       : actionBlocked
         ? {label:"除權息資料未覆蓋", kind:"bad"}
@@ -728,7 +758,7 @@ function renderBenchmarks(data) {
         ? {label:"等待雙邊換月報價", kind:"warn"}
         : stale
           ? {label:"延用前次估值", kind:"warn"}
-          : {label:row.counterfactual_open_replay ? "實際開盤起算" : "可成交估值", kind:"good"};
+          : {label:"跨日持有估值", kind:"good"};
     const holding = isTx
       ? `大台 1 口 · ${row.contract_code || "合約待確認"}`
       : `${number(row.quantity || 1000)} 股 · ${row.symbol || ""}`;
@@ -739,20 +769,28 @@ function renderBenchmarks(data) {
       : row.total_return_contract
         ? `官方除權息因子 ${sourceNumber(row.corporate_action_factor ?? 1)}× · ${number(row.corporate_action_count || 0)} 次 · 覆蓋至 ${row.corporate_action_coverage_end || "—"}`
         : "等待下一個交易分鐘載入含息基準契約";
-    const totalCosts = [row.fixed_fees_twd, row.transaction_tax_twd, row.liquidation_cost_twd]
-      .map(Number).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
+    const totalCosts = Number(row.estimated_tracking_cost_twd);
+    const priorCloseLabel = row.daily_return_previous_close_date
+      ? `前收 ${row.daily_return_previous_close_date}`
+      : "前一交易日收盤";
+    const collateral = isTx
+      ? `${money(row.current_contract_notional_twd)} · 覆蓋 ${sourceNumber(row.collateral_coverage_ratio)}×`
+      : "—";
+    const funding = isTx
+      ? `補入 ${money(row.cumulative_margin_top_up_twd || 0)} · 提回 ${money(row.cumulative_margin_withdrawal_twd || 0)}`
+      : "";
     return `<article class="panel benchmark-card">
       <header><h3>${esc(row.label || row.benchmark_id)}</h3>${badge(status.label, status.kind)}</header>
-      <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
-      <div class="delta ${pnlClass(netPnl)}">${equity == null ? "篩選區間等待完整來源" : `期末權益 ${summaryMoney(equity)} · 區間淨損益 ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
+      <div class="equity ${pnlClass(dailyReturnPct)}">${dailyReturnPct == null ? "尚無前收基準" : `${dailyReturnPct >= 0 ? "+" : ""}${displayPct(dailyReturnPct)}`}</div>
+      <div class="delta ${pnlClass(returnPct)}">${returnPct == null ? "篩選區間等待完整來源" : `今日相對昨收 · 篩選區間 ${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)} · ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
       <div class="benchmark-facts">
         <div><span>持有標的</span><strong class="benchmark-contract">${esc(holding)}</strong></div>
-        <div><span>篩選區間報酬基準</span><strong>${money(rangeSummary?.baseline_equity_twd)}</strong></div>
-        <div><span>起算開盤</span><strong>${sourceNumber(row.entry_price)}<small>${shortTime(row.entry_at)}</small></strong></div>
+        <div><span>${esc(priorCloseLabel)}</span><strong>${sourceNumber(row.daily_return_reference_price ?? row.daily_return_previous_close)}</strong></div>
+        <div><span>Buy & Hold 起點</span><strong>${sourceNumber(row.entry_price)}<small>${shortTime(row.entry_at)}</small></strong></div>
         <div><span>目前可清算價</span><strong>${sourceNumber(row.last_mark_price)}<small>${shortTime(row.last_quote_at || row.last_mark_at)}</small></strong></div>
         <div><span>${isTx ? "自動換月" : "持有契約"}</span><strong>${esc(rollText)}</strong></div>
-        <div><span>已發生＋清算成本</span><strong>${money(totalCosts)}</strong></div>
-        ${isTx ? `<div class="wide"><span>換月規則</span><strong>舊約 bid 與新約 ask 必須同時存在；價差不列為報酬</strong></div>` : ""}
+        <div><span>追蹤成本（不扣報酬）</span><strong>${Number.isFinite(totalCosts) ? money(totalCosts) : "—"}</strong></div>
+        ${isTx ? `<div><span>1:1 名目資金</span><strong>${collateral}</strong></div><div><span>換月資金流</span><strong>${funding}</strong></div><div class="wide"><span>換月規則</span><strong>同一實體合約以前收計日報酬；換月價差只補入／提回現金，不列報酬，槓桿上限 1×</strong></div>` : ""}
       </div>
     </article>`;
   }).join("") || `<article class="panel benchmark-card"><strong>基準尚未建立</strong><small>等待來源與起算價格通過稽核</small></article>`;
@@ -775,6 +813,7 @@ function renderOperations(data) {
   const warmKind = warm.status === "ready" ? "good" : warm.status === "failed" ? "bad" : "warn";
   const phaseKind = ["active", "preopen"].includes(session.phase) ? "good" : session.phase === "force_exit" ? "bad" : "warn";
   const latency = data.today_latency || data.latency || {};
+  const openingLatency = data.opening_signal_latency || {};
   const latencyStageLabels = {
     signal_pre_quote_prepare_ms: "訊號盤前骨架",
     signal_quote_fetch_ms: "訊號行情",
@@ -790,6 +829,7 @@ function renderOperations(data) {
   };
   const latencyValue = (value) => value == null ? "—" : `${number(value, 1)} ms`;
   const noLatency = !Number(latency.sample_count || 0);
+  const noOpeningLatency = !Number(openingLatency.observed_mode_count || 0);
   const latencyEmptyLabel = "今日尚無開盤樣本";
   const latestBottleneck = latencyStageLabels[latency.latest_bottleneck_stage] || latency.latest_bottleneck_stage || "—";
   const serviceSync = data.service_sync || {};
@@ -818,11 +858,19 @@ function renderOperations(data) {
       ? "長期守護 READY"
       : `長期守護 ${String(guardian.status || "MISSING").toUpperCase()}`;
   const guardianNote = `時間 ${guardianComponents.time_sync ? "OK" : "FAIL"} · 156來源 ${guardianComponents.source_events ? "OK" : "FAIL"} · 服務同步 ${guardianComponents.runtime_sync ? "OK" : "FAIL"} · 磁碟 ${guardianComponents.disk ? "OK" : "FAIL"} · ${duration(guardian.age_seconds)}前`;
+  const openingModes = openingLatency.modes || [];
+  const firstOpeningMode = openingModes.reduce((best, row) => !best || Number(row.ready_from_0900_ms) < Number(best.ready_from_0900_ms) ? row : best, null);
+  const openingChangeMs = openingLatency.change_vs_previous_ms == null
+    ? Number.NaN
+    : Number(openingLatency.change_vs_previous_ms);
+  const openingChange = Number.isFinite(openingChangeMs)
+    ? `${openingChangeMs < 0 ? "快" : openingChangeMs > 0 ? "慢" : "持平"} ${duration(Math.abs(openingChangeMs) / 1000)}`
+    : "尚無可比前日";
   $("latency-kpis").innerHTML = [
-    ["最新輸入→落盤", noLatency ? latencyEmptyLabel : latencyValue(latency.latest_ms), noLatency ? "不以舊日或估計值冒充今日速度" : `${esc(latency.latest_market || "—")} · ${shortTime(latency.latest_recorded_at)}`],
-    ["P50", latencyValue(latency.p50_ms), `${number(latency.sample_count || 0)} 個成功模式樣本`],
-    ["P95", latencyValue(latency.p95_ms), "訊號開始至模擬帳本 fsync 前後的牆鐘邊界"],
-    ["最慢", latencyValue(latency.max_ms), "所選交易日成功樣本最大值"],
+    ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : duration(Number(openingLatency.first_ready_ms) / 1000), firstOpeningMode ? `${firstOpeningMode.market} · 不含頁面顯示` : "等待實測"],
+    ["09:00 → 最後訊號", noOpeningLatency ? "—" : duration(Number(openingLatency.final_ready_ms) / 1000), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式${openingLatency.complete ? "完成" : "；仍缺模式"}`],
+    ["相較前次開盤", openingChange, openingLatency.previous_session_date ? `${openingLatency.previous_session_date} 最後訊號 ${duration(Number(openingLatency.previous_final_ready_ms) / 1000)}` : "只比較 09:00 自動樣本"],
+    ["輸入 → 帳本落盤", noLatency ? "—" : `${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`, `${number(latency.sample_count || 0)} 個成功樣本 · P50 / P95`],
     ["最新瓶頸", noLatency ? "—" : latestBottleneck, noLatency ? "等待實測" : latencyValue(latency.latest_bottleneck_ms)],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
   $("operation-kpis").innerHTML = [
@@ -1212,7 +1260,7 @@ function renderPositions(data) {
     return `<tr>
       <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.session_date)} · ${esc(row.symbol)} ${esc(row.name || "")}</small></td>
       <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(signedShares))} 股</small></td>
-      <td><strong>進 ${money(row.entry_price)}</strong><small>${shortTime(row.entry_at)}${row.simulation_replay ? ` · 開盤價重建；原始訊號 ${shortTime(row.source_signal_at)}` : ""}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
+      <td><strong>進 ${money(row.entry_price)}</strong><small>${esc(row.counterfactual_open_replay ? replayTimingText(row, row.entry_at) : shortTime(row.entry_at))}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
       <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small><small>13:25 ${row.closing_auction_limit_price == null ? "—" : sourceNumber(row.closing_auction_limit_price)} · ${esc(row.closing_auction_order_status || "未到")}</small></td>
 	    <td><strong>${row.exit_price == null ? (row.last_exit_price == null ? "持倉中" : `部分 ${money(row.last_exit_price)}`) : money(row.exit_price)}</strong><small>${esc(row.exit_reason || row.status || "—")}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small></td>
 	    <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
@@ -1241,9 +1289,16 @@ function renderSignals() {
   ].map(([label, row]) => `<div><span>${esc(label)}</span><strong>${esc(directionPair(row))}</strong></div>`).join("");
   const openingAuditHtml = Object.entries(signalOpeningExecutionAudit).map(([market, row]) => {
     const missing = Number(row.opening_price_missing_count || 0);
+    const recorded = Number(row.model_signal_row_count || 0);
+    const expected = Number(row.expected_model_signal_row_count || 0);
+    const complete = row.model_signal_rows_complete === true;
+    const belowLot = Number(row.below_one_board_lot_count || 0);
     const reasons = Object.entries(row.unfilled_reason_counts || {}).slice(0, 3)
-      .map(([reason, count]) => `${reason}:${number(count)}`).join(" · ");
-    return `<div><span>${esc(market)} 開盤市價稽核</span><strong class="${missing ? "negative" : "positive"}">${number(row.opening_price_covered_count)}/${number(row.nonzero_signal_count)} 有開盤價 · 缺 ${number(missing)} · 成交 ${number(row.filled_signal_count)}</strong><small>${esc(reasons || "全部非零訊號皆已成交")}</small></div>`;
+      .map(([reason, count]) => `${signalReasonLabel(reason)}:${number(count)}`).join(" · ");
+    const completeness = expected
+      ? `模型決策列 ${number(recorded)}/${number(expected)}${complete ? " 完整" : " 缺漏"}`
+      : `模型決策列 ${number(recorded)}`;
+    return `<div><span>${esc(market)} 完整訊號／執行稽核</span><strong class="${missing || (expected && !complete) ? "negative" : "positive"}">${completeness} · 非零訊號 ${number(row.nonzero_signal_count)} · 成交 ${number(row.filled_signal_count)}</strong><small>${belowLot ? `資金不足一張 ${number(belowLot)} 筆，完整訊號仍保留於下表` : esc(reasons || "全部非零訊號皆已成交")}</small></div>`;
   }).join("");
   $("signal-direction-summary").innerHTML = directionHtml + openingAuditHtml;
   const errorRow = signalLoadError
@@ -1267,16 +1322,17 @@ function renderSignals() {
     const currentPrice = isOpen ? position.last_mark_price : position?.exit_price ?? position?.last_exit_price;
     const currentLabel = isOpen ? "現在可清算價" : hasPosition ? "已平倉價" : "未成交";
     const currentAt = isOpen ? position.last_quote_at : position?.exit_at ?? position?.last_exit_at;
+    const reasonText = signalReasonLabel(row.reason || row.status);
     const eligibility = row.day_trade_eligible
       ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn")
       : badge("不可當沖", "bad");
     const result = badge(row.status, row.status === "ready" ? "good" : row.status === "partial_depth" ? "warn" : row.status === "hold" ? "" : "bad");
     const selected = signalRowKey(row) === featurePanelSignalKey ? " is-selected" : "";
     return `<tr data-signal-key="${esc(signalRowKey(row))}" class="signal-row${selected}">
-      <td><strong>${esc(row.market)}</strong><small>${esc(row.session_date)} · ${shortTime(row.signal_at)}</small></td>
+      <td><strong>${esc(row.market)}</strong><small>${esc(signalTimingText(row))}</small></td>
       <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small></td>
-	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(row.reason || "")}</small></td>
-	    <td>${hasTarget ? `<strong class="${openingPrice == null ? "negative" : ""}">開盤計價 ${money(openingPrice)}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `市價成交 ${money(executionPrice)} · 名目 ${money(entryNotional)}` : hasTarget ? `未成交・${esc(row.reason || row.status || "受限")}` : "不需開盤計價"}</small><small>成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
+	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(reasonText)}</small></td>
+	    <td>${hasTarget ? `<strong class="${openingPrice == null ? "negative" : ""}">開盤計價 ${money(openingPrice)}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `市價成交 ${money(executionPrice)} · 名目 ${money(entryNotional)}` : hasTarget ? `完整模型訊號已保留 · 0 股未成交` : "不需開盤計價"}</small><small>${hasTarget && !hasFill ? `${esc(reasonText)} · ` : ""}成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
 	    <td><strong>${currentLabel} ${hasPosition ? money(currentPrice) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
 	    <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : "未成交不納入"}</small></td>
     </tr>`;
@@ -1372,7 +1428,9 @@ function revisionOf(data) {
   const counts = data.record_counts || {};
   return JSON.stringify([
     data.session_date,
-    counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
+    counts.signals, counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
+    data.opening_signal_latency?.observed_mode_count,
+    data.opening_signal_latency?.final_ready_ms,
     data.session_progress,
     data.preopen?.updated_at,
     data.unattended_guardian?.observed_at_taipei,

@@ -98,6 +98,54 @@ def test_completed_session_gate_accepts_official_close_without_next_opening(
     assert failures == {}
 
 
+def test_completed_session_gate_accepts_event_verified_close(tmp_path: Path) -> None:
+    phase_root = tmp_path / "close_event"
+    phase_root.mkdir()
+    receipt = {
+        "status": "ok",
+        "phase": "close_event",
+        "started_at_taipei": "2026-09-03T13:46:30+08:00",
+        "selected_datasets": ["twse_daily_ohlcv", "tpex_daily_ohlcv"],
+        "download_summary": {
+            "end_date": "2026-09-03",
+            "daily_close_ready": True,
+            "blocking_failed_count": 0,
+            "incomplete_count": 0,
+        },
+    }
+    (phase_root / "latest.json").write_text(json.dumps(receipt), encoding="utf-8")
+
+    accepted_phase, accepted, failures = (
+        completed_session._accepted_close_publication(
+            tmp_path,
+            expected_date="2026-09-03",
+        )
+    )
+
+    assert accepted_phase == "close_event"
+    assert accepted == receipt
+    assert failures == {
+        "close_final": [
+            "status is not ok",
+            "phase is not close_final",
+            "receipt is not from the completed session date",
+            "download_summary is missing",
+        ],
+        "close_revision": [
+            "status is not ok",
+            "phase is not close_revision",
+            "receipt is not from the completed session date",
+            "download_summary is missing",
+        ],
+        "close_initial": [
+            "status is not ok",
+            "phase is not close_initial",
+            "receipt is not from the completed session date",
+            "download_summary is missing",
+        ],
+    }
+
+
 def test_completed_session_refreshes_all_causal_close_layers(tmp_path: Path) -> None:
     commands = completed_session._build_commands(
         live_root=tmp_path,
@@ -499,6 +547,158 @@ def test_source_event_registry_covers_all_official_datasets() -> None:
     assert len(rows) == 156
     assert {row["dataset"] for row in rows} == set(DEFAULT_DATASETS)
     assert {row["interval_seconds"] for row in rows} == {60.0, 300.0, 900.0}
+
+
+def test_source_event_prioritizes_five_second_close_detection() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "fast_interval_seconds": 60.0,
+            "close_probe_interval_seconds": 5.0,
+            "medium_interval_seconds": 300.0,
+            "slow_interval_seconds": 900.0,
+        },
+    )()
+    spec = DEFAULT_DATASETS["tpex_daily_ohlcv"]
+
+    assert source_events._probe_interval(
+        spec,
+        args,
+        observed=datetime(2026, 9, 3, 13, 45, tzinfo=TAIPEI),
+    ) == 5.0
+    assert source_events._probe_interval(
+        spec,
+        args,
+        observed=datetime(2026, 9, 3, 12, 45, tzinfo=TAIPEI),
+    ) == 60.0
+
+
+def test_source_event_close_probes_do_not_wait_for_full_due_batch(
+    tmp_path: Path,
+) -> None:
+    observed = datetime(2026, 9, 3, 13, 45, 10, tzinfo=TAIPEI)
+    due = [
+        DEFAULT_DATASETS["twse_daily_ohlcv"],
+        DEFAULT_DATASETS["twse_daily_valuation"],
+        DEFAULT_DATASETS["tpex_daily_ohlcv"],
+    ]
+
+    prioritized = source_events._prioritize_unpublished_close_event(
+        due,
+        state={"datasets": {}},
+        state_root=tmp_path / "events",
+        observed=observed,
+        close_probe_interval_seconds=5.0,
+    )
+
+    assert [spec.name for spec in prioritized] == [
+        "twse_daily_ohlcv",
+        "tpex_daily_ohlcv",
+    ]
+
+
+def test_source_event_close_priority_ends_after_today_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "publications" / "close_event" / "latest.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "started_at_taipei": "2026-09-03T13:46:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    due = [
+        DEFAULT_DATASETS["twse_daily_ohlcv"],
+        DEFAULT_DATASETS["twse_daily_valuation"],
+    ]
+
+    selected = source_events._prioritize_unpublished_close_event(
+        due,
+        state={"datasets": {}},
+        state_root=tmp_path / "events",
+        observed=datetime(2026, 9, 3, 13, 47, tzinfo=TAIPEI),
+        close_probe_interval_seconds=5.0,
+    )
+
+    assert selected == due
+
+
+def test_source_event_publishes_close_only_after_both_applied_sources_are_current(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    live_root = tmp_path / "live"
+    state_root = tmp_path / "events"
+    live_root.mkdir()
+    state_root.mkdir()
+    monkeypatch.setattr(
+        source_events,
+        "_latest_completed_taiex_session",
+        lambda *_args, **_kwargs: "2026-09-03",
+    )
+    close_dates = {
+        "twse_daily_ohlcv": "2026-09-03",
+        "tpex_daily_ohlcv": "2026-09-02",
+    }
+    monkeypatch.setattr(
+        source_events,
+        "_parquet_max_date",
+        lambda path: close_dates[path.stem],
+    )
+    state = {
+        "datasets": {
+            name: {
+                "observed_version": f"{name}-v1",
+                "applied_version": f"{name}-v1",
+                "last_download_status": "ok",
+                "last_checked_at_taipei": "2026-09-03T13:45:05+08:00",
+                "last_applied_at_taipei": "2026-09-03T13:45:10+08:00",
+            }
+            for name in source_events.CLOSE_EVENT_DATASETS
+        }
+    }
+    observed = datetime(2026, 9, 3, 13, 45, 10, tzinfo=TAIPEI)
+
+    pending = source_events._publish_event_close_receipt_if_ready(
+        state=state,
+        live_root=live_root,
+        state_root=state_root,
+        triggered_datasets=["twse_daily_ohlcv"],
+        observed=observed,
+    )
+    assert pending["status"] == "waiting_source"
+    assert not (tmp_path / "publications" / "close_event" / "latest.json").exists()
+
+    close_dates["tpex_daily_ohlcv"] = "2026-09-03"
+    ready = source_events._publish_event_close_receipt_if_ready(
+        state=state,
+        live_root=live_root,
+        state_root=state_root,
+        triggered_datasets=["tpex_daily_ohlcv"],
+        observed=observed,
+    )
+    receipt = json.loads(Path(ready["receipt"]).read_text(encoding="utf-8"))
+    assert ready["status"] == "ok"
+    assert receipt["phase"] == "close_event"
+    assert receipt["download_summary"]["daily_close_ready"] is True
+    assert receipt["selected_datasets"] == [
+        "tpex_daily_ohlcv",
+        "twse_daily_ohlcv",
+    ]
+
+    reused = source_events._publish_event_close_receipt_if_ready(
+        state=state,
+        live_root=live_root,
+        state_root=state_root,
+        triggered_datasets=["tpex_daily_ohlcv"],
+        observed=observed,
+    )
+    assert reused["reused"] is True
 
 
 def test_source_event_download_retries_are_more_resilient_than_fast_probes() -> None:

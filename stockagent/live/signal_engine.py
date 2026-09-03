@@ -50,6 +50,7 @@ from stockagent.live.quote_provider import (
     fetch_yahoo_last_prices,
     load_prices_csv,
     load_symbol_name_map,
+    seed_tw_opening_snapshot_cache,
 )
 from stockagent.live.report_formatter import format_signal_message, is_display_position_row
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
@@ -110,6 +111,31 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _live_panel_load_workers(configured_workers: int) -> int:
+    """Bound small-file live I/O concurrency to the CPUs visible to this process.
+
+    Training configurations describe the machines on which they were measured
+    and can legitimately request dozens of panel workers.  A Discord process
+    can run on a much smaller host, where that same value only adds scheduler,
+    decompression, and filesystem contention.  Keep an explicit low value, and
+    otherwise cap live-tail reads at half of the available logical CPUs.  The
+    environment override is an operational tuning knob and does not alter the
+    model or panel cache contract.
+    """
+
+    configured = max(0, int(configured_workers))
+    if configured <= 1:
+        return configured
+    raw_cap = str(os.getenv("STOCKAGENT_LIVE_PANEL_LOAD_WORKERS", "")).strip()
+    try:
+        override = int(raw_cap) if raw_cap else 0
+    except ValueError:
+        override = 0
+    available_cpus = max(1, int(os.cpu_count() or 1))
+    live_cap = override if override > 0 else max(1, available_cpus // 2)
+    return min(configured, live_cap)
 
 
 def clear_live_panel_memory_cache() -> None:
@@ -477,6 +503,7 @@ def _build_panel(
 ) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
+    configured_panel_load_workers = int(config.data.panel_load_workers)
     panel_kwargs = {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
@@ -485,7 +512,11 @@ def _build_panel(
         "security_filter": config.data.security_filter,
         "strict_no_fallback": config.training.strict_no_fallback,
         "panel_backend": config.data.panel_backend,
-        "panel_load_workers": config.data.panel_load_workers,
+        "panel_load_workers": (
+            _live_panel_load_workers(configured_panel_load_workers)
+            if live_tail
+            else configured_panel_load_workers
+        ),
         **external_kwargs,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
@@ -554,7 +585,7 @@ def _build_panel(
             trading_volume_policy=config.data.trading_volume_policy,
             security_filter=config.data.security_filter,
             strict_no_fallback=config.training.strict_no_fallback,
-            panel_load_workers=config.data.panel_load_workers,
+            panel_load_workers=int(panel_kwargs["panel_load_workers"]),
             **external_kwargs,
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
@@ -1376,8 +1407,9 @@ def _price_snapshot(
             raise RuntimeError("TW active-universe request is empty")
         requested_symbols = [symbols[int(idx)] for idx in indices]
         requested_fallback = np.asarray(fallback_prices, dtype=np.float64)[indices]
-        snapshot = (
-            fetch_tw_mis_opening_snapshot(
+
+        def fetch_mis_opening(*, allow_network: bool = True) -> PriceSnapshot:
+            return fetch_tw_mis_opening_snapshot(
                 requested_symbols,
                 requested_fallback,
                 parquet_root=parquet_root,
@@ -1406,9 +1438,49 @@ def _price_snapshot(
                         or "16"
                     ),
                 ),
+                allow_network=allow_network,
             )
-            if require_official_tw_session_open
-            else fetch_tw_mis_last_prices(
+
+        fallback_errors: list[str] = []
+        shared_opening: PriceSnapshot | None = None
+        if require_official_tw_session_open:
+            # The paper engine authenticates and resolves Contract V2 at 08:55.
+            # Use that already-hot session as the opening source instead of
+            # first waiting for a full MIS sweep and then logging in a second
+            # Shioaji process. Snapshot.open is accepted by the merge helper
+            # only when its exchange timestamp proves today's Taipei session.
+            cached_opening = fetch_mis_opening(allow_network=False)
+            cached_available = (
+                np.asarray(cached_opening.available_mask, dtype=bool)
+                if cached_opening.available_mask is not None
+                else np.zeros((len(requested_symbols),), dtype=bool)
+            )
+            cached_coverage = (
+                float(np.count_nonzero(cached_available)) / len(requested_symbols)
+                if requested_symbols
+                else 0.0
+            )
+            if cached_coverage >= _tw_opening_minimum_coverage():
+                snapshot = cached_opening
+            else:
+                missing_cached = np.flatnonzero(~cached_available)
+                try:
+                    shared_opening = fetch_shared_day_trade_stock_snapshots(
+                        [requested_symbols[int(idx)] for idx in missing_cached],
+                        requested_fallback[missing_cached],
+                        timeout_seconds=4.0,
+                        purpose="opening_signal",
+                    )
+                    snapshot = _merge_tw_opening_shioaji_fallback(
+                        cached_opening,
+                        shared_opening,
+                        missing_cached,
+                    )
+                except Exception as exc:
+                    fallback_errors.append(f"shared_engine_{type(exc).__name__}")
+                    snapshot = fetch_mis_opening()
+        else:
+            snapshot = fetch_tw_mis_last_prices(
                 requested_symbols,
                 requested_fallback,
                 parquet_root=parquet_root,
@@ -1417,7 +1489,6 @@ def _price_snapshot(
                 max_parallel_requests=16 if force_fresh else None,
                 request_timeout_seconds=1.5 if force_fresh else None,
             )
-        )
         observed_mask = (
             np.asarray(snapshot.available_mask, dtype=bool)
             if snapshot.available_mask is not None
@@ -1435,18 +1506,46 @@ def _price_snapshot(
             else 0.0
         )
         minimum_coverage = _tw_opening_minimum_coverage()
+        if (
+            require_official_tw_session_open
+            and shared_opening is not None
+            and source_coverage < minimum_coverage
+        ):
+            # A partial broker response is not enough. Query the independent
+            # official MIS source only on this degraded path. Seed only the
+            # already timestamp-validated broker rows; the opening-cache layer
+            # then requests unresolved symbols and returns the aligned union.
+            seed_tw_opening_snapshot_cache(
+                requested_symbols,
+                snapshot,
+                parquet_root=parquet_root,
+            )
+            snapshot = fetch_mis_opening()
+            observed_mask = np.asarray(snapshot.available_mask, dtype=bool)
+            source_coverage = (
+                float(np.count_nonzero(observed_mask)) / len(requested_symbols)
+                if requested_symbols
+                else 0.0
+            )
         if source_coverage < minimum_coverage:
             missing = np.flatnonzero(~observed_mask)
-            fallback_errors: list[str] = []
-            if force_fresh:
+            if force_fresh and not require_official_tw_session_open:
                 try:
                     # Reuse the already healthy simulation-only Shioaji session
-                    # owned by the paper engine.  Opening another Discord-process
-                    # login wastes a scarce account connection and was the reason
-                    # /signal_now could not take over when MIS was unavailable.
+                    # owned and contract-warmed by the paper engine. Opening a
+                    # Discord-process login at 09:00 adds authentication latency
+                    # and consumes a scarce account connection.
                     shared_backup = fetch_shared_day_trade_stock_snapshots(
                         [requested_symbols[int(idx)] for idx in missing],
                         requested_fallback[missing],
+                        timeout_seconds=(
+                            4.0 if require_official_tw_session_open else None
+                        ),
+                        purpose=(
+                            "opening_signal"
+                            if require_official_tw_session_open
+                            else "latest_quote"
+                        ),
                     )
                     snapshot = _merge_tw_opening_shioaji_fallback(
                         snapshot,
@@ -1484,11 +1583,11 @@ def _price_snapshot(
                     )
             except Exception as exc:
                 fallback_errors.append(f"direct_shioaji_{type(exc).__name__}")
-            if fallback_errors:
-                snapshot.source = (
-                    f"{snapshot.source}+fallback_unavailable_"
-                    + "_".join(fallback_errors)
-                )
+        if fallback_errors:
+            snapshot.source = (
+                f"{snapshot.source}+fallback_unavailable_"
+                + "_".join(fallback_errors)
+            )
         if snapshot.available_count <= 0:
             if require_official_tw_session_open:
                 return snapshot
@@ -1500,6 +1599,12 @@ def _price_snapshot(
                 ),
                 available_count=0,
                 available_mask=np.zeros((len(symbols),), dtype=bool),
+            )
+        if require_official_tw_session_open:
+            seed_tw_opening_snapshot_cache(
+                requested_symbols,
+                snapshot,
+                parquet_root=parquet_root,
             )
         if indices.size != len(symbols):
             size = len(symbols)

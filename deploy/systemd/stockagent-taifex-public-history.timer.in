@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh TAIFEX public positioning history after official daily files
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 17:30:00 Asia/Taipei
+Persistent=true
+RandomizedDelaySec=10m
+Unit=stockagent-taifex-public-history.service
+
+[Install]
+WantedBy=timers.target

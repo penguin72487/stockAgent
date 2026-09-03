@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 import sys
 
@@ -45,25 +45,47 @@ def parse_args() -> argparse.Namespace:
             "No eligibility row is fabricated, so day-trade execution fails closed."
         ),
     )
+    parser.add_argument(
+        "--incremental-tail-days",
+        type=int,
+        default=0,
+        help=(
+            "Rebuild only this many trailing calendar days and stream-copy the "
+            "receipt-verified older output. Requires --end-date; an absent or "
+            "incompatible prior output automatically falls back to a full build."
+        ),
+    )
     parser.add_argument("--summary-path", default=None, help="Optional JSON summary path.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if int(args.incremental_tail_days) < 0:
+        raise ValueError("--incremental-tail-days must be non-negative")
+    end_date = date.fromisoformat(args.end_date) if args.end_date else None
+    if int(args.incremental_tail_days) and end_date is None:
+        raise ValueError("--incremental-tail-days requires --end-date")
+    incremental_start_date = (
+        end_date - timedelta(days=int(args.incremental_tail_days) - 1)
+        if end_date is not None and int(args.incremental_tail_days)
+        else None
+    )
     result = build_tw_public_training_features(
         input_dir=Path(args.input_dir),
         output_path=Path(args.output_path),
         symbols_root=Path(args.symbols_root) if args.symbols_root else None,
         market_symbol=str(args.market_symbol),
         summary_path=Path(args.summary_path) if args.summary_path else None,
-        end_date=date.fromisoformat(args.end_date) if args.end_date else None,
+        end_date=end_date,
         allow_daily_publication_lag=bool(args.allow_daily_publication_lag),
+        incremental_start_date=incremental_start_date,
     )
     print(
         "[tw-public-features] "
         f"rows={result.rows} stock_rows={result.stock_rows} market_rows={result.market_rows} "
-        f"features={result.feature_count} output={result.output_path}"
+        f"features={result.feature_count} mode={result.build_mode} "
+        f"reused_rows={result.reused_rows} output={result.output_path}"
     )
 
 

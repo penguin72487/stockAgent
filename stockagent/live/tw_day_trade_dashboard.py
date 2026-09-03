@@ -14,6 +14,12 @@ import threading
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
+from stockagent.live.benchmark_accounting import (
+    DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+    TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+    fully_collateralized_futures_notional,
+    previous_close_return,
+)
 from stockagent.live.tw_day_trade_service_sync import (
     DISCORD_SERVICE_STATUS_FILENAME,
     age_seconds,
@@ -54,6 +60,10 @@ _SESSION_TAIL_CACHE: dict[
     tuple[Path, int, str, bool], tuple[int, int, int, int, list[dict[str, Any]]]
 ] = {}
 _SESSION_TAIL_CACHE_LOCK = threading.Lock()
+_LATEST_SESSION_BLOCK_CACHE: dict[
+    tuple[Path, int, str], tuple[int, int, int, int, list[dict[str, Any]]]
+] = {}
+_LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
     tuple[int, int, int, int], list[dict[str, Any]]
 ] = {}
@@ -784,6 +794,96 @@ def _tail_for_session(
     return list(result)
 
 
+def _latest_contiguous_session_rows(
+    path: Path,
+    session_date: str,
+    maximum_rows: int,
+) -> list[dict[str, Any]]:
+    """Read the newest session block without indexing the complete ledger.
+
+    The active session is append-only and occupies the tail of each canonical
+    ledger.  On a cold dashboard process, indexing a multi-GiB signal history
+    before reading that tail adds seconds without changing the answer.  This
+    fast path is used only when the requested date is also present in current
+    engine state; arbitrary historical dates continue through the full byte-
+    span index.
+    """
+
+    if maximum_rows <= 0 or not path.is_file():
+        return []
+    stat = path.stat()
+    cache_key = (path.resolve(), int(maximum_rows), str(session_date))
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    with _LATEST_SESSION_BLOCK_CACHE_LOCK:
+        cached = _LATEST_SESSION_BLOCK_CACHE.get(cache_key)
+        if cached and cached[:4] == signature:
+            return list(cached[4])
+
+    newest_first: list[dict[str, Any]] = []
+    found = False
+    finished = False
+    with path.open("rb") as handle:
+        cursor = handle.seek(0, 2)
+        remainder = b""
+        while cursor > 0 and not finished and len(newest_first) < maximum_rows:
+            chunk_size = min(1 << 20, cursor)
+            cursor -= chunk_size
+            handle.seek(cursor)
+            data = handle.read(chunk_size) + remainder
+            lines = data.split(b"\n")
+            remainder = lines[0]
+            for line in reversed(lines[1:]):
+                if not line.strip():
+                    continue
+                if len(line) > _MAX_LEDGER_LINE_BYTES:
+                    raise ValueError(f"dashboard ledger line is too large: {path}")
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    continue
+                row_date = _ledger_row_session_date(
+                    payload,
+                    recorded_at_fallback=False,
+                )
+                if row_date == session_date:
+                    found = True
+                    newest_first.append(payload)
+                    if len(newest_first) >= maximum_rows:
+                        break
+                elif found:
+                    finished = True
+                    break
+        if (
+            cursor == 0
+            and not finished
+            and remainder.strip()
+            and len(newest_first) < maximum_rows
+        ):
+            payload = json.loads(remainder)
+            if isinstance(payload, dict):
+                row_date = _ledger_row_session_date(
+                    payload,
+                    recorded_at_fallback=False,
+                )
+                if row_date == session_date:
+                    newest_first.append(payload)
+
+    result = list(reversed(newest_first))
+    final_stat = path.stat()
+    if (
+        final_stat.st_dev,
+        final_stat.st_ino,
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+    ) == signature:
+        with _LATEST_SESSION_BLOCK_CACHE_LOCK:
+            if len(_LATEST_SESSION_BLOCK_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
+                _LATEST_SESSION_BLOCK_CACHE.pop(
+                    next(iter(_LATEST_SESSION_BLOCK_CACHE))
+                )
+            _LATEST_SESSION_BLOCK_CACHE[cache_key] = (*signature, result)
+    return list(result)
+
+
 def _percentile(values: list[float], quantile: float) -> float | None:
     finite = sorted(value for value in values if math.isfinite(value))
     if not finite:
@@ -854,6 +954,127 @@ def _latency_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _opening_signal_latency_summary(
+    rows: list[dict[str, Any]],
+    *,
+    expected_markets: list[str],
+    session_date: str,
+) -> dict[str, Any]:
+    """Summarize the actual 09:00 trigger-to-signal-ready boundary by day."""
+
+    expected = sorted({str(value) for value in expected_markets if str(value)})
+    by_session: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        if str(row.get("result") or "") != "registered":
+            continue
+        market = str(row.get("market") or "")
+        if expected and market not in expected:
+            continue
+        try:
+            started = _timestamp(row.get("signal_started_at"))
+            ready = _timestamp(row.get("signal_ready_at"))
+        except (TypeError, ValueError):
+            continue
+        local_started = started.astimezone(TAIPEI)
+        row_session = str(row.get("session_date") or local_started.date().isoformat())
+        try:
+            gate = datetime.fromisoformat(f"{row_session}T09:00:00+08:00").astimezone(
+                timezone.utc
+            )
+        except ValueError:
+            continue
+        # Opening automation is a narrow event. Exclude later interactive
+        # /signal_now calculations and replay jobs from its trend.
+        queue_ms = (started - gate).total_seconds() * 1000.0
+        ready_ms = (ready - gate).total_seconds() * 1000.0
+        if queue_ms < -1_000.0 or queue_ms > 60_000.0 or ready_ms < 0.0:
+            continue
+        candidate = {
+            "market": market,
+            "signal_id": row.get("signal_id"),
+            "started_at": row.get("signal_started_at"),
+            "ready_at": row.get("signal_ready_at"),
+            "queue_ms": round(queue_ms, 3),
+            "compute_ms": round(max(0.0, (ready - started).total_seconds() * 1000.0), 3),
+            "ready_from_0900_ms": round(ready_ms, 3),
+        }
+        existing = by_session.setdefault(row_session, {}).get(market)
+        if existing is None or float(candidate["ready_from_0900_ms"]) < float(
+            existing["ready_from_0900_ms"]
+        ):
+            by_session[row_session][market] = candidate
+
+    trend: list[dict[str, Any]] = []
+    for day, modes_by_market in sorted(by_session.items()):
+        mode_rows = [modes_by_market[key] for key in sorted(modes_by_market)]
+        ready_values = [float(row["ready_from_0900_ms"]) for row in mode_rows]
+        observed = sorted(modes_by_market)
+        trend.append(
+            {
+                "session_date": day,
+                "observed_mode_count": len(observed),
+                "observed_markets": observed,
+                "expected_mode_count": len(expected),
+                "complete": bool(expected) and observed == expected,
+                "missing_markets": sorted(set(expected) - set(observed)),
+                "first_ready_ms": round(min(ready_values), 3) if ready_values else None,
+                "final_ready_ms": round(max(ready_values), 3) if ready_values else None,
+                "modes": mode_rows,
+            }
+        )
+    current = next(
+        (dict(row) for row in reversed(trend) if row["session_date"] == session_date),
+        {
+            "session_date": session_date,
+            "observed_mode_count": 0,
+            "observed_markets": [],
+            "expected_mode_count": len(expected),
+            "complete": False,
+            "missing_markets": expected,
+            "first_ready_ms": None,
+            "final_ready_ms": None,
+            "modes": [],
+        },
+    )
+    current_markets = current.get("observed_markets") or []
+    previous = next(
+        (
+            row
+            for row in reversed(trend)
+            if row["session_date"] < session_date
+            and row.get("final_ready_ms") is not None
+            # Aggregate latency is comparable only when the same modes ran.
+            # Otherwise a faster value can merely mean fewer models existed.
+            and (row.get("observed_markets") or []) == current_markets
+        ),
+        None,
+    )
+    current_final = _finite_float(current.get("final_ready_ms"))
+    previous_final = _finite_float((previous or {}).get("final_ready_ms"))
+    change_ms = (
+        round(current_final - previous_final, 3)
+        if current_final is not None and previous_final is not None
+        else None
+    )
+    current.update(
+        {
+            "schema_version": 1,
+            "measurement_boundary": "09:00_trigger_to_immutable_signal_ready",
+            "slo_ms": 15_000.0,
+            "slo_met": bool(current.get("complete"))
+            and current_final is not None
+            and current_final <= 15_000.0,
+            "previous_session_date": (previous or {}).get("session_date"),
+            "previous_final_ready_ms": previous_final,
+            "change_vs_previous_ms": change_ms,
+            "improved_vs_previous": change_ms is not None and change_ms < 0.0,
+            "trend": trend[-12:],
+            "simulation_only": True,
+        }
+    )
+    return current
+
+
 def _line_count(path: Path) -> int:
     if not path.is_file():
         return 0
@@ -917,7 +1138,7 @@ def _load_benchmark_history(root: Path) -> dict[str, Any]:
         payload = _object(path)
     except (OSError, json.JSONDecodeError, ValueError):
         return {"load_error": "benchmark_history_unavailable"}
-    if int(payload.get("schema_version") or 0) != 1:
+    if int(payload.get("schema_version") or 0) not in {1, 2}:
         return {"load_error": "benchmark_history_schema_unsupported"}
     return payload
 
@@ -1005,19 +1226,54 @@ def _benchmark_history_index(root: Path) -> _BenchmarkHistoryIndex:
     raise OSError("benchmark history changed repeatedly while indexing")
 
 
+def _previous_benchmark_close(
+    history: _BenchmarkHistoryIndex,
+    *,
+    benchmark_id: str,
+    session_date: str,
+    contract_code: str | None = None,
+) -> Mapping[str, Any] | None:
+    """Find the latest completed retained mark before a selected session."""
+
+    wanted_contract = str(contract_code or "").strip().upper()
+    for day in sorted(history.marks_by_session, reverse=True):
+        if day >= session_date:
+            continue
+        rows = history.marks_by_session[day]
+        for row in reversed(rows):
+            if str(row.get("benchmark_id") or "") != benchmark_id:
+                continue
+            if wanted_contract and str(row.get("contract_code") or "").upper() != wanted_contract:
+                continue
+            price = _finite_float(row.get("last_mark_price"))
+            if price is not None and price > 0.0:
+                return row
+    return None
+
+
 def _rebase_live_benchmark(
     source: Mapping[str, Any],
     origin: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Re-anchor a live benchmark mark to the retained actual-open origin.
+    """Re-anchor a live Buy-and-Hold mark to its retained prior-close origin.
 
     The live engine remains untouched while positions are open.  This display
-    projection adds the gross price move that happened before the live
-    benchmark process started and replaces only its initial entry costs.  Roll
-    PnL and all later fees/taxes stay exactly as recorded by the live ledger.
+    Schema 2 chain-links gross wealth at the live-process boundary. The legacy
+    price-offset projection remains below only for schema-1 history files.
     """
 
     row = dict(source)
+    if origin and int(origin.get("benchmark_accounting_contract_version") or 0) >= 2:
+        for key in (
+            "benchmark_accounting_contract_version",
+            "holding_period",
+            "daily_return_basis",
+            "capital_basis",
+            "maximum_leverage",
+            "tracking_costs_excluded_from_return",
+        ):
+            if key in origin:
+                row[key] = origin[key]
     if (
         str(row.get("instrument_type") or "").startswith("stock")
         and str(row.get("valuation_source") or "").startswith(
@@ -1073,6 +1329,43 @@ def _rebase_live_benchmark(
 
     canonical_entry = _finite_float(origin.get("entry_price"))
     canonical_capital = _finite_float(origin.get("initial_capital_twd"))
+    canonical_wealth_at_live = _finite_float(
+        origin.get("canonical_buy_hold_wealth_at_live_origin")
+    )
+    live_wealth = _finite_float(row.get("buy_hold_wealth_index"))
+    if (
+        canonical_entry is not None
+        and canonical_capital is not None
+        and canonical_capital > 0.0
+        and canonical_wealth_at_live is not None
+        and canonical_wealth_at_live > 0.0
+        and live_wealth is not None
+        and live_wealth > 0.0
+    ):
+        wealth = canonical_wealth_at_live * live_wealth
+        performance_pnl = canonical_capital * (wealth - 1.0)
+        row.update(
+            {
+                "entry_at": origin.get("entry_at"),
+                "entry_price": canonical_entry,
+                "initial_capital_twd": canonical_capital,
+                "buy_hold_wealth_index": wealth,
+                "performance_pnl_twd": performance_pnl,
+                "gross_pnl_twd": performance_pnl,
+                "net_pnl_twd": performance_pnl,
+                "total_equity_twd": canonical_capital * wealth,
+                "return_fraction": wealth - 1.0,
+                "return_pct": (wealth - 1.0) * 100.0,
+                "benchmark_origin_rebased": True,
+                "benchmark_origin_session_date": origin.get("session_date"),
+                "counterfactual_open_replay": False,
+                "replay_basis": "cross_session_buy_and_hold_from_previous_close",
+                "valuation_source": (
+                    "retained_prior_close_buy_hold_history_plus_live_wealth"
+                ),
+            }
+        )
+        return row
     raw_net = _finite_float(row.get("net_pnl_twd"))
     gross_multiplier = _finite_float(origin.get("gross_pnl_multiplier"))
     if (
@@ -1161,6 +1454,9 @@ def _rebase_live_benchmark(
     current_transaction_tax = _finite_float(row.get("transaction_tax_twd")) or 0.0
     total_equity = canonical_capital + net_pnl
     return_fraction, return_pct = _capital_return(canonical_capital, total_equity)
+    prior_close_origin = int(
+        origin.get("benchmark_accounting_contract_version") or 0
+    ) >= 2
     row.update(
         {
             "entry_at": origin.get("entry_at"),
@@ -1178,11 +1474,19 @@ def _rebase_live_benchmark(
             "return_pct": return_pct,
             "benchmark_origin_rebased": True,
             "benchmark_origin_session_date": origin.get("session_date"),
-            "counterfactual_open_replay": True,
-            "replay_basis": "actual_session_open_to_recorded_executable_marks",
+            "counterfactual_open_replay": not prior_close_origin,
+            "replay_basis": (
+                "cross_session_buy_and_hold_from_previous_close"
+                if prior_close_origin
+                else "actual_session_open_to_recorded_executable_marks"
+            ),
             "valuation_source": (
                 f"{row.get('valuation_source') or 'recorded_executable_mark'}"
-                "+rebased_to_actual_session_open"
+                + (
+                    "+rebased_to_previous_close_buy_hold_origin"
+                    if prior_close_origin
+                    else "+rebased_to_actual_session_open"
+                )
             ),
         }
     )
@@ -1513,11 +1817,6 @@ def _operational_issues(
             "可成交深度不可用",
             "沒有足夠的可驗證深度，未宣稱成交。",
         ),
-        "below_one_board_lot": (
-            "warning",
-            "訊號不足一張",
-            "整股當沖最小單位為一張；目標股數不足時保持空倉。",
-        ),
     }
     for mode in modes:
         market = str(mode.get("market") or "") or None
@@ -1562,6 +1861,10 @@ def _operational_issues(
             )
         reasons = mode.get("signal_reason_counts")
         reasons = dict(reasons) if isinstance(reasons, Mapping) else {}
+        # ``below_one_board_lot`` is an expected capital/lot conversion result,
+        # not a service incident.  Its complete model row remains visible in
+        # the signal table and execution audit instead of occupying the global
+        # operational-warning surface.
         for reason, count in reasons.items():
             presentation = reason_messages.get(str(reason))
             if presentation is None or not int(count or 0):
@@ -1594,6 +1897,7 @@ def _available_session_dates(
     state: Mapping[str, Any],
     observed: datetime,
     include_ledger_dates: bool = True,
+    include_benchmark_history_dates: bool = True,
 ) -> list[str]:
     root = Path(root)
     mode_dates = tuple(
@@ -1618,7 +1922,7 @@ def _available_session_dates(
             if include_ledger_dates
             else ()
         ),
-        BENCHMARK_HISTORY_FILENAME,
+        *((BENCHMARK_HISTORY_FILENAME,) if include_benchmark_history_dates else ()),
     )
 
     def signature(path: Path) -> tuple[int, int, int, int] | None:
@@ -1669,8 +1973,9 @@ def _available_session_dates(
             )
             if index is not None:
                 dates.update(index.spans)
-    benchmark_history = _benchmark_history_index(root)
-    dates.update(benchmark_history.marks_by_session)
+    if include_benchmark_history_dates:
+        benchmark_history = _benchmark_history_index(root)
+        dates.update(benchmark_history.marks_by_session)
     for raw_date in position_history_dates:
         try:
             datetime_date.fromisoformat(raw_date)
@@ -2813,6 +3118,7 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "signal_id",
         "signal_at",
         "source_signal_at",
+        "open_reconstructed_at",
         "symbol",
         "name",
         "side",
@@ -2868,6 +3174,12 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "counterfactual_open_replay",
     )
     row = {key: position.get(key) for key in allowed if key in position}
+    if bool(position.get("counterfactual_open_replay")):
+        row["open_reconstructed_at"] = (
+            position.get("open_reconstructed_at")
+            or position.get("entry_at")
+            or position.get("signal_at")
+        )
     signed_shares = int(position.get("signed_shares") or 0)
     realized = _finite_float(position.get("realized_net_pnl_twd"))
     if realized is None and signed_shares == 0:
@@ -3073,6 +3385,14 @@ def build_dashboard_snapshot(
                 "signal_id": mode.get("signal_id"),
                 "signal_at": mode.get("signal_at"),
                 "source_signal_at": mode.get("source_signal_at"),
+                "open_reconstructed_at": (
+                    (
+                        mode.get("open_reconstructed_at")
+                        or mode.get("signal_at")
+                    )
+                    if bool(mode.get("counterfactual_open_replay", False))
+                    else None
+                ),
                 "feature_cutoff_date": mode.get("feature_cutoff_date"),
                 "signal_counts": mode.get("signal_counts") or {},
                 "signal_reason_counts": mode.get("signal_reason_counts") or {},
@@ -3134,10 +3454,94 @@ def build_dashboard_snapshot(
     for benchmark_id, raw_benchmark in (state.get("benchmarks") or {}).items():
         if not isinstance(raw_benchmark, Mapping):
             continue
+        benchmark_origin = benchmark_origins.get(str(benchmark_id))
         benchmark = _rebase_live_benchmark(
             raw_benchmark,
-            benchmark_origins.get(str(benchmark_id)),
+            benchmark_origin,
         )
+        if _finite_float(benchmark.get("daily_return_pct")) is None:
+            is_tx = str(benchmark.get("instrument_type") or "") == (
+                "continuous_long_future"
+            )
+            retained_close = _previous_benchmark_close(
+                benchmark_history,
+                benchmark_id=str(benchmark_id),
+                session_date=selected_session_date,
+                contract_code=(
+                    str(benchmark.get("contract_code") or "") if is_tx else None
+                ),
+            )
+            if is_tx:
+                origin_contract = str(
+                    (benchmark_origin or {}).get("latest_completed_contract_code")
+                    or ""
+                ).upper()
+                current_contract = str(benchmark.get("contract_code") or "").upper()
+                origin_close_date = str(
+                    (benchmark_origin or {}).get("latest_completed_close_date") or ""
+                )
+                use_origin_close = (
+                    origin_contract == current_contract
+                    and bool(origin_close_date)
+                    and origin_close_date < selected_session_date
+                )
+                daily_reference = (
+                    _finite_float((benchmark_origin or {}).get("latest_completed_close"))
+                    if use_origin_close
+                    else _finite_float((retained_close or {}).get("last_mark_price"))
+                )
+                previous_close_source = str(
+                    (benchmark_origin or {}).get("latest_completed_close_source")
+                    if use_origin_close
+                    else "retained_receipt_backed_same_contract_close"
+                )
+            else:
+                daily_reference = _finite_float(
+                    benchmark.get("current_session_reference_price")
+                ) or _finite_float((retained_close or {}).get("last_mark_price"))
+                previous_close_source = str(
+                    benchmark.get("previous_official_close_source")
+                    or "retained_official_total_return_close"
+                )
+            daily_fraction, daily_pct = previous_close_return(
+                benchmark.get("last_mark_price"),
+                daily_reference,
+            )
+            benchmark.update(
+                {
+                    "daily_return_fraction": daily_fraction,
+                    "daily_return_pct": daily_pct,
+                    "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+                    "daily_return_reference_price": daily_reference,
+                    "daily_return_previous_close": daily_reference,
+                    "daily_return_previous_close_date": (
+                        (
+                            origin_close_date
+                            if is_tx and use_origin_close
+                            else (retained_close or {}).get("session_date")
+                        )
+                        or benchmark.get("previous_official_close_date")
+                    ),
+                    "daily_return_previous_close_source": previous_close_source,
+                }
+            )
+        if str(benchmark.get("instrument_type") or "") == "continuous_long_future":
+            current_notional = fully_collateralized_futures_notional(
+                benchmark.get("last_mark_price"),
+                benchmark.get("multiplier_twd_per_point") or 200.0,
+            )
+            benchmark.update(
+                {
+                    "capital_basis": TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+                    "current_contract_notional_twd": current_notional,
+                    "fully_collateralized_account_equity_twd": current_notional,
+                    "collateral_coverage_ratio": (
+                        1.0 if current_notional is not None else None
+                    ),
+                    "maximum_leverage": 1.0,
+                    "tracking_costs_excluded_from_return": True,
+                }
+            )
         return_fraction, return_pct = _capital_return(
             benchmark.get("initial_capital_twd"), benchmark.get("total_equity_twd")
         )
@@ -3226,6 +3630,7 @@ def build_dashboard_snapshot(
         selected_session_date,
         recorded_at_fallback=True,
     )
+    all_latency_rows = _tail(root / "latency.jsonl", 2_000)
     latency_rows = _tail_for_session(
         root / "latency.jsonl",
         min(maximum_event_rows, 2_000),
@@ -3246,6 +3651,11 @@ def build_dashboard_snapshot(
     )
     today_latency = _latency_summary(today_latency_rows)
     today_latency["session_date"] = today_session_date
+    opening_signal_latency = _opening_signal_latency_summary(
+        all_latency_rows,
+        expected_markets=[str(row.get("market") or "") for row in modes],
+        session_date=today_session_date,
+    )
 
     if not current_view:
         latest_marks = {
@@ -3342,6 +3752,14 @@ def build_dashboard_snapshot(
             mode["replay_basis"] = (signal_event or {}).get("replay_basis")
             mode["counterfactual_open_replay"] = bool(
                 (signal_event or {}).get("counterfactual_open_replay", False)
+            )
+            mode["open_reconstructed_at"] = (
+                (
+                    (signal_event or {}).get("open_reconstructed_at")
+                    or (signal_event or {}).get("recorded_at")
+                )
+                if mode["counterfactual_open_replay"]
+                else None
             )
             mode["position_count"] = selected_positions_by_market.get(market, 0)
             mode["exit_limit_submitted_at"] = next(
@@ -3533,6 +3951,7 @@ def build_dashboard_snapshot(
         "execution_records": execution_records,
         "latency": latency,
         "today_latency": today_latency,
+        "opening_signal_latency": opening_signal_latency,
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
@@ -3569,10 +3988,10 @@ def build_dashboard_snapshot(
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
             "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
-            "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
-            "benchmarks": "0050/2330 are total-return reference curves anchored to each official session open. Completed-session corporate actions are applied exactly once; minute valuation uses the receipt-backed observed last trade and explicitly carries only the last observation when a minute has no trade, without interpolation. TXFR1 holds one front-month TX reference contract: it enters at the first receipt-backed 08:45 ask and values at the observed best bid attached to retained book/tick evidence, carrying only a prior observed quote when necessary. This is counterfactual reference valuation, not an exchange fill guarantee. Before expiry it rolls only when the old bid and new ask coexist; after expiry it uses official TAIFEX final settlement for the old month and opens the new month at ask. Calendar spread is never booked as return; fees and statutory futures tax remain explicit",
+            "comparison": "strategies retain their own execution-capital returns; all three market benchmarks are separate gross cross-session Buy-and-Hold comparators. Their displayed daily return is current value divided by the preceding session close. TX holds one fully collateralized contract with cash equal to 100% of notional, so leverage never exceeds 1x",
+            "benchmarks": "0050/2330 use a one-board-lot total-return Buy-and-Hold curve from the preceding official close; official ex-date factors are applied exactly once. TXFR1 chain-links one front-month TX contract, marks each day against the same physical contract's preceding close, and treats the price-level difference at a roll as an external cash top-up or withdrawal rather than return. Minute history uses receipt-backed observations and explicitly carries only a prior observation when a minute has no trade, without interpolation. Fees and tax are disclosed as estimated tracking costs but excluded from gross benchmark return",
             "benchmark_history": (
-                "audited actual-open benchmark history is merged read-only with later live executable marks"
+                "audited prior-close Buy-and-Hold benchmark history is merged read-only with later live marks"
                 if benchmark_history.origins
                 else benchmark_history.load_error
                 or "live benchmark marks only; no historical origin file"
@@ -3618,11 +4037,33 @@ def build_dashboard_signal_page(
             if isinstance(raw_mode, Mapping)
         )
     )
+    current_state_dates = sorted(
+        {
+            str(raw_mode.get("session_date") or "")[:10]
+            for raw_mode in (state.get("modes") or {}).values()
+            if isinstance(raw_mode, Mapping) and raw_mode.get("session_date")
+        }
+    )
+    latest_state_date = current_state_dates[-1] if current_state_dates else None
+    requested_single_date = (
+        str(start_date)
+        if start_date and end_date and str(start_date) == str(end_date)
+        else str(session_date)
+        if session_date
+        else None
+    )
+    use_latest_session_fast_path = bool(
+        requested_single_date
+        and latest_state_date
+        and requested_single_date == latest_state_date
+    )
     observed = datetime.now(timezone.utc)
     available_session_dates = _available_session_dates(
         root=root,
         state=state,
         observed=observed,
+        include_ledger_dates=not use_latest_session_fast_path,
+        include_benchmark_history_dates=not use_latest_session_fast_path,
     )
     selected_start_date, selected_end_date, selected_session_dates = (
         _select_session_range(
@@ -3655,11 +4096,25 @@ def build_dashboard_signal_page(
         cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
         if cached_page is not None:
             return dict(cached_page)
-    rows_by_session = _rows_for_sessions(
-        signal_path,
-        selected_session_dates,
-        maximum_scan_rows,
-    )
+    if (
+        use_latest_session_fast_path
+        and selected_session_dates == [requested_single_date]
+    ):
+        rows_by_session = {
+            requested_single_date: tuple(
+                _latest_contiguous_session_rows(
+                    signal_path,
+                    requested_single_date,
+                    maximum_scan_rows,
+                )
+            )
+        }
+    else:
+        rows_by_session = _rows_for_sessions(
+            signal_path,
+            selected_session_dates,
+            maximum_scan_rows,
+        )
     current_rows = [
         row
         for selected_date in selected_session_dates
@@ -3763,12 +4218,12 @@ def build_dashboard_signal_page(
     opening_execution_audit: dict[str, dict[str, Any]] = {}
     for row in summary_rows:
         target = _finite_float(row.get("target_weight")) or 0.0
-        if target == 0.0:
-            continue
         market = str(row.get("market") or "unknown")
         audit = opening_execution_audit.setdefault(
             market,
             {
+                "model_signal_row_count": 0,
+                "zero_target_row_count": 0,
                 "nonzero_signal_count": 0,
                 "opening_price_covered_count": 0,
                 "opening_price_missing_count": 0,
@@ -3776,10 +4231,15 @@ def build_dashboard_signal_page(
                 "requested_signal_count": 0,
                 "filled_signal_count": 0,
                 "unfilled_signal_count": 0,
+                "below_one_board_lot_count": 0,
                 "missing_open_symbols": [],
                 "unfilled_reason_counts": {},
             },
         )
+        audit["model_signal_row_count"] += 1
+        if target == 0.0:
+            audit["zero_target_row_count"] += 1
+            continue
         audit["nonzero_signal_count"] += 1
         sizing_open = _finite_float(row.get("sizing_open_price"))
         if sizing_open is not None and sizing_open > 0.0:
@@ -3799,10 +4259,29 @@ def build_dashboard_signal_page(
         else:
             audit["unfilled_signal_count"] += 1
             reason = str(row.get("reason") or row.get("status") or "unknown")
+            if reason == "below_one_board_lot":
+                audit["below_one_board_lot_count"] += 1
             reason_counts = audit["unfilled_reason_counts"]
             reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
 
-    for audit in opening_execution_audit.values():
+    single_selected_date = (
+        selected_session_dates[0] if len(selected_session_dates) == 1 else None
+    )
+    for market, audit in opening_execution_audit.items():
+        raw_mode = (state.get("modes") or {}).get(market)
+        expected_rows = None
+        if (
+            single_selected_date
+            and isinstance(raw_mode, Mapping)
+            and str(raw_mode.get("session_date") or "") == single_selected_date
+        ):
+            expected_rows = int(raw_mode.get("target_symbol_count") or 0) or None
+        audit["expected_model_signal_row_count"] = expected_rows
+        audit["model_signal_rows_complete"] = (
+            int(audit["model_signal_row_count"]) == expected_rows
+            if expected_rows is not None
+            else None
+        )
         audit["unfilled_reason_counts"] = dict(
             sorted(
                 audit["unfilled_reason_counts"].items(),
@@ -3810,7 +4289,14 @@ def build_dashboard_signal_page(
             )
         )
 
-    page = filtered[offset : offset + limit]
+    page: list[dict[str, Any]] = []
+    for source_row in filtered[offset : offset + limit]:
+        row = dict(source_row)
+        if bool(row.get("counterfactual_open_replay")):
+            row["open_reconstructed_at"] = (
+                row.get("open_reconstructed_at") or row.get("signal_at")
+            )
+        page.append(row)
     feature_drivers_by_signal = _lookup_signal_feature_drivers(
         state_dir=root,
         state=state,
@@ -3834,7 +4320,7 @@ def build_dashboard_signal_page(
         "record_count": _line_count(root / "signals.jsonl"),
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,
-        "opening_execution_audit_scope": "nonzero_target_rows_in_current_signal_id_per_mode",
+        "opening_execution_audit_scope": "complete_current_signal_rows_per_mode",
         "opening_execution_audit": opening_execution_audit,
         "feature_drivers_scope": "all_feature_drivers_if_available_else_top_feature_drivers",
         "feature_drivers_by_signal": feature_drivers_by_signal,

@@ -246,6 +246,7 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                     "symbol": "2330",
                     "bid": float("nan"),
                     "sizing_open_price": 100.0,
+                    "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
                 }
             ],
             "opening_execution_audit": {
@@ -265,7 +266,14 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                 "opening_price_covered_count": 1,
             }
         },
-        "rows": [{"symbol": "2330", "bid": None, "sizing_open_price": 100.0}],
+        "rows": [
+            {
+                "symbol": "2330",
+                "bid": None,
+                "sizing_open_price": 100.0,
+                "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
+            }
+        ],
     }
     assert "private_runtime_state" not in public
     json.dumps(public, allow_nan=False)
@@ -708,7 +716,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="detail-end-date" type="date"' in tw_html
     assert 'id="equity-start-date"' not in tw_html
     assert "rangeSummaryFor" in tw_javascript
-    assert "舊約 bid 與新約 ask 必須同時存在" in tw_javascript
+    assert "換月價差只補入／提回現金" in tw_javascript
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
     assert ".overview-kpis{grid-template-columns:repeat(6,minmax(0,1fr))}" in tw_styles
