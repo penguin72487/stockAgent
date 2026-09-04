@@ -250,7 +250,7 @@ def _live_panel_cache_key(
     semantic_panel_kwargs = {
         key: value
         for key, value in panel_kwargs.items()
-        if key not in {"panel_load_workers", "panel_start_date"}
+        if key not in {"panel_load_workers", "panel_start_date", "panel_cache_root"}
     }
     digest.update(repr(sorted(semantic_panel_kwargs.items())).encode("utf-8"))
     root = Path(config.data.parquet_root)
@@ -319,7 +319,7 @@ def _live_panel_disk_backend_key(
     semantic_panel_kwargs = {
         key: value
         for key, value in panel_kwargs.items()
-        if key not in {"panel_load_workers", "panel_start_date"}
+        if key not in {"panel_load_workers", "panel_start_date", "panel_cache_root"}
     }
     payload = {
         "schema_version": 1,
@@ -517,6 +517,7 @@ def _build_panel(
             if live_tail
             else configured_panel_load_workers
         ),
+        "panel_cache_root": config.data.panel_cache_root or None,
         **external_kwargs,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,

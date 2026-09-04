@@ -1426,6 +1426,7 @@ class EnvironmentConfig:
     use_tensor_cores: bool
     amp_dtype: str
     cudnn_benchmark: bool = True
+    deterministic_algorithms: bool = False
     cpu_threads: int | None = None
     torch_compile_threads: int | None = None
 
@@ -1444,6 +1445,9 @@ class DataConfig:
     trading_volume_policy: str = "auto"
     panel_backend: str = "auto"
     panel_load_workers: int = 4
+    # Node-local, reproducible cache location.  When empty, retain the legacy
+    # behavior of placing panel_cache_v2 below parquet_root.
+    panel_cache_root: str = ""
     live_tail_panel_rows: int = 0
     # Product-neutral point-in-time feature table.  It uses the same canonical
     # panel join as TW public data, but cannot carry Taiwan execution rules.
@@ -3600,6 +3604,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data["panel_load_workers"]))
+    data["panel_cache_root"] = str(data["panel_cache_root"] or "").strip()
     data["live_tail_panel_rows"] = max(0, int(data["live_tail_panel_rows"]))
     raw_panel_start_date = data.get("panel_start_date")
     if raw_panel_start_date is None or not str(raw_panel_start_date).strip():

@@ -87,6 +87,7 @@ def _build_panel(config: ExperimentConfig) -> PanelData:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        panel_cache_root=config.data.panel_cache_root or None,
         **external_panel_data_kwargs(config.data),
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,

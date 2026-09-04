@@ -1261,17 +1261,18 @@ def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> 
 def test_bybit_22_effective_rank_carry_config_adapts_reference_without_tw_rules() -> None:
     config = load_config(
         "configs/markets/"
-        "bybit_perpetual_daily_multi_basis_22_effective_rank_projection_l1_"
-        "carry_syncthing_20260823.yaml"
+        "bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_"
+        "projection_l1_carry.yaml"
     )
 
     assert config.runner.output_dir == (
         "artifacts/markets/"
         "bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_"
-        "projection_l1_carry_syncthing_20260823_v2"
+        "projection_l1_carry_v1"
     )
     assert config.training.pretrained_initialization_root is None
-    assert config.data.parquet_root == "data_bybit_daily_0000_training_20260823"
+    assert config.data.parquet_root == "data_bybit/perpetual_daily_0000"
+    assert config.data.panel_cache_root == "artifacts/cache/bybit_perpetual_daily_0000"
     assert config.data.external_feature_path.endswith(
         "bybit_crypto_public_daily_0000.parquet"
     )
@@ -1301,3 +1302,17 @@ def test_bybit_22_effective_rank_carry_config_adapts_reference_without_tw_rules(
     assert config.trading.tw_day_trade_unlimited_margin_conversion is False
     assert config.data.use_tw_public_rules is False
     assert config.evaluation.eval_log_utility_periods_per_year == 365.0
+
+
+def test_bybit_deterministic_market_config_preserves_formal_training_contract() -> None:
+    config = load_config(
+        "configs/markets/bybit_perpetual_daily_0000_deterministic.yaml"
+    )
+
+    assert config.environment.deterministic_algorithms is True
+    assert config.environment.cudnn_benchmark is False
+    assert config.training.epochs == 1000
+    assert config.training.multi_gpu_strategy == "distributed_data_parallel"
+    assert config.runner.output_dir == (
+        "artifacts/markets/bybit_perpetual_daily_0000_deterministic_v1"
+    )

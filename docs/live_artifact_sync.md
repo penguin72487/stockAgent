@@ -91,23 +91,23 @@ ablation 工作集，直接加入會把 penguin、lab203 與 Vast 的完整輸�
 額外同步與索引。Vast 的執行中產物保持 node-local；完成且通過 lifecycle gate 的 run
 由 `stockagent-cold-artifact-maintenance` 自動逐一封裝到 `stockagent-packed`。維護器每五
 分鐘掃描一次、每次最多發布一個 run，避免填滿本機或遠端傳輸佇列。發布與刪除至少跨
-兩次獨立執行：只有精確 release 再驗證成功、七日使用租期已過、沒有程序引用，而且
-penguin 對整個 packed folder 的 items/bytes/deletes/errors 全為零、completion 100% 且
-`remoteState=valid`，才刪除該 run 的本機來源。任何檢查失敗都保留來源。各節點需要使用
-時再驗證後 materialize；這是角色分工，不是漏配 folder。
+兩次獨立執行：只有 exact release 再驗證成功、七日使用租期已過、來源在驗證期間未變、
+沒有程序引用，而且指定 peer 對整個 packed folder 的 items/bytes/deletes/errors 全為零、
+completion 100% 且 `remoteState=valid`，才刪除該 run 的本機來源。任何檢查失敗都保留
+來源；需要時再由冷庫驗證後 materialize。
 
-安裝自動維護（systemd 主機使用 timer，Vast 容器使用 cron）：
+安裝與唯讀預覽：
 
 ```bash
 sudo ./scripts/install_cold_artifact_maintenance.sh
-```
 
-唯讀預覽：
-
-```bash
 source scripts/runtime_env.sh
 run_fintech_python scripts/maintain_cold_artifacts.py --scope ablations
 ```
+
+預設 peer 名稱是 `penguin`，也可使用 `--peer-name` 或
+`COLD_ARTIFACT_PEER_NAME` 明確指定；工具會由目前 Syncthing config 解析 Device ID，不把
+某台機器的憑證身分硬編碼進程式。
 
 衝突規則：
 

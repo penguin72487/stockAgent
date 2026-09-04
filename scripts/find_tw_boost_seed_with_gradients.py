@@ -195,6 +195,7 @@ def main() -> None:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        panel_cache_root=config.data.panel_cache_root or None,
         external_feature_path=(
             config.data.tw_public_feature_path
             if config.data.use_tw_public_features or config.data.use_tw_public_rules

@@ -891,6 +891,82 @@ def test_failure_kind_distinguishes_cuda_infrastructure_from_oom() -> None:
         _failure_kind(1, "Checkpoint semantic fingerprint mismatch (data: saved=x)")
         == "checkpoint_contract_mismatch"
     )
+    assert (
+        _failure_kind(1, ">>>>>>> deadbeef\nSyntaxError: invalid decimal literal")
+        == "source_integrity_failure"
+    )
+
+
+def test_scheduler_does_not_retry_source_integrity_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "source_failure.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class SyntaxFailureProcess:
+        next_pid = 92_500
+        attempts = 0
+
+        def __init__(self, _command, **kwargs):
+            type(self).next_pid += 1
+            type(self).attempts += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+            kwargs["stdout"].write("SyntaxError: invalid decimal literal\n")
+            kwargs["stdout"].flush()
+
+        def poll(self):
+            self.returncode = 1
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", SyntaxFailureProcess)
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--max-folds",
+            "1",
+            "--max-no-progress-retries",
+            "3",
+            "--retry-backoff-seconds",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        ablation_module.main()
+
+    assert exc_info.value.code == 1
+    assert SyntaxFailureProcess.attempts == 1
+    summary = yaml.safe_load(
+        (output_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary[0]["failure_kind"] == "source_integrity_failure"
 
 
 def test_pinned_panel_cache_resolves_snapshot_receipt_and_checks_identity(

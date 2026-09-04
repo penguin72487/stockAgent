@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -100,3 +101,46 @@ def test_expired_exact_source_is_evicted_after_peer_converges(
     assert len(calls) == 2
     assert result["evicted"] == 1
     assert result["rows"][0]["reason"] == "verified-cold-and-peer-converged"
+
+
+def test_source_changed_during_final_verification_is_kept(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    source = artifact_root / "ablations" / "suite" / "complete"
+    source.mkdir(parents=True)
+    progress = source / "progress.json"
+    progress.write_text(
+        json.dumps({"state": "complete", "phase": "complete"}), encoding="utf-8"
+    )
+    old_ns = time.time_ns() - 8 * 86_400 * 1_000_000_000
+    progress.touch()
+    progress_mtime = old_ns
+    progress.chmod(0o644)
+    os.utime(progress, ns=(progress_mtime, progress_mtime))
+    calls = 0
+
+    def release_matches(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            changed = source / "late-change.txt"
+            changed.write_text("changed", encoding="utf-8")
+        return _Resolved()
+
+    monkeypatch.setattr(maintenance, "_release_matches_source", release_matches)
+    monkeypatch.setattr(maintenance, "artifact_process_references", lambda *args: [])
+
+    result = maintain_completed_artifacts(
+        artifact_root,
+        tmp_path / "packed",
+        tmp_path / "state",
+        retention_days=0,
+        apply=True,
+        peer_converged=lambda: {"ok": True, "completion": 100},
+        now_ns=time.time_ns(),
+    )
+
+    assert source.is_dir()
+    assert result["evicted"] == 0
+    assert result["rows"][0]["reason"] == "source-changed-during-verification"

@@ -96,15 +96,74 @@ immutable manifests、heads、packs/blobs；每次通過 build/audit 並原子�
 不會退回舊版本假裝成功。
 
 目前 canonical 拓撲中，penguin、lab203 與 vastai1T 都加入
-`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。
-Vast 的大量訓練 artifacts 只能在通過 completion contract 後選擇性發布成 cold release，
-不可把整個 node-local `artifacts` 工作集直接加入 hot folder。舊 `stockagent-desync`、
+`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。penguin 是
+full-replica durable node，設計上 lab203 也應如此；沒有 persistent volume 的 vastai1T 是
+index-only edge。每次操作仍必須重新驗收 lab203 的實際連線與完整度，不能只依賴角色名稱。
+Vast 只常駐 heads、manifests 與 inventories。Vast 的大量訓練 artifacts 不可把整個 node-local
+工作集直接加入 hot folder；edge mode 也禁止直接 cold publish。舊 `stockagent-desync`、
 `stockagent-artifacts-live` 與 Git working-tree folder 已退役；不要重新接受 invitation。
 
 作業系統的 service manager 不屬於資料契約：penguin/lab203 使用 systemd，Vast container
 使用平台 supervisor。兩種部署都必須達成同一組內容與連線驗收：永久 Device ID、永久
 packed node ID、相同 Folder ID、`needBytes=0`、`needTotalItems=0`、無 errors、object
 verify 通過，以及實際觀測到的 TLS/QUIC 連線。
+
+## Vast index-only edge
+
+這個模式解決「非持久計算節點不應為 500 GB 冷庫支付常駐空間」問題，而不是降低資料
+保留標準。`.stignore-edge` 只忽略本機 `objects/blobs/**` 與 `objects/packs/**`；heads、
+manifests、inventories 仍透過 Syncthing 即時更新。刪除本機 payload 前必須同時成立：
+
+- penguin full-replica 已完成全物件 SHA-256 audit；
+- Syncthing 對 penguin 為 connected、completion 100%、`remoteState=valid`；
+- folder idle，need bytes/items/deletes 與所有錯誤皆為零；
+- 本機 payload 沒有 fd、mmap、cwd、root 或 executable reference；
+- ignore include 已落盤並完成一次 Syncthing scan。
+
+先 audit，再分兩步套用：
+
+```bash
+source scripts/runtime_env.sh
+set -a
+source /etc/environment
+set +a
+
+./scripts/run_packed_snapshot.sh full-audit
+run_fintech_python scripts/manage_packed_edge.py audit
+run_fintech_python scripts/manage_packed_edge.py enable --apply
+run_fintech_python scripts/manage_packed_edge.py prune --apply
+```
+
+`full-audit` 必須在 durable full replica 執行；它驗證所有 manifest 與每個 stored object 的
+檔名 digest，包含尚未被 manifest 引用的物件，但只寫
+`/var/lib/stockagent-packed-audit/receipts/`，永遠不刪檔。
+
+`enable` 不刪檔；它只寫 node-local ignore/state。`prune` 逐檔重新檢查後，只 unlink 已忽略
+的本機 blob/pack，保留所有 metadata、producer source、materialized data 與 penguin 冷庫。
+Receipt 位於 `/var/lib/stockagent-packed-edge/receipts`。
+
+需要某份資料時，不可解除整個 payload ignore；只允許 exact release objects：
+
+```bash
+run_fintech_python scripts/manage_packed_edge.py use tw-public \
+  --link /root/stockAgent/data_tw_public
+```
+
+工具先產生 exact negated patterns，等待 Syncthing 收到需要的 objects，逐物件驗 SHA-256，
+完成 materialize/READY/lease 後，再移除本機冗餘 packed payload。edge 節點若要發布新資料，
+必須先切回 full-replica 或由 durable node 執行受稽核的 ingest；禁止讓 ignored object 配上
+已發布 head。
+
+既有的五分鐘 `stockagent-data gc` 排程會在 edge 自動改走 `manage_packed_edge.py gc`。
+它只有在 durable peer 當下完整收斂時，才可用外部冷證明刪除到期 hot cache；pin、READY、
+manifest hash 與 `/proc` 使用偵測仍照常 fail closed。Edge TTL 最多七天，舊的長 TTL
+會安全縮為七天；有 live reference 時從最後觀測時間續租，刻意長期保留應使用 pin：
+
+```bash
+stockagent-data gc --dry-run
+stockagent-data gc
+stockagent-data evict DATASET --dry-run
+```
 
 ## Lab203 接收（預設 cold-only）
 

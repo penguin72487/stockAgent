@@ -22,13 +22,16 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 ## 資料與多機維運 Runbook
 
 - [`packed_dataset_storage.md`](packed_dataset_storage.md)：現行 packed 冷庫、增量 pack/blob、
-  多寫者 head、materialize、lease 與 GC。
+  多寫者 head、materialize、lease、GC 與非持久 Vast 的 index-only edge cache。
 - [`live_artifact_sync.md`](live_artifact_sync.md)：可變 artifacts hot transport、完成產物 cold
   release、衝突政策與 hard-link 去重。
+- [`storage_pressure_maintenance.md`](storage_pressure_maintenance.md)：磁碟高水位下只回收
+  allowlisted 可重建編譯快取、訓練程序保護與 receipt 稽核。
 - [`desync_multiwriter_sync.md`](desync_multiwriter_sync.md)：舊 desync snapshot 的遷移／救援流程；
   不再是新部署的日常入口。
 - [`RUN_GUIDE.md`](RUN_GUIDE.md)：補充 operator 指令；使用前仍要核對當前 config 與本機路徑。
 - [`data_api_credentials.md`](data_api_credentials.md)：資料 API credential 邊界。
+- [`public_dashboards_architecture.md`](public_dashboards_architecture.md)：公開面板的唯讀邊界、資料責任、快取、前端更新、安全與部署驗收契約。
 
 ## 資料取得、修復與儲存
 
