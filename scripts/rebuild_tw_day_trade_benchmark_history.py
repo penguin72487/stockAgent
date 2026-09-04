@@ -28,7 +28,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_tw_day_trade_simulation import _mode_specs  # noqa: E402
+from scripts.run_tw_day_trade_simulation import (  # noqa: E402
+    _attach_tx_benchmark_previous_close_context,
+    _mode_specs,
+)
+from stockagent.live.benchmark_accounting import (  # noqa: E402
+    DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+    MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION,
+    TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+    previous_close_return,
+)
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     BENCHMARK_HISTORY_FILENAME,
 )
@@ -40,9 +49,6 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 )
 from stockagent.data.tw_index_futures import (  # noqa: E402
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
-)
-from stockagent.research.taifex_capital_returns import (  # noqa: E402
-    taifex_initial_margin_twd,
 )
 from stockagent.research.taifex_transaction_tax import (  # noqa: E402
     stock_index_futures_tax_rate,
@@ -59,7 +65,49 @@ DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
 )
 DEFAULT_TX_HISTORY_ROOT = Path("data_tw_index_futures/shioaji_history/TXFR1")
+DEFAULT_TX_DAY_SESSION_PATH = Path("data_tw_index_futures/day_session_contracts.parquet")
 TX_SESSION_MINUTES = 300
+
+BENCHMARK_HISTORY_MARK_FIELDS = frozenset(
+    {
+        "benchmark_id", "label", "instrument_type", "symbol", "logical_code",
+        "contract_code", "contract_delivery_month", "quantity", "adjusted_quantity",
+        "entry_price", "entry_at", "origin_entry_price", "origin_entry_at",
+        "initial_capital_twd", "capital_basis", "multiplier_twd_per_point",
+        "recorded_at", "minute", "session_date", "last_mark_price",
+        "last_mark_at", "last_quote_at", "total_equity_twd", "performance_pnl_twd",
+        "gross_pnl_twd", "net_pnl_twd", "return_fraction", "return_pct",
+        "buy_hold_wealth_index", "settled_buy_hold_wealth_index",
+        "daily_return_fraction", "daily_return_pct", "daily_return_basis",
+        "daily_return_reference_price", "daily_return_previous_close",
+        "daily_return_previous_close_date", "daily_return_previous_close_source",
+        "return_type", "holding_period", "tracking_costs_excluded_from_return",
+        "benchmark_accounting_contract_version", "fixed_fees_twd",
+        "transaction_tax_twd", "liquidation_cost_twd", "estimated_entry_cost_twd",
+        "estimated_fixed_fees_twd", "estimated_transaction_tax_twd",
+        "estimated_liquidation_cost_twd", "estimated_tracking_cost_twd",
+        "current_contract_notional_twd", "fully_collateralized_account_equity_twd",
+        "collateral_coverage_ratio", "maximum_leverage", "roll_count", "last_roll_at",
+        "last_roll_funding_flow_twd", "last_margin_top_up_twd",
+        "last_margin_withdrawal_twd", "cumulative_external_funding_flow_twd",
+        "cumulative_margin_top_up_twd", "cumulative_margin_withdrawal_twd",
+        "total_return_contract", "corporate_action_factor", "corporate_action_count",
+        "last_corporate_action_date", "corporate_action_coverage",
+        "corporate_action_status", "corporate_action_coverage_end", "source",
+        "valuation_source", "valuation_stale", "fresh_quote_in_minute",
+        "last_quote_carried", "historical_minute_replay", "minute_valuation_contract",
+        "fresh_trade_position_count", "last_trade_carried_position_count",
+        "missing_price_position_count", "fresh_trade_notional_coverage_ratio",
+        "valuation_executable", "benchmark_origin_rebased",
+        "benchmark_origin_session_date", "counterfactual_open_replay", "replay_basis",
+    }
+)
+
+
+def _compact_benchmark_mark(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove repeated state that neither charting nor row-level audit consumes."""
+
+    return {key: value for key, value in row.items() if key in BENCHMARK_HISTORY_MARK_FIELDS}
 
 
 def _sha256(path: Path) -> str:
@@ -70,11 +118,23 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    compact: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     os.replace(temporary, path)
@@ -108,8 +168,14 @@ def _mark_base(
         "session_date": observed.date().isoformat(),
         "benchmark_origin_rebased": True,
         "benchmark_origin_session_date": observed.date().isoformat(),
-        "counterfactual_open_replay": True,
-        "replay_basis": "actual_session_open_to_recorded_executable_marks",
+        "counterfactual_open_replay": False,
+        "replay_basis": "cross_session_buy_and_hold_from_previous_close",
+        "holding_period": "cross_session_buy_and_hold",
+        "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+        "benchmark_accounting_contract_version": (
+            MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+        ),
+        "tracking_costs_excluded_from_return": True,
         "valuation_stale": False,
     }
 
@@ -123,10 +189,15 @@ def _stock_daily_row(
     tpex_daily_ohlcv_path: Path,
 ) -> dict[str, Any] | None:
     if path.is_file():
+        schema = pl.read_parquet_schema(path)
+        columns = ["date", "open", "close"]
+        columns.extend(
+            name for name in ("adjclose", "data_source") if name in schema.names()
+        )
         frame = (
             pl.scan_parquet(path)
             .filter(pl.col("date") == trading_date)
-            .select("date", "open", "close")
+            .select(columns)
             .collect()
         )
         if frame.height > 1:
@@ -172,8 +243,69 @@ def _stock_daily_row(
             f"duplicate official aggregate row for {symbol} on {trading_date}"
         )
     if matches:
-        return {"date": trading_date, **matches[0]}
+        return {"date": trading_date, "adjclose": matches[0].get("close"), **matches[0]}
     return None
+
+
+def _stock_previous_daily_row(
+    path: Path,
+    trading_date: date,
+    *,
+    symbol: str,
+    twse_daily_ohlcv_path: Path,
+    tpex_daily_ohlcv_path: Path,
+) -> dict[str, Any] | None:
+    """Return the last actual trading row before ``trading_date``."""
+
+    if path.is_file():
+        schema = pl.read_parquet_schema(path)
+        columns = ["date", "open", "close"]
+        columns.extend(
+            name for name in ("adjclose", "data_source") if name in schema.names()
+        )
+        frame = (
+            pl.scan_parquet(path)
+            .filter(pl.col("date").cast(pl.Date) < trading_date)
+            .select(columns)
+            .sort("date")
+            .tail(1)
+            .collect()
+        )
+        if frame.height == 1:
+            return frame.row(0, named=True)
+    for offset in range(1, 15):
+        candidate = _stock_daily_row(
+            Path("/__stockagent_missing_symbol_file__"),
+            trading_date - timedelta(days=offset),
+            symbol=symbol,
+            twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+            tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+        )
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _stock_daily_reference_price(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any] | None,
+) -> float | None:
+    """Map adjusted-close total return back onto today's raw price scale."""
+
+    previous_close = _finite(previous.get("close"))
+    previous_adjusted = _finite(previous.get("adjclose"))
+    current_close = _finite((current or {}).get("close"))
+    current_adjusted = _finite((current or {}).get("adjclose"))
+    if (
+        previous_adjusted is not None
+        and previous_adjusted > 0.0
+        and current_adjusted is not None
+        and current_adjusted > 0.0
+        and current_close is not None
+        and current_close > 0.0
+    ):
+        return previous_adjusted / (current_adjusted / current_close)
+    return previous_close if previous_close is not None and previous_close > 0.0 else None
 
 
 def _current_open_rows(path: Path, trading_date: date) -> dict[str, float]:
@@ -206,6 +338,10 @@ def _stock_mark(
     source: str,
     corporate_action_factor: float,
     corporate_actions: list[dict[str, Any]],
+    daily_reference_price: float,
+    previous_close: float,
+    previous_close_date: date,
+    previous_close_source: str,
 ) -> dict[str, Any]:
     adjusted_quantity = quantity * corporate_action_factor
     liquidation_notional = adjusted_quantity * mark_price
@@ -216,8 +352,12 @@ def _stock_mark(
         fee_schedule=fee_schedule,
     )
     initial_capital = quantity * entry_price
-    net_pnl = liquidation_notional - initial_capital - entry_fee - commission - tax
-    total_equity = initial_capital + net_pnl
+    gross_pnl = liquidation_notional - initial_capital
+    total_equity = initial_capital + gross_pnl
+    daily_return_fraction, daily_return_pct = previous_close_return(
+        mark_price,
+        daily_reference_price,
+    )
     row = _mark_base(
         benchmark_id=benchmark_id,
         label=label,
@@ -233,18 +373,30 @@ def _stock_mark(
             "entry_price": entry_price,
             "entry_at": entry_at.isoformat(timespec="seconds"),
             "initial_capital_twd": initial_capital,
-            "capital_basis": "one_board_lot_actual_open_notional",
-            "initial_fixed_fees_twd": entry_fee,
-            "fixed_fees_twd": entry_fee,
+            "capital_basis": "one_board_lot_previous_close_notional",
+            "initial_fixed_fees_twd": 0.0,
+            "fixed_fees_twd": 0.0,
             "transaction_tax_twd": 0.0,
             "last_mark_price": mark_price,
             "last_mark_at": observed.isoformat(timespec="seconds"),
             "last_quote_at": observed.isoformat(timespec="seconds"),
-            "liquidation_cost_twd": commission + tax,
-            "net_pnl_twd": net_pnl,
+            "liquidation_cost_twd": 0.0,
+            "estimated_entry_cost_twd": entry_fee,
+            "estimated_liquidation_cost_twd": commission + tax,
+            "estimated_tracking_cost_twd": entry_fee + commission + tax,
+            "performance_pnl_twd": gross_pnl,
+            "gross_pnl_twd": gross_pnl,
+            "net_pnl_twd": gross_pnl,
             "total_equity_twd": total_equity,
-            "return_fraction": net_pnl / initial_capital,
-            "return_pct": net_pnl / initial_capital * 100.0,
+            "return_fraction": gross_pnl / initial_capital,
+            "return_pct": gross_pnl / initial_capital * 100.0,
+            "buy_hold_wealth_index": total_equity / initial_capital,
+            "daily_return_fraction": daily_return_fraction,
+            "daily_return_pct": daily_return_pct,
+            "daily_return_reference_price": daily_reference_price,
+            "daily_return_previous_close": previous_close,
+            "daily_return_previous_close_date": previous_close_date.isoformat(),
+            "daily_return_previous_close_source": previous_close_source,
             "return_type": "total_return",
             "total_return_contract": "official_ex_date_reference_reinvestment_v1",
             "corporate_action_factor": corporate_action_factor,
@@ -257,7 +409,7 @@ def _stock_mark(
             "applied_corporate_actions": corporate_actions,
             "source": source,
             "valuation_source": (
-                "total_return_units_marked_at_recorded_bid_after_tw_cash_costs"
+                "gross_total_return_buy_and_hold_units_at_recorded_price"
             ),
         }
     )
@@ -495,6 +647,7 @@ def _tx_engine_history_mark(
     observed: datetime,
 ) -> dict[str, Any]:
     source = dict(engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID])
+    source.pop("roll_history", None)
     row = _mark_base(
         benchmark_id=TX_CONTINUOUS_BENCHMARK_ID,
         label="台指期無限轉倉（大台一口）",
@@ -510,9 +663,10 @@ def _tx_engine_history_mark(
             "session_date": observed.date().isoformat(),
             "benchmark_origin_rebased": True,
             "benchmark_origin_session_date": entry_at.date().isoformat(),
-            "counterfactual_open_replay": True,
+            "counterfactual_open_replay": False,
             "replay_basis": (
-                "retained_executable_front_month_books_with_official_expiry_settlement"
+                "cross_session_fully_collateralized_tx_buy_and_hold_with_"
+                "same_contract_previous_close_and_official_expiry_settlement"
             ),
         }
     )
@@ -719,6 +873,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tx-day-session-path",
+        type=Path,
+        default=DEFAULT_TX_DAY_SESSION_PATH,
+        help="Official all-contract TX daily table used for same-contract prior close.",
+    )
+    parser.add_argument(
         "--final-settlement-path",
         type=Path,
         default=DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
@@ -826,6 +986,8 @@ def main() -> None:
         "tpex_daily_ohlcv_sha256": _sha256(tpex_daily_ohlcv_path),
         "fop_capture_root": str(args.fop_capture_root.resolve()),
         "tx_history_root": str(args.tx_history_root.resolve()),
+        "tx_day_session_path": str(args.tx_day_session_path.resolve()),
+        "tx_day_session_sha256": _sha256(args.tx_day_session_path.resolve()),
         "corporate_action_reference_path": str(corporate_action_path),
         "corporate_action_reference_sha256": _sha256(corporate_action_path),
         "corporate_action_reference_summary_path": str(
@@ -857,10 +1019,20 @@ def main() -> None:
             twse_daily_ohlcv_path=twse_daily_ohlcv_path,
             tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
         )
-        entry_price = _finite((first_daily or {}).get("open"))
+        first_previous = _stock_previous_daily_row(
+            daily_path,
+            start,
+            symbol=symbol,
+            twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+            tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+        )
+        entry_price = _finite((first_previous or {}).get("close"))
         if entry_price is None or entry_price <= 0.0:
-            raise ValueError(f"official {symbol} open is unavailable for {start}")
-        entry_at = datetime.combine(start, time(9, 0), tzinfo=TAIPEI)
+            raise ValueError(
+                f"official {symbol} previous close is unavailable before {start}"
+            )
+        entry_session = first_previous["date"]
+        entry_at = datetime.combine(entry_session, time(13, 30), tzinfo=TAIPEI)
         quantity = 1_000
         buy_rate, sell_rate = TwDayTradeSimulationEngine._stock_benchmark_fee_rates(
             symbol=symbol,
@@ -880,12 +1052,20 @@ def main() -> None:
             "entry_at": entry_at.isoformat(timespec="seconds"),
             "entry_price": entry_price,
             "initial_capital_twd": quantity * entry_price,
-            "initial_fixed_fees_twd": entry_fee,
+            "capital_basis": "one_board_lot_previous_close_notional",
+            "initial_fixed_fees_twd": 0.0,
+            "estimated_initial_fixed_fees_twd": entry_fee,
             "initial_transaction_tax_twd": 0.0,
             "gross_pnl_multiplier": quantity,
             "return_type": "total_return",
+            "holding_period": "cross_session_buy_and_hold",
+            "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+            "tracking_costs_excluded_from_return": True,
+            "benchmark_accounting_contract_version": (
+                MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+            ),
             "total_return_contract": "official_ex_date_reference_reinvestment_v1",
-            "source": "official_daily_session_open",
+            "source": "official_previous_session_close",
             "live_origin": {
                 "entry_at": live.get("entry_at"),
                 "entry_price": live.get("entry_price"),
@@ -904,6 +1084,40 @@ def main() -> None:
                 symbol=symbol,
                 twse_daily_ohlcv_path=twse_daily_ohlcv_path,
                 tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+            )
+            previous_daily = _stock_previous_daily_row(
+                daily_path,
+                trading_date,
+                symbol=symbol,
+                twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+                tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+            )
+            if previous_daily is None:
+                raise ValueError(
+                    f"official {symbol} previous close is unavailable for {trading_date}"
+                )
+            previous_close = _finite(previous_daily.get("close"))
+            previous_close_date = previous_daily.get("date")
+            if previous_close is None or previous_close <= 0.0 or not isinstance(
+                previous_close_date, date
+            ):
+                raise ValueError(
+                    f"invalid official {symbol} previous close for {trading_date}"
+                )
+            daily_reference_price = _stock_daily_reference_price(
+                previous_daily,
+                daily,
+            )
+            if trading_date == end and current_session_unclosed:
+                daily_reference_price = _finite(live.get("current_session_reference_price")) or _finite(
+                    live.get("previous_official_close")
+                ) or daily_reference_price
+            if daily_reference_price is None or daily_reference_price <= 0.0:
+                raise ValueError(
+                    f"official {symbol} daily return reference is unavailable for {trading_date}"
+                )
+            previous_close_source = str(
+                previous_daily.get("data_source") or "official_daily_close"
             )
             if trading_date == end and current_session_unclosed:
                 opening = current_opens.get(symbol)
@@ -937,6 +1151,10 @@ def main() -> None:
                         source="retained_same_session_shioaji_snapshot_open",
                         corporate_action_factor=action_factor,
                         corporate_actions=actions,
+                        daily_reference_price=daily_reference_price,
+                        previous_close=previous_close,
+                        previous_close_date=previous_close_date,
+                        previous_close_source=previous_close_source,
                     )
                 )
                 continue
@@ -977,6 +1195,10 @@ def main() -> None:
                         source=source,
                         corporate_action_factor=action_factor,
                         corporate_actions=actions,
+                        daily_reference_price=daily_reference_price,
+                        previous_close=previous_close,
+                        previous_close_date=previous_close_date,
+                        previous_close_source=previous_close_source,
                     )
                 )
 
@@ -1097,6 +1319,13 @@ def main() -> None:
                     "delivery_month": metadata["delivery_month"],
                     "last_trading_date": metadata["last_trading_date"],
                 }
+                _attach_tx_benchmark_previous_close_context(
+                    quote,
+                    current_contract_code=str(metadata["code"]),
+                    trading_date=observed,
+                    day_session_path=args.tx_day_session_path.resolve(),
+                    history_root=args.tx_history_root.resolve(),
+                )
                 tx_engine._mark_tx_continuous_benchmark(
                     current_contract_code=str(metadata["code"]),
                     current_quote=quote,
@@ -1125,17 +1354,30 @@ def main() -> None:
     )
     live_tx_entry_price = float(live_tx["entry_price"])
     tx_multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"]
-    live_initial_tax = _tx_tax(live_tx_entry_price, live_tx_entry_at.date())
-    canonical_fixed_fees = float(tx_replayed.get("fixed_fees_twd") or 0.0)
-    canonical_transaction_tax = float(tx_replayed.get("transaction_tax_twd") or 0.0)
-    live_net_pnl_offset = (
-        float(tx_replayed.get("realized_gross_pnl_twd") or 0.0)
-        + (live_tx_entry_price - float(tx_replayed["current_contract_entry_price"]))
-        * tx_multiplier
-        - canonical_fixed_fees
-        - canonical_transaction_tax
-        + TX_FEE_PER_SIDE_TWD
-        + live_initial_tax
+    before_live_origin = [
+        row
+        for row in marks
+        if row.get("benchmark_id") == TX_CONTINUOUS_BENCHMARK_ID
+        and datetime.fromisoformat(str(row["recorded_at"])).astimezone(TAIPEI)
+        <= live_tx_entry_at
+        and _finite(row.get("buy_hold_wealth_index")) is not None
+    ]
+    canonical_wealth_at_live_origin = (
+        float(before_live_origin[-1]["buy_hold_wealth_index"])
+        if before_live_origin
+        else None
+    )
+    latest_close_context: dict[str, Any] = {
+        "delivery_month": tx_replayed.get("contract_delivery_month")
+    }
+    _attach_tx_benchmark_previous_close_context(
+        latest_close_context,
+        current_contract_code=str(tx_replayed.get("contract_code") or ""),
+        trading_date=datetime.combine(
+            end + timedelta(days=1), time(8, 45), tzinfo=TAIPEI
+        ),
+        day_session_path=args.tx_day_session_path.resolve(),
+        history_root=args.tx_history_root.resolve(),
     )
     origins[TX_CONTINUOUS_BENCHMARK_ID] = {
         "benchmark_id": TX_CONTINUOUS_BENCHMARK_ID,
@@ -1143,10 +1385,20 @@ def main() -> None:
         "entry_at": entry_at.isoformat(timespec="seconds"),
         "entry_price": entry_price,
         "initial_capital_twd": float(tx_replayed["initial_capital_twd"]),
-        "initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
-        "initial_transaction_tax_twd": _tx_tax(entry_price, start),
+        "initial_fixed_fees_twd": 0.0,
+        "initial_transaction_tax_twd": 0.0,
+        "estimated_initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
+        "estimated_initial_transaction_tax_twd": _tx_tax(entry_price, start),
         "gross_pnl_multiplier": tx_multiplier,
-        "source": "receipt_backed_shioaji_front_month_best_ask_at_day_open",
+        "capital_basis": TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+        "maximum_leverage": 1.0,
+        "holding_period": "cross_session_buy_and_hold_with_continuous_roll",
+        "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+        "tracking_costs_excluded_from_return": True,
+        "benchmark_accounting_contract_version": (
+            MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+        ),
+        "source": "receipt_backed_same_contract_previous_close",
         "contract_code": (
             provenance["tx_capture_manifests"][start.isoformat()]["contract"]["code"]
             if start.isoformat() in provenance["tx_capture_manifests"]
@@ -1158,25 +1410,31 @@ def main() -> None:
             "official final settlement after expiry; new front-month ask; "
             "calendar spread never booked as return"
         ),
-        "live_net_pnl_offset_twd": live_net_pnl_offset,
-        "fixed_fees_twd_to_live_origin": canonical_fixed_fees,
-        "transaction_tax_twd_to_live_origin": canonical_transaction_tax,
-        "current_contract_entry_price_at_live_origin": float(
-            tx_replayed["current_contract_entry_price"]
+        "canonical_buy_hold_wealth_at_live_origin": (
+            canonical_wealth_at_live_origin
         ),
-        "realized_gross_pnl_twd_to_live_origin": float(
-            tx_replayed.get("realized_gross_pnl_twd") or 0.0
+        "latest_completed_contract_code": tx_replayed.get("contract_code"),
+        "latest_completed_close": latest_close_context.get("previous_close"),
+        "latest_completed_close_date": latest_close_context.get(
+            "previous_close_date"
+        ),
+        "latest_completed_close_source": latest_close_context.get(
+            "previous_close_source"
         ),
         "live_origin": {
             "entry_at": live_tx.get("entry_at"),
             "entry_price": live_tx.get("entry_price"),
-            "initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
-            "initial_transaction_tax_twd": live_initial_tax,
+            "initial_fixed_fees_twd": 0.0,
+            "initial_transaction_tax_twd": 0.0,
         },
     }
 
+    marks = [_compact_benchmark_mark(row) for row in marks]
     marks.sort(key=lambda row: (str(row["recorded_at"]), str(row["benchmark_id"])))
     output = {
+        # Keep the envelope at v1 so the already-running read-only dashboard
+        # can consume an atomically rebuilt file without a process restart.
+        # Row-level accounting semantics are versioned independently.
         "schema_version": 1,
         "created_at": now.isoformat(timespec="seconds"),
         "simulation_only": True,
@@ -1185,15 +1443,15 @@ def main() -> None:
         "end_date": end.isoformat(),
         "origin_contract": {
             "stocks": (
-                "one board lot entered at retained actual 09:00 open; official "
-                "close is used only for completed sessions; official ex-date "
-                "reference factors reinvest cash distributions and adjust splits"
+                "one board lot held from the preceding official close; each day's "
+                "return is current value divided by its preceding total-return "
+                "close equivalent; official ex-date factors are applied once"
             ),
             "tx": (
-                "one front-month TX entered at the first valid receipt-backed "
-                "08:45 ask; later minute marks use the observed bid or carry the "
-                "latest observed bid without interpolation; an expired old month "
-                "uses official final settlement before the new month opens at ask"
+                "one front-month TX held with cash equal to 100% of contract "
+                "notional; each day uses the same physical contract's preceding "
+                "close; rolls are chain-linked and their notional difference is "
+                "an external collateral top-up or withdrawal, never return"
             ),
             "calendar_spread_return": "never booked as investment return",
             "missing_data": "fail closed; no synthetic price",
@@ -1215,7 +1473,7 @@ def main() -> None:
             f"TX benchmark minute cardinality mismatch: {tx_rows} != {expected_tx_rows}"
         )
     destination = state_dir / BENCHMARK_HISTORY_FILENAME
-    _atomic_json(destination, output)
+    _atomic_json(destination, output, compact=True)
     print(
         json.dumps(
             {

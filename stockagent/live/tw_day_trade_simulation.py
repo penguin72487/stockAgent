@@ -44,6 +44,16 @@ from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
 )
 from stockagent.data.tw_price_rules import limit_price_numpy, move_price_ticks_numpy
+from stockagent.live.benchmark_accounting import (
+    DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+    MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION,
+    TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+    current_roll_linked_wealth,
+    fully_collateralized_futures_notional,
+    positive_finite,
+    previous_close_return,
+    settle_roll_wealth,
+)
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_FILENAME,
@@ -58,7 +68,7 @@ from stockagent.research.taifex_transaction_tax import (
 
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 SIMULATION_SCHEMA_VERSION: Final[int] = 4
-TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 2
+TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 3
 # The live path starts at the exchange open and must consume only a quote that
 # is strictly later than the immutable signal publication.  ENTRY_GATE remains
 # the historical-replay boundary for compatibility with existing replay tools.
@@ -1137,23 +1147,65 @@ class TwDayTradeSimulationEngine:
             row = benchmarks.get(benchmark_id)
             if not isinstance(row, dict):
                 continue
+            legacy_entry_cost = float(row.get("fixed_fees_twd") or 0.0)
+            legacy_liquidation_cost = float(row.get("liquidation_cost_twd") or 0.0)
             updates = {
                 "label": label,
                 "return_type": "total_return",
                 "total_return_contract": ("official_ex_date_reference_reinvestment_v1"),
+                "holding_period": "cross_session_buy_and_hold",
+                "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+                "benchmark_accounting_contract_version": (
+                    MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+                ),
+                "tracking_costs_excluded_from_return": True,
+                "fixed_fees_twd": 0.0,
+                "transaction_tax_twd": 0.0,
+                "liquidation_cost_twd": 0.0,
+                "estimated_entry_cost_twd": max(
+                    float(row.get("estimated_entry_cost_twd") or 0.0),
+                    legacy_entry_cost,
+                ),
+                "estimated_liquidation_cost_twd": max(
+                    float(row.get("estimated_liquidation_cost_twd") or 0.0),
+                    legacy_liquidation_cost,
+                ),
             }
             for key, value in updates.items():
                 if row.get(key) != value:
                     row[key] = value
                     changed = True
+            estimated_tracking_cost = float(
+                row.get("estimated_entry_cost_twd") or 0.0
+            ) + float(row.get("estimated_liquidation_cost_twd") or 0.0)
+            if row.get("estimated_tracking_cost_twd") != estimated_tracking_cost:
+                row["estimated_tracking_cost_twd"] = estimated_tracking_cost
+                changed = True
         return changed
 
     def _migrate_tx_continuous_benchmark_contract(self) -> bool:
         row = (self.state.get("benchmarks") or {}).get(TX_CONTINUOUS_BENCHMARK_ID)
         if not isinstance(row, dict):
             return False
-        row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
-        row["official_final_settlement_path"] = str(self.final_settlement_path)
+        changed = False
+        previous_contract_version = int(row.get("roll_contract_version") or 0)
+        updates = {
+            "roll_contract_version": TX_CONTINUOUS_ROLL_CONTRACT_VERSION,
+            "official_final_settlement_path": str(self.final_settlement_path),
+            "return_type": "gross_buy_and_hold_time_weighted",
+            "holding_period": "cross_session_buy_and_hold_with_continuous_roll",
+            "daily_return_basis": DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
+            "capital_basis": TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
+            "benchmark_accounting_contract_version": (
+                MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+            ),
+            "tracking_costs_excluded_from_return": True,
+            "maximum_leverage": 1.0,
+        }
+        for key, value in updates.items():
+            if row.get(key) != value:
+                row[key] = value
+                changed = True
         if int(row.get("roll_count") or 0) == 0:
             row.setdefault("origin_entry_price", row.get("entry_price"))
             row.setdefault("origin_entry_at", row.get("entry_at"))
@@ -1165,6 +1217,117 @@ class TwDayTradeSimulationEngine:
             # not manufacture a rebase identity.
             row["roll_contract_migration_error"] = (
                 "legacy_rolled_benchmark_origin_unavailable"
+            )
+            return True
+
+        if previous_contract_version >= TX_CONTINUOUS_ROLL_CONTRACT_VERSION:
+            return changed
+
+        origin_entry = positive_finite(row.get("origin_entry_price"))
+        current_entry = origin_entry
+        settled_wealth = 1.0
+        funding_flow = 0.0
+        margin_top_up = 0.0
+        margin_withdrawal = 0.0
+        for roll in row.get("roll_history") or ():
+            if not isinstance(roll, Mapping):
+                current_entry = None
+                break
+            old_exit = positive_finite(
+                roll.get("old_exit_price")
+                if roll.get("old_exit_price") is not None
+                else roll.get("old_bid")
+            )
+            new_entry = positive_finite(roll.get("new_ask"))
+            next_wealth = settle_roll_wealth(
+                settled_wealth,
+                old_exit,
+                current_entry,
+            )
+            if next_wealth is None or old_exit is None or new_entry is None:
+                current_entry = None
+                break
+            settled_wealth = next_wealth
+            roll_funding = (new_entry - old_exit) * TAIFEX_INDEX_FUTURES_MULTIPLIERS[
+                "TX"
+            ]
+            funding_flow += roll_funding
+            margin_top_up += max(0.0, roll_funding)
+            margin_withdrawal += max(0.0, -roll_funding)
+            current_entry = new_entry
+
+        persisted_current_entry = positive_finite(
+            row.get("current_contract_entry_price") or row.get("entry_price")
+        )
+        if (
+            origin_entry is None
+            or current_entry is None
+            or persisted_current_entry is None
+            or not math.isclose(
+                current_entry,
+                persisted_current_entry,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            row["roll_contract_migration_error"] = (
+                "legacy_roll_history_cannot_reconstruct_buy_hold_wealth"
+            )
+            row["valuation_stale"] = True
+            return True
+
+        old_capital = _finite(row.get("initial_capital_twd"))
+        full_notional = fully_collateralized_futures_notional(
+            origin_entry,
+            TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"],
+        )
+        assert full_notional is not None
+        if previous_contract_version < TX_CONTINUOUS_ROLL_CONTRACT_VERSION:
+            row["legacy_initial_margin_twd"] = old_capital
+        legacy_fixed_fees = float(row.get("fixed_fees_twd") or 0.0)
+        legacy_transaction_tax = float(row.get("transaction_tax_twd") or 0.0)
+        row["estimated_fixed_fees_twd"] = max(
+            float(row.get("estimated_fixed_fees_twd") or 0.0),
+            legacy_fixed_fees,
+        )
+        row["estimated_transaction_tax_twd"] = max(
+            float(row.get("estimated_transaction_tax_twd") or 0.0),
+            legacy_transaction_tax,
+        )
+        row["fixed_fees_twd"] = 0.0
+        row["transaction_tax_twd"] = 0.0
+        row["liquidation_cost_twd"] = 0.0
+        row["estimated_tracking_cost_twd"] = (
+            float(row.get("estimated_fixed_fees_twd") or 0.0)
+            + float(row.get("estimated_transaction_tax_twd") or 0.0)
+            + float(row.get("estimated_liquidation_cost_twd") or 0.0)
+        )
+        row["initial_capital_twd"] = full_notional
+        row["settled_buy_hold_wealth_index"] = settled_wealth
+        row["cumulative_external_funding_flow_twd"] = funding_flow
+        row["cumulative_margin_top_up_twd"] = margin_top_up
+        row["cumulative_margin_withdrawal_twd"] = margin_withdrawal
+        mark = positive_finite(row.get("last_mark_price"))
+        wealth = current_roll_linked_wealth(settled_wealth, mark, current_entry)
+        if wealth is not None and mark is not None:
+            performance_pnl = full_notional * (wealth - 1.0)
+            current_notional = fully_collateralized_futures_notional(
+                mark,
+                TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"],
+            )
+            row.update(
+                {
+                    "buy_hold_wealth_index": wealth,
+                    "performance_pnl_twd": performance_pnl,
+                    "gross_pnl_twd": performance_pnl,
+                    "net_pnl_twd": performance_pnl,
+                    "total_equity_twd": full_notional * wealth,
+                    "return_fraction": wealth - 1.0,
+                    "return_pct": (wealth - 1.0) * 100.0,
+                    "current_contract_notional_twd": current_notional,
+                    "fully_collateralized_account_equity_twd": current_notional,
+                    "collateral_coverage_ratio": 1.0,
+                }
             )
         return True
 
@@ -1585,6 +1748,17 @@ class TwDayTradeSimulationEngine:
                         "net_pnl_twd",
                         "return_fraction",
                         "return_pct",
+                        "daily_return_fraction",
+                        "daily_return_pct",
+                        "daily_return_basis",
+                        "daily_return_previous_close",
+                        "daily_return_previous_close_date",
+                        "daily_return_previous_close_source",
+                        "daily_return_reference_price",
+                        "buy_hold_wealth_index",
+                        "settled_buy_hold_wealth_index",
+                        "performance_pnl_twd",
+                        "gross_pnl_twd",
                         "last_mark_price",
                         "last_quote_at",
                         "valuation_stale",
@@ -1612,6 +1786,23 @@ class TwDayTradeSimulationEngine:
                         "previous_official_close_date",
                         "previous_official_close_source",
                         "return_type",
+                        "holding_period",
+                        "capital_basis",
+                        "benchmark_accounting_contract_version",
+                        "tracking_costs_excluded_from_return",
+                        "estimated_tracking_cost_twd",
+                        "estimated_entry_cost_twd",
+                        "estimated_liquidation_cost_twd",
+                        "current_contract_notional_twd",
+                        "fully_collateralized_account_equity_twd",
+                        "collateral_coverage_ratio",
+                        "maximum_leverage",
+                        "last_roll_funding_flow_twd",
+                        "last_margin_top_up_twd",
+                        "last_margin_withdrawal_twd",
+                        "cumulative_external_funding_flow_twd",
+                        "cumulative_margin_top_up_twd",
+                        "cumulative_margin_withdrawal_twd",
                     )
                 },
             },
@@ -1813,6 +2004,12 @@ class TwDayTradeSimulationEngine:
         )
         row["label"] = label
         row["return_type"] = "total_return"
+        row["holding_period"] = "cross_session_buy_and_hold"
+        row["daily_return_basis"] = DAILY_RETURN_BASIS_PREVIOUS_CLOSE
+        row["benchmark_accounting_contract_version"] = (
+            MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+        )
+        row["tracking_costs_excluded_from_return"] = True
         buy_rate, sell_rate = self._stock_benchmark_fee_rates(
             symbol=symbol,
             security_type=security_type,
@@ -1821,8 +2018,18 @@ class TwDayTradeSimulationEngine:
         ask = _finite(quote.get("ask"))
         bid = _finite(quote.get("bid"))
         quantity = int(row.get("quantity") or 1_000)
-        if row.get("entry_price") is None and ask is not None:
-            entry_notional = quantity * ask
+        if row.get("entry_price") is None:
+            entry_reference = positive_finite(quote.get("reference_price"))
+            if entry_reference is None:
+                entry_reference = positive_finite(quote.get("previous_close"))
+            if entry_reference is None:
+                entry_reference = positive_finite(ask)
+            previous_close_date = _date_value(quote.get("previous_close_date"))
+        else:
+            entry_reference = None
+            previous_close_date = None
+        if row.get("entry_price") is None and entry_reference is not None:
+            entry_notional = quantity * entry_reference
             entry_commission, _entry_tax = self._stock_benchmark_order_cost(
                 notional=entry_notional,
                 commission_rate=buy_rate,
@@ -1831,10 +2038,19 @@ class TwDayTradeSimulationEngine:
             )
             row.update(
                 {
-                    "entry_price": ask,
-                    "entry_at": now.isoformat(timespec="seconds"),
+                    "entry_price": entry_reference,
+                    "entry_at": (
+                        datetime.combine(
+                            previous_close_date,
+                            SESSION_CLOSE,
+                            tzinfo=TAIPEI,
+                        ).isoformat(timespec="seconds")
+                        if previous_close_date is not None
+                        else now.isoformat(timespec="seconds")
+                    ),
                     "initial_capital_twd": entry_notional,
-                    "fixed_fees_twd": entry_commission,
+                    "fixed_fees_twd": 0.0,
+                    "estimated_entry_cost_twd": entry_commission,
                     "capital_basis": "one_board_lot_entry_notional",
                 }
             )
@@ -1896,25 +2112,57 @@ class TwDayTradeSimulationEngine:
                 fee_schedule=fee_schedule,
             )
             liquidation_cost = liquidation_commission + liquidation_tax
-            net_pnl = (
-                gross_pnl - float(row.get("fixed_fees_twd") or 0.0) - liquidation_cost
+            estimated_entry_cost = float(
+                row.get("estimated_entry_cost_twd")
+                or row.get("fixed_fees_twd")
+                or 0.0
             )
+            estimated_tracking_cost = estimated_entry_cost + liquidation_cost
             initial_capital = float(row.get("initial_capital_twd") or 0.0)
             return_fraction = (
-                net_pnl / initial_capital if initial_capital > 0.0 else None
+                gross_pnl / initial_capital if initial_capital > 0.0 else None
+            )
+            daily_reference = positive_finite(quote.get("reference_price"))
+            if daily_reference is None:
+                daily_reference = positive_finite(quote.get("previous_close"))
+            daily_return_fraction, daily_return_pct = previous_close_return(
+                bid,
+                daily_reference,
             )
             row.update(
                 {
                     "last_mark_price": bid,
                     "last_quote_at": quote.get("quote_at"),
                     "last_mark_at": now.isoformat(timespec="seconds"),
-                    "liquidation_cost_twd": liquidation_cost,
-                    "net_pnl_twd": net_pnl,
-                    "total_equity_twd": initial_capital + net_pnl,
+                    "fixed_fees_twd": 0.0,
+                    "transaction_tax_twd": 0.0,
+                    "liquidation_cost_twd": 0.0,
+                    "estimated_entry_cost_twd": estimated_entry_cost,
+                    "estimated_liquidation_cost_twd": liquidation_cost,
+                    "estimated_tracking_cost_twd": estimated_tracking_cost,
+                    "performance_pnl_twd": gross_pnl,
+                    "gross_pnl_twd": gross_pnl,
+                    "net_pnl_twd": gross_pnl,
+                    "total_equity_twd": initial_capital + gross_pnl,
                     "return_fraction": return_fraction,
                     "return_pct": None
                     if return_fraction is None
                     else return_fraction * 100.0,
+                    "buy_hold_wealth_index": (
+                        None if return_fraction is None else 1.0 + return_fraction
+                    ),
+                    "daily_return_fraction": daily_return_fraction,
+                    "daily_return_pct": daily_return_pct,
+                    "daily_return_previous_close": _finite(
+                        quote.get("previous_close")
+                    ),
+                    "daily_return_previous_close_date": quote.get(
+                        "previous_close_date"
+                    ),
+                    "daily_return_previous_close_source": quote.get(
+                        "previous_close_source"
+                    ),
+                    "daily_return_reference_price": daily_reference,
                     "corporate_action_factor": adjustment_factor,
                     "adjusted_quantity": adjusted_quantity,
                     "corporate_action_count": len(corporate_actions),
@@ -1923,7 +2171,9 @@ class TwDayTradeSimulationEngine:
                     ),
                     "applied_corporate_actions": corporate_actions,
                     "valuation_stale": False,
-                    "valuation_source": "total_return_units_at_best_bid_after_tw_cash_costs",
+                    "valuation_source": (
+                        "gross_total_return_buy_and_hold_units_at_best_bid"
+                    ),
                     "source": quote.get("source"),
                 }
             )
@@ -1967,11 +2217,24 @@ class TwDayTradeSimulationEngine:
                 "transaction_tax_twd": 0.0,
                 "roll_count": 0,
                 "roll_contract_version": TX_CONTINUOUS_ROLL_CONTRACT_VERSION,
+                "settled_buy_hold_wealth_index": 1.0,
+                "cumulative_external_funding_flow_twd": 0.0,
+                "cumulative_margin_top_up_twd": 0.0,
+                "cumulative_margin_withdrawal_twd": 0.0,
                 "valuation_stale": True,
             },
         )
         row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
         row["official_final_settlement_path"] = str(self.final_settlement_path)
+        row["return_type"] = "gross_buy_and_hold_time_weighted"
+        row["holding_period"] = "cross_session_buy_and_hold_with_continuous_roll"
+        row["daily_return_basis"] = DAILY_RETURN_BASIS_PREVIOUS_CLOSE
+        row["capital_basis"] = TX_FULLY_COLLATERALIZED_CAPITAL_BASIS
+        row["benchmark_accounting_contract_version"] = (
+            MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+        )
+        row["tracking_costs_excluded_from_return"] = True
+        row["maximum_leverage"] = 1.0
         current_code = str(current_contract_code or "").strip().upper()
         held_code = str(row.get("contract_code") or "").strip().upper()
         current_ask = _finite(current_quote.get("ask"))
@@ -1992,21 +2255,54 @@ class TwDayTradeSimulationEngine:
                 target["contract_last_trading_date"] = delivery_date.isoformat()
 
         if row.get("entry_price") is None and current_code and current_ask is not None:
+            entry_reference = positive_finite(current_quote.get("previous_close"))
+            previous_close_date = _date_value(
+                current_quote.get("previous_close_date")
+            )
+            if entry_reference is None:
+                entry_reference = current_ask
+            full_notional = fully_collateralized_futures_notional(
+                entry_reference,
+                multiplier,
+            )
+            assert full_notional is not None
+            entry_tax = self._tx_trade_tax(entry_reference, trading_date=now.date())
+            entry_at = (
+                datetime.combine(
+                    previous_close_date,
+                    time(13, 45),
+                    tzinfo=TAIPEI,
+                )
+                if previous_close_date is not None
+                else now
+            )
             row.update(
                 {
                     "contract_code": current_code,
-                    "entry_price": current_ask,
-                    "entry_at": now.isoformat(timespec="seconds"),
-                    "origin_entry_price": current_ask,
-                    "origin_entry_at": now.isoformat(timespec="seconds"),
-                    "current_contract_entry_price": current_ask,
-                    "current_contract_entry_at": now.isoformat(timespec="seconds"),
-                    "initial_capital_twd": taifex_initial_margin_twd("TX", now.date()),
-                    "fixed_fees_twd": fee_per_side,
-                    "transaction_tax_twd": self._tx_trade_tax(
-                        current_ask, trading_date=now.date()
+                    "entry_price": entry_reference,
+                    "entry_at": entry_at.isoformat(timespec="seconds"),
+                    "origin_entry_price": entry_reference,
+                    "origin_entry_at": entry_at.isoformat(timespec="seconds"),
+                    "current_contract_entry_price": entry_reference,
+                    "current_contract_entry_at": entry_at.isoformat(timespec="seconds"),
+                    "initial_capital_twd": full_notional,
+                    "official_initial_margin_at_origin_twd": (
+                        taifex_initial_margin_twd("TX", now.date())
                     ),
-                    "capital_basis": "official_taifex_initial_margin_at_entry",
+                    "fixed_fees_twd": 0.0,
+                    "transaction_tax_twd": 0.0,
+                    "estimated_fixed_fees_twd": fee_per_side,
+                    "estimated_transaction_tax_twd": entry_tax,
+                    "estimated_tracking_cost_twd": fee_per_side + entry_tax,
+                    "settled_buy_hold_wealth_index": 1.0,
+                    "buy_hold_wealth_index": 1.0,
+                    "cumulative_external_funding_flow_twd": 0.0,
+                    "cumulative_margin_top_up_twd": 0.0,
+                    "cumulative_margin_withdrawal_twd": 0.0,
+                    "current_contract_notional_twd": full_notional,
+                    "fully_collateralized_account_equity_twd": full_notional,
+                    "collateral_coverage_ratio": 1.0,
+                    "capital_basis": TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
                 }
             )
             update_contract_identity(row, current_quote)
@@ -2052,20 +2348,40 @@ class TwDayTradeSimulationEngine:
                 if not expired
                 else None
             )
-            if old_exit_price is not None and current_ask is not None:
+            new_previous_close = positive_finite(current_quote.get("previous_close"))
+            if (
+                old_exit_price is not None
+                and current_ask is not None
+                and new_previous_close is not None
+            ):
                 entry = float(row["entry_price"])
+                settled_wealth = positive_finite(row.get("buy_hold_wealth_index"))
+                if settled_wealth is None:
+                    row["valuation_stale"] = True
+                    row["roll_blocked_reason"] = "invalid_roll_wealth_inputs"
+                    row["valuation_source"] = "roll_accounting_fail_closed"
+                    self._append_benchmark_mark(row, now=now)
+                    return
+                old_funding_basis = positive_finite(row.get("last_mark_price"))
+                if old_funding_basis is None:
+                    old_funding_basis = old_exit_price
+                roll_funding_flow = (
+                    new_previous_close - old_funding_basis
+                ) * multiplier
+                margin_top_up = max(0.0, roll_funding_flow)
+                margin_withdrawal = max(0.0, -roll_funding_flow)
                 row["realized_gross_pnl_twd"] = (
                     float(row.get("realized_gross_pnl_twd") or 0.0)
                     + (old_exit_price - entry) * multiplier
                 )
                 old_exit_fee = 0.0 if official_settlement is not None else fee_per_side
-                row["fixed_fees_twd"] = (
-                    float(row.get("fixed_fees_twd") or 0.0)
+                row["estimated_fixed_fees_twd"] = (
+                    float(row.get("estimated_fixed_fees_twd") or 0.0)
                     + old_exit_fee
                     + fee_per_side
                 )
-                row["transaction_tax_twd"] = (
-                    float(row.get("transaction_tax_twd") or 0.0)
+                row["estimated_transaction_tax_twd"] = (
+                    float(row.get("estimated_transaction_tax_twd") or 0.0)
                     + self._tx_trade_tax(
                         old_exit_price,
                         trading_date=held_last_trading_date or now.date(),
@@ -2076,9 +2392,16 @@ class TwDayTradeSimulationEngine:
                     {
                         "previous_contract_code": held_code,
                         "contract_code": current_code,
-                        "entry_price": current_ask,
-                        "current_contract_entry_price": current_ask,
-                        "current_contract_entry_at": now.isoformat(timespec="seconds"),
+                        "entry_price": new_previous_close,
+                        "current_contract_entry_price": new_previous_close,
+                        "current_contract_entry_at": (
+                            datetime.combine(
+                                _date_value(current_quote.get("previous_close_date"))
+                                or now.date(),
+                                time(13, 45),
+                                tzinfo=TAIPEI,
+                            ).isoformat(timespec="seconds")
+                        ),
                         "last_roll_at": now.isoformat(timespec="seconds"),
                         "last_roll_old_bid": (
                             old_bid if official_settlement is None else None
@@ -2105,9 +2428,36 @@ class TwDayTradeSimulationEngine:
                             else None
                         ),
                         "last_roll_new_ask": current_ask,
+                        "last_roll_new_previous_close": new_previous_close,
+                        "settled_buy_hold_wealth_index": settled_wealth,
+                        "last_roll_funding_flow_twd": roll_funding_flow,
+                        "last_margin_top_up_twd": margin_top_up,
+                        "last_margin_withdrawal_twd": margin_withdrawal,
+                        "cumulative_external_funding_flow_twd": (
+                            float(
+                                row.get("cumulative_external_funding_flow_twd")
+                                or 0.0
+                            )
+                            + roll_funding_flow
+                        ),
+                        "cumulative_margin_top_up_twd": (
+                            float(row.get("cumulative_margin_top_up_twd") or 0.0)
+                            + margin_top_up
+                        ),
+                        "cumulative_margin_withdrawal_twd": (
+                            float(
+                                row.get("cumulative_margin_withdrawal_twd") or 0.0
+                            )
+                            + margin_withdrawal
+                        ),
                         "roll_count": int(row.get("roll_count") or 0) + 1,
                     }
                 )
+                row["estimated_tracking_cost_twd"] = float(
+                    row.get("estimated_fixed_fees_twd") or 0.0
+                ) + float(row.get("estimated_transaction_tax_twd") or 0.0)
+                row["fixed_fees_twd"] = 0.0
+                row["transaction_tax_twd"] = 0.0
                 update_contract_identity(row, current_quote)
                 roll_history = list(row.get("roll_history") or ())
                 roll_history.append(
@@ -2124,8 +2474,12 @@ class TwDayTradeSimulationEngine:
                         ),
                         "official_final_settlement": official_settlement,
                         "new_ask": current_ask,
+                        "new_previous_close": new_previous_close,
                         "old_exit_fee_twd": old_exit_fee,
                         "new_entry_fee_twd": fee_per_side,
+                        "funding_flow_twd": roll_funding_flow,
+                        "margin_top_up_twd": margin_top_up,
+                        "margin_withdrawal_twd": margin_withdrawal,
                     }
                 )
                 row["roll_history"] = roll_history[-100:]
@@ -2142,6 +2496,10 @@ class TwDayTradeSimulationEngine:
                         "new_entry_ask": current_ask,
                         "official_final_settlement": official_settlement,
                         "realized_gross_pnl_twd": row["realized_gross_pnl_twd"],
+                        "settled_buy_hold_wealth_index": settled_wealth,
+                        "funding_flow_twd": roll_funding_flow,
+                        "margin_top_up_twd": margin_top_up,
+                        "margin_withdrawal_twd": margin_withdrawal,
                         "roll_contract_version": (TX_CONTINUOUS_ROLL_CONTRACT_VERSION),
                     },
                 )
@@ -2154,9 +2512,12 @@ class TwDayTradeSimulationEngine:
                         "roll_waiting_for_official_final_settlement_and_new_ask"
                     )
                 else:
-                    row["roll_blocked_reason"] = (
-                        "missing_old_bid" if old_bid is None else "missing_new_ask"
-                    )
+                    if old_bid is None:
+                        row["roll_blocked_reason"] = "missing_old_bid"
+                    elif current_ask is None:
+                        row["roll_blocked_reason"] = "missing_new_ask"
+                    else:
+                        row["roll_blocked_reason"] = "missing_new_contract_previous_close"
                     row["valuation_source"] = "roll_waiting_for_old_bid_and_new_ask"
                 self._append_benchmark_mark(row, now=now)
                 return
@@ -2166,37 +2527,84 @@ class TwDayTradeSimulationEngine:
             and held_code == current_code
             and current_bid is not None
         ):
-            open_gross_pnl = (current_bid - float(row["entry_price"])) * multiplier
+            settled_wealth = positive_finite(
+                row.get("settled_buy_hold_wealth_index") or 1.0
+            )
+            wealth_index = current_roll_linked_wealth(
+                settled_wealth,
+                current_bid,
+                row.get("entry_price"),
+            )
+            if wealth_index is None:
+                row["valuation_stale"] = True
+                row["valuation_source"] = "buy_hold_wealth_accounting_fail_closed"
+                self._append_benchmark_mark(row, now=now)
+                return
             liquidation_fee = fee_per_side
             liquidation_tax = self._tx_trade_tax(current_bid, trading_date=now.date())
-            net_pnl = (
-                float(row.get("realized_gross_pnl_twd") or 0.0)
-                + open_gross_pnl
-                - float(row.get("fixed_fees_twd") or 0.0)
-                - float(row.get("transaction_tax_twd") or 0.0)
-                - liquidation_fee
-                - liquidation_tax
+            initial_capital = fully_collateralized_futures_notional(
+                row.get("origin_entry_price") or row.get("entry_price"),
+                multiplier,
             )
-            initial_capital = float(row.get("initial_capital_twd") or 0.0)
-            return_fraction = (
-                net_pnl / initial_capital if initial_capital > 0.0 else None
+            assert initial_capital is not None
+            return_fraction = wealth_index - 1.0
+            performance_pnl = initial_capital * return_fraction
+            current_notional = fully_collateralized_futures_notional(
+                current_bid,
+                multiplier,
             )
+            assert current_notional is not None
+            daily_return_fraction, daily_return_pct = previous_close_return(
+                current_bid,
+                current_quote.get("previous_close"),
+            )
+            estimated_incurred_cost = float(
+                row.get("estimated_fixed_fees_twd") or 0.0
+            ) + float(row.get("estimated_transaction_tax_twd") or 0.0)
             row.update(
                 {
                     "last_mark_price": current_bid,
                     "last_quote_at": current_quote.get("quote_at"),
                     "last_mark_at": now.isoformat(timespec="seconds"),
-                    "liquidation_cost_twd": liquidation_fee + liquidation_tax,
-                    "net_pnl_twd": net_pnl,
-                    "total_equity_twd": initial_capital + net_pnl,
+                    "initial_capital_twd": initial_capital,
+                    "fixed_fees_twd": 0.0,
+                    "transaction_tax_twd": 0.0,
+                    "liquidation_cost_twd": 0.0,
+                    "estimated_liquidation_cost_twd": (
+                        liquidation_fee + liquidation_tax
+                    ),
+                    "estimated_tracking_cost_twd": (
+                        estimated_incurred_cost + liquidation_fee + liquidation_tax
+                    ),
+                    "buy_hold_wealth_index": wealth_index,
+                    "performance_pnl_twd": performance_pnl,
+                    "gross_pnl_twd": performance_pnl,
+                    "net_pnl_twd": performance_pnl,
+                    "total_equity_twd": initial_capital * wealth_index,
                     "return_fraction": return_fraction,
-                    "return_pct": None
-                    if return_fraction is None
-                    else return_fraction * 100.0,
+                    "return_pct": return_fraction * 100.0,
+                    "daily_return_fraction": daily_return_fraction,
+                    "daily_return_pct": daily_return_pct,
+                    "daily_return_previous_close": positive_finite(
+                        current_quote.get("previous_close")
+                    ),
+                    "daily_return_reference_price": positive_finite(
+                        current_quote.get("previous_close")
+                    ),
+                    "daily_return_previous_close_date": current_quote.get(
+                        "previous_close_date"
+                    ),
+                    "daily_return_previous_close_source": current_quote.get(
+                        "previous_close_source"
+                    ),
+                    "current_contract_notional_twd": current_notional,
+                    "fully_collateralized_account_equity_twd": current_notional,
+                    "collateral_coverage_ratio": 1.0,
+                    "maximum_leverage": 1.0,
                     "valuation_stale": False,
                     "valuation_source": (
-                        "one_tx_ask_entry_bid_liquidation_with_official_expiry_"
-                        "settlement_roll_fee_and_tax"
+                        "gross_fully_collateralized_1x_tx_buy_and_hold_at_bid_"
+                        "with_close_to_close_roll_linking"
                     ),
                     "source": current_quote.get("source"),
                 }
@@ -3001,6 +3409,15 @@ class TwDayTradeSimulationEngine:
         mode["signal_at"] = signal_at.isoformat(timespec="seconds")
         mode["source_signal_at"] = source_signal_at.isoformat(timespec="seconds")
         mode["counterfactual_open_replay"] = bool(counterfactual_open_replay)
+        # A replay has two different clocks: the immutable model decision time
+        # and the paper ledger time at which the already-observed session open
+        # is applied.  Keep the latter explicit instead of forcing dashboard
+        # clients to infer it from the overloaded ``signal_at`` field.
+        mode["open_reconstructed_at"] = (
+            signal_at.isoformat(timespec="seconds")
+            if counterfactual_open_replay
+            else None
+        )
         mode["signal_source_path"] = summary.get("summary_path")
         mode["target_weights_path"] = summary.get("weights_path")
         mode["target_positions_path"] = summary.get(
@@ -3112,6 +3529,11 @@ class TwDayTradeSimulationEngine:
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
                 "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
+                "open_reconstructed_at": (
+                    signal_at.isoformat(timespec="seconds")
+                    if counterfactual_open_replay
+                    else None
+                ),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -3206,6 +3628,11 @@ class TwDayTradeSimulationEngine:
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
                 "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
+                "open_reconstructed_at": (
+                    signal_at.isoformat(timespec="seconds")
+                    if counterfactual_open_replay
+                    else None
+                ),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -3521,6 +3948,11 @@ class TwDayTradeSimulationEngine:
                 simulation_replay=bool(mode.get("simulation_replay")),
                 replay_basis=mode.get("replay_basis"),
                 source_signal_at=source_signal_at.isoformat(timespec="seconds"),
+                open_reconstructed_at=(
+                    signal_at.isoformat(timespec="seconds")
+                    if counterfactual_open_replay
+                    else None
+                ),
                 counterfactual_open_replay=bool(counterfactual_open_replay),
             )
             self._mark_mode(spec.market, observed, quotes)

@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import polars as pl
+from polars.testing import assert_frame_equal
 import pytest
 
 import stockagent.data.panel as panel_module
@@ -411,6 +412,67 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     receipt, findings = audit_feature_build_receipt(output_path, input_dir, symbols_root)
     assert receipt["valid"] is False
     assert [item.code for item in findings] == ["stale_feature_build_receipt"]
+
+
+def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
+    input_dir = tmp_path / "tw_public"
+    input_dir.mkdir()
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 11.0, 12.0])
+
+    def write_source(dates: list[str], closes: list[str]) -> None:
+        pl.DataFrame(
+            {
+                "證券代號": ["2330"] * len(dates),
+                "收盤價": closes,
+                "最高價": closes,
+                "最低價": closes,
+                "成交股數": ["1000"] * len(dates),
+                "成交金額": ["100000"] * len(dates),
+                "成交筆數": ["10"] * len(dates),
+                "date": dates,
+            }
+        ).write_parquet(input_dir / "twse_daily_ohlcv.parquet")
+
+    incremental_path = tmp_path / "incremental.parquet"
+    write_source(["2024-01-02", "2024-01-03"], ["100", "101"])
+    build_tw_public_training_features(
+        input_dir,
+        incremental_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+
+    write_source(
+        ["2024-01-02", "2024-01-03", "2024-01-04"],
+        ["100", "101", "103"],
+    )
+    incremental = build_tw_public_training_features(
+        input_dir,
+        incremental_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 4),
+        incremental_start_date=date(2024, 1, 3),
+    )
+    full_path = tmp_path / "full.parquet"
+    full = build_tw_public_training_features(
+        input_dir,
+        full_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 4),
+    )
+
+    assert incremental.build_mode == "incremental_tail"
+    assert incremental.incremental_start_date == "2024-01-03"
+    assert incremental.reused_rows == 1
+    assert incremental.rows == full.rows
+    assert_frame_equal(
+        pl.read_parquet(incremental_path),
+        pl.read_parquet(full_path),
+        check_row_order=True,
+        check_column_order=True,
+    )
 
 
 def test_tw_public_feature_builder_excludes_rows_after_completed_cutoff(

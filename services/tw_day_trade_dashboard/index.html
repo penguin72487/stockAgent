@@ -85,7 +85,7 @@
     <section id="mode-cards" class="mode-grid" aria-label="啟用模式績效卡片"></section>
     <div id="baselines" class="subsection-head">
       <div><h3>市場基準</h3><span>0050、2330、台指期前月連續持有</span></div>
-      <p>實際開盤起算；台指期換月不把合約價差灌入報酬。</p>
+      <p>三條皆為跨日 Buy &amp; Hold；每日報酬以昨日收盤為基準。台指期以 1:1 名目資金持有、不開槓桿。</p>
     </div>
     <section id="benchmark-cards" class="benchmark-grid" aria-label="市場基準績效卡片"></section>
 
@@ -144,7 +144,7 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；每個非零訊號都顯示開盤計價，未成交會保留整張、資格、方向平衡等原因，不會偽造成交</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；完整保留每個模型訊號，包括資金不足一張而 0 股未成交的股票</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
 	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
@@ -187,6 +187,6 @@
   </main>
   <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=44" defer></script>
+  <script src="app.js?v=47" defer></script>
 </body>
 </html>

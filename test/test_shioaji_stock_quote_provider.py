@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date
 import sys
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,9 +26,7 @@ class _FakeApi:
         self.snapshot_timeouts: list[int] = []
         self.logged_out = False
 
-    def snapshots(self, contracts, timeout=30000):
-        self.batch_sizes.append(len(contracts))
-        self.snapshot_timeouts.append(int(timeout))
+    def _snapshot_rows(self, contracts):
         now_ns = int(
             np.datetime64(
                 __import__("datetime").datetime.now().replace(tzinfo=None),
@@ -50,6 +49,15 @@ class _FakeApi:
             )
             for contract in contracts
         ]
+
+    def snapshots(self, contracts, timeout=30000, cb=None):
+        self.batch_sizes.append(len(contracts))
+        self.snapshot_timeouts.append(int(timeout))
+        rows = self._snapshot_rows(contracts)
+        if cb is not None:
+            cb(rows)
+            return []
+        return rows
 
     def logout(self):
         self.logged_out = True
@@ -279,8 +287,8 @@ def test_shioaji_stock_snapshot_reconnects_once_after_session_failure(
     )
 
     class ExpiredApi(_FakeApi):
-        def snapshots(self, contracts, timeout=30000):
-            del contracts, timeout
+        def snapshots(self, contracts, timeout=30000, cb=None):
+            del contracts, timeout, cb
             raise RuntimeError("SessionNotEstablished")
 
     class FreshApi(_FakeApi):
@@ -355,7 +363,7 @@ def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):
     )
 
     assert api.batch_sizes == [500, 1]
-    assert api.snapshot_timeouts == [3_000, 3_000]
+    assert api.snapshot_timeouts == [0, 0]
     assert first.source.startswith("shioaji:stock_snapshot")
     assert first.available_count == 501
     assert np.all(first.open_prices == 100.0)
@@ -366,6 +374,105 @@ def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):
     assert np.all(first.timestamps_ms > 0)
     assert np.all(first.exchange_timestamps_ms > 0)
     assert np.array_equal(second.prices, first.prices)
+
+
+def test_shioaji_stock_snapshot_batches_are_all_in_flight_before_waiting(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    symbols = [f"{idx:04d}" for idx in range(1001)]
+    contracts = {
+        code: SimpleNamespace(
+            code=code,
+            reference=100.0,
+            limit_up=110.0,
+            limit_down=90.0,
+        )
+        for code in symbols
+    }
+
+    class DeferredCallbackApi(_FakeApi):
+        def __init__(self):
+            super().__init__(contracts)
+            self.pending = []
+
+        def snapshots(self, requested, timeout=30000, cb=None):
+            assert timeout == 0
+            assert cb is not None
+            self.batch_sizes.append(len(requested))
+            self.snapshot_timeouts.append(int(timeout))
+            self.pending.append((list(requested), cb))
+            # No response is released until all three requests have been
+            # submitted. A sequential implementation deadlocks this test.
+            if len(self.pending) == 3:
+                pending = list(self.pending)
+                for batch, callback in pending:
+                    callback(self._snapshot_rows(batch))
+            return []
+
+    api = DeferredCallbackApi()
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
+
+    snapshot = quote_provider.fetch_shioaji_stock_snapshots(
+        symbols,
+        np.full((len(symbols),), 90.0, dtype=np.float64),
+    )
+
+    assert api.batch_sizes == [500, 500, 1]
+    assert api.snapshot_timeouts == [0, 0, 0]
+    assert snapshot.available_count == len(symbols)
+    assert snapshot.source.endswith("+nonblocking_batch_callbacks")
+
+
+def test_shioaji_stock_snapshot_ignores_duplicate_late_batch_callback(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_SNAPSHOT_TIMEOUT_MS", "250")
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    contracts = {
+        code: SimpleNamespace(
+            code=code,
+            reference=100.0,
+            limit_up=110.0,
+            limit_down=90.0,
+        )
+        for code in ("2330", "2317")
+    }
+
+    class OneLateBatchApi(_FakeApi):
+        def __init__(self):
+            super().__init__(contracts)
+            self.late_callback = None
+
+        def snapshots(self, requested, timeout=30000, cb=None):
+            assert timeout == 0
+            assert cb is not None
+            self.batch_sizes.append(len(requested))
+            self.snapshot_timeouts.append(int(timeout))
+            rows = self._snapshot_rows(requested)
+            cb(rows[:1])
+            self.late_callback = lambda: cb(rows[1:])
+            return []
+
+    api = OneLateBatchApi()
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
+
+    snapshot = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330", "2317"],
+        np.asarray([90.0, 80.0], dtype=np.float64),
+    )
+    assert snapshot.available_mask.tolist() == [True, False]
+    assert api.late_callback is not None
+    api.late_callback()
+    assert "2317" not in quote_provider._SHIOAJI_STOCK_CACHE
 
 
 def test_shioaji_stock_snapshots_fail_closed_without_usable_rows(monkeypatch):
@@ -406,10 +513,16 @@ def test_shioaji_stock_snapshots_never_revive_expired_rows_after_partial_reply(
             super().__init__(contracts)
             self.calls = 0
 
-        def snapshots(self, requested, timeout=30000):
+        def snapshots(self, requested, timeout=30000, cb=None):
             self.calls += 1
-            rows = super().snapshots(requested, timeout=timeout)
-            return rows if self.calls == 1 else rows[:1]
+            rows = self._snapshot_rows(requested)
+            self.batch_sizes.append(len(requested))
+            self.snapshot_timeouts.append(int(timeout))
+            selected = rows if self.calls == 1 else rows[:1]
+            if cb is not None:
+                cb(selected)
+                return []
+            return selected
 
     api = PartialReplyApi()
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
@@ -511,8 +624,8 @@ def test_shioaji_stock_snapshots_restore_only_executable_locked_limit_side(
     }
 
     class LockedLimitApi(_FakeApi):
-        def snapshots(self, requested_contracts, timeout=30000):
-            assert 250 <= int(timeout) <= 5_000
+        def snapshots(self, requested_contracts, timeout=30000, cb=None):
+            assert int(timeout) == 0
             self.batch_sizes.append(len(requested_contracts))
             rows = {
                 "LIMIT_UP": SimpleNamespace(
@@ -552,7 +665,11 @@ def test_shioaji_stock_snapshots_restore_only_executable_locked_limit_side(
                     sell_volume=0.0,
                 ),
             }
-            return [rows[contract.code] for contract in requested_contracts]
+            selected = [rows[contract.code] for contract in requested_contracts]
+            if cb is not None:
+                cb(selected)
+                return []
+            return selected
 
     api = LockedLimitApi(contracts)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
@@ -570,7 +687,8 @@ def test_shioaji_stock_snapshots_restore_only_executable_locked_limit_side(
     np.testing.assert_allclose(snapshot.ask_prices[1], 90.0)
     assert np.isnan(snapshot.bid_prices[2])
     assert np.isnan(snapshot.ask_prices[2])
-    assert snapshot.source.endswith("+locked_limit_book_repair")
+    assert "+locked_limit_book_repair" in snapshot.source
+    assert snapshot.source.endswith("+nonblocking_batch_callbacks")
 
 
 def test_prepare_tw_price_limits_persists_only_static_metadata(monkeypatch, tmp_path):

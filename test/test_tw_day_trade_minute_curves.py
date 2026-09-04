@@ -18,6 +18,7 @@ from scripts.maintain_tw_day_trade_minute_curves import (
 from scripts.rebuild_tw_day_trade_minute_curves import (
     DEFAULT_LOCAL_MINUTE_ROOTS,
     MinutePriceStore,
+    _benchmark_minute_row,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
     rebuild_benchmark_history,
@@ -32,6 +33,27 @@ def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
         "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
     )
 from stockagent.live.tw_day_trade_simulation import position_net_liquidation_pnl
+
+
+def test_stock_benchmark_minute_uses_adjusted_units_without_adjusting_cost_basis() -> None:
+    row = _benchmark_minute_row(
+        {
+            "entry_price": 100.0,
+            "quantity": 1_000,
+            "adjusted_quantity": 1_100.0,
+            "initial_capital_twd": 100_000.0,
+            "last_mark_price": 100.0,
+            "daily_return_reference_price": 98.0,
+        },
+        minute=datetime(2026, 8, 13, 9, 1, tzinfo=ZoneInfo("Asia/Taipei")),
+        price=100.0,
+        fresh=True,
+    )
+
+    assert row["gross_pnl_twd"] == 10_000.0
+    assert row["total_equity_twd"] == 110_000.0
+    assert row["return_pct"] == pytest.approx(10.0)
+    assert row["daily_return_pct"] == pytest.approx((100.0 / 98.0 - 1.0) * 100.0)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")

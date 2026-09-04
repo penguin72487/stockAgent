@@ -10,6 +10,7 @@ import hashlib
 import json
 import pickle
 import os
+import time as time_module
 from typing import Any
 
 import numpy as np
@@ -564,6 +565,21 @@ class _ExternalFeatureArrays:
     official_session_dates: np.ndarray
 
 
+# These sparse facts can affect a later panel row even when their publication
+# date precedes the requested live tail.  Dense per-session rules are needed
+# only on dates represented by the panel.  Keeping the distinction explicit
+# avoids decoding all 17 rule columns for roughly ten million historical rows
+# on every cold Discord start without weakening lifecycle/cover correctness.
+_PERSISTENT_EXTERNAL_RULE_EVENT_COLUMNS = (
+    "_twpub_delisted",
+    "_twpub_force_short_cover",
+    "_twpub_force_cover_lead_sessions",
+    "_twpub_force_cover_anchor_ordinal",
+    "_twpub_force_cover_delisting_ordinal",
+    "_twpub_force_cover_cancel_ordinal",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _CorporateActionReferencePaths:
     parquet: Path
@@ -1058,6 +1074,7 @@ def _load_external_feature_arrays(
     include_rules: bool = True,
     date_start: date | None = None,
     date_end: date | None = None,
+    selected_feature_names: tuple[str, ...] | None = None,
 ) -> _ExternalFeatureArrays:
     if pl is None or pq is None:
         raise RuntimeError("external TW public features require polars and pyarrow")
@@ -1080,6 +1097,17 @@ def _load_external_feature_arrays(
         if include_features
         else []
     )
+    if selected_feature_names is not None:
+        available = set(feature_names)
+        missing_selected = [
+            name for name in selected_feature_names if name not in available
+        ]
+        if missing_selected:
+            raise ValueError(
+                "selected external features are absent from the source: "
+                f"{missing_selected}"
+            )
+        feature_names = list(selected_feature_names)
     rule_names = (
         [column for column in candidate_columns if str(column).startswith("_twpub_")]
         if include_rules
@@ -1111,17 +1139,26 @@ def _load_external_feature_arrays(
             memory_map=True,
         )
     )
-    rule_frame = (
-        pl.from_arrow(
-            pq.read_table(
-                path,
-                columns=["date", "symbol", *rule_names],
-                memory_map=True,
-            )
+    historical_rule_names = [
+        name
+        for name in _PERSISTENT_EXTERNAL_RULE_EVENT_COLUMNS
+        if name in rule_names
+    ]
+    historical_rule_frame = None
+    if filters and historical_rule_names:
+        event_predicate = pl.any_horizontal(
+            [
+                pl.col(name).cast(pl.Float64, strict=False).fill_null(0.0)
+                != 0.0
+                for name in historical_rule_names
+            ]
         )
-        if filters and rule_names
-        else None
-    )
+        historical_rule_frame = (
+            pl.scan_parquet(path)
+            .select(["date", "symbol", *historical_rule_names])
+            .filter(event_predicate)
+            .collect()
+        )
     if not feature_names:
         if not rule_names:
             return _ExternalFeatureArrays(
@@ -1159,10 +1196,30 @@ def _load_external_feature_arrays(
         )
 
     frame = prepare_frame(frame, value_columns)
-    if rule_frame is not None:
-        rule_frame = prepare_frame(rule_frame, rule_names)
-    else:
-        rule_frame = frame
+    rule_frame = frame.select(["date", "symbol", *rule_names])
+    if historical_rule_frame is not None and not historical_rule_frame.is_empty():
+        historical_rule_frame = prepare_frame(
+            historical_rule_frame,
+            historical_rule_names,
+        ).with_columns(
+            [
+                pl.lit(None, dtype=pl.Float64).alias(name)
+                for name in rule_names
+                if name not in historical_rule_names
+            ]
+        )
+        rule_frame = prepare_frame(
+            pl.concat(
+                [
+                    rule_frame,
+                    historical_rule_frame.select(
+                        ["date", "symbol", *rule_names]
+                    ),
+                ],
+                how="vertical_relaxed",
+            ),
+            rule_names,
+        )
     if frame.is_empty() and (rule_frame is None or rule_frame.is_empty()):
         return _ExternalFeatureArrays(
             feature_names=feature_names,
@@ -3672,6 +3729,42 @@ def build_tail_panel(
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
+    selected_panel_feature_names: tuple[str, ...] | None = None
+    selected_external_feature_names: tuple[str, ...] | None = None
+    if external_feature_path is not None:
+        external_schema_columns = list(pq.read_schema(external_feature_path).names)
+        all_external_feature_names = (
+            [
+                name
+                for name in external_schema_columns
+                if name not in {"date", "symbol"}
+                and not str(name).startswith("_")
+            ]
+            if external_include_features
+            else []
+        )
+        effective_feature_exclude = tuple(feature_exclude_patterns)
+        if DAY_TRADE_OPEN_GAP_FEATURE not in feature_include_patterns:
+            effective_feature_exclude = (
+                *effective_feature_exclude,
+                DAY_TRADE_OPEN_GAP_FEATURE,
+            )
+        (
+            _base_indices,
+            _base_destinations,
+            external_indices,
+            _external_destinations,
+            resolved_feature_names,
+        ) = _resolve_panel_feature_indices(
+            list(BASE_PANEL_FEATURE_COLUMNS),
+            all_external_feature_names,
+            feature_include=feature_include_patterns,
+            feature_exclude=effective_feature_exclude,
+        )
+        selected_panel_feature_names = tuple(resolved_feature_names)
+        selected_external_feature_names = tuple(
+            all_external_feature_names[index] for index in external_indices
+        )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
@@ -3707,6 +3800,7 @@ def build_tail_panel(
         f"[panel] building live tail from {len(parquet_paths)} parquet files "
         f"(tail_rows={read_rows}, workers={panel_load_workers})..."
     )
+    build_started = time_module.perf_counter()
 
     def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
         try:
@@ -3727,6 +3821,7 @@ def build_tail_panel(
             loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
     else:
         loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+    symbol_load_seconds = time_module.perf_counter() - build_started
 
     valid_arrays: list[_SymbolPanelArrays] = []
     for path, arrays, exc in loaded_arrays:
@@ -3751,6 +3846,7 @@ def build_tail_panel(
                 [item.dates for item in valid_arrays if item.dates.size]
             )
 
+    external_started = time_module.perf_counter()
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,
@@ -3771,16 +3867,27 @@ def build_tail_panel(
                 if external_date_source.size
                 else None
             ),
+            selected_feature_names=selected_external_feature_names,
         )
         if external_feature_path is not None
         else None
     )
+    external_load_seconds = time_module.perf_counter() - external_started
+    assemble_started = time_module.perf_counter()
     panel = _build_panel_from_symbol_arrays(
         valid_arrays,
         benchmark_name=benchmark_name,
         external_features=external_features,
-        feature_include=feature_include_patterns,
-        feature_exclude=feature_exclude_patterns,
+        feature_include=(
+            selected_panel_feature_names
+            if selected_panel_feature_names is not None
+            else feature_include_patterns
+        ),
+        feature_exclude=(
+            ()
+            if selected_panel_feature_names is not None
+            else feature_exclude_patterns
+        ),
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
@@ -3796,6 +3903,15 @@ def build_tail_panel(
     )
     if panel.unresolved_corporate_action_mask is not None:
         panel = _attach_raw_close_forward_returns(panel)
+    assemble_seconds = time_module.perf_counter() - assemble_started
+    print(
+        "[panel] live tail stages "
+        f"symbols={symbol_load_seconds:.3f}s "
+        f"external={external_load_seconds:.3f}s "
+        f"assemble_rules={assemble_seconds:.3f}s "
+        f"total={time_module.perf_counter() - build_started:.3f}s",
+        flush=True,
+    )
     _print_feature_overview(panel)
     return panel
 

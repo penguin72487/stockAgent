@@ -2242,7 +2242,12 @@ def _signal_now_source_event_token() -> str:
     paths = [receipt_path]
     paths.extend(
         publication_root / phase / "latest.json"
-        for phase in ("close_final", "close_revision", "close_initial")
+        for phase in (
+            "close_final",
+            "close_revision",
+            "close_initial",
+            "close_event",
+        )
     )
     tokens: list[str] = []
     for path in paths:
@@ -2267,7 +2272,7 @@ def _completed_session_publication_ready(status: MarketRuntimeStatus) -> bool:
     if not expected:
         return False
     _receipt_path, publication_root = _completed_session_receipt_paths()
-    for phase in ("close_final", "close_revision", "close_initial"):
+    for phase in ("close_final", "close_revision", "close_initial", "close_event"):
         try:
             publication = json.loads(
                 (publication_root / phase / "latest.json").read_text(
@@ -2312,7 +2317,7 @@ def _completed_session_receipt_ready(status: MarketRuntimeStatus) -> bool:
         return False
     newest_phase: str | None = None
     newest_completed_at: str | None = None
-    for phase in ("close_final", "close_revision", "close_initial"):
+    for phase in ("close_final", "close_revision", "close_initial", "close_event"):
         try:
             publication = json.loads(
                 (publication_root / phase / "latest.json").read_text(
@@ -2551,6 +2556,9 @@ class StockAgentBot(discord.Client):
         self._opening_attempt_market: str | None = None
         self._opening_attempt_hot = False
         self._startup_inference_warmup_complete = False
+        self._startup_inference_warmup_terminal = False
+        self._startup_inference_warmup_failure_count = 0
+        self._startup_inference_warmup_retry_after = 0.0
 
     async def setup_hook(self) -> None:
         # Strategy recording is the primary responsibility of this process.
@@ -2936,6 +2944,35 @@ def _startup_inference_warmup_must_defer() -> bool:
     return False
 
 
+def _startup_warmup_failure_is_retryable(exc: BaseException) -> bool:
+    """Separate transient runtime failures from immutable contract failures."""
+
+    message = str(exc).casefold()
+    permanent_markers = (
+        "checkpoint semantic fingerprint mismatch",
+        "checkpoint fold mismatch",
+        "unsupported checkpoint manifest schema",
+        "does not contain model_state_dict",
+        "unknown checkpoint validation scope",
+    )
+    return not any(marker in message for marker in permanent_markers)
+
+
+def _startup_warmup_retry_delay_seconds(failure_count: int) -> float:
+    base = max(
+        15.0,
+        _env_float("STOCKAGENT_STARTUP_WARM_RETRY_BASE_SECONDS", 60.0),
+    )
+    maximum = max(
+        base,
+        _env_float("STOCKAGENT_STARTUP_WARM_RETRY_MAX_SECONDS", 900.0),
+    )
+    return min(
+        maximum,
+        base * (2 ** min(max(0, int(failure_count) - 1), 6)),
+    )
+
+
 def _warm_startup_inference_sync() -> dict[str, Any]:
     """Warm panel, checkpoint, normalized input, and GPU model without I/O quotes."""
 
@@ -3010,6 +3047,7 @@ def _warm_startup_inference_sync() -> dict[str, Any]:
                     ),
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:2000],
+                    "retryable": _startup_warmup_failure_is_retryable(exc),
                 }
             )
         _write_startup_inference_warmup_status(
@@ -4574,6 +4612,47 @@ def _market_has_generated_signal_for_session(
     return _summary_date_matches(summary.get("generated_at"), session_date)
 
 
+def _is_scheduled_day_trade_opening_signal(
+    cfg: LiveMarketConfig,
+    summary: dict[str, Any],
+    session_date: str,
+) -> bool:
+    """Reject same-day artifacts that were not produced by the 09:00 gate."""
+
+    contract = summary.get("signal_price_contract") or {}
+    if not isinstance(contract, dict):
+        return False
+    if not (
+        _summary_date_matches(summary.get("generated_at"), session_date)
+        and bool(summary.get("live_session_open_feature_applied"))
+        and str(summary.get("day_trade_model_observation") or "").strip().lower()
+        == "session_open"
+        and str(contract.get("model_observation") or "").strip().lower()
+        == "session_open"
+        and contract.get("opening_execution_eligible") is True
+    ):
+        return False
+    raw_started = str(
+        summary.get("signal_started_at") or summary.get("generated_at") or ""
+    ).strip()
+    if not raw_started:
+        return False
+    try:
+        started = datetime.fromisoformat(raw_started.replace("Z", "+00:00"))
+        zone = ZoneInfo(getattr(cfg, "timezone", None) or "Asia/Taipei")
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=zone)
+        else:
+            started = started.astimezone(zone)
+        open_text = str(getattr(cfg, "open_time", None) or "09:00").strip()
+        gate = datetime.fromisoformat(
+            f"{session_date}T{open_text[:5]}:00"
+        ).replace(tzinfo=zone)
+    except (TypeError, ValueError):
+        return False
+    return started >= gate
+
+
 def _day_trade_schedule_state(
     cfg: LiveMarketConfig, session_date: str
 ) -> str:
@@ -4614,6 +4693,12 @@ def _day_trade_schedule_state(
         )
     ):
         return "completed"
+    if not _is_scheduled_day_trade_opening_signal(cfg, summary, session_date):
+        # A manual pre-open panel signal or an intraday ``latest_quote`` signal
+        # is not the immutable scheduled opening artifact.  It must never make
+        # the 09:00 scheduler wait forever for an engine acknowledgement that
+        # is correctly blocked by the execution contract.
+        return "retry"
     # A published opening signal is immutable for the session.  The paper
     # engine owns durable consumption and restart recovery; recomputing after a
     # short acknowledgement timeout changes the signal/price clock and can
@@ -8739,7 +8824,7 @@ async def model_auto_deployment() -> None:
             )
 
 
-@tasks.loop(seconds=15)
+@tasks.loop(seconds=2)
 async def signal_now_job_resumer() -> None:
     await _resume_signal_now_jobs_once()
 
@@ -8748,7 +8833,11 @@ async def signal_now_job_resumer() -> None:
 async def startup_inference_warmup() -> None:
     """Retry background warmup until all active paper modes are process-hot."""
 
-    if bot._startup_inference_warmup_complete:
+    if (
+        bot._startup_inference_warmup_complete
+        or bot._startup_inference_warmup_terminal
+        or time.monotonic() < bot._startup_inference_warmup_retry_after
+    ):
         return
     if _startup_inference_warmup_must_defer():
         return
@@ -8756,9 +8845,16 @@ async def startup_inference_warmup() -> None:
         receipt = await asyncio.to_thread(_warm_startup_inference_sync)
     except Exception as exc:
         _log_exception("startup_inference_warmup", exc)
+        bot._startup_inference_warmup_failure_count += 1
+        delay = _startup_warmup_retry_delay_seconds(
+            bot._startup_inference_warmup_failure_count
+        )
+        bot._startup_inference_warmup_retry_after = time.monotonic() + delay
         return
     if receipt.get("status") == "ready":
         bot._startup_inference_warmup_complete = True
+        bot._startup_inference_warmup_failure_count = 0
+        bot._startup_inference_warmup_retry_after = 0.0
         print(
             "[startup-warm] status=ready "
             f"markets={receipt.get('ready_count')}/{receipt.get('market_count')} "
@@ -8766,11 +8862,30 @@ async def startup_inference_warmup() -> None:
             flush=True,
         )
     else:
-        print(
-            "[startup-warm] status=degraded; retrying in 15s "
-            f"markets={receipt.get('ready_count')}/{receipt.get('market_count')}",
-            flush=True,
-        )
+        failures = [
+            row
+            for row in receipt.get("markets", [])
+            if isinstance(row, dict) and row.get("status") == "failed"
+        ]
+        if failures and not any(bool(row.get("retryable")) for row in failures):
+            bot._startup_inference_warmup_terminal = True
+            print(
+                "[startup-warm] status=degraded terminal=true "
+                f"markets={receipt.get('ready_count')}/{receipt.get('market_count')}",
+                flush=True,
+            )
+        else:
+            bot._startup_inference_warmup_failure_count += 1
+            delay = _startup_warmup_retry_delay_seconds(
+                bot._startup_inference_warmup_failure_count
+            )
+            bot._startup_inference_warmup_retry_after = time.monotonic() + delay
+            print(
+                "[startup-warm] status=degraded "
+                f"retrying_in={delay:.0f}s "
+                f"markets={receipt.get('ready_count')}/{receipt.get('market_count')}",
+                flush=True,
+            )
 
 
 @tasks.loop(seconds=1)

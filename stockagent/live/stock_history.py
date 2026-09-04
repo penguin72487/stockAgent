@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -116,15 +117,29 @@ def _read_price_symbol_series(
     path = _price_history_path(price_root, symbol)
     if path is None:
         return None, None, None
-    frame = _read_table(path)
-    if "date" not in frame.columns:
+    if path.suffix.lower() == ".parquet":
+        schema_names = list(pl.scan_parquet(path).collect_schema().names())
+    else:
+        schema_names = list(_read_table(path).columns)
+    if "date" not in schema_names:
         return None, None, path
     if price_column is not None:
-        price_col = price_column if price_column in frame.columns else None
+        price_col = price_column if price_column in schema_names else None
     else:
-        price_col = "close" if "close" in frame.columns else "adjclose" if "adjclose" in frame.columns else None
+        price_col = (
+            "close"
+            if "close" in schema_names
+            else "adjclose"
+            if "adjclose" in schema_names
+            else None
+        )
     if price_col is None:
         return None, None, path
+    frame = (
+        pl.read_parquet(path, columns=["date", price_col])
+        if path.suffix.lower() == ".parquet"
+        else _read_table(path).select(["date", price_col])
+    )
     selected = frame.with_row_index(_ROW_INDEX_COL).select(
         [
             _date_string_expr(frequency),
@@ -156,6 +171,80 @@ def _read_price_history_map(
         return {}, path
     rows = frame.drop_nulls(["date", "price"]).to_dicts()
     return {str(row["date"]): float(row["price"]) for row in rows}, path
+
+
+@lru_cache(maxsize=2048)
+def _read_price_history_maps_cached(
+    path_text: str,
+    size: int,
+    mtime_ns: int,
+    frequency: str,
+    price_columns: tuple[str, ...],
+) -> dict[str, dict[str, float]]:
+    """Read several price columns once and cache only that immutable revision."""
+
+    del size, mtime_ns
+    import polars as pl
+
+    path = Path(path_text)
+    if path.suffix.lower() == ".parquet":
+        schema_names = list(pl.scan_parquet(path).collect_schema().names())
+        available = [name for name in price_columns if name in schema_names]
+        if "date" not in schema_names or not available:
+            return {name: {} for name in price_columns}
+        frame = pl.read_parquet(path, columns=["date", *available])
+    else:
+        source = _read_table(path)
+        available = [name for name in price_columns if name in source.columns]
+        if "date" not in source.columns or not available:
+            return {name: {} for name in price_columns}
+        frame = source.select(["date", *available])
+    selected = frame.with_row_index(_ROW_INDEX_COL).select(
+        [
+            _date_string_expr(frequency),
+            pl.col(_ROW_INDEX_COL),
+            *[
+                pl.col(name).cast(pl.Float64, strict=False).alias(name)
+                for name in available
+            ],
+        ]
+    )
+    if is_bar_frequency(frequency):
+        selected = selected.drop(_ROW_INDEX_COL)
+    else:
+        selected = _last_daily_snapshot(selected, available)
+    output = {name: {} for name in price_columns}
+    for name in available:
+        rows = selected.drop_nulls(["date", name]).select(["date", name]).to_dicts()
+        output[name] = {
+            str(row["date"]): float(row[name])
+            for row in rows
+        }
+    return output
+
+
+def _read_price_history_maps(
+    price_root: str | Path | None,
+    symbol: str,
+    *,
+    frequency: str | None = "daily",
+    price_columns: tuple[str, ...] = ("open", "close"),
+) -> tuple[dict[str, dict[str, float]], Path | None]:
+    path = _price_history_path(price_root, symbol)
+    columns = tuple(dict.fromkeys(str(name) for name in price_columns if name))
+    if path is None or not columns:
+        return {name: {} for name in columns}, path
+    stat = path.stat()
+    return (
+        _read_price_history_maps_cached(
+            str(path.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            str(frequency or "daily"),
+            columns,
+        ),
+        path,
+    )
 
 
 def _date_string_expr(frequency: str | None = "daily"):

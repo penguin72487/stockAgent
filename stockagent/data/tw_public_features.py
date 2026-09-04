@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextvars import ContextVar
 from datetime import date, timedelta
 import hashlib
 import json
@@ -220,6 +221,37 @@ class TwPublicFeatureBuildResult:
     source_receipts: list[dict[str, str | int]]
     output_receipt: dict[str, str | int]
     symbol_universe_receipt: dict[str, str | int | bool]
+    build_mode: str = "full"
+    incremental_start_date: str | None = None
+    reused_rows: int = 0
+
+
+# Completed-session publication only changes a short daily tail, but the raw
+# TWSE/TPEx archives contain roughly ten million rows.  Keep the filter scoped
+# to date-normalized append/overlap datasets; event/snapshot sources are still
+# read in full so an old announcement whose effective range reaches the live
+# tail cannot disappear.  ContextVar keeps direct helper calls and concurrent
+# test workers isolated.
+_INCREMENTAL_READ_RANGE: ContextVar[tuple[date, date] | None] = ContextVar(
+    "tw_public_incremental_read_range",
+    default=None,
+)
+_INCREMENTAL_DATE_DATASETS = frozenset(
+    {
+        "twse_daily_ohlcv",
+        "tpex_daily_ohlcv",
+        "twse_daily_valuation",
+        "tpex_daily_valuation",
+        "twse_margin_balance",
+        "tpex_margin_balance",
+        "twse_institutional_trades",
+        "tpex_institutional_trades",
+        "twse_market_index",
+        "twse_taiex_ohlc",
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+    }
+)
 
 
 def _file_content_receipt(path: Path) -> dict[str, str | int]:
@@ -257,6 +289,53 @@ def _symbol_universe_receipt(symbols_root: str | Path | None) -> dict[str, str |
     }
 
 
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def _incremental_base_is_compatible(
+    output_path: Path,
+    summary_path: Path,
+    *,
+    market_symbol: str,
+) -> bool:
+    """Accept only a receipt-verified output with the current exact ABI."""
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        schema = pl.read_parquet_schema(output_path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict):
+        return False
+    if list(schema) != [*KEY_COLUMNS, *OUTPUT_COLUMNS]:
+        return False
+    if summary.get("feature_columns") != list(FEATURE_COLUMNS):
+        return False
+    if summary.get("rule_columns") != list(RULE_COLUMNS):
+        return False
+    if summary.get("market_symbol") != market_symbol:
+        return False
+    if (
+        int(summary.get("availability_contract_version") or -1)
+        != TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION
+    ):
+        return False
+    expected = summary.get("output_receipt")
+    if not isinstance(expected, dict):
+        return False
+    try:
+        return expected == _file_content_receipt(output_path)
+    except OSError:
+        return False
+
+
 def build_tw_public_training_features(
     input_dir: str | Path = "data_tw_public",
     output_path: str | Path = "data_tw_public/features/tw_public_stock_daily.parquet",
@@ -266,60 +345,156 @@ def build_tw_public_training_features(
     summary_path: str | Path | None = None,
     end_date: date | None = None,
     allow_daily_publication_lag: bool = False,
+    incremental_start_date: date | None = None,
+    incremental_context_days: int = 45,
 ) -> TwPublicFeatureBuildResult:
     input_dir = Path(input_dir)
     output_path = Path(output_path)
+    resolved_summary_path = Path(
+        summary_path or output_path.with_suffix(".summary.json")
+    )
+    if incremental_context_days < 1:
+        raise ValueError("incremental_context_days must be positive")
+    if incremental_start_date is not None and end_date is None:
+        raise ValueError("incremental_start_date requires end_date")
+    if (
+        incremental_start_date is not None
+        and end_date is not None
+        and incremental_start_date > end_date
+    ):
+        raise ValueError("incremental_start_date must not be after end_date")
+
+    use_incremental = bool(
+        incremental_start_date is not None
+        and output_path.is_file()
+        and _incremental_base_is_compatible(
+            output_path,
+            resolved_summary_path,
+            market_symbol=market_symbol,
+        )
+    )
+    existing_identity = (
+        _stable_file_identity(output_path) if use_incremental else None
+    )
     source_receipts = _source_content_receipts(input_dir)
     symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
     symbols = _load_symbol_filter(symbols_root)
-    stock_frames = [
-        _build_official_ohlcv_features(input_dir),
-        _build_delisted_company_rules(input_dir),
-        _build_valuation_features(input_dir),
-        _build_margin_features(input_dir),
-        _build_institutional_features(input_dir),
-        _build_tdcc_features(input_dir),
-        _build_company_basic_features(input_dir),
-        _build_dividend_features(input_dir),
-        _build_ex_dividend_preview_features(input_dir),
-        _build_material_info_features(input_dir),
-        _build_attention_disposal_features(input_dir),
-        _build_model_useful_financial_features(input_dir),
-        _build_model_useful_ownership_features(input_dir),
-        _build_model_useful_shorting_features(input_dir),
-        _build_model_useful_rule_features(input_dir),
-        _build_day_trade_rule_features(
-            input_dir,
-            symbols=symbols,
-            end_date=end_date,
-            allow_missing_latest_session=allow_daily_publication_lag,
-        ),
-    ]
-    stock_features = _merge_feature_frames(stock_frames)
-    if symbols is not None and not stock_features.is_empty():
-        stock_features = stock_features.filter(pl.col("symbol").is_in(sorted(symbols)))
-
-    market_features = _merge_feature_frames(
-        [
-            _build_twse_market_index_features(input_dir, market_symbol=market_symbol),
-            _build_usdtwd_features(input_dir, market_symbol=market_symbol),
-            _build_cbc_overnight_rate_features(input_dir, market_symbol=market_symbol),
-            _build_cbc_monthly_macro_features(input_dir, market_symbol=market_symbol),
-            _build_dgbas_macro_features(input_dir, market_symbol=market_symbol),
-            _build_mof_macro_features(input_dir, market_symbol=market_symbol),
-            _build_taifex_tx_features(input_dir, market_symbol=market_symbol),
-            _build_taifex_options_features(input_dir, market_symbol=market_symbol),
-            _build_taifex_institutional_features(input_dir, market_symbol=market_symbol),
-            _build_taifex_large_trader_features(input_dir, market_symbol=market_symbol),
-            _build_taifex_final_settlement_features(input_dir, market_symbol=market_symbol),
+    read_token = None
+    if use_incremental:
+        assert incremental_start_date is not None
+        assert end_date is not None
+        read_token = _INCREMENTAL_READ_RANGE.set(
+            (
+                incremental_start_date
+                - timedelta(days=int(incremental_context_days)),
+                end_date,
+            )
+        )
+    try:
+        stock_frames = [
+            _build_official_ohlcv_features(input_dir),
+            _build_delisted_company_rules(input_dir),
+            _build_valuation_features(input_dir),
+            _build_margin_features(input_dir),
+            _build_institutional_features(input_dir),
+            _build_tdcc_features(input_dir),
+            _build_company_basic_features(input_dir),
+            _build_dividend_features(input_dir),
+            _build_ex_dividend_preview_features(input_dir),
+            _build_material_info_features(input_dir),
+            _build_attention_disposal_features(input_dir),
+            _build_model_useful_financial_features(input_dir),
+            _build_model_useful_ownership_features(input_dir),
+            _build_model_useful_shorting_features(input_dir),
+            _build_model_useful_rule_features(input_dir),
+            _build_day_trade_rule_features(
+                input_dir,
+                symbols=symbols,
+                end_date=end_date,
+                allow_missing_latest_session=allow_daily_publication_lag,
+            ),
         ]
-    )
+        if use_incremental:
+            assert incremental_start_date is not None
+            assert end_date is not None
+            stock_frames = [
+                _slice_feature_frame(frame, incremental_start_date, end_date)
+                for frame in stock_frames
+            ]
+        stock_features = _merge_feature_frames(stock_frames)
+        if symbols is not None and not stock_features.is_empty():
+            stock_features = stock_features.filter(
+                pl.col("symbol").is_in(sorted(symbols))
+            )
+
+        market_frames = [
+                _build_twse_market_index_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_usdtwd_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_cbc_overnight_rate_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_cbc_monthly_macro_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_dgbas_macro_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_mof_macro_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_taifex_tx_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_taifex_options_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_taifex_institutional_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_taifex_large_trader_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+                _build_taifex_final_settlement_features(
+                    input_dir,
+                    market_symbol=market_symbol,
+                ),
+            ]
+        if use_incremental:
+            assert incremental_start_date is not None
+            assert end_date is not None
+            market_frames = [
+                _slice_feature_frame(frame, incremental_start_date, end_date)
+                for frame in market_frames
+            ]
+        market_features = _merge_feature_frames(market_frames)
+    finally:
+        if read_token is not None:
+            _INCREMENTAL_READ_RANGE.reset(read_token)
 
     frames = [frame for frame in (stock_features, market_features) if not frame.is_empty()]
     if frames:
         output = pl.concat(frames, how="diagonal_relaxed")
         if end_date is not None:
             output = output.filter(pl.col("date") <= pl.lit(end_date))
+        if use_incremental:
+            assert incremental_start_date is not None
+            output = output.filter(
+                pl.col("date") >= pl.lit(incremental_start_date)
+            )
         output = _ensure_feature_columns(output).sort(["date", "symbol"])
     else:
         output = pl.DataFrame(
@@ -332,29 +507,82 @@ def build_tw_public_training_features(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output_path.with_suffix(output_path.suffix + ".tmp")
-    output.write_parquet(temporary_output, compression="snappy", statistics=True)
+    reused_rows = 0
+    if use_incremental:
+        assert incremental_start_date is not None
+        prefix = pl.scan_parquet(output_path).filter(
+            pl.col("date") < pl.lit(incremental_start_date)
+        )
+        prefix_counts = prefix.select(
+            pl.len().alias("rows"),
+            (pl.col("symbol") != market_symbol).sum().alias("stock_rows"),
+            (pl.col("symbol") == market_symbol).sum().alias("market_rows"),
+        ).collect(engine="streaming").row(0, named=True)
+        reused_rows = int(prefix_counts["rows"] or 0)
+        combined = pl.concat([prefix, output.lazy()], how="vertical")
+        combined.sink_parquet(
+            temporary_output,
+            compression="snappy",
+            statistics=True,
+            row_group_size=64_000,
+            maintain_order=True,
+            engine="streaming",
+        )
+        stock_rows = int(prefix_counts["stock_rows"] or 0) + int(
+            output.filter(pl.col("symbol") != market_symbol).height
+        )
+        market_rows = int(prefix_counts["market_rows"] or 0) + int(
+            output.filter(pl.col("symbol") == market_symbol).height
+        )
+        rows = reused_rows + int(output.height)
+    else:
+        output.write_parquet(
+            temporary_output,
+            compression="snappy",
+            statistics=True,
+            row_group_size=64_000,
+        )
+        rows = int(output.height)
+        stock_rows = (
+            int(output.filter(pl.col("symbol") != market_symbol).height)
+            if not output.is_empty()
+            else 0
+        )
+        market_rows = (
+            int(output.filter(pl.col("symbol") == market_symbol).height)
+            if not output.is_empty()
+            else 0
+        )
     if source_receipts != _source_content_receipts(input_dir):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW public source parquet changed while features were being built")
     if symbol_universe_receipt != _symbol_universe_receipt(symbols_root):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW symbol universe changed while public features were being built")
+    if use_incremental and existing_identity != _stable_file_identity(output_path):
+        temporary_output.unlink(missing_ok=True)
+        raise RuntimeError("TW public feature base changed during incremental build")
     os.replace(temporary_output, output_path)
 
     source_files = sorted(str(path) for path in input_dir.glob("*.parquet"))
     result = TwPublicFeatureBuildResult(
         output_path=output_path,
-        rows=int(output.height),
+        rows=rows,
         feature_count=len(FEATURE_COLUMNS),
-        stock_rows=int(output.filter(pl.col("symbol") != market_symbol).height) if not output.is_empty() else 0,
-        market_rows=int(output.filter(pl.col("symbol") == market_symbol).height) if not output.is_empty() else 0,
+        stock_rows=stock_rows,
+        market_rows=market_rows,
         market_symbol=market_symbol,
         source_files=source_files,
         source_receipts=source_receipts,
         output_receipt=_file_content_receipt(output_path),
         symbol_universe_receipt=symbol_universe_receipt,
+        build_mode="incremental_tail" if use_incremental else "full",
+        incremental_start_date=(
+            incremental_start_date.isoformat() if use_incremental else None
+        ),
+        reused_rows=reused_rows,
     )
-    _write_summary(summary_path or output_path.with_suffix(".summary.json"), result)
+    _write_summary(resolved_summary_path, result)
     return result
 
 
@@ -374,6 +602,9 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "feature_columns": list(FEATURE_COLUMNS),
         "rule_columns": list(RULE_COLUMNS),
         "market_symbol": result.market_symbol,
+        "build_mode": result.build_mode,
+        "incremental_start_date": result.incremental_start_date,
+        "reused_rows": result.reused_rows,
         "availability_contract_version": TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION,
         "availability_policy": AVAILABILITY_POLICY,
     }
@@ -391,11 +622,41 @@ def _load_symbol_filter(symbols_root: str | Path | None) -> set[str] | None:
     return {path.name.removesuffix("_features.parquet").upper() for path in root.glob("*_features.parquet")}
 
 
+def _read_date_bounded_parquet(
+    path: Path,
+    *,
+    dataset: str,
+    columns: list[str] | None = None,
+) -> pl.DataFrame:
+    read_range = _INCREMENTAL_READ_RANGE.get()
+    lazy = pl.scan_parquet(path)
+    if read_range is not None and dataset in _INCREMENTAL_DATE_DATASETS:
+        start, end = read_range
+        schema = pl.read_parquet_schema(path)
+        date_dtype = schema.get("date")
+        if date_dtype == pl.String:
+            predicate = pl.col("date").is_between(
+                pl.lit(start.isoformat()),
+                pl.lit(end.isoformat()),
+                closed="both",
+            )
+        else:
+            predicate = pl.col("date").cast(pl.Date, strict=False).is_between(
+                start,
+                end,
+                closed="both",
+            )
+        lazy = lazy.filter(predicate)
+    if columns is not None:
+        lazy = lazy.select(columns)
+    return lazy.collect(engine="streaming")
+
+
 def _read_optional(input_dir: Path, name: str) -> pl.DataFrame:
     path = input_dir / f"{name}.parquet"
     if not path.exists():
         return pl.DataFrame()
-    return pl.read_parquet(path)
+    return _read_date_bounded_parquet(path, dataset=name)
 
 
 def _next_exchange_session_lookup(input_dir: Path) -> pl.DataFrame:
@@ -452,6 +713,18 @@ def _shift_post_close_features_to_next_session(
                 *[pl.col(name) for name in feature_columns],
             ]
         )
+    )
+
+
+def _slice_feature_frame(
+    frame: pl.DataFrame,
+    start: date,
+    end: date,
+) -> pl.DataFrame:
+    if frame.is_empty() or "date" not in frame.columns:
+        return frame
+    return frame.filter(
+        _date_column_expr("date").is_between(start, end, closed="both")
     )
 
 
@@ -1055,7 +1328,11 @@ def _normalize_day_trade_source(
     projected_columns = ["date", "證券代號"]
     if has_suspension_marker:
         projected_columns.append(DAY_TRADE_SUSPENSION_COLUMN)
-    frame = pl.read_parquet(path, columns=projected_columns)
+    frame = _read_date_bounded_parquet(
+        path,
+        dataset=dataset,
+        columns=projected_columns,
+    )
     normalized = frame.select(
         _date_column_expr("date").alias("date"),
         _symbol_expr("證券代號").alias("symbol"),
@@ -1134,7 +1411,11 @@ def _normalize_day_trade_universe(
         raise ValueError(
             f"{dataset}.parquet is missing required universe columns: {missing}"
         )
-    frame = pl.read_parquet(path, columns=["date", symbol_column])
+    frame = _read_date_bounded_parquet(
+        path,
+        dataset=dataset,
+        columns=["date", symbol_column],
+    )
     return (
         frame.select(
             _date_column_expr("date").alias("date"),

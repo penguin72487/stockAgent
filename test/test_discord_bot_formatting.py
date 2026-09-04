@@ -694,10 +694,17 @@ def test_day_trade_scheduler_waits_for_engine_execution_record(
         "services.discord_bot.bot._latest_market_signal",
         lambda _cfg: (
             tmp_path / "summary.json",
-            {
-                "generated_at": "2026-08-14T09:22:55+08:00",
-                "signal_id": signal_id,
-            },
+                {
+                    "generated_at": "2026-08-14T09:22:55+08:00",
+                    "signal_started_at": "2026-08-14T09:22:55+08:00",
+                    "signal_id": signal_id,
+                    "live_session_open_feature_applied": True,
+                    "day_trade_model_observation": "session_open",
+                    "signal_price_contract": {
+                        "model_observation": "session_open",
+                        "opening_execution_eligible": True,
+                    },
+                },
         ),
     )
 
@@ -2260,6 +2267,62 @@ def test_completed_session_receipt_must_ack_latest_close_phase(
         encoding="utf-8",
     )
     assert not _completed_session_receipt_ready(status)
+
+
+def test_completed_session_receipt_accepts_event_driven_close(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "completed.json"
+    publication_root = tmp_path / "publications"
+    phase_root = publication_root / "close_event"
+    phase_root.mkdir(parents=True)
+    completed_at = "2026-09-03T13:46:31+08:00"
+    publication = {
+        "status": "ok",
+        "phase": "close_event",
+        "started_at_taipei": "2026-09-03T13:46:30+08:00",
+        "completed_at_taipei": completed_at,
+        "download_summary": {
+            "end_date": "2026-09-03",
+            "daily_close_ready": True,
+            "blocking_failed_count": 0,
+            "incomplete_count": 0,
+        },
+    }
+    (phase_root / "latest.json").write_text(
+        json.dumps(publication),
+        encoding="utf-8",
+    )
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "expected_date": "2026-09-03",
+                "source_publication_phase": "close_event",
+                "source_publication_completed_at_taipei": completed_at,
+                "after": {
+                    "current": True,
+                    "dates": {
+                        "stock_panel": "2026-09-03",
+                        "public_features": "2026-09-03",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STOCKAGENT_TW_COMPLETED_SESSION_RECEIPT", str(receipt_path))
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_PUBLICATION_RECEIPT_ROOT",
+        str(publication_root),
+    )
+    status = SimpleNamespace(
+        data=SimpleNamespace(expected_latest_date="2026-09-03")
+    )
+
+    assert _completed_session_publication_ready(status)
+    assert _completed_session_receipt_ready(status)
 
 
 def test_signal_now_stale_response_says_waiting_source_not_background_update(

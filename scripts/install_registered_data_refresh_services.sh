@@ -32,6 +32,8 @@ units=(
   stockagent-binance-public-archive.timer
   stockagent-taifex-auxiliary-daily.service
   stockagent-taifex-auxiliary-daily.timer
+  stockagent-taifex-public-history.service
+  stockagent-taifex-public-history.timer
 )
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
@@ -50,21 +52,25 @@ systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
   "$repo_root/scripts/run_registered_data_refresh.sh" \
+  "$repo_root/scripts/run_downloader_with_release.sh" \
   "$repo_root/scripts/run_binance_public_archive.sh" \
-  "$repo_root/scripts/run_taifex_auxiliary_daily.sh"
+  "$repo_root/scripts/run_taifex_auxiliary_daily.sh" \
+  "$repo_root/scripts/run_taifex_public_history.sh"
 systemctl daemon-reload
 systemctl enable --now \
   stockagent-registered-data-daily.timer \
   stockagent-registered-data-intraday.timer \
   stockagent-registered-data-backfill.timer \
   stockagent-binance-public-archive.timer \
-  stockagent-taifex-auxiliary-daily.timer
+  stockagent-taifex-auxiliary-daily.timer \
+  stockagent-taifex-public-history.timer
 
 if [[ "${START_DATA_REFRESH_NOW:-1}" == "1" ]]; then
   systemctl start --no-block stockagent-registered-data-daily.service
   systemctl start --no-block stockagent-registered-data-intraday.service
   systemctl start --no-block stockagent-binance-public-archive.service
   systemctl start --no-block stockagent-taifex-auxiliary-daily.service
+  systemctl start --no-block stockagent-taifex-public-history.service
   echo "[registered-data] timers enabled; current refreshes requested"
 else
   echo "[registered-data] timers enabled; existing jobs left untouched"
