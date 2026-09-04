@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
+from artifact_io import atomic_write_parquet  # noqa: E402
 from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet  # noqa: E402
 
 
@@ -42,24 +43,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--provider", required=True)
-    parser.add_argument("--workers", type=int, default=max(1, min(16, os.cpu_count() or 1)))
+    parser.add_argument(
+        "--workers", type=int, default=max(1, min(16, os.cpu_count() or 1))
+    )
     parser.add_argument("--refresh", action="store_true")
     return parser.parse_args()
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(),
-            temporary,
-            compression="snappy",
-            write_statistics=True,
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
@@ -116,11 +108,12 @@ def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
     if normalized.is_empty():
         return pl.DataFrame()
     if normalized.select(pl.col("__ts").is_duplicated().any()).item():
-        raise ValueError("duplicate one-minute timestamps would double-count daily volume")
+        raise ValueError(
+            "duplicate one-minute timestamps would double-count daily volume"
+        )
     off_grid = normalized.select(
         (
-            (pl.col("__ts").dt.second() != 0)
-            | (pl.col("__ts").dt.microsecond() != 0)
+            (pl.col("__ts").dt.second() != 0) | (pl.col("__ts").dt.microsecond() != 0)
         ).any()
     ).item()
     if off_grid:
@@ -304,7 +297,9 @@ def main() -> None:
         output_dir / "download_summary.json",
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
-    report = pl.DataFrame([asdict(result) for result in results], infer_schema_length=None)
+    report = pl.DataFrame(
+        [asdict(result) for result in results], infer_schema_length=None
+    )
     atomic_write_text(
         output_dir / "download_report.csv",
         report.sort(["status", "symbol"]).write_csv() if report.height else "",

@@ -133,12 +133,15 @@ coordinated code, config, test, and documentation change.
 
 ### Syncthing topology and identity
 
-- The only shared canonical data folder is `stockagent-packed` at
+- The canonical data namespace is `stockagent-packed` at
   `/srv/stockagent-packed`, configured Send & Receive, filesystem watcher on,
-  and not paused.  It contains only release manifests, per-node heads, packs,
-  blobs, and their proofs.  Repositories, mutable `data_*` trees, materialized
-  caches, downloader shards, and active training directories do not belong in
-  this folder.
+  and not paused.  Durable nodes retain manifests, per-node heads, inventories,
+  packs, blobs, and their proofs.  An explicitly enrolled ephemeral compute node
+  may use index-only edge mode: it still synchronizes heads/manifests/inventories
+  in real time, ignores local blob/pack payload copies, and hydrates the exact
+  objects for a selected release before use.  Repositories, mutable `data_*`
+  trees, materialized caches, downloader shards, and active training directories
+  do not belong in this folder.
 - `stockagent`, `stockagent-desync`, and `stockagent-artifacts-live` are retired
   Folder IDs.  Never recreate or accept them.  `stockagent-artifacts-hot` is a
   non-canonical low-latency channel for an explicitly bounded penguin/lab203
@@ -156,13 +159,24 @@ coordinated code, config, test, and documentation change.
   Vast container may use a user supervisor and cron.  This does not change the
   storage contract.  Before calling a Vast cold store durable, verify that its
   path is on persistent storage that survives instance recreation.
+- Index-only edge conversion is allowed only for a non-persistent compute node
+  after a durable peer passes full object checksums and current Syncthing
+  convergence, the payload tree has no process references, and local ignore
+  rules are active before unlink.  It may delete only its ignored local
+  `objects/blobs` and `objects/packs` copies; heads, manifests, inventories,
+  materialized data, sources, and the durable peer remain untouched.  Direct
+  cold publication is disabled in this mode.  On-demand use must temporarily
+  re-include, receive, hash, and materialize the exact release, then may prune
+  only the redundant local payload copy.
 
 ### Multi-writer publication and conflict resolution
 
-- There is no single publisher.  Every node publishes immutable releases under
-  its own permanent node ID.  Per-node heads plus the deterministic HLC/LWW
-  resolver choose the newest *valid* release; catalog freshness and
-  non-regression checks outrank wall-clock recency.
+- There is no single publisher among full-replica publishing nodes.  They publish
+  immutable releases under their own permanent node IDs.  An index-only edge is
+  a consumer and may not publish until it is explicitly returned to full-replica
+  mode.  Per-node heads plus the deterministic HLC/LWW resolver choose the newest
+  *valid* release; catalog freshness and non-regression checks outrank wall-clock
+  recency.
 - "Newest wins" applies only to validated release heads.  It does not authorize
   agents to compare mtimes, hand-edit a shared head, copy another node's head,
   impersonate its node ID, or accept a Syncthing conflict file.  A conflict file

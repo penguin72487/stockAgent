@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.common import describe_rate_limit, resolve_end_date
+from downloader.artifact_io import atomic_write_parquet
 from downloader.download_tw_public_data import (
     _configure_tw_public_rate_limiter,
     _http_get,
@@ -98,9 +99,8 @@ def _receipt_matches(path: Path, receipt: Any) -> bool:
         return False
     try:
         actual = _file_receipt(path)
-        return (
-            actual["size"] == int(receipt["size"])
-            and actual["sha256"] == str(receipt["sha256"])
+        return actual["size"] == int(receipt["size"]) and actual["sha256"] == str(
+            receipt["sha256"]
         )
     except (KeyError, OSError, TypeError, ValueError):
         return False
@@ -125,7 +125,6 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
 
 
 def _write_parquet_atomic(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(frame.to_arrow().schema.metadata or {})
     metadata.update(
         {
@@ -135,17 +134,7 @@ def _write_parquet_atomic(path: Path, frame: pl.DataFrame) -> None:
         }
     )
     table = frame.to_arrow().replace_schema_metadata(metadata)
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        pq.write_table(table, temporary, compression="zstd")
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, table, compression="zstd", durable=True)
 
 
 def _safe_stem(value: str) -> str:
@@ -292,7 +281,9 @@ def _parse_historical_rule(content: bytes) -> dict[str, Any]:
             f"historical Rule 59 receipt is missing required phrases: {missing}"
         )
     if "20020730" not in re.sub(r"[^0-9]", "", text):
-        raise TransferAdjustmentError("historical Rule 59 receipt lacks 2002-07-30 identity")
+        raise TransferAdjustmentError(
+            "historical Rule 59 receipt lacks 2002-07-30 identity"
+        )
     return {
         "effective_version": "2002-07-30",
         "article": 59,
@@ -311,7 +302,9 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _parse_fmsrfk_payload(content: bytes, *, symbol: str, year: int) -> dict[int, dict[str, float]]:
+def _parse_fmsrfk_payload(
+    content: bytes, *, symbol: str, year: int
+) -> dict[int, dict[str, float]]:
     try:
         payload = json.loads(content.decode("utf-8-sig"))
     except Exception as exc:
@@ -351,7 +344,9 @@ def _parse_fmsrfk_payload(content: bytes, *, symbol: str, year: int) -> dict[int
     low_index = field_index("最低價")
     result: dict[int, dict[str, float]] = {}
     for row in rows:
-        if not isinstance(row, list) or max(month_index, high_index, low_index) >= len(row):
+        if not isinstance(row, list) or max(month_index, high_index, low_index) >= len(
+            row
+        ):
             raise TransferAdjustmentError(f"FMSRFK {symbol} {year} has a malformed row")
         month_value = re.sub(r"[^0-9]", "", str(row[month_index]))
         high = _number(row[high_index])
@@ -430,12 +425,15 @@ def _validate_official_inputs(
         "corporate_reference": official_dir / "tw_corporate_action_reference.parquet",
         "taiex_calendar": official_dir / "twse_taiex_ohlc.parquet",
         "public_summary": official_dir / "download_summary.json",
-        "corporate_summary": official_dir / "tw_corporate_action_reference.summary.json",
+        "corporate_summary": official_dir
+        / "tw_corporate_action_reference.summary.json",
         "taiex_summary": official_dir / "twse_taiex_ohlc.summary.json",
     }
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
-        raise TransferAdjustmentError(f"required official inputs are missing: {missing}")
+        raise TransferAdjustmentError(
+            f"required official inputs are missing: {missing}"
+        )
 
     public_summary = _read_json_object(paths["public_summary"])
     try:
@@ -447,7 +445,9 @@ def _validate_official_inputs(
         )
         public_end = date.fromisoformat(str(public_summary["end_date"])[:10])
     except (KeyError, TypeError, ValueError) as exc:
-        raise TransferAdjustmentError("official download_summary has invalid coverage dates") from exc
+        raise TransferAdjustmentError(
+            "official download_summary has invalid coverage dates"
+        ) from exc
     certified_daily_close = (
         public_summary.get("mode") == "daily"
         and public_summary.get("daily_close_ready") is True
@@ -457,11 +457,15 @@ def _validate_official_inputs(
     )
     if (
         (
-            public_summary.get("coverage_complete") is not True
-            or int(public_summary.get("failed_count", -1)) != 0
+            (
+                public_summary.get("coverage_complete") is not True
+                or int(public_summary.get("failed_count", -1)) != 0
+            )
+            and not certified_daily_close
         )
-        and not certified_daily_close
-    ) or public_start > start or public_end < end:
+        or public_start > start
+        or public_end < end
+    ):
         raise TransferAdjustmentError(
             "official download_summary is not coverage-complete for the requested range"
         )
@@ -482,10 +486,7 @@ def _validate_official_inputs(
             and int(value.get("unresolved_month_count", -1)) == 0
         ),
     )
-    receipts = [
-        _file_receipt(path, role=role)
-        for role, path in paths.items()
-    ]
+    receipts = [_file_receipt(path, role=role) for role, path in paths.items()]
     return paths, receipts
 
 
@@ -506,7 +507,9 @@ def _validate_yahoo_source(
     calendar_dates: set[date],
 ) -> tuple[pl.DataFrame, dict[str, Any], dict[str, str]]:
     if not path.is_file():
-        raise TransferAdjustmentError(f"Yahoo source is missing for transfer {symbol}: {path}")
+        raise TransferAdjustmentError(
+            f"Yahoo source is missing for transfer {symbol}: {path}"
+        )
     schema = set(pq.read_schema(path).names)
     required = {
         "date",
@@ -526,7 +529,9 @@ def _validate_yahoo_source(
         checked_through = date.fromisoformat(metadata["checked_through"][:10])
         metadata_first = date.fromisoformat(metadata["first_date"][:10])
     except ValueError as exc:
-        raise TransferAdjustmentError(f"Yahoo source metadata is invalid: {path}") from exc
+        raise TransferAdjustmentError(
+            f"Yahoo source metadata is invalid: {path}"
+        ) from exc
     if (
         metadata["source"] != "yahoo"
         or metadata["asset_class"] != "tw_stocks"
@@ -541,7 +546,10 @@ def _validate_yahoo_source(
         .select(
             _date_expr("date").alias("date"),
             *[
-                pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
+                pl.col(column)
+                .cast(pl.Float64, strict=False)
+                .fill_nan(None)
+                .alias(column)
                 for column in ("open", "max", "min", "close", "Stock Splits")
             ],
         )
@@ -587,7 +595,10 @@ def _load_calendar(path: Path) -> tuple[pl.DataFrame, set[date]]:
         .select(
             _date_expr("date").alias("date"),
             *[
-                pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
+                pl.col(column)
+                .cast(pl.Float64, strict=False)
+                .fill_nan(None)
+                .alias(column)
                 for column in (
                     "opening_index",
                     "highest_index",
@@ -613,7 +624,9 @@ def _load_calendar(path: Path) -> tuple[pl.DataFrame, set[date]]:
         .sort("date")
     )
     if frame.is_empty() or frame["date"].n_unique() != frame.height:
-        raise TransferAdjustmentError("TAIEX calendar contains duplicate or no valid dates")
+        raise TransferAdjustmentError(
+            "TAIEX calendar contains duplicate or no valid dates"
+        )
     return frame, set(frame.get_column("date").to_list())
 
 
@@ -649,17 +662,23 @@ def _load_candidates(
         raise TransferAdjustmentError("newlisting input lacks Code/Company/Note")
     transfer_rows = (
         newlisting.select(
-            pl.col("Code").cast(pl.String).str.strip_chars().str.to_uppercase().alias("symbol"),
-            pl.col("Company").cast(pl.String).fill_null("").str.strip_chars().alias("company"),
+            pl.col("Code")
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("symbol"),
+            pl.col("Company")
+            .cast(pl.String)
+            .fill_null("")
+            .str.strip_chars()
+            .alias("company"),
             pl.col("Note").cast(pl.String).fill_null("").alias("note"),
         )
         .filter(pl.col("note").str.contains("櫃轉市"))
         .unique("symbol", keep="first")
     )
     transfer_codes = set(transfer_rows.get_column("symbol").to_list())
-    names = dict(
-        transfer_rows.select("symbol", "company").iter_rows()
-    )
+    names = dict(transfer_rows.select("symbol", "company").iter_rows())
     if not transfer_codes:
         raise TransferAdjustmentError("newlisting input contains no 櫃轉市 candidates")
 
@@ -679,7 +698,11 @@ def _load_candidates(
         pl.scan_parquet(paths["tpex_ohlcv"])
         .select(
             _date_expr("date").alias("date"),
-            pl.col("代號").cast(pl.String).str.strip_chars().str.to_uppercase().alias("symbol"),
+            pl.col("代號")
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("symbol"),
             _number_expr("收盤").alias("close"),
         )
         .filter(pl.col("symbol").is_in(sorted(transfer_codes)))
@@ -689,7 +712,9 @@ def _load_candidates(
         .sort(["symbol", "date"])
     )
     if tpex.is_empty() or tpex.select("symbol", "date").n_unique() != tpex.height:
-        raise TransferAdjustmentError("TPEx transfer history is empty or has duplicate keys")
+        raise TransferAdjustmentError(
+            "TPEx transfer history is empty or has duplicate keys"
+        )
     tpex_start = tpex["date"].min()
     last_tpex = (
         tpex.group_by("symbol")
@@ -718,7 +743,9 @@ def _load_candidates(
             continue
         next_sessions = [value for value in sessions if value > previous]
         if not next_sessions:
-            unresolved.append({"symbol": symbol, "error": "no TAIEX session after last TPEx row"})
+            unresolved.append(
+                {"symbol": symbol, "error": "no TAIEX session after last TPEx row"}
+            )
             continue
         transfer_date = next_sessions[0]
         if (symbol, f"{symbol}.TW") not in manifest_pairs:
@@ -785,7 +812,11 @@ def _load_twse_quotes(path: Path, symbols: list[str]) -> pl.DataFrame:
         pl.scan_parquet(path)
         .select(
             _date_expr("date").alias("date"),
-            pl.col("證券代號").cast(pl.String).str.strip_chars().str.to_uppercase().alias("symbol"),
+            pl.col("證券代號")
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("symbol"),
             _number_expr("開盤價").alias("official_open"),
             _number_expr("最高價").alias("official_high"),
             _number_expr("最低價").alias("official_low"),
@@ -810,7 +841,9 @@ def _load_twse_quotes(path: Path, symbols: list[str]) -> pl.DataFrame:
         .sort(["symbol", "date"])
     )
     if frame.select("symbol", "date").n_unique() != frame.height:
-        raise TransferAdjustmentError("TWSE overlap quotes contain duplicate date-symbol keys")
+        raise TransferAdjustmentError(
+            "TWSE overlap quotes contain duplicate date-symbol keys"
+        )
     return frame
 
 
@@ -825,7 +858,11 @@ def _load_corporate_references(path: Path, symbols: list[str]) -> pl.DataFrame:
         pl.read_parquet(path, columns=sorted(required))
         .select(
             _date_expr("date").alias("date"),
-            pl.col("symbol").cast(pl.String).str.strip_chars().str.to_uppercase().alias("symbol"),
+            pl.col("symbol")
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("symbol"),
             pl.col("market").cast(pl.String).str.to_lowercase().alias("market"),
             pl.col("previous_close").cast(pl.Float64, strict=False).fill_nan(None),
             pl.col("source_url").cast(pl.String).alias("source_url"),
@@ -840,12 +877,16 @@ def _split_events(
     frame: pl.DataFrame, *, transfer: date, validation_end: date
 ) -> list[tuple[date, float]]:
     events: list[tuple[date, float]] = []
-    for row in frame.filter(
-        pl.col("date").is_between(transfer, validation_end)
-        & pl.col("Stock Splits").is_not_null()
-        & pl.col("Stock Splits").is_finite()
-        & (pl.col("Stock Splits") > 0.0)
-    ).select("date", "Stock Splits").iter_rows(named=True):
+    for row in (
+        frame.filter(
+            pl.col("date").is_between(transfer, validation_end)
+            & pl.col("Stock Splits").is_not_null()
+            & pl.col("Stock Splits").is_finite()
+            & (pl.col("Stock Splits") > 0.0)
+        )
+        .select("date", "Stock Splits")
+        .iter_rows(named=True)
+    ):
         ratio = float(row["Stock Splits"])
         if ratio <= 0.0 or not math.isfinite(ratio):
             raise TransferAdjustmentError(f"invalid Yahoo split ratio: {row}")
@@ -931,7 +972,10 @@ def _verify_candidate(
             ("official_close", "yahoo_close"),
         ):
             overlap_errors.append(
-                abs(float(row[yahoo_column]) * overlap_scale - float(row[official_column]))
+                abs(
+                    float(row[yahoo_column]) * overlap_scale
+                    - float(row[official_column])
+                )
             )
     overlap_max_error = max(overlap_errors, default=0.0)
     if overlap_max_error > price_tolerance:
@@ -1011,7 +1055,9 @@ def _verify_candidate(
     }
     factor = reconstructed["close"] / candidate.official_reference_price
     if not math.isfinite(factor) or factor <= 0.0:
-        raise TransferAdjustmentError(f"{candidate.symbol} derived an invalid adjustment factor")
+        raise TransferAdjustmentError(
+            f"{candidate.symbol} derived an invalid adjustment factor"
+        )
 
     # FMSRFK is a full-calendar-month statistic.  The six overlap sessions
     # establish the scale, but February must be reconstructed through its
@@ -1024,7 +1070,10 @@ def _verify_candidate(
     )
     official_window = early_window.filter(pl.col("date").is_in(calendar_dates))
     expected_months = sorted(
-        {(value.year, value.month) for value in official_window.get_column("date").to_list()}
+        {
+            (value.year, value.month)
+            for value in official_window.get_column("date").to_list()
+        }
     )
     fms_errors: list[float] = []
     fms_details: list[dict[str, Any]] = []
@@ -1140,8 +1189,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "pre-2004 TPEx-to-TWSE transfers."
         )
     )
-    parser.add_argument("--mode", choices=("rebuild", "repair", "daily"), default="repair")
-    parser.add_argument("--official-input-dir", type=Path, default=Path("data_tw_public"))
+    parser.add_argument(
+        "--mode", choices=("rebuild", "repair", "daily"), default="repair"
+    )
+    parser.add_argument(
+        "--official-input-dir", type=Path, default=Path("data_tw_public")
+    )
     parser.add_argument("--yahoo-source-dir", type=Path, required=True)
     parser.add_argument(
         "--output-path",
@@ -1156,7 +1209,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--request-interval", type=float, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--verify-ssl", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--verify-ssl", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--overlap-scale-relative-tolerance", type=float, default=5e-4)
     parser.add_argument("--price-tolerance", type=float, default=0.011)
     return parser.parse_args(argv)
@@ -1168,7 +1223,10 @@ def _run(args: argparse.Namespace) -> int:
     failure_summary_path = output_path.with_suffix(".failed.json")
     raw_root = output_path.parent / "raw" / DATASET_NAME
     interval = _configure_tw_public_rate_limiter(args.request_interval)
-    print(f"[tw-transfer-adjustment] {describe_rate_limit('tw_public', interval)}", flush=True)
+    print(
+        f"[tw-transfer-adjustment] {describe_rate_limit('tw_public', interval)}",
+        flush=True,
+    )
     generated_at = _utc_now()
     input_receipts: list[dict[str, Any]] = []
     raw_receipts: list[dict[str, Any]] = []
@@ -1194,7 +1252,9 @@ def _run(args: argparse.Namespace) -> int:
         start = date.fromisoformat(str(args.start_date)[:10])
         end = date.fromisoformat(resolve_end_date(str(args.end_date))[:10])
         if start < date(2000, 1, 1) or end < start:
-            raise TransferAdjustmentError("requested range must be valid and start at 2000-01-01 or later")
+            raise TransferAdjustmentError(
+                "requested range must be valid and start at 2000-01-01 or later"
+            )
         if int(args.overlap_sessions) < 2:
             raise TransferAdjustmentError("--overlap-sessions must be at least 2")
         if float(args.price_tolerance) <= 0.0:
@@ -1256,14 +1316,18 @@ def _run(args: argparse.Namespace) -> int:
             {
                 year
                 for candidate in candidates
-                for year in range(candidate.transfer_date.year, official_twse_start.year + 1)
+                for year in range(
+                    candidate.transfer_date.year, official_twse_start.year + 1
+                )
             }
         )
         fms_payloads: dict[str, dict[int, dict[int, dict[str, float]]]] = {
             candidate.symbol: {} for candidate in candidates
         }
 
-        def fetch_fms(item: tuple[str, int]) -> tuple[str, int, dict[int, dict[str, float]], dict[str, Any]]:
+        def fetch_fms(
+            item: tuple[str, int],
+        ) -> tuple[str, int, dict[int, dict[str, float]], dict[str, Any]]:
             symbol, year = item
             params = {"response": "json", "date": f"{year}0101", "stockNo": symbol}
             parsed, receipt = _fetch_validated_raw(
@@ -1283,7 +1347,11 @@ def _run(args: argparse.Namespace) -> int:
             )
             return symbol, year, parsed, receipt
 
-        requests = [(candidate.symbol, year) for candidate in candidates for year in required_years]
+        requests = [
+            (candidate.symbol, year)
+            for candidate in candidates
+            for year in required_years
+        ]
         with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
             futures = {executor.submit(fetch_fms, item): item for item in requests}
             for future in as_completed(futures):
@@ -1308,7 +1376,9 @@ def _run(args: argparse.Namespace) -> int:
         symbols = [candidate.symbol for candidate in candidates]
         official_quotes = _load_twse_quotes(paths["twse_ohlcv"], symbols)
         corporate = _load_corporate_references(paths["corporate_reference"], symbols)
-        for candidate in sorted(candidates, key=lambda value: (value.transfer_date, value.symbol)):
+        for candidate in sorted(
+            candidates, key=lambda value: (value.transfer_date, value.symbol)
+        ):
             try:
                 row, detail = _verify_candidate(
                     candidate,
@@ -1355,11 +1425,15 @@ def _run(args: argparse.Namespace) -> int:
                 f"verification left {len(unresolved)} unresolved transfer symbols"
             )
         if len(artifact_rows) != len(candidates) or not artifact_rows:
-            raise TransferAdjustmentError("artifact rows do not cover every discovered candidate")
+            raise TransferAdjustmentError(
+                "artifact rows do not cover every discovered candidate"
+            )
 
         artifact = pl.DataFrame(artifact_rows).sort(["date", "symbol"])
         if artifact.select("date", "symbol").n_unique() != artifact.height:
-            raise TransferAdjustmentError("artifact contains duplicate date-symbol keys")
+            raise TransferAdjustmentError(
+                "artifact contains duplicate date-symbol keys"
+            )
         _write_parquet_atomic(output_path, artifact)
         output_receipt = _file_receipt(output_path, role="transfer_adjustment_artifact")
         summary = {
@@ -1383,10 +1457,12 @@ def _run(args: argparse.Namespace) -> int:
             "discovery_exclusions": discovery_exclusions,
             "output_receipt": output_receipt,
             "input_receipts": sorted(
-                input_receipts, key=lambda value: (str(value.get("role")), str(value["path"]))
+                input_receipts,
+                key=lambda value: (str(value.get("role")), str(value["path"])),
             ),
             "raw_receipts": sorted(
-                raw_receipts, key=lambda value: (str(value.get("role")), str(value["path"]))
+                raw_receipts,
+                key=lambda value: (str(value.get("role")), str(value["path"])),
             ),
             "per_symbol": details,
             "off_calendar_row_count": sum(
@@ -1446,7 +1522,10 @@ def _run(args: argparse.Namespace) -> int:
             failure_summary_path if preserve_old_summary else summary_path,
             summary,
         )
-        print(f"[tw-transfer-adjustment] coverage incomplete: {fatal_error}", file=sys.stderr)
+        print(
+            f"[tw-transfer-adjustment] coverage incomplete: {fatal_error}",
+            file=sys.stderr,
+        )
         return 1
 
 

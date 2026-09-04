@@ -504,6 +504,32 @@
       "dedup_key": ["index_id", "day"],
       "implementation": "implemented",
       "storage_contract": "research-only until incremental value beyond price is demonstrated"
+    },
+    {
+      "id": "regulated_crypto_positioning",
+      "title": "受監管加密期貨交易者部位",
+      "mechanism": "Trader-category positioning can reveal leverage and hedging pressure that price bars alone do not identify.",
+      "native_granularity": "weekly",
+      "score": 7,
+      "priority": "P1",
+      "canonical_owners": ["CFTC Traders in Financial Futures"],
+      "fallbacks": ["CFTC historical compressed reports"],
+      "dedup_key": ["cftc_report_id"],
+      "implementation": "implemented_research_sidecar",
+      "storage_contract": "event history is retained with assumed and strict availability clocks; training is quarantined until historical release dates are audited"
+    },
+    {
+      "id": "public_attention_pageviews",
+      "title": "公開百科條目關注度",
+      "mechanism": "Article-reading demand is a public attention proxy distinct from exchange order flow, but redirects and revisions can change interpretation.",
+      "native_granularity": "daily",
+      "score": 5,
+      "priority": "P2",
+      "canonical_owners": ["Wikimedia Analytics API"],
+      "fallbacks": [],
+      "dedup_key": ["project", "article", "day", "access", "agent"],
+      "implementation": "implemented_research_sidecar",
+      "storage_contract": "historical observations are retained with local first-observed timestamps and are not backprojected into the causal training ABI"
     }
   ],
   "rejected_or_fallback_only": [

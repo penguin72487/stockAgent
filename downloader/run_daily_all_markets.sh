@@ -28,6 +28,8 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-artifacts/daily_downloader}"
 RUN_LOG_FILE="${RUN_LOG_FILE:-${RUN_LOG_DIR}/${RUN_ID}.log}"
 RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
+STEP_RECEIPT_DIR="${STEP_RECEIPT_DIR:-${RUN_LOG_DIR}/step_receipts/${RUN_ID}}"
+STEP_RECEIPT_LATEST_DIR="${STEP_RECEIPT_LATEST_DIR:-${RUN_LOG_DIR}/step_receipts/latest}"
 TEE_LOG="${TEE_LOG:-1}"
 
 WORKERS="${WORKERS:-16}"
@@ -93,6 +95,9 @@ CRYPTO_ETF_PRIMARY_DOCUMENTS="${CRYPTO_ETF_PRIMARY_DOCUMENTS:-1}"
 RUN_FRED_CRYPTO_MACRO="${RUN_FRED_CRYPTO_MACRO:-0}"
 FRED_CRYPTO_MACRO_OUTPUT_DIR="${FRED_CRYPTO_MACRO_OUTPUT_DIR:-data_fred_crypto_macro}"
 FRED_CRYPTO_MACRO_START_DATE="${FRED_CRYPTO_MACRO_START_DATE:-2000-01-01}"
+FRED_CRYPTO_MACRO_WORKERS="${FRED_CRYPTO_MACRO_WORKERS:-4}"
+FRED_CRYPTO_MACRO_MAX_RETRIES="${FRED_CRYPTO_MACRO_MAX_RETRIES:-5}"
+FRED_CRYPTO_MACRO_HISTORICAL_RECHECK_DAYS="${FRED_CRYPTO_MACRO_HISTORICAL_RECHECK_DAYS:-30}"
 CRYPTO_ACTIVE_INTRADAY_GRAIN="${CRYPTO_ACTIVE_INTRADAY_GRAIN:-1m}"
 RUN_CRYPTO_TRADE_TICKS="${RUN_CRYPTO_TRADE_TICKS:-0}"
 RUN_CRYPTO_ORDER_BOOK="${RUN_CRYPTO_ORDER_BOOK:-0}"
@@ -267,19 +272,64 @@ run_step() {
   local start_ts
   local end_ts
   local elapsed
+  local rc
 
   start_ts="$(date +%s)"
   log "step=${name} start"
+  if ! "$PYTHON_BIN" scripts/write_downloader_step_receipt.py \
+    --receipt-dir "$STEP_RECEIPT_DIR" \
+    --latest-dir "$STEP_RECEIPT_LATEST_DIR" \
+    --run-id "$RUN_ID" \
+    --run-mode "$RUN_MODE" \
+    --step "$name" \
+    --state running \
+    --started-epoch "$start_ts" \
+    --runner-pid "$$"; then
+    log "step=${name} receipt_failed state=running"
+    record_failure "${name}_receipt"
+    return 1
+  fi
   if "$@"; then
     end_ts="$(date +%s)"
     elapsed="$((end_ts - start_ts))"
+    if ! "$PYTHON_BIN" scripts/write_downloader_step_receipt.py \
+      --receipt-dir "$STEP_RECEIPT_DIR" \
+      --latest-dir "$STEP_RECEIPT_LATEST_DIR" \
+      --run-id "$RUN_ID" \
+      --run-mode "$RUN_MODE" \
+      --step "$name" \
+      --state complete \
+      --started-epoch "$start_ts" \
+      --elapsed-seconds "$elapsed" \
+      --exit-code 0 \
+      --runner-pid "$$"; then
+      log "step=${name} receipt_failed state=complete"
+      record_failure "${name}_receipt"
+      return 1
+    fi
     log "step=${name} done elapsed_sec=${elapsed}"
     return 0
+  else
+    rc="$?"
   fi
 
   end_ts="$(date +%s)"
   elapsed="$((end_ts - start_ts))"
-  log "step=${name} failed elapsed_sec=${elapsed}"
+  if ! "$PYTHON_BIN" scripts/write_downloader_step_receipt.py \
+    --receipt-dir "$STEP_RECEIPT_DIR" \
+    --latest-dir "$STEP_RECEIPT_LATEST_DIR" \
+    --run-id "$RUN_ID" \
+    --run-mode "$RUN_MODE" \
+    --step "$name" \
+    --state failed \
+    --started-epoch "$start_ts" \
+    --elapsed-seconds "$elapsed" \
+    --exit-code "$rc" \
+    --runner-pid "$$"; then
+    log "step=${name} receipt_failed state=failed"
+    record_failure "${name}_receipt"
+  fi
+  log "step=${name} failed elapsed_sec=${elapsed} exit_code=${rc}"
   record_failure "$name"
   return 1
 }
@@ -724,7 +774,10 @@ run_fred_crypto_macro_daily() {
       "$PYTHON_BIN" downloader/download_fred_crypto_macro_vintages.py \
       --output-dir "$FRED_CRYPTO_MACRO_OUTPUT_DIR" \
       --start-date "$FRED_CRYPTO_MACRO_START_DATE" \
-      --end-date today
+      --end-date today \
+      --workers "$FRED_CRYPTO_MACRO_WORKERS" \
+      --max-retries "$FRED_CRYPTO_MACRO_MAX_RETRIES" \
+      --historical-recheck-days "$FRED_CRYPTO_MACRO_HISTORICAL_RECHECK_DAYS"
     return
   fi
   log "skip=fred_crypto_macro_update reason=RUN_FRED_CRYPTO_MACRO=${RUN_FRED_CRYPTO_MACRO}"
@@ -1044,6 +1097,18 @@ validate_settings() {
     echo "[daily] RUN_FRED_CRYPTO_MACRO must be 0 or 1" >&2
     exit 2
   fi
+  if ! [[ "$FRED_CRYPTO_MACRO_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[daily] FRED_CRYPTO_MACRO_WORKERS must be a positive integer" >&2
+    exit 2
+  fi
+  if ! [[ "$FRED_CRYPTO_MACRO_MAX_RETRIES" =~ ^[0-9]+$ ]]; then
+    echo "[daily] FRED_CRYPTO_MACRO_MAX_RETRIES must be an integer >= 0" >&2
+    exit 2
+  fi
+  if ! [[ "$FRED_CRYPTO_MACRO_HISTORICAL_RECHECK_DAYS" =~ ^[0-9]+$ ]]; then
+    echo "[daily] FRED_CRYPTO_MACRO_HISTORICAL_RECHECK_DAYS must be an integer >= 0" >&2
+    exit 2
+  fi
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" != "0" && "$RUN_CRYPTO_DAILY_MATERIALIZE" != "1" ]]; then
     echo "[daily] RUN_CRYPTO_DAILY_MATERIALIZE must be 0 or 1" >&2
     exit 2
@@ -1130,9 +1195,15 @@ run_scheduler() {
   done
 }
 
-init_run_logging
-validate_settings
-acquire_lock
-load_schedule_state
-log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} crypto_grain=${CRYPTO_ACTIVE_INTRADAY_GRAIN} crypto_events=disabled python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
-run_scheduler
+main() {
+  init_run_logging
+  validate_settings
+  acquire_lock
+  load_schedule_state
+  log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} crypto_grain=${CRYPTO_ACTIVE_INTRADAY_GRAIN} crypto_events=disabled python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
+  run_scheduler
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -22,6 +22,11 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 try:
+    from .artifact_io import atomic_write_text
+except ImportError:  # direct ``python downloader/<script>.py`` execution
+    from artifact_io import atomic_write_text
+
+try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
@@ -78,21 +83,6 @@ def load_env_file(
         os.environ[name] = value
         loaded.add(name)
     return loaded
-
-
-def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> None:
-    """Publish a small text/CSV/JSON artifact without exposing partial bytes."""
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(
-        f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        temporary.write_text(str(text), encoding=encoding)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 class PersistentProgress:
@@ -234,7 +224,11 @@ class PersistentProgress:
     ) -> None:
         with self._lock:
             final_state = str(state or ("failed" if failed else "complete"))
-            if require_exact and final_state == "complete" and self.current != self.total:
+            if (
+                require_exact
+                and final_state == "complete"
+                and self.current != self.total
+            ):
                 final_state = "partial"
             if final_state == "complete":
                 self.current = self.total
@@ -487,6 +481,25 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
             "Default 10 req/s is a stockAgent policy, not an official "
             "TWSE/TPEx/data.gov.tw limit."
         ),
+    ),
+    "taifex_public": ProviderRateLimit(
+        provider="taifex_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no upstream numeric limit documented",
+        source_url="https://www.taifex.com.tw/cht/9/optQryRes",
+        note=(
+            "Official TAIFEX HTML/ZIP archives share one host-global bucket. "
+            "This 10 req/s ceiling is a stockAgent policy, not an exchange claim."
+        ),
+    ),
+    "cftc_public_archive": ProviderRateLimit(
+        provider="cftc_public_archive",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no upstream numeric limit documented",
+        source_url="https://www.cftc.gov/MarketReports/CommitmentsofTraders/HistoricalCompressed/index.htm",
+        note="Official historical compressed archives; requests share one bucket.",
     ),
     "yahoo_finance": ProviderRateLimit(
         provider="yahoo_finance",

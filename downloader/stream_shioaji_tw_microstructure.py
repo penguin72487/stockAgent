@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from downloader.artifact_io import atomic_write_json, atomic_write_parquet
 from stockagent.data.taifex_sessions import taifex_trading_date
 from stockagent.live.shioaji_traffic_ledger import StreamingLedgerRecorder
 
@@ -413,14 +414,13 @@ class PartWriter:
                 f"part={self.part_sequence:06d}-{stamp}.parquet"
             )
             path = partition / filename
-            temporary = path.with_suffix(".parquet.tmp")
-            pl.from_dicts(rows, schema=self.schema, strict=False).write_parquet(
-                temporary,
+            atomic_write_parquet(
+                path,
+                pl.from_dicts(rows, schema=self.schema, strict=False),
                 compression="zstd",
-                statistics=True,
+                write_statistics=True,
                 row_group_size=128_000,
             )
-            os.replace(temporary, path)
             self.total_rows += len(rows)
             self.total_parts += 1
             self.total_bytes += int(path.stat().st_size)
@@ -462,7 +462,9 @@ class EventSink:
         self.accepted_trade_date = accepted_trade_date
         self.live_book_codes: set[str] = set()
         self.live_book_metadata: dict[str, dict[str, Any]] = {}
-        self.live_books_path = output_dir / "runtime" / f"worker_{worker_index:02d}.json"
+        self.live_books_path = (
+            output_dir / "runtime" / f"worker_{worker_index:02d}.json"
+        )
         options = {
             "worker_index": worker_index,
             "capture_id": capture_id,
@@ -614,13 +616,13 @@ class EventSink:
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        path,
+        payload,
+        durable=True,
+        ensure_ascii=True,
+        sort_keys=True,
     )
-    os.replace(temporary, path)
 
 
 def _stop_datetime(value: str) -> datetime:

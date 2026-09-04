@@ -129,6 +129,26 @@
       "assigned_facts": ["bitcoin_mempool_and_fees"]
     },
     {
+      "id": "cftc",
+      "role": "official_regulated_positioning_history",
+      "credential_id": null,
+      "operational_gate": "CFTC public reporting API returns TFF digital-asset rows",
+      "limit_profiles": ["crypto_historical_public"],
+      "parallel_group": "cftc",
+      "assigned_facts": ["regulated_crypto_positioning"],
+      "activation_rule": "Keep outside the causal feature ABI until historical publication dates, holidays and exceptional reporting delays are audited."
+    },
+    {
+      "id": "wikimedia",
+      "role": "anonymous_public_attention_history",
+      "credential_id": null,
+      "operational_gate": "Wikimedia Analytics API returns complete daily article rows",
+      "limit_profiles": ["crypto_historical_public"],
+      "parallel_group": "wikimedia",
+      "assigned_facts": ["public_attention_pageviews"],
+      "activation_rule": "Research sidecar only until revision, rename and redirect handling is validated."
+    },
+    {
       "id": "venue_context",
       "role": "disabled_by_active_exchange_scope",
       "credential_id": null,
@@ -151,6 +171,8 @@
     "defillama",
     "coinmetrics",
     "mempool_space",
+    "cftc",
+    "wikimedia",
     "blockscout_ethereum",
     "venue_context"
   ],

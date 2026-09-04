@@ -71,6 +71,10 @@ _PACK_STORED_SUFFIXES = {
 _STIGNORE = """// Node-local transactional state must never be replicated.
 (?d).local-state
 (?d).local-state/**
+(?d).stignore-edge
+#include .stignore-edge
+"""
+_EMPTY_EDGE_STIGNORE = """// Full-replica mode: no packed payload objects are ignored.
 """
 
 
@@ -520,6 +524,9 @@ def initialize_packed_layout(
         (sync_root / relative).mkdir(parents=True, exist_ok=True)
     repair_shared_packed_directory_modes(sync_root)
     ignore_path = sync_root / ".stignore"
+    edge_ignore_path = sync_root / ".stignore-edge"
+    if not edge_ignore_path.exists():
+        atomic_write_bytes(edge_ignore_path, _EMPTY_EDGE_STIGNORE.encode("utf-8"))
     if replace_ignore or not ignore_path.exists():
         atomic_write_bytes(ignore_path, _STIGNORE.encode("utf-8"))
     node_path = sync_root / ".local-state" / "node-id"

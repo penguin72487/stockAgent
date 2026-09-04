@@ -15,13 +15,16 @@ from typing import Final
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from downloader.common import SharedRateLimiter  # noqa: E402
+from downloader.common import SharedRateLimiter, resolve_request_interval  # noqa: E402
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
+)
 from scripts.download_taifex_public_history import (  # noqa: E402
     _atomic_write_bytes,
     _atomic_write_parquet,
@@ -69,7 +72,9 @@ def _parse_vix(content: bytes, next_sessions: dict[date, date]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
 
-def _valid_receipt(root: Path, capture_date: date, month: str) -> dict[str, object] | None:
+def _valid_receipt(
+    root: Path, capture_date: date, month: str
+) -> dict[str, object] | None:
     path = root / "receipts" / "vix_daily" / capture_date.isoformat() / f"{month}.json"
     if not path.is_file():
         return None
@@ -104,18 +109,28 @@ def main() -> int:
     )
     parser.add_argument("--capture-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--request-interval", type=float, default=1.0)
+    parser.add_argument("--max-retries", type=int, default=4)
     args = parser.parse_args()
     root = Path(args.output_dir).expanduser().resolve()
     session_path = Path(args.session_parquet).expanduser().resolve()
     sessions, calendar_sha256 = _load_sessions(session_path, date.max)
     next_sessions = _next_session_map(sessions)
-    limiter = SharedRateLimiter(args.request_interval, name="taifex_vix_recent")
-    session = requests.Session()
-    session.headers.update({"User-Agent": "stockAgent/taifex-vix-recent-archive"})
-    limiter.wait()
-    page = session.get(SOURCE_PAGE, timeout=120)
-    page.raise_for_status()
-    urls = list(dict.fromkeys(match.group(0) for match in VIX_URL_PATTERN.finditer(page.text)))
+    interval = resolve_request_interval("taifex_public", args.request_interval)
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=120,
+            max_retries=args.max_retries,
+            retry_base_seconds=0.5,
+        ),
+        limiter=SharedRateLimiter(interval, name="taifex_public"),
+    )
+    headers = {"User-Agent": "stockAgent/taifex-vix-recent-archive"}
+    page = transport.request_bytes(SOURCE_PAGE, headers=headers).body
+    page_text = page.decode("utf-8", errors="replace")
+    urls = list(
+        dict.fromkeys(match.group(0) for match in VIX_URL_PATTERN.finditer(page_text))
+    )
     if not urls:
         raise RuntimeError("TAIFEX VIX page exposed no official monthly files")
 
@@ -127,15 +142,14 @@ def main() -> int:
         month = month_match.group("month")
         receipt = _valid_receipt(root, args.capture_date, month)
         if receipt is None:
-            limiter.wait()
-            response = session.get(url, timeout=120)
-            response.raise_for_status()
-            content = response.content
+            content = transport.request_bytes(url, headers=headers).body
             frame = _parse_vix(content, next_sessions)
             digest = _sha256_bytes(content)
             raw_path = root / "raw" / "vix_daily" / month / f"{digest}.txt.gz"
             shard_path = root / "shards" / "vix_daily" / month / f"{digest}.parquet"
-            _atomic_write_bytes(raw_path, gzip.compress(content, compresslevel=9, mtime=0))
+            _atomic_write_bytes(
+                raw_path, gzip.compress(content, compresslevel=9, mtime=0)
+            )
             if not shard_path.is_file():
                 _atomic_write_parquet(frame, shard_path)
             receipt = {
@@ -174,7 +188,9 @@ def main() -> int:
     )
     # Include every prior content-addressed shard so the merged file only grows
     # when the official rolling window exposes a new month or daily revision.
-    unique_shards = sorted(set(unique_shards) | set((root / "shards" / "vix_daily").glob("*/*.parquet")))
+    unique_shards = sorted(
+        set(unique_shards) | set((root / "shards" / "vix_daily").glob("*/*.parquet"))
+    )
     table = pa.concat_tables(
         [pq.read_table(path) for path in unique_shards], promote_options="default"
     )
