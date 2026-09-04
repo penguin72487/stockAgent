@@ -1,0 +1,76 @@
+base_config: tw_minute_daily_guided_dual_5090.yaml
+
+# Fair minute-decision successor to the completed daily-decision v12 control.
+# The v12 walk-forward policy owns each session's stock selection, sign, and
+# maximum per-name risk envelope.  The causal minute model may only attenuate,
+# exit, or re-enter that envelope after a completed one-minute bar; it cannot
+# reverse a v12 position or enlarge it.  This is intentionally a fresh
+# dataset/checkpoint contract and never resumes the older guided-v2 optimizer.
+experiment_name: tw-minute-daily-guided-v12-exact-official-close-control-v2
+
+runner:
+  # Training contract v14 uses fixed power-of-two global batches and is not
+  # optimizer/checkpoint compatible with the older balanced-batch trajectory.
+  output_dir: artifacts/markets/tw_minute_daily_guided_v12_exact_official_close_control_v2
+  resume: true
+  post_train_infer: false
+
+data:
+  # Node-local, content-addressed full-feature daily panel.  This variant has
+  # causal pre-2020 context, the 2330 adjusted-close benchmark, all 98 cached
+  # daily features, and the same immutable source hash as the completed v12
+  # experiment.  The current packed dataset deliberately does not promise old
+  # cache variant names, so do not reuse the stale 5f505... path.
+  minute_daily_context_panel_meta: data_tw_public/stocks/panel_cache_v2/variants/fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577.json
+  # Built by scripts/build_tw_minute_daily_guidance.py from all eleven
+  # completed v12 folds.  Every minute session has exactly one causal OOF owner
+  # and missing dates/symbols fail closed instead of being silently zero-filled.
+  minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_exact_official_close_requested_weights.parquet
+
+walk_forward:
+  lookback_context: panel_history
+
+trading:
+  # Match the ordinary TW day-trade account assumptions and change only the
+  # decision frequency/execution clock.  The minute ledger charges every fill.
+  frequency: minute
+  execution_mode: tw_minute
+  long_only: false
+  max_volume_participation: 0.5
+  buy_fee_rate: 0.000285
+  sell_fee_rate: 0.001785
+  tw_minute_initial_equity: 10000000.0
+  tw_minute_gross_exposure: 1.0
+  tw_minute_max_name_weight: null
+  tw_minute_outside_cash_logit: null
+  tw_minute_max_order_notional: null
+  tw_minute_slippage_bps_per_side: 0.0
+  tw_minute_force_session_close: true
+
+training:
+  epochs: 1000
+  multi_gpu_strategy: distributed_data_parallel
+  # Measured on Fold 4 with both RTX 5090s. 64x16 is the fastest safe point:
+  # batch 128 and decision chunk 32 were slower, while removing the outer
+  # checkpoint consumed 29.6/32.6 GiB per GPU without improving full epochs.
+  batch_size_train: 64
+  batch_size_eval: 16
+  minute_decision_chunk_rows: 16
+  minute_eval_decision_chunk_rows: 16
+  # The exact applicable one-way fee is the control no-trade threshold.
+  minute_stateful_proximal_allocator: true
+  minute_proximal_cost_multiplier: 1.0
+  minute_full_day_credit_assignment: true
+  minute_full_day_activation_checkpoint: true
+  record_epoch_curve: true
+  epoch_test_curve: true
+  curve_test_interval: 1
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+  financial_transformer:
+    portfolio_mode: long_short
+    portfolio_output_mode: logits
+    center_long_short_logits: false
+    return_aux: false
+    return_aux_details: false

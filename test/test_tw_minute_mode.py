@@ -52,12 +52,14 @@ from stockagent.training.minute import (
     _MinuteDayCache,
     _MinuteSlabForwardAdapter,
     _build_windows,
+    _disable_redundant_minute_ddp_buffer_broadcast,
     _disable_redundant_single_minute_block_checkpointing,
     _execute_minute_chunk,
     _fee_schedule,
     _first_calendar_year_indices,
     _global_session_batches,
     _initialize_daily_guided_minute_head,
+    _minute_checkpoint_preserve_rng_state,
     _minute_benchmark_log_return,
     _minute_chunk_training_loss,
     _run_day_batch,
@@ -585,9 +587,77 @@ def test_minute_ddp_global_batches_preserve_every_chronological_session() -> Non
     assert [index for batch in batches for index in batch] == list(range(19))
     assert all(len(batch[0::2]) >= 1 for batch in batches)
     assert all(len(batch[1::2]) >= 1 for batch in batches)
-    assert [len(batch) for batch in batches] == [7, 6, 6]
+    assert [len(batch) for batch in batches] == [8, 8, 3]
     with pytest.raises(ValueError, match="global batch size"):
         _global_session_batches(range(8), global_batch_size=1, world_size=2)
+
+
+def test_minute_ddp_global_batches_borrow_only_for_sub_rank_tail() -> None:
+    batches = _global_session_batches(
+        range(17),
+        global_batch_size=8,
+        world_size=2,
+    )
+
+    assert [index for batch in batches for index in batch] == list(range(17))
+    assert [len(batch) for batch in batches] == [8, 7, 2]
+    assert all(len(batch[0::2]) >= 1 for batch in batches)
+    assert all(len(batch[1::2]) >= 1 for batch in batches)
+
+
+def test_minute_ddp_global_batches_merge_when_batch_equals_world_size() -> None:
+    batches = _global_session_batches(
+        range(3),
+        global_batch_size=2,
+        world_size=2,
+    )
+
+    assert batches == [[0, 1, 2]]
+
+
+def test_minute_checkpoint_skips_rng_state_only_for_deterministic_financial_model() -> None:
+    deterministic = torch.nn.Module()
+    deterministic.add_module(
+        "policy",
+        type("FinancialTransformerModel", (torch.nn.Module,), {})(),
+    )
+    deterministic.policy.add_module("dropout", torch.nn.Dropout(0.0))
+    assert not _minute_checkpoint_preserve_rng_state(deterministic)
+
+    stochastic = torch.nn.Module()
+    stochastic.add_module(
+        "policy",
+        type("FinancialTransformerModel", (torch.nn.Module,), {})(),
+    )
+    stochastic.policy.add_module("dropout", torch.nn.Dropout(0.1))
+    assert _minute_checkpoint_preserve_rng_state(stochastic)
+    assert _minute_checkpoint_preserve_rng_state(torch.nn.Identity())
+
+
+def test_minute_ddp_disables_only_safe_repeated_buffer_broadcasts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDDP(torch.nn.Module):
+        def __init__(self, module: torch.nn.Module) -> None:
+            super().__init__()
+            self.module = module
+            self.broadcast_buffers = True
+
+    monkeypatch.setattr(
+        torch.nn.parallel,
+        "DistributedDataParallel",
+        FakeDDP,
+    )
+    immutable = torch.nn.Module()
+    immutable.register_buffer("indices", torch.arange(5))
+    wrapped = FakeDDP(immutable)
+
+    assert _disable_redundant_minute_ddp_buffer_broadcast(wrapped) == 1
+    assert wrapped.broadcast_buffers is False
+
+    unsafe = FakeDDP(torch.nn.BatchNorm1d(4))
+    with pytest.raises(RuntimeError, match="stateful batch normalization"):
+        _disable_redundant_minute_ddp_buffer_broadcast(unsafe)
 
 
 def test_minute_ddp_ragged_loss_matches_global_batch_gradient() -> None:

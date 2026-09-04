@@ -120,7 +120,7 @@ MINUTE_BENCHMARK_CONTRACT = "configured_symbol_adjusted_close_buy_hold_first_to_
 # Per-epoch validation/test reporting is audit-only: it does not alter model
 # inputs, optimizer state, scheduler state, sample order, or loss/backtest
 # semantics. Allocation-order changes require a fresh training contract.
-MINUTE_TRAINING_CONTRACT_VERSION = 13
+MINUTE_TRAINING_CONTRACT_VERSION = 14
 MINUTE_DAILY_GUIDANCE_INITIAL_EXPOSURE = 0.90
 
 
@@ -272,6 +272,65 @@ def _disable_redundant_single_minute_block_checkpointing(
         return False
     model.minute_checkpoint_blocks = False
     return True
+
+
+def _minute_checkpoint_preserve_rng_state(model: nn.Module) -> bool:
+    """Preserve RNG only when the active minute policy can consume it.
+
+    Saving/restoring CUDA RNG state around every full-day policy checkpoint is
+    pure overhead for the production zero-dropout FinancialTransformer.  Keep
+    the conservative historical behavior for every other model family and for
+    any FinancialTransformer that enables dropout or another explicit
+    stochastic module attribute.
+    """
+
+    modules = tuple(model.modules())
+    if not any(
+        module.__class__.__name__ == "FinancialTransformerModel"
+        for module in modules
+    ):
+        return True
+    for module in modules:
+        if isinstance(module, nn.Dropout) and float(module.p) > 0.0:
+            return True
+        for attribute in ("dropout_p", "noise_std"):
+            value = getattr(module, attribute, 0.0)
+            if isinstance(value, (int, float)) and float(value) > 0.0:
+                return True
+    return False
+
+
+def _disable_redundant_minute_ddp_buffer_broadcast(model: nn.Module) -> int:
+    """Stop repeated in-place broadcasts of immutable minute-model buffers.
+
+    DDP already synchronizes parameters and buffers when the wrapper is built.
+    The minute graph then executes one daily-context forward followed by many
+    policy forwards before a single backward.  DDP's default per-forward buffer
+    broadcast mutates index buffers retained by the daily graph (for example
+    the CandleEncoder continuous-feature indices), invalidating autograd even
+    though their values never change.  It also adds a collective to every
+    decision chunk.
+
+    FinancialTransformer uses RMSNorm and immutable feature-index, temporal-
+    basis, position, and causal-normalizer buffers during an epoch.  Refuse the
+    optimization if a stateful batch-normalization module is ever introduced.
+    """
+
+    if not isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return 0
+    stateful_norms = tuple(
+        module.__class__.__name__
+        for module in model.module.modules()
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+    )
+    if stateful_norms:
+        raise RuntimeError(
+            "tw_minute cannot disable DDP buffer broadcasts with stateful "
+            f"batch normalization modules present: {stateful_norms[:4]}"
+        )
+    buffer_count = sum(1 for _ in model.module.buffers())
+    model.broadcast_buffers = False
+    return int(buffer_count)
 
 
 class _NullTrainingRunLifecycle:
@@ -1297,6 +1356,7 @@ def _run_day_batch(
         full_day_credit_assignment
         and config.training.minute_full_day_activation_checkpoint
     )
+    preserve_checkpoint_rng_state = _minute_checkpoint_preserve_rng_state(model)
     full_day_log_utility = torch.zeros(
         day_batch_size, device=device, dtype=torch.float32
     )
@@ -1324,7 +1384,7 @@ def _run_day_batch(
                     _encode_daily_context,
                     daily_context_features,
                     use_reentrant=False,
-                    preserve_rng_state=True,
+                    preserve_rng_state=preserve_checkpoint_rng_state,
                 )
             else:
                 policy_daily_context = _encode_daily_context(daily_context_features)
@@ -1423,7 +1483,7 @@ def _run_day_batch(
                     policy_daily_context,
                     daily_guidance_weights,
                     use_reentrant=False,
-                    preserve_rng_state=True,
+                    preserve_rng_state=preserve_checkpoint_rng_state,
                 )
             else:
                 targets = _policy_targets(
@@ -1842,12 +1902,15 @@ def _global_session_batches(
     global_batch_size: int,
     world_size: int,
 ) -> list[list[int]]:
-    """Build chronological global batches with work for every DDP rank.
+    """Build fixed-capacity chronological batches with work for every rank.
 
-    A final batch smaller than ``world_size`` would leave a rank without a
-    forward/backward call and deadlock DDP.  Distribute all sessions over one
-    fewer step in that rare case.  No session is skipped or repeated, and the
-    flattened result remains strictly chronological.
+    Keeping every ordinary batch at ``global_batch_size`` lets train,
+    validation, and test reuse one power-of-two compiled shape.  The final
+    batch is padded later by :func:`_run_split`; its real row count still owns
+    the loss denominator and reporting rows, so no session is repeated.  When
+    a tail contains fewer sessions than ranks, borrow the minimum chronological
+    suffix from the preceding batch.  This avoids a rank with no forward call
+    without balancing every batch into a different non-power-of-two shape.
     """
 
     selected = chronological_session_indices(indices)
@@ -1870,21 +1933,26 @@ def _global_session_batches(
             "tw_minute DDP split has fewer sessions than ranks: "
             f"sessions={len(selected)} world_size={ranks}"
         )
-    steps = max(1, math.ceil(len(selected) / batch_size))
-    steps = min(steps, len(selected) // ranks)
-    base, remainder = divmod(len(selected), steps)
-    sizes = [base + (1 if position < remainder else 0) for position in range(steps)]
-    batches: list[list[int]] = []
-    offset = 0
-    for size in sizes:
-        batch = selected[offset : offset + size]
-        if len(batch) < ranks:
-            raise RuntimeError("tw_minute DDP batch planner produced an empty rank")
-        batches.append(batch)
-        offset += size
+    batches = [
+        selected[start : start + batch_size]
+        for start in range(0, len(selected), batch_size)
+    ]
+    if len(batches) > 1 and len(batches[-1]) < ranks:
+        tail = batches.pop()
+        previous = batches.pop()
+        borrow = ranks - len(tail)
+        if len(previous) - borrow >= ranks:
+            split = len(previous) - borrow
+            batches.extend((previous[:split], previous[split:] + tail))
+        else:
+            # This can occur only when the configured batch is itself close to
+            # ``world_size``.  One larger batch is the sole feasible way to
+            # keep every rank active without duplicating a real session.
+            batches.append(previous + tail)
+    if any(len(batch) < ranks for batch in batches):
+        raise RuntimeError("tw_minute DDP batch planner produced an empty rank")
     if (
-        offset != len(selected)
-        or [item for batch in batches for item in batch] != selected
+        [item for batch in batches for item in batch] != selected
     ):
         raise RuntimeError("tw_minute DDP batch planner changed chronological sessions")
     return batches
@@ -2899,7 +2967,19 @@ def _run_minute_training_impl(
                 # when its initial hooks are suppressed this way.
                 static_graph=False,
             )
-            model_compile_status += ":ddp"
+            immutable_buffer_count = (
+                _disable_redundant_minute_ddp_buffer_broadcast(
+                    slab_forward_module
+                )
+            )
+            model_compile_status += (
+                ":ddp:forward_buffer_broadcast_off"
+            )
+            _progress(
+                f"[Train {train_years}] DDP initialized immutable buffers once; "
+                "disabled redundant per-forward broadcasts "
+                f"(buffers={immutable_buffer_count})"
+            )
 
         model_forward: Callable[..., Any] = slab_forward_module
 

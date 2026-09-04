@@ -16,6 +16,7 @@
 - [發布新資料](#發布新資料)
 - [Syncthing 驗收](#syncthing-驗收)
 - [Artifacts 同步與去重](#artifacts-同步與去重)
+- [磁碟壓力與可重建快取](#磁碟壓力與可重建快取)
 - [資料下載與更新](#資料下載與更新)
 - [訓練、GPU 與解釋](#訓練gpu-與解釋)
 - [即時訊號與服務](#即時訊號與服務)
@@ -545,11 +546,12 @@ Vast 要發布完整可部署 run 時，先在 `configs/data_sync/cold_artifacts
 dataset，並以 `maximum_file_bytes: null` 明確要求包含所有檔案；仍須通過 lifecycle、
 穩定時間、inventory 與 packed-object 驗證。
 
-`artifacts/ablations` 另有自動生命週期維護。它動態為每個通過完整 lifecycle 的 run
-建立穩定 dataset ID，逐一發布完整內容；七日租期到期後，仍須再次驗證 exact packed
-release、確認無程序引用，並確認 penguin 的 `stockagent-packed` 完整收斂，才會刪除本機
-來源。安裝方式：`sudo ./scripts/install_cold_artifact_maintenance.sh`。預設每五分鐘執行，
-一次最多發布一個 run；所有 gate 都是 fail closed。
+`artifacts/ablations` 另有自動生命週期維護。它只發現具有完整 lifecycle envelope 的
+完成 run，使用穩定 path-hash dataset ID 逐一發布完整內容。七日租期到期後，仍須再次
+驗證 exact packed release、確認來源未在驗證期間改變、沒有程序引用，並確認指定 peer 的
+`stockagent-packed` 完整收斂，才會刪除本機熱副本。安裝方式：
+`sudo ./scripts/install_cold_artifact_maintenance.sh`。預設每五分鐘執行、一次最多發布一個
+run；發布與刪除至少跨兩次執行，所有 gate 都 fail closed。
 
 ### cold artifact 完整命令
 
@@ -613,6 +615,61 @@ sudo ./scripts/install_artifact_dedup_service.sh
 
 完整遷移、ignore 與 penguin 衝突權威規則見
 [即時 artifacts 同步](docs/live_artifact_sync.md)。
+
+## 磁碟壓力與可重建快取
+
+資料、checkpoint、artifact 與 cold release 不能因為磁碟不足而直接刪除。唯一可自動回收
+的是 allowlist 內、已超過 14 日的 TorchInductor、Triton 與 CUDA 編譯快取；預設磁碟
+達 95% 才清到 92%。只要有 `train.py`、`torchrun`、distributed launcher 或 compiler
+worker，整次清理會延後，不只依賴當下 fd/mmap。
+
+```bash
+source scripts/runtime_env.sh
+
+# 唯讀盤點並產生 receipt
+run_fintech_python scripts/maintain_storage_pressure.py
+
+# 使用相同 fail-closed 規則套用
+run_fintech_python scripts/maintain_storage_pressure.py --apply
+
+# 安裝 hourly systemd timer；無 systemd 的 Vast container 安裝 cron fallback
+sudo ./scripts/install_storage_pressure_service.sh
+```
+
+Receipt 位於 `/var/lib/stockagent-storage-pressure/receipts/`。`--force` 只供人工測試，會
+明確繞過程序級保護，禁止放進排程。完整邊界與常態環境變數見
+[磁碟壓力維護](docs/storage_pressure_maintenance.md)。
+
+沒有持久卷的 Vast 計算節點不應常駐整份 packed payload。完成 durable peer 全量 checksum
+與 Syncthing 收斂驗證後，可切為 index-only edge：heads、manifests、inventories 繼續即時
+同步，blob/pack 只在 `use` 時下載、逐物件驗證、materialize，之後移除本機冗餘 payload。
+
+```bash
+source scripts/runtime_env.sh
+set -a; source /etc/environment; set +a
+
+# 唯讀容量與安全門檻
+run_fintech_python scripts/manage_packed_edge.py audit
+
+# 在 durable full replica 上逐一驗證所有物件；只產 receipt、不刪檔
+./scripts/run_packed_snapshot.sh full-audit
+
+# 分兩階段啟用；enable 只寫 ignore/state，prune 才回收 payload
+run_fintech_python scripts/manage_packed_edge.py enable --apply
+run_fintech_python scripts/manage_packed_edge.py prune --apply
+
+# 按需取得、驗證、materialize；完成後自動再清掉本機 packed payload
+run_fintech_python scripts/manage_packed_edge.py use DATASET
+
+# edge 的五分鐘排程走同一組 durable-peer safety gates；可先看 dry run
+stockagent-data gc --dry-run
+stockagent-data gc
+```
+
+Edge hot cache 的 TTL 上限為七天；仍在使用會自動續租，刻意長期保留請使用 pin。
+
+此模式禁止在 edge 節點直接發布 cold release；完整使用與回復方式見
+[packed 冷庫文件](docs/packed_dataset_storage.md)。
 
 ## 資料下載與更新
 
@@ -862,6 +919,7 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | 現行正確性契約 | [AGENTS.md](AGENTS.md) | point-in-time、backtest、checkpoint、reproducibility |
 | 文件總索引 | [docs/README.md](docs/README.md) | 區分現行契約、runbook、研究與歷史文件 |
 | 訓練架構 | [training_spec.md](docs/training_spec.md) | 訓練、評估、artifact 驗收 |
+| 公開面板 | [public_dashboards_architecture.md](docs/public_dashboards_architecture.md) | 唯讀資料流、快取、前端競態、安全與上線驗收 |
 | packed 冷庫 | [packed_dataset_storage.md](docs/packed_dataset_storage.md) | pack/blob、manifest、lease 與 smoke 證據 |
 | 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |

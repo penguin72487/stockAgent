@@ -10,22 +10,25 @@
 # Taiwan T+2, tax, lot, eligibility, or session-flat rules.
 base_config: bybit_perpetual_daily_multi_basis_projection_l1_syncthing_20260823.yaml
 
-experiment_name: bybit-perpetual-daily-0000-execution-22-effective-rank-projection-l1-carry-syncthing-20260823-v2
+experiment_name: bybit-perpetual-daily-0000-execution-22-effective-rank-projection-l1-carry-v1
 
 runner:
   # This is checkpoint-incompatible with both the 18-family crypto run and the
   # Taiwan artifact, so it owns a fresh output root and cannot silently resume
   # either experiment.
-  output_dir: artifacts/markets/bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_projection_l1_carry_syncthing_20260823_v2
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_projection_l1_carry_v1
   resume: true
   post_train_infer: false
 
 data:
-  # Separately materialized contract v7: features end at D-1 23:59 UTC and the
+  # Contract v7 derived from the pinned Syncthing release recorded in its
+  # receipt: features end at D-1 23:59 UTC and the
   # executor values an idealized zero-latency fill at the D 00:00 Kline open.
   # Do not point this at the incompatible legacy 00:05/v6 daily tree.
-  parquet_root: data_bybit_daily_0000_training_20260823
-  external_feature_path: data_bybit_daily_0000_public_features_20260823/bybit_crypto_public_daily_0000.parquet
+  parquet_root: data_bybit/perpetual_daily_0000
+  external_feature_path: data_bybit/public_features/bybit_crypto_public_daily_0000.parquet
+  # Reproducible cache is node-local and must never be published as source data.
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_0000
 
 trading:
   crypto_execution_minute_utc: 0

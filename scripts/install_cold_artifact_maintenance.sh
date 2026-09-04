@@ -7,6 +7,12 @@ if (( EUID != 0 )); then
   exit 2
 fi
 
+edge_state_root="${STOCKAGENT_PACKED_EDGE_STATE_ROOT:-/var/lib/stockagent-packed-edge}"
+if [[ -f "$edge_state_root/state.json" ]]; then
+  echo "Refusing full-replica cold maintenance on an index-only edge node." >&2
+  exit 2
+fi
+
 chmod 0755 \
   "$repo_root/scripts/maintain_cold_artifacts.py" \
   "$repo_root/scripts/run_cold_artifact_maintenance.sh" \

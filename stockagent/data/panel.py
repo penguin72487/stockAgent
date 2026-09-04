@@ -5348,6 +5348,7 @@ def build_panel(
     sell_tradable_mode: str | None = None,
     panel_backend: str = "auto",
     panel_load_workers: int = 4,
+    panel_cache_root: str | Path | None = None,
     external_feature_path: str | Path | None = None,
     external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
     external_include_features: bool = True,
@@ -5360,6 +5361,11 @@ def build_panel(
     panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
+    cache_root = (
+        Path(panel_cache_root)
+        if panel_cache_root is not None and str(panel_cache_root).strip()
+        else parquet_root
+    )
     external_feature_path = _resolve_external_data_path(
         external_feature_path,
         include_features=external_include_features,
@@ -5518,7 +5524,7 @@ def build_panel(
             )
     source_hash = _compute_source_hash(source_paths)
 
-    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
+    panel = _load_valid_panel_cache(cache_root, source_paths, backend_key, source_hash)
     if panel is not None:
         if include_day_trade_open_gap:
             panel = _append_configured_day_trade_open_gap_feature(
@@ -5613,8 +5619,8 @@ def build_panel(
     )
     if panel.unresolved_corporate_action_mask is not None:
         panel = _attach_raw_close_forward_returns(panel)
-    _save_panel_cache(parquet_root, panel, source_hash, backend_key)
-    print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
+    _save_panel_cache(cache_root, panel, source_hash, backend_key)
+    print(f"[panel] cache v2 saved: {panel_cache_v2_dir(cache_root)}")
     if include_day_trade_open_gap:
         panel = _append_configured_day_trade_open_gap_feature(
             panel,

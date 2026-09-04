@@ -1,0 +1,114 @@
+# Progressive validation screen for the v12-guided one-minute strategy.
+#
+# Selection must use validation log utility / validation metrics.  Stitched
+# deployment and full-horizon tests are audit evidence, never inputs to early
+# stopping or candidate selection.  The baseline and every candidate keep the
+# same causal minute data, 10M account, 50% per-minute volume cap, normal fees,
+# zero added slippage, long/short rules, and mandatory session-close flattening.
+base_config: configs/markets/tw_minute_daily_guided_v12_dual_5090.yaml
+output_root: artifacts/ablations/tw_minute_daily_guided_v12_optimization_v1
+expected_fold_count: 5
+
+pinned_panel_cache:
+  manifest_path: data_tw_public/stocks/panel_cache_v2/variants/fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577.json
+  version: 54
+  generation: 3726b829b37d4d56833a80b20280e4a2
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+
+  fixed_overrides:
+    runner:
+      resume: true
+      post_train_infer: false
+    walk_forward:
+      lookback_context: panel_history
+    training:
+      epochs: 1000
+      multi_gpu_strategy: distributed_data_parallel
+      record_epoch_curve: true
+      epoch_test_curve: true
+      curve_test_interval: 1
+      curve_plot_interval: 1
+      curve_plot_async: true
+      defer_epoch_curve_plot_until_end: false
+
+  # These are progressive candidates rather than independent claims of causal
+  # attribution.  Compare each row with the preceding simpler row on validation
+  # first; combine changes only when the added constraint improves that axis.
+  dimensions:
+    - name: progressive_candidates
+      enabled: true
+      baseline: v12_guide_cost1_full_bottleneck
+      variants:
+        - name: attention_guide
+          experiment_name: attention_guide
+          description: Use the validation-stronger v12 attention-pooling daily policy as the causal OOF risk envelope.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+
+        - name: attention_guide_cost2
+          experiment_name: attention_guide_cost2
+          description: Require twice the exact one-way fee hurdle before changing the filled minute position.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+            training:
+              minute_proximal_cost_multiplier: 2.0
+
+        - name: attention_guide_cost4
+          experiment_name: attention_guide_cost4
+          description: Stronger four-times-fee no-trade region to test whether lower turnover generalizes better.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+            training:
+              minute_proximal_cost_multiplier: 4.0
+
+        - name: attention_guide_cost2_market_only
+          experiment_name: attention_guide_cost2_market_only
+          description: Remove the redundant latent-factor branch because the daily guide already owns cross-sectional stock selection.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+            training:
+              minute_proximal_cost_multiplier: 2.0
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: true
+              transformer_base_portfolio:
+                use_latent_factors: false
+                use_market_tokens: true
+
+        - name: attention_guide_cost2_no_qk_norm
+          experiment_name: attention_guide_cost2_no_qk_norm
+          description: Preserve the full bottleneck but remove QK normalization, the faster validation-positive v12 architecture row.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+            training:
+              minute_proximal_cost_multiplier: 2.0
+              financial_transformer:
+                qk_norm: false
+              transformer_base_portfolio:
+                qk_norm: false
+
+        - name: attention_guide_cost2_daily_attention
+          experiment_name: attention_guide_cost2_daily_attention
+          description: Let the minute controller attend over all 32 completed daily context states instead of using only the last state.
+          overrides:
+            data:
+              minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+            training:
+              minute_proximal_cost_multiplier: 2.0
+              financial_transformer:
+                daily_context_pooling: attention
+

@@ -38,6 +38,11 @@ _CHECKPOINT_CONTRACT_FAILURE_PATTERNS = (
     "checkpoint settings do not match",
     "checkpoint data fingerprint does not match",
 )
+_SOURCE_INTEGRITY_FAILURE_PATTERNS = (
+    "syntaxerror:",
+    "indentationerror:",
+    "taberror:",
+)
 
 
 @dataclass
@@ -139,6 +144,11 @@ def _attempt_log_text(job: _ActiveRun) -> str:
 
 def _failure_kind(returncode: int, log_text: str) -> str:
     lowered = log_text.lower()
+    if any(pattern in lowered for pattern in _SOURCE_INTEGRITY_FAILURE_PATTERNS):
+        # Retrying an unchanged source tree cannot repair a parser failure. In
+        # particular, unresolved merge markers surface as SyntaxError before
+        # training starts and should fail once with the original traceback.
+        return "source_integrity_failure"
     if any(pattern in lowered for pattern in _CHECKPOINT_CONTRACT_FAILURE_PATTERNS):
         return "checkpoint_contract_mismatch"
     if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
@@ -1173,9 +1183,10 @@ def main() -> None:
                     infrastructure_wait = (
                         failure_kind == "cuda_infrastructure_unavailable"
                     )
-                    non_retryable_contract_failure = (
-                        failure_kind == "checkpoint_contract_mismatch"
-                    )
+                    non_retryable_failure = failure_kind in {
+                        "checkpoint_contract_mismatch",
+                        "source_integrity_failure",
+                    }
                     if infrastructure_wait:
                         # A host driver/UVM outage is not evidence that this
                         # experiment cannot progress. Preserve its retry budget
@@ -1187,7 +1198,7 @@ def main() -> None:
                             else job.consecutive_no_progress_failures
                         )
                         retry_allowed = bool(args.auto_resume)
-                    elif non_retryable_contract_failure:
+                    elif non_retryable_failure:
                         no_progress_failures = (
                             0
                             if made_progress

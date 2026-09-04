@@ -176,8 +176,9 @@ data:
     - crypto_public_etf_reserve_coverage_log
     - crypto_public_etf_issuer_available
   feature_exclude: []
-  # Sparse public families are zero only together with explicit availability
-  # flags; a missing observation is never confused with an observed zero.
+  # Compatibility guard: `feature_zero_fill` disables the full matched channel,
+  # while retaining its model slot. This legacy baseline therefore does not use
+  # any external values; use a fresh preprocessing contract/root to enable them.
   feature_zero_fill:
     - crypto_bybit_*
     - crypto_binance_*

@@ -5,6 +5,24 @@ script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
 script_dir="$(cd -- "$(dirname -- "${script_path}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
+edge_state="${STOCKAGENT_PACKED_EDGE_STATE:-/var/lib/stockagent-packed-edge/state.json}"
+if [ -f "${edge_state}" ]; then
+  case "${1:-}" in
+    use|gc|evict)
+      # shellcheck source=scripts/runtime_env.sh
+      source "${repo_root}/scripts/runtime_env.sh"
+      if [ -r /etc/environment ]; then
+        set -a
+        # shellcheck disable=SC1091
+        source /etc/environment
+        set +a
+      fi
+      run_fintech_python "${repo_root}/scripts/manage_packed_edge.py" "$@"
+      exit $?
+      ;;
+  esac
+fi
+
 case "${1:-}" in
   publish)
     shift

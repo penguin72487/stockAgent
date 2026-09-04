@@ -91,8 +91,9 @@ coordinated code, config, test, and documentation change.
   dataset or training directory.
 - Deduplication is content-addressed.  File names, sizes, mtimes, and apparent
   similarity are not deletion proof.  Preserve one verified object per digest
-  and let manifests retain logical paths.  Never delete a source merely because
-  another path looks duplicated.
+  and let manifests retain logical paths.  An identical inventory is a semantic
+  no-op: reuse the current release and do not advance a timestamp-only head.
+  Never delete a source merely because another path looks duplicated.
 - Small-file query layout and transport layout solve different problems.  Keep
   canonical Parquet/receipt grains needed by readers, but publish them through
   deterministic fixed hash buckets plus large-file blobs.  Do not replace this
@@ -132,12 +133,15 @@ coordinated code, config, test, and documentation change.
 
 ### Syncthing topology and identity
 
-- The only shared canonical data folder is `stockagent-packed` at
+- The canonical data namespace is `stockagent-packed` at
   `/srv/stockagent-packed`, configured Send & Receive, filesystem watcher on,
-  and not paused.  It contains only release manifests, per-node heads, packs,
-  blobs, and their proofs.  Repositories, mutable `data_*` trees, materialized
-  caches, downloader shards, and active training directories do not belong in
-  this folder.
+  and not paused.  Durable nodes retain manifests, per-node heads, inventories,
+  packs, blobs, and their proofs.  An explicitly enrolled ephemeral compute node
+  may use index-only edge mode: it still synchronizes heads/manifests/inventories
+  in real time, ignores local blob/pack payload copies, and hydrates the exact
+  objects for a selected release before use.  Repositories, mutable `data_*`
+  trees, materialized caches, downloader shards, and active training directories
+  do not belong in this folder.
 - `stockagent`, `stockagent-desync`, and `stockagent-artifacts-live` are retired
   Folder IDs.  Never recreate or accept them.  `stockagent-artifacts-hot` is a
   non-canonical low-latency channel for an explicitly bounded penguin/lab203
@@ -155,13 +159,30 @@ coordinated code, config, test, and documentation change.
   Vast container may use a user supervisor and cron.  This does not change the
   storage contract.  Before calling a Vast cold store durable, verify that its
   path is on persistent storage that survives instance recreation.
+- Index-only edge conversion is allowed only for a non-persistent compute node
+  after a durable peer passes full object checksums and current Syncthing
+  convergence, the payload tree has no process references, and local ignore
+  rules are active before unlink.  It may delete only its ignored local
+  `objects/blobs` and `objects/packs` copies; heads, manifests, inventories,
+  materialized data, sources, and the durable peer remain untouched.  Direct
+  cold publication is disabled in this mode.  On-demand use must temporarily
+  re-include, receive, hash, and materialize the exact release, then may prune
+  only the redundant local payload copy.
+- On an index-only edge, cache GC may substitute a freshly observed, fully
+  converged durable-peer proof for local payload presence.  Manifest hash,
+  `READY`, pin, lease age, and live-process checks remain mandatory; a
+  disconnected, incomplete, or invalid peer makes eviction fail closed.  Edge
+  leases are capped at seven days; live references renew that seven-day window,
+  while intentional longer retention must use a pin.
 
 ### Multi-writer publication and conflict resolution
 
-- There is no single publisher.  Every node publishes immutable releases under
-  its own permanent node ID.  Per-node heads plus the deterministic HLC/LWW
-  resolver choose the newest *valid* release; catalog freshness and
-  non-regression checks outrank wall-clock recency.
+- There is no single publisher among full-replica publishing nodes.  They publish
+  immutable releases under their own permanent node IDs.  An index-only edge is
+  a consumer and may not publish until it is explicitly returned to full-replica
+  mode.  Per-node heads plus the deterministic HLC/LWW resolver choose the newest
+  *valid* release; catalog freshness and non-regression checks outrank wall-clock
+  recency.
 - "Newest wins" applies only to validated release heads.  It does not authorize
   agents to compare mtimes, hand-edit a shared head, copy another node's head,
   impersonate its node ID, or accept a Syncthing conflict file.  A conflict file
@@ -175,6 +196,12 @@ coordinated code, config, test, and documentation change.
   caches, and incomplete training runs remain node-local.  Completed artifacts
   may enter cold storage only after their lifecycle/completion contract and
   final hashes pass; an active service or named file is not completion evidence.
+- Automatic completed-artifact maintenance must keep discovery, publication,
+  peer convergence, and source eviction as separate gates.  Publish at most one
+  new wave at a time; deletion requires a later exact cold/source verification,
+  an empty process-reference check, an unchanged source activity fingerprint,
+  expired retention, and full intended-peer convergence.  Resolve peer identity
+  from current Syncthing configuration rather than hard-coding a Device ID.
 - Training, backtest, resume, and audit jobs must resolve and record one exact
   release ID before starting.  They may not re-resolve `latest` during a run or
   silently resume against a different release.
@@ -201,6 +228,14 @@ coordinated code, config, test, and documentation change.
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
   an unmanaged directory.  Cold-object GC stays report-only unless the user has
   explicitly approved a retention policy and fleet-wide reachability proof.
+- Compiler caches are a separate rebuildable layer.  Under disk pressure, use
+  `scripts/maintain_storage_pressure.py`: it may prune only allowlisted old
+  TorchInductor/Triton/CUDA cache files after fd/mmap and signature rechecks.  It
+  must never broaden its target to packed, materialized, source, artifact, Git,
+  checkpoint, or receipt trees.  Automatic cleanup must defer the whole run
+  while training, torchrun, distributed launch, or compiler worker processes
+  are active; only an explicit manual force may bypass that process-level gate.
+  Keep its audit receipt and low-I/O scheduling.
 
 ### Acceptance and reporting
 

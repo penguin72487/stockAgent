@@ -1,0 +1,16 @@
+base_config: bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_projection_l1_carry.yaml
+
+experiment_name: bybit-perpetual-daily-0000-deterministic-v1
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_deterministic_v1
+  resume: true
+
+environment:
+  # A single lucky DDP trajectory is not promotion evidence. Fail closed when
+  # an operation has no deterministic CUDA implementation.
+  cudnn_benchmark: false
+  deterministic_algorithms: true
+
+training:
+  epochs: 1000

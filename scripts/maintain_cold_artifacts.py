@@ -21,9 +21,6 @@ from stockagent.data_sync.artifact_maintenance import maintain_completed_artifac
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
-PENGUIN_DEVICE_ID = "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW"
-
-
 def _request_json(base_url: str, api_key: str, path: str, query: dict[str, str]) -> Any:
     url = base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(query)
     request = urllib.request.Request(url, headers={"X-API-Key": api_key})
@@ -69,6 +66,24 @@ def syncthing_peer_convergence(
     }
 
 
+def syncthing_device_id(
+    base_url: str, api_key: str, *, peer_name: str
+) -> str:
+    devices = _request_json(base_url, api_key, "/rest/config/devices", {})
+    matches = [
+        str(device.get("deviceID"))
+        for device in devices
+        if str(device.get("name", "")) == peer_name
+        and str(device.get("deviceID", ""))
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one Syncthing device named {peer_name!r}; "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-root", type=Path, default=REPO_ROOT / "artifacts")
@@ -82,7 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-publish", type=int, default=1)
     parser.add_argument("--syncthing-url", default="http://127.0.0.1:18384")
     parser.add_argument("--syncthing-folder", default="stockagent-packed")
-    parser.add_argument("--peer-device", default=PENGUIN_DEVICE_ID)
+    parser.add_argument(
+        "--peer-name",
+        default=os.environ.get("COLD_ARTIFACT_PEER_NAME", "penguin"),
+    )
+    parser.add_argument(
+        "--peer-device",
+        default=os.environ.get("COLD_ARTIFACT_PEER_DEVICE"),
+        help="explicit Device ID override; otherwise resolve --peer-name from Syncthing",
+    )
     parser.add_argument("--apply", action="store_true")
     return parser
 
@@ -95,8 +118,16 @@ def main() -> int:
         if not api_key:
             return {"ok": False, "error": "Syncthing API key is unavailable"}
         try:
+            peer_device = args.peer_device or syncthing_device_id(
+                args.syncthing_url,
+                api_key,
+                peer_name=args.peer_name,
+            )
             return syncthing_peer_convergence(
-                args.syncthing_url, api_key, args.syncthing_folder, args.peer_device
+                args.syncthing_url,
+                api_key,
+                args.syncthing_folder,
+                peer_device,
             )
         except (OSError, urllib.error.URLError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

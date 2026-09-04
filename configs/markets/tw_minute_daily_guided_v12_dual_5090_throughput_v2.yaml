@@ -1,0 +1,20 @@
+base_config: tw_minute_daily_guided_v12_dual_5090.yaml
+
+# Compute-optimized v12 control. This changes only the Q/K normalization
+# ablation; data, daily guide, exact fees, allocator, long/short rules, causal
+# clocks, full-session credit assignment, and reporting remain inherited.
+experiment_name: tw-minute-daily-guided-v12-throughput-v2
+
+runner:
+  output_dir: artifacts/markets/tw_minute_daily_guided_v12_throughput_v2
+  resume: true
+
+training:
+  # With one minute of lookback, self-attention is already reduced exactly to
+  # its value projection. qk_norm=false also removes Q/K RMS reductions from
+  # the separate 32-day context encoder. Keep this as a speed candidate until
+  # its validation result is compared with the qk_norm=true control.
+  financial_transformer:
+    qk_norm: false
+  transformer_base_portfolio:
+    qk_norm: false

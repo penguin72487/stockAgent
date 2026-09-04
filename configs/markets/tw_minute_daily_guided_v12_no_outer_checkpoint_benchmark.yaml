@@ -1,0 +1,17 @@
+base_config: tw_minute_daily_guided_v12_dual_5090.yaml
+
+# Throughput probe only.  This keeps the same v12 OOF guide, model, loss, and
+# exact minute ledger while trading VRAM for removal of policy recomputation.
+# Formal training must use a fresh output root if this variant is selected.
+experiment_name: tw-minute-daily-guided-v12-no-outer-checkpoint-benchmark
+
+data:
+  minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_v12_attention_pooling_exact_official_close_requested_weights.parquet
+
+training:
+  minute_proximal_cost_multiplier: 2.0
+  minute_full_day_activation_checkpoint: false
+  financial_transformer:
+    qk_norm: false
+  transformer_base_portfolio:
+    qk_norm: false

@@ -12,11 +12,11 @@
   1m/15m 僅為因果日特徵的原始聚合資料，不會建立盤中訓練樣本或盤中調倉。
 - 特徵完整性與執行可得性分開。若前一日少任何 1m bar，該合約的新策略
   target 會保持為零，直到 32 日 lookback 及差分所需的前置日全部完整；但只要
-  官方 00:05 execution open 存在，該列仍保留給既有部位估值與減倉，不能因
+  官方 00:00 execution open 存在，該列仍保留給既有部位估值與減倉，不能因
   特徵缺口假裝市場無法平倉。
-- 模型在 D 00:00 建立 signed target weight，明確保留五分鐘運算／送單延遲；
-  executor 到 D 00:05 才使用官方 1m Kline open 作 next-trade 研究估值，持有到
-  下一日 00:05 再調整。該 execution price 不會進入 D 的模型特徵。
+- 模型在 D 00:00 建立 signed target weight；executor 同樣以 D 00:00 的官方
+  1m Kline open 作零延遲 counterfactual 估值，持有到下一日 00:00 再調整。
+  該 execution price 不會進入 D 的模型特徵，也不代表真實送單可在原地成交。
   正向為 long、負向為 short，投影在 L1 ball 內，所以 gross exposure 不超過
   1，且可以保留現金。
 - 每次實際買入或賣出名目金額收取 `0.00055` taker fee。正反向換倉按完整
@@ -29,7 +29,7 @@
 
 ## 資金費與跨日漂移
 
-若 00:05 execution open 為 `P0`、下一日 execution open 為 `P1`，期間資金費事件 k 的官方費率
+若 00:00 execution open 為 `P0`、下一日 execution open 為 `P1`，期間資金費事件 k 的官方費率
 與 mark 為 `f_k, M_k`，每一單位起始 NAV 的 long 合約報酬係數為：
 
 ```text
@@ -160,9 +160,12 @@ run_fintech_python downloader/materialize_bybit_perpetual_daily.py \
   --execution-minute-utc 0
 
 run_fintech_python scripts/rebase_bybit_funding_feature_slice.py \
-  --base-feature-path data_bybit/public_features/bybit_crypto_public_daily.parquet \
+  --base-feature-path data_bybit_daily_synced/public_features/bybit_crypto_public_daily.parquet \
   --bybit-daily-dir data_bybit/perpetual_daily_0000 \
   --output-path data_bybit/public_features/bybit_crypto_public_daily_0000.parquet
+
+run_fintech_python train.py \
+  --config configs/markets/bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_projection_l1_carry.yaml
 ```
 
 v7 的資訊集合截至 D-1 23:59 UTC，以 D 00:00 Kline open 作理想化原地

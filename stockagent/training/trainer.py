@@ -21965,11 +21965,32 @@ def _run_training_impl(
             ),
         }
     )
+    deterministic_algorithms = bool(
+        getattr(config.environment, "deterministic_algorithms", False)
+    )
+    if deterministic_algorithms:
+        # cuBLAS reads this before its first workspace is created.  Set it in
+        # every isolated/DDP child before model or optimizer CUDA work starts.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if _distributed_is_rank0():
+            print(
+                "[runtime] deterministic_algorithms=enabled "
+                "cublas_workspace=:4096:8 cudnn_benchmark=false"
+            )
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.benchmark = bool(
+            config.environment.cudnn_benchmark
+        )
+        torch.backends.cudnn.deterministic = False
+
     if config.environment.use_tensor_cores and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
         try:
             # Keep compile/cudagraph enabled while suppressing verbose artifact logs.
             torch._logging.set_logs(

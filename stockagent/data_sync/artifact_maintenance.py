@@ -317,7 +317,30 @@ def maintain_completed_artifacts(
                     row["peer"] = dict(convergence)
                 else:
                     _release_matches_source(sync_root, source, spec)
-                    if apply:
+                    late_references = artifact_process_references(
+                        source,
+                        artifact_root.joinpath(*PurePosixPath(scope).parts),
+                    )
+                    postverification_activity_ns = newest_activity_ns(source)
+                    if late_references:
+                        state["last_used_ns"] = current_ns
+                        state["last_used_at"] = _utc_iso_from_ns(current_ns)
+                        state["last_use_evidence"] = late_references
+                        row.update(
+                            action="keep",
+                            reason="in-use-after-verification",
+                            process_references=late_references,
+                        )
+                    elif postverification_activity_ns != premaintenance_activity_ns:
+                        state["last_used_ns"] = max(
+                            int(state["last_used_ns"]),
+                            postverification_activity_ns,
+                        )
+                        state["last_used_at"] = _utc_iso_from_ns(
+                            int(state["last_used_ns"])
+                        )
+                        row.update(action="keep", reason="source-changed-during-verification")
+                    elif apply:
                         shutil.rmtree(source)
                         state.update(
                             {

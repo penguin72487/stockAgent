@@ -58,6 +58,37 @@ def test_return_label_uses_adjclose_but_execution_price_uses_close() -> None:
     assert math.isclose(float(rows[1]["close_logret_1d"]), math.log(110.0 / 100.0), rel_tol=1e-7)
 
 
+def test_panel_cache_can_live_outside_immutable_source_tree(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    cache_root = tmp_path / "node_local_cache"
+    source_root.mkdir()
+    _write_symbol(
+        source_root / "BTCUSDT_features.parquet",
+        ["2024-01-01", "2024-01-02"],
+        [100.0, 101.0],
+        [10.0, 11.0],
+    )
+
+    first = build_panel(
+        source_root,
+        benchmark_name="BTCUSDT",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        panel_cache_root=cache_root,
+    )
+    second = build_panel(
+        source_root,
+        benchmark_name="BTCUSDT",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        panel_cache_root=cache_root,
+    )
+
+    assert not (source_root / "panel_cache_v2").exists()
+    assert (cache_root / "panel_cache_v2" / "meta.json").is_file()
+    np.testing.assert_array_equal(second.features, first.features)
+
+
 @pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
 def test_explicit_day_trade_open_gap_is_next_open_over_current_close(
     tmp_path: Path,

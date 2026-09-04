@@ -1,0 +1,11 @@
+[Unit]
+Description=Check StockAgent rebuildable caches for disk pressure hourly
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Unit=stockagent-storage-pressure.service
+
+[Install]
+WantedBy=timers.target
