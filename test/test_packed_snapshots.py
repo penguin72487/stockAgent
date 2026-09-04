@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,41 @@ def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
         "materialized_verified"
     ]
+
+
+def test_group_writable_packed_root_repairs_public_directory_modes(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    sync_root.mkdir()
+    sync_root.chmod(0o2770)
+    stale_bucket = sync_root / "objects" / "inventories" / "ff"
+    stale_bucket.mkdir(parents=True)
+    stale_bucket.chmod(0o2755)
+
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(
+        sync_root,
+        "prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=4,
+    )
+
+    public_directories = [
+        path
+        for top in ("heads", "manifests", "objects")
+        for path in (sync_root / top).rglob("*")
+        if path.is_dir()
+    ]
+    public_directories.extend(
+        sync_root / top for top in ("heads", "manifests", "objects")
+    )
+    assert stale_bucket in public_directories
+    assert all(path.stat().st_mode & stat.S_IWGRP for path in public_directories)
+    assert all(path.stat().st_mode & stat.S_ISGID for path in public_directories)
+    assert resolved.manifest_path.parent.stat().st_mode & stat.S_IWGRP
 
 
 def test_packed_snapshot_fetch_subtree_is_atomic_and_verified(tmp_path: Path) -> None:
@@ -172,7 +208,7 @@ def test_packed_snapshot_can_select_only_small_files(tmp_path: Path) -> None:
     ]
 
 
-def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> None:
+def test_unchanged_publish_is_a_semantic_noop(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"
     initialize_packed_layout(sync_root, node_id="node-a")
@@ -191,15 +227,10 @@ def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> N
         pack_buckets=4,
     )
 
-    assert (
-        first.manifest["archive"]["inventory"]["sha256"]
-        == second.manifest["archive"]["inventory"]["sha256"]
-    )
-    assert first.manifest["archive"]["objects"] == second.manifest["archive"]["objects"]
-    assert first.manifest["snapshot_id"] != second.manifest["snapshot_id"]
-    assert second.manifest["archive"]["reused_files"] == 4
-    assert second.manifest["archive"]["changed_files"] == 0
-    assert second.manifest["archive"]["new_stored_bytes"] == 0
+    assert second.manifest["snapshot_id"] == first.manifest["snapshot_id"]
+    assert second.manifest_sha256 == first.manifest_sha256
+    assert second.head_path == first.head_path
+    assert len(list((sync_root / "manifests" / "prices").glob("*.json"))) == 1
 
 
 def test_changed_small_file_uses_delta_pack_and_reuses_old_members(
@@ -255,6 +286,9 @@ def test_latest_packed_snapshot_uses_per_node_heads(tmp_path: Path) -> None:
         sync_root,
         node_id="node-b",
         replace_node_id=True,
+    )
+    (source / "text" / "first.json").write_text(
+        '{"publisher": "node-b"}\n', encoding="utf-8"
     )
     expected = publish_packed_snapshot(sync_root, "prices", source, pack_buckets=2)
 

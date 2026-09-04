@@ -91,8 +91,9 @@ coordinated code, config, test, and documentation change.
   dataset or training directory.
 - Deduplication is content-addressed.  File names, sizes, mtimes, and apparent
   similarity are not deletion proof.  Preserve one verified object per digest
-  and let manifests retain logical paths.  Never delete a source merely because
-  another path looks duplicated.
+  and let manifests retain logical paths.  An identical inventory is a semantic
+  no-op: reuse the current release and do not advance a timestamp-only head.
+  Never delete a source merely because another path looks duplicated.
 - Small-file query layout and transport layout solve different problems.  Keep
   canonical Parquet/receipt grains needed by readers, but publish them through
   deterministic fixed hash buckets plus large-file blobs.  Do not replace this
@@ -175,6 +176,12 @@ coordinated code, config, test, and documentation change.
   caches, and incomplete training runs remain node-local.  Completed artifacts
   may enter cold storage only after their lifecycle/completion contract and
   final hashes pass; an active service or named file is not completion evidence.
+- Automatic completed-artifact maintenance must keep discovery, publication,
+  peer convergence, and source eviction as separate gates.  Publish at most one
+  new wave at a time; deletion requires a later exact cold/source verification,
+  an empty process-reference check, an unchanged source activity fingerprint,
+  expired retention, and full intended-peer convergence.  Resolve peer identity
+  from current Syncthing configuration rather than hard-coding a Device ID.
 - Training, backtest, resume, and audit jobs must resolve and record one exact
   release ID before starting.  They may not re-resolve `latest` during a run or
   silently resume against a different release.
@@ -201,6 +208,14 @@ coordinated code, config, test, and documentation change.
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
   an unmanaged directory.  Cold-object GC stays report-only unless the user has
   explicitly approved a retention policy and fleet-wide reachability proof.
+- Compiler caches are a separate rebuildable layer.  Under disk pressure, use
+  `scripts/maintain_storage_pressure.py`: it may prune only allowlisted old
+  TorchInductor/Triton/CUDA cache files after fd/mmap and signature rechecks.  It
+  must never broaden its target to packed, materialized, source, artifact, Git,
+  checkpoint, or receipt trees.  Automatic cleanup must defer the whole run
+  while training, torchrun, distributed launch, or compiler worker processes
+  are active; only an explicit manual force may bypass that process-level gate.
+  Keep its audit receipt and low-I/O scheduling.
 
 ### Acceptance and reporting
 

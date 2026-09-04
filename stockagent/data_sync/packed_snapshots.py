@@ -319,12 +319,13 @@ def _copy_and_hash(source: Path, destination: Path) -> str:
 
 
 def _install_immutable_object(
+    sync_root: Path,
     temporary: Path,
     destination: Path,
     *,
     expected_sha256: str,
 ) -> bool:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_shared_packed_directory(sync_root, destination.parent)
     if destination.exists():
         if sha256_file(destination) != expected_sha256:
             raise SnapshotError(f"content-addressed object is corrupt: {destination}")
@@ -420,6 +421,79 @@ def _object_relpath(kind: str, digest: str, suffix: str) -> PurePosixPath:
     return PurePosixPath("objects") / kind / digest[:2] / f"{digest}{suffix}"
 
 
+def _ensure_shared_packed_directory(sync_root: Path, directory: Path) -> None:
+    """Create one public packed directory with cooperative writer permissions.
+
+    Most nodes run the publisher and Syncthing as the same Unix user. Vast
+    containers deliberately run Syncthing as ``user`` while root-owned cron
+    publishes releases. When the packed root explicitly opts into group-write,
+    retain that policy and setgid inheritance below ``heads``, ``manifests``,
+    and ``objects``. A normal 0755 single-user root is left unchanged.
+    """
+
+    sync_root = sync_root.resolve()
+    directory = directory.resolve(strict=False)
+    try:
+        relative = directory.relative_to(sync_root)
+    except ValueError as exc:
+        raise SnapshotError(
+            f"packed directory escapes sync root: {directory}"
+        ) from exc
+    if not relative.parts or relative.parts[0] not in {
+        "heads",
+        "manifests",
+        "objects",
+    }:
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    root_mode = stat.S_IMODE(sync_root.stat().st_mode)
+    if not root_mode & stat.S_IWGRP:
+        return
+    inherited = stat.S_IWGRP | stat.S_IXGRP
+    if root_mode & stat.S_ISGID:
+        inherited |= stat.S_ISGID
+    current = sync_root
+    for component in relative.parts:
+        current /= component
+        info = current.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise SnapshotError(f"packed path component is not a directory: {current}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode | inherited != mode:
+            current.chmod(mode | inherited)
+
+
+def repair_shared_packed_directory_modes(sync_root: Path) -> int:
+    """Repair public directory modes for a group-writable packed root."""
+
+    sync_root = sync_root.resolve()
+    if not sync_root.exists():
+        return 0
+    root_mode = stat.S_IMODE(sync_root.stat().st_mode)
+    if not root_mode & stat.S_IWGRP:
+        return 0
+    changed = 0
+    inherited = stat.S_IWGRP | stat.S_IXGRP
+    if root_mode & stat.S_ISGID:
+        inherited |= stat.S_ISGID
+    for top in ("heads", "manifests", "objects"):
+        public_root = sync_root / top
+        if not public_root.exists():
+            continue
+        for directory, dirnames, _filenames in os.walk(public_root, followlinks=False):
+            dirnames.sort()
+            path = Path(directory)
+            info = path.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            mode = stat.S_IMODE(info.st_mode)
+            if mode | inherited != mode:
+                path.chmod(mode | inherited)
+                changed += 1
+    return changed
+
+
 def initialize_packed_layout(
     sync_root: Path,
     *,
@@ -440,10 +514,11 @@ def initialize_packed_layout(
         "objects/blobs",
         "objects/packs",
         "objects/inventories",
-        ".local-state/locks",
-        ".local-state/staging",
     ):
+        _ensure_shared_packed_directory(sync_root, sync_root / relative)
+    for relative in (".local-state/locks", ".local-state/staging"):
         (sync_root / relative).mkdir(parents=True, exist_ok=True)
+    repair_shared_packed_directory_modes(sync_root)
     ignore_path = sync_root / ".stignore"
     if replace_ignore or not ignore_path.exists():
         atomic_write_bytes(ignore_path, _STIGNORE.encode("utf-8"))
@@ -799,7 +874,7 @@ def publish_packed_snapshot(
             relpath = _object_relpath("blobs", digest, ".blob")
             destination = sync_root.joinpath(*relpath.parts)
             already_present = _install_immutable_object(
-                temporary, destination, expected_sha256=digest
+                sync_root, temporary, destination, expected_sha256=digest
             )
             if not already_present:
                 newly_installed_hashes.add(digest)
@@ -835,7 +910,7 @@ def publish_packed_snapshot(
             destination = sync_root.joinpath(*relpath.parts)
             size = temporary.stat().st_size
             already_present = _install_immutable_object(
-                temporary, destination, expected_sha256=digest
+                sync_root, temporary, destination, expected_sha256=digest
             )
             if not already_present:
                 newly_installed_hashes.add(digest)
@@ -868,7 +943,7 @@ def publish_packed_snapshot(
         inventory_path = sync_root.joinpath(*inventory_relpath.parts)
         inventory_bytes = inventory_temp.stat().st_size
         inventory_already_present = _install_immutable_object(
-            inventory_temp, inventory_path, expected_sha256=inventory_sha
+            sync_root, inventory_temp, inventory_path, expected_sha256=inventory_sha
         )
 
         _, after = _collect_entries(
@@ -1009,6 +1084,7 @@ def publish_packed_snapshot(
             manifest["git"] = git_state
         manifest_relpath = PurePosixPath("manifests") / dataset / f"{snapshot_id}.json"
         manifest_path = sync_root.joinpath(*manifest_relpath.parts)
+        _ensure_shared_packed_directory(sync_root, manifest_path.parent)
         manifest_sha = write_immutable_json(manifest_path, manifest)
         head = {
             "schema_version": PACKED_HEAD_SCHEMA_VERSION,
@@ -1021,6 +1097,7 @@ def publish_packed_snapshot(
             "manifest_sha256": manifest_sha,
         }
         head_path = sync_root / "heads" / dataset / f"{publisher_node}.json"
+        _ensure_shared_packed_directory(sync_root, head_path.parent)
         atomic_write_json(head_path, head)
         return ResolvedSnapshot(
             manifest=manifest,
