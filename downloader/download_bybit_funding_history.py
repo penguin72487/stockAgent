@@ -4,22 +4,23 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import hashlib
 import json
-import os
 from pathlib import Path
 import sys
 import threading
 from typing import Any
 
 import polars as pl
-import pyarrow.parquet as pq
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
+from artifact_io import (  # noqa: E402
+    atomic_write_parquet,
+    sha256_file,
+)
 from download_bybit_perp_daily import (  # noqa: E402
     BybitClient,
     SymbolRecord,
@@ -85,23 +86,11 @@ def _standard_linear_usdt(record: SymbolRecord) -> bool:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(), temporary, compression="snappy", write_statistics=True
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _utc_text_to_ms(value: str) -> int:

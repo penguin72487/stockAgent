@@ -4,6 +4,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+edge_state_root="${STOCKAGENT_PACKED_EDGE_STATE_ROOT:-/var/lib/stockagent-packed-edge}"
+if [[ -f "$edge_state_root/state.json" ]]; then
+  echo "Packed store is in index-only edge mode; local cold publication is disabled."
+  exit 0
+fi
+
 exec 9>/run/lock/stockagent-cold-artifact-maintenance.lock
 if ! flock -n 9; then
   echo "Cold-artifact maintenance is already running; skipping this invocation."

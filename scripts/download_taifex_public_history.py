@@ -30,7 +30,6 @@ import os
 from pathlib import Path
 import re
 import sys
-import tempfile
 import time
 from typing import Final, Iterable
 
@@ -43,6 +42,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from downloader.artifact_io import (  # noqa: E402
+    atomic_write_bytes,
+    atomic_write_parquet,
+)
 from downloader.common import SharedRateLimiter, atomic_write_text  # noqa: E402
 from scripts.taifex_daily_download_common import (  # noqa: E402
     month_ranges,
@@ -157,42 +160,16 @@ def _sha256_bytes(content: bytes) -> str:
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if path.read_bytes() != content:
             raise RuntimeError(f"immutable artifact changed: {path}")
         return
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_bytes(path, content, durable=True)
 
 
 def _atomic_write_parquet(frame: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(frame, preserve_index=False)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        pq.write_table(table, temporary, compression="zstd")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, table, compression="zstd")
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -326,10 +303,10 @@ def _parse_institutional(
     return _causal_columns(frame, requested_date, next_sessions)
 
 
-def _parse_pair(value: object, *, percent: bool) -> tuple[float | int | None, float | int | None]:
-    text = re.sub(
-        r"\s+", "", str(value).replace("％", "%").replace("%", "")
-    )
+def _parse_pair(
+    value: object, *, percent: bool
+) -> tuple[float | int | None, float | int | None]:
+    text = re.sub(r"\s+", "", str(value).replace("％", "%").replace("%", ""))
     if text in {"", "-", "--", "nan"}:
         return None, None
     match = _PAIR_PATTERN.fullmatch(text)
@@ -361,7 +338,9 @@ def _parse_large_trader(
         }
         prefixes = ("buy_top5", "buy_top10", "sell_top5", "sell_top10")
         for index, prefix in enumerate(prefixes):
-            positions, specific_positions = _parse_pair(values[2 + index * 2], percent=False)
+            positions, specific_positions = _parse_pair(
+                values[2 + index * 2], percent=False
+            )
             share, specific_share = _parse_pair(values[3 + index * 2], percent=True)
             row[f"{prefix}_positions"] = positions
             row[f"{prefix}_specific_positions"] = specific_positions
@@ -390,7 +369,9 @@ def _parse_positioning(
 ) -> pd.DataFrame:
     requested_text = requested_date.strftime("%Y/%m/%d")
     if requested_text.encode("ascii") not in content:
-        raise ValueError(f"TAIFEX response does not acknowledge requested date {requested_text}")
+        raise ValueError(
+            f"TAIFEX response does not acknowledge requested date {requested_text}"
+        )
     if spec.parser == "institutional":
         return _parse_institutional(
             content, requested_date, next_sessions, calls_puts=False
@@ -504,13 +485,19 @@ def _post(
             content = response.content
             if len(content) < 100:
                 raise RuntimeError(f"TAIFEX returned only {len(content)} bytes")
-            return content, _utc_now(), {key.lower(): value for key, value in response.headers.items()}
+            return (
+                content,
+                _utc_now(),
+                {key.lower(): value for key, value in response.headers.items()},
+            )
         except Exception as exc:  # requests and parser validation retry at caller
             last_error = exc
             if attempt == attempts:
                 break
             response = getattr(exc, "response", None)
-            retry_after = None if response is None else response.headers.get("Retry-After")
+            retry_after = (
+                None if response is None else response.headers.get("Retry-After")
+            )
             if response is not None and response.status_code == 429:
                 try:
                     delay = max(60.0, float(retry_after or 0.0))
@@ -525,7 +512,9 @@ def _post(
                 delay = min(30.0, float(2**attempt))
             limiter.defer(delay)
             time.sleep(min(delay, 60.0))
-    raise RuntimeError(f"TAIFEX POST failed after {attempts} attempts: {url}") from last_error
+    raise RuntimeError(
+        f"TAIFEX POST failed after {attempts} attempts: {url}"
+    ) from last_error
 
 
 def _download_put_call(
@@ -653,7 +642,9 @@ def _merge_dataset(root: Path, dataset: str) -> dict[str, object]:
     tables = [pq.read_table(path) for path in shard_paths]
     table = pa.concat_tables(tables, promote_options="default")
     frame = table.to_pandas()
-    sort_columns = [column for column in ("date", "sequence", "expiry_bucket") if column in frame]
+    sort_columns = [
+        column for column in ("date", "sequence", "expiry_bucket") if column in frame
+    ]
     if sort_columns:
         frame = frame.sort_values(sort_columns, kind="stable")
     frame = frame.drop_duplicates().reset_index(drop=True)
@@ -680,8 +671,12 @@ def main() -> int:
         "--session-parquet",
         default="data_tw_index_futures/day_session_contracts.parquet",
     )
-    parser.add_argument("--end-date", type=date.fromisoformat, default=date.today() - timedelta(days=1))
-    parser.add_argument("--put-call-start", type=date.fromisoformat, default=date(2001, 12, 1))
+    parser.add_argument(
+        "--end-date", type=date.fromisoformat, default=date.today() - timedelta(days=1)
+    )
+    parser.add_argument(
+        "--put-call-start", type=date.fromisoformat, default=date(2001, 12, 1)
+    )
     parser.add_argument(
         "--positioning-start",
         type=date.fromisoformat,
@@ -710,9 +705,7 @@ def main() -> int:
         _subtract_years(args.end_date, 3) + timedelta(days=1)
     )
     positioning_sessions = [
-        item
-        for item in sessions
-        if positioning_start <= item < effective_end
+        item for item in sessions if positioning_start <= item < effective_end
     ]
     # The last retained session has no receipt-verified next session yet, so it
     # cannot receive a fail-closed availability_date until the calendar advances.

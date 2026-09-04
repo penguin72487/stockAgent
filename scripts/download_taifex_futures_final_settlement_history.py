@@ -13,14 +13,11 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import io
-import os
 from pathlib import Path
 import re
 import sys
-import tempfile
-import time
 from typing import Final, Iterable
-from urllib import parse, request
+from urllib import parse
 
 import pandas as pd
 import polars as pl
@@ -34,20 +31,46 @@ from scripts.taifex_daily_download_common import (  # noqa: E402
     parse_iso_date,
     sha256_path,
 )
+from downloader.artifact_io import (  # noqa: E402
+    atomic_write_bytes,
+    atomic_write_parquet,
+)
+from downloader.common import (  # noqa: E402
+    SharedRateLimiter,
+    resolve_request_interval,
+)
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
+)
 from stockagent.data.tw_stock_context_futures_portfolio import (  # noqa: E402
     TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
 )
 
 
-INDEX_FINAL_SETTLEMENT_PAGE: Final[str] = (
-    "https://www.taifex.com.tw/cht/5/futIndxFSP"
-)
-STOCK_FINAL_SETTLEMENT_PAGE: Final[str] = (
-    "https://www.taifex.com.tw/cht/5/sSFFSP"
-)
+INDEX_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/futIndxFSP"
+STOCK_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/sSFFSP"
 INDEX_COMMODITY_IDS: Final[tuple[str, ...]] = (
-    "1", "40", "3", "4", "5", "12", "13", "15", "32", "34", "35",
-    "37", "38", "21", "24", "27", "28", "33", "39", "36",
+    "1",
+    "40",
+    "3",
+    "4",
+    "5",
+    "12",
+    "13",
+    "15",
+    "32",
+    "34",
+    "35",
+    "37",
+    "38",
+    "21",
+    "24",
+    "27",
+    "28",
+    "33",
+    "39",
+    "36",
 )
 _PRODUCT_CODE = re.compile(r"\b[A-Z][A-Z0-9]{1,3}\b")
 
@@ -205,45 +228,31 @@ def _download_html(
     *,
     refresh: bool,
     attempts: int = 3,
+    transport: ResilientHttpTransport | None = None,
 ) -> Path:
     if not refresh and target.is_file() and target.stat().st_size > 1_000:
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    last_error: Exception | None = None
-    body = b""
-    content_type = ""
-    for attempt in range(1, attempts + 1):
-        try:
-            req = request.Request(
-                url,
-                headers={
-                    "User-Agent": "stockAgent/taifex-futures-final-settlement-research"
-                },
-            )
-            with request.urlopen(req, timeout=120) as response:
-                body = response.read()
-                content_type = str(response.headers.get("Content-Type") or "")
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt >= attempts:
-                raise RuntimeError(
-                    f"failed to download {url} after {attempts} attempts"
-                ) from last_error
-            time.sleep(float(attempt))
+    client = transport or ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=120,
+            max_retries=max(0, attempts - 1),
+            retry_base_seconds=0.5,
+        )
+    )
+    response = client.request_bytes(
+        url,
+        headers={"User-Agent": "stockAgent/taifex-futures-final-settlement-research"},
+    )
+    body = response.body
+    content_type = str(
+        response.headers.get("Content-Type")
+        or response.headers.get("content-type")
+        or ""
+    )
     if len(body) < 1_000 or "html" not in content_type.casefold():
         raise RuntimeError(f"TAIFEX response is not non-empty HTML: {url}")
-    with tempfile.NamedTemporaryFile(
-        dir=target.parent,
-        prefix=target.name + ".",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(target)
+    atomic_write_bytes(target, body, durable=True)
     return target
 
 
@@ -259,7 +268,7 @@ def _months(start_date: date, end_date: date) -> Iterable[tuple[int, int]]:
 
 def _index_url(year: int) -> str:
     query: list[tuple[str, str]] = [
-        *(('commodityIds', value) for value in INDEX_COMMODITY_IDS),
+        *(("commodityIds", value) for value in INDEX_COMMODITY_IDS),
         ("start_year", str(year)),
         ("start_month", "01"),
         ("end_year", str(year)),
@@ -269,23 +278,23 @@ def _index_url(year: int) -> str:
 
 
 def _stock_url(year: int, month: int) -> str:
-    return (
-        f"{STOCK_FINAL_SETTLEMENT_PAGE}?"
-        + parse.urlencode(
-            {
-                "down_type": "1",
-                "queryYear": f"{year:04d}",
-                "queryMonth": f"{month:02d}",
-            }
-        )
+    return f"{STOCK_FINAL_SETTLEMENT_PAGE}?" + parse.urlencode(
+        {
+            "down_type": "1",
+            "queryYear": f"{year:04d}",
+            "queryMonth": f"{month:02d}",
+        }
     )
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    frame.write_parquet(temporary, compression="zstd", statistics=True)
-    temporary.replace(target)
+    atomic_write_parquet(
+        target,
+        frame,
+        compression="zstd",
+        write_statistics=True,
+        durable=True,
+    )
 
 
 def _parse_date_arg(value: str) -> date:
@@ -325,6 +334,19 @@ def main() -> int:
     if args.request_delay_seconds < 0.0:
         parser.error("--request-delay-seconds cannot be negative")
 
+    request_interval = resolve_request_interval(
+        "taifex_public", args.request_delay_seconds
+    )
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=120,
+            max_retries=2,
+            retry_base_seconds=0.5,
+        ),
+        limiter=SharedRateLimiter(request_interval, name="taifex_public"),
+    )
+
     output_dir = args.output_dir.expanduser().resolve()
     raw_dir = output_dir / "raw"
     frames: list[pl.DataFrame] = []
@@ -338,6 +360,7 @@ def main() -> int:
             url,
             raw_dir / "index" / f"{year:04d}.html",
             refresh=bool(args.refresh),
+            transport=transport,
         )
         digest = sha256_path(receipt)
         parsed_frame = parse_index_futures_final_settlement_html(
@@ -360,8 +383,6 @@ def main() -> int:
                 "url": url,
             }
         )
-        if args.request_delay_seconds:
-            time.sleep(args.request_delay_seconds)
 
     query_months = set(_months(args.start_date, args.end_date))
     portfolio_path = args.portfolio_path.expanduser().resolve()
@@ -396,6 +417,7 @@ def main() -> int:
             url,
             raw_dir / "stock_etf" / f"{year:04d}-{month:02d}.html",
             refresh=bool(args.refresh),
+            transport=transport,
         )
         digest = sha256_path(receipt)
         parsed_frame = parse_stock_futures_final_settlement_html(
@@ -422,8 +444,6 @@ def main() -> int:
                 "url": url,
             }
         )
-        if args.request_delay_seconds:
-            time.sleep(args.request_delay_seconds)
 
     combined = pl.concat(frames, how="vertical") if frames else _empty_frame()
     if combined.height == 0:

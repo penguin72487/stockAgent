@@ -1403,6 +1403,45 @@ def main() -> None:
         )
     if not all_dates:
         raise RuntimeError("no Bybit daily dates found")
+    # Public-feature artifacts are a single contract.  A source-schema failure
+    # for even one mapped symbol must not publish a smaller replacement and
+    # only raise afterwards: that leaves readers with a new partial artifact
+    # despite the command reporting failure.  Persist separate diagnostics and
+    # stop before the expensive web joins or any canonical output replacement.
+    failed = [item for item in coverage if item.status == "failed"]
+    if failed:
+        failed_coverage_path = output_path.with_name(
+            f"{output_path.stem}_failed_coverage.csv"
+        )
+        _write_text_atomic(
+            pl.DataFrame(
+                [asdict(item) for item in coverage], infer_schema_length=None
+            ).write_csv(),
+            failed_coverage_path,
+        )
+        failure_path = output_path.with_name(f"{output_path.stem}_failure.json")
+        _write_text_atomic(
+            json.dumps(
+                {
+                    "contract_version": 5,
+                    "status": "failed_before_publish",
+                    "failed_symbols": len(failed),
+                    "requested_symbols": len(instruments),
+                    "failed_coverage_path": str(failed_coverage_path),
+                    "output_preserved": str(output_path),
+                    "started_at_utc": started.isoformat(),
+                    "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            failure_path,
+        )
+        raise RuntimeError(
+            f"public feature materialization failed for {len(failed)} symbols "
+            "before canonical output publication"
+        )
     free_frame, free_receipt = _free_public_rows(
         Path(args.free_public_path), sorted(all_dates), symbol_bases
     )
@@ -1477,7 +1516,6 @@ def main() -> None:
         ).write_csv(),
         coverage_path,
     )
-    failed = [item for item in coverage if item.status == "failed"]
     summary = {
         "contract_version": 5,
         "decision_boundary_utc": "00:00",
@@ -1533,10 +1571,6 @@ def main() -> None:
         output_path.with_name(f"{output_path.stem}_summary.json"),
     )
     print(json.dumps(summary, ensure_ascii=False))
-    if failed:
-        raise RuntimeError(
-            f"public feature materialization failed for {len(failed)} symbols"
-        )
 
 
 if __name__ == "__main__":

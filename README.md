@@ -640,6 +640,28 @@ Receipt 位於 `/var/lib/stockagent-storage-pressure/receipts/`。`--force` 只�
 明確繞過程序級保護，禁止放進排程。完整邊界與常態環境變數見
 [磁碟壓力維護](docs/storage_pressure_maintenance.md)。
 
+沒有持久卷的 Vast 計算節點不應常駐整份 packed payload。完成 durable peer 全量 checksum
+與 Syncthing 收斂驗證後，可切為 index-only edge：heads、manifests、inventories 繼續即時
+同步，blob/pack 只在 `use` 時下載、逐物件驗證、materialize，之後移除本機冗餘 payload。
+
+```bash
+source scripts/runtime_env.sh
+set -a; source /etc/environment; set +a
+
+# 唯讀容量與安全門檻
+run_fintech_python scripts/manage_packed_edge.py audit
+
+# 分兩階段啟用；enable 只寫 ignore/state，prune 才回收 payload
+run_fintech_python scripts/manage_packed_edge.py enable --apply
+run_fintech_python scripts/manage_packed_edge.py prune --apply
+
+# 按需取得、驗證、materialize；完成後自動再清掉本機 packed payload
+run_fintech_python scripts/manage_packed_edge.py use DATASET
+```
+
+此模式禁止在 edge 節點直接發布 cold release；完整使用與回復方式見
+[packed 冷庫文件](docs/packed_dataset_storage.md)。
+
 ## 資料下載與更新
 
 ### 每日總入口

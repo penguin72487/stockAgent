@@ -10,13 +10,10 @@ import json
 from pathlib import Path
 import re
 import sys
-import tempfile
 import zipfile
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
-import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -29,6 +26,11 @@ from scripts.download_taifex_public_history import (  # noqa: E402
     _write_json,
 )
 from scripts.taifex_daily_download_common import sha256_path  # noqa: E402
+from downloader.artifact_io import atomic_write_parquet  # noqa: E402
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
+)
 
 
 CONTRACT_VERSION = 1
@@ -85,7 +87,9 @@ def _stable_legacy_types(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _normalize(frame: pd.DataFrame, *, report_mode: str, source_sha256: str) -> pd.DataFrame:
+def _normalize(
+    frame: pd.DataFrame, *, report_mode: str, source_sha256: str
+) -> pd.DataFrame:
     frame = frame.copy()
     frame.columns = [_column_name(column) for column in frame.columns]
     if DATE_COLUMN not in frame:
@@ -108,30 +112,27 @@ def _normalize(frame: pd.DataFrame, *, report_mode: str, source_sha256: str) -> 
 
 
 def _write_parquet(frame: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(frame, preserve_index=False)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        pq.write_table(table, temporary, compression="zstd")
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, table, compression="zstd")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="data_cftc_legacy")
+    parser.add_argument("--max-retries", type=int, default=4)
+    parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()
     root = Path(args.output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    session = requests.Session()
-    session.headers.update({"User-Agent": "stockAgent/cftc-official-legacy-archive"})
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="cftc_public_archive",
+            timeout_seconds=args.timeout,
+            max_retries=args.max_retries,
+            retry_base_seconds=1.0,
+            retry_cap_seconds=60.0,
+        )
+    )
     summaries: list[dict[str, object]] = []
     frames: list[pd.DataFrame] = []
     for report_mode, url, member in ARCHIVES:
@@ -150,9 +151,10 @@ def main() -> int:
                 cached_receipt = candidate
                 content = cached_path.read_bytes()
         if cached_receipt is None:
-            response = session.get(url, timeout=300)
-            response.raise_for_status()
-            content = response.content
+            content = transport.request_bytes(
+                url,
+                headers={"User-Agent": "stockAgent/cftc-official-legacy-archive"},
+            ).body
         if not zipfile.is_zipfile(BytesIO(content)):
             raise ValueError(f"CFTC response is not a ZIP: {url}")
         digest = _sha256_bytes(content)
@@ -193,9 +195,7 @@ def main() -> int:
             flush=True,
         )
 
-    combined = _stable_legacy_types(
-        pd.concat(frames, ignore_index=True, sort=False)
-    )
+    combined = _stable_legacy_types(pd.concat(frames, ignore_index=True, sort=False))
     combined_output = root / "normalized" / "legacy_pre2000.parquet"
     _write_parquet(combined, combined_output)
     openbb_path = Path("data_openBB/compact/cftc/cot/archive.parquet").resolve()
@@ -206,7 +206,9 @@ def main() -> int:
         "scope": "official_legacy_cot_rows_strictly_before_2000_only",
         "post_2000_authority": str(openbb_path),
         "post_2000_authority_present": openbb_path.is_file(),
-        "post_2000_authority_sha256": sha256_path(openbb_path) if openbb_path.is_file() else None,
+        "post_2000_authority_sha256": sha256_path(openbb_path)
+        if openbb_path.is_file()
+        else None,
         "rows": len(combined),
         "date_start": combined["date"].min().date().isoformat(),
         "date_end": combined["date"].max().date().isoformat(),
