@@ -6,8 +6,11 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date as datetime_date, datetime, time as datetime_time, timezone
+import gzip
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import threading
@@ -49,7 +52,7 @@ CHART_RANGE_SECONDS: Final[dict[str, int | None]] = {
     "1y": 365 * 24 * 60 * 60,
     "all": None,
 }
-_LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int]] = {}
+_LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
 _LINE_COUNT_LOCK = threading.Lock()
 _TAIL_CACHE: dict[
     tuple[Path, int], tuple[int, int, int, int, list[dict[str, Any]]]
@@ -74,6 +77,9 @@ _OBJECT_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
+_HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
 _SESSION_DATE_FIELD_PATTERN: Final[re.Pattern[bytes]] = re.compile(
     rb'"session_date"\s*:\s*"(\d{4}-\d{2}-\d{2})"'
@@ -92,6 +98,137 @@ class _LedgerSessionIndex:
 
 _LEDGER_SESSION_INDEX_CACHE: dict[tuple[Path, bool], _LedgerSessionIndex] = {}
 _LEDGER_SESSION_INDEX_LOCK = threading.Lock()
+_LEDGER_SESSION_INDEX_SCHEMA_VERSION: Final[int] = 1
+_LEDGER_SESSION_INDEX_CACHE_ENV: Final[str] = (
+    "STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR"
+)
+
+
+def _persistent_ledger_index_path(
+    source: Path, *, recorded_at_fallback: bool
+) -> Path | None:
+    cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    if not root.is_dir():
+        return None
+    identity = (
+        f"{source.resolve()}\0recorded_at_fallback={int(recorded_at_fallback)}"
+    ).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return root / f"ledger-session-index-v1-{digest}.json"
+
+
+def _load_persistent_ledger_index(
+    source: Path,
+    *,
+    recorded_at_fallback: bool,
+    stat: os.stat_result,
+) -> _LedgerSessionIndex | None:
+    cache_path = _persistent_ledger_index_path(
+        source, recorded_at_fallback=recorded_at_fallback
+    )
+    if cache_path is None or not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_bytes())
+        if not isinstance(payload, Mapping):
+            return None
+        if int(payload.get("schema_version") or 0) != (
+            _LEDGER_SESSION_INDEX_SCHEMA_VERSION
+        ):
+            return None
+        if str(payload.get("source") or "") != str(source.resolve()):
+            return None
+        if bool(payload.get("recorded_at_fallback")) != bool(
+            recorded_at_fallback
+        ):
+            return None
+        device = int(payload.get("device"))
+        inode = int(payload.get("inode"))
+        observed_size = int(payload.get("observed_size"))
+        modified_ns = int(payload.get("modified_ns"))
+        scanned_offset = int(payload.get("scanned_offset"))
+        if (device, inode) != (stat.st_dev, stat.st_ino):
+            return None
+        if not 0 <= scanned_offset <= observed_size <= stat.st_size:
+            return None
+        if stat.st_size == observed_size and stat.st_mtime_ns != modified_ns:
+            return None
+        raw_spans = payload.get("spans")
+        if not isinstance(raw_spans, Mapping):
+            return None
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for raw_date, raw_ranges in raw_spans.items():
+            session_date = str(raw_date)
+            datetime_date.fromisoformat(session_date)
+            if not isinstance(raw_ranges, list):
+                return None
+            validated: list[tuple[int, int]] = []
+            for raw_range in raw_ranges:
+                if not isinstance(raw_range, list) or len(raw_range) != 2:
+                    return None
+                start, end = int(raw_range[0]), int(raw_range[1])
+                if not 0 <= start < end <= observed_size:
+                    return None
+                validated.append((start, end))
+            spans[session_date] = validated
+        return _LedgerSessionIndex(
+            device=device,
+            inode=inode,
+            observed_size=observed_size,
+            modified_ns=modified_ns,
+            scanned_offset=scanned_offset,
+            spans=spans,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _persist_ledger_index(
+    source: Path,
+    *,
+    recorded_at_fallback: bool,
+    index: _LedgerSessionIndex,
+) -> None:
+    cache_path = _persistent_ledger_index_path(
+        source, recorded_at_fallback=recorded_at_fallback
+    )
+    if cache_path is None:
+        return
+    payload = {
+        "schema_version": _LEDGER_SESSION_INDEX_SCHEMA_VERSION,
+        "source": str(source.resolve()),
+        "recorded_at_fallback": bool(recorded_at_fallback),
+        "device": index.device,
+        "inode": index.inode,
+        "observed_size": index.observed_size,
+        "modified_ns": index.modified_ns,
+        "scanned_offset": index.scanned_offset,
+        "spans": {
+            session_date: [[start, end] for start, end in ranges]
+            for session_date, ranges in index.spans.items()
+        },
+    }
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        encoded = (
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, cache_path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -108,6 +245,24 @@ class _BenchmarkHistoryIndex:
 
 _BENCHMARK_HISTORY_INDEX_CACHE: dict[Path, _BenchmarkHistoryIndex] = {}
 _BENCHMARK_HISTORY_INDEX_LOCK = threading.Lock()
+_BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 1
+_BENCHMARK_HISTORY_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
+_BENCHMARK_HISTORY_INTERIOR_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "benchmark_id",
+        "benchmark_origin_rebased",
+        "contract_code",
+        "initial_capital_twd",
+        "last_mark_price",
+        "minute",
+        "recorded_at",
+        "return_fraction",
+        "return_pct",
+        "session_date",
+        "total_equity_twd",
+        "valuation_stale",
+    }
+)
 
 
 def build_dashboard_revision(
@@ -577,6 +732,14 @@ def _ledger_session_index(
         for _attempt in range(3):
             stat = source.stat()
             cached = _LEDGER_SESSION_INDEX_CACHE.get(cache_key)
+            if cached is None:
+                cached = _load_persistent_ledger_index(
+                    source,
+                    recorded_at_fallback=recorded_at_fallback,
+                    stat=stat,
+                )
+                if cached is not None:
+                    _LEDGER_SESSION_INDEX_CACHE[cache_key] = cached
             can_extend = bool(
                 cached is not None
                 and (cached.device, cached.inode) == (stat.st_dev, stat.st_ino)
@@ -652,6 +815,11 @@ def _ledger_session_index(
                 spans=spans,
             )
             _LEDGER_SESSION_INDEX_CACHE[cache_key] = result
+            _persist_ledger_index(
+                source,
+                recorded_at_fallback=recorded_at_fallback,
+                index=result,
+            )
             return result
     raise OSError(f"dashboard ledger changed repeatedly while indexing: {source}")
 
@@ -740,6 +908,36 @@ def _tail_for_session(
         cached = _SESSION_TAIL_CACHE.get(cache_key)
         if cached and cached[:4] == signature:
             return list(cached[4])
+
+    index_cache_key = (path.resolve(), bool(recorded_at_fallback))
+    persistent_index_path = _persistent_ledger_index_path(
+        path, recorded_at_fallback=recorded_at_fallback
+    )
+    if (
+        index_cache_key in _LEDGER_SESSION_INDEX_CACHE
+        or persistent_index_path is not None
+        and persistent_index_path.is_file()
+    ):
+        indexed = list(
+            _rows_for_sessions(
+                path,
+                [session_date],
+                maximum_rows,
+                recorded_at_fallback=recorded_at_fallback,
+            ).get(session_date, ())
+        )
+        final_stat = path.stat()
+        if (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+        ) == signature:
+            with _SESSION_TAIL_CACHE_LOCK:
+                if len(_SESSION_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
+                    _SESSION_TAIL_CACHE.pop(next(iter(_SESSION_TAIL_CACHE)))
+                _SESSION_TAIL_CACHE[cache_key] = (*signature, indexed)
+        return indexed
 
     newest_first: list[dict[str, Any]] = []
     with path.open("rb") as handle:
@@ -1082,14 +1280,58 @@ def _line_count(path: Path) -> int:
     key = path.resolve()
     with _LINE_COUNT_LOCK:
         cached = _LINE_COUNT_CACHE.get(key)
+        if cached is None:
+            cache_root = str(
+                os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or ""
+            ).strip()
+            persistent_path = None
+            if cache_root and Path(cache_root).is_dir():
+                digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+                persistent_path = (
+                    Path(cache_root) / f"ledger-line-count-v1-{digest}.json"
+                )
+                try:
+                    payload = json.loads(persistent_path.read_bytes())
+                    if (
+                        not isinstance(payload, Mapping)
+                        or int(payload.get("schema_version") or 0) != 1
+                    ):
+                        raise ValueError("unsupported persistent line-count cache")
+                    candidate = (
+                        int(payload.get("device")),
+                        int(payload.get("inode")),
+                        int(payload.get("size")),
+                        int(payload.get("modified_ns")),
+                        int(payload.get("count")),
+                    )
+                    if (
+                        str(payload.get("source") or "") == str(key)
+                        and (candidate[0], candidate[1])
+                        == (stat.st_dev, stat.st_ino)
+                        and 0 <= candidate[2] <= stat.st_size
+                        and 0 <= candidate[4]
+                        and not (
+                            candidate[2] == stat.st_size
+                            and candidate[3] != stat.st_mtime_ns
+                        )
+                    ):
+                        cached = candidate
+                        _LINE_COUNT_CACHE[key] = candidate
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        else:
+            persistent_path = None
         same_append_only_file = bool(
             cached
             and cached[0] == stat.st_dev
             and cached[1] == stat.st_ino
             and stat.st_size >= cached[2]
+            and not (
+                stat.st_size == cached[2] and stat.st_mtime_ns != cached[3]
+            )
         )
         start = cached[2] if same_append_only_file and cached else 0
-        count = cached[3] if same_append_only_file and cached else 0
+        count = cached[4] if same_append_only_file and cached else 0
         with path.open("rb") as handle:
             handle.seek(start)
             remaining = stat.st_size - start
@@ -1099,7 +1341,51 @@ def _line_count(path: Path) -> int:
                     break
                 count += chunk.count(b"\n")
                 remaining -= len(chunk)
-        _LINE_COUNT_CACHE[key] = (stat.st_dev, stat.st_ino, stat.st_size, count)
+        result = (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            count,
+        )
+        _LINE_COUNT_CACHE[key] = result
+        if persistent_path is None:
+            cache_root = str(
+                os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or ""
+            ).strip()
+            if cache_root and Path(cache_root).is_dir():
+                digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+                persistent_path = (
+                    Path(cache_root) / f"ledger-line-count-v1-{digest}.json"
+                )
+        if persistent_path is not None:
+            temporary = persistent_path.with_name(
+                f".{persistent_path.name}.{os.getpid()}.tmp"
+            )
+            try:
+                temporary.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "source": str(key),
+                            "device": result[0],
+                            "inode": result[1],
+                            "size": result[2],
+                            "modified_ns": result[3],
+                            "count": result[4],
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, persistent_path)
+            except OSError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return count
 
 
@@ -1143,6 +1429,158 @@ def _load_benchmark_history(root: Path) -> dict[str, Any]:
     return payload
 
 
+def _persistent_benchmark_history_path(source: Path) -> Path | None:
+    cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()
+    return root / f"benchmark-history-index-v1-{digest}.json.gz"
+
+
+def _make_benchmark_history_index(
+    payload: Mapping[str, Any], *, stat: os.stat_result
+) -> _BenchmarkHistoryIndex:
+    load_error = str(payload.get("load_error") or "") or None
+    raw_origins = payload.get("origins")
+    origins = {
+        str(key): value
+        for key, value in (
+            raw_origins.items() if isinstance(raw_origins, Mapping) else ()
+        )
+        if isinstance(value, Mapping)
+    }
+    marks = tuple(
+        row for row in (payload.get("marks") or ()) if isinstance(row, Mapping)
+    )
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in marks:
+        session_date = str(row.get("session_date") or "")[:10]
+        if not session_date:
+            continue
+        grouped.setdefault(session_date, []).append(row)
+    return _BenchmarkHistoryIndex(
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        size=stat.st_size,
+        modified_ns=stat.st_mtime_ns,
+        origins=origins,
+        marks=marks,
+        marks_by_session={key: tuple(value) for key, value in grouped.items()},
+        load_error=load_error,
+    )
+
+
+def _load_persistent_benchmark_history_index(
+    source: Path, *, stat: os.stat_result
+) -> _BenchmarkHistoryIndex | None:
+    cache_path = _persistent_benchmark_history_path(source)
+    if cache_path is None or not cache_path.is_file():
+        return None
+    try:
+        if cache_path.stat().st_size > _BENCHMARK_HISTORY_CACHE_MAX_COMPRESSED_BYTES:
+            return None
+        payload = json.loads(gzip.decompress(cache_path.read_bytes()))
+        if not isinstance(payload, Mapping):
+            return None
+        if int(payload.get("schema_version") or 0) != (
+            _BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION
+        ):
+            return None
+        if str(payload.get("source") or "") != str(source.resolve()):
+            return None
+        if (
+            int(payload.get("device")),
+            int(payload.get("inode")),
+            int(payload.get("size")),
+            int(payload.get("modified_ns")),
+        ) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+            return None
+        index = _make_benchmark_history_index(payload, stat=stat)
+        if int(payload.get("mark_count") or -1) != len(index.marks):
+            return None
+        return index
+    except (
+        EOFError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        gzip.BadGzipFile,
+    ):
+        return None
+
+
+def _persist_benchmark_history_index(
+    source: Path, *, index: _BenchmarkHistoryIndex
+) -> None:
+    cache_path = _persistent_benchmark_history_path(source)
+    if cache_path is None:
+        return
+    latest_indices: dict[tuple[str, str], int] = {}
+    for row_index, row in enumerate(index.marks):
+        latest_indices[
+            (
+                str(row.get("session_date") or ""),
+                str(row.get("benchmark_id") or ""),
+            )
+        ] = row_index
+    compact_marks = [
+        dict(row)
+        if latest_indices.get(
+            (
+                str(row.get("session_date") or ""),
+                str(row.get("benchmark_id") or ""),
+            )
+        )
+        == row_index
+        else {
+            key: value
+            for key, value in row.items()
+            if key in _BENCHMARK_HISTORY_INTERIOR_FIELDS
+        }
+        for row_index, row in enumerate(index.marks)
+    ]
+    payload = {
+        "schema_version": _BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION,
+        "source": str(source.resolve()),
+        "device": index.device,
+        "inode": index.inode,
+        "size": index.size,
+        "modified_ns": index.modified_ns,
+        "mark_count": len(index.marks),
+        "load_error": index.load_error,
+        "origins": index.origins,
+        "marks": compact_marks,
+    }
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        compressed = gzip.compress(encoded, compresslevel=1)
+        if len(compressed) > _BENCHMARK_HISTORY_CACHE_MAX_COMPRESSED_BYTES:
+            return
+        with temporary.open("xb") as handle:
+            handle.write(compressed)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, cache_path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _benchmark_history_index(root: Path) -> _BenchmarkHistoryIndex:
     """Index immutable benchmark marks once per source-file generation.
 
@@ -1180,27 +1618,12 @@ def _benchmark_history_index(root: Path) -> _BenchmarkHistoryIndex:
             ) == signature:
                 return cached
 
+            persisted = _load_persistent_benchmark_history_index(path, stat=stat)
+            if persisted is not None:
+                _BENCHMARK_HISTORY_INDEX_CACHE[path] = persisted
+                return persisted
+
             payload = _load_benchmark_history(path.parent)
-            load_error = str(payload.get("load_error") or "") or None
-            raw_origins = payload.get("origins")
-            origins = {
-                str(key): value
-                for key, value in (
-                    raw_origins.items() if isinstance(raw_origins, Mapping) else ()
-                )
-                if isinstance(value, Mapping)
-            }
-            marks = tuple(
-                row
-                for row in (payload.get("marks") or ())
-                if isinstance(row, Mapping)
-            )
-            grouped: dict[str, list[Mapping[str, Any]]] = {}
-            for row in marks:
-                session_date = str(row.get("session_date") or "")[:10]
-                if not session_date:
-                    continue
-                grouped.setdefault(session_date, []).append(row)
             final_stat = path.stat()
             if (
                 final_stat.st_dev,
@@ -1209,19 +1632,9 @@ def _benchmark_history_index(root: Path) -> _BenchmarkHistoryIndex:
                 final_stat.st_mtime_ns,
             ) != signature:
                 continue
-            result = _BenchmarkHistoryIndex(
-                device=stat.st_dev,
-                inode=stat.st_ino,
-                size=stat.st_size,
-                modified_ns=stat.st_mtime_ns,
-                origins=origins,
-                marks=marks,
-                marks_by_session={
-                    key: tuple(value) for key, value in grouped.items()
-                },
-                load_error=load_error,
-            )
+            result = _make_benchmark_history_index(payload, stat=stat)
             _BENCHMARK_HISTORY_INDEX_CACHE[path] = result
+            _persist_benchmark_history_index(path, index=result)
             return result
     raise OSError("benchmark history changed repeatedly while indexing")
 
@@ -2185,6 +2598,65 @@ def build_dashboard_history_snapshot(
         ),
     }
 
+    explicit_dates = selected_start is not None or selected_end is not None
+    selected_sessions = (
+        sorted(
+            session_date
+            for session_date in available_session_dates
+            if (selected_start is None or session_date >= selected_start.isoformat())
+            and (selected_end is None or session_date <= selected_end.isoformat())
+        )
+        if explicit_dates
+        else []
+    )
+
+    def selected_span_signature(
+        index: _LedgerSessionIndex | None,
+    ) -> tuple[Any, ...]:
+        if index is None:
+            return ("missing",)
+        if not explicit_dates:
+            return (
+                index.device,
+                index.inode,
+                index.observed_size,
+                index.modified_ns,
+            )
+        signed_sessions = set(selected_sessions)
+        # Canonical ledgers are append-only between atomic replacements.  An
+        # older selected session therefore keeps the same byte spans while the
+        # current session grows.  Keying only its visible spans avoids reparsing
+        # an old 270-point curve every minute; inode changes still invalidate
+        # the cache after an atomic historical promotion.
+        return (
+            index.device,
+            index.inode,
+            tuple(
+                (session_date, tuple(index.spans.get(session_date, ())))
+                for session_date in sorted(signed_sessions)
+            ),
+        )
+
+    history_cache_key = (
+        root.resolve(),
+        normalized_range,
+        selected_start.isoformat() if selected_start else None,
+        selected_end.isoformat() if selected_end else None,
+        int(maximum_points_per_series),
+        selected_span_signature(marks_index),
+        (
+            benchmark_history.device,
+            benchmark_history.inode,
+            benchmark_history.size,
+            benchmark_history.modified_ns,
+        ),
+        selected_span_signature(live_benchmark_index),
+    )
+    with _HISTORY_SNAPSHOT_CACHE_LOCK:
+        cached_history = _HISTORY_SNAPSHOT_CACHE.get(history_cache_key)
+        if cached_history is not None:
+            return dict(cached_history)
+
     def add(source: Mapping[str, Any], *, series_type: str) -> None:
         row = dict(source)
         series_id = str(
@@ -2194,6 +2666,18 @@ def build_dashboard_history_snapshot(
         )
         timestamp_seconds = _chart_timestamp(row)
         if not series_id or timestamp_seconds is None:
+            return
+        local_observed = datetime.fromtimestamp(
+            timestamp_seconds, tz=timezone.utc
+        ).astimezone(TAIPEI)
+        local_clock = local_observed.timetz().replace(tzinfo=None)
+        if series_type == "strategy" and not (
+            datetime_time(9, 1) <= local_clock <= datetime_time(13, 30)
+        ):
+            # Signal publication can happen during 09:00, but the canonical
+            # right-labelled strategy curve is exactly 09:01..13:30.  Keeping
+            # a 09:00 point for only the live session makes the latest day use
+            # a different grain from every completed replay.
             return
         return_fraction, return_pct = _capital_return(
             row.get("initial_capital_twd"), row.get("total_equity_twd")
@@ -2218,12 +2702,7 @@ def build_dashboard_history_snapshot(
         minute = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc).isoformat(
             timespec="minutes"
         )
-        session_date = (
-            datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
-            .astimezone(TAIPEI)
-            .date()
-            .isoformat()
-        )
+        session_date = local_observed.date().isoformat()
         deduplicated[(series_id, minute)] = {
             "series_id": series_id,
             "series_type": series_type,
@@ -2258,14 +2737,7 @@ def build_dashboard_history_snapshot(
             ),
         }
 
-    explicit_dates = selected_start is not None or selected_end is not None
     if explicit_dates:
-        selected_sessions = sorted(
-            session_date
-            for session_date in available_session_dates
-            if (selected_start is None or session_date >= selected_start.isoformat())
-            and (selected_end is None or session_date <= selected_end.isoformat())
-        )
         strategy_rows = _rows_for_sessions(
             marks_path,
             selected_sessions,
@@ -2294,81 +2766,6 @@ def build_dashboard_history_snapshot(
                     series_type="benchmark",
                 )
 
-        # Period return needs one true retained observation before the chosen
-        # start for every displayed series.  Walk indexed sessions backwards
-        # and stop independently per source/series instead of parsing every
-        # historical JSONL row merely to find those baselines.
-        if selected_start is not None and deduplicated:
-            strategy_ids = {
-                str(row["series_id"])
-                for row in deduplicated.values()
-                if row["series_type"] == "strategy"
-            }
-            missing_strategy_ids = set(strategy_ids)
-            if marks_index is not None:
-                for session_date in sorted(marks_index.spans, reverse=True):
-                    if session_date >= selected_start.isoformat():
-                        continue
-                    rows = _rows_for_sessions(
-                        marks_path,
-                        [session_date],
-                        None,
-                        recorded_at_fallback=marks_recorded_at_fallback,
-                    ).get(session_date, ())
-                    for row in reversed(rows):
-                        market = str(row.get("market") or "")
-                        if market in missing_strategy_ids:
-                            add(row, series_type="strategy")
-                            missing_strategy_ids.remove(market)
-                    if not missing_strategy_ids:
-                        break
-
-            benchmark_ids = {
-                str(row["series_id"])
-                for row in deduplicated.values()
-                if row["series_type"] == "benchmark"
-            }
-            missing_history_ids = set(benchmark_ids)
-            for session_date in sorted(
-                benchmark_history.marks_by_session, reverse=True
-            ):
-                if session_date >= selected_start.isoformat():
-                    continue
-                for row in reversed(
-                    benchmark_history.marks_by_session.get(session_date, ())
-                ):
-                    benchmark_id = str(row.get("benchmark_id") or "")
-                    if benchmark_id in missing_history_ids:
-                        add(row, series_type="benchmark")
-                        missing_history_ids.remove(benchmark_id)
-                if not missing_history_ids:
-                    break
-
-            missing_live_ids = set(benchmark_ids)
-            if live_benchmark_index is not None:
-                for session_date in sorted(
-                    live_benchmark_index.spans, reverse=True
-                ):
-                    if session_date >= selected_start.isoformat():
-                        continue
-                    rows = _rows_for_sessions(
-                        live_benchmark_path,
-                        [session_date],
-                        None,
-                        recorded_at_fallback=live_benchmark_recorded_at_fallback,
-                    ).get(session_date, ())
-                    for source in reversed(rows):
-                        benchmark_id = str(source.get("benchmark_id") or "")
-                        if benchmark_id in missing_live_ids:
-                            add(
-                                _rebase_live_benchmark(
-                                    source, benchmark_origins.get(benchmark_id)
-                                ),
-                                series_type="benchmark",
-                            )
-                            missing_live_ids.remove(benchmark_id)
-                    if not missing_live_ids:
-                        break
     else:
         for row in _all_json_objects(marks_path) or ():
             add(row, series_type="strategy")
@@ -2381,11 +2778,10 @@ def build_dashboard_history_snapshot(
                 series_type="benchmark",
             )
 
-    all_rows = sorted(
+    rows = sorted(
         deduplicated.values(),
         key=lambda row: (float(row["timestamp_seconds"]), str(row["series_id"])),
     )
-    rows = list(all_rows)
     available_dates = [
         datetime_date.fromisoformat(session_date)
         for session_date in available_session_dates
@@ -2426,31 +2822,6 @@ def build_dashboard_history_snapshot(
     if cutoff is not None:
         rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
 
-    # A detail-date selection is a period-return question.  Rebase every series
-    # to its last retained equity before the selected start date; if the ledger
-    # begins inside the requested range, its explicit initial capital is the
-    # only valid fallback.  This keeps cards, legend values, and chart points on
-    # exactly the same denominator without manufacturing an opening zero point.
-    baseline_by_series: dict[str, dict[str, Any]] = {}
-    if selected_start is not None:
-        for row in all_rows:
-            if datetime_date.fromisoformat(str(row["session_date"])) >= selected_start:
-                continue
-            baseline_by_series[str(row["series_id"])] = row
-        for row in rows:
-            baseline = baseline_by_series.get(str(row["series_id"]))
-            baseline_wealth = (
-                float(baseline["_wealth_index"]) if baseline is not None else 1.0
-            )
-            row_wealth = float(row["_wealth_index"])
-            range_return = (
-                row_wealth / baseline_wealth - 1.0
-                if baseline_wealth > 0.0
-                else row_wealth - baseline_wealth
-            )
-            row["return_fraction"] = range_return
-            row["return_pct"] = range_return * 100.0
-
     historical_rows = [row for row in rows if row["historical_minute_replay"]]
     fresh_coverage = [
         value
@@ -2466,23 +2837,35 @@ def build_dashboard_history_snapshot(
         series_rows.sort(key=lambda row: float(row["timestamp_seconds"]))
         first = series_rows[0]
         last = series_rows[-1]
-        baseline = baseline_by_series.get(series_id)
-        baseline_wealth = (
-            float(baseline["_wealth_index"])
-            if selected_start is not None and baseline is not None
-            else 1.0
-        )
+        baseline_wealth = float(first["_wealth_index"])
         initial_capital = _finite_float(first.get("_initial_capital_twd"))
-        baseline_equity = (
-            _finite_float(baseline.get("_total_equity_twd"))
-            if baseline is not None
-            else initial_capital
-        )
+        baseline_equity = _finite_float(first.get("_total_equity_twd"))
         end_equity = _finite_float(last.get("_total_equity_twd"))
         if baseline_equity is None and initial_capital is not None:
             baseline_equity = initial_capital * baseline_wealth
         if end_equity is None and initial_capital is not None:
             end_equity = initial_capital * float(last["_wealth_index"])
+        cumulative_net_pnl = (
+            end_equity - initial_capital
+            if end_equity is not None and initial_capital is not None
+            else None
+        )
+        # The chart is a normalized view over the visible selection: each
+        # series starts at exactly 0%.  Its underlying cumulative equity and
+        # P&L remain untouched and continue from the original account capital.
+        # A reference that has crossed zero cannot use a return ratio, so keep
+        # the existing finite wealth-index difference fallback in that case.
+        for row in series_rows:
+            wealth = float(row["_wealth_index"])
+            selected_return_fraction = (
+                wealth / baseline_wealth - 1.0
+                if baseline_wealth > 0.0
+                else wealth - baseline_wealth
+            )
+            row["return_fraction"] = selected_return_fraction
+            row["return_pct"] = selected_return_fraction * 100.0
+        period_return_fraction = float(last["return_fraction"])
+        period_return_pct = float(period_return_fraction) * 100.0
         session_point_counts: dict[str, int] = {}
         for row in series_rows:
             session = str(row["session_date"])
@@ -2502,13 +2885,10 @@ def build_dashboard_history_snapshot(
             {
                 "series_id": series_id,
                 "series_type": first["series_type"],
-                "baseline_kind": (
-                    "previous_retained_mark"
-                    if selected_start is not None and baseline is not None
-                    else "initial_capital"
-                ),
-                "baseline_at_utc": baseline.get("minute") if baseline else None,
+                "baseline_kind": "first_visible_mark",
+                "baseline_at_utc": first["minute"],
                 "baseline_equity_twd": baseline_equity,
+                "initial_capital_twd": initial_capital,
                 "start_at_utc": first["minute"],
                 "end_at_utc": last["minute"],
                 "start_equity_twd": _finite_float(first.get("_total_equity_twd")),
@@ -2520,6 +2900,11 @@ def build_dashboard_history_snapshot(
                 ),
                 "return_fraction": last["return_fraction"],
                 "return_pct": last["return_pct"],
+                "cumulative_net_pnl_twd": cumulative_net_pnl,
+                "cumulative_return_fraction": last["cumulative_return_fraction"],
+                "cumulative_return_pct": last["cumulative_return_pct"],
+                "period_return_fraction": period_return_fraction,
+                "period_return_pct": period_return_pct,
                 "point_count": len(series_rows),
                 "session_point_counts": session_point_counts,
                 "expected_minute_points": expected_minute_points,
@@ -2549,7 +2934,7 @@ def build_dashboard_history_snapshot(
             row.pop(internal_key, None)
     coverage_start = sampled[0]["minute"] if sampled else None
     coverage_end = sampled[-1]["minute"] if sampled else None
-    return {
+    payload = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
@@ -2578,7 +2963,9 @@ def build_dashboard_history_snapshot(
         "expected_strategy_session_points_from_09_01": 270,
         "expected_stock_benchmark_session_points_including_09_00": 271,
         "expected_tx_day_session_points": 300,
-        "return_basis": "previous_retained_mark_before_start_else_initial_capital",
+        "return_basis": "selected_range_first_visible_mark",
+        "cumulative_return_basis": "initial_capital_cumulative_total_equity",
+        "period_return_basis": "selected_range_first_visible_mark",
         "range_summary": range_summary,
         "historical_minute_replay_points": len(historical_rows),
         "historical_minute_carried_price_points": sum(
@@ -2595,8 +2982,27 @@ def build_dashboard_history_snapshot(
         "historical_minute_mean_fresh_trade_notional_coverage_ratio": (
             sum(fresh_coverage) / len(fresh_coverage) if fresh_coverage else None
         ),
+        "historical_minute_valuation_contracts": sorted(
+            {
+                str(value)
+                for row in historical_rows
+                if (value := row.get("minute_valuation_contract"))
+            }
+        ),
+        "historical_minute_valuation_sources": sorted(
+            {
+                str(value)
+                for row in historical_rows
+                if (value := row.get("valuation_source"))
+            }
+        ),
         "history": sampled,
     }
+    with _HISTORY_SNAPSHOT_CACHE_LOCK:
+        if len(_HISTORY_SNAPSHOT_CACHE) >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES:
+            _HISTORY_SNAPSHOT_CACHE.pop(next(iter(_HISTORY_SNAPSHOT_CACHE)))
+        _HISTORY_SNAPSHOT_CACHE[history_cache_key] = payload
+    return dict(payload)
 
 
 def _preopen_progress(
@@ -3217,6 +3623,90 @@ def _historical_positions(root: Path, session_date: str) -> list[dict[str, Any]]
             if isinstance(position, Mapping):
                 rows.append(_safe_position(position))
     return rows
+
+
+def _historical_position_count(root: Path) -> int:
+    """Count archived positions while decoding only new or changed snapshots."""
+
+    history_root = Path(root) / "position_history"
+    paths = sorted(history_root.glob("*/*.json"))
+    cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    cache_path: Path | None = None
+    retained: Mapping[str, Any] = {}
+    if cache_root and Path(cache_root).is_dir():
+        digest = hashlib.sha256(str(history_root.resolve()).encode("utf-8")).hexdigest()
+        cache_path = Path(cache_root) / f"historical-position-count-v1-{digest}.json"
+        try:
+            payload = json.loads(cache_path.read_bytes())
+            if isinstance(payload, Mapping) and int(
+                payload.get("schema_version") or 0
+            ) == 1 and str(payload.get("root") or "") == str(
+                history_root.resolve()
+            ):
+                raw_entries = payload.get("entries")
+                if isinstance(raw_entries, Mapping):
+                    retained = raw_entries
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    entries: dict[str, dict[str, int]] = {}
+    total = 0
+    changed = len(retained) != len(paths)
+    for path in paths:
+        stat = path.stat()
+        relative = str(path.relative_to(history_root))
+        cached = retained.get(relative)
+        try:
+            cached_matches = bool(
+                isinstance(cached, Mapping)
+                and int(cached.get("device") or -1) == stat.st_dev
+                and int(cached.get("inode") or -1) == stat.st_ino
+                and int(cached.get("size") or -1) == stat.st_size
+                and int(cached.get("modified_ns") or -1) == stat.st_mtime_ns
+                and int(cached.get("count") or -1) >= 0
+            )
+        except (TypeError, ValueError):
+            cached_matches = False
+        if cached_matches and isinstance(cached, Mapping):
+            count = int(cached["count"])
+        else:
+            count = len((_object(path).get("positions") or ()))
+            changed = True
+        entries[relative] = {
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "size": stat.st_size,
+            "modified_ns": stat.st_mtime_ns,
+            "count": count,
+        }
+        total += count
+
+    if cache_path is not None and changed:
+        temporary = cache_path.with_name(
+            f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "root": str(history_root.resolve()),
+                        "entries": entries,
+                        "count": total,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, cache_path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return total
 
 
 def build_dashboard_snapshot(
@@ -3925,10 +4415,7 @@ def build_dashboard_snapshot(
         "benchmark_history_marks": len(benchmark_history.marks),
         "events": _line_count(root / "events.jsonl"),
         "latency_samples": _line_count(root / "latency.jsonl"),
-        "historical_positions": sum(
-            len((_object(path).get("positions") or ()))
-            for path in (root / "position_history").glob("*/*.json")
-        ),
+        "historical_positions": _historical_position_count(root),
     }
 
     return {
@@ -4623,6 +5110,33 @@ def build_dashboard_summary(
     return {key: snapshot.get(key) for key in keys}
 
 
+def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
+    """Persist compact byte indexes for reboot-fast historical date reads."""
+
+    root = Path(state_dir)
+    sources = (
+        ("signals.jsonl", False),
+        ("orders.jsonl", False),
+        ("fills.jsonl", False),
+        ("marks.jsonl", False),
+        ("marks.jsonl", True),
+        ("benchmark_marks.jsonl", False),
+        ("benchmark_marks.jsonl", True),
+        ("events.jsonl", True),
+        ("latency.jsonl", True),
+    )
+    indexed: dict[str, int] = {}
+    for filename, recorded_at_fallback in sources:
+        index = _ledger_session_index(
+            root / filename,
+            recorded_at_fallback=recorded_at_fallback,
+        )
+        if index is not None:
+            suffix = ":recorded_at_fallback" if recorded_at_fallback else ""
+            indexed[f"{filename}{suffix}"] = len(index.spans)
+    return indexed
+
+
 __all__ = [
     "build_dashboard_event_page",
     "build_dashboard_history_snapshot",
@@ -4631,4 +5145,5 @@ __all__ = [
     "build_dashboard_signal_page",
     "build_dashboard_snapshot",
     "build_dashboard_summary",
+    "warm_dashboard_session_indexes",
 ]

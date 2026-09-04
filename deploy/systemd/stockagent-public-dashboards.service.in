@@ -13,6 +13,9 @@ WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
 Environment="MALLOC_ARENA_MAX=2"
+Environment="STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR=/var/cache/stockagent-public-dashboards"
+CacheDirectory=stockagent-public-dashboards
+CacheDirectoryMode=0700
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_public_dashboards.sh"
 Restart=on-failure
 RestartSec=5s

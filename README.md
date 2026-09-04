@@ -856,6 +856,7 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | 現行正確性契約 | [AGENTS.md](AGENTS.md) | point-in-time、backtest、checkpoint、reproducibility |
 | 文件總索引 | [docs/README.md](docs/README.md) | 區分現行契約、runbook、研究與歷史文件 |
 | 訓練架構 | [training_spec.md](docs/training_spec.md) | 訓練、評估、artifact 驗收 |
+| 公開面板 | [public_dashboards_architecture.md](docs/public_dashboards_architecture.md) | 唯讀資料流、快取、前端競態、安全與上線驗收 |
 | packed 冷庫 | [packed_dataset_storage.md](docs/packed_dataset_storage.md) | pack/blob、manifest、lease 與 smoke 證據 |
 | 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |

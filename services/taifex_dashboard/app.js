@@ -34,7 +34,7 @@ let lastStrategyCatalog = [];
 let lastStrategyCounts = null;
 let lastHeavyRevision = "";
 let refreshInFlight = false;
-let historyInFlight = false;
+const historyRequest = Dashboard.createLatestRequest();
 let lastHistoryEtag = "";
 let historyPayloadCache = new Map();
 let strategySearchFrame = null;
@@ -826,8 +826,7 @@ async function refresh() {
   refreshInFlight = true;
   try {
     const response = await fetchWithTimeout("api/status", { cache: "no-store" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     render(payload);
   } catch (error) {
     const alert = byId("alert");
@@ -866,25 +865,27 @@ async function refreshHistory({preferCache = false} = {}) {
     }
     if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
   }
-  if (historyInFlight) return;
-  historyInFlight = true;
+  const request = historyRequest.begin();
   try {
-    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
+    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, {
+      cache: "default",
+      signal: request.signal,
+    });
     const etag = response.headers.get("ETag") || "";
-    if (requestedRange !== selectedTimeRange) return;
+    if (!request.isCurrent() || requestedRange !== selectedTimeRange) return;
     if (etag && cached?.etag === etag) {
       cached.receivedAt = Date.now();
       return;
     }
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
+    if (!request.isCurrent() || requestedRange !== selectedTimeRange) return;
     historyPayloadCache.set(requestedRange, {payload, etag, receivedAt: Date.now()});
     applyHistoryPayload(payload, etag);
   } catch (error) {
+    if (!request.isCurrent() || error?.name === "AbortError") return;
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
   } finally {
-    historyInFlight = false;
-    if (requestedRange !== selectedTimeRange) void refreshHistory({preferCache: true});
+    request.finish();
   }
 }
 

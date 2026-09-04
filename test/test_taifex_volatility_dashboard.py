@@ -992,13 +992,14 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'return {label: "資料逾時", state: "blocked"}' in javascript
     assert "if (document.hidden || refreshInFlight) return" in javascript
     assert "if (document.hidden) return" in javascript
-    assert "if (historyInFlight) return" in javascript
+    assert "Dashboard.createLatestRequest()" in javascript
+    assert "request.isCurrent()" in javascript
     assert "curveVisibleCount" in javascript
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=14"' in html
     assert 'src="../time-axis.js?v=4"' in html
-    assert 'src="app.js?v=22"' in html
+    assert 'src="app.js?v=23"' in html
     assert "collapseEmptyIntervals: true" in javascript
     assert "全策略皆無資料的區段已略過、不補 0" in javascript
     assert 'id="equity-time-range"' in html
