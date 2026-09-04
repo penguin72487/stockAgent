@@ -96,8 +96,8 @@ immutable manifests、heads、packs/blobs；每次通過 build/audit 並原子�
 不會退回舊版本假裝成功。
 
 目前 canonical 拓撲中，penguin、lab203 與 vastai1T 都加入
-`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。penguin 與
-設計上 lab203 應作為 full-replica durable node；沒有 persistent volume 的 vastai1T 是
+`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。penguin 是
+full-replica durable node，設計上 lab203 也應如此；沒有 persistent volume 的 vastai1T 是
 index-only edge。每次操作仍必須重新驗收 lab203 的實際連線與完整度，不能只依賴角色名稱。
 Vast 只常駐 heads、manifests 與 inventories。Vast 的大量訓練 artifacts 不可把整個 node-local
 工作集直接加入 hot folder；edge mode 也禁止直接 cold publish。舊 `stockagent-desync`、
