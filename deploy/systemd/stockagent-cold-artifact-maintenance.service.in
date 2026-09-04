@@ -1,0 +1,20 @@
+[Unit]
+Description=Publish and evict verified StockAgent cold artifacts
+After=local-fs.target syncthing@root.service
+ConditionPathIsDirectory=__REPO_ROOT__/artifacts/ablations
+ConditionPathIsDirectory=/srv/stockagent-packed
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_cold_artifact_maintenance.sh"
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+TimeoutStartSec=infinity

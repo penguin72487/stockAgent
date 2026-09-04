@@ -16,6 +16,7 @@
 - [發布新資料](#發布新資料)
 - [Syncthing 驗收](#syncthing-驗收)
 - [Artifacts 同步與去重](#artifacts-同步與去重)
+- [磁碟壓力與可重建快取](#磁碟壓力與可重建快取)
 - [資料下載與更新](#資料下載與更新)
 - [訓練、GPU 與解釋](#訓練gpu-與解釋)
 - [即時訊號與服務](#即時訊號與服務)
@@ -545,6 +546,13 @@ Vast 要發布完整可部署 run 時，先在 `configs/data_sync/cold_artifacts
 dataset，並以 `maximum_file_bytes: null` 明確要求包含所有檔案；仍須通過 lifecycle、
 穩定時間、inventory 與 packed-object 驗證。
 
+`artifacts/ablations` 另有自動生命週期維護。它只發現具有完整 lifecycle envelope 的
+完成 run，使用穩定 path-hash dataset ID 逐一發布完整內容。七日租期到期後，仍須再次
+驗證 exact packed release、確認來源未在驗證期間改變、沒有程序引用，並確認指定 peer 的
+`stockagent-packed` 完整收斂，才會刪除本機熱副本。安裝方式：
+`sudo ./scripts/install_cold_artifact_maintenance.sh`。預設每五分鐘執行、一次最多發布一個
+run；發布與刪除至少跨兩次執行，所有 gate 都 fail closed。
+
 ### cold artifact 完整命令
 
 ```text
@@ -607,6 +615,30 @@ sudo ./scripts/install_artifact_dedup_service.sh
 
 完整遷移、ignore 與 penguin 衝突權威規則見
 [即時 artifacts 同步](docs/live_artifact_sync.md)。
+
+## 磁碟壓力與可重建快取
+
+資料、checkpoint、artifact 與 cold release 不能因為磁碟不足而直接刪除。唯一可自動回收
+的是 allowlist 內、已超過 14 日的 TorchInductor、Triton 與 CUDA 編譯快取；預設磁碟
+達 95% 才清到 92%。只要有 `train.py`、`torchrun`、distributed launcher 或 compiler
+worker，整次清理會延後，不只依賴當下 fd/mmap。
+
+```bash
+source scripts/runtime_env.sh
+
+# 唯讀盤點並產生 receipt
+run_fintech_python scripts/maintain_storage_pressure.py
+
+# 使用相同 fail-closed 規則套用
+run_fintech_python scripts/maintain_storage_pressure.py --apply
+
+# 安裝 hourly systemd timer；無 systemd 的 Vast container 安裝 cron fallback
+sudo ./scripts/install_storage_pressure_service.sh
+```
+
+Receipt 位於 `/var/lib/stockagent-storage-pressure/receipts/`。`--force` 只供人工測試，會
+明確繞過程序級保護，禁止放進排程。完整邊界與常態環境變數見
+[磁碟壓力維護](docs/storage_pressure_maintenance.md)。
 
 ## 資料下載與更新
 

@@ -29,10 +29,10 @@ artifacts ──SHA/ZIP packs──> /srv/stockagent-packed
 舊 folder 已完成平行遷移。現在只有 `stockagent-artifacts-hot` 承擔低延遲
 operational artifacts；已完成且可驗證的 cold artifacts 走 `stockagent-packed`。
 
-冷資料登錄表是 `configs/data_sync/cold_artifacts.json`。只有通過明確 completion
-contract 且超過穩定時間的來源可以發布；目前首批只包含通過完整 training
-lifecycle gate 的 `feature_input_lookback32_v4`。另外兩個標示 complete 的舊 run
-因 epoch/summary contract 不完整而保持 hot，不會被誤封存。
+具名冷資料登錄表是 `configs/data_sync/cold_artifacts.json`。只有通過明確 completion
+contract 且超過穩定時間的來源可以發布；表內保留需要穩定部署名稱的 market run。
+`artifacts/ablations` 則由下述自動維護器建立 path-hash dataset ID；未通過
+epoch/summary contract 的舊 run 仍保持 local，不會被誤封存。
 
 登錄項目的 `maximum_file_bytes` 設為整數時，只發布不超過該大小的穩定檔案；設為
 `null` 時發布通過 lifecycle gate 的完整 run。完整 run 中小於
@@ -89,8 +89,25 @@ Ignore file: /root/stockAgent/artifacts/.stignore
 `vastai1T` 不加入 `stockagent-artifacts-hot`。它的 `artifacts` 主要是大型訓練與
 ablation 工作集，直接加入會把 penguin、lab203 與 Vast 的完整輸出做聯集，造成數百 GB
 額外同步與索引。Vast 的執行中產物保持 node-local；完成且通過 lifecycle gate 的 run
-選擇性封裝到 `stockagent-packed`，由各節點驗證後 materialize。這是角色分工，不是
-漏配 folder。
+由 `stockagent-cold-artifact-maintenance` 自動逐一封裝到 `stockagent-packed`。維護器每五
+分鐘掃描一次、每次最多發布一個 run，避免填滿本機或遠端傳輸佇列。發布與刪除至少跨
+兩次獨立執行：只有 exact release 再驗證成功、七日使用租期已過、來源在驗證期間未變、
+沒有程序引用，而且指定 peer 對整個 packed folder 的 items/bytes/deletes/errors 全為零、
+completion 100% 且 `remoteState=valid`，才刪除該 run 的本機來源。任何檢查失敗都保留
+來源；需要時再由冷庫驗證後 materialize。
+
+安裝與唯讀預覽：
+
+```bash
+sudo ./scripts/install_cold_artifact_maintenance.sh
+
+source scripts/runtime_env.sh
+run_fintech_python scripts/maintain_cold_artifacts.py --scope ablations
+```
+
+預設 peer 名稱是 `penguin`，也可使用 `--peer-name` 或
+`COLD_ARTIFACT_PEER_NAME` 明確指定；工具會由目前 Syncthing config 解析 Device ID，不把
+某台機器的憑證身分硬編碼進程式。
 
 衝突規則：
 

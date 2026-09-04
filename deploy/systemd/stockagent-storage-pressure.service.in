@@ -1,0 +1,9 @@
+[Unit]
+Description=Prune old rebuildable StockAgent compiler caches under disk pressure
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_storage_pressure_maintenance.sh"

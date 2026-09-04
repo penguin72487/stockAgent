@@ -25,6 +25,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
   多寫者 head、materialize、lease 與 GC。
 - [`live_artifact_sync.md`](live_artifact_sync.md)：可變 artifacts hot transport、完成產物 cold
   release、衝突政策與 hard-link 去重。
+- [`storage_pressure_maintenance.md`](storage_pressure_maintenance.md)：磁碟高水位下只回收
+  allowlisted 可重建編譯快取、訓練程序保護與 receipt 稽核。
 - [`desync_multiwriter_sync.md`](desync_multiwriter_sync.md)：舊 desync snapshot 的遷移／救援流程；
   不再是新部署的日常入口。
 - [`RUN_GUIDE.md`](RUN_GUIDE.md)：補充 operator 指令；使用前仍要核對當前 config 與本機路徑。
