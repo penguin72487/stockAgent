@@ -236,6 +236,12 @@ coordinated code, config, test, and documentation change.
   while training, torchrun, distributed launch, or compiler worker processes
   are active; only an explicit manual force may bypass that process-level gate.
   Keep its audit receipt and low-I/O scheduling.
+- Windows `%LOCALAPPDATA%\Temp` is not a disposable tree.  Never blanket-delete
+  it from WSL or Windows.  Orphaned WSL swap recovery must use
+  `scripts/cleanup_windows_wsl_temp_swap.ps1`: only a top-level GUID directory
+  containing exactly one aged, inactive, exclusively unlockable `swap.vhdx`
+  may be removed, with an audit/apply receipt and an immediate pre-delete
+  recheck.  The swap belonging to any current `wslhost.exe --vm-id` is protected.
 
 ### Acceptance and reporting
 

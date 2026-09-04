@@ -112,6 +112,24 @@ printf '%s\n%s\n%s\n%s\n%s\n' \
     assert str(inherited / "bin") not in path.split(":")
 
 
+def test_shell_runtime_can_be_sourced_without_home() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    command = r'''
+set -u
+source "$1/scripts/runtime_env.sh"
+printf 'runtime-ready\n'
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", command, "bash", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.stdout == "runtime-ready\n"
+
+
 def test_cuml_umap_uses_random_init_to_avoid_spectral_fallback_warning(monkeypatch) -> None:
     from stockagent.backtest import gpu_plot
 
