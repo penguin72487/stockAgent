@@ -1774,6 +1774,49 @@ def test_integer_0845_funding_safe_trajectory_v3_is_a_fresh_contract() -> None:
     )
 
 
+def test_integer_0845_stable_full_finetune_v4_isolated_training_contract() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_stable_full_finetune_full_features_multi_basis_"
+        "projection_l1_cash_capital10m_v4.yaml"
+    )
+    basis = config.training.transformer_base_portfolio
+    assert config.training.epochs == 1000
+    assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert config.training.futures_portfolio_recoverable_backward is True
+    assert config.training.futures_portfolio_optimizer_step_per_trajectory is True
+    assert config.training.lr_scheduler_warmup_steps == 32
+    assert (
+        config.training.pretrained_initialization_require_improvement_over_flat_cash
+        is True
+    )
+    assert config.training.pretrained_initialization_trainable_parameter_prefixes == []
+    assert len(config.data.feature_include) == 99
+    assert sum(basis.temporal_basis_components_by_family.values()) == 524
+    assert basis.futures_denomination_aware_output is True
+    assert basis.futures_denomination_hard_projection is False
+    assert config.trading.tw_futures_portfolio_integer_contracts is True
+    assert config.data.tw_futures_expiry_settlement_valuation is True
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
+        "effective_rank_stable_full_finetune_cash_capital10m_v4"
+    )
+
+    manifest = build_checkpoint_manifest(
+        _stock_panel(), config, include_data_content=False
+    )
+    training_contract = manifest["contracts"]["training"]
+    assert training_contract["optimizer"]["step_cadence"] == (
+        "full_chronological_trajectory"
+    )
+    assert training_contract["scheduler"]["warmup_steps"] == 32
+    assert training_contract["fold_continuation"][
+        "pretrained_initialization_require_improvement_over_flat_cash"
+    ] is True
+
+
 def test_integer_0845_pretrained_guard_uses_fold_matched_source_and_exact_loss() -> None:
     config = load_config(
         "configs/markets/"

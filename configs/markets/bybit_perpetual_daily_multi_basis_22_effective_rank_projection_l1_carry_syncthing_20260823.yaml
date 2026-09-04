@@ -1,0 +1,112 @@
+# Crypto product adapter for the completed 22-effective-rank Taiwan model
+# architecture. The model shape and finite global basis budgets come from:
+# artifacts/markets/
+# tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_commission20_capital10m_v1
+#
+# Product semantics deliberately continue to inherit from the verified Bybit
+# release adapter. In particular, this is a 24x7 USDT-linear perpetual account
+# that carries executed positions across UTC days, applies every official
+# funding event, charges VIP0 taker fees on actual turnover, and never imports
+# Taiwan T+2, tax, lot, eligibility, or session-flat rules.
+base_config: bybit_perpetual_daily_multi_basis_projection_l1_syncthing_20260823.yaml
+
+experiment_name: bybit-perpetual-daily-0000-execution-22-effective-rank-projection-l1-carry-syncthing-20260823-v2
+
+runner:
+  # This is checkpoint-incompatible with both the 18-family crypto run and the
+  # Taiwan artifact, so it owns a fresh output root and cannot silently resume
+  # either experiment.
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_projection_l1_carry_syncthing_20260823_v2
+  resume: true
+  post_train_infer: false
+
+data:
+  # Separately materialized contract v7: features end at D-1 23:59 UTC and the
+  # executor values an idealized zero-latency fill at the D 00:00 Kline open.
+  # Do not point this at the incompatible legacy 00:05/v6 daily tree.
+  parquet_root: data_bybit_daily_0000_training_20260823
+  external_feature_path: data_bybit_daily_0000_public_features_20260823/bybit_crypto_public_daily_0000.parquet
+
+trading:
+  crypto_execution_minute_utc: 0
+
+training:
+  # Match the measured memory-safe global batch of the completed 524-component
+  # reference on dual RTX 5090. The crypto recurrent executor still requires
+  # compile_loss=false, inherited from the product adapter, because it compiles
+  # and reuses a fixed four-day ledger block instead of unrolling the horizon.
+  batch_size_train: 16
+  batch_size_eval: 16
+
+  transformer_base_portfolio:
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+      - kautz
+      - discrete_hermite
+      - chirplet
+      - pca_klt
+
+    # These are finite global budgets from each complete lookback-32 candidate
+    # pool, not per-dataset hand-picked directions. PCA/KLT remains fold-train
+    # fitted, so validation and test observations cannot define its basis.
+    temporal_basis_components: 31
+    temporal_basis_novelty_threshold: 0.0001
+    temporal_basis_components_by_family:
+      haar: 31
+      swt_db2: 13
+      swt_sym4: 10
+      wavelet_packet: 14
+      walsh: 31
+      fourier: 31
+      dct: 31
+      dpss: 31
+      local_cosine: 31
+      morlet: 27
+      exponential: 8
+      laguerre: 13
+      difference: 31
+      ar_innovation: 8
+      bspline: 30
+      legendre: 31
+      chebyshev: 31
+      learned: 31
+      kautz: 23
+      discrete_hermite: 16
+      chirplet: 21
+      pca_klt: 31
+
+  financial_transformer:
+    # Crypto keeps the transferable reference backbone but not Taiwan's forced
+    # cross-sectional de-meaning. Projection-L1 learns signed gross/cash and is
+    # scaled by the currently active coin count so listing history does not
+    # silently change output magnitude.
+    center_long_short_logits: false
+    portfolio_output_mode: projection_l1
+    projection_l1_scale_by_active_count: true
+    temporal_basis_input: input_features
+    return_aux: false
+    return_aux_details: false
+
+  # Different feature ABI (141 crypto fields), symbols, product accounting and
+  # recurrent state make Taiwan weights unsafe to transplant. Start clean while
+  # preserving its architecture/hyperparameters as the experimental baseline.
+  pretrained_initialization_root: null
+  pretrained_initialization_validation_guard: false
+  pretrained_initialization_trainable_parameter_prefixes: []

@@ -1093,6 +1093,39 @@ def _validate_pretrained_epoch_zero_account_segment(
     return default_count, final_equity_scale
 
 
+def _validate_pretrained_epoch_zero_improves_flat_cash(
+    *,
+    fold_id: int,
+    validation_loss: float,
+    min_delta: float,
+) -> float:
+    """Reject a solvent warm start that is no better than exact flat cash.
+
+    The exact flat portfolio has zero returns, turnover, fees, tax, and loss
+    under the supported log-utility warm-start contract. Solvency alone is
+    therefore insufficient: accepting a positive-loss source makes the
+    checkpoint selector prefer a known-worse policy over available cash.
+    """
+
+    value = float(validation_loss)
+    required_delta = float(min_delta)
+    if not math.isfinite(value):
+        raise ValueError("epoch-zero validation loss must be finite")
+    if not math.isfinite(required_delta) or required_delta < 0.0:
+        raise ValueError(
+            "flat-cash improvement min_delta must be finite and non-negative"
+        )
+    flat_cash_loss = 0.0
+    if value >= flat_cash_loss - required_delta:
+        raise _PretrainedEpochZeroAccountInvalid(
+            "pretrained epoch-zero exact validation policy does not improve on "
+            f"flat cash for fold {fold_id}: validation_loss={value} "
+            f"required_loss_below={flat_cash_loss - required_delta}. "
+            "A solvent but inferior policy is not an acceptable initialization guard."
+        )
+    return flat_cash_loss - value
+
+
 def _checkpoint_file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -2645,6 +2678,24 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    if mode == "crypto_perpetual":
+        execution_minute = int(config.trading.crypto_execution_minute_utc)
+        payload.update(
+            {
+                "execution_clock": (
+                    "official_1m_kline_open_at_0000_utc_zero_latency_research_assumption"
+                    if execution_minute == 0
+                    else "next_trade_official_1m_kline_open_at_0005_utc_after_five_minute_lag"
+                ),
+                "mode_details": {
+                    "crypto_execution_minute_utc": execution_minute,
+                    "funding_boundary_order": (
+                        "boundary_funding_settles_before_new_target"
+                    ),
+                },
+            }
+        )
+        return payload
     if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
         return payload
     payload.update(
@@ -24208,6 +24259,18 @@ def _run_training_impl(
                             equity_scale=epoch_zero_equity,
                         )
                     )
+                    improvement_over_flat_cash: float | None = None
+                    require_flat_cash_improvement = bool(
+                        config.training.pretrained_initialization_require_improvement_over_flat_cash
+                    )
+                    if require_flat_cash_improvement:
+                        improvement_over_flat_cash = (
+                            _validate_pretrained_epoch_zero_improves_flat_cash(
+                                fold_id=int(context.fold.fold_id),
+                                validation_loss=val_loss,
+                                min_delta=early_stop_min_delta,
+                            )
+                        )
                     context.best_val_loss = val_loss
                     guard_payload = {
                         "schema_version": 2,
@@ -24228,6 +24291,12 @@ def _run_training_impl(
                         "settlement_default_count": default_count,
                         "final_alive": True,
                         "final_equity_scale": final_equity_scale,
+                        "flat_cash_validation_loss": (
+                            0.0
+                            if improvement_over_flat_cash is not None
+                            else None
+                        ),
+                        "improvement_over_flat_cash": improvement_over_flat_cash,
                         "replacement_rule": (
                             "later checkpoint must improve target exact "
                             "validation loss"
@@ -24296,7 +24365,7 @@ def _run_training_impl(
                         report=pretrained_initialization_report,
                     )
                     print(
-                        f"[Train {train_years}] epoch 0 transferred account "
+                        f"[Train {train_years}] epoch 0 transferred strategy "
                         f"rejected ({rejected}); applied "
                         f"{fallback_receipt['method']}"
                     )

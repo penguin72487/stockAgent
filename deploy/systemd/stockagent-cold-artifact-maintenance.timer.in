@@ -1,0 +1,11 @@
+[Unit]
+Description=Maintain completed StockAgent artifacts every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=stockagent-cold-artifact-maintenance.service
+
+[Install]
+WantedBy=timers.target

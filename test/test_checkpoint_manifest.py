@@ -408,6 +408,14 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
             "training",
             lambda cfg: setattr(
                 cfg.training,
+                "pretrained_initialization_require_improvement_over_flat_cash",
+                not cfg.training.pretrained_initialization_require_improvement_over_flat_cash,
+            ),
+        ),
+        (
+            "training",
+            lambda cfg: setattr(
+                cfg.training,
                 "early_stopping_min_delta",
                 cfg.training.early_stopping_min_delta + 0.001,
             ),
@@ -467,6 +475,68 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         mutate(changed_config)
         changed = _checkpoint_manifest(panel, changed_config)["fingerprints"]
         assert changed[expected_layer] != baseline[expected_layer]
+
+
+def test_inactive_flat_cash_guard_is_schema4_checkpoint_compatible(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    assert (
+        config.training.pretrained_initialization_require_improvement_over_flat_cash
+        is False
+    )
+    current = _checkpoint_manifest(_panel(), config)
+    current_continuation = current["contracts"]["training"]["fold_continuation"]
+    assert (
+        "pretrained_initialization_require_improvement_over_flat_cash"
+        not in current_continuation
+    )
+
+    explicit_false = copy.deepcopy(current)
+    explicit_false_continuation = explicit_false["contracts"]["training"][
+        "fold_continuation"
+    ]
+    explicit_false_continuation[
+        "pretrained_initialization_require_improvement_over_flat_cash"
+    ] = False
+    explicit_false["fingerprints"]["training"] = trainer_module._stable_fingerprint(
+        explicit_false["contracts"]["training"]
+    )
+    assert explicit_false["fingerprints"]["training"] == current[
+        "compatibility_fingerprints"
+    ]["schema_4_with_inactive_flat_cash_guard"]["training"]
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": explicit_false},
+        current,
+        checkpoint_path=tmp_path / "explicit_false_flat_cash_guard.pt",
+        scope="resume",
+    )
+
+
+def test_enabled_flat_cash_guard_remains_checkpoint_incompatible(
+    tmp_path: Path,
+) -> None:
+    disabled_config = _config()
+    disabled = _checkpoint_manifest(_panel(), disabled_config)
+    enabled_config = copy.deepcopy(disabled_config)
+    enabled_config.training.pretrained_initialization_require_improvement_over_flat_cash = (
+        True
+    )
+    enabled = _checkpoint_manifest(_panel(), enabled_config)
+
+    assert enabled["contracts"]["training"]["fold_continuation"][
+        "pretrained_initialization_require_improvement_over_flat_cash"
+    ] is True
+    assert enabled["fingerprints"]["training"] != disabled["fingerprints"][
+        "training"
+    ]
+    with pytest.raises(RuntimeError, match="training"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": disabled},
+            enabled,
+            checkpoint_path=tmp_path / "enabled_flat_cash_guard.pt",
+            scope="resume",
+        )
 
 
 def test_transformer_bottleneck_switches_are_semantic_and_legacy_compatible() -> None:

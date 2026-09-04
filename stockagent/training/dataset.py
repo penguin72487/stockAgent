@@ -698,15 +698,15 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             close_tradable = futures_executable & finite_target
         elif self.execution_mode == "crypto_perpetual":
             # Row t contains the prior UTC calendar day completed at 00:00;
-            # its executor-only close_prices entry is the next-trade 00:05
-            # Kline open after a five-minute decision/order lag. The prior
+            # its executor-only close_prices entry is the configured 00:00 or
+            # legacy 00:05 Kline open. The prior
             # day's completed volume is observable at decision;
             # whether t->t+1 has a complete label is future information and
             # must never suppress one symbol from the policy/execution masks.
             tradable = np.asarray(panel.tradable_mask, dtype=bool).copy()
             # Policy eligibility and execution availability are distinct. A
             # feature-session gap can make a symbol ineligible for a new model
-            # target while a real 00:05 mark still lets the recurrent account
+            # target while a real execution mark still lets the recurrent account
             # reduce or close an existing position. The explicit side masks
             # remain authoritative below; alive only prevents orders without
             # a current valuation mark.

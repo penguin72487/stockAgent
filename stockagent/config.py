@@ -147,6 +147,7 @@ def _validate_crypto_perpetual_mode_contract(
     portfolio_output_mode: object,
     stateful_proximal_allocator: object,
     proximal_cost_multiplier: object,
+    execution_minute_utc: object,
 ) -> None:
     """Keep the daily Bybit carrying account on one explicit contract."""
 
@@ -155,7 +156,7 @@ def _validate_crypto_perpetual_mode_contract(
     if _normalized_contract_name(frequency) not in {"daily", "1d", "day"}:
         raise ValueError(
             "crypto_perpetual requires trading.frequency='daily' for the "
-            "00:00 decision / 00:05 UTC execution carrying ledger"
+            "00:00 UTC decision/execution carrying ledger"
         )
     if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
         raise ValueError(
@@ -181,6 +182,10 @@ def _validate_crypto_perpetual_mode_contract(
         raise ValueError(
             "crypto_perpetual stateful proximal allocation requires a positive "
             "crypto_proximal_cost_multiplier"
+        )
+    if int(execution_minute_utc) not in {0, 5}:
+        raise ValueError(
+            "crypto_perpetual crypto_execution_minute_utc must be 0 or 5"
         )
 
 
@@ -1598,6 +1603,10 @@ class TradingConfig:
     # 1.0 means the exact configured one-way fee.  Keep this explicit in the
     # configuration fingerprint even when it is not tuned.
     crypto_proximal_cost_multiplier: float = 1.0
+    # Executor-only Kline-open minute after the 00:00 UTC decision cutoff.
+    # 5 preserves the v6 lagged contract; 0 selects the v7 zero-latency
+    # counterfactual and must be paired with matching materialized daily data.
+    crypto_execution_minute_utc: int = 5
     max_volume_participation: float = 0.0
     volume_participation_equity: float = 1_000_000.0
     # Reporting/post-processing multiplier only. Canonical train/eval exposure is 1.0.
@@ -2274,6 +2283,10 @@ class TrainingConfig:
     pretrained_initialization_feature_adapter: str = "none"
     pretrained_initialization_require_exact_backbone: bool = True
     pretrained_initialization_validation_guard: bool = False
+    # A solvent transferred exact-account policy can still be strictly worse
+    # than holding cash.  When enabled, epoch zero must improve on the
+    # analytically flat exact-account loss before it may seed checkpoint_best.
+    pretrained_initialization_require_improvement_over_flat_cash: bool = False
     pretrained_initialization_trainable_parameter_prefixes: list[str] = field(
         default_factory=list
     )
@@ -4657,6 +4670,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["crypto_proximal_cost_multiplier"] = float(
         trading["crypto_proximal_cost_multiplier"]
     )
+    trading["crypto_execution_minute_utc"] = int(
+        trading["crypto_execution_minute_utc"]
+    )
     if (
         not math.isfinite(trading["crypto_proximal_cost_multiplier"])
         or trading["crypto_proximal_cost_multiplier"] < 0.0
@@ -4681,6 +4697,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         proximal_cost_multiplier=trading[
             "crypto_proximal_cost_multiplier"
         ],
+        execution_minute_utc=trading["crypto_execution_minute_utc"],
     )
     return raw
 
@@ -4777,6 +4794,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
             pretrained_initialization_validation_guard=bool(
                 training_raw.get(
                     "pretrained_initialization_validation_guard", False
+                )
+            ),
+            pretrained_initialization_require_improvement_over_flat_cash=bool(
+                training_raw.get(
+                    "pretrained_initialization_require_improvement_over_flat_cash",
+                    False,
                 )
             ),
             pretrained_initialization_trainable_parameter_prefixes=[
