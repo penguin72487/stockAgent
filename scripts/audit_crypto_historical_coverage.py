@@ -250,6 +250,9 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bybit_1m = _footer_tree_profile(root / "data_bybit/1m", "*_features.parquet", "date")
+    bybit_strategy_daily = _footer_tree_profile(
+        root / "data_bybit/perpetual_daily", "*_features.parquet", "date"
+    )
     bybit_funding = _footer_tree_profile(
         root / "data_bybit/funding", "*_funding.parquet", "funding_time_utc"
     )
@@ -300,13 +303,14 @@ def main() -> None:
 
     fear_first, fear_last, fear_rows = free_dates("alternative_me_fear_greed")
     dex_first, dex_last, dex_rows = free_dates("defillama_dex_volume")
-    fees_first, fees_last, fees_rows = free_dates("defillama_fees_revenue")
+    fees_first, fees_last, fees_rows = free_dates("defillama_protocol_fees")
 
     rows = [
         _row("Binance USD-M 1m", "Binance", binance_1m["path"], binance_1m["earliest_event_date"], binance_1m["latest_event_date"], binance_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "可用；需保留歷史成分與上市時間 mask", f"{binance_1m['files_reaching_2020_01_01_or_earlier']}/{binance_1m['files']} files reach cutoff"),
         _row("OKX SWAP 1m core", "OKX", okx_1m["path"], okx_1m["earliest_event_date"], okx_1m["latest_event_date"], okx_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "核心 K 線可用；輔助 mark/index 不完整", f"public feature schema complete {okx_1m['schema_complete_files']}/{okx_1m['files']} files"),
         _row("OKX SWAP 15m enriched", "OKX", okx_15m["path"], okx_15m["earliest_event_date"], okx_15m["latest_event_date"], okx_15m["rows_from_base_parquet_footers"], "A: completed exchange bars", "可因果聚合到日頻；目前正式公開特徵 fallback", f"public feature schema complete {okx_15m['schema_complete_files']}/{okx_15m['files']} files"),
-        _row("Bybit perpetual 1m", "Bybit", bybit_1m["path"], bybit_1m["earliest_event_date"], bybit_1m["latest_event_date"], bybit_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "可用，但交易產品史未延伸至 2020-01-01", f"{bybit_1m['files_reaching_2020_01_01_or_earlier']}/{bybit_1m['files']} files reach cutoff"),
+        _row("Bybit all perpetual 1m (linear+inverse)", "Bybit", bybit_1m["path"], bybit_1m["earliest_event_date"], bybit_1m["latest_event_date"], bybit_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "原始資料可用；2020 前只有 3 個 inverse 合約", f"{bybit_1m['files_reaching_2020_01_01_or_earlier']}/{bybit_1m['files']} files reach cutoff"),
+        _row("Bybit strategy universe daily (linear USDT)", "Bybit", bybit_strategy_daily["path"], bybit_strategy_daily["earliest_event_date"], bybit_strategy_daily["latest_event_date"], bybit_strategy_daily["rows_from_base_parquet_footers"], "A: completed exchange bars plus funding", "可用；但 active strategy universe 最早 2020-03-26", f"{bybit_strategy_daily['files_reaching_2020_01_01_or_earlier']}/{bybit_strategy_daily['files']} files reach cutoff"),
         _row("Bybit funding settlements", "Bybit", bybit_funding["path"], bybit_funding["earliest_event_date"], bybit_funding["latest_event_date"], bybit_funding["rows_from_base_parquet_footers"], "A: official settlement events", "可用，但與合約上市日共同限制", f"{bybit_funding['files']} symbol files"),
         _row("Binance public archive", "Binance Vision", "data_binance_archive", "2020-01-01", None, None, "A/B: immutable bars with archive receipt clock", "可用已驗證物件；整體仍 partial", f"state={archive.get('state')}, source_invalid={archive.get('source_invalid_objects')}, quarantined={archive.get('quarantined_monthly_objects')}"),
         _row("FRED initial releases", "FRED/ALFRED", "data_fred_crypto_macro/observations.parquet", fred_first, fred_last, fred_rows, "A: initial-release vintage", "可用；next-UTC-day 保守延遲", "output_type=4; revisions excluded"),
@@ -381,6 +385,7 @@ def main() -> None:
         },
         "footer_profiles": {
             "bybit_1m": bybit_1m,
+            "bybit_strategy_daily": bybit_strategy_daily,
             "bybit_funding": bybit_funding,
             "binance_1m": binance_1m,
             "okx_1m": okx_1m,

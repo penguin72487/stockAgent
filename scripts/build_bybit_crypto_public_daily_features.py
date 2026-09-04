@@ -33,6 +33,7 @@ from stockagent.data.crypto_public_web import (
     fred_macro_rows,
     sec_etf_filing_rows,
 )
+from downloader.ohlcv_hot_tail import read_logical_parquet
 
 
 BOUNDARY_MINUTES_UTC = 0
@@ -471,7 +472,10 @@ def _positive_log_ratio(last: str, first: str, alias: str) -> pl.Expr:
 
 
 def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
-    frame = pl.read_parquet(path)
+    # Tail-only collectors publish recent immutable rows under ``_hot_tail``.
+    # Reading only the base silently freezes daily public features at the last
+    # compaction date and can keep prospective fields unavailable forever.
+    frame = read_logical_parquet(path)
     required = {
         "date",
         "okx_mark_open",
@@ -640,6 +644,12 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
             else pl.lit(0, dtype=pl.UInt32).alias(f"__count_{column}")
         )
     expected_rows = 1440 // interval_minutes
+    # OKX rolling OI/positioning/taker endpoints are native 5-minute series.
+    # On a 1-minute price panel they are intentionally sparse; requiring 1,440
+    # non-null observations would make a perfectly complete 288-point day
+    # impossible to accept.  A coarser 15-minute panel samples each available
+    # value once per bar, so its expected count remains 96.
+    expected_native_5m_rows = 1440 // max(interval_minutes, 5)
     first_available_offset_minutes = (
         BOUNDARY_MINUTES_UTC // interval_minutes + 1
     ) * interval_minutes
@@ -694,12 +704,12 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
                 ("crypto_okx_index_range_log_1d", "__index_high", "__index_low"),
             )
         ],
-        pl.when(pl.col("__positioning_rows") == expected_rows)
+        pl.when(pl.col("__positioning_rows") == expected_native_5m_rows)
         .then(_positive_log_ratio("__oi_last", "__oi_first", "__unused"))
         .otherwise(None)
         .alias("crypto_okx_open_interest_usd_log_change_1d"),
         pl.when(
-            (pl.col("__taker_rows") == expected_rows)
+            (pl.col("__taker_rows") == expected_native_5m_rows)
             & ((pl.col("__taker_buy") + pl.col("__taker_sell")) > 0)
         )
         .then(
@@ -715,10 +725,10 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
         .cast(pl.Float64)
         .alias("crypto_okx_funding_available"),
         pl.col("__core_complete").cast(pl.Float64).alias("crypto_okx_available"),
-        (pl.col("__positioning_rows") == expected_rows)
+        (pl.col("__positioning_rows") == expected_native_5m_rows)
         .cast(pl.Float64)
         .alias("crypto_okx_positioning_available"),
-        (pl.col("__taker_rows") == expected_rows)
+        (pl.col("__taker_rows") == expected_native_5m_rows)
         .cast(pl.Float64)
         .alias("crypto_okx_taker_available"),
         pl.lit(symbol).alias("symbol"),
@@ -735,7 +745,7 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
             )
         ],
         *[
-            pl.when(pl.col("__positioning_rows") == expected_rows)
+            pl.when(pl.col("__positioning_rows") == expected_native_5m_rows)
             .then(pl.col(name))
             .otherwise(None)
             .alias(name)
@@ -760,7 +770,7 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
 
 
 def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
-    frame = pl.read_parquet(path)
+    frame = read_logical_parquet(path)
     required = {
         "date",
         "binance_volume_quote",
@@ -908,6 +918,9 @@ def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
             ]
         )
     expected_rows = 1440 // interval_minutes
+    # Binance rolling OI/positioning endpoints are native 5-minute series.
+    # A complete 1-minute price day therefore has 288 observations, not 1,440.
+    expected_positioning_rows = 1440 // max(interval_minutes, 5)
     first_available_offset_minutes = (
         BOUNDARY_MINUTES_UTC // interval_minutes + 1
     ) * interval_minutes
@@ -973,12 +986,12 @@ def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
         (pl.col("__funding_rows") == expected_rows)
         .cast(pl.Float64)
         .alias("crypto_binance_funding_available"),
-        pl.when(pl.col("__positioning_rows") == expected_rows)
+        pl.when(pl.col("__positioning_rows") == expected_positioning_rows)
         .then(_positive_log_ratio("__oi_last", "__oi_first", "__unused"))
         .otherwise(None)
         .alias("crypto_binance_open_interest_usd_log_change_1d"),
         pl.when(
-            (pl.col("__positioning_rows") == expected_rows)
+            (pl.col("__positioning_rows") == expected_positioning_rows)
             & (pl.col("__oi_last") > 0)
             & (pl.col("__quote_volume") > 0)
         )
@@ -1001,7 +1014,7 @@ def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
         pl.col("__core_complete")
         .cast(pl.Float64)
         .alias("crypto_binance_core_available"),
-        (pl.col("__positioning_rows") == expected_rows)
+        (pl.col("__positioning_rows") == expected_positioning_rows)
         .cast(pl.Float64)
         .alias("crypto_binance_positioning_available"),
         pl.lit(symbol).alias("symbol"),
@@ -1013,7 +1026,7 @@ def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
     }
     grouped = grouped.with_columns(
         *[
-            pl.when(pl.col("__positioning_rows") == expected_rows)
+            pl.when(pl.col("__positioning_rows") == expected_positioning_rows)
             .then(pl.col(name))
             .otherwise(None)
             .alias(name)
