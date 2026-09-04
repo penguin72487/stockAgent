@@ -35,6 +35,7 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
 .compact-table td small{font-size:10px}
 .time-range-control{padding:10px 14px;border-bottom:1px solid var(--line)}.date-range-picker{display:flex;align-items:center;gap:6px;margin-left:auto}.date-range-picker>span{color:var(--muted);font-size:10px}.date-range-picker label{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:10px}.date-range-picker input{width:132px;min-height:32px;padding:4px 7px;border:1px solid var(--line);border-radius:8px;background:#08131e;color:var(--text);color-scheme:dark;font:inherit;font-size:11px}.date-range-picker input:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}.time-range-control .clear-date-range{border-radius:8px}@media(max-width:1050px){.date-range-picker{width:100%;margin-left:0}}@media(max-width:520px){.date-range-picker{display:grid;grid-template-columns:1fr auto 1fr}.date-range-picker label{display:grid;gap:3px}.date-range-picker input{width:100%}.date-range-picker .clear-date-range{grid-column:1/-1}}
 .controls input[type="date"]{color-scheme:dark}
+.metric-context{display:block;margin:0 0 4px;color:var(--muted);font-size:10px}
 .operation-body>div{min-width:0}.progress-row,.progress-title,progress.progress-track{max-width:100%;min-width:0}td small{font-size:10px}
 
 .signal-row{cursor:pointer}

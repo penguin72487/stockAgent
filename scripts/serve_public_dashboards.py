@@ -56,6 +56,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
+    warm_dashboard_session_indexes,
 )
 
 
@@ -64,6 +65,7 @@ MAX_REQUEST_TARGET_BYTES: Final[int] = 2_048
 PUBLIC_SIGNAL_LIMIT: Final[int] = 250
 PUBLIC_EVENT_LIMIT: Final[int] = 250
 MAX_CACHE_ENTRIES: Final[int] = 512
+MAX_CACHE_BYTES: Final[int] = 128 * 1024 * 1024
 MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
 OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 5 * 60.0
 HISTORY_STALE_GRACE_SECONDS: Final[float] = 15 * 60.0
@@ -137,6 +139,14 @@ class PreparedResponse:
     content_type: str
     etag: str
     cache_control: str
+
+    @property
+    def resident_bytes(self) -> int:
+        """Bytes retained by the in-process raw and gzip response variants."""
+
+        return len(self.body) + (
+            0 if self.gzip_body is self.body else len(self.gzip_body)
+        )
 
 
 @dataclass
@@ -803,6 +813,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.tw_upstream = str(tw_upstream).rstrip("/")
         self.traffic_observer = PublicTrafficObserver()
         self._cache: dict[str, CacheEntry] = {}
+        self._cache_bytes = 0
         self._cache_lock = threading.Lock()
         self._cache_key_locks: dict[str, threading.Lock] = {}
         self._refreshing: set[str] = set()
@@ -856,14 +867,16 @@ class PublicDashboardServer(ThreadingHTTPServer):
             else max(0.0, float(stale_grace_seconds))
         )
         with self._cache_lock:
+            previous = self._cache.get(cache_key)
+            if previous is not None:
+                self._cache_bytes -= previous.response.resident_bytes
             self._cache[cache_key] = CacheEntry(
                 expires_at=observed + float(ttl_seconds),
                 stale_until=observed + float(ttl_seconds) + stale_grace,
                 response=response,
                 last_accessed_at=observed,
             )
-            if len(self._cache) <= MAX_CACHE_ENTRIES:
-                return
+            self._cache_bytes += response.resident_bytes
             removable = sorted(
                 (
                     (entry.last_accessed_at, key)
@@ -873,9 +886,27 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     and not self._cache_key_locks.get(key, threading.Lock()).locked()
                 )
             )
-            for _, key in removable[: len(self._cache) - MAX_CACHE_ENTRIES]:
-                self._cache.pop(key, None)
+            for _, key in removable:
+                if (
+                    len(self._cache) <= MAX_CACHE_ENTRIES
+                    and self._cache_bytes <= MAX_CACHE_BYTES
+                ):
+                    break
+                removed = self._cache.pop(key, None)
+                if removed is not None:
+                    self._cache_bytes -= removed.response.resident_bytes
                 self._cache_key_locks.pop(key, None)
+
+    def cache_residency(self) -> dict[str, int]:
+        """Return bounded, non-sensitive cache capacity and occupancy metrics."""
+
+        with self._cache_lock:
+            return {
+                "resident_entries": len(self._cache),
+                "resident_bytes": max(0, self._cache_bytes),
+                "maximum_entries": MAX_CACHE_ENTRIES,
+                "maximum_resident_bytes": MAX_CACHE_BYTES,
+            }
 
     def _background_refresh(
         self,
@@ -1473,6 +1504,16 @@ class PublicDashboardServer(ThreadingHTTPServer):
                         "public-dashboard view_prewarm_failed "
                         f"error={type(error).__name__}\n"
                     )
+        try:
+            warm_dashboard_session_indexes(
+                state_dir=self.repo_root
+                / "artifacts/live/tw_day_trade_simulation"
+            )
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard session_index_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
 
 
 class PublicDashboardHandler(BaseHTTPRequestHandler):
@@ -2038,9 +2079,21 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/data-monitor/api/summary":
             return self.server.data_monitor_summary()
         if path == "/traffic/api/status":
+            payload = self.server.traffic_observer.snapshot(
+                exclude_current_request=True
+            )
+            payload["cache"].update(self.server.cache_residency())
+            payload["definitions"]["cache_resident_bytes"] = (
+                "程序內 JSON 回應快取目前保留的原始與 gzip body；不含靜態資源、"
+                "Python 物件與作業系統頁面快取。"
+            )
+            payload["definitions"]["cache_capacity"] = (
+                "JSON 回應快取同時受筆數與 body bytes 約束；先到任一上限即按"
+                "最近最少使用順序淘汰。"
+            )
             body = (
                 json.dumps(
-                    self.server.traffic_observer.snapshot(exclude_current_request=True),
+                    payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                     allow_nan=False,

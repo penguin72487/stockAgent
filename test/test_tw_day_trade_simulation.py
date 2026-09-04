@@ -141,6 +141,36 @@ def test_process_quotes_can_defer_state_persistence_for_historical_replay(
     assert not (state_dir / "state.json").exists()
 
 
+def test_strategy_mark_ledger_keeps_exact_right_labelled_session_window(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    engine = TwDayTradeSimulationEngine(state_dir)
+    engine.state["modes"] = {
+        "tw_day_trade": {
+            "market": "tw_day_trade",
+            "session_date": "2026-08-13",
+            "initial_capital_twd": 10_000_000.0,
+            "positions": {},
+        }
+    }
+
+    engine._mark_mode("tw_day_trade", _now(9, 0, 12), {})
+    assert engine.state["modes"]["tw_day_trade"]["last_mark_at"].startswith(
+        "2026-08-13T09:00:12"
+    )
+    assert not engine.marks_path.exists()
+
+    engine._mark_mode("tw_day_trade", _now(9, 1), {})
+    engine._mark_mode("tw_day_trade", _now(13, 30), {})
+    engine._mark_mode("tw_day_trade", _now(13, 31), {})
+    marks = [json.loads(line) for line in engine.marks_path.read_text().splitlines()]
+    assert [row["minute"] for row in marks] == [
+        "2026-08-13T09:01+08:00",
+        "2026-08-13T13:30+08:00",
+    ]
+
+
 def test_historical_replay_ledgers_flush_once_at_session_boundary(
     tmp_path: Path,
 ) -> None:
@@ -3583,7 +3613,7 @@ def test_same_session_stock_benchmark_does_not_require_future_close_receipt(
         assert row["valuation_stale"] is False
 
 
-def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
+def test_dashboard_history_rebases_only_selected_return_not_cumulative_assets(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "state"
@@ -3624,7 +3654,7 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
     assert one_hour["range"] == "1h"
     assert one_hour["raw_points_in_range"] == 2
     assert [row["return_pct"] for row in one_hour["history"]] == pytest.approx(
-        [2.0, 3.0]
+        [0.0, (103.0 / 102.0 - 1.0) * 100.0]
     )
     assert all_time["raw_points_in_range"] == 3
     assert selected_day["start_date"] == "2026-08-14"
@@ -3633,22 +3663,175 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
     assert selected_day["available_end_date"] == "2026-08-14"
     assert selected_day["raw_points_in_range"] == 2
     assert [row["return_pct"] for row in selected_day["history"]] == pytest.approx(
-        [102.0 / 101.0 * 100.0 - 100.0, 103.0 / 101.0 * 100.0 - 100.0]
+        [0.0, (103.0 / 102.0 - 1.0) * 100.0]
     )
+    assert [
+        row["cumulative_return_pct"] for row in selected_day["history"]
+    ] == pytest.approx([2.0, 3.0])
+    assert all("period_return_pct" not in row for row in selected_day["history"])
     assert selected_day["curve_granularity"] == "1m"
-    assert selected_day["return_basis"] == (
-        "previous_retained_mark_before_start_else_initial_capital"
+    assert selected_day["return_basis"] == "selected_range_first_visible_mark"
+    assert selected_day["cumulative_return_basis"] == (
+        "initial_capital_cumulative_total_equity"
     )
+    assert selected_day["period_return_basis"] == "selected_range_first_visible_mark"
     assert len(selected_day["range_summary"]) == 1
     summary = selected_day["range_summary"][0]
     assert summary["series_id"] == "tw_day_trade"
-    assert summary["baseline_kind"] == "previous_retained_mark"
-    assert summary["baseline_equity_twd"] == 101.0
+    assert summary["baseline_kind"] == "first_visible_mark"
+    assert summary["baseline_equity_twd"] == 102.0
+    assert summary["initial_capital_twd"] == 100.0
     assert summary["end_equity_twd"] == 103.0
-    assert summary["range_net_pnl_twd"] == 2.0
+    assert summary["range_net_pnl_twd"] == 1.0
+    assert summary["cumulative_net_pnl_twd"] == 3.0
+    assert summary["cumulative_return_pct"] == pytest.approx(3.0)
+    assert summary["period_return_pct"] == pytest.approx(
+        103.0 / 102.0 * 100.0 - 100.0
+    )
+    assert summary["return_pct"] == pytest.approx(summary["period_return_pct"])
     assert summary["point_count"] == 2
     assert summary["expected_minute_points"] == 270
     assert selected_day["expected_strategy_session_points_from_09_01"] == 270
+
+
+def test_dashboard_history_excludes_pre_0901_strategy_operational_mark(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    rows = [
+        {
+            "market": "tw_day_trade",
+            "minute": "2026-09-03T09:00+08:00",
+            "initial_capital_twd": 100.0,
+            "total_equity_twd": 100.5,
+        },
+        {
+            "market": "tw_day_trade",
+            "minute": "2026-09-03T09:01+08:00",
+            "initial_capital_twd": 100.0,
+            "total_equity_twd": 101.0,
+        },
+    ]
+    (root / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    payload = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-09-03",
+        end_date="2026-09-03",
+    )
+
+    assert payload["raw_points_in_range"] == 1
+    assert [row["minute"] for row in payload["history"]] == [
+        "2026-09-03T01:01+00:00"
+    ]
+
+
+def test_dashboard_history_cache_ignores_repairs_before_selected_start(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    marks_path = root / "marks.jsonl"
+    rows = [
+        {
+            "market": "tw_day_trade",
+            "minute": "2026-08-13T10:00+08:00",
+            "initial_capital_twd": 100.0,
+            "total_equity_twd": 101.0,
+        },
+        {
+            "market": "tw_day_trade",
+            "minute": "2026-08-14T09:30+08:00",
+            "initial_capital_twd": 100.0,
+            "total_equity_twd": 102.0,
+        },
+    ]
+    marks_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    first = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-08-14",
+        end_date="2026-08-14",
+    )
+    assert first["range_summary"][0]["baseline_equity_twd"] == 102.0
+
+    with marks_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "market": "tw_day_trade",
+                    "minute": "2026-08-13T13:30+08:00",
+                    "initial_capital_twd": 100.0,
+                    "total_equity_twd": 101.5,
+                }
+            )
+            + "\n"
+        )
+    second = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-08-14",
+        end_date="2026-08-14",
+    )
+    assert second == first
+
+
+def test_dashboard_history_cache_ignores_appends_after_an_old_selected_day(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    marks_path = root / "marks.jsonl"
+    marks_path.write_text(
+        json.dumps(
+            {
+                "market": "tw_day_trade",
+                "minute": "2026-08-13T09:01+08:00",
+                "initial_capital_twd": 100.0,
+                "total_equity_twd": 101.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-08-13",
+        end_date="2026-08-13",
+    )
+    with marks_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "market": "tw_day_trade",
+                    "minute": "2026-08-14T09:01+08:00",
+                    "initial_capital_twd": 100.0,
+                    "total_equity_twd": 102.0,
+                }
+            )
+            + "\n"
+        )
+    monkeypatch.setattr(
+        dashboard_module,
+        "_rows_for_sessions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a later live append must not reparse an immutable old day")
+        ),
+    )
+    second = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-08-13",
+        end_date="2026-08-13",
+    )
+    assert second == first
 
 
 def test_dashboard_history_keeps_leveraged_reference_below_zero(
@@ -3691,6 +3874,11 @@ def test_dashboard_history_keeps_leveraged_reference_below_zero(
 
     assert result["raw_points_in_range"] == 2
     assert [row["return_pct"] for row in result["history"]] == pytest.approx(
+        [0.0, 5.0]
+    )
+    assert [
+        row["cumulative_return_pct"] for row in result["history"]
+    ] == pytest.approx(
         [-110.0, -105.0]
     )
 
@@ -4337,7 +4525,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="equity-start-date"' not in html
     assert "rangeSummaryFor" in javascript
     assert "selectedDetailStartDate()" in javascript
-    assert "起始日前最後一筆權益" in html
+    assert "所選期間第一個有效分鐘就是 0%" in html
     assert 'id="chart-legend"' in html
     assert 'aria-label="曲線顯示開關"' in html
     assert 'data-range="1y"' not in html
@@ -4350,7 +4538,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "installTwPublicMonitorActivation()" in javascript
     assert "void loadChartHistory({preferCache: !force});" in javascript
     assert "Promise.allSettled(detailLoads)" in javascript
-    assert 'src="app.js?v=47"' in html
+    assert 'src="app.js?v=52"' in html
+    assert 'href="styles.css?v=21"' in html
+    assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
     assert "button[data-series-id]" in javascript
@@ -4713,13 +4903,22 @@ def test_counterfactual_open_replay_cannot_relax_normal_live_signal_gate(
         )
 
 
-def test_dashboard_jsonl_tail_and_incremental_count(tmp_path: Path) -> None:
+def test_dashboard_jsonl_tail_and_incremental_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
     path = tmp_path / "events.jsonl"
     path.write_text(
         "".join(json.dumps({"index": index}) + "\n" for index in range(5)),
         encoding="utf-8",
     )
     assert [row["index"] for row in _tail(path, 2)] == [3, 4]
+    assert _line_count(path) == 5
+    assert len(list(cache_dir.glob("ledger-line-count-v1-*.json"))) == 1
+
+    dashboard_module._LINE_COUNT_CACHE.pop(path.resolve(), None)
     assert _line_count(path) == 5
 
     with path.open("a", encoding="utf-8") as handle:
@@ -4730,6 +4929,38 @@ def test_dashboard_jsonl_tail_and_incremental_count(tmp_path: Path) -> None:
     path.write_text(json.dumps({"index": 9}) + "\n", encoding="utf-8")
     assert _line_count(path) == 1
     assert [row["index"] for row in _tail(path, 2)] == [9]
+
+
+def test_historical_position_count_cache_reads_only_changed_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
+    history_root = tmp_path / "position_history" / "2026-08-13"
+    history_root.mkdir(parents=True)
+    first_path = history_root / "mode_a.json"
+    second_path = history_root / "mode_b.json"
+    first_path.write_text(json.dumps({"positions": [{}, {}]}) + "\n")
+    second_path.write_text(json.dumps({"positions": [{}]}) + "\n")
+
+    assert dashboard_module._historical_position_count(tmp_path) == 3
+    assert len(list(cache_dir.glob("historical-position-count-v1-*.json"))) == 1
+
+    original_object = dashboard_module._object
+    loaded: list[Path] = []
+
+    def observe_object(path: Path) -> dict[str, object]:
+        loaded.append(path)
+        return original_object(path)
+
+    monkeypatch.setattr(dashboard_module, "_object", observe_object)
+    assert dashboard_module._historical_position_count(tmp_path) == 3
+    assert loaded == []
+
+    second_path.write_text(json.dumps({"positions": [{}, {}, {}]}) + "\n")
+    assert dashboard_module._historical_position_count(tmp_path) == 5
+    assert loaded == [second_path]
 
 
 def test_session_tail_is_not_crowded_out_by_a_later_date(tmp_path: Path) -> None:
@@ -4861,6 +5092,160 @@ def test_available_session_date_cache_invalidates_when_ledger_grows(
     )
     assert second["available_session_dates"] == ["2026-08-14", "2026-08-13"]
     assert second["total"] == 2
+
+
+def test_ledger_session_index_survives_process_cache_loss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
+    ledger = tmp_path / "signals.jsonl"
+    ledger.write_text(
+        "".join(
+            json.dumps({"session_date": day, "symbol": symbol}) + "\n"
+            for day, symbol in (
+                ("2026-08-13", "2330"),
+                ("2026-08-14", "2317"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    cache_key = (ledger.resolve(), False)
+
+    first = dashboard_module._ledger_session_index(
+        ledger, recorded_at_fallback=False
+    )
+    assert first is not None
+    assert set(first.spans) == {"2026-08-13", "2026-08-14"}
+    assert len(list(cache_dir.glob("ledger-session-index-v1-*.json"))) == 1
+
+    dashboard_module._LEDGER_SESSION_INDEX_CACHE.pop(cache_key, None)
+    monkeypatch.setattr(
+        dashboard_module,
+        "_ledger_line_session_date",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an unchanged ledger must load its durable byte index")
+        ),
+    )
+    restored = dashboard_module._ledger_session_index(
+        ledger, recorded_at_fallback=False
+    )
+    assert restored == first
+
+
+def test_persistent_ledger_session_index_scans_only_an_appended_tail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
+    ledger = tmp_path / "signals.jsonl"
+    ledger.write_text(
+        json.dumps({"session_date": "2026-08-13", "symbol": "2330"}) + "\n",
+        encoding="utf-8",
+    )
+    cache_key = (ledger.resolve(), False)
+    first = dashboard_module._ledger_session_index(
+        ledger, recorded_at_fallback=False
+    )
+    assert first is not None
+    first_size = first.observed_size
+
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"session_date": "2026-08-14", "symbol": "2317"}) + "\n"
+        )
+    dashboard_module._LEDGER_SESSION_INDEX_CACHE.pop(cache_key, None)
+    observed_lines: list[bytes] = []
+    original_extract = dashboard_module._ledger_line_session_date
+
+    def observe_tail(line: bytes, *, recorded_at_fallback: bool) -> str:
+        observed_lines.append(line)
+        return original_extract(
+            line, recorded_at_fallback=recorded_at_fallback
+        )
+
+    monkeypatch.setattr(
+        dashboard_module, "_ledger_line_session_date", observe_tail
+    )
+    extended = dashboard_module._ledger_session_index(
+        ledger, recorded_at_fallback=False
+    )
+    assert extended is not None
+    assert extended.observed_size > first_size
+    assert set(extended.spans) == {"2026-08-13", "2026-08-14"}
+    assert len(observed_lines) == 1
+    assert b"2026-08-14" in observed_lines[0]
+
+
+def test_compact_benchmark_history_index_survives_process_cache_loss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    source = state_dir / "benchmark_history.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "origins": {
+                    "benchmark_0050": {
+                        "benchmark_accounting_contract_version": 2,
+                        "entry_price": 100.0,
+                    }
+                },
+                "marks": [
+                    {
+                        "benchmark_id": "benchmark_0050",
+                        "session_date": "2026-08-13",
+                        "minute": "2026-08-13T09:00+08:00",
+                        "initial_capital_twd": 100.0,
+                        "total_equity_twd": 101.0,
+                        "last_mark_price": 101.0,
+                        "benchmark_origin_rebased": True,
+                        "large_repeated_provenance": "discard from interior rows",
+                    },
+                    {
+                        "benchmark_id": "benchmark_0050",
+                        "session_date": "2026-08-13",
+                        "minute": "2026-08-13T13:30+08:00",
+                        "initial_capital_twd": 100.0,
+                        "total_equity_twd": 102.0,
+                        "last_mark_price": 102.0,
+                        "benchmark_origin_rebased": True,
+                        "large_repeated_provenance": "retain on session endpoint",
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_key = source.resolve()
+
+    first = dashboard_module._benchmark_history_index(state_dir)
+    assert len(first.marks) == 2
+    assert len(list(cache_dir.glob("benchmark-history-index-v1-*.json.gz"))) == 1
+
+    dashboard_module._BENCHMARK_HISTORY_INDEX_CACHE.pop(source_key, None)
+    monkeypatch.setattr(
+        dashboard_module,
+        "_load_benchmark_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an unchanged benchmark must load its compact index")
+        ),
+    )
+    restored = dashboard_module._benchmark_history_index(state_dir)
+    assert len(restored.marks) == 2
+    assert "large_repeated_provenance" not in restored.marks[0]
+    assert restored.marks[-1]["large_repeated_provenance"] == (
+        "retain on session endpoint"
+    )
+    assert restored.origins == first.origins
 
 
 def test_signal_page_cache_ignores_unrelated_live_state_marks(

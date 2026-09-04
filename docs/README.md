@@ -29,6 +29,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
   不再是新部署的日常入口。
 - [`RUN_GUIDE.md`](RUN_GUIDE.md)：補充 operator 指令；使用前仍要核對當前 config 與本機路徑。
 - [`data_api_credentials.md`](data_api_credentials.md)：資料 API credential 邊界。
+- [`public_dashboards_architecture.md`](public_dashboards_architecture.md)：公開面板的唯讀邊界、資料責任、快取、前端更新、安全與部署驗收契約。
 
 ## 資料取得、修復與儲存
 

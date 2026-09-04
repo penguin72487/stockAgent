@@ -37,7 +37,7 @@ function number(value, digits = 0) {
 function compact(value) {
   if (value == null || value === "") return "—";
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2}).format(parsed) : "—";
+  return Number.isFinite(parsed) ? Dashboard.formatNumber(parsed, {notation: "compact", maximumFractionDigits: 2}) : "—";
 }
 
 function bytes(value) {
@@ -131,7 +131,7 @@ function syncTimeRangeControl(id, selected) {
   });
 }
 
-function setText(id, value) { $(id).textContent = value; }
+function setText(id, value) { Dashboard.setText(id, value); }
 
 function healthPresentation(health) {
   const key = String(health || "unavailable");
@@ -677,8 +677,7 @@ async function refresh() {
   refreshInFlight = true;
   try {
     const response = await fetchWithTimeout("api/status", {cache: "no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    render(await response.json());
+    render(await Dashboard.readJsonResponse(response, {expectedRoot: "object"}));
   } catch (_error) {
     const status = $("connection-status");
     status.className = "status unavailable";

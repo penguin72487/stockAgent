@@ -2,7 +2,7 @@
 
 const REFRESH_MS = 60000;
 const Dashboard = window.StockAgentDashboard;
-const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store", expectedRoot: "object"});
 const timeAxis = window.StockAgentTimeAxis;
 const number = new Intl.NumberFormat("zh-TW");
 const compact = new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2});
@@ -14,6 +14,7 @@ const series = [
 const hiddenSeries = new Set();
 let range = "1d";
 let refreshInFlight = false;
+const historyRequest = Dashboard.createLatestRequest();
 
 const $ = Dashboard.byId;
 const finite = (value, fallback = 0) => Dashboard.finiteNumber(value, fallback);
@@ -245,11 +246,17 @@ function renderChart(rows) {
 }
 
 async function loadHistory() {
+  const requestedRange = range;
+  const request = historyRequest.begin();
   try {
-    const data = await fetchJson(`api/history?range=${encodeURIComponent(range)}`);
+    const data = await fetchJson(`api/history?range=${encodeURIComponent(requestedRange)}`, {signal: request.signal});
+    if (!request.isCurrent() || requestedRange !== range) return;
     renderChart(Array.isArray(data.history) ? data.history : []);
-  } catch (_error) {
+  } catch (error) {
+    if (!request.isCurrent() || error?.name === "AbortError") return;
     renderChart([]);
+  } finally {
+    request.finish();
   }
 }
 

@@ -99,7 +99,7 @@ function renderDefinitions(definitions) {
   const fragment = document.createDocumentFragment();
   for (const [term, definition] of Object.entries(definitions || {})) {
     const row = document.createElement("div"); const dt = document.createElement("dt"); const dd = document.createElement("dd");
-    const labels = {request: "請求", response_body_bytes: "回應 body", latency: "延遲", percentile: "分位數", error_ratio: "錯誤率", visitor: "訪客隱私", cache_hit_ratio: "快取命中率", retention: "保留範圍"};
+    const labels = {request: "請求", response_body_bytes: "回應 body", latency: "延遲", percentile: "分位數", error_ratio: "錯誤率", visitor: "訪客隱私", cache_hit_ratio: "快取命中率", cache_resident_bytes: "常駐回應 bytes", cache_capacity: "快取容量契約", retention: "保留範圍"};
     dt.textContent = labels[term] || term; dd.textContent = String(definition || "—"); row.append(dt, dd); fragment.append(row);
   }
   $("definition-list").replaceChildren(fragment);
@@ -116,6 +116,8 @@ function render(data) {
   $("cache-ratio").textContent = ratio(data.cache?.hit_ratio);
   $("cache-hits").textContent = count(data.cache?.hits);
   $("cache-builds").textContent = count(data.cache?.builds);
+  $("cache-resident").textContent = `${count(data.cache?.resident_entries)} 筆 · ${bytes(data.cache?.resident_bytes)}`;
+  $("cache-capacity").textContent = `${count(data.cache?.maximum_entries)} 筆 · ${bytes(data.cache?.maximum_resident_bytes)}`;
   $("uptime").textContent = duration(data.uptime_seconds);
   renderChart(data.trend);
   renderWindows(data.windows || {});
@@ -156,7 +158,9 @@ async function refresh({manual = false} = {}) {
     const text = await response.text();
     const downloadedAt = performance.now();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const parsedAtStart = performance.now(); const data = JSON.parse(text); const parsedAt = performance.now();
+    const parsedAtStart = performance.now();
+    const data = Dashboard.validateJsonRoot(JSON.parse(text), "object");
+    const parsedAt = performance.now();
     if (sequence !== requestSequence) return;
     const renderStarted = performance.now(); render(data); const renderedAt = performance.now();
     renderLocalTiming({started, server: serverTiming(response), headers: headersAt - started, download: downloadedAt - headersAt, parse: parsedAt - parsedAtStart, render: renderedAt - renderStarted});
