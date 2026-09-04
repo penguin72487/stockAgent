@@ -651,13 +651,22 @@ set -a; source /etc/environment; set +a
 # 唯讀容量與安全門檻
 run_fintech_python scripts/manage_packed_edge.py audit
 
+# 在 durable full replica 上逐一驗證所有物件；只產 receipt、不刪檔
+./scripts/run_packed_snapshot.sh full-audit
+
 # 分兩階段啟用；enable 只寫 ignore/state，prune 才回收 payload
 run_fintech_python scripts/manage_packed_edge.py enable --apply
 run_fintech_python scripts/manage_packed_edge.py prune --apply
 
 # 按需取得、驗證、materialize；完成後自動再清掉本機 packed payload
 run_fintech_python scripts/manage_packed_edge.py use DATASET
+
+# edge 的五分鐘排程走同一組 durable-peer safety gates；可先看 dry run
+stockagent-data gc --dry-run
+stockagent-data gc
 ```
+
+Edge hot cache 的 TTL 上限為七天；仍在使用會自動續租，刻意長期保留請使用 pin。
 
 此模式禁止在 edge 節點直接發布 cold release；完整使用與回復方式見
 [packed 冷庫文件](docs/packed_dataset_storage.md)。

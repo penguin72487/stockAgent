@@ -138,12 +138,20 @@ def _print_human_status(value: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    edge_state = Path(
+        os.environ.get(
+            "STOCKAGENT_PACKED_EDGE_STATE",
+            "/var/lib/stockagent-packed-edge/state.json",
+        )
+    )
+    edge_mode = edge_state.is_file()
     try:
         if args.command == "status":
             status = materialized_cache_status(
                 args.sync_root,
                 args.materialized_root,
                 dataset=args.dataset,
+                require_objects=not edge_mode,
             )
             if args.human:
                 _print_human_status(status)

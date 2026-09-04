@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,13 @@ if str(REPO_ROOT) not in sys.path:
 from stockagent.data_sync.desync_snapshots import (  # noqa: E402
     DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     SnapshotError,
+    atomic_write_json,
 )
 from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     DEFAULT_COMPRESSION_LEVEL,
     DEFAULT_LOOSE_FILE_THRESHOLD_BYTES,
     DEFAULT_PACK_BUCKETS,
+    audit_packed_store,
     fetch_packed_snapshot,
     fetch_packed_subtree,
     initialize_packed_layout,
@@ -164,6 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
         "objects", help="count stored and manifest-referenced objects; never deletes"
     )
     objects.add_argument("--sync-root")
+    full_audit = subparsers.add_parser(
+        "full-audit", help="hash every stored object and validate every manifest"
+    )
+    full_audit.add_argument("--sync-root")
+    full_audit.add_argument(
+        "--receipt-dir",
+        type=Path,
+        default=Path("/var/lib/stockagent-packed-audit/receipts"),
+    )
     return parser
 
 
@@ -297,6 +309,30 @@ def main(argv: list[str] | None = None) -> int:
                     "deleted": 0,
                 }
             )
+            return 0
+        if args.command == "full-audit":
+            started_ns = time.time_ns()
+
+            def progress(files: int, verified_bytes: int) -> None:
+                print(
+                    f"verified_files={files} verified_bytes={verified_bytes}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            result = audit_packed_store(
+                _sync_root(args.sync_root), progress=progress
+            )
+            completed_ns = time.time_ns()
+            payload = {
+                **result,
+                "started_ns": started_ns,
+                "completed_ns": completed_ns,
+            }
+            args.receipt_dir.mkdir(parents=True, exist_ok=True)
+            receipt = args.receipt_dir / f"packed-full-audit-{completed_ns}.json"
+            atomic_write_json(receipt, payload)
+            _print(payload | {"receipt": str(receipt)})
             return 0
     except (OSError, SnapshotError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

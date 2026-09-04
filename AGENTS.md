@@ -168,6 +168,12 @@ coordinated code, config, test, and documentation change.
   cold publication is disabled in this mode.  On-demand use must temporarily
   re-include, receive, hash, and materialize the exact release, then may prune
   only the redundant local payload copy.
+- On an index-only edge, cache GC may substitute a freshly observed, fully
+  converged durable-peer proof for local payload presence.  Manifest hash,
+  `READY`, pin, lease age, and live-process checks remain mandatory; a
+  disconnected, incomplete, or invalid peer makes eviction fail closed.  Edge
+  leases are capped at seven days; live references renew that seven-day window,
+  while intentional longer retention must use a pin.
 
 ### Multi-writer publication and conflict resolution
 
