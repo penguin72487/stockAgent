@@ -24,6 +24,8 @@ from stockagent.data_sync.desync_snapshots import (  # noqa: E402
     atomic_write_json,
 )
 from stockagent.data_sync.materialized_cache import (  # noqa: E402
+    DEFAULT_CACHE_TTL_DAYS,
+    evict_materialized_snapshots,
     process_references,
     use_materialized_snapshot,
 )
@@ -165,7 +167,9 @@ def _load_state(path: Path) -> dict[str, Any]:
 def _allowed_relpaths(sync_root: Path, state: dict[str, Any]) -> set[str]:
     result: set[str] = set()
     for dataset, snapshot_id in sorted(dict(state.get("hydrating", {})).items()):
-        resolved = resolve_packed_snapshot_id(sync_root, dataset, snapshot_id)
+        resolved = resolve_packed_snapshot_id(
+            sync_root, dataset, snapshot_id, require_objects=False
+        )
         result.update(release_payload_relpaths(resolved))
     return result
 
@@ -190,6 +194,16 @@ def build_parser() -> argparse.ArgumentParser:
     enable.add_argument("--apply", action="store_true")
     prune = sub.add_parser("prune")
     prune.add_argument("--apply", action="store_true")
+    gc = sub.add_parser(
+        "gc", help="renew active leases and evict expired verified edge caches"
+    )
+    gc.add_argument("--dry-run", action="store_true")
+    evict = sub.add_parser(
+        "evict", help="immediately evict one unpinned, unused edge cache"
+    )
+    evict.add_argument("dataset")
+    evict.add_argument("--snapshot-id")
+    evict.add_argument("--dry-run", action="store_true")
     hydrate = sub.add_parser("use")
     hydrate.add_argument("dataset")
     hydrate.add_argument("--snapshot-id")
@@ -278,11 +292,64 @@ def main() -> int:
             receipt = write_edge_receipt(receipt_root, payload)
             _print(payload | {"receipt": str(receipt)})
             return 0
+        if args.command in {"gc", "evict"}:
+            if not peer["ok"]:
+                raise SnapshotError("durable Syncthing peer is not fully converged")
+            proof = {
+                "kind": "syncthing-durable-peer",
+                "validated": True,
+                "peer_name": peer["peer_name"],
+                "completion": peer["completion"],
+                "remote_state": peer["remote_state"],
+                "global_bytes": peer["global_bytes"],
+                "transport": peer["transport"],
+                "crypto": peer["crypto"],
+            }
+            cache = evict_materialized_snapshots(
+                sync_root,
+                args.materialized_root,
+                dataset=args.dataset if args.command == "evict" else None,
+                snapshot_id=(
+                    args.snapshot_id if args.command == "evict" else None
+                ),
+                force=args.command == "evict",
+                dry_run=args.dry_run,
+                external_cold_proof=proof,
+                max_ttl_days=DEFAULT_CACHE_TTL_DAYS,
+            )
+            payload_prune = prune_local_payloads(
+                sync_root,
+                allowed_relpaths=_allowed_relpaths(sync_root, state),
+                apply=not args.dry_run,
+            )
+            payload = {
+                "mode": f"index-only-{args.command}",
+                "peer": peer,
+                "cache": cache,
+                "payload_prune": payload_prune,
+            }
+            receipt = write_edge_receipt(receipt_root, payload)
+            _print(payload | {"receipt": str(receipt)})
+            return 0
         if args.command == "use":
+            if not peer["ok"]:
+                raise SnapshotError("durable Syncthing peer is not fully converged")
+            if args.ttl_days > DEFAULT_CACHE_TTL_DAYS:
+                raise SnapshotError(
+                    "edge cache TTL cannot exceed seven days; use a pin for "
+                    "intentional long-term retention"
+                )
             resolved = (
-                resolve_packed_snapshot_id(sync_root, args.dataset, args.snapshot_id)
+                resolve_packed_snapshot_id(
+                    sync_root,
+                    args.dataset,
+                    args.snapshot_id,
+                    require_objects=False,
+                )
                 if args.snapshot_id
-                else resolve_latest_packed(sync_root, args.dataset)
+                else resolve_latest_packed(
+                    sync_root, args.dataset, require_objects=False
+                )
             )
             snapshot_id = str(resolved.manifest["snapshot_id"])
             hydrating = dict(state.get("hydrating", {}))

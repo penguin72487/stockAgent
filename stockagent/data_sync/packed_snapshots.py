@@ -13,7 +13,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from stockagent.data_sync.desync_snapshots import (
     DEFAULT_MAX_CLOCK_SKEW_SECONDS,
@@ -639,6 +639,7 @@ def _head_candidates(
     *,
     now_ns: int,
     max_clock_skew_seconds: int,
+    require_objects: bool = True,
 ) -> tuple[list[ResolvedSnapshot], list[str], list[tuple[HLC | None, str]]]:
     candidates: list[ResolvedSnapshot] = []
     diagnostics: list[str] = []
@@ -676,7 +677,8 @@ def _head_candidates(
                 raise SnapshotError("head and manifest HLC differ")
             if manifest.get("snapshot_id") != head.get("snapshot_id"):
                 raise SnapshotError("head and manifest snapshot IDs differ")
-            _validate_object_presence(sync_root, manifest)
+            if require_objects:
+                _validate_object_presence(sync_root, manifest)
             candidates.append(
                 ResolvedSnapshot(
                     manifest=manifest,
@@ -701,6 +703,7 @@ def resolve_latest_packed(
     *,
     max_clock_skew_seconds: int = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     now_ns: int | None = None,
+    require_objects: bool = True,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     dataset = validate_slug(dataset, "dataset")
@@ -710,6 +713,7 @@ def resolve_latest_packed(
         dataset,
         now_ns=current_ns,
         max_clock_skew_seconds=max_clock_skew_seconds,
+        require_objects=require_objects,
     )
     if not candidates:
         detail = "; ".join(diagnostics) if diagnostics else "no per-node heads found"
@@ -736,7 +740,11 @@ def resolve_latest_packed(
 
 
 def resolve_packed_snapshot_id(
-    sync_root: Path, dataset: str, snapshot_id: str
+    sync_root: Path,
+    dataset: str,
+    snapshot_id: str,
+    *,
+    require_objects: bool = True,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     dataset = validate_slug(dataset, "dataset")
@@ -747,7 +755,8 @@ def resolve_packed_snapshot_id(
     _validate_manifest(manifest)
     if manifest.get("dataset") != dataset or manifest.get("snapshot_id") != snapshot_id:
         raise SnapshotError(f"manifest identity mismatch: {manifest_path}")
-    _validate_object_presence(sync_root, manifest)
+    if require_objects:
+        _validate_object_presence(sync_root, manifest)
     return ResolvedSnapshot(
         manifest=manifest,
         manifest_path=manifest_path,
@@ -1666,3 +1675,84 @@ def referenced_packed_objects(sync_root: Path) -> set[Path]:
                 _path_under(sync_root, str(item["relpath"]), "object relpath")
             )
     return referenced
+
+
+def audit_packed_store(
+    sync_root: Path,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Hash every stored object and validate every immutable manifest.
+
+    This is deliberately read-only. Unreferenced content-addressed objects are
+    reported but retained because fleet-wide reachability is a separate proof.
+    """
+
+    sync_root = sync_root.resolve()
+    expected: dict[Path, tuple[str, int]] = {}
+    manifests = sorted((sync_root / "manifests").glob("*/*.json"))
+    datasets: set[str] = set()
+    for manifest_path in manifests:
+        manifest = _load_json(manifest_path)
+        _validate_manifest(manifest)
+        dataset = str(manifest["dataset"])
+        snapshot_id = str(manifest["snapshot_id"])
+        if manifest_path.parent.name != dataset or manifest_path.stem != snapshot_id:
+            raise SnapshotError(f"manifest path does not match identity: {manifest_path}")
+        datasets.add(dataset)
+        archive = manifest["archive"]
+        for item in [archive["inventory"], *archive["objects"]]:
+            path = _path_under(sync_root, str(item["relpath"]), "object relpath")
+            descriptor = (_validate_hash(item["sha256"], "object SHA-256"), int(item["bytes"]))
+            previous = expected.setdefault(path, descriptor)
+            if previous != descriptor:
+                raise SnapshotError(f"conflicting object descriptor: {path}")
+
+    for dataset in sorted(datasets):
+        resolve_latest_packed(sync_root, dataset)
+
+    stored: list[Path] = []
+    for kind in ("inventories", "blobs", "packs"):
+        parent = sync_root / "objects" / kind
+        if not parent.exists():
+            continue
+        for path in sorted(item for item in parent.rglob("*") if item.is_file()):
+            relative = path.relative_to(parent)
+            if len(relative.parts) != 2 or relative.parts[0] != path.name[:2]:
+                raise SnapshotError(f"non-canonical packed object path: {path}")
+            _validate_hash(path.name.split(".", 1)[0], "stored object SHA-256")
+            stored.append(path.resolve())
+
+    stored_set = set(stored)
+    missing = sorted(path for path in expected if path not in stored_set)
+    if missing:
+        raise SnapshotError(f"referenced packed object is missing: {missing[0]}")
+
+    verified_bytes = 0
+    for index, path in enumerate(stored, start=1):
+        digest = path.name.split(".", 1)[0]
+        if sha256_file(path) != digest:
+            raise SnapshotError(f"stored packed object checksum mismatch: {path}")
+        size = path.stat().st_size
+        if path in expected and expected[path] != (digest, size):
+            raise SnapshotError(f"stored packed object descriptor mismatch: {path}")
+        verified_bytes += size
+        if progress is not None and (index % 100 == 0 or index == len(stored)):
+            progress(index, verified_bytes)
+
+    referenced_set = set(expected)
+    return {
+        "schema_version": 1,
+        "root": str(sync_root),
+        "valid_manifests": len(manifests),
+        "resolved_datasets": len(datasets),
+        "stored_objects": len(stored_set),
+        "referenced_objects": len(referenced_set),
+        "unreferenced_objects": len(stored_set - referenced_set),
+        "unreferenced_bytes": sum(
+            path.stat().st_size for path in stored_set - referenced_set
+        ),
+        "verified_bytes": verified_bytes,
+        "all_stored_object_sha256_valid": True,
+        "deleted": 0,
+    }

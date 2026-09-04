@@ -13,6 +13,7 @@ from stockagent.data_sync.materialized_cache import (
 from stockagent.data_sync.packed_snapshots import (
     initialize_packed_layout,
     publish_packed_snapshot,
+    resolve_packed_snapshot_id,
 )
 
 
@@ -138,6 +139,111 @@ def test_expired_gc_removes_only_hot_copy_and_can_refetch(tmp_path: Path) -> Non
         sync_root, hot_root, "prices", now_ns=BASE_NS + 19 * DAY_NS
     )
     assert Path(renewed["target"]).is_dir()
+
+
+def test_edge_gc_requires_valid_external_cold_proof_for_missing_payload(
+    tmp_path: Path,
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=7,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    resolved = resolve_packed_snapshot_id(sync_root, "prices", snapshot_id)
+    for item in resolved.manifest["archive"]["objects"]:
+        (sync_root / item["relpath"]).unlink()
+
+    conservative = evict_materialized_snapshots(
+        sync_root, hot_root, now_ns=BASE_NS + 18 * DAY_NS
+    )
+    assert conservative["evicted"] == 0
+    assert conservative["results"][0]["reason"].startswith(
+        "cold-release-incomplete:"
+    )
+
+    proof = {
+        "kind": "syncthing-durable-peer",
+        "validated": True,
+        "peer_name": "durable-a",
+        "completion": 100,
+        "remote_state": "valid",
+    }
+    edge = evict_materialized_snapshots(
+        sync_root,
+        hot_root,
+        now_ns=BASE_NS + 18 * DAY_NS,
+        external_cold_proof=proof,
+    )
+    assert edge["evicted"] == 1
+    assert edge["results"][0]["cold_proof"] == proof
+    assert not Path(lease["target"]).exists()
+
+
+def test_edge_status_reads_metadata_without_local_payload(tmp_path: Path) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    resolved = resolve_packed_snapshot_id(sync_root, "prices", snapshot_id)
+    for item in resolved.manifest["archive"]["objects"]:
+        (sync_root / item["relpath"]).unlink()
+
+    status = materialized_cache_status(
+        sync_root,
+        tmp_path / "hot",
+        dataset="prices",
+        require_objects=False,
+    )
+    assert status["datasets"][0]["cold"]["available"] is True
+    assert status["datasets"][0]["cold"]["snapshot_id"] == snapshot_id
+
+
+def test_edge_gc_clamps_legacy_long_lease_to_seven_days(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=365,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    monkeypatch.setattr(
+        materialized_cache_module,
+        "process_references",
+        lambda target: ["pid=123:maps:/hot/prices"],
+    )
+    proof = {
+        "kind": "syncthing-durable-peer",
+        "validated": True,
+        "peer_name": "durable-a",
+        "completion": 100,
+        "remote_state": "valid",
+    }
+
+    result = evict_materialized_snapshots(
+        sync_root,
+        hot_root,
+        now_ns=BASE_NS + 12 * DAY_NS,
+        external_cold_proof=proof,
+        max_ttl_days=7,
+    )
+
+    assert result["renewed"] == 1
+    assert result["results"][0]["ttl_clamped_from_days"] == 365
+    lease_path = (
+        hot_root
+        / ".cache-state"
+        / "leases"
+        / "prices"
+        / f"{snapshot_id}.json"
+    )
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    assert lease["ttl_days"] == 7
+    assert lease["expires_ns"] == BASE_NS + 19 * DAY_NS
 
 
 def test_gc_auto_renews_a_hot_lease_referenced_by_a_process(

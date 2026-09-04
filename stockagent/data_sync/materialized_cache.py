@@ -480,6 +480,8 @@ def _evict_one(
     force: bool,
     dry_run: bool,
     pinned: set[str],
+    external_cold_proof: Mapping[str, Any] | None,
+    max_ttl_days: float | None,
 ) -> dict[str, Any]:
     dataset, snapshot_id, target, ready_path = _validated_lease_identity(
         materialized_root, lease
@@ -496,16 +498,52 @@ def _evict_one(
         result["reason"] = "pinned"
         return result
 
-    # Size/presence validation is deliberately performed before touching the
-    # hot copy.  This proves the cold release is still locally reconstructable.
+    # A full replica proves recoverability from local objects. An index-only
+    # edge may instead provide a live, validated durable-peer proof assembled by
+    # its Syncthing-aware controller. Metadata and READY identity checks remain
+    # mandatory in both modes.
     try:
-        resolved = resolve_packed_snapshot_id(sync_root, dataset, snapshot_id)
+        resolved = resolve_packed_snapshot_id(
+            sync_root,
+            dataset,
+            snapshot_id,
+            require_objects=external_cold_proof is None,
+        )
     except (OSError, SnapshotError) as exc:
         result["reason"] = f"cold-release-incomplete: {exc}"
         return result
     if resolved.manifest_sha256 != lease.get("manifest_sha256"):
         result["reason"] = "manifest-hash-mismatch"
         return result
+    if external_cold_proof is not None:
+        result["cold_proof"] = dict(external_cold_proof)
+
+    if max_ttl_days is not None:
+        try:
+            lease_ttl_days = float(lease.get("ttl_days", DEFAULT_CACHE_TTL_DAYS))
+        except (TypeError, ValueError):
+            lease_ttl_days = 0.0
+        if math.isfinite(lease_ttl_days) and lease_ttl_days > max_ttl_days:
+            last_used_ns = int(lease.get("last_used_ns", 0))
+            capped_expires_ns = last_used_ns + int(
+                max_ttl_days * 86_400 * 1_000_000_000
+            )
+            lease["ttl_days"] = max_ttl_days
+            lease["expires_ns"] = min(
+                int(lease.get("expires_ns", capped_expires_ns)),
+                capped_expires_ns,
+            )
+            lease["expires_at"] = _utc_iso_from_ns(int(lease["expires_ns"]))
+            lease["ttl_clamped_from_days"] = lease_ttl_days
+            result.update(
+                {
+                    "expires_at": lease["expires_at"],
+                    "ttl_clamped_from_days": lease_ttl_days,
+                    "ttl_days": max_ttl_days,
+                }
+            )
+            if not dry_run:
+                atomic_write_json(lease_path, lease)
 
     if not target.exists():
         result["action"] = "would-mark-cold" if dry_run else "marked-cold"
@@ -586,8 +624,15 @@ def evict_materialized_snapshots(
     force: bool = False,
     dry_run: bool = False,
     now_ns: int | None = None,
+    external_cold_proof: Mapping[str, Any] | None = None,
+    max_ttl_days: float | None = None,
 ) -> dict[str, Any]:
-    """Evict expired leases, or one explicitly selected lease with ``force``."""
+    """Evict expired leases, or one explicitly selected lease with ``force``.
+
+    ``external_cold_proof`` is reserved for a controller that has just verified
+    a complete durable replica. Direct callers normally leave it unset so local
+    packed object presence remains a fail-closed deletion prerequisite.
+    """
 
     sync_root = sync_root.resolve()
     materialized_root = materialized_root.resolve()
@@ -599,6 +644,24 @@ def evict_materialized_snapshots(
         snapshot_id = validate_slug(snapshot_id, "snapshot_id")
     if snapshot_id is not None and dataset is None:
         raise SnapshotError("snapshot_id requires dataset")
+    if max_ttl_days is not None and (
+        not math.isfinite(max_ttl_days) or max_ttl_days <= 0
+    ):
+        raise SnapshotError("max_ttl_days must be positive")
+    if external_cold_proof is not None:
+        required_proof = {
+            "kind": "syncthing-durable-peer",
+            "validated": True,
+            "remote_state": "valid",
+            "completion": 100,
+        }
+        if any(
+            external_cold_proof.get(key) != value
+            for key, value in required_proof.items()
+        ):
+            raise SnapshotError("external cold proof is not a validated durable peer")
+        if not str(external_cold_proof.get("peer_name", "")).strip():
+            raise SnapshotError("external cold proof has no peer name")
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
     pinned = _pinned_snapshot_ids(materialized_root)
     candidates = [
@@ -625,6 +688,8 @@ def evict_materialized_snapshots(
                     force=force,
                     dry_run=dry_run,
                     pinned=pinned,
+                    external_cold_proof=external_cold_proof,
+                    max_ttl_days=max_ttl_days,
                 )
             )
     return {
@@ -650,6 +715,7 @@ def materialized_cache_status(
     *,
     dataset: str | None = None,
     now_ns: int | None = None,
+    require_objects: bool = True,
 ) -> dict[str, Any]:
     """Return cheap cold/hot state without rehashing materialized files."""
 
@@ -672,7 +738,12 @@ def materialized_cache_status(
     rows: list[dict[str, Any]] = []
     for name in datasets:
         try:
-            latest = resolve_latest_packed(sync_root, name, now_ns=current_ns)
+            latest = resolve_latest_packed(
+                sync_root,
+                name,
+                now_ns=current_ns,
+                require_objects=require_objects,
+            )
             latest_id = str(latest.manifest["snapshot_id"])
             cold = {
                 "available": True,
@@ -707,7 +778,10 @@ def materialized_cache_status(
                 lease = lease_by_target.get(str(target))
                 try:
                     historical = resolve_packed_snapshot_id(
-                        sync_root, name, snapshot
+                        sync_root,
+                        name,
+                        snapshot,
+                        require_objects=require_objects,
                     )
                     source_logical_bytes = int(
                         historical.manifest["source"]["logical_bytes"]

@@ -8,11 +8,13 @@ import pytest
 
 from stockagent.data_sync.desync_snapshots import SnapshotError, scan_tree
 from stockagent.data_sync.packed_snapshots import (
+    audit_packed_store,
     fetch_packed_snapshot,
     fetch_packed_subtree,
     initialize_packed_layout,
     publish_packed_snapshot,
     resolve_latest_packed,
+    resolve_packed_snapshot_id,
     verify_packed_snapshot,
 )
 
@@ -69,6 +71,45 @@ def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
         "materialized_verified"
     ]
+
+
+def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    published = publish_packed_snapshot(sync_root, "prices", source)
+    for item in published.manifest["archive"]["objects"]:
+        (sync_root / item["relpath"]).unlink()
+
+    with pytest.raises(SnapshotError, match="not locally complete"):
+        resolve_latest_packed(sync_root, "prices")
+
+    resolved = resolve_latest_packed(sync_root, "prices", require_objects=False)
+    by_id = resolve_packed_snapshot_id(
+        sync_root,
+        "prices",
+        str(published.manifest["snapshot_id"]),
+        require_objects=False,
+    )
+    assert resolved.manifest["snapshot_id"] == published.manifest["snapshot_id"]
+    assert by_id.manifest["snapshot_id"] == published.manifest["snapshot_id"]
+
+
+def test_full_store_audit_hashes_all_objects_without_deleting(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    published = publish_packed_snapshot(sync_root, "prices", source)
+
+    result = audit_packed_store(sync_root)
+
+    assert result["valid_manifests"] == 1
+    assert result["resolved_datasets"] == 1
+    assert result["stored_objects"] == published.manifest["archive"]["object_count"] + 1
+    assert result["all_stored_object_sha256_valid"] is True
+    assert result["deleted"] == 0
 
 
 def test_group_writable_packed_root_repairs_public_directory_modes(
