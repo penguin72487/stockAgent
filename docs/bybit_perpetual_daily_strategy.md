@@ -150,6 +150,25 @@ run_fintech_python train.py \
   --config configs/markets/bybit_perpetual_daily_multi_basis_projection_l1.yaml
 ```
 
+零延遲研究版必須使用獨立的 v7 日資料與外部 funding slice，不能只把 v6
+設定檔的文字改成 00:00：
+
+```bash
+run_fintech_python downloader/materialize_bybit_perpetual_daily.py \
+  --input-dir data_bybit/1m --funding-dir data_bybit/funding \
+  --output-dir data_bybit/perpetual_daily_0000 --workers 12 \
+  --execution-minute-utc 0
+
+run_fintech_python scripts/rebase_bybit_funding_feature_slice.py \
+  --base-feature-path data_bybit/public_features/bybit_crypto_public_daily.parquet \
+  --bybit-daily-dir data_bybit/perpetual_daily_0000 \
+  --output-path data_bybit/public_features/bybit_crypto_public_daily_0000.parquet
+```
+
+v7 的資訊集合截至 D-1 23:59 UTC，以 D 00:00 Kline open 作理想化原地
+成交價；同在 00:00 的 funding 先結算給跨越該邊界的舊倉，再建立新 target。
+這是零延遲 counterfactual，不是真實 order-book fill 聲明。
+
 下載器與 materializer 都會留下 summary/report receipt。任何一步失敗時先修復該步
 並原命令續跑，不要加 `--refresh` 重抓已驗證的歷史資料。
 
@@ -183,6 +202,6 @@ CUDA graph 關閉，避免 recurrent output overwrite；非 4 的尾段仍走同
 - 尚無 qty-step/min-notional 精確下單 rounding、order-book slippage、maker fill
   機率與 latency replay。這些是上線前的獨立 executor 工作，不能由連續研究
   回測的高績效推論為已解決。
-- 00:05 Kline open 位於 00:00 決策截止後五分鐘，是因果正確的 next-trade
-  研究價，但仍不是指定帳戶在真實
-  order book 的保證成交價；上線前必須用 bid/ask、深度與延遲 replay 取代。
+- v6 的 00:05 Kline open 位於 00:00 決策截止後五分鐘；v7 則依使用者指定
+  採 00:00 零延遲原地執行。兩者都是研究價而非指定帳戶在真實 order book
+  的保證成交價；上線前必須用 bid/ask、深度與延遲 replay 取代。

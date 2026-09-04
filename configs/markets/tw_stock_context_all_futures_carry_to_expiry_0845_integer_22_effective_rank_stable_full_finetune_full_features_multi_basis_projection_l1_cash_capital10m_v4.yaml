@@ -1,0 +1,41 @@
+# First-principles v4 training correction for the optional cross-session carry
+# policy. The exact whole-contract account, 08:45 information clock, all 99
+# stock features, all 22/524 temporal bases, 1,936 fixed futures slots, causal
+# 50% volume capacity, TWD 40 per-contract per-side fee, residual cash, and
+# mandatory own-expiry close remain unchanged from v3.
+base_config: tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_funding_safe_trajectory_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-to-expiry-0845-integer-22-effective-rank-stable-full-finetune-capital10m-v4
+
+runner:
+  # The optimizer clock, epoch-zero selection rule, and trainable parameter set
+  # are checkpoint-semantic changes. Never resume the v1/v2/v3 directories.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_stable_full_finetune_cash_capital10m_v4
+  resume: true
+  post_train_infer: false
+
+training:
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 1.0e-4
+
+  # Full-trajectory mode performs exactly one AdamW/scheduler update per epoch.
+  # Reach the base LR in 32 updates, well before the 100-epoch no-improvement
+  # window, instead of spending 256 epochs in warmup.
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 32
+  lr_scheduler_eta_min: 1.0e-6
+
+  # Solvency is necessary but not sufficient: a transferred policy must beat
+  # exact flat cash on target validation or its final futures head is reset to
+  # trainable zero exposure. The source optimizer is never imported.
+  pretrained_initialization_validation_guard: true
+  pretrained_initialization_require_improvement_over_flat_cash: true
+
+  # The old carry source has a different execution objective and weak OOS
+  # evidence. Keep its causal initialization, but allow every target parameter
+  # to adapt to the funding-safe exact account rather than freezing the shared
+  # temporal/market representation.
+  pretrained_initialization_trainable_parameter_prefixes: []
+

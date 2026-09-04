@@ -624,6 +624,39 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 training.train_symbol_compaction_bucket_size
             )
         )
+    fold_continuation_contract: dict[str, Any] = {
+        "warm_start_from_previous_fold": bool(
+            training.warm_start_from_previous_fold
+        ),
+        "pretrained_initialization_root": (
+            None
+            if training.pretrained_initialization_root is None
+            else str(training.pretrained_initialization_root)
+        ),
+        "pretrained_initialization_fold_policy": str(
+            training.pretrained_initialization_fold_policy
+        ),
+        "pretrained_initialization_feature_adapter": str(
+            training.pretrained_initialization_feature_adapter
+        ),
+        "pretrained_initialization_require_exact_backbone": bool(
+            training.pretrained_initialization_require_exact_backbone
+        ),
+        "pretrained_initialization_validation_guard": bool(
+            training.pretrained_initialization_validation_guard
+        ),
+        "pretrained_initialization_trainable_parameter_prefixes": [
+            str(value)
+            for value in training.pretrained_initialization_trainable_parameter_prefixes
+        ],
+    }
+    if training.pretrained_initialization_require_improvement_over_flat_cash:
+        # False is the historical behavior. Omit the inactive default so adding
+        # this opt-in guard does not invalidate unrelated checkpoints created
+        # before the configuration field existed.
+        fold_continuation_contract[
+            "pretrained_initialization_require_improvement_over_flat_cash"
+        ] = True
     contract: dict[str, Any] = {
         "seed": int(training.seed),
         "objective": objective,
@@ -640,32 +673,7 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         },
         "scheduler": _active_scheduler_checkpoint_contract(config),
         "batching": batching_contract,
-        "fold_continuation": {
-            "warm_start_from_previous_fold": bool(
-                training.warm_start_from_previous_fold
-            ),
-            "pretrained_initialization_root": (
-                None
-                if training.pretrained_initialization_root is None
-                else str(training.pretrained_initialization_root)
-            ),
-            "pretrained_initialization_fold_policy": str(
-                training.pretrained_initialization_fold_policy
-            ),
-            "pretrained_initialization_feature_adapter": str(
-                training.pretrained_initialization_feature_adapter
-            ),
-            "pretrained_initialization_require_exact_backbone": bool(
-                training.pretrained_initialization_require_exact_backbone
-            ),
-            "pretrained_initialization_validation_guard": bool(
-                training.pretrained_initialization_validation_guard
-            ),
-            "pretrained_initialization_trainable_parameter_prefixes": [
-                str(value)
-                for value in training.pretrained_initialization_trainable_parameter_prefixes
-            ],
-        },
+        "fold_continuation": fold_continuation_contract,
         "validation_and_stopping": {
             "early_stopping_no_improve_ratio": float(
                 training.early_stopping_no_improve_ratio
@@ -2265,6 +2273,29 @@ def _checkpoint_manifest(
         name: _stable_fingerprint(contract) for name, contract in contracts.items()
     }
     fingerprints["data_schema"] = _stable_fingerprint(data_schema_contract)
+    schema_4_with_inactive_flat_cash_guard_fingerprints: dict[str, str] = {}
+    if (
+        not bool(
+            config.training.pretrained_initialization_require_improvement_over_flat_cash
+        )
+        and "fold_continuation" in contracts["training"]
+    ):
+        # A few schema-4 checkpoints may have been emitted while the newly
+        # introduced inactive default was serialized explicitly. Reconstruct
+        # exactly that one representation. True remains a distinct contract.
+        explicit_false_training_contract = dict(contracts["training"])
+        explicit_false_fold_continuation = dict(
+            explicit_false_training_contract["fold_continuation"]
+        )
+        explicit_false_fold_continuation[
+            "pretrained_initialization_require_improvement_over_flat_cash"
+        ] = False
+        explicit_false_training_contract["fold_continuation"] = (
+            explicit_false_fold_continuation
+        )
+        schema_4_with_inactive_flat_cash_guard_fingerprints["training"] = (
+            _stable_fingerprint(explicit_false_training_contract)
+        )
     settings_fingerprint = _stable_fingerprint(
         {name: fingerprints[name] for name in contracts if name != "data"}
     )
@@ -2381,6 +2412,9 @@ def _checkpoint_manifest(
             ),
             "schema_4_with_inactive_futures_fields": (
                 schema_4_with_inactive_futures_fields_fingerprints
+            ),
+            "schema_4_with_inactive_flat_cash_guard": (
+                schema_4_with_inactive_flat_cash_guard_fingerprints
             ),
             "schema_4_pre_minute_tape_fingerprint": (
                 schema_4_pre_minute_tape_fingerprints
@@ -2715,6 +2749,7 @@ def _validate_checkpoint_manifest(
                 ("data_schema", "schema_4_pre_external_feature_source"),
                 ("model", "schema_4_pre_projection_l1_active_count_scale"),
                 ("model", "schema_4_with_inactive_futures_fields"),
+                ("training", "schema_4_with_inactive_flat_cash_guard"),
                 ("data", "schema_4_pre_minute_tape_fingerprint"),
                 (
                     "data",

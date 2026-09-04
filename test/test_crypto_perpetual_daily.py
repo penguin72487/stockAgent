@@ -62,6 +62,9 @@ from scripts.build_bybit_crypto_public_daily_features import (  # noqa: E402
     _okx_daily,
     _resolve_okx_mapping,
 )
+from scripts.rebase_bybit_funding_feature_slice import (  # noqa: E402
+    rebase_bybit_funding_slice,
+)
 from stockagent.data.crypto_public_web import (  # noqa: E402
     coingecko_snapshot_rows,
     coinmetrics_vintage_rows,
@@ -496,6 +499,115 @@ def test_funding_materialization_matches_event_level_cash_identity(
     assert features[1, "crypto_bybit_funding_available"] == 1.0
 
 
+def test_midnight_execution_settles_boundary_funding_before_new_target(
+    tmp_path: Path,
+) -> None:
+    boundaries = [
+        datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+        datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc),
+    ]
+    daily = pl.DataFrame(
+        {
+            "__session_end_date": [
+                datetime(2024, 1, 1).date(),
+                datetime(2024, 1, 2).date(),
+            ],
+            "open": [100.0, 110.0],
+            "max": [101.0, 111.0],
+            "min": [99.0, 109.0],
+            "close": [100.0, 110.0],
+            "execution_price": [100.0, 110.0],
+            "Trading_Volume": [10.0, 12.0],
+            "execution_volume_equivalent": [20.0, 30.0],
+            "source_minute_rows": [1440, 1440],
+            "unique_minute_rows": [1440, 1440],
+            "first_minute_utc": boundaries,
+            "last_minute_utc": boundaries,
+            "minute_grid_complete": [True, True],
+            "__decision_cutoff_utc": boundaries,
+            "__boundary_utc": boundaries,
+        }
+    )
+    funding_path = tmp_path / "funding.parquet"
+    pl.DataFrame(
+        {
+            "funding_time_utc": [
+                "2024-01-01 00:00:00",
+                "2024-01-01 08:00:00",
+                "2024-01-02 00:00:00",
+            ],
+            "funding_rate": [0.01, 0.001, 0.02],
+            "funding_mark_price": [100.0, 102.0, 110.0],
+            "bybit_funding_contract_version": [3, 3, 3],
+        }
+    ).write_parquet(funding_path)
+
+    output, executable, events = _attach_funding_total_return(
+        daily,
+        funding_path,
+        {
+            "head_complete": True,
+            "coverage_start_utc": "2024-01-01 00:00:00",
+            "coverage_end_utc": "2024-01-02 00:00:00",
+        },
+        execution_minutes_utc=0,
+    )
+
+    # The event at entry time is already settled; events in (start, end],
+    # including the next boundary, belong to the carried position.
+    expected_coefficient = 102.0 / 100.0 * 0.001 + 110.0 / 100.0 * 0.02
+    assert executable == 1
+    assert events == 2
+    assert output[0, "funding_cashflow_coefficient_to_next"] == pytest.approx(
+        expected_coefficient
+    )
+    assert output[0, "funding_rate_sum_to_next"] == pytest.approx(0.021)
+    assert output[0, "bybit_perpetual_contract_version"] == 7
+    assert output[0, "decision_cutoff_utc"] == "00:00"
+    assert output[0, "daily_boundary_utc"] == "00:00"
+
+
+def test_rebase_bybit_funding_slice_preserves_other_public_features() -> None:
+    base = pl.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-01"],
+            "symbol": ["BTCUSDT", "__MARKET__"],
+            "crypto_bybit_funding_rate_sum_1d": [9.0, None],
+            "crypto_public_fear_greed_index": [None, 42.0],
+        }
+    )
+    funding = pl.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-02"],
+            "symbol": ["BTCUSDT", "BTCUSDT"],
+            **{
+                name: [float(index + 1), float(index + 2)]
+                for index, name in enumerate(
+                    (
+                        "crypto_bybit_funding_rate_sum_1d",
+                        "crypto_bybit_funding_realized_annualized",
+                        "crypto_bybit_funding_cashflow_coefficient_1d",
+                        "crypto_bybit_funding_last_rate",
+                        "crypto_bybit_funding_age_hours",
+                        "crypto_bybit_funding_event_count_1d",
+                        "crypto_bybit_funding_available",
+                    )
+                )
+            },
+        }
+    )
+
+    output = rebase_bybit_funding_slice(base, funding)
+
+    btc = output.filter(
+        (pl.col("date") == "2024-01-01") & (pl.col("symbol") == "BTCUSDT")
+    )
+    market = output.filter(pl.col("symbol") == "__MARKET__")
+    assert btc[0, "crypto_bybit_funding_rate_sum_1d"] == pytest.approx(1.0)
+    assert market[0, "crypto_public_fear_greed_index"] == pytest.approx(42.0)
+    assert output.filter(pl.col("date") == "2024-01-02").height == 1
+
+
 def test_daily_features_stop_five_minutes_before_execution_open(tmp_path: Path) -> None:
     timestamps = pl.datetime_range(
         datetime(2024, 1, 1, 0, 0),
@@ -522,6 +634,43 @@ def test_daily_features_stop_five_minutes_before_execution_open(tmp_path: Path) 
     assert incomplete_retained == 0
     assert execution_excluded == 1
     assert daily[0, "close"] == pytest.approx(values[-7] + 0.5)
+    assert daily[0, "execution_price"] == pytest.approx(values[-1])
+    assert daily[0, "last_minute_utc"] == datetime(
+        2024, 1, 1, 23, 59, tzinfo=timezone.utc
+    )
+
+
+def test_daily_features_can_execute_at_midnight_without_using_current_bar(
+    tmp_path: Path,
+) -> None:
+    timestamps = pl.datetime_range(
+        datetime(2024, 1, 1, 0, 0),
+        datetime(2024, 1, 2, 0, 0),
+        interval="1m",
+        eager=True,
+    )
+    values = np.arange(len(timestamps), dtype=np.float64) + 100.0
+    path = tmp_path / "BTCUSDT_features.parquet"
+    pl.DataFrame(
+        {
+            "date": timestamps.dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": values,
+            "max": values + 1.0,
+            "min": values - 1.0,
+            "close": values + 0.5,
+            "Trading_Volume": np.ones(len(timestamps)),
+        }
+    ).write_parquet(path)
+
+    daily, incomplete_retained, execution_excluded = _daily_bars(
+        path,
+        execution_minutes_utc=0,
+    )
+
+    assert daily.height == 1
+    assert incomplete_retained == 0
+    assert execution_excluded == 1
+    assert daily[0, "close"] == pytest.approx(values[-2] + 0.5)
     assert daily[0, "execution_price"] == pytest.approx(values[-1])
     assert daily[0, "last_minute_utc"] == datetime(
         2024, 1, 1, 23, 59, tzinfo=timezone.utc
@@ -1083,6 +1232,7 @@ def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> 
     assert config.trading.buy_fee_rate == pytest.approx(0.00055)
     assert config.trading.sell_fee_rate == pytest.approx(0.00055)
     assert config.trading.crypto_stateful_proximal_allocator is True
+    assert config.trading.crypto_execution_minute_utc == 5
     assert config.trading.crypto_proximal_cost_multiplier == pytest.approx(1.0)
     assert config.trading.max_turnover_ratio == pytest.approx(0.0)
     assert config.evaluation.eval_log_utility_periods_per_year == 365.0
@@ -1106,3 +1256,48 @@ def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> 
     external = external_panel_data_kwargs(config.data)
     assert external["external_include_features"] is True
     assert external["external_include_rules"] is False
+
+
+def test_bybit_22_effective_rank_carry_config_adapts_reference_without_tw_rules() -> None:
+    config = load_config(
+        "configs/markets/"
+        "bybit_perpetual_daily_multi_basis_22_effective_rank_projection_l1_"
+        "carry_syncthing_20260823.yaml"
+    )
+
+    assert config.runner.output_dir == (
+        "artifacts/markets/"
+        "bybit_perpetual_daily_0000_execution_multi_basis_22_effective_rank_"
+        "projection_l1_carry_syncthing_20260823_v2"
+    )
+    assert config.training.pretrained_initialization_root is None
+    assert config.data.parquet_root == "data_bybit_daily_0000_training_20260823"
+    assert config.data.external_feature_path.endswith(
+        "bybit_crypto_public_daily_0000.parquet"
+    )
+    assert config.training.epochs == 1000
+    assert config.training.batch_size_train == 16
+    assert config.training.batch_size_eval == 16
+    assert config.training.compile_loss is False
+    assert config.environment.amp_dtype == "bf16"
+
+    model = config.training.financial_transformer
+    assert len(model.temporal_basis_families) == 22
+    assert sum(model.temporal_basis_components_by_family.values()) == 524
+    assert model.temporal_basis_components_by_family["pca_klt"] == 31
+    assert model.temporal_basis_input == "input_features"
+    assert model.center_long_short_logits is False
+    assert model.portfolio_output_mode == "projection_l1"
+    assert model.projection_l1_scale_by_active_count is True
+
+    assert config.trading.execution_mode == "crypto_perpetual"
+    assert config.trading.frequency == "daily"
+    assert config.trading.long_only is False
+    assert config.trading.buy_fee_rate == pytest.approx(0.00055)
+    assert config.trading.sell_fee_rate == pytest.approx(0.00055)
+    assert config.trading.crypto_stateful_proximal_allocator is True
+    assert config.trading.crypto_execution_minute_utc == 0
+    assert config.trading.reporting_leverage == pytest.approx(1.0)
+    assert config.trading.tw_day_trade_unlimited_margin_conversion is False
+    assert config.data.use_tw_public_rules is False
+    assert config.evaluation.eval_log_utility_periods_per_year == 365.0

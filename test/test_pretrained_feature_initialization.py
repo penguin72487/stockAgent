@@ -15,6 +15,7 @@ from stockagent.training.trainer import (
     _transfer_pretrained_feature_identity,
     _transfer_pretrained_transformer_feature_projection,
     _validate_pretrained_epoch_zero_account_segment,
+    _validate_pretrained_epoch_zero_improves_flat_cash,
 )
 
 
@@ -66,6 +67,29 @@ def test_epoch_zero_guard_accepts_only_alive_exact_account() -> None:
         default_reasons=torch.zeros(4, dtype=torch.int64),
         equity_scale=torch.tensor([1.0, 0.9, 1.1, 1.2]),
     ) == (0, pytest.approx(1.1))
+
+
+def test_epoch_zero_guard_rejects_solvent_policy_worse_than_flat_cash() -> None:
+    with pytest.raises(RuntimeError, match=r"does not improve on flat cash"):
+        _validate_pretrained_epoch_zero_improves_flat_cash(
+            fold_id=2,
+            validation_loss=0.14884938299655914,
+            min_delta=1.0e-4,
+        )
+    with pytest.raises(RuntimeError, match=r"does not improve on flat cash"):
+        _validate_pretrained_epoch_zero_improves_flat_cash(
+            fold_id=2,
+            validation_loss=-1.0e-4,
+            min_delta=1.0e-4,
+        )
+
+
+def test_epoch_zero_guard_accepts_policy_strictly_better_than_flat_cash() -> None:
+    assert _validate_pretrained_epoch_zero_improves_flat_cash(
+        fold_id=1,
+        validation_loss=-0.018756341189146042,
+        min_delta=1.0e-4,
+    ) == pytest.approx(0.018756341189146042)
 
 
 def test_rejected_pretrained_account_resets_only_trainable_action_head() -> None:

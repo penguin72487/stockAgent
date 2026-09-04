@@ -1,0 +1,257 @@
+# Architecture/account/output OFAT for the completed exact-minute v12 model.
+#
+# This is deliberately separate from the active v1 temporal-basis checkpoint
+# ablation.  The v1 suite preserves the exact tensor ABI and trains only the
+# v12 adapter/head prefixes.  Several rows below resize or replace model
+# modules, so pretending that they share that strict recovery contract would
+# make the comparison invalid.
+#
+# Every row, including the internal baseline, starts from the matching
+# completed v12 fold.  Compatible tensors are transferred by feature name,
+# incompatible target tensors keep their deterministic initialization, epoch 0
+# is revalued by the exact minute ledger, and no transfer-only prefix freeze is
+# imposed on active target modules.  The internal baseline therefore measures
+# the same full-finetune protocol as the 19 variants.
+base_config: configs/markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml
+output_root: artifacts/ablations/tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_finetune_ofat_v2
+expected_fold_count: 11
+
+pinned_panel_cache:
+  snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  variant_id: fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577
+  version: 54
+  generation: 3726b829b37d4d56833a80b20280e4a2
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+batch_policy:
+  default_global_train_batch: 64
+  full_history_pooling_global_train_batch: 16
+  oom_fallback_order: [64, 32, 16, 8, 4]
+  resolved_experiment_batches:
+    lookback128_batch4: 4
+    mean_pooling: 16
+    attention_pooling: 16
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+
+  fixed_overrides:
+    runner:
+      resume: true
+      post_train_infer: false
+    training:
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      explain_after_each_fold: false
+      # Use one common, completed v12 policy as epoch 0.  Architecture-changing
+      # rows necessarily require guarded partial transfer instead of false
+      # strict-ABI claims.  Empty prefixes explicitly select full fine-tuning.
+      pretrained_initialization_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+      pretrained_initialization_fold_policy: matching_train_and_validation_years
+      pretrained_initialization_feature_adapter: identity_by_feature_name
+      pretrained_initialization_require_exact_backbone: false
+      pretrained_initialization_validation_guard: true
+      pretrained_initialization_trainable_parameter_prefixes: []
+      record_epoch_curve: true
+      epoch_test_curve: true
+
+  dimensions:
+    - name: lookback_batch
+      enabled: true
+      paths:
+        - training.lookback
+        - training.batch_size_train
+      baseline: [32, 64]
+      values:
+        - name: lookback128_batch4
+          experiment_name: lookback128_batch4
+          description: Lookback 128 with the reference suite's feasible global train/eval batch 4.
+          value: [128, 4]
+          overrides:
+            training:
+              batch_size_eval: 4
+              eval_model_chunk_rows: 4
+              eval_auto_chunk_rows_cap: 4
+
+    - name: information_bottleneck
+      enabled: true
+      baseline: [true, true]
+      variants:
+        - name: latent_only
+          experiment_name: latent_only
+          description: Keep latent factors and disable market tokens.
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: true
+                use_market_tokens: false
+        - name: market_only
+          experiment_name: market_only
+          description: Keep market tokens and disable latent factors.
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: true
+        - name: temporal_only
+          experiment_name: temporal_only
+          description: Disable both cross-symbol bottlenecks.
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: false
+
+    - name: temporal_rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_rope_temporal
+          value: false
+
+    # v12 already enables time position, unlike the reference daily control.
+    # Reverse the reference row so this remains a real one-factor comparison.
+    - name: learned_time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_time_position
+          value: false
+
+    - name: learned_symbol_position
+      enabled: true
+      path: training.financial_transformer.use_symbol_pos
+      baseline: false
+      values:
+        - name: enabled
+          experiment_name: with_symbol_position
+          value: true
+
+    - name: qk_normalization
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_qk_norm
+          value: false
+
+    # v12 uses last/last_only.  Full-history pooling is more memory intensive,
+    # so these two rows use the reference suite's measured batch 16.  This
+    # physical-batch difference is recorded in the experiment contract.
+    - name: temporal_pooling
+      enabled: true
+      baseline: last
+      variants:
+        - name: mean
+          experiment_name: mean_pooling
+          description: Mean pool all temporal states at global train/eval batch 16.
+          overrides:
+            training:
+              batch_size_train: 16
+              batch_size_eval: 16
+              eval_model_chunk_rows: 16
+              eval_auto_chunk_rows_cap: 16
+              financial_transformer:
+                temporal_pooling: mean
+                temporal_query_mode: full_then_last
+        - name: attention
+          experiment_name: attention_pooling
+          description: Learned attention pool over all temporal states at global train/eval batch 16.
+          overrides:
+            training:
+              batch_size_train: 16
+              batch_size_eval: 16
+              eval_model_chunk_rows: 16
+              eval_auto_chunk_rows_cap: 16
+              financial_transformer:
+                temporal_pooling: attention
+                temporal_query_mode: full_then_last
+
+    - name: normalization
+      enabled: true
+      path: training.financial_transformer.norm_type
+      baseline: rmsnorm
+      values:
+        - name: layernorm
+          experiment_name: layernorm
+          description: LayerNorm control; raw_features basis input is the required compatible basis path.
+          value: layernorm
+          overrides:
+            training:
+              transformer_base_portfolio:
+                temporal_basis_input: raw_features
+              financial_transformer:
+                temporal_basis_input: raw_features
+
+    - name: feed_forward
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      baseline: swiglu
+      values:
+        - name: gelu
+          experiment_name: gelu_ffn
+          value: gelu
+
+    - name: initial_capital
+      enabled: true
+      path: trading.volume_participation_equity
+      baseline: 10000000.0
+      values:
+        - name: 1m
+          experiment_name: initial_capital_1m
+          value: 1000000.0
+        - name: 100m
+          experiment_name: initial_capital_100m
+          value: 100000000.0
+
+    - name: portfolio_output_mode
+      enabled: true
+      baseline: projection_l1
+      variants:
+        - name: activation_l1
+          experiment_name: output_activation_l1
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: activation_l1
+        - name: logits
+          experiment_name: output_logits
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: logits
+        - name: signed_softmax
+          experiment_name: output_signed_softmax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_softmax
+        - name: signed_entmax15
+          experiment_name: output_signed_entmax15
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_entmax15
+        - name: signed_sparsemax
+          experiment_name: output_signed_sparsemax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_sparsemax

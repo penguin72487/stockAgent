@@ -401,6 +401,107 @@ def test_hybrid_minute_v12_basis_ablation_preserves_full_checkpoint_abi(
         )
 
 
+def test_hybrid_minute_v12_reference_architecture_ofat_uses_fair_finetune_control(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/"
+        "tw_day_trade_hybrid_minute_v12_reference_architecture_"
+        "checkpoint_finetune_ofat_v2.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    names = [row["name"] for row in experiments]
+
+    assert names == [
+        "baseline",
+        "lookback128_batch4",
+        "latent_only",
+        "market_only",
+        "temporal_only",
+        "no_rope_temporal",
+        "no_time_position",
+        "with_symbol_position",
+        "no_qk_norm",
+        "mean_pooling",
+        "attention_pooling",
+        "layernorm",
+        "gelu_ffn",
+        "initial_capital_1m",
+        "initial_capital_100m",
+        "output_activation_l1",
+        "output_logits",
+        "output_signed_softmax",
+        "output_signed_entmax15",
+        "output_signed_sparsemax",
+    ]
+    assert spec["expected_fold_count"] == 11
+    assert spec["runtime"]["parallel_jobs"] == 1
+    assert spec["output_root"].endswith("checkpoint_finetune_ofat_v2")
+    assert spec["pinned_panel_cache"] == {
+        "snapshot_id": (
+            "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba"
+        ),
+        "variant_id": (
+            "fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577"
+        ),
+        "version": 54,
+        "generation": "3726b829b37d4d56833a80b20280e4a2",
+        "source_hash": (
+            "31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0"
+        ),
+    }
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    loaded = {run["name"]: load_config(run["config_path"]) for run in runs}
+    baseline = loaded["baseline"]
+    baseline_model = baseline.training.financial_transformer
+    assert len(baseline.data.feature_include) == 99
+    assert baseline.data.feature_exclude == []
+    assert len(baseline_model.temporal_basis_families) == 22
+    assert sum(baseline_model.temporal_basis_components_by_family.values()) == 524
+    assert baseline_model.use_time_pos is True
+    assert baseline_model.temporal_pooling == "last"
+    assert baseline_model.temporal_query_mode == "last_only"
+    assert baseline.training.batch_size_train == 64
+    assert baseline.trading.volume_participation_equity == 10_000_000.0
+
+    for config in loaded.values():
+        training = config.training
+        assert training.epochs == 1000
+        assert training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+        assert training.pretrained_initialization_root.endswith(
+            "tw_day_trade_hybrid_minute_22_effective_rank_pretrained_"
+            "exact_official_close_commission20_capital10m_all_features_v12"
+        )
+        assert training.pretrained_initialization_require_exact_backbone is False
+        assert training.pretrained_initialization_validation_guard is True
+        assert training.pretrained_initialization_trainable_parameter_prefixes == []
+        assert config.data.feature_exclude == []
+        model = training.financial_transformer
+        assert len(model.temporal_basis_families) == 22
+        assert sum(model.temporal_basis_components_by_family.values()) == 524
+
+    assert loaded["lookback128_batch4"].training.lookback == 128
+    assert loaded["lookback128_batch4"].training.batch_size_train == 4
+    assert loaded["latent_only"].training.financial_transformer.use_market_tokens is False
+    assert loaded["market_only"].training.financial_transformer.use_latent_factors is False
+    assert loaded["temporal_only"].training.financial_transformer.use_latent_factors is False
+    assert loaded["temporal_only"].training.financial_transformer.use_market_tokens is False
+    assert loaded["no_time_position"].training.financial_transformer.use_time_pos is False
+    assert loaded["with_symbol_position"].training.financial_transformer.use_symbol_pos is True
+    assert loaded["mean_pooling"].training.financial_transformer.temporal_pooling == "mean"
+    assert loaded["attention_pooling"].training.financial_transformer.temporal_pooling == "attention"
+    assert loaded["mean_pooling"].training.batch_size_train == 16
+    assert loaded["attention_pooling"].training.batch_size_train == 16
+    assert loaded["layernorm"].training.financial_transformer.norm_type == "layernorm"
+    assert loaded["layernorm"].training.financial_transformer.temporal_basis_input == "raw_features"
+    assert loaded["gelu_ffn"].training.financial_transformer.ffn_type == "gelu"
+    assert loaded["initial_capital_1m"].trading.volume_participation_equity == 1_000_000.0
+    assert loaded["initial_capital_100m"].trading.volume_participation_equity == 100_000_000.0
+
+
 def test_inherited_experiment_override_renames_and_patches_one_row(
     tmp_path: Path,
 ) -> None:

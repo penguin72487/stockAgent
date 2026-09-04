@@ -34,15 +34,16 @@ for path in "${required_data[@]}"; do
   fi
 done
 
-echo "[all-futures-carry-to-expiry] v3 funding-safe exact account; one optimizer step per full trajectory"
-echo "[all-futures-carry-to-expiry] guarded fold-matched initialization; exact target loss; 99 stock features; 22 families/524 components; TWD 10M"
+echo "[all-futures-carry-to-expiry] v4 funding-safe exact account; one optimizer step per full trajectory; 32-epoch warmup"
+echo "[all-futures-carry-to-expiry] fold-matched initialization must beat flat cash; full target fine-tune; exact target loss"
+echo "[all-futures-carry-to-expiry] 99 stock features; 22 families/524 components; 1,936 futures slots; TWD 10M"
 echo "[all-futures-carry-to-expiry] exact whole contracts; prior-volume 50%; cross-session carry; settlement-valued expiry close"
 echo "[all-futures-carry-to-expiry] missing official expiry settlement quarantines the complete physical contract; no redistribution"
 echo "[all-futures-carry-to-expiry] full-notional collateral is a conservative research assumption; no stock T+3 ledger"
 
 # train.py owns fold isolation and DDP. Do not wrap this command in torchrun.
 run_fintech_python train.py \
-  --config configs/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_pretrained_guard_funding_safe_trajectory_full_features_multi_basis_projection_l1_cash_capital10m.yaml \
+  --config configs/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_stable_full_finetune_full_features_multi_basis_projection_l1_cash_capital10m_v4.yaml \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 56 \
   --torch-compile-threads 16 \

@@ -19,10 +19,11 @@ from common import PersistentProgress, atomic_write_text
 from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet
 
 
-CONTRACT_VERSION = 6
+LEGACY_CONTRACT_VERSION = 6
+MIDNIGHT_EXECUTION_CONTRACT_VERSION = 7
 FUNDING_CONTRACT_VERSION = 3
 DECISION_CUTOFF_MINUTES_UTC = 0
-EXECUTION_MINUTES_UTC = 5
+DEFAULT_EXECUTION_MINUTES_UTC = 5
 EXPECTED_MINUTE_ROWS = 1440
 MODEL_LOOKBACK_DAYS = 32
 MODEL_RAW_SESSION_WINDOW_DAYS = MODEL_LOOKBACK_DAYS + 1
@@ -46,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Materialize midnight-cutoff Bybit perpetual daily features and "
-            "00:05 UTC executions with "
+            "00:00 or legacy 00:05 UTC executions with "
             "official funding cash flows embedded in a total-return adjclose."
         )
     )
@@ -59,7 +60,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--execution-minute-utc",
+        type=int,
+        choices=(0, 5),
+        default=DEFAULT_EXECUTION_MINUTES_UTC,
+        help=(
+            "minute after 00:00 UTC used for the executor-only Kline open; "
+            "0 is the zero-latency research contract and 5 preserves v6"
+        ),
+    )
     return parser.parse_args()
+
+
+def _contract_version(execution_minutes_utc: int) -> int:
+    if execution_minutes_utc == 0:
+        return MIDNIGHT_EXECUTION_CONTRACT_VERSION
+    if execution_minutes_utc == 5:
+        return LEGACY_CONTRACT_VERSION
+    raise ValueError("execution_minutes_utc must be 0 or 5")
+
+
+def _clock_hhmm(execution_minutes_utc: int) -> str:
+    _contract_version(execution_minutes_utc)
+    return f"00:{execution_minutes_utc:02d}"
 
 
 def _sha256(path: Path) -> str:
@@ -128,7 +152,12 @@ def _standard_instruments(path: Path) -> pl.DataFrame:
     ).sort("code")
 
 
-def _daily_bars(source_path: Path) -> tuple[pl.DataFrame, int, int]:
+def _daily_bars(
+    source_path: Path,
+    *,
+    execution_minutes_utc: int = DEFAULT_EXECUTION_MINUTES_UTC,
+) -> tuple[pl.DataFrame, int, int]:
+    _contract_version(execution_minutes_utc)
     schema = pq.read_schema(source_path)
     required = {"date", "open", "max", "min", "close", "Trading_Volume"}
     missing = required - set(schema.names)
@@ -197,7 +226,7 @@ def _daily_bars(source_path: Path) -> tuple[pl.DataFrame, int, int]:
         .with_columns(
             (
                 pl.col("__decision_cutoff_utc")
-                + pl.duration(minutes=EXECUTION_MINUTES_UTC)
+                + pl.duration(minutes=execution_minutes_utc)
             ).alias("__boundary_utc")
         )
         .join(
@@ -273,7 +302,7 @@ def _daily_bars(source_path: Path) -> tuple[pl.DataFrame, int, int]:
         grouped.select((~pl.col("execution_available")).sum()).item()
     )
     # A missing feature minute must never erase a real execution mark. Retain
-    # every 00:05-valued row for recurrent valuation and funding accounting;
+    # every execution-valued row for recurrent valuation and funding accounting;
     # policy_tradable remains false until a complete causal 32-day feature
     # window (plus the predecessor required by delta features) is available.
     executable_marks = grouped.filter(pl.col("execution_available")).sort(
@@ -286,7 +315,11 @@ def _attach_funding_total_return(
     daily: pl.DataFrame,
     funding_path: Path,
     coverage_row: dict[str, object],
+    *,
+    execution_minutes_utc: int = DEFAULT_EXECUTION_MINUTES_UTC,
 ) -> tuple[pl.DataFrame, int, int]:
+    contract_version = _contract_version(execution_minutes_utc)
+    execution_clock = _clock_hhmm(execution_minutes_utc)
     if "execution_available" not in daily.columns:
         daily = daily.with_columns(
             (
@@ -406,8 +439,10 @@ def _attach_funding_total_return(
         row_count, np.datetime64("NaT", "us"), dtype="datetime64[us]"
     )
     # Model-side funding features end at the midnight decision cutoff, while
-    # realized PnL above is cut on the 00:05 execution interval. Keeping these
-    # clocks separate preserves the explicit five-minute compute/order lag.
+    # Model features always stop at the 00:00 decision cutoff. For the v7
+    # zero-latency research contract, a funding event exactly on the boundary
+    # settles before the new 00:00 target is valued: (start, end] belongs to the
+    # position carried into end, while a newly opened position starts after it.
     for row in range(1, row_count):
         start = decision_cutoffs[row - 1]
         end = decision_cutoffs[row]
@@ -466,11 +501,11 @@ def _attach_funding_total_return(
         pl.Series("funding_last_rate_previous_session", previous_last_rates),
         pl.Series("funding_age_hours_at_decision", previous_funding_age_hours),
         pl.Series("return_quarantined", quarantined),
-        pl.lit(CONTRACT_VERSION, dtype=pl.Int16).alias(
+        pl.lit(contract_version, dtype=pl.Int16).alias(
             "bybit_perpetual_contract_version"
         ),
         pl.lit("00:00", dtype=pl.String).alias("decision_cutoff_utc"),
-        pl.lit("00:05", dtype=pl.String).alias("daily_boundary_utc"),
+        pl.lit(execution_clock, dtype=pl.String).alias("daily_boundary_utc"),
     ).with_columns(pl.col("__session_end_date").cast(pl.String).alias("date"))
     output_columns = [
         "date",
@@ -521,6 +556,9 @@ def main() -> None:
     input_dir = Path(args.input_dir)
     funding_dir = Path(args.funding_dir)
     output_dir = Path(args.output_dir)
+    execution_minutes_utc = int(args.execution_minute_utc)
+    contract_version = _contract_version(execution_minutes_utc)
+    execution_clock = _clock_hhmm(execution_minutes_utc)
     output_dir.mkdir(parents=True, exist_ok=True)
     instruments = _standard_instruments(funding_dir / "instruments.csv")
     requested = {
@@ -549,7 +587,7 @@ def main() -> None:
     records = instruments.to_dicts()
     progress = PersistentProgress(
         output_dir / "progress.json",
-        label="Bybit 永續日頻 00:00 決策 / 00:05 執行",
+        label=f"Bybit 永續日頻 00:00 決策 / {execution_clock} 執行",
         total=len(records),
         unit="symbol",
         basis="completed local 1m plus official funding materializations",
@@ -581,7 +619,7 @@ def main() -> None:
                     "bybit_perpetual_contract_version"
                 ].max()
             )
-            == CONTRACT_VERSION
+            == contract_version
         ):
             frame = pl.read_parquet(target)
             return MaterializeResult(
@@ -595,9 +633,15 @@ def main() -> None:
                 str(target),
                 _sha256(target),
             )
-        daily, incomplete_retained, execution_excluded = _daily_bars(source)
+        daily, incomplete_retained, execution_excluded = _daily_bars(
+            source,
+            execution_minutes_utc=execution_minutes_utc,
+        )
         output, executable, events = _attach_funding_total_return(
-            daily, funding_path, coverage[symbol]
+            daily,
+            funding_path,
+            coverage[symbol],
+            execution_minutes_utc=execution_minutes_utc,
         )
         _write_parquet_atomic(output, target)
         return MaterializeResult(
@@ -647,14 +691,18 @@ def main() -> None:
     atomic_write_text(output_dir / "symbols.csv", selected_instruments.write_csv())
     failed = [item for item in ordered if item.status == "failed"]
     summary = {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version,
         "product": "bybit_standard_linear_usdt_perpetual",
         "decision_cutoff_utc": "00:00",
-        "execution_boundary_utc": "00:05",
-        "decision_to_execution_lag_minutes": 5,
+        "execution_boundary_utc": execution_clock,
+        "decision_to_execution_lag_minutes": execution_minutes_utc,
         "position_contract": "daily_rebalance_positions_may_carry",
         "feature_session_contract": "previous_calendar_day_0000_through_2359_utc",
-        "execution_price_contract": "first_official_1m_kline_open_at_00:05_utc_after_five_minute_decision_lag",
+        "execution_price_contract": (
+            "first_official_1m_kline_open_at_00:00_utc_zero_latency_research_assumption"
+            if execution_minutes_utc == 0
+            else "first_official_1m_kline_open_at_00:05_utc_after_five_minute_decision_lag"
+        ),
         "funding_contract": "official_event_rate_times_official_hourly_mark_open_over_execution_price",
         "symbols": len(records),
         "completed_symbols": len(records) - len(failed),

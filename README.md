@@ -545,6 +545,12 @@ Vast 要發布完整可部署 run 時，先在 `configs/data_sync/cold_artifacts
 dataset，並以 `maximum_file_bytes: null` 明確要求包含所有檔案；仍須通過 lifecycle、
 穩定時間、inventory 與 packed-object 驗證。
 
+`artifacts/ablations` 另有自動生命週期維護。它動態為每個通過完整 lifecycle 的 run
+建立穩定 dataset ID，逐一發布完整內容；七日租期到期後，仍須再次驗證 exact packed
+release、確認無程序引用，並確認 penguin 的 `stockagent-packed` 完整收斂，才會刪除本機
+來源。安裝方式：`sudo ./scripts/install_cold_artifact_maintenance.sh`。預設每五分鐘執行，
+一次最多發布一個 run；所有 gate 都是 fail closed。
+
 ### cold artifact 完整命令
 
 ```text

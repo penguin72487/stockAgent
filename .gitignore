@@ -233,3 +233,5 @@ data_fred_crypto_macro/*
 data_tw_shioaji_history/*
 data_bybit_daily_training_20260823/*
 data_bybit_daily_synced
+data_bybit_daily_0000_materialized_20260823/*
+data_bybit_daily_0000_training_20260823/*
