@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import pytest
 import requests
 
 from stockagent.live import quote_provider
@@ -20,6 +21,7 @@ from stockagent.live.quote_provider import (
     load_symbol_yahoo_map,
     fetch_yahoo_last_prices,
     load_prices_csv,
+    seed_tw_opening_snapshot_cache,
 )
 
 
@@ -67,6 +69,7 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
                     np.array([100.0, 200.0]),
                     state_dir=tmp_path,
                     timeout_seconds=2.0,
+                    purpose="opening_signal",
                 )
             )
         except BaseException as exc:  # pragma: no cover - asserted below
@@ -81,16 +84,66 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
     receipts = quote_provider.serve_shared_day_trade_quote_requests(
         state_dir=tmp_path,
         max_requests=1,
+        allowed_purposes={"opening_signal"},
     )
     thread.join(timeout=2.0)
 
     assert not errors
     assert not thread.is_alive()
     assert receipts[0]["available_count"] == 2
+    assert receipts[0]["purpose"] == "opening_signal"
     assert result[0].source == "shioaji:stock_snapshot+shared_day_trade_engine"
     np.testing.assert_allclose(result[0].prices, [101.0, 202.0])
     np.testing.assert_allclose(result[0].bid_prices, [100.5, 201.5])
     np.testing.assert_array_equal(result[0].available_mask, [True, True])
+
+
+def test_shared_quote_broker_prioritizes_opening_request_in_protected_window(
+    tmp_path, monkeypatch
+) -> None:
+    expected = PriceSnapshot(
+        prices=np.array([101.0]),
+        source="shioaji:fixture",
+        available_count=1,
+        requested_count=1,
+        available_mask=np.array([True]),
+    )
+    monkeypatch.setattr(
+        quote_provider,
+        "fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: expected,
+    )
+    requests_dir, responses_dir = quote_provider._day_trade_quote_broker_paths(
+        tmp_path
+    )
+    deadline = time.time() + 10.0
+    base = {
+        "schema_version": 1,
+        "requested_at_utc": datetime.now().astimezone().isoformat(),
+        "deadline_epoch": deadline,
+        "symbols": ["2330"],
+        "fallback_prices": [100.0],
+        "requester_pid": 1,
+    }
+    quote_provider._atomic_write_json(
+        requests_dir / "a-interactive.json",
+        {**base, "request_id": "a-interactive", "purpose": "interactive"},
+    )
+    quote_provider._atomic_write_json(
+        requests_dir / "b-opening.json",
+        {**base, "request_id": "b-opening", "purpose": "opening_signal"},
+    )
+
+    receipts = quote_provider.serve_shared_day_trade_quote_requests(
+        state_dir=tmp_path,
+        max_requests=1,
+        allowed_purposes={"opening_signal"},
+    )
+
+    assert [row["request_id"] for row in receipts] == ["b-opening"]
+    assert (requests_dir / "a-interactive.json").exists()
+    assert not (requests_dir / "b-opening.json").exists()
+    assert (responses_dir / "b-opening.json").exists()
 
 
 def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:
@@ -419,6 +472,7 @@ def test_tw_opening_snapshot_is_single_flight_and_shared_across_models(
     monkeypatch.setenv(
         "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
     )
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_NO_OPEN_RETRY_SECONDS", "0")
     monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", None)
     quote_provider._TW_MIS_OPENING_CACHE.clear()
 
@@ -507,6 +561,7 @@ def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
     monkeypatch.setenv(
         "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
     )
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_NO_OPEN_RETRY_SECONDS", "0")
     monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", None)
     quote_provider._TW_MIS_OPENING_CACHE.clear()
 
@@ -527,6 +582,50 @@ def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
     assert np.isfinite(first.open_prices[0])
     assert np.isnan(first.open_prices[1])
     np.testing.assert_allclose(second.open_prices, [101.0, 201.0])
+
+
+def test_tw_opening_snapshot_shares_shioaji_fallback_without_refetch(
+    monkeypatch, tmp_path
+) -> None:
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
+    )
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_NO_OPEN_RETRY_SECONDS", "10")
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", None)
+    quote_provider._TW_MIS_OPENING_CACHE.clear()
+    snapshot = PriceSnapshot(
+        prices=np.array([101.0, 202.0]),
+        source="shioaji:stock_snapshot+prepared_limits",
+        available_count=2,
+        requested_count=2,
+        available_mask=np.ones((2,), dtype=bool),
+        open_prices=np.array([101.0, np.nan]),
+        timestamps_ms=np.full((2,), now_ms, dtype=np.int64),
+        exchange_timestamps_ms=np.full((2,), now_ms, dtype=np.int64),
+    )
+
+    seeded = seed_tw_opening_snapshot_cache(
+        ["2330", "ILLIQUID"],
+        snapshot,
+        parquet_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        quote_provider,
+        "fetch_tw_mis_last_prices",
+        lambda *args, **kwargs: pytest.fail("shared opening batch refetched"),
+    )
+    reused = fetch_tw_mis_opening_snapshot(
+        ["2330", "ILLIQUID"],
+        np.array([100.0, 200.0]),
+        parquet_root=tmp_path,
+    )
+
+    assert seeded["accepted_count"] == 2
+    assert reused.available_count == 2
+    assert reused.source == "shioaji:stock_snapshot+shared_opening_snapshot+cache_hit"
+    assert reused.open_prices[0] == pytest.approx(101.0)
+    assert np.isnan(reused.open_prices[1])
 
 
 def test_tw_opening_snapshot_counts_causal_no_open_row_as_source_coverage(
@@ -573,7 +672,9 @@ def test_tw_opening_snapshot_counts_causal_no_open_row_as_source_coverage(
     assert second.available_count == 1
     assert np.isnan(first.open_prices[0])
     assert np.isnan(second.open_prices[0])
-    assert calls == 2
+    # One scheduled opening batch freezes source-response coverage briefly so
+    # the next model does not repeat a full-market request for a no-print row.
+    assert calls == 1
 
 
 def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:

@@ -1042,6 +1042,55 @@ def test_free_public_registry_can_use_specialized_summary(tmp_path: Path) -> Non
     assert rows[0]["rows"] == 123
 
 
+def test_free_public_registry_explicit_alias_delegates_to_dedicated_group(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "configs"
+    config.mkdir()
+    (config / "free_public_data_sources.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "dedicated_history",
+                        "provider": "fixture",
+                        "dataset_group": "taifex-public-history",
+                        "implementation_status": "implemented",
+                        "registry_alias": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = dashboard._free_public_registry_sources(
+        tmp_path, now=datetime(2026, 8, 16, 5, 1, tzinfo=UTC)
+    )
+
+    assert rows[0]["registry_alias"] is True
+    assert rows[0]["status"] == "current"
+    assert rows[0]["automation_eligible"] is False
+    assert rows[0]["parent_id"] == "group:taifex-public-history"
+
+
+def test_taifex_public_group_rows_sum_distinct_manifest_layers() -> None:
+    payloads = [
+        {
+            "dataset": "taifex_public_history",
+            "datasets": [{"rows": 10}, {"rows": 20}],
+        },
+        {
+            "dataset": "taifex_openapi_point_in_time_catalog",
+            "datasets": [{"rows": 30}, {"rows": 40}],
+        },
+        {"dataset": "taifex_vix_daily_recent", "rows": 5},
+        {"state": "complete", "datasets": [{"rows": 10}, {"rows": 20}]},
+    ]
+
+    assert dashboard._extract_group_rows("taifex-public-history", payloads) == 105
+
+
 def test_product_granularity_and_credential_contracts_are_public_but_secret_free(
     tmp_path: Path,
 ) -> None:

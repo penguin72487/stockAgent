@@ -211,6 +211,14 @@ def _project_temporal_basis_model_config(
         # post-schema field so merely upgrading the runtime cannot invalidate
         # an otherwise identical model/checkpoint contract.
         projected.pop("feature_bottleneck_dim", None)
+    if not bool(projected.get("causal_feature_rms_normalization", False)):
+        # The disabled branch is the exact historical forward: no scale or
+        # active-mask buffers are consulted.  The threshold and epsilon are
+        # consequently unreachable configuration, so adding their defaults to
+        # the dataclass must not invalidate older inference checkpoints.
+        projected.pop("causal_feature_rms_normalization", None)
+        projected.pop("causal_feature_min_active_dates", None)
+        projected.pop("causal_feature_scale_epsilon", None)
     for field_name in (
         "futures_denomination_aware_output",
         "futures_current_open_feature",
@@ -2236,6 +2244,26 @@ def _checkpoint_manifest(
         schema_4_with_inactive_futures_fields_fingerprints["model"] = (
             _stable_fingerprint(historical_model_contract)
         )
+    schema_4_with_inactive_causal_feature_fields_fingerprints: dict[str, str] = {}
+    if "causal_feature_rms_normalization" not in model_contract["model"]:
+        # A short-lived schema-4 runtime serialized the new normalization
+        # controls even when the branch was disabled. Accept that spelling,
+        # but never normalize an enabled branch away.
+        historical_model_values = dict(model_contract["model"])
+        historical_model_values.update(
+            {
+                "causal_feature_rms_normalization": False,
+                "causal_feature_min_active_dates": 1,
+                "causal_feature_scale_epsilon": 1e-6,
+            }
+        )
+        historical_model_contract = {
+            **model_contract,
+            "model": historical_model_values,
+        }
+        schema_4_with_inactive_causal_feature_fields_fingerprints["model"] = (
+            _stable_fingerprint(historical_model_contract)
+        )
     schema_3_model_contract = {
         "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _schema_3_checkpoint_model_values(active_model),
@@ -2415,6 +2443,9 @@ def _checkpoint_manifest(
             ),
             "schema_4_with_inactive_flat_cash_guard": (
                 schema_4_with_inactive_flat_cash_guard_fingerprints
+            ),
+            "schema_4_with_inactive_causal_feature_fields": (
+                schema_4_with_inactive_causal_feature_fields_fingerprints
             ),
             "schema_4_pre_minute_tape_fingerprint": (
                 schema_4_pre_minute_tape_fingerprints
@@ -2750,6 +2781,7 @@ def _validate_checkpoint_manifest(
                 ("model", "schema_4_pre_projection_l1_active_count_scale"),
                 ("model", "schema_4_with_inactive_futures_fields"),
                 ("training", "schema_4_with_inactive_flat_cash_guard"),
+                ("model", "schema_4_with_inactive_causal_feature_fields"),
                 ("data", "schema_4_pre_minute_tape_fingerprint"),
                 (
                     "data",

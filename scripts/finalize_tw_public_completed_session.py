@@ -39,7 +39,7 @@ from scripts.watch_tw_public_publication_group import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-CLOSE_PHASES = ("close_final", "close_revision", "close_initial")
+CLOSE_PHASES = ("close_final", "close_revision", "close_initial", "close_event")
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +69,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expected-date", default=None)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--public-feature-incremental-days",
+        type=int,
+        default=14,
+        help=(
+            "Recompute this trailing calendar-day window and stream-copy the "
+            "receipt-verified historical feature prefix. Set 0 for a full rebuild."
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -220,19 +229,33 @@ def _derived_state(
 
 
 def _build_commands(
-    *, live_root: Path, expected_date: str, workers: int
+    *,
+    live_root: Path,
+    expected_date: str,
+    workers: int,
+    public_feature_incremental_days: int = 14,
 ) -> list[list[str]]:
-    return _derived_data_commands(
+    commands = _derived_data_commands(
         live_root=live_root,
         expected_latest=expected_date,
         workers=workers,
     )
+    if public_feature_incremental_days:
+        commands[-1].extend(
+            [
+                "--incremental-tail-days",
+                str(int(public_feature_incremental_days)),
+            ]
+        )
+    return commands
 
 
 def main() -> int:
     args = parse_args()
     if args.workers <= 0:
         raise ValueError("--workers must be positive")
+    if args.public_feature_incremental_days < 0:
+        raise ValueError("--public-feature-incremental-days must be non-negative")
     started = datetime.now(TAIPEI)
     live_root = args.live_root.expanduser().resolve(strict=True)
     publication_root = _repo_path(args.publication_root).resolve(strict=False)
@@ -292,6 +315,9 @@ def main() -> int:
                     live_root=live_root,
                     expected_date=expected_date,
                     workers=args.workers,
+                    public_feature_incremental_days=(
+                        args.public_feature_incremental_days
+                    ),
                 ),
                 strict=True,
             ):

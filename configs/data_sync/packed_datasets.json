@@ -268,6 +268,32 @@
       "note": "TAIFEX option daily history and receipts."
     },
     {
+      "dataset": "taifex-public-history",
+      "source": "data_taifex_public_history",
+      "role": "training-and-point-in-time-audit",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_taifex_public_history.py",
+        "download_taifex_openapi_catalog.py",
+        "download_taifex_vix_recent.py"
+      ],
+      "note": "Official post-close put/call ratios plus institutional and large-trader positioning, and non-duplicated point-in-time snapshots of the discovered TAIFEX OpenAPI catalog. Raw receipts are immutable; post-close rows use next-session causal availability. Older positioning beyond the free rolling web window requires a TAIFEX historical-data application."
+    },
+    {
+      "dataset": "cftc-legacy-pre2000",
+      "source": "data_cftc_legacy",
+      "role": "training-and-source-audit",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_cftc_legacy_pre2000.py"
+      ],
+      "note": "Official CFTC legacy futures-only 1986-1999 and futures-plus-options 1995-1999 gap only; OpenBB compact remains canonical from 2000 onward."
+    },
+    {
       "dataset": "tw-shioaji-history",
       "source": "data_tw_shioaji_history",
       "role": "training-and-audit",

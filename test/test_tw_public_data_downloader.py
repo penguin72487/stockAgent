@@ -2609,6 +2609,68 @@ def test_merge_frames_replaces_existing_dates():
     assert merged.sort("date")["value"].to_list() == ["new", "keep"]
 
 
+def test_merged_writer_does_not_rewrite_for_fetch_timestamp_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "daily.parquet"
+    existing = pl.DataFrame(
+        {
+            "date": ["2024-06-03", "2024-06-04"],
+            "value": ["same", "keep"],
+            "_downloaded_at_utc": ["old", "old"],
+        }
+    )
+    existing.write_parquet(path)
+    before = path.stat()
+
+    rows = twpub._write_parquet_merged(
+        path,
+        pl.DataFrame(
+            {
+                "date": ["2024-06-03"],
+                "value": ["same"],
+                "_downloaded_at_utc": ["new"],
+            }
+        ),
+        refresh=False,
+    )
+
+    after = path.stat()
+    assert rows == 2
+    assert after.st_ino == before.st_ino
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert pl.read_parquet(path)["_downloaded_at_utc"].to_list() == ["old", "old"]
+
+
+def test_merged_writer_rewrites_real_value_change(tmp_path: Path) -> None:
+    path = tmp_path / "daily.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-06-03"],
+            "value": ["old"],
+            "_downloaded_at_utc": ["old"],
+        }
+    ).write_parquet(path)
+
+    twpub._write_parquet_merged(
+        path,
+        pl.DataFrame(
+            {
+                "date": ["2024-06-03"],
+                "value": ["new"],
+                "_downloaded_at_utc": ["new"],
+            }
+        ),
+        refresh=False,
+    )
+
+    assert pl.read_parquet(path).row(0, named=True) == {
+        "date": "2024-06-03",
+        "value": "new",
+        "_downloaded_at_utc": "new",
+    }
+
+
 def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
     tmp_path: Path,
     monkeypatch,

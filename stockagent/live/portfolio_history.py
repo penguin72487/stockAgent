@@ -13,6 +13,7 @@ from stockagent.live.stock_history import (
     _read_returns,
     _read_table,
     _read_price_history_map,
+    _read_price_history_maps,
     _symbol_name,
     classify_stock_history_action,
     is_bar_frequency,
@@ -322,6 +323,22 @@ class _PriceLookup:
             else self.cache
         )
         key = str(symbol)
+        if (
+            self.execution_mode == "tw_day_trade"
+            and price_column in {"open", "close"}
+            and key not in self.open_cache
+            and key not in self.close_cache
+        ):
+            prices_by_column, path = _read_price_history_maps(
+                self.price_root,
+                key,
+                frequency=self.frequency,
+                price_columns=("open", "close"),
+            )
+            self.open_cache[key] = prices_by_column.get("open", {})
+            self.close_cache[key] = prices_by_column.get("close", {})
+            if path is not None and path not in self.paths:
+                self.paths.append(path)
         if key not in target:
             prices, path = _read_price_history_map(
                 self.price_root,
@@ -369,7 +386,7 @@ def _change_row(
     day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     price = _float_or_none((current or {}).get("price"))
     entry_price_source = "holdings_day_trade_open" if day_trade and price is not None else None
-    if day_trade and price_lookup is not None:
+    if day_trade and resolve_missing_prices and price_lookup is not None:
         official_open = price_lookup.get(symbol, date)
         if official_open is not None:
             price = official_open
@@ -381,7 +398,11 @@ def _change_row(
     prev_price = _float_or_none((previous or {}).get("price"))
     if resolve_missing_prices and prev_price is None and price_lookup is not None:
         prev_price = price_lookup.get(symbol, previous_date)
-    exit_price = price_lookup.get_close(symbol, date) if day_trade and price_lookup is not None else None
+    exit_price = (
+        price_lookup.get_close(symbol, date)
+        if day_trade and resolve_missing_prices and price_lookup is not None
+        else None
+    )
     if day_trade:
         price_return = exit_price / price - 1.0 if price is not None and exit_price is not None and price > 0.0 else None
         return_weight = holding_ratio

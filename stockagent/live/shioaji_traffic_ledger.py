@@ -72,6 +72,11 @@ def _safe_details(details: dict[str, Any] | None) -> dict[str, Any]:
         "logical_code",
         "target_code",
         "cache_scope",
+        "batch_count",
+        "completed_batch_count",
+        "timed_out_batch_count",
+        "timeout_ms",
+        "nonblocking",
         "reason",
         "worker_index",
         "session",
@@ -429,12 +434,20 @@ def shioaji_query(
     method: str,
     asset_class: str,
     details: dict[str, Any] | None = None,
+    request_count: int = 1,
 ) -> Iterator[Callable[[Any], None]]:
-    """Record one billed request without changing its error behavior."""
+    """Record one or more billed requests without changing error behavior.
+
+    A callback-driven batch can issue several independent broker requests under
+    one causal operation. Accounting that operation as a group avoids adding
+    two synchronous ``usage()`` observations and one durable ledger write per
+    request while preserving the exact number of requests in the event.
+    """
 
     before = _usage(api)
     started = time.monotonic()
     rows = 0
+    billed_requests = max(1, int(request_count))
 
     def set_result(value: Any) -> None:
         nonlocal rows
@@ -459,7 +472,7 @@ def shioaji_query(
                 "operation": "query",
                 "status": "failed",
                 "error_type": type(exc).__name__,
-                "request_count": 1,
+                "request_count": billed_requests,
                 "avoided_request_count": 0,
                 "rows": rows,
                 "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
@@ -482,7 +495,7 @@ def shioaji_query(
                 "asset_class": asset_class,
                 "operation": "query",
                 "status": "success",
-                "request_count": 1,
+                "request_count": billed_requests,
                 "avoided_request_count": 0,
                 "rows": rows,
                 "duration_ms": round((time.monotonic() - started) * 1000.0, 3),

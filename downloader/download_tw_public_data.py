@@ -4681,7 +4681,29 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
     if frame.is_empty():
         return _read_existing_row_count(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    merged = _merge_frames(_read_existing(path), frame, refresh=refresh)
+    existing = _read_existing(path)
+    merged = _merge_frames(existing, frame, refresh=refresh)
+    # Re-fetching an overlap updates the observation timestamp even when the
+    # official payload is byte-for-byte equivalent.  Rewriting a multi-million
+    # row archive for that volatile field invalidates every derived cache and
+    # used to trigger another 5-8 minute close rebuild on each boundary retry.
+    # Preserve the prior receipt rows only when every non-volatile value and
+    # row order is identical; any actual value/provenance/schema change still
+    # publishes atomically below.
+    stable_columns = [
+        name for name in merged.columns if name != "_downloaded_at_utc"
+    ]
+    if (
+        not refresh
+        and not existing.is_empty()
+        and existing.columns == merged.columns
+        and existing.height == merged.height
+        and existing.select(stable_columns).equals(
+            merged.select(stable_columns),
+            null_equal=True,
+        )
+    ):
+        return int(existing.height)
     tmp = path.with_suffix(path.suffix + ".tmp")
     merged.write_parquet(tmp, compression="snappy", statistics=True)
     os.replace(tmp, path)

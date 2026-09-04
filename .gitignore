@@ -231,6 +231,8 @@ artifacts_benchmark/*
 data_tw_futures/*
 data_fred_crypto_macro/*
 data_tw_shioaji_history/*
+data_taifex_public_history/*
+data_cftc_legacy/*
 data_bybit_daily_training_20260823/*
 data_bybit_daily_synced
 data_bybit_daily_0000_materialized_20260823/*

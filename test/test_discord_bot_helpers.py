@@ -73,6 +73,60 @@ def test_all_four_day_trade_modes_are_in_the_runtime_schedule() -> None:
     }.issubset(scheduled)
 
 
+def test_startup_warmup_stops_permanent_contract_retry_storm() -> None:
+    mismatch = RuntimeError("Checkpoint semantic fingerprint mismatch (model: saved=x)")
+    transient = OSError("temporary CUDA device busy")
+
+    assert not discord_bot._startup_warmup_failure_is_retryable(mismatch)
+    assert discord_bot._startup_warmup_failure_is_retryable(transient)
+    assert discord_bot._startup_warmup_retry_delay_seconds(1) == 60.0
+    assert discord_bot._startup_warmup_retry_delay_seconds(2) == 120.0
+    assert discord_bot._startup_warmup_retry_delay_seconds(99) == 900.0
+
+
+def test_day_trade_scheduler_accepts_only_the_true_session_open_artifact() -> None:
+    cfg = SimpleNamespace(timezone="Asia/Taipei", open_time="09:00")
+    valid = {
+        "generated_at": "2026-09-03T09:00:00+08:00",
+        "signal_started_at": "2026-09-03T09:00:00.083+08:00",
+        "live_session_open_feature_applied": True,
+        "day_trade_model_observation": "session_open",
+        "signal_price_contract": {
+            "model_observation": "session_open",
+            "opening_execution_eligible": True,
+        },
+    }
+    preopen = {
+        **valid,
+        "signal_started_at": "2026-09-03T08:34:23+08:00",
+        "live_session_open_feature_applied": False,
+        "signal_price_contract": {
+            "model_observation": "completed_panel",
+            "opening_execution_eligible": False,
+        },
+    }
+    latest_quote = {
+        **valid,
+        "signal_started_at": "2026-09-03T09:01:43+08:00",
+        "live_session_open_feature_applied": False,
+        "day_trade_model_observation": "latest_quote",
+        "signal_price_contract": {
+            "model_observation": "intraday_latest_quote",
+            "opening_execution_eligible": False,
+        },
+    }
+
+    assert discord_bot._is_scheduled_day_trade_opening_signal(
+        cfg, valid, "2026-09-03"
+    )
+    assert not discord_bot._is_scheduled_day_trade_opening_signal(
+        cfg, preopen, "2026-09-03"
+    )
+    assert not discord_bot._is_scheduled_day_trade_opening_signal(
+        cfg, latest_quote, "2026-09-03"
+    )
+
+
 def test_day_trade_model_uses_shared_official_opening_snapshot() -> None:
     cfg = discord_bot._market_configs()["tw_day_trade_100m"]
 
@@ -257,7 +311,14 @@ def test_recent_day_trade_artifact_waits_for_engine_instead_of_recomputing(
     observed = datetime.now(ZoneInfo("Asia/Taipei"))
     summary = {
         "generated_at": observed.isoformat(),
+        "signal_started_at": observed.isoformat(),
         "artifact_published_at": observed.isoformat(),
+        "live_session_open_feature_applied": True,
+        "day_trade_model_observation": "session_open",
+        "signal_price_contract": {
+            "model_observation": "session_open",
+            "opening_execution_eligible": True,
+        },
     }
     monkeypatch.setattr(
         discord_bot,

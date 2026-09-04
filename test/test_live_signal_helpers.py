@@ -28,6 +28,7 @@ from stockagent.live.signal_engine import (
     _live_weights_has_date,
     _load_previous_weights,
     _live_panel_cache_key,
+    _live_panel_load_workers,
     _previous_usable_panel_date,
     _price_snapshot,
     _require_supported_live_execution,
@@ -39,6 +40,28 @@ from stockagent.live.signal_engine import (
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
 import stockagent.live.signal_engine as signal_engine
+
+
+def test_live_panel_workers_are_bounded_by_host_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STOCKAGENT_LIVE_PANEL_LOAD_WORKERS", raising=False)
+    monkeypatch.setattr(signal_engine.os, "cpu_count", lambda: 16)
+
+    assert _live_panel_load_workers(112) == 8
+    assert _live_panel_load_workers(6) == 6
+    assert _live_panel_load_workers(1) == 1
+    assert _live_panel_load_workers(0) == 0
+
+
+def test_live_panel_worker_override_is_a_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_LOAD_WORKERS", "4")
+    monkeypatch.setattr(signal_engine.os, "cpu_count", lambda: 16)
+
+    assert _live_panel_load_workers(112) == 4
+    assert _live_panel_load_workers(2) == 2
 
 
 def test_realtime_daily_decision_uses_quote_time_for_weights_history() -> None:
@@ -240,7 +263,7 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
         trading_volume_policy="auto",
         security_filter="none",
         panel_backend="auto",
-        panel_load_workers=2,
+        panel_load_workers=112,
         feature_include=["base"],
         feature_exclude=[],
         feature_zero_fill=[],
@@ -276,11 +299,12 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
     builds: list[int] = []
 
     def fake_build(*args, **kwargs):
-        del args, kwargs
-        builds.append(1)
+        del args
+        builds.append(int(kwargs["panel_load_workers"]))
         return panel
 
     monkeypatch.setattr(signal_engine, "build_tail_panel", fake_build)
+    monkeypatch.setattr(signal_engine.os, "cpu_count", lambda: 16)
     signal_engine.clear_live_panel_memory_cache()
 
     first, first_hit, first_tier = signal_engine._build_panel(
@@ -301,7 +325,7 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
     assert second_tier == "disk"
     assert second.num_dates == 1
     np.testing.assert_array_equal(second.features, panel.features[-1:])
-    assert builds == [1]
+    assert builds == [8]
 
     meta_path = disk_root / "panel_cache_v2" / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -316,7 +340,7 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
     assert not repaired_hit
     assert repaired_tier == "rebuilt"
     assert repaired.num_dates == 1
-    assert builds == [1, 1]
+    assert builds == [8, 8]
     signal_engine.clear_live_panel_memory_cache()
 
 
@@ -811,7 +835,8 @@ def test_day_trade_latest_quote_reuses_shared_engine_before_direct_login(
     )
     shared_requests: list[list[str]] = []
 
-    def shared(symbols, fallback_prices):
+    def shared(symbols, fallback_prices, **kwargs):
+        assert kwargs.get("purpose") == "latest_quote"
         shared_requests.append(list(symbols))
         size = len(symbols)
         return PriceSnapshot(
@@ -853,7 +878,7 @@ def test_day_trade_latest_quote_reuses_shared_engine_before_direct_login(
     np.testing.assert_allclose(snapshot.prices, [101.0, 201.0])
 
 
-def test_day_trade_shared_mis_uses_shioaji_only_below_source_coverage_gate(
+def test_day_trade_opening_uses_preheated_shared_shioaji_before_mis(
     monkeypatch,
 ) -> None:
     from datetime import datetime
@@ -863,22 +888,26 @@ def test_day_trade_shared_mis_uses_shioaji_only_below_source_coverage_gate(
     backup_requests: list[list[str]] = []
 
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
-        lambda symbols, fallback_prices, **kwargs: PriceSnapshot(
+
+    def cache_only_mis(symbols, fallback_prices, **kwargs):
+        if kwargs.get("allow_network") is not False:
+            raise AssertionError("full shared opening coverage must bypass MIS network")
+        return PriceSnapshot(
             prices=np.asarray(fallback_prices, dtype=np.float64),
             source="twse_tpex:mis+shared_opening_snapshot",
-            timestamp=datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
-            available_count=1,
+            available_count=0,
             requested_count=len(symbols),
-            available_mask=np.array([True, False]),
-            open_prices=np.array([101.0, np.nan]),
-            timestamps_ms=np.array([now_ms, 0]),
-        ),
+            available_mask=np.zeros((len(symbols),), dtype=bool),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
+        cache_only_mis,
     )
 
-    def fake_shioaji(symbols, fallback_prices, *, cache_ttl_seconds):
-        del cache_ttl_seconds
+    def fake_shioaji(symbols, fallback_prices, **kwargs):
+        assert kwargs.get("purpose") == "opening_signal"
+        assert kwargs.get("timeout_seconds") == 4.0
         backup_requests.append(list(symbols))
         return PriceSnapshot(
             prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
@@ -895,8 +924,14 @@ def test_day_trade_shared_mis_uses_shioaji_only_below_source_coverage_gate(
         )
 
     monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        "stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots",
         fake_shioaji,
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("opening shared session covered the missing universe")
+        ),
     )
 
     snapshot = _price_snapshot(
@@ -909,10 +944,94 @@ def test_day_trade_shared_mis_uses_shioaji_only_below_source_coverage_gate(
         require_official_tw_session_open=True,
     )
 
-    assert backup_requests == [["B"]]
+    assert backup_requests == [["A", "B"]]
     assert snapshot.available_count == 2
-    np.testing.assert_allclose(snapshot.open_prices, [101.0, 200.5])
-    assert snapshot.source.endswith("+shioaji_missing_fallback")
+    np.testing.assert_allclose(snapshot.open_prices, [100.5, 200.5])
+    assert snapshot.source == "shioaji:fixture"
+
+
+def test_day_trade_partial_shared_opening_queries_mis_only_on_degraded_path(
+    monkeypatch,
+) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    shared_calls: list[list[str]] = []
+    mis_calls: list[list[str]] = []
+    seeded: list[list[bool]] = []
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
+
+    def shared(symbols, fallback_prices, **kwargs):
+        assert kwargs.get("purpose") == "opening_signal"
+        shared_calls.append(list(symbols))
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="shioaji:partial",
+            available_count=1,
+            requested_count=2,
+            available_mask=np.array([True, False]),
+            open_prices=np.array([100.5, np.nan]),
+            timestamps_ms=np.array([now_ms, 0]),
+            exchange_timestamps_ms=np.array([now_ms, 0]),
+        )
+
+    def mis(symbols, fallback_prices, **kwargs):
+        if kwargs.get("allow_network") is False:
+            return PriceSnapshot(
+                prices=np.asarray(fallback_prices, dtype=np.float64),
+                source="twse_tpex:mis+shared_opening_snapshot",
+                available_count=0,
+                requested_count=len(symbols),
+                available_mask=np.array([False, False]),
+            )
+        mis_calls.append(list(symbols))
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis+shared_opening_snapshot+shioaji_open_cache",
+            available_count=2,
+            requested_count=2,
+            available_mask=np.array([True, True]),
+            open_prices=np.array([100.5, 200.5]),
+            timestamps_ms=np.array([now_ms, now_ms]),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots",
+        shared,
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
+        mis,
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.seed_tw_opening_snapshot_cache",
+        lambda symbols, snapshot, **kwargs: seeded.append(
+            np.asarray(snapshot.available_mask, dtype=bool).tolist()
+        ),
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("MIS completed the partial shared opening")
+        ),
+    )
+
+    snapshot = _price_snapshot(
+        source="tw",
+        symbols=["A", "B"],
+        fallback_prices=np.array([100.0, 200.0]),
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        require_official_tw_session_open=True,
+    )
+
+    assert shared_calls == [["A", "B"]]
+    assert mis_calls == [["A", "B"]]
+    assert seeded == [[True, False], [True, True]]
+    assert snapshot.available_count == 2
+    np.testing.assert_allclose(snapshot.open_prices, [100.5, 200.5])
 
 
 def test_day_trade_shioaji_does_not_block_on_duplicate_mis_when_open_is_proven(
@@ -1797,6 +1916,64 @@ def test_load_portfolio_history_skips_change_price_reads_when_top_changes_zero(m
     assert np.isclose(result.period_return, 1.01 * 1.05 - 1.0)
     assert [row["changes"] for row in result.rows] == [[], []]
     assert [row["change_count"] for row in result.rows] == [0, 0]
+
+
+def test_day_trade_portfolio_history_reads_prices_only_for_visible_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fold_dir = tmp_path / "fold_11"
+    price_root = tmp_path / "prices"
+    fold_dir.mkdir()
+    price_root.mkdir()
+    symbols = [f"S{index:02d}" for index in range(10)]
+    pl.DataFrame(
+        {
+            "date": ["2026-01-05", *(["2026-01-05"] * len(symbols))],
+            "symbol": ["CASH", *symbols],
+            "shares": [1000, *range(1, len(symbols) + 1)],
+            "price": [1.0, *([10.0] * len(symbols))],
+            "market_value": [1000.0, *[float(index) for index in range(1, 11)]],
+            "holding_ratio": [1.0, *[index / 100.0 for index in range(1, 11)]],
+            "is_cash": [True, *([False] * len(symbols))],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-05"],
+            "portfolio_return": [0.01],
+            "benchmark_return": [0.0],
+            "turnover": [0.1],
+        }
+    ).write_parquet(
+        fold_dir / "integer_share_daily_portfolio_returns.parquet"
+    )
+    price_reads: list[str] = []
+
+    def fake_price_read(price_root, symbol, *, frequency, price_columns):
+        del price_root, frequency
+        assert price_columns == ("open", "close")
+        price_reads.append(str(symbol))
+        return {
+            "open": {"2026-01-05": 10.0},
+            "close": {"2026-01-05": 11.0},
+        }, tmp_path / f"{symbol}.parquet"
+
+    monkeypatch.setattr(
+        "stockagent.live.portfolio_history._read_price_history_maps",
+        fake_price_read,
+    )
+
+    result = load_portfolio_history(
+        fold_dir,
+        days=1,
+        top_changes=2,
+        price_root=price_root,
+        execution_mode="tw_day_trade",
+    )
+
+    assert [row["symbol"] for row in result.rows[0]["changes"]] == ["S09", "S08"]
+    assert set(price_reads) == {"S09", "S08"}
 
 
 def test_load_portfolio_history_uses_price_root_and_previous_position_for_exit_short(tmp_path) -> None:

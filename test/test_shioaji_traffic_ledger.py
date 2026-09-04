@@ -63,6 +63,37 @@ def test_traffic_ledger_attributes_queries_and_avoided_calls(monkeypatch, tmp_pa
     assert "secret" not in ledger.lower()
 
 
+def test_traffic_ledger_groups_callback_batch_without_losing_request_count(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_TRAFFIC_LEDGER_ROOT", str(tmp_path))
+    api = _UsageApi()
+    usage_calls = 0
+    original_usage = api.usage
+
+    def counted_usage():
+        nonlocal usage_calls
+        usage_calls += 1
+        return original_usage()
+
+    api.usage = counted_usage
+    with shioaji_query(
+        api,
+        consumer="opening_quotes",
+        method="snapshots",
+        asset_class="stock",
+        details={"batch_count": 3, "nonblocking": True},
+        request_count=3,
+    ) as set_result:
+        api.used += 30
+        set_result([1, 2, 3])
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert usage_calls == 2
+    assert summary["totals"]["queries"] == 3
+    assert summary["totals"]["observed_usage_delta_bytes"] == 30
+
+
 def test_traffic_ledger_starts_quota_epoch_only_after_observed_counter_drop(
     monkeypatch, tmp_path: Path
 ) -> None:
