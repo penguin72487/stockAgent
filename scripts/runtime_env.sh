@@ -53,17 +53,24 @@ detect_fintech_env_path() {
     return 0
   fi
 
-  local candidate env_root
+  local candidate env_root home_root
   local -a dynamic_candidates=()
+  local -a home_candidates=()
+  home_root="${HOME:-}"
+  if [[ -n "$home_root" ]]; then
+    home_candidates+=(
+      "$home_root/miniforge3/envs/fintech"
+      "$home_root/mambaforge/envs/fintech"
+      "$home_root/miniconda3/envs/fintech"
+      "$home_root/anaconda3/envs/fintech"
+    )
+  fi
   IFS=':' read -r -a _fintech_env_roots <<< "${CONDA_ENVS_PATH:-}"
   for env_root in "${_fintech_env_roots[@]}"; do
     [[ -n "$env_root" ]] && dynamic_candidates+=("$env_root/fintech")
   done
   for candidate in \
-    "$HOME/miniforge3/envs/fintech" \
-    "$HOME/mambaforge/envs/fintech" \
-    "$HOME/miniconda3/envs/fintech" \
-    "$HOME/anaconda3/envs/fintech" \
+    "${home_candidates[@]}" \
     "/venv/fintech" \
     "/root/miniforge3/envs/fintech" \
     "/home/user/miniforge3/envs/fintech" \

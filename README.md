@@ -17,6 +17,7 @@
 - [Syncthing 驗收](#syncthing-驗收)
 - [Artifacts 同步與去重](#artifacts-同步與去重)
 - [磁碟壓力與可重建快取](#磁碟壓力與可重建快取)
+- [Windows 與 WSL 暫存清理](#windows-與-wsl-暫存清理)
 - [資料下載與更新](#資料下載與更新)
 - [訓練、GPU 與解釋](#訓練gpu-與解釋)
 - [即時訊號與服務](#即時訊號與服務)
@@ -670,6 +671,33 @@ Edge hot cache 的 TTL 上限為七天；仍在使用會自動續租，刻意長
 
 此模式禁止在 edge 節點直接發布 cold release；完整使用與回復方式見
 [packed 冷庫文件](docs/packed_dataset_storage.md)。
+
+## Windows 與 WSL 暫存清理
+
+`%LOCALAPPDATA%\Temp` 是 Windows 每位使用者的暫存區，可能同時包含安裝程式、瀏覽器、
+VS Code、診斷工具與 WSL VM 正在使用的檔案，禁止整個目錄遞迴刪除。WSL 異常重啟有時會
+留下 `<GUID>\swap.vhdx`；只有已不屬於任何 `wslhost.exe --vm-id`、超過最短保留時間、
+目錄內僅有該檔且可取得 exclusive lock 的 swap 才可回收。
+
+從 WSL 執行安全盤點；預設只產生 receipt，不刪除：
+
+```bash
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w scripts/cleanup_windows_wsl_temp_swap.ps1)"
+```
+
+確認 `candidates` 後才套用；腳本會在刪除前再次驗證檔案形狀、大小、mtime 與 exclusive
+lock，現行 WSL swap 一律跳過：
+
+```bash
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w scripts/cleanup_windows_wsl_temp_swap.ps1)" \
+  -Apply
+```
+
+Windows receipt 位於
+`%LOCALAPPDATA%\StockAgent\maintenance\receipts\wsl-temp-swap-{audit,apply}-*.json`。
+刪除的是可重建的虛擬記憶體頁，不是 packed 冷庫、dataset、artifact 或 checkpoint。
 
 ## 資料下載與更新
 
