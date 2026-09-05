@@ -443,6 +443,11 @@ def test_hybrid_minute_v12_reference_architecture_ofat_uses_fair_finetune_contro
         "snapshot_id": (
             "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba"
         ),
+        "cache_root": (
+            "artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/"
+            "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/"
+            "stocks"
+        ),
         "variant_id": (
             "fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577"
         ),
@@ -466,6 +471,11 @@ def test_hybrid_minute_v12_reference_architecture_ofat_uses_fair_finetune_contro
     assert baseline_model.temporal_query_mode == "last_only"
     assert baseline.training.batch_size_train == 64
     assert baseline.trading.volume_participation_equity == 10_000_000.0
+    assert baseline.data.panel_cache_root.endswith(
+        "artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/"
+        "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/"
+        "stocks"
+    )
 
     for config in loaded.values():
         training = config.training
@@ -500,6 +510,20 @@ def test_hybrid_minute_v12_reference_architecture_ofat_uses_fair_finetune_contro
     assert loaded["gelu_ffn"].training.financial_transformer.ffn_type == "gelu"
     assert loaded["initial_capital_1m"].trading.volume_participation_equity == 1_000_000.0
     assert loaded["initial_capital_100m"].trading.volume_participation_equity == 100_000_000.0
+
+
+def test_hybrid_minute_v12_reference_launcher_uses_edge_aware_data_cache() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (
+        repo_root
+        / "scripts/"
+        "run_tw_day_trade_hybrid_minute_v12_reference_architecture_"
+        "ofat_dual_5090.sh"
+    ).read_text(encoding="utf-8")
+
+    assert '"$REPO_ROOT/scripts/run_data_cache.sh" use tw-public' in launcher
+    assert "run_fintech_python scripts/data_cache.py use tw-public" not in launcher
+    assert "--ttl-days 365" not in launcher
 
 
 def test_inherited_experiment_override_renames_and_patches_one_row(
@@ -1010,6 +1034,39 @@ def test_pinned_panel_cache_resolves_snapshot_receipt_and_checks_identity(
     spec["pinned_panel_cache"]["generation"] = "wrong-generation"
     with pytest.raises(ValueError, match="identity mismatch"):
         _resolve_pinned_panel_cache_env(spec)
+
+
+def test_pinned_panel_cache_prefers_explicit_node_local_cache_root(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache" / "stocks"
+    variant_id = "b" * 64
+    manifest_path = (
+        cache_root / "panel_cache_v2" / "variants" / f"{variant_id}.json"
+    )
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        '{"version": 54, "generation": "generation-v2", '
+        '"source_hash": "source-v2"}',
+        encoding="utf-8",
+    )
+
+    env = _resolve_pinned_panel_cache_env(
+        {
+            "pinned_panel_cache": {
+                "snapshot_id": "tw-public-test",
+                "cache_root": str(cache_root),
+                "variant_id": variant_id,
+                "version": 54,
+                "generation": "generation-v2",
+                "source_hash": "source-v2",
+            }
+        }
+    )
+
+    assert env["STOCKAGENT_PINNED_PANEL_CACHE_MANIFEST"] == str(
+        manifest_path.resolve()
+    )
 
 
 def test_cuda_infrastructure_wait_does_not_consume_retry_budget(

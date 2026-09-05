@@ -20,7 +20,6 @@ import argparse
 import csv
 from datetime import date, datetime
 import fcntl
-import hashlib
 import html
 import io
 import json
@@ -29,14 +28,31 @@ import os
 from pathlib import Path
 import re
 import sys
-import tempfile
-import time
 from typing import BinaryIO, Final, TextIO
-from urllib import request
 import zipfile
 from zoneinfo import ZoneInfo
 
 import polars as pl
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from downloader.artifact_io import (  # noqa: E402
+    atomic_write_bytes,
+    atomic_write_parquet,
+    atomic_write_text,
+    sha256_bytes,
+    sha256_file,
+)
+from downloader.common import (  # noqa: E402
+    SharedRateLimiter,
+    resolve_request_interval,
+)
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
+)
 
 
 FUTURES_LISTING_URL: Final[str] = (
@@ -97,77 +113,51 @@ FUTURES_COLUMNS: Final[list[str]] = [
 
 
 def _sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
+    return sha256_bytes(payload)
 
 
 def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=path.name + ".",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
+    atomic_write_bytes(path, payload, durable=True)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    _atomic_write_bytes(path, text.encode("utf-8"))
+    atomic_write_text(path, text, durable=True)
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=path.name + ".",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        frame.write_parquet(temporary, compression="zstd", statistics=True)
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_parquet(
+        path,
+        frame,
+        compression="zstd",
+        write_statistics=True,
+        durable=True,
+    )
 
 
 def _fetch_bytes(
-    url: str, *, attempts: int, timeout: float
+    url: str,
+    *,
+    attempts: int,
+    timeout: float,
+    transport: ResilientHttpTransport | None = None,
 ) -> tuple[bytes, dict[str, str]]:
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            http_request = request.Request(url, headers={"User-Agent": USER_AGENT})
-            with request.urlopen(http_request, timeout=timeout) as response:
-                payload = response.read()
-                headers = {
-                    key.casefold(): value for key, value in response.headers.items()
-                }
-            if not payload:
-                raise ValueError(f"empty HTTP response from {url}")
-            return payload, headers
-        except Exception as exc:  # noqa: BLE001 - preserve provider error chain.
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(float(attempt))
-    raise RuntimeError(
-        f"failed to fetch {url} after {attempts} attempts"
-    ) from last_error
+    client = transport or ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=timeout,
+            max_retries=max(0, attempts - 1),
+            retry_base_seconds=0.5,
+        )
+    )
+    response = client.request_bytes(url, headers={"User-Agent": USER_AGENT})
+    if not response.body:
+        raise ValueError(f"empty HTTP response from {url}")
+    headers = {key.casefold(): value for key, value in response.headers.items()}
+    return response.body, headers
 
 
 def _extract_downloads(
@@ -233,6 +223,7 @@ def _download_zip(
     expected_member: str,
     attempts: int,
     timeout: float,
+    transport: ResilientHttpTransport | None = None,
 ) -> dict[str, object]:
     headers: dict[str, str] = {}
     reused = False
@@ -242,11 +233,21 @@ def _download_zip(
             _validate_zip_payload(payload, expected_member=expected_member)
             reused = True
         except ValueError:
-            payload, headers = _fetch_bytes(url, attempts=attempts, timeout=timeout)
+            payload, headers = _fetch_bytes(
+                url,
+                attempts=attempts,
+                timeout=timeout,
+                transport=transport,
+            )
             _validate_zip_payload(payload, expected_member=expected_member)
             _atomic_write_bytes(target, payload)
     else:
-        payload, headers = _fetch_bytes(url, attempts=attempts, timeout=timeout)
+        payload, headers = _fetch_bytes(
+            url,
+            attempts=attempts,
+            timeout=timeout,
+            transport=transport,
+        )
         _validate_zip_payload(payload, expected_member=expected_member)
         _atomic_write_bytes(target, payload)
     return {
@@ -740,14 +741,29 @@ def main() -> int:
         parser.error("--request-interval must be non-negative")
 
     root = Path(args.output_dir).expanduser().resolve()
+    request_interval = resolve_request_interval("taifex_public", args.request_interval)
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=args.timeout,
+            max_retries=max(0, args.attempts - 1),
+            retry_base_seconds=0.5,
+        ),
+        limiter=SharedRateLimiter(request_interval, name="taifex_public"),
+    )
     lock = _acquire_lock(root / "state" / "download.lock")
     try:
         futures_page, futures_headers = _fetch_bytes(
-            FUTURES_LISTING_URL, attempts=args.attempts, timeout=args.timeout
+            FUTURES_LISTING_URL,
+            attempts=args.attempts,
+            timeout=args.timeout,
+            transport=transport,
         )
-        time.sleep(args.request_interval)
         options_page, options_headers = _fetch_bytes(
-            OPTIONS_LISTING_URL, attempts=args.attempts, timeout=args.timeout
+            OPTIONS_LISTING_URL,
+            attempts=args.attempts,
+            timeout=args.timeout,
+            transport=transport,
         )
         futures_urls = _extract_downloads(futures_page, pattern=FUTURES_URL_RE)
         options_urls = _extract_downloads(options_page, pattern=OPTIONS_URL_RE)
@@ -781,14 +797,15 @@ def main() -> int:
                 expected_member=f"Daily_{compact}.csv",
                 attempts=args.attempts,
                 timeout=args.timeout,
+                transport=transport,
             )
-            time.sleep(args.request_interval)
             options_download = _download_zip(
                 options_urls[trade_date],
                 options_path,
                 expected_member=f"OptionsDaily_{compact}.csv",
                 attempts=args.attempts,
                 timeout=args.timeout,
+                transport=transport,
             )
             downloads.extend(
                 [
@@ -844,8 +861,6 @@ def main() -> int:
                 f"TX rows={int(tx['rows']):,} TXO side_rows={int(txo['rows']):,}",
                 flush=True,
             )
-            time.sleep(args.request_interval)
-
         _write_daily_report(root / "daily_report.csv", report_rows)
         partition_dates = {
             kind: sorted(

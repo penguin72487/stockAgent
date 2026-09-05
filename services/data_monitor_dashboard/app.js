@@ -4,7 +4,7 @@ const REFRESH_MS = 10000;
 const FULL_REFRESH_TICKS = 6;
 const SOURCE_PAGE_SIZE = 100;
 const Dashboard = window.StockAgentDashboard;
-const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store", expectedRoot: "object"});
 const state = {
   data: null,
   refreshInFlight: false,
@@ -50,7 +50,7 @@ function formatInteger(value) {
 function compact(value) {
   const parsed = number(value);
   if (parsed === null) return "—";
-  return new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2}).format(parsed);
+  return Dashboard.formatNumber(parsed, {notation: "compact", maximumFractionDigits: 2});
 }
 
 function ageLabel(seconds) {

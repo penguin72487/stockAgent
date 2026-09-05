@@ -17,17 +17,36 @@ HTTP_MARKERS = (
     "yfinance",
     ".get_json(",
     ".get_bytes(",
+    ".request_bytes(",
 )
 SDK_MARKERS = ("api.kbars(", "api.ticks(", "api.subscribe(", "shioaji_query(")
 DELEGATED_TRANSPORT_MARKERS = (
     "client.get(",
+    "ResilientHttpTransport",
     "run_historical_feature_downloads(",
     "_http_get(",
 )
 RETRY_MARKERS = ("max_retries", "retries", "retry_after", "backoff", "Retry-After")
-ATOMIC_MARKERS = ("os.replace(", ".replace(path", "atomic", ".tmp")
+ATOMIC_MARKERS = (
+    "os.replace(",
+    ".replace(path",
+    "atomic_write_",
+    "_write_parquet_atomic",
+    ".tmp",
+)
 PROGRESS_MARKERS = ("tqdm", "progress", "eta", "estimated")
-RECEIPT_MARKERS = ("receipt", "manifest", "download_summary", "download_report")
+RECEIPT_MARKERS = (
+    "receipt",
+    "manifest",
+    "download_summary",
+    "download_report",
+    "funding_summary",
+    "source_status",
+)
+RATE_PROFILE_CALL_RE = re.compile(r"provider_rate_limit\(\s*[\"']([^\"']+)")
+ENV_ACCESS_RE = re.compile(
+    r"(?:getenv\(|environ(?:\.get)?\[?\()?\s*[\"']([A-Z][A-Z0-9_]+)[\"']"
+)
 
 
 @dataclass(slots=True)
@@ -49,6 +68,10 @@ class AuditRow:
     has_atomic_publication: bool
     has_receipt_or_manifest: bool
     has_main_guard: bool
+    scheduled_by_daily_runner: bool
+    provider_profiles: str
+    credential_env_vars: str
+    contract_grade: str
     static_flags: str
 
 
@@ -67,7 +90,7 @@ def _kind(path: Path, source: str) -> str:
     return "support"
 
 
-def _audit_file(path: Path, root: Path) -> AuditRow:
+def _audit_file(path: Path, root: Path, *, daily_runner: str = "") -> AuditRow:
     source = path.read_text(encoding="utf-8")
     lines = source.splitlines()
     tree = ast.parse(source, filename=str(path))
@@ -97,6 +120,7 @@ def _audit_file(path: Path, root: Path) -> AuditRow:
         for marker in (
             "SharedRateLimiter",
             "SharedRequestRateLimiter",
+            "ResilientHttpTransport",
             "_global_tw_public_rate_limiter",
         )
     )
@@ -114,6 +138,21 @@ def _audit_file(path: Path, root: Path) -> AuditRow:
         flags.append("tabular_write_without_visible_atomic_replace")
     if networked and entrypoint and not has_receipt:
         flags.append("no_receipt_or_manifest_visible")
+    scheduled = path.name in daily_runner
+    if not networked:
+        grade = "not_networked"
+    elif kind == "support":
+        grade = "delegated_support"
+    elif flags:
+        grade = "review"
+    elif (
+        has_receipt
+        and (has_limiter or transport in {"delegated_client", "provider_sdk"})
+        and (not direct_http or has_retry or transport == "provider_sdk")
+    ):
+        grade = "contract_visible"
+    else:
+        grade = "partial"
 
     return AuditRow(
         file=str(path.relative_to(root)),
@@ -144,8 +183,29 @@ def _audit_file(path: Path, root: Path) -> AuditRow:
         has_atomic_publication=atomic,
         has_receipt_or_manifest=has_receipt,
         has_main_guard='if __name__ == "__main__"' in source,
+        scheduled_by_daily_runner=scheduled,
+        provider_profiles=" | ".join(sorted(set(RATE_PROFILE_CALL_RE.findall(source)))),
+        credential_env_vars=" | ".join(
+            sorted(
+                value
+                for value in set(ENV_ACCESS_RE.findall(source))
+                if value.endswith(("KEY", "TOKEN", "SECRET", "PASSWORD", "EMAIL"))
+                or "API" in value
+            )
+        ),
+        contract_grade=grade,
         static_flags=" | ".join(flags),
     )
+
+
+def discover_python_entrypoints(root: Path) -> list[Path]:
+    """Return canonical downloader modules plus script-level data collectors."""
+
+    paths = set((root / "downloader").glob("*.py"))
+    scripts_dir = root / "scripts"
+    for pattern in ("download_*.py", "fetch_*.py", "watch_*.py"):
+        paths.update(scripts_dir.glob(pattern))
+    return sorted(path for path in paths if path.name != "__init__.py")
 
 
 def _write_csv(rows: Iterable[AuditRow], path: Path) -> None:
@@ -174,9 +234,14 @@ def main() -> None:
     args = parser.parse_args()
 
     root = Path(args.repo_root).resolve()
-    downloader_dir = root / "downloader"
-    paths = sorted(downloader_dir.glob("*.py"))
-    rows = [_audit_file(path, root) for path in paths]
+    daily_runner_path = root / "downloader" / "run_daily_all_markets.sh"
+    daily_runner = (
+        daily_runner_path.read_text(encoding="utf-8")
+        if daily_runner_path.is_file()
+        else ""
+    )
+    paths = discover_python_entrypoints(root)
+    rows = [_audit_file(path, root, daily_runner=daily_runner) for path in paths]
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "downloader_inventory.csv"
@@ -184,10 +249,19 @@ def main() -> None:
     _write_csv(rows, csv_path)
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "scope": "downloader/*.py",
+        "scope": (
+            "downloader/*.py + scripts/download_*.py + scripts/fetch_*.py + "
+            "scripts/watch_*.py"
+        ),
         "file_count": len(rows),
         "networked_file_count": sum(row.networked for row in rows),
         "flagged_file_count": sum(bool(row.static_flags) for row in rows),
+        "scheduled_networked_file_count": sum(
+            row.networked and row.scheduled_by_daily_runner for row in rows
+        ),
+        "contract_visible_file_count": sum(
+            row.contract_grade == "contract_visible" for row in rows
+        ),
         "warning": "Static flags require manual review and are not correctness verdicts.",
         "rows": [asdict(row) for row in rows],
     }

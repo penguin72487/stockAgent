@@ -38,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.common import describe_rate_limit
+from downloader.artifact_io import atomic_write_parquet
 from downloader.download_tw_public_data import (
     _configure_tw_public_rate_limiter,
     _global_tw_public_rate_limiter,
@@ -202,19 +203,13 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
     """Replace a canonical parquet only after a complete file is durable."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+    atomic_write_parquet(
+        path,
+        frame,
+        compression="zstd",
+        write_statistics=True,
+        durable=True,
     )
-    temporary = Path(handle.name)
-    handle.close()
-    try:
-        frame.write_parquet(temporary, compression="zstd", statistics=True)
-        with temporary.open("rb") as reader:
-            os.fsync(reader.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _record_raw_receipt_request(
@@ -252,9 +247,7 @@ def _raw_receipt_manifest_bytes(*, output_dir: Path) -> tuple[bytes, int]:
         try:
             relative_path = path.relative_to(output_dir)
         except ValueError as exc:
-            raise ValueError(
-                f"raw MOPS receipt is outside output_dir: {path}"
-            ) from exc
+            raise ValueError(f"raw MOPS receipt is outside output_dir: {path}") from exc
         receipt = _file_receipt(path)
         observed = requests_by_path[path]
         if (
@@ -375,7 +368,11 @@ def _cached_or_post(
             )
             if response.status_code in {403, 408, 429, 500, 502, 503, 504}:
                 retry_after = response.headers.get("Retry-After", "").strip()
-                delay = float(retry_after) if retry_after.isdigit() else min(60.0, 2.0**attempt)
+                delay = (
+                    float(retry_after)
+                    if retry_after.isdigit()
+                    else min(60.0, 2.0**attempt)
+                )
                 limiter.defer(delay)
                 response.close()
                 if attempt < int(retries):
@@ -420,7 +417,9 @@ def _roc_date(value: str) -> date | None:
     if match is None:
         return None
     try:
-        return date(int(match.group(1)) + 1911, int(match.group(2)), int(match.group(3)))
+        return date(
+            int(match.group(1)) + 1911, int(match.group(2)), int(match.group(3))
+        )
     except ValueError:
         return None
 
@@ -505,8 +504,12 @@ def parse_mops_detail(content: bytes, *, key: DetailKey) -> dict[str, Any]:
         r"[0-9]{2,3}年[0-9]{1,2}月[0-9]{1,2}日", cash_payment_start_text
     )
 
-    cash_row = next((row for row in rows if "※除息--普通股：每壹股配發現金(股利)" in row), "")
-    stock_row = next((row for row in rows if "※除權--普通股：每壹股配發股票(股利)" in row), "")
+    cash_row = next(
+        (row for row in rows if "※除息--普通股：每壹股配發現金(股利)" in row), ""
+    )
+    stock_row = next(
+        (row for row in rows if "※除權--普通股：每壹股配發股票(股利)" in row), ""
+    )
     cash_match = re.search(r"每壹股配發現金\(股利\)\s*([0-9,.]+)\s*元", cash_row)
     stock_match = re.search(r"每壹股配發股票\(股利\)\s*([0-9,.]+)\s*元", stock_row)
     free_shares = re.findall(r"每壹仟股無償配發[^0-9]*([0-9,.]+)\s*股", stock_row)
@@ -573,9 +576,7 @@ def _strict_bulk_number(value: str, *, field: str, key: BulkDividendKey) -> floa
     return float(result)
 
 
-def _bulk_dividend_layout(
-    cells: list[str], *, key: BulkDividendKey
-) -> dict[str, int]:
+def _bulk_dividend_layout(cells: list[str], *, key: BulkDividendKey) -> dict[str, int]:
     """Return the evidence-derived column map for each historical MOPS layout."""
 
     # MOPS changed this report twice.  The old table included employee-bonus
@@ -644,14 +645,12 @@ def _bulk_announcement_time(
     match = re.fullmatch(r"([0-9]{1,2}):([0-9]{2}):([0-9]{2})", text)
     if match is None:
         raise ValueError(
-            f"MOPS bulk dividend has an invalid announcement time for {key}: "
-            f"{value!r}"
+            f"MOPS bulk dividend has an invalid announcement time for {key}: {value!r}"
         )
     result = tuple(int(match.group(index)) for index in range(1, 4))
     if result[0] > 23 or result[1] > 59 or result[2] > 59:
         raise ValueError(
-            f"MOPS bulk dividend has an invalid announcement time for {key}: "
-            f"{value!r}"
+            f"MOPS bulk dividend has an invalid announcement time for {key}: {value!r}"
         )
     return result
 
@@ -848,9 +847,7 @@ def _collapse_bulk_event_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
 
     output: list[dict[str, Any]] = []
     for event_key in sorted(grouped):
-        revisions: dict[
-            tuple[date | None, bool, bool, bool], dict[str, Any]
-        ] = {}
+        revisions: dict[tuple[date | None, bool, bool, bool], dict[str, Any]] = {}
         for row in grouped[event_key]:
             action_identity = (
                 row["record_date"],
@@ -984,17 +981,22 @@ def _load_reference(
         .unique(["date", "symbol"], keep="last")
         .sort(["date", "symbol"])
     )
-    universe = pl.read_csv(universe_path).select(
-        pl.col("symbol").cast(pl.String).str.strip_chars().str.to_uppercase(),
-        pl.col("security_type").cast(pl.String).str.to_lowercase(),
-        pl.col("market").cast(pl.String).str.to_lowercase().alias("universe_market"),
-    ).unique("symbol", keep="last")
+    universe = (
+        pl.read_csv(universe_path)
+        .select(
+            pl.col("symbol").cast(pl.String).str.strip_chars().str.to_uppercase(),
+            pl.col("security_type").cast(pl.String).str.to_lowercase(),
+            pl.col("market")
+            .cast(pl.String)
+            .str.to_lowercase()
+            .alias("universe_market"),
+        )
+        .unique("symbol", keep="last")
+    )
     return reference, universe, reference_receipt, universe_receipt
 
 
-def _mutable_receipt_suffix(
-    *, disclosure_year: int, args: argparse.Namespace
-) -> str:
+def _mutable_receipt_suffix(*, disclosure_year: int, args: argparse.Namespace) -> str:
     """Version request-shaped receipts whose upstream result can still change."""
 
     end = date.fromisoformat(args.end_date)
@@ -1027,9 +1029,7 @@ def _requested_listing_keys(company_events: pl.DataFrame) -> list[ListingKey]:
     return sorted(keys, key=lambda value: (value.market, value.symbol, value.roc_year))
 
 
-def _requested_bulk_dividend_keys(
-    *, start: date, end: date
-) -> list[BulkDividendKey]:
+def _requested_bulk_dividend_keys(*, start: date, end: date) -> list[BulkDividendKey]:
     return [
         BulkDividendKey(market=market, roc_year=year - 1911)
         for year in range(start.year, end.year + 1)
@@ -1169,8 +1169,7 @@ def main() -> None:
     reference, universe, reference_receipt, universe_receipt = _load_reference(args)
     joined = reference.join(universe, on="symbol", how="left")
     company_events = joined.filter(
-        pl.col("security_type").eq("stock")
-        & pl.col("market").is_in(["twse", "tpex"])
+        pl.col("security_type").eq("stock") & pl.col("market").is_in(["twse", "tpex"])
     )
     company_cash_events = company_events.filter(
         pl.col("event_type").cast(pl.String).str.strip_chars().is_in(["息", "除息"])
@@ -1275,8 +1274,9 @@ def main() -> None:
     details_for_join = (
         parsed.select("date", "symbol", *detail_columns)
         .join(
-            exact.select("date", "symbol")
-            .with_columns(pl.lit(True).alias("is_exact_cash")),
+            exact.select("date", "symbol").with_columns(
+                pl.lit(True).alias("is_exact_cash")
+            ),
             on=["date", "symbol"],
             how="left",
         )
@@ -1318,9 +1318,10 @@ def main() -> None:
             .then(pl.lit("mops_exact_cash"))
             .when(
                 pl.col("security_type").eq("stock")
-                & pl.col("event_type").cast(pl.String).str.strip_chars().is_in(
-                    ["息", "除息"]
-                )
+                & pl.col("event_type")
+                .cast(pl.String)
+                .str.strip_chars()
+                .is_in(["息", "除息"])
             )
             .then(pl.lit("mops_cash_terms_unavailable_or_complex"))
             .when(pl.col("security_type").eq("stock"))
@@ -1363,9 +1364,7 @@ def main() -> None:
         "parsed_exact_cash_candidates": int(exact.height),
         "exact_cash_events": int(ledger_exact_cash.height),
         "avoided_events": int(ledger.height - ledger_exact_cash.height),
-        "cash_events_without_exact_terms": int(
-            ledger_unresolved_company_cash.height
-        ),
+        "cash_events_without_exact_terms": int(ledger_unresolved_company_cash.height),
         "unmatched_mops_cash_events": int(missing.height),
         "missing_examples": missing.head(50).to_dicts(),
         "failure_count": len(failures),

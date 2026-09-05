@@ -18,6 +18,9 @@ expected_fold_count: 11
 
 pinned_panel_cache:
   snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  # Derived caches are node-local writable state, never part of the immutable
+  # materialized release. Keep this path aligned with data.panel_cache_root.
+  cache_root: artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/stocks
   variant_id: fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577
   version: 54
   generation: 3726b829b37d4d56833a80b20280e4a2
@@ -42,6 +45,8 @@ matrix:
   include_baseline: true
 
   fixed_overrides:
+    data:
+      panel_cache_root: artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/stocks
     runner:
       resume: true
       post_train_infer: false

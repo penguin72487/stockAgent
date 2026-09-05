@@ -6,13 +6,10 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import io
-import os
 from pathlib import Path
 import sys
-import tempfile
-import time
 from typing import Final
-from urllib import parse, request
+from urllib import parse
 
 import pandas as pd
 import polars as pl
@@ -25,6 +22,14 @@ from scripts.taifex_daily_download_common import (  # noqa: E402
     atomic_write_json,
     parse_iso_date,
     sha256_path,
+)
+from downloader.artifact_io import (  # noqa: E402
+    atomic_write_bytes,
+    atomic_write_parquet,
+)
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
 )
 
 
@@ -42,42 +47,29 @@ def _download_html(
 ) -> Path:
     if not refresh and target.is_file() and target.stat().st_size > 1_000:
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    last_error: Exception | None = None
-    body = b""
-    content_type = ""
-    for attempt in range(1, attempts + 1):
-        try:
-            http_request = request.Request(
-                url,
-                headers={"User-Agent": "stockAgent/taifex-final-settlement-research"},
-            )
-            with request.urlopen(http_request, timeout=120) as response:
-                body = response.read()
-                content_type = str(response.headers.get("Content-Type") or "")
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt >= attempts:
-                raise RuntimeError(
-                    f"failed to download TAIFEX final settlements after {attempts} attempts"
-                ) from last_error
-            time.sleep(float(attempt))
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=120,
+            max_retries=max(0, attempts - 1),
+            retry_base_seconds=0.5,
+        )
+    )
+    response = transport.request_bytes(
+        url,
+        headers={"User-Agent": "stockAgent/taifex-final-settlement-research"},
+    )
+    body = response.body
+    content_type = str(
+        response.headers.get("Content-Type")
+        or response.headers.get("content-type")
+        or ""
+    )
     if len(body) < 1_000 or "html" not in content_type.casefold():
         raise RuntimeError(
             "TAIFEX final-settlement response is not a non-empty HTML page"
         )
-    with tempfile.NamedTemporaryFile(
-        dir=target.parent,
-        prefix=target.name + ".",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(target)
+    atomic_write_bytes(target, body, durable=True)
     return target
 
 
@@ -189,10 +181,7 @@ def main() -> int:
         source_url=source_url,
     )
     normalized_path = output_dir / "txo_final_settlement_history.parquet"
-    normalized_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = normalized_path.with_suffix(".parquet.tmp")
-    frame.write_parquet(temporary, compression="zstd")
-    temporary.replace(normalized_path)
+    atomic_write_parquet(normalized_path, frame, compression="zstd", durable=True)
     manifest = {
         "schema_version": OUTPUT_SCHEMA_VERSION,
         "status": "complete",

@@ -5,7 +5,6 @@ import csv
 import fcntl
 import gzip
 from html.parser import HTMLParser
-import hashlib
 from io import BytesIO, StringIO
 import json
 import math
@@ -24,7 +23,6 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 import polars as pl
-import pyarrow.parquet as pq
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -33,10 +31,15 @@ if str(SCRIPT_DIR) not in sys.path:
 from common import (  # noqa: E402
     PersistentProgress,
     SharedRateLimiter,
-    atomic_write_text,
     load_env_file,
     provider_rate_limit,
     retry_delay_seconds,
+)
+from artifact_io import (  # noqa: E402
+    atomic_write_bytes as _atomic_bytes,
+    atomic_write_json as _atomic_json,
+    atomic_write_parquet as _atomic_parquet,
+    sha256_bytes as _sha256,
 )
 
 
@@ -80,7 +83,9 @@ def parse_args() -> argparse.Namespace:
             "versioned official issuer NAV, holdings and asset-per-share history."
         )
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/crypto_etf_sources.json"))
+    parser.add_argument(
+        "--config", type=Path, default=Path("configs/crypto_etf_sources.json")
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data_crypto_etf"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--tickers", nargs="*", default=None)
@@ -98,34 +103,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--retry-base", type=float, default=1.0)
     return parser.parse_args()
-
-
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_json(path: Path, payload: Any) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _atomic_parquet(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        pq.write_table(frame.to_arrow(), temporary, compression="zstd", write_statistics=True)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _safe_float(value: Any) -> float | None:
@@ -199,7 +176,9 @@ class HttpClient:
             limiter = self._limiters.get(profile_name)
             if limiter is None:
                 profile = provider_rate_limit(profile_name)
-                limiter = SharedRateLimiter(profile.interval_seconds, name=profile.provider)
+                limiter = SharedRateLimiter(
+                    profile.interval_seconds, name=profile.provider
+                )
                 self._limiters[profile_name] = limiter
             return limiter
 
@@ -225,11 +204,23 @@ class HttpClient:
             )
             try:
                 with urlopen(request, timeout=120) as response:
-                    return response.read(), {str(key).lower(): str(value) for key, value in response.headers.items()}
+                    return response.read(), {
+                        str(key).lower(): str(value)
+                        for key, value in response.headers.items()
+                    }
             except HTTPError as exc:
                 last_error = exc
-                if exc.code in {408, 429, 500, 502, 503, 504} and attempt < self.max_retries:
-                    limiter.defer(retry_delay_seconds(attempt, base=self.retry_base, retry_after=exc.headers.get("Retry-After")))
+                if (
+                    exc.code in {408, 429, 500, 502, 503, 504}
+                    and attempt < self.max_retries
+                ):
+                    limiter.defer(
+                        retry_delay_seconds(
+                            attempt,
+                            base=self.retry_base,
+                            retry_after=exc.headers.get("Retry-After"),
+                        )
+                    )
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
                 raise HttpStatusError(exc.code, url, detail) from exc
@@ -242,11 +233,17 @@ class HttpClient:
         raise last_error or RuntimeError(f"request failed for {url}")
 
 
-def _persist_raw(output_dir: Path, category: str, source_id: str, payload: bytes, suffix: str) -> tuple[Path, str]:
+def _persist_raw(
+    output_dir: Path, category: str, source_id: str, payload: bytes, suffix: str
+) -> tuple[Path, str]:
     digest = _sha256(payload)
     path = output_dir / "raw" / category / source_id / f"{digest}.{suffix.lstrip('.')}"
     if not path.is_file():
-        stored = gzip.compress(payload, compresslevel=6, mtime=0) if path.suffix == ".gz" else payload
+        stored = (
+            gzip.compress(payload, compresslevel=6, mtime=0)
+            if path.suffix == ".gz"
+            else payload
+        )
         _atomic_bytes(path, stored)
     return path, digest
 
@@ -259,13 +256,22 @@ def _json(payload: bytes) -> dict[str, Any]:
 
 
 def _filing_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    recent = payload.get("filings", {}).get("recent") if isinstance(payload.get("filings"), dict) else payload
+    recent = (
+        payload.get("filings", {}).get("recent")
+        if isinstance(payload.get("filings"), dict)
+        else payload
+    )
     if not isinstance(recent, dict):
         return []
-    columns = {str(key): value for key, value in recent.items() if isinstance(value, list)}
+    columns = {
+        str(key): value for key, value in recent.items() if isinstance(value, list)
+    }
     length = max((len(value) for value in columns.values()), default=0)
     return [
-        {key: values[index] if index < len(values) else None for key, values in columns.items()}
+        {
+            key: values[index] if index < len(values) else None
+            for key, values in columns.items()
+        }
         for index in range(length)
     ]
 
@@ -324,7 +330,9 @@ def _companyfact_rows(
                             "description": str(description or ""),
                             "unit": str(unit),
                             "value_float": value_number,
-                            "value_text": None if value_number is not None else str(item.get("val") or ""),
+                            "value_text": None
+                            if value_number is not None
+                            else str(item.get("val") or ""),
                             "period_start": item.get("start"),
                             "period_end": item.get("end"),
                             "filed_date": item.get("filed"),
@@ -333,7 +341,9 @@ def _companyfact_rows(
                             "fiscal_period": item.get("fp"),
                             "frame": item.get("frame"),
                             "accession_number": item.get("accn"),
-                            "available_at_utc": f"{item.get('filed')}T23:59:59+00:00" if item.get("filed") else retrieved_at,
+                            "available_at_utc": f"{item.get('filed')}T23:59:59+00:00"
+                            if item.get("filed")
+                            else retrieved_at,
                             "retrieved_at_utc": retrieved_at,
                         }
                     )
@@ -359,9 +369,13 @@ def _sec_entity(
     output_paths: list[str] = []
     retrieved_at = datetime.now(UTC).isoformat()
     submissions_url = str(config["submissions_url_template"]).format(cik10=cik10)
-    raw, _ = client.get(submissions_url, profile_name="sec_edgar", user_agent=user_agent)
+    raw, _ = client.get(
+        submissions_url, profile_name="sec_edgar", user_agent=user_agent
+    )
     requests += 1
-    path, submissions_sha = _persist_raw(output_dir, "sec/submissions", cik10, raw, "json.gz")
+    path, submissions_sha = _persist_raw(
+        output_dir, "sec/submissions", cik10, raw, "json.gz"
+    )
     output_paths.append(str(path))
     submissions = _json(raw)
     filings = _filing_rows(submissions)
@@ -370,9 +384,13 @@ def _sec_entity(
         if not name:
             continue
         shard_url = str(config["submission_shard_url_template"]).format(name=name)
-        shard_raw, _ = client.get(shard_url, profile_name="sec_edgar", user_agent=user_agent)
+        shard_raw, _ = client.get(
+            shard_url, profile_name="sec_edgar", user_agent=user_agent
+        )
         requests += 1
-        shard_path, _ = _persist_raw(output_dir, "sec/submission_shards", cik10, shard_raw, "json.gz")
+        shard_path, _ = _persist_raw(
+            output_dir, "sec/submission_shards", cik10, shard_raw, "json.gz"
+        )
         output_paths.append(str(shard_path))
         filings.extend(_filing_rows(_json(shard_raw)))
     normalized_filings: list[dict[str, Any]] = []
@@ -405,24 +423,42 @@ def _sec_entity(
                 "submissions_raw_sha256": submissions_sha,
             }
         )
-    filings_frame = pl.from_dicts(normalized_filings, infer_schema_length=None, strict=False) if normalized_filings else pl.DataFrame()
+    filings_frame = (
+        pl.from_dicts(normalized_filings, infer_schema_length=None, strict=False)
+        if normalized_filings
+        else pl.DataFrame()
+    )
     filings_path = output_dir / "normalized" / "sec" / cik10 / "filings.parquet"
     _atomic_parquet(filings_path, filings_frame)
     output_paths.append(str(filings_path))
 
     facts_url = str(config["companyfacts_url_template"]).format(cik10=cik10)
     try:
-        facts_raw, _ = client.get(facts_url, profile_name="sec_edgar", user_agent=user_agent)
+        facts_raw, _ = client.get(
+            facts_url, profile_name="sec_edgar", user_agent=user_agent
+        )
         requests += 1
-        facts_raw_path, facts_sha = _persist_raw(output_dir, "sec/companyfacts", cik10, facts_raw, "json.gz")
+        facts_raw_path, facts_sha = _persist_raw(
+            output_dir, "sec/companyfacts", cik10, facts_raw, "json.gz"
+        )
         output_paths.append(str(facts_raw_path))
-        fact_rows = _companyfact_rows(_json(facts_raw), cik=cik10, tickers=sorted(tickers), title=title, retrieved_at=retrieved_at)
+        fact_rows = _companyfact_rows(
+            _json(facts_raw),
+            cik=cik10,
+            tickers=sorted(tickers),
+            title=title,
+            retrieved_at=retrieved_at,
+        )
     except HttpStatusError as exc:
         if exc.code != 404:
             raise
         facts_sha = None
         fact_rows = []
-    facts_frame = pl.from_dicts(fact_rows, infer_schema_length=None, strict=False) if fact_rows else pl.DataFrame()
+    facts_frame = (
+        pl.from_dicts(fact_rows, infer_schema_length=None, strict=False)
+        if fact_rows
+        else pl.DataFrame()
+    )
     facts_path = output_dir / "normalized" / "sec" / cik10 / "companyfacts.parquet"
     _atomic_parquet(facts_path, facts_frame)
     output_paths.append(str(facts_path))
@@ -432,14 +468,26 @@ def _sec_entity(
     allowed_forms = {str(value) for value in config.get("forms", [])}
     document_failures: list[dict[str, str]] = []
     if download_documents:
-        candidates = [row for row in normalized_filings if row.get("form") in allowed_forms and row.get("primary_document")]
+        candidates = [
+            row
+            for row in normalized_filings
+            if row.get("form") in allowed_forms and row.get("primary_document")
+        ]
         if max_documents > 0:
             candidates = candidates[:max_documents]
         for row in candidates:
             accession = str(row["accession_number"])
             primary_document = Path(str(row["primary_document"])).name
             accession_compact = accession.replace("-", "")
-            target = output_dir / "raw" / "sec" / "primary_documents" / cik10 / accession / f"{primary_document}.gz"
+            target = (
+                output_dir
+                / "raw"
+                / "sec"
+                / "primary_documents"
+                / cik10
+                / accession
+                / f"{primary_document}.gz"
+            )
             fallback_template = str(
                 config.get("complete_submission_url_template") or ""
             ).strip()
@@ -535,9 +583,16 @@ def _sec_entity(
                 primary_document=quote(primary_document, safe="._-"),
             )
             try:
-                document_raw, _ = client.get(document_url, profile_name="sec_edgar", user_agent=user_agent, accept="text/html,application/xml,text/plain,*/*")
+                document_raw, _ = client.get(
+                    document_url,
+                    profile_name="sec_edgar",
+                    user_agent=user_agent,
+                    accept="text/html,application/xml,text/plain,*/*",
+                )
                 requests += 1
-                _atomic_bytes(target, gzip.compress(document_raw, compresslevel=6, mtime=0))
+                _atomic_bytes(
+                    target, gzip.compress(document_raw, compresslevel=6, mtime=0)
+                )
                 documents_downloaded += 1
                 document_receipts.append(
                     {
@@ -653,7 +708,9 @@ class _NextDataParser(HTMLParser):
             self.parts.append(data)
 
 
-def _issuer_context(spec: dict[str, Any], observed_at: str, raw_sha: str) -> dict[str, Any]:
+def _issuer_context(
+    spec: dict[str, Any], observed_at: str, raw_sha: str
+) -> dict[str, Any]:
     return {
         "source_id": str(spec["id"]),
         "provider": str(spec["provider"]),
@@ -666,14 +723,18 @@ def _issuer_context(spec: dict[str, Any], observed_at: str, raw_sha: str) -> dic
     }
 
 
-def _parse_ishares_xls(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str) -> IssuerFrames:
+def _parse_ishares_xls(
+    spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str
+) -> IssuerFrames:
     book = pd.ExcelFile(BytesIO(raw), engine="xlrd")
     sheet = next((name for name in book.sheet_names if "Gross Proceeds" in name), None)
     if sheet is None:
         raise RuntimeError(f"{spec['id']}: Gross Proceeds sheet is missing")
     table = pd.read_excel(BytesIO(raw), sheet_name=sheet, header=None, engine="xlrd")
     if table.shape[1] < 5:
-        raise RuntimeError(f"{spec['id']}: unexpected Gross Proceeds schema {table.shape}")
+        raise RuntimeError(
+            f"{spec['id']}: unexpected Gross Proceeds schema {table.shape}"
+        )
     context = _issuer_context(spec, observed_at, raw_sha)
     rows: list[dict[str, Any]] = []
     metric_columns = (
@@ -687,14 +748,34 @@ def _parse_ishares_xls(spec: dict[str, Any], raw: bytes, observed_at: str, raw_s
             continue
         for index, metric, unit in metric_columns:
             value = _safe_float(values.iloc[index])
-            rows.append({**context, "event_date": parsed_date.date().isoformat(), "metric": metric, "value": value, "unit": unit})
-    return IssuerFrames(SourceResult(str(spec["id"]), str(spec["provider"]), "complete", len(rows), 1, []), rows, [], [])
+            rows.append(
+                {
+                    **context,
+                    "event_date": parsed_date.date().isoformat(),
+                    "metric": metric,
+                    "value": value,
+                    "unit": unit,
+                }
+            )
+    return IssuerFrames(
+        SourceResult(
+            str(spec["id"]), str(spec["provider"]), "complete", len(rows), 1, []
+        ),
+        rows,
+        [],
+        [],
+    )
 
 
-def _parse_ishares_holdings(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str) -> IssuerFrames:
+def _parse_ishares_holdings(
+    spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str
+) -> IssuerFrames:
     text = raw.decode("utf-8-sig")
     lines = text.splitlines()
-    header_index = next((index for index, line in enumerate(lines) if line.startswith("Ticker,Name,")), None)
+    header_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("Ticker,Name,")),
+        None,
+    )
     if header_index is None:
         raise RuntimeError(f"{spec['id']}: holdings CSV header is missing")
     metadata: dict[str, str] = {}
@@ -723,12 +804,32 @@ def _parse_ishares_holdings(spec: dict[str, Any], raw: bytes, observed_at: str, 
             }
         )
     metrics = [
-        {**context, "event_date": as_of.date().isoformat(), "metric": "shares_outstanding", "value": _safe_float(metadata.get("Shares Outstanding")), "unit": "shares"}
+        {
+            **context,
+            "event_date": as_of.date().isoformat(),
+            "metric": "shares_outstanding",
+            "value": _safe_float(metadata.get("Shares Outstanding")),
+            "unit": "shares",
+        }
     ]
-    return IssuerFrames(SourceResult(str(spec["id"]), str(spec["provider"]), "complete", len(holdings) + len(metrics), 1, []), metrics, holdings, [])
+    return IssuerFrames(
+        SourceResult(
+            str(spec["id"]),
+            str(spec["provider"]),
+            "complete",
+            len(holdings) + len(metrics),
+            1,
+            [],
+        ),
+        metrics,
+        holdings,
+        [],
+    )
 
 
-def _parse_bitwise(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str) -> IssuerFrames:
+def _parse_bitwise(
+    spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: str
+) -> IssuerFrames:
     parser = _NextDataParser()
     parser.feed(raw.decode("utf-8", errors="replace"))
     if not parser.parts:
@@ -739,10 +840,25 @@ def _parse_bitwise(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: 
     context = _issuer_context(spec, observed_at, raw_sha)
     metrics: list[dict[str, Any]] = []
     chart = (data.get("navAndMarketPrice") or {}).get("chart") or {}
-    for field, metric in (("nav", "nav_per_share"), ("marketPrice", "market_price_per_share")):
+    for field, metric in (
+        ("nav", "nav_per_share"),
+        ("marketPrice", "market_price_per_share"),
+    ):
         for timestamp_ms, value in chart.get(field, []):
-            event_date = datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=UTC).date().isoformat()
-            metrics.append({**context, "event_date": event_date, "metric": metric, "value": _safe_float(value), "unit": "USD/share"})
+            event_date = (
+                datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=UTC)
+                .date()
+                .isoformat()
+            )
+            metrics.append(
+                {
+                    **context,
+                    "event_date": event_date,
+                    "metric": metric,
+                    "value": _safe_float(value),
+                    "unit": "USD/share",
+                }
+            )
     details = data.get("fundDetails") or {}
     as_of = str(details.get("asOfDate") or "")
     for field, metric, unit in (
@@ -751,7 +867,15 @@ def _parse_bitwise(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: 
         ("expenseRatio", "expense_ratio", "ratio"),
     ):
         if as_of and details.get(field) is not None:
-            metrics.append({**context, "event_date": as_of, "metric": metric, "value": _safe_float(details.get(field)), "unit": unit})
+            metrics.append(
+                {
+                    **context,
+                    "event_date": as_of,
+                    "metric": metric,
+                    "value": _safe_float(details.get(field)),
+                    "unit": unit,
+                }
+            )
     holdings: list[dict[str, Any]] = []
     holding_payload = data.get("holdings") or {}
     holding_as_of = str(holding_payload.get("asOfDate") or as_of)
@@ -783,11 +907,20 @@ def _parse_bitwise(spec: dict[str, Any], raw: bytes, observed_at: str, raw_sha: 
                 "definition": "Issuer-published proof-of-reserves snapshot; not independently asserted as solvency.",
             }
         )
-    result = SourceResult(str(spec["id"]), str(spec["provider"]), "complete", len(metrics) + len(holdings) + len(reserves), 1, [])
+    result = SourceResult(
+        str(spec["id"]),
+        str(spec["provider"]),
+        "complete",
+        len(metrics) + len(holdings) + len(reserves),
+        1,
+        [],
+    )
     return IssuerFrames(result, metrics, holdings, reserves)
 
 
-def _issuer_source(client: HttpClient, output_dir: Path, spec: dict[str, Any]) -> IssuerFrames:
+def _issuer_source(
+    client: HttpClient, output_dir: Path, spec: dict[str, Any]
+) -> IssuerFrames:
     source_id = str(spec["id"])
     adapter = str(spec["adapter"])
     observed_at = datetime.now(UTC).isoformat()
@@ -810,11 +943,21 @@ def _issuer_source(client: HttpClient, output_dir: Path, spec: dict[str, Any]) -
         except (OSError, KeyError, ValueError, json.JSONDecodeError, gzip.BadGzipFile):
             raw = None
     if raw is None:
-        profile = "ishares_public" if spec.get("provider") == "iShares" else "bitwise_public"
-        raw, headers = client.get(str(spec["url"]), profile_name=profile, user_agent="stockAgent-crypto-etf/1")
+        profile = (
+            "ishares_public" if spec.get("provider") == "iShares" else "bitwise_public"
+        )
+        raw, headers = client.get(
+            str(spec["url"]), profile_name=profile, user_agent="stockAgent-crypto-etf/1"
+        )
         requests = 1
-        extension = "xls" if adapter.endswith("xls") else ("csv.gz" if adapter.endswith("csv") else "html.gz")
-        raw_path, raw_sha = _persist_raw(output_dir, "issuers", source_id, raw, extension)
+        extension = (
+            "xls"
+            if adapter.endswith("xls")
+            else ("csv.gz" if adapter.endswith("csv") else "html.gz")
+        )
+        raw_path, raw_sha = _persist_raw(
+            output_dir, "issuers", source_id, raw, extension
+        )
         _atomic_json(
             receipt_path,
             {
@@ -848,12 +991,24 @@ def _upsert_rows(path: Path, rows: list[dict[str, Any]], keys: list[str]) -> int
     if path.is_file():
         existing = pl.read_parquet(path)
         all_columns = list(dict.fromkeys([*existing.columns, *incoming.columns]))
-        existing = existing.select([pl.col(name) if name in existing.columns else pl.lit(None).alias(name) for name in all_columns])
-        incoming = incoming.select([pl.col(name) if name in incoming.columns else pl.lit(None).alias(name) for name in all_columns])
+        existing = existing.select(
+            [
+                pl.col(name) if name in existing.columns else pl.lit(None).alias(name)
+                for name in all_columns
+            ]
+        )
+        incoming = incoming.select(
+            [
+                pl.col(name) if name in incoming.columns else pl.lit(None).alias(name)
+                for name in all_columns
+            ]
+        )
         frame = pl.concat([existing, incoming], how="vertical_relaxed")
     else:
         frame = incoming
-    frame = frame.sort("observed_at_utc").unique(subset=keys, keep="last", maintain_order=True)
+    frame = frame.sort("observed_at_utc").unique(
+        subset=keys, keep="last", maintain_order=True
+    )
     _atomic_parquet(path, frame)
     return frame.height
 
@@ -865,10 +1020,20 @@ def _resolve_sec_entities(
     funds: list[dict[str, Any]],
     user_agent: str,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
-    raw, _ = client.get(str(sec_config["company_tickers_url"]), profile_name="sec_edgar", user_agent=user_agent)
-    raw_path, digest = _persist_raw(output_dir, "sec", "company_tickers", raw, "json.gz")
+    raw, _ = client.get(
+        str(sec_config["company_tickers_url"]),
+        profile_name="sec_edgar",
+        user_agent=user_agent,
+    )
+    raw_path, digest = _persist_raw(
+        output_dir, "sec", "company_tickers", raw, "json.gz"
+    )
     mapping_payload = _json(raw)
-    mapping = {str(item.get("ticker") or "").upper(): item for item in mapping_payload.values() if isinstance(item, dict)}
+    mapping = {
+        str(item.get("ticker") or "").upper(): item
+        for item in mapping_payload.values()
+        if isinstance(item, dict)
+    }
     entities: dict[int, dict[str, Any]] = {}
     missing: list[str] = []
     for fund in funds:
@@ -878,7 +1043,16 @@ def _resolve_sec_entities(
             missing.append(ticker)
             continue
         cik = int(item["cik_str"])
-        entity = entities.setdefault(cik, {"cik": cik, "tickers": [], "assets": [], "issuers": [], "title": str(item.get("title") or "")})
+        entity = entities.setdefault(
+            cik,
+            {
+                "cik": cik,
+                "tickers": [],
+                "assets": [],
+                "issuers": [],
+                "title": str(item.get("title") or ""),
+            },
+        )
         entity["tickers"].append(ticker)
         entity["assets"].append(str(fund["asset"]))
         entity["issuers"].append(str(fund["issuer"]))
@@ -900,25 +1074,44 @@ def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     config_path = args.config if args.config.is_absolute() else repo_root / args.config
-    output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
-    env_file = args.env_file if args.env_file.is_absolute() else repo_root / args.env_file
-    load_env_file(env_file, allowed_names={"SEC_USER_AGENT", "STOCKAGENT_CONTACT_EMAIL"})
+    output_dir = (
+        args.output_dir
+        if args.output_dir.is_absolute()
+        else repo_root / args.output_dir
+    )
+    env_file = (
+        args.env_file if args.env_file.is_absolute() else repo_root / args.env_file
+    )
+    load_env_file(
+        env_file, allowed_names={"SEC_USER_AGENT", "STOCKAGENT_CONTACT_EMAIL"}
+    )
     config = json.loads(config_path.read_text(encoding="utf-8"))
     selected = {value.upper() for value in args.tickers} if args.tickers else None
-    funds = [item for item in config["sec"]["funds"] if selected is None or str(item["ticker"]).upper() in selected]
+    funds = [
+        item
+        for item in config["sec"]["funds"]
+        if selected is None or str(item["ticker"]).upper() in selected
+    ]
     if selected:
         unknown = selected - {str(item["ticker"]).upper() for item in funds}
         if unknown:
             raise SystemExit(
                 "unregistered crypto ETF tickers: " + ", ".join(sorted(unknown))
             )
-    issuer_specs = [item for item in config.get("issuer_sources", []) if selected is None or str(item["ticker"]).upper() in selected]
+    issuer_specs = [
+        item
+        for item in config.get("issuer_sources", [])
+        if selected is None or str(item["ticker"]).upper() in selected
+    ]
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = (output_dir / ".download.lock").open("a+")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print(f"[crypto-etf] another updater owns {output_dir / '.download.lock'}; skip", flush=True)
+        print(
+            f"[crypto-etf] another updater owns {output_dir / '.download.lock'}; skip",
+            flush=True,
+        )
         return 0
     client = HttpClient(max_retries=args.max_retries, retry_base=args.retry_base)
     results: list[SourceResult] = []
@@ -936,9 +1129,7 @@ def main() -> int:
         if args.max_sec_entities > 0:
             sec_entities = sec_entities[: args.max_sec_entities]
     progress_total = (
-        0
-        if args.skip_sec
-        else max(1, len(sec_entities) + len(missing_sec_tickers))
+        0 if args.skip_sec else max(1, len(sec_entities) + len(missing_sec_tickers))
     ) + (0 if args.skip_issuers else len(issuer_specs))
     progress = PersistentProgress(
         output_dir / "progress.json",
@@ -948,7 +1139,15 @@ def main() -> int:
         basis="ETA uses completed SEC entities and issuer sources; filing-document count and remote publication latency vary.",
     )
     if not args.skip_sec and not sec_user_agent:
-        result = SourceResult("sec_edgar", "SEC EDGAR", "blocked_configuration", 0, 0, [], "Set SEC_USER_AGENT='name organization email' with an ASCII contact email for SEC fair-access identification.")
+        result = SourceResult(
+            "sec_edgar",
+            "SEC EDGAR",
+            "blocked_configuration",
+            0,
+            0,
+            [],
+            "Set SEC_USER_AGENT='name organization email' with an ASCII contact email for SEC fair-access identification.",
+        )
         results.append(result)
         progress.update("SEC_USER_AGENT", result.status)
     elif not args.skip_sec:
@@ -987,31 +1186,76 @@ def main() -> int:
                 try:
                     result = future.result()
                 except Exception as exc:
-                    result = SourceResult(f"sec_cik_{int(entity['cik']):010d}", "SEC EDGAR", "failed", 0, 0, [], f"{type(exc).__name__}: {exc}")
+                    result = SourceResult(
+                        f"sec_cik_{int(entity['cik']):010d}",
+                        "SEC EDGAR",
+                        "failed",
+                        0,
+                        0,
+                        [],
+                        f"{type(exc).__name__}: {exc}",
+                    )
                 results.append(result)
                 progress.update(result.source_id, result.status)
         if initial_requests:
-            results.append(SourceResult("sec_company_tickers", "SEC EDGAR", "complete", len(sec_entities), initial_requests, []))
+            results.append(
+                SourceResult(
+                    "sec_company_tickers",
+                    "SEC EDGAR",
+                    "complete",
+                    len(sec_entities),
+                    initial_requests,
+                    [],
+                )
+            )
 
     issuer_frames: list[IssuerFrames] = []
     if not args.skip_issuers:
         with ThreadPoolExecutor(max_workers=max(1, args.issuer_workers)) as executor:
-            futures = {executor.submit(_issuer_source, client, output_dir, spec): spec for spec in issuer_specs}
+            futures = {
+                executor.submit(_issuer_source, client, output_dir, spec): spec
+                for spec in issuer_specs
+            }
             for future in as_completed(futures):
                 spec = futures[future]
                 try:
                     parsed = future.result()
                 except Exception as exc:
-                    parsed = IssuerFrames(SourceResult(str(spec["id"]), str(spec["provider"]), "failed", 0, 0, [], f"{type(exc).__name__}: {exc}"), [], [], [])
+                    parsed = IssuerFrames(
+                        SourceResult(
+                            str(spec["id"]),
+                            str(spec["provider"]),
+                            "failed",
+                            0,
+                            0,
+                            [],
+                            f"{type(exc).__name__}: {exc}",
+                        ),
+                        [],
+                        [],
+                        [],
+                    )
                 issuer_frames.append(parsed)
                 results.append(parsed.result)
                 progress.update(parsed.result.source_id, parsed.result.status)
         daily_rows = [row for parsed in issuer_frames for row in parsed.daily_metrics]
         holding_rows = [row for parsed in issuer_frames for row in parsed.holdings]
         reserve_rows = [row for parsed in issuer_frames for row in parsed.reserves]
-        daily_total = _upsert_rows(output_dir / "normalized" / "issuer_daily_fund_metrics.parquet", daily_rows, ["source_id", "ticker", "event_date", "metric"])
-        holdings_total = _upsert_rows(output_dir / "normalized" / "issuer_holdings_snapshots.parquet", holding_rows, ["source_id", "ticker", "as_of_date", "holding_ticker"])
-        reserves_total = _upsert_rows(output_dir / "normalized" / "issuer_reserve_snapshots.parquet", reserve_rows, ["source_id", "ticker", "snapshot_at_utc"])
+        daily_total = _upsert_rows(
+            output_dir / "normalized" / "issuer_daily_fund_metrics.parquet",
+            daily_rows,
+            ["source_id", "ticker", "event_date", "metric"],
+        )
+        holdings_total = _upsert_rows(
+            output_dir / "normalized" / "issuer_holdings_snapshots.parquet",
+            holding_rows,
+            ["source_id", "ticker", "as_of_date", "holding_ticker"],
+        )
+        reserves_total = _upsert_rows(
+            output_dir / "normalized" / "issuer_reserve_snapshots.parquet",
+            reserve_rows,
+            ["source_id", "ticker", "snapshot_at_utc"],
+        )
     else:
         daily_total = holdings_total = reserves_total = 0
 
@@ -1031,17 +1275,43 @@ def main() -> int:
         "complete_sources": sum(result.status == "complete" for result in results),
         "failed_sources": sum(result.status == "failed" for result in results),
         "degraded_sources": sum(result.status == "degraded" for result in results),
-        "blocked_sources": sum(result.status == "blocked_configuration" for result in results),
-        "unavailable_mapping_sources": sum(result.status == "unavailable_mapping" for result in results),
+        "blocked_sources": sum(
+            result.status == "blocked_configuration" for result in results
+        ),
+        "unavailable_mapping_sources": sum(
+            result.status == "unavailable_mapping" for result in results
+        ),
         "rows_this_run": sum(result.rows for result in results),
         "requests": sum(result.requests for result in results),
         "issuer_daily_metric_rows_total": daily_total,
         "issuer_holdings_rows_total": holdings_total,
         "issuer_reserve_rows_total": reserves_total,
-        "results": [asdict(result) for result in sorted(results, key=lambda item: item.source_id)],
+        "results": [
+            asdict(result)
+            for result in sorted(results, key=lambda item: item.source_id)
+        ],
     }
     _atomic_json(output_dir / "download_summary.json", summary)
-    print(json.dumps({key: summary[key] for key in ("state", "selected_funds", "sec_entities", "issuer_sources", "complete_sources", "failed_sources", "blocked_sources", "rows_this_run", "requests")}, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                key: summary[key]
+                for key in (
+                    "state",
+                    "selected_funds",
+                    "sec_entities",
+                    "issuer_sources",
+                    "complete_sources",
+                    "failed_sources",
+                    "blocked_sources",
+                    "rows_this_run",
+                    "requests",
+                )
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return 1 if failed else 0
 
 

@@ -9,7 +9,6 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from io import BytesIO, StringIO
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -25,6 +24,11 @@ import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
 import polars as pl
+
+try:
+    from downloader.artifact_io import atomic_write_parquet
+except ImportError:  # pragma: no cover - direct execution from downloader/
+    from artifact_io import atomic_write_parquet
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -87,18 +91,17 @@ def _utc_now() -> datetime:
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(
-        f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    atomic_write_parquet(
+        target,
+        frame,
+        compression="zstd",
+        write_statistics=True,
     )
-    try:
-        frame.write_parquet(temporary, compression="zstd", statistics=True)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
-def _parse_listing(payload: bytes) -> tuple[list[dict[str, object]], list[str], str | None]:
+def _parse_listing(
+    payload: bytes,
+) -> tuple[list[dict[str, object]], list[str], str | None]:
     root = ET.fromstring(payload)
     namespace = ""
     if root.tag.startswith("{"):
@@ -302,7 +305,9 @@ def discover_plan(
     lifecycle: list[dict[str, object]] = []
     lock = threading.Lock()
 
-    def one_symbol(task: tuple[str, str]) -> tuple[list[ArchiveObject], dict[str, object]]:
+    def one_symbol(
+        task: tuple[str, str],
+    ) -> tuple[list[ArchiveObject], dict[str, object]]:
         market, symbol = task
         base = MARKET_PREFIXES[market]
         monthly_prefix = f"{base}/monthly/klines/{symbol}/1m/"
@@ -310,8 +315,7 @@ def discover_plan(
         monthly = [
             value
             for item in monthly_raw
-            if (value := _archive_object(market, symbol, "monthly", item))
-            is not None
+            if (value := _archive_object(market, symbol, "monthly", item)) is not None
         ]
         latest_month = max((item.period for item in monthly), default=None)
         tail_start = _tail_start(latest_month, tail_months)
@@ -332,8 +336,7 @@ def discover_plan(
             daily.extend(
                 value
                 for item in correction_raw
-                if (value := _archive_object(market, symbol, "daily", item))
-                is not None
+                if (value := _archive_object(market, symbol, "daily", item)) is not None
             )
         for repair_market, repair_symbol, repair_month in repair_months or set():
             if (repair_market, repair_symbol) != (market, symbol):
@@ -343,8 +346,7 @@ def discover_plan(
             daily.extend(
                 value
                 for item in repair_raw
-                if (value := _archive_object(market, symbol, "daily", item))
-                is not None
+                if (value := _archive_object(market, symbol, "daily", item)) is not None
             )
         values = {item.key: item for item in [*monthly, *daily]}
         periods = sorted(item.period for item in values.values())
@@ -376,7 +378,9 @@ def discover_plan(
             "first_archive_period": periods[0] if periods else None,
             "last_archive_period": latest_period,
             "archive_object_count": len(values),
-            "archive_compressed_bytes": sum(item.compressed_bytes for item in values.values()),
+            "archive_compressed_bytes": sum(
+                item.compressed_bytes for item in values.values()
+            ),
             "observed_at_utc": _utc_now().isoformat(),
             "point_in_time_state": "retrieval_vintage; lifecycle inferred from archive coverage",
         }
@@ -610,19 +614,27 @@ def _parse_kline_zip(payload: bytes, item: ArchiveObject) -> pl.DataFrame:
     return frame.sort("open_time")
 
 
-def _canonical_merge(existing: pl.DataFrame | None, incoming: list[pl.DataFrame]) -> pl.DataFrame:
-    frames = ([existing] if existing is not None and not existing.is_empty() else []) + incoming
+def _canonical_merge(
+    existing: pl.DataFrame | None, incoming: list[pl.DataFrame]
+) -> pl.DataFrame:
+    frames = (
+        [existing] if existing is not None and not existing.is_empty() else []
+    ) + incoming
     if not frames:
         return pl.DataFrame()
     return (
         pl.concat(frames, how="diagonal_relaxed")
         .sort(["open_time", "source_priority", "available_at_utc", "archive_key"])
-        .unique(subset=["market", "symbol", "open_time"], keep="last", maintain_order=True)
+        .unique(
+            subset=["market", "symbol", "open_time"], keep="last", maintain_order=True
+        )
         .sort("open_time")
     )
 
 
-def _download_one(client: BinanceArchiveClient, item: ArchiveObject) -> tuple[pl.DataFrame, str]:
+def _download_one(
+    client: BinanceArchiveClient, item: ArchiveObject
+) -> tuple[pl.DataFrame, str]:
     checksum_payload = client.archive_bytes(f"{item.key}.CHECKSUM")
     if checksum_payload is None:
         raise RuntimeError(f"missing checksum: {item.key}.CHECKSUM")
@@ -789,7 +801,9 @@ def execute_download(
         raise
     progress.finish(failed=bool(counts["failed"]))
     if error_rows:
-        _atomic_write_parquet(pl.DataFrame(error_rows), root / "download_errors.parquet")
+        _atomic_write_parquet(
+            pl.DataFrame(error_rows), root / "download_errors.parquet"
+        )
     with sqlite3.connect(state_path) as connection:
         durable_counts = {
             str(status): int(count)
@@ -811,9 +825,7 @@ def execute_download(
         "failed_objects": counts["failed"],
         "source_invalid_objects": source_invalid_objects,
         "new_quarantined_repair_objects": new_repair_objects,
-        "new_quarantined_source_invalid_objects": counts[
-            "quarantined_source_invalid"
-        ],
+        "new_quarantined_source_invalid_objects": counts["quarantined_source_invalid"],
         "durable_object_status_counts": durable_counts,
         "quarantined_monthly_objects": durable_counts.get(
             "quarantined_repair_required", 0
@@ -825,27 +837,33 @@ def execute_download(
     }
 
 
-def _plan_frame(objects: list[ArchiveObject], completed: dict[str, str]) -> pl.DataFrame:
+def _plan_frame(
+    objects: list[ArchiveObject], completed: dict[str, str]
+) -> pl.DataFrame:
     rows = []
     for item in objects:
         row = asdict(item)
         row["source_priority"] = item.source_priority
         row["state"] = "complete" if completed.get(item.key) == item.etag else "pending"
         rows.append(row)
-    return pl.DataFrame(rows) if rows else pl.DataFrame(
-        schema={
-            "market": pl.String,
-            "symbol": pl.String,
-            "archive_granularity": pl.String,
-            "period": pl.String,
-            "partition": pl.String,
-            "key": pl.String,
-            "etag": pl.String,
-            "compressed_bytes": pl.Int64,
-            "archive_last_modified_utc": pl.String,
-            "source_priority": pl.Int8,
-            "state": pl.String,
-        }
+    return (
+        pl.DataFrame(rows)
+        if rows
+        else pl.DataFrame(
+            schema={
+                "market": pl.String,
+                "symbol": pl.String,
+                "archive_granularity": pl.String,
+                "period": pl.String,
+                "partition": pl.String,
+                "key": pl.String,
+                "etag": pl.String,
+                "compressed_bytes": pl.Int64,
+                "archive_last_modified_utc": pl.String,
+                "source_priority": pl.Int8,
+                "state": pl.String,
+            }
+        )
     )
 
 
@@ -853,10 +871,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plan and checksum-verify Binance spot/dated-futures 1m archives."
     )
-    parser.add_argument("--output-root", type=Path, default=Path("data_binance_archive"))
+    parser.add_argument(
+        "--output-root", type=Path, default=Path("data_binance_archive")
+    )
     parser.add_argument("--mode", choices=("plan", "download"), default="plan")
-    parser.add_argument("--markets", nargs="+", choices=tuple(MARKET_PREFIXES), default=list(MARKET_PREFIXES))
-    parser.add_argument("--symbols", nargs="*", help="Optional exact symbol allowlist across selected markets.")
+    parser.add_argument(
+        "--markets",
+        nargs="+",
+        choices=tuple(MARKET_PREFIXES),
+        default=list(MARKET_PREFIXES),
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="*",
+        help="Optional exact symbol allowlist across selected markets.",
+    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--tail-months", type=int, default=2)
     parser.add_argument(
@@ -896,7 +925,9 @@ def main() -> int:
     )
     plan = _plan_frame(objects, completed)
     _atomic_write_parquet(plan, root / "archive_plan.parquet")
-    _atomic_write_parquet(pl.DataFrame(lifecycle), root / "instrument_lifecycle.parquet")
+    _atomic_write_parquet(
+        pl.DataFrame(lifecycle), root / "instrument_lifecycle.parquet"
+    )
     pending = [item for item in objects if completed.get(item.key) != item.etag]
     capacity = _capacity_receipt(
         root,

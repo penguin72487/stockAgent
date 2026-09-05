@@ -359,6 +359,12 @@ def _resolve_pinned_panel_cache_env(spec: dict[str, Any]) -> dict[str, str]:
                 "pinned_panel_cache.variant_id must be a 64-character sha256"
             )
         stores: list[Path] = []
+        configured_cache_root = str(raw.get("cache_root", "")).strip()
+        if configured_cache_root:
+            cache_root = _resolve_path(
+                configured_cache_root, relative_to=REPO_ROOT
+            )
+            stores.append(cache_root)
         configured_store = os.environ.get(
             "STOCKAGENT_TW_PUBLIC_SNAPSHOT_STORE", ""
         ).strip()
@@ -378,14 +384,22 @@ def _resolve_pinned_panel_cache_env(spec: dict[str, Any]) -> dict[str, str]:
             if resolved_store in seen:
                 continue
             seen.add(resolved_store)
-            candidates.append(
-                resolved_store
-                / snapshot_id
-                / "stocks"
-                / "panel_cache_v2"
-                / "variants"
-                / f"{variant_id}.json"
-            )
+            if configured_cache_root and resolved_store == cache_root.resolve():
+                candidates.append(
+                    resolved_store
+                    / "panel_cache_v2"
+                    / "variants"
+                    / f"{variant_id}.json"
+                )
+            else:
+                candidates.append(
+                    resolved_store
+                    / snapshot_id
+                    / "stocks"
+                    / "panel_cache_v2"
+                    / "variants"
+                    / f"{variant_id}.json"
+                )
         manifest_path = next(
             (candidate for candidate in candidates if candidate.is_file()),
             candidates[0] if candidates else Path(),

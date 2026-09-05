@@ -32,6 +32,7 @@ from common import (  # noqa: E402
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from artifact_io import atomic_write_parquet, atomic_write_text  # noqa: E402
 from binance_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
     feature_catalog_payload,
@@ -332,9 +333,8 @@ def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
     expression = parsed_date
     if "binance_close_time_ms" in frame.columns:
         close_time_ms = pl.col("binance_close_time_ms").cast(pl.Int64, strict=False)
-        valid_close_time = (
-            close_time_ms.is_not_null()
-            & (close_time_ms % CANDLE_INTERVAL_MS == CANDLE_INTERVAL_MS - 1)
+        valid_close_time = close_time_ms.is_not_null() & (
+            close_time_ms % CANDLE_INTERVAL_MS == CANDLE_INTERVAL_MS - 1
         )
         # Binance kline close time redundantly identifies the exact open-time
         # minute.  Prefer it only when it satisfies the documented interval
@@ -345,9 +345,7 @@ def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
             time_unit="ms",
         )
         expression = (
-            pl.when(valid_close_time)
-            .then(canonical_open)
-            .otherwise(parsed_date)
+            pl.when(valid_close_time).then(canonical_open).otherwise(parsed_date)
         )
     return (
         frame.with_columns(expression.dt.strftime("%Y-%m-%d %H:%M:%S").alias("date"))
@@ -458,14 +456,16 @@ def _load_logical_existing_info(path: Path) -> ExistingCandleInfo:
     dates = _normalize_date_frame(
         pl.from_arrow(pq.read_table(tail_path, columns=["date"], memory_map=True))
     ).select(pl.col("date").str.to_datetime(strict=False).alias("__ts"))
-    base_latest = datetime.fromtimestamp(base.latest_ms / 1000, tz=timezone.utc).replace(
-        tzinfo=None
-    )
+    base_latest = datetime.fromtimestamp(
+        base.latest_ms / 1000, tz=timezone.utc
+    ).replace(tzinfo=None)
     newer = dates.filter(pl.col("__ts") > base_latest)
     first_new = newer.select(pl.col("__ts").min()).item() if newer.height else None
-    contiguous = first_new is None or int(
-        first_new.replace(tzinfo=timezone.utc).timestamp() * 1000
-    ) <= base.latest_ms + CANDLE_INTERVAL_MS
+    contiguous = (
+        first_new is None
+        or int(first_new.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        <= base.latest_ms + CANDLE_INTERVAL_MS
+    )
     return ExistingCandleInfo(
         rows=base.rows + newer.height,
         latest_ms=max(
@@ -473,9 +473,7 @@ def _load_logical_existing_info(path: Path) -> ExistingCandleInfo:
         ),
         interval_ok=bool(base.interval_ok and tail.interval_ok and contiguous),
         earliest_ms=min(
-            value
-            for value in (base.earliest_ms, tail.earliest_ms)
-            if value is not None
+            value for value in (base.earliest_ms, tail.earliest_ms) if value is not None
         ),
     )
 
@@ -485,28 +483,11 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(),
-            temporary,
-            compression="snappy",
-            write_statistics=True,
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, text)
 
 
 def _write_csv_atomic(frame: pl.DataFrame, path: Path) -> None:
@@ -1152,8 +1133,8 @@ def main() -> None:
             mode=args.mode,
             refresh=args.refresh,
             tail_only=args.tail_only,
-            page_progress_callback=lambda _code: (
-                pipeline_progress.observe_request_page("candles")
+            page_progress_callback=lambda _code: pipeline_progress.observe_request_page(
+                "candles"
             ),
         )
         pipeline_progress.update(
