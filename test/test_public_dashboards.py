@@ -166,6 +166,7 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
             "benchmarks": [
                 {
                     "benchmark_id": "tx",
+                    "daily_return_previous_close_source": "/root/private.jsonl",
                     "last_roll_official_settlement_source_file": "/root/private.html",
                 }
             ],
@@ -195,6 +196,7 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
     )
     assert public["operational_issues"][0]["calendar_error"] == "unavailable"
     assert "last_roll_official_settlement_source_file" not in public["benchmarks"][0]
+    assert "daily_return_previous_close_source" not in public["benchmarks"][0]
 
 
 def test_tw_public_status_caps_initial_positions_without_mutating_source() -> None:
@@ -348,17 +350,22 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
             "expected_strategy_session_points_from_09_01": 270,
             "expected_stock_benchmark_session_points_including_09_00": 271,
             "expected_tx_day_session_points": 300,
-            "return_basis": (
-                "previous_retained_mark_before_start_else_initial_capital"
-            ),
+            "return_basis": "selected_range_first_visible_mark",
+            "cumulative_return_basis": "initial_capital_cumulative_total_equity",
+            "period_return_basis": "selected_range_first_visible_mark",
             "range_summary": [
                 {
                     "series_id": "benchmark_0050",
                     "series_type": "benchmark",
-                    "baseline_equity_twd": 100.0,
+                    "baseline_kind": "first_visible_mark",
+                    "baseline_equity_twd": 101.0,
+                    "initial_capital_twd": 100.0,
                     "end_equity_twd": 101.25,
-                    "range_net_pnl_twd": 1.25,
-                    "return_pct": 1.25,
+                    "range_net_pnl_twd": 0.25,
+                    "return_pct": 0.25,
+                    "cumulative_net_pnl_twd": 1.25,
+                    "cumulative_return_pct": 1.25,
+                    "period_return_pct": 0.25,
                     "point_count": 270,
                     "expected_points_per_session": 270,
                     "minute_coverage_ratio": 1.0,
@@ -386,14 +393,24 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
     assert public["available_start_date"] == "2026-08-13"
     assert public["available_end_date"] == "2026-08-17"
     assert public["curve_granularity"] == "1m"
+    assert public["return_basis"] == "selected_range_first_visible_mark"
+    assert public["cumulative_return_basis"] == (
+        "initial_capital_cumulative_total_equity"
+    )
+    assert public["period_return_basis"] == "selected_range_first_visible_mark"
     assert public["range_summary"] == [
         {
             "series_id": "benchmark_0050",
             "series_type": "benchmark",
-            "baseline_equity_twd": 100.0,
+            "baseline_kind": "first_visible_mark",
+            "baseline_equity_twd": 101.0,
+            "initial_capital_twd": 100.0,
             "end_equity_twd": 101.25,
-            "range_net_pnl_twd": 1.25,
-            "return_pct": 1.25,
+            "range_net_pnl_twd": 0.25,
+            "return_pct": 0.25,
+            "cumulative_net_pnl_twd": 1.25,
+            "cumulative_return_pct": 1.25,
+            "period_return_pct": 0.25,
             "point_count": 270,
             "expected_points_per_session": 270,
             "minute_coverage_ratio": 1.0,
@@ -460,8 +477,8 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=1"' in html
-    assert 'src="public.js?v=8"' in html
+    assert 'src="dashboard-core.js?v=2"' in html
+    assert 'src="public.js?v=9"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -654,8 +671,8 @@ def test_public_pages_share_visual_tokens() -> None:
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=6" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=1" defer' in html
-        assert html.index("dashboard-core.js?v=1") < html.index(
+        assert 'dashboard-core.js?v=2" defer' in html
+        assert html.index("dashboard-core.js?v=2") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -676,6 +693,11 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "upstreamSignal?.addEventListener" in shared_javascript
     assert "scheduleRefresh" in shared_javascript
     assert "escapeHtml" in shared_javascript
+    assert "setTrustedHtml" in shared_javascript
+    assert "createLatestRequest" in shared_javascript
+    assert "readJsonResponse" in shared_javascript
+    assert "validateJsonRoot" in shared_javascript
+    assert "expectedRoot" in shared_javascript
     assert "NAV_ITEMS" in shared_javascript
 
     for relative in (
@@ -694,6 +716,10 @@ def test_public_pages_share_visual_tokens() -> None:
     )
     assert "FETCH_TIMEOUT_MS = 5000" in traffic_javascript
     assert "Dashboard.fetchWithTimeout" in traffic_javascript
+    assert '$("cache-resident")' in traffic_javascript
+    assert 'id="cache-resident"' in (
+        root / "traffic_dashboard" / "index.html"
+    ).read_text(encoding="utf-8")
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
@@ -716,9 +742,26 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="detail-end-date" type="date"' in tw_html
     assert 'id="equity-start-date"' not in tw_html
     assert "rangeSummaryFor" in tw_javascript
+    assert "Dashboard.setTrustedHtml" in tw_javascript
+    assert ".innerHTML =" not in tw_javascript
+    assert "renderOverview(snapshot);" in tw_javascript
+    assert "renderModes(snapshot);" in tw_javascript
+    assert "renderBenchmarks(snapshot);" in tw_javascript
     assert "換月價差只補入／提回現金" in tw_javascript
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
+
+    openbb_javascript = (
+        root / "openbb_archive_dashboard" / "app.js"
+    ).read_text(encoding="utf-8")
+    assert "Dashboard.createLatestRequest()" in openbb_javascript
+    assert "requestedRange !== range" in openbb_javascript
+
+    taifex_javascript = (root / "taifex_dashboard" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "Dashboard.createLatestRequest()" in taifex_javascript
+    assert "requestedRange !== selectedTimeRange" in taifex_javascript
     assert ".overview-kpis{grid-template-columns:repeat(6,minmax(0,1fr))}" in tw_styles
     assert ".legend .legend-toggle" in tw_styles
     assert ".legend-toggle.is-hidden" in tw_styles
@@ -1016,6 +1059,12 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
         assert traffic["production_control_possible"] is False
         assert traffic["limits"]["global_rate_limit_enabled"] is False
         assert traffic["limits"]["application_concurrency_limit_enabled"] is False
+        assert traffic["cache"]["resident_entries"] >= 0
+        assert traffic["cache"]["resident_bytes"] >= 0
+        assert traffic["cache"]["maximum_entries"] == 512
+        assert traffic["cache"]["maximum_resident_bytes"] == 128 * 1024 * 1024
+        assert "cache_resident_bytes" in traffic["definitions"]
+        assert "cache_capacity" in traffic["definitions"]
         assert response.getheader("Server-Timing") is not None
     finally:
         connection.close()
@@ -1205,6 +1254,35 @@ def test_same_cold_cache_key_is_built_once_under_concurrency() -> None:
         assert calls == 1
         assert len(responses) == len(workers)
         assert all(json.loads(body) == {"value": 1} for body in responses)
+    finally:
+        server.server_close()
+
+
+def test_response_cache_is_bounded_by_resident_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _test_server()
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.MAX_CACHE_BYTES",
+        2_500,
+    )
+    try:
+        for index in range(3):
+            server.cached_local_json(
+                cache_key=f"large-{index}",
+                ttl_seconds=60.0,
+                cache_control="no-store",
+                builder=lambda index=index: {"payload": str(index) * 900},
+            )
+        residency = server.cache_residency()
+        assert "large-2" in server._cache
+        assert "large-0" not in server._cache
+        assert residency["resident_entries"] == len(server._cache)
+        assert residency["resident_bytes"] == sum(
+            entry.response.resident_bytes for entry in server._cache.values()
+        )
+        assert residency["resident_bytes"] <= 2_500
+        assert residency["maximum_resident_bytes"] == 2_500
     finally:
         server.server_close()
 

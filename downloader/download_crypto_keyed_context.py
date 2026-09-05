@@ -18,7 +18,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import polars as pl
-import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -30,6 +29,11 @@ from common import (  # noqa: E402
     load_env_file,
     provider_rate_limit,
     retry_delay_seconds,
+)
+from artifact_io import (  # noqa: E402
+    atomic_write_bytes as _atomic_bytes,
+    atomic_write_json as _atomic_json,
+    atomic_write_parquet as _atomic_parquet,
 )
 
 
@@ -101,35 +105,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_json(path: Path, payload: Any) -> None:
-    _atomic_bytes(
-        path,
-        (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
-    )
-
-
-def _atomic_parquet(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(), temporary, compression="zstd", write_statistics=True
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -163,10 +138,15 @@ def _read_recent_provider_state(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         checked = _parse_time(payload.get("checked_at_utc"))
-        if checked is None or (datetime.now(UTC) - checked).total_seconds() >= cadence_seconds:
+        if (
+            checked is None
+            or (datetime.now(UTC) - checked).total_seconds() >= cadence_seconds
+        ):
             return None
         payload["requests"] = 0
-        payload["message"] = "Provider capability receipt is current; no duplicate probe was sent."
+        payload["message"] = (
+            "Provider capability receipt is current; no duplicate probe was sent."
+        )
         return ProviderState(**payload)
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
         return None
@@ -189,7 +169,10 @@ def _dataset_due(
     except (OSError, UnicodeError, json.JSONDecodeError):
         return True
     latest = _parse_time(payload.get("last_success_at_utc"))
-    return latest is None or (datetime.now(UTC) - latest).total_seconds() >= cadence_seconds
+    return (
+        latest is None
+        or (datetime.now(UTC) - latest).total_seconds() >= cadence_seconds
+    )
 
 
 def _record_dataset_success(
@@ -235,7 +218,11 @@ def _snapshot_paths(
 ) -> tuple[Path, Path, Path]:
     stem = observed.strftime("%Y%m%dT%H%M%S.%fZ")
     root = output_dir / "snapshots" / dataset / observed.strftime("%Y/%m/%d")
-    return root / f"{stem}.parquet", root / f"{stem}.json.gz", output_dir / "latest" / f"{dataset}.json"
+    return (
+        root / f"{stem}.parquet",
+        root / f"{stem}.json.gz",
+        output_dir / "latest" / f"{dataset}.json",
+    )
 
 
 def _persist_snapshot(
@@ -285,9 +272,7 @@ def _persist_snapshot(
             "canonical_fact_key": canonical_fact_key,
         },
     )
-    _record_dataset_success(
-        output_dir, result, canonical_fact_key=canonical_fact_key
-    )
+    _record_dataset_success(output_dir, result, canonical_fact_key=canonical_fact_key)
     return result
 
 
@@ -329,13 +314,21 @@ class HttpClient:
             try:
                 with urlopen(request, timeout=45) as response:
                     raw = response.read()
-                    if str(response.headers.get("Content-Encoding") or "").lower() == "gzip":
+                    if (
+                        str(response.headers.get("Content-Encoding") or "").lower()
+                        == "gzip"
+                    ):
                         raw = gzip.decompress(raw)
                     decoded = json.loads(raw)
-                    return decoded, {str(k): str(v) for k, v in response.headers.items()}
+                    return decoded, {
+                        str(k): str(v) for k, v in response.headers.items()
+                    }
             except HTTPError as exc:
                 last_error = exc
-                if exc.code in {408, 418, 429, 500, 502, 503, 504} and attempt < self.max_retries:
+                if (
+                    exc.code in {408, 418, 429, 500, 502, 503, 504}
+                    and attempt < self.max_retries
+                ):
                     limiter.defer(
                         retry_delay_seconds(
                             attempt,
@@ -345,7 +338,12 @@ class HttpClient:
                     )
                     continue
                 raise
-            except (URLError, TimeoutError, json.JSONDecodeError, gzip.BadGzipFile) as exc:
+            except (
+                URLError,
+                TimeoutError,
+                json.JSONDecodeError,
+                gzip.BadGzipFile,
+            ) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     limiter.defer(retry_delay_seconds(attempt, base=self.retry_base))
@@ -361,13 +359,17 @@ def _coingecko_catalog_frame(payload: Any) -> pl.DataFrame:
     for item in payload if isinstance(payload, list) else []:
         if not isinstance(item, dict) or not item.get("id"):
             continue
-        platforms = item.get("platforms") if isinstance(item.get("platforms"), dict) else {}
+        platforms = (
+            item.get("platforms") if isinstance(item.get("platforms"), dict) else {}
+        )
         rows.append(
             {
                 "asset_id": str(item["id"]),
                 "symbol": str(item.get("symbol") or ""),
                 "name": str(item.get("name") or ""),
-                "platforms_json": json.dumps(platforms, ensure_ascii=False, sort_keys=True),
+                "platforms_json": json.dumps(
+                    platforms, ensure_ascii=False, sort_keys=True
+                ),
             }
         )
     if not rows:
@@ -425,13 +427,17 @@ def _coingecko_market_frame(payload: Any) -> pl.DataFrame:
                 number = float(value)
             except (TypeError, ValueError, OverflowError):
                 number = None
-            row[field] = number if number is not None and math.isfinite(number) else None
+            row[field] = (
+                number if number is not None and math.isfinite(number) else None
+            )
         rows.append(row)
     if not rows:
         return pl.DataFrame({"asset_id": []}, schema={"asset_id": pl.String})
-    return pl.DataFrame(rows, infer_schema_length=None).unique(
-        "asset_id", keep="last"
-    ).sort(["market_cap_rank", "asset_id"], nulls_last=True)
+    return (
+        pl.DataFrame(rows, infer_schema_length=None)
+        .unique("asset_id", keep="last")
+        .sort(["market_cap_rank", "asset_id"], nulls_last=True)
+    )
 
 
 def _coingecko_global_frame(payload: Any) -> pl.DataFrame:
@@ -518,7 +524,9 @@ def _fetch_coingecko(
                 _cached_result(output_dir, "coingecko_asset_catalog", "CoinGecko Demo")
             )
 
-        if _dataset_due(output_dir, "coingecko_market_snapshot", 24 * 3600, force=force):
+        if _dataset_due(
+            output_dir, "coingecko_market_snapshot", 24 * 3600, force=force
+        ):
             markets: list[Any] = []
             page = 1
             while True:
@@ -556,7 +564,9 @@ def _fetch_coingecko(
             results.append(result)
         else:
             results.append(
-                _cached_result(output_dir, "coingecko_market_snapshot", "CoinGecko Demo")
+                _cached_result(
+                    output_dir, "coingecko_market_snapshot", "CoinGecko Demo"
+                )
             )
 
         if _dataset_due(output_dir, "coingecko_global_snapshot", 15 * 60, force=force):
@@ -579,7 +589,9 @@ def _fetch_coingecko(
             results.append(result)
         else:
             results.append(
-                _cached_result(output_dir, "coingecko_global_snapshot", "CoinGecko Demo")
+                _cached_result(
+                    output_dir, "coingecko_global_snapshot", "CoinGecko Demo"
+                )
             )
     except Exception as exc:
         return (
@@ -634,7 +646,9 @@ def _fetch_coinmarketcap_key_info(
             "COINMARKETCAP_API_KEY is missing.",
             {},
         )
-    if not force and (cached := _read_recent_provider_state(output_dir, "coinmarketcap", 3600)):
+    if not force and (
+        cached := _read_recent_provider_state(output_dir, "coinmarketcap", 3600)
+    ):
         return cached
     try:
         payload, _ = client.get_json(
@@ -644,11 +658,21 @@ def _fetch_coinmarketcap_key_info(
         )
         status = payload.get("status") if isinstance(payload, dict) else None
         data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(status, dict) or status.get("error_code") != 0 or not isinstance(data, dict):
-            raise RuntimeError(str((status or {}).get("error_message") or "invalid key-info response"))
+        if (
+            not isinstance(status, dict)
+            or status.get("error_code") != 0
+            or not isinstance(data, dict)
+        ):
+            raise RuntimeError(
+                str((status or {}).get("error_message") or "invalid key-info response")
+            )
         plan = data.get("plan") if isinstance(data.get("plan"), dict) else {}
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        current_month = usage.get("current_month") if isinstance(usage.get("current_month"), dict) else {}
+        current_month = (
+            usage.get("current_month")
+            if isinstance(usage.get("current_month"), dict)
+            else {}
+        )
         quota = {
             "rate_limit_minute": plan.get("rate_limit_minute"),
             "credit_limit_monthly": plan.get("credit_limit_monthly"),
@@ -693,7 +717,9 @@ def _cmc_asset_map_frame(payload: Any) -> pl.DataFrame:
     for item in data if isinstance(data, list) else []:
         if not isinstance(item, dict) or item.get("id") is None:
             continue
-        platform = item.get("platform") if isinstance(item.get("platform"), dict) else {}
+        platform = (
+            item.get("platform") if isinstance(item.get("platform"), dict) else {}
+        )
         rows.append(
             {
                 "cmc_id": int(item["id"]),
@@ -832,26 +858,34 @@ def _fetch_etherscan(
             },
         )
         if str(gas_payload.get("status")) != "1":
-            result_text = str(gas_payload.get("result") or gas_payload.get("message") or "NOTOK")
-            state = "invalid_credential" if "invalid api key" in result_text.lower() else "not_entitled"
+            result_text = str(
+                gas_payload.get("result") or gas_payload.get("message") or "NOTOK"
+            )
+            state = (
+                "invalid_credential"
+                if "invalid api key" in result_text.lower()
+                else "not_entitled"
+            )
             state = ProviderState(
-                    "etherscan",
-                    "Etherscan V2",
-                    "etherscan",
-                    "configured",
-                    state,
-                    "blocked",
-                    "etherscan_free",
-                    1,
-                    _iso_now(),
-                    result_text,
-                    {"requests_per_second": 3, "calls_per_day": 100000},
+                "etherscan",
+                "Etherscan V2",
+                "etherscan",
+                "configured",
+                state,
+                "blocked",
+                "etherscan_free",
+                1,
+                _iso_now(),
+                result_text,
+                {"requests_per_second": 3, "calls_per_day": 100000},
             )
             _write_provider_state(output_dir, state)
             return state, []
         supply_payload: Any | None = None
         requests = 1
-        if _dataset_due(output_dir, "etherscan_ethereum_supply", 24 * 3600, force=force):
+        if _dataset_due(
+            output_dir, "etherscan_ethereum_supply", 24 * 3600, force=force
+        ):
             supply_payload, _ = client.get_json(
                 base,
                 profile_name="etherscan_free",
@@ -884,33 +918,33 @@ def _fetch_etherscan(
                 },
             )
         state = ProviderState(
-                "etherscan",
-                "Etherscan V2",
-                "etherscan",
-                "configured",
-                "operational",
-                "entitled",
-                "etherscan_free",
-                requests,
-                _iso_now(),
-                "Ethereum gas state is operational; supply is refreshed daily.",
-                {"requests_per_second": 3, "calls_per_day": 100000},
+            "etherscan",
+            "Etherscan V2",
+            "etherscan",
+            "configured",
+            "operational",
+            "entitled",
+            "etherscan_free",
+            requests,
+            _iso_now(),
+            "Ethereum gas state is operational; supply is refreshed daily.",
+            {"requests_per_second": 3, "calls_per_day": 100000},
         )
         _write_provider_state(output_dir, state)
         return state, [result]
     except Exception as exc:
         state = ProviderState(
-                "etherscan",
-                "Etherscan V2",
-                "etherscan",
-                "configured",
-                "failed",
-                "unknown",
-                "etherscan_free",
-                1,
-                _iso_now(),
-                f"{type(exc).__name__}: {exc}",
-                {},
+            "etherscan",
+            "Etherscan V2",
+            "etherscan",
+            "configured",
+            "failed",
+            "unknown",
+            "etherscan_free",
+            1,
+            _iso_now(),
+            f"{type(exc).__name__}: {exc}",
+            {},
         )
         _write_provider_state(output_dir, state)
         return state, []
@@ -934,7 +968,9 @@ def _fetch_coinglass_probe(
             "COINGLASS_API_KEY is missing; exchange-native liquidation streams are the free fallback.",
             {},
         )
-    if not force and (cached := _read_recent_provider_state(output_dir, "coinglass", 24 * 3600)):
+    if not force and (
+        cached := _read_recent_provider_state(output_dir, "coinglass", 24 * 3600)
+    ):
         return cached
     try:
         payload, headers = client.get_json(
@@ -1158,7 +1194,9 @@ def main() -> None:
             datasets.extend(provider_datasets)
             counts: dict[str, int] = {}
             for item in providers:
-                counts[item.operational_state] = counts.get(item.operational_state, 0) + 1
+                counts[item.operational_state] = (
+                    counts.get(item.operational_state, 0) + 1
+                )
             _write_progress(
                 progress_path,
                 started=started,
@@ -1198,7 +1236,9 @@ def main() -> None:
     ended = datetime.now(UTC)
     provider_counts: dict[str, int] = {}
     for item in providers:
-        provider_counts[item.operational_state] = provider_counts.get(item.operational_state, 0) + 1
+        provider_counts[item.operational_state] = (
+            provider_counts.get(item.operational_state, 0) + 1
+        )
     dataset_counts: dict[str, int] = {}
     for item in datasets:
         dataset_counts[item.status] = dataset_counts.get(item.status, 0) + 1

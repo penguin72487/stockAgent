@@ -5,13 +5,26 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 from io import StringIO
 import json
 from pathlib import Path
-from urllib.request import Request, urlopen
+import sys
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from downloader.artifact_io import (  # noqa: E402
+    atomic_write_json,
+    atomic_write_text,
+    sha256_file,
+)
+from downloader.http_transport import (  # noqa: E402
+    HttpRequestPolicy,
+    ResilientHttpTransport,
+)
 
 
 DEFAULT_URL = "https://www.taifex.com.tw/cht/4/contractName"
@@ -22,14 +35,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--max-retries", type=int, default=4)
+    parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
 
-    request = Request(
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="taifex_public",
+            timeout_seconds=args.timeout,
+            max_retries=args.max_retries,
+            retry_base_seconds=0.5,
+        )
+    )
+    body = transport.request_bytes(
         str(args.url),
         headers={"User-Agent": "stockAgent-taifex-product-master/1"},
-    )
-    with urlopen(request, timeout=30) as response:  # noqa: S310 - fixed HTTPS default
-        body = response.read()
+    ).body
     tables = pd.read_html(StringIO(body.decode("utf-8")))
     if len(tables) != 1:
         raise RuntimeError(f"expected one TAIFEX code table, received {len(tables)}")
@@ -50,11 +71,8 @@ def main() -> None:
         raise RuntimeError(f"TAIFEX code table unexpectedly small: {len(output)}")
 
     path = Path(args.output)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    output.to_csv(temp, index=False, encoding="utf-8")
-    temp.replace(path)
-    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    atomic_write_text(path, output.to_csv(index=False), durable=True)
+    sha256 = sha256_file(path)
     receipt = {
         "dataset": "taifex_contract_codes",
         "source_url": str(args.url),
@@ -65,10 +83,7 @@ def main() -> None:
         "sha256": sha256,
     }
     receipt_path = path.with_suffix(".manifest.json")
-    receipt_path.write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(receipt_path, receipt, durable=True)
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
 
 

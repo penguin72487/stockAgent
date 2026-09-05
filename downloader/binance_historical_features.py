@@ -15,6 +15,11 @@ import polars as pl
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+try:
+    from .artifact_io import atomic_write_parquet
+except ImportError:  # direct execution/import from downloader/
+    from artifact_io import atomic_write_parquet
+
 
 KLINE_BAR = "1m"
 STATISTICS_PERIOD = "5m"
@@ -290,15 +295,7 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.features.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(), temporary, compression="snappy", write_statistics=True
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _latest_non_null_ms(

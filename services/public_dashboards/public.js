@@ -5,7 +5,7 @@ let refreshInFlight = false;
 
 const Dashboard = window.StockAgentDashboard;
 const $ = Dashboard.byId;
-const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store", expectedRoot: "object"});
 
 function healthPresentation(value) {
   const health = String(value || "unavailable").toLowerCase();

@@ -16,6 +16,7 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from common import PersistentProgress, atomic_write_text
+from artifact_io import atomic_write_parquet, sha256_file
 from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet
 
 
@@ -87,23 +88,11 @@ def _clock_hhmm(execution_minutes_utc: int) -> str:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(), temporary, compression="snappy", write_statistics=True
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _parse_utc(column: str, schema: pl.Schema) -> pl.Expr:
@@ -265,10 +254,7 @@ def _daily_bars(
     grouped = (
         grouped.sort("__decision_cutoff_utc")
         .with_columns(
-            (
-                pl.col("execution_price").is_finite()
-                & (pl.col("execution_price") > 0.0)
-            )
+            (pl.col("execution_price").is_finite() & (pl.col("execution_price") > 0.0))
             .fill_null(False)
             .alias("execution_available")
         )
@@ -322,10 +308,7 @@ def _attach_funding_total_return(
     execution_clock = _clock_hhmm(execution_minutes_utc)
     if "execution_available" not in daily.columns:
         daily = daily.with_columns(
-            (
-                pl.col("execution_price").is_finite()
-                & (pl.col("execution_price") > 0.0)
-            )
+            (pl.col("execution_price").is_finite() & (pl.col("execution_price") > 0.0))
             .fill_null(False)
             .alias("execution_available")
         )
@@ -480,9 +463,7 @@ def _attach_funding_total_return(
     )
     previous_funding_age_hours = (
         decision_cutoffs_us - previous_last_event_times
-    ).astype(
-        "timedelta64[s]"
-    ).astype(np.float64) / 3600.0
+    ).astype("timedelta64[s]").astype(np.float64) / 3600.0
     previous_funding_age_hours[np.isnat(previous_last_event_times)] = np.nan
 
     result = daily.with_columns(

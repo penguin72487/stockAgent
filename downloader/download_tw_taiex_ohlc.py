@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import threading
 import time
 from typing import Any
@@ -18,6 +17,15 @@ from typing import Any
 import polars as pl
 import requests
 from tqdm import tqdm
+
+try:
+    from downloader.artifact_io import (
+        atomic_write_bytes,
+        atomic_write_json,
+        atomic_write_parquet,
+    )
+except ImportError:  # pragma: no cover - direct execution from downloader/
+    from artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet
 
 try:
     from downloader.common import (
@@ -546,33 +554,21 @@ def _attach_provenance(
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.replace(temporary, path)
+    atomic_write_bytes(path, content, durable=True)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    encoded = (
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    _atomic_write_bytes(path, encoded)
+    atomic_write_json(
+        path,
+        payload,
+        durable=True,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _write_parquet_atomic(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent, suffix=".parquet", delete=False
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        frame.write_parquet(temporary, compression="snappy", statistics=True)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _file_receipt(path: Path) -> dict[str, Any]:

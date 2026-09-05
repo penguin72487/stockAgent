@@ -21,11 +21,15 @@ const TW_STOCK_SESSIONS = [
 ];
 const HIDDEN_EQUITY_SERIES_STORAGE_KEY = "tw-day-trade-hidden-equity-series";
 const HISTORY_CLIENT_CACHE_MS = 45000;
+const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 16;
 let snapshot = null;
 let chartHistory = null;
 let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
+let historyRequestKeyInFlight = "";
+let historyRequestSequence = 0;
+let historyAbortController = null;
 let lastFetchMs = null;
 let refreshInFlight = false;
 let refreshQueued = false;
@@ -80,6 +84,7 @@ try {
 } catch (_error) { /* storage can be disabled */ }
 
 const $ = Dashboard.byId;
+const setHtml = Dashboard.setTrustedHtml;
 const esc = Dashboard.escapeHtml;
 const number = (value, digits = 0) => {
   if (value == null || !Number.isFinite(Number(value))) return "—";
@@ -187,7 +192,11 @@ const displayPct = (value) => {
 };
 const money = (value) => value == null ? "—" : `NT$ ${monetaryNumber(value)}`;
 const pct = (value) => value == null ? "—" : `${sourceNumber(Number(value) * 100)}%`;
-const shortTime = (value) => value ? String(value).replace("T", " ").slice(5, 19) : "—";
+const shortTime = (value) => {
+  if (!value) return "—";
+  const compact = String(value).replace("T", " ").slice(5, 19);
+  return /^[0-9 .:+/\-Z]+$/.test(compact) ? compact : "—";
+};
 const replayTimingText = (row = {}, fallbackAt = null) => {
   const rebuiltAt = row.open_reconstructed_at || fallbackAt || row.signal_at;
   const originalAt = row.source_signal_at;
@@ -233,7 +242,7 @@ const shortDateTime = (value) => {
   });
 };
 const pnlClass = (value) => Number(value || 0) > 0 ? "positive" : Number(value || 0) < 0 ? "negative" : "";
-const badge = (text, kind = "") => `<span class="badge ${kind}">${esc(text)}</span>`;
+const badge = (text, kind = "") => `<span class="badge ${esc(kind)}">${esc(text)}</span>`;
 const clampRatio = (value) => Math.min(1, Math.max(0, Number(value) || 0));
 const duration = (seconds) => {
   if (seconds == null || !Number.isFinite(Number(seconds))) return "—";
@@ -579,11 +588,11 @@ function renderOverview(data) {
     ["各模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
     ["各模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
     ["各模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
-    ["篩選區間報酬", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, `${chartWindowLabel()}；各模式以上一交易日最後權益為基準`, best != null && worst < 0 ? "warn" : pnlClass(best)],
+    ["各模式期間報酬", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, `${chartWindowLabel()}；每條線以所選期間第一個有效分鐘為 0%`, best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
-  $("overview-kpis").innerHTML = cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
+  setHtml("overview-kpis", cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
     <span>${esc(label)}</span><strong class="${esc(kind)}">${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small>
-  </div>`).join("");
+  </div>`).join(""));
   $("overview-kpis").setAttribute("aria-busy", "false");
 }
 
@@ -626,7 +635,7 @@ function renderHeader(data) {
     const signature = messages.join("|");
     alert.classList.remove("hidden");
     if (alert.dataset.signature !== signature) {
-      alert.innerHTML = `<strong>需要注意</strong>${messages.map((message) => `<span>${esc(message)}</span>`).join("")}`;
+      setHtml(alert, `<strong>需要注意</strong>${messages.map((message) => `<span>${esc(message)}</span>`).join("")}`);
       alert.dataset.signature = signature;
     }
   } else {
@@ -648,7 +657,7 @@ function syncFilters(data) {
   availableDetailDates = [...sourceDates].map(String).sort((left, right) => right.localeCompare(left));
   const revision = JSON.stringify([data.modes.map((row) => [row.market, row.label]), availableDetailDates]);
   if (revision !== lastFilterRevision) {
-    mode.innerHTML = `<option value="all">全部模式</option>` + data.modes.map((row) => `<option value="${esc(row.market)}">${esc(row.label || row.market)}</option>`).join("");
+    setHtml(mode, `<option value="all">全部模式</option>` + data.modes.map((row) => `<option value="${esc(row.market)}">${esc(row.label || row.market)}</option>`).join(""));
     if ([...mode.options].some((option) => option.value === previousMode)) mode.value = previousMode;
     const earliest = availableDetailDates.at(-1) || data.session_date || "";
     const latest = availableDetailDates[0] || data.session_date || "";
@@ -664,11 +673,11 @@ function syncFilters(data) {
 }
 
 function renderModes(data) {
-  $("mode-cards").innerHTML = data.modes.map((mode) => {
+  setHtml("mode-cards", data.modes.map((mode) => {
     const rangeSummary = rangeSummaryFor(mode.market);
-    const initial = rangeSummary?.baseline_equity_twd == null ? null : Number(rangeSummary.baseline_equity_twd);
+    const initial = rangeSummary?.initial_capital_twd == null ? null : Number(rangeSummary.initial_capital_twd);
     const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
-    const pnl = rangeSummary?.range_net_pnl_twd == null ? null : Number(rangeSummary.range_net_pnl_twd);
+    const pnl = rangeSummary?.cumulative_net_pnl_twd == null ? null : Number(rangeSummary.cumulative_net_pnl_twd);
     const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
     const status = String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
@@ -712,7 +721,8 @@ function renderModes(data) {
     return `<article class="panel mode-card">
       <header><h3>${esc(mode.label || mode.market)}</h3>${badge(engineStatusShortLabel(status), kind)}</header>
       <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
-      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "篩選區間尚無估值" : `期末權益 ${summaryMoney(equity)} · 區間淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
+      <div class="metric-context">所選期間報酬 · 起始有效分鐘 = 0%</div>
+      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "所選日期尚無估值" : `期末權益 ${summaryMoney(equity)} · 累積淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
       <div class="mode-glance">
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>實際成交結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
@@ -721,7 +731,7 @@ function renderModes(data) {
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
       </div>
       <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
-        <div><span>篩選區間報酬基準</span><strong>${money(initial)}</strong></div>
+        <div><span>原始資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         ${mode.counterfactual_open_replay
           ? `<div class="wide"><span>訊號／重建時間</span><strong>${esc(replayTimingText(mode))}</strong></div>`
@@ -735,17 +745,17 @@ function renderModes(data) {
         <div class="wide"><span>停利停損價位</span><strong>${esc(bracketPolicy)}</strong></div>
       </div></details>
     </article>`;
-  }).join("");
+  }).join(""));
 }
 
 function renderBenchmarks(data) {
   const rows = Array.isArray(data.benchmarks) ? data.benchmarks : [];
-  $("benchmark-cards").innerHTML = rows.map((row) => {
+  setHtml("benchmark-cards", rows.map((row) => {
     const rangeSummary = rangeSummaryFor(row.benchmark_id);
     const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
     const dailyReturnPct = row.daily_return_pct == null ? null : Number(row.daily_return_pct);
     const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
-    const netPnl = rangeSummary?.range_net_pnl_twd == null ? null : Number(rangeSummary.range_net_pnl_twd);
+    const netPnl = rangeSummary?.cumulative_net_pnl_twd == null ? null : Number(rangeSummary.cumulative_net_pnl_twd);
     const isTx = row.instrument_type === "continuous_long_future";
     const waitingRoll = String(row.valuation_source || "").includes("roll_waiting");
     const actionBlocked = !isTx && String(row.valuation_source || "").includes("corporate_action_reference_unavailable");
@@ -779,10 +789,13 @@ function renderBenchmarks(data) {
     const funding = isTx
       ? `補入 ${money(row.cumulative_margin_top_up_twd || 0)} · 提回 ${money(row.cumulative_margin_withdrawal_twd || 0)}`
       : "";
+    const dailyReturnText = dailyReturnPct == null
+      ? "今日相對昨收 —"
+      : `今日相對昨收 ${dailyReturnPct >= 0 ? "+" : ""}${displayPct(dailyReturnPct)}`;
     return `<article class="panel benchmark-card">
       <header><h3>${esc(row.label || row.benchmark_id)}</h3>${badge(status.label, status.kind)}</header>
       <div class="equity ${pnlClass(dailyReturnPct)}">${dailyReturnPct == null ? "尚無前收基準" : `${dailyReturnPct >= 0 ? "+" : ""}${displayPct(dailyReturnPct)}`}</div>
-      <div class="delta ${pnlClass(returnPct)}">${returnPct == null ? "篩選區間等待完整來源" : `今日相對昨收 · 篩選區間 ${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)} · ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
+      <div class="delta ${pnlClass(returnPct)}">${returnPct == null ? "所選日期等待完整來源" : `${dailyReturnText} · 所選期間 ${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)} · 累積損益 ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
       <div class="benchmark-facts">
         <div><span>持有標的</span><strong class="benchmark-contract">${esc(holding)}</strong></div>
         <div><span>${esc(priorCloseLabel)}</span><strong>${sourceNumber(row.daily_return_reference_price ?? row.daily_return_previous_close)}</strong></div>
@@ -793,7 +806,7 @@ function renderBenchmarks(data) {
         ${isTx ? `<div><span>1:1 名目資金</span><strong>${collateral}</strong></div><div><span>換月資金流</span><strong>${funding}</strong></div><div class="wide"><span>換月規則</span><strong>同一實體合約以前收計日報酬；換月價差只補入／提回現金，不列報酬，槓桿上限 1×</strong></div>` : ""}
       </div>
     </article>`;
-  }).join("") || `<article class="panel benchmark-card"><strong>基準尚未建立</strong><small>等待來源與起算價格通過稽核</small></article>`;
+  }).join("") || `<article class="panel benchmark-card"><strong>基準尚未建立</strong><small>等待來源與起算價格通過稽核</small></article>`);
 }
 
 function renderOperations(data) {
@@ -866,14 +879,14 @@ function renderOperations(data) {
   const openingChange = Number.isFinite(openingChangeMs)
     ? `${openingChangeMs < 0 ? "快" : openingChangeMs > 0 ? "慢" : "持平"} ${duration(Math.abs(openingChangeMs) / 1000)}`
     : "尚無可比前日";
-  $("latency-kpis").innerHTML = [
+  setHtml("latency-kpis", [
     ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : duration(Number(openingLatency.first_ready_ms) / 1000), firstOpeningMode ? `${firstOpeningMode.market} · 不含頁面顯示` : "等待實測"],
     ["09:00 → 最後訊號", noOpeningLatency ? "—" : duration(Number(openingLatency.final_ready_ms) / 1000), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式${openingLatency.complete ? "完成" : "；仍缺模式"}`],
     ["相較前次開盤", openingChange, openingLatency.previous_session_date ? `${openingLatency.previous_session_date} 最後訊號 ${duration(Number(openingLatency.previous_final_ready_ms) / 1000)}` : "只比較 09:00 自動樣本"],
     ["輸入 → 帳本落盤", noLatency ? "—" : `${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`, `${number(latency.sample_count || 0)} 個成功樣本 · P50 / P95`],
     ["最新瓶頸", noLatency ? "—" : latestBottleneck, noLatency ? "等待實測" : latencyValue(latency.latest_bottleneck_ms)],
-  ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
-  $("operation-kpis").innerHTML = [
+  ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join(""));
+  setHtml("operation-kpis", [
     ["所選日流程／成交", `${number(execution.executed_count || 0)} 已處理 · ${number(execution.filled_mode_count || 0)} 完整成交`, `${number(execution.partial_mode_count || 0)} 部分、${number(execution.zero_fill_mode_count || 0)} 零成交、${number(execution.no_order_mode_count || 0)} 無合法委託、${number(execution.failed_mode_count || 0)} 阻擋`, execution.all_modes_filled ? "good" : "bad"],
     ["盤前預熱", `${readyModes}/${totalModes || 0} 模型 READY`, `模擬執行 ${simulationWarm.status || "pending"}`, warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
@@ -881,7 +894,7 @@ function renderOperations(data) {
     ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `行情與權益每 ${number(PRICE_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
     ["服務同步", syncLabel, syncNote, syncKind],
     ["無人維護守護", guardianLabel, guardianNote, guardianKind],
-  ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join("");
+  ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join(""));
 
   const workflowRows = [
     {label:"啟用模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
@@ -890,11 +903,11 @@ function renderOperations(data) {
     {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:session.mark_tracking_complete ? "全部模式已平倉，估值追蹤完成" : `目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
     {label:"13:20/13:24/13:25 退出", value:session.exit_progress_ratio, count:`${number(session.exit_started_modes || 0)} / ${number(session.mode_count || 0)}`, note:"先限價、再市價重試；殘餘於 13:25 以漲跌停價參與收盤集合競價", kind:"warn"},
   ];
-  $("workflow-progress").innerHTML = workflowRows.map((row) => `<div class="progress-row">
+  setHtml("workflow-progress", workflowRows.map((row) => `<div class="progress-row">
     <div class="progress-title"><strong>${esc(row.label)}</strong><span>${esc(row.count)}</span></div>
     ${progress(row.value, row.kind)}
     <small>${esc(row.note)}</small>
-  </div>`).join("");
+  </div>`).join(""));
 
   const preopenRows = warm.markets || [];
   const modelPreopenHtml = preopenRows.map((row) => {
@@ -949,7 +962,7 @@ function renderOperations(data) {
     ${progress(simulationWarm.ready ? 1 : 0, simulationKind)}
     <small>${esc(simulationDetail)}</small>
   </div>`;
-  $("preopen-progress").innerHTML = modelPreopenHtml + simulationHtml;
+  setHtml("preopen-progress", modelPreopenHtml + simulationHtml);
   $("operation-source").textContent = warm.updated_at ? `預熱狀態 ${shortTime(warm.updated_at)}` : "預熱狀態尚未建立";
 }
 
@@ -962,7 +975,7 @@ function renderTwPublicMonitor(payload) {
   const rows = twPublicRowsSource(payload)
     .filter((row) => row?.parent_id === "group:tw-public");
   if (!rows.length) {
-    root.innerHTML = `<div class="tw-public-empty">尚未取到台股官方公開資料來源明細。請確認 /data-monitor 是否有載入完成。</div>`;
+    setHtml(root, `<div class="tw-public-empty">尚未取到台股官方公開資料來源明細。請確認 /data-monitor 是否有載入完成。</div>`);
     summary.textContent = "0 / 0 來源可顯示";
     if (fetchState) fetchState.textContent = "無法顯示來源；請稍後重試";
     return;
@@ -1010,7 +1023,7 @@ function renderTwPublicMonitor(payload) {
     fetchState.textContent = `資料鏡像 ${generated} · 輪詢 ${fetchText}`;
   }
 
-  root.innerHTML = prepared.map((item) => {
+  setHtml(root, prepared.map((item) => {
     const row = item.row;
     const state = item.state;
     const ratio = state.ratio;
@@ -1054,7 +1067,7 @@ function renderTwPublicMonitor(payload) {
         <small class="tw-public-footer">freshness：${esc(freshness)}；最後官方/系統檢核：${esc(item.row.last_verified_at_utc || row.latest_at_utc || "—")}</small>
         <small class="tw-public-footer">資料截止：${esc(item.row.data_through || "—")}；最新快照：${shortTime(row.latest_at_utc)}</small>
     </article>`;
-  }).join("");
+  }).join(""));
 }
 
 async function loadTwPublicMonitorWithFallback(controller) {
@@ -1069,11 +1082,7 @@ async function loadTwPublicMonitorWithFallback(controller) {
         failures.push(`${candidate}: HTTP ${response.status}`);
         continue;
       }
-      const payload = await response.json();
-      if (payload == null || typeof payload !== "object") {
-        failures.push(`${candidate}: 回傳資料異常`);
-        continue;
-      }
+      const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
       return payload;
     } catch (error) {
       if (error?.name === "AbortError") throw error;
@@ -1101,7 +1110,7 @@ async function loadTwPublicMonitor() {
   } catch (error) {
     if (error?.name === "AbortError") return;
     const root = $("tw-public-monitor-list");
-    if (root) root.innerHTML = `<div class="tw-public-empty">台股公開資料取得狀態讀取失敗：${esc(error)}</div>`;
+    if (root) setHtml(root, `<div class="tw-public-empty">台股公開資料取得狀態讀取失敗：${esc(error)}</div>`);
     const summary = $("tw-public-monitor-summary");
     if (summary) summary.textContent = "讀取失敗";
   } finally {
@@ -1136,19 +1145,19 @@ function renderChart(data) {
   const allPoints = series.flatMap((item) => item.valid);
   const visibleSeries = series.filter((item) => !hiddenEquitySeries.has(item.seriesId));
   const points = visibleSeries.flatMap((item) => item.valid);
-  $("chart-legend").innerHTML = series.map((item) => {
+  setHtml("chart-legend", series.map((item) => {
     const latest = item.valid.at(-1);
     const latestText = latest ? `${Number(latest.return_pct) >= 0 ? "+" : ""}${sourceNumber(latest.return_pct)}%` : "—";
     const label = labels.get(item.seriesId) || item.seriesId;
     const hidden = hiddenEquitySeries.has(item.seriesId);
     return `<button type="button" class="legend-toggle${hidden ? " is-hidden" : ""}" data-series-id="${esc(item.seriesId)}" aria-pressed="${String(!hidden)}" aria-label="${hidden ? "顯示" : "隱藏"}${esc(label)}曲線"><i class="series-${item.index % COLORS.length}" aria-hidden="true"></i>${esc(label)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></button>`;
-  }).join("");
+  }).join(""));
   const empty = $("chart-empty");
   empty.textContent = allPoints.length ? "所有曲線已隱藏；點選圖例圓點可重新顯示。" : "目前尚無分鐘報酬率資料";
   empty.classList.toggle("hidden", points.length > 0);
   svg.classList.toggle("hidden", points.length === 0);
   if (!points.length) {
-    svg.innerHTML = "";
+    setHtml(svg, "");
     $("equity-range-note").textContent = allPoints.length
       ? `${chartWindowLabel()} · 目前 ${number(series.length)} 條曲線皆已隱藏。`
       : `${chartWindowLabel()}內沒有可繪製資料。`;
@@ -1189,7 +1198,7 @@ function renderChart(data) {
     html += `<path class="chart-line" stroke="${color}" d="${path}"></path>`;
     for (const row of item.valid.filter((value) => value.valuation_stale && (!value.historical_minute_replay || Number(value.missing_price_position_count || 0) > 0))) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
   });
-  svg.innerHTML = html;
+  setHtml(svg, html);
   const start = new Date(times[0]).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const end = new Date(times.at(-1)).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const sampled = chartHistory?.downsampled ? `；已保留端點與區間極值縮圖（原 ${number(chartHistory.raw_points_in_range)} 點）` : "";
@@ -1199,12 +1208,21 @@ function renderChart(data) {
   const replayQuality = replayPoints
     ? `；歷史分鐘 ${number(replayPoints)} 點，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${sourceNumber(replayMean * 100)}%` : "—"}，缺價 ${number(replayMissing)} 點（其餘無成交分鐘延用上一筆）`
     : "";
-  $("equity-range-note").textContent = `${chartWindowLabel()} · 一分鐘曲線 · 報酬基準為起始日前最後一筆權益 · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}`;
+  const coverageGaps = (chartHistory?.range_summary || []).filter((row) => Number(row.minute_coverage_ratio) < .999999);
+  const coverageQuality = coverageGaps.length
+    ? `；分鐘來源未齊：${coverageGaps.map((row) => `${labels.get(row.series_id) || row.series_id} ${number(row.point_count)}/${number(row.expected_minute_points)}`).join("、")}`
+    : "；分鐘覆蓋完整";
+  $("equity-range-note").textContent = `${chartWindowLabel()} · 一分鐘曲線 · 每條線第一個有效分鐘固定為 0%；期末權益與累積淨損益仍沿用原始帳本 · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}${coverageQuality}`;
 }
 
 function applyChartHistory(payload) {
   chartHistory = payload;
-  if (snapshot) renderChart(snapshot);
+  if (snapshot) {
+    renderOverview(snapshot);
+    renderModes(snapshot);
+    renderBenchmarks(snapshot);
+    renderChart(snapshot);
+  }
 }
 
 async function loadChartHistory({preferCache = false} = {}) {
@@ -1222,23 +1240,36 @@ async function loadChartHistory({preferCache = false} = {}) {
     }
     if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
   }
-  if (historyInFlight) return;
+  if (historyInFlight && historyRequestKeyInFlight === requestedKey && preferCache) return;
+  if (historyAbortController) historyAbortController.abort();
+  const controller = new AbortController();
+  historyAbortController = controller;
+  const sequence = ++historyRequestSequence;
   historyInFlight = true;
+  historyRequestKeyInFlight = requestedKey;
   try {
     const params = new URLSearchParams({range: requestedRange});
     if (requestedStart) params.set("start_date", requestedStart);
     if (requestedEnd) params.set("end_date", requestedEnd);
-    const response = await fetchWithTimeout(`api/history?${params.toString()}`, {cache:"default"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
+    const response = await fetchWithTimeout(`api/history?${params.toString()}`, {cache:"default", signal: controller.signal});
+    const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
+    if (sequence !== historyRequestSequence) return;
     if (requestedKey !== chartRequestKey()) return;
+    if (!chartHistoryCache.has(requestedKey) && chartHistoryCache.size >= HISTORY_CLIENT_CACHE_MAX_ENTRIES) {
+      chartHistoryCache.delete(chartHistoryCache.keys().next().value);
+    }
     chartHistoryCache.set(requestedKey, {payload, receivedAt: Date.now()});
     applyChartHistory(payload);
   } catch (error) {
+    if (sequence !== historyRequestSequence || error?.name === "AbortError") return;
     $("equity-range-note").textContent = `${chartWindowLabel()}歷史載入失敗：${error}`;
   } finally {
-    historyInFlight = false;
-    if (requestedKey !== chartRequestKey()) void loadChartHistory({preferCache: true});
+    if (historyAbortController === controller) {
+      historyAbortController = null;
+      historyInFlight = false;
+      historyRequestKeyInFlight = "";
+      if (requestedKey !== chartRequestKey()) void loadChartHistory({preferCache: true});
+    }
   }
 }
 
@@ -1266,7 +1297,7 @@ function renderPositions(data) {
 	    <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
     </tr>`;
   }).join("");
-  $("position-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`);
+  setHtml("position-body", errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`));
 }
 
 function renderSignals() {
@@ -1300,7 +1331,7 @@ function renderSignals() {
       : `模型決策列 ${number(recorded)}`;
     return `<div><span>${esc(market)} 完整訊號／執行稽核</span><strong class="${missing || (expected && !complete) ? "negative" : "positive"}">${completeness} · 非零訊號 ${number(row.nonzero_signal_count)} · 成交 ${number(row.filled_signal_count)}</strong><small>${belowLot ? `資金不足一張 ${number(belowLot)} 筆，完整訊號仍保留於下表` : esc(reasons || "全部非零訊號皆已成交")}</small></div>`;
   }).join("");
-  $("signal-direction-summary").innerHTML = directionHtml + openingAuditHtml;
+  setHtml("signal-direction-summary", directionHtml + openingAuditHtml);
   const errorRow = signalLoadError
     ? `<tr class="signal-load-error"><td colspan="6">${esc(signalLoadError)}</td></tr>`
     : "";
@@ -1337,7 +1368,7 @@ function renderSignals() {
 	    <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : "未成交不納入"}</small></td>
     </tr>`;
   }).join("");
-  $("signal-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的訊號</td></tr>`);
+  setHtml("signal-body", errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的訊號</td></tr>`));
 }
 
 function renderSignalFeaturePanel() {
@@ -1350,7 +1381,7 @@ function renderSignalFeaturePanel() {
   const row = selectedSignalRow();
   if (!row) {
     panel.classList.add("empty");
-    body.innerHTML = "";
+    setHtml(body, "");
     scope.textContent = featureDriversSummaryText();
     empty.classList.remove("hidden");
     empty.textContent = "請點選「所有訊號」中的一列，載入該筆完整 feature 資料。";
@@ -1360,7 +1391,7 @@ function renderSignalFeaturePanel() {
   const drivers = resolveSignalFeatureDrivers(row);
   if (!drivers.length) {
     panel.classList.add("empty");
-    body.innerHTML = "";
+    setHtml(body, "");
     scope.textContent = `${featureDriversSummaryText()}（${esc(row.market)} ${esc(row.symbol)} ${esc(row.session_date)} 無可對應特徵）`;
     empty.classList.remove("hidden");
     empty.textContent = "本筆訊號尚未讀到 summary，請稍後重整。";
@@ -1380,9 +1411,9 @@ function renderSignalFeaturePanel() {
     })
     .join("");
   const head = ["#", ...columns].map((column) => `<th>${esc(column === "feature" ? "Feature" : column)}</th>`).join("");
-  body.innerHTML = `<div class="feature-table-scroll"><table class="compact-table feature-table">
+  setHtml(body, `<div class="feature-table-scroll"><table class="compact-table feature-table">
     <thead><tr>${head}</tr></thead>
-    <tbody>${featureRows}</tbody></table></div>`;
+    <tbody>${featureRows}</tbody></table></div>`);
   empty.classList.add("hidden");
 }
 
@@ -1399,7 +1430,7 @@ function renderEvents() {
     ? `<tr><td colspan="6">${esc(eventLoadError)}</td></tr>`
     : "";
   const rowHtml = eventRows.map((row) => `<tr><td>${esc(row.session_date)}<small>${shortTime(row.fill_at || row.recorded_at)}</small></td><td>${esc(row.market)}<small>${esc(row.symbol)}</small></td><td>${esc(row.purpose)}</td><td>${esc(row.order_type || row.event_kind)}</td><td>${sourceNumber(row.price)} × ${number(row.quantity)}</td><td>${esc(row.status || row.event_kind)}</td></tr>`).join("");
-  $("event-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">尚無委託／成交事件</td></tr>`);
+  setHtml("event-body", errorRow + (rowHtml || `<tr><td colspan="6">尚無委託／成交事件</td></tr>`));
 }
 
 function renderAudit(data) {
@@ -1414,7 +1445,7 @@ function renderAudit(data) {
     ...data.modes.map((mode) => [`${mode.market} 目前資格來源`, Object.entries(mode.current_eligibility_coverage || {}).map(([venue, row]) => `${venue}:${row.covered ? `READY ${row.target_date}` : `缺 ${row.target_date} / latest ${row.latest_date || "—"}`}`).join(" · ") || "尚未檢查"]),
     ...(data.benchmarks || []).map((row) => [`${row.label || row.benchmark_id}`, row.return_pct == null ? `等待可成交報價 · ${row.valuation_source || "尚未進場"}` : `${row.return_pct >= 0 ? "+" : ""}${sourceNumber(row.return_pct)}% · ${shortTime(row.entry_at)} 起 · 資金 ${money(row.initial_capital_twd)} · ${row.contract_code || row.symbol || ""}`]),
   ];
-  $("audit-grid").innerHTML = items.map(([label,value]) => `<div class="audit-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("");
+  setHtml("audit-grid", items.map(([label,value]) => `<div class="audit-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join(""));
   const contract = data.source_contract || {};
   $("source-signal").textContent = contract.signal || "—"; $("source-replay").textContent = contract.replay || "—"; $("source-fill").textContent = contract.entry_fill || "—";
   $("source-fees").textContent = contract.fees || "—";
@@ -1497,8 +1528,7 @@ async function loadSignals({append = false, force = false} = {}) {
   beginSilentTableUpdate("signal-body", "load-more-signals", append);
   try {
     const response = await fetchWithTimeout(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const page = await response.json();
+    const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== signalRequestSequence) return;
     if (requestRange !== detailRangeKey()) return;
     featurePanelScopeText = page.feature_drivers_scope
@@ -1553,8 +1583,7 @@ async function loadPositions({append = false, force = false} = {}) {
   beginSilentTableUpdate("position-body", "load-more-positions", append);
   try {
     const response = await fetchWithTimeout(`api/positions?${params.toString()}`, {cache: "no-store", signal: controller.signal});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const page = await response.json();
+    const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== positionRequestSequence) return;
     if (requestRange !== detailRangeKey()) return;
     positionLoadError = "";
@@ -1596,8 +1625,7 @@ async function loadEvents({append = false, force = false} = {}) {
   beginSilentTableUpdate("event-body", "load-more-events", append);
   try {
     const response = await fetchWithTimeout(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const page = await response.json();
+    const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== eventRequestSequence) return;
     if (requestRange !== detailRangeKey()) return;
     eventLoadError = "";
@@ -1639,8 +1667,7 @@ async function refresh({force = false} = {}) {
     const started = performance.now();
     const date = selectedDate();
     const response = await fetchWithTimeout(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    snapshot = await response.json();
+    snapshot = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     lastServiceRevision = String(snapshot.service_sync?.revision_token || lastServiceRevision || "");
     lastFetchMs = performance.now() - started;
     const sourceUpdatedAt = String(snapshot.source_updated_at || "");
@@ -1723,8 +1750,7 @@ async function refreshServiceRevision() {
   revisionRefreshInFlight = true;
   try {
     const response = await fetchWithTimeout("api/revision", {cache: "no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const serviceSync = await response.json();
+    const serviceSync = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     const revision = String(serviceSync.revision_token || "");
     const changed = Boolean(lastServiceRevision && revision && revision !== lastServiceRevision);
     if (revision) lastServiceRevision = revision;
@@ -1782,6 +1808,7 @@ function detailDateChanged(event) {
   if (signalAbortController) signalAbortController.abort();
   if (eventAbortController) eventAbortController.abort();
   if (positionAbortController) positionAbortController.abort();
+  if (historyAbortController) historyAbortController.abort();
   chartHistory = null;
   void refresh();
 }

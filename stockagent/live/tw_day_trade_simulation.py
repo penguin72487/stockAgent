@@ -4812,6 +4812,14 @@ class TwDayTradeSimulationEngine:
         )
         if not append_history:
             return
+        curve_clock = now.timetz().replace(tzinfo=None)
+        if not ENTRY_GATE <= curve_clock <= SESSION_CLOSE:
+            # The operational state may be marked immediately after a 09:00
+            # signal or during post-close reconciliation, but the canonical
+            # strategy curve is the 270 right-labelled minutes 09:01..13:30.
+            # Persisting the operational mark would give only the current day
+            # a different grain and distort historical comparisons.
+            return
         self._append_ledger(
             self.marks_path,
             {

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 import json
 import math
-import os
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,6 +25,13 @@ from common import (  # noqa: E402
     SharedRateLimiter,
     provider_rate_limit,
     retry_delay_seconds,
+)
+from artifact_io import (  # noqa: E402
+    atomic_write_bytes as _atomic_bytes,
+    atomic_write_json as _atomic_json,
+    atomic_write_parquet as _atomic_parquet,
+    sha256_bytes as _sha256_bytes,
+    sha256_file as _sha256_path,
 )
 
 
@@ -396,47 +401,6 @@ def _float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_json(path: Path, payload: Any) -> None:
-    _atomic_bytes(
-        path,
-        (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
-    )
-
-
-def _atomic_parquet(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(), temporary, compression="zstd", write_statistics=True
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _merge_manifest_results(

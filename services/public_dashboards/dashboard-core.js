@@ -29,6 +29,7 @@
     "'": "&#39;",
   });
   const formatterCache = new Map();
+  const trustedHtmlCache = new WeakMap();
 
   function byId(id) {
     return global.document?.getElementById(String(id)) || null;
@@ -93,7 +94,20 @@
   function setText(target, value, fallback = "—") {
     const node = typeof target === "string" ? byId(target) : target;
     if (!node) return false;
-    node.textContent = value == null || value === "" ? fallback : String(value);
+    const next = value == null || value === "" ? fallback : String(value);
+    if (node.textContent === next) return false;
+    node.textContent = next;
+    return true;
+  }
+
+  /* Callers must escape every user/source string before passing markup here. */
+  function setTrustedHtml(target, markup) {
+    const node = typeof target === "string" ? byId(target) : target;
+    if (!node) return false;
+    const next = String(markup ?? "");
+    if (trustedHtmlCache.get(node) === next) return false;
+    node.innerHTML = next;
+    trustedHtmlCache.set(node, next);
     return true;
   }
 
@@ -139,10 +153,37 @@
     }
   }
 
+  function validateJsonRoot(payload, expectedRoot = null) {
+    if (![null, "object", "array"].includes(expectedRoot)) {
+      throw new TypeError("expectedRoot must be object, array, or null");
+    }
+    if (expectedRoot === "object" && (payload === null || typeof payload !== "object" || Array.isArray(payload))) {
+      throw new TypeError("Dashboard API response root must be an object");
+    }
+    if (expectedRoot === "array" && !Array.isArray(payload)) {
+      throw new TypeError("Dashboard API response root must be an array");
+    }
+    return payload;
+  }
+
+  async function readJsonResponse(response, {expectedRoot = null} = {}) {
+    if (!response || typeof response.json !== "function") {
+      throw new TypeError("Dashboard API response is not a Response-like object");
+    }
+    const payload = await response.json();
+    if (!response.ok) {
+      const message = payload && typeof payload === "object" && !Array.isArray(payload)
+        ? payload.error
+        : null;
+      throw new Error(message || `HTTP ${response.status}`);
+    }
+    return validateJsonRoot(payload, expectedRoot);
+  }
+
   async function fetchJson(input, options = {}) {
-    const response = await fetchWithTimeout(input, options);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
+    const {expectedRoot = null, ...requestOptions} = options;
+    const response = await fetchWithTimeout(input, requestOptions);
+    return readJsonResponse(response, {expectedRoot});
   }
 
   function createFetch({timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
@@ -157,6 +198,31 @@
       ...defaults,
       ...options,
       timeoutMs: options.timeoutMs ?? timeoutMs,
+    });
+  }
+
+  function createLatestRequest() {
+    let sequence = 0;
+    let controller = null;
+    return Object.freeze({
+      begin() {
+        controller?.abort();
+        controller = new AbortController();
+        const activeController = controller;
+        const activeSequence = ++sequence;
+        return Object.freeze({
+          signal: activeController.signal,
+          isCurrent: () => activeSequence === sequence && controller === activeController,
+          finish() {
+            if (controller === activeController) controller = null;
+          },
+        });
+      },
+      abort() {
+        sequence += 1;
+        controller?.abort();
+        controller = null;
+      },
     });
   }
 
@@ -233,7 +299,7 @@
   }
 
   const api = Object.freeze({
-    version: 1,
+    version: 2,
     DEFAULT_TIMEOUT_MS,
     NAV_ITEMS,
     byId,
@@ -243,10 +309,14 @@
     formatAge,
     escapeHtml,
     setText,
+    setTrustedHtml,
     fetchWithTimeout,
+    validateJsonRoot,
+    readJsonResponse,
     fetchJson,
     createFetch,
     createJsonFetcher,
+    createLatestRequest,
     svgElement,
     mountNavigation,
     mountNavigations,

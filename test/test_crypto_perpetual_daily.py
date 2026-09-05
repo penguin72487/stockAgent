@@ -1211,7 +1211,12 @@ def test_binance_public_daily_delays_bars_and_requires_complete_positioning(
         }
     )
     path = tmp_path / "BTCUSDT_features.parquet"
-    source.write_parquet(path)
+    # Tail-only collectors keep recent rows in a logical sidecar.  Daily
+    # features must see the union, otherwise a complete day looks incomplete.
+    source.head(80).write_parquet(path)
+    tail_path = tmp_path / "_hot_tail" / path.name
+    tail_path.parent.mkdir()
+    source.slice(75).write_parquet(tail_path)
     output = _binance_daily(path, "BTCUSDT")
     assert output["date"].to_list() == ["2024-01-02"]
     assert output[0, "crypto_binance_session_coverage"] == 1.0
@@ -1222,6 +1227,61 @@ def test_binance_public_daily_delays_bars_and_requires_complete_positioning(
     assert output[0, "crypto_binance_source_available_at_utc"] == datetime(
         2024, 1, 2, 0, 0, tzinfo=timezone.utc
     )
+
+
+def test_binance_public_daily_accepts_complete_native_5m_positioning_on_1m_bars(
+    tmp_path: Path,
+) -> None:
+    timestamps = pl.datetime_range(
+        datetime(2024, 1, 1, 0, 0),
+        datetime(2024, 1, 1, 23, 59),
+        interval="1m",
+        eager=True,
+    )
+    rows = len(timestamps)
+    values = np.linspace(100.0, 110.0, rows)
+    native_5m = np.arange(rows) % 5 == 0
+
+    def sparse(value: np.ndarray) -> list[float | None]:
+        return [float(item) if keep else None for item, keep in zip(value, native_5m)]
+
+    source = pl.DataFrame(
+        {
+            "date": timestamps.dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "binance_volume_quote": np.full(rows, 100.0),
+            "binance_trade_count": np.full(rows, 10),
+            "binance_taker_buy_quote_volume": np.full(rows, 60.0),
+            "binance_mark_open": values,
+            "binance_mark_high": values + 1.0,
+            "binance_mark_low": values - 1.0,
+            "binance_mark_close": values + 0.2,
+            "binance_index_open": values - 0.1,
+            "binance_index_high": values + 0.8,
+            "binance_index_low": values - 1.2,
+            "binance_index_close": values + 0.1,
+            "binance_funding_rate": np.zeros(rows),
+            "binance_funding_age_hours": (np.arange(rows) % 480) / 60.0,
+            "binance_open_interest_value_usd": sparse(
+                np.linspace(1_000_000.0, 1_100_000.0, rows)
+            ),
+            "binance_global_long_short_account_ratio_log": sparse(
+                np.full(rows, 0.1)
+            ),
+            "binance_top_long_short_account_ratio_log": sparse(
+                np.full(rows, 0.2)
+            ),
+            "binance_top_long_short_position_ratio_log": sparse(
+                np.full(rows, 0.3)
+            ),
+        }
+    )
+    path = tmp_path / "BTCUSDT_features.parquet"
+    source.write_parquet(path)
+    output = _binance_daily(path, "BTCUSDT")
+    assert output["date"].to_list() == ["2024-01-02"]
+    assert output[0, "crypto_binance_session_coverage"] == 1.0
+    assert output[0, "crypto_binance_positioning_available"] == 1.0
+    assert output[0, "crypto_binance_open_interest_usd_log_change_1d"] > 0.0
 
 
 def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> None:

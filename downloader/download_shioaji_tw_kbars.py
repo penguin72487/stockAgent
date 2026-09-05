@@ -27,6 +27,7 @@ try:
     )
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
+from downloader.artifact_io import atomic_write_parquet
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -179,15 +180,13 @@ def _sha256(path: Path) -> str:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> dict[str, Any]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.write_parquet(
-        temporary,
+    atomic_write_parquet(
+        path,
+        frame,
         compression="snappy",
-        statistics=True,
+        write_statistics=True,
         row_group_size=128_000,
     )
-    os.replace(temporary, path)
     return {
         "path": str(path),
         "size": int(path.stat().st_size),

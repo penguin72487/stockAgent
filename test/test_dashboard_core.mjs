@@ -88,6 +88,27 @@ test("shared formatters cap visible precision and escape unsafe strings", () => 
   assert.equal(core.escapeHtml(`<img src=x onerror="alert(1)">`), "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
 });
 
+test("shared DOM writers skip unchanged content", () => {
+  const {core} = loadCore();
+  let textWrites = 0;
+  let htmlWrites = 0;
+  let textValue = "ready";
+  let htmlValue = "";
+  const node = {
+    get textContent() { return textValue; },
+    set textContent(value) { textWrites += 1; textValue = value; },
+    get innerHTML() { return htmlValue; },
+    set innerHTML(value) { htmlWrites += 1; htmlValue = value; },
+  };
+  assert.equal(core.setText(node, "ready"), false);
+  assert.equal(core.setText(node, "updated"), true);
+  assert.equal(core.setText(node, "updated"), false);
+  assert.equal(textWrites, 1);
+  assert.equal(core.setTrustedHtml(node, "<b>safe</b>"), true);
+  assert.equal(core.setTrustedHtml(node, "<b>safe</b>"), false);
+  assert.equal(htmlWrites, 1);
+});
+
 test("shared JSON fetch stays same-origin and carries secure defaults", async () => {
   const {core, requests} = loadCore();
   assert.deepEqual(await core.fetchJson("/api/status", {cache: "no-store"}), {ok: true});
@@ -101,6 +122,29 @@ test("shared JSON fetch stays same-origin and carries secure defaults", async ()
     /must stay on the same origin/,
   );
   assert.equal(requests.length, 1);
+});
+
+test("shared JSON reader rejects invalid roots and preserves API errors", async () => {
+  const {core} = loadCore();
+  assert.throws(() => core.validateJsonRoot([], "object"), /root must be an object/);
+  assert.throws(() => core.validateJsonRoot({}, "array"), /root must be an array/);
+  await assert.rejects(
+    core.readJsonResponse({ok: false, status: 503, json: async () => ({error: "source waiting"})}, {expectedRoot: "object"}),
+    /source waiting/,
+  );
+});
+
+test("latest-request guard cancels and invalidates superseded work", () => {
+  const {core} = loadCore();
+  const latest = core.createLatestRequest();
+  const first = latest.begin();
+  assert.equal(first.isCurrent(), true);
+  const second = latest.begin();
+  assert.equal(first.signal.aborted, true);
+  assert.equal(first.isCurrent(), false);
+  assert.equal(second.isCurrent(), true);
+  second.finish();
+  assert.equal(second.isCurrent(), false);
 });
 
 test("shared fetch propagates caller cancellation", async () => {

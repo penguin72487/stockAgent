@@ -29,10 +29,14 @@ if str(SCRIPT_DIR) not in sys.path:
 from common import (  # noqa: E402
     PersistentProgress,
     SharedRateLimiter,
-    atomic_write_text,
     load_env_file,
     provider_rate_limit,
     retry_delay_seconds,
+)
+from artifact_io import (  # noqa: E402
+    atomic_write_bytes as _atomic_bytes,
+    atomic_write_json as _atomic_json,
+    atomic_write_parquet as _atomic_parquet,
 )
 
 
@@ -103,7 +107,9 @@ def parse_args() -> argparse.Namespace:
             "resumable raw/result partitions with point-in-time lineage."
         )
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/dune_crypto_queries.json"))
+    parser.add_argument(
+        "--config", type=Path, default=Path("configs/dune_crypto_queries.json")
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data_dune_crypto"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--queries", nargs="*", default=None)
@@ -140,37 +146,17 @@ def _add_months(value: date, months: int) -> date:
     return date(year, month, min(value.day, (following - date.resolution).day))
 
 
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_json(path: Path, payload: Any) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _atomic_parquet(path: Path, frame: pl.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        pq.write_table(frame.to_arrow(), temporary, compression="zstd", write_statistics=True)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _load_contracts(config_path: Path, selected: set[str] | None) -> list[QueryContract]:
+def _load_contracts(
+    config_path: Path, selected: set[str] | None
+) -> list[QueryContract]:
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     config_root = config_path.parent
     contracts: list[QueryContract] = []
     for raw in payload.get("queries", []):
         query_id = str(raw.get("id") or "").strip()
-        if not raw.get("enabled", False) or (selected is not None and query_id not in selected):
+        if not raw.get("enabled", False) or (
+            selected is not None and query_id not in selected
+        ):
             continue
         if raw.get("execution_mode") != "sql_file":
             raise ValueError(f"{query_id}: only execution_mode=sql_file is allowed")
@@ -178,10 +164,14 @@ def _load_contracts(config_path: Path, selected: set[str] | None) -> list[QueryC
         try:
             sql_path.relative_to(config_root.resolve())
         except ValueError as exc:
-            raise ValueError(f"{query_id}: sql_file escapes the config directory") from exc
+            raise ValueError(
+                f"{query_id}: sql_file escapes the config directory"
+            ) from exc
         sql = sql_path.read_text(encoding="utf-8")
         if sql.count("{{start_date}}") == 0 or sql.count("{{end_date}}") == 0:
-            raise ValueError(f"{query_id}: SQL must contain start_date and end_date placeholders")
+            raise ValueError(
+                f"{query_id}: SQL must contain start_date and end_date placeholders"
+            )
         primary_key = tuple(str(value) for value in raw.get("primary_key", []))
         expected = tuple(str(value) for value in raw.get("expected_columns", []))
         event_column = str(raw.get("event_time_column") or "")
@@ -207,12 +197,19 @@ def _load_contracts(config_path: Path, selected: set[str] | None) -> list[QueryC
     if selected:
         missing = sorted(selected - {item.query_id for item in contracts})
         if missing:
-            raise ValueError(f"unknown or disabled Dune query contracts: {', '.join(missing)}")
+            raise ValueError(
+                f"unknown or disabled Dune query contracts: {', '.join(missing)}"
+            )
     return contracts
 
 
 def _receipt_path(output_dir: Path, partition: Partition) -> Path:
-    return output_dir / "receipts" / partition.contract.query_id / f"{partition.partition_id}.json"
+    return (
+        output_dir
+        / "receipts"
+        / partition.contract.query_id
+        / f"{partition.partition_id}.json"
+    )
 
 
 def _parquet_path(output_dir: Path, partition: Partition) -> Path:
@@ -320,7 +317,9 @@ def _upgrade_partition_lineage(output_dir: Path, partition: Partition) -> None:
         _atomic_json(receipt_path, receipt)
 
 
-def _partition_due(output_dir: Path, partition: Partition, *, force: bool, today: date) -> bool:
+def _partition_due(
+    output_dir: Path, partition: Partition, *, force: bool, today: date
+) -> bool:
     _migrate_legacy_partition(output_dir, partition)
     _upgrade_partition_lineage(output_dir, partition)
     if force:
@@ -331,14 +330,21 @@ def _partition_due(output_dir: Path, partition: Partition, *, force: bool, today
         return True
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        completed = datetime.fromisoformat(str(receipt["completed_at_utc"]).replace("Z", "+00:00"))
+        completed = datetime.fromisoformat(
+            str(receipt["completed_at_utc"]).replace("Z", "+00:00")
+        )
     except (OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError):
         return True
-    if receipt.get("status") != "complete" or receipt.get("sql_sha256") != partition.contract.sql_sha256:
+    if (
+        receipt.get("status") != "complete"
+        or receipt.get("sql_sha256") != partition.contract.sql_sha256
+    ):
         return True
     if partition.end < today:
         return False
-    return (datetime.now(UTC) - completed.astimezone(UTC)).total_seconds() >= partition.contract.cadence_seconds
+    return (
+        datetime.now(UTC) - completed.astimezone(UTC)
+    ).total_seconds() >= partition.contract.cadence_seconds
 
 
 def _build_partitions(
@@ -349,7 +355,11 @@ def _build_partitions(
 ) -> list[Partition]:
     output: list[Partition] = []
     for contract in contracts:
-        cursor = max(contract.history_start, requested_start) if requested_start else contract.history_start
+        cursor = (
+            max(contract.history_start, requested_start)
+            if requested_start
+            else contract.history_start
+        )
         while cursor < end:
             boundary = min(_add_months(cursor, contract.chunk_months), end)
             output.append(Partition(contract, cursor, boundary))
@@ -380,8 +390,14 @@ class DuneClient:
         self.low_limiter = SharedRateLimiter(low.interval_seconds, name=low.provider)
         self.high_limiter = SharedRateLimiter(high.interval_seconds, name=high.provider)
 
-    def _request(self, method: str, path: str, *, body: Any = None, high: bool) -> dict[str, Any]:
-        encoded = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+    def _request(
+        self, method: str, path: str, *, body: Any = None, high: bool
+    ) -> dict[str, Any]:
+        encoded = (
+            None
+            if body is None
+            else json.dumps(body, separators=(",", ":")).encode("utf-8")
+        )
         limiter = self.high_limiter if high else self.low_limiter
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -406,9 +422,20 @@ class DuneClient:
             except HTTPError as exc:
                 last_error = exc
                 if exc.code == 402:
-                    raise DuneCreditsExhausted("Dune returned HTTP 402; no additional executions will be started") from exc
-                if exc.code in {408, 429, 500, 502, 503, 504} and attempt < self.max_retries:
-                    limiter.defer(retry_delay_seconds(attempt, base=self.retry_base, retry_after=exc.headers.get("Retry-After")))
+                    raise DuneCreditsExhausted(
+                        "Dune returned HTTP 402; no additional executions will be started"
+                    ) from exc
+                if (
+                    exc.code in {408, 429, 500, 502, 503, 504}
+                    and attempt < self.max_retries
+                ):
+                    limiter.defer(
+                        retry_delay_seconds(
+                            attempt,
+                            base=self.retry_base,
+                            retry_after=exc.headers.get("Retry-After"),
+                        )
+                    )
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")[:500]
                 raise RuntimeError(f"Dune HTTP {exc.code}: {detail}") from exc
@@ -447,12 +474,16 @@ class DuneClient:
         while True:
             if heartbeat is not None:
                 heartbeat()
-            payload = self._request("GET", f"/execution/{execution_id}/status", high=True)
+            payload = self._request(
+                "GET", f"/execution/{execution_id}/status", high=True
+            )
             state = str(payload.get("state") or "")
             if state == "QUERY_STATE_COMPLETED":
                 return payload
             if state in TERMINAL_FAILURE_STATES:
-                raise RuntimeError(f"Dune execution {execution_id} ended in {state}: {payload}")
+                raise RuntimeError(
+                    f"Dune execution {execution_id} ended in {state}: {payload}"
+                )
             time.sleep(self.poll_seconds)
 
     def results(self, execution_id: str) -> Iterator[tuple[int, dict[str, Any]]]:
@@ -460,7 +491,9 @@ class DuneClient:
         offset = 0
         while True:
             query = urlencode({"limit": self.page_size, "offset": offset})
-            payload = self._request("GET", f"/execution/{execution_id}/results?{query}", high=True)
+            payload = self._request(
+                "GET", f"/execution/{execution_id}/results?{query}", high=True
+            )
             result = payload.get("result") or {}
             page_rows = result.get("rows") or []
             if not isinstance(page_rows, list):
@@ -478,17 +511,18 @@ class DuneClient:
 
 
 def _render_sql(partition: Partition) -> str:
-    return (
-        partition.contract.sql.replace("{{start_date}}", partition.start.isoformat())
-        .replace("{{end_date}}", partition.end.isoformat())
-    )
+    return partition.contract.sql.replace(
+        "{{start_date}}", partition.start.isoformat()
+    ).replace("{{end_date}}", partition.end.isoformat())
 
 
 def _validate_frame(frame: pl.DataFrame, partition: Partition) -> pl.DataFrame:
     contract = partition.contract
     missing = sorted(set(contract.expected_columns) - set(frame.columns))
     if missing:
-        raise RuntimeError(f"{contract.query_id}: result is missing columns: {', '.join(missing)}")
+        raise RuntimeError(
+            f"{contract.query_id}: result is missing columns: {', '.join(missing)}"
+        )
     frame = frame.select(list(contract.expected_columns))
     if frame.is_empty():
         return frame
@@ -499,12 +533,27 @@ def _validate_frame(frame: pl.DataFrame, partition: Partition) -> pl.DataFrame:
     ).item()
     if null_pk:
         raise RuntimeError(f"{contract.query_id}: primary key contains null values")
-    duplicate_count = frame.select(pl.struct(contract.primary_key).is_duplicated().sum()).item()
+    duplicate_count = frame.select(
+        pl.struct(contract.primary_key).is_duplicated().sum()
+    ).item()
     if int(duplicate_count or 0) > 0:
-        raise RuntimeError(f"{contract.query_id}: {duplicate_count} duplicate primary-key rows")
-    event_dates = frame.get_column(contract.event_time_column).cast(pl.String).str.to_date(strict=False)
-    if event_dates.null_count() or frame.filter((event_dates < partition.start) | (event_dates >= partition.end)).height:
-        raise RuntimeError(f"{contract.query_id}: event dates escape partition [{partition.start}, {partition.end})")
+        raise RuntimeError(
+            f"{contract.query_id}: {duplicate_count} duplicate primary-key rows"
+        )
+    event_dates = (
+        frame.get_column(contract.event_time_column)
+        .cast(pl.String)
+        .str.to_date(strict=False)
+    )
+    if (
+        event_dates.null_count()
+        or frame.filter(
+            (event_dates < partition.start) | (event_dates >= partition.end)
+        ).height
+    ):
+        raise RuntimeError(
+            f"{contract.query_id}: event dates escape partition [{partition.start}, {partition.end})"
+        )
     return frame
 
 
@@ -545,17 +594,32 @@ def _run_partition(
     status_payload = client.wait_complete(execution_id, heartbeat=heartbeat)
     retrieved_at = datetime.now(UTC)
     rows: list[dict[str, Any]] = []
-    raw_root = output_dir / "raw" / contract.query_id / partition.partition_id / execution_id
+    raw_root = (
+        output_dir / "raw" / contract.query_id / partition.partition_id / execution_id
+    )
     page_count = 0
     for offset, payload in client.results(execution_id):
         page_rows = (payload.get("result") or {}).get("rows") or []
         rows.extend(row for row in page_rows if isinstance(row, dict))
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        _atomic_bytes(raw_root / f"page_{offset:012d}.json.gz", gzip.compress(encoded, compresslevel=6, mtime=0))
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        _atomic_bytes(
+            raw_root / f"page_{offset:012d}.json.gz",
+            gzip.compress(encoded, compresslevel=6, mtime=0),
+        )
         page_count += 1
-    frame = pl.from_dicts(rows, infer_schema_length=None, strict=False) if rows else pl.DataFrame(schema={name: pl.String for name in contract.expected_columns})
+    frame = (
+        pl.from_dicts(rows, infer_schema_length=None, strict=False)
+        if rows
+        else pl.DataFrame(
+            schema={name: pl.String for name in contract.expected_columns}
+        )
+    )
     frame = _validate_frame(frame, partition)
-    available_at = str(status_payload.get("execution_ended_at") or retrieved_at.isoformat())
+    available_at = str(
+        status_payload.get("execution_ended_at") or retrieved_at.isoformat()
+    )
     frame = frame.with_columns(
         pl.lit(execution_id).alias("_dune_execution_id"),
         pl.lit(contract.query_id).alias("_dune_contract_id"),
@@ -605,15 +669,29 @@ def _run_partition(
             "receipt_path": str(receipt_path),
         },
     )
-    return PartitionResult(contract.query_id, partition.partition_id, "complete", frame.height, execution_id, str(parquet_path), str(receipt_path))
+    return PartitionResult(
+        contract.query_id,
+        partition.partition_id,
+        "complete",
+        frame.height,
+        execution_id,
+        str(parquet_path),
+        str(receipt_path),
+    )
 
 
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     config_path = args.config if args.config.is_absolute() else repo_root / args.config
-    output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
-    env_file = args.env_file if args.env_file.is_absolute() else repo_root / args.env_file
+    output_dir = (
+        args.output_dir
+        if args.output_dir.is_absolute()
+        else repo_root / args.output_dir
+    )
+    env_file = (
+        args.env_file if args.env_file.is_absolute() else repo_root / args.env_file
+    )
     load_env_file(env_file, allowed_names={"DUNE_API_KEY"})
     api_key = os.getenv("DUNE_API_KEY", "").strip()
     if not api_key:
@@ -623,15 +701,24 @@ def main() -> int:
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print(f"[dune] another updater owns {output_dir / '.download.lock'}; skip", flush=True)
+        print(
+            f"[dune] another updater owns {output_dir / '.download.lock'}; skip",
+            flush=True,
+        )
         return 0
 
     selected = set(args.queries) if args.queries else None
     contracts = _load_contracts(config_path, selected)
     end = _today(args.end_date)
     requested_start = date.fromisoformat(args.start_date) if args.start_date else None
-    all_partitions = _build_partitions(contracts, requested_start=requested_start, end=end)
-    due = [item for item in all_partitions if _partition_due(output_dir, item, force=args.force, today=date.today())]
+    all_partitions = _build_partitions(
+        contracts, requested_start=requested_start, end=end
+    )
+    due = [
+        item
+        for item in all_partitions
+        if _partition_due(output_dir, item, force=args.force, today=date.today())
+    ]
     if args.max_partitions > 0:
         due = due[: args.max_partitions]
     progress = PersistentProgress(
@@ -641,13 +728,25 @@ def main() -> int:
         unit="partitions",
         basis="ETA uses completed calendar partitions; Dune queueing and credit exhaustion can change it.",
     )
-    client = DuneClient(api_key, max_retries=args.max_retries, retry_base=args.retry_base, poll_seconds=args.poll_seconds, page_size=args.page_size)
+    client = DuneClient(
+        api_key,
+        max_retries=args.max_retries,
+        retry_base=args.retry_base,
+        poll_seconds=args.poll_seconds,
+        page_size=args.page_size,
+    )
     results: list[PartitionResult] = []
     stop = threading.Event()
 
     def worker(partition: Partition) -> PartitionResult:
         if stop.is_set():
-            return PartitionResult(partition.contract.query_id, partition.partition_id, "not_started", 0, message="stopped after another partition exhausted credits")
+            return PartitionResult(
+                partition.contract.query_id,
+                partition.partition_id,
+                "not_started",
+                0,
+                message="stopped after another partition exhausted credits",
+            )
         pulse_stop = threading.Event()
         phase = f"{partition.contract.query_id}:{partition.partition_id}"
 
@@ -671,25 +770,39 @@ def main() -> int:
             )
         except DuneCreditsExhausted as exc:
             stop.set()
-            result = PartitionResult(partition.contract.query_id, partition.partition_id, "blocked_credits", 0, message=str(exc))
+            result = PartitionResult(
+                partition.contract.query_id,
+                partition.partition_id,
+                "blocked_credits",
+                0,
+                message=str(exc),
+            )
         except Exception as exc:  # each partition remains independently resumable
-            result = PartitionResult(partition.contract.query_id, partition.partition_id, "failed", 0, message=f"{type(exc).__name__}: {exc}")
+            result = PartitionResult(
+                partition.contract.query_id,
+                partition.partition_id,
+                "failed",
+                0,
+                message=f"{type(exc).__name__}: {exc}",
+            )
         finally:
             pulse_stop.set()
-        progress.update(f"{partition.contract.query_id}:{partition.partition_id}", result.status)
+        progress.update(
+            f"{partition.contract.query_id}:{partition.partition_id}", result.status
+        )
         return result
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(contracts) or 1))) as executor:
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(args.workers, len(contracts) or 1))
+    ) as executor:
         futures = [executor.submit(worker, partition) for partition in due]
         for future in as_completed(futures):
             results.append(future.result())
 
     hard_failed = any(item.status == "failed" for item in results)
-    blocked = any(
-        item.status in {"blocked_credits", "not_started"} for item in results
-    )
+    blocked = any(item.status in {"blocked_credits", "not_started"} for item in results)
     state = "failed" if hard_failed else "blocked" if blocked else "complete"
     progress.finish(state=state)
     summary = {
@@ -701,12 +814,35 @@ def main() -> int:
         "due_partitions": len(due),
         "completed_partitions": sum(item.status == "complete" for item in results),
         "failed_partitions": sum(item.status == "failed" for item in results),
-        "blocked_credit_partitions": sum(item.status == "blocked_credits" for item in results),
+        "blocked_credit_partitions": sum(
+            item.status == "blocked_credits" for item in results
+        ),
         "rows": sum(item.rows for item in results),
-        "results": [asdict(item) for item in sorted(results, key=lambda value: (value.query_id, value.partition_id))],
+        "results": [
+            asdict(item)
+            for item in sorted(
+                results, key=lambda value: (value.query_id, value.partition_id)
+            )
+        ],
     }
     _atomic_json(output_dir / "download_summary.json", summary)
-    print(json.dumps({key: summary[key] for key in ("state", "due_partitions", "completed_partitions", "failed_partitions", "blocked_credit_partitions", "rows")}, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                key: summary[key]
+                for key in (
+                    "state",
+                    "due_partitions",
+                    "completed_partitions",
+                    "failed_partitions",
+                    "blocked_credit_partitions",
+                    "rows",
+                )
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     # Credit exhaustion is an observed external capacity gate, not an updater
     # crash. Keep it visible as ``blocked`` in the receipts while allowing the
     # umbrella daily refresh to complete its unrelated public-data stages.
