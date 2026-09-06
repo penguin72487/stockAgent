@@ -5784,7 +5784,7 @@ def _guide_message() -> str:
         "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）；使用 raw-feature lookback-32 fold 11。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "`tw_day_trade_multi_basis_22` 多基底22 現股當沖（初始 1,000 萬）；使用 22 組 effective-rank 時間基底與 Projection-L1 fold 11。",
-        "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 GELU 現股當沖（初始 1,000 萬）。",
+        "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 LayerNorm v12 現股當沖（初始 1,000 萬）。",
         "",
         "**日常看盤**",
         "`/latest market:<市場>` 最新訊號，不重跑模型。",
