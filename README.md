@@ -772,6 +772,13 @@ run_fintech_python downloader/download_binance_perp_1m.py --help
 首次全量、日期範圍、worker 與 provider-specific 選項請直接看各 downloader `--help`；
 不要從其他 provider 猜相同旗標。
 
+Bybit 日頻策略固定每日 00:00 UTC 決策／零延遲研究執行，可跨日留倉。
+資料已備妥時不要重新下載或建立 snapshot；新版訓練設定為
+`configs/markets/bybit_perpetual_daily_0000_trajectory.yaml`，輸出在
+`artifacts/markets/bybit_perpetual_daily_0000_trajectory_v1`。
+帳本修正、績效診斷與使用者自行執行的命令見
+[Bybit 日頻策略](docs/bybit_perpetual_daily_strategy.md#績效診斷與待驗證修正)。
+
 ### 一分鐘與衍生品資料
 
 ```bash

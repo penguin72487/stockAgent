@@ -1,0 +1,15 @@
+# One intervention relative to the deterministic carry control: optimize the
+# complete chronological training account under one frozen policy per epoch.
+# Also requires the corrected crypto ledger v2 (padding is an identity step).
+# Do not resume the pre-v2 control checkpoint or regenerate its saved artifacts.
+base_config: bybit_perpetual_daily_0000_deterministic.yaml
+
+experiment_name: bybit-perpetual-daily-0000-trajectory-v1
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_trajectory_v1
+  resume: true
+
+training:
+  epochs: 1000
+  crypto_optimizer_step_per_trajectory: true

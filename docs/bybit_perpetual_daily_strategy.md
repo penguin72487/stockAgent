@@ -90,15 +90,17 @@ Funding history 逐事件抓取；event mark 以 Bybit 官方 hourly mark-price 
   與 market snapshots、ETF 發行商 holdings／reserve 也只在首次
   `available_at` 後使用。CoinGecko 同代號若最大市值資產占比低於 90%，映射
   直接失敗而不猜測。
-- 每個稀疏資料族都有 availability feature；缺值才可 zero-fill，不把真正的
-  零和未觀測混為一談。
+- 每個稀疏資料族都有 availability feature；資料準備保留缺值與可用性。
+  注意設定中的 `feature_zero_fill` 是「整個匹配欄位歸零」，不是只補缺值。
+  現行 deterministic 與 trajectory 設定將 126 個外部欄位全部停用，實際啟用
+  的是 15 個 Bybit K 線欄位；不能把 141 欄 ABI 說成 141 個有效訊號。
 - Dune 留存結果的歷史 event date 早於 2026-08 retrieval completion，最新抓取
   又受 credits 阻擋；依它自己的因果契約仍排除，不會為了增加欄位數而倒灌。
 
 ## 多基底模型
 
 設定繼承 canonical FinancialTransformer 訓練生命週期、BF16、DDP、
-panel-history walk-forward 與 1,000 epochs。32 個已觀測日同時投影到 18 個
+panel-history walk-forward 與 1,000 epochs。原始 18-family 設定把 32 個已觀測日投影到 18 個
 固定/可學習 causal basis family：Haar、SWT db2、SWT sym4、wavelet packet、
 Walsh、Fourier、DCT、DPSS、local cosine、Morlet、exponential、Laguerre、
 difference、AR innovation、B-spline、Legendre、Chebyshev、learned。
@@ -109,6 +111,86 @@ count 縮放，保留共同多空方向與合法現金。目前輸入契約共 1
 Bybit session K 線特徵、7 個 Bybit funding 特徵、21 個 Binance、20 個 OKX
 （包含 funding／positioning／taker 可用旗標）與 78 個交易所外公開資料特徵；
 來源時間戳與來源風險保留在 summary／quality receipt 供稽核，不餵入模型。
+
+現行 `bybit_perpetual_daily_0000_deterministic.yaml` 及下述 trajectory 設定
+繼承 22-family、524-component 版本，另含 Kautz、discrete Hermite、chirplet
+與 training-only PCA/KLT。基底數增加不等於獨立歷史資訊增加；不能直接推論
+台股同架構的報酬會在加密貨幣重現。上述 126 個停用欄位仍保留 ABI，這次
+不混入外部特徵啟用或正規化實驗。
+
+## 績效診斷與待驗證修正
+
+2026-09-06 讀取的控制組為
+`artifacts/markets/bybit_perpetual_daily_0000_deterministic_v1`。
+`summary.json` 只有兩個完成 fold，第三折曲線未完成；不是完整 walk-forward
+驗收。以下數字來自完成 fold 的 `test_backtest.npz`，逐日複利重算與 summary 相符。
+
+| 測試區間 | 扣費累積報酬 | 最大回撤 | 日均換手 / NAV | 固定交易路徑的年化對數費用拖累 |
+| --- | ---: | ---: | ---: | ---: |
+| Fold 1：2022-01-01 至 2026-08-19 | -63.79% | -69.40% | 104.67% | 21.03 個百分點 |
+| Fold 2：2023-01-01 至 2026-08-19 | +27.83% | -47.89% | 120.84% | 24.25 個百分點 |
+
+兩折測試年重疊，不能直接相加。既有 `walkforward_deployment_annual_report.txt`
+只串接已完成的 2022、2023 首年部署路徑，累積 -1.11%、最大回撤 -54.73%。
+費用拆解使用儲存的對數報酬 `l_t` 與實際換手 `u_t`：
+
+```text
+g_t = log1p(expm1(l_t) + 0.00055 * u_t)
+annual_log_fee_drag = 365 * mean(g_t - l_t)
+```
+
+這只是固定已成交部位與逐日 NAV 分母下的費用加回，不是真正零費率重跑；
+費率改變也會改變 NAV、後續權重與 proximal allocation。Fold 1 即使這樣加回
+費用，仍為 -4.02%，因此「費用很重」不能替代「訊號有沒有樣本外優勢」。
+第一折驗證年 +160.71%、後續測試期 -63.79% 是泛化落差的證據；期間長短與
+市場狀態不同，不能僅憑此證明是哪一項超參數造成過擬合。
+
+本次實作分成確定的帳本修正與待驗證的優化假說：
+
+1. **帳本修正：非真實日期完全不推進狀態。** 舊 crypto kernel 在
+   `state_advance_mask=False` 時仍可能用重複的有限報酬更新 NAV，或對漂移超過
+   gross cap 的持倉強制減倉。現在假日期的報酬、費用與換手為零，持倉與存活
+   狀態原封不動；跨過內部假日期的下一個真實交易也與移除假日期一致。
+   尾端 padding 的污染未必改變已排除尾列的績效，不能宣稱它解釋整段虧損。
+2. **優化假說：每 epoch 固定一組參數。** 舊設定每 batch 更新一次，前三個
+   training group 每 epoch 分別約 16、39、62 次更新；訓練曲線混合不同參數的
+   帳戶路徑，與驗證時固定模型的路徑不同。新增
+   `training.crypto_optimizer_step_per_trajectory: true`，逐日照常估值、付費、
+   持倉，每個 chunk 的 log-utility 梯度按有效日期數加權，走完全部訓練日期才
+   clip、更新 optimizer 一次。step scheduler 也只推進一次。
+   持倉在 batch 邊界仍 detach，是截斷梯度，不是全歷史 BPTT；收益改善待實測。
+3. **可稽核與相容性。** epoch curve 新增 `train_optimizer_steps`；trajectory
+   模式每個完整 epoch 應為 1。任一 chunk 的 loss/gradient 非有限即整段失敗，
+   不跳過壞批次後繼續更新。crypto ledger v2 與 allocator/執行時刻列入
+   checkpoint trading fingerprint，更新頻率列入 training fingerprint。
+   舊 checkpoint 不可 resume 或覆寫重生 canonical artifacts；模型權重的獨立
+   inference 相容性不是舊帳本相容性。
+
+設定仍是 1,000 epochs 上限並保留原 early stopping，不把每 epoch 一次更新
+假裝成與原本相同的 optimizer 更新預算。此次沒有增加槓桿、人工 top-K、
+換手懲罰、特徵或降低費率，也沒有啟動正式訓練。
+
+### 由使用者執行的新訓練
+
+沿用 `data_bybit/perpetual_daily_0000`、原 public feature 表及原 panel cache。
+不需重跑下面的歷史重建命令，不新增 snapshot 或資料副本。
+新輸出根僅隔離不相容的訓練／帳本版本：
+`artifacts/markets/bybit_perpetual_daily_0000_trajectory_v1`。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+run_fintech_python train.py \
+  --config configs/markets/bybit_perpetual_daily_0000_trajectory.yaml \
+  --no-resume
+```
+
+`--no-resume` 只用於此新根的首次執行；同版本中斷續跑時移除它，不能拿舊根
+的 checkpoint 接續。不要在外層加 `torchrun`，fold orchestration 自己管理 DDP。
+回傳新根的 summary、完成 fold metrics 與 epoch curve 後，再檢查固定模型
+樣本外淨報酬、回撤、換手、更新次數與 fold 完成狀態。已看過的測試期間不是
+新的盲測；若要歸因 optimizer cadence，需在相同修正版帳本下另做控制比較，
+不能把舊帳本到新帳本的全部差異都算成優化效果。
 
 ## 重建命令
 
