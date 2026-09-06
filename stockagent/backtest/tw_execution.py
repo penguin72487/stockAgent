@@ -30,6 +30,7 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_stock_futures_day_trade",
     "tw_stock_futures_day_trade_0900",
     "tw_stock_futures_day_trade_0900_integer",
+    "tw_stock_futures_day_trade_0845_minute",
     "tw_minute",
     "tw_overnight",
     "tw_futures_portfolio_day",
@@ -63,9 +64,11 @@ TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_stock_futures_day_trade",
     "tw_stock_futures_day_trade_0900",
     "tw_stock_futures_day_trade_0900_integer",
+    "tw_stock_futures_day_trade_0845_minute",
 )
 TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_stock_futures_day_trade_0900_integer",
+    "tw_stock_futures_day_trade_0845_minute",
 )
 CRYPTO_PERPETUAL_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "crypto_perpetual",
@@ -170,6 +173,8 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "single_stock_futures_day_trade_0900_integer": (
         "tw_stock_futures_day_trade_0900_integer"
     ),
+    "tw_stock_futures_day_trade_0845_minute": "tw_stock_futures_day_trade_0845_minute",
+    "個股期貨0845分鐘當沖": "tw_stock_futures_day_trade_0845_minute",
     "個股期貨0900整數口當沖": "tw_stock_futures_day_trade_0900_integer",
     "個股期貨9點整數口當沖": "tw_stock_futures_day_trade_0900_integer",
     # Right-labelled one-minute KBar decisions with next-minute execution.

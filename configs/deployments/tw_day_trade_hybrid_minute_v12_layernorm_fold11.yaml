@@ -1,0 +1,21 @@
+base_config: ../markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml
+
+# Deployment-only view of the completed OFAT layernorm run.  The source run's
+# run_manifest.json is authoritative; these are exactly the settings that
+# differ from the v12 base and participate in the fold-11 checkpoint ABI.
+experiment_name: tw-day-trade-hybrid-minute-v12-layernorm-fold11-deployment
+
+runner:
+  output_dir: artifacts/ablations/tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_finetune_ofat_v2/layernorm
+  resume: false
+  post_train_infer: false
+
+training:
+  pretrained_initialization_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+  pretrained_initialization_require_exact_backbone: false
+  pretrained_initialization_trainable_parameter_prefixes: []
+  transformer_base_portfolio:
+    temporal_basis_input: raw_features
+  financial_transformer:
+    norm_type: layernorm
+    temporal_basis_input: raw_features

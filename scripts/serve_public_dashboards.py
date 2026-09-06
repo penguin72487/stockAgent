@@ -14,12 +14,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import sys
 import threading
 import time
 from typing import Any, Callable, Final, Mapping
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import ProxyHandler, build_opener
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +124,11 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/traffic/",
     }
 )
+_QUERY_API_ROUTES: Final[frozenset[str]] = frozenset({
+    "/taifex/api/history", "/tw-day-trade/api/status", "/tw-day-trade/api/history",
+    "/tw-day-trade/api/summary", "/tw-day-trade/api/positions",
+    "/tw-day-trade/api/signals", "/tw-day-trade/api/events", "/openbb/api/history",
+})
 
 
 class InvalidPublicRequest(ValueError):
@@ -138,6 +145,7 @@ class PreparedResponse:
     gzip_body: bytes
     content_type: str
     etag: str
+    gzip_etag: str
     cache_control: str
 
     @property
@@ -509,13 +517,59 @@ def _prepared(
     cache_control: str,
 ) -> PreparedResponse:
     digest = hashlib.sha256(body).hexdigest()
-    compressed = gzip.compress(body, compresslevel=5) if len(body) >= 1_024 else body
+    compressed = gzip.compress(body, compresslevel=5, mtime=0) if len(body) >= 1_024 else body
     return PreparedResponse(
         body=body,
         gzip_body=compressed,
         content_type=content_type,
         etag=f'"sha256-{digest}"',
+        gzip_etag=f'"sha256-{hashlib.sha256(compressed).hexdigest()}"',
         cache_control=cache_control,
+    )
+
+
+def _preferred_encoding(header: str | None, *, gzip_available: bool) -> str | None:
+    """Negotiate our two representations; explicit q=0 always excludes a coding."""
+
+    if not header:
+        return "identity"
+    qualities: dict[str, float] = {}
+    for item in header.lower().split(","):
+        coding, *parameters = item.strip().split(";")
+        coding = coding.strip()
+        quality = 1.0
+        seen_quality = False
+        for parameter in parameters:
+            name, separator, value = parameter.strip().partition("=")
+            if (
+                name.strip() != "q" or not separator or seen_quality
+                or re.fullmatch(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)", value.strip()) is None
+            ):
+                quality = 0.0
+                break
+            seen_quality = True
+            quality = float(value)
+        # Repeated contradictory values are malformed; never override q=0.
+        qualities[coding] = min(quality, qualities.get(coding, quality))
+    gzip_quality = qualities.get("gzip", qualities.get("*", 0.0)) if gzip_available else 0.0
+    identity_quality = qualities.get("identity", 0.0 if qualities.get("*") == 0.0 else 1.0)
+    if gzip_quality > 0 and (
+        "identity" not in qualities or gzip_quality >= identity_quality
+    ):
+        return "gzip"
+    return "identity" if identity_quality > 0 else None
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    """GET/HEAD If-None-Match uses weak comparison, including lists and *."""
+
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    return any(
+        token.removeprefix("W/") == etag
+        for token in re.findall(r'(?:W/)?"[^"\r\n]*"', header)
     )
 
 
@@ -815,7 +869,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self._cache: dict[str, CacheEntry] = {}
         self._cache_bytes = 0
         self._cache_lock = threading.Lock()
-        self._cache_key_locks: dict[str, threading.Lock] = {}
+        # Builders and waiters hold strong references. A lock disappears only
+        # after its last user, independently of success, failure or LRU eviction.
+        self._cache_key_locks: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
         self._refreshing: set[str] = set()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
@@ -867,9 +923,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
             else max(0.0, float(stale_grace_seconds))
         )
         with self._cache_lock:
-            previous = self._cache.get(cache_key)
+            previous = self._cache.pop(cache_key, None)
             if previous is not None:
                 self._cache_bytes -= previous.response.resident_bytes
+            if response.resident_bytes > MAX_CACHE_BYTES or MAX_CACHE_ENTRIES < 1:
+                return  # Still return the response to its caller, without retaining it.
             self._cache[cache_key] = CacheEntry(
                 expires_at=observed + float(ttl_seconds),
                 stale_until=observed + float(ttl_seconds) + stale_grace,
@@ -882,8 +940,6 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     (entry.last_accessed_at, key)
                     for key, entry in self._cache.items()
                     if key != cache_key
-                    and key not in self._refreshing
-                    and not self._cache_key_locks.get(key, threading.Lock()).locked()
                 )
             )
             for _, key in removable:
@@ -895,7 +951,6 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 removed = self._cache.pop(key, None)
                 if removed is not None:
                     self._cache_bytes -= removed.response.resident_bytes
-                self._cache_key_locks.pop(key, None)
 
     def cache_residency(self) -> dict[str, int]:
         """Return bounded, non-sensitive cache capacity and occupancy metrics."""
@@ -1213,8 +1268,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         *,
         start_date: str | None = None,
         end_date: str | None = None,
+        resolution: str = "sampled",
     ) -> PreparedResponse:
-        date_key = f"{start_date or ''}:{end_date or ''}"
+        date_key = f"{start_date or ''}:{end_date or ''}:{resolution}"
         return self.cached_local_json(
             cache_key=f"tw-history:{range_key}:{date_key}",
             ttl_seconds=55.0,
@@ -1226,6 +1282,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     range_key=range_key,
                     start_date=start_date,
                     end_date=end_date,
+                    resolution=resolution,
                 )
             ),
         )
@@ -1534,6 +1591,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
 
     def _security_headers(self) -> None:
+        if self.close_connection:
+            self.send_header("Connection", "close")
         request_started_ns = getattr(self, "_request_started_ns", None)
         if isinstance(request_started_ns, int):
             elapsed_ms = (time.perf_counter_ns() - request_started_ns) / 1_000_000
@@ -1584,25 +1643,35 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         *,
         head_only: bool,
     ) -> None:
-        if self.headers.get("If-None-Match") == response.etag:
+        encoding = _preferred_encoding(
+            ",".join(self.headers.get_all("Accept-Encoding", [])),
+            gzip_available=response.gzip_body is not response.body,
+        )
+        if encoding is None:
+            status = HTTPStatus.NOT_ACCEPTABLE
+            response = _prepared(
+                b'{"error":"no_acceptable_content_encoding"}\n',
+                content_type="application/json; charset=utf-8", cache_control="no-store",
+            )
+        use_gzip = encoding == "gzip"
+        body = response.gzip_body if use_gzip else response.body
+        etag = response.gzip_etag if use_gzip else response.etag
+        if status == HTTPStatus.OK and _etag_matches(self.headers.get("If-None-Match"), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
-            self.send_header("ETag", response.etag)
+            self.send_header("ETag", etag)
             self.send_header("Cache-Control", response.cache_control)
-            self.send_header("Content-Length", "0")
+            self.send_header("Vary", "Accept-Encoding")
             self._security_headers()
             self.end_headers()
             return
-        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
-        use_gzip = accepts_gzip and response.gzip_body is not response.body
-        body = response.gzip_body if use_gzip else response.body
         self.send_response(status)
         self.send_header("Content-Type", response.content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", response.cache_control)
-        self.send_header("ETag", response.etag)
+        self.send_header("ETag", etag)
+        self.send_header("Vary", "Accept-Encoding")
         if use_gzip:
             self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
         self._security_headers()
         self.end_headers()
         if not head_only:
@@ -1694,9 +1763,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "public, max-age=60",
                 )
-            elif suffix == "app.js":
+            elif suffix == "app.js" or (prefix == "/tw-day-trade/" and suffix in {
+                "presentation.js", "detail-components.js",
+            }):
                 routes[path] = (
-                    root / "app.js",
+                    root / suffix,
                     "text/javascript; charset=utf-8",
                     IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
@@ -1832,13 +1903,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=3,
+                max_num_fields=4,
             )
-            if set(query) - {"range", "start_date", "end_date"} or any(
+            if set(query) - {"range", "start_date", "end_date", "resolution"} or any(
                 len(values) != 1 for values in query.values()
             ):
                 raise InvalidPublicRequest("unsupported or repeated query field")
             range_key = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
+            resolution = str(query.get("resolution", ["sampled"])[0])
+            if resolution not in {"sampled", "1m"}:
+                raise InvalidPublicRequest("unsupported history resolution")
             if range_key not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
                 raise InvalidPublicRequest("unsupported chart range")
             start_date = str(query.get("start_date", [""])[0]).strip() or None
@@ -1859,6 +1933,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "range_key": range_key,
                 "start_date": start_date,
                 "end_date": end_date,
+                "resolution": resolution,
             }
         except InvalidPublicRequest:
             raise
@@ -1927,6 +2002,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise InvalidPublicRequest("invalid event query") from error
 
     def _api_response(self, path: str, raw_query: str) -> PreparedResponse:
+        if raw_query and path in _PUBLIC_API_ROUTES and path not in _QUERY_API_ROUTES:
+            raise InvalidPublicRequest("endpoint does not accept query fields")
         if path == "/api/overview":
             return self.server.cached_local_json(
                 cache_key="public-overview",
@@ -1969,6 +2046,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 str(history_query["range_key"]),
                 start_date=history_query["start_date"],
                 end_date=history_query["end_date"],
+                resolution=history_query["resolution"],
             )
         if path == "/tw-day-trade/api/public-data-status":
             if raw_query:
@@ -2108,6 +2186,18 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         raise PublicRouteNotFound(path)
 
     def _handle(self, *, head_only: bool) -> None:
+        # Public GET/HEAD routes have no request-body contract. Reject bodies
+        # and ambiguous framing without consuming or reinterpreting their bytes.
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") is not None or (
+            lengths and (len(lengths) != 1 or re.fullmatch(r"0+", lengths[0].strip()) is None)
+        ):
+            self.close_connection = True
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "request_body_not_supported"},
+                head_only=head_only,
+            )
+            return
         if len(self.path.encode("utf-8", errors="ignore")) > MAX_REQUEST_TARGET_BYTES:
             self._send_json(
                 HTTPStatus.REQUEST_URI_TOO_LONG,
@@ -2115,7 +2205,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 head_only=head_only,
             )
             return
-        parsed = urlparse(self.path)
+        try:
+            parsed = urlparse(self.path)
+        except ValueError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}, head_only=head_only,
+            )
+            return
         path = parsed.path
         if path in {
             "/taifex",
@@ -2192,7 +2288,10 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self._send_prepared(HTTPStatus.OK, response, head_only=head_only)
 
     def _observe_request(self, callback: Callable[[], None]) -> None:
-        path = urlparse(self.path).path
+        try:
+            path = urlparse(self.path).path
+        except ValueError:
+            path = "<invalid>"  # _handle returns a sanitized 400; keep telemetry bounded.
         self._request_started_ns = time.perf_counter_ns()
         self._response_status = int(HTTPStatus.INTERNAL_SERVER_ERROR)
         self._response_body_bytes = 0
@@ -2216,6 +2315,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self._observe_request(lambda: self._handle(head_only=True))
 
     def _method_not_allowed(self) -> None:
+        # Do not parse an unread POST/chunked body as a new keep-alive request.
+        self.close_connection = True
         body = b'{"error":"method_not_allowed"}\n'
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
         self.send_header("Allow", "GET, HEAD")

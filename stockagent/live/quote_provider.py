@@ -584,6 +584,60 @@ def fetch_shioaji_historical_stock_entry_books(
     }
 
 
+def resolve_observed_minute_execution_price(
+    *,
+    amount: object = None,
+    volume_shares: object = None,
+    raw_volume: object = None,
+    contract_unit: object = None,
+    low: object = None,
+    high: object = None,
+    close: object = None,
+) -> tuple[float | None, str | None, float | None]:
+    """Resolve one source-backed completed-minute price without requiring ticks.
+
+    Prefer the bar VWAP when its notional and share volume are internally
+    consistent.  A source-provided KBar close is the deterministic fallback
+    when VWAP cannot be computed.  This never carries an earlier price or
+    manufactures a bar that the source did not publish.
+    """
+
+    parsed_amount = _float_or_none(amount)
+    parsed_shares = _float_or_none(volume_shares)
+    parsed_raw_volume = _float_or_none(raw_volume)
+    parsed_low = _float_or_none(low)
+    parsed_high = _float_or_none(high)
+    parsed_close = _float_or_none(close)
+    if parsed_shares is None and parsed_raw_volume is not None:
+        multipliers: list[float] = []
+        parsed_contract_unit = _float_or_none(contract_unit)
+        if parsed_contract_unit is not None:
+            multipliers.append(parsed_contract_unit)
+        multipliers.extend((1_000.0, 100.0, 10.0, 1.0))
+        if (
+            parsed_amount is not None
+            and parsed_low is not None
+            and parsed_high is not None
+        ):
+            for multiplier in dict.fromkeys(multipliers):
+                candidate_shares = parsed_raw_volume * multiplier
+                candidate_price = parsed_amount / candidate_shares
+                if (
+                    np.isfinite(candidate_price)
+                    and candidate_price > 0.0
+                    and parsed_low * 0.999 <= candidate_price <= parsed_high * 1.001
+                ):
+                    parsed_shares = candidate_shares
+                    break
+    if parsed_amount is not None and parsed_shares is not None:
+        vwap = parsed_amount / parsed_shares
+        if np.isfinite(vwap) and vwap > 0.0:
+            return float(vwap), "minute_vwap", float(parsed_shares)
+    if parsed_close is not None:
+        return float(parsed_close), "minute_close", parsed_shares
+    return None, None, parsed_shares
+
+
 def fetch_shioaji_historical_stock_0901_vwaps(
     symbols: list[str],
     *,
@@ -593,14 +647,17 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     progress_every: int = 50,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, float | int | str]], dict[str, Any]]:
-    """Fetch the observed right-labelled 09:01 minute VWAP per stock.
+    """Fetch the observed right-labelled 09:01 minute price per stock.
 
     The project's minute execution contract labels trades from
     ``09:00:00..09:00:59`` as the completed ``09:01`` bar.  This function
-    computes ``sum(close * volume) / sum(volume)`` from those historical
-    trades.  Tick volume units cancel in the ratio.  Empty/invalid minutes are
-    left unresolved: callers must not replace them with the official open,
-    last price, best quote, or an adverse tick.
+    first computes ``sum(close * volume) / sum(volume)`` from historical
+    trades.  If the tick query is empty, it queries the source-published 09:01
+    KBar and uses its VWAP when possible, otherwise that same bar's Close.
+    Absence of an exact tick is therefore not a no-fill rule.  A symbol remains
+    unresolved only when neither source publishes a valid 09:01 minute price;
+    callers must not replace that gap with the official open, a carried last
+    price, best quote, or an adverse tick.
     """
 
     if not 0.0 < float(max_traffic_fraction) <= 1.0:
@@ -630,6 +687,9 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     error_counts: dict[str, int] = {}
     queried = 0
     source_empty = 0
+    kbar_fallback_queries = 0
+    kbar_fallback_resolved = 0
+    price_method_counts: dict[str, int] = {}
     contract_missing = 0
     stopped_for_traffic = False
     request_times: deque[float] = deque()
@@ -731,11 +791,106 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 last_at = wall_clock
             vwap = notional / total_volume if total_volume > 0.0 else float("nan")
             if not np.isfinite(vwap) or vwap <= 0.0 or accepted <= 0:
-                source_empty += 1
+                current_usage = usage()
+                if current_usage is not None and float(
+                    current_usage["fraction"]
+                ) >= float(max_traffic_fraction):
+                    stopped_for_traffic = True
+                    source_empty += 1
+                    continue
+                now_monotonic = time.monotonic()
+                while request_times and now_monotonic - request_times[0] >= 5.0:
+                    request_times.popleft()
+                if len(request_times) >= 50:
+                    time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
+                    now_monotonic = time.monotonic()
+                    while request_times and now_monotonic - request_times[0] >= 5.0:
+                        request_times.popleft()
+                request_times.append(time.monotonic())
+                with shioaji_query(
+                    api,
+                    consumer="tw_day_trade_missed_open_0901_kbar_fallback",
+                    method="kbars",
+                    asset_class="stock",
+                    details={
+                        "contract": symbol,
+                        "date": trading_date.isoformat(),
+                        "right_label": "09:01:00",
+                    },
+                ) as set_kbar_ledger_result:
+                    kbars = api.kbars(
+                        contract=contract,
+                        start=trading_date.isoformat(),
+                        end=trading_date.isoformat(),
+                        timeout=int(timeout_ms),
+                    )
+                    set_kbar_ledger_result(kbars)
+                kbar_fallback_queries += 1
+                kbar_fields = {
+                    name: list(getattr(kbars, name, ()))
+                    for name in ("ts", "Close", "Low", "High", "Volume", "Amount")
+                }
+                lengths = {len(values) for values in kbar_fields.values()}
+                if len(lengths) != 1:
+                    raise ValueError(
+                        "inconsistent historical KBar fields: "
+                        + ", ".join(
+                            f"{name}={len(values)}"
+                            for name, values in kbar_fields.items()
+                        )
+                    )
+                minute_row: dict[str, object] | None = None
+                for position in range(len(kbar_fields["ts"])):
+                    wall_clock = (
+                        np.datetime64(int(kbar_fields["ts"][position]), "ns")
+                        .astype("datetime64[us]")
+                        .astype(datetime)
+                        .replace(tzinfo=ZoneInfo("Asia/Taipei"))
+                    )
+                    if wall_clock == window_end:
+                        minute_row = {
+                            name: values[position]
+                            for name, values in kbar_fields.items()
+                            if name != "ts"
+                        }
+                        break
+                price, method, normalized_shares = (
+                    resolve_observed_minute_execution_price(
+                        amount=minute_row.get("Amount"),
+                        raw_volume=minute_row.get("Volume"),
+                        low=minute_row.get("Low"),
+                        high=minute_row.get("High"),
+                        close=minute_row.get("Close"),
+                    )
+                    if minute_row is not None
+                    else (None, None, None)
+                )
+                if price is None or method is None:
+                    source_empty += 1
+                else:
+                    kbar_fallback_resolved += 1
+                    price_method_counts[method] = price_method_counts.get(method, 0) + 1
+                    resolved[symbol] = {
+                        "symbol": symbol,
+                        "execution_price_0901": float(price),
+                        "execution_price_0901_method": method,
+                        "tick_volume_units_0901": float(normalized_shares or 0.0),
+                        "tick_count_0901": 0,
+                        "source_window_start": window_start.isoformat(
+                            timespec="seconds"
+                        ),
+                        "source_window_end": window_end.isoformat(timespec="seconds"),
+                        "quote_at": window_end.isoformat(timespec="seconds"),
+                        "source": f"shioaji:historical_kbar_0901_{method}",
+                    }
             else:
+                price_method_counts["minute_vwap"] = (
+                    price_method_counts.get("minute_vwap", 0) + 1
+                )
                 resolved[symbol] = {
                     "symbol": symbol,
                     "execution_price_0901": float(vwap),
+                    "execution_price_0901_method": "minute_vwap",
                     "tick_volume_units_0901": float(total_volume),
                     "tick_count_0901": int(accepted),
                     "source_window_start": first_at.isoformat(timespec="microseconds"),
@@ -759,7 +914,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 progress_callback(index, len(requested), queried, len(resolved))
 
     return resolved, {
-        "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+        "source": "shioaji:historical_0901_minute_price_ticks_then_kbar",
         "trading_date": trading_date.isoformat(),
         "source_window": "09:00:00..09:00:59 Asia/Taipei",
         "right_label": "09:01:00 Asia/Taipei",
@@ -768,6 +923,9 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         "queried_symbols": queried,
         "resolved_symbols": len(resolved),
         "source_empty_symbols": source_empty,
+        "kbar_fallback_queries": kbar_fallback_queries,
+        "kbar_fallback_resolved_symbols": kbar_fallback_resolved,
+        "price_method_counts": price_method_counts,
         "contract_missing_symbols": contract_missing,
         "unqueried_symbols": max(0, len(requested) - queried - contract_missing),
         "error_counts": error_counts,

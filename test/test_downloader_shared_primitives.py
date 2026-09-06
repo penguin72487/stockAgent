@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import traceback
 from urllib.error import HTTPError, URLError
 
 import polars as pl
@@ -178,6 +179,48 @@ def test_http_retry_after_defers_shared_bucket_without_double_sleep() -> None:
     assert limiter.waits == [1.0, 1.0]
     assert limiter.defers == [7.0]
     assert sleeps == []
+
+
+def test_http_redaction_preserves_public_error_details_and_masks_encoded_secrets() -> None:
+    url = "https://user:p%40ss@example.test/data?api_key=a%2Bb%2Fc&output_type=4&limit=100000"
+    error = HttpStatusError(
+        400, url,
+        b'HTTP 400 realtime_end after 2026-09-04; key a+b/c a%2Bb%2Fc user p@ss',
+    )
+    assert "HTTP 400 realtime_end after 2026-09-04" in str(error)
+    for secret in ("a+b/c", "a%2Bb%2Fc", "user", "p@ss", "p%40ss"):
+        assert secret not in str(error)
+    assert error.url == "https://example.test/data"
+
+
+def test_http_redacts_secret_before_preview_truncation() -> None:
+    secret = "credential-crossing-preview-boundary"
+    error = HttpStatusError(
+        400, f"https://example.test/data?unknown={secret}",
+        b"x" * 4090 + secret.encode(),
+    )
+    assert "creden" not in str(error)
+    assert len(error.body) <= 4096
+
+
+@pytest.mark.parametrize("http_error", [True, False])
+def test_http_final_traceback_never_includes_original_secret_reason(http_error) -> None:
+    def opener(request, **kwargs):
+        if http_error:
+            raise HTTPError(request.full_url, 400, "api_key=private-credential", {}, BytesIO(b"bad request"))
+        raise URLError("network failed for " + request.full_url)
+
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(provider="fixture", max_retries=0), limiter=_Limiter(), opener=opener,
+    )
+    with pytest.raises((HttpStatusError, URLError)) as caught:
+        transport.request_bytes("https://example.test/data?api_key=private-credential")
+    rendered = "".join(traceback.format_exception(caught.value))
+    # The source line can contain the test's literal URL. Exception messages
+    # and chained exception sections may not retain the original credentials.
+    assert "private-credential" not in str(caught.value)
+    assert caught.value.__suppress_context__ is True
+    assert "During handling of the above exception" not in rendered
 
 
 def test_scheduler_step_receipt_omits_commands_and_publishes_latest(

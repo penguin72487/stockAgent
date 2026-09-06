@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import fcntl
 import json
 import os
@@ -22,7 +22,9 @@ from scripts.promote_tw_day_trade_replay import (  # noqa: E402
     _validate_minute_curve_coverage,
 )
 from scripts.rebuild_tw_day_trade_minute_curves import (  # noqa: E402
+    _iter_jsonl,
     historical_minute_mark_has_source,
+    missing_accepted_endpoints,
 )
 from stockagent.live.shioaji_schedule import (  # noqa: E402
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -73,6 +75,18 @@ def _completed_scope(
     if not isinstance(modes, dict) or not modes:
         raise RuntimeError("state has no active day-trade modes")
     markets = {str(market) for market in modes}
+    # A one-time replay receipt stops at its deployment day; current state
+    # retains only the latest session. Include intervening settled sessions
+    # from the append-only engine ledger or their gaps disappear from audits.
+    events_path = state_dir / "events.jsonl"
+    if events_path.is_file():
+        for event in _iter_jsonl(events_path):
+            if event.get("event") != "closing_auction_settled" or event.get("market") not in markets:
+                continue
+            settled_at = datetime.fromisoformat(str(event["recorded_at"]))
+            if settled_at.tzinfo is None:
+                settled_at = settled_at.replace(tzinfo=TAIPEI)
+            completed.add(settled_at.astimezone(TAIPEI).date().isoformat())
     session_dates = {
         str(mode.get("session_date") or "")
         for mode in modes.values()
@@ -273,6 +287,29 @@ def main() -> None:
                 "schema_version": 1,
                 "status": "waiting_completed_session",
                 "observed_at": observed.isoformat(timespec="seconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+            }
+            _atomic_json(status_path, payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
+        missing_endpoints = missing_accepted_endpoints(
+            _iter_jsonl(state_dir / "marks.jsonl"),
+            start=date.fromisoformat(completed[0]),
+            end=date.fromisoformat(completed[-1]),
+            expected_sessions=completed,
+            expected_markets=markets,
+        )
+        if missing_endpoints:
+            payload = {
+                "schema_version": 1,
+                "status": "waiting_accepted_endpoints",
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "completed_session_dates": completed,
+                "missing_endpoint_pairs": len(missing_endpoints),
+                "missing_endpoints": missing_endpoints[:50],
+                "reason": "Accepted entry/close ledger marks require canonical history repair; minute prices cannot reconstruct missed executions.",
                 "simulation_only": True,
                 "production_order_possible": False,
             }

@@ -16,6 +16,7 @@ from stockagent.backtest.tw_execution import (
     official_tw_short_initial_margin_rates,
 )
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS
 from stockagent.data.walkforward import normalize_lookback_context
 
 
@@ -437,14 +438,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     panel.num_dates,
                     panel.tradable_mask.shape[1],
                     2,
-                    5,
+                    TAPE_FIELDS if self.execution_mode == MINUTE_MODE else 5,
                 )
                 if integer_execution is None or tuple(
                     np.asarray(integer_execution).shape
                 ) != expected_integer_shape:
                     raise ValueError(
                         "integer stock-futures execution requires candidate "
-                        "tensor [T,S,2,5]"
+                        f"tensor {expected_integer_shape}"
                     )
                 overnight_returns = np.asarray(
                     integer_execution, dtype=np.float32
@@ -690,8 +691,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         elif stock_futures_day_trade_execution:
             # Contract existence is known from the preceding TAIFEX session and
             # is the only futures gate visible to the model. The declared
-            # current entry price (08:45 OPEN for the legacy mode or the first
-            # strictly post-09:00 trade for the successor), CLOSE, and volume
+            # current entry price and the later close/exit bars and volume
             # support remain executor-only and may reduce a requested name to
             # zero without reallocating it.
             tradable = policy_eligible.copy()
@@ -851,10 +851,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     axis=1
                 ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
                 valid_indices = valid_indices[executable_or_terminal]
-            elif valid_indices.size > 0 and stock_futures_day_trade_execution:
+            elif (valid_indices.size > 0 and stock_futures_day_trade_execution
+                  and self.execution_mode != MINUTE_MODE):
                 valid_indices = valid_indices[
                     close_tradable[valid_indices].any(axis=1)
                 ]
+            # Scheduled minute execution retains verified no-fill sessions.
+            # Future entry capacity cannot remove a decision day or inflate
+            # annualized returns by dropping its zero-return account row.
         self.valid_indices = valid_indices
 
         if futures_portfolio_execution and self.valid_indices.size > 0:
@@ -937,7 +941,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         elif stock_futures_day_trade_execution:
             # Cash-stock price limits and short-sale rules do not govern a
             # futures contract. Both directions require the same observed
-            # positive-volume futures OPEN/CLOSE round trip.
+            # positive-volume entry (and a close for legacy daily modes).
             can_buy = close_tradable.copy()
             can_sell = close_tradable.copy()
         raw_short_capacity = getattr(panel, "short_capacity_shares", None)

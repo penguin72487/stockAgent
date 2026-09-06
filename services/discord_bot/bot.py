@@ -1505,7 +1505,7 @@ def _signal_now_job_retry_delay_seconds(attempt: int) -> float:
 
 def _signal_now_job_data_dates(status: MarketRuntimeStatus) -> tuple[str | None, str | None]:
     data = getattr(status, "data", None)
-    expected = _date_key(getattr(data, "expected_latest_date", None))
+    expected = _completed_session_target_date(status)
     actual = _date_key(
         getattr(data, "last_data_date", None)
         or getattr(data, "panel_date", None)
@@ -1530,7 +1530,14 @@ def _register_signal_now_job(
 
     observed = datetime.now().astimezone()
     expected, actual = _signal_now_job_data_dates(runtime_status)
-    waiting_source = not bool(getattr(runtime_status.data, "fresh", False))
+    completed_session = _completed_session_signal_path(cfg, runtime_status)
+    waiting_source = bool(
+        (completed_session and not _completed_session_publication_ready(runtime_status))
+        or (
+            not completed_session
+            and not bool(getattr(runtime_status.data, "fresh", False))
+        )
+    )
     with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         jobs = payload.setdefault("signal_now_jobs", {})
@@ -1564,7 +1571,14 @@ def _register_signal_now_job(
             "error_type": None,
             "error_message": None,
             "waiting_reason": (
-                str(getattr(runtime_status.data, "reason", None) or "source_not_fresh")
+                str(
+                    getattr(runtime_status.data, "reason", None)
+                    or (
+                        "official_close_publication_pending"
+                        if completed_session
+                        else "source_not_fresh"
+                    )
+                )
                 if waiting_source
                 else None
             ),
@@ -1786,6 +1800,12 @@ def _signal_now_source_is_pending(
     status: MarketRuntimeStatus | None,
     exc: Exception,
 ) -> bool:
+    if (
+        status is not None
+        and _completed_session_signal_path(cfg, status)
+        and not _completed_session_publication_ready(status)
+    ):
+        return True
     if status is not None and not bool(getattr(status.data, "fresh", False)):
         return True
     text = str(exc).lower()
@@ -2142,6 +2162,44 @@ def _completed_session_signal_path(
     )
 
 
+def _completed_session_target_date(status: MarketRuntimeStatus) -> str | None:
+    """Resolve the close session independently from generic source-ready time.
+
+    ``data_ready_time`` deliberately delays ordinary freshness until public
+    files are expected to exist.  A manual command immediately after the cash
+    close has a stricter contract: it must wait for *today's* accepted close,
+    rather than treating yesterday's still-fresh panel as today's result.  On
+    weekends/holidays the ordinary expected date remains authoritative.
+    """
+
+    data = getattr(status, "data", None)
+    expected = _date_key(
+        getattr(data, "expected_latest_date", None)
+        or getattr(data, "last_data_date", None)
+        or getattr(data, "panel_date", None)
+    )
+    cfg = getattr(status, "cfg", None)
+    if not (
+        cfg is not None
+        and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+        and not bool(getattr(status, "market_open", False))
+    ):
+        return expected
+    try:
+        now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+        close_minutes = _hhmm_minutes(getattr(cfg, "close_time", None))
+        is_session, _reason = _scheduled_market_session_day(cfg, now)
+    except Exception:
+        return expected
+    if (
+        is_session
+        and close_minutes is not None
+        and now.hour * 60 + now.minute > close_minutes
+    ):
+        return now.date().isoformat()
+    return expected
+
+
 def _run_completed_session_command(
     cfg: LiveMarketConfig,
     *,
@@ -2263,12 +2321,7 @@ def _signal_now_source_event_token() -> str:
 def _completed_session_publication_ready(status: MarketRuntimeStatus) -> bool:
     """Require the official close event before starting expensive derivation."""
 
-    data = getattr(status, "data", None)
-    expected = _date_key(
-        getattr(data, "expected_latest_date", None)
-        or getattr(data, "last_data_date", None)
-        or getattr(data, "panel_date", None)
-    )
+    expected = _completed_session_target_date(status)
     if not expected:
         return False
     _receipt_path, publication_root = _completed_session_receipt_paths()
@@ -2300,12 +2353,7 @@ def _completed_session_publication_ready(status: MarketRuntimeStatus) -> bool:
 def _completed_session_receipt_ready(status: MarketRuntimeStatus) -> bool:
     """Require derived close data to acknowledge the newest accepted close phase."""
 
-    data = getattr(status, "data", None)
-    expected = _date_key(
-        getattr(data, "expected_latest_date", None)
-        or getattr(data, "last_data_date", None)
-        or getattr(data, "panel_date", None)
-    )
+    expected = _completed_session_target_date(status)
     if not expected:
         return False
     receipt_path, publication_root = _completed_session_receipt_paths()
@@ -2384,8 +2432,12 @@ def _should_use_realtime_quote_after_open(cfg: LiveMarketConfig, status: MarketR
         return False
     data = getattr(status, "data", None)
     latest = _date_key(getattr(data, "last_data_date", None) or getattr(data, "panel_date", None))
+    expected = _date_key(getattr(data, "expected_latest_date", None))
     today = now.date().isoformat()
-    return bool(latest and latest < today)
+    # Calendar-day lag is not session lag: a Friday close remains current on
+    # Saturday/Sunday.  The freshness layer owns the exchange calendar, so a
+    # post-open real-time fallback is valid only when today is its target.
+    return bool(latest and expected == today and latest < expected)
 
 
 def _realtime_price_source_for_market(cfg: LiveMarketConfig) -> str | None:
@@ -2399,6 +2451,15 @@ def _realtime_price_source_for_market(cfg: LiveMarketConfig) -> str | None:
 
 def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus, requested: str | None) -> str | None:
     text = str(requested or "").strip().lower()
+    closed_day_trade = bool(
+        getattr(cfg, "day_trade_simulation_enabled", False)
+        and not bool(getattr(status, "market_open", False))
+    )
+    if closed_day_trade and text not in {"", "auto", "panel"}:
+        raise BotUserError(
+            f"`{cfg.market}` 休市後只允許已驗收的官方收盤 panel；"
+            f"不接受 price_source=`{text}` 的即時或盤中報價。"
+        )
     if text and text != "auto":
         return text
     market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
@@ -2415,10 +2476,7 @@ def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus
             # The independent paper engine remains the sole Shioaji client on
             # the execution path and observes a causally later best Bid/Ask for
             # the union of actual order candidates.
-            return "tw" if (
-                bool(getattr(status, "market_open", False))
-                or _should_use_realtime_quote_after_open(cfg, status)
-            ) else None
+            return "tw" if bool(getattr(status, "market_open", False)) else None
         return "shioaji" if (bool(getattr(status, "market_open", False)) or _should_use_realtime_quote_after_open(cfg, status)) else None
     realtime_source = _realtime_price_source_for_market(cfg)
     if realtime_source and _should_use_realtime_quote_after_open(cfg, status):
@@ -4867,6 +4925,33 @@ def _can_reuse_latest_signal_now(
             return False, None
         return True, f"cached_open_yahoo_age={age:.0f}s"
 
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        # Closed-session day-trade results are official-close calculations.
+        # Never reuse a recent MIS/Shioaji artifact as a completed close.
+        if requested not in {"", "auto", "panel"}:
+            return False, "closed_day_trade_requires_official_close"
+        if not bool(getattr(status.data, "fresh", False)):
+            return False, None
+        latest_data_date = (
+            getattr(status.data, "last_data_date", None)
+            or getattr(status.data, "panel_date", None)
+        )
+        if not _summary_date_matches(summary_date, latest_data_date):
+            return False, None
+        if summary_price and not (
+            summary_price.startswith("panel")
+            or summary_price in {"close", "panel_close"}
+        ):
+            return False, "closed_day_trade_requires_official_close"
+        contract = summary.get("signal_price_contract") or {}
+        if (
+            isinstance(contract, dict)
+            and str(contract.get("model_observation") or "").strip().lower()
+            not in {"", "completed_panel", "official_close"}
+        ):
+            return False, "closed_day_trade_contract_mismatch"
+        return True, "cached_latest_official_close"
+
     realtime_source = _realtime_price_source_for_market(cfg)
     if realtime_source and _should_use_realtime_quote_after_open(cfg, status):
         allowed = {"", "auto", realtime_source}
@@ -5784,7 +5869,7 @@ def _guide_message() -> str:
         "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）；使用 raw-feature lookback-32 fold 11。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "`tw_day_trade_multi_basis_22` 多基底22 現股當沖（初始 1,000 萬）；使用 22 組 effective-rank 時間基底與 Projection-L1 fold 11。",
-        "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 GELU 現股當沖（初始 1,000 萬）。",
+        "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 LayerNorm v12 現股當沖（初始 1,000 萬）。",
         "",
         "**日常看盤**",
         "`/latest market:<市場>` 最新訊號，不重跑模型。",
@@ -5946,13 +6031,17 @@ async def _run_signal_now_background_refresh(
     try:
         initial_status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
         completed_session = _completed_session_signal_path(cfg, initial_status)
-        if (
-            not bool(getattr(initial_status.data, "fresh", False))
-            and (
-                not completed_session
-                or not _completed_session_publication_ready(initial_status)
+        source_pending = bool(
+            (
+                completed_session
+                and not _completed_session_publication_ready(initial_status)
             )
-        ):
+            or (
+                not completed_session
+                and not bool(getattr(initial_status.data, "fresh", False))
+            )
+        )
+        if source_pending:
             _update_signal_now_job(
                 key,
                 status="waiting_source",
@@ -6211,18 +6300,21 @@ async def _resume_signal_now_jobs_once() -> None:
                     exc,
                 )
             return
-        if not bool(getattr(status.data, "fresh", False)):
-            completed_session = _completed_session_signal_path(cfg, status)
+        completed_session = _completed_session_signal_path(cfg, status)
+        source_pending = bool(
+            (completed_session and not _completed_session_publication_ready(status))
+            or (
+                not completed_session
+                and not bool(getattr(status.data, "fresh", False))
+            )
+        )
+        if source_pending:
             _update_signal_now_job(
                 key,
                 status="waiting_source",
                 runtime_status=status,
             )
-            if (
-                not completed_session
-                or not _completed_session_publication_ready(status)
-            ):
-                continue
+            continue
         user_ids = {
             int(value)
             for value in row.get("user_ids", [])
@@ -8142,6 +8234,7 @@ async def _handle_signal_now_command(
             cfg,
             requested_price_source=price_source,
             force_refresh=should_refresh_data,
+            completed_session=completed_session,
         )
         await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
         result = await _run_market_signal(

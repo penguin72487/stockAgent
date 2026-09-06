@@ -161,16 +161,18 @@ def test_capacity_gate_fails_before_download(monkeypatch, tmp_path: Path) -> Non
     ]
 
 
+@pytest.mark.parametrize("status", ["failed", "quarantined_repair_required"])
+@pytest.mark.parametrize("reason", ["3 invalid OHLCV rows", "conflicting duplicate open timestamp"])
 def test_invalid_monthly_object_is_quarantined_for_daily_rebuild(
-    tmp_path: Path,
+    tmp_path: Path, status: str, reason: str,
 ) -> None:
     state = tmp_path / "state.sqlite3"
     item = _object()
     _record_state(
         state,
         item,
-        status="failed",
-        error=f"{item.key}: 3 invalid OHLCV rows",
+        status=status,
+        error=f"{item.key}: {reason}",
     )
 
     repairs = _promote_monthly_repairs(state)
@@ -213,6 +215,14 @@ def test_durable_source_quarantine_keeps_data_partial_without_failing_clean_cycl
 
     dataset_state, cycle_state = _download_states(counts, durable_counts)
 
+    assert dataset_state == "partial"
+    assert cycle_state == "complete"
+
+
+@pytest.mark.parametrize("durable_status", ["failed", "quarantined_repair_required"])
+def test_unverified_durable_gap_cannot_be_hidden_by_clean_cycle(durable_status):
+    counts = {"failed": 0, "quarantined_repair_required": 0, "quarantined_source_invalid": 0}
+    dataset_state, cycle_state = _download_states(counts, {"complete": 10, durable_status: 1})
     assert dataset_state == "partial"
     assert cycle_state == "complete"
 

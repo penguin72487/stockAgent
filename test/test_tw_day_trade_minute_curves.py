@@ -21,6 +21,7 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     _benchmark_minute_row,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
+    missing_accepted_endpoints,
     rebuild_benchmark_history,
     rebuild_strategy_marks,
     required_symbol_dates,
@@ -32,7 +33,59 @@ def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
     assert DEFAULT_LOCAL_MINUTE_ROOTS[0] == Path(
         "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
     )
+
+
+def test_prepare_does_not_read_a_lower_priority_duplicate_source(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    _minute_file(first, "2330", [(datetime(2026, 8, 13, 9, 1), 102.0)])
+    _minute_file(second, "2330", [(datetime(2026, 8, 13, 9, 1), 200.0)])
+    for path in second.rglob("*.parquet"):
+        path.write_bytes(b"This duplicate source must not be opened")
+    store = MinutePriceStore([first, second], [])
+    store.prepare({"2330": {"2026-08-13"}})
+    assert store.prices("2330", "2026-08-13")["2026-08-13T09:01+08:00"] == 102.0
 from stockagent.live.tw_day_trade_simulation import position_net_liquidation_pnl
+
+
+def test_endpoint_preflight_finds_wholly_absent_market_session() -> None:
+    rows = ({"session_date": "2026-09-03", "market": "present",
+             "minute": f"2026-09-03T{clock}+08:00"}
+            for clock in ("09:01", "13:30"))
+    missing = missing_accepted_endpoints(
+        rows, start=date(2026, 9, 3), end=date(2026, 9, 3),
+        expected_sessions=["2026-09-03"], expected_markets={"present", "absent"},
+    )
+    assert missing == [{"session_date": "2026-09-03", "market": "absent",
+                        "missing_clocks": ["09:01", "13:30"]}]
+
+
+def test_maintenance_waits_before_subprocess_or_minute_data_loading(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from scripts import maintain_tw_day_trade_minute_curves as maintenance
+
+    (tmp_path / "marks.jsonl").write_text(
+        json.dumps({"session_date": "2026-09-03", "market": "test",
+                    "minute": "2026-09-03T09:01+08:00"}) + "\n",
+        encoding="utf-8",
+    )
+    status = tmp_path / "status.json"
+    monkeypatch.setattr(maintenance, "parse_args", lambda: SimpleNamespace(
+        state_dir=tmp_path, output_root=tmp_path / "output", status_path=status,
+        no_fetch=False,
+    ))
+    monkeypatch.setattr(maintenance, "_completed_scope", lambda _: (["2026-09-03"], {"test"}))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preflight must gate expensive validation and subprocesses")
+
+    monkeypatch.setattr(maintenance, "_validate_current", forbidden)
+    monkeypatch.setattr(maintenance.subprocess, "run", forbidden)
+    maintenance.main()
+    payload = json.loads(status.read_text())
+    assert payload["status"] == "waiting_accepted_endpoints"
+    assert payload["missing_endpoints"][0]["missing_clocks"] == ["13:30"]
+    assert not (tmp_path / "output").exists()
 
 
 def test_stock_benchmark_minute_uses_adjusted_units_without_adjusting_cost_basis() -> None:
@@ -57,6 +110,48 @@ def test_stock_benchmark_minute_uses_adjusted_units_without_adjusting_cost_basis
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_lossless_minute_history_keeps_every_point_beyond_chart_sample_limit(tmp_path: Path) -> None:
+    from stockagent.live.tw_day_trade_dashboard import build_dashboard_history_snapshot
+    from stockagent.live.public_dashboards import sanitize_tw_history
+
+    rows = []
+    for day_offset in range(10):
+        start = datetime(2026, 8, 10, 9, 1, tzinfo=TAIPEI) + timedelta(days=day_offset)
+        for offset in range(270):
+            stamp = start + timedelta(minutes=offset)
+            rows.append({
+                "market": "test", "session_date": stamp.date().isoformat(),
+                "minute": stamp.isoformat(timespec="minutes"),
+                "initial_capital_twd": 10000.0,
+                "total_equity_twd": 10000.0 + len(rows) + (offset % 3) * 5,
+            })
+    (tmp_path / "marks.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    full = build_dashboard_history_snapshot(state_dir=tmp_path, range_key="all", resolution="1m")
+    public = sanitize_tw_history(full)
+    points = public["minute_series"][0]["points"]
+    assert len(points) == 2700 == public["returned_points"] == public["raw_points_in_range"]
+    assert public["downsampled"] is False
+    assert points[0][1] == 0
+    assert len({point[0] for point in points}) == 2700
+    for source, point in zip(rows, points, strict=True):
+        assert point[0] == int(datetime.fromisoformat(source["minute"]).timestamp() // 60)
+        assert point[1] == pytest.approx((source["total_equity_twd"] / 10000 - 1) * 100)
+    sampled = build_dashboard_history_snapshot(state_dir=tmp_path, range_key="all")
+    assert sampled["downsampled"] is True
+    assert len(sampled["history"]) <= 2000
+
+
+def test_public_minute_columns_refuse_non_numeric_embedded_data() -> None:
+    from stockagent.live.public_dashboards import sanitize_tw_history, UnsafePublicDashboardPayload
+
+    with pytest.raises(UnsafePublicDashboardPayload, match="minute point"):
+        sanitize_tw_history({
+            "simulation_only": True, "production_order_possible": False,
+            "history_encoding": "minute_columns_v1",
+            "minute_series": [{"series_id": "a", "points": [[1, 0, "secret", 0]]}],
+        })
 
 
 def test_existing_bracket_aware_strategy_marks_validate_without_rebuild() -> None:
@@ -166,6 +261,22 @@ def test_minute_curve_maintenance_includes_flat_terminal_session(
 
     assert sessions == ["2026-08-31", "2026-09-01"]
     assert markets == {"a", "b", "c"}
+
+
+def test_completed_scope_retains_sessions_between_replay_and_current_state(tmp_path: Path) -> None:
+    _write_maintenance_scope(tmp_path, current_open_positions=0, closing_auction_settled=True)
+    state = json.loads((tmp_path / "state.json").read_text())
+    for mode in state["modes"].values():
+        mode["session_date"] = "2026-09-04"
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    events = [
+        {"event": "closing_auction_settled", "market": "a", "recorded_at": "2026-09-03T05:30:00Z"},
+        {"event": "signal_registered", "market": "a", "recorded_at": "2026-09-02T09:00:00+08:00"},
+        {"event": "closing_auction_settled", "market": "retired", "recorded_at": "2026-09-02T13:30:00+08:00"},
+    ]
+    (tmp_path / "events.jsonl").write_text("\n".join(json.dumps(x) for x in events))
+    sessions, _ = _completed_scope(tmp_path)
+    assert sessions == ["2026-08-31", "2026-09-03", "2026-09-04"]
 
 
 def test_minute_curve_maintenance_requires_all_benchmark_minutes(
@@ -468,6 +579,55 @@ def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(
     assert rows[2]["last_trade_carried_position_count"] == 1
     assert rows[2]["valuation_stale"] is True
     assert stats["generated_rows"] == 270
+
+
+def test_opening_revaluation_uses_same_close_and_fees_as_following_minute(tmp_path: Path) -> None:
+    _minute_file(tmp_path / "kbars", "2330", [(datetime(2026, 8, 13, 9, 1), 102.0)])
+    store = MinutePriceStore(tmp_path / "kbars", tmp_path / "ticks")
+    opening = {"minute": "2026-08-13T09:01+08:00", "session_date": "2026-08-13",
+               "market": "tw_day_trade", "initial_capital_twd": 10_000_000.0,
+               "cumulative_realized_net_pnl_twd": 50.0,
+               "total_equity_twd": 10_000_020.0, "open_position_count": 1}
+    closing = {**opening, "minute": "2026-08-13T13:30+08:00", "open_position_count": 0}
+    positions = {"2026-08-13": {"tw_day_trade": [_position()]}}
+    rows, stats = rebuild_strategy_marks([opening, closing], positions, store,
+        start=date(2026, 8, 13), end=date(2026, 8, 13), revalue_opening_marks=True)
+    expected = 10_000_000 + 50 + 1_000 * (102 - 101) - 30 - 102_000 * (.002425 - .00114)
+    assert rows[0]["total_equity_twd"] == pytest.approx(expected)
+    assert rows[1]["total_equity_twd"] == rows[0]["total_equity_twd"]
+    assert rows[0]["fresh_trade_position_count"] == 1
+    assert rows[1]["last_trade_carried_position_count"] == 1
+    assert rows[-1] == closing
+    assert stats["opening_revaluations"][0]["before_equity_twd"] == 10_000_020
+    missing_store = MinutePriceStore(tmp_path / "missing", tmp_path / "ticks")
+    with pytest.raises(RuntimeError, match="missing completed 09:01"):
+        rebuild_strategy_marks([opening, closing], positions, missing_store,
+            start=date(2026, 8, 13), end=date(2026, 8, 13), revalue_opening_marks=True)
+
+
+def test_position_archive_cannot_resurrect_an_old_replay_without_entry_fill(tmp_path: Path) -> None:
+    from scripts.rebuild_tw_day_trade_minute_curves import load_positions
+    archive = tmp_path / "position_history/2026-08-13/tw_day_trade.json"
+    archive.parent.mkdir(parents=True)
+    archive.write_text(json.dumps({"positions": [_position()]}))
+    (tmp_path / "state.json").write_text('{"modes":{}}')
+    result = load_positions(tmp_path, start=date(2026, 8, 13), end=date(2026, 8, 13), fill_rows=[])
+    assert result["2026-08-13"]["tw_day_trade"] == []
+    assert archive.is_file()
+
+
+def test_historical_benchmark_close_is_not_overwritten_by_old_live_quote(tmp_path: Path) -> None:
+    from stockagent.live.tw_day_trade_dashboard import build_dashboard_history_snapshot
+    first = {"benchmark_id": "benchmark_2330", "session_date": "2026-09-04",
+             "minute": "2026-09-04T09:00+08:00", "initial_capital_twd": 100.0,
+             "total_equity_twd": 110.0, "source": "official_daily_session_open"}
+    last = {**first, "minute": "2026-09-04T13:30+08:00", "total_equity_twd": 121.0,
+            "source": "official_daily_session_close"}
+    (tmp_path / "benchmark_history.json").write_text(json.dumps({"schema_version": 1, "marks": [first, last]}))
+    (tmp_path / "benchmark_marks.jsonl").write_text(json.dumps({**first, "total_equity_twd": 121.0}) + "\n")
+    for dates in ({}, {"start_date": "2026-09-04", "end_date": "2026-09-04"}):
+        history = build_dashboard_history_snapshot(state_dir=tmp_path, range_key="all", **dates)
+        assert [row["return_pct"] for row in history["history"]] == pytest.approx([0.0, 10.0])
 
 
 def test_strategy_minute_rebuild_uses_exit_ledger_for_missing_mark(

@@ -74,3 +74,5 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
   color:var(--amber);
   border-color:#705b2c;
 }
+.compact-table td .stock-futures{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-top:5px}
+.stock-futures .badge{white-space:normal;text-align:center}

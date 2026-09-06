@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 import discord
+import pytest
 
 from services.discord_bot.bot import (
     _BOT_RUN_ID,
@@ -1285,12 +1286,18 @@ def test_signal_now_closed_market_waits_for_official_close_event(
     stale = SimpleNamespace(
         market_open=False,
         data=SimpleNamespace(
-            fresh=False,
+            # Ordinary freshness can still be green for yesterday between
+            # 13:30 and data_ready_time; the close-event gate remains pending.
+            fresh=True,
             expected_latest_date="2026-08-26",
-            last_data_date="2026-08-25",
-            panel_date="2026-08-25",
-            reason="official close event pending",
+            last_data_date="2026-08-26",
+            panel_date="2026-08-26",
+            reason=None,
         ),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._completed_session_publication_ready",
+        lambda _status: False,
     )
     key = "2026-08-26:tw_day_trade_multi_basis:close-event"
     _register_signal_now_job(
@@ -1310,10 +1317,6 @@ def test_signal_now_closed_market_waits_for_official_close_event(
     monkeypatch.setattr(
         "services.discord_bot.bot._ensure_signal_ready_cached",
         lambda _cfg: stale,
-    )
-    monkeypatch.setattr(
-        "services.discord_bot.bot._completed_session_publication_ready",
-        lambda _status: False,
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._prepare_realtime_signal_sync",
@@ -2032,7 +2035,10 @@ def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_mi
     status = SimpleNamespace(
         market_open=False,
         data=SimpleNamespace(
-            fresh=True, last_data_date="2000-01-01", panel_date="2000-01-01"
+            fresh=True,
+            expected_latest_date=datetime.now().date().isoformat(),
+            last_data_date="2000-01-01",
+            panel_date="2000-01-01",
         ),
     )
 
@@ -2063,6 +2069,38 @@ def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_mi
 
     assert reusable
     assert reason == "cached_shioaji_after_close_age=30s"
+
+
+def test_closed_day_trade_cache_rejects_recent_shioaji_snapshot() -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        day_trade_simulation_enabled=True,
+    )
+    status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-09-04",
+            last_data_date="2026-09-04",
+            panel_date="2026-09-04",
+        ),
+    )
+    summary = {
+        "panel_date": "2026-09-04 13:30:00",
+        "price_source": "shioaji:stock_snapshot",
+        "price_available_count": 2293,
+        "signal_price_contract": {"model_observation": "completed_panel"},
+    }
+
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg,
+        status,
+        summary,
+        requested_price_source="auto",
+    )
+
+    assert not reusable
+    assert reason == "closed_day_trade_requires_official_close"
 
 
 def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -> None:
@@ -2317,8 +2355,32 @@ def test_completed_session_receipt_accepts_event_driven_close(
         "STOCKAGENT_TW_PUBLICATION_RECEIPT_ROOT",
         str(publication_root),
     )
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        timezone="Asia/Taipei",
+        close_time="13:30",
+        day_trade_simulation_enabled=True,
+    )
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 3, 13, 46, tzinfo=tz)
+
+    monkeypatch.setattr("services.discord_bot.bot.datetime", FixedDateTime)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda *_args: (True, "verified session"),
+    )
     status = SimpleNamespace(
-        data=SimpleNamespace(expected_latest_date="2026-09-03")
+        cfg=cfg,
+        market_open=False,
+        # Generic freshness intentionally still points at the prior close
+        # before data_ready_time. The completed-session gate must target today.
+        data=SimpleNamespace(
+            expected_latest_date="2026-09-02",
+            last_data_date="2026-09-02",
+        ),
     )
 
     assert _completed_session_publication_ready(status)
@@ -2434,11 +2496,19 @@ def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults()
     today = datetime.now().date().isoformat()
     closed_fresh_status = SimpleNamespace(
         market_open=False,
-        data=SimpleNamespace(last_data_date=today, panel_date=today),
+        data=SimpleNamespace(
+            expected_latest_date=today,
+            last_data_date=today,
+            panel_date=today,
+        ),
     )
     closed_lagging_after_open_status = SimpleNamespace(
         market_open=False,
-        data=SimpleNamespace(last_data_date="2000-01-01", panel_date="2000-01-01"),
+        data=SimpleNamespace(
+            expected_latest_date=today,
+            last_data_date="2000-01-01",
+            panel_date="2000-01-01",
+        ),
     )
     cfg = SimpleNamespace(
         market_type="tw",
@@ -2455,6 +2525,29 @@ def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults()
         _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto")
         == "shioaji"
     )
+
+
+def test_closed_day_trade_auto_never_uses_weekend_realtime_quote() -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        market_type="tw",
+        history_frequency="daily",
+        day_trade_simulation_enabled=True,
+    )
+    status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-09-04",
+            last_data_date="2026-09-04",
+            panel_date="2026-09-04",
+        ),
+    )
+
+    assert _auto_signal_price_source(cfg, status, "auto") is None
+    assert _auto_signal_price_source(cfg, status, "panel") == "panel"
+    with pytest.raises(BotUserError, match="官方收盤 panel"):
+        _auto_signal_price_source(cfg, status, "shioaji")
 
 
 def test_console_progress_prints_backend_progress_bar(capsys) -> None:

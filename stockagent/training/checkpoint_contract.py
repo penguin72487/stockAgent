@@ -1188,6 +1188,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
         "tw_stock_futures_day_trade_0900_integer",
+        "tw_stock_futures_day_trade_0845_minute",
     }:
         from stockagent.data.tw_stock_futures_day_trade import (
             ENTRY_PRICE_SOURCE_DAILY_SESSION_OPEN_0900_PROXY,
@@ -1202,7 +1203,8 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             STOCK_FUTURES_INTEGER_EXECUTION_CHANNELS,
         )
 
-        is_integer = execution_mode == "tw_stock_futures_day_trade_0900_integer"
+        is_minute = execution_mode == "tw_stock_futures_day_trade_0845_minute"
+        is_integer = is_minute or execution_mode == "tw_stock_futures_day_trade_0900_integer"
         is_0900 = execution_mode in {
             "tw_stock_futures_day_trade_0900",
             "tw_stock_futures_day_trade_0900_integer",
@@ -1305,6 +1307,30 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                     "minus_fixed_fees_minus_rounded_tax"
                 ),
                 gradient_contract="exact_forward_straight_through_quantity_v1",
+            )
+        if is_minute:
+            from stockagent.data.tw_stock_futures_minute import (
+                MINUTE_CONTRACT_VERSION, TAPE_CHANNELS,
+            )
+            minute_path = Path(trading.tw_stock_futures_day_trade_minute_data_path)
+            minute_manifest = minute_path.parent / "manifest.json"
+            contract["taiwan_stock_futures_day_trade"].update(
+                data_contract_version=MINUTE_CONTRACT_VERSION,
+                backtest_contract_version=MINUTE_CONTRACT_VERSION,
+                execution_tensor_channels=list(TAPE_CHANNELS),
+                decision_clock="0845_prior_completed_stock_features",
+                current_session_stock_open_feature=False,
+                execution_clock="0846_entry_1320_limit_1324_market_1330_terminal",
+                entry_price_source="right_labelled_minute_vwap",
+                minute_data_path=str(minute_path),
+                minute_manifest_sha256=(hashlib.sha256(minute_manifest.read_bytes()).hexdigest() if minute_manifest.is_file() else None),
+                capacity="floor_each_completed_minute_matched_contracts_times_participation",
+                limit_rule="1320_completed_close_strict_cross_in_1321_to_1324_bars",
+                market_rule="1324_replace_then_1325_to_1330_bars",
+                terminal_rule="residual_contracts_recorded_absorbing_execution_failure",
+                entry_fallback="none_no_daily_open_or_close_substitution",
+                gradient_contract="exact_integer_forward_fractional_quantity_shadow_v1",
+                sample_calendar="all_verified_panel_sessions_including_no_entry_fills",
             )
         if is_0900:
             contract["taiwan_stock_futures_day_trade"].update(

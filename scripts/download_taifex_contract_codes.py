@@ -25,10 +25,42 @@ from downloader.http_transport import (  # noqa: E402
     HttpRequestPolicy,
     ResilientHttpTransport,
 )
+from stockagent.data.tw_stock_futures_catalog import (  # noqa: E402
+    SOURCE_URL as STOCK_FUTURES_URL,
+    parse_stock_futures_catalog,
+    rows_digest,
+)
 
 
 DEFAULT_URL = "https://www.taifex.com.tw/cht/4/contractName"
 DEFAULT_OUTPUT = "data_tw_futures/taifex_contract_codes.csv"
+
+
+def download_stock_futures_catalog(transport: ResilientHttpTransport, output: Path) -> dict:
+    body = transport.request_bytes(STOCK_FUTURES_URL).body
+    rows = parse_stock_futures_catalog(body.decode("utf-8"))
+    # Detect a truncated response even if a proxy supplied a matching subtotal.
+    if len(rows) < 100:
+        raise ValueError("unexpectedly small official stock futures catalog")
+    previous_path = output
+    if previous_path.exists():
+        previous = json.loads(previous_path.read_text())
+        if len(rows) < int(previous.get("row_count", 0)) * .9:
+            raise ValueError("stock futures catalog shrank more than 10%; review required")
+    import hashlib
+
+    source_sha = hashlib.sha256(body).hexdigest()
+    raw_path = output.parent / "stock_futures_catalog_sources" / f"{source_sha}.html"
+    atomic_write_text(raw_path, body.decode("utf-8"), durable=True)
+    payload = {
+        "schema_version": 1, "source_url": STOCK_FUTURES_URL,
+        "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "scope": "latest_catalog_not_signal_date", "complete": True,
+        "row_count": len(rows), "rows_sha256": rows_digest(rows),
+        "source_sha256": source_sha, "rows": rows,
+    }
+    atomic_write_json(output, payload, durable=True)
+    return {key: value for key, value in payload.items() if key != "rows"}
 
 
 def main() -> None:
@@ -37,6 +69,7 @@ def main() -> None:
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--stock-futures-only", action="store_true", help="Refresh only the current stock-futures membership companion")
     args = parser.parse_args()
 
     transport = ResilientHttpTransport(
@@ -47,6 +80,10 @@ def main() -> None:
             retry_base_seconds=0.5,
         )
     )
+    membership_output = Path(args.output).parent / "taifex_stock_futures_catalog.json"
+    if args.stock_futures_only:
+        print(json.dumps(download_stock_futures_catalog(transport, membership_output), ensure_ascii=False, indent=2))
+        return
     body = transport.request_bytes(
         str(args.url),
         headers={"User-Agent": "stockAgent-taifex-product-master/1"},

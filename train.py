@@ -1394,6 +1394,7 @@ def main() -> None:
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
         "tw_stock_futures_day_trade_0900_integer",
+        "tw_stock_futures_day_trade_0845_minute",
     }:
         from stockagent.data.tw_stock_futures_day_trade import (
             attach_stock_futures_day_trade_daily,
@@ -1426,7 +1427,12 @@ def main() -> None:
             ),
             integer_contracts=(
                 str(config.trading.execution_mode)
-                == "tw_stock_futures_day_trade_0900_integer"
+                in {"tw_stock_futures_day_trade_0900_integer", "tw_stock_futures_day_trade_0845_minute"}
+            ),
+            minute_data_path=(
+                config.trading.tw_stock_futures_day_trade_minute_data_path
+                if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute"
+                else None
             ),
             max_volume_participation=(
                 config.trading.max_volume_participation

@@ -293,8 +293,9 @@ def test_running_legacy_page_progress_cannot_claim_false_hundred_percent(
     assert any("假 100%" in warning for warning in group["warnings"])
 
 
+@pytest.mark.parametrize("cycle_complete", [False, True])
 def test_partial_archive_summary_cannot_be_hidden_by_complete_progress(
-    tmp_path: Path,
+    tmp_path: Path, cycle_complete: bool,
 ) -> None:
     registry = tmp_path / "configs/data_sync"
     registry.mkdir(parents=True)
@@ -319,8 +320,9 @@ def test_partial_archive_summary_cannot_be_hidden_by_complete_progress(
         json.dumps(
             {
                 "state": "partial",
+                "cycle_state": "complete" if cycle_complete else "failed",
                 "end_date": "2026-08-19",
-                "status_counts": {
+                "durable_object_status_counts" if cycle_complete else "status_counts": {
                     "complete": 306_378,
                     "quarantined_repair_required": 1_355,
                 },
@@ -348,8 +350,13 @@ def test_partial_archive_summary_cannot_be_hidden_by_complete_progress(
     group = payload["groups"][0]
 
     assert group["status"] == "degraded"
-    assert group["coverage"]["ratio"] < 1.0
-    assert "失敗" in group["status_label"]
+    if cycle_complete:
+        assert group["status_label"] == "本輪維護完成；歷史資料仍有未驗證缺口"
+        assert any("cycle_state=complete" in warning for warning in group["warnings"])
+        assert group["coverage"] is None
+    else:
+        assert group["coverage"]["ratio"] < 1.0
+        assert "失敗" in group["status_label"]
 
 
 def test_sequential_service_does_not_mark_future_provider_stage_active(

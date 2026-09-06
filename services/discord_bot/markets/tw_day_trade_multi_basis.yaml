@@ -25,7 +25,8 @@ day_trade_quote_interval_seconds: 60
 # 09:00 starts the live signal; execution uses the first strictly later best
 # Ask/Bid. Missing causal quotes fail closed without +1 Tick. Historical replay
 # alone is recorded at 09:01: sizing uses the official 09:00 open and execution
-# uses the observed right-labelled 09:01 minute VWAP.
+# uses the observed right-labelled 09:01 minute price (VWAP, otherwise that
+# source-published KBar's Close). Missing ticks alone do not block a fill.
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py
   - --link

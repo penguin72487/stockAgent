@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股多模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=21">
+  <link rel="stylesheet" href="styles.css?v=22">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
 </head>
 <body>
@@ -115,7 +115,7 @@
       <article class="panel timeline-panel">
         <div class="panel-head"><div><h2>執行時鐘與資料契約</h2><p>畫面直接讀取同一份 append-only 模擬帳本</p></div></div>
         <ol class="timeline">
-	          <li><time>09:00</time><div><strong>產生並鎖定當日即時訊號</strong><span>盤前已預熱模型、契約與資格；訊號原子發布後，買入／回補取第一筆較晚 best ask，賣出／放空取第一筆較晚 best bid。若錯過開盤，回補改以官方 09:00 開盤價推論與計算張數、右標記 09:01 首分鐘 VWAP 執行，不使用開盤價成交、last 或 +1 tick。</span></div></li>
+	          <li><time>09:00</time><div><strong>產生並鎖定當日即時訊號</strong><span>盤前已預熱模型、契約與資格；訊號原子發布後，買入／回補取第一筆較晚 best ask，賣出／放空取第一筆較晚 best bid。若錯過開盤，回補改以官方 09:00 開盤價推論與計算張數，並用右標記 09:01 首分鐘價執行（VWAP 優先，否則同根 K 棒 Close）。缺 tick 不阻擋成交；缺整根 K 棒才阻擋，不使用開盤價成交、last 或 +1 tick。</span></div></li>
 	          <li><time>進場</time><div><strong>可成交委託全數成交</strong><span>買入取 best ask、賣空取 best bid；送出的模擬市價量不超過新鮮一檔可見量，因此送單量全成，模型原始目標超出深度的部分另列為未送出，不捏造流動性。</span></div></li>
           <li><time>盤中</time><div><strong>啟用模式 TP/SL 皆內縮一 Tick</strong><span>每個啟用策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
           <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
@@ -144,7 +144,7 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；完整保留每個模型訊號，包括資金不足一張而 0 股未成交的股票</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；保留所有模型訊號與 0 股未成交股票。期貨標記依最新期交所名單（日期列於各股票下方），不是訊號當日資格或目前可成交保證。</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
 	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
@@ -187,6 +187,8 @@
   </main>
   <script src="../dashboard-core.js?v=2" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=52" defer></script>
+  <script src="presentation.js?v=1" defer></script>
+  <script src="detail-components.js?v=1" defer></script>
+  <script src="app.js?v=59" defer></script>
 </body>
 </html>

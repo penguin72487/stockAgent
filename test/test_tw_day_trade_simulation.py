@@ -31,6 +31,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
@@ -39,6 +40,7 @@ from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     LiveEligibility,
     ModeSpec,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
     quote_map_from_snapshot,
@@ -1371,7 +1373,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
 ) -> None:
     spec = replace(
         _spec(tmp_path),
-        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
         entry_price_offset_ticks=0,
     )
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -1379,7 +1381,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
         **_summary(),
         "simulation_replay": True,
         "entry_fill_contract": (
-            "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
         ),
     }
     quote = _quote(open_price=1_000.0, bid=900.0, ask=1_100.0)
@@ -1391,6 +1393,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
             "entry_price_source": (
                 "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
             ),
+            "execution_price_0901_method": "minute_vwap",
         }
     )
 
@@ -1420,8 +1423,10 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     assert position["counterfactual_0901_price_fill"] is True
     assert position["counterfactual_open_price_fill"] is False
     assert position["fill_guaranteed"] is False
-    assert order["order_type"] == "PAPER_0901_MINUTE_VWAP"
+    assert order["order_type"] == "PAPER_0901_MINUTE_PRICE"
     assert mode["entry_0901_vwap_fill_count"] == 1
+    assert mode["entry_0901_close_fill_count"] == 0
+    assert mode["entry_0901_minute_price_fill_count"] == 1
     assert mode["entry_official_open_fill_count"] == 0
 
     # Reproduce the former restart bug: the live default had overwritten the
@@ -1445,19 +1450,19 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     assert restarted_mode["counterfactual_0901_price_fill"] is True
 
 
-def test_missed_opening_replay_never_falls_back_when_0901_vwap_is_missing(
+def test_missed_opening_replay_blocks_only_when_0901_minute_price_is_missing(
     tmp_path: Path,
 ) -> None:
     spec = replace(
         _spec(tmp_path),
-        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     )
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     summary = {
         **_summary(),
         "simulation_replay": True,
         "entry_fill_contract": (
-            "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
         ),
     }
     quote = _quote(open_price=1_000.0, bid=999.0, ask=1_001.0)
@@ -1479,9 +1484,57 @@ def test_missed_opening_replay_never_falls_back_when_0901_vwap_is_missing(
     )
     signal = json.loads(engine.signals_path.read_text().splitlines()[0])
     assert signal["status"] == "blocked"
-    assert signal["reason"] == "observed_09_01_minute_vwap_unavailable"
+    assert signal["reason"] == "observed_09_01_minute_price_unavailable"
     assert signal["execution_price"] is None
     assert not engine.fills_path.exists()
+
+
+def test_missed_opening_replay_executes_from_0901_kbar_close_without_tick(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote(open_price=1_000.0, bid=None, ask=None)
+    quote.update(
+        {
+            "execution_price_0901": 1_006.0,
+            "execution_price_0901_method": "minute_close",
+            "entry_price_source": "shioaji:historical_kbar_0901_minute_close",
+            "quote_at": _now(9, 1).isoformat(),
+        }
+    )
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary={
+                **_summary(),
+                "simulation_replay": True,
+                "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+            },
+            signal_rows=[{**_row(0.1), "open_price": 1_000.0}],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1),
+            counterfactual_open_replay=True,
+        )
+        == "registered"
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    fill = json.loads(engine.fills_path.read_text().splitlines()[0])
+    assert position["sizing_open_price"] == 1_000.0
+    assert position["entry_price"] == 1_006.0
+    assert position["entry_price_method"] == "minute_close"
+    assert fill["entry_price_method"] == "minute_close"
+    assert mode["entry_0901_vwap_fill_count"] == 0
+    assert mode["entry_0901_close_fill_count"] == 1
+    assert mode["entry_0901_minute_price_fill_count"] == 1
 
 
 def test_paper_market_order_fills_full_request_at_best_quote_without_depth_cap(
@@ -4028,10 +4081,9 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     assert payload["simulation_only"] is True
     assert payload["production_order_possible"] is False
     assert "live execution starts at 09:00" in payload["source_contract"]["entry_fill"]
-    assert (
-        "observed 09:01 minute VWAP"
-        in payload["source_contract"]["entry_fill"]
-    )
+    assert "source-backed 09:01 minute price" in payload["source_contract"][
+        "entry_fill"
+    ]
     assert (
         "without open-price fill"
         in payload["source_contract"]["entry_fill"]
@@ -4396,7 +4448,9 @@ def test_simulation_executor_preopen_receipt_requires_both_components(
 def test_dashboard_html_is_local_and_refreshes_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "tw_day_trade_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
-    javascript = (root / "app.js").read_text(encoding="utf-8")
+    javascript = "\n".join((root / filename).read_text(encoding="utf-8") for filename in (
+        "app.js", "presentation.js", "detail-components.js",
+    ))
     assert "http://" not in html and "https://" not in html
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
@@ -4435,8 +4489,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
     assert "function hydrateDefaultPositions(data)" in javascript
-    assert "const detailLoads = [];" in javascript
-    assert "if (shouldReloadPositions) detailLoads.push(loadPositions());" in javascript
+    assert "await loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadPositions) secondaryLoads.push(loadPositions());" in javascript
     assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
     assert "maximumSignificantDigits" not in javascript
@@ -4515,6 +4569,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         '$("detail-end-date").addEventListener("change", detailDateChanged)'
         in javascript
     )
+    assert "const DATE_FILTER_DEBOUNCE_MS = 180" in javascript
+    assert "window.clearTimeout(dateFilterTimer);" in javascript
     assert "啟用模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |持倉目標 %| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
@@ -4536,10 +4592,17 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert '"api/public-data-status"' in javascript
     assert "IntersectionObserver" in javascript
     assert "installTwPublicMonitorActivation()" in javascript
-    assert "void loadChartHistory({preferCache: !force});" in javascript
-    assert "Promise.allSettled(detailLoads)" in javascript
-    assert 'src="app.js?v=52"' in html
-    assert 'href="styles.css?v=21"' in html
+    assert "await loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadSignals) await loadSignals({force: true});" in javascript
+    assert "Promise.allSettled(secondaryLoads)" in javascript
+    assert 'src="app.js?v=59"' in html
+    assert 'src="presentation.js?v=1"' in html
+    assert 'src="detail-components.js?v=1"' in html
+    assert "function chartHistoryMatchesSelection()" in javascript
+    assert "不以最新即時點代替歷史曲線" in javascript
+    assert "historyRows || data.marks" not in javascript
+    assert "historyRows || data.benchmark_marks" not in javascript
+    assert 'href="styles.css?v=22"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
@@ -5207,6 +5270,14 @@ def test_compact_benchmark_history_index_survives_process_cache_loss(
                         "total_equity_twd": 101.0,
                         "last_mark_price": 101.0,
                         "benchmark_origin_rebased": True,
+                        "historical_minute_replay": True,
+                        "minute_valuation_contract": "historical_last_trade_v1",
+                        "valuation_source": "official_minute_close",
+                        "valuation_executable": False,
+                        "fresh_trade_position_count": 1,
+                        "last_trade_carried_position_count": 0,
+                        "missing_price_position_count": 0,
+                        "fresh_trade_notional_coverage_ratio": 1.0,
                         "large_repeated_provenance": "discard from interior rows",
                     },
                     {
@@ -5242,6 +5313,12 @@ def test_compact_benchmark_history_index_survives_process_cache_loss(
     restored = dashboard_module._benchmark_history_index(state_dir)
     assert len(restored.marks) == 2
     assert "large_repeated_provenance" not in restored.marks[0]
+    assert restored.marks[0]["historical_minute_replay"] is True
+    assert restored.marks[0]["minute_valuation_contract"] == (
+        "historical_last_trade_v1"
+    )
+    assert restored.marks[0]["valuation_source"] == "official_minute_close"
+    assert restored.marks[0]["fresh_trade_notional_coverage_ratio"] == 1.0
     assert restored.marks[-1]["large_repeated_provenance"] == (
         "retain on session endpoint"
     )
@@ -5292,6 +5369,76 @@ def test_signal_page_cache_ignores_unrelated_live_state_marks(
 
     second = build_dashboard_signal_page(state_dir=state_dir, limit=10)
     assert second["rows"] == first["rows"]
+
+
+def test_columnar_signal_range_matches_strict_json_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "modes": {
+                    "mode_a": {
+                        "session_date": "2026-08-14",
+                        "initial_capital_twd": 10_000_000,
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "session_date": session_date,
+            "market": "mode_a",
+            "signal_id": f"signal-{session_date}",
+            "symbol": symbol,
+            "name": name,
+            "target_weight": target_weight,
+            "status": status,
+            "ask": 101.0,
+            "bid": 100.0,
+            "filled_weight": target_weight / 2,
+            "filled_shares": 1_000 if target_weight else 0,
+            "requested_shares": 1_000 if target_weight else 0,
+            "sizing_open_price": 100.0,
+            "execution_price": 101.0 if target_weight else None,
+            "reason": "ready" if target_weight else "zero_target_weight",
+        }
+        for session_date, symbol, name, target_weight, status in (
+            ("2026-08-13", "2330", "台積電", 0.1, "ready"),
+            ("2026-08-13", "2317", "鴻海", -0.3, "partial_depth"),
+            ("2026-08-14", "2454", "聯發科", 0.0, "hold"),
+            ("2026-08-14", "2303", "聯電", 0.2, "missing_quote"),
+        )
+    ]
+    (state_dir / "signals.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 10**9)
+    strict = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-14",
+        status="blocked",
+        limit=10,
+    )
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    columnar = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-14",
+        status="blocked",
+        limit=10,
+    )
+
+    assert columnar == strict
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the receipt-backed 09:00 single-stock-futures entry sidecar.
+"""Build receipt-backed single-stock-futures 09:00 entries or 08:46 minute tape.
 
 The input is an archive of official TAIFEX ``Daily_YYYY_MM_DD.zip`` futures
 transaction files.  Every date in the requested daily-source interval must
@@ -32,7 +32,13 @@ from stockagent.data.tw_stock_futures_day_trade import (
     TAIFEX_STOCK_FUTURES_0900_ENTRY_DATA_CONTRACT_VERSION,
     _REQUIRED_COLUMNS,
     select_causal_front_stock_futures,
+    select_causal_front_stock_futures_candidates,
 )
+from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
+from stockagent.data.tw_stock_futures_minute import (
+    MINUTE_CONTRACT_VERSION, MINUTE_DATASET, build_futures_minute_bars,
+)
+from stockagent.data.tw_futures_portfolio_daily import TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
 
 
 DATASET: Final[str] = "taifex_stock_futures_0900_entry_v1"
@@ -192,6 +198,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2014-01-01")
     parser.add_argument("--end-date", default=None)
+    parser.add_argument("--execution-policy", choices=("post_0900", "scheduled_0846"), default="post_0900")
+    parser.add_argument("--archive-override", type=Path, action="append", default=[],
+                        help="Explicit immutable corrected Daily_YYYY_MM_DD.zip; original source is preserved.")
     return parser.parse_args()
 
 
@@ -206,6 +215,12 @@ def main() -> int:
     if not args.ticks_root.is_dir():
         raise FileNotFoundError(args.ticks_root)
 
+    daily_digest = sha256_file(args.daily_data_path)
+    if args.execution_policy == "scheduled_0846":
+        daily_manifest = json.loads(args.daily_data_path.with_name("manifest.json").read_text())
+        if (daily_manifest.get("contract_version") != TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
+                or daily_manifest.get("outputs", {}).get("continuous_daily", {}).get("sha256") != daily_digest):
+            raise ValueError("daily candidate source contract or SHA mismatch")
     source = pl.from_arrow(
         pq.read_table(
             args.daily_data_path,
@@ -216,16 +231,32 @@ def main() -> int:
     ).filter(
         (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
     )
-    selected = select_causal_front_stock_futures(source)
+    minute_policy = args.execution_policy == "scheduled_0846"
+    if minute_policy and args.output_dir == Path("data_tw_futures/taifex_stock_futures_0900_v1"):
+        args.output_dir = Path("data_tw_futures/taifex_stock_futures_minute_v1")
+    selected = (select_causal_front_stock_futures_candidates(source) if minute_policy
+                else select_causal_front_stock_futures(source))
     if selected.is_empty():
         raise ValueError("daily source has no selected stock futures in range")
-    expected_dates = selected["date"].unique().sort().to_list()
+    expected_dates = source["date"].unique().sort().to_list()
     products = tuple(sorted(str(value) for value in selected["product"].unique()))
     archives = _archive_inventory(args.ticks_root)
+    override_dates = set()
+    for archive in args.archive_override:
+        match = ARCHIVE_RE.fullmatch(archive.name)
+        if not archive.is_file() or match is None:
+            raise ValueError(f"invalid explicit archive revision: {archive}")
+        revised_date = date(*(int(match.group(i)) for i in (1, 2, 3)))
+        if revised_date not in expected_dates or revised_date in override_dates:
+            raise ValueError(f"duplicate or out-of-range archive revision: {archive}")
+        override_dates.add(revised_date)
+        archives[revised_date] = archive
     missing_dates = [value for value in expected_dates if value not in archives]
 
     frames: list[pl.DataFrame] = []
-    for trading_date in expected_dates:
+    source_receipts: list[dict] = []
+    incomplete_sessions: list[str] = []
+    for index, trading_date in enumerate(expected_dates, 1):
         archive = archives.get(trading_date)
         if archive is None:
             continue
@@ -239,9 +270,51 @@ def main() -> int:
             futures_outright_contracts_only=True,
         )
         selected_date = selected.filter(pl.col("date") == pl.lit(trading_date))
-        entries = _first_strictly_later_entries(transactions, selected_date)
-        if not entries.is_empty():
+        entries = (build_futures_minute_bars(transactions) if minute_policy
+                   else _first_strictly_later_entries(transactions, selected_date))
+        if sha256_file(archive) != source_sha256:
+            raise ValueError(f"source archive changed while parsing: {archive}")
+        day_rows = transactions.filter(
+            (pl.col("session") == "day") & (pl.col("event_date") == pl.lit(trading_date))
+        )
+        last_time = int(day_rows["event_time"].cast(pl.Int32).max() or 0)
+        if minute_policy and (day_rows.is_empty() or last_time < 133000):
+            incomplete_sessions.append(str(trading_date))
+        source_receipts.append({"date": str(trading_date), "path": str(archive), "sha256": source_sha256,
+                                "day_session_rows": day_rows.height, "day_last_time": last_time})
+        if minute_policy or not entries.is_empty():
             frames.append(entries)
+        if minute_policy:
+            print(f"[futures minutes] {index}/{len(expected_dates)} {trading_date} rows={entries.height}", flush=True)
+
+    if minute_policy:
+        if sha256_file(args.daily_data_path) != daily_digest:
+            raise ValueError("daily candidate source changed during minute build")
+        output_path = args.output_dir / "minutes.parquet"
+        # An incomplete attempt must not replace an accepted data/manifest pair.
+        if missing_dates or incomplete_sessions:
+            atomic_write_json(args.output_dir / "build_failure.json", {
+                "status": "partial", "missing_dates": list(map(str, missing_dates)),
+                "incomplete_sessions": incomplete_sessions,
+                "requested_start": str(start), "requested_end": str(end),
+            })
+            print(f"[futures minutes] rejected missing_dates={list(map(str, missing_dates))} incomplete_sessions={incomplete_sessions}", flush=True)
+            return 2
+        output = pl.concat(frames, how="vertical_relaxed")
+        atomic_write_parquet(output_path, output)
+        atomic_write_json(args.output_dir / "manifest.json", {
+            "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
+            "status": "complete", "timezone": "Asia/Taipei",
+            "source_daily_path": str(args.daily_data_path), "source_daily_sha256": daily_digest,
+            "covered_dates": [str(d) for d in expected_dates], "sources": source_receipts,
+            "clock": "right_labelled_minutes_[label-1min,label)",
+            "quantity": "official_matched_contracts_B_plus_S_divided_by_two",
+            "execution_claim": "historical_minute_vwap_not_order_book_or_guaranteed_fill",
+            "rows": output.height,
+            "outputs": {"minutes": {"path": str(output_path), "sha256": sha256_file(output_path)}},
+        })
+        print(f"[futures minutes] complete dates={len(expected_dates)} rows={output.height} output={output_path}", flush=True)
+        return 0
 
     output = pl.concat(frames, how="vertical_relaxed") if frames else _empty_output()
     output_path = args.output_dir / "entry_0900.parquet"

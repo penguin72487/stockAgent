@@ -183,7 +183,16 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert projection.fold_id == 11
     assert projection.initial_capital == 10_000_000.0
     assert projection.config_path == (
-        "configs/deployments/tw_day_trade_multi_basis_projection_l1_gelu_fold11.yaml"
+        "configs/deployments/tw_day_trade_hybrid_minute_v12_layernorm_fold11.yaml"
+    )
+    projection_root = (
+        "artifacts/ablations/"
+        "tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_"
+        "finetune_ofat_v2/layernorm"
+    )
+    assert projection.output_dir == projection_root
+    assert projection.checkpoint_path == (
+        f"{projection_root}/fold_11/checkpoint_best.pt"
     )
     multi_basis_22 = configs["tw_day_trade_multi_basis_22"]
     multi_basis_22_root = (
@@ -248,3 +257,25 @@ def test_repo_multi_basis_fold11_deployment_keeps_checkpoint_model_contract() ->
         "tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5"
     )
     assert config.training.transformer_base_portfolio.temporal_basis_input == "raw_features"
+
+
+def test_repo_layernorm_v12_deployment_keeps_checkpoint_model_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        root / "configs/deployments/tw_day_trade_hybrid_minute_v12_layernorm_fold11.yaml"
+    )
+
+    assert config.runner.resume is False
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.trading.volume_participation_equity == 10_000_000.0
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.lookback == 32
+    assert config.training.financial_transformer.norm_type == "layernorm"
+    assert (
+        config.training.financial_transformer.temporal_basis_input
+        == "raw_features"
+    )
+    assert (
+        config.training.financial_transformer.portfolio_output_mode
+        == "projection_l1"
+    )
