@@ -308,7 +308,9 @@ def test_recent_day_trade_artifact_waits_for_engine_instead_of_recomputing(
     monkeypatch,
 ) -> None:
     cfg = discord_bot._market_configs()["tw_day_trade_100m"]
-    observed = datetime.now(ZoneInfo("Asia/Taipei"))
+    # Keep the fixture after the 09:00 execution gate.  Using wall-clock
+    # ``now`` made this contract test fail whenever the suite ran pre-open.
+    observed = datetime(2026, 9, 4, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
     summary = {
         "generated_at": observed.isoformat(),
         "signal_started_at": observed.isoformat(),

@@ -88,13 +88,16 @@ Ignore file: /root/stockAgent/artifacts/.stignore
 
 `vastai1T` 不加入 `stockagent-artifacts-hot`。它的 `artifacts` 主要是大型訓練與
 ablation 工作集，直接加入會把 penguin、lab203 與 Vast 的完整輸出做聯集，造成數百 GB
-額外同步與索引。Vast 的執行中產物保持 node-local；完成且通過 lifecycle gate 的 run
-由 `stockagent-cold-artifact-maintenance` 自動逐一封裝到 `stockagent-packed`。維護器每五
-分鐘掃描一次、每次最多發布一個 run，避免填滿本機或遠端傳輸佇列。發布與刪除至少跨
-兩次獨立執行：只有 exact release 再驗證成功、七日使用租期已過、來源在驗證期間未變、
-沒有程序引用，而且指定 peer 對整個 packed folder 的 items/bytes/deletes/errors 全為零、
-completion 100% 且 `remoteState=valid`，才刪除該 run 的本機來源。任何檢查失敗都保留
-來源；需要時再由冷庫驗證後 materialize。
+額外同步與索引。full-replica producer 可以使用 `stockagent-cold-artifact-maintenance`
+逐一封裝完成 run；index-only Vast 因本機不保留 packed payload，不得使用該發布路徑，
+而必須使用下一節的 durable-node ingress。兩條路徑都只接受 lifecycle-complete、無程序
+引用的 immutable run，且每次最多發布一個，避免填滿本機或遠端傳輸佇列。
+
+full-replica 維護器的發布與來源刪除至少跨兩次獨立執行：只有 exact release 再驗證
+成功、七日使用租期已過、來源在驗證期間未變、沒有程序引用，而且指定 peer 對整個
+packed folder 的 items/bytes/deletes/errors 全為零、completion 100% 且
+`remoteState=valid`，才刪除該 run 的本機來源。任何檢查失敗都保留來源；需要時再由
+冷庫驗證後 materialize。
 
 安裝與唯讀預覽：
 
@@ -109,7 +112,36 @@ run_fintech_python scripts/maintain_cold_artifacts.py --scope ablations
 `COLD_ARTIFACT_PEER_NAME` 明確指定；工具會由目前 Syncthing config 解析 Device ID，不把
 某台機器的憑證身分硬編碼進程式。
 
-衝突規則：
+### Index-only Vast 的完成產物入口
+
+Vast 進入 index-only 後不得直接在缺少 payload 的 packed tree 發布 head。需要跨機
+保留的完成產物改由 durable penguin 定時做受限 ingress：只允許明確列入 allowlist 的
+相對根目錄；遠端必須是 lifecycle `complete` 且沒有程序引用；`rsync` 只落到 node-local
+quarantine。penguin 會再次執行完整 artifact contract、確認傳輸前後的檔案數、bytes 與
+最新 mtime 未變，再封裝、逐物件驗證並原子發布到 `stockagent-packed`。Syncthing watcher
+只會看到已完成的 immutable release，不會看到半成品。
+
+此處的「即時」邊界是：五分鐘內發現已完成且穩定的 allowlisted run；驗證與原子發布
+完成後，Syncthing filesystem watcher 立即開始複製 cold release。傳輸中的 staging、
+執行中的 checkpoint 與未完成 run 永遠不直接同步。
+
+在 durable penguin 安裝五分鐘 ingress（私鑰路徑與 SSH endpoint 只寫入本機 `/etc`，
+不進 Git）：
+
+```bash
+sudo ./scripts/install_remote_cold_artifact_ingress.sh \
+  root@114.32.64.6 40032 \
+  /root/.ssh/stockagent_vastai1t_ed25519 \
+  ablations/tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_finetune_ofat_v2/layernorm
+```
+
+這不是把 Vast 的整棵 `artifacts` 直接同步。新增另一個必須即時冷藏的完成產物時，先
+評估容量與權限，再把其 exact relative root 加入 node-local allowlist；不得把 `ablations`
+整個目錄當成萬用 allowlist。Vast endpoint 改變時重跑 installer 即可，既有 packed
+release 不受影響。同一 relative root 若在發布後又改變 inventory identity，ingress 會
+fail closed，要求 producer 以新 relative root 發布，不能靜默覆寫既有 immutable release。
+
+hot transport 衝突規則：
 
 - penguin 已有同一路徑時，永遠保留 penguin 內容，並回寫傳輸目錄。
 - penguin 沒有的路徑才接收 peer 內容。

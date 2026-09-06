@@ -1,7 +1,7 @@
 market: tw_day_trade_multi_basis_projection_l1_gelu
-label: 台股・Multi-Basis Projection-L1 GELU 當沖（初始 1,000 萬）
-# The synchronized artifact, current-panel inference, and open-signal backfill
-# passed their fail-closed gates. The rebuilt paper ledger is promoted next.
+label: 台股・Multi-Basis Projection-L1 LayerNorm v12 當沖（初始 1,000 萬）
+# Keep the stable market ID to preserve the existing paper ledger while the
+# manually selected immutable checkpoint is replaced.
 enabled: true
 market_type: tw
 timezone: Asia/Taipei
@@ -54,4 +54,4 @@ benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
 max_gross_warning: 1.05
-unsupported_message: "**台股・Multi-Basis Projection-L1 GELU 當沖（初始 1,000 萬）** 模型尚未準備完成。"
+unsupported_message: "**台股・Multi-Basis Projection-L1 LayerNorm v12 當沖（初始 1,000 萬）** 模型尚未準備完成。"

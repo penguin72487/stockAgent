@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from stockagent.data_sync.cold_artifacts import (
     COLD_IGNORE_DIRECTIVE,
     COLD_IGNORE_INCLUDE,
     ColdArtifactSpec,
     activate_cold_artifact,
     load_cold_artifact_registry,
+    publish_cold_artifact,
 )
+from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.packed_snapshots import (
     initialize_packed_layout,
     publish_packed_snapshot,
@@ -190,3 +194,21 @@ def test_registry_allows_full_run_without_file_size_limit(tmp_path: Path) -> Non
     registry = load_cold_artifact_registry(path)
 
     assert registry["full-run"].maximum_file_bytes is None
+
+
+def test_publish_rejects_reserved_metadata_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spec = _spec()
+    monkeypatch.setattr(
+        "stockagent.data_sync.cold_artifacts.validate_cold_artifact_source",
+        lambda *_args: {"source": str(tmp_path)},
+    )
+
+    with pytest.raises(SnapshotError, match="reserved key"):
+        publish_cold_artifact(
+            tmp_path / "packed",
+            tmp_path,
+            spec,
+            metadata={"artifact_relative_root": "other/root"},
+        )
