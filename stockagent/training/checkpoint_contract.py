@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from stockagent.backtest.simulator import CANONICAL_BACKTEST_CONTRACT_VERSION
+from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     TW_STOCK_EXECUTION_MODES,
@@ -675,7 +676,10 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "grad_clip_norm": float(training.grad_clip_norm),
             **(
                 {"step_cadence": "full_chronological_trajectory"}
-                if training.futures_portfolio_optimizer_step_per_trajectory
+                if (
+                    training.futures_portfolio_optimizer_step_per_trajectory
+                    or training.crypto_optimizer_step_per_trajectory
+                )
                 else {}
             ),
         },
@@ -773,6 +777,7 @@ def _training_checkpoint_contract_schema_3(
     # constraint below separately prevents unsafe optimizer resume when enabled.
     contract.pop("cache_train_features_in_amp_dtype", None)
     contract.pop("compile_eval_model", None)
+    contract.pop("crypto_optimizer_step_per_trajectory", None)
     # This decoupling control did not exist in schema 3; historical runs always
     # used trading.min_trade_weight in the loss.
     contract.pop("loss_min_trade_weight", None)
@@ -921,6 +926,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             trading.portfolio_activation
         ),
     }
+    if execution_mode == "crypto_perpetual":
+        contract["crypto_perpetual"] = {
+            "backtest_contract_version": CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+            "execution_minute_utc": int(trading.crypto_execution_minute_utc),
+            "stateful_proximal_allocator": bool(trading.crypto_stateful_proximal_allocator),
+            "proximal_cost_multiplier": float(trading.crypto_proximal_cost_multiplier),
+        }
     if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         contract["taiwan_index_futures_day"] = {
             "backtest_contract_version": int(

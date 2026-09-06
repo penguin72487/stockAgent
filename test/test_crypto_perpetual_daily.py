@@ -293,6 +293,48 @@ def test_padding_row_preserves_position_without_fee_pnl_or_valuation() -> None:
     assert result.final_alive.item() is True
 
 
+@pytest.mark.parametrize("initial", [0.4, 1.2, -1.2])
+@pytest.mark.parametrize("rows", [1, 4, 5])
+def test_padding_with_finite_labels_is_exact_identity_even_above_gross_cap(initial, rows):
+    # Include a full 4-row recurrent block and an eager remainder. Padding must
+    # neither apply repeated price/funding labels nor enforce a new risk trade.
+    target = torch.full((rows, 1), -0.7, requires_grad=True)
+    previous = torch.tensor([initial], requires_grad=True)
+    result = _ledger(
+        target,
+        torch.full_like(target, 0.02),
+        torch.full_like(target, 0.03),
+        state_advance_mask=torch.zeros(rows, dtype=torch.bool),
+        initial_weights=previous,
+        stateful_proximal_allocator=True,
+    )
+    torch.testing.assert_close(result.final_weights, previous, rtol=0, atol=0)
+    torch.testing.assert_close(result.executed_weights, previous.expand(rows, 1), rtol=0, atol=0)
+    assert torch.count_nonzero(result.strategy_simple_returns) == 0
+    assert torch.count_nonzero(result.turnovers) == 0
+    assert result.final_alive.item() is True
+    (result.final_weights.sum() + result.strategy_simple_returns.sum()).backward()
+    torch.testing.assert_close(previous.grad, torch.ones_like(previous))
+    torch.testing.assert_close(target.grad, torch.zeros_like(target))
+
+
+def test_interior_nonadvancing_crypto_row_cannot_change_next_real_trade():
+    target = torch.tensor([[0.4], [-0.8], [0.3]], requires_grad=True)
+    effective = torch.tensor([[0.02], [0.9], [-0.01]])
+    price = torch.tensor([[0.03], [0.8], [-0.02]])
+    result = _ledger(target, effective, price, state_advance_mask=torch.tensor([True, False, True]))
+    selected = torch.tensor([0, 2])
+    oracle_target = target.detach()[selected].clone().requires_grad_(True)
+    oracle = _ledger(oracle_target, effective[selected], price[selected])
+    torch.testing.assert_close(result.final_weights, oracle.final_weights)
+    torch.testing.assert_close(result.strategy_simple_returns[selected], oracle.strategy_simple_returns)
+    torch.testing.assert_close(result.turnovers[selected], oracle.turnovers)
+    result.strategy_simple_returns.sum().backward()
+    oracle.strategy_simple_returns.sum().backward()
+    torch.testing.assert_close(target.grad[selected], oracle_target.grad)
+    assert target.grad[1].item() == 0.0
+
+
 def test_nontradable_row_does_not_manufacture_a_close_but_missing_active_mark_ruins() -> (
     None
 ):

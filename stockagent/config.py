@@ -148,10 +148,16 @@ def _validate_crypto_perpetual_mode_contract(
     stateful_proximal_allocator: object,
     proximal_cost_multiplier: object,
     execution_minute_utc: object,
+    optimizer_step_per_trajectory: object = False,
 ) -> None:
     """Keep the daily Bybit carrying account on one explicit contract."""
 
     if execution_mode != "crypto_perpetual":
+        if bool(optimizer_step_per_trajectory):
+            raise ValueError(
+                "crypto_optimizer_step_per_trajectory requires "
+                "trading.execution_mode='crypto_perpetual'"
+            )
         return
     if _normalized_contract_name(frequency) not in {"daily", "1d", "day"}:
         raise ValueError(
@@ -2264,6 +2270,10 @@ class TrainingConfig:
     # account trajectory. Batches remain bounded truncated-BPTT chunks, while
     # AdamW and the step scheduler advance exactly once after the full epoch.
     futures_portfolio_optimizer_step_per_trajectory: bool = False
+    # Daily crypto shares the bounded recurrent executor. Keep one policy for
+    # all training dates and weight each chunk by its valid-date count before
+    # one optimizer update; this is an opt-in optimization-semantic change.
+    crypto_optimizer_step_per_trajectory: bool = False
     # Executor-only optimization: compile the panel-slab model with a symbolic
     # stock axis so expanding walk-forward folds can reuse one Inductor graph.
     # Batch/time/feature axes remain static and assets are never padded.
@@ -4703,6 +4713,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "crypto_proximal_cost_multiplier"
         ],
         execution_minute_utc=trading["crypto_execution_minute_utc"],
+        optimizer_step_per_trajectory=training[
+            "crypto_optimizer_step_per_trajectory"
+        ],
     )
     return raw
 
@@ -4772,6 +4785,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ],
             futures_portfolio_optimizer_step_per_trajectory=training_raw[
                 "futures_portfolio_optimizer_step_per_trajectory"
+            ],
+            crypto_optimizer_step_per_trajectory=training_raw[
+                "crypto_optimizer_step_per_trajectory"
             ],
             compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
