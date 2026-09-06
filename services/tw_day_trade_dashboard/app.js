@@ -22,6 +22,7 @@ const TW_STOCK_SESSIONS = [
 const HIDDEN_EQUITY_SERIES_STORAGE_KEY = "tw-day-trade-hidden-equity-series";
 const HISTORY_CLIENT_CACHE_MS = 45000;
 const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 16;
+const DATE_FILTER_DEBOUNCE_MS = 180;
 let snapshot = null;
 let chartHistory = null;
 let hiddenEquitySeries = new Set();
@@ -52,6 +53,7 @@ let signalFeatureDrivers = {};
 let featurePanelSignalKey = "";
 let featurePanelScopeText = "";
 let signalFilterTimer = null;
+let dateFilterTimer = null;
 let signalAbortController = null;
 let eventRows = [];
 let eventTotal = 0;
@@ -1692,18 +1694,26 @@ async function refresh({force = false} = {}) {
     // the three detail tables are independent read-only views; loading them
     // after paint prevents a cold multi-session curve from holding the whole
     // dashboard blank.
-    void loadChartHistory({preferCache: !force});
+    const detailRequestRange = detailRangeKey();
     const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
-    const detailLoads = [];
     const shouldReloadSignals = force || signalRecordCount == null || currentSignalCount !== signalRecordCount;
-    if (shouldReloadSignals) detailLoads.push(loadSignals({force: true}));
     const counts = snapshot.record_counts || {};
     const currentEventRevision = JSON.stringify([detailRangeKey(), Number(counts.orders || 0), Number(counts.fills || 0)]);
     const shouldReloadEvents = force || eventRecordRevision == null || currentEventRevision !== eventRecordRevision;
-    if (shouldReloadEvents) detailLoads.push(loadEvents({force: true}));
     const shouldReloadPositions = force || sourceHasChanged || !positionsHydrated;
-    if (shouldReloadPositions) detailLoads.push(loadPositions());
-    if (detailLoads.length) void Promise.allSettled(detailLoads);
+    // Finish the visible minute curve, then the signal page, before secondary
+    // ledgers compete for Python CPU and disk. These native-backed queries are
+    // individually fast, but launching them together increases all latencies.
+    void (async () => {
+      await loadChartHistory({preferCache: !force});
+      if (detailRequestRange !== detailRangeKey()) return;
+      if (shouldReloadSignals) await loadSignals({force: true});
+      if (detailRequestRange !== detailRangeKey()) return;
+      const secondaryLoads = [];
+      if (shouldReloadEvents) secondaryLoads.push(loadEvents({force: true}));
+      if (shouldReloadPositions) secondaryLoads.push(loadPositions());
+      if (secondaryLoads.length) await Promise.allSettled(secondaryLoads);
+    })();
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
     $("health").textContent = "UNAVAILABLE"; $("health").className = "pill critical";
@@ -1810,7 +1820,14 @@ function detailDateChanged(event) {
   if (positionAbortController) positionAbortController.abort();
   if (historyAbortController) historyAbortController.abort();
   chartHistory = null;
-  void refresh();
+  // Native date pickers can commit the two boundaries separately. Coalesce
+  // near-simultaneous edits so an obsolete range never starts a second set of
+  // multi-ledger scans on the server.
+  window.clearTimeout(dateFilterTimer);
+  dateFilterTimer = window.setTimeout(() => {
+    dateFilterTimer = null;
+    void refresh();
+  }, DATE_FILTER_DEBOUNCE_MS);
 }
 $("detail-start-date").addEventListener("change", detailDateChanged);
 $("detail-end-date").addEventListener("change", detailDateChanged);
