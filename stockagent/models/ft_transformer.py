@@ -87,6 +87,8 @@ class CrossSectionalFTTransformer(nn.Module):
             encoder_layer,
             num_layers=n_layers,
             norm=nn.LayerNorm(d_token),
+            # Pre-Norm cannot use PyTorch's nested-tensor fast path.
+            enable_nested_tensor=False,
         )
         self.head = nn.Sequential(
             nn.LayerNorm(d_token),

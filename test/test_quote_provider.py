@@ -191,10 +191,65 @@ def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:
     )
 
     assert rows["2330"]["execution_price_0901"] == 107.5
+    assert rows["2330"]["execution_price_0901_method"] == "minute_vwap"
     assert rows["2330"]["tick_count_0901"] == 2
     assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
     assert receipt["resolved_symbols"] == 1
     assert receipt["right_label"] == "09:01:00 Asia/Taipei"
+
+
+def test_historical_0901_price_uses_kbar_close_when_tick_query_is_empty(
+    monkeypatch,
+) -> None:
+    minute = int(np.datetime64("2026-08-13T09:01:00", "ns").astype(np.int64))
+
+    class FakeAPI:
+        contracts = SimpleNamespace(get=lambda symbol: object())
+
+        @staticmethod
+        def usage():
+            return SimpleNamespace(bytes=10, limit_bytes=1_000_000)
+
+        @staticmethod
+        def ticks(**_kwargs):
+            return SimpleNamespace(ts=[], close=[], volume=[])
+
+        @staticmethod
+        def kbars(**_kwargs):
+            return SimpleNamespace(
+                ts=[minute],
+                Close=[101.0],
+                Low=[100.0],
+                High=[102.0],
+                Volume=[0.0],
+                Amount=[0.0],
+            )
+
+    @contextmanager
+    def fake_query(*_args, **_kwargs):
+        yield lambda _result: None
+
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: FakeAPI())
+    monkeypatch.setattr(quote_provider, "shioaji_query", fake_query)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setitem(
+        sys.modules,
+        "shioaji",
+        SimpleNamespace(TicksQueryType=SimpleNamespace(RangeTime="RangeTime")),
+    )
+
+    rows, receipt = quote_provider.fetch_shioaji_historical_stock_0901_vwaps(
+        ["2330"],
+        trading_date=date(2026, 8, 13),
+        progress_every=0,
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 101.0
+    assert rows["2330"]["execution_price_0901_method"] == "minute_close"
+    assert rows["2330"]["tick_count_0901"] == 0
+    assert receipt["kbar_fallback_queries"] == 1
+    assert receipt["kbar_fallback_resolved_symbols"] == 1
+    assert receipt["source_empty_symbols"] == 0
 
 
 class _FakeResponse:

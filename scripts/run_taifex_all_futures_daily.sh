@@ -27,3 +27,9 @@ run_fintech_python "$repo_root/scripts/build_taifex_futures_portfolio_daily.py" 
   --source "$repo_root/data_tw_index_futures/all_futures_daily_sessions.parquet" \
   --official-product-codes "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
   --output-root "$repo_root/data_tw_futures/taifex_portfolio_daily_v4"
+
+# Read-only dashboard enrichment has a separate acceptance gate. A failure is
+# visible in maintenance status, but must not prevent the canonical panel build.
+run_fintech_python "$repo_root/scripts/download_taifex_contract_codes.py" \
+  --output "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
+  --stock-futures-only

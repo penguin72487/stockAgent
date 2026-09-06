@@ -11,6 +11,7 @@ import polars as pl
 import pytest
 
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
+from stockagent.config import DataConfig, TrainingConfig
 from stockagent.data.panel import PanelData
 from stockagent.live.market_config import LiveMarketConfig
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
@@ -255,7 +256,7 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
     disk_root = tmp_path / "runtime-cache"
     monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", str(disk_root))
     monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_DISK_CACHE", "1")
-    data = SimpleNamespace(
+    data = DataConfig(
         parquet_root=str(source_root),
         benchmark_name="universe_average_return",
         usd_only_trading_pairs=False,
@@ -273,17 +274,14 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
         use_external_features=False,
         use_tw_public_features=False,
         use_tw_public_rules=False,
-        external_feature_path=None,
+        external_feature_path="",
         external_market_symbol="__MARKET__",
-        tw_public_feature_path=None,
+        tw_public_feature_path="",
         tw_public_market_symbol="__MARKET__",
-        external_include_features=False,
-        external_include_rules=False,
-        external_data_required=False,
     )
     config = SimpleNamespace(
         data=data,
-        training=SimpleNamespace(lookback=2, strict_no_fallback=True),
+        training=TrainingConfig(non_blocking_transfer=False, lookback=2, strict_no_fallback=True),
     )
     panel = PanelData(
         dates=np.array(["2026-09-01", "2026-09-02"], dtype="datetime64[D]"),

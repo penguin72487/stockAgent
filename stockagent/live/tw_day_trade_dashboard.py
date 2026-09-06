@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date as datetime_date, datetime, time as datetime_time, timezone
 import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -16,6 +17,8 @@ import re
 import threading
 from typing import Any, Final
 from zoneinfo import ZoneInfo
+
+from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
 
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
@@ -81,6 +84,8 @@ _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
+_COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
+_COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
 _SESSION_DATE_FIELD_PATTERN: Final[re.Pattern[bytes]] = re.compile(
     rb'"session_date"\s*:\s*"(\d{4}-\d{2}-\d{2})"'
 )
@@ -245,21 +250,29 @@ class _BenchmarkHistoryIndex:
 
 _BENCHMARK_HISTORY_INDEX_CACHE: dict[Path, _BenchmarkHistoryIndex] = {}
 _BENCHMARK_HISTORY_INDEX_LOCK = threading.Lock()
-_BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 1
+_BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 2
 _BENCHMARK_HISTORY_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
 _BENCHMARK_HISTORY_INTERIOR_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "benchmark_id",
         "benchmark_origin_rebased",
         "contract_code",
+        "fresh_trade_notional_coverage_ratio",
+        "fresh_trade_position_count",
+        "historical_minute_replay",
         "initial_capital_twd",
         "last_mark_price",
+        "last_trade_carried_position_count",
         "minute",
+        "minute_valuation_contract",
+        "missing_price_position_count",
         "recorded_at",
         "return_fraction",
         "return_pct",
         "session_date",
         "total_equity_twd",
+        "valuation_executable",
+        "valuation_source",
         "valuation_stale",
     }
 )
@@ -849,6 +862,27 @@ def _rows_for_sessions(
         for session_date in selected_dates
         for start, end in index.spans.get(session_date, ())
     )
+    source = Path(path)
+    stat = source.stat()
+    if (stat.st_dev, stat.st_ino) != (index.device, index.inode):
+        raise OSError(f"dashboard ledger changed before indexed read: {source}")
+    columnar = _columnar_ledger_frame(
+        source,
+        selected_spans=selected_spans,
+        maximum_rows=maximum_rows,
+    )
+    if columnar is not None:
+        _, frame = columnar
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for payload in frame.to_dicts():
+            session_date = _ledger_row_session_date(
+                payload,
+                recorded_at_fallback=recorded_at_fallback,
+            )
+            if session_date in selected_dates:
+                grouped.setdefault(session_date, []).append(payload)
+        return {key: tuple(value) for key, value in grouped.items()}
+
     retained: deque[tuple[str, dict[str, Any]]] | list[
         tuple[str, dict[str, Any]]
     ] = (
@@ -856,10 +890,6 @@ def _rows_for_sessions(
         if maximum_rows is not None
         else []
     )
-    source = Path(path)
-    stat = source.stat()
-    if (stat.st_dev, stat.st_ino) != (index.device, index.inode):
-        raise OSError(f"dashboard ledger changed before indexed read: {source}")
     with source.open("rb") as handle:
         for start, end, indexed_date in selected_spans:
             handle.seek(start)
@@ -883,6 +913,57 @@ def _rows_for_sessions(
     for session_date, row in retained:
         grouped.setdefault(session_date, []).append(row)
     return {key: tuple(value) for key, value in grouped.items()}
+
+
+def _columnar_ledger_frame(
+    source: Path,
+    *,
+    selected_spans: list[tuple[int, int, str]],
+    maximum_rows: int | None,
+) -> tuple[Any, Any] | None:
+    """Decode sufficiently large indexed NDJSON spans into a columnar frame.
+
+    Date filtering first resolves immutable byte spans from the append-only
+    ledger index.  Decoding those spans one JSON object at a time dominates a
+    cold filter request and temporarily expands every field into Python
+    objects.  Polars parses the same bounded bytes in native code and lets
+    callers project/filter before materializing Python rows.  Small fixtures,
+    unavailable optional runtimes, and unusual schemas retain the strict
+    stdlib path below, so this is an optimization rather than a new storage
+    authority.
+    """
+
+    total_bytes = sum(end - start for start, end, _ in selected_spans)
+    if not _COLUMNAR_LEDGER_MIN_BYTES <= total_bytes <= _COLUMNAR_LEDGER_MAX_BYTES:
+        return None
+    try:
+        import polars as pl
+    except ImportError:
+        return None
+
+    chunks: list[bytes] = []
+    with Path(source).open("rb") as handle:
+        for start, end, _ in selected_spans:
+            handle.seek(start)
+            chunk = handle.read(end - start)
+            if len(chunk) != end - start or (chunk and not chunk.endswith(b"\n")):
+                raise ValueError(f"dashboard ledger span is invalid: {source}")
+            chunks.append(chunk)
+    payload = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    try:
+        frame = pl.read_ndjson(
+            io.BytesIO(payload),
+            infer_schema_length=1_000,
+            rechunk=False,
+        )
+    except Exception:
+        # Mixed legacy rows can defeat bounded schema inference.  The existing
+        # line-by-line decoder remains the correctness fallback and will still
+        # surface malformed JSON instead of silently dropping it.
+        return None
+    if maximum_rows is not None and frame.height > maximum_rows:
+        frame = frame.tail(maximum_rows)
+    return pl, frame
 
 
 def _tail_for_session(
@@ -2193,7 +2274,12 @@ def _operational_issues(
         "observed_09_01_minute_vwap_unavailable": (
             "error",
             "09:01 首分鐘成交價不可用",
-            "漏跑回補缺少右標記 09:01 首分鐘 VWAP，該股票保持空倉；不以 09:00 開盤價、Bid/Ask、最後價或 +1 Tick 替代。",
+            "舊版漏跑回補缺少右標記 09:01 首分鐘價格，該股票保持空倉；不以 09:00 開盤價、Bid/Ask、最後價或 +1 Tick 替代。",
+        ),
+        "observed_09_01_minute_price_unavailable": (
+            "error",
+            "09:01 首分鐘成交價不可用",
+            "漏跑回補連來源 K 棒都沒有有效的右標記 09:01 價格，該股票保持空倉；只有缺 tick 時會改用同一根 K 棒價格。",
         ),
         "synthetic_open_tick_price_unavailable": (
             "error",
@@ -2516,13 +2602,14 @@ def build_dashboard_history_snapshot(
     start_date: str | datetime_date | None = None,
     end_date: str | datetime_date | None = None,
     maximum_points_per_series: int = 2_000,
+    resolution: str = "sampled",
 ) -> dict[str, Any]:
     """Return cross-session strategy and total-return benchmark curves.
 
     Time windows are anchored to the newest retained observation rather than
     wall-clock time, so historical/replay ledgers remain inspectable.  Longer
-    windows scan only the two append-only mark ledgers and are then bounded by
-    extrema-preserving downsampling at the API boundary.
+    windows scan only the mark ledgers. Legacy sampled responses preserve
+    extrema; resolution=1m transports every minute in compact numeric columns.
     """
 
     normalized_range = str(range_key or "1d").strip().lower()
@@ -2530,6 +2617,8 @@ def build_dashboard_history_snapshot(
         raise ValueError(f"unsupported chart range: {range_key}")
     if not 100 <= int(maximum_points_per_series) <= 10_000:
         raise ValueError("maximum_points_per_series must be between 100 and 10000")
+    if resolution not in {"sampled", "1m"}:
+        raise ValueError("unsupported history resolution")
     selected_start = (
         start_date
         if isinstance(start_date, datetime_date)
@@ -2551,6 +2640,7 @@ def build_dashboard_history_snapshot(
     benchmark_history = _benchmark_history_index(root)
     benchmark_origins = benchmark_history.origins
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+    canonical_benchmark_keys: set[tuple[str, str]] = set()
     marks_path = root / "marks.jsonl"
     live_benchmark_path = root / "benchmark_marks.jsonl"
     marks_recorded_at_fallback = False
@@ -2643,6 +2733,7 @@ def build_dashboard_history_snapshot(
         selected_start.isoformat() if selected_start else None,
         selected_end.isoformat() if selected_end else None,
         int(maximum_points_per_series),
+        resolution,
         selected_span_signature(marks_index),
         (
             benchmark_history.device,
@@ -2657,7 +2748,7 @@ def build_dashboard_history_snapshot(
         if cached_history is not None:
             return dict(cached_history)
 
-    def add(source: Mapping[str, Any], *, series_type: str) -> None:
+    def add(source: Mapping[str, Any], *, series_type: str, canonical: bool = False) -> None:
         row = dict(source)
         series_id = str(
             row.get("market")
@@ -2703,6 +2794,14 @@ def build_dashboard_history_snapshot(
             timespec="minutes"
         )
         session_date = local_observed.date().isoformat()
+        point_key = (series_id, minute)
+        if not canonical and point_key in canonical_benchmark_keys:
+            # A historical Close/reference mark and an old live Bid/Ask mark
+            # are different valuation contracts. Do not weave both into one
+            # completed curve according to incidental file-read order.
+            return
+        if canonical:
+            canonical_benchmark_keys.add(point_key)
         deduplicated[(series_id, minute)] = {
             "series_id": series_id,
             "series_type": series_type,
@@ -2749,7 +2848,7 @@ def build_dashboard_history_snapshot(
                 add(row, series_type="strategy")
         for session_date in selected_sessions:
             for row in benchmark_history.marks_by_session.get(session_date, ()):
-                add(row, series_type="benchmark")
+                add(row, series_type="benchmark", canonical=True)
         live_benchmark_rows = _rows_for_sessions(
             live_benchmark_path,
             selected_sessions,
@@ -2770,7 +2869,7 @@ def build_dashboard_history_snapshot(
         for row in _all_json_objects(marks_path) or ():
             add(row, series_type="strategy")
         for row in benchmark_history.marks:
-            add(row, series_type="benchmark")
+            add(row, series_type="benchmark", canonical=True)
         for source in _all_json_objects(live_benchmark_path) or ():
             benchmark_id = str(source.get("benchmark_id") or "")
             add(
@@ -2916,7 +3015,7 @@ def build_dashboard_history_snapshot(
                 ),
             }
         )
-    sampled = [
+    sampled = rows if resolution == "1m" else [
         row
         for series_rows in grouped.values()
         for row in _downsample_chart_series(
@@ -2998,6 +3097,30 @@ def build_dashboard_history_snapshot(
         ),
         "history": sampled,
     }
+    if resolution == "1m":
+        # Lossless columnar transport avoids repeating IDs, timestamps and
+        # field names hundreds of thousands of times. Each row is an actual
+        # retained minute; the browser must not reconstruct interpolated rows.
+        payload["history_encoding"] = "minute_columns_v1"
+        payload["minute_series"] = [
+            {
+                "series_id": series_id,
+                "series_type": values[0]["series_type"],
+                "points": [
+                    [
+                        int(_timestamp(row["minute"]).timestamp() // 60),
+                        row["return_pct"],
+                        row["cumulative_return_pct"],
+                        int(row["valuation_stale"])
+                        | (int(row["historical_minute_replay"]) << 1)
+                        | (int(int(row.get("missing_price_position_count") or 0) > 0) << 2),
+                    ]
+                    for row in values
+                ],
+            }
+            for series_id, values in grouped.items()
+        ]
+        payload["history"] = []
     with _HISTORY_SNAPSHOT_CACHE_LOCK:
         if len(_HISTORY_SNAPSHOT_CACHE) >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES:
             _HISTORY_SNAPSHOT_CACHE.pop(next(iter(_HISTORY_SNAPSHOT_CACHE)))
@@ -3858,6 +3981,14 @@ def build_dashboard_snapshot(
                 "entry_0901_vwap_fill_count": int(
                     mode.get("entry_0901_vwap_fill_count") or 0
                 ),
+                "entry_0901_close_fill_count": int(
+                    mode.get("entry_0901_close_fill_count") or 0
+                ),
+                "entry_0901_minute_price_fill_count": int(
+                    mode.get("entry_0901_minute_price_fill_count")
+                    or mode.get("entry_0901_vwap_fill_count")
+                    or 0
+                ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
@@ -4236,6 +4367,14 @@ def build_dashboard_snapshot(
             mode["entry_0901_vwap_fill_count"] = int(
                 (signal_event or {}).get("entry_0901_vwap_fill_count") or 0
             )
+            mode["entry_0901_close_fill_count"] = int(
+                (signal_event or {}).get("entry_0901_close_fill_count") or 0
+            )
+            mode["entry_0901_minute_price_fill_count"] = int(
+                (signal_event or {}).get("entry_0901_minute_price_fill_count")
+                or (signal_event or {}).get("entry_0901_vwap_fill_count")
+                or 0
+            )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -4465,8 +4604,8 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the observed right-labelled 09:01 minute VWAP. It is explicitly counterfactual and is not a live quote or real order fill",
-            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline waits for the observed 09:01 minute VWAP; missing data is blocked without open-price fill, last-price, or adverse-tick substitution",
+            "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the source-backed right-labelled 09:01 minute price (VWAP, otherwise that KBar's Close). It is explicitly counterfactual and is not a live quote or real order fill",
+            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline uses the source-backed 09:01 minute price; missing ticks alone do not block, but a missing minute bar is blocked without open-price fill, carried last-price, or adverse-tick substitution",
             "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
@@ -4483,7 +4622,7 @@ def build_dashboard_snapshot(
                 else benchmark_history.load_error
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the observed 09:01 minute VWAP for price; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the source-backed 09:01 minute price for execution; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
             "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
@@ -4565,6 +4704,7 @@ def build_dashboard_signal_page(
     normalized_status = str(status or "all").strip().casefold()
     signal_path = root / "signals.jsonl"
     signal_stat = signal_path.stat()
+    futures_catalog = load_stock_futures_catalog()
     cache_key = (
         root.resolve(),
         signal_stat.st_dev,
@@ -4578,11 +4718,14 @@ def build_dashboard_signal_page(
         int(offset),
         int(limit),
         state_signal_signature,
+        futures_catalog.revision,
     )
     with _SIGNAL_PAGE_CACHE_LOCK:
         cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
         if cached_page is not None:
             return dict(cached_page)
+    signal_frame: Any | None = None
+    polars_module: Any | None = None
     if (
         use_latest_session_fast_path
         and selected_session_dates == [requested_single_date]
@@ -4597,16 +4740,58 @@ def build_dashboard_signal_page(
             )
         }
     else:
-        rows_by_session = _rows_for_sessions(
+        signal_index = _ledger_session_index(
             signal_path,
-            selected_session_dates,
-            maximum_scan_rows,
+            recorded_at_fallback=False,
         )
-    current_rows = [
-        row
-        for selected_date in selected_session_dates
-        for row in rows_by_session.get(selected_date, ())
-    ]
+        selected_spans = (
+            sorted(
+                (start, end, session_date)
+                for session_date in selected_session_dates
+                for start, end in signal_index.spans.get(session_date, ())
+            )
+            if signal_index is not None
+            else []
+        )
+        columnar = _columnar_ledger_frame(
+            signal_path,
+            selected_spans=selected_spans,
+            maximum_rows=maximum_scan_rows,
+        )
+        if columnar is not None:
+            polars_module, candidate_frame = columnar
+            required_columns = {
+                "ask",
+                "bid",
+                "execution_price",
+                "filled_shares",
+                "filled_weight",
+                "market",
+                "reason",
+                "requested_shares",
+                "session_date",
+                "signal_id",
+                "sizing_open_price",
+                "status",
+                "symbol",
+                "target_weight",
+            }
+            if required_columns.issubset(candidate_frame.columns):
+                signal_frame = candidate_frame
+        if signal_frame is None:
+            rows_by_session = _rows_for_sessions(
+                signal_path,
+                selected_session_dates,
+                maximum_scan_rows,
+            )
+
+    current_rows: list[dict[str, Any]] = []
+    if signal_frame is None:
+        current_rows = [
+            row
+            for selected_date in selected_session_dates
+            for row in rows_by_session.get(selected_date, ())
+        ]
 
     def included(row: Mapping[str, Any]) -> bool:
         if normalized_mode and normalized_mode != "all":
@@ -4624,8 +4809,6 @@ def build_dashboard_signal_page(
             }
         return True
 
-    filtered = [row for row in current_rows if included(row)]
-
     def sort_key(row: Mapping[str, Any]) -> tuple[float, int, float, str, str]:
         weight = _finite_float(row.get("target_weight"))
         resolved = weight if weight is not None else 0.0
@@ -4637,19 +4820,89 @@ def build_dashboard_signal_page(
             str(row.get("symbol") or ""),
         )
 
-    filtered.sort(key=sort_key)
+    filtered: list[dict[str, Any]] = []
+    filtered_frame: Any | None = None
+    if signal_frame is None:
+        filtered = [row for row in current_rows if included(row)]
+        filtered.sort(key=sort_key)
+        source_rows_scanned = len(current_rows)
+        filtered_total = len(filtered)
+    else:
+        pl = polars_module
+        predicate = pl.lit(True)
+        if normalized_mode and normalized_mode != "all":
+            predicate &= pl.col("market").fill_null("") == normalized_mode
+        if normalized_symbol:
+            # Keep Python's Unicode casefold semantics for textual searches.
+            # Decode the already bounded frame once; date-only filtering takes
+            # the native columnar path below without Python row materialization.
+            decoded_rows_by_session: dict[str, list[dict[str, Any]]] = {}
+            for row in signal_frame.to_dicts():
+                decoded_rows_by_session.setdefault(
+                    str(row.get("session_date") or "")[:10], []
+                ).append(row)
+            signal_frame = None
+            current_rows = [
+                row
+                for selected_date in selected_session_dates
+                for row in decoded_rows_by_session.get(selected_date, ())
+            ]
+            filtered = [row for row in current_rows if included(row)]
+            filtered.sort(key=sort_key)
+            source_rows_scanned = len(current_rows)
+            filtered_total = len(filtered)
+        else:
+            if normalized_status == "blocked":
+                predicate &= ~pl.col("status").fill_null("").is_in(
+                    ["ready", "partial_depth", "hold"]
+                )
+            resolved_weight = (
+                pl.col("target_weight")
+                .cast(pl.Float64, strict=False)
+                .fill_null(0.0)
+            )
+            filtered_frame = (
+                signal_frame.filter(predicate)
+                .with_columns(
+                    resolved_weight.alias("__resolved_weight"),
+                    resolved_weight.abs().alias("__absolute_weight"),
+                )
+                .sort(
+                    [
+                        "__absolute_weight",
+                        "session_date",
+                        "__resolved_weight",
+                        "market",
+                        "symbol",
+                    ],
+                    descending=[True, True, True, False, False],
+                    nulls_last=True,
+                )
+            )
+            source_rows_scanned = signal_frame.height
+            filtered_total = filtered_frame.height
     capitals = {
         str(market): _finite_float(raw_mode.get("initial_capital_twd"))
         for market, raw_mode in (state.get("modes") or {}).items()
         if isinstance(raw_mode, Mapping)
     }
     current_signal_ids: dict[tuple[str, str], str] = {}
-    for row in current_rows:
-        row_date = str(row.get("session_date") or "")[:10]
-        market = str(row.get("market") or "")
-        signal_id = str(row.get("signal_id") or "")
-        if row_date and market and signal_id:
-            current_signal_ids[(row_date, market)] = signal_id
+    if signal_frame is not None:
+        for row_date, market, signal_id in signal_frame.select(
+            "session_date", "market", "signal_id"
+        ).iter_rows():
+            row_date = str(row_date or "")[:10]
+            market = str(market or "")
+            signal_id = str(signal_id or "")
+            if row_date and market and signal_id:
+                current_signal_ids[(row_date, market)] = signal_id
+    else:
+        for row in current_rows:
+            row_date = str(row.get("session_date") or "")[:10]
+            market = str(row.get("market") or "")
+            signal_id = str(row.get("signal_id") or "")
+            if row_date and market and signal_id:
+                current_signal_ids[(row_date, market)] = signal_id
     direction_summary: dict[str, dict[str, float | int]] = {
         stage: {
             "long_count": 0,
@@ -4659,26 +4912,43 @@ def build_dashboard_signal_page(
         }
         for stage in ("target", "actual")
     }
-    summary_rows = [
-        row
-        for row in filtered
-        if not current_signal_ids.get(
-            (
-                str(row.get("session_date") or "")[:10],
-                str(row.get("market") or ""),
-            )
-        )
-        or str(row.get("signal_id") or "")
-        == current_signal_ids[
-            (
-                str(row.get("session_date") or "")[:10],
-                str(row.get("market") or ""),
-            )
-        ]
+    summary_columns = [
+        "session_date",
+        "market",
+        "signal_id",
+        "target_weight",
+        "filled_weight",
+        "filled_shares",
+        "ask",
+        "bid",
+        "sizing_open_price",
+        "execution_price",
+        "requested_shares",
+        "reason",
+        "status",
+        "symbol",
     ]
-    for row in summary_rows:
+
+    def summary_rows():
+        candidates = (
+            filtered_frame.select(summary_columns).iter_rows(named=True)
+            if filtered_frame is not None
+            else iter(filtered)
+        )
+        for row in candidates:
+            identity = (
+                str(row.get("session_date") or "")[:10],
+                str(row.get("market") or ""),
+            )
+            current_signal_id = current_signal_ids.get(identity)
+            if not current_signal_id or str(row.get("signal_id") or "") == current_signal_id:
+                yield row
+
+    opening_execution_audit: dict[str, dict[str, Any]] = {}
+    for row in summary_rows():
         target = _finite_float(row.get("target_weight")) or 0.0
-        capital = capitals.get(str(row.get("market") or ""))
+        market = str(row.get("market") or "unknown")
+        capital = capitals.get(market)
         entry_price = _finite_float(row.get("ask") if target > 0.0 else row.get("bid"))
 
         def executed_weight(explicit_key: str, shares_key: str) -> float:
@@ -4701,11 +4971,6 @@ def build_dashboard_signal_page(
             elif value < 0.0:
                 direction_summary[stage]["short_count"] += 1
                 direction_summary[stage]["short_gross"] += -value
-
-    opening_execution_audit: dict[str, dict[str, Any]] = {}
-    for row in summary_rows:
-        target = _finite_float(row.get("target_weight")) or 0.0
-        market = str(row.get("market") or "unknown")
         audit = opening_execution_audit.setdefault(
             market,
             {
@@ -4776,9 +5041,17 @@ def build_dashboard_signal_page(
             )
         )
 
+    source_page = (
+        filtered_frame.slice(offset, limit)
+        .drop("__resolved_weight", "__absolute_weight")
+        .to_dicts()
+        if filtered_frame is not None
+        else filtered[offset : offset + limit]
+    )
     page: list[dict[str, Any]] = []
-    for source_row in filtered[offset : offset + limit]:
+    for source_row in source_page:
         row = dict(source_row)
+        row["stock_futures"] = futures_catalog.membership(str(row.get("symbol") or ""))
         if bool(row.get("counterfactual_open_replay")):
             row["open_reconstructed_at"] = (
                 row.get("open_reconstructed_at") or row.get("signal_at")
@@ -4801,9 +5074,9 @@ def build_dashboard_signal_page(
         "offset": offset,
         "limit": limit,
         "returned": len(page),
-        "total": len(filtered),
-        "has_more": offset + len(page) < len(filtered),
-        "source_rows_scanned": len(current_rows),
+        "total": filtered_total,
+        "has_more": offset + len(page) < filtered_total,
+        "source_rows_scanned": source_rows_scanned,
         "record_count": _line_count(root / "signals.jsonl"),
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,

@@ -32,6 +32,8 @@ STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/presentation.js": ("presentation.js", "text/javascript; charset=utf-8"),
+    "/detail-components.js": ("detail-components.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
 
@@ -54,13 +56,16 @@ def _history_query(raw_query: str) -> dict[str, str | None]:
         raw_query,
         keep_blank_values=True,
         strict_parsing=False,
-        max_num_fields=3,
+        max_num_fields=4,
     )
-    if set(query) - {"range", "start_date", "end_date"} or any(
+    if set(query) - {"range", "start_date", "end_date", "resolution"} or any(
         len(values) != 1 for values in query.values()
     ):
         raise ValueError("unsupported or repeated query field")
     range_key = str(query.get("range", ["1d"])[0]).strip() or "1d"
+    resolution = str(query.get("resolution", ["sampled"])[0])
+    if resolution not in {"sampled", "1m"}:
+        raise ValueError("unsupported history resolution")
     start_date = str(query.get("start_date", [""])[0]).strip() or None
     end_date = str(query.get("end_date", [""])[0]).strip() or None
     if start_date is not None:
@@ -69,7 +74,12 @@ def _history_query(raw_query: str) -> dict[str, str | None]:
         datetime_date.fromisoformat(end_date)
     if start_date is not None and end_date is not None and start_date > end_date:
         raise ValueError("history start_date must not be after end_date")
-    return {"range_key": range_key, "start_date": start_date, "end_date": end_date}
+    return {
+        "range_key": range_key,
+        "start_date": start_date,
+        "end_date": end_date,
+        "resolution": resolution,
+    }
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -115,12 +125,14 @@ class DashboardServer(ThreadingHTTPServer):
         range_key: str,
         start_date: str | None = None,
         end_date: str | None = None,
+        resolution: str = "sampled",
     ) -> dict[str, object]:
         return build_dashboard_history_snapshot(
             state_dir=self.state_dir,
             range_key=range_key,
             start_date=start_date,
             end_date=end_date,
+            resolution=resolution,
         )
 
     def summary(self, *, session_date: str | None = None) -> dict[str, object]:

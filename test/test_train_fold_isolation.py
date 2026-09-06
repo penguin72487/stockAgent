@@ -168,12 +168,22 @@ def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -
         and node.func.id == "_refresh_walkforward_artifacts"
     ]
 
-    assert len(calls) == 1
-    call = calls[0]
-    assert isinstance(call.args[0], ast.Call)
-    assert isinstance(call.args[1], ast.Name) and call.args[1].id == "results"
-    keyword_names = {keyword.arg for keyword in call.keywords}
-    assert keyword_names == {"panel", "config"}
+    # Refresh immediately after each child AND once before final completion.
+    assert len(calls) == 2
+    calls.sort(key=lambda call: call.lineno)
+    for call, result_name in zip(calls, ("partial_results", "results"), strict=True):
+        assert isinstance(call.args[0], ast.Call)
+        assert isinstance(call.args[1], ast.Name) and call.args[1].id == result_name
+        assert {keyword.arg for keyword in call.keywords} == {"panel", "config"}
+    child_loops = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "pending_fold"
+    ]
+    assert len(child_loops) == 1
+    assert calls[0] in list(ast.walk(child_loops[0]))
+    assert calls[1] not in list(ast.walk(child_loops[0]))
 
     finalizers = [
         node
@@ -183,4 +193,4 @@ def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -
         and node.func.id == "_finalize_isolated_training_lifecycle"
     ]
     assert len(finalizers) == 1
-    assert finalizers[0].lineno > call.lineno
+    assert finalizers[0].lineno > calls[-1].lineno

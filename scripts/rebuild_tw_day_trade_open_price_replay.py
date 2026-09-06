@@ -3,9 +3,12 @@
 
 The active replay contract uses the official 09:00 session open only for model
 inference and whole-lot sizing, then values paper execution at the observed
-right-labelled 09:01 minute VWAP. Missing opens or VWAPs fail closed; no
-Bid/Ask, last price, opening-price fill, or adverse-tick substitute is allowed.
-This is explicitly counterfactual and is never labelled as a live exchange fill.
+right-labelled 09:01 minute price. The price is the minute VWAP when its amount
+and normalized share volume are valid, otherwise the source-published 09:01
+KBar Close. A missing tick is not a no-fill rule. Missing opens or an entirely
+missing 09:01 bar still fail closed; no Bid/Ask, carried last price,
+opening-price fill, or adverse-tick substitute is allowed. This is explicitly
+counterfactual and is never labelled as a live exchange fill.
 
 Legacy forensic modes remain available. With
 ``--paper-market-at-best`` it queries each actionable symbol's first
@@ -45,12 +48,13 @@ from downloader.download_tw_public_data import (  # noqa: E402
     _validated_taiex_session_dates,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ModeSpec,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
 )
@@ -58,6 +62,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_historical_stock_entry_books,
     fetch_shioaji_stock_snapshots,
+    resolve_observed_minute_execution_price,
 )
 from stockagent.data.tw_price_rules import move_price_ticks_numpy  # noqa: E402
 
@@ -282,6 +287,58 @@ def _source_ledger_signal_ids(
     }
 
 
+def _resolve_source_signal_pins(
+    source_signal_ids: Mapping[tuple[str, str], str],
+    *,
+    expected_signal_keys: set[tuple[str, str]],
+    known_markets: set[str],
+    allowed_unpinned_markets: set[str],
+    replacement_signal_markets: set[str],
+) -> tuple[dict[tuple[str, str], str], dict[str, Any]]:
+    """Keep the old ledger pinned except for explicitly replaced markets.
+
+    Adding a mode and replacing a mode are different migrations.  An add-mode
+    exception may discover only keys absent from the source ledger.  A
+    replacement deliberately removes the old pins for that stable market ID so
+    the replay resolves the newly deployed signal artifacts instead.
+    """
+
+    unknown = (allowed_unpinned_markets | replacement_signal_markets) - known_markets
+    if unknown:
+        raise ValueError(f"signal pin exceptions name unknown modes: {sorted(unknown)}")
+    overlap = allowed_unpinned_markets & replacement_signal_markets
+    if overlap:
+        raise ValueError(
+            f"a market cannot be both added and replaced: {sorted(overlap)}"
+        )
+
+    pins = dict(source_signal_ids)
+    replacement_keys = {
+        key for key in expected_signal_keys if key[1] in replacement_signal_markets
+    }
+    replaced_pinned_keys = replacement_keys & set(pins)
+    for key in replacement_keys:
+        pins.pop(key, None)
+
+    missing_signal_keys = sorted(expected_signal_keys - set(pins))
+    discoverable_markets = allowed_unpinned_markets | replacement_signal_markets
+    disallowed_missing = [
+        key for key in missing_signal_keys if key[1] not in discoverable_markets
+    ]
+    if disallowed_missing:
+        raise ValueError(
+            "source ledger is missing replay signal identities: "
+            f"{disallowed_missing[:20]}"
+        )
+    return pins, {
+        "allowed_unpinned_markets": sorted(allowed_unpinned_markets),
+        "replacement_signal_markets": sorted(replacement_signal_markets),
+        "replaced_pinned_signal_keys": len(replaced_pinned_keys),
+        "discovered_signal_keys": len(missing_signal_keys),
+        "pinned_signal_keys": len(expected_signal_keys) - len(missing_signal_keys),
+    }
+
+
 def _load_retained_historical_entry_books(
     *,
     historical_book_root: Path,
@@ -323,11 +380,12 @@ def _local_0901_vwap_rows(
     symbols: list[str],
     trading_date: date,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Resolve 09:01 VWAPs from canonical local minute data before Shioaji."""
+    """Resolve source-backed 09:01 minute prices locally before Shioaji."""
 
     requested = set(symbols)
     resolved: dict[str, dict[str, Any]] = {}
     source_counts: dict[str, int] = {}
+    price_method_counts: dict[str, int] = {}
 
     def accept(frame: pl.DataFrame, source: Path) -> None:
         if not frame.height:
@@ -345,64 +403,28 @@ def _local_0901_vwap_rows(
             symbol = str(row.get("symbol") or "")
             if symbol not in requested or symbol in resolved:
                 continue
-            try:
-                amount = float(row.get("Amount"))
-            except (TypeError, ValueError):
-                amount = math.nan
-            try:
-                volume_shares = float(row.get("volume_shares"))
-            except (TypeError, ValueError):
-                volume_shares = math.nan
-            if not (math.isfinite(volume_shares) and volume_shares > 0.0):
-                try:
-                    raw_volume = float(row.get("Volume"))
-                except (TypeError, ValueError):
-                    raw_volume = math.nan
-                candidates: list[float] = []
-                try:
-                    contract_unit = float(row.get("contract_unit"))
-                    if math.isfinite(contract_unit) and contract_unit > 0.0:
-                        candidates.append(contract_unit)
-                except (TypeError, ValueError):
-                    pass
-                candidates.extend([1_000.0, 100.0, 10.0, 1.0])
-                try:
-                    low = float(row.get("Low"))
-                    high = float(row.get("High"))
-                except (TypeError, ValueError):
-                    low, high = math.nan, math.nan
-                for multiplier in dict.fromkeys(candidates):
-                    candidate_shares = raw_volume * multiplier
-                    candidate_price = (
-                        amount / candidate_shares
-                        if candidate_shares > 0.0
-                        else math.nan
-                    )
-                    if (
-                        math.isfinite(candidate_price)
-                        and candidate_price > 0.0
-                        and math.isfinite(low)
-                        and math.isfinite(high)
-                        and low * 0.999 <= candidate_price <= high * 1.001
-                    ):
-                        volume_shares = candidate_shares
-                        break
-            vwap = (
-                amount / volume_shares
-                if math.isfinite(amount)
-                and amount > 0.0
-                and math.isfinite(volume_shares)
-                and volume_shares > 0.0
-                else math.nan
+            price, price_method, volume_shares = (
+                resolve_observed_minute_execution_price(
+                    amount=row.get("Amount"),
+                    volume_shares=row.get("volume_shares"),
+                    raw_volume=row.get("Volume"),
+                    contract_unit=row.get("contract_unit"),
+                    low=row.get("Low"),
+                    high=row.get("High"),
+                    close=row.get("Close"),
+                )
             )
-            if not math.isfinite(vwap) or vwap <= 0.0:
+            if price is None or price_method is None:
                 continue
             row_source = Path(str(row.get("_source_path") or source))
-            source_text = f"local_minute_parquet_0901_vwap:{row_source.resolve()}"
+            source_text = (
+                f"local_minute_parquet_0901_{price_method}:{row_source.resolve()}"
+            )
             resolved[symbol] = {
                 "symbol": symbol,
-                "execution_price_0901": float(vwap),
-                "tick_volume_units_0901": float(volume_shares),
+                "execution_price_0901": float(price),
+                "execution_price_0901_method": price_method,
+                "tick_volume_units_0901": float(volume_shares or 0.0),
                 "tick_count_0901": 0,
                 "source_window_start": datetime.combine(
                     trading_date, time(9, 0), tzinfo=TAIPEI
@@ -416,6 +438,9 @@ def _local_0901_vwap_rows(
                 "source": source_text,
             }
             source_counts[source_text] = source_counts.get(source_text, 0) + 1
+            price_method_counts[price_method] = (
+                price_method_counts.get(price_method, 0) + 1
+            )
 
     for root in minute_roots:
         unresolved = requested - set(resolved)
@@ -452,6 +477,7 @@ def _local_0901_vwap_rows(
                     "contract_unit",
                     "Low",
                     "High",
+                    "Close",
                 )
                 if name in schema
             ]
@@ -481,6 +507,7 @@ def _local_0901_vwap_rows(
                     "contract_unit",
                     "Low",
                     "High",
+                    "Close",
                 )
                 if name in schema
             ]
@@ -492,10 +519,11 @@ def _local_0901_vwap_rows(
             )
             accept(frame, partition)
     return resolved, {
-        "source": "local_minute_data_0901_vwap",
+        "source": "local_minute_data_0901_price",
         "requested_symbols": len(requested),
         "resolved_symbols": len(resolved),
         "source_counts": source_counts,
+        "price_method_counts": price_method_counts,
         "additional_shioaji_requests": 0,
     }
 
@@ -578,7 +606,8 @@ def _entry_quotes(
     adverse_tick_fallback_rows = 0
     exact_best_quote_symbols: list[str] = []
     adverse_tick_fallback_symbols: list[str] = []
-    observed_0901_vwap_symbols: list[str] = []
+    observed_0901_price_symbols: list[str] = []
+    observed_0901_price_method_counts: dict[str, int] = {}
     missing_official_open_symbols: list[str] = []
     official_open_mismatches: list[dict[str, Any]] = []
     for row in rows:
@@ -635,7 +664,7 @@ def _entry_quotes(
         )
         book = historical_books.get(symbol) or {}
         is_0901_vwap_policy = (
-            spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
         )
         transaction_price_key = "ask" if side == "long" else "bid"
         transaction_volume_key = "ask_volume" if side == "long" else "bid_volume"
@@ -657,7 +686,7 @@ def _entry_quotes(
             execution_price_0901 = float(book.get("execution_price_0901"))
         except (TypeError, ValueError):
             execution_price_0901 = math.nan
-        has_0901_vwap = bool(
+        has_0901_price = bool(
             potentially_executable
             and math.isfinite(execution_price_0901)
             and execution_price_0901 > 0.0
@@ -677,13 +706,22 @@ def _entry_quotes(
         elif use_adverse_tick_fallback:
             adverse_tick_fallback_rows += 1
             adverse_tick_fallback_symbols.append(symbol)
-        if is_0901_vwap_policy and has_0901_vwap:
-            observed_0901_vwap_symbols.append(symbol)
+        execution_price_0901_method = str(
+            book.get("execution_price_0901_method") or "minute_vwap"
+        )
+        if is_0901_vwap_policy and has_0901_price:
+            observed_0901_price_symbols.append(symbol)
+            observed_0901_price_method_counts[execution_price_0901_method] = (
+                observed_0901_price_method_counts.get(
+                    execution_price_0901_method, 0
+                )
+                + 1
+            )
         source_quote_at = book.get(source_quote_at_key) or book.get("quote_at")
         entry_price_source = (
-            str(book.get("source") or "observed_right_labelled_09_01_minute_vwap")
-            if is_0901_vwap_policy and has_0901_vwap
-            else "missing_observed_09_01_minute_vwap"
+            str(book.get("source") or "observed_right_labelled_09_01_minute_price")
+            if is_0901_vwap_policy and has_0901_price
+            else "missing_observed_09_01_minute_price"
             if is_0901_vwap_policy
             else
             f"shioaji:historical_stock_tick_best_{transaction_price_key}"
@@ -697,7 +735,7 @@ def _entry_quotes(
             "open": serialized_open,
             "last": (
                 execution_price_0901
-                if is_0901_vwap_policy and has_0901_vwap
+                if is_0901_vwap_policy and has_0901_price
                 else book.get("last") or serialized_open
             ),
             "bid": book.get("bid") if has_required_best_quote else None,
@@ -706,7 +744,10 @@ def _entry_quotes(
             "ask_volume": (book.get("ask_volume") if has_required_best_quote else None),
             "minute_volume_lots": None,
             "execution_price_0901": (
-                execution_price_0901 if has_0901_vwap else None
+                execution_price_0901 if has_0901_price else None
+            ),
+            "execution_price_0901_method": (
+                execution_price_0901_method if has_0901_price else None
             ),
             "upper_limit": evidence.get("upper_limit_price"),
             "lower_limit": evidence.get("lower_limit_price"),
@@ -721,9 +762,9 @@ def _entry_quotes(
                 else source_quote_at
             ),
             "source": (
-                str(book.get("source") or "observed_right_labelled_09_01_minute_vwap")
-                if is_0901_vwap_policy and has_0901_vwap
-                else "missing_observed_09_01_minute_vwap"
+                str(book.get("source") or "observed_right_labelled_09_01_minute_price")
+                if is_0901_vwap_policy and has_0901_price
+                else "missing_observed_09_01_minute_price"
                 if is_0901_vwap_policy
                 else
                 "shioaji:historical_stock_tick_best_quote"
@@ -741,7 +782,7 @@ def _entry_quotes(
         if str(row.get("symbol") or "")
         and abs(float(row.get("target_weight") or 0.0)) > 0.0
     }
-    observed_0901_vwap_symbol_set = set(observed_0901_vwap_symbols)
+    observed_0901_price_symbol_set = set(observed_0901_price_symbols)
     return quotes, {
         "potential_whole_lot_rows": potential_whole_lot_rows,
         "official_open_covered_rows": official_open_covered_rows,
@@ -752,10 +793,18 @@ def _entry_quotes(
         "exact_best_quote_symbols": sorted(set(exact_best_quote_symbols)),
         "adverse_tick_fallback_rows": adverse_tick_fallback_rows,
         "adverse_tick_fallback_symbols": sorted(set(adverse_tick_fallback_symbols)),
-        "observed_0901_vwap_rows": len(observed_0901_vwap_symbols),
-        "observed_0901_vwap_symbols": sorted(set(observed_0901_vwap_symbols)),
+        "observed_0901_price_rows": len(observed_0901_price_symbols),
+        "observed_0901_price_symbols": sorted(observed_0901_price_symbol_set),
+        "observed_0901_price_method_counts": observed_0901_price_method_counts,
+        "missing_0901_price_symbols": sorted(
+            nonzero_target_symbols - observed_0901_price_symbol_set
+        ),
+        # Compatibility aliases for older receipt readers. These now mean any
+        # source-backed 09:01 minute price, not exclusively a tick VWAP.
+        "observed_0901_vwap_rows": len(observed_0901_price_symbols),
+        "observed_0901_vwap_symbols": sorted(observed_0901_price_symbol_set),
         "missing_0901_vwap_symbols": sorted(
-            nonzero_target_symbols - observed_0901_vwap_symbol_set
+            nonzero_target_symbols - observed_0901_price_symbol_set
         ),
     }
 
@@ -1475,6 +1524,14 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
         "entry_0901_vwap_fill_count": int(
             mode.get("entry_0901_vwap_fill_count") or 0
         ),
+        "entry_0901_close_fill_count": int(
+            mode.get("entry_0901_close_fill_count") or 0
+        ),
+        "entry_0901_minute_price_fill_count": int(
+            mode.get("entry_0901_minute_price_fill_count")
+            or mode.get("entry_0901_vwap_fill_count")
+            or 0
+        ),
         "entry_requested_shares": int(mode.get("entry_requested_shares") or 0),
         "entry_filled_shares": int(mode.get("entry_filled_shares") or 0),
         "entry_unfilled_shares": int(mode.get("entry_unfilled_shares") or 0),
@@ -1902,6 +1959,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--replace-signal-market",
+        action="append",
+        default=[],
+        help=(
+            "Explicit strategy-replacement exception: discard the source-ledger "
+            "signal pins for this existing stable market ID and discover its "
+            "signals from the currently resolved deployment output. Every other "
+            "date/mode remains pinned. Requires --source-ledger-dir. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-history-source",
         type=Path,
         help=(
@@ -1923,7 +1991,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=[],
         help=(
-            "Local canonical minute-data root checked before any 09:01 VWAP "
+            "Local canonical minute-data root checked before any 09:01 price "
             "Shioaji query; repeat for multiple roots."
         ),
     )
@@ -2056,11 +2124,11 @@ def main() -> None:
     else:
         # Historical/missed-opening reconstruction is deliberately different
         # from the live runner. It sizes from the official 09:00 open and
-        # executes from the observed right-labelled 09:01 minute VWAP.
+        # executes from the source-backed right-labelled 09:01 minute price.
         specs = [
             replace(
                 spec,
-                entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+                entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                 entry_price_offset_ticks=0,
             )
             for spec in specs
@@ -2121,34 +2189,32 @@ def main() -> None:
             for day in official_sessions
             for spec in specs
         }
-        missing_signal_keys = sorted(expected_signal_keys - set(source_signal_ids))
         allowed_unpinned_markets = {
             str(value).strip()
             for value in args.allow_unpinned_market
             if str(value).strip()
         }
-        unknown_unpinned_markets = allowed_unpinned_markets - set(specs_by_market)
-        if unknown_unpinned_markets:
-            raise ValueError(
-                "--allow-unpinned-market names unknown modes: "
-                f"{sorted(unknown_unpinned_markets)}"
-            )
-        disallowed_missing = [
-            key for key in missing_signal_keys if key[1] not in allowed_unpinned_markets
-        ]
-        if disallowed_missing:
-            raise ValueError(
-                "source ledger is missing replay signal identities: "
-                f"{disallowed_missing[:20]}"
-            )
+        replacement_signal_markets = {
+            str(value).strip()
+            for value in args.replace_signal_market
+            if str(value).strip()
+        }
+        source_signal_ids, pin_provenance = _resolve_source_signal_pins(
+            source_signal_ids,
+            expected_signal_keys=expected_signal_keys,
+            known_markets=set(specs_by_market),
+            allowed_unpinned_markets=allowed_unpinned_markets,
+            replacement_signal_markets=replacement_signal_markets,
+        )
         source_ledger_provenance = {
             **(source_ledger_provenance or {}),
-            "allowed_unpinned_markets": sorted(allowed_unpinned_markets),
-            "discovered_signal_keys": len(missing_signal_keys),
-            "pinned_signal_keys": len(expected_signal_keys) - len(missing_signal_keys),
+            **pin_provenance,
         }
-    elif args.allow_unpinned_market:
-        raise ValueError("--allow-unpinned-market requires --source-ledger-dir")
+    elif args.allow_unpinned_market or args.replace_signal_market:
+        raise ValueError(
+            "--allow-unpinned-market and --replace-signal-market require "
+            "--source-ledger-dir"
+        )
     benchmark_state_provenance: dict[str, Any] | None = None
     if args.benchmark_state_source is not None:
         benchmark_state_path = args.benchmark_state_source.resolve()
@@ -2187,13 +2253,13 @@ def main() -> None:
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
         for spec in specs
     )
-    minute_vwap_at_0901 = bool(specs) and all(
-        spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+    minute_price_at_0901 = bool(specs) and all(
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
         for spec in specs
     )
     replay_entry_contract = (
-        "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
-        if minute_vwap_at_0901
+        REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+        if minute_price_at_0901
         else "retrospective_official_session_open_at_09_01_counterfactual"
         if official_open_at_0901
         else "retrospective_historical_best_quote_market_else_adverse_open_tick_counterfactual"
@@ -2203,7 +2269,7 @@ def main() -> None:
         else "retrospective_observed_best_quote_counterfactual"
     )
     receipt: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at": current.isoformat(timespec="seconds"),
         "simulation_only": True,
         "production_order_possible": False,
@@ -2211,10 +2277,11 @@ def main() -> None:
             "entry": replay_entry_contract,
             "entry_price": (
                 "the official 09:00 open is used only for inference/sizing and every "
-                "direction executes at the observed right-labelled 09:01 minute VWAP; "
-                "missing opens or VWAPs fail closed without open-fill, Bid/Ask, last, "
-                "or adverse-tick substitution"
-                if minute_vwap_at_0901
+                "direction executes at the source-backed right-labelled 09:01 minute "
+                "price (VWAP, otherwise that bar's Close); a missing tick is not a "
+                "no-fill rule, while a missing bar fails closed without open-fill, "
+                "carried last, Bid/Ask, or adverse-tick substitution"
+                if minute_price_at_0901
                 else "every direction uses the official session open and missing opens "
                 "fail closed without Bid/Ask, last-price, or adverse-tick substitution"
                 if official_open_at_0901
@@ -2224,8 +2291,8 @@ def main() -> None:
             ),
             "entry_liquidity": (
                 "complete independently legal whole-lot paper quantity at the observed "
-                "09:01 minute VWAP without any exchange-fill or queue claim"
-                if minute_vwap_at_0901
+                "09:01 minute price without any exchange-fill or queue claim"
+                if minute_price_at_0901
                 else
                 "complete independently legal whole-lot paper quantity at the official "
                 "open without any exchange-fill or queue claim"
@@ -2257,7 +2324,7 @@ def main() -> None:
             "recorded_entry_time": "09:01:00 Asia/Taipei for every replayed session",
             "historical_quote_window": (
                 "09:00:00-09:00:59 Asia/Taipei, right-labelled 09:01"
-                if minute_vwap_at_0901
+                if minute_price_at_0901
                 else "not used by official-open execution"
                 if official_open_at_0901
                 else "09:00:00-09:00:59 Asia/Taipei"
@@ -2469,7 +2536,7 @@ def main() -> None:
                     ),
                 }
             )
-        elif minute_vwap_at_0901:
+        elif minute_price_at_0901:
             try:
                 local_books, local_query = _local_0901_vwap_rows(
                     minute_roots=minute_data_roots,
@@ -2479,7 +2546,7 @@ def main() -> None:
                 unresolved = sorted(set(requested_book_symbols) - set(local_books))
                 remote_books: dict[str, dict[str, Any]] = {}
                 remote_query: dict[str, Any] = {
-                    "source": "not_required_local_0901_vwap_complete",
+                    "source": "not_required_local_0901_price_complete",
                     "requested_symbols": 0,
                     "queried_symbols": 0,
                     "resolved_symbols": 0,
@@ -2501,7 +2568,7 @@ def main() -> None:
                     except Exception as exc:
                         remote_books = {}
                         remote_query = {
-                            "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                            "source": "shioaji:historical_0901_minute_price_ticks_then_kbar",
                             "requested_symbols": len(unresolved),
                             "resolved_symbols": 0,
                             "unqueried_symbols": len(unresolved),
@@ -2512,7 +2579,7 @@ def main() -> None:
                         }
                 historical_books = {**local_books, **remote_books}
                 historical_book_query = {
-                    "source": "local_first_then_shioaji_0901_vwap",
+                    "source": "local_first_then_shioaji_0901_minute_price",
                     "trading_date": day.isoformat(),
                     "requested_symbols": len(requested_book_symbols),
                     "resolved_symbols": len(historical_books),
@@ -2530,7 +2597,7 @@ def main() -> None:
             except Exception as exc:
                 historical_books = {}
                 historical_book_query = {
-                    "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                    "source": "shioaji:historical_0901_minute_price_ticks_then_kbar",
                     "trading_date": day.isoformat(),
                     "requested_symbols": len(requested_book_symbols),
                     "resolved_symbols": 0,
@@ -2566,18 +2633,18 @@ def main() -> None:
                 books=historical_books,
             ),
         }
-        if minute_vwap_at_0901:
+        if minute_price_at_0901:
             resolved_symbols = set(historical_books)
             missing_symbols = sorted(
                 set(requested_book_symbols) - resolved_symbols
             )
             # The independent per-symbol execution contract must not turn one
             # illiquid/no-print stock into a portfolio-wide outage.  A row
-            # without an observed 09:01 VWAP remains blocked by
-            # _prepare_entry_plan; it is never replaced by the official open,
-            # last price, a best quote, or an adverse tick.  Retain the gap in
-            # the receipt so replay completeness cannot be confused with data
-            # completeness.
+            # without a source-backed 09:01 minute price remains blocked by
+            # _prepare_entry_plan; lack of ticks alone is not a blocker because
+            # a canonical KBar can supply VWAP or Close. An entirely missing
+            # bar is never replaced by the official open, carried last price,
+            # a best quote, or an adverse tick. Retain that gap in the receipt.
             historical_book_query.update(
                 {
                     "missing_actionable_symbols": missing_symbols,
@@ -2623,12 +2690,12 @@ def main() -> None:
                     "weights_path": str(weights_path.resolve()),
                     "simulation_replay": True,
                     "replay_basis": (
-                        "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_intraday_kbar_schedule"
-                        if minute_vwap_at_0901 and should_close and args.replay_intraday_kbars
-                        else "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_official_close"
-                        if minute_vwap_at_0901 and should_close
-                        else "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_live_quotes"
-                        if minute_vwap_at_0901
+                        "official_09_00_open_inference_to_observed_09_01_minute_price_to_intraday_kbar_schedule"
+                        if minute_price_at_0901 and should_close and args.replay_intraday_kbars
+                        else "official_09_00_open_inference_to_observed_09_01_minute_price_to_official_close"
+                        if minute_price_at_0901 and should_close
+                        else "official_09_00_open_inference_to_observed_09_01_minute_price_to_live_quotes"
+                        if minute_price_at_0901
                         else "official_session_open_at_09_01_to_official_close"
                         if official_open_at_0901 and should_close
                         else "official_session_open_at_09_01_to_live_quotes"
@@ -2638,16 +2705,16 @@ def main() -> None:
                         else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
                     "replay_source": (
-                        "immutable_live_signal_official_daily_session_open_and_shioaji_09_01_minute_vwap"
-                        if minute_vwap_at_0901
+                        "immutable_live_signal_official_daily_session_open_and_source_backed_09_01_minute_price"
+                        if minute_price_at_0901
                         else "immutable_live_signal_and_official_daily_session_open"
                         if official_open_at_0901
                         else "immutable_live_signal_shioaji_historical_tick_and_official_market_data"
                     ),
                     "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
-                        "observed_09_01_minute_vwap_full_requested_paper_quantity_no_exchange_fill_claim"
-                        if minute_vwap_at_0901
+                        "observed_09_01_minute_price_full_requested_paper_quantity_no_exchange_fill_claim"
+                        if minute_price_at_0901
                         else "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
                         if official_open_at_0901
                         else "historical_best_quote_full_requested_paper_quantity_else_"

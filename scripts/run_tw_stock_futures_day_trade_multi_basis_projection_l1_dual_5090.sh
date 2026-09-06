@@ -15,6 +15,8 @@ required_data=(
   data_tw_futures/taifex_portfolio_daily_v4/manifest.json
   data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
   data_tw_public/features/tw_public_stock_daily.parquet
+  data_tw_futures/taifex_stock_futures_minute_v1/manifest.json
+  data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet
 )
 for path in "${required_data[@]}"; do
   if [[ ! -s "$path" ]]; then
@@ -24,10 +26,10 @@ for path in "${required_data[@]}"; do
 done
 
 echo "[tw-stock-futures-day-trade] exact integer standard+mini contracts; full absolute-notional collateral; TWD 40/contract/side"
-echo "[tw-stock-futures-day-trade] 09:00 decision uses the daily 08:45 OPEN-to-CLOSE research proxy; it is not a live 09:00 fill claim"
+echo "[tw-stock-futures-day-trade] 08:45 decision; 08:46 minute entry; 13:20 limit; 13:24 market; 13:30 terminal"
 
 run_fintech_python train.py \
-  --config configs/markets/tw_stock_futures_day_trade_0900_integer_full_features_multi_basis_projection_l1_cash_capital10m.yaml \
+  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 56 \
   --torch-compile-threads 16 \

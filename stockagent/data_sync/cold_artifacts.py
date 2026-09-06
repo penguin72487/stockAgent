@@ -203,9 +203,29 @@ def publish_cold_artifact(
     *,
     node_id: str | None = None,
     repo_root: Path | None = None,
+    metadata: Mapping[str, str] | None = None,
 ) -> ResolvedSnapshot:
     status = validate_cold_artifact_source(artifact_root, spec)
     source = Path(str(status["source"]))
+    release_metadata = {
+        "artifact_relative_root": spec.relative_root,
+        "completion_contract": spec.completion_contract,
+        "source_lifecycle_validated": "true",
+        "transport_role": (
+            "cold-full-run"
+            if spec.maximum_file_bytes is None
+            else "cold-small-files"
+        ),
+    }
+    reserved = sorted(set(release_metadata) & set(metadata or {}))
+    if reserved:
+        raise SnapshotError(
+            "cold artifact metadata cannot override reserved key(s): "
+            + ", ".join(reserved)
+        )
+    release_metadata.update(
+        {str(key): str(value) for key, value in (metadata or {}).items()}
+    )
     return publish_packed_snapshot(
         sync_root,
         spec.dataset,
@@ -214,16 +234,7 @@ def publish_cold_artifact(
         loose_file_threshold_bytes=spec.loose_file_threshold_bytes,
         pack_buckets=spec.pack_buckets,
         maximum_file_bytes=spec.maximum_file_bytes,
-        metadata={
-            "artifact_relative_root": spec.relative_root,
-            "completion_contract": spec.completion_contract,
-            "source_lifecycle_validated": "true",
-            "transport_role": (
-                "cold-full-run"
-                if spec.maximum_file_bytes is None
-                else "cold-small-files"
-            ),
-        },
+        metadata=release_metadata,
         repo_root=repo_root,
     )
 

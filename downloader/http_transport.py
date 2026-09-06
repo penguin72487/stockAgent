@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 try:
@@ -22,25 +22,43 @@ except ImportError:  # direct ``python downloader/<script>.py`` execution
 
 
 DEFAULT_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# Public request selectors are useful in provider diagnostics. Unknown fields
+# still fail closed; do not infer that a short value cannot be a credential.
+_PUBLIC_QUERY_FIELDS = frozenset({
+    "series_id", "file_type", "observation_start", "observation_end",
+    "realtime_start", "realtime_end", "output_type", "sort_order",
+    "limit", "offset",
+})
 
 
 def sanitized_url(url: str) -> str:
     """Remove query/fragment data so API keys never reach errors or receipts."""
 
     parts = urlsplit(str(url))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
 
 
 def _sanitized_error_body(body: bytes, url: str) -> bytes:
     """Redact query values if an upstream error echoes the request URL."""
 
-    preview = body[:4096].decode("utf-8", errors="replace")
+    # Redact before truncation so a credential crossing the preview boundary
+    # cannot leak its prefix. Cover URL-encoded echoes as well as decoded ones.
+    preview = body.decode("utf-8", errors="replace")
     parts = urlsplit(str(url))
     preview = preview.replace(str(url), sanitized_url(url))
-    for _name, value in parse_qsl(parts.query, keep_blank_values=False):
-        if value:
-            preview = preview.replace(value, "[REDACTED]")
-    return preview.encode("utf-8", errors="replace")
+    secrets = {
+        value for name, value in parse_qsl(parts.query, keep_blank_values=False)
+        if name.casefold() not in _PUBLIC_QUERY_FIELDS
+    }
+    secrets.update(unquote(value) for value in (parts.username, parts.password) if value)
+    variants = {variant for value in secrets if value
+                for variant in (value, quote(value, safe=""), quote_plus(value, safe=""))}
+    variants.update(value for part in parts.query.split("&")
+                    for name, separator, value in [part.partition("=")]
+                    if separator and value and unquote_plus(name).casefold() not in _PUBLIC_QUERY_FIELDS)
+    for value in sorted(variants, key=len, reverse=True):
+        preview = preview.replace(value, "[REDACTED]")
+    return preview.encode("utf-8", errors="replace")[:4096]
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +162,9 @@ class ResilientHttpTransport:
                 if status in accepted_statuses:
                     return HttpResponse(status, body, headers_map, attempt + 1)
                 if status not in self.policy.retryable_statuses or attempt >= retries:
-                    raise HttpStatusError(status, url, body) from exc
+                    # The original HTTPError.reason may itself contain the
+                    # credential-bearing URL; don't leak it through traceback.
+                    raise HttpStatusError(status, url, body) from None
                 retry_after = next(
                     (
                         value
@@ -163,9 +183,10 @@ class ResilientHttpTransport:
                 # worker as well would apply the same backoff twice and leave
                 # the official bucket unnecessarily idle.
                 self.limiter.defer(cooldown)
-            except (URLError, TimeoutError, OSError):
+            except (URLError, TimeoutError, OSError) as exc:
                 if attempt >= retries:
-                    raise
+                    detail = _sanitized_error_body(str(exc).encode(), url).decode(errors="replace")
+                    raise URLError(f"{type(exc).__name__} for {sanitized_url(url)}: {detail}") from None
                 # Transport failures do not imply that every worker sharing
                 # the provider bucket must stop, so back off only this caller.
                 self._sleep(

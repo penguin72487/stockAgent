@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Rebuild audited one-minute day-trade and stock-benchmark curves.
 
-The script never changes orders, fills, positions, or final PnL.  It preserves
-the accepted 09:01 strategy-entry and 13:30 ledger marks byte-for-byte at the JSON-object
-level and inserts right-labelled historical one-minute last-trade valuations
-between them.  Missing trade minutes carry the latest observed trade/open
-price and are explicitly counted; prices are never linearly interpolated.
+The script never changes orders, fills, positions, or final PnL. It preserves
+the accepted 13:30 ledger marks and reconstructs right-labelled historical
+minute valuations. Explicit --revalue-opening-marks repairs entry-fee-only
+09:01 marks from the completed source Close. Missing later trade minutes carry
+the latest observed trade and are counted; prices are never interpolated.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 import sys
 
 import polars as pl
@@ -67,8 +67,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
@@ -76,8 +75,49 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             payload = json.loads(line)
             if not isinstance(payload, dict):
                 raise ValueError(f"JSONL row {line_number} is not an object: {path}")
-            rows.append(payload)
-    return rows
+            yield payload
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return list(_iter_jsonl(path))
+
+
+def missing_accepted_endpoints(
+    rows: Iterable[Mapping[str, Any]], *, start: date, end: date,
+    expected_sessions: Iterable[str] | None = None,
+    expected_markets: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Check irrecoverable ledger gaps before loading minute data or fetching.
+
+    Retain only endpoint keys so maintenance can stream a large marks ledger.
+    The completed-session/mode contract can also expose wholly absent pairs.
+    """
+    sessions: set[str] = set()
+    markets: set[str] = set()
+    present: set[tuple[str, str, str]] = set()
+    for row in rows:
+        session = str(row.get("session_date") or "")
+        if not _in_range(session, start, end):
+            continue
+        market = str(row.get("market") or "")
+        sessions.add(session)
+        markets.add(market)
+        minute = str(row.get("minute") or "")
+        for clock in ("09:01", "13:30"):
+            if minute == f"{session}T{clock}+08:00":
+                present.add((session, market, clock))
+    if expected_sessions is not None:
+        sessions = set(expected_sessions)
+    if expected_markets is not None:
+        markets = set(expected_markets)
+    missing = []
+    for session in sorted(sessions):
+        for market in sorted(markets):
+            clocks = [clock for clock in ("09:01", "13:30")
+                      if (session, market, clock) not in present]
+            if clocks:
+                missing.append({"session_date": session, "market": market, "missing_clocks": clocks})
+    return missing
 
 
 def _atomic_text(path: Path, text: str) -> None:
@@ -188,6 +228,7 @@ def load_positions(
     *,
     start: date,
     end: date,
+    fill_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
     by_day: dict[str, dict[str, dict[str, dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(dict)
@@ -227,6 +268,31 @@ def load_positions(
                 raise ValueError(f"current position without identity: {market}")
             by_day[session_date][str(market)][key] = dict(position)
 
+    if fill_rows is not None:
+        # Archives may retain positions from an older replay under the same
+        # stable market ID. Only the current append-only entry ledger proves
+        # that a position belongs to this replay; never resurrect stale trades.
+        entries = {
+            (str(row.get("session_date")), str(row.get("market")), str(row.get("position_id"))): row
+            for row in fill_rows if row.get("purpose") == "entry"
+            and _in_range(str(row.get("session_date") or ""), start, end)
+        }
+        for day, markets in by_day.items():
+            for market, positions in markets.items():
+                for key in list(positions):
+                    entry = entries.get((day, market, key))
+                    if entry is None:
+                        del positions[key]
+                        continue
+                    position = positions[key]
+                    if (_filled_quantity(position) != int(entry["quantity"])
+                        or not math.isclose(float(position["entry_price"]), float(entry["price"]), abs_tol=1e-8)):
+                        raise RuntimeError(f"position archive disagrees with entry ledger: {day}:{market}:{key}")
+        retained = {(day, market, key) for day, markets in by_day.items()
+                    for market, positions in markets.items() for key in positions}
+        missing = set(entries) - retained
+        if missing:
+            raise RuntimeError(f"entry ledger has no reconstructable position: {sorted(missing)[:10]}")
     return {
         day: {market: list(rows.values()) for market, rows in markets.items()}
         for day, markets in by_day.items()
@@ -397,6 +463,12 @@ class MinutePriceStore:
             root_identity = str(root.resolve())
             for (symbol, session_date), prices in staged.items():
                 self._root_cache[(root_identity, symbol, session_date)] = dict(prices)
+            # prices() uses the first nonempty source for a symbol/session.
+            # Reading lower-priority duplicates cannot change that result and
+            # needlessly loads the same multi-month tape twice into memory.
+            pairs = [pair for pair in pairs if not staged[pair]]
+            if not pairs:
+                break
 
     def prices(self, symbol: str, session_date: str) -> dict[str, float]:
         key = (str(symbol), str(session_date))
@@ -646,6 +718,8 @@ def rebuild_strategy_marks(
     end: date,
     fill_rows: Sequence[Mapping[str, Any]] = (),
     repair_unverified_existing: bool = False,
+    revalue_opening_marks: bool = False,
+    recompute_existing_marks: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fill exact minute holes without replacing observed strategy marks.
 
@@ -654,7 +728,9 @@ def rebuild_strategy_marks(
     interior minutes without auditable price provenance, are reconstructed
     from the retained one-minute trade tape and append-only exit-fill ledger.
     The fill ledger preserves real stop, take-profit, and partial-exit state;
-    the accepted 09:01 entry and 13:30 endpoint remain untouched.
+    Entry/exit fills and the accepted 13:30 endpoint remain untouched.
+    Explicit opening repair values 09:01 at its completed source bar Close,
+    using the same net-liquidation accounting as every following minute.
     """
 
     outside = [
@@ -693,6 +769,9 @@ def rebuild_strategy_marks(
     preserved_rows = 0
     carried_rows = 0
     fresh_ratios: list[float] = []
+    opening_revaluations: list[dict[str, Any]] = []
+    changed_equity_rows = 0
+    maximum_equity_change_twd = 0.0
     fills_by_position: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(
         list
     )
@@ -769,15 +848,25 @@ def rebuild_strategy_marks(
                 preserve_existing = bool(
                     existing is not None
                     and (
-                        clock in {"09:01", "13:30"}
-                        or not repair_unverified_existing
-                        or historical_minute_mark_has_source(existing)
+                        clock == "13:30"
+                        or (clock == "09:01" and not revalue_opening_marks)
+                        or (clock != "09:01" and not recompute_existing_marks and (
+                            not repair_unverified_existing
+                            or historical_minute_mark_has_source(existing)
+                        ))
                     )
                 )
                 if preserve_existing:
                     generated.append(dict(existing))
                     preserved_rows += 1
                     continue
+                if clock == "09:01" and revalue_opening_marks:
+                    missing_open = set(minute_prices) - fresh_symbols
+                    if missing_open:
+                        raise RuntimeError(
+                            f"missing completed 09:01 valuation bar for "
+                            f"{session_date}:{market}:{sorted(missing_open)}"
+                        )
                 if existing is not None:
                     replaced_unverified_rows += 1
                 open_net = 0.0
@@ -871,6 +960,18 @@ def rebuild_strategy_marks(
                         "simulation_only": True,
                     }
                 )
+                if clock == "09:01" and revalue_opening_marks:
+                    opening_revaluations.append({
+                        "session_date": session_date,
+                        "market": market,
+                        "before_equity_twd": float(opening["total_equity_twd"]),
+                        "after_equity_twd": initial_capital + cumulative + open_net,
+                    })
+                if existing is not None:
+                    delta = abs(float(existing.get("total_equity_twd") or 0.0)
+                                - generated[-1]["total_equity_twd"])
+                    changed_equity_rows += int(delta > 0.000001)
+                    maximum_equity_change_twd = max(maximum_equity_change_twd, delta)
                 inserted_rows += int(existing is None)
     rows = outside + generated
     rows.sort(
@@ -889,6 +990,9 @@ def rebuild_strategy_marks(
         "inserted_missing_rows": inserted_rows,
         "replaced_unverified_rows": replaced_unverified_rows,
         "duplicate_rows_removed": duplicate_rows_removed,
+        "opening_revaluations": opening_revaluations,
+        "changed_equity_rows": changed_equity_rows,
+        "maximum_equity_change_twd": maximum_equity_change_twd,
         "rows_with_carried_prices": carried_rows,
         "minimum_fresh_trade_notional_coverage_ratio": min(fresh_ratios, default=1.0),
         "mean_fresh_trade_notional_coverage_ratio": (
@@ -1202,6 +1306,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--fetch-workers", type=int, default=1)
+    parser.add_argument(
+        "--revalue-opening-marks", action="store_true",
+        help="Revalue 09:01 from the completed source bar Close; preserve all fills and 13:30.",
+    )
+    parser.add_argument("--recompute-existing-strategy-marks", action="store_true",
+                        help="Reconcile all interior marks with entry/exit fills and source minute prices.")
     parser.add_argument("--requests-per-second", type=float, default=5.0)
     parser.add_argument(
         "--max-traffic-fraction",
@@ -1214,6 +1324,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if (args.revalue_opening_marks or args.recompute_existing_strategy_marks) and args.validate_existing_strategy_marks:
+        raise ValueError("opening revaluation cannot be combined with preserve-only validation")
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
     if start > end:
@@ -1238,9 +1350,12 @@ def main() -> None:
         *DEFAULT_LOCAL_MINUTE_CACHE_ROOTS,
     ]
     store = MinutePriceStore(local_roots, local_cache_roots)
-    positions = load_positions(args.state_dir, start=start, end=end)
     source_marks = _read_jsonl(args.state_dir / "marks.jsonl")
+    missing_endpoints = missing_accepted_endpoints(source_marks, start=start, end=end)
+    if missing_endpoints:
+        raise RuntimeError(f"missing accepted endpoints before minute-data preparation: {missing_endpoints[:20]}")
     source_fills = _read_jsonl(args.state_dir / "fills.jsonl")
+    positions = load_positions(args.state_dir, start=start, end=end, fill_rows=source_fills)
     session_dates = sorted(
         {
             str(row.get("session_date"))
@@ -1307,6 +1422,8 @@ def main() -> None:
             repair_unverified_existing=bool(
                 args.repair_unverified_strategy_marks
             ),
+            revalue_opening_marks=bool(args.revalue_opening_marks),
+            recompute_existing_marks=bool(args.recompute_existing_strategy_marks),
         )
     source_benchmarks = _read_json(args.state_dir / "benchmark_history.json")
     rebuilt_benchmarks, benchmark_stats = rebuild_benchmark_history(
@@ -1330,7 +1447,10 @@ def main() -> None:
         "end_date": end.isoformat(),
         "minute_contract": MINUTE_CONTRACT,
         "linear_interpolation_used": False,
-        "accepted_09_01_strategy_and_13_30_endpoints_preserved": True,
+        "accepted_09_01_strategy_and_13_30_endpoints_preserved": not args.revalue_opening_marks,
+        "accepted_13_30_endpoints_preserved": True,
+        "opening_marks_revalued_at_completed_minute": bool(args.revalue_opening_marks),
+        "unchanged_fills_sha256": _sha256(args.state_dir / "fills.jsonl"),
         "existing_bracket_aware_strategy_marks_preserved": bool(
             args.validate_existing_strategy_marks
         ),

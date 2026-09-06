@@ -26,6 +26,10 @@
 
 ## 第一性架構
 
+整個研究與線上系統的模組、組件、策略入口和服務責任，見
+[專案架構與修改導航](docs/project_architecture.md)。該頁也提供從現行 registry、
+configs、Git refs 與 systemd 產生 AI 可讀清單的唯讀命令。
+
 ### 要解決的限制
 
 1. Git 適合程式與小型設定，不適合數十 GB 資料或模型產物。

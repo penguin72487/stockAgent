@@ -8,7 +8,8 @@ executes the same production pre-open readiness gate.  Only after that gate is
 ready does it inject an opening observation, publish four atomic signal
 pointers, and execute them immediately after 09:00 using a strictly later best
 Ask/Bid. A separate isolated phase proves that missed-opening replay sizes from
-the official 09:00 open and executes from an observed 09:01 minute VWAP.
+the official 09:00 open and executes from a source-backed 09:01 minute price
+(VWAP, otherwise that KBar's Close).
 
 The final phase advances that same durable engine through intraday marking,
 13:20 passive exits, 13:24 market-at-best force exits, the 13:30 close, and two
@@ -56,10 +57,11 @@ from scripts.run_tw_day_trade_simulation import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_service_sync import load_service_sync  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     LiveEligibility,
     ModeSpec,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     TwDayTradeSimulationEngine,
 )
 
@@ -329,6 +331,7 @@ def _discord_receipt(
         "production_order_possible": False,
         "discord_connected": True,
         "day_trade_markets": [spec.market for spec in specs],
+        "scheduled_day_trade_markets": [spec.market for spec in specs],
     }
 
 
@@ -1012,7 +1015,7 @@ def run_two_phase_cold_test(
     )
 
     # Phase 2C: replay is isolated from live state and keeps inference/sizing
-    # at the official 09:00 open while execution uses the 09:01 minute VWAP.
+    # at the official 09:00 open while execution uses the 09:01 minute price.
     replay_engine = TwDayTradeSimulationEngine(sandbox / "replay_engine")
     replay_at = _at(session_date, 9, 1)
     replay_results: dict[str, str] = {}
@@ -1020,7 +1023,7 @@ def run_two_phase_cold_test(
     for spec in specs:
         replay_spec = replace(
             spec,
-            entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+            entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
             entry_price_offset_ticks=0,
         )
         loaded = _latest_signal(spec, commit_at)
@@ -1031,15 +1034,14 @@ def run_two_phase_cold_test(
             **source_summary,
             "signal_id": f"replay-{session_date.isoformat()}-{spec.market}",
             "simulation_replay": True,
-            "replay_basis": "official_09_00_open_to_observed_09_01_minute_vwap",
-            "entry_fill_contract": (
-                "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
-            ),
+            "replay_basis": "official_09_00_open_to_observed_09_01_minute_price",
+            "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
         }
         replay_quote = _opening_quote(session_date, replay_at)
         replay_quote.update(
             {
                 "execution_price_0901": 1_003.0,
+                "execution_price_0901_method": "minute_vwap",
                 "entry_price_source": "fixture_0901_minute_vwap",
                 "historical_source_quote_at": _at(
                     session_date, 9, 0, 59
@@ -1075,13 +1077,13 @@ def run_two_phase_cold_test(
         }
     _assert_check(
         checks,
-        "phase2_missed_open_replay_uses_open_for_sizing_and_0901_vwap_for_fill",
+        "phase2_missed_open_replay_uses_open_for_sizing_and_0901_price_for_fill",
         set(replay_results.values()) == {"registered"}
         and all(
             row["entry_price"] == 1_003.0
             and row["entry_at"] == replay_at.isoformat(timespec="seconds")
             and row["entry_fill_policy"]
-            == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+            == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
             and row["counterfactual_open_price_fill"] is False
             and row["counterfactual_0901_price_fill"] is True
             and row["synthetic_fallback_fill"] is False
@@ -1375,7 +1377,7 @@ def run_two_phase_cold_test(
             "production_atomic_signal_pointer_consumer": True,
             "production_integer_paper_execution_engine": True,
             "production_0900_live_causal_best_quote_contract": True,
-            "missed_open_0900_inference_0901_vwap_replay_contract": True,
+            "missed_open_0900_inference_0901_price_replay_contract": True,
             "production_intraday_mark_and_exit_state_machine": True,
             "production_restart_recovery_and_idempotency": True,
             "external_publication_delivery": "deterministic_fixture",

@@ -4,7 +4,8 @@ base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10
 # 2014-01-06 至真實分鐘資料首日前使用明確標記的日 K 壓力代理：多單
 # open+1 tick / close-1 tick，空單 open-1 tick / close+1 tick；代理一分鐘量
 # 為日成交量 / 271，再由相同 executor 取 50%，避免誤用整天成交量。
-# 分鐘資料開始後仍依序執行 09:01 首分鐘 VWAP、13:20
+# 分鐘資料開始後仍依序執行 09:01 首分鐘價（VWAP 優先，
+# 否則使用同來源該根 K 棒 Close）、13:20
 # 限價、13:24 市價、13:25 Limit ROD / 13:30 收盤集合競價，且每個
 # 分鐘 K 只取 50%，缺少分鐘 partition 時不准退回日 K 代理。
 experiment_name: tw-day-trade-daily-multi-basis-projection-l1-hybrid-minute-tplus2-close-commission20-capital10m-all-features-causal-rms-v8

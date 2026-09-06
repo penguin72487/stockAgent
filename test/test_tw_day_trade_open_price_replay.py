@@ -370,9 +370,42 @@ def test_local_0901_vwap_loader_uses_amount_over_normalized_shares(
     )
 
     assert rows["2330"]["execution_price_0901"] == 100.75
+    assert rows["2330"]["execution_price_0901_method"] == "minute_vwap"
     assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
     assert receipt["resolved_symbols"] == 1
     assert receipt["additional_shioaji_requests"] == 0
+
+
+def test_local_0901_price_loader_uses_source_kbar_close_without_tick_or_vwap(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "minute" / "trade_date=2026-08-13"
+    partition.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330"],
+            "date": [date(2026, 8, 13)],
+            "ts": [datetime(2026, 8, 13, 9, 1)],
+            "minutes_from_open": [1],
+            "Open": [100.0],
+            "High": [102.0],
+            "Low": [99.0],
+            "Close": [101.0],
+            "Amount": [0.0],
+            "volume_shares": [0.0],
+        }
+    ).write_parquet(partition / "data.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 101.0
+    assert rows["2330"]["execution_price_0901_method"] == "minute_close"
+    assert rows["2330"]["tick_count_0901"] == 0
+    assert receipt["price_method_counts"] == {"minute_close": 1}
 
 
 def test_previous_official_session_ignores_malformed_legacy_date(
@@ -567,6 +600,56 @@ def test_source_ledger_pins_each_date_mode_signal_identity(tmp_path: Path) -> No
     }
     assert provenance["signal_registrations"] == 2
     assert len(provenance["sha256"]) == 64
+
+
+def test_source_signal_pins_replace_only_the_selected_stable_market() -> None:
+    expected = {
+        ("2026-08-13", "stable"),
+        ("2026-08-13", "control"),
+        ("2026-08-14", "stable"),
+        ("2026-08-14", "control"),
+    }
+    source = {
+        key: f"old-{day}-{market}"
+        for day, market in expected
+        for key in [(day, market)]
+    }
+
+    pins, provenance = replay._resolve_source_signal_pins(
+        source,
+        expected_signal_keys=expected,
+        known_markets={"stable", "control"},
+        allowed_unpinned_markets=set(),
+        replacement_signal_markets={"stable"},
+    )
+
+    assert set(pins) == {
+        ("2026-08-13", "control"),
+        ("2026-08-14", "control"),
+    }
+    assert provenance == {
+        "allowed_unpinned_markets": [],
+        "replacement_signal_markets": ["stable"],
+        "replaced_pinned_signal_keys": 2,
+        "discovered_signal_keys": 2,
+        "pinned_signal_keys": 2,
+    }
+
+
+def test_source_signal_pins_fail_closed_for_unselected_missing_mode() -> None:
+    expected = {
+        ("2026-08-13", "stable"),
+        ("2026-08-13", "control"),
+    }
+
+    with pytest.raises(ValueError, match="missing replay signal identities"):
+        replay._resolve_source_signal_pins(
+            {("2026-08-13", "stable"): "old-stable"},
+            expected_signal_keys=expected,
+            known_markets={"stable", "control"},
+            allowed_unpinned_markets=set(),
+            replacement_signal_markets={"stable"},
+        )
 
 
 def test_counterfactual_open_input_excludes_intraday_high_low_close() -> None:

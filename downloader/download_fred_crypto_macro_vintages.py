@@ -215,11 +215,43 @@ def _realtime_windows(start_date: str, end_date: str) -> list[tuple[str, str]]:
     return windows
 
 
+def _resolve_end_date(
+    requested: str, *, series_id: str, api_key: str,
+    transport: ResilientHttpTransport,
+) -> tuple[str, dict[str, str]]:
+    """Pin the run to FRED's own current date, independent of host timezone.
+
+    Omitting realtime_start/end uses the provider's documented current-date
+    defaults. A one-row probe supplies that boundary without guessing its
+    timezone or requesting a future vintage at the Taiwan daily schedule.
+    """
+    requested_day = None if requested in {"today", "now"} else date.fromisoformat(requested)
+    params = {"series_id": series_id, "api_key": api_key, "file_type": "json", "limit": 1}
+    response = transport.request_bytes(
+        f"{BASE_URL}?{urlencode(params)}", headers={"Accept": "application/json"},
+    )
+    document = json.loads(response.body)
+    provider_day = date.fromisoformat(str(document["realtime_end"]))
+    if provider_day == date.max:
+        raise ValueError("FRED current-date probe returned an unbounded realtime_end")
+    effective = min(requested_day, provider_day) if requested_day else provider_day
+    return effective.isoformat(), {
+        "requested_end_date": requested,
+        "provider_current_date": provider_day.isoformat(),
+        "effective_end_date": effective.isoformat(),
+        "end_date_basis": "fred_default_realtime_end",
+    }
+
+
 def parse_initial_release_rows(
     series_id: str, payload: bytes, *, retrieved_at_utc: datetime
 ) -> list[dict[str, object]]:
     document = json.loads(payload)
-    observations = document.get("observations") or []
+    if not isinstance(document, dict) or not isinstance(document.get("observations"), list):
+        raise ValueError("FRED payload must contain an observations array")
+    observations = document["observations"]
+    if "count" in document and int(document["count"]) != len(observations):
+        raise ValueError("FRED observation response is incomplete; count differs from returned rows")
     rows: list[dict[str, object]] = []
     raw_sha256 = sha256_bytes(payload)
     for item in observations:
@@ -292,7 +324,11 @@ def _read_cached_window(
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if (
-            int(receipt.get("request_contract_version", -1)) != REQUEST_CONTRACT_VERSION
+            receipt.get("status") not in {"complete", "complete_with_point_in_time_gap"}
+            or receipt.get("series_id") != window.series_id
+            or receipt.get("realtime_start") != window.realtime_start
+            or receipt.get("realtime_end") != window.realtime_end
+            or int(receipt.get("request_contract_version", -1)) != REQUEST_CONTRACT_VERSION
             or str(receipt.get("observation_start") or "") != observation_start
             or int(receipt.get("output_type", -1)) != 4
         ):
@@ -469,16 +505,12 @@ def main() -> None:
     started = datetime.now(timezone.utc)
     output_dir = Path(args.output_dir)
     api_key = _configured_api_key(Path(args.env_file))
-    end_date = (
-        date.today().isoformat() if args.end_date in {"today", "now"} else args.end_date
-    )
     try:
         start_day = date.fromisoformat(args.start_date)
-        end_day = date.fromisoformat(end_date)
+        if args.end_date not in {"today", "now"}:
+            date.fromisoformat(args.end_date)
     except ValueError as exc:
         raise ValueError("FRED start/end dates must use ISO YYYY-MM-DD") from exc
-    if end_day < start_day:
-        raise ValueError("FRED end date precedes start date")
     series = tuple(
         dict.fromkeys(
             str(value).strip().upper() for value in args.series if str(value).strip()
@@ -486,6 +518,33 @@ def main() -> None:
     )
     if not series:
         raise ValueError("at least one FRED series is required")
+    progress: PersistentProgress | None = None
+    transport = ResilientHttpTransport(
+        HttpRequestPolicy(
+            provider="fred_api", timeout_seconds=60, max_retries=args.max_retries,
+            retry_base_seconds=1.0, retry_cap_seconds=30.0,
+        ),
+        on_attempt=lambda _provider: progress.observe(
+            "fred_request", "http_attempts", publish_interval_seconds=1.0
+        ) if progress is not None else None,
+    )
+    try:
+        end_date, date_boundary = _resolve_end_date(
+            args.end_date, series_id=series[0], api_key=api_key, transport=transport,
+        )
+    except Exception as exc:
+        output_path = output_dir / "observations.parquet"
+        _atomic_json(output_dir / "download_summary.json", {
+            "schema_version": SCHEMA_VERSION, "state": "failed",
+            "failed_stage": "provider_date_probe", "requested_end_date": args.end_date,
+            "canonical_output_preserved": output_path.is_file(),
+            "error": f"{type(exc).__name__}: {exc}",
+            "started_at_utc": started.isoformat(),
+            "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        raise
+    if date.fromisoformat(end_date) < start_day:
+        raise ValueError("FRED effective end date precedes start date")
     windows = [
         FredWindow(series_id, realtime_start, realtime_end)
         for series_id in series
@@ -498,18 +557,6 @@ def main() -> None:
         unit="series-window",
         basis="hash-verified cached or completed FRED vintage windows",
         started_at=started,
-    )
-    transport = ResilientHttpTransport(
-        HttpRequestPolicy(
-            provider="fred_api",
-            timeout_seconds=60,
-            max_retries=args.max_retries,
-            retry_base_seconds=1.0,
-            retry_cap_seconds=30.0,
-        ),
-        on_attempt=lambda _provider: progress.observe(
-            "fred_request", "http_attempts", publish_interval_seconds=1.0
-        ),
     )
     results: list[FredWindowResult] = []
     pending: list[FredWindow] = []
@@ -618,6 +665,7 @@ def main() -> None:
             "series": list(series),
             "start_date": args.start_date,
             "end_date": end_date,
+            **date_boundary,
             "failed_windows": len(failed),
             "canonical_output_preserved": output_path.is_file(),
             "canonical_output_path": str(output_path)
@@ -653,6 +701,7 @@ def main() -> None:
         "rows": frame.height,
         "start_date": args.start_date,
         "end_date": end_date,
+        **date_boundary,
         "point_in_time_contract": (
             "Only initial-release values are retained; each is usable at the "
             "first UTC midnight after FRED realtime_start because no intraday "

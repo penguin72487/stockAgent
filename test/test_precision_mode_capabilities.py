@@ -12,6 +12,7 @@ from scripts.benchmark_precision_modes import (
 )
 from types import SimpleNamespace
 from stockagent.training.trainer import _resolve_amp_dtype
+import scripts.benchmark_precision_modes as precision_benchmark
 
 
 def _cuda_supports_nvfp4() -> bool:
@@ -22,6 +23,13 @@ def test_project_amp_contract_remains_bf16_and_fp16_only() -> None:
     assert _resolve_amp_dtype("bf16") is torch.bfloat16
     assert _resolve_amp_dtype("fp16") is torch.float16
     assert _resolve_amp_dtype("tf32") is None
+
+
+def test_optional_precision_backend_preserves_import_failure_reason(monkeypatch) -> None:
+    monkeypatch.setattr(precision_benchmark, "te", None)
+    monkeypatch.setattr(precision_benchmark, "TRANSFORMER_ENGINE_IMPORT_ERROR", "ImportError: missing native library")
+    with pytest.raises(RuntimeError, match="ImportError: missing native library"):
+        TransformerEngineLinearCompat(nn.Linear(2, 1), "transformer_engine_nvfp4")
 
 
 def test_precision_benchmark_runnable_training_modes() -> None:

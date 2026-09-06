@@ -1,0 +1,32 @@
+base_config: tw_stock_futures_day_trade_0900_integer_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-futures-day-trade-0845-decision-0846-entry-1330-flat-v1
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_minute_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  # 08:45 is before the cash-stock auction. Keep every prior-completed feature.
+  day_trade_open_feature: false
+  feature_exclude:
+    - next_session_open_gap_logret
+
+trading:
+  execution_mode: tw_stock_futures_day_trade_0845_minute
+  tw_stock_futures_day_trade_minute_data_path: data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet
+  max_volume_participation: 0.5
+
+training:
+  multi_gpu_strategy: auto
+  # Isolate this contract from stale kernels in the shared compiler cache.
+  torchinductor_cache_dir: ~/.cache/torchinductor/tw_stock_futures_0845_minute_v1
+  triton_cache_dir: ~/.cache/triton/tw_stock_futures_0845_minute_v1
+  # One daily action; the canonical loss owns scheduled integer executions.
+  compile_loss: false
+  # The scheduled contract runs through the existing eager integer adapter.
+  backtest_compile: false
+  eval_backtest_compile: false
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false

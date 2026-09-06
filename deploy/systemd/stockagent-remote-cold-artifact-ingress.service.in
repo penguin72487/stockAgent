@@ -1,0 +1,21 @@
+[Unit]
+Description=Ingest allowlisted complete artifacts into the durable StockAgent cold store
+Wants=network-online.target syncthing@root.service
+After=network-online.target syncthing@root.service
+ConditionPathIsDirectory=/srv/stockagent-packed
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/etc/stockagent/remote-cold-artifact-ingress.env
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_remote_cold_artifact_ingress.sh"
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+TimeoutStartSec=infinity

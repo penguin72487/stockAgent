@@ -1317,6 +1317,12 @@ def _generic_group(
         for payload in payloads
         if isinstance(payload, Mapping)
     )
+    completed_cycle_with_gaps = any(
+        str(payload.get("state") or "").lower() == "partial"
+        and str(payload.get("cycle_state") or "").lower() == "complete"
+        for payload in payloads
+        if isinstance(payload, Mapping)
+    )
     completed = max(0, total - failure)
     coverage = _coverage(completed, total, unit="項", label="最近批次")
 
@@ -1329,7 +1335,9 @@ def _generic_group(
     elif failure or batch_incomplete:
         status = "degraded"
         status_label = (
-            f"最近批次有 {failure:,} 個失敗" if failure else "最近批次未完整收斂"
+            "本輪維護完成；歷史資料仍有未驗證缺口"
+            if completed_cycle_with_gaps and not failure
+            else f"最近批次有 {failure:,} 個失敗" if failure else "最近批次未完整收斂"
         )
     elif fresh["state"] == "stale":
         status = "stale"
@@ -1437,8 +1445,14 @@ def _generic_group(
             eta = _unknown_eta("waiting_schedule", "等待下一輪重試與新回執。")
 
     warning = []
+    if completed_cycle_with_gaps:
+        warning.append(
+            "cycle_state=complete 只代表本輪維護成功；state=partial 代表歷史資料尚未完整。"
+            "隔離來源或修補候選仍須獨立驗證，不能以重跑成功取代完整性證明。"
+        )
     if failure or batch_incomplete:
-        warning.append("最近一次摘要含失敗項目；成功檔案不代表整批完整。")
+        if not completed_cycle_with_gaps or failure:
+            warning.append("最近一次摘要含失敗項目；成功檔案不代表整批完整。")
     if isinstance(progress_payload, Mapping):
         live_counts = progress_payload.get("status_counts")
         live_failures = 0
