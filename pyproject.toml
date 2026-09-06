@@ -2,11 +2,12 @@
 testpaths = ["test"]
 python_files = ["test_*.py"]
 filterwarnings = [
-  # Treat new warnings as failures. These two exact deprecations are emitted by
-  # OpenBB 4.7.2 internals and cannot be repaired from stockAgent; keep the
-  # exceptions narrow by message and originating module until OpenBB removes
-  # its aiohttp subclass and classmethod Pydantic validator.
+  # Treat new warnings as failures. Keep third-party compatibility exceptions
+  # narrow by message and originating module; do not hide project warnings.
   "error",
+  # discord.py imports this Python 3.12 stdlib module for voice support even
+  # when only Gateway commands are used. Keep other deprecations actionable.
+  "ignore:'audioop' is deprecated and slated for removal in Python 3.13:DeprecationWarning:discord\\.player",
   "ignore:Inheritance class ClientSession from ClientSession is discouraged:DeprecationWarning:openbb_core\\.provider\\.utils\\.client",
   "ignore:Using `@model_validator` with mode='after' on a classmethod is deprecated.*:DeprecationWarning:openbb_core\\.app\\.model\\.system_settings",
   # PyTorch 2.x still imports an internal MKLDNN ScriptModule while resetting

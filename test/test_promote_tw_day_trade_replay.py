@@ -118,6 +118,33 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     )
 
 
+def test_opening_revaluation_requires_unchanged_fills_and_sourced_opening(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path)
+    fills = candidate / "fills.jsonl"
+    fills.write_text("")
+    receipt_path = candidate / "minute_curve_receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt.update(accepted_09_01_strategy_and_13_30_endpoints_preserved=False,
+                   accepted_13_30_endpoints_preserved=True,
+                   opening_marks_revalued_at_completed_minute=True,
+                   unchanged_fills_sha256=promotion._sha256(fills))
+    receipt_path.write_text(json.dumps(receipt))
+    result = promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+    assert result["minute_curve_validation"]["opening_marks_revalued_at_completed_minute"] is True
+    fills.write_text("{}\n")
+    with pytest.raises(RuntimeError, match="changed the accepted fills ledger"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+    fills.write_text("")
+    marks = candidate / "marks.jsonl"
+    rows = [json.loads(line) for line in marks.read_text().splitlines()]
+    rows[0].pop("valuation_source")
+    marks.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    receipt["outputs"]["marks"]["sha256"] = promotion._sha256(marks)
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="without auditable historical"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+
 def test_validate_rebuild_rejects_stale_daily_only_curve(tmp_path: Path) -> None:
     candidate = _candidate(tmp_path)
     receipt_path = candidate / "minute_curve_receipt.json"
@@ -221,7 +248,7 @@ def test_validate_rebuild_accepts_0901_official_open_contract(tmp_path: Path) ->
     assert result["synthetic_fallback_fills"] == 0
 
 
-def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
+def test_validate_rebuild_accepts_0900_open_0901_kbar_close_contract(
     tmp_path: Path,
 ) -> None:
     candidate = _candidate(tmp_path)
@@ -229,17 +256,19 @@ def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     for mode in state["modes"].values():
         mode["entry_fill_policy"] = promotion.MINUTE_VWAP_0901_ENTRY_POLICY
-        mode["entry_fill_contract"] = promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT
+        mode["entry_fill_contract"] = promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
     receipt_path = candidate / "rebuild_receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["replay_contract"] = {"entry": promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT}
+    receipt["replay_contract"] = {"entry": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT}
     for row in receipt["sessions"][0]["modes"]:
         row["entry"] = {
             "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
             "entry_fill_count": 1,
-            "entry_0901_vwap_fill_count": 1,
+            "entry_0901_vwap_fill_count": 0,
+            "entry_0901_close_fill_count": 1,
+            "entry_0901_minute_price_fill_count": 1,
             "entry_official_open_fill_count": 0,
             "entry_fill_is_synthetic": False,
         }
@@ -263,7 +292,8 @@ def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
                     "filled_shares": 1_000,
                     "execution_price": 101.0,
                     "sizing_open_price": 100.0,
-                    "entry_price_source": "fixture_0901_minute_vwap",
+                    "entry_price_source": "fixture_0901_minute_close",
+                    "entry_price_method": "minute_close",
                 }
             )
             + "\n"
@@ -279,8 +309,9 @@ def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
                     "market": market,
                     "purpose": "entry",
                     "fill_at": "2026-08-13T09:01:00+08:00",
-                    "fill_contract": promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT,
+                    "fill_contract": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT,
                     "price": 101.0,
+                    "entry_price_method": "minute_close",
                 }
             )
             + "\n"
@@ -291,9 +322,10 @@ def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
 
     result = promotion._validate_rebuild(candidate, expected_markets=MARKETS)
 
-    assert result["minute_vwap_0901_fills"] == 3
+    assert result["minute_vwap_0901_fills"] == 0
+    assert result["minute_price_0901_fills"] == 3
     assert result["signal_ledger_validation"][
-        "fill_ledger_minute_vwap_0901_fills"
+        "fill_ledger_minute_price_0901_fills"
     ] == 3
 
 

@@ -95,8 +95,10 @@ checkpoint/artifact gate 通過並建立獨立 deployment manifest 後才能啟�
 既有模式仍然每天只輸出一次 signed target weights，不是每分鐘重新決策。執行
 label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 26]`：
 
-- 官方開盤價只負責把權重換算成整張股數；09:01 第一根完成 K 的
-  `Amount / volume_shares` VWAP 才是進場成交價。
+- 官方開盤價只負責模型輸入與把權重換算成整張股數；09:01 第一根完成 K
+  優先用 `Amount / volume_shares` VWAP，無法計算時使用同根來源 K 棒
+  `Close`。逐筆 tick 缺失不是不成交條件；整根 09:01 K 棒缺失才
+  fail-closed，且兩種價格都只是反事實紙上成交，不是交易所撮合證明。
 - 每次成交容量都是 `floor(50% * 該分鐘成交股數 / 1000) * 1000`。
 - 13:20 以已完成 K 的收盤價掛被動限價；13:21--13:23 必須嚴格穿價才
   成交，只有碰價不假設排隊成交。

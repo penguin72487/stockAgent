@@ -14,6 +14,37 @@
 
 歷史官方開盤訊號重建屬於反事實模擬。它不表示訊號當天 09:00 已實際存在，也不表示成交是交易所或券商回報。
 
+事後回補的價格契約固定分成兩個時鐘：09:00 官方開盤價只供模型輸入與整張股數計算；紙上買賣記在 09:01，優先使用右標記首分鐘的 `Amount / volume_shares`，無法計算 VWAP 時改用來源實際發布的同根 K 棒 `Close`。沒有逐筆 tick 本身不構成不成交；只有整根 09:01 K 棒缺失或價格無效才 fail-closed，而且不得用 09:00 開盤、前價、Bid/Ask 或不利一 Tick 補造。Ledger 必須留下 `minute_vwap` 或 `minute_close` 方法，兩者都只是反事實紙上估值。
+
+### 每分鐘曲線與成交價格分開核對
+
+曲線的每個點是「初始資金＋截至該分鐘的已實現淨損益＋剩餘持倉淨清算損益」。
+09:01 成交可用 VWAP，但 09:01 估值必須與後續分鐘一致：使用該根來源 K 棒 Close，
+扣除尚未分攤的進場費用與預估出場費用。不可只記進場費用、把第一分鐘價格變化拖到 09:02。
+停利、停損與部分出場的股數及已實現損益必須以 `fills.jsonl` 核對；
+舊 replay 留下、卻不在本次進場帳本中的 `position_history` 不可重新算成有效交易。
+
+修復既有曲線時，先複製完整 live 目錄為同檔案系統的隔離 candidate，再執行：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/rebuild_tw_day_trade_minute_curves.py \
+  --state-dir <candidate-directory> \
+  --start-date 2026-02-25 --end-date 2026-09-04 \
+  --output-dir <audit-output-directory> \
+  --simulation --revalue-opening-marks --recompute-existing-strategy-marks --publish
+```
+
+日期須依完成交易日調整；此處 `--publish` 只寫入 candidate，不可直接指定運行中的 live。
+重建不改成交、模型、部位封存及 13:30 收盤損益；收據保留第一點重估前後值與不變的成交帳本 hash。
+之後必須使用既有 `promote_tw_day_trade_replay.py --validate-only`、空倉檢查與原子交換流程，
+保留 rollback，再驗證公開頁。缺少實際 09:01 來源時，重估必須拒絕，不可用其他價格補造。
+
+公開曲線使用 `api/history?range=all&resolution=1m&start_date=...&end_date=...`。
+`minute_columns_v1` 每列為 `[UTC epoch minute, 所選期間報酬率%, 累積報酬率%, 品質位元]`，
+品質位元依序表示舊價、歷史回補、缺價。它是無損欄位精簡，不是每 2,000 點抽樣；
+每條線在所選期間第一個有效點重新設為 0%，帳本絕對權益不變。舊客戶端仍可使用預設抽樣介面。
+
 ## 日常接口
 
 先預覽，不修改資料：

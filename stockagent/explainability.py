@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import polars as pl

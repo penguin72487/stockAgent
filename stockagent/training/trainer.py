@@ -2703,7 +2703,7 @@ def _mode_artifact_contract_for_config(
             "frequency": "daily_policy_exact_minute_execution",
             "decision_clock": "observed_session_open",
             "execution_clock": (
-                "official_open_sizing_then_0901_vwap_entry_1320_limit_"
+                "official_open_sizing_then_0901_minute_price_entry_1320_limit_"
                 "1324_market_1330_auction"
             ),
             "recurrent_state_scope": "cross_session_t_plus_2_net_claim_account",
@@ -7726,6 +7726,23 @@ def _step_batch_lr_scheduler(
     return time.perf_counter() - start
 
 
+def _validate_futures_minute_audit(result: BacktestResult, rows: int, symbols: int) -> None:
+    if result.execution_mode != "tw_stock_futures_day_trade_0845_minute":
+        return
+    if result.weights_history.shape[0] == 0:
+        return
+    for name in ("futures_contract_quantities_history", "futures_residual_contract_quantities_history"):
+        value = getattr(result, name)
+        if value is None or np.asarray(value).shape != (rows, symbols, 2) or not np.issubdtype(np.asarray(value).dtype, np.integer):
+            raise ValueError(f"futures minute artifact requires integer {name} [T,S,2]")
+    defaults = result.settlement_default
+    if defaults is None or np.asarray(defaults).shape != (rows,):
+        raise ValueError("futures minute artifact requires an execution failure audit")
+    residual = np.asarray(result.futures_residual_contract_quantities_history)
+    if np.any(np.any(residual != 0, axis=(1, 2)) & ~np.asarray(defaults, dtype=bool)):
+        raise ValueError("futures minute residual was relabelled as a successful flat close")
+
+
 def _save_backtest_artifact(
     output_path: Path,
     result: BacktestResult,
@@ -7758,6 +7775,7 @@ def _save_backtest_artifact(
             "or [0, symbols] when history recording was disabled"
         )
     symbol_count = int(weights_history.shape[1])
+    _validate_futures_minute_audit(result, rows, symbol_count)
     mode = normalize_execution_mode(result.execution_mode)
     short_sale_collateral_history = result.short_sale_collateral_history
     short_margin_collateral_history = result.short_margin_collateral_history
@@ -8468,6 +8486,8 @@ def _save_backtest_artifact(
             payload[name] = np.asarray(value)
 
     add_optional("requested_weights_history", result.requested_weights_history)
+    add_optional("futures_contract_quantities_history", result.futures_contract_quantities_history)
+    add_optional("futures_residual_contract_quantities_history", result.futures_residual_contract_quantities_history)
     add_optional("open_weights_history", result.open_weights_history)
     add_optional("close_weights_history", result.close_weights_history)
     add_optional("event_turnovers", result.event_turnovers)
@@ -8790,6 +8810,8 @@ def _save_best_val_backtest_snapshot(
         event_turnovers=sliced_optional_float32(
             val_backtest.event_turnovers
         ),
+        futures_contract_quantities_history=(None if val_backtest.futures_contract_quantities_history is None else val_backtest.futures_contract_quantities_history[row_start:row_end].detach().cpu().numpy().copy()),
+        futures_residual_contract_quantities_history=(None if val_backtest.futures_residual_contract_quantities_history is None else val_backtest.futures_residual_contract_quantities_history[row_start:row_end].detach().cpu().numpy().copy()),
         executed_buy_weights=sliced_optional_float32(
             val_backtest.executed_buy_weights
         ),
@@ -10331,6 +10353,8 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             execution_mode=execution_mode,
             settlement_ledger_unit=ledger_unit,
             requested_weights_history=optional("requested_weights_history"),
+            futures_contract_quantities_history=optional("futures_contract_quantities_history", None),
+            futures_residual_contract_quantities_history=optional("futures_residual_contract_quantities_history", None),
             open_weights_history=optional("open_weights_history"),
             close_weights_history=optional("close_weights_history"),
             event_turnovers=optional("event_turnovers"),
@@ -10410,6 +10434,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             raise ValueError(
                 f"backtest artifact {name} must have shape ({rows},)"
             )
+    _validate_futures_minute_audit(result, rows, result.weights_history.shape[1] if result.weights_history.ndim == 2 else 0)
     if result.weights_history.ndim != 2 or int(result.weights_history.shape[0]) not in {
         0,
         rows,
@@ -11606,6 +11631,8 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
         )
     return BacktestResult(
         strategy_returns=np.asarray(result.strategy_returns[:rows]).copy(),
+        futures_contract_quantities_history=(None if result.futures_contract_quantities_history is None else np.asarray(result.futures_contract_quantities_history[:rows]).copy()),
+        futures_residual_contract_quantities_history=(None if result.futures_residual_contract_quantities_history is None else np.asarray(result.futures_residual_contract_quantities_history[:rows]).copy()),
         benchmark_returns=np.asarray(result.benchmark_returns[:rows]).copy(),
         turnovers=np.asarray(result.turnovers[:rows]).copy(),
         weights_history=np.asarray(result.weights_history[:rows]).copy(),
@@ -13476,6 +13503,8 @@ def _run_eval_backtest_from_weight_buffers(
     executed_short_open_weights_out: torch.Tensor | None = None
     executed_short_cover_weights_out: torch.Tensor | None = None
     due_weights_history_out: torch.Tensor | None = None
+    futures_quantities_out: torch.Tensor | None = None
+    futures_residuals_out: torch.Tensor | None = None
     commission_rebate_accrued_history_out: torch.Tensor | None = None
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
@@ -13494,6 +13523,12 @@ def _run_eval_backtest_from_weight_buffers(
         equity_scale_history_out = torch.empty(
             (total_rows,), device=device, dtype=output_dtype
         )
+    if execution_mode == "tw_stock_futures_day_trade_0845_minute":
+        settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
+        default_reason_history_out = torch.empty((total_rows,), device=device, dtype=torch.int64)
+        if return_weights_history:
+            futures_quantities_out = torch.empty((total_rows, num_symbols, 2), device=device, dtype=torch.int64)
+            futures_residuals_out = torch.empty_like(futures_quantities_out)
     if integer_stock_context_execution:
         settlement_default_out = torch.empty(
             (total_rows,), device=device, dtype=torch.bool
@@ -14087,6 +14122,11 @@ def _run_eval_backtest_from_weight_buffers(
         strategy_returns_out[start:end].copy_(backtest_chunk.strategy_returns[:valid_rows])
         benchmark_returns_out[start:end].copy_(backtest_chunk.benchmark_returns[:valid_rows])
         turnovers_out[start:end].copy_(backtest_chunk.turnovers[:valid_rows])
+        if futures_quantities_out is not None:
+            if backtest_chunk.futures_contract_quantities_history is None or backtest_chunk.futures_residual_contract_quantities_history is None:
+                raise RuntimeError("futures minute evaluator lost its contract audit")
+            futures_quantities_out[start:end].copy_(backtest_chunk.futures_contract_quantities_history[:valid_rows])
+            futures_residuals_out[start:end].copy_(backtest_chunk.futures_residual_contract_quantities_history[:valid_rows])
         if return_weights_history:
             weights_history_out[start:end].copy_(backtest_chunk.weights_history[:valid_rows])
             if requested_weights_history_out is None:
@@ -14228,6 +14268,8 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_s += time.perf_counter() - backtest_start
 
     backtest = BacktestResultTensor(
+        futures_contract_quantities_history=futures_quantities_out,
+        futures_residual_contract_quantities_history=futures_residuals_out,
         strategy_returns=strategy_returns_out,
         benchmark_returns=benchmark_returns_out,
         turnovers=turnovers_out,
@@ -15598,6 +15640,8 @@ def _slice_backtest_rows(
         execution_mode=result.execution_mode,
         settlement_ledger_unit=result.settlement_ledger_unit,
         requested_weights_history=rows(result.requested_weights_history),
+        futures_contract_quantities_history=rows(result.futures_contract_quantities_history),
+        futures_residual_contract_quantities_history=rows(result.futures_residual_contract_quantities_history),
         open_weights_history=rows(result.open_weights_history),
         close_weights_history=rows(result.close_weights_history),
         event_turnovers=rows(result.event_turnovers),
@@ -15865,6 +15909,7 @@ def _replay_taiwan_stitched_deployment(
             "tw_stock_futures_day_trade",
             "tw_stock_futures_day_trade_0900",
             "tw_stock_futures_day_trade_0900_integer",
+            "tw_stock_futures_day_trade_0845_minute",
             "crypto_perpetual",
         }
     )

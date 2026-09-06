@@ -365,15 +365,16 @@ authoritative and must not be replaced by Taiwan stock-day-trade semantics.
 
 For full-stock-context nearby single-stock-futures day trade, the product-
 specific default is
-`configs/markets/tw_stock_futures_day_trade_0900_full_features_multi_basis_projection_l1_cash_capital10m.yaml`.
-It inherits the complete feature ABI and common 1000-epoch/BF16/DDP/walk-forward
-standard, but its 09:00 information clock, daily futures OPEN-to-CLOSE research
-proxy, futures costs/capacity, causal futures mask, and learned residual-cash
-exposure contract override the generic cash-stock execution semantics. TAIFEX
-OPEN is 08:45, so this proxy is explicitly counterfactual and is not a live
-09:00 fill claim. The legacy 08:45-decision v1/v2 and post-09:00-sidecar v3
-contracts remain reproducibility controls; their checkpoints are incompatible
-with this baseline.
+`configs/markets/tw_stock_futures_day_trade_0845_minute.yaml`.
+It inherits the common 1000-epoch/BF16/walk-forward standard and all 98
+prior-completed stock features. The 08:45 daily decision excludes the 09:00
+cash-stock opening gap; the 08:46 right-labelled futures bar owns entry.
+At 13:20 place a passive limit, replace it at 13:24 with market exits through
+the 13:30 deadline. Preserve whole contracts, per-minute capacity, futures
+costs, causal candidate masks, and residual cash. Missing minute history must
+fail closed, never substitute a daily OPEN/CLOSE label. Earlier 08:45 daily
+v1/v2, 09:00 sidecar v3, and 09:00 daily proxy v4/v5 remain incompatible
+reproducibility controls. See `docs/tw_stock_futures_day_trade_minute.md`.
 
 Every completed fold must immediately refresh the cumulative root-level
 walk-forward report from all contract-compatible folds completed so far. Do not
@@ -565,8 +566,15 @@ Guidelines:
   submitted whole-lot buy/cover at the first strictly later best Ask and each
   sell/short at the first strictly later best Bid. Missing causal quotes fail
   closed; never substitute the 09:01 price, last price, or an adverse `+1 tick`.
-  Historical replay is a separate counterfactual contract recorded at 09:01
-  using the observed official session open; never relabel it as live execution,
+  Historical replay/backfill is a separate counterfactual contract: the
+  official 09:00 session open is the model input and whole-lot sizing price,
+  while the paper transaction is recorded at 09:01 from that completed
+  right-labelled minute. Prefer `Amount / volume_shares`; when no usable tick or
+  VWAP exists, use the same source-published 09:01 KBar `Close`. Missing ticks
+  alone must not create a no-fill. Only an entirely missing/invalid 09:01 bar
+  remains a visible price gap; never substitute the 09:00 open, a carried last
+  price, Bid/Ask, or an adverse tick. Record whether the method was
+  `minute_vwap` or `minute_close`, and never relabel either as live execution,
   an exchange fill, queue acknowledgement, or guaranteed real fill.
 
 - The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
@@ -599,8 +607,25 @@ Guidelines:
   endpoint-only curve or a stale `minute_curve_receipt.json` is not promotable.
   A still-open current session may be deferred, but the weekday post-close
   minute-curve maintenance event must finalize it once the historical source is
-  available. Preserve accepted 09:01/13:30 ledger endpoints, disclose carried
-  last trades, and never use linear interpolation.
+  available. Preserve accepted entry/exit fills and the 13:30 ledger endpoint.
+  Historical 09:01 marks must value held quantities at the completed 09:01
+  source Close with the same net-liquidation fee accounting as later minutes,
+  not merely preserve an entry-fee-only mark and delay its price change to
+  09:02. Revaluation requires an explicit receipt and unchanged fill hash;
+  missing 09:01 source prices fail closed. Disclose carried last trades and
+  never use linear interpolation. The dashboard's full-minute mode must retain
+  every available minute, including multi-month selections, and rebase each
+  series at its first selected valid mark without modifying absolute equity.
+
+- Dashboard strategy names come from the active mode descriptor (`label`), not
+  the stable ledger `market` key. Use the shared TW presentation and detail
+  components; never hard-code model aliases in individual tables or rename
+  persisted IDs to fix display text. Stock-futures badges are read-only current
+  TAIFEX catalog membership with an observed date, not point-in-time signal
+  eligibility, liquidity, or permission to trade. Missing, invalid, or expired
+  catalog evidence is unknown, never false. Keep this enrichment out of model
+  inputs and execution, and never call a broker/network API per displayed row.
+  See `docs/public_dashboards_architecture.md` for component and producer gates.
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
@@ -630,7 +655,15 @@ Guidelines:
 
 ### Full-stock-context single-stock-futures day trade
 
-- `tw_stock_futures_day_trade_0900` is the default baseline. It keeps the
+- `tw_stock_futures_day_trade_0845_minute` is the current daily-decision baseline:
+  prior-completed stock features at 08:45, first completed 08:46 futures minute
+  execution, 13:20 passive limit, 13:24 market replacement, final 13:30 deadline.
+  A 13:24 order change first consumes the 13:25 right-labelled bar. The minute
+  tape is executor-only; capacity is per physical contract and per minute.
+  Residual contracts remain explicit execution failures, never stock margin
+  conversions or fabricated 13:45/daily-close fills. Source coverage, hashes,
+  whole quantities, costs, and clock belong to the checkpoint contract.
+- The legacy `tw_stock_futures_day_trade_0900` research control keeps the
   complete ordered Taiwan cash-stock feature panel and may use data complete
   through `t-1` plus the dedicated observed
   `log(OPEN[t] / CLOSE[t-1])` channel at 09:00. No session-`t` high, low, close,
@@ -647,7 +680,7 @@ Guidelines:
   weight or capacity to another name. A stock without a known future has zero
   effective output and cannot trade. The 09:00 mode must not use the execution
   mask in its policy normalization or model inputs.
-- By the user's explicit daily-data choice, the default 09:00 research ledger
+- The legacy 09:00 research ledger
   computes the selected physical future's immutable TAIFEX day-session
   OPEN-to-CLOSE return. The OPEN is stamped 08:45 and precedes the 09:00 model
   decision, so this is a counterfactual label, not a causally executable fill
@@ -659,13 +692,13 @@ Guidelines:
   capacity ceiling based on the selected contract's completed preceding-
   session volume valued at the actual declared entry price. Cash-stock fees,
   price limits, and short inventory do not govern this futures execution path.
-- The default 09:00 model uses raw long/short scores with no cross-sectional
+- The 09:00 model and its 08:45 minute successor use raw long/short scores with no cross-sectional
   de-meaning, divides by the active causal-futures count, and projects onto the
   unit L1 ball. Therefore gross exposure is learned in `[0,1]` and residual
   capital may remain cash; do not add top-K, fixed long/short ratios, an outside-
   cash heuristic, or forced full investment. Current execution failures remain
   unfilled and their unused risk is not redistributed.
-- The default 09:00 entry/return source is the immutable aligned daily table
+- The legacy 09:00 entry/return source is the immutable aligned daily table
   `data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet` with
   `tw_stock_futures_day_trade_0900_entry_source: daily_session_open_proxy`.
   `post_0900_trade_sidecar` may opt into

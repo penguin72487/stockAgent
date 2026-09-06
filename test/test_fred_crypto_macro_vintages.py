@@ -4,10 +4,35 @@ from urllib.error import URLError
 
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
 
 from downloader.http_transport import HttpResponse
 
 from downloader import download_fred_crypto_macro_vintages as fred
+
+
+@pytest.mark.parametrize("requested, expected", [
+    ("today", "2026-09-04"), ("now", "2026-09-04"),
+    ("2026-09-05", "2026-09-04"), ("2020-01-01", "2020-01-01"),
+])
+def test_fred_pins_end_to_provider_calendar(requested, expected) -> None:
+    class Transport:
+        def request_bytes(self, url, **kwargs):
+            params = parse_qs(urlsplit(url).query)
+            assert "realtime_end" not in params
+            assert "realtime_start" not in params
+            assert params["limit"] == ["1"]
+            return HttpResponse(200, b'{"realtime_end":"2026-09-04"}', {}, 1)
+
+    end, receipt = fred._resolve_end_date(
+        requested, series_id="DFF", api_key="fixture", transport=Transport(),
+    )
+    assert end == expected
+    assert receipt["requested_end_date"] == requested
+    assert receipt["provider_current_date"] == "2026-09-04"
+    assert receipt["effective_end_date"] == expected
 
 
 class _Response:
@@ -147,3 +172,28 @@ def test_fred_window_failure_publishes_failure_receipt(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert receipt["status"] == "failed"
     assert "fixture transport failure" in receipt["error"]
+
+
+@pytest.mark.parametrize("payload", [b'{}', b'{"observations":null}', b'{"count":2,"observations":[]}'])
+def test_fred_rejects_malformed_or_truncated_success_response(payload) -> None:
+    with pytest.raises(ValueError):
+        fred.parse_initial_release_rows("DFF", payload, retrieved_at_utc=fred.datetime.now(fred.timezone.utc))
+
+
+def test_fred_probe_failure_records_failure_without_replacing_data(tmp_path, monkeypatch) -> None:
+    canonical = tmp_path / "observations.parquet"
+    canonical.write_bytes(b"previous verified data")
+    monkeypatch.setattr(fred.sys, "argv", ["fred", "--output-dir", str(tmp_path)])
+    monkeypatch.setattr(fred, "_configured_api_key", lambda _: "fixture")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(fred, "_resolve_end_date", fail)
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        fred.main()
+    receipt = json.loads((tmp_path / "download_summary.json").read_text())
+    assert receipt["state"] == "failed"
+    assert receipt["failed_stage"] == "provider_date_probe"
+    assert receipt["canonical_output_preserved"] is True
+    assert canonical.read_bytes() == b"previous verified data"

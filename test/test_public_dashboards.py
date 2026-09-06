@@ -76,6 +76,22 @@ def test_taifex_public_projection_removes_local_receipts() -> None:
     assert source["sources"][0]["path"] == "marks.jsonl"
 
 
+@pytest.mark.parametrize("sanitizer", [sanitize_tw_status, sanitize_taifex_status])
+def test_public_status_scrubs_nested_credential_fields_without_hiding_revision(sanitizer):
+    source = {
+        "simulation_only": True, "production_order_possible": False,
+        "revision_token": "safe-revision", "health": "ok",
+        "diagnostics": [{key: "DO-NOT-PUBLISH" for key in (
+            "api_key", "apiSecret", "Authorization", "Cookie", "password",
+            "access_token", "refreshToken", "private_key", "account_id", "broker_id",
+        )}],
+    }
+    public = sanitizer(source)
+    assert "DO-NOT-PUBLISH" not in json.dumps(public)
+    assert public["revision_token"] == "safe-revision"
+    assert source["diagnostics"][0]["api_key"] == "DO-NOT-PUBLISH"
+
+
 def test_taifex_history_is_an_explicit_allowlist() -> None:
     public = sanitize_taifex_history(
         {
@@ -431,6 +447,7 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
         "range_key": "all",
         "start_date": "2026-08-13",
         "end_date": "2026-08-14",
+        "resolution": "sampled",
     }
     with pytest.raises(ValueError):
         PublicDashboardHandler._history_range_query("range=5y")
@@ -824,6 +841,8 @@ def _test_server() -> PublicDashboardServer:
     [
         ("/time-axis.js", b"buildTimeAxis"),
         ("/dashboard-core.js", b"StockAgentDashboard"),
+        ("/tw-day-trade/presentation.js", b"StockAgentTwPresentation"),
+        ("/tw-day-trade/detail-components.js", b"StockAgentTwDetailComponents"),
     ],
 )
 def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> None:
@@ -1285,6 +1304,165 @@ def test_response_cache_is_bounded_by_resident_bytes(
         assert residency["maximum_resident_bytes"] == 2_500
     finally:
         server.server_close()
+
+
+def test_single_oversized_response_does_not_defeat_cache_limit(monkeypatch):
+    server = _test_server()
+    monkeypatch.setattr("scripts.serve_public_dashboards.MAX_CACHE_BYTES", 100)
+    try:
+        response = server.cached_local_json(
+            cache_key="oversized", ttl_seconds=60, cache_control="no-store",
+            builder=lambda: {"payload": "x" * 1000},
+        )
+        assert len(json.loads(response.body)["payload"]) == 1000
+        assert server.cache_residency()["resident_bytes"] <= 100
+    finally:
+        server.server_close()
+
+
+def test_failed_unique_keys_do_not_leave_permanent_locks():
+    server = _test_server()
+    def fail():
+        raise ValueError("fixture build failure")
+    try:
+        for index in range(50):
+            with pytest.raises(ValueError, match="fixture build failure"):
+                server.cached_local_json(
+                    cache_key=f"failed-{index}", ttl_seconds=60,
+                    cache_control="no-store", builder=fail,
+                )
+        assert not server._cache_key_locks
+        assert not server._cache
+    finally:
+        server.server_close()
+
+
+def test_lru_evicts_active_entry_without_replacing_waiters_lock(monkeypatch):
+    server = _test_server()
+    monkeypatch.setattr("scripts.serve_public_dashboards.MAX_CACHE_ENTRIES", 1)
+    key_lock = threading.Lock()
+    try:
+        response = server.cached_local_json(
+            cache_key="old", ttl_seconds=60, cache_control="no-store", builder=lambda: {},
+        )
+        with key_lock:
+            server._cache_key_locks["old"] = key_lock
+            server._store_cached_response("new", response, 60)
+            assert server.cache_residency()["resident_entries"] == 1
+            assert "old" not in server._cache
+            assert server._cache_key_locks["old"] is key_lock
+    finally:
+        server.server_close()
+
+
+@pytest.fixture
+def protocol_server():
+    server = _test_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        yield connection
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("encoding", ["gzip;q=0", "notgzip", "gzip;q=0, *;q=1", "gzip;q=0.2, identity;q=1"])
+def test_http_respects_unaccepted_or_less_preferred_gzip(protocol_server, encoding):
+    protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding})
+    response = protocol_server.getresponse()
+    body = response.read()
+    assert response.status == 200
+    assert response.getheader("Content-Encoding") is None
+    assert response.getheader("Vary") == "Accept-Encoding"
+    assert b"StockAgentDashboard" in body
+
+
+def test_encoding_variants_have_distinct_validators_and_valid_304(protocol_server):
+    tags = {}
+    for encoding in ("identity", "gzip"):
+        protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding})
+        response = protocol_server.getresponse()
+        response.read()
+        assert response.status == 200
+        tags[encoding] = response.getheader("ETag")
+    assert tags["identity"] != tags["gzip"]
+    protocol_server.request("GET", "/dashboard-core.js", headers={
+        "Accept-Encoding": "gzip", "If-None-Match": f'"different", W/{tags["gzip"]}',
+    })
+    response = protocol_server.getresponse()
+    assert response.read() == b""
+    assert response.status == 304
+    assert response.getheader("Vary") == "Accept-Encoding"
+    assert response.getheader("Content-Length") is None
+
+
+def test_http_rejects_when_all_supported_encodings_are_forbidden(protocol_server):
+    protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": "identity;q=0, gzip;q=0"})
+    response = protocol_server.getresponse()
+    response.read()
+    assert response.status == 406
+
+
+def test_rejected_post_body_cannot_be_parsed_as_next_request(protocol_server):
+    protocol_server.request("POST", "/", body=b"unconsumed request payload")
+    response = protocol_server.getresponse()
+    response.read()
+    assert response.status == 405
+    assert response.getheader("Connection") == "close"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_read_only_request_body_is_rejected_and_connection_closed(protocol_server, method):
+    protocol_server.request(method, "/healthz", body=b"unexpected body")
+    response = protocol_server.getresponse()
+    body = response.read()
+    assert response.status == 400
+    assert response.getheader("Connection") == "close"
+    if method == "GET":
+        assert json.loads(body) == {"error": "request_body_not_supported"}
+    else:
+        assert body == b""
+
+
+def test_read_only_chunked_request_is_rejected_without_reading_body(protocol_server):
+    protocol_server.request("GET", "/healthz", headers={"Transfer-Encoding": "chunked"})
+    response = protocol_server.getresponse()
+    assert response.status == 400
+    assert response.getheader("Connection") == "close"
+    response.read()
+
+
+@pytest.mark.parametrize("path", ["/api/overview", "/taifex/api/status", "/data-monitor/api/status", "/traffic/api/status"])
+def test_parameterless_public_routes_reject_unknown_query(protocol_server, path):
+    protocol_server.request("GET", path + "?unexpected=fixture")
+    response = protocol_server.getresponse()
+    assert response.status == 400
+    assert json.loads(response.read()) == {"error": "invalid_request"}
+
+
+def test_malformed_request_target_returns_sanitized_400(protocol_server):
+    protocol_server.putrequest("GET", "http://[", skip_host=True)
+    protocol_server.putheader("Host", "localhost")
+    protocol_server.endheaders()
+    response = protocol_server.getresponse()
+    assert response.status == 400
+    assert json.loads(response.read()) == {"error": "invalid_request"}
+
+
+@pytest.mark.parametrize(("header", "expected"), [
+    (None, "identity"), ("", "identity"), ("*", "gzip"), ("*;q=0", None),
+    ("gzip;q=0, *;q=1", "identity"), ("gzip;q=0.5, identity;q=0", "gzip"),
+    ("gzip;q=0;q=1", "identity"), ("gzip;q=NaN", "identity"),
+    ("gzip;q=1.1", "identity"), ("gzip;q=0.8, identity;q=0.9", "identity"),
+])
+def test_encoding_quality_contract(header, expected):
+    from scripts.serve_public_dashboards import _preferred_encoding
+
+    assert _preferred_encoding(header, gzip_available=True) == expected
 
 
 def test_overview_cache_matches_one_minute_client_refresh_contract() -> None:

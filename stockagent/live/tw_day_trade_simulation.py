@@ -6,7 +6,7 @@ after 09:00, this module waits for a strictly later executable best Ask/Bid,
 converts target weights to board lots, and owns the only paper order/fill/
 position ledger used by the dashboard. Historical or missed-opening recovery
 is a distinct counterfactual contract: size/infer from the official 09:00 open,
-then value execution from the observed right-labelled 09:01 minute VWAP.
+then value execution from a source-backed right-labelled 09:01 minute price.
 
 This module never calls a broker order API.  ``simulation_only`` and
 ``production_order_possible`` are persisted in every status snapshot so a
@@ -91,6 +91,16 @@ ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK: Final[str] = (
 ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901: Final[str] = "official_open_at_09_01"
 ENTRY_FILL_POLICY_0901_MINUTE_VWAP: Final[str] = (
     "official_open_signal_0900_execute_0901_vwap"
+)
+# Compatibility alias: the persisted policy value predates the accepted
+# source-published 09:01 KBar-close fallback. New code should use the
+# minute-price name while old ledgers retain their stable enum value.
+ENTRY_FILL_POLICY_0901_MINUTE_PRICE: Final[str] = (
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+)
+REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE: Final[str] = (
+    "retrospective_official_open_signal_at_09_00_observed_09_01_"
+    "minute_price_counterfactual_v2"
 )
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
@@ -426,8 +436,8 @@ def _prepare_entry_plan(
     official_open_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
     )
-    minute_vwap_at_0901 = (
-        spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+    minute_price_at_0901 = (
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
     )
     synthetic_fallback_fill = bool(
         spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
@@ -438,7 +448,7 @@ def _prepare_entry_plan(
         sizing_price
         if official_open_at_0901
         else _finite(quote_values.get("execution_price_0901"))
-        if minute_vwap_at_0901
+        if minute_price_at_0901
         else _finite(quote_values.get("ask" if side == "long" else "bid"))
     )
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
@@ -511,8 +521,8 @@ def _prepare_entry_plan(
             )
         if entry_price is None:
             status, reason = (
-                ("blocked", "observed_09_01_minute_vwap_unavailable")
-                if minute_vwap_at_0901
+                ("blocked", "observed_09_01_minute_price_unavailable")
+                if minute_price_at_0901
                 else
                 ("blocked", "synthetic_open_tick_price_unavailable")
                 if synthetic_entry_fill
@@ -520,15 +530,17 @@ def _prepare_entry_plan(
             )
         elif upper is None or lower is None:
             status, reason = "blocked", "price_limit_unavailable"
-        elif minute_vwap_at_0901:
+        elif minute_price_at_0901:
             # Missed-opening recovery separates the two causal roles that the
             # legacy replay conflated. The official session open sizes the
             # order/model input, while this observed right-labelled first
-            # minute VWAP prices the 09:01 counterfactual paper execution.
-            # Missing VWAP evidence is blocked above and is never replaced by
-            # the open, last price, a best quote, or an adverse tick.
+            # source-backed minute price values the 09:01 counterfactual paper
+            # execution. Prefer VWAP, but a source-published KBar Close is
+            # admissible when no tick/VWAP exists. A missing minute bar remains
+            # blocked and is never replaced by the open, a carried last price,
+            # a best quote, or an adverse tick.
             filled_shares = requested_shares
-            reason = "counterfactual_observed_09_01_minute_vwap_fill"
+            reason = "counterfactual_observed_09_01_minute_price_fill"
         elif official_open_at_0901:
             # User-selected paper convention: at 09:01 use the already observed
             # official session open for both directions.  This is deterministic
@@ -624,8 +636,8 @@ def _prepare_entry_plan(
         "entry_price_offset_ticks": int(spec.entry_price_offset_ticks),
         "entry_price_source": quote_values.get("entry_price_source")
         or (
-            "observed_right_labelled_09_01_minute_vwap"
-            if minute_vwap_at_0901
+            "observed_right_labelled_09_01_minute_price"
+            if minute_price_at_0901
             else
             "official_session_open_observed_by_09_01"
             if official_open_at_0901
@@ -635,8 +647,9 @@ def _prepare_entry_plan(
         "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
         "paper_market_fill": market_at_best_else_tick and filled_shares > 0,
         "counterfactual_0901_price_fill": (
-            minute_vwap_at_0901 and filled_shares > 0
+            minute_price_at_0901 and filled_shares > 0
         ),
+        "entry_price_method": quote_values.get("execution_price_0901_method"),
         "counterfactual_open_price_fill": (official_open_at_0901 and filled_shares > 0),
     }
 
@@ -2687,7 +2700,7 @@ class TwDayTradeSimulationEngine:
             if len(committed_policies) == 1:
                 mode["entry_fill_policy"] = committed_policies.pop()
             elif mode.get("counterfactual_0901_price_fill") is True:
-                mode["entry_fill_policy"] = ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+                mode["entry_fill_policy"] = ENTRY_FILL_POLICY_0901_MINUTE_PRICE
             elif mode.get("counterfactual_open_price_fill") is True:
                 mode["entry_fill_policy"] = ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
         else:
@@ -3216,8 +3229,8 @@ class TwDayTradeSimulationEngine:
                 "retrospective_actual_session_open_price_counterfactual"
                 if spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
                 else (
-                    "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
-                    if spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+                    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+                    if spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
                     else
                     "retrospective_official_session_open_at_09_01_counterfactual"
                     if spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -3257,7 +3270,7 @@ class TwDayTradeSimulationEngine:
         entry_gate = (
             ENTRY_GATE
             if counterfactual_open_replay
-            or spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+            or spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
             or spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
             else LIVE_ENTRY_GATE
         )
@@ -3338,15 +3351,15 @@ class TwDayTradeSimulationEngine:
         deterministic_official_open_fill = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
         )
-        deterministic_0901_vwap_fill = (
-            spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+        deterministic_0901_minute_price_fill = (
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
         )
         if (
             actionable_symbols
             and not later_quote_found
             and not synthetic_open_fill
             and not deterministic_paper_market_fill
-            and not deterministic_0901_vwap_fill
+            and not deterministic_0901_minute_price_fill
             and not deterministic_official_open_fill
         ):
             mode["pending_signal_id"] = signal_id
@@ -3358,7 +3371,7 @@ class TwDayTradeSimulationEngine:
             actionable_symbols
             and not synthetic_open_fill
             and not deterministic_paper_market_fill
-            and not deterministic_0901_vwap_fill
+            and not deterministic_0901_minute_price_fill
             and not deterministic_official_open_fill
             and wall_time >= FIRST_MINUTE_EXECUTION_TIME
             and all(
@@ -3435,8 +3448,8 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
             "synthetic_observed_session_open_adverse_tick"
             if synthetic_open_fill
-            else "counterfactual_official_open_signal_0900_observed_0901_minute_vwap"
-            if deterministic_0901_vwap_fill
+            else "counterfactual_official_open_signal_0900_observed_0901_minute_price"
+            if deterministic_0901_minute_price_fill
             else "counterfactual_official_session_open_at_09_01"
             if deterministic_official_open_fill
             else "paper_market_order_at_best_quote_else_adverse_open_tick"
@@ -3448,8 +3461,8 @@ class TwDayTradeSimulationEngine:
         ) or (
             "counterfactual_unbounded_no_exchange_fill_claim"
             if synthetic_open_fill
-            else "observed_09_01_minute_vwap_full_requested_paper_quantity_no_exchange_fill_claim"
-            if deterministic_0901_vwap_fill
+            else "observed_09_01_minute_price_full_requested_paper_quantity_no_exchange_fill_claim"
+            if deterministic_0901_minute_price_fill
             else "official_open_price_full_requested_paper_quantity_no_exchange_fill_claim"
             if deterministic_official_open_fill
             else "full_requested_quantity_at_observed_best_quote_else_adverse_open_tick_no_exchange_depth_claim"
@@ -3459,7 +3472,9 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_policy"] = spec.entry_fill_policy
         mode["entry_price_offset_ticks"] = int(spec.entry_price_offset_ticks)
         mode["entry_fill_is_synthetic"] = bool(synthetic_open_fill)
-        mode["counterfactual_0901_price_fill"] = bool(deterministic_0901_vwap_fill)
+        mode["counterfactual_0901_price_fill"] = bool(
+            deterministic_0901_minute_price_fill
+        )
         mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
@@ -3572,6 +3587,7 @@ class TwDayTradeSimulationEngine:
                 "entry_fill_policy": plan["entry_fill_policy"],
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "entry_price_source": entry_price_source,
+                "entry_price_method": plan["entry_price_method"],
                 "synthetic_fill": bool(plan["synthetic_fill"]),
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
                 "paper_market_fill": bool(plan["paper_market_fill"]),
@@ -3696,6 +3712,7 @@ class TwDayTradeSimulationEngine:
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "entry_fill_is_synthetic": bool(plan["synthetic_fill"]),
                 "entry_price_source": entry_price_source,
+                "entry_price_method": plan["entry_price_method"],
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
                 "paper_market_fill": bool(plan["paper_market_fill"]),
                 "counterfactual_0901_price_fill": bool(
@@ -3731,7 +3748,7 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "side": "buy" if side == "long" else "sell_short",
                     "order_type": (
-                        "PAPER_0901_MINUTE_VWAP"
+                        "PAPER_0901_MINUTE_PRICE"
                         if bool(plan["counterfactual_0901_price_fill"])
                         else "PAPER_OPEN_PRICE_0901"
                         if bool(plan["counterfactual_open_price_fill"])
@@ -3756,6 +3773,7 @@ class TwDayTradeSimulationEngine:
                         plan["counterfactual_open_price_fill"]
                     ),
                     "entry_price_source": entry_price_source,
+                    "entry_price_method": plan["entry_price_method"],
                     "historical_source_quote_at": quote.get(
                         "historical_source_quote_at"
                     ),
@@ -3790,6 +3808,7 @@ class TwDayTradeSimulationEngine:
                         plan["counterfactual_open_price_fill"]
                     ),
                     "entry_price_source": entry_price_source,
+                    "entry_price_method": plan["entry_price_method"],
                 }
             )
             for purpose, order_type, price, order_status in (
@@ -3844,6 +3863,17 @@ class TwDayTradeSimulationEngine:
             bool(plan.get("counterfactual_open_price_fill")) for plan in plans
         )
         entry_0901_vwap_fill_count = sum(
+            bool(plan.get("counterfactual_0901_price_fill"))
+            and str(plan.get("entry_price_method") or "minute_vwap")
+            == "minute_vwap"
+            for plan in plans
+        )
+        entry_0901_close_fill_count = sum(
+            bool(plan.get("counterfactual_0901_price_fill"))
+            and plan.get("entry_price_method") == "minute_close"
+            for plan in plans
+        )
+        entry_0901_minute_price_fill_count = sum(
             bool(plan.get("counterfactual_0901_price_fill")) for plan in plans
         )
         entry_fill_outcome = (
@@ -3868,13 +3898,17 @@ class TwDayTradeSimulationEngine:
         mode["entry_paper_market_fill_count"] = entry_paper_market_fill_count
         mode["entry_official_open_fill_count"] = entry_official_open_fill_count
         mode["entry_0901_vwap_fill_count"] = entry_0901_vwap_fill_count
+        mode["entry_0901_close_fill_count"] = entry_0901_close_fill_count
+        mode["entry_0901_minute_price_fill_count"] = (
+            entry_0901_minute_price_fill_count
+        )
         mode["entry_fill_has_synthetic_fallback"] = bool(
             entry_synthetic_fallback_fill_count
         )
         mode["entry_fill_is_synthetic"] = bool(entry_synthetic_fill_count)
         mode["paper_fill_deterministic"] = bool(deterministic_paper_market_fill)
         mode["counterfactual_0901_price_fill"] = bool(
-            deterministic_0901_vwap_fill
+            deterministic_0901_minute_price_fill
         )
         mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["exchange_fill_guaranteed"] = False
@@ -3945,6 +3979,10 @@ class TwDayTradeSimulationEngine:
                     entry_synthetic_fallback_fill_count
                 ),
                 entry_0901_vwap_fill_count=entry_0901_vwap_fill_count,
+                entry_0901_close_fill_count=entry_0901_close_fill_count,
+                entry_0901_minute_price_fill_count=(
+                    entry_0901_minute_price_fill_count
+                ),
                 simulation_replay=bool(mode.get("simulation_replay")),
                 replay_basis=mode.get("replay_basis"),
                 source_signal_at=source_signal_at.isoformat(timespec="seconds"),
@@ -5117,6 +5155,7 @@ class TwDayTradeSimulationEngine:
 
 __all__ = [
     "CLOSING_AUCTION_TIME",
+    "ENTRY_FILL_POLICY_0901_MINUTE_PRICE",
     "ENTRY_FILL_POLICY_0901_MINUTE_VWAP",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
@@ -5128,6 +5167,7 @@ __all__ = [
     "EXIT_LIMIT_TIME",
     "FIRST_MINUTE_EXECUTION_TIME",
     "FORCE_EXIT_TIME",
+    "REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE",
     "LiveEligibility",
     "ModeSpec",
     "TwDayTradeSimulationEngine",

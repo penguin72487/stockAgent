@@ -1,3 +1,5 @@
+"""Offline columnar compaction; not a panel or training-runtime backend."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -7,7 +9,6 @@ import os
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import duckdb
 import polars as pl
 import pyarrow.parquet as pq
 
@@ -155,6 +156,9 @@ def compact_parquet_files(
     row contract, DuckDB performs bounded-memory union-by-name compaction, and
     PyArrow, Polars, and a fresh DuckDB query must agree before publication.
     """
+
+    # Metadata/receipt helpers must not load this optional offline SQL engine.
+    import duckdb
 
     paths = [Path(path).resolve() for path in source_paths]
     codec = str(compression).strip().lower()

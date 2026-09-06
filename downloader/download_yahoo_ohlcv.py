@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
+from downloader.artifact_io import atomic_write_json, atomic_write_text
 from downloader.common import (
     SharedRateLimiter,
     describe_rate_limit,
@@ -3474,30 +3475,27 @@ def _write_symbol_manifest(
         )
     included = _dedupe_records_by_code(included)
     exclusions = _dedupe_excluded_records(exclusions)
-    pl.DataFrame([asdict(record) for record in included]).write_csv(manifest_path)
+    atomic_write_text(
+        manifest_path, pl.DataFrame([asdict(record) for record in included]).write_csv(),
+    )
 
     reason_counts: dict[str, int] = {}
     for record in exclusions:
         reason_counts[record.reason] = reason_counts.get(record.reason, 0) + 1
-    (output_dir / "symbols_manifest_summary.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "generated_at_utc": datetime.now(timezone.utc)
-                .replace(microsecond=0)
-                .isoformat(),
-                "asset_class": asset_class,
-                "included_record_count": len(included),
-                "excluded_record_count": len(exclusions),
-                "excluded_reason_counts": reason_counts,
-                "excluded_records": [asdict(record) for record in exclusions],
-            },
-            indent=2,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        output_dir / "symbols_manifest_summary.json",
+        {
+            "schema_version": 1,
+            "generated_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+            "asset_class": asset_class,
+            "included_record_count": len(included),
+            "excluded_record_count": len(exclusions),
+            "excluded_reason_counts": reason_counts,
+            "excluded_records": [asdict(record) for record in exclusions],
+        },
+        sort_keys=True,
     )
 
 
@@ -3564,19 +3562,28 @@ def _write_download_artifacts(
     report_frame = _report_frame_from_rows(report_rows, report_columns)
     if manifest_codes is not None and report_path.is_file():
         try:
-            previous = pl.read_csv(report_path, infer_schema_length=10000)
-            if set(report_columns) <= set(previous.columns):
-                previous = previous.select(report_columns).filter(
-                    pl.col("code").cast(pl.String).is_in(sorted(manifest_codes))
-                )
-                report_frame = (
-                    pl.concat([previous, report_frame], how="diagonal_relaxed")
-                    .unique(subset=["code"], keep="last", maintain_order=True)
-                )
-        except Exception:
-            # A malformed old report must not block a fresh complete write.
-            pass
-    report_frame.write_csv(report_path)
+            # Security identifiers are strings: inferring 0050 as integer 50
+            # silently drops a valid ETF when filtering the preserved rows.
+            previous = pl.read_csv(
+                report_path, infer_schema_length=10000,
+                schema_overrides={"code": pl.String},
+            )
+            if not set(report_columns) <= set(previous.columns):
+                raise ValueError("missing report columns")
+            previous = previous.select(report_columns).filter(
+                pl.col("code").is_in(sorted(manifest_codes))
+            )
+            report_frame = (
+                pl.concat([previous, report_frame], how="diagonal_relaxed")
+                .unique(subset=["code"], keep="last", maintain_order=True)
+            )
+        except Exception as exc:
+            # Only a complete replacement may discard an unreadable report.
+            # A targeted repair has no evidence for the untouched symbols.
+            if not manifest_codes <= {result.code for result in results}:
+                raise ValueError(
+                    f"Cannot preserve previous download report during partial update: {report_path}"
+                ) from exc
 
     counts: dict[str, int] = {}
     total_rows = 0
@@ -3587,14 +3594,20 @@ def _write_download_artifacts(
 
     summary = {
         "asset_class": asset_class,
-        "symbol_count": len(results),
+        "symbol_count": report_frame.height,
+        "run_symbol_count": len(results),
         "row_count": total_rows,
         "status_counts": counts,
     }
+    if manifest_codes is not None:
+        summary["manifest_symbol_count"] = len(manifest_codes)
     if asset_class == "crypto":
         summary["interval"] = YF_CRYPTO_INTRADAY_INTERVAL
         summary["max_lookback_days"] = YF_CRYPTO_MAX_LOOKBACK_DAYS
-    (output_dir / "download_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Publish each file atomically after both payloads validate. These are
+    # separate files, not a claim of a multi-file transaction or source freshness.
+    atomic_write_text(report_path, report_frame.write_csv())
+    atomic_write_json(output_dir / "download_summary.json", summary)
 
 
 def _resolve_asset_output_dir(args: argparse.Namespace, asset_class: str) -> Path:
@@ -4366,7 +4379,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         for check in checks
     ]
     repair_report_frame = _report_frame_from_rows(repair_report_rows, repair_report_columns)
-    repair_report_frame.write_csv(repair_report_path)
+    atomic_write_text(repair_report_path, repair_report_frame.write_csv())
 
     # Post-repair coverage: compute entirely from in-memory data; no second disk scan.
     post_oldest, post_newest, post_lag_days, post_tracked = _summarize_post_repair_coverage(
@@ -4499,7 +4512,7 @@ def main() -> None:
         summary_name = "daily_update_summary.json"
     summary_path = Path(args.output_root) / summary_name
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(summary_path, summaries)
     failures = []
     for asset_class, counts in summaries.items():
         reason = download_counts_failure_reason(counts)

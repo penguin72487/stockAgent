@@ -45,12 +45,13 @@ from stockagent.live.quote_provider import (  # noqa: E402
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     LIVE_ENTRY_GATE,
     CLOSING_AUCTION_TIME,
     FORCE_EXIT_TIME,
     ModeSpec,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     STOCK_BENCHMARKS,
     TX_CONTINUOUS_LOGICAL_CODE,
     TwDayTradeSimulationEngine,
@@ -77,7 +78,7 @@ MISSED_OPENING_COMMIT_DEADLINE = datetime_time(9, 0, 15)
 MISSED_OPENING_REPLAY_AT = datetime_time(9, 1)
 MISSED_OPENING_SOURCE_SETTLE_DEADLINE = datetime_time(9, 3)
 MISSED_OPENING_REPLAY_CONTRACT = (
-    "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
 )
 
 
@@ -167,15 +168,18 @@ def _persist_missed_opening_prices(
     path = _missed_opening_receipt_path(state_dir, observed)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "session_date": observed.date().isoformat(),
         "simulation_only": True,
         "production_order_possible": False,
         "inference_price_contract": "official_session_open_at_09_00",
         "execution_price_contract": (
-            "right_labelled_09_01_minute_vwap_from_09_00_00_to_09_00_59_ticks"
+            "source_backed_right_labelled_09_01_minute_price_vwap_else_kbar_close"
         ),
-        "missing_price_policy": "fail_closed_no_open_last_best_quote_or_tick_fallback",
+        "missing_price_policy": (
+            "missing_tick_uses_source_kbar_price; missing_09_01_bar_fails_closed_"
+            "without_open_carried_last_best_quote_or_adverse_tick"
+        ),
         "updated_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
         "prices": prices,
         "query_receipt": query_receipt,
@@ -1990,21 +1994,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     register_spec = replace(
                         spec,
-                        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+                        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                         entry_price_offset_ticks=0,
                     )
                     register_summary = {
                         **summary,
                         "simulation_replay": True,
                         "replay_basis": (
-                            "official_09_00_open_inference_to_observed_09_01_minute_vwap"
+                            "official_09_00_open_inference_to_observed_09_01_minute_price"
                         ),
                         "replay_source": (
                             "immutable_live_signal_official_open_and_shioaji_historical_ticks"
                         ),
                         "entry_fill_contract": MISSED_OPENING_REPLAY_CONTRACT,
                         "entry_liquidity_assumption": (
-                            "full_requested_paper_quantity_at_observed_09_01_minute_vwap_"
+                            "full_requested_paper_quantity_at_observed_09_01_minute_price_"
                             "without_exchange_fill_or_queue_claim"
                         ),
                         "replay_effective_signal_at": replay_at.isoformat(
@@ -2036,12 +2040,15 @@ def main(argv: list[str] | None = None) -> int:
                             "bid": None,
                             "ask": None,
                             "execution_price_0901": valid_price,
+                            "execution_price_0901_method": price_row.get(
+                                "execution_price_0901_method"
+                            ),
                             "quote_at": replay_at.isoformat(timespec="seconds"),
                             "historical_source_quote_at": price_row.get(
                                 "source_window_end"
                             ),
                             "source": price_row.get("source")
-                            or "missing_observed_09_01_minute_vwap",
+                            or "missing_observed_09_01_minute_price",
                             "entry_price_source": price_row.get("source"),
                         }
                     register_observed = replay_at
