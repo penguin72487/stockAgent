@@ -282,6 +282,58 @@ def _source_ledger_signal_ids(
     }
 
 
+def _resolve_source_signal_pins(
+    source_signal_ids: Mapping[tuple[str, str], str],
+    *,
+    expected_signal_keys: set[tuple[str, str]],
+    known_markets: set[str],
+    allowed_unpinned_markets: set[str],
+    replacement_signal_markets: set[str],
+) -> tuple[dict[tuple[str, str], str], dict[str, Any]]:
+    """Keep the old ledger pinned except for explicitly replaced markets.
+
+    Adding a mode and replacing a mode are different migrations.  An add-mode
+    exception may discover only keys absent from the source ledger.  A
+    replacement deliberately removes the old pins for that stable market ID so
+    the replay resolves the newly deployed signal artifacts instead.
+    """
+
+    unknown = (allowed_unpinned_markets | replacement_signal_markets) - known_markets
+    if unknown:
+        raise ValueError(f"signal pin exceptions name unknown modes: {sorted(unknown)}")
+    overlap = allowed_unpinned_markets & replacement_signal_markets
+    if overlap:
+        raise ValueError(
+            f"a market cannot be both added and replaced: {sorted(overlap)}"
+        )
+
+    pins = dict(source_signal_ids)
+    replacement_keys = {
+        key for key in expected_signal_keys if key[1] in replacement_signal_markets
+    }
+    replaced_pinned_keys = replacement_keys & set(pins)
+    for key in replacement_keys:
+        pins.pop(key, None)
+
+    missing_signal_keys = sorted(expected_signal_keys - set(pins))
+    discoverable_markets = allowed_unpinned_markets | replacement_signal_markets
+    disallowed_missing = [
+        key for key in missing_signal_keys if key[1] not in discoverable_markets
+    ]
+    if disallowed_missing:
+        raise ValueError(
+            "source ledger is missing replay signal identities: "
+            f"{disallowed_missing[:20]}"
+        )
+    return pins, {
+        "allowed_unpinned_markets": sorted(allowed_unpinned_markets),
+        "replacement_signal_markets": sorted(replacement_signal_markets),
+        "replaced_pinned_signal_keys": len(replaced_pinned_keys),
+        "discovered_signal_keys": len(missing_signal_keys),
+        "pinned_signal_keys": len(expected_signal_keys) - len(missing_signal_keys),
+    }
+
+
 def _load_retained_historical_entry_books(
     *,
     historical_book_root: Path,
@@ -1902,6 +1954,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--replace-signal-market",
+        action="append",
+        default=[],
+        help=(
+            "Explicit strategy-replacement exception: discard the source-ledger "
+            "signal pins for this existing stable market ID and discover its "
+            "signals from the currently resolved deployment output. Every other "
+            "date/mode remains pinned. Requires --source-ledger-dir. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-history-source",
         type=Path,
         help=(
@@ -2121,34 +2184,32 @@ def main() -> None:
             for day in official_sessions
             for spec in specs
         }
-        missing_signal_keys = sorted(expected_signal_keys - set(source_signal_ids))
         allowed_unpinned_markets = {
             str(value).strip()
             for value in args.allow_unpinned_market
             if str(value).strip()
         }
-        unknown_unpinned_markets = allowed_unpinned_markets - set(specs_by_market)
-        if unknown_unpinned_markets:
-            raise ValueError(
-                "--allow-unpinned-market names unknown modes: "
-                f"{sorted(unknown_unpinned_markets)}"
-            )
-        disallowed_missing = [
-            key for key in missing_signal_keys if key[1] not in allowed_unpinned_markets
-        ]
-        if disallowed_missing:
-            raise ValueError(
-                "source ledger is missing replay signal identities: "
-                f"{disallowed_missing[:20]}"
-            )
+        replacement_signal_markets = {
+            str(value).strip()
+            for value in args.replace_signal_market
+            if str(value).strip()
+        }
+        source_signal_ids, pin_provenance = _resolve_source_signal_pins(
+            source_signal_ids,
+            expected_signal_keys=expected_signal_keys,
+            known_markets=set(specs_by_market),
+            allowed_unpinned_markets=allowed_unpinned_markets,
+            replacement_signal_markets=replacement_signal_markets,
+        )
         source_ledger_provenance = {
             **(source_ledger_provenance or {}),
-            "allowed_unpinned_markets": sorted(allowed_unpinned_markets),
-            "discovered_signal_keys": len(missing_signal_keys),
-            "pinned_signal_keys": len(expected_signal_keys) - len(missing_signal_keys),
+            **pin_provenance,
         }
-    elif args.allow_unpinned_market:
-        raise ValueError("--allow-unpinned-market requires --source-ledger-dir")
+    elif args.allow_unpinned_market or args.replace_signal_market:
+        raise ValueError(
+            "--allow-unpinned-market and --replace-signal-market require "
+            "--source-ledger-dir"
+        )
     benchmark_state_provenance: dict[str, Any] | None = None
     if args.benchmark_state_source is not None:
         benchmark_state_path = args.benchmark_state_source.resolve()

@@ -569,6 +569,56 @@ def test_source_ledger_pins_each_date_mode_signal_identity(tmp_path: Path) -> No
     assert len(provenance["sha256"]) == 64
 
 
+def test_source_signal_pins_replace_only_the_selected_stable_market() -> None:
+    expected = {
+        ("2026-08-13", "stable"),
+        ("2026-08-13", "control"),
+        ("2026-08-14", "stable"),
+        ("2026-08-14", "control"),
+    }
+    source = {
+        key: f"old-{day}-{market}"
+        for day, market in expected
+        for key in [(day, market)]
+    }
+
+    pins, provenance = replay._resolve_source_signal_pins(
+        source,
+        expected_signal_keys=expected,
+        known_markets={"stable", "control"},
+        allowed_unpinned_markets=set(),
+        replacement_signal_markets={"stable"},
+    )
+
+    assert set(pins) == {
+        ("2026-08-13", "control"),
+        ("2026-08-14", "control"),
+    }
+    assert provenance == {
+        "allowed_unpinned_markets": [],
+        "replacement_signal_markets": ["stable"],
+        "replaced_pinned_signal_keys": 2,
+        "discovered_signal_keys": 2,
+        "pinned_signal_keys": 2,
+    }
+
+
+def test_source_signal_pins_fail_closed_for_unselected_missing_mode() -> None:
+    expected = {
+        ("2026-08-13", "stable"),
+        ("2026-08-13", "control"),
+    }
+
+    with pytest.raises(ValueError, match="missing replay signal identities"):
+        replay._resolve_source_signal_pins(
+            {("2026-08-13", "stable"): "old-stable"},
+            expected_signal_keys=expected,
+            known_markets={"stable", "control"},
+            allowed_unpinned_markets=set(),
+            replacement_signal_markets={"stable"},
+        )
+
+
 def test_counterfactual_open_input_excludes_intraday_high_low_close() -> None:
     rows, missing_limits = signal_backfill._open_input_rows(
         official_rows={
