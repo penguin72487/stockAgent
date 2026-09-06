@@ -48,6 +48,14 @@ MINUTE_VWAP_0901_ENTRY_POLICY = "official_open_signal_0900_execute_0901_vwap"
 MINUTE_VWAP_0901_REPLAY_CONTRACT = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
 )
+MINUTE_PRICE_0901_REPLAY_CONTRACT = (
+    "retrospective_official_open_signal_at_09_00_observed_09_01_"
+    "minute_price_counterfactual_v2"
+)
+MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
+    MINUTE_VWAP_0901_REPLAY_CONTRACT,
+    MINUTE_PRICE_0901_REPLAY_CONTRACT,
+}
 MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 MINUTE_CURVE_SESSION_POINTS = 270
 
@@ -133,7 +141,14 @@ def _validate_minute_curve_coverage(
         failures.append("minute curve receipt has the wrong one-minute contract")
     if receipt.get("linear_interpolation_used") is not False:
         failures.append("minute curve receipt permits linear interpolation")
-    if receipt.get("accepted_09_01_strategy_and_13_30_endpoints_preserved") is not True:
+    opening_revalued = receipt.get("opening_marks_revalued_at_completed_minute") is True
+    if opening_revalued:
+        if receipt.get("accepted_13_30_endpoints_preserved") is not True:
+            failures.append("minute revaluation did not preserve accepted 13:30 endpoints")
+        fills_path = marks_path.parent / "fills.jsonl"
+        if not fills_path.is_file() or receipt.get("unchanged_fills_sha256") != _sha256(fills_path):
+            failures.append("minute revaluation changed the accepted fills ledger")
+    elif receipt.get("accepted_09_01_strategy_and_13_30_endpoints_preserved") is not True:
         failures.append("minute curve receipt did not preserve accepted endpoints")
     if int(coverage.get("missing_pairs") or 0) != 0:
         failures.append("minute curve receipt still has missing symbol-date pairs")
@@ -182,7 +197,8 @@ def _validate_minute_curve_coverage(
                 minute = str(row.get("minute") or "")
                 observed.setdefault((session_date, market), set()).add(minute)
                 if (
-                    minute[11:16] not in {"09:01", "13:30"}
+                    (minute[11:16] != "13:30" if opening_revalued
+                     else minute[11:16] not in {"09:01", "13:30"})
                     and not historical_minute_mark_has_source(row)
                 ):
                     unverified_interior_rows += 1
@@ -214,6 +230,7 @@ def _validate_minute_curve_coverage(
         "contract": str(receipt.get("minute_contract") or ""),
         "completed_session_dates": completed_session_dates,
         "points_per_session_mode": MINUTE_CURVE_SESSION_POINTS,
+        "opening_marks_revalued_at_completed_minute": opening_revalued,
         "validated_rows": sum(len(values) for values in observed.values()),
         "audited_historical_interior_rows": (
             len(completed_session_dates) * len(expected_markets) * 268
@@ -462,7 +479,7 @@ def _validate_official_open_fill_ledger(
     return {"fill_ledger_official_open_fills": fill_count}
 
 
-def _validate_0901_vwap_signal_ledger(
+def _validate_0901_minute_price_signal_ledger(
     candidate: Path,
     *,
     expected_fills: int,
@@ -470,8 +487,8 @@ def _validate_0901_vwap_signal_ledger(
 ) -> dict[str, int]:
     path = candidate / "signals.jsonl"
     if not path.is_file():
-        failures.append("09:01 VWAP replay has no signals.jsonl audit ledger")
-        return {"minute_vwap_0901_fills": 0}
+        failures.append("09:01 minute-price replay has no signals.jsonl audit ledger")
+        return {"minute_price_0901_fills": 0, "minute_vwap_0901_fills": 0}
     fill_count = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -491,10 +508,11 @@ def _validate_0901_vwap_signal_ledger(
                 recorded_at = datetime.fromisoformat(str(row.get("recorded_at")))
             except (TypeError, ValueError):
                 failures.append(
-                    f"signals.jsonl:{line_number}: malformed 09:01 VWAP fill"
+                    f"signals.jsonl:{line_number}: malformed 09:01 minute-price fill"
                 )
                 continue
             source = str(row.get("entry_price_source") or "")
+            method = str(row.get("entry_price_method") or "minute_vwap")
             if (
                 row.get("counterfactual_0901_price_fill") is not True
                 or row.get("counterfactual_open_price_fill") is not False
@@ -507,20 +525,24 @@ def _validate_0901_vwap_signal_ledger(
                 or not math.isfinite(sizing_open)
                 or sizing_open <= 0.0
                 or "0901" not in source.replace(":", "").replace("_", "")
+                or method not in {"minute_vwap", "minute_close"}
                 or recorded_at.hour != 9
                 or recorded_at.minute != 1
             ):
                 failures.append(
-                    f"signals.jsonl:{line_number}: 09:00-open/09:01-VWAP contract mismatch"
+                    f"signals.jsonl:{line_number}: 09:00-open/09:01-minute-price contract mismatch"
                 )
     if fill_count != expected_fills:
         failures.append(
-            f"signals ledger 09:01 VWAP fills={fill_count} receipt={expected_fills}"
+            f"signals ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
         )
-    return {"minute_vwap_0901_fills": fill_count}
+    return {
+        "minute_price_0901_fills": fill_count,
+        "minute_vwap_0901_fills": fill_count,
+    }
 
 
-def _validate_0901_vwap_fill_ledger(
+def _validate_0901_minute_price_fill_ledger(
     candidate: Path,
     *,
     expected_fills: int,
@@ -528,8 +550,11 @@ def _validate_0901_vwap_fill_ledger(
 ) -> dict[str, int]:
     path = candidate / "fills.jsonl"
     if not path.is_file():
-        failures.append("09:01 VWAP replay has no fills.jsonl audit ledger")
-        return {"fill_ledger_minute_vwap_0901_fills": 0}
+        failures.append("09:01 minute-price replay has no fills.jsonl audit ledger")
+        return {
+            "fill_ledger_minute_price_0901_fills": 0,
+            "fill_ledger_minute_vwap_0901_fills": 0,
+        }
     fill_count = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -541,7 +566,7 @@ def _validate_0901_vwap_fill_ledger(
             if (
                 str(row.get("purpose") or "") != "entry"
                 or str(row.get("fill_contract") or "")
-                != MINUTE_VWAP_0901_REPLAY_CONTRACT
+                not in MINUTE_PRICE_0901_REPLAY_CONTRACTS
             ):
                 continue
             fill_count += 1
@@ -550,7 +575,7 @@ def _validate_0901_vwap_fill_ledger(
                 fill_at = datetime.fromisoformat(str(row.get("fill_at")))
             except (TypeError, ValueError):
                 failures.append(
-                    f"fills.jsonl:{line_number}: malformed 09:01 VWAP fill"
+                    f"fills.jsonl:{line_number}: malformed 09:01 minute-price fill"
                 )
                 continue
             if (
@@ -561,19 +586,24 @@ def _validate_0901_vwap_fill_ledger(
                 or row.get("synthetic_fill") is not False
                 or row.get("synthetic_fallback_fill") is not False
                 or row.get("paper_market_fill") is not False
+                or str(row.get("entry_price_method") or "minute_vwap")
+                not in {"minute_vwap", "minute_close"}
                 or not math.isfinite(price)
                 or price <= 0.0
                 or fill_at.hour != 9
                 or fill_at.minute != 1
             ):
                 failures.append(
-                    f"fills.jsonl:{line_number}: 09:01 VWAP contract mismatch"
+                    f"fills.jsonl:{line_number}: 09:01 minute-price contract mismatch"
                 )
     if fill_count != expected_fills:
         failures.append(
-            f"fills ledger 09:01 VWAP fills={fill_count} receipt={expected_fills}"
+            f"fills ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
         )
-    return {"fill_ledger_minute_vwap_0901_fills": fill_count}
+    return {
+        "fill_ledger_minute_price_0901_fills": fill_count,
+        "fill_ledger_minute_vwap_0901_fills": fill_count,
+    }
 
 
 def _validate_rebuild(
@@ -614,6 +644,7 @@ def _validate_rebuild(
     synthetic_fallback_fills = 0
     official_open_fills = 0
     minute_vwap_0901_fills = 0
+    minute_price_0901_fills = 0
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -671,18 +702,35 @@ def _validate_rebuild(
                 minute_vwap_0901_count = int(
                     entry.get("entry_0901_vwap_fill_count") or 0
                 )
+                minute_close_0901_count = int(
+                    entry.get("entry_0901_close_fill_count") or 0
+                )
+                minute_price_0901_count = int(
+                    entry.get("entry_0901_minute_price_fill_count")
+                    or minute_vwap_0901_count
+                    or 0
+                )
                 best_quote_fills += exact_count
                 synthetic_fallback_fills += fallback_count
                 official_open_fills += official_open_count
                 minute_vwap_0901_fills += minute_vwap_0901_count
+                minute_price_0901_fills += minute_price_0901_count
                 if policy == MINUTE_VWAP_0901_ENTRY_POLICY:
-                    if receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT:
+                    if receipt_entry_contract not in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
                         failures.append(
-                            f"{session_date}/{market}: 09:01 VWAP replay contract is not explicit"
+                            f"{session_date}/{market}: 09:01 minute-price replay contract is not explicit"
                         )
-                    if minute_vwap_0901_count != fill_count:
+                    if minute_price_0901_count != fill_count:
                         failures.append(
-                            f"{session_date}/{market}: 09:01 VWAP fill counts do not reconcile"
+                            f"{session_date}/{market}: 09:01 minute-price fill counts do not reconcile"
+                        )
+                    if (
+                        receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT
+                        and minute_vwap_0901_count + minute_close_0901_count
+                        != minute_price_0901_count
+                    ):
+                        failures.append(
+                            f"{session_date}/{market}: 09:01 VWAP+Close method counts do not reconcile"
                         )
                     if (
                         entry.get("entry_fill_is_synthetic") is True
@@ -690,7 +738,7 @@ def _validate_rebuild(
                         or official_open_count
                     ):
                         failures.append(
-                            f"{session_date}/{market}: 09:01 VWAP fill uses a forbidden fallback"
+                            f"{session_date}/{market}: 09:01 minute-price fill uses a forbidden synthetic fallback"
                         )
                 if policy == OFFICIAL_OPEN_ENTRY_POLICY:
                     if receipt_entry_contract != OFFICIAL_OPEN_REPLAY_CONTRACT:
@@ -776,10 +824,10 @@ def _validate_rebuild(
             )
         if (
             mode_is_0901_vwap
-            and receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT
+            and receipt_entry_contract not in MINUTE_PRICE_0901_REPLAY_CONTRACTS
         ):
             failures.append(
-                f"{market}: 09:01 VWAP final state has no matching receipt"
+                f"{market}: 09:01 minute-price final state has no matching receipt"
             )
         positions = mode.get("positions")
         if not isinstance(positions, dict):
@@ -811,7 +859,7 @@ def _validate_rebuild(
             if mode_is_official_open:
                 allowed_contracts.add(OFFICIAL_OPEN_REPLAY_CONTRACT)
             if mode_is_0901_vwap:
-                allowed_contracts.add(MINUTE_VWAP_0901_REPLAY_CONTRACT)
+                allowed_contracts.update(MINUTE_PRICE_0901_REPLAY_CONTRACTS)
             if mode.get("entry_fill_contract") not in allowed_contracts:
                 failures.append(f"{market}: current entry fill contract is invalid")
             if mode.get("entry_fill_is_synthetic") is not False and not (
@@ -842,7 +890,7 @@ def _validate_rebuild(
                     or position.get("counterfactual_open_price_fill") is not False
                 ):
                     failures.append(
-                        f"{market}/{symbol}: position is not an observed 09:01 VWAP fill"
+                        f"{market}/{symbol}: position is not an observed 09:01 minute-price fill"
                     )
                 if (
                     position.get("entry_fill_is_synthetic") is not False
@@ -880,16 +928,21 @@ def _validate_rebuild(
                 failures=failures,
             )
         )
-    elif receipt_entry_contract == MINUTE_VWAP_0901_REPLAY_CONTRACT:
-        signal_ledger_validation = _validate_0901_vwap_signal_ledger(
+    elif receipt_entry_contract in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
+        expected_minute_price_fills = (
+            minute_price_0901_fills
+            if receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT
+            else minute_vwap_0901_fills
+        )
+        signal_ledger_validation = _validate_0901_minute_price_signal_ledger(
             candidate,
-            expected_fills=minute_vwap_0901_fills,
+            expected_fills=expected_minute_price_fills,
             failures=failures,
         )
         signal_ledger_validation.update(
-            _validate_0901_vwap_fill_ledger(
+            _validate_0901_minute_price_fill_ledger(
                 candidate,
-                expected_fills=minute_vwap_0901_fills,
+                expected_fills=expected_minute_price_fills,
                 failures=failures,
             )
         )
@@ -916,6 +969,7 @@ def _validate_rebuild(
         "synthetic_fallback_fills": synthetic_fallback_fills,
         "official_open_fills": official_open_fills,
         "minute_vwap_0901_fills": minute_vwap_0901_fills,
+        "minute_price_0901_fills": minute_price_0901_fills,
         "signal_ledger_validation": signal_ledger_validation,
         "minute_curve_validation": minute_curve_validation,
         "mode_set": sorted(expected_markets),

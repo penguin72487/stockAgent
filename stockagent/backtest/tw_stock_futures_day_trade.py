@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from stockagent.data.tw_stock_futures_minute import BAR_FIELDS, EVENT_MINUTES, TAPE_FIELDS
+
 
 @dataclass(slots=True)
 class StockFuturesDayTradeTensorResult:
@@ -18,6 +20,8 @@ class StockFuturesDayTradeTensorResult:
     equity_scale_history: torch.Tensor | None = None
     final_equity_scale: torch.Tensor | None = None
     contract_quantities_history: torch.Tensor | None = None
+    residual_contract_quantities_history: torch.Tensor | None = None
+    default_history: torch.Tensor | None = None
 
 
 def run_tw_stock_futures_day_trade_continuous_torch(
@@ -249,6 +253,64 @@ def _integer_candidate_basket(
     )[:, 0, :].to(dtype=torch.int64)
 
 
+def _scheduled_futures_day(
+    requested: torch.Tensor, execution: torch.Tensor, equity: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One fixed daily order and its causal limit/market exit sequence.
+
+    Only completed entry evidence constrains entry. Future exit capacity never
+    shrinks an opening order. A residual is returned explicitly, never sold at
+    a daily CLOSE, converted to stock margin, or silently erased.
+    """
+    multiplier, fee, tax = execution[:, :, 0], execution[:, :, 1], execution[:, :, 2]
+    bars = execution[:, :, 3:].reshape(-1, 2, len(EVENT_MINUTES), len(BAR_FIELDS))
+    entry = bars[:, :, 0, 0]
+    caps = bars[:, :, 0, 4]
+    valid = (torch.isfinite(execution[:, :, :3]).all(-1)
+             & (multiplier > 0) & (fee >= 0) & (tax >= 0)
+             & torch.isfinite(entry) & (entry > 0)
+             & torch.isfinite(caps) & (caps >= 0))
+    clean = lambda x: torch.where(valid, torch.nan_to_num(x), torch.zeros_like(x))
+    notional = clean(entry * multiplier)
+    entry_tax = torch.floor(clean(notional * tax) + 0.5)
+    reserve = notional + 2 * (clean(fee) + entry_tax)
+    target_cash = requested.abs() * equity.detach().clamp_min(0)
+    counts_int = _integer_candidate_basket(target_cash, notional, reserve, caps, valid)
+    # Fractional shadow of the same order, with exact integer forward fills.
+    soft = target_cash[:, None] / torch.where(valid, reserve, torch.zeros_like(reserve)).sum(-1).clamp_min(1e-12)[:, None]
+    soft = torch.where(valid, torch.minimum(soft, caps.clamp_min(0)), torch.zeros_like(soft))
+    counts = soft + (counts_int.to(soft.dtype) - soft).detach()
+    remaining = counts
+    sign = torch.sign(requested)[:, None]
+    pnl = -(counts * (clean(fee) + entry_tax)).sum()
+    turnover = (counts.detach() * notional).sum()
+    limit = bars[:, :, 1, 3]  # 13:20 completed close; never a later bar.
+    for event in range(2, len(EVENT_MINUTES)):
+        price, high, low, _, capacity = bars[:, :, event, :].unbind(-1)
+        observed = (valid & torch.isfinite(price) & (price > 0)
+                    & torch.isfinite(capacity) & (capacity >= 0))
+        if event <= 5:  # 13:21..13:24 bars, strictly before market phase.
+            observed = observed & torch.isfinite(limit) & (limit > 0) & torch.where(
+                sign >= 0, high > limit, low < limit,
+            )
+            price = limit
+        capacity = torch.where(observed, capacity.clamp_min(0), torch.zeros_like(capacity))
+        filled = torch.minimum(remaining, capacity)
+        safe_price = torch.where(observed, price, torch.zeros_like(price))
+        exit_notional = safe_price * clean(multiplier)
+        exit_tax = torch.floor(exit_notional * clean(tax) + 0.5)
+        pnl = pnl + (filled * (sign * (safe_price - clean(entry)) * clean(multiplier)
+                              - clean(fee) - exit_tax)).sum()
+        turnover = turnover + (filled.detach() * exit_notional).sum()
+        remaining = remaining - filled
+    exact_abs = (counts_int.to(notional.dtype) * notional).sum(-1)
+    executed_weight = torch.sign(requested) * exact_abs / equity.detach().clamp_min(1e-12)
+    signed = counts_int * sign.to(torch.int64)
+    residual = torch.round(remaining.detach()).to(torch.int64) * sign.to(torch.int64)
+    failed_exposure = (remaining * notional).sum() / equity.detach().clamp_min(1e-12)
+    return pnl / equity.detach().clamp_min(1e-12), executed_weight, signed, residual, turnover / equity.detach().clamp_min(1e-12), failed_exposure
+
+
 def run_tw_stock_futures_day_trade_integer_torch(
     target_weights: torch.Tensor,
     candidate_execution: torch.Tensor,
@@ -258,6 +320,7 @@ def run_tw_stock_futures_day_trade_integer_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
+    scheduled_events: bool = False,
 ) -> StockFuturesDayTradeTensorResult:
     """Run an exact-forward, fully collateralized whole-contract day ledger.
 
@@ -276,9 +339,9 @@ def run_tw_stock_futures_day_trade_integer_torch(
         )
     if candidate_execution.ndim != 4 or tuple(candidate_execution.shape[:2]) != tuple(
         target_weights.shape
-    ) or tuple(candidate_execution.shape[2:]) != (2, 5):
+    ) or tuple(candidate_execution.shape[2:]) != (2, TAPE_FIELDS if scheduled_events else 5):
         raise ValueError(
-            "candidate_execution must have shape [T,S,2,5] for standard/mini"
+            "candidate_execution has incompatible standard/mini channels"
         )
     capital = float(initial_capital)
     if not capital > 0.0 or not math.isfinite(capital):
@@ -316,12 +379,36 @@ def run_tw_stock_futures_day_trade_integer_torch(
     weight_rows: list[torch.Tensor] = []
     quantity_rows: list[torch.Tensor] = []
     equity_scale_rows: list[torch.Tensor] = []
+    residual_rows: list[torch.Tensor] = []
+    default_rows: list[torch.Tensor] = []
     for row in range(rows):
         requested = torch.where(
             advance[row] & alive,
             weights[row],
             torch.zeros_like(weights[row]),
         )
+        if scheduled_events:
+            net_simple, exact_signed_weight, signed_counts, residual, turnover, failed_exposure = _scheduled_futures_day(
+                requested, execution[row], equity,
+            )
+            next_equity = equity * (1.0 + net_simple)
+            failed = (residual != 0).any() | ~torch.isfinite(next_equity) | (next_equity <= 0)
+            row_alive = ~failed
+            # Separate the absorbing failure penalty from an invented sale.
+            # Its bounded shadow discourages trapped exposure even when the
+            # exact forward account is rejected, avoiding a constant dead loss.
+            failure_log = torch.full_like(net_simple, math.log(1e-7)) - (failed_exposure - failed_exposure.detach())
+            log_return = torch.where(row_alive, torch.log1p(net_simple.clamp_min(-1 + 1e-7)), failure_log)
+            return_rows.append(torch.where(advance[row] & alive, log_return, torch.zeros_like(log_return)))
+            default_rows.append(advance[row] & alive & failed)
+            residual_rows.append(residual)
+            equity = torch.where(advance[row] & alive, torch.where(row_alive, next_equity, torch.zeros_like(next_equity)), equity)
+            alive = alive & ((~advance[row]) | row_alive)
+            weight_rows.append(requested + (exact_signed_weight - requested).detach())
+            quantity_rows.append(signed_counts)
+            turnover_rows.append(turnover)
+            equity_scale_rows.append(equity / capital)
+            continue
         long_net = execution[row, :, :, 0]
         short_net = execution[row, :, :, 1]
         notionals = execution[row, :, :, 2]
@@ -423,6 +510,8 @@ def run_tw_stock_futures_day_trade_integer_torch(
         equity_scale_history=equity_scales,
         final_equity_scale=equity_scales[-1] if equity_scales.numel() else starting_scale,
         contract_quantities_history=quantities_history,
+        residual_contract_quantities_history=(torch.stack(residual_rows) if residual_rows else None),
+        default_history=(torch.stack(default_rows) if default_rows else None),
     )
 
 

@@ -53,6 +53,9 @@ from stockagent.live.market_config import (  # noqa: E402
     resolved_live_output_dir,
 )
 from stockagent.live.market_status import short_file_fingerprint  # noqa: E402
+from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -243,6 +246,11 @@ def _current_deployment_evidence(
     source_ledger = rebuild.get("source_signal_ledger") or {}
     if market not in set(source_ledger.get("replacement_signal_markets") or ()):
         reasons.append("target_market_was_not_explicitly_replaced")
+    replay_entry_contract = str(
+        (rebuild.get("replay_contract") or {}).get("entry") or ""
+    )
+    if replay_entry_contract != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE:
+        reasons.append("replay_entry_contract_version_mismatch")
     mode = (state.get("modes") or {}).get(market) or {}
     if float(mode.get("initial_capital_twd") or 0.0) != initial_capital_twd:
         reasons.append("initial_capital_mismatch")
@@ -285,6 +293,8 @@ def _current_deployment_evidence(
         "minute_rows": int(minute.get("validated_rows") or 0),
         "target_signal_summaries": summary_count,
         "target_checkpoint_fingerprints": sorted(observed_fingerprints),
+        "replay_entry_contract": replay_entry_contract,
+        "required_replay_entry_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
         "promoted_at": promotion.get("promoted_at"),
         "rollback_directory": promotion.get("rollback_directory"),
     }
@@ -751,6 +761,7 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
                     "--simulation",
                     "--fetch-missing-kbars",
                     "--repair-unverified-strategy-marks",
+                    "--revalue-opening-marks",
                     "--publish",
                 ],
                 run_dir=run_dir,

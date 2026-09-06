@@ -4,7 +4,8 @@ The policy still observes the complete Taiwan stock panel.  This module adds
 only executor labels aligned to that stock order: a stock without a causally
 known front-month futures contract is masked out before portfolio allocation,
 and a known contract without the execution prices required by its declared
-clock cannot execute.  The default 09:00 research baseline uses the immutable
+clock cannot execute. The 08:45 minute mode attaches scheduled physical-contract
+bars. The legacy 09:00 research baseline uses the immutable
 daily session OPEN-to-CLOSE label as an explicit counterfactual proxy.  Because
 that OPEN is stamped 08:45, the proxy is not an executable 09:00 fill claim.
 The separately receipted first strictly-later public trade through 09:00:59
@@ -665,6 +666,7 @@ def attach_stock_futures_day_trade_daily(
     entry_0900_data_path: str | Path | None = None,
     integer_contracts: bool = False,
     max_volume_participation: float = 0.5,
+    minute_data_path: str | Path | None = None,
 ) -> PanelData:
     """Attach nearby-futures labels without changing model input symbol axes."""
 
@@ -712,6 +714,50 @@ def attach_stock_futures_day_trade_daily(
         if integer_contracts
         else select_causal_front_stock_futures(source)
     )
+    if minute_data_path is not None:
+        if not integer_contracts:
+            raise ValueError("scheduled futures minutes require integer candidates")
+        from stockagent.data.tw_stock_futures_minute import (
+            MINUTE_CONTRACT_VERSION, load_futures_minute_tape,
+        )
+        tape, _ = load_futures_minute_tape(
+            minute_data_path, selected, dates, symbols,
+            daily_sha256=expected_hash, fee=fee_per_contract_per_side_twd,
+            participation=max_volume_participation,
+        )
+        policy = (tape[..., 0] > 0).any(axis=-1)
+        entry = tape[..., 3]
+        terminal = tape[..., -5]
+        entry_available = (entry > 0) & (tape[..., 7] > 0)
+        marked = entry_available & (terminal > 0)
+        simple = np.divide(terminal, entry, out=np.ones_like(entry), where=marked) - 1
+        count = marked.sum(axis=-1)
+        returns = np.log1p(np.divide(
+            simple.sum(axis=-1), count, out=np.zeros(policy.shape, dtype=np.float32),
+            where=count > 0,
+        ))
+        benchmark_count = marked.sum(axis=(1, 2))
+        benchmark = np.log1p(np.divide(
+            simple.sum(axis=(1, 2)), benchmark_count,
+            out=np.zeros(len(dates), dtype=np.float32), where=benchmark_count > 0,
+        ))
+        panel.stock_futures_day_trade_daily = TaiwanStockFuturesDayTradeDaily(
+            dates=dates, symbols=symbols, intraday_log_returns=returns,
+            policy_eligible_mask=policy, executable_mask=entry_available.any(axis=-1),
+            round_trip_cost_rate_per_open_notional=np.zeros_like(returns),
+            prior_volume_notional=np.zeros_like(returns), benchmark_log_returns=benchmark,
+            selected_rows=selected.height,
+            selected_underlyings=selected["underlying_symbol"].n_unique(),
+            source_path=str(data_path), manifest_path=str(manifest_path),
+            entry_clock="0846_right_labelled_minute_after_0845_daily_decision",
+            entry_source_path=str(minute_data_path),
+            entry_manifest_path=str(Path(minute_data_path).parent / "manifest.json"),
+            integer_candidate_execution=tape,
+            integer_candidate_multipliers=STOCK_FUTURES_INTEGER_CANDIDATE_MULTIPLIERS,
+            integer_candidate_selection="causal_standard_and_mini_prior_session_liquidity",
+            contract_version=MINUTE_CONTRACT_VERSION,
+        )
+        return panel
     normalized_entry_source = str(entry_price_source).strip().lower()
     if normalized_entry_source not in STOCK_FUTURES_DAY_TRADE_ENTRY_PRICE_SOURCES:
         raise ValueError(

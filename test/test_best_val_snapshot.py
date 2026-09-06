@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from stockagent.backtest.simulator import BacktestResult, BacktestResultTensor
+from stockagent.config import TradingConfig, TrainingConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 import stockagent.training.trainer as trainer_module
@@ -176,10 +177,11 @@ def test_save_fold_output_artifacts_writes_standard_files_with_compressed_backte
         test_integer_metrics=None,
     )
     config = SimpleNamespace(
-        training=SimpleNamespace(
+        trading=TradingConfig(frequency="daily", buy_fee_rate=0.0, sell_fee_rate=0.0, long_only=False),
+        training=TrainingConfig(
+            non_blocking_transfer=False,
             table_output_format="csv",
             save_daily_weights_table=True,
-            save_daily_weights_csv=True,
             save_integer_share_daily_weights_table=False,
             save_integer_share_holdings_table=False,
             backtest_artifact_compression="none",
@@ -263,7 +265,9 @@ def test_save_fold_output_artifacts_survives_broken_report_pipe(
         test_metrics={},
     )
     config = SimpleNamespace(
-        training=SimpleNamespace(
+        trading=TradingConfig(frequency="daily", buy_fee_rate=0.0, sell_fee_rate=0.0, long_only=False),
+        training=TrainingConfig(
+            non_blocking_transfer=False,
             table_output_format="csv",
             save_daily_weights_table=False,
             save_integer_share_daily_weights_table=False,

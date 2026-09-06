@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import time
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,10 +38,22 @@ def _ensure_transformer_engine_cuda_include_env() -> None:
 
 _ensure_transformer_engine_cuda_include_env()
 
+TRANSFORMER_ENGINE_IMPORT_ERROR: str | None = None
 try:
-    import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import Float8CurrentScaling, NVFP4BlockScaling
-except Exception:  # noqa: BLE001 - optional precision backend.
+    # TE still scripts its quantization helpers at import time on PyTorch
+    # 2.12. Suppress only that upstream deprecation in this import scope;
+    # project warnings and genuine backend import failures stay actionable.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"`torch\.jit\.script` is deprecated\. Please switch to `torch\.compile` or `torch\.export`\.",
+            category=DeprecationWarning,
+            module=r"torch\.jit\._script",
+        )
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import Float8CurrentScaling, NVFP4BlockScaling
+except Exception as exc:  # noqa: BLE001 - optional precision backend.
+    TRANSFORMER_ENGINE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
     te = None
     Float8CurrentScaling = None
     NVFP4BlockScaling = None
@@ -233,7 +246,7 @@ class TransformerEngineLinearCompat(nn.Module):
     def __init__(self, source: nn.Linear, backend: str) -> None:
         super().__init__()
         if te is None:
-            raise RuntimeError("transformer_engine is not available")
+            raise RuntimeError(f"transformer_engine is not available: {TRANSFORMER_ENGINE_IMPORT_ERROR}")
         self.in_features = int(source.in_features)
         self.out_features = int(source.out_features)
         self.backend = str(backend)
@@ -584,9 +597,9 @@ def _run_supported_mode(
                 "mode": mode,
                 "status": "unsupported_native",
                 "runnable": False,
-                "reason": f"transformer_engine is not installed; {mode.upper()} native mode cannot run.",
+                "reason": f"transformer_engine could not be imported; {mode.upper()} native mode cannot run.",
                 "error_type": "MissingOptionalDependency",
-                "error": "transformer_engine.pytorch import failed",
+                "error": TRANSFORMER_ENGINE_IMPORT_ERROR,
             }
         model = _make_model(args, device)
         model.load_state_dict(base_state)

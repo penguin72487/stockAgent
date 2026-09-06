@@ -214,6 +214,72 @@ def test_targeted_download_report_preserves_other_manifest_terminal_rows(tmp_pat
         "2833": "not_found",
         "2330": "updated",
     }
+    summary = json.loads((tmp_path / "download_summary.json").read_text())
+    assert summary["symbol_count"] == report.height == 2
+    assert sum(summary["status_counts"].values()) == summary["symbol_count"]
+    assert summary["run_symbol_count"] == 1
+    assert summary["manifest_symbol_count"] == 2
+
+
+def _report_result(code, *, status="updated", rows=10):
+    return yahoo.DownloadResult(
+        asset_class="tw_stocks", code=code, yahoo_symbol=f"{code}.TW",
+        market="listed", status=status, rows=rows,
+        output_path=f"{code}_features.parquet",
+    )
+
+
+def test_targeted_download_report_preserves_leading_zero_codes(tmp_path):
+    yahoo._write_download_artifacts(tmp_path, "tw_stocks", [_report_result("0050")])
+    yahoo._write_download_artifacts(
+        tmp_path, "tw_stocks", [_report_result("2330")],
+        manifest_codes={"0050", "2330"},
+    )
+    report = pl.read_csv(tmp_path / "download_report.csv", schema_overrides={"code": pl.String})
+    assert report["code"].to_list() == ["0050", "2330"]
+
+
+@pytest.mark.parametrize("old_report", ["broken\nreceipt\n", ""])
+def test_targeted_download_refuses_to_erase_unreadable_previous_report(tmp_path, old_report):
+    report = tmp_path / "download_report.csv"
+    report.write_text(old_report)
+    summary = tmp_path / "download_summary.json"
+    summary.write_text('{"old": true}')
+    with pytest.raises(ValueError, match="previous download report"):
+        yahoo._write_download_artifacts(
+            tmp_path, "tw_stocks", [_report_result("2330")],
+            manifest_codes={"0050", "2330"},
+        )
+    assert report.read_text() == old_report
+    assert summary.read_text() == '{"old": true}'
+
+
+def test_complete_download_can_replace_unreadable_previous_report(tmp_path):
+    (tmp_path / "download_report.csv").write_text("broken\nreceipt\n")
+    yahoo._write_download_artifacts(
+        tmp_path, "tw_stocks", [_report_result("2330")], manifest_codes={"2330"},
+    )
+    assert pl.read_csv(tmp_path / "download_report.csv").height == 1
+
+
+def test_failed_report_publication_preserves_previous_artifacts(tmp_path, monkeypatch):
+    from downloader import artifact_io
+
+    yahoo._write_download_artifacts(tmp_path, "tw_stocks", [_report_result("0050")])
+    before = {name: (tmp_path / name).read_bytes() for name in (
+        "download_report.csv", "download_summary.json",
+    )}
+    def reject_replace(source, target):
+        raise OSError("simulated replace failure")
+    monkeypatch.setattr(artifact_io.os, "replace", reject_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        yahoo._write_download_artifacts(
+            tmp_path, "tw_stocks", [_report_result("2330")],
+            manifest_codes={"0050", "2330"},
+        )
+    for name, payload in before.items():
+        assert (tmp_path / name).read_bytes() == payload
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_tw_exchange_parser_excludes_warrant_like_listings(monkeypatch):

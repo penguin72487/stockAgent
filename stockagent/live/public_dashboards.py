@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
+import re
 import threading
 import time
 from typing import Any, Final
@@ -49,12 +50,19 @@ def _scrub_public_value(value: Any) -> Any:
         "source_file",
         "source_path",
     }
+    credential_keys = {
+        "apikey", "apisecret", "secret", "secretkey", "password", "passwd",
+        "authorization", "cookie", "setcookie", "token", "accesstoken",
+        "refreshtoken", "privatekey", "accountid", "accountnumber", "brokerid",
+    }
     if isinstance(value, Mapping):
         output: dict[str, Any] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
             if (
                 key in dropped_keys
+                or normalized in credential_keys
                 or key.endswith("_path")
                 or key.endswith("_dir")
                 or key.endswith("_file")
@@ -414,6 +422,31 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             "minute_coverage_ratio",
         },
     )
+    if payload.get("history_encoding") == "minute_columns_v1":
+        series = []
+        for raw in payload.get("minute_series") or ():
+            if not isinstance(raw, Mapping):
+                raise UnsafePublicDashboardPayload("invalid minute series")
+            points = []
+            for point in raw.get("points") or ():
+                if (
+                    not isinstance(point, (list, tuple))
+                    or len(point) != 4
+                    or any(type(value) not in (int, float) or not math.isfinite(value)
+                           for value in point)
+                    or int(point[0]) != point[0]
+                    or int(point[3]) != point[3]
+                    or not 0 <= point[3] <= 7
+                ):
+                    raise UnsafePublicDashboardPayload("invalid minute point")
+                points.append(list(point))
+            series.append({
+                "series_id": _scrub_public_value(str(raw.get("series_id") or "")),
+                "series_type": "benchmark" if raw.get("series_type") == "benchmark" else "strategy",
+                "points": points,
+            })
+        output["history_encoding"] = "minute_columns_v1"
+        output["minute_series"] = series
     return output
 
 
@@ -481,8 +514,16 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "symbol",
             "target_weight",
             "top_book_capacity_shares",
+            "stock_futures",
         },
     )
+    # Keep the enrichment DTO bounded just like the surrounding signal row.
+    for row in output.get("rows", []):
+        membership = row.get("stock_futures")
+        if isinstance(membership, dict):
+            row["stock_futures"] = {key: membership[key] for key in (
+                "status", "products", "as_of", "scope", "reason", "source_url"
+            ) if key in membership}
     return output
 
 

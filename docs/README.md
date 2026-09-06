@@ -12,6 +12,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## 現行正確性契約
 
+- [`project_architecture.md`](project_architecture.md)：全專案模組／服務責任導航與可重建的 AI 可讀清單。
 - [`../AGENTS.md`](../AGENTS.md)：point-in-time、fee/mask、checkpoint、重現性與目前量測建議。
 - [`training_spec.md`](training_spec.md)：第一性訓練、評估、checkpoint 與驗收契約。
 - [`training_mode_adapter_architecture.md`](training_mode_adapter_architecture.md)：共用訓練核心與模式 adapter 邊界。
@@ -57,6 +58,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 - [`tw_index_futures_day_strategy.md`](tw_index_futures_day_strategy.md)
 - [`tw_futures_portfolio_day.md`](tw_futures_portfolio_day.md)
+- [`tw_stock_futures_day_trade_minute.md`](tw_stock_futures_day_trade_minute.md)：08:45 決策、08:46 分鐘執行、13:30 退出的個股期貨當沖。
 - [`tw_index_derivatives_day_multi_basis.md`](tw_index_derivatives_day_multi_basis.md)
 - [`tw_index_derivatives_tick_strategy.md`](tw_index_derivatives_tick_strategy.md)
 
@@ -66,7 +68,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## Review 與歷史工程快照
 
-- [`PROJECT_REVIEW_2026-08-10.md`](PROJECT_REVIEW_2026-08-10.md) 是最近一次全專案 review。
+- [`PROJECT_REVIEW_2026-09-05.md`](PROJECT_REVIEW_2026-09-05.md) 是最近一次全專案 review，包含修正、驗證與保留的決策邊界。
+- [`PROJECT_REVIEW_2026-08-10.md`](PROJECT_REVIEW_2026-08-10.md) 保留為當時的 review 快照。
 - `ARCHITECTURE_REVIEW.md`、`COMPREHENSIVE_ANALYSIS.md`、`FIXES_*`、
   `OPTIMIZATION_*`、`EXECUTIVE_SUMMARY.md`、`ANALYSIS_INDEX.md` 與
   `CODE_ORGANIZATION.md` 是特定日期的工程快照。

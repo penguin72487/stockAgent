@@ -449,13 +449,18 @@ def _promote_monthly_repairs(path: Path) -> set[tuple[str, str, str]]:
     repairs: set[tuple[str, str, str]] = set()
     with sqlite3.connect(path) as connection:
         rows = connection.execute(
-            """SELECT object_key, error FROM archive_objects
+            """SELECT object_key, error, status FROM archive_objects
                WHERE status IN ('failed', 'quarantined_repair_required')"""
         ).fetchall()
-        for key_value, error_value in rows:
+        for key_value, error_value, status in rows:
             key = str(key_value)
             error = str(error_value or "")
-            if "/monthly/klines/" not in key or "invalid OHLCV rows" not in error:
+            semantic_failure = (
+                status == "quarantined_repair_required"
+                or "invalid OHLCV rows" in error
+                or "conflicting duplicate open timestamp" in error
+            )
+            if "/monthly/klines/" not in key or not semantic_failure:
                 continue
             parts = key.split("/")
             market = "spot" if parts[1:3] == ["spot", "monthly"] else parts[2]
@@ -700,10 +705,14 @@ def _download_states(
             "quarantined_source_invalid",
         )
     )
-    dataset_partial = bool(
-        counts["failed"]
-        or counts["quarantined_repair_required"]
-        or durable_counts.get("quarantined_source_invalid", 0)
+    # A clean cycle (including an empty/targeted plan) cannot certify old gaps.
+    # Daily replacements require a separate coverage proof before a quarantined
+    # monthly object may cease to count as an unresolved dataset gap.
+    dataset_partial = cycle_failed or any(
+        durable_counts.get(name, 0)
+        for name in (
+            "failed", "quarantined_repair_required", "quarantined_source_invalid",
+        )
     )
     return (
         "partial" if dataset_partial else "complete",

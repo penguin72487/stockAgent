@@ -1508,6 +1508,8 @@ class BacktestResult:
     executed_short_cover_weights: np.ndarray | None = None
     due_weights_history: np.ndarray | None = None
     final_due_weights: np.ndarray | None = None
+    futures_contract_quantities_history: np.ndarray | None = None
+    futures_residual_contract_quantities_history: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1562,6 +1564,8 @@ class BacktestResultTensor:
     executed_short_cover_weights: torch.Tensor | None = None
     due_weights_history: torch.Tensor | None = None
     final_due_weights: torch.Tensor | None = None
+    futures_contract_quantities_history: torch.Tensor | None = None
+    futures_residual_contract_quantities_history: torch.Tensor | None = None
 
     def to_numpy(self) -> BacktestResult:
         # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
@@ -1580,6 +1584,8 @@ class BacktestResultTensor:
             )
 
         return BacktestResult(
+            futures_contract_quantities_history=(None if self.futures_contract_quantities_history is None else self.futures_contract_quantities_history.detach().cpu().numpy()),
+            futures_residual_contract_quantities_history=(None if self.futures_residual_contract_quantities_history is None else self.futures_residual_contract_quantities_history.detach().cpu().numpy()),
             strategy_returns=as_float32(self.strategy_returns),
             benchmark_returns=as_float32(self.benchmark_returns),
             turnovers=as_float32(self.turnovers),
@@ -3583,6 +3589,7 @@ def run_backtest_torch(
             initial_equity_scale=initial_equity_scale,
             initial_alive=initial_alive,
             return_weights_history=return_weights_history,
+            scheduled_events=mode == "tw_stock_futures_day_trade_0845_minute",
         )
         return BacktestResultTensor(
             strategy_returns=result.strategy_returns,
@@ -3597,6 +3604,10 @@ def run_backtest_torch(
             equity_scale_history=result.equity_scale_history,
             final_equity_scale=result.final_equity_scale,
             execution_mode=mode,
+            settlement_default=result.default_history,
+            default_reason_history=(None if result.default_history is None else result.default_history.to(torch.int64)),
+            futures_contract_quantities_history=result.contract_quantities_history,
+            futures_residual_contract_quantities_history=result.residual_contract_quantities_history,
             settlement_ledger_unit=None,
         )
     if mode in TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES:
@@ -5319,6 +5330,7 @@ def run_backtest_integer_shares(
             "tw_stock_futures_day_trade",
             "tw_stock_futures_day_trade_0900",
             "tw_stock_futures_day_trade_0900_integer",
+            "tw_stock_futures_day_trade_0845_minute",
             "crypto_perpetual",
         }:
             raise ValueError(

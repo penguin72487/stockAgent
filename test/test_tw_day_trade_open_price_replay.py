@@ -370,9 +370,42 @@ def test_local_0901_vwap_loader_uses_amount_over_normalized_shares(
     )
 
     assert rows["2330"]["execution_price_0901"] == 100.75
+    assert rows["2330"]["execution_price_0901_method"] == "minute_vwap"
     assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
     assert receipt["resolved_symbols"] == 1
     assert receipt["additional_shioaji_requests"] == 0
+
+
+def test_local_0901_price_loader_uses_source_kbar_close_without_tick_or_vwap(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "minute" / "trade_date=2026-08-13"
+    partition.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330"],
+            "date": [date(2026, 8, 13)],
+            "ts": [datetime(2026, 8, 13, 9, 1)],
+            "minutes_from_open": [1],
+            "Open": [100.0],
+            "High": [102.0],
+            "Low": [99.0],
+            "Close": [101.0],
+            "Amount": [0.0],
+            "volume_shares": [0.0],
+        }
+    ).write_parquet(partition / "data.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 101.0
+    assert rows["2330"]["execution_price_0901_method"] == "minute_close"
+    assert rows["2330"]["tick_count_0901"] == 0
+    assert receipt["price_method_counts"] == {"minute_close": 1}
 
 
 def test_previous_official_session_ignores_malformed_legacy_date(

@@ -20,7 +20,9 @@ day_trade_quote_interval_seconds: 60
 
 # Live 09:00 signals execute at the first strictly later causal best Ask/Bid.
 # Historical replay is separately labelled and sizes from the official 09:00
-# open before execution at the observed right-labelled 09:01 minute VWAP.
+# open before execution at the observed right-labelled 09:01 minute price
+# (VWAP, otherwise that source-published KBar's Close). Missing ticks alone do
+# not block a fill.
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py
   - --link

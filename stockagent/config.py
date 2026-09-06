@@ -884,6 +884,7 @@ def _validate_tw_stock_futures_day_trade_mode_contract(
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
         "tw_stock_futures_day_trade_0900_integer",
+        "tw_stock_futures_day_trade_0845_minute",
     }
     if execution_mode not in modes:
         return
@@ -932,13 +933,16 @@ def _validate_tw_stock_futures_day_trade_mode_contract(
         raise ValueError(
             f"{label} fixed fee must be finite and non-negative"
         )
-    integer_contracts = execution_mode == "tw_stock_futures_day_trade_0900_integer"
+    minute_execution = execution_mode == "tw_stock_futures_day_trade_0845_minute"
+    integer_contracts = minute_execution or execution_mode == "tw_stock_futures_day_trade_0900_integer"
+    if minute_execution and bool(day_trade_open_feature):
+        raise ValueError("08:45 futures decisions cannot observe the 09:00 cash-stock open")
     if integer_contracts and abs(fee - 40.0) > 1.0e-9:
         raise ValueError(
-            "tw_stock_futures_day_trade_0900_integer requires the declared "
+            f"{label} requires the declared "
             "network-order fee of exactly TWD 40 per contract per side"
         )
-    if execution_mode not in {
+    if not minute_execution and execution_mode not in {
         "tw_stock_futures_day_trade_0900",
         "tw_stock_futures_day_trade_0900_integer",
     }:
@@ -948,27 +952,27 @@ def _validate_tw_stock_futures_day_trade_mode_contract(
         "daily_session_open_proxy",
         "post_0900_trade_sidecar",
     }
-    if entry_source not in valid_entry_sources:
+    if not minute_execution and entry_source not in valid_entry_sources:
         raise ValueError(
             f"{label} requires "
             "tw_stock_futures_day_trade_0900_entry_source to be one of: "
             + ", ".join(sorted(valid_entry_sources))
         )
     if (
-        entry_source == "post_0900_trade_sidecar"
+        not minute_execution and entry_source == "post_0900_trade_sidecar"
         and not str(entry_0900_data_path or "").strip()
     ):
         raise ValueError(
             "tw_stock_futures_day_trade_0900 with post_0900_trade_sidecar "
             "requires a receipt-backed tw_stock_futures_day_trade_0900_data_path"
         )
-    if integer_contracts and entry_source != "daily_session_open_proxy":
+    if integer_contracts and not minute_execution and entry_source != "daily_session_open_proxy":
         raise ValueError(
             "tw_stock_futures_day_trade_0900_integer requires "
             "entry_source='daily_session_open_proxy' until the receipt-backed "
             "sidecar contains both standard and mini candidates"
         )
-    if not bool(day_trade_open_feature):
+    if not minute_execution and not bool(day_trade_open_feature):
         raise ValueError(
             f"{label} requires day_trade_open_feature=true"
         )
@@ -1758,6 +1762,10 @@ class TradingConfig:
     )
     tw_stock_futures_day_trade_fee_twd: float = 40.0
     tw_stock_futures_day_trade_initial_capital: float = 10_000_000.0
+    # Receipt-backed physical-contract minute bars; never a daily OPEN/CLOSE fallback.
+    tw_stock_futures_day_trade_minute_data_path: str = (
+        "data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet"
+    )
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )

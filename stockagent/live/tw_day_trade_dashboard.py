@@ -18,6 +18,8 @@ import threading
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
+from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
+
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
     TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
@@ -2272,7 +2274,12 @@ def _operational_issues(
         "observed_09_01_minute_vwap_unavailable": (
             "error",
             "09:01 首分鐘成交價不可用",
-            "漏跑回補缺少右標記 09:01 首分鐘 VWAP，該股票保持空倉；不以 09:00 開盤價、Bid/Ask、最後價或 +1 Tick 替代。",
+            "舊版漏跑回補缺少右標記 09:01 首分鐘價格，該股票保持空倉；不以 09:00 開盤價、Bid/Ask、最後價或 +1 Tick 替代。",
+        ),
+        "observed_09_01_minute_price_unavailable": (
+            "error",
+            "09:01 首分鐘成交價不可用",
+            "漏跑回補連來源 K 棒都沒有有效的右標記 09:01 價格，該股票保持空倉；只有缺 tick 時會改用同一根 K 棒價格。",
         ),
         "synthetic_open_tick_price_unavailable": (
             "error",
@@ -2595,13 +2602,14 @@ def build_dashboard_history_snapshot(
     start_date: str | datetime_date | None = None,
     end_date: str | datetime_date | None = None,
     maximum_points_per_series: int = 2_000,
+    resolution: str = "sampled",
 ) -> dict[str, Any]:
     """Return cross-session strategy and total-return benchmark curves.
 
     Time windows are anchored to the newest retained observation rather than
     wall-clock time, so historical/replay ledgers remain inspectable.  Longer
-    windows scan only the two append-only mark ledgers and are then bounded by
-    extrema-preserving downsampling at the API boundary.
+    windows scan only the mark ledgers. Legacy sampled responses preserve
+    extrema; resolution=1m transports every minute in compact numeric columns.
     """
 
     normalized_range = str(range_key or "1d").strip().lower()
@@ -2609,6 +2617,8 @@ def build_dashboard_history_snapshot(
         raise ValueError(f"unsupported chart range: {range_key}")
     if not 100 <= int(maximum_points_per_series) <= 10_000:
         raise ValueError("maximum_points_per_series must be between 100 and 10000")
+    if resolution not in {"sampled", "1m"}:
+        raise ValueError("unsupported history resolution")
     selected_start = (
         start_date
         if isinstance(start_date, datetime_date)
@@ -2630,6 +2640,7 @@ def build_dashboard_history_snapshot(
     benchmark_history = _benchmark_history_index(root)
     benchmark_origins = benchmark_history.origins
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+    canonical_benchmark_keys: set[tuple[str, str]] = set()
     marks_path = root / "marks.jsonl"
     live_benchmark_path = root / "benchmark_marks.jsonl"
     marks_recorded_at_fallback = False
@@ -2722,6 +2733,7 @@ def build_dashboard_history_snapshot(
         selected_start.isoformat() if selected_start else None,
         selected_end.isoformat() if selected_end else None,
         int(maximum_points_per_series),
+        resolution,
         selected_span_signature(marks_index),
         (
             benchmark_history.device,
@@ -2736,7 +2748,7 @@ def build_dashboard_history_snapshot(
         if cached_history is not None:
             return dict(cached_history)
 
-    def add(source: Mapping[str, Any], *, series_type: str) -> None:
+    def add(source: Mapping[str, Any], *, series_type: str, canonical: bool = False) -> None:
         row = dict(source)
         series_id = str(
             row.get("market")
@@ -2782,6 +2794,14 @@ def build_dashboard_history_snapshot(
             timespec="minutes"
         )
         session_date = local_observed.date().isoformat()
+        point_key = (series_id, minute)
+        if not canonical and point_key in canonical_benchmark_keys:
+            # A historical Close/reference mark and an old live Bid/Ask mark
+            # are different valuation contracts. Do not weave both into one
+            # completed curve according to incidental file-read order.
+            return
+        if canonical:
+            canonical_benchmark_keys.add(point_key)
         deduplicated[(series_id, minute)] = {
             "series_id": series_id,
             "series_type": series_type,
@@ -2828,7 +2848,7 @@ def build_dashboard_history_snapshot(
                 add(row, series_type="strategy")
         for session_date in selected_sessions:
             for row in benchmark_history.marks_by_session.get(session_date, ()):
-                add(row, series_type="benchmark")
+                add(row, series_type="benchmark", canonical=True)
         live_benchmark_rows = _rows_for_sessions(
             live_benchmark_path,
             selected_sessions,
@@ -2849,7 +2869,7 @@ def build_dashboard_history_snapshot(
         for row in _all_json_objects(marks_path) or ():
             add(row, series_type="strategy")
         for row in benchmark_history.marks:
-            add(row, series_type="benchmark")
+            add(row, series_type="benchmark", canonical=True)
         for source in _all_json_objects(live_benchmark_path) or ():
             benchmark_id = str(source.get("benchmark_id") or "")
             add(
@@ -2995,7 +3015,7 @@ def build_dashboard_history_snapshot(
                 ),
             }
         )
-    sampled = [
+    sampled = rows if resolution == "1m" else [
         row
         for series_rows in grouped.values()
         for row in _downsample_chart_series(
@@ -3077,6 +3097,30 @@ def build_dashboard_history_snapshot(
         ),
         "history": sampled,
     }
+    if resolution == "1m":
+        # Lossless columnar transport avoids repeating IDs, timestamps and
+        # field names hundreds of thousands of times. Each row is an actual
+        # retained minute; the browser must not reconstruct interpolated rows.
+        payload["history_encoding"] = "minute_columns_v1"
+        payload["minute_series"] = [
+            {
+                "series_id": series_id,
+                "series_type": values[0]["series_type"],
+                "points": [
+                    [
+                        int(_timestamp(row["minute"]).timestamp() // 60),
+                        row["return_pct"],
+                        row["cumulative_return_pct"],
+                        int(row["valuation_stale"])
+                        | (int(row["historical_minute_replay"]) << 1)
+                        | (int(int(row.get("missing_price_position_count") or 0) > 0) << 2),
+                    ]
+                    for row in values
+                ],
+            }
+            for series_id, values in grouped.items()
+        ]
+        payload["history"] = []
     with _HISTORY_SNAPSHOT_CACHE_LOCK:
         if len(_HISTORY_SNAPSHOT_CACHE) >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES:
             _HISTORY_SNAPSHOT_CACHE.pop(next(iter(_HISTORY_SNAPSHOT_CACHE)))
@@ -3937,6 +3981,14 @@ def build_dashboard_snapshot(
                 "entry_0901_vwap_fill_count": int(
                     mode.get("entry_0901_vwap_fill_count") or 0
                 ),
+                "entry_0901_close_fill_count": int(
+                    mode.get("entry_0901_close_fill_count") or 0
+                ),
+                "entry_0901_minute_price_fill_count": int(
+                    mode.get("entry_0901_minute_price_fill_count")
+                    or mode.get("entry_0901_vwap_fill_count")
+                    or 0
+                ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
@@ -4315,6 +4367,14 @@ def build_dashboard_snapshot(
             mode["entry_0901_vwap_fill_count"] = int(
                 (signal_event or {}).get("entry_0901_vwap_fill_count") or 0
             )
+            mode["entry_0901_close_fill_count"] = int(
+                (signal_event or {}).get("entry_0901_close_fill_count") or 0
+            )
+            mode["entry_0901_minute_price_fill_count"] = int(
+                (signal_event or {}).get("entry_0901_minute_price_fill_count")
+                or (signal_event or {}).get("entry_0901_vwap_fill_count")
+                or 0
+            )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -4544,8 +4604,8 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the observed right-labelled 09:01 minute VWAP. It is explicitly counterfactual and is not a live quote or real order fill",
-            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline waits for the observed 09:01 minute VWAP; missing data is blocked without open-price fill, last-price, or adverse-tick substitution",
+            "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the source-backed right-labelled 09:01 minute price (VWAP, otherwise that KBar's Close). It is explicitly counterfactual and is not a live quote or real order fill",
+            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline uses the source-backed 09:01 minute price; missing ticks alone do not block, but a missing minute bar is blocked without open-price fill, carried last-price, or adverse-tick substitution",
             "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
@@ -4562,7 +4622,7 @@ def build_dashboard_snapshot(
                 else benchmark_history.load_error
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the observed 09:01 minute VWAP for price; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the source-backed 09:01 minute price for execution; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
             "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
@@ -4644,6 +4704,7 @@ def build_dashboard_signal_page(
     normalized_status = str(status or "all").strip().casefold()
     signal_path = root / "signals.jsonl"
     signal_stat = signal_path.stat()
+    futures_catalog = load_stock_futures_catalog()
     cache_key = (
         root.resolve(),
         signal_stat.st_dev,
@@ -4657,6 +4718,7 @@ def build_dashboard_signal_page(
         int(offset),
         int(limit),
         state_signal_signature,
+        futures_catalog.revision,
     )
     with _SIGNAL_PAGE_CACHE_LOCK:
         cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
@@ -4989,6 +5051,7 @@ def build_dashboard_signal_page(
     page: list[dict[str, Any]] = []
     for source_row in source_page:
         row = dict(source_row)
+        row["stock_futures"] = futures_catalog.membership(str(row.get("symbol") or ""))
         if bool(row.get("counterfactual_open_replay")):
             row["open_reconstructed_at"] = (
                 row.get("open_reconstructed_at") or row.get("signal_at")
