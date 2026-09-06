@@ -4435,8 +4435,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
     assert "function hydrateDefaultPositions(data)" in javascript
-    assert "const detailLoads = [];" in javascript
-    assert "if (shouldReloadPositions) detailLoads.push(loadPositions());" in javascript
+    assert "await loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadPositions) secondaryLoads.push(loadPositions());" in javascript
     assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
     assert "maximumSignificantDigits" not in javascript
@@ -4515,6 +4515,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         '$("detail-end-date").addEventListener("change", detailDateChanged)'
         in javascript
     )
+    assert "const DATE_FILTER_DEBOUNCE_MS = 180" in javascript
+    assert "window.clearTimeout(dateFilterTimer);" in javascript
     assert "啟用模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |持倉目標 %| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
@@ -4536,9 +4538,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert '"api/public-data-status"' in javascript
     assert "IntersectionObserver" in javascript
     assert "installTwPublicMonitorActivation()" in javascript
-    assert "void loadChartHistory({preferCache: !force});" in javascript
-    assert "Promise.allSettled(detailLoads)" in javascript
-    assert 'src="app.js?v=52"' in html
+    assert "await loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadSignals) await loadSignals({force: true});" in javascript
+    assert "Promise.allSettled(secondaryLoads)" in javascript
+    assert 'src="app.js?v=53"' in html
     assert 'href="styles.css?v=21"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
@@ -5207,6 +5210,14 @@ def test_compact_benchmark_history_index_survives_process_cache_loss(
                         "total_equity_twd": 101.0,
                         "last_mark_price": 101.0,
                         "benchmark_origin_rebased": True,
+                        "historical_minute_replay": True,
+                        "minute_valuation_contract": "historical_last_trade_v1",
+                        "valuation_source": "official_minute_close",
+                        "valuation_executable": False,
+                        "fresh_trade_position_count": 1,
+                        "last_trade_carried_position_count": 0,
+                        "missing_price_position_count": 0,
+                        "fresh_trade_notional_coverage_ratio": 1.0,
                         "large_repeated_provenance": "discard from interior rows",
                     },
                     {
@@ -5242,6 +5253,12 @@ def test_compact_benchmark_history_index_survives_process_cache_loss(
     restored = dashboard_module._benchmark_history_index(state_dir)
     assert len(restored.marks) == 2
     assert "large_repeated_provenance" not in restored.marks[0]
+    assert restored.marks[0]["historical_minute_replay"] is True
+    assert restored.marks[0]["minute_valuation_contract"] == (
+        "historical_last_trade_v1"
+    )
+    assert restored.marks[0]["valuation_source"] == "official_minute_close"
+    assert restored.marks[0]["fresh_trade_notional_coverage_ratio"] == 1.0
     assert restored.marks[-1]["large_repeated_provenance"] == (
         "retain on session endpoint"
     )
@@ -5292,6 +5309,76 @@ def test_signal_page_cache_ignores_unrelated_live_state_marks(
 
     second = build_dashboard_signal_page(state_dir=state_dir, limit=10)
     assert second["rows"] == first["rows"]
+
+
+def test_columnar_signal_range_matches_strict_json_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "modes": {
+                    "mode_a": {
+                        "session_date": "2026-08-14",
+                        "initial_capital_twd": 10_000_000,
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "session_date": session_date,
+            "market": "mode_a",
+            "signal_id": f"signal-{session_date}",
+            "symbol": symbol,
+            "name": name,
+            "target_weight": target_weight,
+            "status": status,
+            "ask": 101.0,
+            "bid": 100.0,
+            "filled_weight": target_weight / 2,
+            "filled_shares": 1_000 if target_weight else 0,
+            "requested_shares": 1_000 if target_weight else 0,
+            "sizing_open_price": 100.0,
+            "execution_price": 101.0 if target_weight else None,
+            "reason": "ready" if target_weight else "zero_target_weight",
+        }
+        for session_date, symbol, name, target_weight, status in (
+            ("2026-08-13", "2330", "台積電", 0.1, "ready"),
+            ("2026-08-13", "2317", "鴻海", -0.3, "partial_depth"),
+            ("2026-08-14", "2454", "聯發科", 0.0, "hold"),
+            ("2026-08-14", "2303", "聯電", 0.2, "missing_quote"),
+        )
+    ]
+    (state_dir / "signals.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 10**9)
+    strict = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-14",
+        status="blocked",
+        limit=10,
+    )
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    columnar = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-14",
+        status="blocked",
+        limit=10,
+    )
+
+    assert columnar == strict
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:
