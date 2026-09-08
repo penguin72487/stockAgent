@@ -2679,6 +2679,16 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    if mode == "tw_stock_futures_day_trade_0845_minute":
+        cutoff = config.trading.tw_stock_futures_day_trade_daily_proxy_before
+        if cutoff is not None:
+            payload.update(execution_clock=f"daily_open_close_before_{cutoff}_else_0846_1320_1324_1330",
+                           benchmark_contract=f"equal_weight_observed_futures_daily_open_close_before_{cutoff}_else_0846_to_1330",
+                           terminal_policy=f"assumed_daily_close_flat_before_{cutoff}_else_1330_or_absorbing_execution_failure",
+                           mode_details={"daily_proxy_before": cutoff, "execution_contract_version": 2,
+                                         "daily_proxy_caveat": "daily close is not a 13:30 fill",
+                                         "post_cutoff_missing_source": "fail_closed"})
+        return payload
     if mode == "crypto_perpetual":
         execution_minute = int(config.trading.crypto_execution_minute_utc)
         payload.update(

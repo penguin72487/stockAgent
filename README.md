@@ -816,6 +816,57 @@ run_fintech_python train.py --config configs/markets/tw_public.yaml
 市場、資料範圍、execution mode、模型、loss、checkpoint 與 output root 都以該次 YAML
 為準，不要只看 README 的範例推測實驗契約。
 
+### 08:45 個股期貨當沖
+
+此模式直接使用實體契約的 1 分鐘 K 棒與來源 manifest，不需要 tick。
+Git 更新不會下載資料；正式設定從 2014 年開始，近期幾十日的分鐘棒無法滿足跨年 walk-forward。
+
+統一使用原本的 `scripts/run_tw_stock_futures_day_trade_0845_minute.sh`，正式設定
+位於 `configs/markets/tw_stock_futures_day_trade_0845_minute.yaml`。它保留完整股票
+特徵、每日一次 FinancialTransformer 決策、BF16、1000 epochs、年度 folds 與既有
+`train.py` 生命週期。資料路徑固定在 YAML 宣告的 release，啟動器沿用
+`run_data_cache.sh use` 驗證／續租，訓練期間保留資料目錄引用；本機面板快取寫在
+`artifacts/cache`。不需要操作目錄的額外 runtime YAML 或 `train_carry.sh`。
+
+```bash
+# 只檢查已存在的資料；不解包、下載或啟動訓練
+bash scripts/run_tw_stock_futures_day_trade_0845_minute.sh --check-data-only
+
+# 正式訓練；由 train.py 自動選擇單卡／DDP
+bash scripts/run_tw_stock_futures_day_trade_0845_minute.sh
+```
+
+目前固定的 2026-09-06 release 只有 50 個分鐘交易日，原年度範圍仍會被預檢擋下。
+`train_carry.sh` 使用全期貨留倉模式，輸入及會計契約不同，不是此當沖策略的替代入口。
+補資料仍沿用既有建置器：
+
+```bash
+source scripts/runtime_env.sh
+# 唯讀驗證既有 KBar chunk、實體契約、日期覆蓋與 SHA；不讀取 tick
+run_fintech_python scripts/build_tw_stock_futures_0900_entries.py \
+  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml \
+  --minute-root data_tw_shioaji_history --check-only
+
+# 補齊所有歷史來源後，沿用同一正式設定建置並驗收分鐘成品
+run_fintech_python scripts/build_tw_stock_futures_0900_entries.py \
+  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml \
+  --minute-root data_tw_shioaji_history \
+  --output-dir data_tw_futures/taifex_stock_futures_minute_v1
+```
+
+若使用 Shioaji，既有 `downloader/download_shioaji_historical_market_data.py`
+支援 `--collections exact_futures --kbars-only`；只取得目前可查詢實體契約的分鐘棒，
+不排程、不讀取 tick，也不把分鐘完成狀態寫成 tick 完成。此選項不能補出已不可查詢的
+到期契約或 2014～2019 年資料。其他分鐘來源須提供實體月份與時間／量能單位，才能接入。
+
+成品必須寫入 catalog 的可寫來源，發布新 release 後更新正式 YAML 的固定來源及
+output root，再做資料驗收。不能覆寫 `/srv/stockagent-packed-materialized` 的舊版本。
+
+`--check-data-only` 驗證資料 SHA、來源收據與實際股票面板每個日期的覆蓋，
+不啟動訓練或 DDP；可能建立可重建的本機 panel cache。一般訓練也會在面板建置前
+檢查分鐘來源，缺檔時印出修復指令。取得歷史來源與分鐘成交契約見
+[08:45 個股期貨分鐘資料](docs/tw_stock_futures_day_trade_minute.md)。
+
 ### 多 GPU job manager
 
 先編輯 `configs/gpu_jobs.yaml`，再使用：
@@ -965,6 +1016,7 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | 台灣資料 | [tw_public_download_resume_and_rate_limits.md](docs/tw_public_download_resume_and_rate_limits.md) | rebuild、repair、daily、receipt |
 | 執行模式 | [tw_execution_modes.md](docs/tw_execution_modes.md) | day/cash/overnight 與交易語意 |
 | 分鐘資料 | [tw_minute_kbar_research.md](docs/tw_minute_kbar_research.md) | causal minute dataset 與訓練 |
+| 個股期貨分鐘訓練 | [tw_stock_futures_day_trade_minute.md](docs/tw_stock_futures_day_trade_minute.md) | 08:45 決策、分鐘執行、早期日線近似與來源缺口 |
 | TX/TXO | [tw_index_derivatives_tick_strategy.md](docs/tw_index_derivatives_tick_strategy.md) | 期貨選擇權 tick 策略 |
 | OpenBB | [openbb_archive_downloader.md](docs/openbb_archive_downloader.md) | archive ingestion 與 compaction |
 | 操作補充 | [RUN_GUIDE.md](docs/RUN_GUIDE.md) | 特定 operator 工作流；執行前核對當前 config/path |

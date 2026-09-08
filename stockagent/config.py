@@ -1772,6 +1772,8 @@ class TradingConfig:
     tw_stock_futures_day_trade_minute_data_path: str = (
         "data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet"
     )
+    # Explicit user-selected historical approximation; never applies on/after this date.
+    tw_stock_futures_day_trade_daily_proxy_before: str | None = None
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )
@@ -4074,6 +4076,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
     )
+    cutoff = trading["tw_stock_futures_day_trade_daily_proxy_before"]
+    if cutoff is not None:
+        from datetime import date as _cutoff_date
+        if trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute":
+            raise ValueError("daily_proxy_before requires the stock futures minute execution mode")
+        trading["tw_stock_futures_day_trade_daily_proxy_before"] = _cutoff_date.fromisoformat(str(cutoff)).isoformat()
     _validate_tw_index_derivatives_day_mode_contract(
         execution_mode=trading["execution_mode"],
         model_name=training["model_name"],

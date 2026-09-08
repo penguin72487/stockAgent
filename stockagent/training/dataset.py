@@ -16,7 +16,7 @@ from stockagent.backtest.tw_execution import (
     official_tw_short_initial_margin_rates,
 )
 from stockagent.data.panel import PanelData
-from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS
+from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS, HYBRID_TAPE_FIELDS
 from stockagent.data.walkforward import normalize_lookback_context
 
 
@@ -438,7 +438,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     panel.num_dates,
                     panel.tradable_mask.shape[1],
                     2,
-                    TAPE_FIELDS if self.execution_mode == MINUTE_MODE else 5,
+                    (HYBRID_TAPE_FIELDS if getattr(stock_futures_daily, "contract_version", 1) == 2
+                     else TAPE_FIELDS) if self.execution_mode == MINUTE_MODE else 5,
                 )
                 if integer_execution is None or tuple(
                     np.asarray(integer_execution).shape

@@ -766,6 +766,10 @@ def _should_isolate_selected_folds(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
     parser.add_argument("--config", default="configs/markets/tw.yaml", help="Path to experiment config")
+    parser.add_argument(
+        "--check-data-only", action="store_true",
+        help="Validate 08:45 futures minute sources and exact stock-panel date coverage, then exit before training.",
+    )
     parser.add_argument("--output-dir", default=None, help="Directory for training outputs (override config.runner.output_dir)")
     parser.add_argument(
         "--mode",
@@ -1083,6 +1087,44 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute":
+        from stockagent.data.tw_stock_futures_minute import (
+            preflight_futures_minute_training, validate_futures_minute_data,
+        )
+
+        try:
+            minute_receipt = preflight_futures_minute_training(config, config_path=args.config)
+            if args.check_data_only:
+                from stockagent.data.panel import build_panel
+                from stockagent.data.tw_stock_futures_day_trade import attach_stock_futures_day_trade_daily
+
+                panel = build_panel(config.data.parquet_root, **_build_panel_kwargs(config))
+                validate_futures_minute_data(
+                    config.trading.tw_stock_futures_day_trade_minute_data_path,
+                    daily_sha256=minute_receipt["source_daily_sha256"],
+                    dates=np.asarray(panel.dates, dtype="datetime64[D]"),
+                    daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+                )
+                # Match the actual training candidate check, including per-contract
+                # source evidence; a dated manifest alone is not sufficient.
+                attach_stock_futures_day_trade_daily(
+                    panel, config.trading.tw_stock_futures_day_trade_data_path,
+                    fee_per_contract_per_side_twd=config.trading.tw_stock_futures_day_trade_fee_twd,
+                    integer_contracts=True,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    minute_data_path=config.trading.tw_stock_futures_day_trade_minute_data_path,
+                    daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+                )
+                print(
+                    f"[futures-minute preflight] verified sources and all {len(panel.dates)} "
+                    f"panel sessions ({panel.dates[0]}..{panel.dates[-1]}); no training started.",
+                    flush=True,
+                )
+                return
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+    elif args.check_data_only:
+        raise SystemExit("--check-data-only currently requires the 08:45 futures minute execution mode")
     _maybe_relaunch_for_ddp(config, args)
     _install_graceful_termination_handlers()
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
@@ -1437,6 +1479,7 @@ def main() -> None:
             max_volume_participation=(
                 config.trading.max_volume_participation
             ),
+            daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
         )
     if (
         str(config.trading.execution_mode) == "tw_day_trade"

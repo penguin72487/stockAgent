@@ -371,10 +371,36 @@ prior-completed stock features. The 08:45 daily decision excludes the 09:00
 cash-stock opening gap; the 08:46 right-labelled futures bar owns entry.
 At 13:20 place a passive limit, replace it at 13:24 with market exits through
 the 13:30 deadline. Preserve whole contracts, per-minute capacity, futures
-costs, causal candidate masks, and residual cash. Missing minute history must
-fail closed, never substitute a daily OPEN/CLOSE label. Earlier 08:45 daily
+costs, causal candidate masks, and residual cash. In this strict v1 config,
+missing minute history must fail closed, never substitute a daily OPEN/CLOSE label. Earlier 08:45 daily
 v1/v2, 09:00 sidecar v3, and 09:00 daily proxy v4/v5 remain incompatible
 reproducibility controls. See `docs/tw_stock_futures_day_trade_minute.md`.
+
+The user's 2026-09-07 historical-data request additionally authorizes
+`configs/markets/tw_stock_futures_day_trade_0845_historical.yaml`: contract v2
+uses official same-physical-contract daily OPEN/CLOSE for unavailable early
+minutes strictly before `tw_stock_futures_day_trade_daily_proxy_before`
+(currently `2020-01-01`). On/after that cutoff the existing minute clock and
+missing-source rejection remain mandatory. A daily CLOSE is not a proven
+13:30 fill. Keep regime channels, cutoff, benchmark/terminal reporting, and
+checkpoint fingerprints explicit; reuse the common trainer and integer basket.
+Do not silently extend the cutoff to Shioaji's 2020-03-22 history boundary.
+
+The user's 2026-09-08 follow-up narrows this historical experiment to Shioaji's
+available period: `data.panel_start_date: 2020-03-23` (first day session) and
+`walk_forward.expected_first_year: 2020`. Preserve earlier source data and the
+v2 cutoff, but include no early daily-proxy rows in this experiment. Use a new
+prepared-data version and artifact root; all later missing-source and physical-
+identity checks still apply. This changes the requested horizon, not the
+08:45/08:46/13:20/13:24/13:30 execution clock.
+
+Receipt-backed one-minute KBars are sufficient where their dated physical
+identity and Amount/Volume contract verify; preserve the existing --minute-root
+and --kbars-only collector paths. Validate source integrity before the stock
+panel or DDP. A complete receipt covers only declared dates, not the entire
+configured history. Use train.py --config ... --check-data-only for coverage
+and scripts/run_data_cache.sh for exact-release verification and leases.
+The user's current direct train.py entry point remains authoritative.
 
 Every completed fold must immediately refresh the cumulative root-level
 walk-forward report from all contract-compatible folds completed so far. Do not
@@ -663,6 +689,10 @@ Guidelines:
   Residual contracts remain explicit execution failures, never stock margin
   conversions or fabricated 13:45/daily-close fills. Source coverage, hashes,
   whole quantities, costs, and clock belong to the checkpoint contract.
+- Its explicit historical v2 variant appends daily-regime/open/close/capacity
+  channels to the unchanged v1 event tape. Early daily capacity uses prior
+  session volume; post-cutoff capacity and unfilled-exit failure use actual
+  minute facts. Missing post-cutoff sources must not become zero-return days.
 - The legacy `tw_stock_futures_day_trade_0900` research control keeps the
   complete ordered Taiwan cash-stock feature panel and may use data complete
   through `t-1` plus the dedicated observed

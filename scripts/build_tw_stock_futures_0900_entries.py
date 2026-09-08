@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build receipt-backed single-stock-futures 09:00 entries or 08:46 minute tape.
 
-The input is an archive of official TAIFEX ``Daily_YYYY_MM_DD.zip`` futures
+The 08:46 policy accepts receipt-backed one-minute KBars via --minute-root.
+The legacy input is an archive of official TAIFEX ``Daily_YYYY_MM_DD.zip`` futures
 transaction files.  Every date in the requested daily-source interval must
 have one ZIP before the manifest is marked complete.  A covered date may
 legitimately produce no entry row for a selected contract; a missing ZIP is a
@@ -178,30 +179,78 @@ def _empty_output() -> pl.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    parser.add_argument("--config", type=Path,
+                        help="08:45 training config; inherit daily source, output and panel start date.")
+    parser.add_argument("--check-only", action="store_true",
+                        help="Read-only source check (KBar receipts/content or legacy ZIP inventory).")
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument("--shioaji-ticks-root", type=Path,
+                         help="Continuous Shioaji history; validate dated physical identity before aggregation.")
+    parser.add_argument("--daily-proxy-before", default=None,
+                        help="Explicit exclusive cutoff for early futures daily OPEN-to-CLOSE approximation.")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--assemble-cached", action="store_true",
+                        help="Assemble the existing SHA-verified dated shards without refreshing their raw-source snapshot.")
+    parser.add_argument("--work-dir", type=Path, default=Path("artifacts/cache/futures_minute_history"))
+    sources.add_argument("--minute-root", type=Path,
+                         help="Existing Shioaji historical collector root; read only one-minute KBar chunks.")
+    sources.add_argument(
         "--ticks-root",
         type=Path,
-        required=True,
         help="Archive root containing official Daily_YYYY_MM_DD.zip files.",
     )
     parser.add_argument(
         "--daily-data-path",
         type=Path,
-        default=Path(
-            "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
-        ),
+        default=None,
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data_tw_futures/taifex_stock_futures_0900_v1"),
+        default=None,
     )
-    parser.add_argument("--start-date", default="2014-01-01")
+    parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
-    parser.add_argument("--execution-policy", choices=("post_0900", "scheduled_0846"), default="post_0900")
+    parser.add_argument("--execution-policy", choices=("post_0900", "scheduled_0846"), default=None)
     parser.add_argument("--archive-override", type=Path, action="append", default=[],
                         help="Explicit immutable corrected Daily_YYYY_MM_DD.zip; original source is preserved.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.config is not None:
+        from stockagent.config import load_config
+        from stockagent.data.tw_stock_futures_minute import MINUTE_MODE
+
+        config = load_config(args.config)
+        if config.trading.execution_mode != MINUTE_MODE:
+            parser.error("--config must select the 08:45 futures minute execution mode")
+        if args.execution_policy not in (None, "scheduled_0846"):
+            parser.error("--config cannot be combined with a different execution policy")
+        args.execution_policy = "scheduled_0846"
+        args.daily_data_path = args.daily_data_path or Path(config.trading.tw_stock_futures_day_trade_data_path)
+        minute_path = Path(config.trading.tw_stock_futures_day_trade_minute_data_path)
+        if args.output_dir is None and minute_path.name != "minutes.parquet":
+            parser.error("configured minute output must be named minutes.parquet")
+        args.output_dir = args.output_dir or minute_path.parent
+        args.start_date = args.start_date or config.data.panel_start_date
+        args.daily_proxy_before = args.daily_proxy_before or config.trading.tw_stock_futures_day_trade_daily_proxy_before
+    args.execution_policy = args.execution_policy or "post_0900"
+    if args.assemble_cached and args.shioaji_ticks_root is None:
+        parser.error("--assemble-cached requires --shioaji-ticks-root")
+    if args.shioaji_ticks_root is not None:
+        if args.execution_policy != "scheduled_0846" or not args.daily_proxy_before or args.workers < 1:
+            parser.error("continuous ticks require scheduled_0846, explicit --daily-proxy-before and positive workers")
+        date.fromisoformat(args.daily_proxy_before)
+    if args.minute_root is not None and (args.execution_policy != "scheduled_0846" or args.archive_override):
+        parser.error("--minute-root requires the scheduled_0846 policy and cannot use archive overrides")
+    args.daily_data_path = args.daily_data_path or Path(
+        "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
+    )
+    args.output_dir = args.output_dir or Path(
+        "data_tw_futures/taifex_stock_futures_minute_v1"
+        if args.execution_policy == "scheduled_0846"
+        else "data_tw_futures/taifex_stock_futures_0900_v1"
+    )
+    args.start_date = args.start_date or "2014-01-01"
+    return args
 
 
 def main() -> int:
@@ -210,9 +259,20 @@ def main() -> int:
     end = date.fromisoformat(str(args.end_date)) if args.end_date else date.max
     if start > end:
         raise ValueError("start-date must not be after end-date")
+    if not getattr(args, "check_only", False):
+        output = args.output_dir.resolve()
+        for parent in (output, *output.parents):
+            if (parent.name in {"stockagent-packed", "stockagent-packed-materialized"}
+                    or (parent.parent / f".{parent.name}.READY.json").is_file()):
+                raise ValueError(
+                    f"builder output is immutable packed/materialized data: {output}; "
+                    "set --output-dir to the catalog's writable tw-futures source workspace, "
+                    "then publish a new release and update the training config"
+                )
     if not args.daily_data_path.is_file():
         raise FileNotFoundError(args.daily_data_path)
-    if not args.ticks_root.is_dir():
+    if (args.execution_policy != "scheduled_0846"
+            and not getattr(args, "check_only", False) and not args.ticks_root.is_dir()):
         raise FileNotFoundError(args.ticks_root)
 
     daily_digest = sha256_file(args.daily_data_path)
@@ -224,7 +284,8 @@ def main() -> int:
     source = pl.from_arrow(
         pq.read_table(
             args.daily_data_path,
-            columns=list(_REQUIRED_COLUMNS),
+            columns=(list(dict.fromkeys([*_REQUIRED_COLUMNS, "contract", "shioaji_roots", "high", "low"]))
+                     if getattr(args, "shioaji_ticks_root", None) is not None else list(_REQUIRED_COLUMNS)),
             filters=[("asset_class", "=", "stock_future")],
             memory_map=True,
         )
@@ -234,12 +295,14 @@ def main() -> int:
     minute_policy = args.execution_policy == "scheduled_0846"
     if minute_policy and args.output_dir == Path("data_tw_futures/taifex_stock_futures_0900_v1"):
         args.output_dir = Path("data_tw_futures/taifex_stock_futures_minute_v1")
-    selected = (select_causal_front_stock_futures_candidates(source) if minute_policy
-                else select_causal_front_stock_futures(source))
-    if selected.is_empty():
-        raise ValueError("daily source has no selected stock futures in range")
     expected_dates = source["date"].unique().sort().to_list()
-    products = tuple(sorted(str(value) for value in selected["product"].unique()))
+    if not expected_dates:
+        raise ValueError("daily source has no stock-futures sessions in range")
+    if getattr(args, "shioaji_ticks_root", None) is not None:
+        from stockagent.data.tw_stock_futures_history import build_continuous_history
+        return build_continuous_history(args, source, expected_dates, daily_digest)
+    if getattr(args, "minute_root", None) is not None:
+        return _build_from_kbars(args, source, expected_dates, daily_digest)
     archives = _archive_inventory(args.ticks_root)
     override_dates = set()
     for archive in args.archive_override:
@@ -252,6 +315,35 @@ def main() -> int:
         override_dates.add(revised_date)
         archives[revised_date] = archive
     missing_dates = [value for value in expected_dates if value not in archives]
+    inventory_report = {
+        "status": "partial" if missing_dates else "source_inventory_complete",
+        "stage": "archive_inventory", "ticks_root": str(args.ticks_root),
+        "requested_start": str(start), "requested_end": str(end),
+        "session_start": str(expected_dates[0]), "session_end": str(expected_dates[-1]),
+        "expected_sessions": len(expected_dates),
+        "available_archives": len(expected_dates) - len(missing_dates),
+        "missing_dates": list(map(str, missing_dates)), "incomplete_sessions": [],
+        "source_daily_sha256": daily_digest,
+        "contents_validated": False,
+    }
+    if getattr(args, "check_only", False):
+        print(json.dumps(inventory_report, ensure_ascii=False, indent=2), flush=True)
+        return 2 if missing_dates else 0
+    if minute_policy and missing_dates:
+        atomic_write_json(args.output_dir / "build_failure.json", inventory_report)
+        print(
+            f"[futures minutes] rejected before ZIP parsing: missing {len(missing_dates)}/"
+            f"{len(expected_dates)} sessions ({missing_dates[0]}..{missing_dates[-1]}); "
+            f"full inventory: {args.output_dir / 'build_failure.json'}",
+            flush=True,
+        )
+        return 2
+
+    selected = (select_causal_front_stock_futures_candidates(source) if minute_policy
+                else select_causal_front_stock_futures(source))
+    if selected.is_empty():
+        raise ValueError("daily source has no selected stock futures in range")
+    products = tuple(sorted(str(value) for value in selected["product"].unique()))
 
     frames: list[pl.DataFrame] = []
     source_receipts: list[dict] = []
@@ -364,6 +456,54 @@ def main() -> int:
         flush=True,
     )
     return 0 if status == "complete" else 2
+
+
+def _build_from_kbars(args, source: pl.DataFrame, expected_dates: list[date], daily_digest: str) -> int:
+    from stockagent.data.tw_stock_futures_kbars import KBAR_SOURCE, read_futures_kbar_sources
+    from stockagent.data.tw_stock_futures_minute import validate_futures_minute_data
+
+    selected = select_causal_front_stock_futures_candidates(source)
+    if selected.is_empty():
+        raise ValueError("daily source has no selected stock futures in range")
+    output, sources, missing = read_futures_kbar_sources(args.minute_root, selected, expected_dates)
+    report = {
+        "status": "partial" if missing else "source_inventory_complete",
+        "stage": "one_minute_kbars", "minute_root": str(args.minute_root),
+        "expected_sessions": len(expected_dates), "selected_contract_days": selected.height,
+        "session_start": str(expected_dates[0]), "session_end": str(expected_dates[-1]),
+        "missing_contract_days": len(missing), "missing": missing,
+        "source_daily_sha256": daily_digest, "contents_validated": not missing,
+    }
+    if args.check_only or missing:
+        if missing and not args.check_only:
+            atomic_write_json(args.output_dir / "build_failure.json", report)
+        print(json.dumps({**report, "missing": missing[:20]}, ensure_ascii=False, indent=2), flush=True)
+        return 2 if missing else 0
+    if sha256_file(args.daily_data_path) != daily_digest:
+        raise ValueError("daily candidate source changed during KBar build")
+    # Validate the complete pair before replacing an accepted output.
+    with tempfile.TemporaryDirectory(prefix="futures-kbars-") as temporary:
+        staged = Path(temporary) / "minutes.parquet"
+        atomic_write_parquet(staged, output)
+        manifest = {
+            "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
+            "source_kind": KBAR_SOURCE, "status": "complete", "timezone": "Asia/Taipei",
+            "source_daily_path": str(args.daily_data_path), "source_daily_sha256": daily_digest,
+            "covered_dates": list(map(str, expected_dates)), "sources": sources,
+            "clock": "right_labelled_minutes_[label-1min,label)",
+            "quantity": "contracts", "price": "Amount/Volume",
+            "execution_claim": "historical_minute_vwap_not_order_book_or_guaranteed_fill",
+            "rows": output.height,
+            "outputs": {"minutes": {"sha256": sha256_file(staged)}},
+        }
+        atomic_write_json(staged.with_name("manifest.json"), manifest)
+        validate_futures_minute_data(staged, daily_sha256=daily_digest)
+        output_path = args.output_dir / "minutes.parquet"
+        atomic_write_parquet(output_path, output)
+        manifest["outputs"]["minutes"] = {"path": str(output_path), "sha256": sha256_file(output_path)}
+        atomic_write_json(args.output_dir / "manifest.json", manifest)
+    print(f"[futures minutes] complete source=kbars dates={len(expected_dates)} rows={output.height} output={output_path}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

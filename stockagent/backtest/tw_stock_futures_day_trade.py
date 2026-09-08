@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
-from stockagent.data.tw_stock_futures_minute import BAR_FIELDS, EVENT_MINUTES, TAPE_FIELDS
+from stockagent.data.tw_stock_futures_minute import BAR_FIELDS, EVENT_MINUTES, TAPE_FIELDS, HYBRID_TAPE_FIELDS
 
 
 @dataclass(slots=True)
@@ -263,13 +265,21 @@ def _scheduled_futures_day(
     a daily CLOSE, converted to stock margin, or silently erased.
     """
     multiplier, fee, tax = execution[:, :, 0], execution[:, :, 1], execution[:, :, 2]
-    bars = execution[:, :, 3:].reshape(-1, 2, len(EVENT_MINUTES), len(BAR_FIELDS))
+    bars = execution[:, :, 3:TAPE_FIELDS].reshape(-1, 2, len(EVENT_MINUTES), len(BAR_FIELDS))
     entry = bars[:, :, 0, 0]
     caps = bars[:, :, 0, 4]
+    daily = torch.zeros_like(entry, dtype=torch.bool)
+    daily_close = torch.zeros_like(entry)
+    if execution.size(-1) == HYBRID_TAPE_FIELDS:
+        daily = execution[:, :, TAPE_FIELDS] == 1
+        entry = torch.where(daily, execution[:, :, TAPE_FIELDS + 1], entry)
+        daily_close = execution[:, :, TAPE_FIELDS + 2]
+        caps = torch.where(daily, execution[:, :, TAPE_FIELDS + 3], caps)
     valid = (torch.isfinite(execution[:, :, :3]).all(-1)
              & (multiplier > 0) & (fee >= 0) & (tax >= 0)
              & torch.isfinite(entry) & (entry > 0)
-             & torch.isfinite(caps) & (caps >= 0))
+             & torch.isfinite(caps) & (caps >= 0)
+             & (~daily | (torch.isfinite(daily_close) & (daily_close > 0))))
     clean = lambda x: torch.where(valid, torch.nan_to_num(x), torch.zeros_like(x))
     notional = clean(entry * multiplier)
     entry_tax = torch.floor(clean(notional * tax) + 0.5)
@@ -284,6 +294,15 @@ def _scheduled_futures_day(
     sign = torch.sign(requested)[:, None]
     pnl = -(counts * (clean(fee) + entry_tax)).sum()
     turnover = (counts.detach() * notional).sum()
+    # The explicit early-history daily CLOSE has no invented 13:30 timestamp.
+    daily_filled = torch.where(daily, counts, torch.zeros_like(counts))
+    close_price = torch.where(daily & valid, daily_close, torch.zeros_like(daily_close))
+    close_notional = close_price * clean(multiplier)
+    close_tax = torch.floor(close_notional * clean(tax) + 0.5)
+    pnl = pnl + (daily_filled * (sign * (close_price - clean(entry)) * clean(multiplier)
+                                - clean(fee) - close_tax)).sum()
+    turnover = turnover + (daily_filled.detach() * close_notional).sum()
+    remaining = remaining - daily_filled
     limit = bars[:, :, 1, 3]  # 13:20 completed close; never a later bar.
     for event in range(2, len(EVENT_MINUTES)):
         price, high, low, _, capacity = bars[:, :, event, :].unbind(-1)
@@ -311,6 +330,22 @@ def _scheduled_futures_day(
     return pnl / equity.detach().clamp_min(1e-12), executed_weight, signed, residual, turnover / equity.detach().clamp_min(1e-12), failed_exposure
 
 
+@lru_cache(maxsize=1)
+def _compiled_scheduled_futures_day():
+    """Fuse one session, keeping the chronological equity ledger outside it.
+
+    The eager function remains the only fill/accounting implementation. Dynamic
+    symbol width supports expanding folds without unrolling a full year or
+    consuming a new fixed-shape graph for every universe. CUDA graphs are off:
+    autograd retains several successive daily outputs until batch backward.
+    Compile errors propagate; this path never silently switches executors.
+    """
+    return torch.compile(
+        _scheduled_futures_day, fullgraph=True, dynamic=True,
+        options={"triton.cudagraphs": False},
+    )
+
+
 def run_tw_stock_futures_day_trade_integer_torch(
     target_weights: torch.Tensor,
     candidate_execution: torch.Tensor,
@@ -321,6 +356,7 @@ def run_tw_stock_futures_day_trade_integer_torch(
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
     scheduled_events: bool = False,
+    use_compile: bool | None = None,
 ) -> StockFuturesDayTradeTensorResult:
     """Run an exact-forward, fully collateralized whole-contract day ledger.
 
@@ -339,7 +375,9 @@ def run_tw_stock_futures_day_trade_integer_torch(
         )
     if candidate_execution.ndim != 4 or tuple(candidate_execution.shape[:2]) != tuple(
         target_weights.shape
-    ) or tuple(candidate_execution.shape[2:]) != (2, TAPE_FIELDS if scheduled_events else 5):
+    ) or tuple(candidate_execution.shape[2:]) not in (
+        {(2, TAPE_FIELDS), (2, HYBRID_TAPE_FIELDS)} if scheduled_events else {(2, 5)}
+    ):
         raise ValueError(
             "candidate_execution has incompatible standard/mini channels"
         )
@@ -374,6 +412,15 @@ def run_tw_stock_futures_day_trade_integer_torch(
     )
     equity = weights.new_tensor(capital) * starting_scale
 
+    compile_requested = (
+        os.environ.get("STOCKAGENT_BACKTEST_COMPILE", "0").lower() in {"1", "true", "yes", "on"}
+        if use_compile is None else bool(use_compile)
+    )
+    scheduled_day = _scheduled_futures_day
+    if (scheduled_events and compile_requested and weights.device.type == "cuda"
+            and not torch.compiler.is_compiling()):
+        scheduled_day = _compiled_scheduled_futures_day()
+
     return_rows: list[torch.Tensor] = []
     turnover_rows: list[torch.Tensor] = []
     weight_rows: list[torch.Tensor] = []
@@ -388,7 +435,7 @@ def run_tw_stock_futures_day_trade_integer_torch(
             torch.zeros_like(weights[row]),
         )
         if scheduled_events:
-            net_simple, exact_signed_weight, signed_counts, residual, turnover, failed_exposure = _scheduled_futures_day(
+            net_simple, exact_signed_weight, signed_counts, residual, turnover, failed_exposure = scheduled_day(
                 requested, execution[row], equity,
             )
             next_equity = equity * (1.0 + net_simple)

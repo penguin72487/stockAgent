@@ -1,13 +1,20 @@
 base_config: tw_stock_futures_day_trade_0900_integer_full_features_multi_basis_projection_l1_cash_capital10m.yaml
 
-experiment_name: tw-stock-futures-day-trade-0845-decision-0846-entry-1330-flat-v1
+experiment_name: tw-stock-futures-day-trade-0845-decision-0846-entry-1330-flat-v1-data-20260907
 
 runner:
-  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_minute_v1
+  # These source releases differ from the original local data; isolate checkpoints.
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_minute_v1_data_20260907
   resume: true
   post_train_infer: false
 
 data:
+  # Exact audited releases, shared by the normal launcher and direct train.py.
+  # Keep full cash-stock context; do not substitute the carry-mode futures slots.
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260906T151104843336596Z-l0-penguin-246aab6e5c72e427/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260906T151104843336596Z-l0-penguin-246aab6e5c72e427/features/tw_public_stock_daily.parquet
+  # Packed materializations are immutable; panel caches stay node-local.
+  panel_cache_root: artifacts/cache/tw_stock_futures_day_trade_0845_minute_panel
   # 08:45 is before the cash-stock auction. Keep every prior-completed feature.
   day_trade_open_feature: false
   feature_exclude:
@@ -15,7 +22,8 @@ data:
 
 trading:
   execution_mode: tw_stock_futures_day_trade_0845_minute
-  tw_stock_futures_day_trade_minute_data_path: data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet
+  tw_stock_futures_day_trade_data_path: /srv/stockagent-packed-materialized/tw-futures/tw-futures-20260907T024404680420085Z-l0-penguin-fb2f3972dafefd96/taifex_portfolio_daily_v4/continuous_daily.parquet
+  tw_stock_futures_day_trade_minute_data_path: /srv/stockagent-packed-materialized/tw-futures/tw-futures-20260907T024404680420085Z-l0-penguin-fb2f3972dafefd96/taifex_stock_futures_minute_v1/minutes.parquet
   max_volume_participation: 0.5
 
 training:
