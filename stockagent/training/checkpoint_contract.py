@@ -273,6 +273,9 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    trading = snapshot.get("trading")
+    if isinstance(trading, dict) and trading.get("tw_stock_futures_day_trade_daily_proxy_before") is None:
+        trading.pop("tw_stock_futures_day_trade_daily_proxy_before", None)
     training = snapshot.get("training")
     if isinstance(training, dict):
         active_model_name = _normalized_model_name(config.training.model_name)
@@ -1310,10 +1313,11 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             )
         if is_minute:
             from stockagent.data.tw_stock_futures_minute import (
-                MINUTE_CONTRACT_VERSION, TAPE_CHANNELS,
+                MINUTE_CONTRACT_VERSION, TAPE_CHANNELS, HYBRID_CONTRACT_VERSION, HYBRID_TAPE_CHANNELS,
             )
             minute_path = Path(trading.tw_stock_futures_day_trade_minute_data_path)
             minute_manifest = minute_path.parent / "manifest.json"
+            daily_cutoff = trading.tw_stock_futures_day_trade_daily_proxy_before
             contract["taiwan_stock_futures_day_trade"].update(
                 data_contract_version=MINUTE_CONTRACT_VERSION,
                 backtest_contract_version=MINUTE_CONTRACT_VERSION,
@@ -1332,6 +1336,20 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 gradient_contract="exact_integer_forward_fractional_quantity_shadow_v1",
                 sample_calendar="all_verified_panel_sessions_including_no_entry_fills",
             )
+            if daily_cutoff is not None:
+                contract["taiwan_stock_futures_day_trade"].update(
+                    data_contract_version=HYBRID_CONTRACT_VERSION,
+                    backtest_contract_version=HYBRID_CONTRACT_VERSION,
+                    execution_tensor_channels=list(HYBRID_TAPE_CHANNELS),
+                    daily_proxy_before=daily_cutoff,
+                    entry_fallback="explicit_pre_cutoff_futures_daily_open_close_only",
+                    entry_price_source="pre_cutoff_daily_OPEN_else_right_labelled_minute_VWAP",
+                    execution_clock=f"daily_session_open_close_before_{daily_cutoff}_else_0846_1320_1324_1330",
+                    capacity="daily_proxy_prior_session_volume_else_each_observed_minute_volume",
+                    daily_proxy_caveat="daily_CLOSE_is_not_a_1330_fill; no_minute_fill_or_exit_capacity_proof",
+                    terminal_rule="pre_cutoff_daily_CLOSE_assumed_flat_else_residual_absorbing_execution_failure",
+                    missing_source_policy="fail_closed_no_post_cutoff_daily_or_zero_return_substitution",
+                )
         if is_0900:
             contract["taiwan_stock_futures_day_trade"].update(
                 entry_price_source=entry_source,

@@ -50,7 +50,6 @@ from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     _write_parquet_atomic,
     iter_date_chunks,
 )
-from downloader.download_shioaji_tx_futures_ticks import _ticks_frame  # noqa: E402
 from stockagent.data.taifex_sessions import taifex_trading_date  # noqa: E402
 from stockagent.live.shioaji_schedule import (  # noqa: E402
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -158,6 +157,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated exact contract codes for a bounded run.",
     )
     parser.add_argument("--max-queries", type=int, default=0)
+    parser.add_argument("--kbars-only", action="store_true",
+                        help="Download and verify one-minute KBars only; never schedule or read ticks.")
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--no-refresh-inventory", action="store_true")
@@ -680,6 +681,7 @@ def build_tasks(
     rows: Sequence[HistoryContract],
     *,
     chunk_days: int,
+    kbars_only: bool = False,
 ) -> list[HistoryTask]:
     tasks: list[HistoryTask] = []
     for row in rows:
@@ -699,6 +701,8 @@ def build_tasks(
                     end,
                 )
             )
+        if kbars_only:
+            continue
         for trading_date in observed_tick_dates(root, row, chunk_days=chunk_days):
             data_path, receipt_path = _tick_paths(root, row, trading_date)
             if _valid_receipt(receipt_path, data_path, method="ticks", code=row.code):
@@ -736,6 +740,7 @@ def _write_summary(
     usage: tuple[int, int] | None,
     progress_path: Path,
     persist: bool = True,
+    kbars_only: bool = False,
 ) -> dict[str, Any]:
     collection_rows: dict[str, dict[str, Any]] = {}
     totals = {
@@ -777,7 +782,7 @@ def _write_summary(
                 contract_kbar_resolved += 1
                 bucket["kbar_rows"] += int(receipt.get("rows") or 0)
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
-        dates = observed_tick_dates(root, row, chunk_days=chunk_days)
+        dates = [] if kbars_only else observed_tick_dates(root, row, chunk_days=chunk_days)
         resolved_ticks = 0
         for trading_date in dates:
             data_path, receipt_path = _tick_paths(root, row, trading_date)
@@ -799,17 +804,18 @@ def _write_summary(
         for key in totals:
             if key in bucket:
                 totals[key] += int(bucket[key])
-    pending = build_tasks(root, rows, chunk_days=chunk_days)
+    pending = build_tasks(root, rows, chunk_days=chunk_days, kbars_only=kbars_only)
     payload = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "source": SOURCE,
+        "methods": ["kbars"] if kbars_only else ["kbars", "ticks"],
         "written_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "state": "complete" if not pending else state,
         **totals,
         "complete_contracts": completed_contracts,
         "pending_queries": len(pending),
         "tick_target_universe_finalized": bool(
-            totals["resolved_kbar_chunks"] == totals["kbar_chunks"]
+            not kbars_only and totals["resolved_kbar_chunks"] == totals["kbar_chunks"]
         ),
         "by_collection": collection_rows,
         "traffic_used_bytes": usage[0] if usage else None,
@@ -817,18 +823,20 @@ def _write_summary(
         "max_traffic_fraction": HISTORICAL_MAX_TRAFFIC_FRACTION,
         "progress_path": str(progress_path),
         "completeness_contract": (
-            "KBar chunks are complete/source_empty receipts; Tick targets are the "
+            "Only receipt-verified one-minute KBar chunks are required; no Tick coverage is claimed"
+            if kbars_only else "KBar chunks are complete/source_empty receipts; Tick targets are the "
             "union of trading dates observed by those verified KBar chunks, and each "
             "target requires its own complete/source_empty Tick receipt"
         ),
         "historical_depth_contract": (
+            "KBars only; no quote depth is claimed" if kbars_only else
             "historical ticks contain only the one best bid/ask attached to each trade; "
             "historical five-level books are not claimed"
         ),
         "no_data_fabricated": True,
     }
     if persist:
-        _atomic_write_json(root / "summary.json", payload)
+        _atomic_write_json(root / ("summary_kbars.json" if kbars_only else "summary.json"), payload)
     return payload
 
 
@@ -860,7 +868,10 @@ def _query_task(
     retries: int,
     retry_backoff: float,
     rate_limiter: SharedRateLimiter,
+    kbars_only: bool = False,
 ) -> tuple[dict[str, Any], list[HistoryTask]]:
+    if kbars_only and task.method != "kbars":
+        raise ValueError("KBar-only collection cannot execute a tick task")
     row = task.contract
     contract = api.contracts.get(row.code)
     if contract is None:
@@ -917,6 +928,8 @@ def _query_task(
         }
         _atomic_write_json(receipt_path, receipt)
         added: list[HistoryTask] = []
+        if kbars_only:
+            return receipt, added
         for trading_date in trading_dates:
             tick_data, tick_receipt = _tick_paths(output_root, row, trading_date)
             if _valid_receipt(
@@ -957,6 +970,8 @@ def _query_task(
     payload = _query_with_retries(
         call_ticks, retries=retries, retry_backoff=retry_backoff
     )
+    from downloader.download_shioaji_tx_futures_ticks import _ticks_frame
+
     frame, source_order_monotonic = _ticks_frame(
         payload, trading_date=task.start, contract_code=row.code
     )
@@ -1029,7 +1044,7 @@ def main() -> int:
         raise RuntimeError("SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required")
     api = sj.Shioaji(simulation=bool(args.simulation))
     logged_in = False
-    progress_path = args.output_dir / "progress.json"
+    progress_path = args.output_dir / ("progress_kbars.json" if args.kbars_only else "progress.json")
     usage: tuple[int, int] | None = None
     try:
         api.set_event_callback(lambda *_args: None)
@@ -1067,7 +1082,7 @@ def main() -> int:
             and (not selected_codes or row.code in selected_codes)
         ]
         tasks = build_tasks(
-            args.output_dir, rows, chunk_days=int(args.chunk_days)
+            args.output_dir, rows, chunk_days=int(args.chunk_days), kbars_only=args.kbars_only,
         )
         if args.dry_run:
             summary = _write_summary(
@@ -1078,6 +1093,7 @@ def main() -> int:
                 usage=None,
                 progress_path=progress_path,
                 persist=False,
+                kbars_only=args.kbars_only,
             )
             print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
             return 0
@@ -1087,6 +1103,7 @@ def main() -> int:
             total=len(tasks),
             unit="API query receipts",
             basis=(
+                "Receipt-verified one-minute KBar chunks only" if args.kbars_only else
                 "latest weekly options, latest monthly options, exact futures, then "
                 "indices; newest chunks first; Tick dates derive from verified KBars"
             ),
@@ -1131,6 +1148,7 @@ def main() -> int:
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
                     rate_limiter=rate_limiter,
+                    kbars_only=args.kbars_only,
                 )
             except LookupError as exc:
                 # Retained expired catalog rows remain explicit unresolved gaps.
@@ -1169,6 +1187,7 @@ def main() -> int:
                     state=state,
                     usage=usage,
                     progress_path=progress_path,
+                    kbars_only=args.kbars_only,
                 )
             print(
                 f"[shioaji-history] query={completed_queries} "
@@ -1185,6 +1204,7 @@ def main() -> int:
             state=state,
             usage=usage,
             progress_path=progress_path,
+            kbars_only=args.kbars_only,
         )
         final_state = str(summary["state"])
         progress.finish(

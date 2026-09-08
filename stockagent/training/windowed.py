@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS
+from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS, HYBRID_TAPE_FIELDS
 
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
@@ -124,12 +124,12 @@ class WindowedSplitTensors:
             self.execution_mode
             in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
             and tuple(self.overnight_log_returns.shape)
-            != (
+            not in {(
                 int(self.features.size(0)),
                 int(self.features.size(1)),
                 2,
-                TAPE_FIELDS if self.execution_mode == MINUTE_MODE else 5,
-            )
+                fields,
+            ) for fields in ((TAPE_FIELDS, HYBRID_TAPE_FIELDS) if self.execution_mode == MINUTE_MODE else (5,))}
         ):
             raise ValueError(
                 "integer stock-futures execution tensor has incompatible candidate channels"
