@@ -553,6 +553,7 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._scheduled_market_session_day",
         lambda _cfg, current: (current.weekday() < 5, "fixture calendar"),
     )
+    monkeypatch.setattr("services.discord_bot.bot._day_trade_schedule_state", lambda *_: "retry")
     now = datetime(2026, 7, 6, 8, 30, tzinfo=ZoneInfo("Asia/Taipei"))
     configured = SimpleNamespace(
         market="tw_day_trade",
@@ -1801,7 +1802,7 @@ def test_current_discord_performance_snapshot_skips_history_scan(
     )
     revision = {"schema_version": 1, "returns": None, "latest_signal": None}
     summary = {
-        "discord_presentation_schema_version": 1,
+        "discord_presentation_schema_version": 2,
         "discord_performance_revision": revision,
         "recent_performance": {
             "window_days": 1,
@@ -3977,8 +3978,8 @@ def test_recent_performance_uses_settled_history_then_contiguous_live_signal(
     pl.DataFrame(
         {
             "date": ["2026-07-28", "2026-07-29"],
-            "portfolio_return": [0.01, 0.02],
-            "benchmark_return": [0.001, 0.002],
+            "portfolio_return": np.log1p([0.01, 0.02]).tolist(),
+            "benchmark_return": np.log1p([0.001, 0.002]).tolist(),
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
     stale_path = tmp_path / "stale.json"
@@ -5176,7 +5177,12 @@ def test_live_signal_lines_use_current_weight_for_pnl_direction() -> None:
     assert "`pnl_contrib=+0.50%`" in rebalance
 
 
-def test_signal_enrichment_adds_capital_pnl_and_crypto_window_label() -> None:
+def test_signal_enrichment_adds_capital_pnl_and_crypto_window_label(monkeypatch) -> None:
+    # This test owns sizing/formatting, not a machine's live artifact files.
+    monkeypatch.setattr(
+        "services.discord_bot.bot._refresh_summary_recent_performance_from_history",
+        lambda *_args, **_kwargs: True,
+    )
     cfg = SimpleNamespace(
         market="crypto",
         current_capital=500_000.0,

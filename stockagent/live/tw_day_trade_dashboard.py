@@ -19,6 +19,7 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
+from stockagent.live.performance_contract import paper_account_performance
 
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
@@ -1682,11 +1683,8 @@ def _finite_float(value: object) -> float | None:
 def _capital_return(
     initial_capital: object, total_equity: object
 ) -> tuple[float | None, float | None]:
-    initial = _finite_float(initial_capital)
-    equity = _finite_float(total_equity)
-    if initial is None or initial <= 0.0 or equity is None:
-        return None, None
-    return equity / initial - 1.0, (equity / initial - 1.0) * 100.0
+    result = paper_account_performance({"initial_capital_twd": initial_capital, "total_equity_twd": total_equity})
+    return result["return_fraction"], result["return_pct"]
 
 
 def _load_benchmark_history(root: Path) -> dict[str, Any]:
@@ -4236,6 +4234,8 @@ def build_dashboard_snapshot(
                 "entry_fill_outcome": entry_fill_outcome,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "total_equity_twd": mode.get("total_equity_twd"),
+                "last_mark_at": mode.get("last_mark_at"),
+                "valuation_stale": mode.get("valuation_stale", False),
                 "return_fraction": return_fraction,
                 "return_pct": return_pct,
                 "cumulative_realized_net_pnl_twd": mode.get(
@@ -4654,12 +4654,17 @@ def build_dashboard_snapshot(
                     mode[key] = last_mark.get(key)
                 mode["return_fraction"] = last_mark.get("return_fraction")
                 mode["return_pct"] = last_mark.get("return_pct")
+                mode["last_mark_at"] = last_mark.get("minute") or last_mark.get("recorded_at")
+                mode["valuation_stale"] = bool(last_mark.get("valuation_stale") or last_mark.get("stale_position_count"))
             else:
                 mode["total_equity_twd"] = None
                 mode["return_fraction"] = None
                 mode["return_pct"] = None
                 mode["open_position_count"] = 0
                 mode["stale_position_count"] = 0
+                mode["last_mark_at"] = None
+                mode["closing_auction_settled_at"] = None
+                mode["valuation_stale"] = False
             if (signal_event or {}).get("event") == "signal_blocked":
                 mode["engine_status"] = "historical_signal_blocked"
             elif (signal_event or {}).get("event") == "signal_registered":
@@ -4689,6 +4694,9 @@ def build_dashboard_snapshot(
         observed=selected_observed,
         session_date=selected_session_date,
     )
+    for mode in modes:
+        mode["account_performance"] = paper_account_performance(mode, revision=state.get("state_revision") if current_view else None)
+        mode["signal_product"] = "scheduled_execution"
     modes.sort(key=lambda row: str(row.get("market")))
     benchmarks.sort(key=lambda row: str(row.get("benchmark_id")))
     positions.sort(

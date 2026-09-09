@@ -1644,8 +1644,8 @@ def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) 
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
-            "portfolio_return": [0.01, -0.02, 0.03],
-            "benchmark_return": [0.00, 0.01, -0.01],
+            "portfolio_return": np.log1p([0.01, -0.02, 0.03]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.01, -0.01]).tolist(),
             "turnover": [0.1, 0.2, 0.3],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -1811,8 +1811,8 @@ def test_day_trade_stock_history_uses_same_session_open_to_close(tmp_path) -> No
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.05, -0.03],
-            "benchmark_return": [0.01, 0.02],
+            "portfolio_return": np.log1p([0.05, -0.03]).tolist(),
+            "benchmark_return": np.log1p([0.01, 0.02]).tolist(),
             "turnover": [1.0, 0.6],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -1878,8 +1878,8 @@ def test_load_stock_history_collapses_intraday_snapshots_to_daily(tmp_path) -> N
     pl.DataFrame(
         {
             "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
-            "portfolio_return": [0.01, 0.02, 0.03],
-            "benchmark_return": [0.00, 0.01, -0.01],
+            "portfolio_return": np.log1p([0.01, 0.02, 0.03]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.01, -0.01]).tolist(),
             "turnover": [0.10, 0.20, 0.30],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -1926,8 +1926,8 @@ def test_load_stock_history_can_preserve_intraday_bar_rows(tmp_path) -> None:
     pl.DataFrame(
         {
             "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
-            "portfolio_return": [0.01, 0.02, 0.03],
-            "benchmark_return": [0.00, 0.01, -0.01],
+            "portfolio_return": np.log1p([0.01, 0.02, 0.03]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.01, -0.01]).tolist(),
             "turnover": [0.10, 0.20, 0.30],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -1963,8 +1963,8 @@ def test_load_portfolio_history_summarizes_pnl_and_holding_changes(tmp_path) -> 
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
-            "portfolio_return": [0.01, 0.05, -0.02],
-            "benchmark_return": [0.00, 0.02, 0.01],
+            "portfolio_return": np.log1p([0.01, 0.05, -0.02]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.02, 0.01]).tolist(),
             "turnover": [0.10, 0.20, 0.30],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2000,8 +2000,8 @@ def test_load_portfolio_history_skips_change_price_reads_when_top_changes_zero(m
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.01, 0.05],
-            "benchmark_return": [0.00, 0.02],
+            "portfolio_return": np.log1p([0.01, 0.05]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.02]).tolist(),
             "turnover": [0.10, 0.20],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2041,8 +2041,8 @@ def test_day_trade_portfolio_history_reads_prices_only_for_visible_changes(
     pl.DataFrame(
         {
             "date": ["2026-01-05"],
-            "portfolio_return": [0.01],
-            "benchmark_return": [0.0],
+            "portfolio_return": np.log1p([0.01]).tolist(),
+            "benchmark_return": np.log1p([0.0]).tolist(),
             "turnover": [0.1],
         }
     ).write_parquet(
@@ -2095,8 +2095,8 @@ def test_load_portfolio_history_uses_price_root_and_previous_position_for_exit_s
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.00, 0.05],
-            "benchmark_return": [0.00, 0.00],
+            "portfolio_return": np.log1p([0.00, 0.05]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.00]).tolist(),
             "turnover": [0.0, 0.5],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2138,8 +2138,8 @@ def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.01, 0.02],
-            "benchmark_return": [0.0, 0.0],
+            "portfolio_return": np.log1p([0.01, 0.02]).tolist(),
+            "benchmark_return": np.log1p([0.0, 0.0]).tolist(),
             "turnover": [0.2, 0.4],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2196,8 +2196,8 @@ def test_day_trade_portfolio_history_rejects_non_open_holding_records(tmp_path) 
     pl.DataFrame(
         {
             "date": ["2026-01-02"],
-            "portfolio_return": [0.01],
-            "benchmark_return": [0.0],
+            "portfolio_return": np.log1p([0.01]).tolist(),
+            "benchmark_return": np.log1p([0.0]).tolist(),
             "turnover": [0.2],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2228,8 +2228,8 @@ def test_day_trade_portfolio_history_records_open_nav_and_same_session_pnl(tmp_p
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.10, -0.05],
-            "benchmark_return": [0.0, 0.0],
+            "portfolio_return": np.log1p([0.10, -0.05]).tolist(),
+            "benchmark_return": np.log1p([0.0, 0.0]).tolist(),
             "turnover": [0.2, 0.0],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2293,8 +2293,8 @@ def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> 
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "portfolio_return": [0.01, 0.05],
-            "benchmark_return": [0.00, 0.02],
+            "portfolio_return": np.log1p([0.01, 0.05]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.02]).tolist(),
             "turnover": [0.10, 0.20],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2326,8 +2326,8 @@ def test_load_portfolio_history_collapses_intraday_snapshots_to_daily(tmp_path) 
     pl.DataFrame(
         {
             "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
-            "portfolio_return": [0.01, 0.02, 0.03],
-            "benchmark_return": [0.00, 0.01, -0.01],
+            "portfolio_return": np.log1p([0.01, 0.02, 0.03]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.01, -0.01]).tolist(),
             "turnover": [0.10, 0.20, 0.30],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
@@ -2375,8 +2375,8 @@ def test_load_portfolio_history_can_preserve_intraday_bar_rows(tmp_path) -> None
     pl.DataFrame(
         {
             "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
-            "portfolio_return": [0.01, 0.02, 0.03],
-            "benchmark_return": [0.00, 0.01, -0.01],
+            "portfolio_return": np.log1p([0.01, 0.02, 0.03]).tolist(),
+            "benchmark_return": np.log1p([0.00, 0.01, -0.01]).tolist(),
             "turnover": [0.10, 0.20, 0.30],
         }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")

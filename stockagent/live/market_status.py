@@ -768,15 +768,11 @@ def runtime_status(
     )
 
 
-def cumulative_recent_returns(path: Path | None, *, window_days: int) -> dict[str, Any] | None:
+def cumulative_recent_returns(path: Path | None, *, window_days: int, prefer_integer: bool = True) -> dict[str, Any] | None:
     if path is None or not path.exists():
         return None
-    target: Path | None = None
-    for name in ("daily_portfolio_returns.parquet", "daily_portfolio_returns.csv"):
-        candidate = path.parent / name if path.name == "checkpoint_best.pt" else path / name
-        if candidate.exists():
-            target = candidate
-            break
+    from stockagent.live.performance_contract import compound_simple_returns, resolve_return_artifact, simple_return_frame
+    target = resolve_return_artifact(path.parent if path.name == "checkpoint_best.pt" else path, prefer_integer=prefer_integer)
     if target is None:
         return None
     try:
@@ -788,10 +784,11 @@ def cumulative_recent_returns(path: Path | None, *, window_days: int) -> dict[st
         frame = frame.sort("date").tail(max(1, int(window_days)))
         dates = frame.get_column("date").to_list()
         date_only = not any(":" in str(item) for item in dates)
-        strategy = [float(x or 0.0) for x in frame.get_column("portfolio_return").to_list()]
-        benchmark = [float(x or 0.0) for x in frame.get_column("benchmark_return").to_list()]
-        strat_ret = math.exp(sum(strategy)) - 1.0
-        bench_ret = math.exp(sum(benchmark)) - 1.0
+        frame = simple_return_frame(frame)
+        strat_ret = compound_simple_returns(frame["portfolio_return"].to_list())
+        bench_ret = compound_simple_returns(frame["benchmark_return"].to_list())
+        if strat_ret is None or bench_ret is None:
+            return None
         return {
             "window_days": int(frame.height),
             "start_date": _date_to_text(dates[0], date_only=date_only),
@@ -800,6 +797,8 @@ def cumulative_recent_returns(path: Path | None, *, window_days: int) -> dict[st
             "benchmark_return": float(bench_ret),
             "excess_return": float(strat_ret - bench_ret),
             "source_path": str(target),
+            "return_type": "simple",
+            "source": "model_backtest_returns",
         }
     except Exception:
         return None

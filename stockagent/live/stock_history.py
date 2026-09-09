@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from stockagent.live.capital import CapitalScale, resolve_fold_capital_scale
+from stockagent.live.performance_contract import simple_return_frame
 
 _ROW_INDEX_COL = "__stockagent_row_index"
 
@@ -505,7 +506,9 @@ def _read_returns(fold_dir: Path, *, frequency: str | None = "daily"):
     for name in ("portfolio_return", "benchmark_return", "turnover"):
         if name in frame.columns:
             columns.append(name)
-    return _returns_from_frame(frame, [name for name in columns if name != "date"], frequency=frequency), path
+    decoded = simple_return_frame(frame)
+    result = _returns_from_frame(decoded, [name for name in columns if name != "date"], frequency=frequency)
+    return result.with_columns(pl.lit("simple").alias("return_type")), path
 
 
 def _symbol_name(symbol_names: dict[str, str] | None, symbol: str) -> str:

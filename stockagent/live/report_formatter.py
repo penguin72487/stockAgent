@@ -199,6 +199,34 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
         f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
         _kv_line(*price_pairs),
     ])
+    if is_day_trade:
+        observation = (summary.get("signal_price_contract") or {}).get("model_observation")
+        product = (
+            "盤後快速預覽（暫定）" if isinstance(postclose_fast, dict) and postclose_fast.get("provisional")
+            else "開盤決策" if observation == "session_open"
+            else "盤中即時重估" if observation == "intraday_latest_quote"
+            else "官方盤後重估" if observation == "completed_panel"
+            else "模型目標預覽"
+        )
+        lines.append(_kv_line(("product", product), ("signal_id", summary.get("signal_id") or "n/a")))
+        lines.append("目標配置不是成交紀錄；即時／盤後重估不會改寫今日已執行的開盤持倉。")
+        account = summary.get("account_performance")
+        if isinstance(account, dict) and account.get("status") == "available":
+            lines.extend([
+                "", "**模擬帳戶累積績效（與網頁帳戶累積欄同口徑）**",
+                _kv_line(("equity", _fmt_money(account.get("total_equity_twd"))),
+                         ("pnl", _fmt_money(account.get("net_pnl_twd"))),
+                         ("return", _fmt_signed_pct(account.get("return_fraction")))),
+                _kv_line(("initial", _fmt_money(account.get("initial_capital_twd"))),
+                         ("session", account.get("session_date")),
+                         ("asof", _fmt_time(account.get("asof"), summary)),
+                         ("revision", account.get("state_revision"))),
+                "基準：原始帳戶資金；不等於明細日期篩選的區間報酬。",
+            ])
+            if account.get("valuation_stale"):
+                lines.append("warning: 帳戶估值有缺價／沿用舊價，非完整即時估值。")
+        elif isinstance(account, dict):
+            lines.append("模擬帳戶績效暫不可用；不以模型回測代替。")
     if execution_preview_only:
         lines.extend(
             [
@@ -225,7 +253,7 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
                 ),
             ]
         )
-    if _float_or_none(summary.get("portfolio_pnl_value")) is not None:
+    if not execution_preview_only and _float_or_none(summary.get("portfolio_pnl_value")) is not None:
         lines.append(
             _kv_line(
                 ("capital", _fmt_capital(summary.get("display_capital"))),
@@ -252,6 +280,8 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
 
     if recent:
         recent_label = str(recent.get("window_label") or f"過去{recent.get('window_days', 'n')}期/天")
+        if is_day_trade:
+            recent_label = "模型歷史回測・" + recent_label
         lines.extend(
             [
                 "",
@@ -263,6 +293,14 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
                 ),
             ]
         )
+        if recent.get("start_date") or recent.get("end_date"):
+            lines.append(_kv_line(("from", recent.get("start_date")), ("through", recent.get("end_date"))))
+        if is_day_trade:
+            lines.append("不是模擬帳戶實績；下列金額依參考資金換算。")
+            if recent.get("status") == "unavailable":
+                lines.append("warning: 回測來源未通過驗收；不沿用舊數值。")
+            if recent.get("through_signal_date") is False:
+                lines.append("warning: 回測績效截止日早於本次訊號日期，尚未包含該日。")
         if _float_or_none(recent.get("strategy_pnl_value")) is not None:
             lines.append(
                 _kv_line(

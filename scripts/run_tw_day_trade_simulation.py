@@ -1048,6 +1048,33 @@ def _active_quote_due(
     )
 
 
+def _flat_mark_markets_due(engine, *, observed: datetime, last_mark_minute: str | None) -> list[str]:
+    """A flat cash account still owns every minute and a terminal NAV.
+
+    Quote acquisition is not the clock for ledger publication. After close,
+    catch up once through the same settlement engine without fetching quotes.
+    """
+    minute = observed.replace(second=0, microsecond=0)
+    clock = minute.timetz().replace(tzinfo=None)
+    session = observed.date().isoformat()
+    enabled = engine.state.get("enabled_markets")
+    due = []
+    for market, mode in (engine.state.get("modes") or {}).items():
+        if isinstance(enabled, list) and market not in enabled:
+            continue
+        if str(mode.get("session_date") or "") != session:
+            continue
+        if any(int(position.get("signed_shares") or 0) for position in (mode.get("positions") or {}).values()):
+            continue
+        terminal = mode.get("terminal_curve_mark") or []
+        if clock >= datetime_time(13, 30):
+            if not terminal or terminal[0] != session:
+                due.append(market)
+        elif datetime_time(9, 1) <= clock and last_mark_minute != minute.isoformat(timespec="minutes"):
+            due.append(market)
+    return due
+
+
 def _loop_sleep_seconds(
     observed: datetime,
     *,
@@ -1356,6 +1383,7 @@ def main(argv: list[str] | None = None) -> int:
     last_readiness = 0.0
     last_quote_minute: str | None = None
     last_benchmark_minute: str | None = None
+    last_ledger_mark_minute: str | None = None
     pending_retry_after: dict[str, float] = {}
     quote_client_warmed_session: str | None = None
     quote_client_prewarm_retry_after = 0.0
@@ -1795,7 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         benchmark_due = (
             observed.weekday() < 5
-            and datetime_time(9, 0) <= wall_time < datetime_time(13, 30)
+            and datetime_time(9, 0) <= wall_time < datetime_time(13, 31)
             and last_benchmark_minute != minute_key
         )
         benchmark_symbols = (
@@ -2116,6 +2144,13 @@ def main(argv: list[str] | None = None) -> int:
                 now=datetime.now(TAIPEI),
                 append_mark_history=not same_minute_force_exit_retry,
             )
+            last_ledger_mark_minute = datetime.now(TAIPEI).replace(second=0, microsecond=0).isoformat(timespec="minutes")
+        else:
+            mark_observed = datetime.now(TAIPEI)
+            flat_markets = _flat_mark_markets_due(engine, observed=mark_observed, last_mark_minute=last_ledger_mark_minute)
+            if flat_markets:
+                engine.process_quotes(quotes={}, now=mark_observed, markets=flat_markets)
+                last_ledger_mark_minute = mark_observed.replace(second=0, microsecond=0).isoformat(timespec="minutes")
         if benchmark_due and specs:
             current_contract = str(future_snapshot.get("current_contract_code") or "")
             future_quotes = future_snapshot.get("quotes") or {}

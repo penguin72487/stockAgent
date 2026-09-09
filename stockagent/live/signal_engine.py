@@ -3704,7 +3704,10 @@ def generate_live_signal(
     )
     current_risk = portfolio_risk_summary(current_weights)
     target_risk = portfolio_risk_summary(target_weights)
-    recent_performance = cumulative_recent_returns(checkpoint, window_days=benchmark_window_days)
+    recent_performance = cumulative_recent_returns(
+        checkpoint, window_days=benchmark_window_days,
+        prefer_integer=not (execution_mode == "tw_day_trade" and config.trading.tw_day_trade_unlimited_margin_conversion),
+    )
     risk_warnings = _risk_warnings(
         turnover=turnover,
         target_risk=target_risk,
