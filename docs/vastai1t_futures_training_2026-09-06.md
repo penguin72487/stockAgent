@@ -1,5 +1,12 @@
 # vastai1T 期貨訓練準備（2026-09-06）
 
+> 2026-09-07 入口修正：股票特徵驅動的 08:45 個股期貨當沖，統一使用
+> `bash scripts/run_tw_stock_futures_day_trade_0845_minute.sh`。
+> 資料版本已放回 `configs/markets/tw_stock_futures_day_trade_0845_minute.yaml`；
+> 原腳本沿用共用資料續租與 `train.py`，不用下列操作目錄的 runtime YAML。
+> 本文其餘部分保留 2026-09-06 的準備證據。`train_carry.sh` 是另一個全期貨留倉
+> 實驗，其完成 smoke 不能代表 08:45 當沖已可正式訓練；50 日分鐘歷史缺口仍存在。
+
 本次準備兩種模式：`tw_futures_portfolio_day` 留倉訓練，以及
 `tw_stock_futures_day_trade_0845_minute` 個股期貨當沖訓練。
 兩者保留 FinancialTransformer、多基底、BF16、雙 GPU、1000 epochs 與原年度切分。

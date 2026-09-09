@@ -404,6 +404,14 @@ source-quality scope, not a claim about historical market eligibility. Never
 infer additional exclusions from gaps or failed strategy exits. Manifest,
 checkpoint, reporting, and a new artifact root must bind the exact scope.
 
+Receipt-backed one-minute KBars are sufficient where their dated physical
+identity and Amount/Volume contract verify; preserve the existing --minute-root
+and --kbars-only collector paths. Validate source integrity before the stock
+panel or DDP. A complete receipt covers only declared dates, not the entire
+configured history. Use train.py --config ... --check-data-only for coverage
+and scripts/run_data_cache.sh for exact-release verification and leases.
+The user's current direct train.py entry point remains authoritative.
+
 Every completed fold must immediately refresh the cumulative root-level
 walk-forward report from all contract-compatible folds completed so far. Do not
 wait for the full fold suite and do not require a duplicate post-training

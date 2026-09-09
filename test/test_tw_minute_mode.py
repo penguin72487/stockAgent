@@ -2080,6 +2080,39 @@ def test_daily_guided_minute_config_reuses_runner_with_a_bounded_gate() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("config_name", "qk_norm"),
+    [
+        ("tw_minute_daily_guided_v12_dual_5090.yaml", True),
+        ("tw_minute_daily_guided_v12_dual_5090_throughput_v2.yaml", False),
+        ("tw_minute_daily_guided_v12_dual_5090_qk_norm_v3.yaml", True),
+    ],
+)
+def test_v12_minute_cache_repair_preserves_legacy_config_contracts(
+    config_name: str, qk_norm: bool,
+) -> None:
+    root = Path(__file__).parents[1]
+    config = load_config(root / "configs/markets" / config_name)
+    # Repair v3 without changing the paths fingerprinted by older checkpoints.
+    # Derived caches are not present in rematerialized packed releases.
+    cache_root = (
+        "artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/"
+        "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/stocks"
+        if config_name.endswith("qk_norm_v3.yaml")
+        else "data_tw_public/stocks"
+    )
+    assert config.data.minute_daily_context_panel_meta == (
+        f"{cache_root}/panel_cache_v2/variants/"
+        "fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577.json"
+    )
+    assert config.training.financial_transformer.qk_norm is qk_norm
+    assert config.training.transformer_base_portfolio.qk_norm is qk_norm
+    assert config.training.epochs == 1000
+    assert config.training.multi_gpu_strategy == "distributed_data_parallel"
+    assert config.training.batch_size_train == 64
+    assert config.training.minute_decision_chunk_rows == 16
+
+
 def test_dual_5090_minute_trading_contract_matches_daily_day_trade() -> None:
     root = Path(__file__).parents[1]
     daily = load_config(root / "configs/markets/tw_public_lanten_market_candles.yaml")

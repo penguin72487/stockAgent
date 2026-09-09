@@ -1313,6 +1313,56 @@ def test_disabled_daily_context_is_backward_compatible_but_enabled_branch_is_not
     assert enabled_manifest["fingerprints"]["model"] != baseline["fingerprints"]["model"]
 
 
+def test_crypto_trajectory_cadence_requires_fresh_optimizer_checkpoint(tmp_path: Path) -> None:
+    config = load_config("configs/markets/bybit_perpetual_daily_0000_deterministic.yaml")
+    panel = _panel()
+    baseline = _checkpoint_manifest(panel, config)
+    candidate = copy.deepcopy(config)
+    candidate.training.crypto_optimizer_step_per_trajectory = True
+    changed = _checkpoint_manifest(panel, candidate)
+    assert changed["contracts"]["training"]["optimizer"]["step_cadence"] == "full_chronological_trajectory"
+    assert "step_cadence" not in baseline["contracts"]["training"]["optimizer"]
+    assert changed["fingerprints"]["model"] == baseline["fingerprints"]["model"]
+    assert changed["fingerprints"]["trading"] == baseline["fingerprints"]["trading"]
+    checkpoint = {"experiment_manifest": baseline}
+    with pytest.raises(RuntimeError, match="training"):
+        _validate_checkpoint_manifest(
+            checkpoint, changed, checkpoint_path=tmp_path / "old.pt", scope="resume"
+        )
+    # Cadence alone changes training semantics, not model inference. This does
+    # not authorize replaying the older, pre-fix crypto ledger contract.
+    _validate_checkpoint_manifest(
+        checkpoint, changed, checkpoint_path=tmp_path / "old.pt", scope="inference"
+    )
+
+
+def test_crypto_ledger_revision_and_execution_settings_are_checkpoint_contracts(tmp_path: Path) -> None:
+    from stockagent.training.checkpoint_contract import _stable_fingerprint
+    from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+
+    config = load_config("configs/markets/bybit_perpetual_daily_0000_deterministic.yaml")
+    current = _checkpoint_manifest(_panel(), config)
+    assert current["contracts"]["trading"]["crypto_perpetual"]["backtest_contract_version"] == CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+    legacy = copy.deepcopy(current)
+    legacy["contracts"]["trading"].pop("crypto_perpetual")
+    legacy["fingerprints"]["trading"] = _stable_fingerprint(legacy["contracts"]["trading"])
+    for scope in ("resume", "artifact"):
+        with pytest.raises(RuntimeError, match="trading"):
+            _validate_checkpoint_manifest(
+                {"experiment_manifest": legacy}, current,
+                checkpoint_path=tmp_path / "old.pt", scope=scope,
+            )
+    for name, value in (
+        ("crypto_execution_minute_utc", 5),
+        ("crypto_stateful_proximal_allocator", False),
+        ("crypto_proximal_cost_multiplier", 2.0),
+    ):
+        changed = copy.deepcopy(config)
+        setattr(changed.trading, name, value)
+        manifest = _checkpoint_manifest(_panel(), changed)
+        assert manifest["fingerprints"]["trading"] != current["fingerprints"]["trading"]
+
+
 def test_checkpoint_validation_scopes_resume_and_future_inference_data(tmp_path: Path) -> None:
     panel = _panel()
     config = _config()

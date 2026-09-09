@@ -37,6 +37,7 @@ from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
 
+from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
 from stockagent.backtest.report import (
     compute_metrics,
     generate_annual_report,
@@ -2745,6 +2746,7 @@ def _mode_artifact_contract_for_config(
                     else "next_trade_official_1m_kline_open_at_0005_utc_after_five_minute_lag"
                 ),
                 "mode_details": {
+                    "crypto_backtest_contract_version": CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
                     "crypto_execution_minute_utc": execution_minute,
                     "funding_boundary_order": (
                         "boundary_funding_settles_before_new_target"
@@ -3115,6 +3117,7 @@ class TimingBreakdown:
     finite_check_s: float = 0.0
     step_s: float = 0.0
     step_cuda_s: float = 0.0
+    optimizer_steps: int = 0
     scheduler_s: float = 0.0
     backtest_s: float = 0.0
     backtest_prepare_s: float = 0.0
@@ -3196,6 +3199,7 @@ def _broadcast_epoch_eval_timing(
             if name
             in {
                 "batches",
+                "optimizer_steps",
                 "gradient_norm_zero_batches",
                 "gradient_norm_observations",
                 "gradient_norm_first_zero_batch",
@@ -3347,6 +3351,7 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
     ):
         setattr(dst, name, getattr(dst, name) + getattr(src, name))
     dst.batches += src.batches
+    dst.optimizer_steps += src.optimizer_steps
     dst.cuda_events.extend(src.cuda_events)
 
 
@@ -5868,6 +5873,7 @@ def _timing_curve_payload(
     unattributed_s = max(0.0, epoch_total_s - measured_total_s)
     return {
         "train_batches": int(train_timing.batches),
+        "train_optimizer_steps": int(train_timing.optimizer_steps),
         "timing_synchronized": int(bool(timing_synchronized)),
         "train_total_s": float(train_timing.total_s),
         "train_total_ms_per_batch": _avg_ms(train_timing.total_s),
@@ -6466,6 +6472,7 @@ def _finalize_trajectory_optimizer_step(
     _stabilize_model_parameters_after_step(model)
     _maybe_sync_cuda(device, profile_timing)
     timing.step_s += time.perf_counter() - step_start
+    timing.optimizer_steps += 1
     if lr_scheduler is not None and lr_scheduler_interval == "step":
         timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
     if not _model_parameters_are_finite(model):
@@ -18133,9 +18140,9 @@ def _train_epoch_windowed_tensor(
         else 0
     )
     if optimizer_step_per_trajectory:
-        if not sequential_return_objective:
+        if _normalize_risk_objective(objective) != "log_utility":
             raise RuntimeError(
-                "trajectory optimizer cadence requires a chronological return-series objective"
+                "trajectory optimizer cadence requires decomposable log_utility"
             )
         if trajectory_valid_rows <= 0:
             raise RuntimeError("trajectory optimizer cadence requires valid training rows")
@@ -18508,7 +18515,7 @@ def _train_epoch_windowed_tensor(
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = _should_check_finite(
+        should_check_finite = optimizer_step_per_trajectory or _should_check_finite(
             step_idx,
             finite_check_interval_steps,
             final_step=step_idx >= num_batches,
@@ -18697,6 +18704,7 @@ def _train_epoch_windowed_tensor(
                 with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                     scaler.step(optimizer)
                     scaler.update()
+                timing.optimizer_steps += 1
                 _stabilize_model_parameters_after_step(model)
                 _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
                 _maybe_sync_cuda(device, profile_timing)
@@ -18749,6 +18757,7 @@ def _train_epoch_windowed_tensor(
                 step_start = time.perf_counter()
                 with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                     optimizer.step()
+                timing.optimizer_steps += 1
                 _stabilize_model_parameters_after_step(model)
                 _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
                 _maybe_sync_cuda(device, profile_timing)
@@ -18974,6 +18983,10 @@ def _train_epoch_windowed_tensor_ddp(
         else 0
     )
     if optimizer_step_per_trajectory:
+        if _normalize_risk_objective(objective) != "log_utility":
+            raise RuntimeError(
+                "trajectory optimizer cadence requires decomposable log_utility"
+            )
         if trajectory_valid_rows <= 0:
             raise RuntimeError("trajectory optimizer cadence requires valid training rows")
         optimizer.zero_grad(set_to_none=True)
@@ -19313,7 +19326,7 @@ def _train_epoch_windowed_tensor_ddp(
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = _should_check_finite(
+        should_check_finite = optimizer_step_per_trajectory or _should_check_finite(
             step_idx,
             finite_check_interval_steps,
             final_step=step_idx >= num_batches,
@@ -19491,6 +19504,7 @@ def _train_epoch_windowed_tensor_ddp(
                 with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                     scaler.step(optimizer)
                     scaler.update()
+                timing.optimizer_steps += 1
                 _stabilize_model_parameters_after_step(model)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.step_s += time.perf_counter() - step_start
@@ -19540,6 +19554,7 @@ def _train_epoch_windowed_tensor_ddp(
                 step_start = time.perf_counter()
                 with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                     optimizer.step()
+                timing.optimizer_steps += 1
                 _stabilize_model_parameters_after_step(model)
                 _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
                 _maybe_sync_cuda(device, profile_timing)
@@ -22981,10 +22996,21 @@ def _run_training_impl(
             train_batch_size=train_batch_size,
         )
         optimizer_step_per_trajectory = bool(
-            config.training.futures_portfolio_optimizer_step_per_trajectory
-            and execution_runtime.mode == "tw_stock_context_futures_portfolio"
-            and config.trading.tw_futures_portfolio_integer_contracts
+            (
+                config.training.futures_portfolio_optimizer_step_per_trajectory
+                and execution_runtime.mode == "tw_stock_context_futures_portfolio"
+                and config.trading.tw_futures_portfolio_integer_contracts
+            )
+            or (
+                config.training.crypto_optimizer_step_per_trajectory
+                and execution_runtime.mode == "crypto_perpetual"
+            )
         )
+        if optimizer_step_per_trajectory and _distributed_is_rank0():
+            print(
+                f"[Train {train_years}] optimizer_cadence=trajectory "
+                "loss_weighting=valid_dates state_gradient=detached_at_batch_boundary"
+            )
         scheduler_steps_per_epoch = (
             1 if optimizer_step_per_trajectory else train_steps_per_epoch
         )
