@@ -576,15 +576,8 @@ def _daily_changes(
 
 
 def _period_total_return(rows: list[dict[str, Any]], key: str) -> float | None:
-    total = 1.0
-    seen = False
-    for row in rows:
-        value = row.get(key)
-        if value is None:
-            continue
-        total *= 1.0 + float(value)
-        seen = True
-    return total - 1.0 if seen else None
+    from stockagent.live.performance_contract import compound_simple_returns
+    return compound_simple_returns(row.get(key) for row in rows)
 
 
 def load_portfolio_history(

@@ -4891,19 +4891,37 @@ class TwDayTradeSimulationEngine:
         )
         if not append_history:
             return
-        curve_clock = now.timetz().replace(tzinfo=None)
-        if not ENTRY_GATE <= curve_clock <= SESSION_CLOSE:
+        mark_at = now.replace(second=0, microsecond=0)
+        curve_clock = mark_at.timetz().replace(tzinfo=None)
+        same_session = str(mode.get("session_date") or now.date().isoformat()) == now.date().isoformat()
+        settled_at = str(mode.get("closing_auction_settled_at") or "")
+        try:
+            settled_time = datetime.fromisoformat(settled_at)
+            settled_valid = settled_time.tzinfo is not None and settled_time <= now and settled_time.astimezone(now.tzinfo).date() == now.date()
+        except ValueError:
+            settled_valid = False
+        settled_flat = same_session and not open_count and settled_valid
+        terminal = same_session and curve_clock >= SESSION_CLOSE
+        if terminal and settled_flat:
+            # A delayed loop/restart may publish a proven flat settlement NAV
+            # at the session endpoint. No price, fill, or interior bar is made up.
+            mark_at = now.replace(hour=13, minute=30, second=0, microsecond=0)
+            curve_clock = SESSION_CLOSE
+        if not same_session or not ENTRY_GATE <= curve_clock <= SESSION_CLOSE:
             # The operational state may be marked immediately after a 09:00
             # signal or during post-close reconciliation, but the canonical
             # strategy curve is the 270 right-labelled minutes 09:01..13:30.
             # Persisting the operational mark would give only the current day
             # a different grain and distort historical comparisons.
             return
+        terminal_signature = [now.date().isoformat(), total_equity, cumulative, open_net, open_count, stale_count, settled_at]
+        if terminal and mode.get("terminal_curve_mark") == terminal_signature:
+            return
         self._append_ledger(
             self.marks_path,
             {
                 "recorded_at": now.isoformat(timespec="seconds"),
-                "minute": now.replace(second=0, microsecond=0).isoformat(
+                "minute": mark_at.isoformat(
                     timespec="minutes"
                 ),
                 "session_date": mode.get("session_date") or now.date().isoformat(),
@@ -4917,6 +4935,8 @@ class TwDayTradeSimulationEngine:
                 "valuation_stale": stale_count > 0,
             },
         )
+        if terminal:
+            mode["terminal_curve_mark"] = terminal_signature
 
     def _persist(self, now: datetime | None = None) -> None:
         observed = _now_taipei(now)

@@ -797,6 +797,9 @@ function renderModes(data) {
     const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
     const pnl = rangeSummary?.cumulative_net_pnl_twd == null ? null : Number(rangeSummary.cumulative_net_pnl_twd);
     const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
+    const account = mode.account_performance;
+    const accountReturnPct = account?.status === "available" && account.return_pct != null
+      ? Number(account.return_pct) : null;
     const status = String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
     const fillOutcome = fillOutcomePresentation(mode.today_execution_outcome || mode.entry_fill_outcome);
@@ -818,6 +821,7 @@ function renderModes(data) {
       <div class="metric-context">所選期間報酬 · 起始有效分鐘 = 0%</div>
       <div class="delta ${pnlClass(pnl)}">${pnl == null ? "所選日期尚無估值" : `期末權益 ${summaryMoney(equity)} · 累積淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
       <div class="mode-glance">
+        <div><span>帳戶累積報酬（Discord 同口徑）</span><strong class="${pnlClass(accountReturnPct)}">${accountReturnPct == null ? "資料不可用" : `${accountReturnPct >= 0 ? "+" : ""}${displayPct(accountReturnPct)}`}</strong></div>
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>實際成交結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
@@ -825,6 +829,9 @@ function renderModes(data) {
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
       </div>
       <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
+        <div class="wide"><span>帳戶累積報酬基準</span><strong>原始帳戶資金至本次估值；與上方篩選區間報酬分開</strong></div>
+        <div><span>帳戶估值時間</span><strong>${shortTime(account?.asof)}</strong></div>
+        <div><span>帳本版本</span><strong>${esc(account?.state_revision ?? "歷史估值")}</strong></div>
         <div><span>原始資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         ${mode.counterfactual_open_replay

@@ -4354,7 +4354,7 @@ def _refresh_summary_recent_performance_from_history(
     summary: dict[str, Any],
     *,
     capital: float | None = None,
-) -> None:
+) -> bool:
     raw_recent = summary.get("recent_performance")
     if isinstance(raw_recent, dict):
         window = _float_or_none(raw_recent.get("window_days"))
@@ -4367,7 +4367,7 @@ def _refresh_summary_recent_performance_from_history(
     except Exception:
         days = 0
     if days <= 0:
-        return
+        return False
     try:
         recent_fast = _recent_performance_from_returns(cfg, days, capital=capital)
     except MarketUnsupportedError:
@@ -4386,10 +4386,10 @@ def _refresh_summary_recent_performance_from_history(
                 capital,
             )
         except MarketUnsupportedError:
-            return
+            return False
         except Exception as exc:
             _log_exception(f"recent_performance_history_fallback:{cfg.market}", exc)
-            return
+            return False
         recent_fast = {
             "window_days": int(history.days),
             "strategy_return": history.period_return,
@@ -4423,20 +4423,14 @@ def _refresh_summary_recent_performance_from_history(
                     recent_fast[target_key] = value * float(capital)
     recent: dict[str, Any] = dict(raw_recent) if isinstance(raw_recent, dict) else {}
     recent.update(recent_fast)
+    recent["status"] = "available"
     summary["recent_performance"] = recent
+    return True
 
 
 def _returns_artifact_path(fold_dir: Path) -> Path | None:
-    for name in (
-        "integer_share_daily_portfolio_returns.parquet",
-        "integer_share_daily_portfolio_returns.csv",
-        "daily_portfolio_returns.parquet",
-        "daily_portfolio_returns.csv",
-    ):
-        path = fold_dir / name
-        if path.exists():
-            return path
-    return None
+    from stockagent.live.performance_contract import resolve_return_artifact
+    return resolve_return_artifact(fold_dir)
 
 
 def _formal_returns_artifact_path(cfg: LiveMarketConfig) -> Path | None:
@@ -4459,16 +4453,8 @@ def _formal_returns_artifact_path(cfg: LiveMarketConfig) -> Path | None:
         )
     except Exception:
         incompatible_integer_oracle = False
-    if not incompatible_integer_oracle:
-        return _returns_artifact_path(fold_dir)
-    for name in (
-        "daily_portfolio_returns.parquet",
-        "daily_portfolio_returns.csv",
-    ):
-        path = fold_dir / name
-        if path.exists():
-            return path
-    return None
+    from stockagent.live.performance_contract import resolve_return_artifact
+    return resolve_return_artifact(fold_dir, prefer_integer=not incompatible_integer_oracle)
 
 
 def _path_revision(path: Path | None) -> tuple[str, int, int] | None:
@@ -4507,13 +4493,17 @@ def _has_current_discord_performance_snapshot(
     cfg: LiveMarketConfig,
     summary: dict[str, Any],
 ) -> bool:
+    from stockagent.live.performance_contract import PERFORMANCE_SCHEMA_VERSION
+
     try:
         schema_version = int(summary.get("discord_presentation_schema_version") or 0)
     except (TypeError, ValueError):
         return False
-    if schema_version < 1:
+    if schema_version != PERFORMANCE_SCHEMA_VERSION:
         return False
     if not isinstance(summary.get("recent_performance"), dict):
+        return False
+    if summary["recent_performance"].get("status") == "unavailable":
         return False
     stored = summary.get("discord_performance_revision")
     return isinstance(stored, dict) and stored == _discord_performance_revision(cfg)
@@ -4524,15 +4514,9 @@ def _history_sort_dt(value: Any) -> datetime:
 
 
 def _compound_return_values(values: list[float | None]) -> float | None:
-    total = 1.0
-    seen = False
-    for value in values:
-        number = _float_or_none(value)
-        if number is None:
-            continue
-        total *= 1.0 + number
-        seen = True
-    return total - 1.0 if seen else None
+    """Compound simple consumer DTOs, never raw training log-return columns."""
+    from stockagent.live.performance_contract import compound_simple_returns
+    return compound_simple_returns(values)
 
 
 def _risk_adjusted_metrics_from_simple_returns(
@@ -4548,7 +4532,14 @@ def _risk_adjusted_metrics_from_simple_returns(
     periods = max(1, int(annualization_periods))
     if simple.size == 0:
         return {}
-    log_returns = np.log1p(np.clip(simple, -0.999999, None))
+    if not np.isfinite(simple).all() or (simple < -1.0).any():
+        raise ValueError("Invalid simple returns for risk metrics")
+    if (simple == -1.0).any():
+        return {"sharpe": None, "sortino": None, "max_drawdown": -1.0,
+                "annualized_return": -1.0, "calmar": -1.0, "ruined": True,
+                "risk_observations": int(simple.size), "risk_annualization_periods": periods,
+                "risk_return_basis": "net_log_return", "risk_status": "undefined_after_ruin"}
+    log_returns = np.log1p(simple)
     average = float(log_returns.mean())
     volatility = float(log_returns.std(ddof=0))
     downside = np.minimum(log_returns, 0.0)
@@ -4582,6 +4573,7 @@ def _recent_performance_from_returns(
     capital: float | None = None,
 ) -> dict[str, Any] | None:
     import polars as pl
+    from stockagent.live.performance_contract import simple_return_frame
 
     try:
         limit = max(1, int(periods))
@@ -4594,9 +4586,12 @@ def _recent_performance_from_returns(
         source_paths.append(path)
         columns = ["date", "portfolio_return", "benchmark_return"]
         if path.suffix == ".parquet":
-            frame = pl.scan_parquet(path).select([pl.col(name) for name in columns if name]).tail(limit * 2).collect()
+            scan = pl.scan_parquet(path)
+            unit_columns = ["return_type"] if "return_type" in scan.collect_schema().names() else []
+            frame = scan.select(columns + unit_columns).sort("date").tail(limit * 2).collect()
         else:
-            frame = pl.read_csv(path, columns=columns, infer_schema_length=10000).tail(limit * 2)
+            frame = pl.read_csv(path, infer_schema_length=10000).sort("date").tail(limit * 2)
+        frame = simple_return_frame(frame)
         for row in frame.select(columns).to_dicts():
             date_key = _date_key(row.get("date"))
             if not date_key:
@@ -4669,7 +4664,9 @@ def _recent_performance_from_returns(
         "strategy_return": strategy,
         "benchmark_return": benchmark,
         "excess_return": excess,
-        "source": "returns_artifact_with_live_signals",
+        "source": "model_backtest_returns" if bool(getattr(cfg, "day_trade_simulation_enabled", False)) else "returns_artifact_with_live_signals",
+        "return_type": "simple",
+        "source_return_type": "log",
         "start_date": str(selected[0].get("date")),
         "end_date": str(selected[-1].get("date")),
     }
@@ -4732,6 +4729,8 @@ def _summary_with_capital_context(
     current_capital: float | None = None,
     reuse_current_performance_snapshot: bool = False,
 ) -> dict[str, Any]:
+    from stockagent.live.performance_contract import PERFORMANCE_SCHEMA_VERSION, paper_account_performance
+
     out = dict(summary)
     capital = _resolve_current_capital(cfg, current_capital=current_capital)
     if capital is not None:
@@ -4748,7 +4747,12 @@ def _summary_with_capital_context(
         reuse_current_performance_snapshot
         and _has_current_discord_performance_snapshot(cfg, out)
     ):
-        _refresh_summary_recent_performance_from_history(cfg, out, capital=capital)
+        refreshed = _refresh_summary_recent_performance_from_history(cfg, out, capital=capital)
+        if refreshed is False:
+            # Never stamp the new semantics version onto an old numeric block
+            # when the source is missing/invalid. The next request may retry.
+            out["recent_performance"] = {"status": "unavailable", "return_type": "simple",
+                                         "window_days": getattr(cfg, "benchmark_window_days", 32)}
     recent = out.get("recent_performance")
     if isinstance(recent, dict):
         recent = dict(recent)
@@ -4762,8 +4766,28 @@ def _summary_with_capital_context(
                 value = _float_or_none(recent.get(source_key))
                 if value is not None:
                     recent[target_key] = value * float(capital)
+        if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            recent["performance_kind"] = "model_backtest"
+            recent["return_type"] = "simple"
+            recent["signal_date"] = _date_key(out.get("asof_date") or out.get("panel_data_date"))
+            recent["through_signal_date"] = bool(recent.get("end_date") and recent.get("signal_date") and str(recent["end_date"])[:10] >= str(recent["signal_date"])[:10])
         out["recent_performance"] = recent
-    out["discord_presentation_schema_version"] = 1
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        # Read one atomic state, not the historical model table or a previous
+        # Discord summary. This never scans ledgers or enters the model worker.
+        root = _resolve_repo_path(getattr(cfg, "day_trade_simulation_state_dir", None)) or _day_trade_state_dir()
+        try:
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            modes = state.get("modes") or {}
+            mode = modes.get(cfg.market) or {}
+            enabled = state.get("enabled_markets")
+            if isinstance(enabled, list) and cfg.market not in enabled:
+                mode = {}
+            out["account_performance"] = paper_account_performance(mode, revision=state.get("state_revision"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            out["account_performance"] = paper_account_performance({})
+        out["display_capital_basis"] = "sizing_reference_not_paper_account_equity"
+    out["discord_presentation_schema_version"] = PERFORMANCE_SCHEMA_VERSION
     out["discord_performance_revision"] = _discord_performance_revision(cfg)
     return out
 
@@ -6932,6 +6956,12 @@ def _performance_message(
     debug: bool = False,
 ) -> str:
     del summary_path
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        prepared = dict(summary)
+        if int(days or 0) > 0:
+            prepared["recent_performance"] = {**(prepared.get("recent_performance") or {}), "window_days": int(days)}
+        enriched = _summary_with_capital_context(cfg, prepared, current_capital=current_capital)
+        return format_signal_message(enriched, max_rows=0, debug=debug)
     enriched = _summary_with_capital_context(cfg, summary, current_capital=current_capital)
     portfolio_return = _float_or_none(enriched.get("portfolio_simple_return"))
     benchmark_return = _float_or_none(enriched.get("benchmark_simple_return"))

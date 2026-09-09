@@ -4178,7 +4178,11 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     )
     assert payload["signals"] == []
     assert payload["payload_window"]["signals"] == 0
-    assert "account" not in json.dumps(payload).casefold()
+    # Public paper-account arithmetic is not a broker identity. Check secrets
+    # explicitly instead of rejecting the ordinary word "account".
+    encoded = json.dumps(payload).casefold()
+    for forbidden in ("account_id", "account_number", "broker_account", "api_key", "api_secret"):
+        assert forbidden not in encoded
     assert "broker" not in json.dumps(payload).casefold()
 
 
@@ -4685,7 +4689,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "Promise.allSettled(secondaryLoads)" in javascript
-    assert 'src="app.js?v=67"' in html
+    assert 'src="app.js?v=68"' in html
     assert 'src="presentation.js?v=1"' in html
     assert 'src="detail-components.js?v=3"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
