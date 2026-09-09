@@ -1,0 +1,23 @@
+base_config: tw_minute_daily_guided_v12_dual_5090_throughput_v2.yaml
+
+# Restore Q/K normalization while retaining all other throughput settings.
+# Keep a separate artifact root from the qk_norm=false checkpoint family.
+experiment_name: tw-minute-daily-guided-v12-qk-norm-v3
+
+runner:
+  output_dir: artifacts/markets/tw_minute_daily_guided_v12_qk_norm_v3
+  resume: true
+
+data:
+  # Packed releases exclude panel_cache_v2. Use the independently retained
+  # reference cache, not the mutable data_tw_public materialization link.
+  # Byte-identical metadata/axes and all 26 array content hashes verified.
+  # Panel version 54, generation 3726b829b37d4d56833a80b20280e4a2.
+  # Keep this override local to v3: paths are part of checkpoint compatibility.
+  minute_daily_context_panel_meta: artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/stocks/panel_cache_v2/variants/fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577.json
+
+training:
+  financial_transformer:
+    qk_norm: true
+  transformer_base_portfolio:
+    qk_norm: true

@@ -14,6 +14,9 @@ from stockagent.backtest.portfolio_allocator import (
 )
 
 
+# v2 makes non-advancing rows an exact identity transition, including finite
+# duplicated tail labels and carried gross exposure above the cap.
+CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION = 2
 _MIN_WEALTH_FACTOR = 1.0e-6
 _DAY_KERNEL_CACHE: dict[
     tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]
@@ -100,6 +103,7 @@ def _day_kernel_factory(
         volume: torch.Tensor,
         row_advances: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
+        incoming_previous = previous
         previous = torch.where(alive, previous, torch.zeros_like(previous))
         forced = force_exit & row_advances
         forced_delta = torch.where(forced, -previous, torch.zeros_like(previous))
@@ -195,6 +199,14 @@ def _day_kernel_factory(
         next_previous = torch.where(
             next_alive, next_previous, torch.zeros_like(next_previous)
         )
+        # Padding is not a market session. Gating only target/mark drift is not
+        # sufficient: finite duplicated labels still create PnL and gross-cap
+        # enforcement can manufacture deleveraging. Freeze every output here.
+        next_previous = torch.where(row_advances, next_previous, incoming_previous)
+        next_alive = torch.where(row_advances, next_alive, alive)
+        net_simple = torch.where(row_advances, net_simple, torch.zeros_like(net_simple))
+        turnover = torch.where(row_advances, turnover, torch.zeros_like(turnover))
+        executed = torch.where(row_advances, executed, incoming_previous)
         return next_previous, next_alive, net_simple, turnover, executed
 
     return day

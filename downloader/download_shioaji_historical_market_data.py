@@ -1221,6 +1221,21 @@ def main() -> int:
             args.output_dir, rows, chunk_days=int(args.chunk_days), kbars_only=args.kbars_only,
             refresh_empty=args.refresh_empty, activity=activity,
         )
+        if args.dry_run:
+            summary = _write_summary(
+                args.output_dir,
+                rows,
+                chunk_days=int(args.chunk_days),
+                state="planned",
+                usage=None,
+                progress_path=progress_path,
+                persist=False,
+                kbars_only=args.kbars_only,
+                refresh_empty=args.refresh_empty,
+                activity=activity,
+            )
+            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+            return 0
         progress = PersistentProgress(
             progress_path,
             label="Shioaji option, exact-future, and index historical data",
