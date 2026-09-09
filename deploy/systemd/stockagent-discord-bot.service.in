@@ -1,7 +1,7 @@
 [Unit]
 Description=StockAgent Discord Gateway and live scheduled signal service
-Wants=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
-After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
+Wants=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service stockagent-tw-overnight-simulation.service
+After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service stockagent-tw-overnight-simulation.service
 StartLimitIntervalSec=60
 StartLimitBurst=20
 
@@ -24,6 +24,12 @@ WatchdogSec=90s
 TimeoutStartSec=60s
 TimeoutStopSec=30s
 KillMode=control-group
+# The same long-lived process owns the 09:00 and 13:30 deadline paths. Give it
+# precedence over download/backfill maintenance when the host is contended;
+# application-level guards still defer non-critical bot work at those windows.
+Nice=-5
+CPUWeight=200
+IOWeight=200
 # The Gateway and live command plane must survive best-effort maintenance OOM.
 OOMScoreAdjust=-500
 

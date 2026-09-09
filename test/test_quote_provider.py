@@ -18,11 +18,17 @@ from stockagent.live.quote_provider import (
     PriceSnapshot,
     fetch_tw_mis_last_prices,
     fetch_tw_mis_opening_snapshot,
+    fetch_tw_mis_session_snapshot,
     load_symbol_yahoo_map,
     fetch_yahoo_last_prices,
     load_prices_csv,
     seed_tw_opening_snapshot_cache,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_opening_quote_receipts(monkeypatch, tmp_path):
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening_receipts"))
 
 
 def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
@@ -96,6 +102,31 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
     np.testing.assert_allclose(result[0].prices, [101.0, 202.0])
     np.testing.assert_allclose(result[0].bid_prices, [100.5, 201.5])
     np.testing.assert_array_equal(result[0].available_mask, [True, True])
+    timing = result[0].transport_timing
+    assert timing is not None
+    assert timing["clock"] == "monotonic_durations_and_utc_wall_timestamps"
+    assert timing["server_provider_fetch_ms"] >= 0.0
+    assert timing["server_snapshot_serialize_ms"] >= 0.0
+    assert timing["client_round_trip_ms"] >= 0.0
+    assert timing["client_total_ms"] >= timing["client_round_trip_ms"]
+
+
+def test_price_snapshot_payload_preserves_exchange_time_and_simtrade() -> None:
+    snapshot = PriceSnapshot(
+        prices=np.array([101.0, 202.0]),
+        source="shioaji:test",
+        exchange_timestamps_ms=np.array([1_788_925_800_000, 1_788_925_800_001]),
+        simtrade_flags=np.array([1, 0], dtype=np.int8),
+    )
+
+    restored = quote_provider._price_snapshot_from_payload(
+        quote_provider._price_snapshot_payload(snapshot)
+    )
+
+    np.testing.assert_array_equal(
+        restored.exchange_timestamps_ms, snapshot.exchange_timestamps_ms
+    )
+    np.testing.assert_array_equal(restored.simtrade_flags, [1, 0])
 
 
 def test_shared_quote_broker_prioritizes_opening_request_in_protected_window(
@@ -730,6 +761,110 @@ def test_tw_opening_snapshot_counts_causal_no_open_row_as_source_coverage(
     # One scheduled opening batch freezes source-response coverage briefly so
     # the next model does not repeat a full-market request for a no-print row.
     assert calls == 1
+
+
+def test_tw_session_snapshot_forces_once_then_reuses_without_touching_opening_cache(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[list[str]] = []
+    now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+
+    def fake_fetch(symbols, fallback_prices, **kwargs):
+        del kwargs
+        calls.append(list(symbols))
+        bump = float(len(calls))
+        size = len(symbols)
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + bump,
+            source="twse_tpex:mis",
+            available_count=size,
+            requested_count=size,
+            available_mask=np.ones((size,), dtype=bool),
+            timestamps_ms=np.full((size,), now_ms, dtype=np.int64),
+        )
+
+    opening_sentinel = {"KEEP": (time.monotonic(), {"available": True})}
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_fetch)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_SESSION_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_SESSION_CACHE", {})
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE", opening_sentinel)
+
+    first = fetch_tw_mis_session_snapshot(
+        ["2330", "2317"],
+        np.array([100.0, 200.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=120.0,
+        force_refresh=True,
+    )
+    reused = fetch_tw_mis_session_snapshot(
+        ["2330"],
+        np.array([100.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=120.0,
+    )
+    refreshed = fetch_tw_mis_session_snapshot(
+        ["2330"],
+        np.array([100.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=120.0,
+        force_refresh=True,
+    )
+
+    assert calls == [["2330", "2317"], ["2330"]]
+    np.testing.assert_allclose(first.prices, [101.0, 201.0])
+    np.testing.assert_allclose(reused.prices, [101.0])
+    np.testing.assert_allclose(refreshed.prices, [102.0])
+    assert reused.source.endswith("+cache_hit")
+    assert quote_provider._TW_MIS_OPENING_CACHE is opening_sentinel
+
+
+def test_tw_session_forced_refresh_never_returns_an_older_cached_quote(
+    monkeypatch, tmp_path
+) -> None:
+    now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    monkeypatch.setattr(
+        quote_provider,
+        "_TW_MIS_SESSION_CACHE_KEY",
+        datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat(),
+    )
+    monkeypatch.setattr(
+        quote_provider,
+        "_TW_MIS_SESSION_CACHE",
+        {
+            "2330": (
+                time.monotonic(),
+                {
+                    "available": True,
+                    "price": 99.0,
+                    "timestamp_ms": now_ms,
+                    "source": "twse_tpex:mis",
+                },
+            )
+        },
+    )
+    monkeypatch.setattr(
+        quote_provider,
+        "fetch_tw_mis_last_prices",
+        lambda symbols, fallback_prices, **_kwargs: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=0,
+            requested_count=len(symbols),
+            available_mask=np.zeros((len(symbols),), dtype=bool),
+            timestamps_ms=np.zeros((len(symbols),), dtype=np.int64),
+        ),
+    )
+
+    result = fetch_tw_mis_session_snapshot(
+        ["2330"],
+        np.array([88.0]),
+        parquet_root=tmp_path,
+        force_refresh=True,
+    )
+
+    assert result.available_count == 0
+    assert result.available_mask.tolist() == [False]
+    np.testing.assert_allclose(result.prices, [88.0])
 
 
 def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:

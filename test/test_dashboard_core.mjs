@@ -60,20 +60,20 @@ function loadCore({current = "tw-day-trade", fetchImpl} = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox, {filename: "dashboard-core.js"});
-  return {core: sandbox.StockAgentDashboard, nav, requests};
+  return {core: sandbox.StockAgentDashboard, nav, requests, sandbox};
 }
 
 test("shared navigation renders one canonical route list and current page", () => {
   const {core, nav} = loadCore({current: "tw-day-trade"});
-  assert.equal(core.NAV_ITEMS.length, 7);
-  assert.equal(nav.children.length, 7);
+  assert.equal(core.NAV_ITEMS.length, 8);
+  assert.equal(nav.children.length, 8);
   assert.deepEqual(nav.children.map((link) => link.textContent), [
-    "總覽", "TAIFEX", "台股當沖", "永豐 API", "OpenBB", "全資料", "流量",
+    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "OpenBB", "全資料", "流量",
   ]);
   assert.equal(nav.children[0].href, "../");
   assert.equal(nav.children[2].href, "./");
   assert.equal(nav.children[2].attributes["aria-current"], "page");
-  assert.equal(nav.children[5].href, "../data-monitor/");
+  assert.equal(nav.children[6].href, "../data-monitor/");
   assert.equal(nav.dataset.dashboardNavMounted, "true");
   assert.ok(Object.isFrozen(core));
   assert.ok(Object.isFrozen(core.NAV_ITEMS));
@@ -159,4 +159,44 @@ test("shared fetch propagates caller cancellation", async () => {
   });
   controller.abort(new DOMException("superseded", "AbortError"));
   await assert.rejects(request, (error) => error?.name === "AbortError");
+});
+
+test("revision subscription uses SSE, validates messages, and releases hidden streams", () => {
+  const {core, sandbox} = loadCore();
+  const streams = [], received = [], listeners = new Map();
+  sandbox.document.addEventListener = (name, fn) => {
+    if (!listeners.has(name)) listeners.set(name, []);
+    listeners.get(name).push(fn);
+  };
+  sandbox.EventSource = class {
+    constructor(url) { this.url = url; streams.push(this); }
+    addEventListener(name, fn) { this[name] = fn; }
+    close() { this.closed = true; }
+  };
+  let fallbacks = 0;
+  const subscription = core.subscribeRevisions("api/updates", (payload) => received.push(payload), () => { fallbacks++; });
+  assert.equal(streams.length, 1);
+  streams[0].onopen();
+  streams[0].revision({data: '{"revision_token":"2"}'});
+  streams[0].revision({data: "[]"});
+  assert.equal(received.length, 1);
+  assert.equal(received[0].revision_token, "2");
+  assert.equal(fallbacks, 1);
+  sandbox.document.hidden = true;
+  listeners.get("visibilitychange").forEach((fn) => fn());
+  assert.equal(streams[0].closed, true);
+  sandbox.document.hidden = false;
+  listeners.get("visibilitychange").forEach((fn) => fn());
+  assert.equal(streams.length, 2);
+  subscription.dispose();
+  assert.equal(streams[1].closed, true);
+  assert.throws(() => core.subscribeRevisions("https://evil.example/events", () => {}, () => {}), /same origin/);
+});
+
+test("revision subscription keeps polling when EventSource is unavailable", () => {
+  const {core} = loadCore();
+  let fallbacks = 0;
+  const subscription = core.subscribeRevisions("api/updates", () => assert.fail("no stream"), () => { fallbacks++; });
+  assert.equal(fallbacks, 1);
+  subscription.dispose();
 });

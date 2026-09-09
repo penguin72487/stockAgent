@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
 import json
@@ -45,9 +45,21 @@ _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
 _TW_MIS_BOOTSTRAP_LOCK = threading.Lock()
 _TW_MIS_BOOTSTRAP_COOKIES: dict[str, str] = {}
 _TW_MIS_BOOTSTRAP_AT = 0.0
+# A bounded process-wide pool retains per-worker HTTP keep-alive connections.
+# Recreating both for every sweep pays DNS/TCP/TLS setup on the critical path.
+_TW_MIS_HTTP_WORKERS = 16
+_TW_MIS_HTTP_POOL = ThreadPoolExecutor(
+    max_workers=_TW_MIS_HTTP_WORKERS, thread_name_prefix="tw-mis-http"
+)
+_TW_MIS_HTTP_LOCAL = threading.local()
+_TW_MIS_INFLIGHT_LOCK = threading.Lock()
+_TW_MIS_INFLIGHT: dict[tuple[Any, ...], list[tuple[tuple[str, ...], Future]]] = {}
 _TW_MIS_OPENING_LOCK = threading.Lock()
 _TW_MIS_OPENING_CACHE_KEY: tuple[str, str] | None = None
 _TW_MIS_OPENING_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_TW_MIS_SESSION_LOCK = threading.Lock()
+_TW_MIS_SESSION_CACHE_KEY: str | None = None
+_TW_MIS_SESSION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 _PRICE_SNAPSHOT_ARRAY_FIELDS = (
     "open_prices",
@@ -89,6 +101,14 @@ class PriceSnapshot:
     # decoding yields Taiwan wall time; it is not a UTC epoch to shift by +8h.
     # timestamps_ms remains the true local response receipt time.
     exchange_timestamps_ms: np.ndarray | None = None
+    # -1 = provider did not expose the flag, 0 = regular trade, 1 = simulated
+    # matching.  An explicit tri-state prevents an absent field from being
+    # silently interpreted as a real exchange match.
+    simtrade_flags: np.ndarray | None = None
+    # Local transport measurements are observational metadata only.  They are
+    # kept separate from exchange time and from per-symbol callback receipt
+    # times so no wall-clock inference can be mistaken for market provenance.
+    transport_timing: dict[str, Any] | None = None
 
 
 def _day_trade_quote_broker_paths(
@@ -146,6 +166,12 @@ def _price_snapshot_payload(snapshot: PriceSnapshot) -> dict[str, Any]:
         values = getattr(snapshot, name)
         if values is not None:
             payload[name] = np.asarray(values, dtype=np.int64).tolist()
+    if snapshot.simtrade_flags is not None:
+        payload["simtrade_flags"] = np.asarray(
+            snapshot.simtrade_flags, dtype=np.int8
+        ).tolist()
+    if snapshot.transport_timing is not None:
+        payload["transport_timing"] = dict(snapshot.transport_timing)
     return payload
 
 
@@ -168,6 +194,12 @@ def _price_snapshot_from_payload(payload: dict[str, Any]) -> PriceSnapshot:
     for name in ("timestamps_ms", "exchange_timestamps_ms"):
         if payload.get(name) is not None:
             keyword[name] = np.asarray(payload[name], dtype=np.int64)
+    if payload.get("simtrade_flags") is not None:
+        keyword["simtrade_flags"] = np.asarray(
+            payload["simtrade_flags"], dtype=np.int8
+        )
+    if isinstance(payload.get("transport_timing"), dict):
+        keyword["transport_timing"] = dict(payload["transport_timing"])
     return PriceSnapshot(**keyword)
 
 
@@ -981,6 +1013,7 @@ def _shioaji_snapshot_values(
             return raw * 1_000
         return None
 
+    raw_simtrade = getattr(row, "simtrade", None)
     return {
         "price": price,
         "open": _float_or_none(getattr(row, "open", None)),
@@ -1001,6 +1034,7 @@ def _shioaji_snapshot_values(
         "ask_volume": _float_or_none(getattr(row, "sell_volume", None)),
         "reference": reference,
         "exchange_ms": exchange_timestamp_ms(getattr(row, "ts", None)),
+        "simtrade": -1 if raw_simtrade is None else int(bool(raw_simtrade)),
         # Causal execution uses the local observation time.  Snapshot ``ts`` is
         # exchange metadata and can predate the request when a symbol is idle.
         "received_ms": int(received_ms),
@@ -1199,8 +1233,10 @@ def fetch_shared_day_trade_stock_snapshots(
     request_id = uuid.uuid4().hex
     request_path = requests_dir / f"{request_id}.json"
     response_path = responses_dir / f"{request_id}.json"
+    client_started = time.perf_counter()
     requested_at = datetime.now(timezone.utc)
     deadline_epoch = time.time() + timeout
+    request_write_started = time.perf_counter()
     _atomic_write_json(
         request_path,
         {
@@ -1214,8 +1250,10 @@ def fetch_shared_day_trade_stock_snapshots(
             "purpose": normalized_purpose,
         },
     )
+    request_published = time.perf_counter()
     try:
         while time.time() < deadline_epoch:
+            response_read_started = time.perf_counter()
             try:
                 payload = json.loads(response_path.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -1237,6 +1275,42 @@ def fetch_shared_day_trade_stock_snapshots(
                     "shared day-trade quote response size mismatch: "
                     f"received={len(snapshot.prices)} requested={len(requested)}"
                 )
+            response_observed = time.perf_counter()
+            broker_timing = payload.get("broker_timing")
+            timing = (
+                dict(broker_timing) if isinstance(broker_timing, dict) else {}
+            )
+            timing.update(
+                {
+                    "schema_version": 1,
+                    "clock": "monotonic_durations_and_utc_wall_timestamps",
+                    "client_requested_at_utc": requested_at.isoformat(),
+                    "client_response_observed_at_utc": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "client_request_write_ms": round(
+                        (request_published - request_write_started) * 1000.0,
+                        3,
+                    ),
+                    "client_broker_wait_ms": round(
+                        (response_read_started - request_published) * 1000.0,
+                        3,
+                    ),
+                    "client_response_read_decode_ms": round(
+                        (response_observed - response_read_started) * 1000.0,
+                        3,
+                    ),
+                    "client_round_trip_ms": round(
+                        (response_observed - request_published) * 1000.0,
+                        3,
+                    ),
+                    "client_total_ms": round(
+                        (response_observed - client_started) * 1000.0,
+                        3,
+                    ),
+                }
+            )
+            snapshot.transport_timing = timing
             snapshot.source = f"{snapshot.source}+shared_day_trade_engine"
             return snapshot
         raise TimeoutError(
@@ -1273,15 +1347,22 @@ def serve_shared_day_trade_quote_requests(
             break
         request_id = request_path.stem
         response_path = responses_dir / f"{request_id}.json"
-        served_at = datetime.now(timezone.utc)
+        server_received = datetime.now(timezone.utc)
+        server_started = time.perf_counter()
         response: dict[str, Any] = {
             "schema_version": 1,
             "request_id": request_id,
-            "served_at_utc": served_at.isoformat(),
+            "served_at_utc": server_received.isoformat(),
             "server_pid": os.getpid(),
         }
+        request_parse_ms = 0.0
+        provider_fetch_ms = 0.0
+        snapshot_serialize_ms = 0.0
+        request_queue_ms: float | None = None
         try:
+            parse_started = time.perf_counter()
             request = json.loads(request_path.read_text(encoding="utf-8"))
+            request_parse_ms = (time.perf_counter() - parse_started) * 1000.0
             request_purpose = str(
                 request.get("purpose") or "interactive"
             ).strip().lower()
@@ -1292,6 +1373,22 @@ def serve_shared_day_trade_quote_requests(
                 continue
             if str(request.get("request_id") or "") != request_id:
                 raise ValueError("quote request id does not match its filename")
+            try:
+                requested_at = datetime.fromisoformat(
+                    str(request.get("requested_at_utc") or "").replace(
+                        "Z", "+00:00"
+                    )
+                )
+                if requested_at.tzinfo is None:
+                    requested_at = requested_at.replace(tzinfo=timezone.utc)
+                request_queue_ms = max(
+                    0.0,
+                    (server_received - requested_at.astimezone(timezone.utc))
+                    .total_seconds()
+                    * 1000.0,
+                )
+            except (TypeError, ValueError):
+                request_queue_ms = None
             deadline_epoch = float(request.get("deadline_epoch") or 0.0)
             if deadline_epoch <= now_epoch:
                 raise TimeoutError("shared quote request expired before service")
@@ -1303,17 +1400,37 @@ def serve_shared_day_trade_quote_requests(
                 raise ValueError("shared quote request symbols/fallback are invalid")
             if len(symbols) > 5_000:
                 raise ValueError("shared quote request exceeds 5000 symbols")
+            provider_started = time.perf_counter()
             snapshot = fetch_shioaji_stock_snapshots(
                 symbols,
                 fallback,
                 cache_ttl_seconds=0.0,
             )
+            provider_fetch_ms = (time.perf_counter() - provider_started) * 1000.0
+            serialize_started = time.perf_counter()
             response["snapshot"] = _price_snapshot_payload(snapshot)
+            snapshot_serialize_ms = (
+                time.perf_counter() - serialize_started
+            ) * 1000.0
             response["available_count"] = int(snapshot.available_count)
             response["requested_count"] = len(symbols)
             response["purpose"] = request_purpose
         except Exception as exc:
             response["error"] = f"{type(exc).__name__}: {exc}"
+        response["broker_timing"] = {
+            "server_received_at_utc": server_received.isoformat(),
+            "server_response_ready_at_utc": datetime.now(timezone.utc).isoformat(),
+            "server_request_queue_ms": (
+                round(request_queue_ms, 3) if request_queue_ms is not None else None
+            ),
+            "server_request_parse_ms": round(request_parse_ms, 3),
+            "server_provider_fetch_ms": round(provider_fetch_ms, 3),
+            "server_snapshot_serialize_ms": round(snapshot_serialize_ms, 3),
+            "server_total_before_publish_ms": round(
+                (time.perf_counter() - server_started) * 1000.0,
+                3,
+            ),
+        }
         try:
             _atomic_write_json(response_path, response)
         finally:
@@ -1537,6 +1654,7 @@ def _fetch_shioaji_stock_snapshots_once(
         }
         timestamps_ms = np.zeros((size,), dtype=np.int64)
         exchange_timestamps_ms = np.zeros((size,), dtype=np.int64)
+        simtrade_flags = np.full((size,), -1, dtype=np.int8)
         for idx, code in enumerate(requested):
             cached = _SHIOAJI_STOCK_CACHE.get(code)
             if cached is None:
@@ -1552,6 +1670,7 @@ def _fetch_shioaji_stock_snapshots_once(
                     target[idx] = float(value)
             timestamps_ms[idx] = int(values.get("received_ms") or 0)
             exchange_timestamps_ms[idx] = int(values.get("exchange_ms") or 0)
+            simtrade_flags[idx] = int(values.get("simtrade", -1))
 
     prepared_limits, _limit_path = _load_prepared_tw_price_limits()
     prepared_count = 0
@@ -1678,6 +1797,7 @@ def _fetch_shioaji_stock_snapshots_once(
         reference_prices=arrays["reference"],
         timestamps_ms=timestamps_ms,
         exchange_timestamps_ms=exchange_timestamps_ms,
+        simtrade_flags=simtrade_flags,
     )
 
 
@@ -2477,6 +2597,109 @@ def fetch_tw_mis_last_prices(
     empty_chunk_retry_delay_seconds: float | None = None,
     max_parallel_requests: int | None = None,
     request_timeout_seconds: float | None = None,
+    minimum_response_coverage: float = 1.0,
+) -> PriceSnapshot:
+    """Share only overlapping in-flight rows across different model universes.
+
+    A caller owns the symbols no earlier request is already fetching. Results
+    are remapped to its own order and fallback prices. Completed work is removed
+    immediately, so a later command always creates a fresh network observation.
+    """
+    requested = tuple(str(symbol) for symbol in symbols)
+    fallback = np.asarray(fallback_prices, dtype=np.float64)
+    if fallback.shape != (len(requested),):
+        raise ValueError("symbols and fallback_prices must have equal length")
+    kwargs = dict(parquet_root=parquet_root, chunk_size=chunk_size,
+                  empty_chunk_retry_attempts=empty_chunk_retry_attempts,
+                  empty_chunk_retry_delay_seconds=empty_chunk_retry_delay_seconds,
+                  max_parallel_requests=max_parallel_requests,
+                  request_timeout_seconds=request_timeout_seconds,
+                  minimum_response_coverage=minimum_response_coverage)
+    if not requested or len(set(requested)) != len(requested):
+        return _fetch_tw_mis_last_prices(list(requested), fallback, **kwargs)
+    policy = (str(Path(parquet_root).resolve()), *tuple(kwargs[key] for key in kwargs if key != "parquet_root"))
+    started = time.perf_counter()
+    remaining = set(requested)
+    borrowed = []
+    with _TW_MIS_INFLIGHT_LOCK:
+        for batch_symbols, future in _TW_MIS_INFLIGHT.get(policy, []):
+            common = remaining.intersection(batch_symbols)
+            if common:
+                borrowed.append((batch_symbols, future, common))
+                remaining.difference_update(common)
+        own_symbols = tuple(symbol for symbol in requested if symbol in remaining)
+        own_future = Future() if own_symbols else None
+        if own_future is not None:
+            _TW_MIS_INFLIGHT.setdefault(policy, []).append((own_symbols, own_future))
+    own_snapshot = None
+    if own_future is not None:
+        try:
+            positions = {symbol: idx for idx, symbol in enumerate(requested)}
+            own_fallback = fallback[[positions[symbol] for symbol in own_symbols]]
+            own_snapshot = _fetch_tw_mis_last_prices(list(own_symbols), own_fallback, **kwargs)
+            own_future.set_result(own_snapshot)
+        except BaseException as exc:
+            own_future.set_exception(exc)
+            raise
+        finally:
+            with _TW_MIS_INFLIGHT_LOCK:
+                pending = [(values, future) for values, future in _TW_MIS_INFLIGHT.get(policy, []) if future is not own_future]
+                if pending:
+                    _TW_MIS_INFLIGHT[policy] = pending
+                else:
+                    _TW_MIS_INFLIGHT.pop(policy, None)
+    if not borrowed:
+        return own_snapshot
+
+    groups = [(values, future.result(), common) for values, future, common in borrowed]
+    if own_snapshot is not None:
+        groups.append((own_symbols, own_snapshot, set(own_symbols)))
+    size = len(requested)
+    prices = fallback.copy()
+    available = np.zeros(size, dtype=bool)
+    positions = {symbol: idx for idx, symbol in enumerate(requested)}
+    fields = {}
+    for name in (*_PRICE_SNAPSHOT_ARRAY_FIELDS, "timestamps_ms", "exchange_timestamps_ms"):
+        if any(getattr(snapshot, name) is not None for _values, snapshot, _common in groups):
+            integer = name.endswith("timestamps_ms")
+            fields[name] = np.full(size, 0 if integer else np.nan, dtype=np.int64 if integer else np.float64)
+    for values, snapshot, common in groups:
+        source_indices = [idx for idx, symbol in enumerate(values) if symbol in common]
+        target_indices = [positions[values[idx]] for idx in source_indices]
+        valid = np.asarray(snapshot.available_mask, dtype=bool)[source_indices]
+        available[target_indices] = valid
+        prices[np.asarray(target_indices)[valid]] = np.asarray(snapshot.prices)[np.asarray(source_indices)[valid]]
+        for name, target in fields.items():
+            source = getattr(snapshot, name)
+            if source is not None:
+                target[target_indices] = np.asarray(source)[source_indices]
+    timestamps = fields.get("timestamps_ms", np.zeros(size, dtype=np.int64))
+    latest_ms = int(timestamps.max(initial=0))
+    return PriceSnapshot(
+        prices=prices, source="twse_tpex:mis+inflight_shared",
+        timestamp=datetime.fromtimestamp(latest_ms / 1000.0, tz=timezone.utc).isoformat() if latest_ms else None,
+        requested_count=size, available_count=int(available.sum()), available_mask=available,
+        transport_timing={
+            "mis_inflight_shared_symbols": size - len(own_symbols),
+            "mis_newly_requested_symbols": len(own_symbols),
+            "mis_total_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "mis_keep_alive_pool": True,
+        },
+        **fields,
+    )
+
+
+def _fetch_tw_mis_last_prices(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    parquet_root: str | Path,
+    chunk_size: int = 80,
+    empty_chunk_retry_attempts: int | None = None,
+    empty_chunk_retry_delay_seconds: float | None = None,
+    max_parallel_requests: int | None = None,
+    request_timeout_seconds: float | None = None,
+    minimum_response_coverage: float = 1.0,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
@@ -2513,7 +2736,11 @@ def fetch_tw_mis_last_prices(
         if max_parallel_requests is not None
         else int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "4") or "4")
     )
-    workers = max(1, min(len(chunks) or 1, max_parallel))
+    workers = max(1, min(len(chunks) or 1, max_parallel, _TW_MIS_HTTP_WORKERS))
+    minimum_coverage = float(minimum_response_coverage)
+    if not 0.0 < minimum_coverage <= 1.0:
+        raise ValueError("minimum_response_coverage must be in (0, 1]")
+    fetch_started = time.perf_counter()
     request_timeout = max(
         0.25,
         float(request_timeout_seconds)
@@ -2534,27 +2761,32 @@ def fetch_tw_mis_last_prices(
             os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"
         ),
     )
-    session_local = threading.local()
     try:
-        bootstrap = warm_tw_mis_quote_client()
+        warm_tw_mis_quote_client()
     except Exception:
-        bootstrap = {"ready": False}
+        pass
 
     def session() -> requests.Session:
-        sess = getattr(session_local, "session", None)
-        if sess is None:
+        sess = getattr(_TW_MIS_HTTP_LOCAL, "session", None)
+        if sess is None or getattr(_TW_MIS_HTTP_LOCAL, "factory", None) is not requests.Session:
+            if sess is not None:
+                close = getattr(sess, "close", None)
+                if close is not None:
+                    close()
             sess = requests.Session()
             sess.headers.update(_YAHOO_HEADERS)
-            with _TW_MIS_BOOTSTRAP_LOCK:
-                cookies = dict(_TW_MIS_BOOTSTRAP_COOKIES)
+            _TW_MIS_HTTP_LOCAL.session = sess
+            _TW_MIS_HTTP_LOCAL.factory = requests.Session
+            _TW_MIS_HTTP_LOCAL.bootstrap_at = None
+        with _TW_MIS_BOOTSTRAP_LOCK:
+            bootstrap_at = _TW_MIS_BOOTSTRAP_AT
+            cookies = dict(_TW_MIS_BOOTSTRAP_COOKIES)
+        if getattr(_TW_MIS_HTTP_LOCAL, "bootstrap_at", None) != bootstrap_at:
             if cookies:
                 sess.cookies.update(cookies)
-            elif not bootstrap.get("ready"):
-                try:
-                    sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
-                except Exception:
-                    pass
-            session_local.session = sess
+            _TW_MIS_HTTP_LOCAL.bootstrap_at = bootstrap_at
+        # The bootstrap already attempted the browser page once. A failed
+        # browser page must not add another eight-second wait in every worker.
         return sess
 
     def fetch_chunk(
@@ -2683,21 +2915,38 @@ def fetch_tw_mis_last_prices(
             ]
         ]
     ] = [[] for _ in chunks]
-    with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="tw-mis-quote"
-    ) as executor:
-        futures = {
-            executor.submit(fetch_chunk, chunk): chunk_index
-            for chunk_index, chunk in enumerate(chunks)
-        }
-        for future in as_completed(futures):
-            chunk_results[futures[future]] = future.result()
+    def fetch_indices(indices: list[int]) -> None:
+        # Bound each caller's outstanding work as well as total network
+        # concurrency. Workers return rows; they never mutate the result after
+        # it has been handed to an inference caller.
+        remaining = iter(indices)
+        pending = {}
+        for _ in range(min(workers, len(indices))):
+            index = next(remaining)
+            pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index])] = index
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                index = pending.pop(future)
+                rows = future.result()
+                if rows:
+                    chunk_results[index] = rows
+                next_index = next(remaining, None)
+                if next_index is not None:
+                    pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[next_index])] = next_index
+
+    fetch_indices(list(range(len(chunks))))
+    first_pass_ms = (time.perf_counter() - fetch_started) * 1000.0
+    retry_rounds = 0
 
     # MIS intermittently closes full-universe connections. Empty chunks are not
     # evidence that no symbol traded. Retry the empty set in bounded parallel
     # rounds: the former per-chunk serial loop multiplied an outage into about
     # 82 seconds before the healthy broker fallback could even run.
     for attempt in range(retry_attempts):
+        observed_indices = {row[0] for rows in chunk_results for row in rows}
+        if len(observed_indices) >= int(np.ceil(len(symbols) * minimum_coverage)):
+            break
         empty_indices = [
             index for index, rows in enumerate(chunk_results) if not rows
         ]
@@ -2705,20 +2954,8 @@ def fetch_tw_mis_last_prices(
             break
         if retry_delay_seconds > 0.0:
             time.sleep(retry_delay_seconds * (attempt + 1))
-        retry_workers = max(1, min(len(empty_indices), workers))
-        with ThreadPoolExecutor(
-            max_workers=retry_workers,
-            thread_name_prefix="tw-mis-quote-retry",
-        ) as executor:
-            retry_futures = {
-                executor.submit(fetch_chunk, chunks[index]): index
-                for index in empty_indices
-            }
-            for future in as_completed(retry_futures):
-                index = retry_futures[future]
-                rows = future.result()
-                if rows:
-                    chunk_results[index] = rows
+        retry_rounds += 1
+        fetch_indices(empty_indices)
 
     for rows in chunk_results:
         for (
@@ -2769,6 +3006,14 @@ def fetch_tw_mis_last_prices(
     return PriceSnapshot(
         prices=prices,
         source="twse_tpex:mis",
+        transport_timing={
+            "mis_first_pass_ms": round(first_pass_ms, 3),
+            "mis_total_ms": round((time.perf_counter() - fetch_started) * 1000.0, 3),
+            "mis_retry_rounds": retry_rounds,
+            "mis_http_workers": workers,
+            "mis_keep_alive_pool": True,
+            "mis_minimum_response_coverage": minimum_coverage,
+        },
         timestamp=timestamp,
         available_count=int(filled.sum()),
         available_mask=filled,
@@ -2964,6 +3209,174 @@ def fetch_tw_mis_opening_snapshot(
         if has_shioaji
         else "twse_tpex:mis+shared_opening_snapshot"
     )
+    if cache_hits:
+        source += "+cache_hit"
+    return PriceSnapshot(
+        prices=prices,
+        source=source,
+        timestamp=timestamp,
+        available_count=int(available.sum()),
+        requested_count=size,
+        available_mask=available,
+        open_prices=arrays["open_prices"],
+        high_prices=arrays["high_prices"],
+        low_prices=arrays["low_prices"],
+        volumes=arrays["volumes"],
+        upper_limit_prices=arrays["upper_limit_prices"],
+        lower_limit_prices=arrays["lower_limit_prices"],
+        bid_prices=arrays["bid_prices"],
+        ask_prices=arrays["ask_prices"],
+        bid_volumes=arrays["bid_volumes"],
+        ask_volumes=arrays["ask_volumes"],
+        reference_prices=arrays["reference_prices"],
+        timestamps_ms=timestamps_ms,
+    )
+
+
+def fetch_tw_mis_session_snapshot(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    parquet_root: str | Path,
+    chunk_size: int = 80,
+    cache_ttl_seconds: float = 120.0,
+    max_parallel_requests: int = 16,
+    force_refresh: bool = False,
+    allow_network: bool = True,
+) -> PriceSnapshot:
+    """Return one shared, current-session MIS quote snapshot.
+
+    This cache is deliberately separate from the immutable opening-observation
+    cache.  At 13:30 the first model forces a bounded full refresh; subsequent
+    models reuse those exact response rows and fetch only universe deltas.  It
+    is memory-only, so it cannot overwrite the receipt used to prove 09:00
+    opening inputs or enter formal portfolio history.
+    """
+
+    global _TW_MIS_SESSION_CACHE_KEY
+    requested = [str(symbol).strip() for symbol in symbols]
+    fallback = np.asarray(fallback_prices, dtype=np.float64)
+    if len(requested) != len(fallback):
+        raise ValueError("symbols and fallback_prices must have equal length")
+    session_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    ttl = max(0.1, float(cache_ttl_seconds))
+
+    # Keep the network request inside the lock.  This is an intentional
+    # single-flight boundary: concurrent model jobs wait for one market sweep
+    # rather than multiplying HTTP fan-out at the close.
+    with _TW_MIS_SESSION_LOCK:
+        if _TW_MIS_SESSION_CACHE_KEY != session_date:
+            _TW_MIS_SESSION_CACHE.clear()
+            _TW_MIS_SESSION_CACHE_KEY = session_date
+        if force_refresh:
+            # A forced deadline observation may not fall back to an earlier
+            # in-session row when the fresh request fails.
+            for symbol in requested:
+                _TW_MIS_SESSION_CACHE.pop(symbol, None)
+        now_monotonic = time.monotonic()
+        missing_indices = [
+            idx
+            for idx, symbol in enumerate(requested)
+            if bool(force_refresh)
+            or (cached := _TW_MIS_SESSION_CACHE.get(symbol)) is None
+            or now_monotonic - cached[0] > ttl
+        ]
+        cache_hits = 0 if force_refresh else len(requested) - len(missing_indices)
+        if missing_indices and allow_network:
+            missing_symbols = [requested[idx] for idx in missing_indices]
+            fresh = fetch_tw_mis_last_prices(
+                missing_symbols,
+                fallback[np.asarray(missing_indices, dtype=np.int64)],
+                parquet_root=parquet_root,
+                chunk_size=chunk_size,
+                empty_chunk_retry_attempts=0,
+                max_parallel_requests=max_parallel_requests,
+                request_timeout_seconds=max(
+                    0.25,
+                    float(
+                        os.getenv(
+                            "STOCKAGENT_POSTCLOSE_FAST_REQUEST_TIMEOUT_SECONDS",
+                            "1.5",
+                        )
+                        or "1.5"
+                    ),
+                ),
+            )
+            stored_at = time.monotonic()
+            fresh_available = (
+                np.asarray(fresh.available_mask, dtype=bool)
+                if fresh.available_mask is not None
+                else np.zeros((len(missing_symbols),), dtype=bool)
+            )
+            fresh_timestamps = (
+                np.asarray(fresh.timestamps_ms, dtype=np.int64)
+                if fresh.timestamps_ms is not None
+                else np.zeros((len(missing_symbols),), dtype=np.int64)
+            )
+            for local_idx, symbol in enumerate(missing_symbols):
+                timestamp_ms = int(fresh_timestamps[local_idx])
+                if not (
+                    bool(fresh_available[local_idx])
+                    and _same_taipei_session_timestamp(timestamp_ms, session_date)
+                ):
+                    continue
+                row: dict[str, Any] = {
+                    "available": True,
+                    "price": (
+                        float(fresh.prices[local_idx])
+                        if np.isfinite(fresh.prices[local_idx])
+                        else None
+                    ),
+                    "timestamp_ms": timestamp_ms,
+                    "source": str(fresh.source or "twse_tpex:mis"),
+                }
+                for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
+                    values = getattr(fresh, field)
+                    value = (
+                        float(np.asarray(values)[local_idx])
+                        if values is not None
+                        else float("nan")
+                    )
+                    row[field] = value if np.isfinite(value) else None
+                _TW_MIS_SESSION_CACHE[symbol] = (stored_at, row)
+
+        size = len(requested)
+        prices = fallback.copy()
+        available = np.zeros((size,), dtype=bool)
+        timestamps_ms = np.zeros((size,), dtype=np.int64)
+        arrays = {
+            field: np.full((size,), np.nan, dtype=np.float64)
+            for field in _PRICE_SNAPSHOT_ARRAY_FIELDS
+        }
+        assembled_at = time.monotonic()
+        observed_sources: set[str] = set()
+        for idx, symbol in enumerate(requested):
+            cached = _TW_MIS_SESSION_CACHE.get(symbol)
+            if cached is None or assembled_at - cached[0] > ttl:
+                continue
+            row = cached[1]
+            available[idx] = bool(row.get("available"))
+            price = row.get("price")
+            if price is not None:
+                prices[idx] = float(price)
+            timestamps_ms[idx] = int(row.get("timestamp_ms") or 0)
+            observed_sources.add(str(row.get("source") or "twse_tpex:mis"))
+            for field, target in arrays.items():
+                value = row.get(field)
+                if value is not None:
+                    target[idx] = float(value)
+
+    latest_ms = int(timestamps_ms.max(initial=0))
+    timestamp = (
+        datetime.fromtimestamp(latest_ms / 1000.0, tz=timezone.utc).isoformat()
+        if latest_ms > 0
+        else None
+    )
+    source = "twse_tpex:mis+shared_session_quote_snapshot"
+    if observed_sources and all(
+        value.startswith("shioaji:") for value in observed_sources
+    ):
+        source = "shioaji:stock_snapshot+shared_session_quote_snapshot"
     if cache_hits:
         source += "+cache_hit"
     return PriceSnapshot(

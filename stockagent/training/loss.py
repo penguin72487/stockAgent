@@ -22,7 +22,7 @@ from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
 )
 from stockagent.data.tw_index_futures import TAIFEX_INDEX_FUTURES_ACTION_COUNT
-from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS
+from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS, HYBRID_TAPE_FIELDS
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -338,6 +338,7 @@ def factor_generalization_loss(
     short_capacity_weights: Tensor | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: Tensor | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -480,6 +481,7 @@ def factor_generalization_loss(
         short_capacity_weights=short_capacity_weights,
         short_maintenance_ratio=short_maintenance_ratio,
         short_handling_fee_rate=short_handling_fee_rate,
+        overnight_fixed_close_to_open=overnight_fixed_close_to_open,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -690,6 +692,7 @@ def portfolio_autoencoder_loss(
     short_capacity_weights: Tensor | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: Tensor | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -783,6 +786,7 @@ def portfolio_autoencoder_loss(
         short_capacity_weights=short_capacity_weights,
         short_maintenance_ratio=short_maintenance_ratio,
         short_handling_fee_rate=short_handling_fee_rate,
+        overnight_fixed_close_to_open=overnight_fixed_close_to_open,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -1205,6 +1209,7 @@ def risk_aware_loss(
     short_capacity_weights: Tensor | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: Tensor | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -1352,10 +1357,10 @@ def risk_aware_loss(
             raise ValueError(
                 f"{mode} supports only canonical log utility"
             )
-        candidate_fields = TAPE_FIELDS if mode == MINUTE_MODE else 5
+        candidate_fields = (TAPE_FIELDS, HYBRID_TAPE_FIELDS) if mode == MINUTE_MODE else (5,)
         if overnight_log_returns is None or tuple(
             overnight_log_returns.shape
-        ) != (int(weights.size(0)), int(weights.size(1)), 2, candidate_fields):
+        ) not in {(int(weights.size(0)), int(weights.size(1)), 2, fields) for fields in candidate_fields}:
             raise ValueError(
                 f"{mode} requires integer candidate execution tensor [T,S,2,{candidate_fields}]"
             )
@@ -1457,6 +1462,7 @@ def risk_aware_loss(
             short_capacity_weights=short_capacity_weights,
             short_maintenance_ratio=short_maintenance_ratio,
             short_handling_fee_rate=short_handling_fee_rate,
+            overnight_fixed_close_to_open=overnight_fixed_close_to_open,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -1510,6 +1516,7 @@ def risk_aware_loss(
             short_capacity_weights=short_capacity_weights,
             short_maintenance_ratio=short_maintenance_ratio,
             short_handling_fee_rate=short_handling_fee_rate,
+            overnight_fixed_close_to_open=overnight_fixed_close_to_open,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -1752,6 +1759,7 @@ def risk_aware_loss(
         short_capacity_weights=short_capacity_weights,
         short_maintenance_ratio=short_maintenance_ratio,
         short_handling_fee_rate=short_handling_fee_rate,
+        overnight_fixed_close_to_open=overnight_fixed_close_to_open,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,

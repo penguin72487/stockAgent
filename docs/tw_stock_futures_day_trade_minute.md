@@ -1,9 +1,111 @@
 # 個股期貨當沖：08:45 決策、08:46 執行、13:30 結束
 
+2026-09-09 現行 historical 設定僅隔離 `2021-06-21 / LVF:202107`，保留該日
+其他 209 個候選合約、全部 1,573 個決策日與完整股票特徵。
+來源仍如實記錄一個缺口；不補造分鐘或以日線取代。詳見
+[合約日隔離修正與開訓指令](FUTURES_CONTRACT_QUARANTINE_2026-09-09.md)。
+
+## 目前準備範圍：2020/03/23 起
+
+使用者 2026-09-08 後續要求只從永豐有的期貨歷史開始。一般 historical YAML
+現選定 `data.panel_start_date: 2020-03-23`、`walk_forward.expected_first_year: 2020`，
+沿用分鐘時鐘與既有訓練器，使用獨立資料版本和訓練產物目錄。這次範圍不含日線近似；
+更早的原始資料與下方 v2 近似能力仍保留。驗收狀態及路徑見
+[2020/03/23 起資料準備](futures_from_20200323_preparation.md)。
+
+## 2026-09-07 新增的早期歷史近似
+
+2026-09-08 全量整理已完成：25,574,357 筆已觀測分鐘、297 種商品，但仍有 37,723 個
+候選合約日缺口，完整訓練尚未就緒。期間、逐商品明細與驗收證據見
+[本次資料與訓練接入報告](FUTURES_MINUTE_TRAINING_2026-09-08.md)。
+指定的 vastai1T 已收到私人準備快照與配對日線；交付 SHA、硬體測量及遠端驗收見
+[vastai1T 準備報告](vastai1t_futures_training_2026-09-08.md)。
+
+依使用者這次明確指定，新增
+`configs/markets/tw_stock_futures_day_trade_0845_historical.yaml`，仍走同一個
+`train.py`、FinancialTransformer、98 個前日特徵、BF16 及整數口執行器。
+`tw_stock_futures_day_trade_daily_proxy_before: '2020-01-01'` 是**不含當日**的分界：
+
+- 2014–2019：缺分鐘時，使用官方**同一實體期貨**日盤 Open / Close 近似進出。
+  以先前交易日成交量限制口數，保留雙邊費用、逐口稅額、標準／小型契約及餘額現金。
+  日線 Close 並非已證明的 13:30 成交，這段不能用來證明分鐘退出能力。
+- 2020-01-01 起：保留 08:45 決策、08:46 進場、13:20 限價、13:24 撤換、
+  13:30 截止。缺來源必須報缺口，不能變成日線成交或零報酬。
+- [永豐官方歷史資料文件](https://sinotrade.github.io/zh/tutor/market_data/historical/#_3)
+  公布期貨 Tick / KBar 起點為 **2020-03-22**；因此 2020 年初仍有不可由該 API
+  補足的區間。尚未另獲使用者指定前，不自動把日線近似延伸到 2020 年 3 月。
+
+2020 年以前的成交資料仍可另向期交所取得。2026-09-07 查閱
+[期交所交易歷史資料申購頁](https://www.taifex.com.tw/cht/3/hisAppForm)
+及其「交易歷史資料價格及起迄時間一覽表」：期貨成交簡檔自 1998-07-21 起提供，
+價格為每半年 NT$1,000，各商品仍以實際上市日期為起點。其格式含成交日期、實體
+到期月份、成交時間、價格及買賣雙邊合計數量，可聚合分鐘；買賣雙邊數量須依官方
+parser 規則換成撮合口數，不能照搬永豐 Tick 的數量。申購與授權尚未執行。
+本次保存價目及格式文件於
+`artifacts/operations/futures_minute_training_20260907/taifex_historical_availability.odt`
+及 `taifex_simple_trade_format.odt`。
+
+從已下載的連續 Tick 整理資料：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/build_tw_stock_futures_0900_entries.py \
+  --config configs/markets/tw_stock_futures_day_trade_0845_historical.yaml \
+  --shioaji-ticks-root data_tw_futures/shioaji_history
+```
+
+R1 當下解析到的月份不能用來標示歷史月份。建置器先用官方逐日月契約排序決定
+R1 實體身分，再核對當日 OHLC、Tick receipt / SHA、查詢日期與別名；不使用
+事後價格挑選表現較好的月份。時間戳是台北牆上時間，不再加八小時。
+來源資料正被更新時，前後 SHA 或 receipt 不同會拒絕該次建置。
+
+輸出目錄 `data_tw_futures/taifex_stock_futures_minute_history_v2/`：
+
+| 檔案 | 內容 |
+|---|---|
+| `all_minutes.parquet` | 已核對實體身分之候選合約的全部日盤 1 分鐘棒；不補價格 |
+| `minutes.parquet` | 執行器需要的 08:46、13:20–13:30 事件棒 |
+| `coverage.parquet` | 每個候選合約日的來源、SHA、核對狀態及成交量對照 |
+| `gaps.parquet` | 缺憑證、空回覆、月份未核實、OHLC 不一致等待補項目 |
+| `manifest.json` | 日線來源 SHA、輸出 SHA、日期、分界及完成狀態 |
+
+實際 Tick 成交量可能小於官方日成交量；容量只採已觀測 Tick，不放大補齊。
+中間逐日分片在 `artifacts/cache/futures_minute_history/`，不進 cold store。
+新資料完整性未通過前，catalog 明確排除 `taifex_stock_futures_minute_history_v2`。
+這份 YAML 固定股票 release，並把分鐘 manifest 與獨立保存的日線 SHA 配對。
+使用者指定的私人準備交付保留 `partial`，不等於完整 cold release 或正式訓練就緒。
+通過完整審核後須發布新 release、固定來源版本，再移除 catalog 排除項。
+不得把 partial 成品標成已驗收訓練資料。
+
+日線若已更新，須先保存新的版本，使用 `--daily-data-path` 指定它，並以新的
+`--output-dir` 建置配對分鐘；驗收後一起更新 YAML 的日線與分鐘路徑。
+不能只替換日線檔、改寫舊 manifest 的 SHA，或讓既有 checkpoint 靜默使用新來源。
+
+資料檢查及原生訓練入口：
+
+```bash
+run_fintech_python train.py --config configs/markets/tw_stock_futures_day_trade_0845_historical.yaml --check-data-only
+run_fintech_python train.py --config configs/markets/tw_stock_futures_day_trade_0845_historical.yaml
+```
+
+若仍有後期缺口，兩個指令都會列出原因並停止。契約 v2 的 67 個執行通道將日線近似
+放在獨立欄位，不假造分鐘棒；checkpoint 與報告保留分界，不能續用下列嚴格 v1 實驗。
+
+## 原有嚴格分鐘契約（保留重現）
+
 本契約依 2026-09-06 的使用者要求，沿用一般股票當沖的每日模型與退出節奏。
 正式設定為 `configs/markets/tw_stock_futures_day_trade_0845_minute.yaml`，模式為
 `tw_stock_futures_day_trade_0845_minute`。模型、BF16、walk-forward、optimizer、
 checkpoint、epoch curve 與報告均走既有 `train.py`，每日只產生一次權重。
+
+訓練維持共用 `train.py --config` 入口；原本的
+`scripts/run_tw_stock_futures_day_trade_0845_minute.sh` 也轉入同一個 CLI。
+正式 YAML 直接指定固定的股票／期貨 release；bash 入口從該 YAML 讀取版本，沿用
+`scripts/run_data_cache.sh use` 與 process-reference 續租，不生成另一份 runtime YAML。
+`--check-data-only` 直接進入共用 `train.py` 資料驗收，不啟動資料解包或 GPU 訓練。
+新資料使用 YAML `runner.output_dir` 指定的獨立 checkpoint 根目錄。
+FinancialTransformer、多基底、BF16、1000 epochs、年度切分與原共用訓練流程不變。
+操作目錄的 `train_carry.sh` 是全期貨留倉實驗；不能用它取代股票特徵驅動的當沖策略。
 
 ## 資訊與訂單
 
@@ -41,6 +143,84 @@ VWAP 成交假設仍不等於真實委託簿排隊或券商成交保證。
 - forward 採整數成交與同一費稅帳，backward 使用有容量限制的 fractional shadow。
 
 ## 資料建置與指令
+
+### 正式設定與缺檔診斷
+
+自 2026-09-07 的分鐘來源修正起，可直接由既有 Shioaji collector 的 **1 分鐘 KBar**
+建置 `minutes.parquet`，不需要 tick。Git 不保存市場資料。
+缺少成品時，先確認分鐘 chunk 或可驗證的同源成品在哪裡。目錄名稱相同、
+Syncthing 已連線或日線資料存在，都不能證明分鐘資料已就緒。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/build_tw_stock_futures_0900_entries.py \
+  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml \
+  --minute-root data_tw_shioaji_history --check-only
+```
+
+`--config` 解析繼承後的分鐘模式、日線來源、分鐘輸出目錄及 `panel_start_date`。
+唯讀的 `--check-only` 驗證 collector 的 `inventory/contracts.parquet`、inventory SHA、
+`contracts/futures/*/kbars/*/receipt.json` 與分鐘 Parquet SHA，對照既有日線選出的
+每個日期／實體契約。退出碼 2 表示缺來源；0 表示此日線範圍的分鐘來源驗證完成，
+仍須用下方 `--check-data-only` 檢查實際股票面板。
+
+KBar 本來就是右標分鐘，08:46 不再向後平移。Shioaji 期貨的 `Volume` 單位是口，
+`Amount / Volume` 必須逐棒通過 High／Low 價格檢查，才可接入目前的 VWAP 合約；
+不乘股票張數、不再除以二，也不以 OHLC 平均冒充 VWAP。
+[Shioaji KBar 官方範例](https://sinotrade.github.io/zh/tutor/market_data/historical/#kbars_1)
+零成交事件分鐘保留零容量；缺少某個候選契約的歷史回覆會拒絕建置，不能當成零成交。
+已完成 API 回覆也必須晚於查詢末日的日盤結束。新 manifest 記錄
+`source_kind: shioaji_exact_futures_kbars_1m` 與每個日期／實體契約的來源 SHA。
+
+2026-09-07 實際資料驗證發現兩項限制：增量查詢可能留下日期重疊的完整 chunk，
+接入器現在比較同日全部正成交量日盤 KBar，完全相同才去重，衝突仍拒絕使用；
+另外，部分個股期貨的 Amount 精度不足。例如 CAFI6 在 2025-11-12 的單口 KBar
+OHLC 全為 49.65，Amount 卻是 49，不能據此宣稱 VWAP 為 49。
+目前仍拒絕這類價格，不自動改用 Close、不修改原始來源，也不將已下載標記當成
+可訓練證明。實際例證保存在
+`artifacts/operations/vastai1t_futures_prepare_20260907/kbar_price_validation.json`。
+
+下載沿用既有 collector，僅選分鐘：
+
+```bash
+run_fintech_python downloader/download_shioaji_historical_market_data.py \
+  --collections exact_futures --kbars-only
+```
+
+此選項保留既有流量、查詢分段、盤中保護及續傳；不建立 tick 任務，也不掃描 tick
+收據。分鐘完成狀態另寫 `summary_kbars.json`，保留原本完整歷史的 summary。
+目前可查詢的實體契約不等於已到期歷史；R1／R2 的當前 target 不能直接當成歷史月份。
+Shioaji 公布的期貨歷史起點為 2020-03-22，因此本選項不會補出 2014～2019 年。
+
+補齊完整歷史來源後，去掉 `--check-only` 並指定
+`--output-dir data_tw_futures/taifex_stock_futures_minute_v1` 才建置。
+正式 YAML 現在讀 immutable release；建置器會拒絕寫入該目錄。
+新成品須從 catalog 可寫來源發布成新 release，再更新正式 YAML 的來源及 output root。
+建置器遇到缺少契約／日期會另寫 `build_failure.json`，保留既有已接受成品。
+所有來源都有完整日盤後，再檢查訓練實際使用的日期：
+
+```bash
+run_fintech_python train.py \
+  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml --check-data-only
+```
+
+此指令不啟動 DDP、CUDA 訓練或產生 checkpoint；會驗證完整資料 SHA、來源收據
+及 canonical 股票 panel 的每個日期，可能建立本機 panel cache。一般啟動也會先
+驗證來源及設定要求的首年；全部 panel 日期仍由同一 loader 做最後驗收。
+日線來源的末日若落後股票面板，必須同時補齊日線與分鐘來源，不能把股票面板截短。
+
+### 舊有官方 ZIP 來源的重現方式
+
+以下僅記錄既有 50 日成品的來源；分鐘 KBar 接入不依賴此路徑。
+
+官方公開下載頁提供[前 30 個交易日期貨每筆成交資料](https://www.taifex.com.tw/cht/3/futPrevious30DaysSalesData)。
+完整跨年歷史須使用已保存的官方檔或依[交易歷史資料申請](https://www.taifex.com.tw/cht/3/hisAppForm)
+取得；不同交付格式須先確認 parser 相容，不能只改副檔名。若成品位於另一節點，
+以 catalog 的 `tw-futures` release 發布、驗證、明確 materialize，並確認
+`source_daily_sha256` 與本次日線來源相同；raw ZIP 的 catalog 為
+`tw-index-derivatives-ticks`。禁止 downloader／builder 寫入 immutable materialized 目錄。
+
+### 舊有近期資料建置範例（不滿足正式跨年訓練）
 
 延伸既有 09:00 sidecar builder，復用官方 ZIP parser 與 atomic writer：
 

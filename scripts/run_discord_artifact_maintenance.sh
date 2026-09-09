@@ -17,4 +17,4 @@ set +a
 
 # shellcheck disable=SC1091
 source "$REPO_ROOT/scripts/runtime_env.sh"
-run_fintech_python "$REPO_ROOT/scripts/run_discord_artifact_maintenance.py"
+run_fintech_python "$REPO_ROOT/scripts/run_discord_artifact_maintenance.py" "$@"

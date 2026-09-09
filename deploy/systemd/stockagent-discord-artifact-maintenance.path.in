@@ -1,0 +1,9 @@
+[Unit]
+Description=Trigger Discord post-close cache when the accepted TW session advances
+
+[Path]
+PathChanged=@REPO_ROOT@/artifacts/data_refresh/tw_public/completed_session/latest.json
+Unit=stockagent-discord-postclose-cache.service
+
+[Install]
+WantedBy=multi-user.target

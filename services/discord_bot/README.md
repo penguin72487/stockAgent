@@ -103,6 +103,49 @@ Market configs:
 - `initial_capital` / `current_capital` can define default capital used for
   amount estimates. Runtime overrides can also be set with `/set_capital`.
 
+### TW intraday latency contract
+
+The four deployed day-trade models share a bounded 16-worker MIS HTTP pool and
+reuse keep-alive connections. Overlapping requests share only the symbols still
+being fetched; differing model universes request their remaining symbols and
+restore their own order, fallback values, and missing-price masks. Once a
+request completes, a new `/signal_now` fetches new prices. Reaching the configured
+90% response coverage avoids an unnecessary empty-chunk retry; unresolved source
+failures still follow the independent paper engine's Shioaji fallback.
+
+Intraday quote I/O runs before acquiring the serialized model-runtime lock.
+The consumer verifies the complete quote request again, and rejects a prefetched
+result after five seconds or when the universe, price basis, source, or mask
+changes. Aligned immutable panel/checkpoint pairs are reused; model manifest
+validation continues on every inference. Overlapping identical slash commands
+share one inference, and cancelling one interaction does not cancel its peers.
+
+The scheduled opening batch has priority at the opening boundary. Intraday
+reference signals retain their per-signal artifacts and review buttons without
+replacing the scheduled `latest_signal.json`. Formal returns own day-trade
+performance; preview directories are not rescanned to reconstruct those returns.
+Performance enrichment runs in worker threads so the Gateway and scheduler can
+continue responding.
+
+Reproduce the four-model command/queue benchmark without sending Discord
+messages or changing paper-account state:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_discord_intraday_latency.py \
+  --quote-session 2026-09-08 --feature-date 2026-09-07 \
+  --synthetic-quotes --io-delay 0.25 --repeats 3 \
+  --output artifacts/operations/discord_latency/command_benchmark.json
+```
+
+Choose an available accepted feature date and a later quote session. This uses
+real checkpoints/features but explicitly synthetic prices and a controlled
+250 ms I/O wait; it measures the command implementation, not market latency or
+Discord network RTT. Omitting `--synthetic-quotes` probes the actual MIS session
+and fails closed if the returned prices do not pass coverage/session gates.
+Both modes also verify durable private signal artifacts and unchanged scheduled
+pointers in an isolated temporary directory.
+
 Useful commands:
 
 - `/ask question:...` verifies that Otto Suwen can be invoked from a personal
@@ -165,6 +208,10 @@ Operational files:
 
 - Runtime overrides: `artifacts/discord_bot/state.json`
 - Button/action audit trail: `artifacts/discord_bot/audit_events.jsonl`
+  - `/signal_now` records millisecond timestamps and `interaction_id` for
+    `accepted → generated/cached → delivered`. Generated events include quote,
+    model, queue, and readiness durations; delivered events include
+    `command_total_ms` and `delivery_ms`.
 - Detailed command tracebacks: `artifacts/discord_bot/errors.log`
   - The active log is capped at 4 MiB and keeps three rotated generations by
     default. Startup also rotates an oversized inherited log so old failures do

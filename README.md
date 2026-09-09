@@ -869,6 +869,14 @@ run_fintech_python services/discord_bot/bot.py
 `STOCKAGENT_DEFAULT_MARKET`。市場 YAML 決定 checkpoint discovery、資料更新器與
 `live_output_dir`。
 
+台股當沖盤後採雙軌：13:20 起預熱面板/checkpoint/GPU 模型，13:30:00 立即以
+同交易日最後行情建立記憶體快取；`/signal_now` 預設先回傳明確標示為「非官方收盤版」
+的暫定訊號，且不更新 `latest_signal.json` 或正式績效歷史。官方 close receipt 通過後，
+可恢復背景工作再以官方 panel 覆核並 DM。盤後快取進度與每個模型的
+`cash_close_to_cache_ms` 位於
+`artifacts/discord_bot/postclose_fast_cache.json`；預設同日報價覆蓋門檻為 90%，
+未通過時 fail closed，不用前收價偽造結果。
+
 systemd 服務一律用同一組操作方式；以下以 Shioaji top-200 為例：
 
 ```bash
@@ -957,7 +965,9 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |
 | 台灣資料 | [tw_public_download_resume_and_rate_limits.md](docs/tw_public_download_resume_and_rate_limits.md) | rebuild、repair、daily、receipt |
 | 執行模式 | [tw_execution_modes.md](docs/tw_execution_modes.md) | day/cash/overnight 與交易語意 |
+| 13:25 隔日沖研究 | [tw_overnight_1325_training.md](docs/tw_overnight_1325_training.md) | 遠端 22 基底、缺價用收盤替代、次日開盤退出與訓練驗收 |
 | 分鐘資料 | [tw_minute_kbar_research.md](docs/tw_minute_kbar_research.md) | causal minute dataset 與訓練 |
+| 個股期貨分鐘訓練 | [tw_stock_futures_day_trade_minute.md](docs/tw_stock_futures_day_trade_minute.md) | 08:45 決策、分鐘執行、早期日線近似與來源缺口 |
 | TX/TXO | [tw_index_derivatives_tick_strategy.md](docs/tw_index_derivatives_tick_strategy.md) | 期貨選擇權 tick 策略 |
 | OpenBB | [openbb_archive_downloader.md](docs/openbb_archive_downloader.md) | archive ingestion 與 compaction |
 | 操作補充 | [RUN_GUIDE.md](docs/RUN_GUIDE.md) | 特定 operator 工作流；執行前核對當前 config/path |

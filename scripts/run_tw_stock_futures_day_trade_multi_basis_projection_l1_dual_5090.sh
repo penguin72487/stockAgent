@@ -8,28 +8,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export STOCKAGENT_DDP_CPU_AFFINITY="${STOCKAGENT_DDP_CPU_AFFINITY:-42-55,154-167;28-41,140-153}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-source scripts/runtime_env.sh
-run_fintech_python scripts/check_environment.py --require-cuda --strict
-
-required_data=(
-  data_tw_futures/taifex_portfolio_daily_v4/manifest.json
-  data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
-  data_tw_public/features/tw_public_stock_daily.parquet
-  data_tw_futures/taifex_stock_futures_minute_v1/manifest.json
-  data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet
-)
-for path in "${required_data[@]}"; do
-  if [[ ! -s "$path" ]]; then
-    echo "[tw-stock-futures-day-trade] missing required artifact: $path" >&2
-    exit 2
-  fi
-done
-
-echo "[tw-stock-futures-day-trade] exact integer standard+mini contracts; full absolute-notional collateral; TWD 40/contract/side"
-echo "[tw-stock-futures-day-trade] 08:45 decision; 08:46 minute entry; 13:20 limit; 13:24 market; 13:30 terminal"
-
-run_fintech_python train.py \
-  --config configs/markets/tw_stock_futures_day_trade_0845_minute.yaml \
+# Keep this hardware alias thin; source preparation and training belong to the
+# normal 08:45 launcher.
+exec bash scripts/run_tw_stock_futures_day_trade_0845_minute.sh \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 56 \
   --torch-compile-threads 16 \

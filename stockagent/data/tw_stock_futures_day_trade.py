@@ -136,6 +136,8 @@ class TaiwanStockFuturesDayTradeDaily:
     entry_clock: str = "taifex_day_session_open_0845"
     entry_source_path: str | None = None
     entry_manifest_path: str | None = None
+    quarantined_decision_dates: tuple[str, ...] = ()
+    quarantined_contract_days: tuple[dict[str, str], ...] = ()
     integer_candidate_execution: np.ndarray | None = None
     integer_candidate_multipliers: tuple[float, ...] = ()
     integer_candidate_selection: str | None = None
@@ -667,6 +669,9 @@ def attach_stock_futures_day_trade_daily(
     integer_contracts: bool = False,
     max_volume_participation: float = 0.5,
     minute_data_path: str | Path | None = None,
+    daily_proxy_before: str | None = None,
+    quarantine_dates: tuple[str, ...] | list[str] = (),
+    quarantine_contract_days: tuple[dict, ...] | list[dict] = (),
 ) -> PanelData:
     """Attach nearby-futures labels without changing model input symbol axes."""
 
@@ -718,17 +723,26 @@ def attach_stock_futures_day_trade_daily(
         if not integer_contracts:
             raise ValueError("scheduled futures minutes require integer candidates")
         from stockagent.data.tw_stock_futures_minute import (
-            MINUTE_CONTRACT_VERSION, load_futures_minute_tape,
+            MINUTE_CONTRACT_VERSION, HYBRID_CONTRACT_VERSION, TAPE_FIELDS, load_futures_minute_tape,
         )
         tape, _ = load_futures_minute_tape(
             minute_data_path, selected, dates, symbols,
             daily_sha256=expected_hash, fee=fee_per_contract_per_side_twd,
             participation=max_volume_participation,
+            daily_proxy_before=daily_proxy_before,
+            quarantine_dates=quarantine_dates,
+            quarantine_contract_days=quarantine_contract_days,
         )
         policy = (tape[..., 0] > 0).any(axis=-1)
         entry = tape[..., 3]
-        terminal = tape[..., -5]
-        entry_available = (entry > 0) & (tape[..., 7] > 0)
+        terminal = tape[..., TAPE_FIELDS - 5]
+        capacity = tape[..., 7]
+        if daily_proxy_before is not None:
+            daily = tape[..., TAPE_FIELDS] == 1
+            entry = np.where(daily, tape[..., TAPE_FIELDS + 1], entry)
+            terminal = np.where(daily, tape[..., TAPE_FIELDS + 2], terminal)
+            capacity = np.where(daily, tape[..., TAPE_FIELDS + 3], capacity)
+        entry_available = (entry > 0) & (capacity > 0)
         marked = entry_available & (terminal > 0)
         simple = np.divide(terminal, entry, out=np.ones_like(entry), where=marked) - 1
         count = marked.sum(axis=-1)
@@ -749,13 +763,16 @@ def attach_stock_futures_day_trade_daily(
             selected_rows=selected.height,
             selected_underlyings=selected["underlying_symbol"].n_unique(),
             source_path=str(data_path), manifest_path=str(manifest_path),
-            entry_clock="0846_right_labelled_minute_after_0845_daily_decision",
+            entry_clock=(f"daily_open_close_before_{daily_proxy_before}_else_0846_scheduled"
+                         if daily_proxy_before else "0846_right_labelled_minute_after_0845_daily_decision"),
             entry_source_path=str(minute_data_path),
             entry_manifest_path=str(Path(minute_data_path).parent / "manifest.json"),
+            quarantined_decision_dates=tuple(quarantine_dates),
+            quarantined_contract_days=tuple(quarantine_contract_days),
             integer_candidate_execution=tape,
             integer_candidate_multipliers=STOCK_FUTURES_INTEGER_CANDIDATE_MULTIPLIERS,
             integer_candidate_selection="causal_standard_and_mini_prior_session_liquidity",
-            contract_version=MINUTE_CONTRACT_VERSION,
+            contract_version=HYBRID_CONTRACT_VERSION if daily_proxy_before else MINUTE_CONTRACT_VERSION,
         )
         return panel
     normalized_entry_source = str(entry_price_source).strip().lower()

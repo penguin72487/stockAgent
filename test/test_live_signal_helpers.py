@@ -30,6 +30,7 @@ from stockagent.live.signal_engine import (
     _load_previous_weights,
     _live_panel_cache_key,
     _live_panel_load_workers,
+    _opening_price_receipt_timing,
     _previous_usable_panel_date,
     _price_snapshot,
     _require_supported_live_execution,
@@ -41,6 +42,11 @@ from stockagent.live.signal_engine import (
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
 import stockagent.live.signal_engine as signal_engine
+
+
+@pytest.fixture(autouse=True)
+def _isolate_opening_quote_receipts(monkeypatch, tmp_path):
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening_receipts"))
 
 
 def test_live_panel_workers_are_bounded_by_host_capacity(
@@ -625,7 +631,6 @@ def test_daily_price_timestamp_clamps_realtime_after_close_to_market_close() -> 
         timestamp="2026-07-09T06:30:00+00:00",
         available_count=1,
     )
-
     assert (
         _daily_price_timestamp(
             price_snapshot=snapshot,
@@ -638,6 +643,39 @@ def test_daily_price_timestamp_clamps_realtime_after_close_to_market_close() -> 
         == "2026-07-09 13:30:00"
     )
 
+
+def test_opening_price_receipt_timing_separates_source_arrival_from_compute() -> None:
+    gate = datetime.fromisoformat("2026-09-09T09:00:00+08:00")
+    gate_ms = int(gate.timestamp() * 1000)
+    snapshot = PriceSnapshot(
+        prices=np.array([10.0, 20.0, 30.0]),
+        source="shioaji:fixture",
+        available_count=3,
+        requested_count=3,
+        timestamps_ms=np.array(
+            [gate_ms + 100, gate_ms + 350, gate_ms + 900],
+            dtype=np.int64,
+        ),
+    )
+
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot,
+        observed_mask=np.array([True, True, True]),
+        required_count=2,
+        session_date="2026-09-09",
+        display_timezone="Asia/Taipei",
+        quote_requested_at="2026-09-09T09:00:00.050000+08:00",
+        quote_received_at="2026-09-09T09:00:01.000000+08:00",
+        signal_ready_at="2026-09-09T09:00:01.300000+08:00",
+    )
+
+    assert timing["quality"] == "observed"
+    assert timing["first_receipt_from_open_ms"] == pytest.approx(100.0)
+    assert timing["coverage_receipt_from_open_ms"] == pytest.approx(350.0)
+    assert timing["last_receipt_from_open_ms"] == pytest.approx(900.0)
+    assert timing["quote_request_to_coverage_ms"] == pytest.approx(300.0)
+    assert timing["coverage_to_quote_response_ms"] == pytest.approx(650.0)
+    assert timing["coverage_to_signal_ready_ms"] == pytest.approx(950.0)
 
 def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> None:
     message = format_signal_message(
@@ -876,13 +914,71 @@ def test_day_trade_latest_quote_reuses_shared_engine_before_direct_login(
     np.testing.assert_allclose(snapshot.prices, [101.0, 201.0])
 
 
+def test_postclose_latest_quote_reuses_one_session_snapshot_across_models(
+    monkeypatch,
+) -> None:
+    fallback = np.array([100.0, 200.0])
+    calls: list[dict] = []
+
+    def shared_session(symbols, fallback_prices, **kwargs):
+        calls.append(dict(kwargs))
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
+            source="twse_tpex:mis+shared_session_quote_snapshot+cache_hit",
+            timestamp=datetime.now().isoformat(),
+            available_count=len(symbols),
+            requested_count=len(symbols),
+            available_mask=np.ones((len(symbols),), dtype=bool),
+            timestamps_ms=np.full(
+                (len(symbols),),
+                int(datetime.now().timestamp() * 1000),
+                dtype=np.int64,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_session_snapshot",
+        shared_session,
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("postclose models must use the shared session cache")
+        ),
+    )
+
+    snapshot = _price_snapshot(
+        source="tw",
+        symbols=["2330", "2317"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, True]),
+        force_fresh=True,
+        tw_latest_quote_cache_seconds=120.0,
+        tw_latest_quote_force_refresh=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["cache_ttl_seconds"] == 120.0
+    assert calls[0]["force_refresh"] is True
+    assert calls[0]["max_parallel_requests"] == 16
+    assert calls[0]["allow_network"] is True
+    assert "shared_session_quote_snapshot" in snapshot.source
+
+
 def test_day_trade_opening_uses_preheated_shared_shioaji_before_mis(
     monkeypatch,
 ) -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    now_ms = int(
+        np.datetime64(
+            datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None), "ms"
+        ).astype(np.int64)
+    )
     backup_requests: list[list[str]] = []
 
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
@@ -954,7 +1050,11 @@ def test_day_trade_partial_shared_opening_queries_mis_only_on_degraded_path(
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    now_ms = int(
+        np.datetime64(
+            datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None), "ms"
+        ).astype(np.int64)
+    )
     shared_calls: list[list[str]] = []
     mis_calls: list[list[str]] = []
     seeded: list[list[bool]] = []
@@ -1037,10 +1137,12 @@ def test_day_trade_shioaji_does_not_block_on_duplicate_mis_when_open_is_proven(
 ) -> None:
     fallback = np.array([10.0, 20.0, 30.0])
     now_ms = int(
-        __import__("datetime").datetime.now(
-            __import__("zoneinfo").ZoneInfo("Asia/Taipei")
-        ).timestamp()
-        * 1000
+        np.datetime64(
+            __import__("datetime")
+            .datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Taipei"))
+            .replace(tzinfo=None),
+            "ms",
+        ).astype(np.int64)
     )
 
     monkeypatch.setattr(

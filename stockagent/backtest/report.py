@@ -14,6 +14,9 @@ from stockagent.backtest.simulator import BacktestResult
 
 _PLOT_LOG_MIN = -60.0
 _PLOT_LOG_MAX = 60.0
+# A zero-NAV return is -inf, not missing data. Use a finite underflow floor
+# only for log-risk statistics; cumulative returns/drawdown still equal -100%.
+_ZERO_NAV_LOG = float(np.log(np.finfo(np.float64).tiny))
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 _MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
     r"This figure includes Axes that are not compatible with tight_layout.*"
@@ -142,8 +145,8 @@ def _build_plot_result(
     benchmark_log_returns: np.ndarray,
 ) -> BacktestResult:
     """Build a minimal BacktestResult for plotting-only metrics overlays."""
-    strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    benchmark = np.nan_to_num(np.asarray(benchmark_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    strategy = _clean_log_returns(strategy_log_returns)
+    benchmark = _clean_log_returns(benchmark_log_returns)
     rows = int(strategy.shape[0])
     return BacktestResult(
         strategy_returns=strategy,
@@ -164,16 +167,17 @@ def _safe_expm1(log_sum: float) -> float:
 
 def _total_log_return(log_returns: np.ndarray) -> float:
     """Return the finite cumulative log return for summary plots."""
-    clean = np.nan_to_num(np.asarray(log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    clean = _clean_log_returns(log_returns)
     return float(clean.sum())
 
 
 def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     """Build a plot-safe equity curve from log returns."""
-    clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    clean = _clean_log_returns(log_returns)
     cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LOG_MAX, neginf=_PLOT_LOG_MIN)
     # Keep plotting range finite to avoid matplotlib overflow warnings.
     equity = np.exp(np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX))
+    equity[np.maximum.accumulate(cum_log <= _ZERO_NAV_LOG + 1e-9)] = 0.0
     return np.nan_to_num(
         equity,
         nan=float(np.exp(_PLOT_LOG_MIN)),
@@ -184,7 +188,7 @@ def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
 
 def _safe_log10_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     """Build a plot-safe log10 NAV curve from log returns."""
-    clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    clean = _clean_log_returns(log_returns)
     log10_nav = np.cumsum(clean) / math.log(10.0)
     finite = log10_nav[np.isfinite(log10_nav)]
     if finite.size == 0:
@@ -203,7 +207,16 @@ def _finite_values(values: list[float] | np.ndarray, *, nan: float = 0.0) -> np.
 
 
 def _clean_log_returns(values: np.ndarray) -> np.ndarray:
-    return np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    raw = np.asarray(values, dtype=np.float64)
+    clean = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=_ZERO_NAV_LOG)
+    zero_nav = np.flatnonzero(raw <= _ZERO_NAV_LOG)
+    if zero_nav.size:
+        first = int(zero_nav[0])
+        # Also recognizes float-min sentinels from historical np.nan_to_num
+        # report adapters. Capital cannot recover after an absorbing default.
+        clean[first] = _ZERO_NAV_LOG - float(clean[:first].sum())
+        clean[first + 1:] = 0.0
+    return clean
 
 
 def _finite_xy(x_values: np.ndarray, y_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1208,8 +1221,8 @@ def plot_first_test_year_only(
     if len(dates) == 0:
         return
 
-    strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    baseline = np.nan_to_num(np.asarray(baseline_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    strategy = _clean_log_returns(strategy_log_returns)
+    baseline = _clean_log_returns(baseline_log_returns)
     date_values = np.asarray(dates, dtype="datetime64[ns]")
     strategy_nav = _safe_equity_for_plot(strategy)
     baseline_nav = _safe_equity_for_plot(baseline)

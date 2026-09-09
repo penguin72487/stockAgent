@@ -199,7 +199,8 @@ def test_canonical_training_loss_uses_scheduled_tape_and_backpropagates():
     assert torch.isfinite(weights.grad).all() and weights.grad.item() < 0
 
 
-def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window():
+@pytest.mark.parametrize('quarantine', [(), ('2026-09-04',)])
+def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quarantine):
     from stockagent.data.panel import PanelData
     from stockagent.data.tw_stock_futures_day_trade import TaiwanStockFuturesDayTradeDaily
     from stockagent.training.dataset import CrossSectionalDataset
@@ -225,16 +226,22 @@ def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window():
         round_trip_cost_rate_per_open_notional=zeros, prior_volume_notional=zeros,
         benchmark_log_returns=np.zeros(6, np.float32), selected_rows=12, selected_underlyings=2,
         source_path="fixture", manifest_path="fixture", integer_candidate_execution=x,
+        quarantined_decision_dates=quarantine,
     )
     dataset = CrossSectionalDataset(panel, np.arange(6), 2, execution_mode=MINUTE_MODE)
-    assert dataset.valid_indices.tolist() == [2, 3, 4, 5]
+    expected = [2, 4, 5] if quarantine else [2, 3, 4, 5]
+    assert dataset.valid_indices.tolist() == expected
+    if quarantine:
+        # All symbols lose this decision label, but the next day's feature
+        # window still contains that independently valid stock session.
+        assert dataset[1]['x'][:, 0, 0].tolist() == [2, 3]
     assert dataset[0]["x"][:, 0, 0].tolist() == [0, 1]
-    assert dataset[3]["tradable_mask"].all() and not dataset[3]["can_buy_mask"].any()
+    assert dataset[len(dataset)-1]["tradable_mask"].all() and not dataset[len(dataset)-1]["can_buy_mask"].any()
     before = dataset[0]["x"].clone()
     panel.features[2:] = 999  # A future price/feature cannot enter the 08:45 window.
     torch.testing.assert_close(dataset[0]["x"], before)
     windowed = dataset_to_windowed_tensors(dataset)
-    assert windowed.valid_indices.tolist() == [2, 3, 4, 5]
+    assert windowed.valid_indices.tolist() == expected
     assert windowed.overnight_log_returns.shape == (6, 2, 2, TAPE_FIELDS)
     torch.testing.assert_close(windowed.overnight_log_returns, torch.from_numpy(x))
 
@@ -254,39 +261,53 @@ def test_config_clock_and_checkpoint_are_separate():
     assert "proxy" not in json.dumps(contract)
 
 
-@pytest.mark.parametrize("source_state", ["complete", "night_only", "missing"])
-def test_builder_rejects_incomplete_source_without_replacing_accepted_pair(tmp_path, monkeypatch, source_state):
+@pytest.mark.parametrize("check_only", [False, True])
+@pytest.mark.parametrize("source_state", ["complete", "night_only", "missing", "missing_root", "partial"])
+def test_builder_rejects_incomplete_source_without_replacing_accepted_pair(tmp_path, monkeypatch, source_state, check_only):
     import argparse
     from scripts import build_tw_stock_futures_0900_entries as builder
     from test_tw_stock_futures_day_trade import _candidate
     from stockagent.data.tw_futures_portfolio_daily import TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
     daily = tmp_path / "daily.parquet"
-    atomic_write_parquet(daily, pl.DataFrame([_candidate(
+    candidates = [_candidate(
         day=date(2026, 9, 3), product="CDF", prior_volume=100, current_volume=200,
-    )]))
+    )]
+    if source_state == "partial":
+        candidates.append(_candidate(day=date(2026, 9, 2), product="CDF", prior_volume=100, current_volume=200))
+    atomic_write_parquet(daily, pl.DataFrame(candidates))
     atomic_write_json(daily.with_name("manifest.json"), {
         "contract_version": TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
         "outputs": {"continuous_daily": {"sha256": sha256_file(daily)}},
     })
     raw = tmp_path / "raw"
-    raw.mkdir()
+    if source_state != "missing_root":
+        raw.mkdir()
     archive = raw / "Daily_2026_09_03.zip"
-    if source_state != "missing":
+    if source_state not in {"missing", "missing_root"}:
         archive.write_bytes(b"immutable raw parser fixture")
     output = tmp_path / "minutes"
     output.mkdir()
     (output / "minutes.parquet").write_bytes(b"accepted data")
     (output / "manifest.json").write_bytes(b"accepted receipt")
     monkeypatch.setattr(builder, "parse_args", lambda: argparse.Namespace(
-        start_date="2026-09-03", end_date="2026-09-03", daily_data_path=daily,
+        start_date="2026-09-02", end_date="2026-09-03", daily_data_path=daily,
         ticks_root=raw, output_dir=output, execution_policy="scheduled_0846", archive_override=[],
+        check_only=check_only,
     ))
-    monkeypatch.setattr(builder, "_parse_zip", lambda *args, **kwargs: transactions().with_columns(
-        pl.lit("day" if source_state == "complete" else "night").alias("session"),
-        pl.lit(kwargs["source_sha256"]).alias("source_sha256"),
-    ))
+    def parse_archive(*args, **kwargs):
+        assert not check_only and source_state not in {"missing", "missing_root", "partial"}
+        return transactions().with_columns(
+            pl.lit("day" if source_state == "complete" else "night").alias("session"),
+            pl.lit(kwargs["source_sha256"]).alias("source_sha256"),
+        )
+    monkeypatch.setattr(builder, "_parse_zip", parse_archive)
     result = builder.main()
-    if source_state == "complete":
+    if check_only:
+        assert result == (2 if source_state in {"missing", "missing_root", "partial"} else 0)
+        assert (output / "minutes.parquet").read_bytes() == b"accepted data"
+        assert (output / "manifest.json").read_bytes() == b"accepted receipt"
+        assert not (output / "build_failure.json").exists()
+    elif source_state == "complete":
         assert result == 0
         proof = json.loads((output / "manifest.json").read_text())
         assert proof["status"] == "complete" and proof["covered_dates"] == ["2026-09-03"]
@@ -296,3 +317,109 @@ def test_builder_rejects_incomplete_source_without_replacing_accepted_pair(tmp_p
         assert (output / "minutes.parquet").read_bytes() == b"accepted data"
         assert (output / "manifest.json").read_bytes() == b"accepted receipt"
         assert json.loads((output / "build_failure.json").read_text())["status"] == "partial"
+
+
+def test_builder_inherits_effective_minute_config(monkeypatch):
+    import sys
+    from pathlib import Path
+    from scripts import build_tw_stock_futures_0900_entries as builder
+    path = "configs/markets/tw_stock_futures_day_trade_0845_minute.yaml"
+    config = load_config(path)
+    monkeypatch.setattr(sys, "argv", ["builder", "--config", path, "--ticks-root", "raw", "--check-only"])
+    args = builder.parse_args()
+    assert args.execution_policy == "scheduled_0846"
+    assert args.start_date == config.data.panel_start_date
+    assert args.daily_data_path == Path(config.trading.tw_stock_futures_day_trade_data_path)
+    assert args.output_dir == Path(config.trading.tw_stock_futures_day_trade_minute_data_path).parent
+    assert args.check_only
+
+
+def test_builder_refuses_output_inside_materialized_release(tmp_path, monkeypatch):
+    import argparse
+    from scripts import build_tw_stock_futures_0900_entries as builder
+    root = tmp_path / "tw-futures-fixture"
+    root.mkdir()
+    (tmp_path / ".tw-futures-fixture.READY.json").write_text("{}")
+    output = root / "minutes"
+    monkeypatch.setattr(builder, "parse_args", lambda: argparse.Namespace(
+        start_date="2026-09-03", end_date=None, output_dir=output, check_only=False,
+    ))
+    with pytest.raises(ValueError, match="immutable packed/materialized"):
+        builder.main()
+    assert not output.exists()
+
+
+def test_training_rejects_missing_minutes_before_panel_or_ddp(tmp_path, monkeypatch):
+    import sys
+    import train
+    from stockagent.data import panel
+    config = load_config("configs/markets/tw_stock_futures_day_trade_0845_minute.yaml")
+    config.trading.tw_stock_futures_day_trade_data_path = str(tmp_path / "daily.parquet")
+    config.trading.tw_stock_futures_day_trade_minute_data_path = str(tmp_path / "minutes.parquet")
+    monkeypatch.setattr(train, "load_config", lambda _: config)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--config", "selected config.yaml"])
+    def forbidden(*args, **kwargs):
+        pytest.fail("missing minute input must fail before panel construction or DDP launch")
+    monkeypatch.setattr(train, "_maybe_relaunch_for_ddp", forbidden)
+    monkeypatch.setattr(panel, "build_panel", forbidden)
+    with pytest.raises(SystemExit) as exc:
+        train.main()
+    message = str(exc.value)
+    assert "--config 'selected config.yaml'" in message
+    assert "--check-only" in message and "epochs=1000" in message
+    assert "panel_start_date=2014-01-01" in message
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("case", ["valid", "recent_only", "panel_gap", "daily_hash_mismatch"])
+def test_check_data_only_validates_actual_panel_dates_without_training(tmp_path, monkeypatch, case):
+    import sys
+    from types import SimpleNamespace
+    import train
+    from stockagent.data import panel
+    from stockagent.data.tw_futures_portfolio_daily import TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
+    from test_tw_stock_futures_day_trade import _candidate
+
+    config = load_config("configs/markets/tw_stock_futures_day_trade_0845_minute.yaml")
+    config.walk_forward.expected_first_year = 2014 if case == "recent_only" else 2026
+    daily = tmp_path / "daily" / "continuous_daily.parquet"
+    daily.parent.mkdir()
+    atomic_write_parquet(daily, pl.DataFrame([_candidate(
+        day=date(2026, 9, 3), product="CDF", prior_volume=100, current_volume=100,
+    )]))
+    daily_sha = sha256_file(daily)
+    atomic_write_json(daily.with_name("manifest.json"), {
+        "contract_version": TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
+        "outputs": {"continuous_daily": {"sha256": daily_sha}},
+    })
+    minute = tmp_path / "minute" / "minutes.parquet"
+    atomic_write_parquet(minute, build_futures_minute_bars(transactions()))
+    atomic_write_json(minute.with_name("manifest.json"), {
+        "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
+        "status": "complete", "source_daily_sha256": daily_sha,
+        "covered_dates": ["2026-09-03"],
+        "sources": [{"date": "2026-09-03", "sha256": "a" * 64,
+                     "day_session_rows": 100, "day_last_time": 134459}],
+        "outputs": {"minutes": {"sha256": sha256_file(minute)}},
+    })
+    if case == "daily_hash_mismatch":
+        daily.write_bytes(b"changed daily source")
+    config.trading.tw_stock_futures_day_trade_data_path = str(daily)
+    config.trading.tw_stock_futures_day_trade_minute_data_path = str(minute)
+    monkeypatch.setattr(train, "load_config", lambda _: config)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--check-data-only"])
+    def forbidden(*args, **kwargs):
+        pytest.fail("data-only validation must never launch training/DDP")
+    monkeypatch.setattr(train, "_maybe_relaunch_for_ddp", forbidden)
+    def build_panel(*args, **kwargs):
+        assert case not in {"recent_only", "daily_hash_mismatch"}
+        dates = ["2026-09-02", "2026-09-03"] if case == "panel_gap" else ["2026-09-03"]
+        return SimpleNamespace(dates=np.array(dates, dtype="datetime64[D]"), symbols=("2330",))
+    monkeypatch.setattr(panel, "build_panel", build_panel)
+    if case == "valid":
+        assert train.main() is None
+    else:
+        message = {"recent_only": "first panel year 2014", "panel_gap": "misses 1 panel dates",
+                   "daily_hash_mismatch": "daily candidate source contract or SHA mismatch"}[case]
+        with pytest.raises(SystemExit, match=message):
+            train.main()

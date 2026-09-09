@@ -247,7 +247,8 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_tw_index_futures_day_session.py"
+        "download_tw_index_futures_day_session.py",
+        "download_shioaji_tx_futures_ticks"
       ],
       "note": "TAIFEX index-futures daily/session data."
     },
@@ -313,7 +314,7 @@
       "pack_buckets": 64,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_shioaji_historical_market_data.py"
+        "download_shioaji_historical_market_data"
       ],
       "note": "Receipt-backed latest weekly/monthly option strips, exact-delivery futures, and TW index Tick plus one-minute KBar history. Contract V2 snapshots are retained as a stable union; partial writer output is never published."
     },
@@ -324,13 +325,19 @@
       "publish": true,
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "taifex_stock_futures_minute_history_v2",
+        "shioaji_gap_repair"
+      ],
       "active_process_substrings": [
-        "download_shioaji_tx_futures_ticks.py",
+        "download_shioaji_tx_futures_ticks",
+        "export_shioaji_futures_products.py",
         "download_taifex_contract_codes.py",
         "download_taifex_futures_final_settlement_history.py",
-        "build_taifex_futures_portfolio_daily.py"
+        "build_taifex_futures_portfolio_daily.py",
+        "build_tw_stock_futures_0900_entries.py"
       ],
-      "note": "Shioaji/TAIFEX futures data, including historical+current stock/ETF/domestic+foreign-index delivery-month-slot daily training data."
+      "note": "Shioaji/TAIFEX futures data, including historical+current stock/ETF/domestic+foreign-index delivery-month-slot daily training data. Historical minute v2 remains local until its coverage audit is complete; remove that exclusion only with an audited release and pinned training inputs."
     },
     {
       "dataset": "forex-frankfurter",

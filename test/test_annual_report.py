@@ -5,6 +5,7 @@ import pytest
 
 from stockagent.backtest.report import (
     _max_drawdown_from_log_returns,
+    _safe_equity_for_plot,
     compute_metrics,
     compute_metrics_by_year,
     generate_annual_report,
@@ -95,3 +96,18 @@ def test_max_drawdown_includes_initial_nav_before_first_day_loss() -> None:
     )
     assert compute_metrics(result)["max_drawdown"] == pytest.approx(-0.10)
     assert compute_metrics_by_year(result, dates)[2026]["max_drawdown"] == pytest.approx(-0.10)
+
+
+@pytest.mark.parametrize('default_return', [-np.inf, np.finfo(np.float64).min, np.finfo(np.float32).min])
+def test_zero_nav_is_not_cleaned_into_profit_or_recovered(default_return) -> None:
+    result = _backtest_result([0., 0., 0.])
+    result.strategy_returns = np.array([np.log(1.1), default_return, np.log(2.)])
+    dates = np.asarray(['2026-01-02', '2026-01-05', '2026-01-06'], dtype='datetime64[D]')
+    metrics = compute_metrics(result)
+    assert metrics['cumulative_return'] == -1.
+    assert metrics['cagr'] == -1.
+    assert metrics['max_drawdown'] == -1.
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert compute_metrics_by_year(result, dates)[2026]['cumulative_return'] == -1.
+    np.testing.assert_array_equal(_safe_equity_for_plot(result.strategy_returns)[1:], [0., 0.])
+    assert '-100.00%' in _report_row(generate_annual_report(result, dates), 'TOTAL')

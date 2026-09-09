@@ -180,11 +180,25 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     if summary.get("feature_cutoff_date"):
         price_pairs.append(("features_through", _fmt_time(summary.get("feature_cutoff_date", "n/a"), summary)))
 
-    lines = [
+    lines = []
+    postclose_fast = summary.get("postclose_fast_preview")
+    if isinstance(postclose_fast, dict) and bool(postclose_fast.get("provisional")):
+        lines.extend(
+            [
+                "**⚡ 13:30 盤後快速暫定訊號（非官方收盤版）**",
+                _kv_line(
+                    ("quote_coverage", _fmt_pct(postclose_fast.get("quote_coverage"))),
+                    ("official_recheck", "pending"),
+                    ("formal_history", "excluded"),
+                ),
+                "",
+            ]
+        )
+    lines.extend([
         f"{title}",
         f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
         _kv_line(*price_pairs),
-    ]
+    ])
     if execution_preview_only:
         lines.extend(
             [
