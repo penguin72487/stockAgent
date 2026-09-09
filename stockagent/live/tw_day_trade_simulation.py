@@ -958,6 +958,23 @@ def quote_map_from_snapshot(
         if snapshot.timestamps_ms is not None
         else np.zeros((count,), dtype=np.int64)
     )
+    exchange_timestamps = (
+        np.asarray(snapshot.exchange_timestamps_ms, dtype=np.int64)
+        if snapshot.exchange_timestamps_ms is not None
+        else np.zeros((count,), dtype=np.int64)
+    )
+    simtrade_flags = (
+        np.asarray(snapshot.simtrade_flags, dtype=np.int8)
+        if snapshot.simtrade_flags is not None
+        else np.full((count,), -1, dtype=np.int8)
+    )
+    for name, array in (
+        ("timestamps_ms", timestamps),
+        ("exchange_timestamps_ms", exchange_timestamps),
+        ("simtrade_flags", simtrade_flags),
+    ):
+        if array.shape != (count,):
+            raise ValueError(f"{name} shape {array.shape} != {(count,)}")
     date_values = np.full((count,), np.datetime64(trading_date.isoformat(), "D"))
     computed_upper = limit_price_numpy(reference, 1.10, date_values)
     computed_lower = limit_price_numpy(reference, 0.90, date_values)
@@ -973,6 +990,19 @@ def quote_map_from_snapshot(
                 .astimezone(TAIPEI)
                 .isoformat(timespec="milliseconds")
             )
+        exchange_timestamp = None
+        if int(exchange_timestamps[idx]) > 0:
+            exchange_timestamp = (
+                datetime.fromtimestamp(
+                    int(exchange_timestamps[idx]) / 1000.0,
+                    tz=timezone.utc,
+                )
+                # Shioaji encodes Taiwan exchange wall time in its numeric
+                # Snapshot.ts field. Preserve that clock; converting it as a
+                # real UTC epoch would incorrectly add eight hours.
+                .replace(tzinfo=TAIPEI)
+                .isoformat(timespec="milliseconds")
+            )
         output[str(raw_symbol)] = {
             "symbol": str(raw_symbol),
             "last": _finite(last[idx]),
@@ -986,6 +1016,12 @@ def quote_map_from_snapshot(
             "lower_limit": _finite(lower[idx]),
             "reference_price": _finite(reference[idx]),
             "quote_at": timestamp,
+            "exchange_quote_at": exchange_timestamp,
+            "simtrade": (
+                None
+                if int(simtrade_flags[idx]) < 0
+                else bool(simtrade_flags[idx])
+            ),
             "source": snapshot.source,
         }
     return output
@@ -4611,6 +4647,8 @@ class TwDayTradeSimulationEngine:
         reason: str,
         order_type: str,
         quantity: int,
+        ledger_order_id: str | None = None,
+        ledger_session_date: str | None = None,
     ) -> None:
         signed = int(position.get("signed_shares") or 0)
         if signed == 0:
@@ -4716,10 +4754,12 @@ class TwDayTradeSimulationEngine:
             float(mode.get("cumulative_commission_rebate_accrued_twd") or 0.0)
             + exit_rebate
         )
-        order_id = f"{position.get('position_id')}:{reason}:{remaining_before}"
+        order_id = ledger_order_id or (
+            f"{position.get('position_id')}:{reason}:{remaining_before}"
+        )
         common = {
             "recorded_at": now.isoformat(timespec="seconds"),
-            "session_date": mode.get("session_date"),
+            "session_date": ledger_session_date or mode.get("session_date"),
             "market": position.get("market"),
             "position_id": position.get("position_id"),
             "symbol": position.get("symbol"),
@@ -4745,6 +4785,7 @@ class TwDayTradeSimulationEngine:
                 **common,
                 "fill_at": now.isoformat(timespec="seconds"),
                 "quote_at": quote.get("quote_at"),
+                "exchange_match_at": quote.get("exchange_match_at"),
                 "price": float(price),
                 "fee_and_tax_twd": exit_fee,
                 "gross_fee_and_tax_twd": exit_gross_fee,

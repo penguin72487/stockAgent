@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sys
+import threading
 from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
+    warm_dashboard_session_indexes,
 )
 
 
@@ -99,6 +101,22 @@ class DashboardServer(ThreadingHTTPServer):
         self.preopen_readiness_path = (
             None if preopen_readiness_path is None else Path(preopen_readiness_path)
         )
+        self.session_indexes_ready = threading.Event()
+        self.session_index_warm_error: str | None = None
+        self.session_index_warm_thread = threading.Thread(
+            target=self._warm_session_indexes,
+            name="dashboard-session-index-warm",
+            daemon=True,
+        )
+        self.session_index_warm_thread.start()
+
+    def _warm_session_indexes(self) -> None:
+        try:
+            warm_dashboard_session_indexes(state_dir=self.state_dir)
+        except Exception as exc:
+            self.session_index_warm_error = f"{type(exc).__name__}: {exc}"
+            return
+        self.session_indexes_ready.set()
 
     def snapshot(self, *, session_date: str | None = None) -> dict[str, object]:
         return build_dashboard_snapshot(
@@ -108,6 +126,7 @@ class DashboardServer(ThreadingHTTPServer):
             maximum_event_rows=500,
             maximum_mark_rows=32,
             include_position_rows=False,
+            include_ledger_session_dates=self.session_indexes_ready.is_set(),
         )
 
     def signal_page(self, **kwargs: object) -> dict[str, object]:
@@ -140,6 +159,7 @@ class DashboardServer(ThreadingHTTPServer):
             state_dir=self.state_dir,
             preopen_readiness_path=self.preopen_readiness_path,
             session_date=session_date,
+            include_ledger_session_dates=self.session_indexes_ready.is_set(),
         )
 
     def revision(self) -> dict[str, object]:

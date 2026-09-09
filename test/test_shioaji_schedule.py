@@ -107,14 +107,11 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
     assert "SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90" in futures_runner
     assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
-    assert "rc == 78" in futures_runner
-    assert "status=contract_unavailable" in futures_runner
     assert "rc == 79" in futures_runner
-    assert "reason=connection_capacity" in futures_runner
-    assert "target_advanced=true" in futures_runner
-    assert "action=restart_batch" in futures_runner
-    assert "evidence=terminal_manifest" in futures_runner
-    assert "evidence=provider_unavailable_manifest" in futures_runner
+    assert "connection_capacity" in futures_runner
+    assert "--refresh-inventory --refresh-empty" in futures_runner
+    assert "--contracts-file" in futures_runner
+    assert "batch_is_current" not in futures_runner
 
 
 def test_market_schedule_import_does_not_load_training_config() -> None:

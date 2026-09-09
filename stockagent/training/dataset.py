@@ -16,7 +16,7 @@ from stockagent.backtest.tw_execution import (
     official_tw_short_initial_margin_rates,
 )
 from stockagent.data.panel import PanelData
-from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS
+from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS, HYBRID_TAPE_FIELDS
 from stockagent.data.walkforward import normalize_lookback_context
 
 
@@ -438,7 +438,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     panel.num_dates,
                     panel.tradable_mask.shape[1],
                     2,
-                    TAPE_FIELDS if self.execution_mode == MINUTE_MODE else 5,
+                    (HYBRID_TAPE_FIELDS if getattr(stock_futures_daily, "contract_version", 1) == 2
+                     else TAPE_FIELDS) if self.execution_mode == MINUTE_MODE else 5,
                 )
                 if integer_execution is None or tuple(
                     np.asarray(integer_execution).shape
@@ -730,6 +731,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             prior_alive = np.zeros_like(panel.alive_mask, dtype=bool)
             prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
             tradable = prior_alive
+            if panel.overnight_1325_available is not None:
+                if self.execution_mode != "tw_overnight":
+                    raise ValueError("13:25 information is only valid for tw_overnight")
+                available = np.asarray(panel.overnight_1325_available, dtype=bool)
+                if available.shape != tradable.shape:
+                    raise ValueError("13:25 availability must match the full panel")
+                tradable = tradable & available
             # At close[t], quote/limit availability is observable, while the
             # close[t]->next-session valuation label is not.  Side execution
             # masks must therefore use the raw current-session trading mask,
@@ -859,6 +867,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # Scheduled minute execution retains verified no-fill sessions.
             # Future entry capacity cannot remove a decision day or inflate
             # annualized returns by dropping its zero-return account row.
+        if stock_futures_day_trade_execution and self.execution_mode == MINUTE_MODE:
+            quarantine = tuple(getattr(stock_futures_daily, 'quarantined_decision_dates', ()))
+            if quarantine:
+                # Explicit source-quality quarantine removes decision labels,
+                # never stock feature dates or rolling lookback context.
+                valid_indices = valid_indices[~np.isin(
+                    np.asarray(panel.dates, dtype='datetime64[D]')[valid_indices],
+                    np.asarray(quarantine, dtype='datetime64[D]'))]
         self.valid_indices = valid_indices
 
         if futures_portfolio_execution and self.valid_indices.size > 0:
@@ -867,6 +883,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # omits the cost of closing an otherwise carryable final position.
             force_exit = np.asarray(force_exit, dtype=bool).copy()
             force_exit[int(self.valid_indices[-1]), :] = True
+
+        if panel.overnight_1325_available is not None and self.valid_indices.size > 0:
+            # Keep the final opening liquidation, but submit no closing entry
+            # whose next-session outcome lies outside this owned split.
+            tradable = tradable.copy()
+            tradable[int(self.valid_indices[-1]), :] = False
 
         if stock_context_futures_portfolio_execution:
             assert stock_context_futures_daily is not None

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import UTC, date, datetime, timedelta
 import fcntl
 import json
@@ -38,6 +39,11 @@ from downloader.download_shioaji_tw_kbars import (
     _sha256,
     _taiwan_market_hours_now,
     _write_parquet_atomic,
+)
+from downloader.shioaji_history_repair import (
+    DEFAULT_FUTURES_ACTIVITY, FuturesActivity, checked_time,
+    load_futures_activity, parsed_time, retry_due, retry_metadata, utc_stamp, verified_sha,
+    futures_date_is_closed,
 )
 
 
@@ -87,6 +93,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-dates", type=int, default=0)
     parser.add_argument("--oldest-first", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument('--contracts-file', type=Path, help='Batch all retained aliases with one API login.')
+    parser.add_argument('--history-root', type=Path, default=Path('data_tw_futures/shioaji_history'))
+    parser.add_argument('--tx-history-root', type=Path, default=Path('data_tw_index_futures/shioaji_history/TXFR1'))
+    parser.add_argument('--batch-receipt', type=Path, default=Path('artifacts/data_repair/shioaji_futures_history/latest_batch.json'))
+    parser.add_argument('--refresh-inventory', action='store_true')
+    parser.add_argument('--refresh-empty', action='store_true')
+    parser.add_argument('--official-activity', type=Path, default=DEFAULT_FUTURES_ACTIVITY)
+    parser.add_argument('--dates-per-contract', type=int, default=32)
+    parser.add_argument('--empty-probes-per-contract', type=int, default=2)
     return parser.parse_args()
 
 
@@ -129,12 +144,13 @@ def _valid_receipt(root: Path, trading_date: date) -> dict[str, Any] | None:
         and payload.get("contract") == root.name
         and payload.get("trading_date") == trading_date.isoformat()
         and payload.get("status") in {"complete", "source_empty"}
+        and payload.get('session_finalized') is not False
     ):
         return None
     if payload.get("status") == "source_empty":
         return payload
     data_path = _data_path(root, trading_date)
-    if not data_path.is_file() or _sha256(data_path) != payload.get("sha256"):
+    if not data_path.is_file() or verified_sha(data_path) != payload.get("sha256"):
         return None
     return payload
 
@@ -182,6 +198,7 @@ def _write_manifest(
     stopped_for_traffic: bool,
     stopped_for_market_hours: bool,
     usage: tuple[int, int] | None,
+    positive_dates: set[date] | None = None,
 ) -> dict[str, Any]:
     resolved: list[dict[str, Any]] = []
     for trading_date in expected:
@@ -192,6 +209,8 @@ def _write_manifest(
     available = [item for item in resolved if item.get("status") == "complete"]
     source_empty = [item for item in resolved if item.get("status") == "source_empty"]
     missing = [value.isoformat() for value in expected if value.isoformat() not in resolved_dates]
+    positives = {str(day) for day in positive_dates or set()}
+    gaps = [r['trading_date'] for r in source_empty if r['trading_date'] in positives]
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "dataset": SOURCE,
@@ -203,6 +222,10 @@ def _write_manifest(
         "resolved_trading_dates": len(resolved),
         "complete_trading_dates": len(available),
         "source_empty_trading_dates": len(source_empty),
+        'coverage_state': 'source_gaps' if gaps else ('empty_replies_present' if source_empty else 'observed_data'),
+        'positive_activity_empty_dates': gaps,
+        'empty_recheck_due_dates': sum(retry_due(r, positive_activity=r['trading_date'] in positives) for r in source_empty),
+        'checked_at_utc': utc_stamp(),
         "missing_trading_dates": missing,
         "rows": sum(int(item.get("rows", 0)) for item in available),
         "bytes": sum(int(item.get("size", 0)) for item in available),
@@ -231,6 +254,8 @@ def _write_contract_unavailable_manifest(
 ) -> dict[str, Any]:
     """Persist a truthful terminal provider-catalog gap without fabricating data."""
 
+    preserved = _write_manifest(root, contract=contract, expected=expected,
+                                stopped_for_traffic=False, stopped_for_market_hours=False, usage=None)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "dataset": SOURCE,
@@ -262,12 +287,44 @@ def _write_contract_unavailable_manifest(
             "the alias queryable"
         ),
     }
+    for key in ('resolved_trading_dates', 'complete_trading_dates', 'source_empty_trading_dates',
+                'missing_trading_dates', 'rows', 'bytes'):
+        manifest[key] = preserved[key]
+    manifest['next_retry_at_utc'] = utc_stamp(datetime.now(UTC) + timedelta(days=1))
     _atomic_write_json(root / "manifest.json", manifest)
     return manifest
 
 
-def main() -> int:
-    args = parse_args()
+def pending_dates(root: Path, expected: list[date], *, refresh_empty: bool,
+                  positive_dates: set[date], empty_probes: int = 2,
+                  oldest_first: bool = False, stats: dict | None = None) -> list[date]:
+    missing, gaps, unknown = [], [], []
+    empty_total = positive_gaps = 0
+    for day in expected:
+        receipt = _valid_receipt(root, day)
+        if receipt and receipt.get('status') == 'source_empty':
+            empty_total += 1
+            positive_gaps += day in positive_dates
+        if receipt is None:
+            missing.append(day)
+        elif refresh_empty and receipt.get('status') == 'source_empty' and retry_due(
+                receipt, positive_activity=day in positive_dates):
+            (gaps if day in positive_dates else unknown).append((checked_time(receipt), day))
+    missing.sort(reverse=not oldest_first)
+    gaps.sort(key=lambda item: (item[0], -item[1].toordinal()))
+    unknown.sort(key=lambda item: (item[0], -item[1].toordinal()))
+    if stats is not None:
+        stats.update(missing_dates=len(missing), source_empty_dates=empty_total,
+                     positive_activity_empty_dates=positive_gaps,
+                     due_positive_empty_dates=len(gaps), due_unknown_empty_dates=len(unknown))
+    # New dates and official contradictions precede bounded unknown-empty probes.
+    return missing + [day for _, day in gaps] + [day for _, day in unknown[:empty_probes]]
+
+
+def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None) -> int:
+    args = args or parse_args()
+    if args.contracts_file is not None:
+        return run_batch(args)
     if args.request_interval is not None and float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be >= 0")
     request_interval = resolve_request_interval(
@@ -298,8 +355,14 @@ def main() -> int:
     expected = _calendar(args.calendar_path, start, end)
     if not expected:
         raise RuntimeError("official TX calendar contains no selected trading dates")
-    pending = [value for value in expected if _valid_receipt(args.output_dir, value) is None]
-    pending.sort(reverse=not args.oldest_first)
+    if args.refresh_empty and activity is None:
+        activity = load_futures_activity(args.official_activity, start=start, end=end)
+    positive_dates = (activity or FuturesActivity()).continuous.get(str(args.contract), set())
+    pending = getattr(args, '_pending_override', None)
+    if pending is None:
+        pending = pending_dates(args.output_dir, expected, refresh_empty=args.refresh_empty,
+                            positive_dates=positive_dates, empty_probes=args.empty_probes_per_contract,
+                            oldest_first=args.oldest_first)
     if args.max_dates:
         pending = pending[: args.max_dates]
     if args.dry_run:
@@ -316,6 +379,7 @@ def main() -> int:
             stopped_for_traffic=False,
             stopped_for_market_hours=False,
             usage=None,
+            positive_dates=positive_dates,
         )
         print(
             "[shioaji-futures-history] "
@@ -342,15 +406,18 @@ def main() -> int:
     secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
     if not api_key or not secret_key:
         raise RuntimeError("SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required")
-    api = sj.Shioaji(simulation=bool(args.simulation))
+    api = shared_api if shared_api is not None else sj.Shioaji(simulation=bool(args.simulation))
     logged_in = False
     stopped_for_traffic = False
     stopped_for_market_hours = False
+    args.completed_queries = 0
     usage: tuple[int, int] | None = None
     try:
-        api.set_event_callback(lambda *_args: None)
+        if shared_api is None:
+            api.set_event_callback(lambda *_args: None)
         try:
-            api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+            if shared_api is None:
+                api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
         except Exception as exc:  # noqa: BLE001 - normalize broker exception surface.
             if getattr(exc, "code", None) == 451 or "Too Many Connections" in str(exc):
                 print(
@@ -390,6 +457,10 @@ def main() -> int:
             except TrafficBudgetReached:
                 stopped_for_traffic = True
                 break
+            rate_limiter.wait()
+            if _taiwan_market_hours_now() and not args.allow_market_hours:
+                stopped_for_market_hours = True
+                break
             with shioaji_query(
                 api,
                 consumer="futures_history_backfill",
@@ -400,7 +471,7 @@ def main() -> int:
                     "date": trading_date.isoformat(),
                 },
             ) as set_ledger_result:
-                rate_limiter.wait()
+                args.completed_queries += 1
                 ticks = api.ticks(
                     contract=contract,
                     date=trading_date.isoformat(),
@@ -410,6 +481,10 @@ def main() -> int:
             frame, source_order_monotonic = _ticks_frame(
                 ticks, trading_date=trading_date, contract_code=str(args.contract)
             )
+            prior_receipt = _valid_receipt(args.output_dir, trading_date)
+            refresh_fields = retry_metadata(prior_receipt, empty=frame.is_empty(),
+                                            positive_activity=trading_date in positive_dates)
+            refresh_fields['session_finalized'] = futures_date_is_closed(trading_date)
             if frame.is_empty():
                 current_usage = api.usage()
                 usage = int(current_usage.bytes), int(current_usage.limit_bytes)
@@ -431,6 +506,7 @@ def main() -> int:
                         "trading_date": trading_date.isoformat(),
                         "rows": 0,
                         "traffic_used_bytes_after_query": usage[0],
+                        **refresh_fields,
                     },
                 )
                 print(
@@ -450,6 +526,7 @@ def main() -> int:
                 "rows": frame.height,
                 "source_order_monotonic": source_order_monotonic,
                 **output,
+                **refresh_fields,
             }
             _atomic_write_json(_receipt_path(args.output_dir, trading_date), receipt)
             print(
@@ -464,7 +541,7 @@ def main() -> int:
             usage = int(current.bytes), int(current.limit_bytes)
     finally:
         try:
-            if logged_in:
+            if logged_in and shared_api is None:
                 api.logout()
         finally:
             lock_handle.close()
@@ -475,6 +552,7 @@ def main() -> int:
         stopped_for_traffic=stopped_for_traffic,
         stopped_for_market_hours=stopped_for_market_hours,
         usage=usage,
+        positive_dates=positive_dates,
     )
     print(
         "[shioaji-futures-history] "
@@ -487,7 +565,151 @@ def main() -> int:
     )
     if manifest["status"] == "complete":
         return 0
-    return 76 if stopped_for_market_hours else 75
+    return 76 if stopped_for_market_hours else (75 if stopped_for_traffic else 0)
+
+
+def run_batch(args) -> int:
+    """One bounded sweep, one client; shell supervisor owns timing/publication."""
+    if args.dry_run:
+        return _run_batch(args)
+    args.history_root.mkdir(parents=True, exist_ok=True)
+    with (args.history_root / 'batch.lock').open('a+b') as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError('another futures history batch holds the lock') from exc
+        return _run_batch(args)
+
+
+def _run_batch(args) -> int:
+    if not args.dry_run and _taiwan_market_hours_now() and not args.allow_market_hours:
+        return 76
+    if args.dates_per_contract < 1 or args.empty_probes_per_contract < 0 or args.max_dates < 0:
+        raise ValueError('invalid batch query limits')
+    start, end = max(date.fromisoformat(args.start_date), HISTORY_START), date.fromisoformat(args.end_date)
+    expected = _calendar(args.calendar_path, start, end)
+    if not expected:
+        raise RuntimeError('no completed official query dates')
+    activity = load_futures_activity(args.official_activity, start=start, end=end) if args.refresh_empty else FuturesActivity()
+    api = None
+    logged_in = False
+    records = []
+    queries = 0
+    exit_code = 0
+    consecutive_failures = 0
+    receipt_path = args.batch_receipt.with_name('latest_plan.json') if args.dry_run else args.batch_receipt
+
+    def login():
+        nonlocal api, logged_in
+        if api is not None:
+            return api
+        import shioaji as sj
+        key, secret = os.getenv('SHIOAJI_API_KEY', '').strip(), os.getenv('SHIOAJI_SECRET_KEY', '').strip()
+        if not key or not secret:
+            raise RuntimeError('SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required')
+        api = sj.Shioaji(simulation=args.simulation)
+        api.set_event_callback(lambda *_: None)
+        api.login(api_key=key, secret_key=secret, subscribe_trade=False)
+        logged_in = True
+        return api
+
+    try:
+        if args.refresh_inventory and not args.dry_run:
+            from scripts.export_shioaji_futures_products import export_inventory
+            export_inventory(login(), args.contracts_file.parent)
+        catalog_sha = _sha256(args.contracts_file)
+        aliases = pl.read_csv(args.contracts_file).sort(['priority', 'contract']).to_dicts()
+        _atomic_write_json(receipt_path, {'schema_version': 2, 'status': 'planning',
+                                         'target_end_date': str(end), 'total_contracts': len(aliases),
+                                         'catalog_sha256': catalog_sha, 'started_at_utc': utc_stamp()})
+        for index, item in enumerate(aliases):
+            code = item['contract']
+            root = args.tx_history_root if code == 'TXFR1' else args.history_root / code
+            positive = activity.continuous.get(code, set())
+            stats = {'contract': code, 'source_root': str(root)}
+            pending = pending_dates(root, expected, refresh_empty=args.refresh_empty,
+                                    positive_dates=positive, empty_probes=args.empty_probes_per_contract,
+                                    oldest_first=args.oldest_first, stats=stats)
+            stats['planned_queries'] = min(len(pending), args.dates_per_contract)
+            stats['queries'] = 0
+            stats['missing_dates_after_batch'] = stats['missing_dates']
+            stats['positive_empty_dates_after_batch'] = stats['positive_activity_empty_dates']
+            prior_manifest = {}
+            try:
+                prior_manifest = json.loads((root / 'manifest.json').read_text())
+            except (OSError, ValueError):
+                pass
+            unavailable = prior_manifest.get('status') == 'contract_unavailable'
+            cooldown = (unavailable and prior_manifest.get('catalog_sha256') == catalog_sha
+                        and (parsed_time(prior_manifest.get('next_retry_at_utc')) or datetime.min.replace(tzinfo=UTC)) > datetime.now(UTC))
+            stats['provider_unavailable'] = unavailable
+            if pending and not args.dry_run and not cooldown and (not args.max_dates or queries < args.max_dates):
+                child = copy.copy(args)
+                child.contracts_file = None
+                child.contract = code
+                child.output_dir = root
+                child.max_dates = min(args.dates_per_contract, args.max_dates - queries) if args.max_dates else args.dates_per_contract
+                child._pending_override = pending
+                child.completed_queries = 0
+                try:
+                    rc = main(child, shared_api=login(), activity=activity)
+                    consecutive_failures = 0
+                    stats['provider_unavailable'] = rc == CONTRACT_UNAVAILABLE_EXIT
+                    if rc == CONTRACT_UNAVAILABLE_EXIT:
+                        manifest = json.loads((root / 'manifest.json').read_text())
+                        manifest['catalog_sha256'] = catalog_sha
+                        _atomic_write_json(root / 'manifest.json', manifest)
+                    else:
+                        manifest = json.loads((root / 'manifest.json').read_text())
+                        stats['missing_dates_after_batch'] = len(manifest['missing_trading_dates'])
+                        stats['positive_empty_dates_after_batch'] = len(manifest.get('positive_activity_empty_dates', []))
+                    if rc in (75, 76, 79):
+                        exit_code = rc
+                except Exception as exc:
+                    if getattr(exc, 'code', None) == 451 or 'Too Many Connections' in str(exc):
+                        exit_code = CONNECTION_CAPACITY_EXIT
+                    else:
+                        stats['error_type'] = type(exc).__name__
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            exit_code = 1
+                        print(f'[shioaji-futures-history] contract={code} state=query_failed error_type={type(exc).__name__}', flush=True)
+                finally:
+                    stats['queries'] = child.completed_queries
+                    queries += stats['queries']
+            stats['latest_date_queried'] = stats['provider_unavailable'] or _valid_receipt(root, expected[-1]) is not None
+            records.append(stats)
+            if (index + 1) % 25 == 0:
+                print(f'[shioaji-futures-history] scanned={index + 1}/{len(aliases)} queries={queries}', flush=True)
+            if exit_code:
+                break
+        payload = {'schema_version': 2, 'status': 'planned' if args.dry_run else 'batch_finished',
+                   'target_end_date': str(end), 'catalog_sha256': catalog_sha,
+                   'total_contracts': len(aliases), 'scanned_contracts': len(records),
+                   'queries': queries, 'planned_queries': sum(r['planned_queries'] for r in records),
+                   'provider_unavailable_contracts': sum(r['provider_unavailable'] for r in records),
+                   'positive_activity_empty_dates_before_batch': sum(r['positive_activity_empty_dates'] for r in records),
+                   'unknown_empty_dates_due_before_batch': sum(r['due_unknown_empty_dates'] for r in records),
+                   'failed_contracts': sum('error_type' in r for r in records),
+                   'missing_dates_after_batch': sum(r['missing_dates_after_batch'] for r in records),
+                   'positive_activity_empty_dates_after_batch': sum(r['positive_empty_dates_after_batch'] for r in records),
+                   'current_query_sweep_complete': len(records) == len(aliases) and all(r['latest_date_queried'] and 'error_type' not in r for r in records),
+                   'exit_code': exit_code, 'completed_at_utc': utc_stamp(),
+                   'official_activity': activity.provenance, 'contracts': records,
+                   'completion_contract': 'Batch progress is separate from source coverage; empty replies and unavailable codes remain explicit gaps.'}
+        _atomic_write_json(receipt_path, payload)
+        print('[shioaji-futures-history] batch_receipt=' + str(receipt_path) + f' queries={queries} exit={exit_code}', flush=True)
+        return exit_code or (1 if payload['failed_contracts'] else 0)
+    except Exception as exc:
+        if getattr(exc, 'code', None) == 451 or 'Too Many Connections' in str(exc):
+            return CONNECTION_CAPACITY_EXIT
+        raise
+    finally:
+        if logged_in:
+            try:
+                api.logout()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

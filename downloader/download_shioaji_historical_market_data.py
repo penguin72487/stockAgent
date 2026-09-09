@@ -5,7 +5,7 @@ The collector deliberately separates four claims:
 
 * Contract V2 discovery says what is queryable *now*.
 * A KBar chunk receipt proves that one bounded ``api.kbars`` query completed.
-* Tick targets are the trading dates actually observed in verified KBars.
+* Futures Tick targets also include independently verified official activity.
 * A Tick receipt proves that one ``api.ticks`` trading-date query completed.
 
 This avoids inventing a holiday calendar, querying every option strike on every
@@ -15,7 +15,7 @@ calendar day, or treating a running process as completed historical coverage.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 import fcntl
 import hashlib
@@ -50,20 +50,24 @@ from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     _write_parquet_atomic,
     iter_date_chunks,
 )
-from downloader.download_shioaji_tx_futures_ticks import _ticks_frame  # noqa: E402
 from stockagent.data.taifex_sessions import taifex_trading_date  # noqa: E402
 from stockagent.live.shioaji_schedule import (  # noqa: E402
     HISTORICAL_MAX_TRAFFIC_FRACTION,
     historical_query_is_protected,
 )
 from stockagent.live.shioaji_traffic_ledger import shioaji_query  # noqa: E402
+from downloader.shioaji_history_repair import (
+    DEFAULT_FUTURES_ACTIVITY, FuturesActivity, load_futures_activity,
+    retry_due, retry_metadata, utc_stamp, verified_sha, latest_completed_futures_session,
+    futures_date_is_closed,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE = "shioaji_historical_market_data_v2"
 INVENTORY_SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 2
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 FOP_HISTORY_START = date(2020, 3, 22)
 INDEX_HISTORY_START = date(2020, 3, 2)
 MAX_KBAR_QUERY_DAYS = 29
@@ -77,6 +81,10 @@ COLLECTION_PRIORITY = {
     "exact_futures": 2,
     "indices": 3,
 }
+
+
+class HistoricalWindowReached(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +166,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated exact contract codes for a bounded run.",
     )
     parser.add_argument("--max-queries", type=int, default=0)
+    parser.add_argument("--kbars-only", action="store_true",
+                        help="Download and verify one-minute KBars only; never schedule or read ticks.")
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--no-refresh-inventory", action="store_true")
     parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument('--refresh-empty', action='store_true')
+    parser.add_argument('--official-activity', type=Path, default=DEFAULT_FUTURES_ACTIVITY)
+    parser.add_argument('--prioritize-futures', action='store_true')
+    parser.add_argument('--plan-output', type=Path)
     return parser.parse_args()
 
 
@@ -226,21 +240,7 @@ def _completed_from_calendar(path: Path, *, column: str = "date") -> date | None
 
 
 def latest_completed_session(taifex_calendar: Path, twse_calendar: Path) -> date:
-    candidates = [
-        value
-        for value in (
-            _completed_from_calendar(taifex_calendar),
-            _completed_from_calendar(twse_calendar),
-        )
-        if value is not None
-    ]
-    if candidates:
-        return max(candidates)
-    local = datetime.now(TAIPEI)
-    candidate = local.date() if local.time().hour >= 14 else local.date() - timedelta(1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
+    return latest_completed_futures_session(taifex_calendar)
 
 
 def select_latest_option_infos(
@@ -351,8 +351,8 @@ def discover_contracts(api: Any, *, completed_session: date) -> list[HistoryCont
             continue
         try:
             option_infos.extend(api.contracts.options(root))
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f'option catalog discovery failed for root {root}; inventory preserved') from exc
     weekly, monthly = select_latest_option_infos(
         option_infos, completed_session=completed_session
     )
@@ -379,8 +379,8 @@ def discover_contracts(api: Any, *, completed_session: date) -> list[HistoryCont
         root = str(root_item[0] if isinstance(root_item, (tuple, list)) else root_item)
         try:
             chain = api.contracts.futures(root)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f'futures catalog discovery failed for root {root}; inventory preserved') from exc
         for info in chain:
             values = _info_dict(info)
             code = str(values.get("code") or "")
@@ -467,6 +467,8 @@ def _write_inventory(
     inventory_dir.mkdir(parents=True, exist_ok=True)
     observed = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     current_records = [_contract_record(row, observed_at=observed) for row in rows]
+    if not current_records:
+        raise RuntimeError('empty contract catalog; previous inventory preserved')
     path = inventory_dir / "contracts.parquet"
     previous: dict[tuple[str, str], dict[str, Any]] = {}
     if path.is_file():
@@ -478,6 +480,8 @@ def _write_inventory(
         prior = previous.get(key)
         if prior is not None:
             item["first_observed_at_utc"] = prior.get("first_observed_at_utc") or observed
+            item['begin_date'] = min(item['begin_date'], prior['begin_date'])
+            item['end_date'] = max(item['end_date'], prior['end_date'])
         previous[key] = item
     merged = sorted(
         previous.values(),
@@ -604,11 +608,16 @@ def _valid_receipt(path: Path, data_path: Path, *, method: str, code: str) -> di
         and payload.get("method") == method
         and payload.get("contract") == code
         and payload.get("status") in {"complete", "source_empty"}
+        and payload.get('session_finalized') is not False
     ):
+        return None
+    partition = (f"start={payload.get('start')}_end={payload.get('end')}" if method == 'kbars'
+                 else f"trading_date={payload.get('trading_date')}")
+    if data_path.parent.name != partition:
         return None
     if payload.get("status") == "source_empty":
         return payload
-    if not data_path.is_file() or _sha256(data_path) != payload.get("sha256"):
+    if not data_path.is_file() or verified_sha(data_path) != payload.get("sha256"):
         return None
     return payload
 
@@ -675,17 +684,36 @@ def observed_tick_dates(root: Path, row: HistoryContract, *, chunk_days: int) ->
     return sorted(values)
 
 
+def missing_kbar_activity(receipt: dict[str, Any], start: date, end: date,
+                          official_dates: set[date]) -> set[date]:
+    observed = {_date_value(value) for value in receipt.get('observed_trading_dates', [])}
+    return {day for day in official_dates if start <= day <= end and day not in observed}
+
+
 def build_tasks(
     root: Path,
     rows: Sequence[HistoryContract],
     *,
     chunk_days: int,
+    kbars_only: bool = False,
+    refresh_empty: bool = False,
+    activity: FuturesActivity | None = None,
 ) -> list[HistoryTask]:
     tasks: list[HistoryTask] = []
     for row in rows:
+        unavailable = _read_receipt(root / 'availability' / f'{row.code}.json')
+        if refresh_empty and unavailable and unavailable.get('status') in {'contract_unavailable', 'query_failed'} and not retry_due(unavailable):
+            continue
+        official_dates = (activity or FuturesActivity()).exact_dates(row)
         for start, end in iter_date_chunks(row.begin_date, row.end_date, chunk_days):
             data_path, receipt_path = _kbar_paths(root, row, start, end)
-            if _valid_receipt(receipt_path, data_path, method="kbars", code=row.code):
+            receipt = _valid_receipt(receipt_path, data_path, method='kbars', code=row.code)
+            positive = any(start <= day <= end for day in official_dates)
+            repair_partial = bool(receipt and receipt['status'] == 'complete'
+                                  and missing_kbar_activity(receipt, start, end, official_dates)
+                                  and retry_due(receipt.get('coverage_retry'), positive_activity=True))
+            if receipt and not (refresh_empty and (repair_partial or (receipt['status'] == 'source_empty'
+                                and retry_due(receipt, positive_activity=positive)))):
                 continue
             tasks.append(
                 HistoryTask(
@@ -699,9 +727,14 @@ def build_tasks(
                     end,
                 )
             )
-        for trading_date in observed_tick_dates(root, row, chunk_days=chunk_days):
+        if kbars_only:
+            continue
+        dates = set(observed_tick_dates(root, row, chunk_days=chunk_days)) | official_dates
+        for trading_date in sorted(dates):
             data_path, receipt_path = _tick_paths(root, row, trading_date)
-            if _valid_receipt(receipt_path, data_path, method="ticks", code=row.code):
+            receipt = _valid_receipt(receipt_path, data_path, method='ticks', code=row.code)
+            if receipt and not (refresh_empty and receipt['status'] == 'source_empty'
+                                and retry_due(receipt, positive_activity=True)):
                 continue
             tasks.append(
                 HistoryTask(
@@ -736,6 +769,9 @@ def _write_summary(
     usage: tuple[int, int] | None,
     progress_path: Path,
     persist: bool = True,
+    kbars_only: bool = False,
+    refresh_empty: bool = False,
+    activity: FuturesActivity | None = None,
 ) -> dict[str, Any]:
     collection_rows: dict[str, dict[str, Any]] = {}
     totals = {
@@ -749,7 +785,13 @@ def _write_summary(
         "stored_bytes": 0,
     }
     completed_contracts = 0
+    source_empty_queries = positive_empty_queries = unavailable_contracts = failed_contracts = 0
+    partial_kbar_chunks = missing_kbar_dates = 0
     for row in rows:
+        official_dates = (activity or FuturesActivity()).exact_dates(row)
+        availability = _read_receipt(root / 'availability' / f'{row.code}.json') or {}
+        unavailable_contracts += availability.get('status') == 'contract_unavailable'
+        failed_contracts += availability.get('status') == 'query_failed'
         bucket = collection_rows.setdefault(
             row.collection,
             {
@@ -777,7 +819,13 @@ def _write_summary(
                 contract_kbar_resolved += 1
                 bucket["kbar_rows"] += int(receipt.get("rows") or 0)
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
-        dates = observed_tick_dates(root, row, chunk_days=chunk_days)
+                gaps = missing_kbar_activity(receipt, start, end, official_dates)
+                missing_kbar_dates += len(gaps)
+                partial_kbar_chunks += bool(gaps and receipt['status'] == 'complete')
+                if receipt['status'] == 'source_empty':
+                    source_empty_queries += 1
+                    positive_empty_queries += any(start <= day <= end for day in official_dates)
+        dates = [] if kbars_only else sorted(set(observed_tick_dates(root, row, chunk_days=chunk_days)) | official_dates)
         resolved_ticks = 0
         for trading_date in dates:
             data_path, receipt_path = _tick_paths(root, row, trading_date)
@@ -788,6 +836,9 @@ def _write_summary(
                 resolved_ticks += 1
                 bucket["tick_rows"] += int(receipt.get("rows") or 0)
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
+                if receipt['status'] == 'source_empty':
+                    source_empty_queries += 1
+                    positive_empty_queries += 1
         bucket["kbar_chunks"] += contract_kbar_total
         bucket["resolved_kbar_chunks"] += contract_kbar_resolved
         bucket["tick_dates"] += len(dates)
@@ -799,17 +850,31 @@ def _write_summary(
         for key in totals:
             if key in bucket:
                 totals[key] += int(bucket[key])
-    pending = build_tasks(root, rows, chunk_days=chunk_days)
+    pending = build_tasks(root, rows, chunk_days=chunk_days, kbars_only=kbars_only,
+                          refresh_empty=refresh_empty, activity=activity)
+    unresolved = totals['kbar_chunks'] - totals['resolved_kbar_chunks'] + totals['tick_dates'] - totals['resolved_tick_dates']
+    final_state = state if pending else ('waiting_source' if unresolved or positive_empty_queries or missing_kbar_dates or failed_contracts else 'complete')
     payload = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "source": SOURCE,
+        "methods": ["kbars"] if kbars_only else ["kbars", "ticks"],
         "written_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "state": "complete" if not pending else state,
+        "state": final_state,
+        'query_receipt_state': 'complete' if not unresolved else 'partial',
+        'source_empty_queries': source_empty_queries,
+        'positive_activity_empty_queries': positive_empty_queries,
+        'partial_kbar_chunks': partial_kbar_chunks,
+        'official_activity_missing_kbar_dates': missing_kbar_dates,
+        'provider_unavailable_contracts': unavailable_contracts,
+        'failed_contracts': failed_contracts,
+        'coverage_state': 'source_gaps' if positive_empty_queries or missing_kbar_dates or unresolved or failed_contracts or unavailable_contracts else ('empty_replies_present' if source_empty_queries else 'observed_data'),
+        'completed_session': max((row.end_date for row in rows), default=date.today()).isoformat(),
+        'official_activity': (activity or FuturesActivity()).provenance,
         **totals,
         "complete_contracts": completed_contracts,
         "pending_queries": len(pending),
         "tick_target_universe_finalized": bool(
-            totals["resolved_kbar_chunks"] == totals["kbar_chunks"]
+            not kbars_only and totals["resolved_kbar_chunks"] == totals["kbar_chunks"]
         ),
         "by_collection": collection_rows,
         "traffic_used_bytes": usage[0] if usage else None,
@@ -817,18 +882,22 @@ def _write_summary(
         "max_traffic_fraction": HISTORICAL_MAX_TRAFFIC_FRACTION,
         "progress_path": str(progress_path),
         "completeness_contract": (
-            "KBar chunks are complete/source_empty receipts; Tick targets are the "
+            "Only receipt-verified one-minute KBar chunks are required; no Tick coverage is claimed"
+            if kbars_only else "KBar chunks are complete/source_empty receipts; Tick targets are the "
             "union of trading dates observed by those verified KBar chunks, and each "
-            "target requires its own complete/source_empty Tick receipt"
+            "target requires its own complete/source_empty Tick receipt; futures targets also "
+            "include official positive-volume dates matched by root and expiry. Empty replies "
+            "expire under the repair policy and are not evidence of no trading."
         ),
         "historical_depth_contract": (
+            "KBars only; no quote depth is claimed" if kbars_only else
             "historical ticks contain only the one best bid/ask attached to each trade; "
             "historical five-level books are not claimed"
         ),
         "no_data_fabricated": True,
     }
     if persist:
-        _atomic_write_json(root / "summary.json", payload)
+        _atomic_write_json(root / ("summary_kbars.json" if kbars_only else "summary.json"), payload)
     return payload
 
 
@@ -842,7 +911,9 @@ def _query_with_retries(
     for attempt in range(max(0, retries) + 1):
         try:
             return call()
-        except BaseException as exc:  # Shioaji exposes several native exception types.
+        except Exception as exc:  # Interrupts and process exits must not be retried.
+            if isinstance(exc, (TrafficBudgetReached, HistoricalWindowReached)) or getattr(exc, 'code', None) == 451:
+                raise
             last_error = exc
             if attempt >= max(0, retries):
                 raise
@@ -860,15 +931,42 @@ def _query_task(
     retries: int,
     retry_backoff: float,
     rate_limiter: SharedRateLimiter,
+    kbars_only: bool = False,
+    activity: FuturesActivity | None = None,
+    max_traffic_fraction: float | None = None,
+    allow_market_hours: bool = True,
+    allow_archived_contract: bool = False,
 ) -> tuple[dict[str, Any], list[HistoryTask]]:
+    if kbars_only and task.method != "kbars":
+        raise ValueError("KBar-only collection cannot execute a tick task")
     row = task.contract
+    official_dates = (activity or FuturesActivity()).exact_dates(row)
     contract = api.contracts.get(row.code)
+    archived_lookup = contract is None
+    if contract is None and allow_archived_contract:
+        # Historical-only opt-in for a dated physical contract from an audited
+        # official inventory. The current trading catalog is not an archive.
+        # A backend empty/error response remains missing source, never success.
+        if (row.collection != 'exact_futures' or row.security_type != 'FUT'
+                or row.exchange != 'TAIFEX' or not re.fullmatch(r'\d{6}', row.delivery_month)
+                or not 1 <= int(row.delivery_month[4:]) <= 12
+                or row.code != row.root + 'ABCDEFGHIJKL'[int(row.delivery_month[4:]) - 1] + row.delivery_month[3]
+                or not 0 <= int(row.delivery_month[:4]) - task.start.year <= 1):
+            raise ValueError('invalid archived physical futures identity')
+        import shioaji as sj
+        contract = sj.BaseContract(security_type='FUT', exchange='TAIFEX', code=row.code)
     if contract is None:
         raise LookupError(f"contract_not_in_current_catalog:{row.security_type}:{row.code}")
     started = datetime.now(UTC)
+    def query_gate():
+        if not allow_market_hours and historical_query_is_protected():
+            raise HistoricalWindowReached('history query entered the live-priority window')
+        if max_traffic_fraction is not None:
+            _check_traffic_budget(api, max_fraction=max_traffic_fraction)
     if task.method == "kbars":
         def call_kbars():
             rate_limiter.wait()
+            query_gate()
             with shioaji_query(
                 api,
                 consumer="historical_market_data_backfill",
@@ -896,6 +994,18 @@ def _query_task(
         data_path, receipt_path = _kbar_paths(
             output_root, row, task.start, task.end
         )
+        if not frame.height and max_traffic_fraction is not None:
+            _check_traffic_budget(api, max_fraction=max_traffic_fraction)
+        previous = _read_receipt(receipt_path)
+        response_rows = frame.height
+        previous_valid = _valid_receipt(receipt_path, data_path, method='kbars', code=row.code)
+        if previous_valid and previous_valid['status'] == 'complete':
+            # A partial/empty retry cannot discard previously verified minutes.
+            preserved = pl.read_parquet(data_path)
+            frame = (pl.concat([preserved, frame], how='diagonal_relaxed')
+                     .unique(subset=['ts'], keep='last', maintain_order=True).sort('ts')) if frame.height else preserved
+            trading_dates = list(frame.get_column('trading_date').unique().sort())
+        gaps = {day for day in official_dates if task.start <= day <= task.end} - set(trading_dates)
         output = (
             _write_parquet_atomic(frame, data_path) if frame.height else {}
         )
@@ -907,6 +1017,8 @@ def _query_task(
             "contract": row.code,
             "security_type": row.security_type,
             "collection": row.collection,
+            "contract_resolution": "archived_physical_contract" if archived_lookup else "current_catalog",
+            "physical_contract": f"{row.root}:{row.delivery_month}" if row.delivery_month else None,
             "start": task.start.isoformat(),
             "end": task.end.isoformat(),
             "rows": frame.height,
@@ -914,9 +1026,19 @@ def _query_task(
             "started_at_utc": started.isoformat().replace("+00:00", "Z"),
             "finished_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             **output,
+            **retry_metadata(previous, empty=not frame.height,
+                             positive_activity=any(task.start <= day <= task.end for day in official_dates)),
+            'latest_response_rows': response_rows,
+            'merged_previous_sha256': previous_valid.get('sha256') if previous_valid else None,
+            'official_activity_missing_dates': [str(day) for day in sorted(gaps)],
+            'coverage_retry': {'status': 'source_gaps' if gaps else 'complete',
+                               **retry_metadata((previous or {}).get('coverage_retry'), empty=bool(gaps), positive_activity=True)},
+            'session_finalized': futures_date_is_closed(task.end),
         }
         _atomic_write_json(receipt_path, receipt)
         added: list[HistoryTask] = []
+        if kbars_only:
+            return receipt, added
         for trading_date in trading_dates:
             tick_data, tick_receipt = _tick_paths(output_root, row, trading_date)
             if _valid_receipt(
@@ -939,6 +1061,7 @@ def _query_task(
 
     def call_ticks():
         rate_limiter.wait()
+        query_gate()
         with shioaji_query(
             api,
             consumer="historical_market_data_backfill",
@@ -957,6 +1080,8 @@ def _query_task(
     payload = _query_with_retries(
         call_ticks, retries=retries, retry_backoff=retry_backoff
     )
+    from downloader.download_shioaji_tx_futures_ticks import _ticks_frame
+
     frame, source_order_monotonic = _ticks_frame(
         payload, trading_date=task.start, contract_code=row.code
     )
@@ -966,6 +1091,9 @@ def _query_task(
             pl.lit(row.security_type).alias("security_type"),
         )
     data_path, receipt_path = _tick_paths(output_root, row, task.start)
+    if not frame.height and max_traffic_fraction is not None:
+        _check_traffic_budget(api, max_fraction=max_traffic_fraction)
+    previous = _read_receipt(receipt_path)
     output = _write_parquet_atomic(frame, data_path) if frame.height else {}
     receipt = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
@@ -982,6 +1110,8 @@ def _query_task(
         "started_at_utc": started.isoformat().replace("+00:00", "Z"),
         "finished_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         **output,
+        **retry_metadata(previous, empty=not frame.height, positive_activity=True),
+        'session_finalized': futures_date_is_closed(task.end),
     }
     _atomic_write_json(receipt_path, receipt)
     return receipt, []
@@ -1010,6 +1140,31 @@ def main() -> int:
         for value in str(args.contract_codes).split(",")
         if value.strip()
     }
+    def selected_rows():
+        selected = [row for row in load_inventory(args.output_dir)
+                    if row.collection in collections and (not selected_codes or row.code in selected_codes)]
+        if args.prioritize_futures:
+            selected = [replace(row, priority=-1) if row.collection == 'exact_futures' else row for row in selected]
+        return selected
+
+    def official_activity(rows):
+        if not args.refresh_empty or not rows:
+            return FuturesActivity()
+        return load_futures_activity(args.official_activity,
+                                     start=min(row.begin_date for row in rows),
+                                     end=max(row.end_date for row in rows))
+
+    if args.dry_run:
+        rows = selected_rows()
+        activity = official_activity(rows)
+        summary = _write_summary(args.output_dir, rows, chunk_days=args.chunk_days,
+                                 state='planned', usage=None, progress_path=args.output_dir / 'progress.json',
+                                 persist=False, kbars_only=args.kbars_only,
+                                 refresh_empty=args.refresh_empty, activity=activity)
+        if args.plan_output:
+            _atomic_write_json(args.plan_output, summary)
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        return 0
     if historical_query_is_protected() and not args.allow_market_hours:
         print("[shioaji-history] state=waiting_market protected=07:45-14:31")
         return MARKET_WINDOW_EXIT
@@ -1029,7 +1184,7 @@ def main() -> int:
         raise RuntimeError("SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required")
     api = sj.Shioaji(simulation=bool(args.simulation))
     logged_in = False
-    progress_path = args.output_dir / "progress.json"
+    progress_path = args.output_dir / ("progress_kbars.json" if args.kbars_only else "progress.json")
     usage: tuple[int, int] | None = None
     try:
         api.set_event_callback(lambda *_args: None)
@@ -1060,35 +1215,21 @@ def main() -> int:
             )
         if args.inventory_only:
             return 0
-        rows = [
-            row
-            for row in load_inventory(args.output_dir)
-            if row.collection in collections
-            and (not selected_codes or row.code in selected_codes)
-        ]
+        rows = selected_rows()
+        activity = official_activity(rows)
         tasks = build_tasks(
-            args.output_dir, rows, chunk_days=int(args.chunk_days)
+            args.output_dir, rows, chunk_days=int(args.chunk_days), kbars_only=args.kbars_only,
+            refresh_empty=args.refresh_empty, activity=activity,
         )
-        if args.dry_run:
-            summary = _write_summary(
-                args.output_dir,
-                rows,
-                chunk_days=int(args.chunk_days),
-                state="planned",
-                usage=None,
-                progress_path=progress_path,
-                persist=False,
-            )
-            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-            return 0
         progress = PersistentProgress(
             progress_path,
             label="Shioaji option, exact-future, and index historical data",
             total=len(tasks),
             unit="API query receipts",
             basis=(
-                "latest weekly options, latest monthly options, exact futures, then "
-                "indices; newest chunks first; Tick dates derive from verified KBars"
+                "Receipt-verified one-minute KBar chunks only" if args.kbars_only else
+                ("exact futures first; " if args.prioritize_futures else "weekly, monthly, exact futures, indices; ")
+                + "newest chunks first; Tick dates use verified KBars and official root/expiry activity"
             ),
         )
         heap = [task.heap_key() for task in tasks]
@@ -1109,6 +1250,9 @@ def main() -> int:
             flush=True,
         )
         completed_queries = 0
+        unavailable_codes = set()
+        observed_available = set()
+        consecutive_failures = 0
         state = "running"
         while heap and (not args.max_queries or completed_queries < args.max_queries):
             if historical_query_is_protected() and not args.allow_market_hours:
@@ -1122,6 +1266,8 @@ def main() -> int:
                 state = "waiting_traffic"
                 break
             *_key, task = heapq.heappop(heap)
+            if task.code in unavailable_codes:
+                continue
             try:
                 receipt, added = _query_task(
                     api,
@@ -1131,15 +1277,50 @@ def main() -> int:
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
                     rate_limiter=rate_limiter,
+                    kbars_only=args.kbars_only,
+                    activity=activity, max_traffic_fraction=float(args.max_traffic_fraction),
+                    allow_market_hours=args.allow_market_hours,
                 )
+            except HistoricalWindowReached:
+                state = 'waiting_market'
+                break
+            except TrafficBudgetReached:
+                state = 'waiting_traffic'
+                break
             except LookupError as exc:
                 # Retained expired catalog rows remain explicit unresolved gaps.
                 progress.update(
                     f"{task.contract.collection}:{task.code}:{task.method}",
                     "contract_unavailable",
                 )
-                print(f"[shioaji-history] status=contract_unavailable error={exc}")
+                unavailable_codes.add(task.code)
+                path = args.output_dir / 'availability' / f'{task.code}.json'
+                previous = _read_receipt(path)
+                _atomic_write_json(path, {'status':'contract_unavailable', 'contract':task.code,
+                                         'reason':'shioaji_contract_catalog_missing',
+                                         **retry_metadata(previous, empty=True, positive_activity=True)})
+                print(f"[shioaji-history] status=contract_unavailable contract={task.code}")
                 continue
+            except Exception as exc:
+                if getattr(exc, 'code', None) == 451:
+                    state = 'waiting_connection_capacity'
+                    break
+                unavailable_codes.add(task.code)
+                consecutive_failures += 1
+                _atomic_write_json(args.output_dir / 'availability' / f'{task.code}.json',
+                                   {'status':'query_failed', 'contract':task.code,
+                                    'error_type':type(exc).__name__, 'checked_at_utc':utc_stamp(),
+                                    'next_retry_at_utc':utc_stamp(datetime.now(UTC) + timedelta(hours=1))})
+                print(f'[shioaji-history] status=query_failed contract={task.code} error_type={type(exc).__name__}', flush=True)
+                if consecutive_failures >= 3:
+                    state = 'waiting_source'
+                    break
+                continue
+            consecutive_failures = 0
+            if task.code not in observed_available:
+                _atomic_write_json(args.output_dir / 'availability' / f'{task.code}.json',
+                                   {'status':'available', 'contract':task.code, 'checked_at_utc':utc_stamp()})
+                observed_available.add(task.code)
             completed_queries += 1
             for new_task in added:
                 identity = (
@@ -1169,6 +1350,8 @@ def main() -> int:
                     state=state,
                     usage=usage,
                     progress_path=progress_path,
+                    kbars_only=args.kbars_only,
+                    refresh_empty=args.refresh_empty, activity=activity,
                 )
             print(
                 f"[shioaji-history] query={completed_queries} "
@@ -1185,6 +1368,8 @@ def main() -> int:
             state=state,
             usage=usage,
             progress_path=progress_path,
+            kbars_only=args.kbars_only,
+            refresh_empty=args.refresh_empty, activity=activity,
         )
         final_state = str(summary["state"])
         progress.finish(
@@ -1196,6 +1381,8 @@ def main() -> int:
             return TRAFFIC_BUDGET_EXIT
         if final_state == "waiting_market":
             return MARKET_WINDOW_EXIT
+        if final_state == 'waiting_connection_capacity':
+            return CONNECTION_CAPACITY_EXIT
         return 0
     finally:
         if logged_in:

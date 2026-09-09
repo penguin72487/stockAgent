@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import polars as pl
 
@@ -135,6 +136,8 @@ def test_tick_targets_derive_only_from_verified_kbar_receipts(tmp_path: Path) ->
             "method": "kbars",
             "contract": row.code,
             "rows": 1,
+            "start": row.begin_date.isoformat(),
+            "end": row.end_date.isoformat(),
             "observed_trading_dates": ["2026-08-27", "2026-08-28"],
             "sha256": __import__("hashlib").sha256(data_path.read_bytes()).hexdigest(),
         },
@@ -191,6 +194,8 @@ def test_source_empty_receipt_is_terminal_without_fake_parquet(tmp_path: Path) -
             "status": "source_empty",
             "method": "kbars",
             "contract": row.code,
+            "start": row.begin_date.isoformat(),
+            "end": row.end_date.isoformat(),
             "rows": 0,
             "observed_trading_dates": [],
         },
@@ -227,3 +232,37 @@ def test_corrupt_tick_artifact_invalidates_receipt(tmp_path: Path) -> None:
     assert _valid_receipt(
         receipt_path, data_path, method="ticks", code=row.code
     ) is None
+
+
+def test_kbars_only_never_reads_or_schedules_ticks_and_preserves_full_summary(tmp_path, monkeypatch):
+    import downloader.download_shioaji_historical_market_data as collector
+
+    row = _row(collection="exact_futures", priority=2, code="CDFI6", security_type="FUT",
+               begin=date(2026, 8, 28), end=date(2026, 8, 28))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("KBar-only mode must never use tick data")
+    monkeypatch.setattr(collector, "_tick_paths", forbidden)
+    monkeypatch.setattr(collector, "observed_tick_dates", forbidden)
+    monkeypatch.setattr(collector, "shioaji_query", lambda *a, **k: nullcontext(lambda _: None))
+    payload = SimpleNamespace(dict=lambda: {
+        "ts": [_ns(datetime(2026, 8, 28, 8, 46))],
+        "Open": [100.], "High": [102.], "Low": [100.], "Close": [102.],
+        "Volume": [2], "Amount": [202.],
+    })
+    api = SimpleNamespace(contracts=SimpleNamespace(get=lambda _: object()),
+                          kbars=lambda **_: payload, ticks=forbidden)
+    tasks = build_tasks(tmp_path, [row], chunk_days=29, kbars_only=True)
+    assert [t.method for t in tasks] == ["kbars"]
+    receipt, added = collector._query_task(
+        api, tasks[0], output_root=tmp_path, timeout_ms=1000, retries=0,
+        retry_backoff=0, rate_limiter=SimpleNamespace(wait=lambda: None), kbars_only=True,
+    )
+    assert receipt["rows"] == 1 and added == []
+    assert build_tasks(tmp_path, [row], chunk_days=29, kbars_only=True) == []
+    (tmp_path / "summary.json").write_text("existing complete tick summary")
+    summary = collector._write_summary(tmp_path, [row], chunk_days=29, state="running",
+                                       usage=None, progress_path=tmp_path / "progress_kbars.json", kbars_only=True)
+    assert summary["state"] == "complete" and summary["methods"] == ["kbars"]
+    assert summary["tick_dates"] == 0 and not summary["tick_target_universe_finalized"]
+    assert (tmp_path / "summary.json").read_text() == "existing complete tick summary"
+    assert (tmp_path / "summary_kbars.json").is_file()

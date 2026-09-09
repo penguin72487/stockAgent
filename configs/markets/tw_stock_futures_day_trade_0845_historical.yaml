@@ -1,0 +1,61 @@
+base_config: tw_stock_futures_day_trade_0845_minute.yaml
+
+experiment_name: tw-stock-futures-shioaji-from-20200323-minute-v2-contract-quarantine-v1
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v1_vast5090
+  resume: true
+
+environment:
+  # Measured on vastai1T: 53.76 container CPU quota, two RTX 5090s.
+  # These are host-wide totals, divided across the two canonical DDP ranks.
+  cpu_threads: 48
+  torch_compile_threads: 16
+
+training:
+  # Seven full-workflow benchmarks (including two six-epoch repeats) retain
+  # the original global batch 128, model width, all bases and 1000 epochs.
+  # See docs/vastai1t_futures_training_2026-09-08.md for measured scope.
+  vram_budget_gb: 32
+  vram_safety_margin_gb: 3.0
+  target_vram_fraction: 0.9
+  torchinductor_cache_dir: ~/.cache/torchinductor/tw_stock_futures_historical_v2
+  triton_cache_dir: ~/.cache/triton/tw_stock_futures_historical_v2
+  backtest_compile: true
+  eval_backtest_compile: true
+  inference_backtest_compile: true
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  financial_transformer:
+    temporal_basis_algebraic_contraction: true
+
+data:
+  # User-selected horizon: first day session in Shioaji's futures history.
+  # Earlier source history remains preserved, outside this training experiment.
+  panel_start_date: '2020-03-23'
+  # Inherit the exact audited stock release from the minute baseline. A local
+  # data_tw_public link may point at a different, older snapshot on another node.
+  panel_cache_root: artifacts/cache/tw_stock_futures_day_trade_from_20200323_v2_panel
+
+walk_forward:
+  expected_first_year: 2020
+
+trading:
+  # Retain the v2 source contract's exclusive cutoff. The selected horizon is
+  # entirely later, so this experiment contains no daily OPEN/CLOSE proxy rows.
+  tw_stock_futures_day_trade_daily_proxy_before: '2020-01-01'
+  # User correction on 2026-09-09: exclude only the unresolved physical contract
+  # on its missing date. Retain all other candidates and the full decision calendar.
+  # This is retrospective source-quality scope, not historical market eligibility.
+  tw_stock_futures_day_trade_quarantine_dates: []
+  tw_stock_futures_day_trade_quarantine_contract_days:
+    - date: '2021-06-21'
+      physical_contract: LVF:202107
+  # The minute history was built from this newer daily SHA, not the older
+  # baseline release. Keep the explicitly delivered private source snapshot
+  # paired with its minute manifest; it remains outside cold publication.
+  tw_stock_futures_day_trade_data_path: artifacts/data_preparation/futures_daily_70a57dd76de74fd0a365/continuous_daily.parquet
+  # Exact-month KBar/Tick recovery and independently proven zero outright
+  # capacity. Preflight rejects unresolved contract-days outside the explicit
+  # exact contract-day quarantine above. The earlier whole-day version is preserved.
+  tw_stock_futures_day_trade_minute_data_path: artifacts/data_preparation/futures_minutes_contract_quarantine_v1_20260909/minutes.parquet
