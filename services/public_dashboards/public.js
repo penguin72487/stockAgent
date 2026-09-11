@@ -55,6 +55,14 @@ function renderTw(data) {
     $("tw-summary").textContent = `${modes} 模式 · ${positions} 個持倉`;
 }
 
+function renderOvernight(data) {
+    setHealth("overnight", data.health);
+    $("overnight-freshness").textContent = ageLabel(data.source_age_seconds);
+    const modes = Number(data.modes || 0);
+    const positions = Number(data.open_positions || 0);
+    $("overnight-summary").textContent = `${modes} 模式 · ${positions} 個隔夜持倉`;
+}
+
 function bytes(value) {
   return Dashboard.formatBytes(value, {maximumFractionDigits: 1});
 }
@@ -89,11 +97,13 @@ function renderTraffic(data) {
 }
 
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "shioaji", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "overnight", "shioaji", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
+  $("overnight-freshness").textContent = "無法取得";
   $("taifex-summary").textContent = "進入面板查看";
   $("tw-summary").textContent = "進入面板查看";
+  $("overnight-summary").textContent = "進入面板查看";
   $("shioaji-traffic").textContent = "無法取得";
   $("shioaji-progress").textContent = "進入面板查看";
   $("openbb-freshness").textContent = "無法取得";
@@ -111,6 +121,7 @@ async function refresh() {
     const data = await fetchJson("api/overview");
     renderTaifex(data.taifex || {});
     renderTw(data.tw || {});
+    renderOvernight(data.overnight || {});
     renderShioaji(data.shioaji || {});
     renderOpenbb(data.openbb || {});
     renderDataMonitor(data.data_monitor || {});

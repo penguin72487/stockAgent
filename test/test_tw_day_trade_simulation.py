@@ -414,7 +414,7 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> N
     assert latency["not_external_order_or_venue_rtt"] is True
     opening = payload["opening_signal_latency"]
     assert opening["measurement_boundary"] == (
-        "09:00_trigger_to_immutable_signal_ready"
+        "09:00_gate_to_local_quote_coverage_to_immutable_signal_ready"
     )
     assert opening["observed_mode_count"] == 1
     assert opening["expected_mode_count"] == 1
@@ -467,6 +467,89 @@ def test_opening_latency_compares_only_the_same_mode_set() -> None:
     assert comparable["previous_session_date"] == "2026-08-12"
     assert comparable["change_vs_previous_ms"] == pytest.approx(-1_000.0)
     assert comparable["improved_vs_previous"] is True
+
+
+def test_opening_latency_uses_dedicated_source_and_stage_telemetry() -> None:
+    rows = [
+        {
+            "schema_version": 2,
+            "source": "discord_scheduled_signal",
+            "status": "ready",
+            "session_date": "2026-09-09",
+            "market": "mode-a",
+            "signal_id": "signal-a",
+            "gate_at": "2026-09-09T09:00:00+08:00",
+            "signal_started_at": "2026-09-09T09:00:00.050000+08:00",
+            "signal_ready_at": "2026-09-09T09:00:00.800000+08:00",
+            "ready_from_open_ms": 800.0,
+            "source_ready_from_open_ms": 300.0,
+            "source_ready_to_signal_ms": 500.0,
+            "stages": {
+                "scheduler_wake_ms": 20.0,
+                "signal_quote_fetch_ms": 250.0,
+                "model_inference_ms": 40.0,
+            },
+            "quote_transport": {"server_provider_fetch_ms": 200.0},
+        },
+        {
+            "schema_version": 2,
+            "source": "discord_scheduled_signal",
+            "status": "ready",
+            "session_date": "2026-09-09",
+            "market": "mode-b",
+            "gate_at": "2026-09-09T09:00:00+08:00",
+            "signal_started_at": "2026-09-09T09:00:00.810000+08:00",
+            "signal_ready_at": "2026-09-09T09:00:01.200000+08:00",
+            "ready_from_open_ms": 1_200.0,
+            "source_ready_from_open_ms": 300.0,
+            "source_ready_to_signal_ms": 900.0,
+            "stages": {"model_lock_queue_ms": 10.0, "model_inference_ms": 60.0},
+        },
+        {
+            "schema_version": 2,
+            "source": "discord_scheduled_signal",
+            "status": "failed",
+            "session_date": "2026-09-09",
+            "market": "mode-b",
+            "recorded_at": "2026-09-09T09:00:00.500000+08:00",
+            "error_type": "TimeoutError",
+        },
+        {
+            "schema_version": 1,
+            "result": "registered",
+            "session_date": "2026-09-09",
+            "market": "mode-a",
+            "signal_id": "signal-a",
+            "signal_started_at": "2026-09-09T09:00:00.050000+08:00",
+            "signal_ready_at": "2026-09-09T09:00:00.800000+08:00",
+            "artifact_published_at": "2026-09-09T09:00:00.825000+08:00",
+            "ledger_persisted_at": "2026-09-09T09:00:01.400000+08:00",
+            "input_to_ledger_ms": 1_350.0,
+            "ready_to_ledger_ms": 600.0,
+            "stages": {"artifact_discovery_ms": 600.0},
+        },
+    ]
+
+    summary = dashboard_module._opening_signal_latency_summary(
+        rows,
+        expected_markets=["mode-a", "mode-b"],
+        session_date="2026-09-09",
+    )
+
+    assert summary["schema_version"] == 2
+    assert summary["goal_ms"] == 1_000.0
+    assert summary["first_ready_ms"] == 800.0
+    assert summary["final_ready_ms"] == 1_200.0
+    assert summary["first_source_ready_ms"] == 300.0
+    assert summary["source_ready_to_signal_p50_ms"] == 700.0
+    assert summary["first_signal_goal_met"] is True
+    assert summary["all_modes_goal_met"] is False
+    assert summary["failure_count"] == 1
+    assert summary["modes"][0]["bottleneck_stage"] == "artifact_discovery_ms"
+    assert summary["modes"][0]["input_to_ledger_ms"] == 1_350.0
+    assert summary["modes"][0]["telemetry_source"] == (
+        "opening_attempt_v2+executor_latency_v1"
+    )
 
 
 def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
@@ -4095,7 +4178,11 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     )
     assert payload["signals"] == []
     assert payload["payload_window"]["signals"] == 0
-    assert "account" not in json.dumps(payload).casefold()
+    # Public paper-account arithmetic is not a broker identity. Check secrets
+    # explicitly instead of rejecting the ordinary word "account".
+    encoded = json.dumps(payload).casefold()
+    for forbidden in ("account_id", "account_number", "broker_account", "api_key", "api_secret"):
+        assert forbidden not in encoded
     assert "broker" not in json.dumps(payload).casefold()
 
 
@@ -4456,8 +4543,11 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="preopen-progress"' in html
     assert "fetchWithTimeout(`api/status" in javascript
     assert 'fetchWithTimeout("api/revision"' in javascript
-    assert "const SERVICE_REVISION_REFRESH_MS = 250" in javascript
-    assert "Dashboard.scheduleRefresh(refreshServiceRevision" in javascript
+    assert "const SERVICE_REVISION_REFRESH_MS = 1000" in javascript
+    assert (
+        'Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, '
+        "refreshServiceRevision"
+    ) in javascript
     assert "服務同步" in javascript
     assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/positions?${params.toString()}`" in javascript
@@ -4472,7 +4562,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert javascript.count("positionRows = [];") == 1
     assert javascript.count("eventRows = [];") == 1
     assert "location.reload" not in javascript
-    assert "window.location" not in javascript
+    assert 'window.location.pathname.startsWith("/tw-overnight/")' in javascript
     assert (
         'beginSilentTableUpdate("signal-body", "load-more-signals", append)'
         in javascript
@@ -4489,7 +4579,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
     assert "function hydrateDefaultPositions(data)" in javascript
-    assert "await loadChartHistory({preferCache: !force});" in javascript
+    assert "const historyReady = loadChartHistory({preferCache: !force});" in javascript
     assert "if (shouldReloadPositions) secondaryLoads.push(loadPositions());" in javascript
     assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
@@ -4554,7 +4644,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "原子指標由 inotify 事件即時喚醒" in javascript
     assert 'id="latency-kpis"' in html
-    assert "今日尚無開盤樣本" in javascript
+    assert "所選日尚無開盤樣本" in javascript
+    assert "value == null ? Number.NaN : Number(value)" in javascript
     assert "這不是券商回報或交易所往返時間" in html
     assert javascript.count("const requestRange = detailRangeKey();") == 3
     assert "start_date: selectedDetailStartDate()" in javascript
@@ -4592,12 +4683,15 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert '"api/public-data-status"' in javascript
     assert "IntersectionObserver" in javascript
     assert "installTwPublicMonitorActivation()" in javascript
-    assert "await loadChartHistory({preferCache: !force});" in javascript
-    assert "if (shouldReloadSignals) await loadSignals({force: true});" in javascript
+    assert "const historyReady = loadChartHistory({preferCache: !force});" in javascript
+    assert (
+        "const signalsReady = shouldReloadSignals ? loadSignals({force: true})"
+        in javascript
+    )
     assert "Promise.allSettled(secondaryLoads)" in javascript
-    assert 'src="app.js?v=59"' in html
+    assert 'src="app.js?v=68"' in html
     assert 'src="presentation.js?v=1"' in html
-    assert 'src="detail-components.js?v=1"' in html
+    assert 'src="detail-components.js?v=3"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript

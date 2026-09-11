@@ -166,6 +166,12 @@ ready = (
     and int(receipt.get("terminal_contracts", -1))
         == int(receipt.get("total_contracts", -2))
 )
+if receipt.get('schema_version') == 2:
+    # Old source gaps do not monopolize the account after today's query sweep.
+    from downloader.shioaji_history_repair import latest_completed_futures_session
+    target = latest_completed_futures_session(calendar)
+    ready = (receipt.get('target_end_date') == target.isoformat()
+             and receipt.get('current_query_sweep_complete') is True)
 print("0 futures_history_current" if ready else "60 futures_history_priority")
 PY
 }

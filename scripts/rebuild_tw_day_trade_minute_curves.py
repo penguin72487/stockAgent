@@ -11,9 +11,11 @@ the latest observed trade and are counted; prices are never interpolated.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from collections import Counter, defaultdict
 from datetime import date, datetime, time as datetime_time, timedelta
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -1079,6 +1081,169 @@ def validate_existing_strategy_marks(
     }
 
 
+def recover_terminal_marks(
+    state_dir: Path, source_rows: list[dict[str, Any]], *, start: date, end: date,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Recover only flat 13:30 NAV from accepted fills, never from prices.
+
+    Two intraday realized-PnL anchors, complete position lifecycles and the
+    settlement event must agree. A later actual fill cannot be backdated.
+    No orders, fills, source prices or strategy decisions are regenerated.
+    """
+    state = _read_json(state_dir / "state.json")
+    selected = [r for r in source_rows if _in_range(str(r.get("session_date") or ""), start, end)]
+    missing = missing_accepted_endpoints(selected, start=start, end=end,
+                                         expected_markets=state["modes"])
+    if any(r["missing_clocks"] != ["13:30"] for r in missing):
+        raise RuntimeError("terminal recovery cannot synthesize an opening mark")
+    fills = _read_jsonl(state_dir / "fills.jsonl")
+    events = _read_jsonl(state_dir / "events.jsonl")
+    recovered = []
+    now = datetime.now(TAIPEI)
+
+    def timestamp(value):
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            raise RuntimeError("terminal evidence requires timezone-aware timestamps")
+        return parsed.astimezone(TAIPEI)
+
+    def number(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise RuntimeError("nonfinite terminal accounting evidence")
+        return result
+
+    def close(a, b):
+        if not math.isclose(number(a), number(b), rel_tol=0, abs_tol=1e-6):
+            raise RuntimeError(f"terminal accounting evidence disagrees: {a} != {b}")
+
+    for gap in missing:
+        day, market = gap["session_date"], gap["market"]
+        endpoint = datetime.fromisoformat(f"{day}T13:30:00+08:00")
+        deadline = endpoint + timedelta(minutes=1)
+        if now < deadline:
+            raise RuntimeError("terminal recovery is only for completed sessions")
+        valid = sorted((r for r in selected if r.get("session_date") == day and r.get("market") == market
+                        and f"{day}T09:01+08:00" <= str(r.get("minute")) < f"{day}T13:30+08:00"),
+                       key=lambda r: r["minute"])
+        if len(valid) < 2:
+            raise RuntimeError(f"missing independent realized-PnL anchors: {day}:{market}")
+        first, anchor = valid[0], valid[-1]
+        first_at, anchor_at = timestamp(first["recorded_at"]), timestamp(anchor["recorded_at"])
+        if first_at.date().isoformat() != day or not first_at < anchor_at < endpoint:
+            raise RuntimeError("invalid pre-close anchor timestamps")
+        settled = [e for e in events if e.get("event") == "closing_auction_settled" and e.get("market") == market
+                   and endpoint <= timestamp(e["recorded_at"]) < deadline]
+        if not settled:
+            raise RuntimeError(f"missing same-session closing settlement: {day}:{market}")
+        current = state["modes"][market]
+        if current.get("session_date") == day:
+            positions = list(current["positions"].values())
+            position_source = "state.json"
+        else:
+            position_source = f"position_history/{day}/{market}.json"
+            archive = _read_json(state_dir / position_source)
+            if archive.get("session_date") != day or archive.get("market") != market:
+                raise RuntimeError("position archive identity mismatch")
+            positions = archive["positions"]
+        if not positions or any(int(p["signed_shares"]) for p in positions):
+            raise RuntimeError("terminal recovery requires proven flat positions")
+        session_fills = [f for f in fills if f.get("session_date") == day and f.get("market") == market]
+        if not session_fills:
+            raise RuntimeError("terminal recovery requires accepted fills")
+        by_position = defaultdict(list)
+        for fill in session_fills:
+            recorded = timestamp(fill["recorded_at"])
+            if recorded.date().isoformat() != day or recorded >= deadline or timestamp(fill["fill_at"]) >= deadline:
+                raise RuntimeError("a later fill cannot be backdated to 13:30")
+            by_position[fill["position_id"]].append(fill)
+        if set(by_position) != {p["position_id"] for p in positions}:
+            raise RuntimeError("fill and position identities disagree")
+        for position in positions:
+            pf = by_position[position["position_id"]]
+            entries = sum(int(f["quantity"]) for f in pf if f["purpose"] == "entry")
+            exits = sum(int(f["quantity"]) for f in pf if f["purpose"] != "entry")
+            if entries <= 0 or entries != exits or entries != int(position["filled_shares"]):
+                raise RuntimeError("incomplete or duplicated position fill lifecycle")
+            close(math.fsum(number(f["net_pnl_twd"]) for f in pf if f["purpose"] != "entry"),
+                  position["realized_net_pnl_twd"])
+        exit_fills = [f for f in session_fills if f["purpose"] != "entry"]
+        realized_between = math.fsum(number(f["net_pnl_twd"]) for f in exit_fills
+                                     if first_at < timestamp(f["recorded_at"]) <= anchor_at)
+        close(number(first["cumulative_realized_net_pnl_twd"]) + realized_between,
+              anchor["cumulative_realized_net_pnl_twd"])
+        for mark, at in ((first, first_at), (anchor, anchor_at)):
+            remaining = defaultdict(int)
+            for f in session_fills:
+                if timestamp(f["recorded_at"]) <= at:
+                    remaining[f["position_id"]] += int(f["quantity"]) * (1 if f["purpose"] == "entry" else -1)
+            if any(q < 0 for q in remaining.values()) or sum(q > 0 for q in remaining.values()) != int(mark["open_position_count"]):
+                raise RuntimeError("anchor position count disagrees with accepted fills")
+        cumulative = number(anchor["cumulative_realized_net_pnl_twd"]) + math.fsum(
+            number(f["net_pnl_twd"]) for f in exit_fills if timestamp(f["recorded_at"]) > anchor_at)
+        initial = number(anchor["initial_capital_twd"])
+        close(first["initial_capital_twd"], initial)
+        equity = initial + cumulative
+        if current.get("session_date") == day:
+            close(current["total_equity_twd"], equity)
+        recovered.append({
+            "session_date": day, "market": market, "minute": endpoint.isoformat(timespec="minutes"),
+            "recorded_at": now.isoformat(timespec="seconds"), "initial_capital_twd": initial,
+            "cumulative_realized_net_pnl_twd": cumulative, "open_net_liquidation_pnl_twd": 0.0,
+            "total_equity_twd": equity, "open_position_count": 0, "stale_position_count": 0,
+            "valuation_stale": False, "valuation_source": "accepted_closed_fill_ledger",
+            "terminal_recovery": {"contract": "flat_settlement_nav_v1", "position_source": position_source,
+                                  "settled_at": settled[-1]["recorded_at"], "anchor_at": anchor["recorded_at"]},
+        })
+    # The old engine also emitted prior-session flat NAV at the next day's
+    # 09:01. Remove only that proven duplicate, retaining a full before-image.
+    endpoints = {(r["session_date"], r["market"]): r for r in [*selected, *recovered]
+                 if r.get("minute") == f"{r['session_date']}T13:30+08:00"}
+    rows, removed = [], []
+    for row in source_rows:
+        day = str(row.get("session_date") or "")
+        if _in_range(day, start, end) and not str(row.get("minute", "")).startswith(day + "T"):
+            endpoint_row = endpoints.get((day, row["market"]))
+            if endpoint_row is None or int(row["open_position_count"]) or number(row["open_net_liquidation_pnl_twd"]) != 0:
+                raise RuntimeError("unproven cross-session mark cannot be removed")
+            close(row["total_equity_twd"], endpoint_row["total_equity_twd"])
+            removed.append(row)
+        else:
+            rows.append(row)
+    rows.extend(recovered)
+    rows.sort(key=lambda r: (str(r.get("minute")), str(r.get("market"))))
+    _, coverage = validate_existing_strategy_marks(rows, start=start, end=end)
+    return rows, {"recovered_endpoints": recovered, "removed_cross_session_duplicates": removed, "coverage": coverage}
+
+
+def repair_terminal_marks_only(args, *, start: date, end: date) -> None:
+    """Stage and validate first; publish one ledger atomically under engine lock."""
+    if args.output_dir.resolve().is_relative_to(args.state_dir.resolve()):
+        raise ValueError("terminal candidate must be outside the live ledger directory")
+    lock_path = args.state_dir / ".engine.lock"
+    with (lock_path.open("a+") if args.publish else nullcontext()) as lock:
+        if lock is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sources = ["state.json", "fills.jsonl", "orders.jsonl", "signals.jsonl", "events.jsonl", "marks.jsonl"]
+        before = {name: _sha256(args.state_dir / name) for name in sources}
+        source = _read_jsonl(args.state_dir / "marks.jsonl")
+        rows, result = recover_terminal_marks(args.state_dir, source, start=start, end=end)
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_text(args.output_dir / "marks.before.jsonl", (args.state_dir / "marks.jsonl").read_text())
+        _atomic_jsonl(args.output_dir / "marks.jsonl", rows)
+        if before != {name: _sha256(args.state_dir / name) for name in sources}:
+            raise RuntimeError("ledger changed during terminal recovery; retry from a stable revision")
+        result.update({"contract": "terminal_nav_only_no_replay_v1", "source_sha256": before,
+                       "candidate_sha256": _sha256(args.output_dir / "marks.jsonl"), "published": bool(args.publish)})
+        _atomic_json(args.output_dir / "terminal_curve_recovery_receipt.json", result)
+        if args.publish:
+            _atomic_text(args.state_dir / "marks.jsonl", (args.output_dir / "marks.jsonl").read_text())
+            _atomic_json(args.state_dir / "terminal_curve_recovery_receipt.json", result)
+        print(json.dumps({"published": bool(args.publish), "recovered_endpoints": len(result["recovered_endpoints"]),
+                          "removed_cross_session_duplicates": len(result["removed_cross_session_duplicates"]),
+                          "coverage": result["coverage"]}, ensure_ascii=False))
+
+
 def _benchmark_minute_row(
     template: Mapping[str, Any],
     *,
@@ -1319,6 +1484,8 @@ def parse_args() -> argparse.Namespace:
         default=HISTORICAL_MAX_TRAFFIC_FRACTION,
     )
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--repair-terminal-only", action="store_true",
+                        help="Recover missing flat 13:30 NAV from accepted fills only; no price fetch or trade replay.")
     return parser.parse_args()
 
 
@@ -1330,6 +1497,11 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("start date must not be after end date")
+    if getattr(args, "repair_terminal_only", False):
+        if args.fetch_missing_kbars or args.revalue_opening_marks or args.recompute_existing_strategy_marks or args.repair_unverified_strategy_marks:
+            raise ValueError("terminal-only recovery cannot change prices or interior marks")
+        repair_terminal_marks_only(args, start=start, end=end)
+        return
     if not 0.0 < args.requests_per_second <= 10.0:
         raise ValueError("requests per second must be in (0, 10]")
     if not 0.0 < args.max_traffic_fraction < 1.0:

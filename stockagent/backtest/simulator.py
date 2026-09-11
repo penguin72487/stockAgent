@@ -3069,6 +3069,7 @@ def run_backtest(
     short_capacity_weights: np.ndarray | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: np.ndarray | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     force_exit_mask: np.ndarray | None = None,
     volume_limit_weights: np.ndarray | None = None,
     execution_mode: str = "naive",
@@ -3136,6 +3137,7 @@ def run_backtest(
             short_capacity_weights=tensor(short_capacity_weights),
             short_maintenance_ratio=short_maintenance_ratio,
             short_handling_fee_rate=tensor(short_handling_fee_rate),
+            overnight_fixed_close_to_open=overnight_fixed_close_to_open,
             force_exit_mask=tensor(force_exit_mask),
             volume_limit_weights=tensor(volume_limit_weights),
             overnight_returns=tensor(overnight_returns),
@@ -3227,6 +3229,7 @@ def run_backtest_torch(
     short_capacity_weights: torch.Tensor | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: torch.Tensor | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     force_exit_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
@@ -3280,6 +3283,11 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if overnight_fixed_close_to_open:
+        if mode != "tw_overnight":
+            raise ValueError("fixed close-to-open requires tw_overnight")
+        if normalize_portfolio_activation(portfolio_activation) != "pre_normalized":
+            raise ValueError("fixed close-to-open requires pre_normalized close weights")
     if mode == "crypto_perpetual":
         if overnight_returns is None:
             raise ValueError(
@@ -4055,8 +4063,17 @@ def run_backtest_torch(
                     f"{mode} phase execution requires explicit point-in-time "
                     "open-session buy/sell masks"
                 )
+            phase_actions = weights
+            if overnight_fixed_close_to_open:
+                if weights.dim() != 3 or int(weights.size(1)) != 3:
+                    raise ValueError("fixed close-to-open requires actions [T,3,S]")
+                # Clear unused channels before the shared daily budget is
+                # normalized, so arbitrary morning requests cannot dilute it.
+                phase_actions = torch.stack((torch.ones_like(weights[:, 2]),
+                                             torch.zeros_like(weights[:, 2]),
+                                             weights[:, 2]), dim=1)
             prepped_weights = _prepare_tw_phase_actions(
-                weights,
+                phase_actions,
                 tradable_mask,
                 execution_mode=mode,
                 long_only=long_only,
@@ -4065,6 +4082,13 @@ def run_backtest_torch(
                 portfolio_activation=portfolio_activation,
                 symbol_sharded=symbol_sharded_ledger,
             )
+            if overnight_fixed_close_to_open:
+                # Do not let a 13:25 signal change a preceding opening order.
+                prepped_weights = torch.stack((
+                    torch.ones_like(prepped_weights[:, 2]),
+                    torch.zeros_like(prepped_weights[:, 2]),
+                    prepped_weights[:, 2],
+                ), dim=1)
             device = prepped_weights.device
             daily_tradable = tradable_mask.to(device=device, dtype=torch.bool)
             close_buy = can_buy_mask.to(device=device, dtype=torch.bool)
@@ -4115,6 +4139,13 @@ def run_backtest_torch(
                     dim=1,
                 )
             phase_margin_rate: torch.Tensor | float | None = short_margin_rate
+            if overnight_fixed_close_to_open:
+                close_exit = (torch.zeros_like(daily_tradable) if force_exit_mask is None
+                              else force_exit_mask.to(device=device, dtype=torch.bool))
+                phase_force_exit = torch.stack((torch.ones_like(close_exit), close_exit), dim=1)
+                # Selection is a 13:25 policy mask; it cannot freeze a morning
+                # liquidation. The independent auction-side masks own fills.
+                phase_tradable = torch.stack((torch.ones_like(daily_tradable), daily_tradable), dim=1)
             if (
                 isinstance(short_margin_rate, torch.Tensor)
                 and short_margin_rate.dim() == 2
@@ -5284,6 +5315,7 @@ def run_backtest_integer_shares(
     short_capacity_shares: np.ndarray | None = None,
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: np.ndarray | float = 0.0,
+    overnight_fixed_close_to_open: bool = False,
     open_prices: np.ndarray | None = None,
     can_short_open_open_mask: np.ndarray | None = None,
     day_trade_eligible_mask: np.ndarray | None = None,
@@ -5349,6 +5381,11 @@ def run_backtest_integer_shares(
     either canonical result with a lower-fidelity Taiwan share audit.
     """
     mode = normalize_execution_mode(execution_mode)
+    if overnight_fixed_close_to_open:
+        if mode != "tw_overnight":
+            raise ValueError("fixed close-to-open requires tw_overnight")
+        if normalize_portfolio_activation(portfolio_activation) != "pre_normalized":
+            raise ValueError("fixed close-to-open requires pre_normalized close weights")
     if precomputed_exact_backtest is not None:
         if mode not in {
             "tw_day_trade",
@@ -6090,6 +6127,10 @@ def run_backtest_integer_shares(
                 clean_weights,
                 0.0,
             )
+            if overnight_fixed_close_to_open:
+                clean_weights = np.stack((np.ones_like(clean_weights[:, 2]),
+                                          np.zeros_like(clean_weights[:, 2]),
+                                          clean_weights[:, 2]), axis=1)
             if mode == "tw_cash":
                 flat_actions = clean_weights.reshape(
                     t_len_real * 2,
@@ -6384,6 +6425,15 @@ def run_backtest_integer_shares(
                     ),
                     axis=1,
                 )
+
+            if overnight_fixed_close_to_open:
+                target_weights = np.stack((np.ones_like(target_weights[:, 2]),
+                                           np.zeros_like(target_weights[:, 2]),
+                                           target_weights[:, 2]), axis=1)
+                close_exit = (np.zeros(daily_shape, dtype=bool) if force_exit_mask is None
+                              else required_daily_bool("force_exit_mask", force_exit_mask))
+                phase_force_exit = np.stack((np.ones_like(close_exit), close_exit), axis=1)
+                phase_tradable[:, 0] = True
 
             if max_volume_participation > 0.0:
                 if cash_close_volume_reference is None:

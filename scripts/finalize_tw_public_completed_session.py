@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-date", default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
+        "--step-attempts",
+        type=int,
+        default=4,
+        help="Retry each still-stale derived step before yielding to a later event.",
+    )
+    parser.add_argument(
+        "--step-retry-base-seconds",
+        type=float,
+        default=1.0,
+        help="Base delay for bounded exponential retries of one derived step.",
+    )
+    parser.add_argument(
         "--public-feature-incremental-days",
         type=int,
         default=14,
@@ -140,9 +152,18 @@ def _accepted_close_publication(
     *,
     expected_date: str,
     required_phase: str | None = None,
+    live_root: Path | None = None,
 ) -> tuple[str | None, dict[str, Any], dict[str, list[str]]]:
     phases = (required_phase,) if required_phase else CLOSE_PHASES
     failures: dict[str, list[str]] = {}
+    close_errors: list[str] = []
+    if live_root is not None:
+        for dataset in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
+            actual = _max_date(live_root / f"{dataset}.parquet")
+            if actual != expected_date:
+                close_errors.append(
+                    f"{dataset}: effective date {actual!r} != {expected_date}"
+                )
     for phase in phases:
         assert phase is not None
         receipt = _json(publication_root / phase / "latest.json")
@@ -151,6 +172,7 @@ def _accepted_close_publication(
             phase=phase,
             expected_date=expected_date,
         )
+        errors.extend(close_errors)
         if not errors:
             return phase, receipt, failures
         failures[phase] = errors
@@ -254,6 +276,10 @@ def main() -> int:
     args = parse_args()
     if args.workers <= 0:
         raise ValueError("--workers must be positive")
+    if args.step_attempts <= 0:
+        raise ValueError("--step-attempts must be positive")
+    if args.step_retry_base_seconds < 0:
+        raise ValueError("--step-retry-base-seconds must be non-negative")
     if args.public_feature_incremental_days < 0:
         raise ValueError("--public-feature-incremental-days must be non-negative")
     started = datetime.now(TAIPEI)
@@ -268,6 +294,7 @@ def main() -> int:
         publication_root,
         expected_date=expected_date,
         required_phase=args.publication_phase,
+        live_root=live_root,
     )
     steps: list[dict[str, Any]] = []
     if phase is None:
@@ -330,17 +357,57 @@ def main() -> int:
                 if not args.force and not current_errors.get(status_label):
                     continue
                 step_started = time.perf_counter()
-                completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+                attempts: list[dict[str, Any]] = []
+                completed: subprocess.CompletedProcess[Any] | None = None
+                for attempt in range(1, int(args.step_attempts) + 1):
+                    attempt_started = time.perf_counter()
+                    completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+                    attempt_elapsed = time.perf_counter() - attempt_started
+                    refreshed = _derived_state(
+                        live_root,
+                        expected_date=expected_date,
+                        session_date=started.date().isoformat(),
+                    )
+                    remaining = list(
+                        (refreshed.get("derived_errors") or {}).get(
+                            status_label,
+                            (),
+                        )
+                    )
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "return_code": int(completed.returncode),
+                            "elapsed_seconds": round(attempt_elapsed, 3),
+                            "remaining_errors": remaining,
+                        }
+                    )
+                    if completed.returncode == 0 and not remaining:
+                        break
+                    if attempt < int(args.step_attempts):
+                        delay = min(
+                            30.0,
+                            float(args.step_retry_base_seconds)
+                            * (2 ** (attempt - 1)),
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
+                assert completed is not None
                 steps.append(
                     {
                         "step": name,
                         "return_code": int(completed.returncode),
+                        "attempt_count": len(attempts),
+                        "attempts": attempts,
                         "elapsed_seconds": round(
                             time.perf_counter() - step_started, 3
                         ),
                     }
                 )
-                if completed.returncode != 0:
+                if (
+                    completed.returncode != 0
+                    or attempts[-1]["remaining_errors"]
+                ):
                     break
         after = _derived_state(
             live_root,

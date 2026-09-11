@@ -77,3 +77,32 @@ test("one paged-table shell preserves rows during errors and owns loading/count 
   assert.equal(byId("load-more-signals").disabled, true);
   assert.equal(byId("load-more-signals").classes.hidden, false);
 });
+
+test("mode card keeps filtered returns separate from the shared Discord account DTO", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function renderModes(data)"), app.indexOf("function renderBenchmarks(data)"));
+  let output = "";
+  let selectedReturn = 2;
+  const formatters = Object.fromEntries(["esc", "strategyLabel", "engineStatusShortLabel", "badge", "pnlClass", "summaryMoney", "number", "money", "shortTime", "sourceNumber"].map((key) => [key, String]));
+  const context = vm.createContext({...formatters, IS_OVERNIGHT: false,
+    rangeSummaryFor: () => ({return_pct: selectedReturn, end_equity_twd: 1250, cumulative_net_pnl_twd: 250, initial_capital_twd: 1000}),
+    executionStatusPresentation: () => ({kind: "good", label: "done"}),
+    fillOutcomePresentation: () => ({kind: "good", label: "done"}),
+    Presentation: {entryPolicy: () => "causal"}, displayPct: (value) => `${Number(value).toFixed(2)}%`,
+    setHtml: (_id, html) => { output = html; },
+  });
+  vm.runInContext(source, context);
+  const mode = {market: "unit", account_performance: {status: "available", return_pct: 25, asof: "2026-09-09", state_revision: 10}};
+  context.renderModes({modes: [mode]});
+  assert.match(output, />\+2\.00%</);
+  assert.match(output, /帳戶累積報酬（Discord 同口徑）/);
+  assert.match(output, />\+25\.00%</);
+  selectedReturn = 3;
+  context.renderModes({modes: [mode]});
+  assert.match(output, />\+3\.00%</);
+  assert.match(output, />\+25\.00%</);
+  mode.account_performance = {status: "unavailable"};
+  context.renderModes({modes: [mode]});
+  assert.match(output, /資料不可用/);
+  assert.doesNotMatch(output, />\+25\.00%</);
+});

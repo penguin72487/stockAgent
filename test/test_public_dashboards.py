@@ -494,8 +494,8 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=2"' in html
-    assert 'src="public.js?v=9"' in html
+    assert 'src="dashboard-core.js?v=4"' in html
+    assert 'src="public.js?v=10"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -688,8 +688,8 @@ def test_public_pages_share_visual_tokens() -> None:
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=6" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=2" defer' in html
-        assert html.index("dashboard-core.js?v=2") < html.index(
+        assert 'dashboard-core.js?v=4" defer' in html
+        assert html.index("dashboard-core.js?v=4") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -843,6 +843,8 @@ def _test_server() -> PublicDashboardServer:
         ("/dashboard-core.js", b"StockAgentDashboard"),
         ("/tw-day-trade/presentation.js", b"StockAgentTwPresentation"),
         ("/tw-day-trade/detail-components.js", b"StockAgentTwDetailComponents"),
+        ("/tw-overnight/presentation.js", b"StockAgentTwPresentation"),
+        ("/tw-overnight/detail-components.js", b"StockAgentTwDetailComponents"),
     ],
 )
 def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> None:

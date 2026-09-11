@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import csv
 import fcntl
 import json
@@ -103,6 +104,7 @@ from stockagent.live.signal_engine import (
     LiveSignalResult,
     clear_live_panel_memory_cache,
     generate_live_signal,
+    prefetch_live_signal_prices,
     write_live_weights_history,
 )
 from stockagent.live.service_notify import notify_systemd
@@ -120,8 +122,12 @@ ARTIFACT_BACKFILL_STATUS_PATH = (
 STARTUP_INFERENCE_WARMUP_STATUS_PATH = (
     ROOT / "artifacts" / "discord_bot" / "startup_inference_warmup.json"
 )
+POSTCLOSE_FAST_CACHE_STATUS_PATH = (
+    ROOT / "artifacts" / "discord_bot" / "postclose_fast_cache.json"
+)
 PYTHON_EXECUTABLE_SENTINEL = "{python}"
 _MODEL_INFERENCE_LOCK = threading.Lock()
+_OPENING_SIGNAL_LATENCY_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
 _PRE_SIGNAL_RUN_LOCKS_LOCK = threading.Lock()
 _PREWARM_RUN_LOCKS_LOCK = threading.Lock()
@@ -129,12 +135,28 @@ _PREOPEN_READINESS_LOCK = threading.Lock()
 _SERVICE_STATUS_LOCK = threading.Lock()
 _ARTIFACT_BACKFILL_STATUS_LOCK = threading.Lock()
 _STARTUP_INFERENCE_WARMUP_STATUS_LOCK = threading.Lock()
+_POSTCLOSE_FAST_CACHE_STATUS_LOCK = threading.Lock()
 _ERROR_LOG_LOCK = threading.Lock()
+_LATEST_SIGNAL_CACHE_LOCK = threading.Lock()
+_ARTIFACT_ROWS_CACHE_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 _PRE_SIGNAL_FAILURE_AT: dict[tuple[str, ...], tuple[float, str]] = {}
 _PRE_SIGNAL_RUN_LOCKS: dict[tuple[str, ...], threading.Lock] = {}
 _PREWARM_RUN_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _PREWARM_RESULTS: dict[tuple[str, str], LiveSignalResult] = {}
+_LATEST_SIGNAL_CACHE: dict[
+    str,
+    tuple[
+        tuple[str, int, int],
+        Path,
+        tuple[str, int, int],
+        dict[str, Any],
+    ],
+] = {}
+_ARTIFACT_ROWS_CACHE: dict[
+    str,
+    tuple[tuple[str, int, int], list[dict[str, Any]]],
+] = {}
 _BOT_RUN_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
 _BOT_RUN_ID = f"{os.getpid()}-{time.time_ns()}"
 
@@ -145,6 +167,161 @@ def _day_trade_state_dir() -> Path:
         "artifacts/live/tw_day_trade_simulation",
     )
     return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _opening_signal_latency_path() -> Path:
+    return _day_trade_state_dir() / "opening_signal_latency.jsonl"
+
+
+def _opening_gate_at(cfg: LiveMarketConfig, session_date: str) -> datetime:
+    zone = ZoneInfo(cfg.timezone or "Asia/Taipei")
+    open_text = str(
+        getattr(cfg, "open_time", None) or _market_schedule_time(cfg)
+    ).strip()
+    return datetime.fromisoformat(
+        f"{session_date}T{open_text[:5]}:00"
+    ).replace(tzinfo=zone)
+
+
+def _timestamp_delta_ms(later: Any, earlier: Any) -> float | None:
+    try:
+        later_dt = datetime.fromisoformat(str(later).replace("Z", "+00:00"))
+        earlier_dt = datetime.fromisoformat(str(earlier).replace("Z", "+00:00"))
+        if later_dt.tzinfo is None or earlier_dt.tzinfo is None:
+            return None
+        return round((later_dt - earlier_dt).total_seconds() * 1000.0, 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opening_signal_latency_record(
+    *,
+    cfg: LiveMarketConfig,
+    session_date: str,
+    schedule_key: str,
+    timing: dict[str, Any],
+    result: LiveSignalResult | None,
+    error: BaseException | None,
+) -> dict[str, Any]:
+    """Build one source-backed opening attempt without inferring missing clocks."""
+
+    gate = _opening_gate_at(cfg, session_date)
+    gate_text = gate.isoformat(timespec="microseconds")
+    summary = result.summary if result is not None else {}
+    live_latency = summary.get("live_latency") or {}
+    if not isinstance(live_latency, dict):
+        live_latency = {}
+    receipt = summary.get("price_receipt_timing") or {}
+    if not isinstance(receipt, dict):
+        receipt = {}
+    signal_started_at = summary.get("signal_started_at")
+    signal_ready_at = summary.get("signal_ready_at")
+    artifact_published_at = summary.get("artifact_published_at")
+    artifact_completed_at = summary.get("artifact_completed_at")
+    source_ready_from_open_ms = receipt.get("coverage_receipt_from_open_ms")
+    source_ready_to_signal_ms = receipt.get("coverage_to_signal_ready_ms")
+    signal_stage_keys = (
+        "pre_quote_prepare_ms",
+        "quote_fetch_ms",
+        "pre_inference_prepare_ms",
+        "model_inference_ms",
+        "post_inference_format_ms",
+    )
+    known_signal_ms = sum(
+        float(value)
+        for key in signal_stage_keys
+        if (value := live_latency.get(key)) is not None
+    )
+    signal_total_ms = live_latency.get("compute_before_publish_ms")
+    signal_other_ms = (
+        round(max(0.0, float(signal_total_ms) - known_signal_ms), 3)
+        if signal_total_ms is not None
+        else None
+    )
+    stages = {
+        "scheduler_wake_ms": timing.get("scheduler_wake_ms"),
+        "preopen_catch_up_ms": timing.get("preopen_catch_up_ms"),
+        "realtime_prepare_ms": timing.get("realtime_prepare_ms"),
+        "model_lock_queue_ms": timing.get("model_lock_queue_ms"),
+        "signal_pre_quote_prepare_ms": live_latency.get("pre_quote_prepare_ms"),
+        "signal_quote_fetch_ms": live_latency.get("quote_fetch_ms"),
+        "signal_pre_inference_prepare_ms": live_latency.get(
+            "pre_inference_prepare_ms"
+        ),
+        "model_inference_ms": live_latency.get("model_inference_ms"),
+        "signal_post_inference_format_ms": live_latency.get(
+            "post_inference_format_ms"
+        ),
+        "signal_other_compute_ms": signal_other_ms,
+        "artifact_publish_ms": live_latency.get("artifact_publish_ms"),
+    }
+    return {
+        "schema_version": 2,
+        "recorded_at": datetime.now().astimezone().isoformat(
+            timespec="microseconds"
+        ),
+        "run_id": _BOT_RUN_ID,
+        "source": "discord_scheduled_signal",
+        "measurement_boundary": "scheduled_open_gate_to_immutable_signal_ready",
+        "goal_ms": 1_000.0,
+        "status": "ready" if result is not None and error is None else "failed",
+        "session_date": session_date,
+        "market": str(cfg.market),
+        "schedule_key": schedule_key,
+        "gate_at": gate_text,
+        "scheduler_observed_at": timing.get("scheduler_observed_at"),
+        "attempt_started_at": timing.get("attempt_started_at"),
+        "model_lock_requested_at": timing.get("model_lock_requested_at"),
+        "model_lock_acquired_at": timing.get("model_lock_acquired_at"),
+        "signal_started_at": signal_started_at,
+        "signal_ready_at": signal_ready_at,
+        "artifact_published_at": artifact_published_at,
+        "artifact_completed_at": artifact_completed_at,
+        "signal_id": summary.get("signal_id"),
+        "price_source": summary.get("price_source"),
+        "price_request_started_at": summary.get("price_request_started_at"),
+        "price_response_received_at": summary.get(
+            "price_response_received_at"
+        ),
+        "ready_from_open_ms": _timestamp_delta_ms(signal_ready_at, gate_text),
+        "published_from_open_ms": _timestamp_delta_ms(
+            artifact_published_at, gate_text
+        ),
+        "completed_from_open_ms": _timestamp_delta_ms(
+            artifact_completed_at, gate_text
+        ),
+        "source_ready_from_open_ms": source_ready_from_open_ms,
+        "source_ready_to_signal_ms": source_ready_to_signal_ms,
+        "stages": stages,
+        "price_receipt_timing": receipt or None,
+        "quote_transport": live_latency.get("quote_transport"),
+        "ensure_previous_signal": timing.get("ensure_previous_signal"),
+        "previous_signal_backfill_limit": timing.get(
+            "previous_signal_backfill_limit"
+        ),
+        "previous_signal_history_disabled": (
+            timing.get("ensure_previous_signal") is False
+            and int(timing.get("previous_signal_backfill_limit") or 0) == 0
+        ),
+        "simulation_only": True,
+        "not_external_order_or_venue_rtt": True,
+        "error_type": type(error).__name__ if error is not None else None,
+        "error_code": getattr(error, "code", None) if error is not None else None,
+    }
+
+
+def _record_opening_signal_latency(payload: dict[str, Any]) -> None:
+    """Append after signal readiness so observability cannot delay publication."""
+
+    try:
+        path = _opening_signal_latency_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with _OPENING_SIGNAL_LATENCY_LOCK:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception as exc:
+        _log_exception("opening_signal_latency", exc)
 
 
 def _discord_service_status_path() -> Path:
@@ -584,17 +761,22 @@ def _log_exception(context: str, exc: Exception) -> None:
 
 
 def _record_audit_event(signal_id: str, action: str, interaction: discord.Interaction, **extra: Any) -> None:
-    AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    event = {
-        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "signal_id": signal_id,
-        "action": action,
-        "user_id": getattr(interaction.user, "id", None),
-        "user": str(interaction.user),
-        **extra,
-    }
-    with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "signal_id": signal_id,
+            "action": action,
+            "interaction_id": getattr(interaction, "id", None),
+            "user_id": getattr(interaction.user, "id", None),
+            "user": str(interaction.user),
+            **extra,
+        }
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        # Observability must never become a command-delivery dependency.
+        _log_exception(f"audit_event:{action}:{signal_id}", exc)
 
 
 def _markets_dir() -> Path:
@@ -861,6 +1043,44 @@ def _scheduled_markets() -> list[str]:
     return sorted(key for key, cfg in configs.items() if _market_enabled(cfg))
 
 
+def _artifact_maintenance_markets() -> list[str]:
+    """Prioritize user-facing paper modes ahead of generic history jobs."""
+
+    return sorted(
+        _scheduled_markets(),
+        key=lambda market: (
+            not bool(
+                getattr(
+                    _resolve_market(market),
+                    "day_trade_simulation_enabled",
+                    False,
+                )
+            ),
+            market,
+        ),
+    )
+
+
+def _tw_public_refresh_in_progress() -> bool:
+    """Return true while a writer owns the canonical TW live-data revision."""
+
+    configured = _env(
+        "STOCKAGENT_TW_PUBLIC_REFRESH_LOCK",
+        "/srv/stockagent-live/.locks/tw-public-refresh.lock",
+    )
+    lock_path = Path(str(configured))
+    if not lock_path.is_absolute():
+        lock_path = ROOT / lock_path
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return False
+
+
 @lru_cache(maxsize=32)
 def _scheduled_calendar_root(
     rule_data_dir: str,
@@ -936,15 +1156,21 @@ def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     schedule_time = _market_schedule_time(cfg)
     if now.strftime("%H:%M") == schedule_time:
         return f"{now.strftime('%Y-%m-%d')}:{cfg.market}"
-    if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+    day_trade = bool(getattr(cfg, "day_trade_simulation_enabled", False))
+    overnight = bool(getattr(cfg, "overnight_simulation_enabled", False))
+    if not day_trade and not overnight:
         return None
     schedule_minutes = _hhmm_minutes(schedule_time)
     now_minutes = now.hour * 60 + now.minute
-    exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+    last_entry_minutes = (
+        13 * 60 + 30
+        if overnight
+        else EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+    )
     if (
         schedule_minutes is None
         or now_minutes < schedule_minutes
-        or now_minutes >= exit_limit_minutes
+        or now_minutes >= last_entry_minutes
     ):
         return None
     # A machine or bot restart after the configured minute must not silently
@@ -958,7 +1184,10 @@ def _scheduled_signal_requires_preopen_catch_up(
     cfg: LiveMarketConfig, now: datetime
 ) -> bool:
     return (
-        bool(getattr(cfg, "day_trade_simulation_enabled", False))
+        bool(
+            getattr(cfg, "day_trade_simulation_enabled", False)
+            or getattr(cfg, "overnight_simulation_enabled", False)
+        )
         and now.strftime("%H:%M") != _market_schedule_time(cfg)
         and not _preopen_market_ready_for_session(cfg, now.date().isoformat())
     )
@@ -986,6 +1215,13 @@ def _preopen_market_ready_for_session(
         return False
     if not _summary_date_matches(row.get("completed_at"), session_date):
         return False
+    if bool(getattr(cfg, "overnight_simulation_enabled", False)):
+        return bool(
+            row.get("warm_contract") == "overnight_13_25_model_cache"
+            and row.get("panel_date")
+            and row.get("checkpoint_fingerprint")
+            and int(row.get("symbol_count") or 0) > 0
+        )
     limits = row.get("preopen_price_limits")
     eligibility = row.get("same_session_eligibility")
     venues = eligibility.get("venues") if isinstance(eligibility, dict) else None
@@ -1024,13 +1260,21 @@ def _preopen_market_final_armed_for_session(
     opening_prewarm = (
         opening_prewarm if isinstance(opening_prewarm, dict) else {}
     )
-    return bool(
+    common_ready = bool(
         final_arm.get("status") == "ready"
         and final_arm.get("run_id") == _BOT_RUN_ID
         and _summary_date_matches(final_arm.get("completed_at"), session_date)
         and latency.get("panel_cache_hit") is True
         and latency.get("checkpoint_cache_hit") is True
         and latency.get("model_cache_hit") is True
+    )
+    if bool(getattr(cfg, "overnight_simulation_enabled", False)):
+        return bool(
+            common_ready
+            and final_arm.get("warm_contract") == "overnight_13_25_model_cache"
+        )
+    return bool(
+        common_ready
         and opening_prewarm.get("ready") is True
         and opening_prewarm.get("run_id") == _BOT_RUN_ID
         and opening_prewarm.get("source") == "twse_tpex:mis"
@@ -1119,22 +1363,29 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     if not configured_prepare_time:
         return None
     prepare_minutes = _hhmm_minutes(configured_prepare_time)
-    open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None) or "09:00")
-    if prepare_minutes is None or open_minutes is None:
+    overnight = bool(getattr(cfg, "overnight_simulation_enabled", False))
+    decision_minutes = _hhmm_minutes(
+        _market_schedule_time(cfg)
+        if overnight
+        else (getattr(cfg, "open_time", None) or "09:00")
+    )
+    if prepare_minutes is None or decision_minutes is None:
         return None
     now_minutes = now.hour * 60 + now.minute
     session_open, _session_reason = _scheduled_market_session_day(cfg, now)
     if not session_open:
         return None
     session_date = now.date().isoformat()
-    if (
-        now_minutes >= open_minutes
-        and _day_trade_schedule_state(cfg, session_date) != "retry"
-    ):
+    decision_complete = (
+        _market_has_generated_signal_for_session(cfg, session_date)
+        if overnight
+        else _day_trade_schedule_state(cfg, session_date) != "retry"
+    )
+    if now_minutes >= decision_minutes and decision_complete:
         # After the engine has accepted today's signal, another bot restart
         # must not rebuild the panel/model or re-probe MIS for that market.
         return None
-    if prepare_minutes <= now_minutes < open_minutes:
+    if prepare_minutes <= now_minutes < decision_minutes:
         final_arm_lead = max(
             1,
             min(
@@ -1143,7 +1394,7 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
             ),
         )
         if (
-            now_minutes >= open_minutes - final_arm_lead
+            now_minutes >= decision_minutes - final_arm_lead
             and _preopen_market_ready_for_session(cfg, session_date)
             and not _preopen_market_final_armed_for_session(cfg, session_date)
         ):
@@ -1152,7 +1403,7 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
     if (
         bool(getattr(cfg, "day_trade_simulation_enabled", False))
-        and open_minutes <= now_minutes < exit_limit_minutes
+        and decision_minutes <= now_minutes < exit_limit_minutes
         and not _preopen_market_ready_for_session(cfg, session_date)
     ):
         return f"{session_date}:{cfg.market}:preopen-catch-up"
@@ -2149,6 +2400,16 @@ def _run_pre_signal_command_serialized(
     clear_live_panel_memory_cache()
 
 
+def _is_tw_daily_signal_market(cfg: LiveMarketConfig) -> bool:
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        return True
+    market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
+    frequency = str(
+        getattr(cfg, "history_frequency", "daily") or "daily"
+    ).strip().lower()
+    return market_type in {"tw", "taiwan"} and frequency in {"", "daily", "day", "1d"}
+
+
 def _completed_session_signal_path(
     cfg: LiveMarketConfig,
     status: MarketRuntimeStatus,
@@ -2156,8 +2417,7 @@ def _completed_session_signal_path(
     """Use official completed-session close data outside the live auction."""
 
     return bool(
-        getattr(cfg, "day_trade_simulation_enabled", False)
-        and getattr(cfg, "completed_session_command", ())
+        _is_tw_daily_signal_market(cfg)
         and not bool(getattr(status, "market_open", False))
     )
 
@@ -2181,7 +2441,7 @@ def _completed_session_target_date(status: MarketRuntimeStatus) -> str | None:
     cfg = getattr(status, "cfg", None)
     if not (
         cfg is not None
-        and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+        and _is_tw_daily_signal_market(cfg)
         and not bool(getattr(status, "market_open", False))
     ):
         return expected
@@ -2194,7 +2454,7 @@ def _completed_session_target_date(status: MarketRuntimeStatus) -> str | None:
     if (
         is_session
         and close_minutes is not None
-        and now.hour * 60 + now.minute > close_minutes
+        and now.hour * 60 + now.minute >= close_minutes
     ):
         return now.date().isoformat()
     return expected
@@ -2324,6 +2584,29 @@ def _completed_session_publication_ready(status: MarketRuntimeStatus) -> bool:
     expected = _completed_session_target_date(status)
     if not expected:
         return False
+    cfg = getattr(status, "cfg", None)
+    rule_root = getattr(cfg, "day_trade_rule_data_dir", None)
+    if rule_root:
+        live_root = _resolve_repo_path(rule_root) or Path(str(rule_root))
+        try:
+            import polars as pl
+
+            close_dates = {
+                name: (
+                    pl.scan_parquet(live_root / f"{name}.parquet")
+                    .select(pl.col("date").cast(pl.Date, strict=False).max())
+                    .collect()
+                    .item()
+                )
+                for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+            }
+        except Exception:
+            return False
+        if any(
+            value is None or value.isoformat() != expected
+            for value in close_dates.values()
+        ):
+            return False
     _receipt_path, publication_root = _completed_session_receipt_paths()
     for phase in ("close_final", "close_revision", "close_initial", "close_event"):
         try:
@@ -2451,17 +2734,17 @@ def _realtime_price_source_for_market(cfg: LiveMarketConfig) -> str | None:
 
 def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus, requested: str | None) -> str | None:
     text = str(requested or "").strip().lower()
-    closed_day_trade = bool(
-        getattr(cfg, "day_trade_simulation_enabled", False)
-        and not bool(getattr(status, "market_open", False))
-    )
-    if closed_day_trade and text not in {"", "auto", "panel"}:
+    completed_tw_session = _completed_session_signal_path(cfg, status)
+    if completed_tw_session and text not in {"", "auto", "panel"}:
+        market = str(getattr(cfg, "market", None) or "tw")
         raise BotUserError(
-            f"`{cfg.market}` 休市後只允許已驗收的官方收盤 panel；"
+            f"`{market}` 休市後只允許已驗收的官方收盤 panel；"
             f"不接受 price_source=`{text}` 的即時或盤中報價。"
         )
     if text and text != "auto":
         return text
+    if completed_tw_session:
+        return None
     market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
     frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
     if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "1m", "15m"}:
@@ -2469,7 +2752,10 @@ def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus
             return None
         return "panel"
     if market_type in {"tw", "taiwan"}:
-        if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        if bool(
+            getattr(cfg, "day_trade_simulation_enabled", False)
+            or getattr(cfg, "overnight_simulation_enabled", False)
+        ):
             # The model needs one official same-session opening observation,
             # not a full-universe executable book.  The ``tw`` provider owns a
             # receipt-backed single-flight MIS snapshot shared by all models.
@@ -2515,7 +2801,31 @@ async def market_autocomplete(
     query = str(current or "").strip().lower()
     choices: list[app_commands.Choice[str]] = []
     for key, cfg in sorted(_market_configs().items()):
-        if not _market_enabled(cfg):
+        # An enabled data/dashboard mode is not necessarily an executable
+        # deployment.  Do not advertise a target that deterministically fails
+        # with model_unsupported (for example, tw_cash before promotion).
+        if not _market_enabled(cfg) or not _market_has_model(cfg):
+            continue
+        label = f"{key} - {cfg.label}"
+        if query and query not in key.lower() and query not in cfg.label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=key))
+    return choices[:25]
+
+
+async def signal_market_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Expose only deployments maintained by the production signal schedule."""
+
+    del interaction
+    query = str(current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    configs = _market_configs()
+    for key in _scheduled_markets():
+        cfg = configs.get(key)
+        if cfg is None or not _market_enabled(cfg) or not _market_has_model(cfg):
             continue
         label = f"{key} - {cfg.label}"
         if query and query not in key.lower() and query not in cfg.label.lower():
@@ -2536,46 +2846,127 @@ def _signal_kwargs(
     progress_label: str | None = None,
     include_unconstrained_raw_scores: bool = False,
     day_trade_model_observation: str | None = None,
+    tw_latest_quote_cache_seconds: float | None = None,
+    tw_latest_quote_force_refresh: bool | None = None,
     prepared_status: MarketRuntimeStatus | None = None,
+    write: bool | None = None,
+    publish_latest: bool | None = None,
 ) -> dict:
     cfg = _effective_market_config(_resolve_market(market))
     status = prepared_status or _ensure_signal_ready(cfg, scheduled=scheduled)
-    configured_backfill = max(0, int(getattr(cfg, "previous_signal_backfill_limit", 32)))
-    backfill_limit = max(
-        0,
-        _env_int("STOCKAGENT_SIGNAL_BACKFILL_LIMIT", configured_backfill)
-        or configured_backfill,
-    )
+    is_day_trade = bool(getattr(cfg, "day_trade_simulation_enabled", False))
+    is_overnight = bool(getattr(cfg, "overnight_simulation_enabled", False))
+    if is_day_trade or is_overnight:
+        # Both adapters start a new model cohort without inheriting the prior
+        # signal artifact as a portfolio state.  Recursively producing older
+        # signals cannot change this cohort and only delays its critical path.
+        backfill_limit = 0
+    else:
+        configured_backfill = max(
+            0,
+            int(getattr(cfg, "previous_signal_backfill_limit", 32)),
+        )
+        backfill_limit = max(
+            0,
+            _env_int("STOCKAGENT_SIGNAL_BACKFILL_LIMIT", configured_backfill)
+            or configured_backfill,
+        )
     overrides = {
         "price_source": price_source if price_source and price_source != "auto" else None,
         "top_n": top_n,
         "min_abs_delta": min_abs_delta,
         "signal_id": signal_id,
         "market_notice": _market_notice(status),
+        "ensure_previous_signal": not (is_day_trade or is_overnight),
         "previous_signal_backfill_limit": backfill_limit,
         "progress_callback": progress_callback,
         "progress_label": progress_label,
         "include_unconstrained_raw_scores": bool(include_unconstrained_raw_scores),
-        "day_trade_model_observation": day_trade_model_observation,
+        "day_trade_model_observation": (
+            day_trade_model_observation
+            or ("latest_quote" if is_overnight else None)
+        ),
+        "tw_latest_quote_cache_seconds": tw_latest_quote_cache_seconds,
+        "tw_latest_quote_force_refresh": tw_latest_quote_force_refresh,
+        "write": write,
+        "publish_latest": publish_latest,
     }
     return cfg.signal_kwargs(**overrides)
 
 
-async def _send_command_error(interaction: discord.Interaction, prefix: str, exc: Exception) -> None:
-    if isinstance(exc, BotUserError):
-        _log_exception(prefix, exc)
+async def _deliver_deferred_response(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    context: str,
+    view: discord.ui.View | None = None,
+) -> str:
+    """Resolve a deferred interaction, with webhook and DM fallbacks.
+
+    ``response.defer(thinking=True)`` creates the interaction's original
+    response. Editing it is the shortest path to clear Discord's pending
+    spinner. A standalone follow-up does not resolve that original response
+    and, when it failed, used to leave /signal_now without a visible result or
+    durable delivery evidence.
+    """
+
+    payload = str(content or "(empty)")
+    failures: list[Exception] = []
+    edit_original = getattr(interaction, "edit_original_response", None)
+    if callable(edit_original):
         try:
-            await interaction.followup.send(str(exc))
-        except discord.HTTPException as send_exc:
-            _log_exception(f"{prefix}:error_response", send_exc)
-        return
+            await edit_original(content=payload, view=view)
+            return "original_response"
+        except Exception as exc:
+            failures.append(exc)
+            _log_exception(f"{context}:edit_original_response", exc)
+
+    followup = getattr(interaction, "followup", None)
+    followup_send = getattr(followup, "send", None)
+    if callable(followup_send):
+        try:
+            await followup_send(payload, view=view)
+            return "followup"
+        except Exception as exc:
+            failures.append(exc)
+            _log_exception(f"{context}:followup", exc)
+
+    user = getattr(interaction, "user", None)
+    user_send = getattr(user, "send", None)
+    if callable(user_send):
+        try:
+            # Views carry interaction-token state and are intentionally omitted
+            # from the final token-independent delivery path.
+            await user_send(payload)
+            return "dm_fallback"
+        except Exception as exc:
+            failures.append(exc)
+            _log_exception(f"{context}:dm_fallback", exc)
+
+    if failures:
+        raise RuntimeError(
+            f"Discord response delivery failed after {len(failures)} attempts"
+        ) from failures[-1]
+    raise RuntimeError("Discord interaction exposes no response delivery path")
+
+
+async def _send_command_error(interaction: discord.Interaction, prefix: str, exc: Exception) -> None:
     _log_exception(prefix, exc)
-    try:
-        await interaction.followup.send(
-            f"{prefix} failed: `{type(exc).__name__}`。詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
+    if isinstance(exc, BotUserError):
+        content = str(exc)
+    else:
+        content = (
+            f"{prefix} failed: `{type(exc).__name__}`。"
+            f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
         )
-    except discord.HTTPException as send_exc:
-        _log_exception(f"{prefix}:error_response", send_exc)
+    try:
+        await _deliver_deferred_response(
+            interaction,
+            content,
+            context=f"{prefix}:error_response",
+        )
+    except Exception as send_exc:
+        _log_exception(f"{prefix}:error_response_exhausted", send_exc)
 
 
 class StockAgentBot(discord.Client):
@@ -2617,12 +3008,25 @@ class StockAgentBot(discord.Client):
         self._startup_inference_warmup_terminal = False
         self._startup_inference_warmup_failure_count = 0
         self._startup_inference_warmup_retry_after = 0.0
+        self._postclose_fast_arm_keys: set[str] = set()
+        self._postclose_fast_completed_keys: set[str] = set()
+        self._postclose_fast_cache: dict[str, Any] = {}
+        self._postclose_fast_cache_inflight: dict[str, asyncio.Task[Any]] = {}
+        self._postclose_fast_quote_refresh_keys: set[str] = set()
+        self._postclose_fast_retry_after: dict[str, float] = {}
+        self._postclose_fast_state_date: str | None = None
+        self._postclose_fast_market_order: tuple[str, ...] = ()
+        self._postclose_fast_market_signature: tuple[str, ...] = ()
+        self._intraday_signal_inflight: dict[str, asyncio.Task[Any]] = {}
 
     async def setup_hook(self) -> None:
-        # Strategy recording is the primary responsibility of this process.
-        # Start its catch-up loop before Discord command synchronization so a
-        # missed market schedule is recovered immediately after login.
+        # Market-deadline work starts before Discord REST synchronization.
+        # The close loop is a cheap no-op outside its window, so this ordering
+        # also preserves the 09:00 scheduler while making an exact-13:30
+        # restart choose cache preparation first.
         _rotate_error_log_if_needed()
+        postclose_fast_arm.start()
+        postclose_fast_cache.start()
         scheduled_signal.start()
         service_heartbeat.start()
         notify_systemd(
@@ -2666,6 +3070,39 @@ class StockAgentBot(discord.Client):
 
 
 bot = StockAgentBot()
+
+
+@bot.tree.error
+async def _on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    """Make command-dispatch failures visible even before a callback runs."""
+
+    original = getattr(error, "original", error)
+    _log_exception("app_command_dispatch", original)
+    _record_audit_event(
+        f"interaction:{getattr(interaction, 'id', 'unknown')}",
+        "dispatch_failed",
+        interaction,
+        command=str(getattr(getattr(interaction, "command", None), "name", "unknown")),
+        error_type=type(original).__name__,
+    )
+    content = (
+        f"Discord 指令處理失敗：`{type(original).__name__}`。"
+        "服務已記錄錯誤，請直接重試一次。"
+    )
+    try:
+        if interaction.response.is_done():
+            await _deliver_deferred_response(
+                interaction,
+                content,
+                context="app_command_dispatch:error_response",
+            )
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception as send_exc:
+        _log_exception("app_command_dispatch:error_response_exhausted", send_exc)
 
 
 def _touch_opening_attempt_progress(message: str) -> None:
@@ -2741,13 +3178,49 @@ class _ConsoleProgress:
 
 
 def _run_market_signal_sync(**kwargs):
+    timing_sink = kwargs.pop("_timing_sink", None)
+    prefetch_prices = bool(kwargs.pop("_prefetch_prices", False))
+    worker_started = time.perf_counter()
     if _env_bool("STOCKAGENT_BOT_PROGRESS", True) and kwargs.get("progress_callback") is None:
         market = str(kwargs.get("market") or _default_market()).strip() or _default_market()
         label = str(kwargs.get("progress_label") or f"discord:{market}").strip()
         kwargs["progress_callback"] = _ConsoleProgress(prefix=label)
         kwargs["progress_label"] = label
+    resolved_kwargs = _signal_kwargs(**kwargs)
+    if prefetch_prices:
+        resolved_kwargs["_prefetched_quote"] = prefetch_live_signal_prices(**resolved_kwargs)
+    if isinstance(timing_sink, dict):
+        timing_sink["prepare_and_prefetch_ms"] = round((time.perf_counter() - worker_started) * 1000.0, 3)
+    if isinstance(timing_sink, dict):
+        timing_sink["ensure_previous_signal"] = bool(
+            resolved_kwargs.get("ensure_previous_signal", True)
+        )
+        timing_sink["previous_signal_backfill_limit"] = int(
+            resolved_kwargs.get("previous_signal_backfill_limit", 0) or 0
+        )
+    lock_requested = time.perf_counter()
+    if isinstance(timing_sink, dict):
+        timing_sink["model_lock_requested_at"] = (
+            datetime.now().astimezone().isoformat(timespec="microseconds")
+        )
     with _MODEL_INFERENCE_LOCK:
-        return generate_live_signal(**_signal_kwargs(**kwargs))
+        lock_acquired = time.perf_counter()
+        if isinstance(timing_sink, dict):
+            timing_sink["model_lock_acquired_at"] = (
+                datetime.now().astimezone().isoformat(timespec="microseconds")
+            )
+            timing_sink["model_lock_queue_ms"] = round(
+                (lock_acquired - lock_requested) * 1000.0,
+                3,
+            )
+        try:
+            return generate_live_signal(**resolved_kwargs)
+        finally:
+            if isinstance(timing_sink, dict):
+                timing_sink["signal_worker_ms"] = round(
+                    (time.perf_counter() - worker_started) * 1000.0,
+                    3,
+                )
 
 
 async def _run_market_signal(**kwargs):
@@ -2814,6 +3287,7 @@ def _write_preopen_readiness(
             "checkpoint_fingerprint": (summary or {}).get("checkpoint_fingerprint"),
             "symbol_count": (summary or {}).get("symbol_count"),
             "live_latency": (summary or {}).get("live_latency"),
+            "warm_contract": (summary or {}).get("warm_contract"),
             "preopen_price_limits": (summary or {}).get("preopen_price_limits"),
             "same_session_eligibility": (summary or {}).get(
                 "same_session_eligibility"
@@ -2881,6 +3355,7 @@ def _write_preopen_final_arm(
             "elapsed_seconds": round(float(elapsed_seconds), 3),
             "attempts": max(1, int(attempts)),
             "live_latency": (summary or {}).get("live_latency"),
+            "warm_contract": (summary or {}).get("warm_contract"),
             "opening_source_prewarm": (summary or {}).get(
                 "opening_source_prewarm"
             ),
@@ -2972,6 +3447,134 @@ def _load_startup_inference_warmup_status() -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("run_id") != _BOT_RUN_ID:
         return {"status": "pending", "run_id": _BOT_RUN_ID, "markets": []}
     return payload
+
+
+def _postclose_fast_cache_status_path() -> Path:
+    configured = _env(
+        "STOCKAGENT_POSTCLOSE_FAST_CACHE_STATUS_PATH",
+        str(POSTCLOSE_FAST_CACHE_STATUS_PATH),
+    )
+    return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _load_postclose_fast_cache_status() -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            _postclose_fast_cache_status_path().read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "pending", "markets": {}}
+    return payload if isinstance(payload, dict) else {"status": "pending", "markets": {}}
+
+
+def _write_postclose_fast_cache_status(
+    cfg: LiveMarketConfig,
+    *,
+    session_date: str,
+    phase: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    """Atomically expose the 13:20 arm and 13:30 cache acceptance states."""
+
+    path = _postclose_fast_cache_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    observed = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    with _POSTCLOSE_FAST_CACHE_STATUS_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("session_date") != session_date:
+            payload = {
+                "schema_version": 1,
+                "run_id": _BOT_RUN_ID,
+                "run_started_at": _BOT_RUN_STARTED_AT,
+                "session_date": session_date,
+                "markets": {},
+            }
+        markets = payload.setdefault("markets", {})
+        row = markets.setdefault(str(cfg.market), {})
+        phase_row = {
+            "status": str(status),
+            "updated_at": observed,
+            **(dict(details) if isinstance(details, dict) else {}),
+        }
+        if error is not None:
+            phase_row.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:1000],
+                }
+            )
+        row[str(phase)] = phase_row
+        expected_markets = [
+            market
+            for market in _scheduled_markets()
+            if bool(
+                getattr(
+                    _resolve_market(market),
+                    "day_trade_simulation_enabled",
+                    False,
+                )
+            )
+        ]
+        cache_ready = sum(
+            1
+            for market in expected_markets
+            if str(
+                ((markets.get(market) or {}).get("cache") or {}).get("status")
+            )
+            == "ready"
+        )
+        cache_failed = sum(
+            1
+            for market in expected_markets
+            if str(
+                ((markets.get(market) or {}).get("cache") or {}).get("status")
+            )
+            == "failed"
+        )
+        payload.update(
+            {
+                "updated_at": observed,
+                "market_count": len(expected_markets),
+                "cache_ready_count": cache_ready,
+                "cache_failed_count": cache_failed,
+                "status": (
+                    "ready"
+                    if expected_markets and cache_ready == len(expected_markets)
+                    else "degraded"
+                    if cache_failed
+                    else "warming"
+                ),
+            }
+        )
+        temporary = path.with_name(
+            f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return payload
+
+
+def _write_postclose_fast_cache_status_best_effort(
+    cfg: LiveMarketConfig,
+    **kwargs: Any,
+) -> None:
+    try:
+        _write_postclose_fast_cache_status(cfg, **kwargs)
+    except Exception as exc:
+        # The cache is the product; its telemetry must never stop retries.
+        _log_exception(f"postclose_fast_status:{cfg.market}", exc)
 
 
 def _startup_inference_warmup_must_defer() -> bool:
@@ -3179,6 +3782,53 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
         status = _runtime_status(cfg)
         if not status.data.fresh:
             _require_fresh_data_for_artifact_generation(cfg, status)
+        if bool(getattr(cfg, "overnight_simulation_enabled", False)):
+            # The 13:25 adapter needs the completed panel, checkpoint, model,
+            # and CUDA kernels hot.  Same-session day-trade eligibility and
+            # the 09:00 MIS opening receipt are unrelated to a close-auction
+            # decision and must not delay or falsely gate this product.
+            update_progress(3, "overnight panel and checkpoint ready")
+
+            def overnight_signal_progress(event: dict[str, Any]) -> None:
+                raw_step = max(0, int(event.get("step") or 0))
+                update_progress(
+                    min(progress_total - 1, raw_step + 3),
+                    str(event.get("message") or "overnight model warmup"),
+                )
+
+            kwargs = _signal_kwargs(
+                market=cfg.market,
+                price_source="panel",
+                scheduled=True,
+                progress_callback=_ConsoleProgress(
+                    prefix=f"preclose:{cfg.market}",
+                    event_callback=overnight_signal_progress,
+                ),
+                progress_label=f"preclose:{cfg.market}",
+                # This pass is cache preparation only.  The immutable signal
+                # still uses the latest-quote observation at 13:25.
+                day_trade_model_observation="session_open",
+            )
+            kwargs.update(
+                write=False,
+                ensure_previous_signal=False,
+                previous_signal_backfill_limit=0,
+            )
+            with _MODEL_INFERENCE_LOCK:
+                result = generate_live_signal(**kwargs)
+            result.summary["warm_contract"] = "overnight_13_25_model_cache"
+            update_progress(progress_total, "overnight model cache ready")
+            _write_preopen_readiness(
+                cfg,
+                status="ready",
+                started_at=started_at,
+                elapsed_seconds=time.perf_counter() - started,
+                summary=result.summary,
+                step=progress_total,
+                total=progress_total,
+                message="ready",
+            )
+            return result
         # Previous live-weight history is reporting state for tw_day_trade;
         # reconcile it before the opening gate, never on the 09:00 hot path.
         _sync_latest_live_weights_to_market_artifact(cfg)
@@ -3283,7 +3933,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
 
 
 def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
-    """Prove the panel/checkpoint/GPU model hot immediately before 09:00."""
+    """Prove panel/checkpoint/GPU caches immediately before the decision."""
 
     timezone_name = cfg.timezone or "Asia/Taipei"
     observed = datetime.now(ZoneInfo(timezone_name))
@@ -3295,13 +3945,16 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
     attempts = 0
     try:
         experiment = load_config(cfg.config_path)
-        opening_source_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
-            parquet_root=experiment.data.parquet_root,
-            session_date=session_date,
-            force_probe=True,
-        )
-        opening_source_prewarm["run_id"] = _BOT_RUN_ID
-        _sync_latest_live_weights_to_market_artifact(cfg)
+        overnight = bool(getattr(cfg, "overnight_simulation_enabled", False))
+        opening_source_prewarm: dict[str, Any] = {}
+        if not overnight:
+            opening_source_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
+                parquet_root=experiment.data.parquet_root,
+                session_date=session_date,
+                force_probe=True,
+            )
+            opening_source_prewarm["run_id"] = _BOT_RUN_ID
+            _sync_latest_live_weights_to_market_artifact(cfg)
 
         def run_once() -> LiveSignalResult:
             nonlocal attempts
@@ -3311,6 +3964,9 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
                 price_source="panel",
                 scheduled=True,
                 progress_label=f"final-arm:{cfg.market}",
+                day_trade_model_observation=(
+                    "session_open" if overnight else None
+                ),
             )
             kwargs.update(
                 write=False,
@@ -3335,8 +3991,11 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
         missing = [key for key in cache_keys if latency.get(key) is not True]
         if missing:
             raise RuntimeError(f"preopen final arm cache proof failed: {missing}")
-        result.summary["opening_source_prewarm"] = opening_source_prewarm
-        result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
+        if overnight:
+            result.summary["warm_contract"] = "overnight_13_25_model_cache"
+        else:
+            result.summary["opening_source_prewarm"] = opening_source_prewarm
+            result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
         _write_preopen_final_arm(
             cfg,
             status="ready",
@@ -3383,12 +4042,19 @@ async def _send_long_response(interaction: discord.Interaction, content: str) ->
     await _send_paginated_response(interaction, _split_content_pages(content))
 
 
-async def _send_signal_response(interaction: discord.Interaction, content: str, signal_id: str, market: str) -> None:
+async def _send_signal_response(
+    interaction: discord.Interaction,
+    content: str,
+    signal_id: str,
+    market: str,
+) -> str:
     view = SignalReviewView(signal_id=signal_id, market=market)
-    if len(content) <= 1900:
-        await interaction.followup.send(content, view=view)
-        return
-    await interaction.followup.send(content[:1900], view=view)
+    return await _deliver_deferred_response(
+        interaction,
+        content if len(content) <= 1900 else content[:1900],
+        context=f"signal_now:{market}:{signal_id}",
+        view=view,
+    )
 
 
 def _symbol_label(row: dict) -> str:
@@ -3634,11 +4300,23 @@ def _rewrite_signal_artifacts(result: Any) -> None:
     path = _resolve_repo_path(str(output_dir)) or Path(str(output_dir))
     if not path.exists():
         return
-    (path / "summary.json").write_text(
-        json.dumps(result.summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (path / "discord_message.md").write_text(result.message, encoding="utf-8")
+    payloads = {
+        path / "summary.json": json.dumps(
+            result.summary,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        path / "discord_message.md": str(result.message),
+    }
+    for target, content in payloads.items():
+        temporary = target.with_name(
+            f".{target.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _enrich_signal_performance_for_discord(
@@ -3648,40 +4326,26 @@ def _enrich_signal_performance_for_discord(
     max_rows: int,
     current_capital: float | None = None,
     debug: bool = False,
+    persist_artifacts: bool = True,
 ) -> Any:
-    capital = _resolve_current_capital(cfg, current_capital=current_capital)
-    summary = result.summary
-    if capital is not None:
-        summary["display_capital"] = float(capital)
-        portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
-        benchmark_return = _float_or_none(summary.get("benchmark_simple_return"))
-        if portfolio_return is not None:
-            summary["portfolio_pnl_value"] = portfolio_return * float(capital)
-        if benchmark_return is not None:
-            summary["benchmark_pnl_value"] = benchmark_return * float(capital)
-        if portfolio_return is not None and benchmark_return is not None:
-            summary["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
-
-    _refresh_summary_recent_performance_from_history(cfg, summary, capital=capital)
-
-    recent = summary.get("recent_performance")
-    if isinstance(recent, dict):
-        recent["window_label"] = _performance_window_label(cfg, recent)
-        if capital is not None:
-            for source_key, target_key in (
-                ("strategy_return", "strategy_pnl_value"),
-                ("benchmark_return", "benchmark_pnl_value"),
-                ("excess_return", "excess_pnl_value"),
-            ):
-                value = _float_or_none(recent.get(source_key))
-                if value is not None:
-                    recent[target_key] = value * float(capital)
-
-    result.message = format_signal_message(summary, max_rows=max_rows, debug=debug)
-    try:
-        _rewrite_signal_artifacts(result)
-    except Exception as exc:
-        _log_exception(f"rewrite_signal_artifacts:{cfg.market}", exc)
+    enriched = _summary_with_capital_context(
+        cfg,
+        result.summary,
+        current_capital=current_capital,
+        reuse_current_performance_snapshot=True,
+    )
+    result.summary.clear()
+    result.summary.update(enriched)
+    result.message = format_signal_message(
+        result.summary,
+        max_rows=max_rows,
+        debug=debug,
+    )
+    if persist_artifacts:
+        try:
+            _rewrite_signal_artifacts(result)
+        except Exception as exc:
+            _log_exception(f"rewrite_signal_artifacts:{cfg.market}", exc)
     return result
 
 
@@ -3690,7 +4354,7 @@ def _refresh_summary_recent_performance_from_history(
     summary: dict[str, Any],
     *,
     capital: float | None = None,
-) -> None:
+) -> bool:
     raw_recent = summary.get("recent_performance")
     if isinstance(raw_recent, dict):
         window = _float_or_none(raw_recent.get("window_days"))
@@ -3703,7 +4367,7 @@ def _refresh_summary_recent_performance_from_history(
     except Exception:
         days = 0
     if days <= 0:
-        return
+        return False
     try:
         recent_fast = _recent_performance_from_returns(cfg, days, capital=capital)
     except MarketUnsupportedError:
@@ -3722,10 +4386,10 @@ def _refresh_summary_recent_performance_from_history(
                 capital,
             )
         except MarketUnsupportedError:
-            return
+            return False
         except Exception as exc:
             _log_exception(f"recent_performance_history_fallback:{cfg.market}", exc)
-            return
+            return False
         recent_fast = {
             "window_days": int(history.days),
             "strategy_return": history.period_return,
@@ -3759,20 +4423,14 @@ def _refresh_summary_recent_performance_from_history(
                     recent_fast[target_key] = value * float(capital)
     recent: dict[str, Any] = dict(raw_recent) if isinstance(raw_recent, dict) else {}
     recent.update(recent_fast)
+    recent["status"] = "available"
     summary["recent_performance"] = recent
+    return True
 
 
 def _returns_artifact_path(fold_dir: Path) -> Path | None:
-    for name in (
-        "integer_share_daily_portfolio_returns.parquet",
-        "integer_share_daily_portfolio_returns.csv",
-        "daily_portfolio_returns.parquet",
-        "daily_portfolio_returns.csv",
-    ):
-        path = fold_dir / name
-        if path.exists():
-            return path
-    return None
+    from stockagent.live.performance_contract import resolve_return_artifact
+    return resolve_return_artifact(fold_dir)
 
 
 def _formal_returns_artifact_path(cfg: LiveMarketConfig) -> Path | None:
@@ -3795,16 +4453,60 @@ def _formal_returns_artifact_path(cfg: LiveMarketConfig) -> Path | None:
         )
     except Exception:
         incompatible_integer_oracle = False
-    if not incompatible_integer_oracle:
-        return _returns_artifact_path(fold_dir)
-    for name in (
-        "daily_portfolio_returns.parquet",
-        "daily_portfolio_returns.csv",
-    ):
-        path = fold_dir / name
-        if path.exists():
-            return path
-    return None
+    from stockagent.live.performance_contract import resolve_return_artifact
+    return resolve_return_artifact(fold_dir, prefer_integer=not incompatible_integer_oracle)
+
+
+def _path_revision(path: Path | None) -> tuple[str, int, int] | None:
+    """Return a cheap version for an atomically replaced artifact."""
+
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _discord_performance_revision(cfg: LiveMarketConfig) -> dict[str, Any]:
+    """Fingerprint mutable inputs behind the cached performance block."""
+
+    effective = _effective_market_config(cfg)
+    live_root = _resolve_repo_path(getattr(effective, "live_output_dir", None))
+    try:
+        returns_path = _formal_returns_artifact_path(effective)
+    except (MarketUnsupportedError, AttributeError, TypeError, ValueError):
+        returns_path = None
+    returns_revision = _path_revision(returns_path)
+    pointer_revision = _path_revision(
+        live_root / "latest_signal.json" if live_root is not None else None
+    )
+    return {
+        "schema_version": 1,
+        "returns": list(returns_revision) if returns_revision is not None else None,
+        "latest_signal": list(pointer_revision) if pointer_revision is not None else None,
+    }
+
+
+def _has_current_discord_performance_snapshot(
+    cfg: LiveMarketConfig,
+    summary: dict[str, Any],
+) -> bool:
+    from stockagent.live.performance_contract import PERFORMANCE_SCHEMA_VERSION
+
+    try:
+        schema_version = int(summary.get("discord_presentation_schema_version") or 0)
+    except (TypeError, ValueError):
+        return False
+    if schema_version != PERFORMANCE_SCHEMA_VERSION:
+        return False
+    if not isinstance(summary.get("recent_performance"), dict):
+        return False
+    if summary["recent_performance"].get("status") == "unavailable":
+        return False
+    stored = summary.get("discord_performance_revision")
+    return isinstance(stored, dict) and stored == _discord_performance_revision(cfg)
 
 
 def _history_sort_dt(value: Any) -> datetime:
@@ -3812,15 +4514,9 @@ def _history_sort_dt(value: Any) -> datetime:
 
 
 def _compound_return_values(values: list[float | None]) -> float | None:
-    total = 1.0
-    seen = False
-    for value in values:
-        number = _float_or_none(value)
-        if number is None:
-            continue
-        total *= 1.0 + number
-        seen = True
-    return total - 1.0 if seen else None
+    """Compound simple consumer DTOs, never raw training log-return columns."""
+    from stockagent.live.performance_contract import compound_simple_returns
+    return compound_simple_returns(values)
 
 
 def _risk_adjusted_metrics_from_simple_returns(
@@ -3836,7 +4532,14 @@ def _risk_adjusted_metrics_from_simple_returns(
     periods = max(1, int(annualization_periods))
     if simple.size == 0:
         return {}
-    log_returns = np.log1p(np.clip(simple, -0.999999, None))
+    if not np.isfinite(simple).all() or (simple < -1.0).any():
+        raise ValueError("Invalid simple returns for risk metrics")
+    if (simple == -1.0).any():
+        return {"sharpe": None, "sortino": None, "max_drawdown": -1.0,
+                "annualized_return": -1.0, "calmar": -1.0, "ruined": True,
+                "risk_observations": int(simple.size), "risk_annualization_periods": periods,
+                "risk_return_basis": "net_log_return", "risk_status": "undefined_after_ruin"}
+    log_returns = np.log1p(simple)
     average = float(log_returns.mean())
     volatility = float(log_returns.std(ddof=0))
     downside = np.minimum(log_returns, 0.0)
@@ -3870,6 +4573,7 @@ def _recent_performance_from_returns(
     capital: float | None = None,
 ) -> dict[str, Any] | None:
     import polars as pl
+    from stockagent.live.performance_contract import simple_return_frame
 
     try:
         limit = max(1, int(periods))
@@ -3882,9 +4586,12 @@ def _recent_performance_from_returns(
         source_paths.append(path)
         columns = ["date", "portfolio_return", "benchmark_return"]
         if path.suffix == ".parquet":
-            frame = pl.scan_parquet(path).select([pl.col(name) for name in columns if name]).tail(limit * 2).collect()
+            scan = pl.scan_parquet(path)
+            unit_columns = ["return_type"] if "return_type" in scan.collect_schema().names() else []
+            frame = scan.select(columns + unit_columns).sort("date").tail(limit * 2).collect()
         else:
-            frame = pl.read_csv(path, columns=columns, infer_schema_length=10000).tail(limit * 2)
+            frame = pl.read_csv(path, infer_schema_length=10000).sort("date").tail(limit * 2)
+        frame = simple_return_frame(frame)
         for row in frame.select(columns).to_dicts():
             date_key = _date_key(row.get("date"))
             if not date_key:
@@ -3899,7 +4606,14 @@ def _recent_performance_from_returns(
             )
 
     live_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
-    for summary_path, summary in _recent_market_signal_metrics(cfg, max_summaries=max(limit * 4, 64)):
+    # All day-trade signal artifacts are target previews; only the settled
+    # account history owns returns. Scanning thousands of preview directories
+    # cannot add a valid return and grows command latency with system uptime.
+    live_metrics = (
+        [] if bool(getattr(cfg, "day_trade_simulation_enabled", False))
+        else _recent_market_signal_metrics(cfg, max_summaries=max(limit * 4, 64))
+    )
+    for summary_path, summary in live_metrics:
         if bool(summary.get("execution_preview_only")):
             continue
         date_key = _date_key(
@@ -3950,7 +4664,9 @@ def _recent_performance_from_returns(
         "strategy_return": strategy,
         "benchmark_return": benchmark,
         "excess_return": excess,
-        "source": "returns_artifact_with_live_signals",
+        "source": "model_backtest_returns" if bool(getattr(cfg, "day_trade_simulation_enabled", False)) else "returns_artifact_with_live_signals",
+        "return_type": "simple",
+        "source_return_type": "log",
         "start_date": str(selected[0].get("date")),
         "end_date": str(selected[-1].get("date")),
     }
@@ -4011,7 +4727,10 @@ def _summary_with_capital_context(
     summary: dict[str, Any],
     *,
     current_capital: float | None = None,
+    reuse_current_performance_snapshot: bool = False,
 ) -> dict[str, Any]:
+    from stockagent.live.performance_contract import PERFORMANCE_SCHEMA_VERSION, paper_account_performance
+
     out = dict(summary)
     capital = _resolve_current_capital(cfg, current_capital=current_capital)
     if capital is not None:
@@ -4024,7 +4743,16 @@ def _summary_with_capital_context(
             out["benchmark_pnl_value"] = benchmark_return * float(capital)
         if portfolio_return is not None and benchmark_return is not None:
             out["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
-    _refresh_summary_recent_performance_from_history(cfg, out, capital=capital)
+    if not (
+        reuse_current_performance_snapshot
+        and _has_current_discord_performance_snapshot(cfg, out)
+    ):
+        refreshed = _refresh_summary_recent_performance_from_history(cfg, out, capital=capital)
+        if refreshed is False:
+            # Never stamp the new semantics version onto an old numeric block
+            # when the source is missing/invalid. The next request may retry.
+            out["recent_performance"] = {"status": "unavailable", "return_type": "simple",
+                                         "window_days": getattr(cfg, "benchmark_window_days", 32)}
     recent = out.get("recent_performance")
     if isinstance(recent, dict):
         recent = dict(recent)
@@ -4038,7 +4766,29 @@ def _summary_with_capital_context(
                 value = _float_or_none(recent.get(source_key))
                 if value is not None:
                     recent[target_key] = value * float(capital)
+        if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            recent["performance_kind"] = "model_backtest"
+            recent["return_type"] = "simple"
+            recent["signal_date"] = _date_key(out.get("asof_date") or out.get("panel_data_date"))
+            recent["through_signal_date"] = bool(recent.get("end_date") and recent.get("signal_date") and str(recent["end_date"])[:10] >= str(recent["signal_date"])[:10])
         out["recent_performance"] = recent
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        # Read one atomic state, not the historical model table or a previous
+        # Discord summary. This never scans ledgers or enters the model worker.
+        root = _resolve_repo_path(getattr(cfg, "day_trade_simulation_state_dir", None)) or _day_trade_state_dir()
+        try:
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            modes = state.get("modes") or {}
+            mode = modes.get(cfg.market) or {}
+            enabled = state.get("enabled_markets")
+            if isinstance(enabled, list) and cfg.market not in enabled:
+                mode = {}
+            out["account_performance"] = paper_account_performance(mode, revision=state.get("state_revision"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            out["account_performance"] = paper_account_performance({})
+        out["display_capital_basis"] = "sizing_reference_not_paper_account_equity"
+    out["discord_presentation_schema_version"] = PERFORMANCE_SCHEMA_VERSION
+    out["discord_performance_revision"] = _discord_performance_revision(cfg)
     return out
 
 
@@ -4635,6 +5385,14 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
     if root is None or not root.exists():
         return None
     pointer_path = root / "latest_signal.json"
+    pointer_revision = _path_revision(pointer_path)
+    if pointer_revision is not None:
+        with _LATEST_SIGNAL_CACHE_LOCK:
+            cached = _LATEST_SIGNAL_CACHE.get(str(root))
+        if cached is not None and cached[0] == pointer_revision:
+            summary_path = cached[1]
+            if _path_revision(summary_path) == cached[2]:
+                return summary_path, dict(cached[3])
     try:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         if not isinstance(pointer, dict):
@@ -4647,6 +5405,17 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         ):
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             if isinstance(summary, dict):
+                summary_revision = _path_revision(summary_path)
+                if pointer_revision is not None and summary_revision is not None:
+                    with _LATEST_SIGNAL_CACHE_LOCK:
+                        if len(_LATEST_SIGNAL_CACHE) >= 32:
+                            _LATEST_SIGNAL_CACHE.pop(next(iter(_LATEST_SIGNAL_CACHE)))
+                        _LATEST_SIGNAL_CACHE[str(root)] = (
+                            pointer_revision,
+                            summary_path,
+                            summary_revision,
+                            summary,
+                        )
                 return summary_path, summary
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         pass
@@ -4778,6 +5547,27 @@ def _write_discord_service_status() -> dict[str, Any]:
     scheduled_day_trade_markets = sorted(
         set(day_trade_markets).intersection(_scheduled_markets())
     )
+    overnight_configs = {
+        market: cfg
+        for market, cfg in configs.items()
+        if _market_enabled(cfg)
+        and bool(getattr(cfg, "overnight_simulation_enabled", False))
+    }
+    overnight_markets = sorted(overnight_configs)
+    overnight_state_dirs = {
+        str(getattr(cfg, "overnight_simulation_state_dir", "") or "").strip()
+        for cfg in overnight_configs.values()
+    }
+    overnight_state_dirs.discard("")
+    overnight_engine = (
+        load_service_sync(
+            _resolve_repo_path(next(iter(overnight_state_dirs)))
+            or Path(next(iter(overnight_state_dirs)))
+        )
+        if len(overnight_state_dirs) == 1
+        else {}
+    ) or {}
+    overnight_modes = overnight_engine.get("modes") or {}
     engine = load_service_sync(_day_trade_state_dir()) or {}
     modes = engine.get("modes") or {}
     payload = {
@@ -4794,8 +5584,13 @@ def _write_discord_service_status() -> dict[str, Any]:
         # Discord liveness gate. Keep their state visible without disconnecting
         # commands when a warmup retry is still pending.
         "startup_inference_warmup": _load_startup_inference_warmup_status(),
+        "postclose_fast_cache": _load_postclose_fast_cache_status(),
         "day_trade_markets": day_trade_markets,
         "scheduled_day_trade_markets": scheduled_day_trade_markets,
+        "overnight_markets": overnight_markets,
+        "scheduled_overnight_markets": sorted(
+            set(overnight_markets).intersection(_scheduled_markets())
+        ),
         "engine_run_id": engine.get("engine_run_id"),
         "engine_state_revision": int(engine.get("state_revision") or 0),
         "engine_published_at": engine.get("published_at"),
@@ -4803,6 +5598,16 @@ def _write_discord_service_status() -> dict[str, Any]:
             market: (modes.get(market) or {}).get("signal_id")
             for market in day_trade_markets
             if isinstance(modes.get(market), dict)
+        },
+        "overnight_engine_run_id": overnight_engine.get("engine_run_id"),
+        "overnight_engine_state_revision": int(
+            overnight_engine.get("state_revision") or 0
+        ),
+        "overnight_engine_published_at": overnight_engine.get("published_at"),
+        "overnight_mode_signal_ids": {
+            market: (overnight_modes.get(market) or {}).get("signal_id")
+            for market in overnight_markets
+            if isinstance(overnight_modes.get(market), dict)
         },
         "simulation_only": True,
         "production_order_possible": False,
@@ -5019,8 +5824,21 @@ def _latest_signal_result_from_artifacts(
     current_capital: float | None = None,
     debug: bool = False,
 ):
-    enriched = _summary_with_capital_context(cfg, dict(summary), current_capital=current_capital)
-    message = _latest_signal_message(cfg, summary_path, enriched, top_n=top_n, current_capital=current_capital, debug=debug)
+    enriched = _summary_with_capital_context(
+        cfg,
+        dict(summary),
+        current_capital=current_capital,
+        reuse_current_performance_snapshot=True,
+    )
+    message = _latest_signal_message(
+        cfg,
+        summary_path,
+        enriched,
+        top_n=top_n,
+        current_capital=current_capital,
+        debug=debug,
+        summary_prepared=True,
+    )
     return SimpleNamespace(
         summary=enriched,
         weights_rows=_latest_artifact_rows(enriched, summary_path, "weights_path", "top_positions"),
@@ -5060,6 +5878,363 @@ def _signal_now_cached_result(
     result = _latest_signal_result_from_artifacts(cfg, summary_path, summary, top_n=top_n, debug=debug)
     result.summary["signal_now_cache"] = reason
     return summary_path, result, reason
+
+
+def _postclose_fast_window_minutes() -> float:
+    return max(
+        15.0,
+        _env_float("STOCKAGENT_POSTCLOSE_FAST_WINDOW_MINUTES", 90.0),
+    )
+
+
+def _postclose_fast_arm_minutes() -> float:
+    return max(
+        1.0,
+        _env_float("STOCKAGENT_POSTCLOSE_FAST_ARM_MINUTES", 10.0),
+    )
+
+
+def _postclose_fast_timeout_seconds() -> float:
+    # Leave enough time to resolve and edit the original Discord response
+    # before the one-minute product SLO expires.
+    return min(
+        55.0,
+        max(
+            5.0,
+            _env_float("STOCKAGENT_POSTCLOSE_FAST_TIMEOUT_SECONDS", 50.0),
+        ),
+    )
+
+
+def _postclose_fast_price_source(requested_price_source: str | None) -> str | None:
+    source = str(requested_price_source or "auto").strip().lower() or "auto"
+    if source in {"auto", "tw", "twse", "tpex", "mis", "tw_mis"}:
+        # ``tw`` is the diversified source router: official MIS first, then
+        # the already-running paper-engine Shioaji session, then direct
+        # Shioaji for only the still-missing symbols.
+        return "tw"
+    if source in {"shioaji", "sj", "sinopac", "永豐"}:
+        return "shioaji"
+    return None
+
+
+def _postclose_fast_signal_context(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the bounded 13:30 provisional-close product window.
+
+    This gate deliberately does not use ``status.market_open``: that value is
+    display-cached and can still say open during the first few seconds after
+    13:30.  The exchange calendar plus the configured cash close own this
+    deadline instead.
+    """
+
+    if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        return None
+    if not _is_tw_daily_signal_market(cfg):
+        return None
+    timezone_name = str(getattr(cfg, "timezone", None) or "Asia/Taipei")
+    local_now = now or datetime.now(ZoneInfo(timezone_name))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo(timezone_name))
+    else:
+        local_now = local_now.astimezone(ZoneInfo(timezone_name))
+    close_minutes = _hhmm_minutes(getattr(cfg, "close_time", None))
+    if close_minutes is None:
+        return None
+    close_at = local_now.replace(
+        hour=close_minutes // 60,
+        minute=close_minutes % 60,
+        second=0,
+        microsecond=0,
+    )
+    elapsed = (local_now - close_at).total_seconds()
+    if elapsed < 0.0 or elapsed > _postclose_fast_window_minutes() * 60.0:
+        return None
+    session_open, _reason = _scheduled_market_session_day(cfg, local_now)
+    if not session_open:
+        return None
+    session_date = local_now.date().isoformat()
+    data = getattr(status, "data", None)
+    latest = _date_key(
+        getattr(data, "last_data_date", None)
+        or getattr(data, "panel_date", None)
+    )
+    if latest and latest > session_date:
+        return None
+    # Do not gate on generic ``expected_latest_date`` here. Before the
+    # configured official data-ready time (typically 13:40), that field is
+    # intentionally still the prior session—the exact window this fast causal
+    # product exists to bridge.
+    if (
+        not bool(getattr(status, "market_open", False))
+        and _completed_session_receipt_ready(status)
+    ):
+        # Once the canonical panel has passed its receipt, the ordinary
+        # official-close path is both fast and authoritative.
+        return None
+    return {
+        "schema_version": 1,
+        "session_date": session_date,
+        "close_at": close_at.isoformat(timespec="seconds"),
+        "elapsed_since_close_seconds": round(max(0.0, elapsed), 3),
+        "deadline": (
+            close_at + timedelta(minutes=_postclose_fast_window_minutes())
+        ).isoformat(timespec="seconds"),
+    }
+
+
+def _postclose_fast_cache_key(
+    cfg: LiveMarketConfig,
+    context: dict[str, Any],
+    *,
+    price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    include_unconstrained_raw_scores: bool,
+) -> str:
+    return (
+        f"{context['session_date']}:{cfg.market}:{price_source}:"
+        f"{int(top_n)}:{float(min_abs_delta):.8g}:"
+        f"{int(bool(include_unconstrained_raw_scores))}"
+    )
+
+
+def _clone_live_signal_result(result: Any) -> Any:
+    return SimpleNamespace(
+        summary=copy.deepcopy(dict(result.summary)),
+        weights_rows=copy.deepcopy(list(getattr(result, "weights_rows", []))),
+        rebalance_rows=copy.deepcopy(list(getattr(result, "rebalance_rows", []))),
+        decision_rows=copy.deepcopy(list(getattr(result, "decision_rows", []))),
+        message=str(getattr(result, "message", "")),
+        # A provisional result is intentionally memory-only and must never
+        # cause the formal latest-signal pointer or portfolio history to move.
+        output_dir=None,
+    )
+
+
+def _mark_postclose_fast_preview(
+    cfg: LiveMarketConfig,
+    result: Any,
+    context: dict[str, Any],
+    *,
+    official_job_key: str | None = None,
+) -> Any:
+    summary = result.summary
+    contract = summary.get("signal_price_contract")
+    observation = (
+        str(contract.get("model_observation") or "").strip().lower()
+        if isinstance(contract, dict)
+        else ""
+    )
+    if observation != "intraday_latest_quote":
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版拒絕非即時行情模型輸入："
+            f"model_observation=`{observation or 'missing'}`。"
+        )
+    source = str(summary.get("price_source") or "").strip().lower()
+    if not source or source.startswith("panel"):
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版沒有取得即時來源，拒絕沿用前收價。"
+        )
+    session_date = str(context["session_date"])
+    if _date_key(summary.get("price_timestamp")) != session_date:
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版行情不是同一交易日，拒絕產生訊號。"
+        )
+    close_at = datetime.fromisoformat(str(context["close_at"]))
+    quote_received_at = _parse_time(summary.get("price_response_received_at"))
+    if quote_received_at is None or quote_received_at < close_at:
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版缺少收盤後行情接收證明，拒絕沿用盤前快取。"
+        )
+    feature_cutoff = _date_key(
+        summary.get("feature_cutoff_date") or summary.get("panel_data_date")
+    )
+    if not feature_cutoff or feature_cutoff >= session_date:
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版特徵截止日不符合前一個已驗收交易日："
+            f"features_through=`{feature_cutoff or 'missing'}` session=`{session_date}`。"
+        )
+    coverage = _float_or_none(summary.get("opening_quote_active_coverage"))
+    minimum_coverage = min(
+        1.0,
+        max(
+            0.0,
+            _env_float("STOCKAGENT_TW_OPENING_MIN_COVERAGE", 0.90),
+        ),
+    )
+    if coverage is None or coverage < minimum_coverage:
+        raise BotUserError(
+            f"`{cfg.market}` 盤後快速版同日行情覆蓋不足："
+            f"coverage=`{coverage if coverage is not None else 'missing'}` "
+            f"required=`{minimum_coverage:.2f}`。"
+        )
+    prior_marker = summary.get("postclose_fast_preview")
+    prior_marker = prior_marker if isinstance(prior_marker, dict) else {}
+    ready_at = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+    marker = {
+        "schema_version": 1,
+        "provisional": True,
+        "session_date": session_date,
+        "cash_close_at": str(context["close_at"]),
+        "cache_ready_at": prior_marker.get("cache_ready_at")
+        or ready_at.isoformat(timespec="milliseconds"),
+        "cash_close_to_cache_ms": prior_marker.get("cash_close_to_cache_ms")
+        if prior_marker.get("cash_close_to_cache_ms") is not None
+        else round(
+            max(0.0, (ready_at - close_at).total_seconds()) * 1000.0,
+            3,
+        ),
+        "basis": "same_session_last_quote_over_previous_accepted_daily_features",
+        "quote_received_at": quote_received_at.isoformat(timespec="milliseconds"),
+        "quote_coverage": float(coverage),
+        "minimum_quote_coverage": float(minimum_coverage),
+        "official_close_receipt_accepted": False,
+        "opening_execution_eligible": False,
+        "formal_history_eligible": False,
+        "official_reconciliation_job": official_job_key,
+    }
+    summary["postclose_fast_preview"] = marker
+    summary["execution_preview_only"] = True
+    if isinstance(contract, dict):
+        contract["opening_execution_eligible"] = False
+        contract["intraday_prices_allowed_in_portfolio_history"] = False
+    original_notice = str(summary.get("market_notice") or "").strip()
+    summary["postclose_fast_source_notice"] = original_notice or None
+    summary["market_notice"] = (
+        "13:30 盤後快速暫定版：使用同交易日最後行情與前一個已驗收交易日特徵；"
+        "不是官方收盤版、不可寫入正式歷史或視為成交。官方 close receipt 通過後會另行覆核。"
+    )
+    return result
+
+
+async def _generate_postclose_fast_signal(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    context: dict[str, Any],
+    *,
+    price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    include_unconstrained_raw_scores: bool,
+    debug: bool,
+) -> Any:
+    refresh_key = f"{context['session_date']}:tw-session-quote"
+    force_quote_refresh = bool(
+        price_source == "tw"
+        and refresh_key not in bot._postclose_fast_quote_refresh_keys
+    )
+    if force_quote_refresh:
+        # Reserve before the first await so simultaneous slash commands cannot
+        # each launch a full-universe close sweep.
+        bot._postclose_fast_quote_refresh_keys.add(refresh_key)
+    try:
+        result = await _run_market_signal(
+            market=cfg.market,
+            price_source=price_source,
+            top_n=top_n,
+            min_abs_delta=min_abs_delta,
+            progress_label=f"postclose-fast:{cfg.market}",
+            include_unconstrained_raw_scores=include_unconstrained_raw_scores,
+            day_trade_model_observation="latest_quote",
+            tw_latest_quote_cache_seconds=max(
+                1.0,
+                _env_float(
+                    "STOCKAGENT_POSTCLOSE_FAST_QUOTE_CACHE_SECONDS",
+                    120.0,
+                ),
+            ),
+            tw_latest_quote_force_refresh=force_quote_refresh,
+            prepared_status=status,
+            write=False,
+        )
+    except Exception:
+        if force_quote_refresh:
+            bot._postclose_fast_quote_refresh_keys.discard(refresh_key)
+        raise
+    _mark_postclose_fast_preview(cfg, result, context)
+    return await asyncio.to_thread(
+        _enrich_signal_performance_for_discord,
+        cfg,
+        result,
+        max_rows=0,
+        debug=debug,
+        persist_artifacts=False,
+    )
+
+
+async def _postclose_fast_result(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    context: dict[str, Any],
+    *,
+    price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    include_unconstrained_raw_scores: bool,
+    debug: bool,
+    official_job_key: str | None = None,
+) -> tuple[Any, str]:
+    _prune_postclose_fast_state(str(context["session_date"]))
+    key = _postclose_fast_cache_key(
+        cfg,
+        context,
+        price_source=price_source,
+        top_n=top_n,
+        min_abs_delta=min_abs_delta,
+        include_unconstrained_raw_scores=include_unconstrained_raw_scores,
+    )
+    cached = bot._postclose_fast_cache.get(key)
+    cache_state = "memory"
+    if cached is None:
+        cache_state = "generated"
+        task = bot._postclose_fast_cache_inflight.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                _generate_postclose_fast_signal(
+                    cfg,
+                    status,
+                    context,
+                    price_source=price_source,
+                    top_n=top_n,
+                    min_abs_delta=min_abs_delta,
+                    include_unconstrained_raw_scores=include_unconstrained_raw_scores,
+                    debug=debug,
+                )
+            )
+            bot._postclose_fast_cache_inflight[key] = task
+
+            def clear_inflight(done: asyncio.Task[Any], *, cache_key: str = key) -> None:
+                if bot._postclose_fast_cache_inflight.get(cache_key) is done:
+                    bot._postclose_fast_cache_inflight.pop(cache_key, None)
+
+            task.add_done_callback(clear_inflight)
+        cached = await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=_postclose_fast_timeout_seconds(),
+        )
+        bot._postclose_fast_cache[key] = _clone_live_signal_result(cached)
+    result = _clone_live_signal_result(cached)
+    _mark_postclose_fast_preview(
+        cfg,
+        result,
+        context,
+        official_job_key=official_job_key,
+    )
+    result = await asyncio.to_thread(
+        _enrich_signal_performance_for_discord,
+        cfg,
+        result,
+        max_rows=0,
+        debug=debug,
+        persist_artifacts=False,
+    )
+    result.summary["signal_now_cache"] = f"postclose_fast_{cache_state}"
+    return result, cache_state
 
 
 def _summary_has_raw_score_contract(
@@ -5323,7 +6498,11 @@ def _artifact_backfill_is_current(
         )
     if execution_mode == "tw_day_trade":
         formal_latest = _formal_history_latest_date(cfg)
-        return bool(formal_latest and formal_latest >= target_key)
+        return bool(
+            formal_latest
+            and formal_latest >= target_key
+            and _market_has_panel_close_signal_for_date(cfg, target_key)
+        )
     return _market_has_live_signal_for_date(cfg, target_key)
 
 
@@ -5432,6 +6611,48 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
 _run_day_trade_settlement_backfill = _run_formal_history_backfill
 
 
+def _run_completed_session_signal_cache_sync(
+    cfg: LiveMarketConfig,
+) -> LiveSignalResult | None:
+    """Publish the cheap latest-close signal before full-history maintenance."""
+
+    cfg = _effective_market_config(cfg)
+    status = _ensure_signal_ready(cfg)
+    if not _completed_session_signal_path(cfg, status):
+        return None
+    if not _completed_session_receipt_ready(status) or not status.data.fresh:
+        return None
+    target_date = _date_key(
+        status.data.expected_latest_date
+        or status.data.last_data_date
+        or status.data.panel_date
+    )
+    if not target_date or _market_has_panel_close_signal_for_date(cfg, target_date):
+        return None
+    progress_label = f"postclose-cache:{cfg.market}"
+    progress_callback = (
+        _ConsoleProgress(prefix=progress_label)
+        if _env_bool("STOCKAGENT_BOT_PROGRESS", True)
+        else None
+    )
+    with _MODEL_INFERENCE_LOCK:
+        result = generate_live_signal(
+            **cfg.signal_kwargs(
+                price_source="panel",
+                market_notice=_market_notice(status),
+                progress_callback=progress_callback,
+                progress_label=progress_label,
+            )
+        )
+    result = _enrich_signal_performance_for_discord(
+        cfg,
+        result,
+        max_rows=0,
+    )
+    _sync_latest_live_weights_to_market_artifact(cfg)
+    return result
+
+
 def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | None:
     cfg = _effective_market_config(cfg)
     status = _ensure_signal_ready(cfg)
@@ -5462,7 +6683,7 @@ def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | Non
             _sync_latest_live_weights_to_market_artifact(cfg)
             return None
         _run_formal_history_backfill(cfg, status)
-        if execution_mode == "naive":
+        if execution_mode in {"naive", "tw_day_trade"}:
             if _artifact_backfill_is_current(cfg, status, execution_mode):
                 _sync_latest_live_weights_to_market_artifact(cfg)
                 return None
@@ -5576,7 +6797,19 @@ def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
 
     if not path.exists():
         raise FileNotFoundError(path)
-    return pl.read_parquet(path).to_dicts()
+    revision = _path_revision(path)
+    if revision is not None:
+        with _ARTIFACT_ROWS_CACHE_LOCK:
+            cached = _ARTIFACT_ROWS_CACHE.get(str(path))
+        if cached is not None and cached[0] == revision:
+            return [dict(row) for row in cached[1]]
+    rows = pl.read_parquet(path).to_dicts()
+    if revision is not None:
+        with _ARTIFACT_ROWS_CACHE_LOCK:
+            if len(_ARTIFACT_ROWS_CACHE) >= 64:
+                _ARTIFACT_ROWS_CACHE.pop(next(iter(_ARTIFACT_ROWS_CACHE)))
+            _ARTIFACT_ROWS_CACHE[str(path)] = (revision, rows)
+    return [dict(row) for row in rows]
 
 
 def _latest_signal_or_raise(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]]:
@@ -5645,9 +6878,18 @@ def _latest_signal_message(
     top_n: int = 8,
     current_capital: float | None = None,
     debug: bool = False,
+    summary_prepared: bool = False,
 ) -> str:
     del summary_path
-    enriched = _summary_with_capital_context(cfg, summary, current_capital=current_capital)
+    enriched = (
+        dict(summary)
+        if summary_prepared
+        else _summary_with_capital_context(
+            cfg,
+            summary,
+            current_capital=current_capital,
+        )
+    )
     message = format_signal_message(enriched, max_rows=max(0, int(top_n)), debug=debug)
     return _prepend_sanity_notice(message, cfg, enriched)
 
@@ -5714,6 +6956,12 @@ def _performance_message(
     debug: bool = False,
 ) -> str:
     del summary_path
+    if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        prepared = dict(summary)
+        if int(days or 0) > 0:
+            prepared["recent_performance"] = {**(prepared.get("recent_performance") or {}), "window_days": int(days)}
+        enriched = _summary_with_capital_context(cfg, prepared, current_capital=current_capital)
+        return format_signal_message(enriched, max_rows=0, debug=debug)
     enriched = _summary_with_capital_context(cfg, summary, current_capital=current_capital)
     portfolio_return = _float_or_none(enriched.get("portfolio_simple_return"))
     benchmark_return = _float_or_none(enriched.get("benchmark_simple_return"))
@@ -8115,6 +9363,90 @@ async def watchlist_command(
     )
 
 
+def _intraday_waits_for_opening(now: datetime | None = None) -> bool:
+    """Give the scheduled opening batch first use of quotes and inference."""
+    observed = now or datetime.now(ZoneInfo("Asia/Taipei"))
+    # The calendar/state reads are needed only for this 45-second boundary.
+    gate = observed.replace(hour=9, minute=0, second=0, microsecond=0)
+    if not -30.0 <= (observed - gate).total_seconds() < 15.0:
+        return False
+    for market in _scheduled_markets():
+        cfg = _resolve_market(market)
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        session_open, _reason = _scheduled_market_session_day(cfg, observed)
+        if session_open and _day_trade_schedule_state(cfg, observed.date().isoformat()) == "retry":
+            return True
+    return bot._opening_attempt_started_monotonic is not None
+
+
+async def _intraday_signal_now_result(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    *,
+    price_source: str | None,
+    top_n: int,
+    min_abs_delta: float,
+    include_unconstrained_raw_scores: bool,
+    debug: bool,
+) -> Any:
+    """Coalesce overlapping identical requests, with no completed-price TTL.
+
+    Each new request after completion obtains a new price set. The durable
+    per-signal artifact still backs review buttons, while only the scheduled
+    execution path can replace its latest-signal pointer.
+    """
+
+    key = repr((
+        cfg, getattr(status, "data", None), price_source, int(top_n),
+        float(min_abs_delta), bool(include_unconstrained_raw_scores), bool(debug),
+    ))
+    task = bot._intraday_signal_inflight.get(key)
+    joined = task is not None and not task.done()
+    if not joined:
+        async def generate() -> Any:
+            timing: dict[str, Any] = {}
+            barrier_started = time.perf_counter()
+            while await asyncio.to_thread(_intraday_waits_for_opening):
+                await asyncio.sleep(0.05)
+            timing["opening_priority_wait_ms"] = round((time.perf_counter() - barrier_started) * 1000.0, 3)
+            result = await _run_market_signal(
+                market=cfg.market,
+                price_source=price_source,
+                top_n=top_n,
+                min_abs_delta=min_abs_delta,
+                include_unconstrained_raw_scores=include_unconstrained_raw_scores,
+                day_trade_model_observation="latest_quote",
+                progress_label=f"signal-now-intraday:{cfg.market}",
+                prepared_status=status,
+                publish_latest=False,
+                _timing_sink=timing,
+                _prefetch_prices=True,
+            )
+            result.summary["signal_worker_timing"] = timing
+            return await asyncio.to_thread(
+                _enrich_signal_performance_for_discord,
+                cfg, result, max_rows=0, debug=debug,
+            )
+
+        task = asyncio.create_task(generate())
+        bot._intraday_signal_inflight[key] = task
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            if bot._intraday_signal_inflight.get(key) is done:
+                bot._intraday_signal_inflight.pop(key, None)
+            if not done.cancelled():
+                done.exception()  # also observe a failure if every waiter left
+
+        task.add_done_callback(finished)
+    # One cancelled Discord interaction cannot cancel another user's result.
+    generated = await asyncio.shield(task)
+    result = copy.copy(generated)
+    result.summary = copy.deepcopy(generated.summary)
+    result.summary["signal_now_singleflight_joined"] = joined
+    return result
+
+
 async def _handle_signal_now_command(
     interaction: discord.Interaction,
     *,
@@ -8126,20 +9458,51 @@ async def _handle_signal_now_command(
     refresh_data: bool,
     debug: bool,
 ) -> None:
+    command_started = time.perf_counter()
     normalized_mode = _normalize_signal_now_mode(mode)
     include_raw_universe = normalized_mode == "raw_scores"
     command_name = "raw_score_now" if include_raw_universe else "signal_now"
     await interaction.response.defer(thinking=True)
+    deferred_at = time.perf_counter()
+    _record_audit_event(
+        f"interaction:{getattr(interaction, 'id', 'unknown')}",
+        "accepted",
+        interaction,
+        command=f"/{command_name}",
+        requested_market=str(market or ""),
+        requested_price_source=price_source,
+        mode=normalized_mode,
+        defer_ms=round((deferred_at - command_started) * 1000.0, 3),
+    )
     try:
         shown_rows = _top_n(top_n)
         cfg = _resolve_market(market)
         status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
+        ready_checked_at = time.perf_counter()
+        postclose_fast_source = (
+            None if refresh_data else _postclose_fast_price_source(price_source)
+        )
+        postclose_fast_context = (
+            _postclose_fast_signal_context(cfg, status)
+            if postclose_fast_source is not None
+            else None
+        )
+        if postclose_fast_context is not None:
+            # The display-status cache can retain the 13:29 market_open bit for
+            # a few seconds. Refresh once at this hard market deadline before
+            # registering the official reconciliation job.
+            status = await asyncio.to_thread(_ensure_signal_ready, cfg)
+            postclose_fast_context = _postclose_fast_signal_context(cfg, status)
         completed_session = _completed_session_signal_path(cfg, status)
         completed_session_ready = bool(
             not completed_session or _completed_session_receipt_ready(status)
         )
         cached = None
-        if not refresh_data and completed_session_ready:
+        if (
+            postclose_fast_context is None
+            and not refresh_data
+            and completed_session_ready
+        ):
             cached = await asyncio.to_thread(
                 _signal_now_cached_result,
                 cfg,
@@ -8166,25 +9529,103 @@ async def _handle_signal_now_command(
                 summary=str(summary_path),
                 sanity=_signal_sanity_level(_signal_sanity_issues(cfg, result.summary)),
             )
-            await _send_signal_response(
+            delivery = await _send_signal_response(
                 interaction,
                 result.message,
                 str(result.summary.get("signal_id")),
                 str(result.summary.get("market") or market or _default_market()),
             )
-            for pages in _signal_now_detail_page_groups(
-                cfg,
-                result,
-                mode=normalized_mode,
-                top_n=shown_rows,
-                debug=debug,
-            ):
-                await _send_paginated_response(interaction, pages)
+            _record_audit_event(
+                str(result.summary.get("signal_id")),
+                "delivered",
+                interaction,
+                market=str(result.summary.get("market") or market or _default_market()),
+                command=f"/{command_name}",
+                result="cached",
+                delivery=delivery,
+                command_total_ms=round((time.perf_counter() - command_started) * 1000.0, 3),
+            )
+            try:
+                for pages in _signal_now_detail_page_groups(
+                    cfg,
+                    result,
+                    mode=normalized_mode,
+                    top_n=shown_rows,
+                    debug=debug,
+                ):
+                    await _send_paginated_response(interaction, pages)
+            except Exception as exc:
+                _log_exception(f"{command_name}:{cfg.market}:detail_delivery", exc)
+                _record_audit_event(
+                    str(result.summary.get("signal_id")),
+                    "detail_delivery_failed",
+                    interaction,
+                    market=cfg.market,
+                    command=f"/{command_name}",
+                    error_type=type(exc).__name__,
+                )
             return
-        should_refresh_data = bool(
-            _signal_now_should_refresh_data(status, refresh_data=refresh_data)
-            or not completed_session_ready
-        )
+        postclose_cache_state: str | None = None
+        official_job_key: str | None = None
+        if postclose_fast_context is not None and postclose_fast_source is not None:
+            user_id = int(getattr(interaction.user, "id", 0) or 0)
+            official_status = status
+            if bool(getattr(status, "market_open", False)):
+                # ``market_is_open`` includes exactly 13:30:00. The
+                # provisional deadline begins at that same instant, while its
+                # reconciliation is semantically a completed-session job.
+                try:
+                    official_status = replace(
+                        status,
+                        market_open=False,
+                        market_open_reason="cash close deadline reached",
+                    )
+                except TypeError:
+                    official_status = copy.copy(status)
+                    official_status.market_open = False
+                    official_status.market_open_reason = (
+                        "cash close deadline reached"
+                    )
+            official_job_key, _official_started = _enqueue_signal_now_background_refresh(
+                user_id=user_id,
+                cfg=cfg,
+                runtime_status=official_status,
+                # Reconciliation always uses the accepted official panel,
+                # independent of the quote route selected for the fast view.
+                requested_price_source="panel",
+                top_n=shown_rows,
+                min_abs_delta=min_abs_delta,
+                debug=debug,
+                force_refresh=False,
+                mode=normalized_mode,
+            )
+            try:
+                result, postclose_cache_state = await _postclose_fast_result(
+                    cfg,
+                    status,
+                    postclose_fast_context,
+                    price_source=postclose_fast_source,
+                    top_n=shown_rows,
+                    min_abs_delta=min_abs_delta,
+                    include_unconstrained_raw_scores=include_raw_universe,
+                    debug=debug,
+                    official_job_key=official_job_key,
+                )
+            except asyncio.TimeoutError as exc:
+                raise BotUserError(
+                    f"`{cfg.market}` 13:30 快速快取未能在 "
+                    f"{_postclose_fast_timeout_seconds():.0f} 秒內通過同日行情驗收；"
+                    "系統拒絕用舊價湊訊號，快取仍在背景繼續，"
+                    f"官方覆核 job=`{official_job_key}`。"
+                ) from exc
+            auto_refreshed = False
+            resolved_price_source = postclose_fast_source
+            should_refresh_data = False
+        else:
+            should_refresh_data = bool(
+                _signal_now_should_refresh_data(status, refresh_data=refresh_data)
+                or not completed_session_ready
+            )
         if should_refresh_data:
             user_id = int(getattr(interaction.user, "id", 0) or 0)
             key, started = _enqueue_signal_now_background_refresh(
@@ -8205,7 +9646,7 @@ async def _handle_signal_now_command(
             ):
                 if completed_session:
                     verb = "已開始" if started else "已合併至既有"
-                    await interaction.followup.send(
+                    status_message = (
                         f"`{cfg.market}` {verb}最新已完成交易日的官方收盤驗收、"
                         "衍生層原子重建與推論；不會要求下一交易日資格或 MIS 開盤行情。\n"
                         f"latest=`{actual or 'n/a'}` target_close=`{expected or 'n/a'}` "
@@ -8215,7 +9656,7 @@ async def _handle_signal_now_command(
                     )
                 else:
                     verb = "已登記" if started else "已合併至既有"
-                    await interaction.followup.send(
+                    status_message = (
                         f"`{cfg.market}` 資料尚未通過 freshness gate，{verb}可恢復的來源等待工作；"
                         "不會重算舊資料，也不會把 activation 誤當下載。\n"
                         f"latest=`{actual or 'n/a'}` expected=`{expected or 'n/a'}` "
@@ -8224,35 +9665,67 @@ async def _handle_signal_now_command(
                     )
             else:
                 verb = "已開始" if started else "已加入既有"
-                await interaction.followup.send(
+                status_message = (
                     f"`{cfg.market}` refresh_data=true，{verb}背景驗證與推論；完成後會 DM 結果。\n"
                     f"command=`/{command_name}` job=`{key}`"
                 )
+            delivery = await _deliver_deferred_response(
+                interaction,
+                status_message,
+                context=f"{command_name}:{cfg.market}:queued",
+            )
+            _record_audit_event(
+                key,
+                "delivered",
+                interaction,
+                market=cfg.market,
+                command=f"/{command_name}",
+                result="queued",
+                delivery=delivery,
+            )
             return
-        resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
-            _prepare_realtime_signal_sync,
-            cfg,
-            requested_price_source=price_source,
-            force_refresh=should_refresh_data,
-            completed_session=completed_session,
-        )
-        await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
-        result = await _run_market_signal(
-            market=market,
-            price_source=resolved_price_source,
-            top_n=shown_rows,
-            min_abs_delta=min_abs_delta,
-            progress_label=f"{command_name}:{cfg.market}",
-            include_unconstrained_raw_scores=include_raw_universe,
-            day_trade_model_observation=(
-                "latest_quote"
-                if bool(getattr(status, "market_open", False))
+        if postclose_fast_context is None:
+            intraday = (
+                bool(getattr(status, "market_open", False))
                 and bool(getattr(cfg, "day_trade_simulation_enabled", False))
                 and not completed_session
-                else None
-            ),
-        )
-        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
+            )
+            if intraday:
+                # Freshness was already checked above. Day-trade accounts start
+                # flat, so syncing yesterday's live weights cannot affect this
+                # reference calculation and must not precede its quote request.
+                resolved_price_source = _auto_signal_price_source(cfg, status, price_source)
+                auto_refreshed = False
+                result = await _intraday_signal_now_result(
+                    cfg, status,
+                    price_source=resolved_price_source,
+                    top_n=shown_rows,
+                    min_abs_delta=min_abs_delta,
+                    include_unconstrained_raw_scores=include_raw_universe,
+                    debug=debug,
+                )
+            else:
+                resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
+                    _prepare_realtime_signal_sync,
+                    cfg,
+                    requested_price_source=price_source,
+                    force_refresh=should_refresh_data,
+                    completed_session=completed_session,
+                )
+                await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
+                result = await _run_market_signal(
+                    market=market,
+                    price_source=resolved_price_source,
+                    top_n=shown_rows,
+                    min_abs_delta=min_abs_delta,
+                    progress_label=f"{command_name}:{cfg.market}",
+                    include_unconstrained_raw_scores=include_raw_universe,
+                    prepared_status=status,
+                )
+                result = await asyncio.to_thread(
+                    _enrich_signal_performance_for_discord,
+                    cfg, result, max_rows=0, debug=debug,
+                )
     except Exception as exc:
         error_prefix = "raw score" if include_raw_universe else "live signal"
         await _send_command_error(interaction, error_prefix, exc)
@@ -8270,23 +9743,64 @@ async def _handle_signal_now_command(
         auto_refreshed=bool(auto_refreshed),
         requested_price_source=price_source,
         resolved_price_source=resolved_price_source or "config",
+        postclose_fast=bool(postclose_fast_context is not None),
+        postclose_fast_cache=postclose_cache_state,
+        official_reconciliation_job=official_job_key,
         mode=normalized_mode,
         sanity=_signal_sanity_level(sanity_issues),
+        command_to_generated_ms=round((time.perf_counter() - command_started) * 1000.0, 3),
+        readiness_ms=round((ready_checked_at - deferred_at) * 1000.0, 3),
+        live_latency=result.summary.get("live_latency"),
+        worker_timing=result.summary.get("signal_worker_timing"),
+        singleflight_joined=result.summary.get("signal_now_singleflight_joined", False),
     )
-    await _send_signal_response(
-        interaction,
-        result.message,
+    delivery_started = time.perf_counter()
+    try:
+        delivery = await _send_signal_response(
+            interaction,
+            result.message,
+            str(result.summary.get("signal_id")),
+            str(result.summary.get("market") or market or _default_market()),
+        )
+    except Exception as exc:
+        await _send_command_error(interaction, f"{command_name} delivery", exc)
+        return
+    _record_audit_event(
         str(result.summary.get("signal_id")),
-        str(result.summary.get("market") or market or _default_market()),
+        "delivered",
+        interaction,
+        market=str(result.summary.get("market") or market or _default_market()),
+        command=f"/{command_name}",
+        result=(
+            "postclose_fast_cached"
+            if postclose_cache_state == "memory"
+            else "postclose_fast_generated"
+            if postclose_fast_context is not None
+            else "generated"
+        ),
+        delivery=delivery,
+        delivery_ms=round((time.perf_counter() - delivery_started) * 1000.0, 3),
+        command_total_ms=round((time.perf_counter() - command_started) * 1000.0, 3),
     )
-    for pages in _signal_now_detail_page_groups(
-        cfg,
-        result,
-        mode=normalized_mode,
-        top_n=shown_rows,
-        debug=debug,
-    ):
-        await _send_paginated_response(interaction, pages)
+    try:
+        for pages in _signal_now_detail_page_groups(
+            cfg,
+            result,
+            mode=normalized_mode,
+            top_n=shown_rows,
+            debug=debug,
+        ):
+            await _send_paginated_response(interaction, pages)
+    except Exception as exc:
+        _log_exception(f"{command_name}:{cfg.market}:detail_delivery", exc)
+        _record_audit_event(
+            str(result.summary.get("signal_id")),
+            "detail_delivery_failed",
+            interaction,
+            market=cfg.market,
+            command=f"/{command_name}",
+            error_type=type(exc).__name__,
+        )
 
 
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
@@ -8298,7 +9812,7 @@ async def _handle_signal_now_command(
     refresh_data="Run the market pre-signal data updater before generating. Default false for fast query.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
 )
-@app_commands.autocomplete(market=market_autocomplete)
+@app_commands.autocomplete(market=signal_market_autocomplete)
 async def signal_now(
     interaction: discord.Interaction,
     market: str = "",
@@ -8330,7 +9844,7 @@ async def signal_now(
     refresh_data="Run the market pre-signal data updater first. Default false for fast query.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
 )
-@app_commands.autocomplete(market=market_autocomplete)
+@app_commands.autocomplete(market=signal_market_autocomplete)
 async def raw_score_now(
     interaction: discord.Interaction,
     market: str = "",
@@ -8824,6 +10338,316 @@ async def set_capital(
     )
 
 
+def _postclose_fast_clock_key(
+    cfg: LiveMarketConfig,
+    now: datetime,
+    *,
+    phase: str,
+) -> str | None:
+    if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        return None
+    close_minutes = _hhmm_minutes(getattr(cfg, "close_time", None))
+    if close_minutes is None:
+        return None
+    close_at = now.replace(
+        hour=close_minutes // 60,
+        minute=close_minutes % 60,
+        second=0,
+        microsecond=0,
+    )
+    elapsed = (now - close_at).total_seconds()
+    if phase == "arm":
+        if not (-_postclose_fast_arm_minutes() * 60.0 <= elapsed < 0.0):
+            return None
+    elif phase == "cache":
+        if not (0.0 <= elapsed <= _postclose_fast_window_minutes() * 60.0):
+            return None
+    else:
+        raise ValueError(f"unknown postclose fast phase: {phase}")
+    return f"{now.date().isoformat()}:{cfg.market}:postclose-fast-{phase}"
+
+
+def _prune_postclose_fast_state(session_date: str) -> None:
+    """Keep one session of large result rows in a long-lived bot process."""
+
+    target = str(session_date)
+    if bot._postclose_fast_state_date == target:
+        return
+    prefix = f"{target}:"
+    bot._postclose_fast_cache = {
+        key: value
+        for key, value in bot._postclose_fast_cache.items()
+        if key.startswith(prefix)
+    }
+    bot._postclose_fast_cache_inflight = {
+        key: task
+        for key, task in bot._postclose_fast_cache_inflight.items()
+        if key.startswith(prefix) or not task.done()
+    }
+    bot._postclose_fast_arm_keys = {
+        key for key in bot._postclose_fast_arm_keys if key.startswith(prefix)
+    }
+    bot._postclose_fast_completed_keys = {
+        key for key in bot._postclose_fast_completed_keys if key.startswith(prefix)
+    }
+    bot._postclose_fast_quote_refresh_keys = {
+        key
+        for key in bot._postclose_fast_quote_refresh_keys
+        if key.startswith(prefix)
+    }
+    bot._postclose_fast_retry_after = {
+        key: value
+        for key, value in bot._postclose_fast_retry_after.items()
+        if key.startswith(prefix)
+    }
+    bot._postclose_fast_state_date = target
+
+
+def _postclose_fast_markets() -> list[str]:
+    markets = [
+        market
+        for market in _scheduled_markets()
+        if bool(
+            getattr(
+                _resolve_market(market),
+                "day_trade_simulation_enabled",
+                False,
+            )
+        )
+    ]
+    signature = tuple(sorted(markets))
+    if bot._postclose_fast_market_signature != signature:
+        markets.sort(
+            key=lambda market: (
+                -_preopen_market_symbol_count(_resolve_market(market)),
+                market,
+            )
+        )
+        bot._postclose_fast_market_signature = signature
+        bot._postclose_fast_market_order = tuple(markets)
+    return list(bot._postclose_fast_market_order)
+
+
+def _postclose_fast_priority_window_active() -> bool:
+    for market in _postclose_fast_markets():
+        cfg = _resolve_market(market)
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        arm_key = _postclose_fast_clock_key(cfg, now, phase="arm")
+        if arm_key is not None and arm_key not in bot._postclose_fast_arm_keys:
+            return True
+        cache_key = _postclose_fast_clock_key(cfg, now, phase="cache")
+        if (
+            cache_key is not None
+            and cache_key not in bot._postclose_fast_completed_keys
+        ):
+            return True
+    return False
+
+
+def _postclose_fast_arm_market_sync(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+) -> Any:
+    """Materialize panel/checkpoint/model caches without network or writes."""
+
+    return _run_market_signal_sync(
+        market=cfg.market,
+        price_source="panel",
+        top_n=MIN_DISCORD_ROWS,
+        min_abs_delta=float(cfg.min_abs_delta),
+        progress_label=f"postclose-arm:{cfg.market}",
+        prepared_status=status,
+        write=False,
+    )
+
+
+@tasks.loop(seconds=1)
+async def postclose_fast_arm() -> None:
+    """Warm every cash-day-trade model ten minutes before the 13:30 deadline."""
+
+    for market in _postclose_fast_markets():
+        cfg = _resolve_market(market)
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        key = _postclose_fast_clock_key(cfg, now, phase="arm")
+        if key is None or key in bot._postclose_fast_arm_keys:
+            continue
+        if not _scheduled_retry_allowed(bot._postclose_fast_retry_after, key):
+            continue
+        session_open, _reason = await asyncio.to_thread(
+            _scheduled_market_session_day,
+            cfg,
+            now,
+        )
+        if not session_open:
+            bot._postclose_fast_arm_keys.add(key)
+            continue
+        try:
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="arm",
+                status="running",
+            )
+            status = await asyncio.to_thread(_ensure_signal_ready, cfg)
+            result = await asyncio.to_thread(
+                _postclose_fast_arm_market_sync,
+                cfg,
+                status,
+            )
+            bot._postclose_fast_arm_keys.add(key)
+            bot._postclose_fast_retry_after.pop(key, None)
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="arm",
+                status="ready",
+                details={
+                    "panel_date": result.summary.get("panel_date"),
+                    "live_latency": result.summary.get("live_latency"),
+                },
+            )
+            print(
+                f"[postclose-fast-arm] market={market} status=ready "
+                f"panel={result.summary.get('panel_date')} "
+                f"latency={result.summary.get('live_latency')}",
+                flush=True,
+            )
+        except Exception as exc:
+            _log_exception(f"postclose_fast_arm:{market}", exc)
+            bot._postclose_fast_retry_after[key] = time.monotonic() + 2.0
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="arm",
+                status="failed",
+                error=exc,
+            )
+            print(
+                f"[postclose-fast-arm] market={market} status=failed "
+                f"retry_seconds=2 error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+
+@tasks.loop(seconds=0.1)
+async def postclose_fast_cache() -> None:
+    """At 13:30, build memory-only provisional caches ahead of Discord demand."""
+
+    for market in _postclose_fast_markets():
+        cfg = _resolve_market(market)
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        schedule_key = _postclose_fast_clock_key(cfg, now, phase="cache")
+        if (
+            schedule_key is None
+            or schedule_key in bot._postclose_fast_completed_keys
+            or not _scheduled_retry_allowed(
+                bot._postclose_fast_retry_after,
+                schedule_key,
+            )
+        ):
+            continue
+        # Match the slash-command default. Full day-trade position paging uses
+        # ``weights_rows`` and therefore remains complete even though the
+        # compact summary cache keeps only 20 driver rows.
+        top_n = 20
+        try:
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="cache",
+                status="running",
+            )
+            # Bypass the display TTL exactly at 13:30 so the deadline cannot
+            # inherit a pre-close status snapshot.
+            status = await asyncio.to_thread(_ensure_signal_ready, cfg)
+            context = await asyncio.to_thread(
+                _postclose_fast_signal_context,
+                cfg,
+                status,
+                now=now,
+            )
+            if context is None:
+                bot._postclose_fast_completed_keys.add(schedule_key)
+                await asyncio.to_thread(
+                    _write_postclose_fast_cache_status_best_effort,
+                    cfg,
+                    session_date=now.date().isoformat(),
+                    phase="cache",
+                    status="ready",
+                    details={
+                        "provisional_needed": False,
+                        "reason": "official_close_ready_or_gate_not_applicable",
+                    },
+                )
+                continue
+            result, cache_state = await _postclose_fast_result(
+                cfg,
+                status,
+                context,
+                price_source="tw",
+                top_n=top_n,
+                min_abs_delta=float(cfg.min_abs_delta),
+                include_unconstrained_raw_scores=False,
+                debug=False,
+            )
+            bot._postclose_fast_completed_keys.add(schedule_key)
+            bot._postclose_fast_retry_after.pop(schedule_key, None)
+            marker = result.summary.get("postclose_fast_preview") or {}
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="cache",
+                status="ready",
+                details={
+                    "signal_id": result.summary.get("signal_id"),
+                    "price_source": result.summary.get("price_source"),
+                    "price_timestamp": result.summary.get("price_timestamp"),
+                    "feature_cutoff_date": result.summary.get(
+                        "feature_cutoff_date"
+                    ),
+                    "quote_coverage": marker.get("quote_coverage"),
+                    "quote_received_at": marker.get("quote_received_at"),
+                    "minimum_quote_coverage": marker.get(
+                        "minimum_quote_coverage"
+                    ),
+                    "cash_close_to_cache_ms": marker.get(
+                        "cash_close_to_cache_ms"
+                    ),
+                    "live_latency": result.summary.get("live_latency"),
+                    "formal_history_eligible": False,
+                    "official_reconciliation": "pending",
+                },
+            )
+            print(
+                f"[postclose-fast-cache] market={market} status=ready "
+                f"cache={cache_state} signal={result.summary.get('signal_id')} "
+                f"coverage={marker.get('quote_coverage')} "
+                f"close_to_cache_ms={marker.get('cash_close_to_cache_ms')}",
+                flush=True,
+            )
+        except Exception as exc:
+            _log_exception(f"postclose_fast_cache:{market}", exc)
+            bot._postclose_fast_retry_after[schedule_key] = time.monotonic() + 1.0
+            await asyncio.to_thread(
+                _write_postclose_fast_cache_status_best_effort,
+                cfg,
+                session_date=now.date().isoformat(),
+                phase="cache",
+                status="failed",
+                error=exc,
+            )
+            print(
+                f"[postclose-fast-cache] market={market} status=failed "
+                f"retry_seconds=1 error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+
 @bot.tree.command(name="daily_summary", description="Show today's market summary.")
 @app_commands.describe(
     market="Market id",
@@ -8887,6 +10711,8 @@ def _run_model_auto_deploy_sync(cfg: LiveMarketConfig) -> tuple[str, ModelDeploy
 
 @tasks.loop(seconds=10)
 async def model_auto_deployment() -> None:
+    if _postclose_fast_priority_window_active():
+        return
     now = time.monotonic()
     for cfg in _market_configs().values():
         if not cfg.model_auto_deploy or not _market_enabled(cfg):
@@ -8919,6 +10745,8 @@ async def model_auto_deployment() -> None:
 
 @tasks.loop(seconds=2)
 async def signal_now_job_resumer() -> None:
+    if _postclose_fast_priority_window_active():
+        return
     await _resume_signal_now_jobs_once()
 
 
@@ -8926,6 +10754,8 @@ async def signal_now_job_resumer() -> None:
 async def startup_inference_warmup() -> None:
     """Retry background warmup until all active paper modes are process-hot."""
 
+    if _postclose_fast_priority_window_active():
+        return
     if (
         bot._startup_inference_warmup_complete
         or bot._startup_inference_warmup_terminal
@@ -9067,6 +10897,7 @@ async def preopen_prepare() -> None:
                 key,
                 day_trade=bool(
                     getattr(cfg, "day_trade_simulation_enabled", False)
+                    or getattr(cfg, "overnight_simulation_enabled", False)
                 ),
             )
             print(
@@ -9090,6 +10921,7 @@ async def scheduled_signal() -> None:
             0
             if bool(
                 getattr(_resolve_market(market), "day_trade_simulation_enabled", False)
+                or getattr(_resolve_market(market), "overnight_simulation_enabled", False)
             )
             else 1,
             -_preopen_market_symbol_count(_resolve_market(market)),
@@ -9113,6 +10945,10 @@ async def scheduled_signal() -> None:
         day_trade_simulation = bool(
             getattr(cfg, "day_trade_simulation_enabled", False)
         )
+        overnight_simulation = bool(
+            getattr(cfg, "overnight_simulation_enabled", False)
+        )
+        latency_critical_simulation = day_trade_simulation or overnight_simulation
         if day_trade_simulation:
             execution_state = _day_trade_schedule_state(
                 cfg, now.date().isoformat()
@@ -9145,8 +10981,27 @@ async def scheduled_signal() -> None:
             continue
         if not _scheduled_retry_allowed(bot._scheduled_retry_after, key):
             continue
+        attempt_timing: dict[str, Any] = {}
+        result: LiveSignalResult | None = None
+        attempt_error: BaseException | None = None
         if day_trade_simulation:
             attempt_started = time.monotonic()
+            gate = _opening_gate_at(cfg, now.date().isoformat())
+            attempt_timing.update(
+                {
+                    "scheduler_observed_at": now.isoformat(
+                        timespec="microseconds"
+                    ),
+                    "attempt_started_at": datetime.now(
+                        ZoneInfo(cfg.timezone or bot.tz.key)
+                    ).isoformat(timespec="microseconds"),
+                    "scheduler_wake_ms": round(
+                        (now - gate).total_seconds() * 1000.0,
+                        3,
+                    ),
+                    "preopen_catch_up_ms": 0.0,
+                }
+            )
             bot._opening_attempt_started_monotonic = attempt_started
             bot._opening_attempt_last_progress_monotonic = attempt_started
             bot._opening_attempt_progress_message = "scheduled attempt started"
@@ -9161,27 +11016,43 @@ async def scheduled_signal() -> None:
                 # the exact scheduled signal minute.  Reuse the complete
                 # pre-open contract so same-session eligibility and price
                 # limits exist before recording the strategy signal.
-                await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
-            resolved_price_source, prepared_status, _ = await asyncio.to_thread(
-                _prepare_realtime_signal_sync,
-                cfg,
-                requested_price_source="auto",
-                force_refresh=False,
-            )
+                catch_up_started = time.perf_counter()
+                try:
+                    await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
+                finally:
+                    attempt_timing["preopen_catch_up_ms"] = round(
+                        (time.perf_counter() - catch_up_started) * 1000.0,
+                        3,
+                    )
+            prepare_started = time.perf_counter()
+            try:
+                resolved_price_source, prepared_status, _ = await asyncio.to_thread(
+                    _prepare_realtime_signal_sync,
+                    cfg,
+                    requested_price_source="auto",
+                    force_refresh=False,
+                )
+            finally:
+                attempt_timing["realtime_prepare_ms"] = round(
+                    (time.perf_counter() - prepare_started) * 1000.0,
+                    3,
+                )
             result = await _run_market_signal(
                 market=market,
                 scheduled=True,
                 price_source=resolved_price_source,
                 prepared_status=prepared_status,
                 progress_label=f"scheduled:{market}",
+                _timing_sink=attempt_timing,
             )
         except BotUserError as exc:
+            attempt_error = exc
             if not isinstance(exc, MarketClosedError):
                 retry_delay = _mark_signal_retry(
                     bot._scheduled_retry_after,
                     bot._scheduled_failure_counts,
                     key,
-                    day_trade=day_trade_simulation,
+                    day_trade=latency_critical_simulation,
                 )
                 if key not in bot._scheduled_error_notice_keys:
                     error_messages.append(str(exc))
@@ -9193,12 +11064,13 @@ async def scheduled_signal() -> None:
                 )
             continue
         except Exception as exc:
+            attempt_error = exc
             _log_exception(f"scheduled_signal:{market}", exc)
             retry_delay = _mark_signal_retry(
                 bot._scheduled_retry_after,
                 bot._scheduled_failure_counts,
                 key,
-                day_trade=day_trade_simulation,
+                day_trade=latency_critical_simulation,
             )
             if key not in bot._scheduled_error_notice_keys:
                 error_messages.append(
@@ -9213,11 +11085,25 @@ async def scheduled_signal() -> None:
             continue
         finally:
             if day_trade_simulation:
+                _record_opening_signal_latency(
+                    _opening_signal_latency_record(
+                        cfg=cfg,
+                        session_date=now.date().isoformat(),
+                        schedule_key=key,
+                        timing=attempt_timing,
+                        result=result,
+                        error=attempt_error,
+                    )
+                )
                 bot._opening_attempt_started_monotonic = None
                 bot._opening_attempt_last_progress_monotonic = None
                 bot._opening_attempt_progress_message = None
                 bot._opening_attempt_market = None
                 bot._opening_attempt_hot = False
+        if result is None:
+            # Both exception branches continue above.  Keep this assertion as
+            # a fail-closed guard if that control flow is changed later.
+            raise RuntimeError("scheduled signal returned no result")
         if day_trade_simulation:
             bot._scheduled_retry_after[key] = (
                 time.monotonic() + _day_trade_confirmation_delay_seconds()
@@ -9329,13 +11215,51 @@ async def artifact_backfill() -> None:
             flush=True,
         )
         return
+    if await asyncio.to_thread(_tw_public_refresh_in_progress):
+        print(
+            "[artifact-backfill] deferred: canonical TW public refresh in progress",
+            flush=True,
+        )
+        return
+    markets = _artifact_maintenance_markets()
+    # The user-facing latest-close cache is a separate, bounded product from
+    # full fold history. Populate every paper mode first so one long historical
+    # inference cannot keep the other Discord commands waiting.
+    for market in markets:
+        cfg = _resolve_market(market)
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        if _interactive_signal_work_pending():
+            return
+        if await asyncio.to_thread(_tw_public_refresh_in_progress):
+            return
+        try:
+            result = await asyncio.to_thread(
+                _run_completed_session_signal_cache_sync,
+                cfg,
+            )
+            if result is not None:
+                print(
+                    f"[postclose-cache] market={market} "
+                    f"signal={result.summary.get('signal_id')} "
+                    f"panel={result.summary.get('panel_date')}",
+                    flush=True,
+                )
+        except Exception as exc:
+            _log_exception(f"postclose_signal_cache:{market}", exc)
+            print(
+                f"[postclose-cache] market={market} status=failed "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
     channel = None
     if bot.channel_id is not None and _public_broadcasts_enabled():
         try:
             channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
         except Exception:
             channel = None
-    for market in _scheduled_markets():
+    for market in markets:
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
         # Computing the key resolves runtime freshness, which may scan thousands

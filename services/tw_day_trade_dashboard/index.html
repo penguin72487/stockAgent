@@ -50,7 +50,7 @@
     </div>
     <section class="panel operations-panel">
       <div class="panel-head">
-        <div><h2>今日端到端速度、預熱與執行進度</h2><p>從訊號輸入到模擬帳本耐久落盤；這不是券商回報或交易所往返時間</p></div>
+        <div><h2>所選交易日端到端速度、預熱與執行進度</h2><p>從 09:00、行情本機到達、訊號發布到模擬帳本落盤；這不是券商回報或交易所往返時間</p></div>
         <span id="operation-source" class="count">—</span>
       </div>
       <div id="latency-kpis" class="latency-kpis" aria-label="所選交易日端到端延遲"></div>
@@ -59,6 +59,14 @@
         <div>
           <h3>工作流程</h3>
           <div id="workflow-progress" class="progress-list"></div>
+        </div>
+        <div>
+          <h3>09:00 訊號逐模式測速</h3>
+          <div id="opening-stage-progress" class="progress-list"></div>
+        </div>
+        <div>
+          <h3>每日開盤延遲趨勢</h3>
+          <div id="opening-latency-trend" class="progress-list"></div>
         </div>
         <div>
           <h3>啟用模式盤前預熱測速（不等同該日執行完成）</h3>
@@ -185,10 +193,10 @@
       <div id="tw-public-monitor-list" class="tw-public-monitor-list"><div class="tw-public-empty">資料尚未載入，請稍後重整。</div></div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=2" defer></script>
+  <script src="../dashboard-core.js?v=4" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
   <script src="presentation.js?v=1" defer></script>
-  <script src="detail-components.js?v=1" defer></script>
-  <script src="app.js?v=59" defer></script>
+  <script src="detail-components.js?v=3" defer></script>
+  <script src="app.js?v=68" defer></script>
 </body>
 </html>

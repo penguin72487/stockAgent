@@ -1476,6 +1476,10 @@ class DataConfig:
     # Explicitly append the open[t]/close[t-1] execution-context feature.  It
     # is valid only for tw_day_trade and is never part of the default schema.
     day_trade_open_feature: bool = False
+    # Receipt-verified 13:25 prices, appended after the immutable daily cache.
+    overnight_1325_root: str | None = None
+    # Explicit research exception: current close is not available at 13:25.
+    overnight_1325_missing_price_policy: str = "reject"
     # Research-only 08:45 all-futures clock.  The same daily TAIFEX OPEN is
     # exposed as current information and used by the execution proxy, while
     # the cash-stock panel remains complete only through session t-1.
@@ -1582,6 +1586,9 @@ def external_panel_data_kwargs(data: DataConfig) -> dict[str, object]:
         "external_include_features": generic or tw_features,
         "external_include_rules": tw_rules,
         "external_data_required": generic or tw_data,
+        **({"overnight_1325_root": data.overnight_1325_root,
+            "overnight_1325_missing_price_policy": data.overnight_1325_missing_price_policy}
+           if data.overnight_1325_root else {}),
     }
 
 
@@ -1630,6 +1637,7 @@ class TradingConfig:
     # Execution accounting is selected independently from portfolio construction.
     # ``naive`` preserves the historical continuous-weight, immediate-fee path.
     execution_mode: str = "naive"
+    tw_overnight_fixed_close_to_open: bool = False
     tw_commission_rate: float = 0.001425
     # Ultimate commission price after the broker rebate.  The executor still
     # charges the gross rate first and releases the earned rebate only at the
@@ -3955,6 +3963,25 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         model_config=training["executable_portfolio_transformer"],
         multitask_config=training["multitask_loss"],
     )
+    overnight_missing_policy = str(data["overnight_1325_missing_price_policy"]).strip().lower()
+    if overnight_missing_policy not in {"reject", "same_session_close"}:
+        raise ValueError("overnight_1325_missing_price_policy must be reject or same_session_close")
+    data["overnight_1325_missing_price_policy"] = overnight_missing_policy
+    if overnight_missing_policy != "reject" and not trading["tw_overnight_fixed_close_to_open"]:
+        raise ValueError("overnight close fallback requires the fixed close-to-open research contract")
+    if trading["tw_overnight_fixed_close_to_open"]:
+        if trading["execution_mode"] != "tw_overnight" or not data["overnight_1325_root"]:
+            raise ValueError("fixed overnight requires tw_overnight and data.overnight_1325_root")
+        if data["day_trade_open_feature"] or DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]:
+            raise ValueError("13:25 overnight replaces the opening-gap feature; disable day_trade_open_feature")
+        if not trading["long_only"]:
+            raise ValueError("fixed overnight v1 is long-only; a borrowed-short contract is required for shorts")
+        if phase_model_config["portfolio_output_mode"] != "projection_l1":
+            raise ValueError("fixed overnight requires projection_l1 resolved close allocations")
+        if trading["tw_day_trade_unlimited_margin_conversion"]:
+            raise ValueError("overnight cannot inherit unlimited day-trade margin conversion")
+    elif data["overnight_1325_root"]:
+        raise ValueError("overnight_1325_root requires the fixed close-to-open contract")
     _validate_tw_phase_mode_contract(
         execution_mode=trading["execution_mode"],
         model_name=training["model_name"],

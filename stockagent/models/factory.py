@@ -510,6 +510,7 @@ def build_model(
             categorical_embedding_dim=tbp_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
+            overnight_fixed_close_to_open=config.trading.tw_overnight_fixed_close_to_open,
             **futures_kwargs,
         )
 
@@ -682,6 +683,7 @@ def build_model(
             daily_context_layers=fin_cfg.daily_context_layers,
             daily_context_pooling=fin_cfg.daily_context_pooling,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
+            overnight_fixed_close_to_open=config.trading.tw_overnight_fixed_close_to_open,
             **derivative_kwargs,
             **executable_kwargs,
         )

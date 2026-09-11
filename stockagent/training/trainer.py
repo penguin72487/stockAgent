@@ -2057,6 +2057,7 @@ class _ExecutionRuntime:
     short_lot_sizes: np.ndarray | None = None
     short_initial_margin_rate: float = 0.90
     short_handling_fee_rate: float = 0.0
+    overnight_fixed_close_to_open: bool = False
     short_maintenance_ratio: float = 1.30
     short_capacity_limit_enabled: bool = True
     corporate_action_mode: str = "avoid"
@@ -2147,6 +2148,14 @@ def _build_execution_runtime(
 ) -> _ExecutionRuntime:
     """Resolve one immutable execution schedule for the panel symbol order."""
 
+    if config.trading.tw_overnight_fixed_close_to_open:
+        from stockagent.data.tw_overnight import OVERNIGHT_1325_FEATURE
+        if (panel.overnight_1325_available is None
+                or OVERNIGHT_1325_FEATURE not in panel.feature_names):
+            raise ValueError("fixed overnight training requires verified 13:25 panel context")
+        fallback_enabled = config.data.overnight_1325_missing_price_policy == "same_session_close"
+        if fallback_enabled != (panel.overnight_1325_close_fallback_mask is not None):
+            raise ValueError("13:25 prepared-panel fallback policy disagrees with training config")
     mode = normalize_execution_mode(config.trading.execution_mode)
     lag = int(config.trading.tw_settlement_lag_sessions)
     if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
@@ -2444,6 +2453,7 @@ def _build_execution_runtime(
         ),
         short_initial_margin_rate=short_schedule.initial_margin_rate,
         short_handling_fee_rate=short_schedule.handling_fee_rate,
+        overnight_fixed_close_to_open=config.trading.tw_overnight_fixed_close_to_open,
         short_maintenance_ratio=short_schedule.maintenance_ratio,
         short_capacity_limit_enabled=bool(
             config.trading.tw_short_capacity_limit_enabled
@@ -2586,6 +2596,7 @@ def _integer_execution_runtime_kwargs(
             short_capacity_shares=effective_short_capacity,
             short_maintenance_ratio=runtime.short_maintenance_ratio,
             short_handling_fee_rate=runtime.short_handling_fee_rate,
+            overnight_fixed_close_to_open=runtime.overnight_fixed_close_to_open,
         )
     return kwargs
 
@@ -2704,6 +2715,32 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    # Artifact-only callers may provide a minimal compatibility namespace.
+    # A missing overnight flag means that the legacy/non-overnight contract
+    # applies; it must not make artifact serialization fail.
+    if bool(getattr(config.trading, "tw_overnight_fixed_close_to_open", False)):
+        payload.update(
+            decision_clock="1325_completed_minute_close_plus_prior_completed_daily_features",
+            execution_clock="same_session_close_then_next_session_open_auctions",
+            terminal_policy="mandatory_next_open_or_absorbing_failure; no_new_cohort_at_split_final_close",
+            weight_snapshot_contract="post_close_cohort_notional_over_nav",
+            turnover_contract="gross_close_entry_plus_next_open_exit_notional_over_daily_open_nav",
+            mode_details={"overnight_contract_version": 1,
+                          "auction_liquidity": "historical_price_reference_not_queue_fill_proof",
+                          "order_sizing": "auction_price_target_weight_research_approximation",
+                          "settlement": "t_plus_2_session_open_carrying_account",
+                          "bankruptcy_reporting": "zero_nav_retained_log_risk_underflow_floor_v1",
+                          "overnight_1325_root": config.data.overnight_1325_root},
+        )
+        if config.data.overnight_1325_missing_price_policy == "same_session_close":
+            from stockagent.data.tw_overnight import OVERNIGHT_CLOSE_FALLBACK_CAVEAT
+            payload["decision_clock"] = "1325_or_same_session_final_close_research_approximation"
+            payload["mode_details"].update(
+                overnight_contract_version=2,
+                missing_1325_input="same_session_close",
+                timing_assumption="user_authorized_same_close_lookahead_approximation",
+                caveat=OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
+            )
     if mode == "tw_stock_futures_day_trade_0845_minute":
         cutoff = config.trading.tw_stock_futures_day_trade_daily_proxy_before
         if cutoff is not None:
@@ -4128,6 +4165,10 @@ def _evaluated_backtest_loss(
             if execution_runtime is None
             else execution_runtime.short_handling_fee_rate
         ),
+        overnight_fixed_close_to_open=(
+            False if execution_runtime is None
+            else execution_runtime.overnight_fixed_close_to_open
+        ),
         long_only=config.trading.long_only,
         buy_fee_rate=config.trading.buy_fee_rate,
         sell_fee_rate=config.trading.sell_fee_rate,
@@ -4638,6 +4679,10 @@ def _evaluate_windowed_aux_objective_loss(
             if execution_runtime is None
             else execution_runtime.short_handling_fee_rate
         ),
+        overnight_fixed_close_to_open=(
+            False if execution_runtime is None
+            else execution_runtime.overnight_fixed_close_to_open
+        ),
         gross_leverage=gross_leverage,
         execution_mode=execution_mode,
         buy_fee_rates=(
@@ -4714,6 +4759,7 @@ def _evaluate_windowed_aux_objective_loss(
                 "short_margin_rate",
                 "short_maintenance_ratio",
                 "short_handling_fee_rate",
+                "overnight_fixed_close_to_open",
                 "claim_queue_sessions",
             }
         },
@@ -14209,6 +14255,10 @@ def _run_eval_backtest_from_weight_buffers(
                         if execution_runtime is None
                         else execution_runtime.short_handling_fee_rate
                     ),
+                    overnight_fixed_close_to_open=(
+                        False if execution_runtime is None
+                        else execution_runtime.overnight_fixed_close_to_open
+                    ),
                     force_exit_mask=force_exit_mask_chunk,
                     return_weights_history=return_weights_history,
                     initial_weights=initial_weights_chunk,
@@ -16298,6 +16348,7 @@ def _replay_taiwan_stitched_deployment(
                 volume_limit_weights=volume_limit_weights,
                 execution_mode=runtime.mode,
                 buy_fee_rates=runtime.buy_fee_rates,
+                overnight_fixed_close_to_open=runtime.overnight_fixed_close_to_open,
                 sell_fee_rates=runtime.sell_fee_rates,
                 normal_sell_fee_rates=runtime.normal_sell_fee_rates,
                 day_trade_unlimited_margin_conversion=(
@@ -17579,6 +17630,10 @@ def _probe_compiled_loss_forward_backward(
                     0.0
                     if execution_runtime is None
                     else execution_runtime.short_handling_fee_rate
+                ),
+                overnight_fixed_close_to_open=(
+                    False if execution_runtime is None
+                    else execution_runtime.overnight_fixed_close_to_open
                 ),
                 aux_outputs=aux_outputs,
                 symbol_sharded_ledger=symbol_sharded_ledger,
@@ -20507,7 +20562,7 @@ def _run_training_tree_models(
 
 
 def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
-    return {
+    identity = {
         "dates": int(panel.num_dates),
         "first_date": (
             None if panel.num_dates == 0 else str(np.asarray(panel.dates[0]))
@@ -20520,6 +20575,27 @@ def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
         "symbol_names": [str(symbol) for symbol in panel.symbols],
         "feature_names": [str(name) for name in panel.feature_names],
     }
+    if panel.overnight_1325_available is not None:
+        identity["overnight_1325"] = {
+            "source": panel.overnight_1325_source,
+            "available_symbol_sessions": int(np.count_nonzero(panel.overnight_1325_available)),
+            "missing_symbol_sessions": int(np.count_nonzero(~panel.overnight_1325_available[1:])),
+            "missing_input_policy": "no_new_entry; mandatory_open_exit_unchanged",
+        }
+        fallback = panel.overnight_1325_close_fallback_mask
+        if fallback is not None:
+            from stockagent.data.tw_overnight import OVERNIGHT_CLOSE_FALLBACK_CAVEAT
+            identity["overnight_1325"].update(
+                missing_price_policy="same_session_close",
+                observed_1325_symbol_sessions=int(np.count_nonzero(panel.overnight_1325_available & ~fallback)),
+                close_fallback_symbol_sessions=int(np.count_nonzero(fallback)),
+                close_fallback_sessions=int(np.count_nonzero(np.any(fallback, axis=1))),
+                close_fallback_by_year={str(year): int(np.count_nonzero(fallback[
+                    np.asarray(panel.dates, dtype="datetime64[Y]") == year]))
+                    for year in np.unique(np.asarray(panel.dates, dtype="datetime64[Y]"))},
+                caveat=OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
+            )
+    return identity
 
 
 def _start_training_lifecycle(
@@ -22290,6 +22366,7 @@ def _run_training_impl(
             "short_margin_rate": execution_runtime.short_initial_margin_rate,
             "short_maintenance_ratio": execution_runtime.short_maintenance_ratio,
             "short_handling_fee_rate": execution_runtime.short_handling_fee_rate,
+            "overnight_fixed_close_to_open": execution_runtime.overnight_fixed_close_to_open,
             "claim_queue_sessions": execution_runtime.claim_queue_sessions,
             "crypto_stateful_proximal_allocator": (
                 execution_runtime.crypto_stateful_proximal_allocator

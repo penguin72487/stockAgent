@@ -394,6 +394,16 @@ prepared-data version and artifact root; all later missing-source and physical-
 identity checks still apply. This changes the requested horizon, not the
 08:45/08:46/13:20/13:24/13:30 execution clock.
 
+The user's 2026-09-09 correction replaces whole-session source quarantine with
+explicit physical-contract-day quarantine. For the historical experiment only,
+`tw_stock_futures_day_trade_quarantine_contract_days` excludes
+`2021-06-21 / LVF:202107`; `tw_stock_futures_day_trade_quarantine_dates` is empty.
+Preserve every other candidate, original candidate slots, the complete decision
+and stock-feature calendars, and raw unresolved evidence. This is retrospective
+source-quality scope, not a claim about historical market eligibility. Never
+infer additional exclusions from gaps or failed strategy exits. Manifest,
+checkpoint, reporting, and a new artifact root must bind the exact scope.
+
 Receipt-backed one-minute KBars are sufficient where their dated physical
 identity and Amount/Volume contract verify; preserve the existing --minute-root
 and --kbars-only collector paths. Validate source integrity before the stock
@@ -767,6 +777,17 @@ Rules:
   `PORTFOLIO_L1_EPS`. For P3, OPEN/CLOSE entry allocations share one direction;
   the model adapter fail-closes an impossible opposite-sign pair to zero and
   the direct ledger APIs reject it.
+- The user's 2026-09-09 fixed 13:25 overnight research follow-up explicitly
+  authorizes `data.overnight_1325_missing_price_policy: same_session_close`.
+  Prefer a verified 13:25 price; when it is absent, use that same session's
+  finite official daily close as the decision-price proxy. Preserve 23 prior
+  daily features, the close-entry/next-open exit clock, and the full requested
+  history. Record a per-symbol/session fallback mask, counts, and the
+  same-close look-ahead caveat in the prepared data/checkpoint/report contract.
+  Missing both prices remains unavailable; corrupt hashes/receipts/clocks
+  remain errors. Use the v2 close-fallback artifact root and never resume v1
+  checkpoints. This research exception does not authorize fabricated live
+  quotes/fills or change the strict default (`reject`).
 - Apply permissions, volume, turnover, and borrow capacity to the requested
   signed endpoint before splitting it into buy/sell/short-cover/short-open
   legs. A cross-zero transition must first reduce the existing side; blocked

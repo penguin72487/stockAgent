@@ -55,6 +55,27 @@ services/public_dashboards/dashboard-core.js
 
 ## 性能與更新契約
 
+### 2026-09-09 即時通知與關鍵畫面
+
+- 當沖及共用隔日沖前端透過同源 `api/updates` SSE 接收唯讀 revision。
+  公開服務僅監看既有 receipt：Linux inotify 察覺原子替換後喚醒所有讀者，
+  不呼叫交易引擎、不送單、不下載，也不重啟其他服務。
+- 全服務最多 64 條更新連線、一個檔案 watcher；每 topic 僅保存最新 generation，
+  不累積逐客戶事件佇列。慢客戶寫入逾時 5 秒；15 秒心跳，隱藏分頁關閉串流。
+  缺 inotify 時改用 250 ms 檔案檢查；串流失敗時前端每秒輪詢，正常時每 15 秒對帳。
+- 通知不是資料本身。引擎 revision 改變，以及該 revision 的公開 status 快取完成，
+  都會通知。前端以「已套用 status」而非「已收到通知」判斷進度，避免
+  stale-while-rebuild 回傳舊畫面後就吞掉新版。來源缺口與等待狀態仍原樣顯示。
+- history/signals/positions/events 快取鍵含內容 revision；前端分鐘快取也包含
+  已套用 revision，不能為等待 45/55 秒 TTL 而漏顯新訊號或新分鐘。
+- 訊號請求先送出，分鐘歷史隨即獨立載入；兩者不互相 await。次要明細等主畫面
+  後才載入。日期改變時過期 status 回應不得覆寫新篩選。
+- 分鐘欄位只解碼一次；未變更曲線不重建 SVG，共用時間座標每分鐘只計算一次。
+  保留全部既有分鐘點、缺口與品質旗標，不以下採樣、插值或偽造價格換速度。
+
+測量腳本、冷熱快取限制及正式 HTTPS 驗收見
+[`WEB_LATENCY_2026-09-09.md`](WEB_LATENCY_2026-09-09.md)。
+
 資料是一分鐘更新一次的頁面，不應靠整頁 reload。背景更新取得 JSON 後，只更新變動區塊：
 
 1. `dashboard-core.js` 的 `setText` 與 `setTrustedHtml` 會跳過內容相同的 DOM 寫入。
@@ -74,6 +95,31 @@ services/public_dashboards/dashboard-core.js
 大範圍極值計算不得使用 `Math.min(...points)` 等有參數數量上限的做法。
 已回補的 `benchmark_history.json` 同分鐘優先於舊 `benchmark_marks.jsonl`，
 即時帳本只能補尚未回補的分鐘，避免歷史 Close 與 Bid/Ask 因讀檔順序混接。
+
+### 09:00 當沖延遲契約
+
+`artifacts/live/tw_day_trade_simulation/opening_signal_latency.jsonl` 是每日開盤訊號的
+小型 append-only 測速帳本。每個排程嘗試都須留下成功或失敗終態；成功列分別記錄排程喚醒、
+漏失盤前補備、即時狀態準備、模型鎖等待、行情請求、推論輸入、模型推論、格式化與原子發布。
+共享報價程序另記 request queue、provider、snapshot serialization 與 client round trip。
+
+- 跨程序的 09:00、行情到達與 signal-ready 使用帶時區牆鐘；單一程序內的階段耗時使用
+  monotonic clock。
+- `PriceSnapshot.exchange_timestamps_ms` 是市場牆鐘，`timestamps_ms` 才是本機 callback
+  收到資料的因果時間；兩者不得互換。行情覆蓋時間不是交易所 RTT 或券商回報時間。
+- 目標 `1,000 ms` 同時呈現「第一個訊號」與「全部啟用模式」；不得因少跑模式就宣稱達標。
+  `source_ready_from_open_ms` 與 `source_ready_to_signal_ms` 分開，避免把資料商尚未送達的時間
+  誤判成模型運算。
+- 當沖開盤路徑必須 `ensure_previous_signal=false` 且
+  `previous_signal_backfill_limit=0`。當日帳戶從空倉開始，遞迴補生前幾日訊號不改變今日目標，
+  只會增加延遲；測速列會保存這個守門結果。
+- 公開頁仍為唯讀，不接受瀏覽器回寫測速。前端顯示本次 API 請求時間；伺服器每日趨勢以
+  immutable signal-ready/published 與模擬帳本時間為準，不把某位訪客何時打開頁面混入策略 SLA。
+
+重啟後，狀態 API 在完整帳本索引尚未就緒時只讀目前 state 與最新連續交易日尾段；
+`STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR` 的完整日期、行數及 benchmark-history 索引在背景建立。
+索引未完成時 `record_counts_ready=false` 且累積筆數為 `null`，不得顯示成零或同步掃描數 GiB
+帳本來阻塞即時頁面。
 
 ## 台股策略身分與明細元件
 

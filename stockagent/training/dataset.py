@@ -737,6 +737,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             prior_alive = np.zeros_like(panel.alive_mask, dtype=bool)
             prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
             tradable = prior_alive
+            if panel.overnight_1325_available is not None:
+                if self.execution_mode != "tw_overnight":
+                    raise ValueError("13:25 information is only valid for tw_overnight")
+                available = np.asarray(panel.overnight_1325_available, dtype=bool)
+                if available.shape != tradable.shape:
+                    raise ValueError("13:25 availability must match the full panel")
+                tradable = tradable & available
             # At close[t], quote/limit availability is observable, while the
             # close[t]->next-session valuation label is not.  Side execution
             # masks must therefore use the raw current-session trading mask,
@@ -882,6 +889,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # omits the cost of closing an otherwise carryable final position.
             force_exit = np.asarray(force_exit, dtype=bool).copy()
             force_exit[int(self.valid_indices[-1]), :] = True
+
+        if panel.overnight_1325_available is not None and self.valid_indices.size > 0:
+            # Keep the final opening liquidation, but submit no closing entry
+            # whose next-session outcome lies outside this owned split.
+            tradable = tradable.copy()
+            tradable[int(self.valid_indices[-1]), :] = False
 
         if stock_context_futures_portfolio_execution:
             assert stock_context_futures_daily is not None

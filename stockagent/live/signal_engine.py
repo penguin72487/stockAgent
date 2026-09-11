@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ from stockagent.live.quote_provider import (
     fetch_shioaji_stock_snapshots,
     fetch_tw_mis_last_prices,
     fetch_tw_mis_opening_snapshot,
+    fetch_tw_mis_session_snapshot,
     fetch_yahoo_last_prices,
     load_prices_csv,
     load_symbol_name_map,
@@ -87,6 +89,22 @@ class LiveSignalResult:
     output_dir: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PrefetchedLiveQuote:
+    request_key: str
+    snapshot: PriceSnapshot
+    workflow_started: float
+    workflow_started_utc: datetime
+    quote_started: float
+    quote_finished: float
+    requested_at_utc: datetime
+    received_at_utc: datetime
+
+
+_LIVE_QUOTE_INFLIGHT: dict[str, Future[PrefetchedLiveQuote]] = {}
+_LIVE_QUOTE_INFLIGHT_LOCK = threading.Lock()
+
+
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
 _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
@@ -104,6 +122,10 @@ _LIVE_MODEL_INPUT_CACHE: OrderedDict[
     str, tuple[weakref.ReferenceType[np.ndarray], np.ndarray]
 ] = OrderedDict()
 _LIVE_MODEL_INPUT_CACHE_LOCK = threading.Lock()
+_LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
+    tuple[int, str], tuple[PanelData, PanelData]
+] = OrderedDict()
+_LIVE_ALIGNED_PANEL_CACHE_LOCK = threading.Lock()
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -144,6 +166,8 @@ def clear_live_panel_memory_cache() -> None:
         _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE.clear()
+    with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
+        _LIVE_ALIGNED_PANEL_CACHE.clear()
 
 
 def clear_live_inference_memory_cache() -> None:
@@ -175,6 +199,43 @@ def _cached_checkpoint(path: Path) -> tuple[dict[str, Any], str, bool]:
         while len(_LIVE_CHECKPOINT_CACHE) > _LIVE_CHECKPOINT_CACHE_MAX_ENTRIES:
             _LIVE_CHECKPOINT_CACHE.popitem(last=False)
     return payload, key, False
+
+
+def _cached_aligned_panel(
+    panel: PanelData,
+    *,
+    checkpoint_key: str,
+    checkpoint_payload: dict[str, Any],
+    state_dict: dict[str, Any],
+    fold_dir: Path,
+    context: str,
+) -> tuple[PanelData, bool]:
+    """Retain the exact alignment of an immutable cached panel/checkpoint pair.
+
+    Holding the source object proves identity even after CPython reuses an id.
+    Legacy checkpoints still resolve their mutable weight-table universe on
+    every call. Manifest validation remains outside this cache on every call.
+    """
+
+    symbols = checkpoint_manifest_symbols(checkpoint_payload)
+    key = (id(panel), checkpoint_key)
+    if symbols is not None:
+        with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
+            cached = _LIVE_ALIGNED_PANEL_CACHE.get(key)
+            if cached is not None and cached[0] is panel:
+                _LIVE_ALIGNED_PANEL_CACHE.move_to_end(key)
+                return cached[1], True
+    aligned = align_panel_to_checkpoint_universe(
+        panel, fold_dir, state_dict,
+        checkpoint_symbols=symbols, context=context, allow_missing_masked=True,
+    )
+    if symbols is not None:
+        with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
+            _LIVE_ALIGNED_PANEL_CACHE[key] = (panel, aligned)
+            _LIVE_ALIGNED_PANEL_CACHE.move_to_end(key)
+            while len(_LIVE_ALIGNED_PANEL_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES:
+                _LIVE_ALIGNED_PANEL_CACHE.popitem(last=False)
+    return aligned, False
 
 
 def _model_cache_key(
@@ -1139,6 +1200,21 @@ def _merge_tw_opening_shioaji_fallback(
             output[target_indices] = values[accepted_local]
         return output
 
+    def merged_simtrade_flags() -> np.ndarray | None:
+        primary_values = primary.simtrade_flags
+        backup_values = backup.simtrade_flags
+        if primary_values is None and backup_values is None:
+            return None
+        output = (
+            np.asarray(primary_values, dtype=np.int8).copy()
+            if primary_values is not None
+            else np.full((size,), -1, dtype=np.int8)
+        )
+        if backup_values is not None and accepted_local.size:
+            values = np.asarray(backup_values, dtype=np.int8)
+            output[target_indices] = values[accepted_local]
+        return output
+
     shared_provenance = (
         "+shared_day_trade_engine"
         if "shared_day_trade_engine" in str(backup.source)
@@ -1176,6 +1252,14 @@ def _merge_tw_opening_shioaji_fallback(
         reference_prices=merged_float_array("reference_prices"),
         timestamps_ms=merged_int_array("timestamps_ms"),
         exchange_timestamps_ms=merged_int_array("exchange_timestamps_ms"),
+        simtrade_flags=merged_simtrade_flags(),
+        transport_timing=(
+            dict(backup.transport_timing)
+            if isinstance(backup.transport_timing, dict)
+            else dict(primary.transport_timing)
+            if isinstance(primary.transport_timing, dict)
+            else None
+        ),
     )
 
 
@@ -1190,6 +1274,8 @@ def _price_snapshot(
     request_mask: np.ndarray | None = None,
     require_official_tw_session_open: bool = False,
     force_fresh: bool = False,
+    tw_latest_quote_cache_seconds: float = 0.0,
+    tw_latest_quote_force_refresh: bool = False,
 ) -> PriceSnapshot:
     source_norm = str(source).strip().lower()
     if source_norm == "panel":
@@ -1396,6 +1482,11 @@ def _price_snapshot(
                 partial.exchange_timestamps_ms,
                 integer=True,
             ),
+            transport_timing=(
+                dict(partial.transport_timing)
+                if isinstance(partial.transport_timing, dict)
+                else None
+            ),
         )
     if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
         indices = np.arange(len(symbols), dtype=np.int64)
@@ -1480,6 +1571,24 @@ def _price_snapshot(
                 except Exception as exc:
                     fallback_errors.append(f"shared_engine_{type(exc).__name__}")
                     snapshot = fetch_mis_opening()
+        elif force_fresh and (
+            float(tw_latest_quote_cache_seconds) > 0.0
+            or bool(tw_latest_quote_force_refresh)
+        ):
+            # The first 13:30 model refreshes the session-row cache; every
+            # following model consumes the exact same received quote rows and
+            # requests only universe deltas. This is never enabled for live
+            # intraday /signal_now calls, which retain a zero-TTL boundary.
+            snapshot = fetch_tw_mis_session_snapshot(
+                requested_symbols,
+                requested_fallback,
+                parquet_root=parquet_root,
+                chunk_size=yahoo_chunk_size,
+                cache_ttl_seconds=float(tw_latest_quote_cache_seconds),
+                max_parallel_requests=16,
+                force_refresh=bool(tw_latest_quote_force_refresh),
+                allow_network=True,
+            )
         else:
             snapshot = fetch_tw_mis_last_prices(
                 requested_symbols,
@@ -1487,6 +1596,9 @@ def _price_snapshot(
                 parquet_root=parquet_root,
                 chunk_size=yahoo_chunk_size,
                 empty_chunk_retry_attempts=1 if force_fresh else None,
+                minimum_response_coverage=(
+                    _tw_opening_minimum_coverage() if force_fresh else 1.0
+                ),
                 max_parallel_requests=16 if force_fresh else None,
                 request_timeout_seconds=1.5 if force_fresh else None,
             )
@@ -1647,6 +1759,11 @@ def _price_snapshot(
                 timestamps_ms=expanded(snapshot.timestamps_ms, integer=True),
                 exchange_timestamps_ms=expanded(
                     snapshot.exchange_timestamps_ms, integer=True
+                ),
+                transport_timing=(
+                    dict(snapshot.transport_timing)
+                    if isinstance(snapshot.transport_timing, dict)
+                    else None
                 ),
             )
         return snapshot
@@ -1811,6 +1928,101 @@ def _daily_price_timestamp(
     return price_snapshot.timestamp or resolved_asof
 
 
+def _opening_price_receipt_timing(
+    *,
+    price_snapshot: PriceSnapshot,
+    observed_mask: np.ndarray,
+    required_count: int,
+    session_date: str,
+    display_timezone: str,
+    quote_requested_at: str,
+    quote_received_at: str,
+    signal_ready_at: str,
+) -> dict[str, Any]:
+    """Measure causal local quote receipt without pretending it is venue RTT."""
+
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "clock": "unix_epoch_ms_local_callback_receipt",
+        "measurement_boundary": "09:00_gate_to_local_quote_coverage_to_signal_ready",
+        "observed_count": int(np.count_nonzero(observed_mask)),
+        "timestamped_count": 0,
+        "required_count": max(0, int(required_count)),
+        "quality": "unavailable",
+        "first_receipt_at": None,
+        "coverage_receipt_at": None,
+        "last_receipt_at": None,
+        "first_receipt_from_open_ms": None,
+        "coverage_receipt_from_open_ms": None,
+        "last_receipt_from_open_ms": None,
+        "quote_request_to_coverage_ms": None,
+        "coverage_to_quote_response_ms": None,
+        "coverage_to_signal_ready_ms": None,
+    }
+    values = price_snapshot.timestamps_ms
+    normalized_mask = np.asarray(observed_mask, dtype=bool)
+    if values is None or normalized_mask.ndim != 1:
+        return result
+    timestamps = np.asarray(values, dtype=np.int64)
+    if timestamps.shape != normalized_mask.shape:
+        return result
+    ordered = np.sort(timestamps[normalized_mask & (timestamps > 0)])
+    result["timestamped_count"] = int(ordered.size)
+    required = max(0, int(required_count))
+    if ordered.size <= 0 or required <= 0 or ordered.size < required:
+        result["quality"] = "insufficient_timestamped_coverage"
+        return result
+
+    zone = ZoneInfo(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
+    try:
+        gate = datetime.fromisoformat(f"{session_date}T09:00:00").replace(
+            tzinfo=zone
+        )
+
+        def parsed_wall(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=zone)
+
+        requested = parsed_wall(quote_requested_at)
+        received = parsed_wall(quote_received_at)
+        ready = parsed_wall(signal_ready_at)
+    except (TypeError, ValueError):
+        result["quality"] = "invalid_wall_clock"
+        return result
+
+    first = datetime.fromtimestamp(int(ordered[0]) / 1000.0, tz=timezone.utc)
+    coverage = datetime.fromtimestamp(
+        int(ordered[required - 1]) / 1000.0,
+        tz=timezone.utc,
+    )
+    last = datetime.fromtimestamp(int(ordered[-1]) / 1000.0, tz=timezone.utc)
+
+    def milliseconds(later: datetime, earlier: datetime) -> float:
+        return round((later - earlier).total_seconds() * 1000.0, 3)
+
+    result.update(
+        {
+            "quality": "observed",
+            "first_receipt_at": first.astimezone(zone).isoformat(
+                timespec="milliseconds"
+            ),
+            "coverage_receipt_at": coverage.astimezone(zone).isoformat(
+                timespec="milliseconds"
+            ),
+            "last_receipt_at": last.astimezone(zone).isoformat(
+                timespec="milliseconds"
+            ),
+            "first_receipt_from_open_ms": milliseconds(first, gate),
+            "coverage_receipt_from_open_ms": milliseconds(coverage, gate),
+            "last_receipt_from_open_ms": milliseconds(last, gate),
+            "quote_request_to_coverage_ms": milliseconds(coverage, requested),
+            "coverage_to_quote_response_ms": milliseconds(received, coverage),
+            "coverage_to_signal_ready_ms": milliseconds(ready, coverage),
+        }
+    )
+    return result
+
+
 def _snapshot_local_timestamp(
     snapshot: PriceSnapshot,
     *,
@@ -1842,10 +2054,11 @@ def _day_trade_live_model_window(
 ) -> tuple[np.ndarray, str, str, bool, np.ndarray]:
     """Build a same-session observation without inventing a completed daily bar.
 
-    ``session_open`` is the executable 09:00 strategy contract.  The explicit
-    ``latest_quote`` mode is reserved for interactive /signal_now inspection:
-    it replaces the live gap input with the freshly observed last-price gap,
-    and its artifact is labelled non-opening/non-executable downstream.
+    ``session_open`` is the executable 09:00 day-trade contract.  The explicit
+    ``latest_quote`` mode replaces the live gap input with the freshly observed
+    last-price gap.  It remains non-opening for the day-trade executor, while a
+    distinct close-to-next-open paper adapter may consume it at its own 13:25
+    decision gate.
     """
 
     observation = str(model_observation or "session_open").strip().lower()
@@ -2635,6 +2848,106 @@ def _risk_warnings(
     return warnings
 
 
+def _live_quote_request(
+    *, config: ExperimentConfig, panel: PanelData, panel_idx: int,
+    execution_mode: str, observation: str, price_source: str,
+    prices_csv: str | Path | None, yahoo_chunk_size: int,
+    tw_latest_quote_cache_seconds: float, tw_latest_quote_force_refresh: bool,
+) -> dict[str, Any]:
+    return dict(
+        source=price_source,
+        symbols=panel.symbols,
+        fallback_prices=np.asarray(panel.close_prices[panel_idx], dtype=np.float64),
+        parquet_root=config.data.parquet_root,
+        prices_csv=prices_csv,
+        yahoo_chunk_size=yahoo_chunk_size,
+        request_mask=(np.asarray(panel.alive_mask[panel_idx], dtype=bool)
+                      if execution_mode == "tw_day_trade" else None),
+        require_official_tw_session_open=(execution_mode == "tw_day_trade" and observation == "session_open"),
+        force_fresh=(execution_mode == "tw_day_trade" and observation == "latest_quote"),
+        tw_latest_quote_cache_seconds=float(tw_latest_quote_cache_seconds),
+        tw_latest_quote_force_refresh=bool(tw_latest_quote_force_refresh),
+    )
+
+
+def _live_quote_request_key(request: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(request.items()):
+        digest.update(name.encode())
+        if isinstance(value, np.ndarray):
+            digest.update(str((value.dtype, value.shape)).encode())
+            digest.update(value.tobytes())
+        else:
+            digest.update(repr(value).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def prefetch_live_signal_prices(
+    *, config_path: str | Path, output_dir: str | Path | None = None,
+    fold_id: int | None = None, checkpoint_path: str | Path | None = None,
+    panel_date: str | None = None, price_source: str = "panel",
+    prices_csv: str | Path | None = None, yahoo_chunk_size: int = 80,
+    day_trade_model_observation: str = "session_open",
+    tw_latest_quote_cache_seconds: float = 0.0,
+    tw_latest_quote_force_refresh: bool = False, **_unused: Any,
+) -> PrefetchedLiveQuote:
+    """Fetch independent I/O before acquiring the serialized model runtime.
+
+    No model/runtime globals are changed here. The consumer compares the
+    complete quote request again after acquiring its lock; a changed panel,
+    mask, universe, or price contract invalidates this result. Overlapping
+    identical quote requests share one in-flight result, never a completed TTL.
+    """
+    started, started_utc = time.perf_counter(), datetime.now(timezone.utc)
+    config = load_config(config_path)
+    execution_mode = _require_supported_live_execution(config.trading.execution_mode)
+    if execution_mode != "tw_day_trade" or day_trade_model_observation != "latest_quote":
+        raise ValueError("quote prefetch is restricted to intraday day-trade previews")
+    root = Path(output_dir if output_dir is not None else config.runner.output_dir)
+    resolved_fold, checkpoint = _resolve_checkpoint(root, fold_id, checkpoint_path)
+    payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
+    panel, _hit, _tier = _build_panel(config, live_tail=True)
+    panel, _hit = _cached_aligned_panel(
+        panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
+        state_dict=payload["model_state_dict"],
+        fold_dir=root / f"fold_{resolved_fold:02d}", context="quote prefetch",
+    )
+    index, _notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
+    request = _live_quote_request(
+        config=config, panel=panel, panel_idx=index, execution_mode=execution_mode,
+        observation=day_trade_model_observation, price_source=price_source,
+        prices_csv=prices_csv, yahoo_chunk_size=yahoo_chunk_size,
+        tw_latest_quote_cache_seconds=tw_latest_quote_cache_seconds,
+        tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
+    )
+    key = _live_quote_request_key(request)
+    with _LIVE_QUOTE_INFLIGHT_LOCK:
+        future = _LIVE_QUOTE_INFLIGHT.get(key)
+        owner = future is None
+        if owner:
+            future = Future()
+            _LIVE_QUOTE_INFLIGHT[key] = future
+    if not owner:
+        return future.result()
+    try:
+        quote_started, requested = time.perf_counter(), datetime.now(timezone.utc)
+        snapshot = _price_snapshot(**request)
+        result = PrefetchedLiveQuote(
+            key, snapshot, started, started_utc,
+            quote_started, time.perf_counter(), requested, datetime.now(timezone.utc),
+        )
+        future.set_result(result)
+        return result
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _LIVE_QUOTE_INFLIGHT_LOCK:
+            if _LIVE_QUOTE_INFLIGHT.get(key) is future:
+                _LIVE_QUOTE_INFLIGHT.pop(key, None)
+
+
 def generate_live_signal(
     *,
     market: str | None = None,
@@ -2663,13 +2976,17 @@ def generate_live_signal(
     display_timezone: str | None = DEFAULT_DISPLAY_TIMEZONE,
     daily_bar_time: str | None = None,
     write: bool = True,
+    publish_latest: bool = True,
     ensure_previous_signal: bool = True,
     previous_signal_backfill_limit: int = 8,
     progress_callback: ProgressCallback | None = None,
     progress_label: str | None = None,
     include_unconstrained_raw_scores: bool = False,
     day_trade_model_observation: str = "session_open",
+    tw_latest_quote_cache_seconds: float = 0.0,
+    tw_latest_quote_force_refresh: bool = False,
     _panel_override: PanelData | None = None,
+    _prefetched_quote: PrefetchedLiveQuote | None = None,
 ) -> LiveSignalResult:
     signal_started = time.perf_counter()
     signal_started_wall_utc = datetime.now(timezone.utc)
@@ -2743,13 +3060,13 @@ def generate_live_signal(
             live_tail=True,
         )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
-    panel = align_panel_to_checkpoint_universe(
+    panel, alignment_cache_hit = _cached_aligned_panel(
         panel,
-        resolved_output_dir / f"fold_{resolved_fold_id:02d}",
-        state_dict,
-        checkpoint_symbols=checkpoint_manifest_symbols(checkpoint_payload),
+        checkpoint_key=checkpoint_cache_key,
+        checkpoint_payload=checkpoint_payload,
+        state_dict=state_dict,
+        fold_dir=resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         context=f"live signal {market_id or resolved_fold_id}",
-        allow_missing_masked=True,
     )
     saved_fold_id = checkpoint_payload.get("fold_id")
     if saved_fold_id is not None and int(saved_fold_id) != int(resolved_fold_id):
@@ -2787,31 +3104,32 @@ def generate_live_signal(
     quote_requested_at_text = datetime.now(display_tz).isoformat(
         timespec="microseconds"
     )
-    price_snapshot = _price_snapshot(
-        source=price_source,
-        symbols=panel.symbols,
-        fallback_prices=panel_prices,
-        parquet_root=config.data.parquet_root,
-        prices_csv=prices_csv,
-        yahoo_chunk_size=yahoo_chunk_size,
-        request_mask=(
-            np.asarray(panel.alive_mask[panel_idx], dtype=bool)
-            if execution_mode == "tw_day_trade"
-            else None
-        ),
-        require_official_tw_session_open=(
-            execution_mode == "tw_day_trade"
-            and normalized_day_trade_observation == "session_open"
-        ),
-        force_fresh=(
-            execution_mode == "tw_day_trade"
-            and normalized_day_trade_observation == "latest_quote"
-        ),
+    quote_request = _live_quote_request(
+        config=config, panel=panel, panel_idx=panel_idx, execution_mode=execution_mode,
+        observation=normalized_day_trade_observation, price_source=price_source,
+        prices_csv=prices_csv, yahoo_chunk_size=yahoo_chunk_size,
+        tw_latest_quote_cache_seconds=tw_latest_quote_cache_seconds,
+        tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
+    )
+    quote_prefetched = bool(
+        _prefetched_quote is not None
+        and _prefetched_quote.request_key == _live_quote_request_key(quote_request)
+        and 0.0 <= time.perf_counter() - _prefetched_quote.quote_finished <= 5.0
+    )
+    price_snapshot = (
+        _prefetched_quote.snapshot if quote_prefetched else _price_snapshot(**quote_request)
     )
     quote_finished = time.perf_counter()
     quote_received_at_text = datetime.now(display_tz).isoformat(
         timespec="microseconds"
     )
+    if quote_prefetched:
+        signal_started = _prefetched_quote.workflow_started
+        signal_started_wall_utc = _prefetched_quote.workflow_started_utc
+        signal_started_at_text = signal_started_wall_utc.astimezone(display_tz).isoformat(timespec="microseconds")
+        quote_started, quote_finished = _prefetched_quote.quote_started, _prefetched_quote.quote_finished
+        quote_requested_at_text = _prefetched_quote.requested_at_utc.astimezone(display_tz).isoformat(timespec="microseconds")
+        quote_received_at_text = _prefetched_quote.received_at_utc.astimezone(display_tz).isoformat(timespec="microseconds")
     quote_latency_ms = (quote_finished - quote_started) * 1000.0
     if (
         execution_mode == "tw_day_trade"
@@ -2879,6 +3197,7 @@ def generate_live_signal(
     day_trade_active_open_count = 0
     day_trade_active_quote_count = 0
     day_trade_required_quote_count = 0
+    day_trade_quote_observed_mask = np.zeros((panel.num_symbols,), dtype=bool)
     day_trade_open_coverage: float | None = None
     day_trade_quote_coverage: float | None = None
     if execution_mode == "tw_day_trade":
@@ -2923,8 +3242,9 @@ def generate_live_signal(
                     observed_open,
                 )
             )
+            day_trade_quote_observed_mask = active_mask & quote_observed
             day_trade_active_quote_count = int(
-                np.count_nonzero(active_mask & quote_observed)
+                np.count_nonzero(day_trade_quote_observed_mask)
             )
             minimum_coverage = _tw_opening_minimum_coverage()
             day_trade_required_quote_count = max(
@@ -3121,6 +3441,16 @@ def generate_live_signal(
         if panel.can_short_open_mask is not None
         else can_sell_np,
         dtype=bool,
+    )
+    # Preserve the completed-panel cash-market constraint before the temporary
+    # tw_day_trade live adapter replaces its same-session masks.  The overnight
+    # paper executor may reuse the model score, but it must still enforce the
+    # ordinary short-sale rule and source-backed inventory available at 13:25.
+    overnight_can_short_open_np = can_short_open_np.copy()
+    overnight_short_capacity_shares_np = (
+        np.asarray(panel.short_capacity_shares[panel_idx], dtype=np.float64)
+        if panel.short_capacity_shares is not None
+        else np.full((panel.num_symbols,), np.nan, dtype=np.float64)
     )
     force_short_cover_np = np.asarray(
         panel.force_short_cover_mask[panel_idx]
@@ -3374,7 +3704,10 @@ def generate_live_signal(
     )
     current_risk = portfolio_risk_summary(current_weights)
     target_risk = portfolio_risk_summary(target_weights)
-    recent_performance = cumulative_recent_returns(checkpoint, window_days=benchmark_window_days)
+    recent_performance = cumulative_recent_returns(
+        checkpoint, window_days=benchmark_window_days,
+        prefer_integer=not (execution_mode == "tw_day_trade" and config.trading.tw_day_trade_unlimited_margin_conversion),
+    )
     risk_warnings = _risk_warnings(
         turnover=turnover,
         target_risk=target_risk,
@@ -3472,6 +3805,15 @@ def generate_live_signal(
                 "tradable": bool(mask_np[idx]),
                 "can_buy": bool(can_buy_np[idx]),
                 "can_sell": bool(can_sell_np[idx]),
+                "overnight_can_short_open": bool(
+                    overnight_can_short_open_np[idx]
+                ),
+                "overnight_short_capacity_shares": (
+                    float(overnight_short_capacity_shares_np[idx])
+                    if np.isfinite(overnight_short_capacity_shares_np[idx])
+                    and overnight_short_capacity_shares_np[idx] >= 0.0
+                    else None
+                ),
                 "alive": bool(panel.alive_mask[panel_idx, idx]),
                 "position_status": _position_status(
                     tradable=bool(mask_np[idx]),
@@ -3539,6 +3881,22 @@ def generate_live_signal(
     )
     signal_ready = time.perf_counter()
     signal_ready_at_text = datetime.now(display_tz).isoformat(timespec="microseconds")
+    price_receipt_timing = (
+        _opening_price_receipt_timing(
+            price_snapshot=price_snapshot,
+            observed_mask=day_trade_quote_observed_mask,
+            required_count=day_trade_required_quote_count,
+            session_date=panel_date_str,
+            display_timezone=display_timezone_name,
+            quote_requested_at=quote_requested_at_text,
+            quote_received_at=quote_received_at_text,
+            signal_ready_at=signal_ready_at_text,
+        )
+        if execution_mode == "tw_day_trade"
+        and day_trade_live_session
+        and not str(price_snapshot.source).startswith("panel")
+        else None
+    )
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
         "generated_at": generated_at_text,
@@ -3599,6 +3957,7 @@ def generate_live_signal(
         "price_requested_count": int(
             price_snapshot.requested_count or panel.num_symbols
         ),
+        "price_receipt_timing": price_receipt_timing,
         "opening_price_available_count": opening_price_available_count,
         "opening_price_active_count": day_trade_active_open_count,
         "opening_price_required_count": 0,
@@ -3617,6 +3976,8 @@ def generate_live_signal(
             "panel_cache_tier": str(panel_cache_tier),
             "checkpoint_cache_hit": bool(checkpoint_cache_hit),
             "model_cache_hit": bool(model_cache_hit),
+            "alignment_cache_hit": bool(alignment_cache_hit),
+            "quote_prefetched_outside_model_lock": quote_prefetched,
             "pre_quote_prepare_ms": round(
                 float((quote_started - signal_started) * 1000.0), 3
             ),
@@ -3630,6 +3991,11 @@ def generate_live_signal(
             ),
             "compute_before_publish_ms": round(
                 float((signal_ready - signal_started) * 1000.0), 3
+            ),
+            "quote_transport": (
+                dict(price_snapshot.transport_timing)
+                if isinstance(price_snapshot.transport_timing, dict)
+                else None
             ),
         },
         "signal_price_contract": {
@@ -3779,10 +4145,11 @@ def generate_live_signal(
                 result_path / "execution_weights.json"
             ),
         }
-        _atomic_write_json(
-            output_root / "latest_signal.json",
-            pointer_payload,
-        )
+        if publish_latest:
+            _atomic_write_json(
+                output_root / "latest_signal.json",
+                pointer_payload,
+            )
         # The execution contract is now visible to the separate simulation
         # process. Rich Parquet/Markdown/Discord artifacts are completed after
         # that causal handoff and may not delay the order-simulation ledger.
@@ -3804,9 +4171,10 @@ def generate_live_signal(
             float((time.perf_counter() - signal_ready) * 1000.0), 3
         )
         _atomic_write_json(summary_path, result.summary)
-        _atomic_write_json(
-            output_root / "latest_signal.json",
-            {**pointer_payload, "artifact_complete": True},
-        )
+        if publish_latest:
+            _atomic_write_json(
+                output_root / "latest_signal.json",
+                {**pointer_payload, "artifact_complete": True},
+            )
     _emit_progress(progress_callback, label=progress_name, step=17, total=progress_total, message="done")
     return result
