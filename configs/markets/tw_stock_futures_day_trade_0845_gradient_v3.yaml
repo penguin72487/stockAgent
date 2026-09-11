@@ -1,0 +1,17 @@
+base_config: tw_stock_futures_day_trade_0845_gradient_v2.yaml
+
+experiment_name: tw-stock-futures-0845-1330-adjacent-basket-gradient-v3
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v1_gradient_v3_vast5090
+  resume: true
+
+training:
+  # Reuse the common exact-futures optimizer cadence and train-only recovery.
+  # Integer forward/evaluation remain strict: residuals at 13:30 fail the run.
+  futures_portfolio_recoverable_backward: true
+  futures_portfolio_optimizer_step_per_trajectory: true
+
+# Single-stock futures do not qualify for TAIFEX's reduced day-trade margin.
+# The inherited notional cash sleeves are a research exposure/collateral limit,
+# not a claim to reconstruct the historical broker margin account.

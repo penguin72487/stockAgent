@@ -1,0 +1,27 @@
+# User-selected 2026-09-09 rule: ceil(50% * observed minute contract volume).
+# This changes entry AND exit capacity. Whole-contract cash affordability,
+# fees/tax, 13:30 flat deadline, v4 features and v3 backward remain unchanged.
+# User approved the two additional missing-source contract-day exclusions;
+# retain all decision dates and all other physical candidates.
+base_config: tw_stock_futures_day_trade_0845_gradient_v4.yaml
+
+experiment_name: tw-stock-futures-0845-1330-minute-capacity-ceil50-v5-source-quarantine-v2
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v2_capacity_ceil_v5_vast5090
+  resume: true
+
+training:
+  epochs: 10000
+
+trading:
+  max_volume_participation: 0.5
+  tw_stock_futures_day_trade_minute_capacity_rounding: ceil
+  tw_stock_futures_day_trade_minute_data_path: artifacts/data_preparation/futures_minutes_capacity_ceil_quarantine_v2_20260909/minutes.parquet
+  tw_stock_futures_day_trade_quarantine_contract_days:
+    - date: '2021-06-21'
+      physical_contract: LVF:202107
+    - date: '2023-07-13'
+      physical_contract: PZF:202308
+    - date: '2024-01-10'
+      physical_contract: LIF:202401

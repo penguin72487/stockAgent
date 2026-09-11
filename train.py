@@ -696,6 +696,7 @@ def _run_isolated_train_fold_processes(
     folds: Sequence[object],
     *,
     argv: Sequence[str],
+    output_dir: str | Path | None = None,
 ) -> None:
     """Run selected folds sequentially with a fresh CUDA process per fold."""
 
@@ -707,20 +708,62 @@ def _run_isolated_train_fold_processes(
             f"[runner] isolated train fold {index}/{total}: fold={fold_id}",
             flush=True,
         )
+        failure_before = _isolated_futures_failure_receipts(output_dir)
         completed = subprocess.run(
             _isolated_fold_command(argv, fold_id=fold_id),
             env=child_env,
             check=False,
         )
         if completed.returncode != 0:
+            details = _isolated_futures_failure_detail(output_dir, failure_before)
             raise RuntimeError(
                 "isolated train.py child failed: "
-                f"fold={fold_id} returncode={completed.returncode}"
+                f"fold={fold_id} returncode={completed.returncode}{details}"
             )
         print(
             f"[runner] isolated train fold complete: fold={fold_id}",
             flush=True,
         )
+
+
+def _isolated_futures_failure_receipts(output_dir):
+    """Capture only this runner's small structured failure receipts."""
+    if output_dir is None:
+        return {}
+    result = {}
+    for path in Path(output_dir).glob('futures_data_failure_rank*.json'):
+        try:
+            info = path.stat()
+            if info.st_size <= 1024 * 1024:
+                result[str(path)] = (info.st_mtime_ns, info.st_ino, path.read_bytes())
+        except OSError:
+            continue
+    return result
+
+
+def _isolated_futures_failure_detail(output_dir, before):
+    """Keep the actual data error visible after torchrun's generic footer."""
+    for name, snapshot in sorted(_isolated_futures_failure_receipts(output_dir).items()):
+        if before.get(name) == snapshot:
+            continue
+        try:
+            receipt = json.loads(snapshot[2])
+            if receipt.get('status') != 'data_invalid':
+                continue
+            evidence = receipt['evidence']
+            reason = evidence.get('reason')
+            positions = [p for p in evidence.get('positions', []) if p.get('held_quantity')]
+            if reason == 'unresolved_corporate_contract_transition':
+                positions = [p for p in positions if p.get('unsupported_corporate_transition')]
+            elif reason == 'held_minute_source_missing':
+                positions = [p for p in positions if not p.get('minute_source_verified')]
+            identifiers = sorted({str(p.get('held_physical_contract') or p.get('tape_physical_contract')) for p in positions})
+            return (f"; root_cause={reason} date={evidence.get('date')}"
+                    f" scope={evidence.get('scope')} contracts={','.join(identifiers[:8])}"
+                    f"; evidence={name}")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return ''
 
 
 def _run_isolated_post_train_inference(*, argv: Sequence[str]) -> None:
@@ -1104,6 +1147,10 @@ def main() -> None:
                     daily_sha256=minute_receipt["source_daily_sha256"],
                     dates=np.asarray(panel.dates, dtype="datetime64[D]"),
                     daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+                    participation=config.trading.max_volume_participation,
+                    capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
+                    quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
+                    quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
                 )
                 # Match the actual training candidate check, including per-contract
                 # source evidence; a dated manifest alone is not sufficient.
@@ -1113,11 +1160,22 @@ def main() -> None:
                     integer_contracts=True,
                     max_volume_participation=config.trading.max_volume_participation,
                     minute_data_path=config.trading.tw_stock_futures_day_trade_minute_data_path,
+                    minute_capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
                     daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+                    quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
+                    quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
+                    residual_policy=config.trading.tw_stock_futures_day_trade_residual_policy,
+                    final_settlement_path=config.trading.tw_futures_portfolio_final_settlement_path,
+                    carry_evidence_path=config.trading.tw_stock_futures_day_trade_carry_evidence_path,
+                    corporate_action_path=config.trading.tw_stock_futures_day_trade_corporate_action_path,
+                    corporate_transition_path=config.trading.tw_stock_futures_day_trade_corporate_transition_path,
+                    quarantined_carry_policy=config.trading.tw_stock_futures_day_trade_quarantined_carry_policy,
                 )
                 print(
-                    f"[futures-minute preflight] verified sources and all {len(panel.dates)} "
-                    f"panel sessions ({panel.dates[0]}..{panel.dates[-1]}); no training started.",
+                    f"[futures-minute preflight] verified {len(panel.dates)} panel sessions "
+                    f"({panel.dates[0]}..{panel.dates[-1]}); explicit quarantined decision dates="
+                    f"{config.trading.tw_stock_futures_day_trade_quarantine_dates}; explicit quarantined contract-days="
+                    f"{config.trading.tw_stock_futures_day_trade_quarantine_contract_days}; no training started.",
                     flush=True,
                 )
                 return
@@ -1479,8 +1537,21 @@ def main() -> None:
             max_volume_participation=(
                 config.trading.max_volume_participation
             ),
+            minute_capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
             daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+            quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
+            quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
+            residual_policy=config.trading.tw_stock_futures_day_trade_residual_policy,
+            carry_evidence_path=config.trading.tw_stock_futures_day_trade_carry_evidence_path,
+            corporate_action_path=config.trading.tw_stock_futures_day_trade_corporate_action_path,
+            corporate_transition_path=config.trading.tw_stock_futures_day_trade_corporate_transition_path,
+            quarantined_carry_policy=config.trading.tw_stock_futures_day_trade_quarantined_carry_policy,
+            final_settlement_path=config.trading.tw_futures_portfolio_final_settlement_path,
         )
+        if config.trading.tw_stock_futures_day_trade_residual_policy == "carry" and _distributed_rank() == 0:
+            from downloader.artifact_io import atomic_write_json
+            atomic_write_json(Path(output_dir) / "futures_carry_physical_contracts.json",
+                              panel.stock_futures_day_trade_daily.carry_metadata)
     if (
         str(config.trading.execution_mode) == "tw_day_trade"
         and config.data.day_trade_minute_execution_root is not None
@@ -1906,6 +1977,7 @@ def main() -> None:
             _run_isolated_train_fold_processes(
                 (pending_fold,),
                 argv=sys.argv[1:],
+                output_dir=output_dir,
             )
             partial_results = []
             for selected_fold in folds:

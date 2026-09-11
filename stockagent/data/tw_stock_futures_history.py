@@ -17,11 +17,15 @@ import polars as pl
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from stockagent.data.tw_stock_futures_day_trade import select_causal_front_stock_futures_candidates
 from stockagent.data.tw_stock_futures_minute import EVENT_MINUTES
+from stockagent.data.tw_stock_futures_quarantine import (
+    CONTRACT_DAY_QUARANTINE_VERSION, CONTRACT_DAY_QUARANTINE_POLICY,
+    normalize_contract_days, validate_contract_day_quarantine,
+)
 
 HISTORY_SOURCE = "shioaji_continuous_ticks_dated_physical_v1"
 HISTORY_DATASET = "taifex_stock_futures_minute_history_v2"
 HISTORY_VERSION = 2
-ACCEPTED = {"minute_verified", "daily_open_close_proxy"}
+ACCEPTED = {"minute_verified", "daily_open_close_proxy", "official_no_outright_trades", "official_subcontract_capacity"}
 MINUTE_SCHEMA = {"date": pl.Date, "physical_contract": pl.String, "minute": pl.Int32,
                  **{c: pl.Float64 for c in ("vwap", "high", "low", "close", "volume")},
                  "source_file_sha256": pl.String}
@@ -127,6 +131,12 @@ def _reuse_verified_contract(root: Path, evidence: dict) -> bool:
     """Cached facts are reusable only while their exact raw inputs still match."""
     if evidence.get("status") != "minute_verified":
         return False
+    if evidence.get('repair_kind') in {'exact_kbars', 'exact_ticks'}:
+        try:
+            return (sha256_file(evidence['repair_receipt_path']) == evidence['receipt_sha256']
+                    and sha256_file(evidence['repair_data_path']) == evidence['source_file_sha256'])
+        except OSError:
+            return False
     alias, day = evidence["alias"], evidence["date"]
     receipt = root / alias / "receipts" / f"trading_date={day}.json"
     ticks = root / alias / "ticks" / f"trading_date={day}" / "data.parquet"
@@ -151,8 +161,32 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
         return 0
     root, output = Path(args.shioaji_ticks_root), Path(args.output_dir)
     cache = Path(args.work_dir) / f"{daily_digest[:20]}-{cutoff}-v{HISTORY_VERSION}"
+    original_cache = cache
+    recovery, official = None, None
+    if getattr(args, 'repair_root', None):
+        from stockagent.data.tw_stock_futures_repair import ExactMinuteRecovery, apply_block_evidence
+        evidence_dir = Path(args.official_evidence_dir)
+        evidence_receipt = json.loads((evidence_dir/'official_evidence_manifest.json').read_text())
+        official_sha = sha256_file(evidence_dir/'official_evidence.parquet')
+        if evidence_receipt.get('source') != 'taifex_complete_daily_and_spread_legs_v1' or evidence_receipt.get('sha256') != official_sha:
+            raise ValueError('official gap evidence SHA/source mismatch')
+        for item in evidence_receipt['sources']:
+            if sha256_file(item['path']) != item['sha256']:
+                raise ValueError('official gap archive changed since audit')
+        official = pl.read_parquet(evidence_dir/'official_evidence.parquet')
+        block_manifest = evidence_dir/'block_evidence_manifest.json'
+        if block_manifest.exists():
+            official, block_receipt = apply_block_evidence(official, block_manifest)
+            evidence_receipt['block_evidence'] = block_receipt
+        recovery = ExactMinuteRecovery(Path(args.repair_root), official,
+                                       participation=getattr(args, 'capacity_participation', None),
+                                       capacity_rounding=getattr(args, 'capacity_rounding', 'floor'))
+        cache = cache.with_name(cache.name + '-exact-v1-' + official_sha[:16])
+        if getattr(args, 'capacity_rounding', 'floor') != 'floor':
+            cache = cache.with_name(cache.name + '-' + args.capacity_rounding)
     cache.mkdir(parents=True, exist_ok=True)
     frames, inventories = [], []
+    refresh_dates = set(getattr(args, 'refresh_dates', None) or [])
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for index, day in enumerate(expected_dates, 1):
             cache_bars, cache_coverage, receipt_path = (cache / f"{day}.{suffix}" for suffix in ("parquet", "coverage.parquet", "json"))
@@ -162,8 +196,16 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
             cached = (cache_bars.is_file() and cache_coverage.is_file()
                     and saved.get("bars_sha256") == sha256_file(cache_bars)
                     and saved.get("coverage_sha256") == sha256_file(cache_coverage))
-            if getattr(args, "assemble_cached", False):
-                if not cached:
+            prior_bars, prior_coverage = cache_bars, cache_coverage
+            if recovery and not cached:
+                prior_bars, prior_coverage, old_receipt = (original_cache / f'{day}.{suffix}' for suffix in ('parquet','coverage.parquet','json'))
+                old = json.loads(old_receipt.read_text()) if old_receipt.is_file() else {}
+                cached = (prior_bars.is_file() and prior_coverage.is_file()
+                          and sha256_file(prior_bars) == old.get('bars_sha256')
+                          and sha256_file(prior_coverage) == old.get('coverage_sha256'))
+            preserve_date = bool(refresh_dates) and str(day) not in refresh_dates
+            if getattr(args, "assemble_cached", False) or preserve_date:
+                if not cached or prior_bars != cache_bars:
                     raise ValueError(f"cannot assemble missing/corrupt dated shard: {day}")
             elif cached and day < cutoff:
                 bars, coverage = pl.read_parquet(cache_bars), pl.read_parquet(cache_coverage)
@@ -171,17 +213,35 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
                 rows = selected.filter(pl.col("date") == day).to_dicts()
                 previous_evidence, previous_bars = {}, {}
                 if cached:
-                    previous_evidence = {r["physical_contract"]: r for r in pl.read_parquet(cache_coverage).to_dicts()}
-                    previous_bars = pl.read_parquet(cache_bars).partition_by("physical_contract", as_dict=True)
+                    previous_evidence = {r["physical_contract"]: r for r in pl.read_parquet(prior_coverage).to_dicts()}
+                    previous_bars = pl.read_parquet(prior_bars).partition_by("physical_contract", as_dict=True)
                 def read_or_reuse(row):
                     prior = previous_evidence.get(row["physical_contract"], {})
                     if _reuse_verified_contract(root, prior):
-                        return previous_bars.get((row["physical_contract"],), pl.DataFrame(schema=MINUTE_SCHEMA)), prior
-                    return _contract_day(row, root, cutoff)
+                        result = previous_bars.get((row["physical_contract"],), pl.DataFrame(schema=MINUTE_SCHEMA)), prior
+                    else:
+                        result = _contract_day(row, root, cutoff)
+                    if recovery:
+                        bars, evidence = result
+                        if evidence['status'] not in ACCEPTED:
+                            bars, evidence = recovery.recover(row, bars, evidence)
+                        if evidence.get('repair_kind') and evidence['status'] == 'minute_verified':
+                            evidence['tick_volume'] = int(bars['volume'].sum())
+                        for key in ('repair_kind', 'repair_data_path', 'repair_receipt_path', 'official_reason', 'non_execution_quarantine'):
+                            evidence.setdefault(key, '')
+                        evidence.setdefault('outright_volume', None)
+                        return bars, evidence
+                    return result
                 results = list(pool.map(read_or_reuse, rows))
                 bars = pl.concat([r[0] for r in results]) if results else pl.DataFrame(schema=MINUTE_SCHEMA)
                 coverage = pl.DataFrame([r[1] for r in results], infer_schema_length=None).with_columns(
                     pl.col("tick_volume", "tick_rows", "official_volume").cast(pl.Int64)) if results else pl.DataFrame()
+                if recovery and coverage.height:
+                    coverage = coverage.with_columns(pl.col('outright_volume').cast(pl.Int64)).select(
+                        'date','physical_contract','status','alias','source_file_sha256','receipt_sha256',
+                        'official_volume','tick_volume','tick_rows','detail','source_row_observed',
+                        'repair_kind','repair_data_path','repair_receipt_path','official_reason',
+                        'non_execution_quarantine','outright_volume')
                 atomic_write_parquet(cache_bars, bars)
                 atomic_write_parquet(cache_coverage, coverage)
                 atomic_write_json(receipt_path, {"complete": bool(rows) and coverage["status"].is_in(ACCEPTED).all(),
@@ -200,6 +260,14 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
     coverage = pl.scan_parquet(inventories).collect(engine="streaming")
     gaps = coverage.filter(~pl.col("status").is_in(ACCEPTED))
     complete_dates = sorted(set(map(str, expected_dates)) - set(map(str, gaps["date"].to_list())))
+    quarantine = sorted(set(getattr(args, 'quarantine_dates', None) or []))
+    if set(quarantine) - set(map(str, expected_dates)):
+        raise ValueError('quarantined dates must belong to the requested calendar')
+    contract_days = normalize_contract_days(getattr(args, 'quarantine_contract_days', None) or [])
+    if any(item['date'] not in set(map(str, expected_dates)) or item['date'] in quarantine for item in contract_days):
+        raise ValueError('contract-day quarantine must belong to requested non-quarantined calendar')
+    training_gaps = validate_contract_day_quarantine(coverage, contract_days, accepted=ACCEPTED).filter(
+        ~pl.col('date').cast(pl.String).is_in(quarantine))
     output.mkdir(parents=True, exist_ok=True)
     outputs = {}
     for key, filename, frame in (("all_minutes", "all_minutes.parquet", full),
@@ -211,13 +279,33 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
     if sha256_file(args.daily_data_path) != daily_digest:
         raise ValueError("daily source changed during build; outputs cannot be accepted")
     manifest = {"dataset": HISTORY_DATASET, "contract_version": HISTORY_VERSION, "source_kind": HISTORY_SOURCE,
-                "status": "partial" if gaps.height else "complete", "source_daily_sha256": daily_digest,
+                "status": ("partial" if training_gaps.height else "complete_with_quarantine" if quarantine or contract_days else "complete"), "source_daily_sha256": daily_digest,
+                "quarantined_dates": quarantine,
                 "daily_proxy_before": str(cutoff), "covered_dates": complete_dates,
                 "requested_dates": list(map(str, expected_dates)), "outputs": outputs,
                 "counts": dict(coverage.group_by("status").len().iter_rows()),
                 "mapping": "dated_observed_monthly_R1_then_OHLC_verification_not_query_time_target",
                 "capacity": "observed_tick_volume_no_scaling_to_official_daily_volume",
                 "daily_proxy_caveat": "daily_session_open_to_close_not_0846_or_1330_executable_fills"}
+    if contract_days:
+        manifest.update(
+            quarantined_contract_days=contract_days,
+            contract_day_quarantine_version=CONTRACT_DAY_QUARANTINE_VERSION,
+            contract_day_quarantine_policy=CONTRACT_DAY_QUARANTINE_POLICY,
+            usable_dates=sorted(set(map(str, expected_dates)) - set(quarantine)
+                                - set(map(str, training_gaps['date'].to_list()))),
+        )
+    if recovery:
+        from stockagent.data.tw_stock_futures_repair import REPAIR_SOURCE
+        atomic_write_parquet(output/'official_evidence.parquet', official)
+        outputs['official_evidence'] = dict(file='official_evidence.parquet', sha256=sha256_file(output/'official_evidence.parquet'), rows=official.height)
+        manifest.update(source_kind=REPAIR_SOURCE, repair_contract_version=1,
+                        capacity_participation=getattr(args, 'capacity_participation', None),
+                        official_evidence=evidence_receipt,
+                        mapping='dated_R1_OHLC_or_exact_physical_month_with_official_outright_evidence',
+                        capacity='observed_source_volume_only; official_spread_only_or_empty_days_have_zero_outright_capacity')
+        if getattr(args, 'capacity_rounding', 'floor') != 'floor':
+            manifest['capacity_rounding'] = args.capacity_rounding
     manifest_path = output / "manifest.json"
     previous_manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else None
     # Preserve the exact manifest bytes for an identical inventory. JSON key
@@ -229,4 +317,4 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
         "sessions_done": len(expected_dates), "sessions_total": len(expected_dates),
     })
     print(json.dumps({k: manifest[k] for k in ("status", "counts", "daily_proxy_before")}), flush=True)
-    return 2 if gaps.height else 0
+    return 2 if training_gaps.height else 0

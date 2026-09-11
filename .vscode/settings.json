@@ -1,0 +1,28 @@
+{
+  "workbench.editor.limit.enabled": true,
+  "workbench.editor.limit.value": 80,
+  "workbench.editor.limit.perEditorGroup": false,
+  "workbench.editor.limit.excludeDirty": true,
+  "files.watcherExclude": {
+    "artifacts/**": true,
+    "artifacts_*/**": true,
+    "data_*/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.cache/**": true,
+    "**/.venv/**": true
+  },
+  "search.exclude": {
+    "artifacts/**": true,
+    "artifacts_*/**": true,
+    "data_*/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.cache/**": true,
+    "**/.venv/**": true
+  }
+}

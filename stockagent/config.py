@@ -1768,12 +1768,22 @@ class TradingConfig:
     )
     tw_stock_futures_day_trade_fee_twd: float = 40.0
     tw_stock_futures_day_trade_initial_capital: float = 10_000_000.0
+    tw_stock_futures_day_trade_residual_policy: str = "fail"
+    tw_stock_futures_day_trade_carry_evidence_path: str | None = None
+    tw_stock_futures_day_trade_corporate_action_path: str | None = None
+    tw_stock_futures_day_trade_corporate_transition_path: str | None = None
+    tw_stock_futures_day_trade_quarantined_carry_policy: str = 'reject'
     # Receipt-backed physical-contract minute bars; never a daily OPEN/CLOSE fallback.
     tw_stock_futures_day_trade_minute_data_path: str = (
         "data_tw_futures/taifex_stock_futures_minute_v1/minutes.parquet"
     )
+    # Round observed per-minute participation capacity, never the cash budget.
+    # Keep floor for reproducibility; the user-selected ceil experiment opts in.
+    tw_stock_futures_day_trade_minute_capacity_rounding: str = "floor"
     # Explicit user-selected historical approximation; never applies on/after this date.
     tw_stock_futures_day_trade_daily_proxy_before: str | None = None
+    tw_stock_futures_day_trade_quarantine_dates: list[str] = field(default_factory=list)
+    tw_stock_futures_day_trade_quarantine_contract_days: list[dict[str, str]] = field(default_factory=list)
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )
@@ -2272,10 +2282,16 @@ class TrainingConfig:
     # relaxation and reserve the exact integer ledger for validation/test.
     # This avoids carrying a stale discrete account across optimizer steps.
     futures_portfolio_training_surrogate_only: bool = False
-    # Preserve the exact integer account in forward while allowing a resettable
-    # shadow account only in backward after exact insolvency. This prevents an
-    # absorbing default in one batch from zeroing all later optimizer gradients.
+    # Exact forward account; train-only recovery after absorbing failure. The
+    # all-futures mode uses a shadow account. The 08:45 minute mode uses adjacent
+    # executable basket slopes and counterfactual days, with the same deadline.
     futures_portfolio_recoverable_backward: bool = False
+    # Minute-only opt-in: retain the feasible inward basket secant when entry
+    # capacity is saturated. False preserves the v3-v5 optimization contract.
+    futures_minute_saturation_recovery: bool = False
+    # execution_utility compares exact basket log returns/failure utility and
+    # restores failed baskets toward cash. The default retains v3-v6 slopes.
+    futures_minute_recovery_objective: str = "residual_notional"
     # Preserve one policy parameter vector over the complete chronological
     # account trajectory. Batches remain bounded truncated-BPTT chunks, while
     # AdamW and the step scheduler advance exactly once after the full epoch.
@@ -4076,7 +4092,74 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
     )
+    minute_rounding = trading["tw_stock_futures_day_trade_minute_capacity_rounding"]
+    residual_policy = trading["tw_stock_futures_day_trade_residual_policy"]
+    transition_path=trading['tw_stock_futures_day_trade_corporate_transition_path']
+    if transition_path is not None and (not isinstance(transition_path,str) or not transition_path.strip() or residual_policy!='carry'):
+        raise ValueError('corporate contract transitions require an explicit manifest path and residual carry')
+    if residual_policy not in {"fail", "carry"}:
+        raise ValueError("futures residual policy must be fail or carry")
+    if residual_policy == "carry":
+        if trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute":
+            raise ValueError("residual carry requires physical minute execution")
+        if not trading["tw_futures_portfolio_final_settlement_path"]:
+            raise ValueError("residual carry requires official final settlement data")
+        if training["futures_portfolio_recoverable_backward"]:
+            raise ValueError("flat-failure recovery gradients cannot be used with residual carry")
+        if not training["futures_portfolio_optimizer_step_per_trajectory"]:
+            raise ValueError("residual carry requires full-trajectory optimizer cadence")
+        if training["compile_loss"]:
+            raise ValueError("residual carry requires compile_loss=false for the host data-validity gate; the daily ledger remains compiled")
+        if not data["panel_start_date"] or str(data["panel_start_date"]) < "2020-03-23":
+            raise ValueError("residual carry requires the verified minute horizon from 2020-03-23")
+    recovery_objective = training["futures_minute_recovery_objective"]
+    if recovery_objective not in {"residual_notional", "execution_utility"}:
+        raise ValueError("futures minute recovery objective must be residual_notional or execution_utility")
+    if recovery_objective != "residual_notional" and (
+        trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+        or not training["futures_portfolio_recoverable_backward"]
+    ):
+        raise ValueError("execution utility recovery requires minute recoverable backward")
+    if training["futures_minute_saturation_recovery"] and (
+        trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+        or not training["futures_portfolio_recoverable_backward"]
+    ):
+        raise ValueError("futures minute saturation recovery requires minute recoverable backward")
+    if minute_rounding not in {"floor", "ceil"}:
+        raise ValueError("futures minute capacity rounding must be floor or ceil")
+    if minute_rounding != "floor" and trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute":
+        raise ValueError("futures minute capacity rounding requires minute execution")
+    if trading["execution_mode"] == "tw_stock_futures_day_trade_0845_minute":
+        if training["futures_portfolio_training_surrogate_only"]:
+            raise ValueError("08:45 minute training requires the exact integer forward account")
+        if (training["futures_portfolio_recoverable_backward"]
+                and not training["futures_portfolio_optimizer_step_per_trajectory"]):
+            raise ValueError("08:45 minute recoverable backward requires full-trajectory optimizer cadence")
     cutoff = trading["tw_stock_futures_day_trade_daily_proxy_before"]
+    from stockagent.data.tw_stock_futures_quarantine import normalize_contract_days
+    contract_days = normalize_contract_days(trading['tw_stock_futures_day_trade_quarantine_contract_days'])
+    if contract_days and (trading['execution_mode'] != 'tw_stock_futures_day_trade_0845_minute' or cutoff is None):
+        raise ValueError('contract-day quarantine requires receipt-backed historical minute execution')
+    trading['tw_stock_futures_day_trade_quarantine_contract_days'] = contract_days
+    quarantined_carry_policy = trading['tw_stock_futures_day_trade_quarantined_carry_policy']
+    if quarantined_carry_policy not in ('reject', 'hold_official_settlement'):
+        raise ValueError('quarantined carry policy must be reject or hold_official_settlement')
+    if quarantined_carry_policy != 'reject' and (
+        residual_policy != 'carry' or not contract_days
+        or not trading['tw_stock_futures_day_trade_carry_evidence_path']
+        or trading['tw_stock_futures_day_trade_quarantine_dates']
+    ):
+        raise ValueError('quarantined carry requires residual carry, explicit contract-days and official settlement evidence; whole-date quarantine is unsupported')
+    quarantine = trading['tw_stock_futures_day_trade_quarantine_dates']
+    if not isinstance(quarantine, list):
+        raise ValueError('futures quarantine dates must be an explicit list')
+    if quarantine:
+        from datetime import date as _quarantine_date
+        if trading['execution_mode'] != 'tw_stock_futures_day_trade_0845_minute':
+            raise ValueError('futures quarantine dates require minute execution')
+        trading['tw_stock_futures_day_trade_quarantine_dates'] = sorted({_quarantine_date.fromisoformat(str(d)).isoformat() for d in quarantine})
+    if any(item['date'] in quarantine for item in contract_days):
+        raise ValueError('contract-day quarantine must not overlap whole-date quarantine')
     if cutoff is not None:
         from datetime import date as _cutoff_date
         if trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute":
@@ -4799,6 +4882,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             futures_portfolio_recoverable_backward=training_raw[
                 "futures_portfolio_recoverable_backward"
             ],
+            futures_minute_saturation_recovery=training_raw["futures_minute_saturation_recovery"],
+            futures_minute_recovery_objective=training_raw["futures_minute_recovery_objective"],
             futures_portfolio_optimizer_step_per_trajectory=training_raw[
                 "futures_portfolio_optimizer_step_per_trajectory"
             ],

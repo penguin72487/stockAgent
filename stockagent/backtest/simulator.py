@@ -1470,6 +1470,7 @@ class BacktestResult:
     payables_history: np.ndarray | None = None
     receivables_history: np.ndarray | None = None
     settlement_default: np.ndarray | None = None
+    default_reason_history: np.ndarray | None = None
     equity_scale_history: np.ndarray | None = None
     final_cash: np.ndarray | None = None
     final_payables: np.ndarray | None = None
@@ -1510,6 +1511,8 @@ class BacktestResult:
     final_due_weights: np.ndarray | None = None
     futures_contract_quantities_history: np.ndarray | None = None
     futures_residual_contract_quantities_history: np.ndarray | None = None
+    final_futures_carry_state: np.ndarray | None = None
+    futures_carry_state_history: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1566,6 +1569,8 @@ class BacktestResultTensor:
     final_due_weights: torch.Tensor | None = None
     futures_contract_quantities_history: torch.Tensor | None = None
     futures_residual_contract_quantities_history: torch.Tensor | None = None
+    final_futures_carry_state: torch.Tensor | None = None
+    futures_carry_state_history: torch.Tensor | None = None
 
     def to_numpy(self) -> BacktestResult:
         # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
@@ -1584,7 +1589,10 @@ class BacktestResultTensor:
             )
 
         return BacktestResult(
+            default_reason_history=(None if self.default_reason_history is None else self.default_reason_history.detach().cpu().numpy()),
             futures_contract_quantities_history=(None if self.futures_contract_quantities_history is None else self.futures_contract_quantities_history.detach().cpu().numpy()),
+            final_futures_carry_state=optional_float32(self.final_futures_carry_state),
+            futures_carry_state_history=optional_float32(self.futures_carry_state_history),
             futures_residual_contract_quantities_history=(None if self.futures_residual_contract_quantities_history is None else self.futures_residual_contract_quantities_history.detach().cpu().numpy()),
             strategy_returns=as_float32(self.strategy_returns),
             benchmark_returns=as_float32(self.benchmark_returns),
@@ -3255,6 +3263,7 @@ def run_backtest_torch(
     cash_dividend_payment_delay_sessions: torch.Tensor | None = None,
     claim_queue_sessions: int | None = None,
     initial_equity_scale: torch.Tensor | None = None,
+    initial_futures_carry_state: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
     initial_long_margin_debt: torch.Tensor | None = None,
@@ -3265,6 +3274,8 @@ def run_backtest_torch(
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
+    futures_minute_saturation_recovery: bool = False,
+    futures_minute_recovery_objective: str = "residual_notional",
     return_turnovers: bool = True,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
@@ -3581,16 +3592,30 @@ def run_backtest_torch(
             min_trade_weight,
             portfolio_activation,
         )
-        result = run_tw_stock_futures_day_trade_integer_torch(
-            prepped_weights,
-            overnight_returns,
-            initial_capital=day_trade_execution_initial_capital,
-            state_advance_mask=state_advance_mask,
-            initial_equity_scale=initial_equity_scale,
-            initial_alive=initial_alive,
-            return_weights_history=return_weights_history,
-            scheduled_events=mode == "tw_stock_futures_day_trade_0845_minute",
-        )
+        from stockagent.data.tw_stock_futures_carry import CARRY_SUPPORTED_TAPE_FIELDS, CARRY_LEDGER_UNIT
+        carrying = mode == "tw_stock_futures_day_trade_0845_minute" and overnight_returns.shape[-1] in CARRY_SUPPORTED_TAPE_FIELDS
+        if carrying:
+            from stockagent.backtest.tw_stock_futures_carry import run_tw_stock_futures_carry_torch
+            result = run_tw_stock_futures_carry_torch(
+                prepped_weights, overnight_returns, initial_capital=day_trade_execution_initial_capital,
+                state_advance_mask=state_advance_mask, initial_equity_scale=initial_equity_scale,
+                initial_alive=initial_alive, return_weights_history=return_weights_history,
+                initial_carry_state=initial_futures_carry_state,
+            )
+        else:
+            result = run_tw_stock_futures_day_trade_integer_torch(
+                prepped_weights,
+                overnight_returns,
+                initial_capital=day_trade_execution_initial_capital,
+                state_advance_mask=state_advance_mask,
+                initial_equity_scale=initial_equity_scale,
+                initial_alive=initial_alive,
+                return_weights_history=return_weights_history,
+                scheduled_events=mode == "tw_stock_futures_day_trade_0845_minute",
+                recoverable_backward=futures_portfolio_recoverable_backward,
+                saturation_recovery=futures_minute_saturation_recovery,
+                recovery_objective=futures_minute_recovery_objective,
+            )
         return BacktestResultTensor(
             strategy_returns=result.strategy_returns,
             benchmark_returns=benchmark_returns.to(
@@ -3605,10 +3630,12 @@ def run_backtest_torch(
             final_equity_scale=result.final_equity_scale,
             execution_mode=mode,
             settlement_default=result.default_history,
-            default_reason_history=(None if result.default_history is None else result.default_history.to(torch.int64)),
+            default_reason_history=(result.default_reason_history if carrying else (None if result.default_history is None else result.default_history.to(torch.int64))),
             futures_contract_quantities_history=result.contract_quantities_history,
             futures_residual_contract_quantities_history=result.residual_contract_quantities_history,
             settlement_ledger_unit=None,
+            final_futures_carry_state=result.final_carry_state,
+            futures_carry_state_history=result.carry_state_history,
         )
     if mode in TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES:
         if overnight_returns is None:
