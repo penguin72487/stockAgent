@@ -43,7 +43,8 @@ def empty_minute_bars() -> pl.DataFrame:
 
 
 def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
-                           physical_contract: str, source_sha256: str) -> pl.DataFrame:
+                           physical_contract: str, source_sha256: str,
+                           full_session: bool = False) -> pl.DataFrame:
     required = {"ts", "trading_date", "query_contract", "security_type",
                 "Open", "High", "Low", "Close", "Volume", "Amount"}
     if not required <= set(frame.columns):
@@ -82,7 +83,7 @@ def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
              + pl.col("bar_end").dt.minute()).alias("minute"),
         )
         .filter((pl.col("bar_end").dt.date() == pl.col("trading_date"))
-                & pl.col("minute").is_in(EVENT_MINUTES))
+                & (pl.col("minute").is_between(526, 825) if full_session else pl.col("minute").is_in(EVENT_MINUTES)))
         .select(
             pl.col("trading_date").alias("date"),
             pl.lit(physical_contract).alias("physical_contract"), "minute", "vwap",

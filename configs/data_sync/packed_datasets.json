@@ -326,7 +326,8 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "excluded_subtrees": [
-        "taifex_stock_futures_minute_history_v2"
+        "taifex_stock_futures_minute_history_v2",
+        "shioaji_gap_repair"
       ],
       "active_process_substrings": [
         "download_shioaji_tx_futures_ticks",

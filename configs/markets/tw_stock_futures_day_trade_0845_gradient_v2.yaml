@@ -1,0 +1,11 @@
+base_config: tw_stock_futures_day_trade_0845_historical.yaml
+
+experiment_name: tw-stock-futures-from-20200323-contract-quarantine-v1-gradient-v2
+
+runner:
+  # Optimizer gradients changed; never resume the v1 optimizer/checkpoints.
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v1_gradient_v2_vast5090
+  resume: true
+
+# Inherit the same source releases, calendar, features, whole-contract account,
+# BF16/DDP model, and 1000-epoch budget. Only empty-minute shadow gradients change.

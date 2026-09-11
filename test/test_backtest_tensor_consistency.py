@@ -4126,6 +4126,7 @@ def test_rank0_final_artifact_failure_is_raised_on_waiting_worker(monkeypatch) -
     def gather_rank0_failure(statuses, local_status) -> None:
         statuses[0] = {
             "rank": 0,
+            "phase": "final_fold_artifacts",
             "ok": False,
             "error": "OSError: artifact disk full",
         }

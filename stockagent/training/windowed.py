@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from stockagent.data.tw_stock_futures_minute import MINUTE_MODE, TAPE_FIELDS, HYBRID_TAPE_FIELDS
+from stockagent.data.tw_stock_futures_carry import CARRY_SUPPORTED_TAPE_FIELDS
 
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
@@ -123,6 +124,10 @@ class WindowedSplitTensors:
         elif (
             self.execution_mode
             in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+            and not (self.execution_mode == MINUTE_MODE and self.overnight_log_returns.ndim == 4
+                     and self.overnight_log_returns.shape[:2] == self.features.shape[:2]
+                     and self.overnight_log_returns.shape[2] >= 2
+                     and self.overnight_log_returns.shape[3] in CARRY_SUPPORTED_TAPE_FIELDS)
             and tuple(self.overnight_log_returns.shape)
             not in {(
                 int(self.features.size(0)),

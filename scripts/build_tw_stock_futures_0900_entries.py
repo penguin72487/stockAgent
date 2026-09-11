@@ -192,6 +192,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assemble-cached", action="store_true",
                         help="Assemble the existing SHA-verified dated shards without refreshing their raw-source snapshot.")
     parser.add_argument("--work-dir", type=Path, default=Path("artifacts/cache/futures_minute_history"))
+    parser.add_argument('--repair-root', type=Path, help='Canonical exact-month KBar gap-repair workspace.')
+    parser.add_argument('--official-evidence-dir', type=Path, help='SHA-bound complete official daily/spread evidence for repair.')
+    parser.add_argument('--refresh-dates', nargs='+', help='Refresh only these dates; preserve every other SHA-verified cached shard.')
+    parser.add_argument('--capacity-participation', type=float, help='Prove zero integer capacity from an official daily volume upper bound.')
+    parser.add_argument('--capacity-rounding', choices=['floor', 'ceil'], default=None,
+                        help='Minute participation rounding; ceil requires actual minute evidence for positive volume.')
+    parser.add_argument('--quarantine-dates', nargs='*', help='Explicit user-authorized excluded decision dates; retain their unresolved evidence.')
+    parser.add_argument('--quarantine-contract-days', type=json.loads,
+                        help='Explicit JSON list of {date, physical_contract}; preserve other contracts and dates.')
     sources.add_argument("--minute-root", type=Path,
                          help="Existing Shioaji historical collector root; read only one-minute KBar chunks.")
     sources.add_argument(
@@ -220,6 +229,14 @@ def parse_args() -> argparse.Namespace:
         from stockagent.data.tw_stock_futures_minute import MINUTE_MODE
 
         config = load_config(args.config)
+        if args.capacity_participation is None:
+            args.capacity_participation = config.trading.max_volume_participation
+        if args.capacity_rounding is None:
+            args.capacity_rounding = config.trading.tw_stock_futures_day_trade_minute_capacity_rounding
+        if args.quarantine_dates is None:
+            args.quarantine_dates = config.trading.tw_stock_futures_day_trade_quarantine_dates
+        if args.quarantine_contract_days is None:
+            args.quarantine_contract_days = config.trading.tw_stock_futures_day_trade_quarantine_contract_days
         if config.trading.execution_mode != MINUTE_MODE:
             parser.error("--config must select the 08:45 futures minute execution mode")
         if args.execution_policy not in (None, "scheduled_0846"):
@@ -233,6 +250,9 @@ def parse_args() -> argparse.Namespace:
         args.start_date = args.start_date or config.data.panel_start_date
         args.daily_proxy_before = args.daily_proxy_before or config.trading.tw_stock_futures_day_trade_daily_proxy_before
     args.execution_policy = args.execution_policy or "post_0900"
+    args.capacity_rounding = args.capacity_rounding or 'floor'
+    if args.capacity_participation is not None and not 0 < args.capacity_participation <= 1:
+        parser.error('--capacity-participation must be within (0,1]')
     if args.assemble_cached and args.shioaji_ticks_root is None:
         parser.error("--assemble-cached requires --shioaji-ticks-root")
     if args.shioaji_ticks_root is not None:

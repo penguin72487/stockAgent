@@ -1,0 +1,11 @@
+# Retain the model, integer execution and residual-carry policy. Repair the
+# cash-boundary fee gradient and prior-holder cash-dividend accounting; reject
+# unknown trajectories before loss/update/reporting. Fresh optimizer required.
+base_config: tw_stock_futures_day_trade_0845_carry_v8.yaml
+experiment_name: tw-stock-futures-0845-carry-data-validity-v9
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_0845_carry_v9_vast5090
+  resume: true
+trading:
+  tw_stock_futures_day_trade_carry_evidence_path: artifacts/data_preparation/futures_carry_evidence_v2_settlement_20260909/official_evidence.parquet
+  tw_stock_futures_day_trade_corporate_action_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260906T151104843336596Z-l0-penguin-246aab6e5c72e427/tw_corporate_action_entitlements.parquet

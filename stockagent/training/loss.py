@@ -1281,6 +1281,8 @@ def risk_aware_loss(
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
+    futures_minute_saturation_recovery: bool = False,
+    futures_minute_recovery_objective: str = "residual_notional",
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1353,9 +1355,13 @@ def risk_aware_loss(
                 f"{mode} supports only canonical log utility"
             )
         candidate_fields = (TAPE_FIELDS, HYBRID_TAPE_FIELDS) if mode == MINUTE_MODE else (5,)
-        if overnight_log_returns is None or tuple(
+        from stockagent.data.tw_stock_futures_carry import CARRY_SUPPORTED_TAPE_FIELDS
+        carrying = (mode == MINUTE_MODE and overnight_log_returns is not None
+                    and overnight_log_returns.ndim == 4 and overnight_log_returns.shape[-1] in CARRY_SUPPORTED_TAPE_FIELDS
+                    and overnight_log_returns.shape[:2] == weights.shape)
+        if not carrying and (overnight_log_returns is None or tuple(
             overnight_log_returns.shape
-        ) not in {(int(weights.size(0)), int(weights.size(1)), 2, fields) for fields in candidate_fields}:
+        ) not in {(int(weights.size(0)), int(weights.size(1)), 2, fields) for fields in candidate_fields}):
             raise ValueError(
                 f"{mode} requires integer candidate execution tensor [T,S,2,{candidate_fields}]"
             )
@@ -1821,6 +1827,7 @@ def risk_aware_loss(
         initial_commission_rebate_due=initial_commission_rebate_due,
         initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_equity_scale=initial_equity_scale,
+        initial_futures_carry_state=(None if aux_outputs is None else aux_outputs.get("initial_futures_carry_state")),
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
         initial_long_margin_debt=initial_long_margin_debt,
@@ -1837,6 +1844,8 @@ def risk_aware_loss(
         futures_portfolio_recoverable_backward=(
             futures_portfolio_recoverable_backward
         ),
+        futures_minute_saturation_recovery=futures_minute_saturation_recovery,
+        futures_minute_recovery_objective=futures_minute_recovery_objective,
         # The exact carrying account does not use turnover to advance state.
         # Its only supported objective is log utility, whose turnover branch
         # is mathematically absent when gamma_turnover is zero.  Validation,
@@ -1851,6 +1860,9 @@ def risk_aware_loss(
 
     if aux_outputs is not None and backtest.final_weights is not None:
         state_update_start = _loss_timer_start()
+        if backtest.final_futures_carry_state is not None:
+            aux_outputs["_final_futures_carry_state"] = _clone_portfolio_state_for_loss(
+                backtest.final_futures_carry_state, stat_prefix="final_futures_carry_state_clone")
         # Avoid carrying graph-owned output storage into the next step.
         aux_outputs["_final_weights"] = _clone_portfolio_state_for_loss(
             backtest.final_weights,

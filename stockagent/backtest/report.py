@@ -332,6 +332,8 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
         max_drawdown, calmar, turnover, daily_hit_rate, excess_return_vs_benchmark,
         cumulative_benchmark
     """
+    from stockagent.backtest.futures_data_validity import reject_invalid_carry_artifact
+    reject_invalid_carry_artifact(result)
     r = _clean_log_returns(result.strategy_returns)
     b = _clean_log_returns(result.benchmark_returns)
 

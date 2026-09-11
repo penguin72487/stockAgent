@@ -818,6 +818,57 @@ run_fintech_python train.py --config configs/markets/tw_public.yaml
 
 ### 08:45 個股期貨當沖
 
+2026-09-09 後續指示改為 **13:30 未成交部位留倉，隔日依目標口數差額調整**。
+使用 `configs/markets/tw_stock_futures_day_trade_0845_carry_v15.yaml`，保留 50% 分鐘容量向上取整；
+目前繼承 v8 檔案的 1,000 epochs 上限，命令列可用 `--epochs 10000` 調整，early stopping 仍適用。
+v15 使用獨立輸出目錄與來源指紋，從新 optimizer 開始；保留先前 checkpoint 供重現，
+不可跨不同來源版本直接續接 optimizer。跨日損益與正式到期規則見
+[剩餘部位留倉](docs/FUTURES_RESIDUAL_CARRY_2026-09-09.md)。
+已核准的三個隔離合約日保留多空口數、禁止該合約成交，按核實的同日官方結算價記帳，
+次日恢復原規則。v15 合併 PL1、CL1、JF1、RF1、KG1、MK1 調整合約來源，
+並核實 2026-08-12 至 2026-09-04 的 8,425 個近期官方合約日；完整結算價值不冒充成交。
+MKF → MK1 另按公告對舊多空持倉加減每口 8,297 元一次。2024-08-30 的 exact KBar
+及 Tick 均觀測 314 口，官方為 315 口；差額 1 口仍未知，依既有 KBar 規則只用觀測量，
+不補造分鐘或放大容量。另有 206 個潛在公司行動事件仍缺受支援的持倉轉換證據，實際持倉碰到仍會拒絕更新與報告，
+沒有新增隔離或刪減日曆。修復範圍與實機驗證見
+[第 5 折美律修復](docs/FUTURES_MKF_TRANSITION_REPAIR_2026-09-10.md)。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py --config configs/markets/tw_stock_futures_day_trade_0845_carry_v15.yaml
+```
+
+較早的嚴格當日歸零對照使用
+`configs/markets/tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml`：每分鐘進出場
+容量為 `ceil(0.5 × 該分鐘成交口數)`，零成交量仍為零；資金可負擔口數仍向下取整。
+沿用 v4 特徵正規化、FinancialTransformer、v3 相鄰整口梯度、每日 13:30 清倉、
+費稅；使用者最新指定 v5 的 `training.epochs: 10000`，既有 early stopping 仍適用。
+新 output root 不續接舊容量契約的 checkpoint。
+使用者已同意將缺來源的 `2023-07-13 / PZF:202308`、`2024-01-10 / LIF:202401`
+加入原有的 `2021-06-21 / LVF:202107` 契約日隔離。V5 已接到新的
+`futures_minutes_capacity_ceil_quarantine_v2_20260909` 資料版本，保留全部
+1,573 個決策日及同日其他候選；原始分鐘與缺口證據保留。
+詳見 [50% 無條件進位驗證](docs/FUTURES_CAPACITY_CEIL_2026-09-09.md)。
+
+舊 v4 的第一 fold 對照、成交與測試結果見
+[空手模型診斷與 v4 修正](docs/FUTURES_CASH_POLICY_AUDIT_2026-09-09.md)。
+**v4 仍是診斷實驗，尚未通過策略驗收。** 最新實際執行仍有測試清倉失敗，
+第二 fold 最新紀錄也多數零損失；詳見 [後續稽核](docs/FUTURES_V4_FOLLOWUP_2026-09-09.md)。
+完成的分鐘期貨 fold 另輸出 `execution_status.json`，區分有效空手、有效交易與
+帳戶失敗後停止交易；不能把失敗後的零部位當作模型主動空手。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py --config configs/markets/tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml --check-data-only
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+# 上述分鐘資料預檢通過後，再使用同一設定訓練。
+run_fintech_python train.py --config configs/markets/tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml
+```
+
+此設定引用私人分鐘準備快照，由同一 `train.py` 管理新容量契約的預檢、DDP、訓練與報表。
+以下是原始 **2014 起嚴格分鐘資料模板**的啟動器與建置流程，保留供重現；
+它的日期範圍及資料來源與上述 v5 不同。
+
 此模式直接使用實體契約的 1 分鐘 K 棒與來源 manifest，不需要 tick。
 Git 更新不會下載資料；正式設定從 2014 年開始，近期幾十日的分鐘棒無法滿足跨年 walk-forward。
 

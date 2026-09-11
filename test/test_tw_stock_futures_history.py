@@ -148,7 +148,17 @@ def test_checkpoint_and_reporting_reject_semantically_interchangeable_claim():
     assert b["daily_proxy_before"] == "2020-01-01" and a != b
     assert "tw_stock_futures_day_trade_daily_proxy_before" not in _configuration_fingerprint_snapshot(old)["trading"]
     assert _configuration_fingerprint_snapshot(new)["trading"]["tw_stock_futures_day_trade_daily_proxy_before"] == "2020-01-01"
+    assert 'tw_stock_futures_day_trade_quarantine_dates' not in _configuration_fingerprint_snapshot(old)['trading']
+    expected = [{'date': '2021-06-21', 'physical_contract': 'LVF:202107'}]
+    assert 'tw_stock_futures_day_trade_quarantine_contract_days' not in _configuration_fingerprint_snapshot(old)['trading']
+    assert 'tw_stock_futures_day_trade_quarantine_dates' not in _configuration_fingerprint_snapshot(new)['trading']
+    assert _configuration_fingerprint_snapshot(new)['trading']['tw_stock_futures_day_trade_quarantine_contract_days'] == expected
+    assert b['quarantined_contract_days'] == expected
+    assert b['contract_day_quarantine_version'] == 1
+    assert b['sample_calendar'] == 'all_verified_panel_sessions_including_no_entry_fills'
     report = _mode_artifact_contract_for_config(new)
+    assert report['mode_details']['quarantined_contract_days'] == expected
+    assert 'quarantined_decision_dates' not in report['mode_details']
     assert report["mode_details"]["execution_contract_version"] == 2
     assert "daily_close_flat_before_2020-01-01" in report["terminal_policy"]
     assert "daily_open_close_before_2020-01-01" in report["benchmark_contract"]

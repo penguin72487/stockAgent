@@ -1,9 +1,9 @@
 base_config: tw_stock_futures_day_trade_0845_minute.yaml
 
-experiment_name: tw-stock-futures-shioaji-from-20200323-minute-v2
+experiment_name: tw-stock-futures-shioaji-from-20200323-minute-v2-contract-quarantine-v1
 
 runner:
-  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_vast5090
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v1_vast5090
   resume: true
 
 environment:
@@ -44,8 +44,18 @@ trading:
   # Retain the v2 source contract's exclusive cutoff. The selected horizon is
   # entirely later, so this experiment contains no daily OPEN/CLOSE proxy rows.
   tw_stock_futures_day_trade_daily_proxy_before: '2020-01-01'
+  # User correction on 2026-09-09: exclude only the unresolved physical contract
+  # on its missing date. Retain all other candidates and the full decision calendar.
+  # This is retrospective source-quality scope, not historical market eligibility.
+  tw_stock_futures_day_trade_quarantine_dates: []
+  tw_stock_futures_day_trade_quarantine_contract_days:
+    - date: '2021-06-21'
+      physical_contract: LVF:202107
   # The minute history was built from this newer daily SHA, not the older
   # baseline release. Keep the explicitly delivered private source snapshot
   # paired with its minute manifest; it remains outside cold publication.
   tw_stock_futures_day_trade_data_path: artifacts/data_preparation/futures_daily_70a57dd76de74fd0a365/continuous_daily.parquet
-  tw_stock_futures_day_trade_minute_data_path: artifacts/data_preparation/futures_minutes_from_20200323_20260908/minutes.parquet
+  # Exact-month KBar/Tick recovery and independently proven zero outright
+  # capacity. Preflight rejects unresolved contract-days outside the explicit
+  # exact contract-day quarantine above. The earlier whole-day version is preserved.
+  tw_stock_futures_day_trade_minute_data_path: artifacts/data_preparation/futures_minutes_contract_quarantine_v1_20260909/minutes.parquet

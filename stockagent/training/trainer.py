@@ -36,6 +36,7 @@ from torch import nn
 from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
+from stockagent.backtest.futures_data_validity import FuturesCarryDataError
 
 from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
 from stockagent.backtest.report import (
@@ -245,6 +246,7 @@ def _raise_if_distributed_phase_failed(
 
     local_status = {
         "rank": _distributed_rank(),
+        "phase": str(phase),
         "ok": local_error is None,
         "error": (
             None
@@ -254,6 +256,21 @@ def _raise_if_distributed_phase_failed(
     }
     statuses: list[dict[str, Any] | None] = [None] * _distributed_world_size()
     dist.all_gather_object(statuses, local_status)
+    # A skipped file-dependent phase can otherwise match the next object
+    # collective and appear successful. Stop here before an object-size gather
+    # gets paired with unrelated model/gradient collectives (and a bogus size).
+    invalid_statuses = [
+        f"slot{rank}={status!r}"
+        for rank, status in enumerate(statuses)
+        if not isinstance(status, Mapping)
+        or status.get("rank") != rank
+        or status.get("phase") != str(phase)
+    ]
+    if invalid_statuses:
+        raise RuntimeError(
+            f"Distributed phase order mismatch while expecting {phase!r}: "
+            + "; ".join(invalid_statuses)
+        ) from local_error
     failures = sorted(
         (
             status
@@ -335,6 +352,7 @@ def _run_rank0_store_synchronized_phase(
             status = {
                 "ok": False,
                 "error": f"{type(exc).__name__}: {exc}",
+                "futures_carry_data_error": exc.evidence if isinstance(exc, FuturesCarryDataError) else None,
             }
         store.set(phase_key, json.dumps(status))
         store.set(ack_key, json.dumps({"ok": True, "error": None}))
@@ -388,6 +406,8 @@ def _run_rank0_store_synchronized_phase(
             ) from receive_error
 
     if not bool(status.get("ok", False)):
+        if status.get("futures_carry_data_error") is not None:
+            raise FuturesCarryDataError(status["futures_carry_data_error"])
         message = f"Distributed phase {phase!r} failed on rank 0: {status.get('error')}"
         if local_error is not None:
             raise RuntimeError(message) from local_error
@@ -409,6 +429,8 @@ class _Rank0StorePhase:
 
     def finish(self, local_error: BaseException | None) -> None:
         if not self.enabled:
+            if isinstance(local_error, FuturesCarryDataError):
+                raise local_error
             if local_error is not None:
                 raise RuntimeError(
                     f"Distributed phase {self.phase!r} failed: "
@@ -420,6 +442,7 @@ class _Rank0StorePhase:
         if self.rank == 0:
             status = {
                 "ok": local_error is None,
+                "futures_carry_data_error": local_error.evidence if isinstance(local_error, FuturesCarryDataError) else None,
                 "error": (
                     None
                     if local_error is None
@@ -476,6 +499,8 @@ class _Rank0StorePhase:
                 ) from receive_error
 
         if not bool(status.get("ok", False)):
+            if status.get("futures_carry_data_error") is not None:
+                raise FuturesCarryDataError(status["futures_carry_data_error"])
             message = (
                 f"Distributed phase {self.phase!r} failed on rank 0: "
                 f"{status.get('error')}"
@@ -2688,6 +2713,47 @@ def _mode_artifact_contract_for_config(
                            mode_details={"daily_proxy_before": cutoff, "execution_contract_version": 2,
                                          "daily_proxy_caveat": "daily close is not a 13:30 fill",
                                          "post_cutoff_missing_source": "fail_closed"})
+        quarantine = config.trading.tw_stock_futures_day_trade_quarantine_dates
+        if quarantine:
+            payload.setdefault('mode_details', {}).update(
+                quarantined_decision_dates=list(quarantine),
+                quarantine_policy='exclude_entire_decision_label; preserve_complete_stock_feature_calendar; never_impute_return')
+        contract_days = config.trading.tw_stock_futures_day_trade_quarantine_contract_days
+        if contract_days:
+            from stockagent.data.tw_stock_futures_quarantine import CONTRACT_DAY_QUARANTINE_VERSION, CONTRACT_DAY_QUARANTINE_POLICY
+            payload.setdefault('mode_details', {}).update(
+                quarantined_contract_days=list(contract_days),
+                contract_day_quarantine_version=CONTRACT_DAY_QUARANTINE_VERSION,
+                contract_day_quarantine_policy=CONTRACT_DAY_QUARANTINE_POLICY,
+            )
+        if config.trading.tw_stock_futures_day_trade_residual_policy == 'carry':
+            payload.update(
+                execution_clock='0846_target_difference_1320_limit_1324_market_1330_residual_carry',
+                recurrent_state_scope='physical_signed_contracts_marks_identity_and_equity_across_chunks',
+                terminal_policy='mark_open_inventory_or_official_expiry_settlement; unknown_data_is_error',
+                turnover_contract='filled_target_differences_scheduled_exits_and_expiry_over_opening_equity',
+            )
+            payload.setdefault('mode_details', {}).update(
+                execution_contract_version=4, residual_policy='carry', daily_proxy_before=None,
+                daily_proxy_caveat=None, post_cutoff_missing_source='raise_data_error_not_return_penalty',
+                valuation_is_official_daily_settlement_guaranteed=False,
+                cash_dividend_rule='verified_equity_credit_debit_before_open_only_old_positions',
+                corporate_action_transitions='unsupported_non_cash_events_raise_on_old_inventory',
+                cross_fold_inventory_transfer='not_implemented_independent_fold_accounts',
+            )
+            if config.trading.tw_stock_futures_day_trade_corporate_transition_path:
+                from stockagent.data.tw_stock_futures_transition import TRANSITION_POLICY
+                payload['mode_details'].update(execution_contract_version=5,
+                    corporate_action_transitions=TRANSITION_POLICY)
+            if config.trading.tw_stock_futures_day_trade_quarantined_carry_policy != 'reject':
+                from stockagent.data.tw_stock_futures_carry import CARRY_QUARANTINE_CONTRACT_VERSION
+                payload['mode_details'].update(
+                    execution_contract_version=CARRY_QUARANTINE_CONTRACT_VERSION,
+                    quarantined_carry_policy=config.trading.tw_stock_futures_day_trade_quarantined_carry_policy,
+                    quarantine_valuation='verified_same_day_official_settlement_end_of_day_only',
+                    quarantine_execution='no_orders_no_fills_no_fees_preserve_signed_inventory',
+                    post_cutoff_missing_source='explicit_quarantine_hold_else_raise_data_error',
+                )
         return payload
     if mode == "crypto_perpetual":
         execution_minute = int(config.trading.crypto_execution_minute_utc)
@@ -3487,6 +3553,7 @@ class _CompiledLossFallback:
                 aux_outputs.pop("_final_commission_rebate_due", None)
                 aux_outputs.pop("_final_commission_rebate_month_id", None)
                 aux_outputs.pop("_final_equity_scale", None)
+                aux_outputs.pop("_final_futures_carry_state", None)
             return self._eager_fn(*args, **kwargs)
 
     @property
@@ -5363,6 +5430,35 @@ def _archive_restart_artifact(path: Path, *, reason: str) -> Path | None:
     return archived
 
 
+def _archive_fold_best_checkpoint_for_restart(
+    checkpoint_path: Path,
+    *,
+    fold_id: int,
+    restarting: bool,
+) -> Path | None:
+    """Coordinate every pending fold; only rank 0 inspects/moves its file.
+
+    Call unconditionally on all ranks. Rank 0 may have already moved the file
+    before a delayed worker arrives, so existence must never guard rendezvous.
+    A missing file is a successful no-op, not a reason to skip a collective.
+    """
+    archived: Path | None = None
+    archive_error: BaseException | None = None
+    try:
+        if restarting and _distributed_should_write():
+            archived = _archive_restart_artifact(
+                checkpoint_path,
+                reason="unresumable_without_optimizer_state",
+            )
+    except BaseException as exc:
+        archive_error = exc
+    _raise_if_distributed_phase_failed(
+        f"archive_unresumable_fold_{fold_id}_checkpoint",
+        archive_error,
+    )
+    return archived
+
+
 def _coerce_nonnegative_int(value: object) -> int | None:
     if value is None:
         return None
@@ -6358,6 +6454,61 @@ def _accumulate_gradient_norm_diagnostic_(
 def _trajectory_valid_row_count(split: WindowedSplitTensors) -> int:
     mask = split._default_sample_mask if split.sample_mask is None else split.sample_mask
     return int(mask.detach().to(device="cpu", dtype=torch.int64).sum().item())
+
+
+@contextmanager
+def _capture_carry_data_error(errors):
+    """Defer only a data error until independent eval ranks can rendezvous."""
+    try:
+        yield
+    except FuturesCarryDataError as exc:
+        errors.append(exc.evidence)
+
+
+def _synchronize_carry_data_error(error, device, *, distributed):
+    if distributed:
+        world_size = dist.get_world_size()
+        owner = torch.tensor(dist.get_rank() if error is not None else world_size,
+                             device=device, dtype=torch.int64)
+        dist.all_reduce(owner, op=dist.ReduceOp.MIN)
+        failing_rank = int(owner.item())
+        if failing_rank < world_size:
+            payload = [error]
+            dist.broadcast_object_list(payload, src=failing_rank, device=device)
+            error = payload[0]
+    return error
+
+
+@contextmanager
+def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=False):
+    """Reject the complete trajectory on all ranks before backward/AdamW.
+
+    The ledger cannot own a collective: validation can run on one rank only.
+    Only the explicitly distributed training caller joins this rendezvous.
+    """
+    from stockagent.data.tw_stock_futures_carry import CARRY_SUPPORTED_TAPE_FIELDS
+    tape = split.overnight_log_returns
+    carrying = (split.execution_mode == "tw_stock_futures_day_trade_0845_minute"
+                and tape is not None and tape.ndim == 4
+                and tape.shape[-1] in CARRY_SUPPORTED_TAPE_FIELDS)
+    if not carrying:
+        yield
+        return
+    from stockagent.backtest.futures_data_validity import FuturesCarryDataError
+    error = None
+    try:
+        yield
+    except FuturesCarryDataError as exc:
+        from stockagent.backtest.futures_data_validity import map_carry_failure_symbols
+        evidence = map_carry_failure_symbols(exc.evidence, getattr(split, 'symbol_indices', None))
+        row = row_offset + int(evidence['row'])
+        evidence.update(scope='train', split_row=row,
+                        panel_row=int(split._valid_indices_cpu[row]))
+        error = evidence
+    error = _synchronize_carry_data_error(error, device, distributed=distributed)
+    if error is not None:
+        optimizer.zero_grad(set_to_none=True)
+        raise FuturesCarryDataError(error)
 
 
 def _finalize_trajectory_optimizer_step(
@@ -7748,16 +7899,31 @@ def _validate_futures_minute_audit(result: BacktestResult, rows: int, symbols: i
         return
     if result.weights_history.shape[0] == 0:
         return
+    carry = result.final_futures_carry_state
+    lanes = 2 if carry is None else np.asarray(carry).shape[1]
+    if carry is not None:
+        from stockagent.backtest.futures_data_validity import reject_invalid_carry_artifact
+        reject_invalid_carry_artifact(result)
+        state = np.asarray(carry)
+        if state.shape != (symbols, lanes, 4) or not np.isfinite(state).all() or np.any(state[..., 0] != np.round(state[..., 0])):
+            raise ValueError("invalid physical futures carry terminal state")
+        reasons = result.default_reason_history
+        if (reasons is None or np.asarray(reasons).shape != (rows,)
+                or not np.issubdtype(np.asarray(reasons).dtype, np.integer)
+                or np.any((np.asarray(reasons) < 0) | (np.asarray(reasons) > 6))):
+            raise ValueError("futures carry artifact requires complete failure reason history")
     for name in ("futures_contract_quantities_history", "futures_residual_contract_quantities_history"):
         value = getattr(result, name)
-        if value is None or np.asarray(value).shape != (rows, symbols, 2) or not np.issubdtype(np.asarray(value).dtype, np.integer):
-            raise ValueError(f"futures minute artifact requires integer {name} [T,S,2]")
+        if value is None or np.asarray(value).shape != (rows, symbols, lanes) or not np.issubdtype(np.asarray(value).dtype, np.integer):
+            raise ValueError(f"futures minute artifact requires integer {name} [T,S,K]")
     defaults = result.settlement_default
     if defaults is None or np.asarray(defaults).shape != (rows,):
         raise ValueError("futures minute artifact requires an execution failure audit")
     residual = np.asarray(result.futures_residual_contract_quantities_history)
-    if np.any(np.any(residual != 0, axis=(1, 2)) & ~np.asarray(defaults, dtype=bool)):
+    if carry is None and np.any(np.any(residual != 0, axis=(1, 2)) & ~np.asarray(defaults, dtype=bool)):
         raise ValueError("futures minute residual was relabelled as a successful flat close")
+    if carry is not None and rows and not np.array_equal(residual[-1], np.asarray(carry)[..., 0]):
+        raise ValueError("futures carry terminal inventory differs from its history")
 
 
 def _save_backtest_artifact(
@@ -8505,6 +8671,9 @@ def _save_backtest_artifact(
     add_optional("requested_weights_history", result.requested_weights_history)
     add_optional("futures_contract_quantities_history", result.futures_contract_quantities_history)
     add_optional("futures_residual_contract_quantities_history", result.futures_residual_contract_quantities_history)
+    add_optional("final_futures_carry_state", result.final_futures_carry_state)
+    add_optional("futures_carry_state_history", result.futures_carry_state_history)
+    add_optional("default_reason_history", result.default_reason_history)
     add_optional("open_weights_history", result.open_weights_history)
     add_optional("close_weights_history", result.close_weights_history)
     add_optional("event_turnovers", result.event_turnovers)
@@ -8829,6 +8998,9 @@ def _save_best_val_backtest_snapshot(
         ),
         futures_contract_quantities_history=(None if val_backtest.futures_contract_quantities_history is None else val_backtest.futures_contract_quantities_history[row_start:row_end].detach().cpu().numpy().copy()),
         futures_residual_contract_quantities_history=(None if val_backtest.futures_residual_contract_quantities_history is None else val_backtest.futures_residual_contract_quantities_history[row_start:row_end].detach().cpu().numpy().copy()),
+        futures_carry_state_history=(None if val_backtest.futures_carry_state_history is None else val_backtest.futures_carry_state_history[row_start:row_end].detach().cpu().numpy().copy()),
+        default_reason_history=(None if val_backtest.default_reason_history is None else val_backtest.default_reason_history[row_start:row_end].detach().cpu().numpy().copy()),
+        final_futures_carry_state=(None if val_backtest.futures_carry_state_history is None else val_backtest.futures_carry_state_history[row_end-1].detach().cpu().numpy().copy()),
         executed_buy_weights=sliced_optional_float32(
             val_backtest.executed_buy_weights
         ),
@@ -9297,6 +9469,26 @@ def _save_fold_output_artifacts(
     )
     save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     save_timing["backtest_artifact_compression"] = compression
+    if requested_mode == "tw_stock_futures_day_trade_0845_minute":
+        from stockagent.evaluation.futures_execution_status import (
+            save_futures_minute_execution_status,
+        )
+
+        status = save_futures_minute_execution_status(
+            fold_dir / "execution_status.json", test_backtest, test_dates, symbols,
+        )
+        if print_report:
+            activity = (f"entry_contracts={status['entry_contracts']}" if status['residual_policy'] == 'fail'
+                        else f"traded_days={status['traded_days']}; overnight_days={status['overnight_position_days']}; terminal_contracts={status['terminal_open_contracts']}")
+            print(
+                f"[test execution] {status['status']}; "
+                f"{activity}; "
+                f"first_failure_date={status['first_failure_date']}; "
+                f"first_failure_reason={status['first_failure_reason']}; "
+                f"inactive_days_after_failure={status['inactive_days_after_failure']}"
+            )
+            if status['first_failure_date'] is not None:
+                print('[test execution] reported returns include an invalid-path penalty marker; they are not verified realized performance')
     if requested_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         benchmark_audit_start = time.perf_counter()
         _save_tw_index_futures_benchmark_audit(
@@ -10372,6 +10564,9 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             requested_weights_history=optional("requested_weights_history"),
             futures_contract_quantities_history=optional("futures_contract_quantities_history", None),
             futures_residual_contract_quantities_history=optional("futures_residual_contract_quantities_history", None),
+            final_futures_carry_state=optional("final_futures_carry_state", None),
+            futures_carry_state_history=optional("futures_carry_state_history", None),
+            default_reason_history=optional("default_reason_history", None),
             open_weights_history=optional("open_weights_history"),
             close_weights_history=optional("close_weights_history"),
             event_turnovers=optional("event_turnovers"),
@@ -11570,6 +11765,10 @@ def _index_futures_flat_terminal_state_at_row(
         final_weights = np.zeros(
             weights_history.shape[1:], dtype=weights_history.dtype
         )
+    if result.futures_carry_state_history is not None and endpoint > 0:
+        state = np.asarray(result.futures_carry_state_history[endpoint - 1])
+        final_weights = state[..., 3].sum(axis=-1)
+        final_alive = np.asarray(not np.asarray(result.settlement_default[:endpoint], dtype=bool).any())
     return final_weights, final_alive, final_scale
 
 
@@ -11650,6 +11849,9 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
         strategy_returns=np.asarray(result.strategy_returns[:rows]).copy(),
         futures_contract_quantities_history=(None if result.futures_contract_quantities_history is None else np.asarray(result.futures_contract_quantities_history[:rows]).copy()),
         futures_residual_contract_quantities_history=(None if result.futures_residual_contract_quantities_history is None else np.asarray(result.futures_residual_contract_quantities_history[:rows]).copy()),
+        futures_carry_state_history=(None if result.futures_carry_state_history is None else np.asarray(result.futures_carry_state_history[:rows]).copy()),
+        default_reason_history=(None if result.default_reason_history is None else np.asarray(result.default_reason_history[:rows]).copy()),
+        final_futures_carry_state=(None if result.futures_carry_state_history is None else np.asarray(result.futures_carry_state_history[rows-1]).copy()),
         benchmark_returns=np.asarray(result.benchmark_returns[:rows]).copy(),
         turnovers=np.asarray(result.turnovers[:rows]).copy(),
         weights_history=np.asarray(result.weights_history[:rows]).copy(),
@@ -13456,6 +13658,7 @@ def _run_eval_backtest_from_weight_buffers(
     session_month_ids_all: torch.Tensor | None = None,
     commission_rebate_payment_eligible_mask_all: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
+    panel_row_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
@@ -13522,6 +13725,7 @@ def _run_eval_backtest_from_weight_buffers(
     due_weights_history_out: torch.Tensor | None = None
     futures_quantities_out: torch.Tensor | None = None
     futures_residuals_out: torch.Tensor | None = None
+    futures_carry_states_out: torch.Tensor | None = None
     commission_rebate_accrued_history_out: torch.Tensor | None = None
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
@@ -13544,8 +13748,12 @@ def _run_eval_backtest_from_weight_buffers(
         settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
         default_reason_history_out = torch.empty((total_rows,), device=device, dtype=torch.int64)
         if return_weights_history:
-            futures_quantities_out = torch.empty((total_rows, num_symbols, 2), device=device, dtype=torch.int64)
+            futures_lanes = int(overnight_log_returns_all.size(2))
+            futures_quantities_out = torch.empty((total_rows, num_symbols, futures_lanes), device=device, dtype=torch.int64)
             futures_residuals_out = torch.empty_like(futures_quantities_out)
+            from stockagent.data.tw_stock_futures_carry import CARRY_SUPPORTED_TAPE_FIELDS
+            if overnight_log_returns_all.size(-1) in CARRY_SUPPORTED_TAPE_FIELDS:
+                futures_carry_states_out = torch.empty((total_rows, num_symbols, futures_lanes, 4), device=device)
     if integer_stock_context_execution:
         settlement_default_out = torch.empty(
             (total_rows,), device=device, dtype=torch.bool
@@ -13635,6 +13843,7 @@ def _run_eval_backtest_from_weight_buffers(
     prev_commission_rebate_due: torch.Tensor | None = None
     prev_commission_rebate_month_id: torch.Tensor | None = None
     prev_equity_scale: torch.Tensor | None = None
+    prev_futures_carry_state: torch.Tensor | None = None
     prev_short_sale_collateral: torch.Tensor | None = None
     prev_short_margin_collateral: torch.Tensor | None = None
     prev_long_margin_debt: torch.Tensor | None = None
@@ -13649,6 +13858,7 @@ def _run_eval_backtest_from_weight_buffers(
             prev_commission_rebate_due = None
             prev_commission_rebate_month_id = None
             prev_equity_scale = None
+            prev_futures_carry_state = None
             prev_short_sale_collateral = None
             prev_short_margin_collateral = None
             prev_long_margin_debt = None
@@ -14082,6 +14292,7 @@ def _run_eval_backtest_from_weight_buffers(
                         prev_commission_rebate_month_id
                     ),
                     initial_equity_scale=prev_equity_scale,
+                    initial_futures_carry_state=prev_futures_carry_state,
                     initial_short_sale_collateral=prev_short_sale_collateral,
                     initial_short_margin_collateral=prev_short_margin_collateral,
                     initial_long_margin_debt=prev_long_margin_debt,
@@ -14102,6 +14313,15 @@ def _run_eval_backtest_from_weight_buffers(
                         float(max_volume_participation)
                     ),
                 )
+        except FuturesCarryDataError as exc:
+            split_row = start + int(exc.evidence['row'])
+            from stockagent.backtest.futures_data_validity import map_carry_failure_symbols
+            evidence = {**map_carry_failure_symbols(exc.evidence, symbol_indices),
+                        'scope': 'evaluation', 'progress_label': progress_label,
+                        'split_row': split_row, 'chunk_start': start, 'chunk_end': end}
+            if panel_row_indices is not None:
+                evidence['panel_row'] = int(panel_row_indices[split_row])
+            raise FuturesCarryDataError(evidence) from exc
         except RuntimeError as exc:
             raise RuntimeError(
                 f"evaluation backtest chunk rows=[{start},{end}) failed: {exc}"
@@ -14111,6 +14331,7 @@ def _run_eval_backtest_from_weight_buffers(
 
         backtest_finalize_start = time.perf_counter()
         prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
+        prev_futures_carry_state = _detach_portfolio_state(backtest_chunk.final_futures_carry_state)
         prev_alive = _detach_portfolio_state(backtest_chunk.final_alive)
         prev_cash = _detach_portfolio_state(backtest_chunk.final_cash)
         prev_payables = _detach_portfolio_state(backtest_chunk.final_payables)
@@ -14144,6 +14365,8 @@ def _run_eval_backtest_from_weight_buffers(
                 raise RuntimeError("futures minute evaluator lost its contract audit")
             futures_quantities_out[start:end].copy_(backtest_chunk.futures_contract_quantities_history[:valid_rows])
             futures_residuals_out[start:end].copy_(backtest_chunk.futures_residual_contract_quantities_history[:valid_rows])
+            if futures_carry_states_out is not None:
+                futures_carry_states_out[start:end].copy_(backtest_chunk.futures_carry_state_history[:valid_rows])
         if return_weights_history:
             weights_history_out[start:end].copy_(backtest_chunk.weights_history[:valid_rows])
             if requested_weights_history_out is None:
@@ -14287,6 +14510,8 @@ def _run_eval_backtest_from_weight_buffers(
     backtest = BacktestResultTensor(
         futures_contract_quantities_history=futures_quantities_out,
         futures_residual_contract_quantities_history=futures_residuals_out,
+        final_futures_carry_state=prev_futures_carry_state,
+        futures_carry_state_history=futures_carry_states_out,
         strategy_returns=strategy_returns_out,
         benchmark_returns=benchmark_returns_out,
         turnovers=turnovers_out,
@@ -15374,6 +15599,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 commission_rebate_payment_all
             ),
             symbol_indices=split.symbol_indices,
+            panel_row_indices=split._valid_indices_cpu,
         )
 
         ic_start = time.perf_counter()
@@ -15659,6 +15885,9 @@ def _slice_backtest_rows(
         requested_weights_history=rows(result.requested_weights_history),
         futures_contract_quantities_history=rows(result.futures_contract_quantities_history),
         futures_residual_contract_quantities_history=rows(result.futures_residual_contract_quantities_history),
+        futures_carry_state_history=rows(result.futures_carry_state_history),
+        default_reason_history=rows(result.default_reason_history),
+        final_futures_carry_state=(None if result.futures_carry_state_history is None else rows(result.futures_carry_state_history)[-1]),
         open_weights_history=rows(result.open_weights_history),
         close_weights_history=rows(result.close_weights_history),
         event_turnovers=rows(result.event_turnovers),
@@ -18031,6 +18260,7 @@ def _train_epoch_windowed_tensor(
         dtype=torch.float32,
     )
     portfolio_prev_alive = torch.ones((), device=device, dtype=torch.bool)
+    portfolio_prev_futures_carry_state = None
     portfolio_prev_cash = torch.ones((), device=device, dtype=torch.float32)
     portfolio_prev_equity_scale = torch.ones(
         (), device=device, dtype=torch.float32
@@ -18333,6 +18563,8 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
                 aux_outputs["initial_alive"] = portfolio_prev_alive
+                if portfolio_prev_futures_carry_state is not None:
+                    aux_outputs["initial_futures_carry_state"] = portfolio_prev_futures_carry_state
                 if _split_uses_recurrent_futures_equity_scale(split):
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
@@ -18367,7 +18599,7 @@ def _train_epoch_windowed_tensor(
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 loss_context = profile_range("train.forward.loss") if PROFILE_RANGES_ENABLED else nullcontext()
-                with loss_context:
+                with loss_context, _carry_loss_data_guard(split, optimizer, device, start):
                     loss = loss_fn(
                         weights,
                         batch_ret,
@@ -18473,6 +18705,7 @@ def _train_epoch_windowed_tensor(
                 batch_valid_rows / float(trajectory_valid_rows)
             )
         if sequential_return_objective and aux_outputs is not None:
+            portfolio_prev_futures_carry_state = _detach_portfolio_state(aux_outputs.get("_final_futures_carry_state"))
             next_prev = aux_outputs.get("_final_weights")
             next_alive = aux_outputs.get("_final_alive")
             next_cash = aux_outputs.get("_final_cash")
@@ -18879,6 +19112,7 @@ def _train_epoch_windowed_tensor_ddp(
         dtype=torch.float32,
     )
     portfolio_prev_alive = torch.ones((), device=device, dtype=torch.bool)
+    portfolio_prev_futures_carry_state = None
     portfolio_prev_cash = torch.ones((), device=device, dtype=torch.float32)
     portfolio_prev_equity_scale = torch.ones(
         (), device=device, dtype=torch.float32
@@ -19158,12 +19392,15 @@ def _train_epoch_windowed_tensor_ddp(
 
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
-            with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
+            with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing), \
+                    _carry_loss_data_guard(split, optimizer, device, global_start, distributed=True):
                 aux_outputs: dict[str, torch.Tensor] | None = None
                 aux_outputs = {
                     "initial_weights": portfolio_prev_weights,
                     "initial_alive": portfolio_prev_alive,
                 }
+                if portfolio_prev_futures_carry_state is not None:
+                    aux_outputs["initial_futures_carry_state"] = portfolio_prev_futures_carry_state
                 if _split_uses_recurrent_futures_equity_scale(split):
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
@@ -19286,6 +19523,7 @@ def _train_epoch_windowed_tensor_ddp(
             )
 
         next_prev = (aux_outputs or {}).get("_final_weights")
+        portfolio_prev_futures_carry_state = _detach_portfolio_state((aux_outputs or {}).get("_final_futures_carry_state"))
         next_alive = (aux_outputs or {}).get("_final_alive")
         next_cash = (aux_outputs or {}).get("_final_cash")
         next_payables = (aux_outputs or {}).get("_final_payables")
@@ -20438,6 +20676,26 @@ def run_training(
             lifecycle=lifecycle,
         )
     except BaseException as exc:
+        if isinstance(exc, FuturesCarryDataError):
+            from downloader.artifact_io import atomic_write_json
+            evidence = dict(exc.evidence)
+            if 'panel_row' in evidence:
+                evidence['date'] = str(panel.dates[evidence['panel_row']])[:10]
+            attachment = panel.stock_futures_day_trade_daily
+            ids = {} if attachment is None else (attachment.carry_metadata or {}).get('physical_ids', {})
+            physical_names = {int(value): name for name, value in ids.items()}
+            for position in evidence.get('positions', []):
+                symbol_index = position.get('panel_symbol_index')
+                if symbol_index is not None and 0 <= symbol_index < len(panel.symbols):
+                    position['underlying_symbol'] = str(panel.symbols[symbol_index])
+                for field in ('held_physical_id', 'tape_physical_id'):
+                    position[field.replace('_id', '_contract')] = physical_names.get(position[field])
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            atomic_write_json(Path(output_dir) / f'futures_data_failure_rank{rank}.json', {
+                'schema_version': 1, 'status': 'data_invalid',
+                'trajectory_optimizer_update_permitted': False,
+                'evidence': evidence,
+            })
         lifecycle.fail(exc)
         raise
     completed_fold_ids = [result.fold_id for result in results]
@@ -21896,11 +22154,17 @@ def _run_training_impl(
     )
     risk_loss_kwargs["futures_portfolio_recoverable_backward"] = bool(
         config.training.futures_portfolio_recoverable_backward
-        and normalize_execution_mode(config.trading.execution_mode)
-        == "tw_stock_context_futures_portfolio"
-        and config.trading.tw_futures_portfolio_integer_contracts
+        and (
+            normalize_execution_mode(config.trading.execution_mode) == "tw_stock_futures_day_trade_0845_minute"
+            or (normalize_execution_mode(config.trading.execution_mode) == "tw_stock_context_futures_portfolio"
+                and config.trading.tw_futures_portfolio_integer_contracts)
+        )
     )
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
+    risk_loss_kwargs["futures_minute_saturation_recovery"] = bool(
+        config.training.futures_minute_saturation_recovery
+    )
+    risk_loss_kwargs["futures_minute_recovery_objective"] = config.training.futures_minute_recovery_objective
     if factor_aug_kwargs and _distributed_is_rank0():
         print(
             "[loss-contract] factor consistency augmentation scope=train_only; "
@@ -22587,28 +22851,19 @@ def _run_training_impl(
                 checkpoint_best_path=checkpoint_best_path,
             )
 
-            if checkpoint_best_path.exists() and (
-                not resume or not group_resume_checkpoint_readable
-            ):
-                archive_error: BaseException | None = None
-                archived_checkpoint: Path | None = None
-                try:
-                    if _distributed_should_write():
-                        archived_checkpoint = _archive_restart_artifact(
-                            checkpoint_best_path,
-                            reason="unresumable_without_optimizer_state",
-                        )
-                except BaseException as exc:
-                    archive_error = exc
-                _raise_if_distributed_phase_failed(
-                    f"archive_unresumable_fold_{fold.fold_id}_checkpoint",
-                    archive_error,
-                )
+            restarting_fold = not resume or not group_resume_checkpoint_readable
+            archived_checkpoint = _archive_fold_best_checkpoint_for_restart(
+                checkpoint_best_path,
+                fold_id=fold.fold_id,
+                restarting=restarting_fold,
+            )
+            if restarting_fold:
                 if archived_checkpoint is not None:
                     print(
                         f"[Fold {fold.fold_id}] archived validation-best "
-                        "checkpoint because no readable same-group optimizer "
-                        f"checkpoint exists: {archived_checkpoint}"
+                        "checkpoint for a clean restart (resume disabled or "
+                        "no readable same-group optimizer checkpoint): "
+                        f"{archived_checkpoint}"
                     )
             elif resume and checkpoint_best_path.exists():
                 checkpoint = _load_checkpoint(checkpoint_best_path)
@@ -22911,8 +23166,9 @@ def _run_training_impl(
         optimizer_step_per_trajectory = bool(
             (
                 config.training.futures_portfolio_optimizer_step_per_trajectory
-                and execution_runtime.mode == "tw_stock_context_futures_portfolio"
-                and config.trading.tw_futures_portfolio_integer_contracts
+                and (execution_runtime.mode == "tw_stock_futures_day_trade_0845_minute"
+                     or (execution_runtime.mode == "tw_stock_context_futures_portfolio"
+                         and config.trading.tw_futures_portfolio_integer_contracts))
             )
             or (
                 config.training.crypto_optimizer_step_per_trajectory
@@ -23272,6 +23528,8 @@ def _run_training_impl(
         # Recovery is a backward-only training mechanism. Validation/test have
         # gradients disabled and always report the exact absorbing account.
         eval_risk_loss_kwargs["futures_portfolio_recoverable_backward"] = False
+        eval_risk_loss_kwargs["futures_minute_saturation_recovery"] = False
+        eval_risk_loss_kwargs["futures_minute_recovery_objective"] = "residual_notional"
         if factor_aug_kwargs:
             # Input augmentation is stochastic regularization.  Validation and
             # test report the deterministic factor objective and explicitly
@@ -25138,233 +25396,104 @@ def _run_training_impl(
             deferred_val_loss_tensors: torch.Tensor | None = None
             deferred_test_loss_tensors: torch.Tensor | None = None
             val_return_weights_history = val_return_weights_history_config
-            if full_objective_eval_required:
-                val_eval_start = time.perf_counter()
-                eval_model.eval()
-                with torch.inference_mode():
-                    for index, (_, context) in enumerate(fold_contexts.items()):
-                        start = val_offsets[index]
-                        end = val_offsets[index + 1]
-
-                        val_loss, val_ic, val_fold_timing = _evaluate_windowed_aux_objective_loss(
-                            eval_model,
-                            combined_val_windowed,
-                            start,
-                            end,
-                            device,
-                            amp_dtype,
-                            non_blocking,
-                            chunk_rows=eval_chunk_rows,
-                            objective=loss_objective,
-                            long_only=config.trading.long_only,
-                            buy_fee_rate=config.trading.buy_fee_rate,
-                            sell_fee_rate=config.trading.sell_fee_rate,
-                            max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=1.0,
-                            gamma_sharpe=config.evaluation.gamma_sharpe,
-                            gamma_excess=config.evaluation.gamma_excess,
-                            gamma_cvar=config.evaluation.gamma_cvar,
-                            cvar_alpha=config.evaluation.cvar_alpha,
-                            gamma_drawdown=config.evaluation.gamma_drawdown,
-                            drawdown_target=config.evaluation.drawdown_target,
-                            gamma_turnover=config.evaluation.gamma_turnover,
-                            gamma_underperformance=config.evaluation.gamma_underperformance,
-                            excess_target=config.evaluation.excess_target,
-                            cvar_budget=config.evaluation.cvar_budget,
-                            drawdown_budget=config.evaluation.drawdown_budget,
-                            turnover_budget=config.evaluation.turnover_budget,
-                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                            rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
-                            return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
-                            direction_weight=config.training.multitask_loss.direction_weight,
-                            volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
-                            concentration_weight=config.training.multitask_loss.concentration_weight,
-                            regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
-                            regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
-                            factor_loss_kwargs=eval_risk_loss_kwargs,
-                            max_volume_participation=config.trading.max_volume_participation,
-                            volume_participation_equity=config.trading.volume_participation_equity,
-                            execution_runtime=execution_runtime,
-                        )
-                        _add_timing(val_timing, val_fold_timing)
-                        val_losses.append(val_loss)
-                        if val_ic is not None:
-                            val_ics.append(val_ic)
-
-                        checkpoint_epoch_allowed = (
-                            best_checkpoint_max_epoch <= 0
-                            or int(epoch) <= best_checkpoint_max_epoch
-                        )
-                        should_checkpoint_fold = _distributed_rank0_decision(
-                            checkpoint_epoch_allowed
-                            and val_loss < (context.best_val_loss - early_stop_min_delta),
-                            device,
-                        )
-                        if should_checkpoint_fold:
-                            any_fold_improved = True
-                            context.best_val_loss = val_loss
-                            fold_ckpt_start = time.perf_counter()
-                            fold_checkpoint_error: BaseException | None = None
-                            try:
-                                _save_fold_checkpoint(
-                                    context.checkpoint_best_path,
-                                    fold=context.fold,
-                                    epoch=epoch,
-                                    best_val_loss=val_loss,
-                                    model=model,
-                                    optimizer=optimizer,
-                                    scaler=scaler,
-                                    experiment_manifest=experiment_manifest,
-                                    check_finite=config.training.checkpoint_finite_check,
-                                )
-                            except BaseException as exc:
-                                fold_checkpoint_error = exc
-                            _raise_if_distributed_phase_failed(
-                                f"epoch_{epoch}_fold_{context.fold.fold_id}_checkpoint",
-                                fold_checkpoint_error,
-                            )
-                            fold_ckpt_total += time.perf_counter() - fold_ckpt_start
-                val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
-                val_loss_total = 0.0
-            elif not parallel_ddp_epoch_eval or eval_rank == 0:
-                val_eval_start = time.perf_counter()
-                val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
-                    eval_model,
-                    eval_panel_slab_model,
-                    combined_val_windowed,
-                    device,
-                    amp_dtype,
-                    non_blocking,
-                    config.trading.long_only,
-                    config.trading.buy_fee_rate,
-                    config.trading.sell_fee_rate,
-                    config.trading.max_turnover_ratio,
-                    1.0,
-                    config.trading.min_trade_weight,
-                    portfolio_activation=config.trading.portfolio_activation,
-                    chunk_rows=eval_chunk_rows,
-                    backtest_chunk_rows=eval_backtest_chunk_rows,
-                    compute_ic=False,
-                    compute_metrics_summary=False,
-                    return_weights_history=val_return_weights_history,
-                    profile_timing=profile_timing,
-                    timing_out=val_timing,
-                    reset_at_rows=val_offsets,
-                    max_volume_participation=config.trading.max_volume_participation,
-                    volume_participation_equity=config.trading.volume_participation_equity,
-                    execution_runtime=execution_runtime,
-                )
-                val_eval_total = time.perf_counter() - val_eval_start
-
-                val_loss_start = time.perf_counter()
-                deferred_val_loss_contexts = list(fold_contexts.values())
-                deferred_val_loss_tensors = _batched_loss_from_backtest_segments(
-                    val_backtest_epoch.strategy_returns,
-                    val_backtest_epoch.benchmark_returns,
-                    val_backtest_epoch.turnovers,
-                    val_offsets,
-                    gamma_sharpe=config.evaluation.gamma_sharpe,
-                    gamma_excess=config.evaluation.gamma_excess,
-                    gamma_cvar=config.evaluation.gamma_cvar,
-                    cvar_alpha=config.evaluation.cvar_alpha,
-                    gamma_drawdown=config.evaluation.gamma_drawdown,
-                    drawdown_target=config.evaluation.drawdown_target,
-                    gamma_turnover=config.evaluation.gamma_turnover,
-                    gamma_underperformance=config.evaluation.gamma_underperformance,
-                    excess_target=config.evaluation.excess_target,
-                    cvar_budget=config.evaluation.cvar_budget,
-                    drawdown_budget=config.evaluation.drawdown_budget,
-                    turnover_budget=config.evaluation.turnover_budget,
-                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                    objective=loss_objective,
-                    log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
-                    log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
-                    log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
-                )
-                val_loss_total = time.perf_counter() - val_loss_start
-            else:
-                # Rank 0 owns validation and broadcasts only the per-segment
-                # scalar losses. Rank 1 can evaluate the independent sampled
-                # test segment at the same time on the other GPU.
-                deferred_val_loss_contexts = list(fold_contexts.values())
-                val_eval_total = 0.0
-                val_loss_total = 0.0
-
-            curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 1)))
-            should_compute_test_mean = (
-                run_epoch_test_curve
-                and (
-                    epoch == start_epoch
-                    or (epoch % curve_test_interval == 0)
-                    or (epoch == config.training.epochs)
-                )
-            )
-            sampled_test_mean: float | None = None
-            curve_test_total = 0.0
-            test_loss_total = 0.0
-            test_losses_epoch: list[float] = []
-            if should_compute_test_mean and (
-                not parallel_ddp_epoch_eval or eval_rank == 1
-            ):
-                curve_test_start = time.perf_counter()
+            carry_eval_errors = []
+            with _capture_carry_data_error(carry_eval_errors):
                 if full_objective_eval_required:
+                    val_eval_start = time.perf_counter()
                     eval_model.eval()
                     with torch.inference_mode():
-                        start = curve_test_start_row
-                        end = curve_test_end_row
-                        test_loss, _, test_fold_timing = _evaluate_windowed_aux_objective_loss(
-                            eval_model,
-                            combined_test_windowed,
-                            start,
-                            end,
-                            device,
-                            amp_dtype,
-                            non_blocking,
-                            chunk_rows=eval_chunk_rows,
-                            objective=loss_objective,
-                            long_only=config.trading.long_only,
-                            buy_fee_rate=config.trading.buy_fee_rate,
-                            sell_fee_rate=config.trading.sell_fee_rate,
-                            max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=1.0,
-                            gamma_sharpe=config.evaluation.gamma_sharpe,
-                            gamma_excess=config.evaluation.gamma_excess,
-                            gamma_cvar=config.evaluation.gamma_cvar,
-                            cvar_alpha=config.evaluation.cvar_alpha,
-                            gamma_drawdown=config.evaluation.gamma_drawdown,
-                            drawdown_target=config.evaluation.drawdown_target,
-                            gamma_turnover=config.evaluation.gamma_turnover,
-                            gamma_underperformance=config.evaluation.gamma_underperformance,
-                            excess_target=config.evaluation.excess_target,
-                            cvar_budget=config.evaluation.cvar_budget,
-                            drawdown_budget=config.evaluation.drawdown_budget,
-                            turnover_budget=config.evaluation.turnover_budget,
-                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                            rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
-                            return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
-                            direction_weight=config.training.multitask_loss.direction_weight,
-                            volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
-                            concentration_weight=config.training.multitask_loss.concentration_weight,
-                            regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
-                            regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
-                            factor_loss_kwargs=eval_risk_loss_kwargs,
-                            max_volume_participation=config.trading.max_volume_participation,
-                            volume_participation_equity=config.trading.volume_participation_equity,
-                            execution_runtime=execution_runtime,
-                        )
-                        _add_timing(test_curve_timing, test_fold_timing)
-                        test_losses_epoch.append(test_loss)
-                else:
-                    test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
+                        for index, (_, context) in enumerate(fold_contexts.items()):
+                            start = val_offsets[index]
+                            end = val_offsets[index + 1]
+
+                            val_loss, val_ic, val_fold_timing = _evaluate_windowed_aux_objective_loss(
+                                eval_model,
+                                combined_val_windowed,
+                                start,
+                                end,
+                                device,
+                                amp_dtype,
+                                non_blocking,
+                                chunk_rows=eval_chunk_rows,
+                                objective=loss_objective,
+                                long_only=config.trading.long_only,
+                                buy_fee_rate=config.trading.buy_fee_rate,
+                                sell_fee_rate=config.trading.sell_fee_rate,
+                                max_turnover_ratio=config.trading.max_turnover_ratio,
+                                gross_leverage=1.0,
+                                gamma_sharpe=config.evaluation.gamma_sharpe,
+                                gamma_excess=config.evaluation.gamma_excess,
+                                gamma_cvar=config.evaluation.gamma_cvar,
+                                cvar_alpha=config.evaluation.cvar_alpha,
+                                gamma_drawdown=config.evaluation.gamma_drawdown,
+                                drawdown_target=config.evaluation.drawdown_target,
+                                gamma_turnover=config.evaluation.gamma_turnover,
+                                gamma_underperformance=config.evaluation.gamma_underperformance,
+                                excess_target=config.evaluation.excess_target,
+                                cvar_budget=config.evaluation.cvar_budget,
+                                drawdown_budget=config.evaluation.drawdown_budget,
+                                turnover_budget=config.evaluation.turnover_budget,
+                                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                                rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                                return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
+                                direction_weight=config.training.multitask_loss.direction_weight,
+                                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                                concentration_weight=config.training.multitask_loss.concentration_weight,
+                                regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                                regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                                factor_loss_kwargs=eval_risk_loss_kwargs,
+                                max_volume_participation=config.trading.max_volume_participation,
+                                volume_participation_equity=config.trading.volume_participation_equity,
+                                execution_runtime=execution_runtime,
+                            )
+                            _add_timing(val_timing, val_fold_timing)
+                            val_losses.append(val_loss)
+                            if val_ic is not None:
+                                val_ics.append(val_ic)
+
+                            checkpoint_epoch_allowed = (
+                                best_checkpoint_max_epoch <= 0
+                                or int(epoch) <= best_checkpoint_max_epoch
+                            )
+                            should_checkpoint_fold = _distributed_rank0_decision(
+                                checkpoint_epoch_allowed
+                                and val_loss < (context.best_val_loss - early_stop_min_delta),
+                                device,
+                            )
+                            if should_checkpoint_fold:
+                                any_fold_improved = True
+                                context.best_val_loss = val_loss
+                                fold_ckpt_start = time.perf_counter()
+                                fold_checkpoint_error: BaseException | None = None
+                                try:
+                                    _save_fold_checkpoint(
+                                        context.checkpoint_best_path,
+                                        fold=context.fold,
+                                        epoch=epoch,
+                                        best_val_loss=val_loss,
+                                        model=model,
+                                        optimizer=optimizer,
+                                        scaler=scaler,
+                                        experiment_manifest=experiment_manifest,
+                                        check_finite=config.training.checkpoint_finite_check,
+                                    )
+                                except BaseException as exc:
+                                    fold_checkpoint_error = exc
+                                _raise_if_distributed_phase_failed(
+                                    f"epoch_{epoch}_fold_{context.fold.fold_id}_checkpoint",
+                                    fold_checkpoint_error,
+                                )
+                                fold_ckpt_total += time.perf_counter() - fold_ckpt_start
+                    val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
+                    val_loss_total = 0.0
+                elif not parallel_ddp_epoch_eval or eval_rank == 0:
+                    val_eval_start = time.perf_counter()
+                    val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                         eval_model,
                         eval_panel_slab_model,
-                        combined_test_windowed,
+                        combined_val_windowed,
                         device,
                         amp_dtype,
                         non_blocking,
@@ -25379,20 +25508,23 @@ def _run_training_impl(
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
-                        return_weights_history=False,
-                        profile_timing=False,
-                        timing_out=test_curve_timing,
-                        reset_at_rows=curve_test_offsets,
+                        return_weights_history=val_return_weights_history,
+                        profile_timing=profile_timing,
+                        timing_out=val_timing,
+                        reset_at_rows=val_offsets,
                         max_volume_participation=config.trading.max_volume_participation,
                         volume_participation_equity=config.trading.volume_participation_equity,
                         execution_runtime=execution_runtime,
                     )
-                    test_loss_start = time.perf_counter()
-                    deferred_test_loss_tensors = _batched_loss_from_backtest_segments(
-                        test_backtest_epoch.strategy_returns,
-                        test_backtest_epoch.benchmark_returns,
-                        test_backtest_epoch.turnovers,
-                        curve_test_offsets,
+                    val_eval_total = time.perf_counter() - val_eval_start
+
+                    val_loss_start = time.perf_counter()
+                    deferred_val_loss_contexts = list(fold_contexts.values())
+                    deferred_val_loss_tensors = _batched_loss_from_backtest_segments(
+                        val_backtest_epoch.strategy_returns,
+                        val_backtest_epoch.benchmark_returns,
+                        val_backtest_epoch.turnovers,
+                        val_offsets,
                         gamma_sharpe=config.evaluation.gamma_sharpe,
                         gamma_excess=config.evaluation.gamma_excess,
                         gamma_cvar=config.evaluation.gamma_cvar,
@@ -25413,8 +25545,145 @@ def _run_training_impl(
                         log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
                         log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
                     )
-                    test_loss_total = time.perf_counter() - test_loss_start
-                curve_test_total = time.perf_counter() - curve_test_start
+                    val_loss_total = time.perf_counter() - val_loss_start
+                else:
+                    # Rank 0 owns validation and broadcasts only the per-segment
+                    # scalar losses. Rank 1 can evaluate the independent sampled
+                    # test segment at the same time on the other GPU.
+                    deferred_val_loss_contexts = list(fold_contexts.values())
+                    val_eval_total = 0.0
+                    val_loss_total = 0.0
+
+                curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 1)))
+                should_compute_test_mean = (
+                    run_epoch_test_curve
+                    and (
+                        epoch == start_epoch
+                        or (epoch % curve_test_interval == 0)
+                        or (epoch == config.training.epochs)
+                    )
+                )
+                sampled_test_mean: float | None = None
+                curve_test_total = 0.0
+                test_loss_total = 0.0
+                test_losses_epoch: list[float] = []
+                if should_compute_test_mean and (
+                    not parallel_ddp_epoch_eval or eval_rank == 1
+                ):
+                    curve_test_start = time.perf_counter()
+                    if full_objective_eval_required:
+                        eval_model.eval()
+                        with torch.inference_mode():
+                            start = curve_test_start_row
+                            end = curve_test_end_row
+                            test_loss, _, test_fold_timing = _evaluate_windowed_aux_objective_loss(
+                                eval_model,
+                                combined_test_windowed,
+                                start,
+                                end,
+                                device,
+                                amp_dtype,
+                                non_blocking,
+                                chunk_rows=eval_chunk_rows,
+                                objective=loss_objective,
+                                long_only=config.trading.long_only,
+                                buy_fee_rate=config.trading.buy_fee_rate,
+                                sell_fee_rate=config.trading.sell_fee_rate,
+                                max_turnover_ratio=config.trading.max_turnover_ratio,
+                                gross_leverage=1.0,
+                                gamma_sharpe=config.evaluation.gamma_sharpe,
+                                gamma_excess=config.evaluation.gamma_excess,
+                                gamma_cvar=config.evaluation.gamma_cvar,
+                                cvar_alpha=config.evaluation.cvar_alpha,
+                                gamma_drawdown=config.evaluation.gamma_drawdown,
+                                drawdown_target=config.evaluation.drawdown_target,
+                                gamma_turnover=config.evaluation.gamma_turnover,
+                                gamma_underperformance=config.evaluation.gamma_underperformance,
+                                excess_target=config.evaluation.excess_target,
+                                cvar_budget=config.evaluation.cvar_budget,
+                                drawdown_budget=config.evaluation.drawdown_budget,
+                                turnover_budget=config.evaluation.turnover_budget,
+                                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                                rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                                return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
+                                direction_weight=config.training.multitask_loss.direction_weight,
+                                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                                concentration_weight=config.training.multitask_loss.concentration_weight,
+                                regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                                regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                                factor_loss_kwargs=eval_risk_loss_kwargs,
+                                max_volume_participation=config.trading.max_volume_participation,
+                                volume_participation_equity=config.trading.volume_participation_equity,
+                                execution_runtime=execution_runtime,
+                            )
+                            _add_timing(test_curve_timing, test_fold_timing)
+                            test_losses_epoch.append(test_loss)
+                    else:
+                        test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
+                            eval_model,
+                            eval_panel_slab_model,
+                            combined_test_windowed,
+                            device,
+                            amp_dtype,
+                            non_blocking,
+                            config.trading.long_only,
+                            config.trading.buy_fee_rate,
+                            config.trading.sell_fee_rate,
+                            config.trading.max_turnover_ratio,
+                            1.0,
+                            config.trading.min_trade_weight,
+                            portfolio_activation=config.trading.portfolio_activation,
+                            chunk_rows=eval_chunk_rows,
+                            backtest_chunk_rows=eval_backtest_chunk_rows,
+                            compute_ic=False,
+                            compute_metrics_summary=False,
+                            return_weights_history=False,
+                            profile_timing=False,
+                            timing_out=test_curve_timing,
+                            reset_at_rows=curve_test_offsets,
+                            max_volume_participation=config.trading.max_volume_participation,
+                            volume_participation_equity=config.trading.volume_participation_equity,
+                            execution_runtime=execution_runtime,
+                        )
+                        test_loss_start = time.perf_counter()
+                        deferred_test_loss_tensors = _batched_loss_from_backtest_segments(
+                            test_backtest_epoch.strategy_returns,
+                            test_backtest_epoch.benchmark_returns,
+                            test_backtest_epoch.turnovers,
+                            curve_test_offsets,
+                            gamma_sharpe=config.evaluation.gamma_sharpe,
+                            gamma_excess=config.evaluation.gamma_excess,
+                            gamma_cvar=config.evaluation.gamma_cvar,
+                            cvar_alpha=config.evaluation.cvar_alpha,
+                            gamma_drawdown=config.evaluation.gamma_drawdown,
+                            drawdown_target=config.evaluation.drawdown_target,
+                            gamma_turnover=config.evaluation.gamma_turnover,
+                            gamma_underperformance=config.evaluation.gamma_underperformance,
+                            excess_target=config.evaluation.excess_target,
+                            cvar_budget=config.evaluation.cvar_budget,
+                            drawdown_budget=config.evaluation.drawdown_budget,
+                            turnover_budget=config.evaluation.turnover_budget,
+                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                            objective=loss_objective,
+                            log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
+                            log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+                            log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
+                        )
+                        test_loss_total = time.perf_counter() - test_loss_start
+                    curve_test_total = time.perf_counter() - curve_test_start
+
+            if config.trading.tw_stock_futures_day_trade_residual_policy == 'carry':
+                carry_eval_error = _synchronize_carry_data_error(
+                    carry_eval_errors[0] if carry_eval_errors else None, device,
+                    distributed=parallel_ddp_epoch_eval)
+                if carry_eval_error is not None:
+                    raise FuturesCarryDataError(carry_eval_error)
+            elif carry_eval_errors:
+                raise FuturesCarryDataError(carry_eval_errors[0])
 
             parallel_eval_overlap_s = 0.0
             if parallel_ddp_epoch_eval:
@@ -25922,6 +26191,7 @@ def _run_training_impl(
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
+                    progress_label=f"[Train {train_years} fold {fold.fold_id} final-test]",
                     max_volume_participation=config.trading.max_volume_participation,
                     volume_participation_equity=config.trading.volume_participation_equity,
                     execution_runtime=execution_runtime,

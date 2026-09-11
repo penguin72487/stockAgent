@@ -1,0 +1,9 @@
+base_config: tw_stock_futures_day_trade_0845_carry_v13.yaml
+experiment_name: tw-stock-futures-0845-carry-recent-official-evidence-v14
+
+trading:
+  tw_stock_futures_day_trade_carry_evidence_path: artifacts/data_preparation/futures_carry_evidence_v3_recent_20260910/official_evidence.parquet
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_0845_carry_v14_vast5090
+  resume: true

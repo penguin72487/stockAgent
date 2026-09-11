@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import io
+import math
 from pathlib import Path
 import re
 import sys
@@ -82,6 +83,7 @@ def _empty_frame() -> pl.DataFrame:
             "product": pl.String,
             "contract": pl.String,
             "final_settlement_price": pl.Float64,
+            "final_settlement_value": pl.Float64,
             "source_kind": pl.String,
             "source_file": pl.String,
             "source_sha256": pl.String,
@@ -207,12 +209,18 @@ def parse_stock_futures_final_settlement_html(
             or price is None
         ):
             continue
+        contract_value = _positive_float(row.iloc[6]) if len(row) >= 7 else None
+        if len(row) >= 7 and (contract_value is None or not math.isfinite(contract_value)):
+            raise ValueError(f'invalid official final contract value: {product}:{contract}')
         records.append(
             {
                 "settlement_date": settlement_date,
                 "product": product,
                 "contract": contract,
                 "final_settlement_price": price,
+                # Adjusted SSF contracts can carry rights/cash in addition to
+                # price * multiplier. Preserve the exchange's complete value.
+                "final_settlement_value": contract_value,
                 "source_kind": "official_stock_etf_futures_html",
                 "source_file": source_file,
                 "source_sha256": source_sha256,
@@ -453,8 +461,9 @@ def main() -> int:
         .agg(
             pl.len().alias("rows"),
             pl.col("final_settlement_price").n_unique().alias("prices"),
+            pl.col("final_settlement_value").n_unique().alias("values"),
         )
-        .filter(pl.col("prices") != 1)
+        .filter((pl.col("prices") != 1) | (pl.col("values") != 1))
     )
     if conflict.height:
         raise RuntimeError("conflicting official final settlement values")
