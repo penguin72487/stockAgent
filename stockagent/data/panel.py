@@ -383,6 +383,10 @@ class PanelData:
     # stock feature column; this attachment owns the causal futures mapping,
     # execution mask, return, capacity, and round-trip cost side channels.
     stock_futures_day_trade_daily: Any | None = None
+    # Appended fields preserve positional compatibility for existing callers.
+    overnight_1325_available: np.ndarray | None = None
+    overnight_1325_source: dict[str, Any] | None = None
+    overnight_1325_close_fallback_mask: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -434,6 +438,9 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         symbols=panel.symbols,
         feature_names=panel.feature_names,
         features=panel.features[slc],
+        overnight_1325_available=sliced(panel.overnight_1325_available),
+        overnight_1325_source=panel.overnight_1325_source,
+        overnight_1325_close_fallback_mask=sliced(panel.overnight_1325_close_fallback_mask),
         returns_1d=panel.returns_1d[slc],
         tradable_mask=panel.tradable_mask[slc],
         can_buy_mask=sliced(panel.can_buy_mask),
@@ -5014,6 +5021,9 @@ def _filter_panel_features(
         symbols=panel.symbols,
         feature_names=filtered_names,
         features=np.ascontiguousarray(panel.features[:, :, selected]),
+        overnight_1325_available=panel.overnight_1325_available,
+        overnight_1325_source=panel.overnight_1325_source,
+        overnight_1325_close_fallback_mask=panel.overnight_1325_close_fallback_mask,
         returns_1d=panel.returns_1d,
         tradable_mask=panel.tradable_mask,
         can_buy_mask=panel.can_buy_mask,
@@ -5359,7 +5369,16 @@ def build_panel(
     feature_zero_fill: Any = None,
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
+    overnight_1325_root: str | Path | None = None,
+    overnight_1325_missing_price_policy: str = "reject",
 ) -> PanelData:
+    def append_overnight_context(panel: PanelData) -> PanelData:
+        if overnight_1325_root is not None:
+            from stockagent.data.tw_overnight import attach_overnight_1325
+            return attach_overnight_1325(panel, overnight_1325_root,
+                                         missing_price_policy=overnight_1325_missing_price_policy)
+        return panel
+
     parquet_root = Path(parquet_root)
     cache_root = (
         Path(panel_cache_root)
@@ -5534,6 +5553,7 @@ def build_panel(
                     feature_shift_next_session_patterns
                 ),
             )
+        panel = append_overnight_context(panel)
         _print_feature_overview(panel)
         return panel
 
@@ -5629,5 +5649,6 @@ def build_panel(
                 feature_shift_next_session_patterns
             ),
         )
+    panel = append_overnight_context(panel)
     _print_feature_overview(panel)
     return panel

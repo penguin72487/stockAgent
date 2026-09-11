@@ -19,6 +19,7 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
+from stockagent.live.performance_contract import paper_account_performance
 
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
@@ -67,7 +68,7 @@ _SESSION_TAIL_CACHE: dict[
 ] = {}
 _SESSION_TAIL_CACHE_LOCK = threading.Lock()
 _LATEST_SESSION_BLOCK_CACHE: dict[
-    tuple[Path, int, str], tuple[int, int, int, int, list[dict[str, Any]]]
+    tuple[Path, int, str, bool], tuple[int, int, int, int, list[dict[str, Any]]]
 ] = {}
 _LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
@@ -76,7 +77,7 @@ _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
 _AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = {}
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
-_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any]]] = {}
+_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, bytes, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
@@ -248,6 +249,19 @@ class _BenchmarkHistoryIndex:
     load_error: str | None = None
 
 
+def _empty_benchmark_history_index() -> _BenchmarkHistoryIndex:
+    return _BenchmarkHistoryIndex(
+        device=0,
+        inode=0,
+        size=0,
+        modified_ns=0,
+        origins={},
+        marks=(),
+        marks_by_session={},
+        load_error="benchmark_history_index_warming",
+    )
+
+
 _BENCHMARK_HISTORY_INDEX_CACHE: dict[Path, _BenchmarkHistoryIndex] = {}
 _BENCHMARK_HISTORY_INDEX_LOCK = threading.Lock()
 _BENCHMARK_HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 2
@@ -282,6 +296,8 @@ def build_dashboard_revision(
     *,
     state_dir: Path,
     discord_service_status_path: Path | None = None,
+    discord_markets_field: str = "day_trade_markets",
+    discord_engine_revision_field: str = "engine_state_revision",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return the tiny cross-service commit/ack state used for fast polling."""
@@ -315,10 +331,10 @@ def build_dashboard_revision(
 
     engine_revision = int(engine.get("state_revision") or 0)
     content_revision = int(engine.get("content_revision") or engine_revision)
-    bot_revision = int((bot or {}).get("engine_state_revision") or 0)
+    bot_revision = int((bot or {}).get(discord_engine_revision_field) or 0)
     engine_markets = sorted(str(item) for item in engine.get("enabled_markets") or ())
     bot_markets = sorted(
-        str(item) for item in (bot or {}).get("day_trade_markets") or ()
+        str(item) for item in (bot or {}).get(discord_markets_field) or ()
     )
     engine_age = age_seconds(engine.get("published_at"), now=observed)
     bot_age = age_seconds((bot or {}).get("updated_at"), now=observed)
@@ -370,6 +386,8 @@ def build_dashboard_revision(
             "age_seconds": round(bot_age, 3) if bot_age is not None else None,
             "engine_state_revision": bot_revision,
             "day_trade_markets": bot_markets,
+            "markets": bot_markets,
+            "markets_field": discord_markets_field,
         },
         "status": status_text,
         "synchronized": synchronized,
@@ -383,13 +401,20 @@ def build_dashboard_revision(
 
 def _object(path: Path) -> dict[str, Any]:
     cache_key = path.resolve()
+    raw = path.read_bytes()
     stat = path.stat()
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    signature = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        hashlib.blake2b(raw, digest_size=16).digest(),
+    )
     with _OBJECT_CACHE_LOCK:
         cached = _OBJECT_CACHE.get(cache_key)
-        if cached is not None and cached[:4] == signature:
-            return dict(cached[4])
-    payload = json.loads(path.read_text(encoding="utf-8"))
+        if cached is not None and cached[:5] == signature:
+            return dict(cached[5])
+    payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     final_stat = path.stat()
@@ -398,7 +423,7 @@ def _object(path: Path) -> dict[str, Any]:
         final_stat.st_ino,
         final_stat.st_size,
         final_stat.st_mtime_ns,
-    ) == signature:
+    ) == signature[:4]:
         with _OBJECT_CACHE_LOCK:
             _OBJECT_CACHE[cache_key] = (*signature, payload)
     return dict(payload)
@@ -1077,6 +1102,8 @@ def _latest_contiguous_session_rows(
     path: Path,
     session_date: str,
     maximum_rows: int,
+    *,
+    recorded_at_fallback: bool = False,
 ) -> list[dict[str, Any]]:
     """Read the newest session block without indexing the complete ledger.
 
@@ -1091,7 +1118,12 @@ def _latest_contiguous_session_rows(
     if maximum_rows <= 0 or not path.is_file():
         return []
     stat = path.stat()
-    cache_key = (path.resolve(), int(maximum_rows), str(session_date))
+    cache_key = (
+        path.resolve(),
+        int(maximum_rows),
+        str(session_date),
+        bool(recorded_at_fallback),
+    )
     signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
     with _LATEST_SESSION_BLOCK_CACHE_LOCK:
         cached = _LATEST_SESSION_BLOCK_CACHE.get(cache_key)
@@ -1121,7 +1153,7 @@ def _latest_contiguous_session_rows(
                     continue
                 row_date = _ledger_row_session_date(
                     payload,
-                    recorded_at_fallback=False,
+                    recorded_at_fallback=recorded_at_fallback,
                 )
                 if row_date == session_date:
                     found = True
@@ -1141,7 +1173,7 @@ def _latest_contiguous_session_rows(
             if isinstance(payload, dict):
                 row_date = _ledger_row_session_date(
                     payload,
-                    recorded_at_fallback=False,
+                    recorded_at_fallback=recorded_at_fallback,
                 )
                 if row_date == session_date:
                     newest_first.append(payload)
@@ -1239,16 +1271,34 @@ def _opening_signal_latency_summary(
     expected_markets: list[str],
     session_date: str,
 ) -> dict[str, Any]:
-    """Summarize the actual 09:00 trigger-to-signal-ready boundary by day."""
+    """Summarize source arrival and controllable 09:00 signal stages by day."""
 
+    goal_ms = 1_000.0
     expected = sorted({str(value) for value in expected_markets if str(value)})
     by_session: dict[str, dict[str, dict[str, Any]]] = {}
+    failures_by_session: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        if str(row.get("result") or "") != "registered":
-            continue
         market = str(row.get("market") or "")
         if expected and market not in expected:
             continue
+        is_attempt = str(row.get("source") or "") == "discord_scheduled_signal"
+        status = str(row.get("status") or "")
+        if is_attempt:
+            row_session = str(row.get("session_date") or "")[:10]
+            if status != "ready":
+                if row_session:
+                    failures_by_session.setdefault(row_session, []).append(
+                        {
+                            "market": market,
+                            "recorded_at": row.get("recorded_at"),
+                            "error_type": row.get("error_type"),
+                            "error_code": row.get("error_code"),
+                        }
+                    )
+                continue
+        elif str(row.get("result") or "") != "registered":
+            continue
+
         try:
             started = _timestamp(row.get("signal_started_at"))
             ready = _timestamp(row.get("signal_ready_at"))
@@ -1257,47 +1307,185 @@ def _opening_signal_latency_summary(
         local_started = started.astimezone(TAIPEI)
         row_session = str(row.get("session_date") or local_started.date().isoformat())
         try:
-            gate = datetime.fromisoformat(f"{row_session}T09:00:00+08:00").astimezone(
-                timezone.utc
-            )
-        except ValueError:
+            gate = _timestamp(row.get("gate_at")) if is_attempt else datetime.fromisoformat(
+                f"{row_session}T09:00:00+08:00"
+            ).astimezone(timezone.utc)
+        except (TypeError, ValueError):
             continue
-        # Opening automation is a narrow event. Exclude later interactive
-        # /signal_now calculations and replay jobs from its trend.
         queue_ms = (started - gate).total_seconds() * 1000.0
-        ready_ms = (ready - gate).total_seconds() * 1000.0
-        if queue_ms < -1_000.0 or queue_ms > 60_000.0 or ready_ms < 0.0:
+        measured_ready_ms = _finite_float(row.get("ready_from_open_ms"))
+        ready_ms = (
+            measured_ready_ms
+            if is_attempt and measured_ready_ms is not None
+            else (ready - gate).total_seconds() * 1000.0
+        )
+        # Exclude later manual/recovery runs from opening trend while retaining
+        # a five-minute window for explicitly recorded scheduled retries.
+        if queue_ms < -1_000.0 or queue_ms > 300_000.0 or ready_ms < 0.0:
             continue
+        raw_stages = row.get("stages") or {}
+        stages = {
+            str(name): round(float(value), 3)
+            for name, raw_value in raw_stages.items()
+            if (value := _finite_float(raw_value)) is not None and value >= 0.0
+        }
+        bottleneck_stage = (
+            max(stages, key=lambda name: (stages[name], name)) if stages else None
+        )
+        receipt = row.get("price_receipt_timing") or {}
+        source_ready_ms = _finite_float(row.get("source_ready_from_open_ms"))
+        if source_ready_ms is None and isinstance(receipt, Mapping):
+            source_ready_ms = _finite_float(
+                receipt.get("coverage_receipt_from_open_ms")
+            )
+        source_to_signal_ms = _finite_float(row.get("source_ready_to_signal_ms"))
+        if source_to_signal_ms is None and isinstance(receipt, Mapping):
+            source_to_signal_ms = _finite_float(
+                receipt.get("coverage_to_signal_ready_ms")
+            )
+        published_ms = _finite_float(row.get("published_from_open_ms"))
         candidate = {
             "market": market,
             "signal_id": row.get("signal_id"),
             "started_at": row.get("signal_started_at"),
             "ready_at": row.get("signal_ready_at"),
+            "published_at": row.get("artifact_published_at"),
+            "consumer_detected_at": row.get("consumer_detected_at"),
+            "ledger_persisted_at": row.get("ledger_persisted_at"),
             "queue_ms": round(queue_ms, 3),
-            "compute_ms": round(max(0.0, (ready - started).total_seconds() * 1000.0), 3),
+            "scheduler_wake_ms": stages.get("scheduler_wake_ms"),
+            "compute_ms": round(
+                max(0.0, (ready - started).total_seconds() * 1000.0), 3
+            ),
             "ready_from_0900_ms": round(ready_ms, 3),
+            "published_from_0900_ms": published_ms,
+            "input_to_ledger_ms": _finite_float(row.get("input_to_ledger_ms")),
+            "ready_to_ledger_ms": _finite_float(row.get("ready_to_ledger_ms")),
+            "source_ready_from_0900_ms": source_ready_ms,
+            "source_ready_to_signal_ms": source_to_signal_ms,
+            "stages": stages,
+            "bottleneck_stage": bottleneck_stage,
+            "bottleneck_ms": stages.get(bottleneck_stage)
+            if bottleneck_stage
+            else None,
+            "price_receipt_timing": receipt if isinstance(receipt, Mapping) else {},
+            "quote_transport": row.get("quote_transport")
+            if isinstance(row.get("quote_transport"), Mapping)
+            else {},
+            "previous_signal_history_disabled": row.get(
+                "previous_signal_history_disabled"
+            ),
+            "telemetry_source": "opening_attempt_v2" if is_attempt else "executor_latency_v1",
         }
         existing = by_session.setdefault(row_session, {}).get(market)
+        if (
+            existing is not None
+            and existing.get("signal_id")
+            and existing.get("signal_id") == candidate.get("signal_id")
+        ):
+            merged_stages = {
+                **(existing.get("stages") or {}),
+                **candidate["stages"],
+            }
+            existing["stages"] = merged_stages
+            merged_bottleneck = (
+                max(
+                    merged_stages,
+                    key=lambda name: (merged_stages[name], name),
+                )
+                if merged_stages
+                else None
+            )
+            existing["bottleneck_stage"] = merged_bottleneck
+            existing["bottleneck_ms"] = (
+                merged_stages.get(merged_bottleneck)
+                if merged_bottleneck
+                else None
+            )
+            for name in (
+                "published_at",
+                "consumer_detected_at",
+                "ledger_persisted_at",
+                "published_from_0900_ms",
+                "input_to_ledger_ms",
+                "ready_to_ledger_ms",
+                "source_ready_from_0900_ms",
+                "source_ready_to_signal_ms",
+            ):
+                if existing.get(name) is None and candidate.get(name) is not None:
+                    existing[name] = candidate[name]
+            if not existing.get("price_receipt_timing"):
+                existing["price_receipt_timing"] = candidate[
+                    "price_receipt_timing"
+                ]
+            if not existing.get("quote_transport"):
+                existing["quote_transport"] = candidate["quote_transport"]
+            if is_attempt:
+                existing["previous_signal_history_disabled"] = candidate[
+                    "previous_signal_history_disabled"
+                ]
+            existing["telemetry_source"] = (
+                "opening_attempt_v2+executor_latency_v1"
+            )
+            continue
         if existing is None or float(candidate["ready_from_0900_ms"]) < float(
             existing["ready_from_0900_ms"]
         ):
             by_session[row_session][market] = candidate
 
     trend: list[dict[str, Any]] = []
-    for day, modes_by_market in sorted(by_session.items()):
+    all_sessions = sorted(set(by_session) | set(failures_by_session))
+    for day in all_sessions:
+        modes_by_market = by_session.get(day, {})
         mode_rows = [modes_by_market[key] for key in sorted(modes_by_market)]
         ready_values = [float(row["ready_from_0900_ms"]) for row in mode_rows]
+        source_values = [
+            float(value)
+            for row in mode_rows
+            if (value := _finite_float(row.get("source_ready_from_0900_ms")))
+            is not None
+        ]
+        controllable_values = [
+            float(value)
+            for row in mode_rows
+            if (value := _finite_float(row.get("source_ready_to_signal_ms")))
+            is not None
+        ]
         observed = sorted(modes_by_market)
+        first_ready_ms = round(min(ready_values), 3) if ready_values else None
+        final_ready_ms = round(max(ready_values), 3) if ready_values else None
+        complete = bool(expected) and observed == expected
         trend.append(
             {
                 "session_date": day,
                 "observed_mode_count": len(observed),
                 "observed_markets": observed,
                 "expected_mode_count": len(expected),
-                "complete": bool(expected) and observed == expected,
+                "complete": complete,
                 "missing_markets": sorted(set(expected) - set(observed)),
-                "first_ready_ms": round(min(ready_values), 3) if ready_values else None,
-                "final_ready_ms": round(max(ready_values), 3) if ready_values else None,
+                "failure_count": len(failures_by_session.get(day, ())),
+                "failures": failures_by_session.get(day, ()),
+                "first_ready_ms": first_ready_ms,
+                "final_ready_ms": final_ready_ms,
+                "first_source_ready_ms": round(min(source_values), 3)
+                if source_values
+                else None,
+                "final_source_ready_ms": round(max(source_values), 3)
+                if source_values
+                else None,
+                "source_ready_to_signal_p50_ms": _percentile(
+                    controllable_values, 0.5
+                ),
+                "source_ready_to_signal_max_ms": round(
+                    max(controllable_values), 3
+                )
+                if controllable_values
+                else None,
+                "first_signal_goal_met": first_ready_ms is not None
+                and first_ready_ms <= goal_ms,
+                "all_modes_goal_met": complete
+                and final_ready_ms is not None
+                and final_ready_ms <= goal_ms,
                 "modes": mode_rows,
             }
         )
@@ -1310,8 +1498,16 @@ def _opening_signal_latency_summary(
             "expected_mode_count": len(expected),
             "complete": False,
             "missing_markets": expected,
+            "failure_count": 0,
+            "failures": [],
             "first_ready_ms": None,
             "final_ready_ms": None,
+            "first_source_ready_ms": None,
+            "final_source_ready_ms": None,
+            "source_ready_to_signal_p50_ms": None,
+            "source_ready_to_signal_max_ms": None,
+            "first_signal_goal_met": False,
+            "all_modes_goal_met": False,
             "modes": [],
         },
     )
@@ -1337,18 +1533,24 @@ def _opening_signal_latency_summary(
     )
     current.update(
         {
-            "schema_version": 1,
-            "measurement_boundary": "09:00_trigger_to_immutable_signal_ready",
-            "slo_ms": 15_000.0,
-            "slo_met": bool(current.get("complete"))
-            and current_final is not None
-            and current_final <= 15_000.0,
+            "schema_version": 2,
+            "measurement_boundary": "09:00_gate_to_local_quote_coverage_to_immutable_signal_ready",
+            "goal_ms": goal_ms,
+            "slo_ms": goal_ms,
+            "slo_met": bool(current.get("all_modes_goal_met")),
             "previous_session_date": (previous or {}).get("session_date"),
             "previous_final_ready_ms": previous_final,
             "change_vs_previous_ms": change_ms,
             "improved_vs_previous": change_ms is not None and change_ms < 0.0,
-            "trend": trend[-12:],
+            "trend": trend[-30:],
+            "metric_definitions": {
+                "total": "09:00 market gate to immutable signal-ready timestamp",
+                "source": "09:00 market gate to required local callback-receipt coverage",
+                "controllable": "required local quote coverage to immutable signal ready",
+                "clock": "timezone-aware wall clock across processes; monotonic clock within each process stage",
+            },
             "simulation_only": True,
+            "not_external_order_or_venue_rtt": True,
         }
     )
     return current
@@ -1488,11 +1690,8 @@ def _finite_float(value: object) -> float | None:
 def _capital_return(
     initial_capital: object, total_equity: object
 ) -> tuple[float | None, float | None]:
-    initial = _finite_float(initial_capital)
-    equity = _finite_float(total_equity)
-    if initial is None or initial <= 0.0 or equity is None:
-        return None, None
-    return equity / initial - 1.0, (equity / initial - 1.0) * 100.0
+    result = paper_account_performance({"initial_capital_twd": initial_capital, "total_equity_twd": total_equity})
+    return result["return_fraction"], result["return_pct"]
 
 
 def _load_benchmark_history(root: Path) -> dict[str, Any]:
@@ -3836,6 +4035,7 @@ def build_dashboard_snapshot(
     *,
     state_dir: Path,
     preopen_readiness_path: Path | None = None,
+    discord_service_status_path: Path | None = None,
     session_date: str | None = None,
     now: datetime | None = None,
     max_source_age_seconds: float = DEFAULT_MAX_SOURCE_AGE_SECONDS,
@@ -3845,19 +4045,27 @@ def build_dashboard_snapshot(
     include_position_rows: bool = True,
     include_ledger_session_dates: bool = True,
     unattended_guardian_path: Path = DEFAULT_UNATTENDED_GUARDIAN_PATH,
+    discord_markets_field: str = "day_trade_markets",
+    discord_engine_revision_field: str = "engine_state_revision",
 ) -> dict[str, Any]:
     root = Path(state_dir)
     state = _object(root / "state.json")
     status = _object(root / "status.json")
     observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    discord_service_status_path = (
-        Path(preopen_readiness_path).with_name(DISCORD_SERVICE_STATUS_FILENAME)
-        if preopen_readiness_path is not None
-        else None
+    resolved_discord_status_path = (
+        Path(discord_service_status_path)
+        if discord_service_status_path is not None
+        else (
+            Path(preopen_readiness_path).with_name(DISCORD_SERVICE_STATUS_FILENAME)
+            if preopen_readiness_path is not None
+            else None
+        )
     )
     service_sync = build_dashboard_revision(
         state_dir=root,
-        discord_service_status_path=discord_service_status_path,
+        discord_service_status_path=resolved_discord_status_path,
+        discord_markets_field=discord_markets_field,
+        discord_engine_revision_field=discord_engine_revision_field,
         now=observed,
     )
     unattended_guardian = _unattended_guardian_status(
@@ -3868,6 +4076,7 @@ def build_dashboard_snapshot(
         state=state,
         observed=observed,
         include_ledger_dates=include_ledger_session_dates,
+        include_benchmark_history_dates=include_ledger_session_dates,
     )
     selected_session_date = _select_session_date(
         session_date,
@@ -3889,7 +4098,11 @@ def build_dashboard_snapshot(
     health = str(status.get("health") or "unknown")
     if source_age > float(max_source_age_seconds):
         health = "stale"
-    benchmark_history = _benchmark_history_index(root)
+    benchmark_history = (
+        _benchmark_history_index(root)
+        if include_ledger_session_dates
+        else _empty_benchmark_history_index()
+    )
     benchmark_origins = benchmark_history.origins
     benchmark_history_marks = [
         dict(row)
@@ -4028,6 +4241,8 @@ def build_dashboard_snapshot(
                 "entry_fill_outcome": entry_fill_outcome,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "total_equity_twd": mode.get("total_equity_twd"),
+                "last_mark_at": mode.get("last_mark_at"),
+                "valuation_stale": mode.get("valuation_stale", False),
                 "return_fraction": return_fraction,
                 "return_pct": return_pct,
                 "cumulative_realized_net_pnl_twd": mode.get(
@@ -4200,17 +4415,43 @@ def build_dashboard_snapshot(
             )
         ]
 
+    state_session_dates = {
+        str(raw_mode.get("session_date") or "")[:10]
+        for raw_mode in (state.get("modes") or {}).values()
+        if isinstance(raw_mode, Mapping) and raw_mode.get("session_date")
+    }
+    use_contiguous_tail = (
+        not include_ledger_session_dates
+        and selected_session_date in state_session_dates
+    )
+
+    def selected_session_rows(
+        filename: str,
+        maximum_rows: int,
+        *,
+        recorded_at_fallback: bool = False,
+    ) -> list[dict[str, Any]]:
+        path = root / filename
+        if use_contiguous_tail:
+            return _latest_contiguous_session_rows(
+                path,
+                selected_session_date,
+                maximum_rows,
+                recorded_at_fallback=recorded_at_fallback,
+            )
+        return _tail_for_session(
+            path,
+            maximum_rows,
+            selected_session_date,
+            recorded_at_fallback=recorded_at_fallback,
+        )
+
     signals = current(_tail(root / "signals.jsonl", maximum_signal_rows))
-    orders = _tail_for_session(
-        root / "orders.jsonl", maximum_event_rows, selected_session_date
-    )
-    fills = _tail_for_session(
-        root / "fills.jsonl", maximum_event_rows, selected_session_date
-    )
-    raw_marks = _tail_for_session(
-        root / "marks.jsonl",
+    orders = selected_session_rows("orders.jsonl", maximum_event_rows)
+    fills = selected_session_rows("fills.jsonl", maximum_event_rows)
+    raw_marks = selected_session_rows(
+        "marks.jsonl",
         maximum_mark_rows,
-        selected_session_date,
         recorded_at_fallback=True,
     )
     marks_by_mode_minute: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4223,10 +4464,9 @@ def build_dashboard_snapshot(
         row["return_pct"] = return_pct
         marks_by_mode_minute[(str(row.get("market")), str(row.get("minute")))] = row
     marks = list(marks_by_mode_minute.values())
-    raw_benchmark_marks = _tail_for_session(
-        root / "benchmark_marks.jsonl",
+    raw_benchmark_marks = selected_session_rows(
+        "benchmark_marks.jsonl",
         maximum_mark_rows,
-        selected_session_date,
         recorded_at_fallback=True,
     )
     benchmark_marks_by_id_minute: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4245,17 +4485,19 @@ def build_dashboard_snapshot(
             (str(row.get("benchmark_id")), str(row.get("minute")))
         ] = row
     benchmark_marks = list(benchmark_marks_by_id_minute.values())
-    events = _tail_for_session(
-        root / "events.jsonl",
+    events = selected_session_rows(
+        "events.jsonl",
         min(maximum_event_rows, 2_000),
-        selected_session_date,
         recorded_at_fallback=True,
     )
     all_latency_rows = _tail(root / "latency.jsonl", 2_000)
-    latency_rows = _tail_for_session(
-        root / "latency.jsonl",
+    opening_attempt_rows = _tail(
+        root / "opening_signal_latency.jsonl",
+        10_000,
+    )
+    latency_rows = selected_session_rows(
+        "latency.jsonl",
         min(maximum_event_rows, 2_000),
-        selected_session_date,
         recorded_at_fallback=True,
     )
     latency = _latency_summary(latency_rows)
@@ -4273,9 +4515,9 @@ def build_dashboard_snapshot(
     today_latency = _latency_summary(today_latency_rows)
     today_latency["session_date"] = today_session_date
     opening_signal_latency = _opening_signal_latency_summary(
-        all_latency_rows,
+        [*opening_attempt_rows, *all_latency_rows],
         expected_markets=[str(row.get("market") or "") for row in modes],
-        session_date=today_session_date,
+        session_date=selected_session_date,
     )
 
     if not current_view:
@@ -4419,12 +4661,17 @@ def build_dashboard_snapshot(
                     mode[key] = last_mark.get(key)
                 mode["return_fraction"] = last_mark.get("return_fraction")
                 mode["return_pct"] = last_mark.get("return_pct")
+                mode["last_mark_at"] = last_mark.get("minute") or last_mark.get("recorded_at")
+                mode["valuation_stale"] = bool(last_mark.get("valuation_stale") or last_mark.get("stale_position_count"))
             else:
                 mode["total_equity_twd"] = None
                 mode["return_fraction"] = None
                 mode["return_pct"] = None
                 mode["open_position_count"] = 0
                 mode["stale_position_count"] = 0
+                mode["last_mark_at"] = None
+                mode["closing_auction_settled_at"] = None
+                mode["valuation_stale"] = False
             if (signal_event or {}).get("event") == "signal_blocked":
                 mode["engine_status"] = "historical_signal_blocked"
             elif (signal_event or {}).get("event") == "signal_registered":
@@ -4454,6 +4701,9 @@ def build_dashboard_snapshot(
         observed=selected_observed,
         session_date=selected_session_date,
     )
+    for mode in modes:
+        mode["account_performance"] = paper_account_performance(mode, revision=state.get("state_revision") if current_view else None)
+        mode["signal_product"] = "scheduled_execution"
     modes.sort(key=lambda row: str(row.get("market")))
     benchmarks.sort(key=lambda row: str(row.get("benchmark_id")))
     positions.sort(
@@ -4545,16 +4795,32 @@ def build_dashboard_snapshot(
         modes=modes,
         marks=marks,
     )
+    count_or_pending = (
+        (lambda filename: _line_count(root / filename))
+        if include_ledger_session_dates
+        else (lambda _filename: None)
+    )
     record_counts = {
-        "signals": _line_count(root / "signals.jsonl"),
-        "orders": _line_count(root / "orders.jsonl"),
-        "fills": _line_count(root / "fills.jsonl"),
-        "marks": _line_count(root / "marks.jsonl"),
-        "benchmark_marks": _line_count(root / "benchmark_marks.jsonl"),
-        "benchmark_history_marks": len(benchmark_history.marks),
-        "events": _line_count(root / "events.jsonl"),
-        "latency_samples": _line_count(root / "latency.jsonl"),
-        "historical_positions": _historical_position_count(root),
+        "signals": count_or_pending("signals.jsonl"),
+        "orders": count_or_pending("orders.jsonl"),
+        "fills": count_or_pending("fills.jsonl"),
+        "marks": count_or_pending("marks.jsonl"),
+        "benchmark_marks": count_or_pending("benchmark_marks.jsonl"),
+        "benchmark_history_marks": (
+            len(benchmark_history.marks)
+            if include_ledger_session_dates
+            else None
+        ),
+        "events": count_or_pending("events.jsonl"),
+        "latency_samples": count_or_pending("latency.jsonl"),
+        "opening_signal_latency_samples": count_or_pending(
+            "opening_signal_latency.jsonl"
+        ),
+        "historical_positions": (
+            _historical_position_count(root)
+            if include_ledger_session_dates
+            else None
+        ),
     }
 
     return {
@@ -4589,6 +4855,7 @@ def build_dashboard_snapshot(
         "benchmark_marks": benchmark_marks,
         "events": events,
         "record_counts": record_counts,
+        "record_counts_ready": bool(include_ledger_session_dates),
         "payload_window": {
             "positions": len(positions) if include_position_rows else 0,
             "signals": len(signals),
@@ -4606,7 +4873,7 @@ def build_dashboard_snapshot(
             "signal": "Discord live target_weights.parquet after observed opening quote",
             "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the source-backed right-labelled 09:01 minute price (VWAP, otherwise that KBar's Close). It is explicitly counterfactual and is not a live quote or real order fill",
             "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline uses the source-backed 09:01 minute price; missing ticks alone do not block, but a missing minute bar is blocked without open-price fill, carried last-price, or adverse-tick substitution",
-            "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
+            "latency": "opening telemetry separates 09:00 scheduler wake, local quote callback coverage, quote-service queue/provider/serialization, feature preparation, model lock/inference, atomic signal publication, consumer discovery, and ledger persistence; local callback receipt is not exchange matching time, order acknowledgement, or venue round-trip latency",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
             "mark": "best bid liquidates long; best ask covers short",
@@ -5349,6 +5616,7 @@ def build_dashboard_summary(
     session_date: str | None = None,
     now: datetime | None = None,
     max_source_age_seconds: float = DEFAULT_MAX_SOURCE_AGE_SECONDS,
+    include_ledger_session_dates: bool = True,
 ) -> dict[str, Any]:
     """Return the frequently refreshed operational subset of the dashboard."""
 
@@ -5362,6 +5630,7 @@ def build_dashboard_summary(
         maximum_event_rows=500,
         maximum_mark_rows=4_000,
         include_position_rows=False,
+        include_ledger_session_dates=include_ledger_session_dates,
     )
     keys = (
         "schema_version",
@@ -5376,9 +5645,13 @@ def build_dashboard_summary(
         "preopen",
         "operational_issues",
         "execution_records",
+        "latency",
+        "today_latency",
+        "opening_signal_latency",
         "session_progress",
         "modes",
         "record_counts",
+        "record_counts_ready",
     )
     return {key: snapshot.get(key) for key in keys}
 
@@ -5387,6 +5660,7 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
     """Persist compact byte indexes for reboot-fast historical date reads."""
 
     root = Path(state_dir)
+    benchmark_history = _benchmark_history_index(root)
     sources = (
         ("signals.jsonl", False),
         ("orders.jsonl", False),
@@ -5399,6 +5673,7 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
         ("latency.jsonl", True),
     )
     indexed: dict[str, int] = {}
+    indexed[BENCHMARK_HISTORY_FILENAME] = len(benchmark_history.marks_by_session)
     for filename, recorded_at_fallback in sources:
         index = _ledger_session_index(
             root / filename,
@@ -5407,6 +5682,18 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
         if index is not None:
             suffix = ":recorded_at_fallback" if recorded_at_fallback else ""
             indexed[f"{filename}{suffix}"] = len(index.spans)
+    for filename in {
+        "signals.jsonl",
+        "orders.jsonl",
+        "fills.jsonl",
+        "marks.jsonl",
+        "benchmark_marks.jsonl",
+        "events.jsonl",
+        "latency.jsonl",
+        "opening_signal_latency.jsonl",
+    }:
+        indexed[f"{filename}:line_count"] = _line_count(root / filename)
+    indexed["historical_positions"] = _historical_position_count(root)
     return indexed
 
 

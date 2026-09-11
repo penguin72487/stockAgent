@@ -38,6 +38,7 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_tw_signals,
     sanitize_tw_status,
 )
+from stockagent.live.dashboard_updates import DashboardUpdateHub, file_signature  # noqa: E402
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
 )
@@ -102,9 +103,19 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/positions",
         "/tw-day-trade/api/public-data-status",
         "/tw-day-trade/api/revision",
+        "/tw-day-trade/api/updates",
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/events",
+        "/tw-overnight/api/status",
+        "/tw-overnight/api/history",
+        "/tw-overnight/api/positions",
+        "/tw-overnight/api/public-data-status",
+        "/tw-overnight/api/revision",
+        "/tw-overnight/api/updates",
+        "/tw-overnight/api/summary",
+        "/tw-overnight/api/signals",
+        "/tw-overnight/api/events",
         "/shioaji/api/status",
         "/openbb/api/status",
         "/openbb/api/history",
@@ -118,6 +129,7 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/",
         "/taifex/",
         "/tw-day-trade/",
+        "/tw-overnight/",
         "/shioaji/",
         "/openbb/",
         "/data-monitor/",
@@ -128,6 +140,9 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset({
     "/taifex/api/history", "/tw-day-trade/api/status", "/tw-day-trade/api/history",
     "/tw-day-trade/api/summary", "/tw-day-trade/api/positions",
     "/tw-day-trade/api/signals", "/tw-day-trade/api/events", "/openbb/api/history",
+    "/tw-overnight/api/status", "/tw-overnight/api/history",
+    "/tw-overnight/api/summary", "/tw-overnight/api/positions",
+    "/tw-overnight/api/signals", "/tw-overnight/api/events",
 })
 
 
@@ -730,12 +745,16 @@ def build_public_overview(
     openbb: Mapping[str, Any] | None = None,
     data_monitor: Mapping[str, Any] | None = None,
     traffic: Mapping[str, Any] | None = None,
+    overnight: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return only the fields required by the public landing cards."""
 
     tw_open, _ = _open_position_summary(tw)
+    overnight = overnight if isinstance(overnight, Mapping) else {}
+    overnight_open, _ = _open_position_summary(overnight)
     taifex_strategies = taifex.get("strategies")
     tw_modes = tw.get("modes")
+    overnight_modes = overnight.get("modes")
     shioaji_traffic = shioaji.get("traffic")
     backfill = shioaji.get("backfill")
     pipeline_summary = shioaji.get("pipeline_summary")
@@ -781,6 +800,14 @@ def build_public_overview(
             "source_age_seconds": tw.get("source_age_seconds"),
             "modes": len(tw_modes) if isinstance(tw_modes, list) else 0,
             "open_positions": tw_open,
+        },
+        "overnight": {
+            "health": overnight.get("health"),
+            "source_age_seconds": overnight.get("source_age_seconds"),
+            "modes": (
+                len(overnight_modes) if isinstance(overnight_modes, list) else 0
+            ),
+            "open_positions": overnight_open,
         },
         "shioaji": {
             "health": shioaji.get("health"),
@@ -853,11 +880,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
         repo_root: Path,
         taifex_upstream: str,
         tw_upstream: str,
+        overnight_static_root: Path | None = None,
     ) -> None:
         super().__init__(address, PublicDashboardHandler)
         self.public_static_root = Path(public_static_root)
         self.taifex_static_root = Path(taifex_static_root)
         self.tw_static_root = Path(tw_static_root)
+        self.overnight_static_root = Path(overnight_static_root or tw_static_root)
         self.shioaji_static_root = Path(shioaji_static_root)
         self.openbb_static_root = Path(openbb_static_root)
         self.data_monitor_static_root = Path(data_monitor_static_root)
@@ -875,6 +904,27 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self._refreshing: set[str] = set()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
+        bot = self.repo_root / "artifacts/discord_bot"
+        self.update_hub = DashboardUpdateHub({
+            topic: (
+                self.repo_root / f"artifacts/live/{directory}/service_sync.json",
+                self.repo_root / f"artifacts/live/{directory}/status.json",
+                bot / "service_status.json",
+                bot / "preopen_readiness.json",
+            )
+            for topic, directory in (
+                ("tw", "tw_day_trade_simulation"),
+                ("overnight", "tw_overnight_simulation"),
+            )
+        })
+
+    def server_close(self) -> None:
+        self.update_hub.close()
+        super().server_close()
+
+    def content_token(self, topic: str = "tw") -> str:
+        response = self.tw_revision() if topic == "tw" else self.overnight_revision()
+        return str(_response_json(response).get("revision_token") or "missing")
 
     def cached_static(
         self,
@@ -951,6 +1001,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 removed = self._cache.pop(key, None)
                 if removed is not None:
                     self._cache_bytes -= removed.response.resident_bytes
+        # A new content revision may temporarily return the prior verified view.
+        # Notify again when its replacement is committed; otherwise viewers can
+        # consume the revision notification but keep that stale view for a minute.
+        for topic, prefix in (("tw", "tw-status:"), ("overnight", "overnight-status:")):
+            if cache_key.startswith(prefix):
+                self.update_hub.publish(topic)
 
     def cache_residency(self) -> dict[str, int]:
         """Return bounded, non-sensitive cache capacity and occupancy metrics."""
@@ -1250,8 +1306,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         )
 
     def tw_revision(self) -> PreparedResponse:
+        signature = tuple(file_signature(path) for path in self.update_hub.paths["tw"])
         return self.cached_local_json(
-            cache_key="tw-revision",
+            cache_key=f"tw-revision:{signature}",
             ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
@@ -1272,13 +1329,115 @@ class PublicDashboardServer(ThreadingHTTPServer):
     ) -> PreparedResponse:
         date_key = f"{start_date or ''}:{end_date or ''}:{resolution}"
         return self.cached_local_json(
-            cache_key=f"tw-history:{range_key}:{date_key}",
+            cache_key=f"tw-history:{range_key}:{date_key}:{self.content_token()}",
             ttl_seconds=55.0,
             cache_control="no-cache",
             stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
             builder=lambda: sanitize_tw_history(
                 build_dashboard_history_snapshot(
                     state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                    range_key=range_key,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolution=resolution,
+                )
+            ),
+        )
+
+    def overnight_revision(self) -> PreparedResponse:
+        signature = tuple(file_signature(path) for path in self.update_hub.paths["overnight"])
+        return self.cached_local_json(
+            cache_key=f"overnight-revision:{signature}",
+            ttl_seconds=0.05,
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
+            builder=lambda: build_dashboard_revision(
+                state_dir=self.repo_root
+                / "artifacts/live/tw_overnight_simulation",
+                discord_service_status_path=self.repo_root
+                / "artifacts/discord_bot/service_status.json",
+                discord_markets_field="overnight_markets",
+                discord_engine_revision_field="overnight_engine_state_revision",
+            ),
+        )
+
+    def overnight_status(self, session_date: str | None = None) -> PreparedResponse:
+        normalized_date = str(session_date or "").strip()
+        revision = _response_json(self.overnight_revision())
+        revision_token = str(
+            revision.get("revision_token")
+            or revision.get("state_revision")
+            or "missing"
+        )
+
+        def build() -> Mapping[str, Any]:
+            payload = sanitize_tw_status(
+                build_dashboard_snapshot(
+                    state_dir=self.repo_root
+                    / "artifacts/live/tw_overnight_simulation",
+                    discord_service_status_path=self.repo_root
+                    / "artifacts/discord_bot/service_status.json",
+                    session_date=normalized_date or None,
+                    maximum_event_rows=500,
+                    maximum_mark_rows=32,
+                    include_position_rows=False,
+                    include_ledger_session_dates=False,
+                    discord_markets_field="overnight_markets",
+                    discord_engine_revision_field="overnight_engine_state_revision",
+                )
+            )
+            payload["product"] = "tw_overnight"
+            payload["model_adapter_notice"] = (
+                "13:25 target weights temporarily reuse the day-trade checkpoint; "
+                "the model has not been trained for overnight risk"
+            )
+            payload["source_contract"] = {
+                "signal": "13:25 current quote and temporary day-trade model weights",
+                "replay": "13:25-13:30 and 08:30-09:00 simulated matching is indicative only",
+                "entry_fill": "legal-limit LMT_ROD submitted at 13:25; fill uses the actual close auction print",
+                "fees": "ordinary cash-stock commission and ordinary stock or ETF transaction tax",
+                "comparison": "absolute equity remains ledger cumulative; selected-period percentage alone resets to zero",
+                "benchmarks": "this adapter has no day-trade benchmark ledger",
+                "benchmark_history": "no benchmark history is fabricated for the new product",
+                "eligibility": "buy permission and ordinary next-day short-open inventory are evaluated separately from day-trade eligibility",
+                "depth_limit": "full requested quantity is a paper-auction assumption; level-one data cannot prove queue allocation",
+                "bracket_fill": "orders use same-session legal price limits and are settled only by an actual auction print",
+                "terminal_flatten": "no same-day terminal flatten; a proven close fill must remain open overnight",
+                "exit_schedule": "next-session legal-limit LMT_ROD from 08:30; fill uses the actual opening auction print at or after 09:00",
+                "latency": "13:25 signal publication, consumer discovery and ledger timestamps are recorded separately",
+                "simtrade": "indicative matching is displayed as waiting and is never a fill",
+                "queue": "paper quantity assumes full auction allocation and makes no exchange fill claim",
+            }
+            return payload
+
+        return self.cached_local_json(
+            cache_key=(
+                f"overnight-status:{normalized_date or 'latest'}:{revision_token}"
+            ),
+            ttl_seconds=55.0,
+            cache_control="no-store",
+            stale_grace_seconds=120.0,
+            builder=build,
+        )
+
+    def overnight_history(
+        self,
+        range_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        resolution: str = "sampled",
+    ) -> PreparedResponse:
+        date_key = f"{start_date or ''}:{end_date or ''}:{resolution}"
+        return self.cached_local_json(
+            cache_key=f"overnight-history:{range_key}:{date_key}:{self.content_token('overnight')}",
+            ttl_seconds=55.0,
+            cache_control="no-cache",
+            stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
+            builder=lambda: sanitize_tw_history(
+                build_dashboard_history_snapshot(
+                    state_dir=self.repo_root
+                    / "artifacts/live/tw_overnight_simulation",
                     range_key=range_key,
                     start_date=start_date,
                     end_date=end_date,
@@ -1402,7 +1561,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # the critical path concurrently, then reuse Shioaji/OpenBB in the
         # dependent all-data projection instead of reading them twice.
         with ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=5,
             thread_name_prefix="public-overview",
         ) as executor:
             taifex_future = executor.submit(
@@ -1424,6 +1583,18 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     self.repo_root / "artifacts/live/tw_day_trade_simulation"
                 ),
             )
+            overnight_future = executor.submit(
+                self.cached_local_json,
+                cache_key="overnight-overview-status",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=OVERVIEW_STALE_GRACE_SECONDS,
+                builder=lambda: build_compact_tw_overview_status(
+                    self.repo_root / "artifacts/live/tw_overnight_simulation",
+                    opening_gate_path=self.repo_root
+                    / "artifacts/live/tw_overnight_simulation/preopen_readiness.json",
+                ),
+            )
             shioaji_future = executor.submit(
                 self.cached_local_json,
                 cache_key="shioaji-status",
@@ -1435,6 +1606,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             openbb_future = executor.submit(self.openbb_status)
             taifex = _response_json(taifex_future.result())
             tw = _response_json(tw_future.result())
+            overnight = _response_json(overnight_future.result())
             shioaji = _response_json(shioaji_future.result())
             openbb = _response_json(openbb_future.result())
         data_monitor = _response_json(
@@ -1450,6 +1622,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             openbb,
             data_monitor,
             self.traffic_observer.snapshot(),
+            overnight=overnight,
         )
 
     def prewarm_overview(self) -> None:
@@ -1751,6 +1924,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         for prefix, root in (
             ("/taifex/", self.server.taifex_static_root),
             ("/tw-day-trade/", self.server.tw_static_root),
+            ("/tw-overnight/", self.server.overnight_static_root),
             ("/shioaji/", self.server.shioaji_static_root),
             ("/openbb/", self.server.openbb_static_root),
             ("/data-monitor/", self.server.data_monitor_static_root),
@@ -1763,7 +1937,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "public, max-age=60",
                 )
-            elif suffix == "app.js" or (prefix == "/tw-day-trade/" and suffix in {
+            elif suffix == "app.js" or (prefix in {"/tw-day-trade/", "/tw-overnight/"} and suffix in {
                 "presentation.js", "detail-components.js",
             }):
                 routes[path] = (
@@ -2069,7 +2243,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             normalized = self._signal_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
             return self.server.cached_local_json(
-                cache_key=f"tw-signals:{normalized}",
+                cache_key=f"tw-signals:{normalized}:{self.server.content_token()}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -2092,7 +2266,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             normalized = self._signal_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
             return self.server.cached_local_json(
-                cache_key=f"tw-positions:{normalized}",
+                cache_key=f"tw-positions:{normalized}:{self.server.content_token()}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -2122,7 +2296,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
             return self.server.cached_local_json(
-                cache_key=f"tw-events:{normalized}",
+                cache_key=f"tw-events:{normalized}:{self.server.content_token()}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -2137,6 +2311,105 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=symbol,
                         offset=offset,
                         limit=limit,
+                    )
+                ),
+            )
+        if path == "/tw-overnight/api/status":
+            return self.server.overnight_status(self._date_query(raw_query))
+        if path == "/tw-overnight/api/revision":
+            if raw_query:
+                raise InvalidPublicRequest("revision does not accept query fields")
+            return self.server.overnight_revision()
+        if path == "/tw-overnight/api/history":
+            history_query = self._tw_history_query(raw_query)
+            return self.server.overnight_history(
+                str(history_query["range_key"]),
+                start_date=history_query["start_date"],
+                end_date=history_query["end_date"],
+                resolution=history_query["resolution"],
+            )
+        if path == "/tw-overnight/api/public-data-status":
+            if raw_query:
+                raise InvalidPublicRequest(
+                    "public data status does not accept query fields"
+                )
+            return self.server.tw_public_data_status()
+        if path == "/tw-overnight/api/summary":
+            session_date = self._date_query(raw_query)
+            return self.server.cached_local_json(
+                cache_key=f"overnight-summary:{session_date or 'latest'}",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: summarize_tw_status(
+                    _response_json(self.server.overnight_status(session_date))
+                ),
+            )
+        if path == "/tw-overnight/api/signals":
+            normalized = self._signal_query(raw_query)
+            query = parse_qs(normalized, keep_blank_values=True)
+            return self.server.cached_local_json(
+                cache_key=f"overnight-signals:{normalized}:{self.server.content_token('overnight')}",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: sanitize_tw_signals(
+                    build_dashboard_signal_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_overnight_simulation",
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        status=str(query.get("status", ["all"])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
+                    )
+                ),
+            )
+        if path == "/tw-overnight/api/positions":
+            normalized = self._signal_query(raw_query)
+            query = parse_qs(normalized, keep_blank_values=True)
+            return self.server.cached_local_json(
+                cache_key=f"overnight-positions:{normalized}:{self.server.content_token('overnight')}",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: sanitize_tw_positions(
+                    build_dashboard_position_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_overnight_simulation",
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        status=str(query.get("status", ["all"])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
+                    )
+                ),
+            )
+        if path == "/tw-overnight/api/events":
+            normalized = self._event_query(raw_query)
+            query = parse_qs(normalized, keep_blank_values=True)
+            return self.server.cached_local_json(
+                cache_key=f"overnight-events:{normalized}:{self.server.content_token('overnight')}",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: sanitize_tw_events(
+                    build_dashboard_event_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_overnight_simulation",
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0]),
                     )
                 ),
             )
@@ -2185,6 +2458,55 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
         raise PublicRouteNotFound(path)
 
+    def _stream_updates(self, topic: str, *, head_only: bool) -> None:
+        # SSE uses identity with immediate flush, not a buffered gzip response.
+        if _preferred_encoding(
+            ",".join(self.headers.get_all("Accept-Encoding", [])), gzip_available=False,
+        ) is None:
+            self._send_json(HTTPStatus.NOT_ACCEPTABLE, {"error": "no_acceptable_content_encoding"}, head_only=head_only)
+            return
+        hub = self.server.update_hub
+        if not head_only and not hub.acquire(topic):
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "update_stream_capacity"}, head_only=False)
+            return
+        self.close_connection = True
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Vary", "Accept-Encoding")
+            self._security_headers()
+            self.end_headers()
+            if head_only:
+                return
+            self.connection.settimeout(5.0)  # slow consumers cannot pin writers
+            version = -1
+            while not hub.closed:
+                current = hub.wait(topic, version)
+                if hub.closed:
+                    break
+                if current != version:
+                    revision = self.server.tw_revision() if topic == "tw" else self.server.overnight_revision()
+                    payload = _response_json(revision)
+                    payload["view_generation"] = current
+                    frame = b"event: revision\ndata: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"
+                    version = current
+                else:
+                    frame = b": heartbeat\n\n"
+                self.wfile.write(frame)
+                self.wfile.flush()
+                if not hasattr(self, "_stream_first_frame_ms"):
+                    self._stream_first_frame_ms = (time.perf_counter_ns() - self._request_started_ns) / 1_000_000
+                self._response_body_bytes += len(frame)
+        except (OSError, ValueError):
+            # Disconnects/timeouts and transient invalid source receipts close
+            # the stream; the browser reconnects and keeps its polling fallback.
+            pass
+        finally:
+            if not head_only:
+                hub.release()
+
     def _handle(self, *, head_only: bool) -> None:
         # Public GET/HEAD routes have no request-body contract. Reject bodies
         # and ambiguous framing without consuming or reinterpreting their bytes.
@@ -2216,6 +2538,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path in {
             "/taifex",
             "/tw-day-trade",
+            "/tw-overnight",
             "/shioaji",
             "/openbb",
             "/data-monitor",
@@ -2240,6 +2563,12 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
 
         is_api = "/api/" in path
+        if path in {"/tw-day-trade/api/updates", "/tw-overnight/api/updates"}:
+            if parsed.query:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}, head_only=head_only)
+            else:
+                self._stream_updates("tw" if path.startswith("/tw-day-trade/") else "overnight", head_only=head_only)
+            return
         if is_api:
             try:
                 response = self._api_response(path, parsed.query)
@@ -2293,13 +2622,17 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             path = "<invalid>"  # _handle returns a sanitized 400; keep telemetry bounded.
         self._request_started_ns = time.perf_counter_ns()
+        self.__dict__.pop("_stream_first_frame_ms", None)
         self._response_status = int(HTTPStatus.INTERNAL_SERVER_ERROR)
         self._response_body_bytes = 0
         observed = self.server.traffic_observer.request_started(path)
         try:
             callback()
         finally:
-            elapsed_ms = (time.perf_counter_ns() - self._request_started_ns) / 1_000_000
+            # An SSE connection's lifetime is not an HTTP response latency.
+            elapsed_ms = getattr(self, "_stream_first_frame_ms", None)
+            if elapsed_ms is None:
+                elapsed_ms = (time.perf_counter_ns() - self._request_started_ns) / 1_000_000
             self.server.traffic_observer.request_finished(
                 observed=observed,
                 path=path,
@@ -2361,6 +2694,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("services/tw_day_trade_dashboard"),
     )
     parser.add_argument(
+        "--overnight-static-root",
+        type=Path,
+        default=Path("services/tw_day_trade_dashboard"),
+    )
+    parser.add_argument(
         "--shioaji-static-root",
         type=Path,
         default=Path("services/shioaji_api_dashboard"),
@@ -2395,6 +2733,7 @@ def main(argv: list[str] | None = None) -> int:
         public_static_root=Path(args.public_static_root),
         taifex_static_root=Path(args.taifex_static_root),
         tw_static_root=Path(args.tw_static_root),
+        overnight_static_root=Path(args.overnight_static_root),
         shioaji_static_root=Path(args.shioaji_static_root),
         openbb_static_root=Path(args.openbb_static_root),
         data_monitor_static_root=Path(args.data_monitor_static_root),

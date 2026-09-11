@@ -8,6 +8,9 @@ source scripts/runtime_env.sh
 selected_python="$(resolve_fintech_python)"
 child_pids=()
 SHIOAJI_ENV_FILE="${SHIOAJI_ENV_FILE:-$REPO_ROOT/.env}"
+STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR="${STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR:-$REPO_ROOT/artifacts/cache/tw_day_trade_dashboard_indexes}"
+mkdir -p "$STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR"
+export STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR
 
 if [[ ! -f "$SHIOAJI_ENV_FILE" ]]; then
   echo "[tw-day-trade] missing Shioaji quote environment file: $SHIOAJI_ENV_FILE" >&2

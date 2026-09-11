@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_shioaji_tw_kbars import _atomic_write_json
+from downloader.artifact_io import atomic_write_text
 
 
 CORE_ROOT_PRIORITY = (
@@ -37,68 +38,34 @@ def _product_name(value: str) -> str:
     return re.sub(r"\s+\d{6}(?:\s+W\d+)?$", "", value).strip()
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("data_tw_futures/shioaji_contracts"),
-    )
-    parser.add_argument("--simulation", action="store_true")
-    args = parser.parse_args()
-
-    import shioaji as sj
-
-    api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
-    secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
-    if not api_key or not secret_key:
-        raise RuntimeError("SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required")
-    api = sj.Shioaji(simulation=bool(args.simulation))
+def export_inventory(api, output: Path) -> dict:
+    """Reuse the caller's login; retain old aliases and fail closed on discovery errors."""
     rows: list[dict[str, object]] = []
-    try:
-        api.set_event_callback(lambda *_args: None)
-        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
-        for root_item in api.contracts.futures_roots():
-            if isinstance(root_item, (tuple, list)):
-                root = str(root_item[0])
-                raw_name = str(root_item[1]) if len(root_item) > 1 else root
-            else:
-                root = str(getattr(root_item, "root", root_item))
-                raw_name = str(getattr(root_item, "name", root))
-            chain = list(api.contracts.futures(root))
-            codes = sorted({str(item.base.code) for item in chain})
-            continuous = sorted(
-                code for code in codes if code.endswith("R1") or code.endswith("R2")
-            )
-            if not continuous:
-                continue
-            rows.append(
-                {
-                    "root": root,
-                    "product_name": _product_name(raw_name),
-                    "raw_root_name": raw_name,
-                    "listed_contracts": len(codes),
-                    "continuous_r1": next(
-                        (code for code in continuous if code.endswith("R1")), ""
-                    ),
-                    "continuous_r2": next(
-                        (code for code in continuous if code.endswith("R2")), ""
-                    ),
-                    "listed_codes_json": json.dumps(codes, ensure_ascii=False),
-                }
-            )
-    finally:
-        try:
-            api.logout()
-        except Exception:
-            pass
+    for root_item in api.contracts.futures_roots():
+        if isinstance(root_item, (tuple, list)):
+            root = str(root_item[0])
+            raw_name = str(root_item[1]) if len(root_item) > 1 else root
+        else:
+            root = str(getattr(root_item, "root", root_item))
+            raw_name = str(getattr(root_item, "name", root))
+        chain = list(api.contracts.futures(root))
+        codes = sorted({str(item.base.code) for item in chain})
+        continuous = sorted(code for code in codes if code.endswith(('R1', 'R2')))
+        if not continuous:
+            continue
+        rows.append({'root': root, 'product_name': _product_name(raw_name),
+                     'raw_root_name': raw_name, 'listed_contracts': len(codes),
+                     'continuous_r1': next((code for code in continuous if code.endswith('R1')), ''),
+                     'continuous_r2': next((code for code in continuous if code.endswith('R2')), ''),
+                     'listed_codes_json': json.dumps(codes, ensure_ascii=False)})
+    if not rows:
+        raise RuntimeError('empty futures catalog; previous inventory preserved')
 
     priority = {root: index for index, root in enumerate(CORE_ROOT_PRIORITY)}
     rows.sort(key=lambda row: (priority.get(str(row["root"]), 10_000), str(row["root"])))
-    output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     products_path = output / "futures_products.csv"
-    pl.DataFrame(rows).write_csv(products_path)
+    atomic_write_text(products_path, pl.DataFrame(rows).write_csv())
     markdown_path = output / "futures_products.md"
     markdown_lines = [
         "# Shioaji futures products",
@@ -111,7 +78,7 @@ def main() -> int:
         "{listed_contracts} |".format(**row)
         for row in rows
     )
-    markdown_path.write_text("\n".join(markdown_lines) + "\n", encoding="utf-8")
+    atomic_write_text(markdown_path, "\n".join(markdown_lines) + "\n")
 
     aliases: list[dict[str, object]] = []
     for row in rows:
@@ -133,13 +100,24 @@ def main() -> int:
             )
     aliases.sort(key=lambda row: (int(row["priority"]), str(row["contract"])))
     aliases_path = output / "continuous_contracts.csv"
-    pl.DataFrame(aliases).write_csv(aliases_path)
+    current_path = output / 'current_continuous_contracts.csv'
+    atomic_write_text(current_path, pl.DataFrame(aliases).write_csv())
+    retained = {str(row['contract']): row for row in pl.read_csv(aliases_path).to_dicts()} if aliases_path.exists() else {}
+    for row in retained.values():
+        row['active_selection'] = False
+    for row in aliases:
+        retained[str(row['contract'])] = {**row, 'active_selection': True}
+    union = sorted(retained.values(), key=lambda row: (int(row['priority']), str(row['contract'])))
+    atomic_write_text(aliases_path, pl.DataFrame(union).write_csv())
     manifest = {
         "schema_version": 1,
         "source": "shioaji_contract_v2_futures",
         "generated_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
         "futures_roots": len(rows),
-        "continuous_contracts": len(aliases),
+        "continuous_contracts": len(union),
+        "current_continuous_contracts": len(aliases),
+        "current_continuous_contracts_path": str(current_path),
+        "current_continuous_contracts_sha256": _sha256(current_path),
         "r1_contracts": sum(row["tenor"] == "R1" for row in aliases),
         "r2_contracts": sum(row["tenor"] == "R2" for row in aliases),
         "products_path": str(products_path),
@@ -150,7 +128,25 @@ def main() -> int:
         "continuous_contracts_sha256": _sha256(aliases_path),
     }
     _atomic_write_json(output / "manifest.json", manifest)
-    print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+    return manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', type=Path, default=Path('data_tw_futures/shioaji_contracts'))
+    parser.add_argument('--simulation', action='store_true')
+    args = parser.parse_args()
+    import shioaji as sj
+    key, secret = os.getenv('SHIOAJI_API_KEY', '').strip(), os.getenv('SHIOAJI_SECRET_KEY', '').strip()
+    if not key or not secret:
+        raise RuntimeError('SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required')
+    api = sj.Shioaji(simulation=args.simulation)
+    try:
+        api.set_event_callback(lambda *_: None)
+        api.login(api_key=key, secret_key=secret, subscribe_trade=False)
+        print(json.dumps(export_inventory(api, args.output_dir), ensure_ascii=False, sort_keys=True))
+    finally:
+        api.logout()
     return 0
 
 

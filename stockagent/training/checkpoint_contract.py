@@ -273,6 +273,12 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if config.data.overnight_1325_missing_price_policy == "reject":
+        snapshot["data"].pop("overnight_1325_missing_price_policy", None)
+    if not config.trading.tw_overnight_fixed_close_to_open:
+        snapshot["trading"].pop("tw_overnight_fixed_close_to_open", None)
+    if not config.data.overnight_1325_root:
+        snapshot["data"].pop("overnight_1325_root", None)
     trading = snapshot.get("trading")
     if isinstance(trading, dict) and trading.get("tw_stock_futures_day_trade_daily_proxy_before") is None:
         trading.pop("tw_stock_futures_day_trade_daily_proxy_before", None)
@@ -937,6 +943,21 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             trading.portfolio_activation
         ),
     }
+    if trading.tw_overnight_fixed_close_to_open:
+        contract["overnight_fixed_close_to_open"] = {
+            "version": 1, "decision": "13:25 Asia/Taipei",
+            "entry": "same_session_closing_auction",
+            "exit": "next_observed_session_opening_auction",
+            "failed_open_exit": "absorbing_execution_failure",
+            "source_root": config.data.overnight_1325_root,
+            "sizing": "auction_price_target_weight_research_approximation",
+            "settlement": "t_plus_2_session_open_carrying_account",
+        }
+        if config.data.overnight_1325_missing_price_policy == "same_session_close":
+            contract["overnight_fixed_close_to_open"].update(
+                version=2, missing_1325_input="same_session_close",
+                timing_assumption="user_authorized_same_close_lookahead_approximation",
+            )
     if execution_mode == "crypto_perpetual":
         contract["crypto_perpetual"] = {
             "backtest_contract_version": CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
@@ -1960,6 +1981,21 @@ def _checkpoint_manifest(
             ),
             "force_exit_mask": fingerprint("force_exit_mask", effective_force_exit),
         }
+        if config.trading.tw_overnight_fixed_close_to_open:
+            panel_arrays["overnight_1325_available"] = fingerprint(
+                "overnight_1325_available", panel.overnight_1325_available
+            )
+            if config.data.overnight_1325_missing_price_policy == "same_session_close":
+                panel_arrays["overnight_1325_close_fallback_mask"] = fingerprint(
+                    "overnight_1325_close_fallback_mask", panel.overnight_1325_close_fallback_mask
+                )
+            # Provenance records the local path in the run manifest; content
+            # compatibility must survive moving the same source to another node.
+            panel_arrays["overnight_1325_source"] = (
+                None if panel.overnight_1325_source is None else
+                {key: value for key, value in panel.overnight_1325_source.items()
+                 if key != "source_root"}
+            )
         if execution_mode == "tw_day_trade":
             panel_arrays.update(
                 {
@@ -3061,6 +3097,9 @@ def _subset_panel_symbols(
         alive_mask=aligned_2d(panel.alive_mask, False),
         benchmark_returns=panel.benchmark_returns,
         close_prices=aligned_2d(panel.close_prices, np.nan),
+        overnight_1325_available=aligned_2d(panel.overnight_1325_available, False),
+        overnight_1325_source=panel.overnight_1325_source,
+        overnight_1325_close_fallback_mask=aligned_2d(panel.overnight_1325_close_fallback_mask, False),
         can_buy_mask=aligned_2d(panel.can_buy_mask, False),
         can_sell_mask=aligned_2d(panel.can_sell_mask, False),
         can_short_open_mask=aligned_2d(panel.can_short_open_mask, False),

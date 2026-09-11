@@ -899,6 +899,38 @@ def _refresh_selector_names(names: list[str]) -> list[str]:
     return sorted(selected)
 
 
+def _calendar_advance_refresh_names(
+    names: list[str],
+    *,
+    live_root: Path,
+    specs_by_name: Mapping[str, DatasetSpec],
+    observed: datetime,
+) -> tuple[list[str], bool]:
+    """Make a newly published session immediately pull both close cores.
+
+    The TAIEX session archive is the authority for which dates must exist.  If
+    it advances after an unrelated historical-source event, downloading only
+    that triggering dataset leaves TWSE/TPEx OHLCV falsely "up to date" until
+    the next fixed sweep.  Expand the same atomic refresh before the calendar
+    command runs so the close event can be accepted in that cycle.
+    """
+
+    selected = sorted(set(names))
+    historical = any(
+        specs_by_name[name].kind == "historical_json_table"
+        for name in selected
+    )
+    local = observed.astimezone(TAIPEI)
+    needs_calendar = bool(
+        historical
+        and local.timetz().replace(tzinfo=None) >= datetime_time(13, 30)
+        and not _completed_calendar_is_current(live_root, local)
+    )
+    if needs_calendar:
+        selected = sorted(set(selected) | set(CLOSE_EVENT_DATASETS))
+    return selected, needs_calendar
+
+
 def _download_retry_due(row: Mapping[str, Any], observed: datetime) -> bool:
     retry_at = _parse_timestamp(row.get("next_download_retry_at_taipei"))
     return retry_at is None or retry_at <= observed
@@ -980,6 +1012,12 @@ def _refresh_pending_serialized(
     started = datetime.now(TAIPEI)
     run_id = started.strftime("%Y%m%dT%H%M%S%f")
     metadata_dir = state_root / "download_runs" / run_id
+    names, calendar_refresh_needed = _calendar_advance_refresh_names(
+        names,
+        live_root=live_root,
+        specs_by_name=specs_by_name,
+        observed=started,
+    )
     selector_names = _refresh_selector_names(names)
     phase = PublicationPhase(
         name="source_event",
@@ -1056,11 +1094,7 @@ def _refresh_pending_serialized(
     else:
         end_date = "today"
     commands: list[list[str]] = []
-    if (
-        historical
-        and started.timetz().replace(tzinfo=None) >= datetime_time(13, 30)
-        and not _completed_calendar_is_current(live_root, started)
-    ):
+    if calendar_refresh_needed:
         commands.append(
             _taiex_calendar_command(live_root=live_root, args=download_args)
         )
@@ -1342,6 +1376,69 @@ def _publish_event_close_receipt_if_ready(
         "receipt": str(latest_path),
         "content_fingerprint": content_fingerprint,
         "reused": False,
+    }
+
+
+def _finalize_completed_session_close_event(
+    close_event: Mapping[str, Any],
+    *,
+    live_root: Path,
+    state_root: Path,
+    heartbeat_seconds: float,
+) -> dict[str, Any]:
+    """Immediately advance the derived close layer after an accepted event."""
+
+    if close_event.get("status") != "ok":
+        return {"status": "not_ready"}
+    expected_date = str(close_event.get("expected_date") or "")[:10]
+    completed_receipt_path = state_root.parent / "completed_session" / "latest.json"
+    completed = _read_json(completed_receipt_path)
+    after = completed.get("after")
+    if (
+        close_event.get("reused") is True
+        and completed.get("status") == "ok"
+        and completed.get("expected_date") == expected_date
+        and isinstance(after, Mapping)
+        and after.get("current") is True
+    ):
+        return {
+            "status": "already_current",
+            "expected_date": expected_date,
+            "receipt": str(completed_receipt_path),
+        }
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "finalize_tw_public_completed_session.py"),
+        "--live-root",
+        str(live_root),
+        "--publication-root",
+        str(state_root.parent / "publications"),
+        "--expected-date",
+        expected_date,
+    ]
+    started = time.monotonic()
+    process = subprocess.Popen(command, cwd=REPO_ROOT)
+    while process.poll() is None:
+        notify_systemd(
+            "WATCHDOG=1\n"
+            f"STATUS=finalizing completed TW session pid={process.pid} "
+            f"elapsed={time.monotonic() - started:.1f}s"
+        )
+        if _STOP.wait(max(1.0, min(10.0, float(heartbeat_seconds) / 2.0))):
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise RuntimeError("source-event monitor stopped during close finalization")
+    return {
+        "status": "ok" if process.returncode == 0 else "failed",
+        "expected_date": expected_date,
+        "return_code": int(process.returncode),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "command": command,
+        "receipt": str(completed_receipt_path),
     }
 
 
@@ -1660,6 +1757,14 @@ def main() -> int:
                         ),
                     )
                     refresh["completed_session_close_event"] = close_event
+                    refresh["completed_session_finalize"] = (
+                        _finalize_completed_session_close_event(
+                            close_event,
+                            live_root=live_root,
+                            state_root=state_root,
+                            heartbeat_seconds=float(args.heartbeat_seconds),
+                        )
+                    )
                 state["last_refresh"] = refresh
                 if refresh["status"] == "deferred_opening_revision":
                     state["opening_apply_deferred_until_taipei"] = (

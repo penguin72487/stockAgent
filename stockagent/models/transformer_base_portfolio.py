@@ -2059,6 +2059,7 @@ class TransformerBasePortfolioModel(nn.Module):
         use_latent_factors: bool | None = None,
         use_market_tokens: bool | None = None,
         execution_mode: str = "naive",
+        overnight_fixed_close_to_open: bool = False,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
@@ -2066,6 +2067,9 @@ class TransformerBasePortfolioModel(nn.Module):
         self.num_symbols = int(num_symbols)
         self.d_model = int(d_model)
         self.execution_mode = normalize_execution_mode(execution_mode)
+        self.overnight_fixed_close_to_open = bool(overnight_fixed_close_to_open)
+        if self.overnight_fixed_close_to_open and self.execution_mode != "tw_overnight":
+            raise ValueError("fixed close-to-open actions require tw_overnight")
         self.action_channel_names = action_channels_for_execution_mode(
             self.execution_mode
         )
@@ -4080,6 +4084,17 @@ class TransformerBasePortfolioModel(nn.Module):
                 phases=self.num_action_channels,
                 symbols=int(symbols),
             )
+        elif self.execution_mode == "tw_overnight" and self.overnight_fixed_close_to_open:
+            # Only the close allocation is learned. The morning liquidation is
+            # unconditional and cannot depend on this afternoon's observations.
+            close_weights, parts = self._postprocess_flat_target_logits(
+                action_logits[:, 2], mask_bool,
+                output_mode=resolved_mode,
+                portfolio_activation=resolved_activation,
+                return_parts=return_parts,
+            )
+            weights = torch.stack((torch.ones_like(close_weights),
+                                   torch.zeros_like(close_weights), close_weights), dim=1)
         elif self.execution_mode == "tw_overnight":
             due_exit_fraction = torch.sigmoid(action_logits[:, 0]).masked_fill(
                 ~mask_bool,

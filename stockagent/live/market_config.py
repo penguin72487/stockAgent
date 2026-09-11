@@ -66,6 +66,11 @@ class LiveMarketConfig:
     day_trade_simulation_state_dir: str | None = None
     day_trade_rule_data_dir: str | None = None
     day_trade_quote_interval_seconds: int = 60
+    # Overnight paper execution deliberately has its own state and lifecycle.
+    # The referenced checkpoint may still be a temporary tw_day_trade adapter,
+    # but enabling this flag must never make the day-trade executor consume it.
+    overnight_simulation_enabled: bool = False
+    overnight_simulation_state_dir: str | None = None
     trader_role_ids: tuple[int, ...] = ()
     trader_role_names: tuple[str, ...] = ()
 
@@ -326,6 +331,12 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         day_trade_rule_data_dir=_optional_str(raw.get("day_trade_rule_data_dir")),
         day_trade_quote_interval_seconds=max(
             1, int(raw.get("day_trade_quote_interval_seconds") or 60)
+        ),
+        overnight_simulation_enabled=_bool_value(
+            raw.get("overnight_simulation_enabled"), False
+        ),
+        overnight_simulation_state_dir=_optional_str(
+            raw.get("overnight_simulation_state_dir")
         ),
         trader_role_ids=_int_tuple(raw.get("trader_role_ids")),
         trader_role_names=_str_tuple(raw.get("trader_role_names")),

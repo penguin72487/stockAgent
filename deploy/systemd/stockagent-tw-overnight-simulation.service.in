@@ -1,0 +1,56 @@
+[Unit]
+Description=StockAgent Taiwan close-to-next-open paper execution
+Wants=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
+After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
+Before=stockagent-discord-bot.service stockagent-public-dashboards.service
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_overnight_services.sh"
+Nice=-4
+CPUWeight=90
+IOWeight=90
+Restart=always
+RestartSec=1s
+WatchdogSec=90s
+TimeoutStartSec=60s
+SuccessExitStatus=143 SIGTERM
+TimeoutStopSec=20s
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@REPO_ROOT@/artifacts/live/tw_overnight_simulation @REPO_ROOT@/artifacts/live/tw_day_trade_simulation
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+# NumPy/OpenMP probes sched_setaffinity during import, so @resources cannot be
+# denied as a group.  The service still has no realtime scheduling privilege.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

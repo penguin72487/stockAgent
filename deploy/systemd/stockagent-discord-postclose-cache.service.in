@@ -1,0 +1,24 @@
+[Unit]
+Description=StockAgent bounded Discord post-close signal cache
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --signal-cache-only
+TimeoutStartSec=10m
+KillMode=control-group
+# This bounded cache is the latency-sensitive bridge between an accepted
+# official close and Discord.  Formal history remains in the low-priority unit.
+Nice=0
+CPUWeight=100
+IOWeight=100
+OOMScoreAdjust=0
+
+[Install]
+WantedBy=multi-user.target

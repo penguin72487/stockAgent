@@ -16,6 +16,7 @@
     Object.freeze({id: "overview", label: "總覽", slug: ""}),
     Object.freeze({id: "taifex", label: "TAIFEX", slug: "taifex"}),
     Object.freeze({id: "tw-day-trade", label: "台股當沖", slug: "tw-day-trade"}),
+    Object.freeze({id: "tw-overnight", label: "隔日沖", slug: "tw-overnight"}),
     Object.freeze({id: "shioaji", label: "永豐 API", slug: "shioaji"}),
     Object.freeze({id: "openbb", label: "OpenBB", slug: "openbb"}),
     Object.freeze({id: "data-monitor", label: "全資料", slug: "data-monitor"}),
@@ -243,7 +244,9 @@
 
   function mountNavigation(target) {
     if (!target || target.dataset.dashboardNavMounted === "true") return target;
-    const current = String(target.dataset.dashboardNav || "overview");
+    const current = global.location?.pathname?.startsWith("/tw-overnight/")
+      ? "tw-overnight"
+      : String(target.dataset.dashboardNav || "overview");
     if (!NAV_ITEMS.some((item) => item.id === current)) {
       throw new TypeError(`Unknown public dashboard id: ${current}`);
     }
@@ -298,6 +301,60 @@
     });
   }
 
+  function subscribeRevisions(input, onRevision, fallback, {fallbackMs = 1000, reconcileMs = 15000} = {}) {
+    sameOriginUrl(input);
+    let source = null;
+    let opened = false;
+    let disposed = false;
+    let lastReconcile = 0;
+    const disconnect = () => {
+      source?.close();
+      source = null;
+      opened = false;
+    };
+    const connect = () => {
+      if (disposed || global.document?.hidden || source || typeof global.EventSource !== "function") return;
+      try {
+        const active = new global.EventSource(input);
+        source = active;
+        active.onopen = () => { if (source === active) opened = true; };
+        active.onerror = () => { if (source === active) opened = false; };
+        active.addEventListener("revision", (event) => {
+          if (source !== active || disposed) return;
+          try {
+            const payload = validateJsonRoot(JSON.parse(event.data), "object");
+            onRevision(payload);
+          } catch (_error) { opened = false; }
+        });
+      } catch (_error) { disconnect(); }
+    };
+    const poll = () => {
+      connect();
+      if (opened && Date.now() - lastReconcile < reconcileMs) return;
+      lastReconcile = Date.now();
+      return fallback();
+    };
+    const visibility = () => {
+      if (global.document?.hidden) disconnect();
+      else { connect(); lastReconcile = 0; }
+    };
+    global.document?.addEventListener("visibilitychange", visibility);
+    global.addEventListener?.("pagehide", disconnect);
+    global.addEventListener?.("pageshow", visibility);
+    connect();
+    const scheduler = scheduleRefresh(poll, {intervalMs: fallbackMs});
+    return Object.freeze({
+      dispose() {
+        disposed = true;
+        disconnect();
+        scheduler.dispose();
+        global.document?.removeEventListener("visibilitychange", visibility);
+        global.removeEventListener?.("pagehide", disconnect);
+        global.removeEventListener?.("pageshow", visibility);
+      },
+    });
+  }
+
   const api = Object.freeze({
     version: 2,
     DEFAULT_TIMEOUT_MS,
@@ -321,6 +378,7 @@
     mountNavigation,
     mountNavigations,
     scheduleRefresh,
+    subscribeRevisions,
   });
 
   Object.defineProperty(global, "StockAgentDashboard", {

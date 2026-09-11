@@ -146,6 +146,94 @@ def test_completed_session_gate_accepts_event_verified_close(tmp_path: Path) -> 
     }
 
 
+def test_completed_session_gate_rejects_receipt_when_one_close_core_is_stale(
+    tmp_path: Path,
+) -> None:
+    phase_root = tmp_path / "publications" / "close_initial"
+    phase_root.mkdir(parents=True)
+    receipt = {
+        "status": "ok",
+        "phase": "close_initial",
+        "started_at_taipei": "2026-09-07T14:00:00+08:00",
+        "selected_datasets": ["twse_daily_ohlcv", "tpex_daily_ohlcv"],
+        "download_summary": {
+            "end_date": "2026-09-07",
+            "daily_close_ready": True,
+            "blocking_failed_count": 0,
+            "incomplete_count": 0,
+        },
+    }
+    (phase_root / "latest.json").write_text(json.dumps(receipt), encoding="utf-8")
+    pl.DataFrame({"date": ["2026-09-07"]}).write_parquet(
+        tmp_path / "twse_daily_ohlcv.parquet"
+    )
+    pl.DataFrame({"date": ["2026-09-04"]}).write_parquet(
+        tmp_path / "tpex_daily_ohlcv.parquet"
+    )
+
+    phase, _accepted, failures = completed_session._accepted_close_publication(
+        tmp_path / "publications",
+        expected_date="2026-09-07",
+        required_phase="close_initial",
+        live_root=tmp_path,
+    )
+
+    assert phase is None
+    assert failures["close_initial"] == [
+        "tpex_daily_ohlcv: effective date '2026-09-04' != 2026-09-07"
+    ]
+
+
+def test_calendar_advance_forces_both_close_core_downloads(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(source_events, "_completed_calendar_is_current", lambda *_: False)
+    names, refresh_calendar = source_events._calendar_advance_refresh_names(
+        ["twse_daily_valuation"],
+        live_root=tmp_path,
+        specs_by_name=DEFAULT_DATASETS,
+        observed=datetime(2026, 9, 7, 14, 26, tzinfo=TAIPEI),
+    )
+
+    assert refresh_calendar
+    assert {"twse_daily_ohlcv", "tpex_daily_ohlcv"} <= set(names)
+
+
+def test_close_event_finalizer_uses_newest_accepted_phase(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: list[list[str]] = []
+
+    class Process:
+        returncode = 0
+        pid = 123
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        source_events.subprocess,
+        "Popen",
+        lambda command, cwd: (captured.append(command) or Process()),
+    )
+    result = source_events._finalize_completed_session_close_event(
+        {
+            "status": "ok",
+            "expected_date": "2026-09-07",
+            "reused": False,
+        },
+        live_root=tmp_path / "live",
+        state_root=tmp_path / "events",
+        heartbeat_seconds=30.0,
+    )
+
+    assert result["status"] == "ok"
+    assert "--publication-phase" not in captured[0]
+    assert captured[0][captured[0].index("--expected-date") + 1] == "2026-09-07"
+
+
 def test_completed_session_refreshes_all_causal_close_layers(tmp_path: Path) -> None:
     commands = completed_session._build_commands(
         live_root=tmp_path,
