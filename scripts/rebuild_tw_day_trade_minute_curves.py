@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from stockagent.live.tw_day_trade_simulation import (
     TAIPEI,
     position_net_liquidation_pnl,
+    minute_curve_write_lock,
 )
 from stockagent.live.benchmark_accounting import previous_close_return
 from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
@@ -279,10 +280,15 @@ def load_positions(
             for row in fill_rows if row.get("purpose") == "entry"
             and _in_range(str(row.get("session_date") or ""), start, end)
         }
+        carried_entries = {(market, key): row for (_, market, key), row in entries.items()}
         for day, markets in by_day.items():
             for market, positions in markets.items():
                 for key in list(positions):
                     entry = entries.get((day, market, key))
+                    if entry is None and positions[key].get("margin_carry_contract"):
+                        entry = carried_entries.get((market, key))
+                        if entry is not None and str(entry["session_date"]) > day:
+                            raise RuntimeError("carried archive precedes its entry")
                     if entry is None:
                         del positions[key]
                         continue
@@ -315,6 +321,7 @@ class MinutePriceStore:
         self,
         kbar_roots: Path | Sequence[Path],
         tick_minute_roots: Path | Sequence[Path],
+        *, require_receipts: bool = False,
     ) -> None:
         def unique_paths(value: Path | Sequence[Path]) -> tuple[Path, ...]:
             candidates = (
@@ -342,6 +349,51 @@ class MinutePriceStore:
         self._source_cache: dict[tuple[str, str], str | None] = {}
         self._root_cache: dict[tuple[str, str, str], dict[str, float]] = {}
         self._chunk_index: dict[tuple[str, str], tuple[Path, ...]] = {}
+        self.require_receipts = require_receipts
+        self._verified_chunk_dates: dict[Path, tuple[tuple, set[str]]] = {}
+        self._verified_raw_tick_signatures: dict[Path, tuple[int, int, int]] = {}
+
+    def _verified_chunk(self, path: Path, symbol: str, session_date: str) -> bool:
+        if not self.require_receipts:
+            return True
+        receipt = path.with_suffix(".receipt.json")
+        if not receipt.is_file():
+            return False
+        signature = tuple((p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in (path, receipt))
+        cached = self._verified_chunk_dates.get(path)
+        if cached is None or cached[0] != signature:
+            from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid
+            first, last = map(date.fromisoformat, path.stem.split("_"))
+            proof = _read_json(receipt)
+            output = proof.get("output_receipt") or {}
+            valid = (Path(str(output.get("path", ""))).resolve() == path.resolve()
+                     and minute_receipt_valid(receipt, symbol=symbol, start=first, end=last))
+            if valid:
+                for source in proof.get("raw_tick_sources", []):
+                    raw = Path(source["path"])
+                    stat = raw.stat()
+                    signature_now = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                    previous = self._verified_raw_tick_signatures.setdefault(raw, signature_now)
+                    if previous != signature_now:
+                        raise RuntimeError(f"verified raw tick source changed: {raw}")
+            days = set(proof.get("returned_dates", [])) if valid else set()
+            self._verified_chunk_dates[path] = (signature, days)
+        return session_date in self._verified_chunk_dates[path][1]
+
+    def assert_sources_unchanged(self) -> None:
+        """Reject a price/receipt replacement between verification and publish."""
+        for path, expected in self._verified_raw_tick_signatures.items():
+            stat = path.stat()
+            if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != expected:
+                raise RuntimeError(f"verified raw tick source changed: {path}")
+        for path, (expected, _) in self._verified_chunk_dates.items():
+            try:
+                actual = tuple((p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                               for p in (path, path.with_suffix(".receipt.json")))
+            except OSError as exc:
+                raise RuntimeError(f"verified minute source disappeared: {path}") from exc
+            if actual != expected:
+                raise RuntimeError(f"verified minute source changed during reconstruction: {path}")
 
     @staticmethod
     def _frame_prices(frame: pl.DataFrame, session_date: str) -> dict[str, float]:
@@ -353,6 +405,8 @@ class MinutePriceStore:
             if "date" in frame.columns
             else frame
         )
+        if "Volume" in selected.columns:
+            selected = selected.filter(pl.col("Volume").is_finite() & (pl.col("Volume") > 0))
         output: dict[str, float] = {}
         for row in selected.select("ts", "Close").iter_rows(named=True):
             stamp = row["ts"]
@@ -379,7 +433,8 @@ class MinutePriceStore:
         selected: list[Path] = []
         for path in indexed:
             boundaries = path.stem.split("_")
-            if len(boundaries) == 2 and boundaries[0] <= session_date <= boundaries[1]:
+            if (len(boundaries) == 2 and boundaries[0] <= session_date <= boundaries[1]
+                    and self._verified_chunk(path, symbol, session_date)):
                 selected.append(path)
         return tuple(selected)
 
@@ -396,15 +451,15 @@ class MinutePriceStore:
 
         output: dict[str, float] = {}
         for path in self._chunk_paths(root, symbol, session_date):
-            frame = pl.read_parquet(path, columns=["date", "ts", "Close"])
+            frame = pl.read_parquet(path, columns=["date", "ts", "Close", *(["Volume"] if self.require_receipts else [])])
             output.update(self._frame_prices(frame, session_date))
-        if not output:
+        if not output and not self.require_receipts:
             partition = root / f"trade_date={session_date}" / "data.parquet"
             if partition.is_file():
                 frame = (
                     pl.scan_parquet(partition)
                     .filter(pl.col("symbol") == symbol)
-                    .select("date", "ts", "Close")
+                    .select("date", "ts", "Close", *(["Volume"] if self.require_receipts else []))
                     .collect()
                 )
                 output = self._frame_prices(frame, session_date)
@@ -432,7 +487,7 @@ class MinutePriceStore:
                 frame = (
                     pl.scan_parquet(path)
                     .filter(pl.col("date").is_in(dates))
-                    .select("date", "ts", "Close")
+                    .select("date", "ts", "Close", *(["Volume"] if self.require_receipts else []))
                     .collect()
                 )
                 for symbol, session_date in selected_pairs:
@@ -445,6 +500,8 @@ class MinutePriceStore:
                 if not staged[(symbol, session_date)]:
                     by_date[session_date].add(symbol)
             for session_date, symbols in by_date.items():
+                if self.require_receipts:
+                    continue
                 partition = root / f"trade_date={session_date}" / "data.parquet"
                 if not partition.is_file():
                     continue
@@ -484,7 +541,7 @@ class MinutePriceStore:
             if output:
                 source = f"local_kbar:{root.resolve()}"
                 break
-        if not output:
+        if not output and not self.require_receipts:
             for tick_root in self.tick_minute_roots:
                 tick_path = tick_root / key[0] / f"{key[1]}.parquet"
                 if not tick_path.is_file():
@@ -560,45 +617,10 @@ def required_symbol_dates(
 def _ticks_to_minute_frame(
     ticks: Any, *, symbol: str, session_date: str
 ) -> pl.DataFrame:
-    frame = pl.DataFrame(
-        {"ts": ticks.ts, "price": ticks.close, "volume": ticks.volume}
-    ).with_columns(pl.col("ts").cast(pl.Datetime("ns")))
-    if not frame.height:
-        return pl.DataFrame(
-            schema={
-                "ts": pl.Datetime("ns"),
-                "Close": pl.Float64,
-                "Volume": pl.Float64,
-                "date": pl.Date,
-                "symbol": pl.String,
-            }
-        )
-    session_open = datetime.fromisoformat(f"{session_date}T09:00:00")
-    session_close = datetime.fromisoformat(f"{session_date}T13:30:00")
-    return (
-        frame.filter((pl.col("ts") >= session_open) & (pl.col("ts") <= session_close))
-        .with_columns(
-            pl.when(pl.col("ts") == session_close)
-            .then(pl.col("ts") - pl.duration(microseconds=1))
-            .otherwise(pl.col("ts"))
-            .alias("bucket_input")
-        )
-        .with_columns(
-            (pl.col("bucket_input").dt.truncate("1m") + pl.duration(minutes=1)).alias(
-                "ts"
-            )
-        )
-        .group_by("ts", maintain_order=True)
-        .agg(
-            pl.col("price").last().cast(pl.Float64).alias("Close"),
-            pl.col("volume").sum().cast(pl.Float64).alias("Volume"),
-        )
-        .with_columns(
-            pl.lit(date.fromisoformat(session_date)).alias("date"),
-            pl.lit(symbol).alias("symbol"),
-        )
-        .sort("ts")
-    )
+    from downloader.download_shioaji_tw_minute_kbars import ticks_to_minute_kbars
+    # This valuation-only interface does not consume Amount or contract_unit.
+    return ticks_to_minute_kbars(ticks, symbol=symbol, market="", session_date=session_date,
+                                contract_unit=1).select("ts", "Close", "Volume", "date", "symbol")
 
 
 def fetch_missing_kbars(
@@ -1003,6 +1025,149 @@ def rebuild_strategy_marks(
     }
 
 
+def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill_rows, start, end, preserve_sourced=True):
+    """Revalue an immutable carried fill/action book, never re-execute trades.
+
+    Unlike the flat-session path, inventory, cost basis, unallocated entry
+    fees, cash claims and financing charges all survive the session boundary.
+    Accepted endpoint NAV is preserved and its accounting is independently
+    checked. Interior prices come only from retained completed-minute trades.
+    """
+    selected = {(r["market"], r["minute"]): r for r in source_rows
+                if _in_range(r["session_date"], start, end)}
+    days = sorted({r["session_date"] for r in selected.values()})
+    output = [r for r in source_rows if not _in_range(r["session_date"], start, end)]
+    for market, mode in state["modes"].items():
+        metadata = {p["position_id"]: p for modes in positions.values() for p in modes.get(market, [])}
+        fills = [f for f in fill_rows if f["market"] == market]
+        if any(f["session_date"] < days[0] for f in fills):
+            raise RuntimeError("carried minute reconstruction requires the full accepted ledger horizon")
+        events = sorted([*(f | {"clock": str(f.get("fill_at") or f["recorded_at"])} for f in fills),
+                         *(a | {"clock": a["recorded_at"], "share_action": True}
+                           for a in mode.get("share_replacement_ledger", []))], key=lambda e: e["clock"])
+        book, prices, price_times, seen_entries = {}, {}, {}, set()
+        cursor, realized = 0, 0.
+        for day in days:
+            symbols = {p["symbol"] for p in positions.get(day, {}).get(market, [])}
+            source = {symbol: store.prices(symbol, day) for symbol in symbols}
+            claims = [c for c in mode.get("corporate_action_ledger", []) if c["ex_date"] <= day]
+            earned = sum(float(c["amount_twd"]) for c in claims)
+            paid = sum(float(c["amount_twd"]) for c in claims if c["payment_date"] <= day)
+            costs = mode.get("carry_cost_ledger", [])
+            charges = sum(float(c["amount_twd"]) for c in costs if c["date"] < day or
+                          (c["date"] == day and c["kind"] != "short_conversion_tax_and_handling"))
+            terminal_charges = sum(float(c["amount_twd"]) for c in costs
+                                   if c["date"] == day and c["kind"] == "short_conversion_tax_and_handling")
+            for minute in _session_minutes(date.fromisoformat(day))[1:]:
+                key, clock = minute.isoformat(timespec="minutes"), minute.isoformat(timespec="seconds")
+                existing = selected.get((market, key))
+                cutoff = clock
+                if existing and key[11:16] in {"09:01", "13:30"}:
+                    cutoff = max(clock, str(existing.get("recorded_at") or clock))
+                while cursor < len(events) and events[cursor]["clock"] <= cutoff:
+                    event = events[cursor]
+                    identity = event["position_id"]
+                    if event.get("share_action"):
+                        p = book[identity]
+                        if p["signed_shares"] != event["old_signed_shares"]:
+                            raise RuntimeError("minute share replacement disagrees with retained inventory")
+                        p["signed_shares"] = int(event["new_signed_shares"])
+                        p["inventory_basis_price"] = float(event["new_entry_price"])
+                        symbol = p["symbol"]
+                        if price_times.get(symbol, "") < day:
+                            prices[symbol] = (prices[symbol] - event["cash_per_old_share"]) / event["ratio"]
+                            price_times[symbol] = event["clock"]
+                    elif event["purpose"] == "entry":
+                        if identity in seen_entries or identity not in metadata:
+                            raise RuntimeError("minute entry identity is duplicate or has no accepted position")
+                        seen_entries.add(identity)
+                        p = dict(metadata[identity])
+                        sign = 1 if p["side"] == "long" else -1
+                        p.update(signed_shares=sign * int(event["quantity"]), inventory_basis_price=float(event["price"]),
+                                 remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
+                        book[identity] = p
+                        symbol = p["symbol"]
+                        if price_times.get(symbol, "") < event["clock"]:
+                            prices[symbol], price_times[symbol] = float(event["price"]), event["clock"]
+                    else:
+                        p = book[identity]
+                        quantity = int(event["quantity"])
+                        if quantity > abs(p["signed_shares"]):
+                            raise RuntimeError("minute exit exceeds retained carried inventory")
+                        p["signed_shares"] -= quantity * (1 if p["signed_shares"] > 0 else -1)
+                        p["remaining_entry_fee_twd"] -= float(event["entry_fee_allocated_twd"])
+                        realized += float(event["net_pnl_twd"])
+                        if not p["signed_shares"]:
+                            del book[identity]
+                    cursor += 1
+                fresh = set()
+                for symbol, values in source.items():
+                    if key in values:
+                        prices[symbol], price_times[symbol] = float(values[key]), clock
+                        fresh.add(symbol)
+                count, fresh_count, net, notional, fresh_notional = 0, 0, 0., 0., 0.
+                for p in book.values():
+                    if not p["signed_shares"]:
+                        continue
+                    symbol = p["symbol"]
+                    if symbol not in prices:
+                        raise RuntimeError("carried valuation has no prior observed price")
+                    valuation = dict(p)
+                    if str(p.get("margin_converted_at") or "9999") > clock:
+                        valuation.pop("margin_carry_contract", None)
+                    net += position_net_liquidation_pnl(valuation, prices[symbol])
+                    count += 1
+                    amount = abs(p["signed_shares"] * prices[symbol])
+                    notional += amount
+                    if symbol in fresh:
+                        fresh_count += 1
+                        fresh_notional += amount
+                cost = charges + (terminal_charges if key[11:16] == "13:30" else 0.)
+                initial = float(mode["initial_capital_twd"])
+                row = {"recorded_at": clock, "minute": key, "session_date": day, "market": market,
+                       "initial_capital_twd": initial, "cumulative_realized_net_pnl_twd": realized,
+                       "open_net_liquidation_pnl_twd": net, "total_equity_twd": initial + realized + net + earned - cost,
+                       "cumulative_carry_cost_twd": cost, "cumulative_corporate_action_net_twd": earned,
+                       "corporate_action_cash_net_twd": paid,
+                       "corporate_action_receivable_twd": sum(max(0., float(c["amount_twd"])) for c in claims if c["payment_date"] > day),
+                       "corporate_action_payable_twd": sum(max(0., -float(c["amount_twd"])) for c in claims if c["payment_date"] > day),
+                       "margin_carry_contract": mode["margin_carry_contract"],
+                       "odd_lot_execution_policy": mode.get("odd_lot_execution_policy"),
+                       "open_position_count": count, "stale_position_count": count - fresh_count,
+                       "valuation_stale": count > fresh_count, "fresh_trade_position_count": fresh_count,
+                       "last_trade_carried_position_count": count - fresh_count, "missing_price_position_count": 0,
+                       "fresh_trade_notional_coverage_ratio": fresh_notional / notional if notional else 1.,
+                       "historical_minute_replay": True, "minute_valuation_contract": MINUTE_CONTRACT,
+                       "valuation_source": "retained_1m_close_from_immutable_carried_fill_and_action_book",
+                       "valuation_executable": False, "simulation_only": True}
+                if key[11:16] in {"09:01", "13:30"}:
+                    if existing is None:
+                        raise RuntimeError("carried reconstruction cannot manufacture accepted endpoints")
+                    for field in ("cumulative_realized_net_pnl_twd", "open_position_count", "cumulative_carry_cost_twd", "cumulative_corporate_action_net_twd"):
+                        if not math.isclose(float(existing.get(field) or 0), float(row[field]), rel_tol=1e-12, abs_tol=1e-6):
+                            raise RuntimeError(f"carried endpoint accounting disagrees: {market}:{key}:{field}")
+                    row = dict(existing)
+                    row["accepted_endpoint_accounting_verified"] = True
+                elif preserve_sourced and existing and historical_minute_mark_has_source(existing):
+                    row = dict(existing)
+                output.append(row)
+    output.sort(key=lambda r: (r["minute"], r["market"]))
+    _, stats = validate_existing_strategy_marks(output, start=start, end=end)
+    stats["carried_fill_book_revalued_without_execution"] = True
+    differences = [{"market": r["market"], "minute": r["minute"],
+                    "original_equity_twd": float(selected[(r["market"], r["minute"])]["total_equity_twd"]),
+                    "revalued_equity_twd": float(r["total_equity_twd"]),
+                    "difference_twd": abs(float(r["total_equity_twd"]) - float(selected[(r["market"], r["minute"])]["total_equity_twd"]))}
+                   for r in output if (r["market"], r["minute"]) in selected]
+    stats["maximum_original_equity_difference_twd"] = max((d["difference_twd"] for d in differences), default=0.)
+    changed = [d for d in differences if d["difference_twd"] > 1e-6]
+    stats["differing_original_equity_points"] = len(changed)
+    stats["equity_difference_counts_by_market_date"] = dict(Counter(
+        f"{row['market']}:{row['minute'][:10]}" for row in changed))
+    stats["equity_difference_samples"] = sorted(changed, key=lambda d: d["difference_twd"], reverse=True)[:20]
+    return output, stats
+
+
 def validate_existing_strategy_marks(
     source_rows: list[dict[str, Any]],
     *,
@@ -1047,6 +1212,17 @@ def validate_existing_strategy_marks(
                     f"{session_date}:{market}; expected exactly 09:01..13:30"
                 )
             for row in rows:
+                if row.get("margin_carry_contract"):
+                    endpoint = str(row.get("minute", ""))[11:16] in {"09:01", "13:30"}
+                    if not historical_minute_mark_has_source(row) and not (endpoint and row.get("accepted_endpoint_accounting_verified") is True):
+                        raise RuntimeError(f"unsourced carried-account minute: {session_date}:{market}")
+                    expected_equity = (float(row["initial_capital_twd"])
+                        + float(row["cumulative_realized_net_pnl_twd"])
+                        + float(row["open_net_liquidation_pnl_twd"])
+                        - float(row.get("cumulative_carry_cost_twd") or 0)
+                        + float(row.get("cumulative_corporate_action_net_twd") or 0))
+                    if not math.isclose(expected_equity, float(row["total_equity_twd"]), rel_tol=1e-12, abs_tol=1e-6):
+                        raise RuntimeError(f"carried-account NAV mismatch: {session_date}:{market}")
                 stale = (
                     bool(row.get("valuation_stale"))
                     or int(row.get("stale_position_count") or 0) > 0
@@ -1477,6 +1653,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--recompute-existing-strategy-marks", action="store_true",
                         help="Reconcile all interior marks with entry/exit fills and source minute prices.")
+    parser.add_argument("--revalue-carried-marks", action="store_true",
+                        help="Revalue carried inventory from immutable fills/actions; preserve accepted endpoints and every execution.")
+    parser.add_argument("--require-revaluation-parity", action="store_true",
+                        help="Cross-check a new full replay against independent minute valuation; refuse publication on any discrepancy.")
     parser.add_argument("--requests-per-second", type=float, default=5.0)
     parser.add_argument(
         "--max-traffic-fraction",
@@ -1489,14 +1669,54 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _carried_accounting_signature(state_dir: Path, end: date) -> str:
+    state = _read_json(state_dir / "state.json")
+    payload = {}
+    for market, mode in state.get("modes", {}).items():
+        payload[market] = {"initial_capital_twd": mode.get("initial_capital_twd")}
+        for field, day_field in (("share_replacement_ledger", "effective_date"),
+                                 ("corporate_action_ledger", "ex_date"), ("carry_cost_ledger", "date")):
+            payload[market][field] = [row for row in mode.get(field, []) if str(row[day_field]) <= str(end)]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _assert_minute_publication_window(state_dir: Path, now: datetime) -> None:
+    if not datetime_time(8, 30) <= now.time() < datetime_time(14, 31):
+        return
+    with (state_dir / ".engine.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("live engine is in its protected window; defer minute publication") from exc
+
+
 def main() -> None:
     args = parse_args()
+    args.revalue_carried_marks = bool(getattr(args, "revalue_carried_marks", False))
+    args.require_revaluation_parity = bool(getattr(args, "require_revaluation_parity", False))
+    if args.require_revaluation_parity and not (args.revalue_carried_marks and args.recompute_existing_strategy_marks):
+        raise ValueError("parity verification requires full independent carried revaluation")
     if (args.revalue_opening_marks or args.recompute_existing_strategy_marks) and args.validate_existing_strategy_marks:
         raise ValueError("opening revaluation cannot be combined with preserve-only validation")
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("start date must not be after end date")
+    source_hashes = {name: _sha256(args.state_dir / name) for name in
+                     ("marks.jsonl", "fills.jsonl", "orders.jsonl", "benchmark_history.json")
+                     if (args.state_dir / name).exists()}
+    source_marks = _read_jsonl(args.state_dir / "marks.jsonl")
+    has_margin_carry = any(row.get("margin_carry_contract") for row in source_marks)
+    accounting_signature = _carried_accounting_signature(args.state_dir, end) if args.revalue_carried_marks else None
+    if args.revalue_carried_marks and (not has_margin_carry or args.validate_existing_strategy_marks
+                                      or args.revalue_opening_marks):
+        raise ValueError("carried revaluation requires its own explicit inventory contract")
+    if has_margin_carry and (not (args.validate_existing_strategy_marks or args.revalue_carried_marks)
+            or args.repair_terminal_only or args.repair_unverified_strategy_marks):
+        raise RuntimeError(
+            "margin-carry histories require the canonical stateful open-price replay; "
+            "the flat-session minute rebuilder cannot reconstruct carried basis and interest"
+        )
     if getattr(args, "repair_terminal_only", False):
         if args.fetch_missing_kbars or args.revalue_opening_marks or args.recompute_existing_strategy_marks or args.repair_unverified_strategy_marks:
             raise ValueError("terminal-only recovery cannot change prices or interior marks")
@@ -1521,8 +1741,7 @@ def main() -> None:
         tick_root,
         *DEFAULT_LOCAL_MINUTE_CACHE_ROOTS,
     ]
-    store = MinutePriceStore(local_roots, local_cache_roots)
-    source_marks = _read_jsonl(args.state_dir / "marks.jsonl")
+    store = MinutePriceStore(local_roots, local_cache_roots, require_receipts=has_margin_carry)
     missing_endpoints = missing_accepted_endpoints(source_marks, start=start, end=end)
     if missing_endpoints:
         raise RuntimeError(f"missing accepted endpoints before minute-data preparation: {missing_endpoints[:20]}")
@@ -1540,6 +1759,29 @@ def main() -> None:
         session_dates,
         include_stock_benchmarks=True,
     )
+    official_no_trade_pairs = []
+    if has_margin_carry:
+        # A source-verified no-print session has no minute trades to download.
+        # Preserve the marked stale holding; never invent a 270-bar price path.
+        replay_path = args.state_dir / "rebuild_receipt.json"
+        replay = _read_json(replay_path) if replay_path.exists() else {}
+        for session in replay.get("sessions", ()):
+            day = str(session.get("session_date") or "")
+            for symbol in (session.get("intraday_replay") or {}).get("official_no_trade_carried_symbols", ()):
+                if day in required.get(symbol, set()):
+                    required[symbol].remove(day)
+                    official_no_trade_pairs.append({"symbol": symbol, "session_date": day})
+        from stockagent.live.tw_share_replacement import halted_symbols
+        action_roots = {Path(m["margin_corporate_action_reference_path"]).parent
+                        for m in _read_json(args.state_dir / "state.json")["modes"].values()
+                        if m.get("margin_corporate_action_reference_path")}
+        for day in session_dates:
+            halted = set().union(*(halted_symbols(root, date.fromisoformat(day)) for root in action_roots))
+            for symbol in halted:
+                if day in required.get(symbol, set()):
+                    required[symbol].remove(day)
+                    official_no_trade_pairs.append({"symbol": symbol, "session_date": day})
+        required = {symbol: days for symbol, days in required.items() if days}
     store.prepare(required)
     coverage_before = store.coverage(required)
     fetch = {
@@ -1579,7 +1821,12 @@ def main() -> None:
         _atomic_json(args.output_dir / "minute_curve_gap_audit.json", gap_audit)
         raise RuntimeError(f"required minute prices are missing: {missing[:20]}")
 
-    if args.validate_existing_strategy_marks:
+    if args.revalue_carried_marks:
+        rebuilt_marks, strategy_stats = rebuild_carried_strategy_marks(
+            source_marks, positions, store, state=_read_json(args.state_dir / "state.json"),
+            fill_rows=source_fills, start=start, end=end,
+            preserve_sourced=not args.recompute_existing_strategy_marks)
+    elif args.validate_existing_strategy_marks:
         rebuilt_marks, strategy_stats = validate_existing_strategy_marks(
             source_marks, start=start, end=end
         )
@@ -1598,6 +1845,10 @@ def main() -> None:
             recompute_existing_marks=bool(args.recompute_existing_strategy_marks),
         )
     source_benchmarks = _read_json(args.state_dir / "benchmark_history.json")
+    if args.require_revaluation_parity and strategy_stats["differing_original_equity_points"]:
+        _atomic_json(args.output_dir / "minute_revaluation_parity_failure.json", strategy_stats)
+        _atomic_jsonl(args.output_dir / "unpromotable_revalued_marks.jsonl", rebuilt_marks)
+        raise RuntimeError("independent carried minute valuation differs from replay; publication refused")
     rebuilt_benchmarks, benchmark_stats = rebuild_benchmark_history(
         source_benchmarks, store, start=start, end=end
     )
@@ -1619,10 +1870,20 @@ def main() -> None:
         "end_date": end.isoformat(),
         "minute_contract": MINUTE_CONTRACT,
         "linear_interpolation_used": False,
+        "carried_inventory_marks_preserved": has_margin_carry and not args.revalue_carried_marks,
+        "carried_inventory_revalued_from_unchanged_executions": args.revalue_carried_marks,
+        "independent_carried_valuation_parity_required": args.require_revaluation_parity,
+        "independent_carried_valuation_parity_passed": bool(
+            args.require_revaluation_parity
+            and strategy_stats["differing_original_equity_points"] == 0
+        ),
+        "official_no_trade_carried_pairs": official_no_trade_pairs,
         "accepted_09_01_strategy_and_13_30_endpoints_preserved": not args.revalue_opening_marks,
         "accepted_13_30_endpoints_preserved": True,
         "opening_marks_revalued_at_completed_minute": bool(args.revalue_opening_marks),
         "unchanged_fills_sha256": _sha256(args.state_dir / "fills.jsonl"),
+        "source_ledger_hashes": source_hashes,
+        "source_carried_accounting_signature": accounting_signature,
         "existing_bracket_aware_strategy_marks_preserved": bool(
             args.validate_existing_strategy_marks
         ),
@@ -1705,19 +1966,19 @@ def main() -> None:
         },
     }
     receipt_path = args.output_dir / "minute_curve_receipt.json"
+    store.assert_sources_unchanged()
     _atomic_json(receipt_path, receipt)
     if args.publish:
-        _atomic_text(
-            args.state_dir / "marks.jsonl", marks_path.read_text(encoding="utf-8")
-        )
-        _atomic_text(
-            args.state_dir / "benchmark_history.json",
-            benchmark_path.read_text(encoding="utf-8"),
-        )
-        _atomic_text(
-            args.state_dir / "minute_curve_receipt.json",
-            receipt_path.read_text(encoding="utf-8"),
-        )
+        _assert_minute_publication_window(args.state_dir, datetime.now(TAIPEI))
+        with minute_curve_write_lock(args.state_dir):
+            store.assert_sources_unchanged()
+            if source_hashes != {name: _sha256(args.state_dir / name) for name in source_hashes}:
+                raise RuntimeError("accepted ledger changed during minute reconstruction; publication refused")
+            if accounting_signature is not None and accounting_signature != _carried_accounting_signature(args.state_dir, end):
+                raise RuntimeError("carried accounting changed during minute reconstruction; publication refused")
+            _atomic_text(args.state_dir / "marks.jsonl", marks_path.read_text(encoding="utf-8"))
+            _atomic_text(args.state_dir / "benchmark_history.json", benchmark_path.read_text(encoding="utf-8"))
+            _atomic_text(args.state_dir / "minute_curve_receipt.json", receipt_path.read_text(encoding="utf-8"))
     print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
 
 

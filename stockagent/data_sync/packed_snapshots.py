@@ -771,12 +771,14 @@ def _observed_stamps(
     *,
     now_ns: int,
     max_clock_skew_seconds: int,
+    require_objects: bool = True,
 ) -> list[HLC]:
     candidates, diagnostics, incomplete = _head_candidates(
         sync_root,
         dataset,
         now_ns=now_ns,
         max_clock_skew_seconds=max_clock_skew_seconds,
+        require_objects=require_objects,
     )
     blocking = [message for _, message in incomplete]
     blocking.extend(item for item in diagnostics if "in the future" in item)
@@ -799,6 +801,7 @@ def publish_packed_snapshot(
     excluded_subtrees: Iterable[str] = (),
     maximum_file_bytes: int | None = None,
     repo_root: Path | None = None,
+    recover_missing_base_objects: bool = False,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
@@ -833,11 +836,13 @@ def publish_packed_snapshot(
         previous: ResolvedSnapshot | None = None
         previous_files: dict[str, dict[str, Any]] = {}
         previous_objects: dict[str, dict[str, Any]] = {}
+        missing_base_objects: list[dict[str, Any]] = []
         if any((sync_root / "heads" / dataset).glob("*.json")):
             previous = resolve_latest_packed(
                 sync_root,
                 dataset,
                 max_clock_skew_seconds=max_clock_skew_seconds,
+                require_objects=not recover_missing_base_objects,
             )
             previous_inventory = _load_inventory(sync_root, previous.manifest)
             _validate_inventory(previous.manifest, previous_inventory)
@@ -850,6 +855,17 @@ def publish_packed_snapshot(
                 str(item["sha256"]): dict(item)
                 for item in previous.manifest["archive"]["objects"]
             }
+            if recover_missing_base_objects:
+                # Reuse only objects which still exist. Missing base objects
+                # make ALL their current source members changed files. The
+                # regular content-addressed writer creates fresh objects; it
+                # never puts new bytes under a missing old digest. Old
+                # manifests/inventories are retained as recovery evidence.
+                for digest, item in list(previous_objects.items()):
+                    object_path = sync_root.joinpath(*PurePosixPath(item["relpath"]).parts)
+                    if not object_path.is_file():
+                        missing_base_objects.append(dict(item))
+                        del previous_objects[digest]
 
         reused_files = 0
         changed_files: list[_SourceEntry] = []
@@ -985,6 +1001,8 @@ def publish_packed_snapshot(
             and str(previous.manifest["archive"]["inventory"]["sha256"])
             == inventory_sha
         ):
+            if recover_missing_base_objects:
+                verify_packed_snapshot(sync_root, previous)
             return previous
 
         wall_time_ns = time.time_ns()
@@ -994,6 +1012,7 @@ def publish_packed_snapshot(
                 dataset,
                 now_ns=wall_time_ns,
                 max_clock_skew_seconds=max_clock_skew_seconds,
+                require_objects=not recover_missing_base_objects,
             ),
             node_id=publisher_node,
             now_ns=wall_time_ns,
@@ -1084,6 +1103,8 @@ def publish_packed_snapshot(
                 "base_snapshot_id": (
                     previous.manifest["snapshot_id"] if previous else None
                 ),
+                **({"base_missing_objects_repacked_from_current_source": missing_base_objects}
+                   if missing_base_objects else {}),
                 "reused_files": reused_files,
                 "changed_files": len(changed_files),
                 "new_object_count": len(newly_installed_hashes)
@@ -1102,6 +1123,15 @@ def publish_packed_snapshot(
         manifest_path = sync_root.joinpath(*manifest_relpath.parts)
         _ensure_shared_packed_directory(sync_root, manifest_path.parent)
         manifest_sha = write_immutable_json(manifest_path, manifest)
+        if recover_missing_base_objects:
+            # Recovery must independently verify every selected object and
+            # member BEFORE replacing this node's head, including intact
+            # objects reused from the damaged release. Fail closed on any
+            # checksum mismatch; do not overwrite corrupted existing bytes.
+            verify_packed_snapshot(sync_root, ResolvedSnapshot(
+                manifest=manifest, manifest_path=manifest_path,
+                manifest_sha256=manifest_sha,
+                head_path=sync_root / "heads" / dataset / f"{publisher_node}.json"))
         head = {
             "schema_version": PACKED_HEAD_SCHEMA_VERSION,
             "dataset": dataset,

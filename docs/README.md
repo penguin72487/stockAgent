@@ -24,6 +24,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 - [`packed_dataset_storage.md`](packed_dataset_storage.md)：現行 packed 冷庫、增量 pack/blob、
   多寫者 head、materialize、lease、GC 與非持久 Vast 的 index-only edge cache。
+- [`packed_cold_backup.md`](packed_cold_backup.md)：penguin 權威冷庫至 D 槽的事件觸發增量備份、
+  防誤刪、checksum、掛載防護、續傳、驗收與還原。
 - [`live_artifact_sync.md`](live_artifact_sync.md)：可變 artifacts hot transport、完成產物 cold
   release、衝突政策與 hard-link 去重。
 - [`storage_pressure_maintenance.md`](storage_pressure_maintenance.md)：磁碟高水位下只回收

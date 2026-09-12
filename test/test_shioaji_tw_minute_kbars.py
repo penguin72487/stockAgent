@@ -20,6 +20,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
     contract_for_stock_symbol,
     minute_chunk_paths,
     minute_receipt_valid,
+    provisional_publication_tail_dates,
     query_minute_chunk,
     restore_extended_tail_from_archived_manifest,
     select_universe,
@@ -31,9 +32,57 @@ from scripts.build_shioaji_tw_minute_dataset import (
     MODEL_FEATURE_COLUMNS,
     _available_collection_symbols,
     _feature_statistics,
+    _quarantine_stale_partitions,
+    _split_official_session_rows,
     _validate_collection_gate,
     build_research_frame,
 )
+
+
+def test_provisional_tail_uses_official_calendar_not_weekday_guess(tmp_path: Path) -> None:
+    reference = tmp_path / "2330.parquet"
+    pl.DataFrame({
+        "date": [date(2026, 9, 4)],
+        "Trading_Volume": [1_000.0],
+    }).write_parquet(reference)
+    result = provisional_publication_tail_dates(
+        reference,
+        start=date(2026, 9, 4),
+        end=date(2026, 9, 8),
+        expected_dates={date(2026, 9, 4)},
+        official_dates={date(2026, 9, 4), date(2026, 9, 7)},
+    )
+    assert result == {date(2026, 9, 7), date(2026, 9, 8)}
+
+
+def test_research_builder_excludes_non_session_provider_rows() -> None:
+    frame = pl.DataFrame(
+        {
+            "date": [date(2026, 9, 4), date(2026, 9, 5)],
+            "symbol": ["2330", "2330"],
+        }
+    )
+    accepted, rejected = _split_official_session_rows(
+        frame, {date(2026, 9, 4)}
+    )
+    assert accepted["date"].to_list() == [date(2026, 9, 4)]
+    assert rejected == {"2026-09-05": 1}
+
+
+def test_research_builder_quarantines_stale_output_without_deleting(tmp_path: Path) -> None:
+    output = tmp_path / "research_dataset"
+    kept = output / "trade_date=2026-09-04"
+    stale = output / "trade_date=2026-09-05"
+    kept.mkdir(parents=True)
+    stale.mkdir()
+    (stale / "data.parquet").write_bytes(b"recoverable")
+
+    moved = _quarantine_stale_partitions(output, {"2026-09-04"})
+
+    assert kept.is_dir()
+    assert not stale.exists()
+    destination = Path(moved[0]["quarantine"])
+    assert (destination / "data.parquet").read_bytes() == b"recoverable"
 from stockagent.research.tw_minute_kbars import (
     MinuteKbarBacktestConfig,
     chronological_date_splits,
@@ -451,6 +500,94 @@ def test_contract_lookup_is_restricted_to_taiwan_stocks() -> None:
     assert resolved is contract
     assert unit == pytest.approx(1000.0)
     assert message == ""
+
+
+def test_historical_identity_is_exact_and_not_live_eligibility(tmp_path: Path) -> None:
+    from downloader.download_shioaji_tw_minute_kbars import historical_stock_identity, historical_stock_units
+    source = tmp_path / "00883B_features.parquet"
+    source.touch()
+    row = UniverseRow("00883B", "中信ESG投資級債", "tpex", "etf", source)
+    units = historical_stock_units(["00883B=1000"], [row])
+    contract, unit, message = historical_stock_identity(row, units[row.symbol])
+    assert (contract.code, contract.exchange, contract.security_type) == ("00883B", "OTC", "STK")
+    assert unit == 1000 and message == "explicit_public_historical_identity_read_only_v1"
+    assert contract_for_stock_symbol(SimpleNamespace(), row, {}) == (None, 0.0, "stock_contract_not_found")
+
+
+@pytest.mark.parametrize("value", ["2330=1000", "00883B=nan", "00883B=0", "00883B=1.5", "00883B"])
+def test_historical_unit_rejects_unselected_or_invalid_values(value: str) -> None:
+    from downloader.download_shioaji_tw_minute_kbars import historical_stock_units
+    row = UniverseRow("00883B", "ETF", "tpex", "etf", Path("source"))
+    with pytest.raises(ValueError):
+        historical_stock_units([value], [row])
+
+
+def test_historical_unit_is_independently_checked_against_amount() -> None:
+    from downloader.download_shioaji_tw_minute_kbars import validate_historical_unit_amount
+    frame = pl.DataFrame({"Volume": [2.0], "Amount": [63000.0], "Low": [31.0], "High": [32.0]})
+    validate_historical_unit_amount(frame, 1000)
+    with pytest.raises(ValueError, match="unit/amount inconsistent"):
+        validate_historical_unit_amount(frame, 100)
+    with pytest.raises(ValueError, match="unit/amount inconsistent"):
+        validate_historical_unit_amount(frame.with_columns(pl.lit(None).alias("Amount")), 1000)
+
+
+@pytest.mark.parametrize("market,security_type,source_exists", [
+    ("unknown", "stock", True), ("twse", "warrant", True), ("tpex", "etf", False),
+])
+def test_historical_identity_rejects_missing_public_reference(
+    tmp_path: Path, market: str, security_type: str, source_exists: bool,
+) -> None:
+    from downloader.download_shioaji_tw_minute_kbars import historical_stock_identity
+    path = tmp_path / "source.parquet"
+    if source_exists:
+        path.touch()
+    with pytest.raises(ValueError, match="unverified historical stock identity"):
+        historical_stock_identity(UniverseRow("00883B", "ETF", market, security_type, path), 1000)
+
+
+def test_missing_kbars_tick_fallback_keeps_raw_evidence_and_time_units(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    import numpy as np
+    from downloader import download_shioaji_tw_minute_kbars as collector
+    day = date(2026, 2, 25)
+    base = tmp_path / "3454.parquet"
+    pl.DataFrame({"date": [day], "Trading_Volume": [3000.]}).write_parquet(base)
+    row = UniverseRow("3454", "晶睿", "twse", "stock", base)
+    raw = {"ts": [int(np.datetime64(f"{day}T09:00:59", "ns").astype(np.int64)),
+                  int(np.datetime64(f"{day}T09:00:10", "ns").astype(np.int64))],
+           "close": [102., 100.], "volume": [2, 1]}
+    ticks = SimpleNamespace(**raw, dict=lambda: raw)
+    class API:
+        def kbars(self, **kwargs):
+            raise RuntimeError("Data not found")
+        def ticks(self, **kwargs):
+            assert kwargs["date"] == str(day)
+            return ticks
+    monkeypatch.setattr(collector, "_taiwan_market_hours_now", lambda: False)
+    traffic_checks = []
+    monkeypatch.setattr(collector, "_check_traffic_budget", lambda api, *, max_fraction: traffic_checks.append(max_fraction))
+    monkeypatch.setattr(collector, "shioaji_query", lambda *args, **kwargs: nullcontext(lambda _: None))
+    slots = []
+    frame, audit = collector.query_minute_chunk(
+        API(), object(), row, contract_unit=1000, start=day, end=day, timeout_ms=10,
+        retries=0, retry_backoff=0, expected_dates={day}, request_started=lambda: slots.append(1),
+        tick_fallback_root=tmp_path / "raw", max_traffic_fraction=.25)
+    assert frame["ts"].to_list() == [datetime(2026, 2, 25, 9, 1)]
+    assert frame["Open"].item() == 100 and frame["Close"].item() == 102
+    assert frame["Volume"].item() == 3 and frame["Amount"].item() == 304000
+    assert audit["source_gap_dates"] == [] and audit["tick_fallback_queries"] == 1
+    assert len(slots) == 2 and traffic_checks == [.25]
+    path = tmp_path / "minute.parquet"
+    output = collector._write_minute_parquet(frame, path)
+    proof = {"schema_version": collector.RECEIPT_SCHEMA_VERSION, "source": collector.SOURCE_NAME,
+             "storage_frequency": "minute", "symbol": "3454", "start_date": str(day), "end_date": str(day),
+             "status": "ok", "rows": 1, "output_receipt": output, **audit}
+    receipt = tmp_path / "minute.receipt.json"
+    receipt.write_text(json.dumps(proof))
+    assert collector.minute_receipt_valid(receipt, symbol="3454", start=day, end=day)
+    Path(audit["raw_tick_sources"][0]["path"]).write_bytes(b"corrupt")
+    assert not collector.minute_receipt_valid(receipt, symbol="3454", start=day, end=day)
 
 
 def test_sealed_manifest_is_a_fast_restart_checkpoint(tmp_path: Path) -> None:
@@ -893,10 +1030,15 @@ def test_query_single_day_fallback_records_persistent_source_gap() -> None:
     assert request_starts == [1, 2]
 
 
+@pytest.mark.parametrize("tick_backed", [False, True])
+@pytest.mark.parametrize("extra_chunks", [0, 2])
 def test_delisted_contract_extension_repacks_covered_archived_tail(
-    tmp_path: Path,
+    tmp_path: Path, tick_backed: bool, extra_chunks: int,
 ) -> None:
-    row = UniverseRow("4130", "健亞", "tpex", "stock", Path("4130_features.parquet"))
+    from datetime import timedelta
+    base = tmp_path / "4130_features.parquet"
+    pl.DataFrame({'date': [TRADE_DATE], 'Trading_Volume': [1000.]}).write_parquet(base)
+    row = UniverseRow("4130", "健亞", "tpex", "stock", base)
     root = tmp_path / "minute"
     old_start = date(2026, 7, 9)
     old_end = date(2026, 7, 27)
@@ -905,6 +1047,26 @@ def test_delisted_contract_extension_repacks_covered_archived_tail(
     old_path.parent.mkdir(parents=True)
     frame = _raw_minute_frame().with_columns(pl.lit(row.symbol).alias("symbol"))
     frame.write_parquet(old_path)
+    old_path.with_suffix(".receipt.json").write_text(json.dumps({
+        "schema_version": 1, "source": "shioaji_kbars_1m", "storage_frequency": "minute",
+        "simulation": True, "symbol": row.symbol, "start_date": str(old_start), "end_date": str(old_end),
+        "status": "ok", "rows": frame.height,
+        "output_receipt": {"path": str(old_path), "size": old_path.stat().st_size,
+                           "sha256": hashlib.sha256(old_path.read_bytes()).hexdigest()},
+    }))
+    if tick_backed:
+        raw = root / "raw_ticks.parquet"
+        raw.write_bytes(b"retained tick test fixture")
+        old_path.with_suffix(".receipt.json").write_text(json.dumps({
+            "schema_version": 1, "source": "shioaji_kbars_1m", "storage_frequency": "minute",
+            "simulation": True, "symbol": row.symbol, "start_date": str(old_start), "end_date": str(old_end),
+            "status": "ok", "rows": frame.height,
+            "underlying_data_method": "observed_ticks_aggregated_to_right_labelled_1m",
+            "raw_tick_sources": [{"path": str(raw), "symbol": row.symbol, "size": raw.stat().st_size,
+                                  "sha256": hashlib.sha256(raw.read_bytes()).hexdigest()}],
+            "output_receipt": {"path": str(old_path), "size": old_path.stat().st_size,
+                               "sha256": hashlib.sha256(old_path.read_bytes()).hexdigest()},
+        }))
     manifest_path = root / "symbols" / f"{row.symbol}.manifest.json"
     manifest_path.parent.mkdir(parents=True)
     manifest_path.write_text(
@@ -934,12 +1096,22 @@ def test_delisted_contract_extension_repacks_covered_archived_tail(
         encoding="utf-8",
     )
 
+    chunks = [(old_start, new_end)]
+    for _ in range(extra_chunks):
+        chunks.append((chunks[-1][1] + timedelta(days=1), chunks[-1][1] + timedelta(days=29)))
+    # A newly observed public trade outside the archive must not become an empty
+    # bucket, even when the current contract directory no longer lists it.
+    pl.DataFrame({'date': [TRADE_DATE, chunks[-1][1]], 'Trading_Volume': [1000., 1000.]}).write_parquet(base)
+    assert not restore_extended_tail_from_archived_manifest(root, row, chunks,
+        requested_start=old_start, requested_end=chunks[-1][1], simulation=True,
+        expected_dates={TRADE_DATE, chunks[-1][1]})
+    pl.DataFrame({'date': [TRADE_DATE], 'Trading_Volume': [1000.]}).write_parquet(base)
     restored = restore_extended_tail_from_archived_manifest(
         root,
         row,
-        [(old_start, new_end)],
+        chunks,
         requested_start=old_start,
-        requested_end=new_end,
+        requested_end=chunks[-1][1],
         simulation=True,
         expected_dates={TRADE_DATE},
     )
@@ -957,6 +1129,20 @@ def test_delisted_contract_extension_repacks_covered_archived_tail(
     assert receipt["query_performed"] is False
     assert receipt["query_skipped_reason"] == "archived_delisted_contract_tail_repacked"
     assert receipt["rows"] == frame.height
+    for start, end in chunks[1:]:
+        p = minute_chunk_paths(root, row.symbol, start, end)[1]
+        assert minute_receipt_valid(p, symbol=row.symbol, start=start, end=end)
+        proof = json.loads(p.read_text())
+        assert proof['status'] == 'empty' and proof['output_receipt'] is None
+        assert proof['returned_dates'] == [] and not proof['query_performed']
+        assert proof['expected_reference_receipt']['sha256'] == hashlib.sha256(base.read_bytes()).hexdigest()
+    if tick_backed:
+        assert receipt["underlying_data_method"] == "observed_ticks_aggregated_to_right_labelled_1m"
+        assert receipt["raw_tick_sources"][0]["path"] == str(raw)
+        new_receipt = minute_chunk_paths(root, row.symbol, old_start, new_end)[1]
+        assert minute_receipt_valid(new_receipt, symbol=row.symbol, start=old_start, end=new_end)
+        raw.write_bytes(b"changed")
+        assert not minute_receipt_valid(new_receipt, symbol=row.symbol, start=old_start, end=new_end)
 
 
 def test_completed_bar_features_do_not_read_next_bar() -> None:

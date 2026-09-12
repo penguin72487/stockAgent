@@ -48,6 +48,7 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (  # noqa: E402
 )
 from scripts.run_tw_day_trade_simulation import _mode_specs  # noqa: E402
 from stockagent.config import load_config  # noqa: E402
+from stockagent.data.tw_price_rules import TW_ORDER_PRICE_CONTRACT_VERSION  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
     load_market_config,
     resolved_live_output_dir,
@@ -74,6 +75,46 @@ DISCORD_STATUS_PATH = Path("artifacts/discord_bot/service_status.json")
 
 def _resolved(path: Path) -> Path:
     return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def _require_requested_artifact(
+    market_config: Any, expected_artifact_root: Path | None
+) -> dict[str, Any] | None:
+    """Bind an explicit user request before trusting a stable market alias.
+
+    The selector can override the YAML's visible checkpoint/output fields.
+    Similar model labels or architecture names are not artifact identities.
+    Existing lifecycle and checkpoint checks still own artifact acceptance.
+    """
+    if expected_artifact_root is None:
+        return None
+    requested = _resolved(expected_artifact_root).resolve()
+    if not requested.is_dir():
+        raise FileNotFoundError(f"requested training artifact is unavailable: {requested}")
+    selected = _resolved(Path(str(market_config.output_dir or ""))).resolve()
+    if selected != requested:
+        raise ValueError(
+            "requested training artifact differs from resolved model selection: "
+            f"requested={requested} selected={selected}"
+        )
+    if market_config.fold_id is None:
+        raise ValueError("requested training artifact requires an explicit fold_id")
+    expected_checkpoint = requested / f"fold_{int(market_config.fold_id):02d}" / "checkpoint_best.pt"
+    selected_checkpoint = _resolved(Path(str(market_config.checkpoint_path or ""))).resolve()
+    if selected_checkpoint != expected_checkpoint.resolve():
+        raise ValueError(
+            "selected checkpoint does not belong to the requested training artifact: "
+            f"selected={selected_checkpoint} expected={expected_checkpoint}"
+        )
+    if not expected_checkpoint.is_file():
+        raise FileNotFoundError(expected_checkpoint)
+    return {
+        "requested_artifact_root": str(requested),
+        "selected_artifact_root": str(selected),
+        "checkpoint_sha256": _sha256(expected_checkpoint),
+        "identity_matches": True,
+        "training_execution_parity_proven": False,
+    }
 
 
 def _latest_completed_session(
@@ -251,6 +292,9 @@ def _current_deployment_evidence(
     )
     if replay_entry_contract != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE:
         reasons.append("replay_entry_contract_version_mismatch")
+    price_contract = (rebuild.get("replay_contract") or {}).get("order_price_contract_version")
+    if type(price_contract) is not int or price_contract != TW_ORDER_PRICE_CONTRACT_VERSION:
+        reasons.append("order_price_contract_version_mismatch")
     mode = (state.get("modes") or {}).get(market) or {}
     if float(mode.get("initial_capital_twd") or 0.0) != initial_capital_twd:
         reasons.append("initial_capital_mismatch")
@@ -295,6 +339,8 @@ def _current_deployment_evidence(
         "target_checkpoint_fingerprints": sorted(observed_fingerprints),
         "replay_entry_contract": replay_entry_contract,
         "required_replay_entry_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+        "order_price_contract_version": price_contract,
+        "required_order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
         "promoted_at": promotion.get("promoted_at"),
         "rollback_directory": promotion.get("rollback_directory"),
     }
@@ -303,6 +349,9 @@ def _current_deployment_evidence(
 def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     market_config_path = _resolved(args.market_config)
     market_config = load_market_config(market_config_path)
+    requested_artifact = _require_requested_artifact(
+        market_config, getattr(args, "expected_artifact_root", None)
+    )
     experiment_path = _resolved(Path(market_config.config_path))
     experiment = load_config(experiment_path)
     if str(experiment.trading.execution_mode) != "tw_day_trade":
@@ -407,6 +456,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "fold_id": market_config.fold_id,
             "initial_capital_twd": capital,
             "lifecycle": lifecycle,
+            "requested_artifact": requested_artifact,
         },
         "history": {
             "start_date": start.isoformat(),
@@ -946,6 +996,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat())
     parser.add_argument("--end-date", default="latest")
     parser.add_argument("--expected-initial-capital", type=float, default=10_000_000.0)
+    parser.add_argument(
+        "--expected-artifact-root", type=Path,
+        help="Require this exact training artifact after model-selector resolution; never substitute a similarly named run.",
+    )
     parser.add_argument(
         "--markets-dir", type=Path, default=Path("services/discord_bot/markets")
     )

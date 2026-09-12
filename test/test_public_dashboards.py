@@ -263,6 +263,8 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                     "signal_id": "private",
                     "symbol": "2330",
                     "bid": float("nan"),
+                    "counterfactual_overnight_replay": True,
+                    "sizing_capital_twd": 10_000_000.0,
                     "sizing_open_price": 100.0,
                     "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
                 }
@@ -288,6 +290,8 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
             {
                 "symbol": "2330",
                 "bid": None,
+                "counterfactual_overnight_replay": True,
+                "sizing_capital_twd": 10_000_000.0,
                 "sizing_open_price": 100.0,
                 "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
             }
@@ -1013,6 +1017,24 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert calls == 2
     finally:
         release_build.set()
+        server.server_close()
+
+
+def test_tw_status_never_reuses_yesterday_cache_after_rollover(monkeypatch):
+    server = _test_server()
+    day = ["2026-09-08"]
+    server.tw_revision = lambda: server.cached_local_json(
+        cache_key=f"rollover-fixture-{day[0]}", ttl_seconds=60, cache_control="no-store",
+        builder=lambda: {"revision_token": day[0], "session_clock": {"display_session_date": day[0]}},
+    )
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", lambda **kw: {
+        "simulation_only": True, "production_order_possible": False, "modes": [], "session_date": day[0],
+    })
+    try:
+        assert json.loads(server.tw_status().body)["session_date"] == "2026-09-08"
+        day[0] = "2026-09-09"
+        assert json.loads(server.tw_status().body)["session_date"] == "2026-09-09"
+    finally:
         server.server_close()
 
 

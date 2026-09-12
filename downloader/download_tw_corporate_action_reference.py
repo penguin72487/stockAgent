@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
         description="Download official TWSE/TPEx ex-right/ex-dividend reference prices by year."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public"))
+    parser.add_argument("--tpex-daily-path", type=Path,
+                        help="Read the canonical daily archive without copying it into a separately dated execution-action workspace.")
     parser.add_argument(
         "--mode",
         choices=("rebuild", "repair", "daily"),
@@ -1088,7 +1090,7 @@ def main() -> None:
     monthly_start: date | None = None
     monthly_end: date | None = None
     if requested_start_date <= end_date:
-        tpex_daily_path = args.output_dir / "tpex_daily_ohlcv.parquet"
+        tpex_daily_path = getattr(args, "tpex_daily_path", None) or (args.output_dir / "tpex_daily_ohlcv.parquet")
         if not tpex_daily_path.is_file():
             raise FileNotFoundError(
                 "TPEx monthly corporate-action fallback requires "

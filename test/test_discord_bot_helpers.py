@@ -633,6 +633,41 @@ def test_recent_day_trade_artifact_waits_for_engine_instead_of_recomputing(
     )
 
 
+@pytest.mark.parametrize("authorized", [False, True])
+def test_prior_margin_carry_does_not_suppress_next_opening(monkeypatch, authorized):
+    from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+    cfg = SimpleNamespace(market="new", timezone="Asia/Taipei", open_time="09:00",
+                          day_trade_residual_margin_conversion=authorized)
+    mode = {"session_date": "2026-09-09", "entry_completed_at": "2026-09-09T09:01:00+08:00",
+            "open_position_count": 1, "margin_carry_position_count": 1,
+            "margin_carry_contract": MARGIN_CARRY_CONTRACT,
+            "closing_auction_settled_at": "2026-09-09T13:30:00+08:00",
+            "residual_conversion_completed_at": "2026-09-09T13:30:00+08:00"}
+    summary = {"generated_at": "2026-09-10T10:00:00+08:00",
+               "replay_effective_signal_at": "2026-09-09T09:00:00+08:00",
+               "live_session_open_feature_applied": True,
+               "day_trade_model_observation": "session_open",
+               "signal_price_contract": {"model_observation": "session_open", "opening_execution_eligible": True}}
+    monkeypatch.setattr(discord_bot, "load_service_sync", lambda _: {"modes": {"new": mode}})
+    monkeypatch.setattr(discord_bot, "_latest_market_signal", lambda _: (None, summary))
+    assert discord_bot._day_trade_schedule_state(cfg, "2026-09-10") == ("retry" if authorized else "blocked_open_position")
+    assert not discord_bot._is_scheduled_day_trade_opening_signal(cfg, summary, "2026-09-10")
+    if authorized:
+        summary["replay_effective_signal_at"] = "2026-09-10T09:00:00+08:00"
+        assert discord_bot._day_trade_schedule_state(cfg, "2026-09-10") == "pending_confirmation"
+        mode.pop("residual_conversion_completed_at")
+        assert discord_bot._day_trade_schedule_state(cfg, "2026-09-10") == "blocked_open_position"
+
+
+def test_committed_current_session_is_not_recomputed_when_pointer_is_missing(monkeypatch):
+    cfg = SimpleNamespace(market="new")
+    monkeypatch.setattr(discord_bot, "load_service_sync", lambda _: {"modes": {"new": {
+        "session_date": "2026-09-10", "entry_completed_at": "2026-09-10T09:01:00+08:00",
+        "open_position_count": 1}}})
+    monkeypatch.setattr(discord_bot, "_latest_market_signal", lambda _: None)
+    assert discord_bot._day_trade_schedule_state(cfg, "2026-09-10") == "completed"
+
+
 def test_discord_page_size_and_top_n_floor_to_ten() -> None:
     assert discord_bot._page_size(1) == 10
     assert discord_bot._page_size(5) == 10

@@ -5,7 +5,7 @@ The drill deliberately starts with every registered TW public source stale,
 no same-session opening observation, no signal pointer, and an unsynchronised
 Discord receipt.  It then atomically applies repaired source receipts and
 executes the same production pre-open readiness gate.  Only after that gate is
-ready does it inject an opening observation, publish four atomic signal
+ready does it inject an opening observation, publish each account's atomic signal
 pointers, and execute them immediately after 09:00 using a strictly later best
 Ask/Bid. A separate isolated phase proves that missed-opening replay sizes from
 the official 09:00 open and executes from a source-backed 09:01 minute price
@@ -56,10 +56,12 @@ from scripts.run_tw_day_trade_simulation import (  # noqa: E402
     _mode_specs,
 )
 from stockagent.live.tw_day_trade_service_sync import load_service_sync  # noqa: E402
+from stockagent.live.market_config import enabled_day_trade_markets  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     LiveEligibility,
+    MARGIN_CARRY_CONTRACT,
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     TwDayTradeSimulationEngine,
@@ -67,11 +69,8 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-EXPECTED_MARKETS = (
-    "tw_day_trade_100m",
-    "tw_day_trade_multi_basis",
-    "tw_day_trade_multi_basis_22",
-    "tw_day_trade_multi_basis_projection_l1_gelu",
+EXPECTED_MARKETS = enabled_day_trade_markets(
+    REPO_ROOT / "services/discord_bot/markets"
 )
 TARGET_WEIGHTS = {
     "tw_day_trade_100m": 0.01,
@@ -878,7 +877,7 @@ def run_two_phase_cold_test(
             spec,
             session=session_date,
             signal_at=signal_at,
-            target_weight=TARGET_WEIGHTS[spec.market],
+            target_weight=TARGET_WEIGHTS.get(spec.market, 0.10),
         )
     pointer_results: dict[str, str] = {}
     for spec in specs:
@@ -1043,6 +1042,7 @@ def run_two_phase_cold_test(
                 "execution_price_0901": 1_003.0,
                 "execution_price_0901_method": "minute_vwap",
                 "entry_price_source": "fixture_0901_minute_vwap",
+                "minute_volume_lots": 100.0,
                 "historical_source_quote_at": _at(
                     session_date, 9, 0, 59
                 ).isoformat(timespec="seconds"),
@@ -1262,20 +1262,49 @@ def run_two_phase_cold_test(
         == "session_flat_after_exit"
         for market in markets
     )
+    residual_mode = final_modes["tw_day_trade_multi_basis"]
+    margin_enabled = next(
+        spec.residual_margin_conversion
+        for spec in specs if spec.market == "tw_day_trade_multi_basis"
+    )
+    residual_positions = [
+        position for position in (residual_mode.get("positions") or {}).values()
+        if int(position.get("signed_shares") or 0)
+    ]
+    expected_residual_status = (
+        "margin_carried_waiting_next_signal" if margin_enabled
+        else "critical_residual_carried_after_13_30"
+    )
+    residual_contract_valid = (
+        len(residual_positions) == 1
+        and int(residual_positions[0]["signed_shares"]) == -1_000
+        and residual_positions[0].get("fill_guaranteed") is False
+        and residual_positions[0].get("carry_type") == (
+            "assumed_margin_short" if margin_enabled
+            else "unresolved_day_trade_delivery_obligation"
+        )
+        and (
+            residual_positions[0].get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+            if margin_enabled else not residual_positions[0].get("margin_carry_contract")
+        )
+    )
     _assert_check(
         checks,
-        "phase3_1330_all_modes_are_terminal_and_flat",
-        all_flat
-        and len(force_fills) == 3
+        "phase3_1330_preserves_unfilled_obligation_without_synthetic_fill",
+        not all_flat
+        and len(force_fills) == len(markets) - 1
         and all(float(row.get("price") or 0.0) == 998.0 for row in force_fills)
-        and len(terminal_fills) == 1
-        and terminal_fills[0].get("market") == "tw_day_trade_multi_basis"
-        and terminal_fills[0].get("fill_contract")
-        == "simulation_terminal_ledger_not_exchange_fill",
+        and len(terminal_fills) == 0
+        and residual_mode.get("force_exit_failures") == 1
+        and residual_mode.get("engine_status") == expected_residual_status
+        and residual_contract_valid,
         evidence={
             "force_exit_fill_count": len(force_fills),
             "terminal_fill_count": len(terminal_fills),
             "all_flat": all_flat,
+            "margin_conversion_enabled": margin_enabled,
+            "residual_status": residual_mode.get("engine_status"),
+            "residual_contract_valid": residual_contract_valid,
         },
     )
 
@@ -1295,18 +1324,7 @@ def run_two_phase_cold_test(
         != completed_run_id
         and engine.fills_path.read_text(encoding="utf-8").splitlines()
         == fill_lines_at_close
-        and all(
-            not any(
-                int(position.get("signed_shares") or 0) != 0
-                for position in (
-                    ((engine.state.get("modes") or {}).get(market) or {}).get(
-                        "positions", {}
-                    )
-                    or {}
-                ).values()
-            )
-            for market in markets
-        ),
+        and engine.state["modes"]["tw_day_trade_multi_basis"].get("force_exit_failures") == 1,
     )
     mark_rows = [
         json.loads(line)
@@ -1336,6 +1354,9 @@ def run_two_phase_cold_test(
         "force_exit_signed_shares": force_state,
         "close_at": close_at.isoformat(timespec="seconds"),
         "all_modes_flat": all_flat,
+        "margin_conversion_enabled": margin_enabled,
+        "residual_status": residual_mode.get("engine_status"),
+        "residual_contract_valid": residual_contract_valid,
         "force_exit_fill_count": len(force_fills),
         "terminal_ledger_fill_count": len(terminal_fills),
         "terminal_fill_contract": (

@@ -137,6 +137,66 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         mode.setdefault("pending_entry_orders", {})
         return mode
 
+    def _signal_timestamp(self, summary: Mapping[str, Any]) -> datetime | None:
+        return _parse_timestamp(
+            summary.get("signal_ready_at")
+            or summary.get("artifact_published_at")
+            or summary.get("generated_at")
+        )
+
+    def _match_auction_print(
+        self, quote: Mapping[str, Any], *, symbol: str, **kwargs: Any,
+    ) -> tuple[float, datetime | None] | None:
+        return _auction_print(quote, **kwargs)
+
+    def _auction_fill_contract(self, phase: str) -> str:
+        return (
+            "actual_close_auction_price" if phase == "close"
+            else "actual_next_session_opening_auction_price"
+        )
+
+    def _auction_price_within_limits(
+        self,
+        price: float,
+        lower: float | None,
+        upper: float | None,
+        *,
+        phase: str,
+    ) -> bool:
+        """Validate a live auction print against the dated legal price band."""
+
+        _ = phase
+        return _inside_limits(price, lower, upper)
+
+    @staticmethod
+    def _entry_sizing_capital(mode: Mapping[str, Any], spec: ModeSpec) -> float:
+        """Use the account NAV available before the new close cohort.
+
+        The prior implementation reapplied ``initial_capital_twd`` every day,
+        so an account that had already lost its capital could continue opening
+        the same notional exposure.  The next cohort is instead sized from the
+        latest reconciled equity.  A new account still begins at its configured
+        initial capital.
+        """
+
+        try:
+            current = float(mode.get("total_equity_twd"))
+        except (TypeError, ValueError):
+            current = float(spec.initial_capital_twd)
+        if not math.isfinite(current):
+            current = float(spec.initial_capital_twd)
+        return max(0.0, current)
+
+    def _opening_limits_current(
+        self, quote: Mapping[str, Any], *, session_date: str,
+    ) -> bool:
+        exchange_at = _parse_timestamp(quote.get("exchange_quote_at"))
+        return bool(
+            exchange_at is not None
+            and exchange_at.date().isoformat() == session_date
+            and OPEN_ORDER_GATE <= _clock(exchange_at) <= OPEN_OBSERVATION_DEADLINE
+        )
+
     def record_close_signal_latency_sample(
         self,
         *,
@@ -333,11 +393,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             return self._block_signal(mode, signal_id, "not_tw_day_trade_adapter", observed)
         if not bool(summary.get("live_session_latest_quote_feature_applied")):
             return self._block_signal(mode, signal_id, "latest_quote_feature_missing", observed)
-        signal_at = _parse_timestamp(
-            summary.get("signal_ready_at")
-            or summary.get("artifact_published_at")
-            or summary.get("generated_at")
-        )
+        signal_at = self._signal_timestamp(summary)
         if signal_at is None or signal_at.date() != observed.date():
             return self._block_signal(mode, signal_id, "signal_not_current_session", observed)
         if not CLOSE_ORDER_GATE <= _clock(observed) < REGULAR_CLOSE:
@@ -363,6 +419,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         if prior_session and prior_session != observed.date().isoformat():
             self._archive_mode_positions(mode, archived_at=observed)
         session_date = observed.date().isoformat()
+        sizing_capital_twd = self._entry_sizing_capital(mode, spec)
         mode.update(
             {
                 "session_date": session_date,
@@ -385,6 +442,8 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "pending_entry_orders": {},
                 "positions": {},
                 "blocked_reason": None,
+                "entry_sizing_capital_twd": sizing_capital_twd,
+                "entry_sizing_capital_basis": "current_pre_entry_total_equity",
             }
         )
         counts: dict[str, int] = {}
@@ -415,13 +474,15 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 status, reason = "blocked", "ordinary_short_open_not_allowed"
             elif sizing_price is None:
                 status, reason = "blocked", "13_25_sizing_price_missing"
+            elif sizing_capital_twd <= 0.0:
+                status, reason = "blocked", "nonpositive_equity_no_new_exposure"
             elif lower is None or upper is None:
                 status, reason = "blocked", "same_session_price_limits_missing"
             else:
                 requested_shares = int(
                     math.floor(
                         abs(target_weight)
-                        * float(spec.initial_capital_twd)
+                        * sizing_capital_twd
                         / sizing_price
                         / int(spec.lot_size)
                     )
@@ -452,6 +513,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
                 "source_signal_at": summary.get("signal_started_at"),
+                "signal_source_path": summary.get("summary_path"),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -459,6 +521,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "score": row.get("score"),
                 "raw_score": row.get("raw_score"),
                 "target_weight": target_weight,
+                "sizing_capital_twd": sizing_capital_twd,
                 "requested_shares": requested_shares,
                 "filled_shares": 0,
                 "execution_price": None,
@@ -569,8 +632,9 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 continue
             symbol = str(order.get("symbol") or "")
             quote = dict(quotes.get(symbol) or {})
-            matched = _auction_print(
+            matched = self._match_auction_print(
                 quote,
+                symbol=symbol,
                 session_date=session_date,
                 not_before=REGULAR_CLOSE,
                 not_after=DELAYED_CLOSE_DEADLINE,
@@ -601,9 +665,14 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                     changed = True
                 continue
             price, exchange_at = matched
+            exchange_match_at = (
+                exchange_at.isoformat(timespec="milliseconds") if exchange_at else None
+            )
             lower = _finite(order.get("lower_limit"))
             upper = _finite(order.get("upper_limit"))
-            if not _inside_limits(price, lower, upper):
+            if not self._auction_price_within_limits(
+                price, lower, upper, phase="close"
+            ):
                 order["status"] = "blocked_close_outside_legal_limits"
                 self._order(
                     {**order, "recorded_at": now.isoformat(timespec="seconds")}
@@ -640,9 +709,12 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "entry_order_id": order_id,
                 "entry_at": now.isoformat(timespec="seconds"),
                 "entry_quote_at": quote.get("quote_at"),
-                "entry_exchange_at": exchange_at.isoformat(timespec="milliseconds"),
+                "entry_exchange_at": exchange_match_at,
                 "entry_price": price,
-                "entry_price_source": "actual_close_auction_print",
+                "entry_price_source": (
+                    "actual_close_auction_print" if exchange_at
+                    else self._auction_fill_contract("close")
+                ),
                 "entry_fee_twd": entry_fee,
                 "remaining_entry_fee_twd": entry_fee,
                 "entry_gross_fee_and_tax_twd": gross_fee,
@@ -671,7 +743,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 {
                     "status": "filled",
                     "filled_at": now.isoformat(timespec="seconds"),
-                    "exchange_match_at": exchange_at.isoformat(timespec="milliseconds"),
+                    "exchange_match_at": exchange_match_at,
                     "fill_price": price,
                 }
             )
@@ -687,13 +759,13 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                     "purpose": "close_auction_entry",
                     "fill_at": now.isoformat(timespec="seconds"),
                     "quote_at": quote.get("quote_at"),
-                    "exchange_match_at": exchange_at.isoformat(timespec="milliseconds"),
+                    "exchange_match_at": exchange_match_at,
                     "quantity": quantity,
                     "price": price,
                     "fee_and_tax_twd": entry_fee,
                     "gross_fee_and_tax_twd": gross_fee,
                     "commission_rebate_accrued_twd": rebate,
-                    "fill_contract": "actual_close_auction_price",
+                    "fill_contract": self._auction_fill_contract("close"),
                     "depth_assumption": "full_paper_quantity_no_queue_allocation_claim",
                     "simulation_only": True,
                 }
@@ -811,11 +883,8 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 )
                 changed = True
             quote = dict(quotes.get(str(position.get("symbol") or "")) or {})
-            exchange_at = _parse_timestamp(quote.get("exchange_quote_at"))
-            current_session_quote = bool(
-                exchange_at is not None
-                and exchange_at.date().isoformat() == session_date
-                and OPEN_ORDER_GATE <= _clock(exchange_at) <= OPEN_OBSERVATION_DEADLINE
+            current_session_quote = self._opening_limits_current(
+                quote, session_date=session_date,
             )
             lower = _finite(quote.get("lower_limit"))
             upper = _finite(quote.get("upper_limit"))
@@ -897,8 +966,9 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 changed = True
                 continue
             quote = dict(quotes.get(str(position.get("symbol") or "")) or {})
-            matched = _auction_print(
+            matched = self._match_auction_print(
                 quote,
+                symbol=str(position.get("symbol") or ""),
                 session_date=now.date().isoformat(),
                 not_before=OPEN_MATCH_GATE,
                 not_after=OPEN_OBSERVATION_DEADLINE,
@@ -915,9 +985,14 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                     changed = True
                 continue
             price, exchange_at = matched
+            exchange_match_at = (
+                exchange_at.isoformat(timespec="milliseconds") if exchange_at else None
+            )
             lower = _finite(quote.get("lower_limit"))
             upper = _finite(quote.get("upper_limit"))
-            if not _inside_limits(price, lower, upper):
+            if not self._auction_price_within_limits(
+                price, lower, upper, phase="open"
+            ):
                 position["opening_exit_order_status"] = "blocked_open_outside_legal_limits"
                 self._order(
                     {
@@ -935,9 +1010,9 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 )
                 changed = True
                 continue
-            quote["fill_contract"] = "actual_next_session_opening_auction_price"
+            quote["fill_contract"] = self._auction_fill_contract("open")
             quote["depth_assumption"] = "full_paper_quantity_no_queue_allocation_claim"
-            quote["exchange_match_at"] = exchange_at.isoformat(timespec="milliseconds")
+            quote["exchange_match_at"] = exchange_match_at
             self._close_position(
                 position,
                 mode,
@@ -952,7 +1027,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             )
             position["opening_exit_order_status"] = "filled"
             position["exit_session_date"] = now.date().isoformat()
-            position["exit_exchange_at"] = exchange_at.isoformat(timespec="milliseconds")
+            position["exit_exchange_at"] = exchange_match_at
             changed = True
             closed_any = True
         if closed_any and not any(

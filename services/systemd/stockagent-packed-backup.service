@@ -1,0 +1,29 @@
+[Unit]
+Description=Penguin additive verified packed cold backup to D drive
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+ExecStart=/bin/bash "@REPO_ROOT@/scripts/run_packed_backup.sh" watch
+Restart=always
+RestartSec=30
+TimeoutStopSec=20
+KillMode=control-group
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=10
+IOWeight=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/stockagent-packed
+ReadWritePaths=/mnt/d/stockagent-backup /var/lib/stockagent-packed-backup
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

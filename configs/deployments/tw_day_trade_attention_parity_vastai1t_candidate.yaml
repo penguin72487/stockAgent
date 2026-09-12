@@ -1,0 +1,21 @@
+# Remote formal recipe. Loading YAML is not readiness: training still fails
+# closed until the physical source, cache, checkpoint and full-history gates pass.
+# Pin exact immutable data paths; never read the main worktree's moving links.
+base_config: ../markets/tw_day_trade_attention_layernorm_paper_parity_candidate.yaml
+
+runner:
+  output_dir: /root/stockAgent-daytrade-parity-20260910/artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_candidate_v1
+
+environment:
+  # Observed cgroup quota is ~53.76 CPUs, shared by both GPU ranks. These are
+  # bounded starting limits, NOT a full-epoch measured optimum.
+  cpu_threads: 24
+  torch_compile_threads: 8
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260910T100453368085496Z-l0-penguin-234efa703efde4b2/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260910T100453368085496Z-l0-penguin-234efa703efde4b2/features/tw_public_stock_daily.parquet
+  day_trade_minute_execution_root: /srv/stockagent-packed-materialized/tw-minute-train/tw-minute-train-20260910T121601063496311Z-l0-penguin-09bedd96a2f68c39
+  panel_cache_root: /root/stockAgent-daytrade-parity-20260910/artifacts/cache/tw_public_paper_parity_234efa703efde4b2/stocks
+  day_trade_minute_execution_cache_dir: /root/stockAgent-daytrade-parity-20260910/artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39
+  panel_load_workers: 16

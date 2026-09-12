@@ -22,6 +22,9 @@ from stockagent.backtest.tw_continuous import (
 from stockagent.backtest.tw_day_trade_minute import (
     run_tw_day_trade_minute_execution,
 )
+from stockagent.backtest.tw_day_trade_carry import (
+    DayTradeCarrySession, DayTradeCarryState, run_day_trade_carry_sessions,
+)
 from stockagent.backtest.tw_commission_rebate import (
     commission_rebate_calendar,
     normalize_commission_rebate_timing,
@@ -1510,6 +1513,8 @@ class BacktestResult:
     final_due_weights: np.ndarray | None = None
     futures_contract_quantities_history: np.ndarray | None = None
     futures_residual_contract_quantities_history: np.ndarray | None = None
+    day_trade_carry_state: DayTradeCarryState | None = None
+    minute_nav: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1566,15 +1571,20 @@ class BacktestResultTensor:
     final_due_weights: torch.Tensor | None = None
     futures_contract_quantities_history: torch.Tensor | None = None
     futures_residual_contract_quantities_history: torch.Tensor | None = None
+    day_trade_carry_state: DayTradeCarryState | None = None
+    minute_nav: torch.Tensor | None = None
+    shares_history: torch.Tensor | None = None
 
     def to_numpy(self) -> BacktestResult:
         # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
         # than after .numpy(), because the latter raises before astype can run.
-        def as_float32(tensor: torch.Tensor) -> np.ndarray:
-            return tensor.detach().to(device="cpu", dtype=torch.float32).numpy()
+        # Physical accounting remains float64 through report conversion.
+        numeric_dtype = torch.float64 if self.day_trade_carry_state is not None else torch.float32
+        def as_float(tensor: torch.Tensor) -> np.ndarray:
+            return tensor.detach().to(device="cpu", dtype=numeric_dtype).numpy()
 
-        def optional_float32(tensor: torch.Tensor | None) -> np.ndarray | None:
-            return None if tensor is None else as_float32(tensor)
+        def optional_float(tensor: torch.Tensor | None) -> np.ndarray | None:
+            return None if tensor is None else as_float(tensor)
 
         def optional_bool(tensor: torch.Tensor | None) -> np.ndarray | None:
             return (
@@ -1584,57 +1594,61 @@ class BacktestResultTensor:
             )
 
         return BacktestResult(
+            day_trade_carry_state=(None if self.day_trade_carry_state is None
+                                  else self.day_trade_carry_state.detached(device="cpu")),
+            minute_nav=(None if self.minute_nav is None else self.minute_nav.detach().cpu().numpy()),
+            shares_history=(None if self.shares_history is None else self.shares_history.detach().cpu().numpy()),
             futures_contract_quantities_history=(None if self.futures_contract_quantities_history is None else self.futures_contract_quantities_history.detach().cpu().numpy()),
             futures_residual_contract_quantities_history=(None if self.futures_residual_contract_quantities_history is None else self.futures_residual_contract_quantities_history.detach().cpu().numpy()),
-            strategy_returns=as_float32(self.strategy_returns),
-            benchmark_returns=as_float32(self.benchmark_returns),
-            turnovers=as_float32(self.turnovers),
-            weights_history=as_float32(self.weights_history),
-            requested_weights_history=optional_float32(self.requested_weights_history),
-            open_weights_history=optional_float32(self.open_weights_history),
-            close_weights_history=optional_float32(self.close_weights_history),
-            event_turnovers=optional_float32(self.event_turnovers),
-            executed_buy_weights=optional_float32(self.executed_buy_weights),
-            executed_sell_weights=optional_float32(self.executed_sell_weights),
-            executed_long_buy_weights=optional_float32(self.executed_long_buy_weights),
-            executed_long_sell_weights=optional_float32(
+            strategy_returns=as_float(self.strategy_returns),
+            benchmark_returns=as_float(self.benchmark_returns),
+            turnovers=as_float(self.turnovers),
+            weights_history=as_float(self.weights_history),
+            requested_weights_history=optional_float(self.requested_weights_history),
+            open_weights_history=optional_float(self.open_weights_history),
+            close_weights_history=optional_float(self.close_weights_history),
+            event_turnovers=optional_float(self.event_turnovers),
+            executed_buy_weights=optional_float(self.executed_buy_weights),
+            executed_sell_weights=optional_float(self.executed_sell_weights),
+            executed_long_buy_weights=optional_float(self.executed_long_buy_weights),
+            executed_long_sell_weights=optional_float(
                 self.executed_long_sell_weights
             ),
-            executed_short_open_weights=optional_float32(
+            executed_short_open_weights=optional_float(
                 self.executed_short_open_weights
             ),
-            executed_short_cover_weights=optional_float32(
+            executed_short_cover_weights=optional_float(
                 self.executed_short_cover_weights
             ),
-            due_weights_history=optional_float32(self.due_weights_history),
-            final_due_weights=optional_float32(self.final_due_weights),
+            due_weights_history=optional_float(self.due_weights_history),
+            final_due_weights=optional_float(self.final_due_weights),
             execution_mode=self.execution_mode,
             settlement_ledger_unit=self.settlement_ledger_unit,
-            cash_history=optional_float32(self.cash_history),
-            payables_history=optional_float32(self.payables_history),
-            receivables_history=optional_float32(self.receivables_history),
+            cash_history=optional_float(self.cash_history),
+            payables_history=optional_float(self.payables_history),
+            receivables_history=optional_float(self.receivables_history),
             settlement_default=optional_bool(self.settlement_default),
-            equity_scale_history=optional_float32(self.equity_scale_history),
-            final_weights=optional_float32(self.final_weights),
-            final_cash=optional_float32(self.final_cash),
-            final_payables=optional_float32(self.final_payables),
-            final_receivables=optional_float32(self.final_receivables),
-            commission_rebate_accrued_history=optional_float32(
+            equity_scale_history=optional_float(self.equity_scale_history),
+            final_weights=optional_float(self.final_weights),
+            final_cash=optional_float(self.final_cash),
+            final_payables=optional_float(self.final_payables),
+            final_receivables=optional_float(self.final_receivables),
+            commission_rebate_accrued_history=optional_float(
                 self.commission_rebate_accrued_history
             ),
-            commission_rebate_paid_history=optional_float32(
+            commission_rebate_paid_history=optional_float(
                 self.commission_rebate_paid_history
             ),
-            commission_rebate_current_history=optional_float32(
+            commission_rebate_current_history=optional_float(
                 self.commission_rebate_current_history
             ),
-            commission_rebate_due_history=optional_float32(
+            commission_rebate_due_history=optional_float(
                 self.commission_rebate_due_history
             ),
-            final_commission_rebate_current=optional_float32(
+            final_commission_rebate_current=optional_float(
                 self.final_commission_rebate_current
             ),
-            final_commission_rebate_due=optional_float32(
+            final_commission_rebate_due=optional_float(
                 self.final_commission_rebate_due
             ),
             final_commission_rebate_month_id=(
@@ -1644,23 +1658,23 @@ class BacktestResultTensor:
                 .to(device="cpu", dtype=torch.int64)
                 .numpy()
             ),
-            final_equity_scale=optional_float32(self.final_equity_scale),
-            short_sale_collateral_history=optional_float32(
+            final_equity_scale=optional_float(self.final_equity_scale),
+            short_sale_collateral_history=optional_float(
                 self.short_sale_collateral_history
             ),
-            short_margin_collateral_history=optional_float32(
+            short_margin_collateral_history=optional_float(
                 self.short_margin_collateral_history
             ),
-            final_short_sale_collateral=optional_float32(
+            final_short_sale_collateral=optional_float(
                 self.final_short_sale_collateral
             ),
-            final_short_margin_collateral=optional_float32(
+            final_short_margin_collateral=optional_float(
                 self.final_short_margin_collateral
             ),
-            long_margin_debt_history=optional_float32(
+            long_margin_debt_history=optional_float(
                 self.long_margin_debt_history
             ),
-            final_long_margin_debt=optional_float32(
+            final_long_margin_debt=optional_float(
                 self.final_long_margin_debt
             ),
             final_alive=optional_bool(self.final_alive),
@@ -3269,9 +3283,76 @@ def run_backtest_torch(
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
     return_turnovers: bool = True,
+    day_trade_carry_sessions: tuple[DayTradeCarrySession, ...] | None = None,
+    initial_day_trade_carry_state: DayTradeCarryState | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if day_trade_carry_sessions is not None:
+        if weights.ndim != 2 or future_returns.shape != weights.shape or benchmark_returns.shape != weights.shape[:1]:
+            raise ValueError("physical FIFO inputs require aligned [T,S] actions and [T] benchmark")
+        if (mode != "tw_day_trade" or not day_trade_unlimited_margin_conversion
+                or overnight_returns is not None or symbol_sharded_ledger
+                or max_turnover_ratio != 0 or day_trade_execution_volume_participation != 0.5
+                or normalize_commission_rebate_timing(commission_rebate_timing) != "daily_close"):
+            raise ValueError("physical FIFO sessions require the exact 50%-minute carry contract, without a legacy tape")
+        if (day_trade_eligible_mask is None or day_trade_can_buy_open_mask is None
+                or day_trade_can_sell_open_mask is None or normal_sell_fee_rates is None
+                or (not long_only and can_short_open_mask is None)):
+            raise ValueError("physical FIFO sessions require exact opening permissions and normal sell fees")
+        if any(value is not None for value in (
+            initial_weights, initial_alive, initial_cash, initial_payables, initial_receivables,
+            initial_commission_rebate_current, initial_commission_rebate_due,
+            initial_commission_rebate_month_id, initial_equity_scale,
+            initial_short_sale_collateral, initial_short_margin_collateral, initial_long_margin_debt,
+            state_advance_mask, force_exit_mask, force_short_cover_mask,
+            unresolved_corporate_action_mask, cash_dividend_yield, cash_dividend_payment_delay_sessions,
+            volume_limit_weights, short_capacity_weights,
+        )):
+            raise ValueError("physical FIFO sessions cannot discard legacy state, padding, force masks or approximate action/capacity fields")
+        for value in (tradable_mask, day_trade_eligible_mask, day_trade_can_buy_open_mask,
+                      day_trade_can_sell_open_mask, can_short_open_mask):
+            if value is not None and (value.shape != weights.shape or value.device != weights.device):
+                raise ValueError("physical FIFO permissions differ from the active trajectory/device")
+        if any(value != expected for value, expected in (
+            (day_trade_margin_financing_ratio, 0.60),
+            (day_trade_margin_financing_annual_rate, 0.16),
+            (day_trade_margin_short_handling_fee_rate, 0.001),
+            (day_trade_margin_short_annual_borrow_rate, 0.20),
+        )):
+            raise ValueError("physical FIFO financing rates differ from the shared paper contract")
+        # CLOSE-side executability is future information at 09:00. Normalize
+        # only on the supplied causal universe/open permissions, not exit success.
+        requested, _, open_buy, open_sell = _prepare_scan_inputs(weights, tradable_mask,
+            day_trade_can_buy_open_mask, day_trade_can_sell_open_mask, long_only,
+            gross_leverage, min_trade_weight, portfolio_activation)
+        shorts = torch.zeros_like(open_sell) if can_short_open_mask is None else can_short_open_mask.bool()
+        enter = day_trade_eligible_mask.bool() & torch.where(requested >= 0, open_buy, open_sell & shorts)
+        def rate(values, default):
+            if values is None:
+                return torch.full((weights.shape[1],), default, device=weights.device, dtype=torch.float64)
+            if symbol_indices is not None:
+                values = values.index_select(0, symbol_indices.to(device=values.device, dtype=torch.long))
+            if values.shape != (weights.shape[1],):
+                raise ValueError("physical FIFO fee vector differs from the active symbol universe")
+            return values.to(device=weights.device, dtype=torch.float64)
+        carry = run_day_trade_carry_sessions(requested, day_trade_carry_sessions, can_enter=enter,
+            buy_fee_rate=rate(buy_fee_rates, buy_fee_rate), day_sell_fee_rate=rate(sell_fee_rates, sell_fee_rate),
+            normal_sell_fee_rate=rate(normal_sell_fee_rates, sell_fee_rate),
+            rebate_rate=rate(commission_rebate_rates, 0), initial_capital=day_trade_execution_initial_capital,
+            initial_state=initial_day_trade_carry_state)
+        return BacktestResultTensor(strategy_returns=carry.strategy_returns,
+            benchmark_returns=benchmark_returns.to(device=weights.device, dtype=torch.float64),
+            turnovers=carry.turnovers, weights_history=carry.weights_history,
+            requested_weights_history=requested, shares_history=carry.shares_history,
+            final_weights=carry.weights_history[-1], final_alive=carry.final_state.alive,
+            execution_mode=mode, settlement_ledger_unit="currency",
+            settlement_default=carry.settlement_default,
+            equity_scale_history=carry.minute_nav[:, -1] / day_trade_execution_initial_capital,
+            final_equity_scale=carry.final_state.last_nav / day_trade_execution_initial_capital,
+            day_trade_carry_state=carry.final_state, minute_nav=carry.minute_nav)
+    if initial_day_trade_carry_state is not None:
+        raise ValueError("physical FIFO state cannot be silently consumed by another executor")
     if overnight_fixed_close_to_open:
         if mode != "tw_overnight":
             raise ValueError("fixed close-to-open requires tw_overnight")
@@ -4327,8 +4408,9 @@ def run_backtest_torch(
                     raise ValueError(
                         "stateful carry tw_day_trade cannot use the legacy "
                         "minute tape executor because it discards per-symbol "
-                        "residual holdings; use the causal daily OPEN/CLOSE "
-                        "ledger until a stateful minute ledger is available"
+                        "residual holdings; a stateful minute inventory ledger "
+                        "is required. The daily OPEN/CLOSE ledger is a different "
+                        "execution contract, not a web-paper parity fallback"
                     )
                 if normal_sell_fee_rates is None:
                     raise ValueError(

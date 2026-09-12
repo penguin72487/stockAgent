@@ -63,6 +63,10 @@ class LiveMarketConfig:
     initial_capital: float | None = None
     current_capital: float | None = None
     day_trade_simulation_enabled: bool = False
+    day_trade_residual_margin_conversion: bool = False
+    day_trade_strict_intraday: bool = False
+    day_trade_odd_lot_execution_policy: str = "reject"
+    day_trade_margin_action_data_dir: str | None = None
     day_trade_simulation_state_dir: str | None = None
     day_trade_rule_data_dir: str | None = None
     day_trade_quote_interval_seconds: int = 60
@@ -99,6 +103,7 @@ class LiveMarketConfig:
             "display_timezone": self.display_timezone,
             "daily_bar_time": self.close_time,
             "previous_signal_backfill_limit": self.previous_signal_backfill_limit,
+            "day_trade_rule_data_dir": self.day_trade_rule_data_dir,
             "write": True,
         }
         for key, value in overrides.items():
@@ -325,6 +330,10 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         day_trade_simulation_enabled=_bool_value(
             raw.get("day_trade_simulation_enabled"), False
         ),
+        day_trade_residual_margin_conversion=_bool_value(raw.get("day_trade_residual_margin_conversion"), False),
+        day_trade_strict_intraday=_bool_value(raw.get("day_trade_strict_intraday"), False),
+        day_trade_odd_lot_execution_policy=str(raw.get("day_trade_odd_lot_execution_policy") or "reject"),
+        day_trade_margin_action_data_dir=raw.get("day_trade_margin_action_data_dir") or None,
         day_trade_simulation_state_dir=_optional_str(
             raw.get("day_trade_simulation_state_dir")
         ),
@@ -352,6 +361,17 @@ def load_market_configs(directory: str | Path) -> dict[str, LiveMarketConfig]:
         cfg = load_market_config(path)
         configs[cfg.market] = cfg
     return configs
+
+
+def enabled_day_trade_markets(directory: str | Path) -> tuple[str, ...]:
+    """One configured account set for the engine, guardian, and cold drills."""
+    markets = tuple(sorted(
+        name for name, cfg in load_market_configs(directory).items()
+        if cfg.enabled and cfg.day_trade_simulation_enabled
+    ))
+    if not markets:
+        raise ValueError(f"no enabled day-trade accounts in {directory}")
+    return markets
 
 
 def resolved_live_output_dir(config: LiveMarketConfig) -> Path:

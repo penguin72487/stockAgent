@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date as datetime_date, datetime, time as datetime_time, timezone
+from datetime import date as datetime_date, datetime, time as datetime_time, timedelta, timezone
+from functools import lru_cache
 import gzip
 import hashlib
 import io
@@ -19,7 +20,8 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
-from stockagent.live.performance_contract import paper_account_performance
+from stockagent.live.performance_contract import capital_return, paper_account_performance
+from stockagent.live.market_status import _tw_holiday_schedule_path, verified_tw_stock_session_day
 
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
@@ -38,7 +40,12 @@ from stockagent.live.tw_day_trade_service_sync import (
 DASHBOARD_SCHEMA_VERSION: Final[int] = 5
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 30.0
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
+DEFAULT_CALENDAR_PARQUET_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "data_tw_public/stocks"
 BENCHMARK_HISTORY_FILENAME: Final[str] = "benchmark_history.json"
+OVERNIGHT_HISTORY_FILENAME: Final[str] = "overnight_history.json"
+OVERNIGHT_SIGNAL_HISTORY_FILENAME: Final[str] = "overnight_signal_history.parquet"
+OVERNIGHT_EVENT_HISTORY_FILENAME: Final[str] = "overnight_event_history.parquet"
+OVERNIGHT_POSITION_HISTORY_DIRNAME: Final[str] = "overnight_position_history"
 DEFAULT_OPENING_GATE_PATH: Final[Path] = (
     Path(__file__).resolve().parents[2]
     / "artifacts/data_refresh/tw_public/preopen_gate/latest.json"
@@ -292,6 +299,55 @@ _BENCHMARK_HISTORY_INTERIOR_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
+@lru_cache(maxsize=32)
+def _session_clock_cached(
+    local_date: str, after_rollover: bool, parquet_root: Path, calendar_signature: tuple,
+) -> dict[str, Any]:
+    """Presentation clock only: a verified session is not a readiness/fill claim."""
+    today = datetime_date.fromisoformat(local_date)
+    display_date = None
+    next_rollover = None
+    # Include long exchange holiday breaks, without inventing a weekday calendar.
+    for offset in range(40):
+        day = today - timedelta(days=offset + (not after_rollover))
+        valid, reason = verified_tw_stock_session_day(day, parquet_root=parquet_root)
+        if valid:
+            display_date = day.isoformat()
+            break
+        if "missing" in reason or "unverified" in reason:
+            break
+    for offset in range(40):
+        day = today + timedelta(days=offset + after_rollover)
+        valid, reason = verified_tw_stock_session_day(day, parquet_root=parquet_root)
+        if valid:
+            next_rollover = datetime.combine(day, datetime_time(8, 30), tzinfo=TAIPEI).isoformat()
+            break
+        if "missing" in reason or "unverified" in reason:
+            break
+    return {
+        "display_session_date": display_date,
+        "next_rollover_at": next_rollover,
+        "rollover_local_time": "08:30",
+        "timezone": "Asia/Taipei",
+        "calendar_verified": display_date is not None and next_rollover is not None,
+        "readiness_implied": False,
+    }
+
+
+def dashboard_session_clock(observed: datetime) -> dict[str, Any]:
+    parquet_root = DEFAULT_CALENDAR_PARQUET_ROOT
+    path = _tw_holiday_schedule_path(parquet_root)
+    try:
+        stat = path.stat() if path is not None else None
+        signature = (str(path.resolve()), stat.st_ino, stat.st_size, stat.st_mtime_ns) if stat else ()
+    except OSError:
+        signature = ()
+    local = observed.astimezone(TAIPEI)
+    return dict(_session_clock_cached(
+        local.date().isoformat(), local.time() >= datetime_time(8, 30), parquet_root, signature,
+    ))
+
+
 def build_dashboard_revision(
     *,
     state_dir: Path,
@@ -368,10 +424,13 @@ def build_dashboard_revision(
         except OSError:
             preopen_revision = "missing"
 
+    session_clock = dashboard_session_clock(observed) if discord_markets_field == "day_trade_markets" else {}
+    session_token = session_clock.get("display_session_date") or "unverified"
     return {
         "schema_version": 1,
         "generated_at_utc": observed.isoformat(timespec="milliseconds"),
-        "revision_token": f"{content_revision}:{preopen_revision}",
+        "revision_token": f"{content_revision}:{preopen_revision}:{session_token}",
+        "session_clock": session_clock,
         "state_revision": engine_revision,
         "content_revision": content_revision,
         "engine_published_at": engine.get("published_at"),
@@ -479,6 +538,8 @@ def _unattended_guardian_status(
                 isinstance(post_close, Mapping)
                 and post_close.get("ready") is True
             ),
+            **({"post_close_accounting": bool(components["post_close_accounting"].get("ready"))}
+               if isinstance(components.get("post_close_accounting"), Mapping) else {}),
             "disk": bool(
                 disk_rows
                 and all(
@@ -901,6 +962,51 @@ def _rows_for_sessions(
                 grouped.setdefault(session_date, []).append(payload)
         return {key: tuple(value) for key, value in grouped.items()}
 
+    # The contract retains only the last maximum_rows matching records. Reading
+    # and decoding years of discarded prefixes is unnecessary (3 GiB in the
+    # live signal ledger). Walk indexed spans backwards and stop at that exact
+    # bound, then restore the original source order. Unlimited readers retain
+    # their full scan and validation path below.
+    if maximum_rows is not None:
+        newest_first: list[tuple[str, dict[str, Any]]] = []
+        with source.open("rb") as handle:
+            for start, end, indexed_date in reversed(selected_spans):
+                handle.seek(end - 1)
+                if handle.read(1) != b"\n":
+                    raise ValueError(f"dashboard ledger span is invalid: {source}")
+                cursor, remainder = end, b""
+                while cursor > start and len(newest_first) < maximum_rows:
+                    size = min(1 << 20, cursor - start)
+                    cursor -= size
+                    handle.seek(cursor)
+                    chunk = handle.read(size)
+                    if len(chunk) != size:
+                        raise ValueError(f"dashboard ledger span is invalid: {source}")
+                    lines = (chunk + remainder).split(b"\n")
+                    remainder = lines[0] if cursor > start else b""
+                    complete = lines[1:] if cursor > start else lines
+                    if len(remainder) > _MAX_LEDGER_LINE_BYTES:
+                        raise ValueError(f"dashboard ledger line is too large: {source}")
+                    for line in reversed(complete):
+                        if not line.strip():
+                            continue
+                        if len(line) > _MAX_LEDGER_LINE_BYTES:
+                            raise ValueError(f"dashboard ledger line is too large: {source}")
+                        payload = json.loads(line)
+                        if not isinstance(payload, dict):
+                            continue
+                        row_date = _ledger_row_session_date(payload, recorded_at_fallback=recorded_at_fallback)
+                        if row_date == indexed_date:
+                            newest_first.append((row_date, payload))
+                            if len(newest_first) >= maximum_rows:
+                                break
+                if len(newest_first) >= maximum_rows:
+                    break
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row_date, payload in reversed(newest_first):
+            grouped.setdefault(row_date, []).append(payload)
+        return {key: tuple(value) for key, value in grouped.items()}
+
     retained: deque[tuple[str, dict[str, Any]]] | list[
         tuple[str, dict[str, Any]]
     ] = (
@@ -982,6 +1088,44 @@ def _columnar_ledger_frame(
     if maximum_rows is not None and frame.height > maximum_rows:
         frame = frame.tail(maximum_rows)
     return pl, frame
+
+
+def _bounded_parquet_history_rows(
+    path: Path,
+    *,
+    session_dates: list[str] | tuple[str, ...],
+    maximum_rows: int,
+) -> tuple[list[dict[str, Any]], int, tuple[int, int, int, int] | None]:
+    """Read a bounded newest slice from an immutable historical detail table."""
+
+    source = Path(path)
+    if not source.is_file() or not session_dates or maximum_rows <= 0:
+        return [], 0, None
+    stat = source.stat()
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    try:
+        import polars as pl
+    except ImportError as exc:  # pragma: no cover - production runtime requires Polars
+        raise RuntimeError("Polars is required for historical dashboard tables") from exc
+    selected = [str(value) for value in session_dates]
+    lazy = pl.scan_parquet(source).filter(pl.col("session_date").is_in(selected))
+    total = int(lazy.select(pl.len().alias("rows")).collect().item())
+    if total == 0:
+        return [], 0, signature
+    frame = (
+        lazy.sort(["session_date", "market", "symbol"])
+        .tail(int(maximum_rows))
+        .collect()
+    )
+    final_stat = source.stat()
+    if (
+        final_stat.st_dev,
+        final_stat.st_ino,
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+    ) != signature:
+        raise OSError(f"historical dashboard table changed while reading: {source}")
+    return frame.to_dicts(), total, signature
 
 
 def _tail_for_session(
@@ -1683,8 +1827,7 @@ def _finite_float(value: object) -> float | None:
 def _capital_return(
     initial_capital: object, total_equity: object
 ) -> tuple[float | None, float | None]:
-    result = paper_account_performance({"initial_capital_twd": initial_capital, "total_equity_twd": total_equity})
-    return result["return_fraction"], result["return_pct"]
+    return capital_return(initial_capital, total_equity)
 
 
 def _load_benchmark_history(root: Path) -> dict[str, Any]:
@@ -2512,6 +2655,19 @@ def _operational_issues(
     for mode in modes:
         market = str(mode.get("market") or "") or None
         label = str(mode.get("label") or market or "模式")
+        settlement = mode.get("manual_close_settlement")
+        if isinstance(settlement, Mapping):
+            last_prices = settlement.get("last_traded_prices") or []
+            price_detail = "；".join(
+                f"{p.get('symbol')}：{float(p.get('price') or 0):.2f} 元（價格日期 {p.get('price_date')}）"
+                for p in last_prices if isinstance(p, Mapping)
+            )
+            basis = "收盤價／最後成交價" if last_prices else "官方收盤價"
+            add(severity="warning", scope="mode", market=market, code="manual_official_close_settlement",
+                title=f"{label} {'收盤價／最後成交價' if last_prices else '收盤價'}補登清算",
+                detail=f"依使用者要求按{basis}清算 {int(settlement.get('settled_count') or 0)} 筆；這是模擬帳本補登，不是當時的券商或交易所成交。剩餘 {int(settlement.get('remaining_count') or 0)} 筆。"
+                       + (f"最後成交價：{price_detail}；不是本日收盤成交。" if last_prices else ""),
+                observed_at=settlement.get("recorded_at"))
         if mode.get("checkpoint_ready") is False:
             add(
                 severity="error",
@@ -2524,13 +2680,19 @@ def _operational_issues(
             )
         engine_status = str(mode.get("engine_status") or "")
         if engine_status.startswith(("critical", "blocked")):
+            execution_details = {
+                "critical_day_trade_exit_unresolved": "當沖部位未能在當日沖銷；缺資料、容量不足或程式異常不得當成一般隔夜持倉。",
+                "critical_adverse_limit_exception": "不利漲跌停且退出方向無對手量，保留例外證據；下一交易時段優先沖銷，並非券商已核准融資融券。",
+                "critical_prior_inventory_liquidation": "前日殘餘部位優先沖銷，清理前不建立新的當沖曝險，不依新訊號留用舊庫存。",
+                "critical_legacy_carry_requires_review": "本日帳本按舊規則留下殘餘；新規則已設定，未倒改本日訊號或成交。",
+            }
             add(
                 severity="error",
                 scope="mode",
                 market=market,
                 code=engine_status,
                 title=f"{label} 執行器已阻擋",
-                detail="執行器偵測到安全性或資料契約錯誤，未繼續建立新部位。",
+                detail=execution_details.get(engine_status, "執行器偵測到安全性或資料契約錯誤，未繼續建立新部位。"),
                 observed_at=mode.get("signal_at"),
             )
         outcome = str(mode.get("today_execution_outcome") or "")
@@ -2589,8 +2751,11 @@ def _available_session_dates(
     observed: datetime,
     include_ledger_dates: bool = True,
     include_benchmark_history_dates: bool = True,
+    include_preopen_session: bool = False,
+    ledger_filenames: tuple[str, ...] | None = None,
 ) -> list[str]:
     root = Path(root)
+    display_session = dashboard_session_clock(observed).get("display_session_date") if include_preopen_session else None
     mode_dates = tuple(
         sorted(
             {
@@ -2600,19 +2765,11 @@ def _available_session_dates(
             }
         )
     )
+    tracked_ledgers = (ledger_filenames if ledger_filenames is not None else (
+        "marks.jsonl", "signals.jsonl", "orders.jsonl", "fills.jsonl", "benchmark_marks.jsonl", "events.jsonl",
+    )) if include_ledger_dates else ()
     tracked_filenames = (
-        *(
-            (
-                "marks.jsonl",
-                "signals.jsonl",
-                "orders.jsonl",
-                "fills.jsonl",
-                "benchmark_marks.jsonl",
-                "events.jsonl",
-            )
-            if include_ledger_dates
-            else ()
-        ),
+        *tracked_ledgers,
         *((BENCHMARK_HISTORY_FILENAME,) if include_benchmark_history_dates else ()),
     )
 
@@ -2628,11 +2785,23 @@ def _available_session_dates(
             {path.parent.name for path in (root / "position_history").glob("*/*.json")}
         )
     )
+    overnight_position_history_dates = tuple(
+        sorted(
+            {
+                path.parent.name
+                for path in (root / OVERNIGHT_POSITION_HISTORY_DIRNAME).glob("*/*.json")
+            }
+        )
+    )
+    overnight_history_path = root / OVERNIGHT_HISTORY_FILENAME
     cache_signature: tuple[Any, ...] = (
         mode_dates,
         tuple((filename, signature(root / filename)) for filename in tracked_filenames),
         position_history_dates,
+        overnight_position_history_dates,
+        signature(overnight_history_path),
         observed.astimezone(TAIPEI).date().isoformat(),
+        display_session,
     )
     resolved_root = root.resolve()
     with _AVAILABLE_SESSION_DATES_CACHE_LOCK:
@@ -2645,14 +2814,7 @@ def _available_session_dates(
         if isinstance(raw_mode, Mapping) and raw_mode.get("session_date"):
             dates.add(str(raw_mode["session_date"])[:10])
     if include_ledger_dates:
-        for filename in (
-            "marks.jsonl",
-            "signals.jsonl",
-            "orders.jsonl",
-            "fills.jsonl",
-            "benchmark_marks.jsonl",
-            "events.jsonl",
-        ):
+        for filename in tracked_ledgers:
             # Core execution ledgers carry an explicit session_date and their
             # detail readers use that exact contract. Reuse the same compact
             # index instead of building a duplicate fallback index over every
@@ -2673,9 +2835,36 @@ def _available_session_dates(
         except ValueError:
             continue
         dates.add(raw_date)
-    local = observed.astimezone(TAIPEI)
-    if not dates and local.weekday() < 5:
-        dates.add(local.date().isoformat())
+    for raw_date in overnight_position_history_dates:
+        try:
+            datetime_date.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        dates.add(raw_date)
+    if overnight_history_path.is_file():
+        overnight_history = _object(overnight_history_path)
+        if (
+            overnight_history.get("product") == "tw_overnight"
+            and overnight_history.get("simulation_only") is True
+            and overnight_history.get("production_order_possible") is False
+        ):
+            for row in overnight_history.get("marks") or ():
+                if not isinstance(row, Mapping):
+                    continue
+                raw_date = str(row.get("session_date") or "")[:10]
+                try:
+                    datetime_date.fromisoformat(raw_date)
+                except ValueError:
+                    continue
+                dates.add(raw_date)
+    if display_session:
+        dates.add(display_session)
+    elif not dates:
+        # Empty ledgers still need a dated waiting view. Require the same
+        # verified calendar rather than accepting a bare weekday guess.
+        verified_session = dashboard_session_clock(observed).get("display_session_date")
+        if verified_session:
+            dates.add(verified_session)
     result = sorted(dates, reverse=True)
     with _AVAILABLE_SESSION_DATES_CACHE_LOCK:
         if len(_AVAILABLE_SESSION_DATES_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
@@ -2829,12 +3018,44 @@ def build_dashboard_history_snapshot(
         if selected_start > selected_end:
             raise ValueError("history start_date must not be after end_date")
     root = Path(state_dir)
+    try:
+        state = _object(root / "state.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        state = {}
+    is_overnight = str(state.get("product") or "") == "tw_overnight"
     benchmark_history = _benchmark_history_index(root)
     benchmark_origins = benchmark_history.origins
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
     canonical_benchmark_keys: set[tuple[str, str]] = set()
     marks_path = root / "marks.jsonl"
     live_benchmark_path = root / "benchmark_marks.jsonl"
+    overnight_history_path = root / OVERNIGHT_HISTORY_FILENAME
+    overnight_history = (
+        _object(overnight_history_path)
+        if is_overnight and overnight_history_path.is_file()
+        else {}
+    )
+    overnight_history_valid = bool(
+        overnight_history.get("product") == "tw_overnight"
+        and overnight_history.get("simulation_only") is True
+        and overnight_history.get("production_order_possible") is False
+        and int(overnight_history.get("schema_version") or 0) == 1
+    )
+    overnight_history_marks = tuple(
+        row
+        for row in (overnight_history.get("marks") or ())
+        if overnight_history_valid and isinstance(row, Mapping)
+    )
+    try:
+        overnight_history_stat = overnight_history_path.stat()
+        overnight_history_signature = (
+            overnight_history_stat.st_dev,
+            overnight_history_stat.st_ino,
+            overnight_history_stat.st_size,
+            overnight_history_stat.st_mtime_ns,
+        )
+    except FileNotFoundError:
+        overnight_history_signature = None
     marks_recorded_at_fallback = False
     marks_index = _ledger_session_index(
         marks_path, recorded_at_fallback=marks_recorded_at_fallback
@@ -2877,6 +3098,11 @@ def build_dashboard_history_snapshot(
             live_benchmark_index.spans
             if live_benchmark_index is not None
             else ()
+        ),
+        *(
+            str(row.get("session_date") or "")[:10]
+            for row in overnight_history_marks
+            if row.get("session_date")
         ),
     }
 
@@ -2933,6 +3159,7 @@ def build_dashboard_history_snapshot(
             benchmark_history.size,
             benchmark_history.modified_ns,
         ),
+        overnight_history_signature,
         selected_span_signature(live_benchmark_index),
     )
     with _HISTORY_SNAPSHOT_CACHE_LOCK:
@@ -2941,7 +3168,7 @@ def build_dashboard_history_snapshot(
             return dict(cached_history)
 
     def add(source: Mapping[str, Any], *, series_type: str, canonical: bool = False) -> None:
-        row = dict(source)
+        row = source  # read-only projection: no copy of discarded private fields
         series_id = str(
             row.get("market")
             if series_type == "strategy"
@@ -2955,7 +3182,14 @@ def build_dashboard_history_snapshot(
         ).astimezone(TAIPEI)
         local_clock = local_observed.timetz().replace(tzinfo=None)
         if series_type == "strategy" and not (
-            datetime_time(9, 1) <= local_clock <= datetime_time(13, 30)
+            (
+                local_clock.hour == 9
+                and local_clock.minute == 0
+                or local_clock.hour == 13
+                and local_clock.minute == 30
+            )
+            if is_overnight
+            else datetime_time(9, 1) <= local_clock <= datetime_time(13, 30)
         ):
             # Signal publication can happen during 09:00, but the canonical
             # right-labelled strategy curve is exactly 09:01..13:30.  Keeping
@@ -3014,6 +3248,7 @@ def build_dashboard_history_snapshot(
             "valuation_stale": bool(row.get("valuation_stale", False)),
             "historical_minute_replay": bool(
                 row.get("historical_minute_replay", False)
+                or row.get("historical_counterfactual_replay", False)
             ),
             "minute_valuation_contract": row.get("minute_valuation_contract"),
             "valuation_source": row.get("valuation_source"),
@@ -3029,6 +3264,10 @@ def build_dashboard_history_snapshot(
         }
 
     if explicit_dates:
+        selected_date_set = set(selected_sessions)
+        for row in overnight_history_marks:
+            if str(row.get("session_date") or "")[:10] in selected_date_set:
+                add(row, series_type="strategy")
         strategy_rows = _rows_for_sessions(
             marks_path,
             selected_sessions,
@@ -3058,6 +3297,8 @@ def build_dashboard_history_snapshot(
                 )
 
     else:
+        for row in overnight_history_marks:
+            add(row, series_type="strategy")
         for row in _all_json_objects(marks_path) or ():
             add(row, series_type="strategy")
         for row in benchmark_history.marks:
@@ -3165,7 +3406,9 @@ def build_dashboard_history_snapshot(
         # fabricated 09:00 position. Cash benchmarks retain the 09:00 official
         # open, while the right-labelled TX day session covers 08:46..13:45.
         points_per_session = (
-            270
+            2
+            if is_overnight and first["series_type"] == "strategy"
+            else 270
             if first["series_type"] == "strategy"
             else 300
             if series_id == "benchmark_tx_continuous"
@@ -3249,11 +3492,18 @@ def build_dashboard_history_snapshot(
         "raw_points_in_range": len(rows),
         "returned_points": len(sampled),
         "downsampled": len(sampled) < len(rows),
-        "curve_granularity": "1m",
+        "curve_granularity": "auction_events" if is_overnight else "1m",
+        "history_contract": (
+            "13:30 official close and next-session 09:00 official open "
+            "counterfactual events; no intraminute interpolation or exchange fill claim"
+            if is_overnight
+            else "right_labelled_one_minute"
+        ),
         "expected_right_labelled_session_minute_points": 270,
         "expected_strategy_session_points_from_09_01": 270,
         "expected_stock_benchmark_session_points_including_09_00": 271,
         "expected_tx_day_session_points": 300,
+        "expected_overnight_auction_event_points": 2 if is_overnight else None,
         "return_basis": "selected_range_first_visible_mark",
         "cumulative_return_basis": "initial_capital_cumulative_total_equity",
         "period_return_basis": "selected_range_first_visible_mark",
@@ -3851,6 +4101,10 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "entry_at",
         "entry_quote_at",
         "entry_price",
+        "inventory_basis_price",
+        "odd_lot_execution_policy",
+        "share_replacement_contract",
+        "share_replacement_halted_until",
         "sizing_open_price",
         "entry_fee_twd",
         "remaining_entry_fee_twd",
@@ -3893,6 +4147,18 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "replay_basis",
         "replay_source",
         "counterfactual_open_replay",
+        "carry_type",
+        "margin_carry_contract",
+        "margin_converted_at",
+        "margin_exception_evidence",
+        "manual_close_settlement",
+        "mandatory_exit_pending",
+        "stop_triggered_at",
+        "exit_quote_status",
+        "margin_cost_accrued_through",
+        "margin_cost_twd",
+        "current_target_signal_id",
+        "inventory_session_date",
     )
     row = {key: position.get(key) for key in allowed if key in position}
     if bool(position.get("counterfactual_open_replay")):
@@ -3927,16 +4193,21 @@ def _historical_positions(root: Path, session_date: str) -> list[dict[str, Any]]
     """Load deterministic per-mode position snapshots for one prior session."""
 
     rows: list[dict[str, Any]] = []
-    session_root = root / "position_history" / session_date
-    if not session_root.is_dir():
-        return rows
-    for path in sorted(session_root.glob("*.json")):
-        payload = _object(path)
-        if str(payload.get("session_date") or "") != session_date:
+    for directory in ("position_history", OVERNIGHT_POSITION_HISTORY_DIRNAME):
+        session_root = root / directory / session_date
+        if not session_root.is_dir():
             continue
-        for position in payload.get("positions") or ():
-            if isinstance(position, Mapping):
-                rows.append(_safe_position(position))
+        for path in sorted(session_root.glob("*.json")):
+            payload = _object(path)
+            if str(payload.get("session_date") or "") != session_date:
+                continue
+            for position in payload.get("positions") or ():
+                if isinstance(position, Mapping):
+                    rows.append(
+                        _safe_position(
+                            dict(position) | {"inventory_session_date": session_date}
+                        )
+                    )
     return rows
 
 
@@ -4070,9 +4341,11 @@ def build_dashboard_snapshot(
         observed=observed,
         include_ledger_dates=include_ledger_session_dates,
         include_benchmark_history_dates=include_ledger_session_dates,
+        include_preopen_session=discord_markets_field == "day_trade_markets",
     )
+    clock_session = service_sync.get("session_clock", {}).get("display_session_date")
     selected_session_date = _select_session_date(
-        session_date,
+        session_date or (clock_session if clock_session in available_session_dates else None),
         available_session_dates,
     )
     local_observed = observed.astimezone(TAIPEI)
@@ -4231,6 +4504,13 @@ def build_dashboard_snapshot(
                 "entry_requested_shares": entry_requested_shares,
                 "entry_filled_shares": entry_filled_shares,
                 "entry_unfilled_shares": entry_unfilled_shares,
+                "intraday_contract": mode.get("intraday_contract"),
+                "configured_intraday_contract": mode.get("configured_intraday_contract"),
+                "pending_entry_shares": mode.get("pending_entry_shares", 0),
+                "manual_close_settlement": mode.get("manual_close_settlement"),
+                "closing_auction_pending_count": mode.get("closing_auction_pending_count", 0),
+                "margin_exception_count": mode.get("margin_exception_count", 0),
+                "unresolved_exit_count": mode.get("unresolved_exit_count", 0),
                 "entry_fill_outcome": entry_fill_outcome,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "total_equity_twd": mode.get("total_equity_twd"),
@@ -4513,7 +4793,11 @@ def build_dashboard_snapshot(
         session_date=selected_session_date,
     )
 
-    if not current_view:
+    pending_session_markets = {
+        str(mode.get("market")) for mode in modes
+        if str(mode.get("session_date") or "") != selected_session_date
+    }
+    if not current_view or pending_session_markets:
         latest_marks = {
             str(row.get("market") or ""): row for row in marks if row.get("market")
         }
@@ -4528,6 +4812,7 @@ def build_dashboard_snapshot(
             position
             for position in positions
             if str(position.get("session_date") or "") == selected_session_date
+            or (current_view and int(position.get("signed_shares") or 0) != 0)
         ]
         positions_by_id = {
             str(position.get("position_id") or ""): position
@@ -4542,6 +4827,8 @@ def build_dashboard_snapshot(
             )
         for mode in modes:
             market = str(mode.get("market") or "")
+            if current_view and market not in pending_session_markets:
+                continue
             market_events = events_by_market.get(market, [])
             signal_event = next(
                 (
@@ -4656,6 +4943,13 @@ def build_dashboard_snapshot(
                 mode["return_pct"] = last_mark.get("return_pct")
                 mode["last_mark_at"] = last_mark.get("minute") or last_mark.get("recorded_at")
                 mode["valuation_stale"] = bool(last_mark.get("valuation_stale") or last_mark.get("stale_position_count"))
+            elif current_view:
+                # Carry the real account forward, never yesterday's signal or
+                # fill counters. Do not manufacture a current-session mark.
+                mode["return_fraction"] = None
+                mode["return_pct"] = None
+                mode["last_mark_at"] = None
+                mode["closing_auction_settled_at"] = None
             else:
                 mode["total_equity_twd"] = None
                 mode["return_fraction"] = None
@@ -4673,6 +4967,8 @@ def build_dashboard_snapshot(
                     if int(mode.get("open_position_count") or 0)
                     else "historical_session_complete"
                 )
+            elif current_view:
+                mode["engine_status"] = "waiting_open" if local_observed.time() < datetime_time(9) else "waiting_signal"
             else:
                 mode["engine_status"] = "historical_session_missed"
 
@@ -4695,7 +4991,8 @@ def build_dashboard_snapshot(
         session_date=selected_session_date,
     )
     for mode in modes:
-        mode["account_performance"] = paper_account_performance(mode, revision=state.get("state_revision") if current_view else None)
+        account_source = (state.get("modes") or {}).get(mode["market"], mode) if current_view else mode
+        mode["account_performance"] = paper_account_performance(account_source, revision=state.get("state_revision") if current_view else None)
         mode["signal_product"] = "scheduled_execution"
     modes.sort(key=lambda row: str(row.get("market")))
     benchmarks.sort(key=lambda row: str(row.get("benchmark_id")))
@@ -4882,10 +5179,10 @@ def build_dashboard_snapshot(
                 else benchmark_history.load_error
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the source-backed 09:01 minute price for execution; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the source-backed 09:01 minute price for execution; v3 caps quantity at 50 percent of observed minute volume and the session NAV risk budget. Historical prices remain proxies, never proof of queue priority, broker buying power, or a guaranteed exchange fill",
             "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
-            "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
+            "terminal_flatten": "v3 preserves unfilled delivery obligations after the sourced 13:30 auction and blocks new exposure; only legacy ledgers contain explicitly tagged synthetic terminal valuation, never an exchange fill",
         },
     }
 
@@ -4949,7 +5246,11 @@ def build_dashboard_signal_page(
         state=state,
         observed=observed,
         include_ledger_dates=not use_latest_session_fast_path,
-        include_benchmark_history_dates=not use_latest_session_fast_path,
+        # Signal/position archives already enumerate execution sessions. The
+        # benchmark curve must not be decoded just to populate a detail filter.
+        include_benchmark_history_dates=False,
+        include_preopen_session=bool(start_date or end_date or session_date),
+        ledger_filenames=("signals.jsonl",),
     )
     selected_start_date, selected_end_date, selected_session_dates = (
         _select_session_range(
@@ -4964,6 +5265,25 @@ def build_dashboard_signal_page(
     normalized_status = str(status or "all").strip().casefold()
     signal_path = root / "signals.jsonl"
     signal_stat = signal_path.stat()
+    formal_signal_path = root / OVERNIGHT_SIGNAL_HISTORY_FILENAME
+    try:
+        formal_signal_stat = formal_signal_path.stat()
+        formal_signal_signature = (
+            formal_signal_stat.st_dev,
+            formal_signal_stat.st_ino,
+            formal_signal_stat.st_size,
+            formal_signal_stat.st_mtime_ns,
+        )
+    except FileNotFoundError:
+        formal_signal_signature = None
+    formal_signal_record_count = 0
+    overnight_history_path = root / OVERNIGHT_HISTORY_FILENAME
+    if overnight_history_path.is_file():
+        overnight_history = _object(overnight_history_path)
+        if overnight_history.get("product") == "tw_overnight":
+            formal_signal_record_count = int(
+                overnight_history.get("signal_count") or 0
+            )
     futures_catalog = load_stock_futures_catalog()
     cache_key = (
         root.resolve(),
@@ -4971,12 +5291,14 @@ def build_dashboard_signal_page(
         signal_stat.st_ino,
         signal_stat.st_size,
         signal_stat.st_mtime_ns,
+        formal_signal_signature,
         tuple(selected_session_dates),
         normalized_mode,
         normalized_symbol,
         normalized_status,
         int(offset),
         int(limit),
+        int(maximum_scan_rows),
         state_signal_signature,
         futures_catalog.revision,
     )
@@ -5052,6 +5374,37 @@ def build_dashboard_signal_page(
             for selected_date in selected_session_dates
             for row in rows_by_session.get(selected_date, ())
         ]
+    formal_rows, formal_signal_total, _ = _bounded_parquet_history_rows(
+        formal_signal_path,
+        session_dates=selected_session_dates,
+        maximum_rows=maximum_scan_rows,
+    )
+    if formal_rows:
+        if signal_frame is not None:
+            current_rows = signal_frame.to_dicts()
+            signal_frame = None
+            polars_module = None
+        # A current real-time row supersedes the counterfactual row for the
+        # same signal identity.  Historical data never overwrite live proof.
+        combined = formal_rows + current_rows
+        deduplicated_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in combined:
+            identity = (
+                str(row.get("session_date") or "")[:10],
+                str(row.get("market") or ""),
+                str(row.get("symbol") or ""),
+            )
+            deduplicated_rows[identity] = row
+        current_rows = list(deduplicated_rows.values())
+        if len(current_rows) > maximum_scan_rows:
+            current_rows.sort(
+                key=lambda row: (
+                    str(row.get("session_date") or ""),
+                    str(row.get("market") or ""),
+                    str(row.get("symbol") or ""),
+                )
+            )
+            current_rows = current_rows[-maximum_scan_rows:]
 
     def included(row: Mapping[str, Any]) -> bool:
         if normalized_mode and normalized_mode != "all":
@@ -5188,6 +5541,8 @@ def build_dashboard_signal_page(
         "status",
         "symbol",
     ]
+    if filtered_frame is not None and "inventory_weight_after" in filtered_frame.columns:
+        summary_columns.append("inventory_weight_after")
 
     def summary_rows():
         candidates = (
@@ -5208,7 +5563,7 @@ def build_dashboard_signal_page(
     for row in summary_rows():
         target = _finite_float(row.get("target_weight")) or 0.0
         market = str(row.get("market") or "unknown")
-        capital = capitals.get(market)
+        capital = _finite_float(row.get("sizing_capital_twd")) or capitals.get(market)
         entry_price = _finite_float(row.get("ask") if target > 0.0 else row.get("bid"))
 
         def executed_weight(explicit_key: str, shares_key: str) -> float:
@@ -5222,7 +5577,9 @@ def build_dashboard_signal_page(
 
         values = {
             "target": target,
-            "actual": executed_weight("filled_weight", "filled_shares"),
+            "actual": (_finite_float(row.get("inventory_weight_after"))
+                       if row.get("inventory_weight_after") is not None
+                       else executed_weight("filled_weight", "filled_shares")),
         }
         for stage, value in values.items():
             if value > 0.0:
@@ -5337,10 +5694,18 @@ def build_dashboard_signal_page(
         "total": filtered_total,
         "has_more": offset + len(page) < filtered_total,
         "source_rows_scanned": source_rows_scanned,
-        "record_count": _line_count(root / "signals.jsonl"),
+        "scan_limit": maximum_scan_rows,
+        "scan_limit_reached": (
+            source_rows_scanned >= maximum_scan_rows
+            or formal_signal_total > len(formal_rows)
+        ),
+        "record_count": (
+            _line_count(root / "signals.jsonl")
+            + max(formal_signal_record_count, formal_signal_total)
+        ),
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,
-        "opening_execution_audit_scope": "complete_current_signal_rows_per_mode",
+        "opening_execution_audit_scope": "bounded_recent_signal_rows_per_mode" if source_rows_scanned >= maximum_scan_rows else "complete_current_signal_rows_per_mode",
         "opening_execution_audit": opening_execution_audit,
         "feature_drivers_scope": "all_feature_drivers_if_available_else_top_feature_drivers",
         "feature_drivers_by_signal": feature_drivers_by_signal,
@@ -5378,6 +5743,8 @@ def build_dashboard_position_page(
         state=state,
         observed=datetime.now(timezone.utc),
         include_ledger_dates=not bool(start_date or end_date or session_date),
+        include_benchmark_history_dates=False,
+        include_preopen_session=bool(start_date or end_date or session_date),
     )
     selected_start_date, selected_end_date, selected_session_dates = (
         _select_session_range(
@@ -5484,6 +5851,9 @@ def build_dashboard_event_page(
         root=root,
         state=state,
         observed=observed,
+        include_preopen_session=bool(start_date or end_date or session_date),
+        include_benchmark_history_dates=False,
+        ledger_filenames=("orders.jsonl", "fills.jsonl"),
     )
     selected_start_date, selected_end_date, selected_session_dates = (
         _select_session_range(
@@ -5555,6 +5925,11 @@ def build_dashboard_event_page(
         selected_session_dates,
         maximum_scan_rows,
     )
+    formal_rows, formal_event_total, _ = _bounded_parquet_history_rows(
+        root / OVERNIGHT_EVENT_HISTORY_FILENAME,
+        session_dates=selected_session_dates,
+        maximum_rows=maximum_scan_rows,
+    )
     orders = [
         safe_event(row, "order")
         for selected_date in selected_session_dates
@@ -5567,7 +5942,28 @@ def build_dashboard_event_page(
         for row in fill_rows.get(selected_date, ())
         if included(row)
     ]
-    rows = orders + fills
+    formal_events = [
+        safe_event(row, str(row.get("event_kind") or "order"))
+        for row in formal_rows
+        if included(row)
+    ]
+    rows = formal_events + orders + fills
+    rows = list(
+        {
+            (
+                str(row.get("event_kind") or ""),
+                str(row.get("recorded_at") or ""),
+                str(row.get("fill_at") or ""),
+                str(row.get("market") or ""),
+                str(row.get("symbol") or ""),
+                str(row.get("purpose") or ""),
+                str(row.get("status") or ""),
+                str(row.get("quantity") or ""),
+                str(row.get("price") or ""),
+            ): row
+            for row in rows
+        }.values()
+    )
     rows.sort(
         key=lambda row: (
             str(row.get("fill_at") or row.get("recorded_at") or ""),
@@ -5591,12 +5987,15 @@ def build_dashboard_event_page(
         "limit": limit,
         "returned": len(page),
         "total": len(rows),
-        "order_total": len(orders),
-        "fill_total": len(fills),
+        "order_total": sum(row.get("event_kind") == "order" for row in rows),
+        "fill_total": sum(row.get("event_kind") == "fill" for row in rows),
         "has_more": offset + len(page) < len(rows),
         "record_counts": {
-            "orders": _line_count(root / "orders.jsonl"),
-            "fills": _line_count(root / "fills.jsonl"),
+            "orders": _line_count(root / "orders.jsonl")
+            + sum(row.get("event_kind") == "order" for row in formal_rows),
+            "fills": _line_count(root / "fills.jsonl")
+            + sum(row.get("event_kind") == "fill" for row in formal_rows),
+            "formal_selected_rows": formal_event_total,
         },
         "rows": page,
     }

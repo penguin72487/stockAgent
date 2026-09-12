@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-config", type=Path, required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--live-output-dir", type=Path, help="Isolated candidate signal root; never overwrite accepted live artifacts.")
     parser.add_argument(
         "--input-root",
         type=Path,
@@ -252,7 +253,7 @@ def main() -> None:
             f"{current.isoformat()}"
         )
         kwargs = market_config.signal_kwargs(
-            live_output_dir=str(resolved_live_output_dir(market_config)),
+            live_output_dir=str(args.live_output_dir.resolve() if args.live_output_dir else resolved_live_output_dir(market_config)),
             panel_date=previous_panel_date.isoformat(),
             asof_date=effective_at.isoformat(timespec="seconds"),
             price_source="csv",

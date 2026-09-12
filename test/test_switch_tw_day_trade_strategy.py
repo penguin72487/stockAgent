@@ -1,12 +1,90 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import switch_tw_day_trade_strategy as strategy_switch
+
+
+@pytest.mark.parametrize("version,expected", [(None, False), (0, False), (True, False), ("1", False), (1, True)])
+def test_current_deployment_requires_product_aware_tick_receipt(tmp_path, version, expected):
+    day = date(2026, 2, 25)
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"checkpoint_fingerprint": "exact"}))
+    (tmp_path / "promotion_receipt.json").write_text(json.dumps({
+        "acceptance": {"session_dates": [day.isoformat()], "minute_curve_validation": {"validated_rows": 270}},
+    }))
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({
+        "source_signal_ledger": {"replacement_signal_markets": ["target"]},
+        "replay_contract": {"entry": strategy_switch.REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+                            "order_price_contract_version": version},
+        "sessions": [{"modes": [{"market": "target", "summary_path": str(summary)}]}],
+    }))
+    (tmp_path / "state.json").write_text(json.dumps({"modes": {"target": {"initial_capital_twd": 10000000}}}))
+    result = strategy_switch._current_deployment_evidence(
+        live_dir=tmp_path, market="target", live_output=tmp_path,
+        checkpoint_fingerprint="exact", initial_capital_twd=10000000,
+        start_date=day, end_date=day, session_count=1, expected_minute_rows=270,
+    )
+    assert result["matches"] is expected
+    assert result["reasons"] == ([] if expected else ["order_price_contract_version_mismatch"])
+
+
+def test_requested_artifact_missing_never_uses_selected_other_model(tmp_path: Path) -> None:
+    selected = tmp_path / "layernorm"
+    selected.mkdir()
+    config = SimpleNamespace(output_dir=str(selected), fold_id=11, checkpoint_path="unused")
+    with pytest.raises(FileNotFoundError, match="requested training artifact is unavailable"):
+        strategy_switch._require_requested_artifact(config, tmp_path / "attention_layernorm")
+
+
+def test_requested_artifact_rejects_similar_but_different_selected_run(tmp_path: Path) -> None:
+    selected = tmp_path / "layernorm"
+    requested = tmp_path / "attention_layernorm"
+    selected.mkdir()
+    requested.mkdir()
+    config = SimpleNamespace(output_dir=str(selected), fold_id=11, checkpoint_path="unused")
+    with pytest.raises(ValueError, match="differs from resolved model selection"):
+        strategy_switch._require_requested_artifact(config, requested)
+
+
+def test_requested_artifact_checkpoint_cannot_escape_selected_root(tmp_path: Path) -> None:
+    requested = tmp_path / "attention_layernorm"
+    requested.mkdir()
+    config = SimpleNamespace(output_dir=str(requested), fold_id=11,
+                             checkpoint_path=str(tmp_path / "other/fold_11/checkpoint_best.pt"))
+    with pytest.raises(ValueError, match="does not belong"):
+        strategy_switch._require_requested_artifact(config, requested)
+
+
+def test_requested_artifact_exact_identity_is_not_execution_parity(tmp_path: Path) -> None:
+    requested = tmp_path / "attention_layernorm"
+    fold = requested / "fold_11"
+    fold.mkdir(parents=True)
+    checkpoint = fold / "checkpoint_best.pt"
+    checkpoint.write_bytes(b"exact checkpoint")
+    config = SimpleNamespace(output_dir=str(requested), fold_id=11, checkpoint_path=str(checkpoint))
+    alias = tmp_path / "alias"
+    alias.symlink_to(requested, target_is_directory=True)
+    evidence = strategy_switch._require_requested_artifact(config, alias)
+    assert evidence["identity_matches"] is True
+    assert evidence["training_execution_parity_proven"] is False
+    assert evidence["checkpoint_sha256"] == strategy_switch._sha256(checkpoint)
+    assert strategy_switch._require_requested_artifact(config, None) is None
+
+
+def test_requested_artifact_gate_runs_before_calendar_or_live_state(monkeypatch, tmp_path: Path) -> None:
+    args = strategy_switch.build_parser().parse_args([
+        "plan", "--expected-artifact-root", str(tmp_path / "missing"),
+    ])
+    monkeypatch.setattr(strategy_switch, "load_market_config", lambda path: SimpleNamespace())
+    monkeypatch.setattr(strategy_switch, "load_config", lambda path: pytest.fail("must not load a different experiment"))
+    with pytest.raises(FileNotFoundError, match="requested training artifact is unavailable"):
+        strategy_switch._build_plan(args)
 
 
 def test_flat_live_state_refuses_an_open_position(tmp_path: Path) -> None:

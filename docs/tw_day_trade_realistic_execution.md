@@ -44,12 +44,14 @@ source scripts/runtime_env.sh
 # 若 receipt-backed research dataset 尚未建立：
 run_fintech_python scripts/build_shioaji_tw_minute_dataset.py \
   --input-root data_tw_minute/shioaji_1m \
-  --output-root data_tw_minute/research_dataset
+  --output-root data_tw_minute/research_dataset \
+  --calendar-root data_tw_public
 
 # 訓練前必須驗證全部 partitions 與 manifest SHA；不得只看 manifest 名稱。
 run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
   --dataset-root data_tw_minute/research_dataset \
   --all-partitions \
+  --calendar-root data_tw_public \
   --output artifacts/validation/tw_day_trade_minute_volume100_data_audit.json
 ```
 

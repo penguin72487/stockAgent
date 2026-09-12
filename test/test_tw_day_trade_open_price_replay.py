@@ -133,6 +133,21 @@ def test_live_missed_opening_finalizes_empty_source_after_settle_deadline(
     assert finalized["unresolved_union_symbols"] == 1
 
 
+def test_completed_0901_query_is_scoped_and_new_account_symbols_are_queried(tmp_path, monkeypatch):
+    calls = []
+    def fetch(symbols, **kwargs):
+        calls.append(list(symbols))
+        return {}, _complete_0901_query_receipt(resolved=0, requested=len(symbols))
+    monkeypatch.setattr(live_runner, "fetch_shioaji_historical_stock_0901_vwaps", fetch)
+    now = datetime(2026, 8, 13, 11, 0, tzinfo=TAIPEI)
+    live_runner._resolve_missed_opening_prices(tmp_path, now, {"2330"})
+    live_runner._resolve_missed_opening_prices(tmp_path, now, {"2330", "4905"})
+    live_runner._resolve_missed_opening_prices(tmp_path, now, {"2330", "4905"})
+    assert calls == [["2330"], ["4905"]]
+    _, receipt = live_runner._load_missed_opening_prices(tmp_path, now)
+    assert receipt["attempted_symbols"] == ["2330", "4905"]
+
+
 def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:
     source = tmp_path / "source" / "benchmark_history.json"
     source.parent.mkdir()
@@ -405,6 +420,7 @@ def test_local_0901_price_loader_uses_source_kbar_close_without_tick_or_vwap(
     assert rows["2330"]["execution_price_0901"] == 101.0
     assert rows["2330"]["execution_price_0901_method"] == "minute_close"
     assert rows["2330"]["tick_count_0901"] == 0
+    assert rows["2330"]["valuation_price_0901"] is None
     assert receipt["price_method_counts"] == {"minute_close": 1}
 
 
@@ -456,6 +472,19 @@ def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
     assert receipt["missing_symbols"] == []
 
 
+def test_intraday_zero_volume_padding_cannot_refresh_price_or_trigger_orders(tmp_path):
+    root = tmp_path / "minute"
+    partition = root / "trade_date=2026-09-07"
+    partition.mkdir(parents=True)
+    pl.DataFrame({"symbol": ["8342", "8342"],
+        "ts": [datetime(2026, 9, 7, 9, 2), datetime(2026, 9, 7, 10, 1)],
+        "Open": [87., 88.], "High": [87., 88.], "Low": [87., 88.], "Close": [87., 88.],
+        "Amount": [0., 88000.], "volume_shares": [0., 1000.]}).write_parquet(partition / "data.parquet")
+    bars, proof = replay._minute_bar_rows((root,), trading_date=date(2026, 9, 7), symbols={"8342"})
+    assert list(bars["8342"]) == ["2026-09-07T10:01+08:00"]
+    assert proof["ignored_zero_volume_rows"] == 1
+
+
 def _write_signal_candidate(
     root: Path,
     *,
@@ -484,7 +513,7 @@ def _write_signal_candidate(
         "counterfactual_open_provenance": {
             "source": "official_daily_session_open",
             "input_path": str(input_path),
-            "input_sha256": "fixture-sha256",
+            "input_sha256": replay._sha256(input_path),
         },
     }
     (signal_root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -533,6 +562,97 @@ def test_latest_valid_signal_rejects_backdated_signal_without_contract(
 
     with pytest.raises(FileNotFoundError, match="no open-feature-applied"):
         replay._latest_valid_signal(spec, trading_date)
+
+
+def test_replay_resolves_accepted_isolated_artifact_not_same_id_live_copy(tmp_path):
+    day = date(2026, 8, 13)
+    specs = []
+    for name in ("accepted", "live"):
+        spec = _write_signal_candidate(tmp_path / name, market="mode_a", trading_date=day,
+            generated_at=datetime(2026, 8, 20, 20, 0, tzinfo=TAIPEI), counterfactual=True)
+        path = next(spec.live_output_dir.rglob("summary.json"))
+        data = json.loads(path.read_text()) | {"signal_id": "same-id", "version": name}
+        path.write_text(json.dumps(data))
+        specs.append(spec)
+    accepted = next(specs[0].live_output_dir.rglob("summary.json"))
+    row = {"market": "mode_a", "signal_id": "same-id", "summary_path": str(accepted),
+           "weights_path": str(accepted.with_name("target_weights.parquet")),
+           "summary_sha256": replay._sha256(accepted)}
+    source = tmp_path / "ledger"
+    nested = source / "account_receipts" / "mode_a"
+    nested.mkdir(parents=True)
+    (nested / "rebuild_receipt.json").write_text(json.dumps({"sessions": [
+        {"session_date": str(day), "modes": [row]}]}))
+    pins = replay._source_ledger_signal_artifacts(source, {(str(day), "mode_a"): "same-id"})
+    proof = pins[(str(day), "mode_a")]
+    result = replay._latest_valid_signal(specs[1], day, preferred_signal_id="same-id", pinned_artifact=proof)
+    assert result[3]["version"] == "accepted"
+    input_path = Path(proof["open_input_path"])
+    original_input = input_path.read_bytes()
+    input_path.write_bytes(original_input + b" ")
+    with pytest.raises(ValueError, match="open input hash changed"):
+        replay._latest_valid_signal(specs[1], day, preferred_signal_id="same-id", pinned_artifact=proof)
+    with pytest.raises(ValueError, match="open input hash changed"):
+        replay._source_ledger_signal_artifacts(source, {(str(day), "mode_a"): "same-id"})
+    input_path.write_bytes(original_input)
+    accepted.write_text(accepted.read_text() + " ")
+    with pytest.raises(ValueError, match="hash changed"):
+        replay._latest_valid_signal(specs[1], day, preferred_signal_id="same-id", pinned_artifact=proof)
+    with pytest.raises(ValueError, match="hash changed"):
+        replay._source_ledger_signal_artifacts(source, {(str(day), "mode_a"): "same-id"})
+    # Explicit replacement removed the old pin; stale old artifacts do not
+    # become an authority for a newly requested model.
+    assert replay._source_ledger_signal_artifacts(source, {}) == {}
+
+
+def test_declared_missing_signal_artifact_never_falls_back_to_live_directory(tmp_path):
+    path = tmp_path / "missing" / "summary.json"
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({"sessions": [
+        {"session_date": "2026-08-13", "modes": [{"market": "mode_a", "signal_id": "id",
+         "summary_path": str(path), "weights_path": str(path.with_name("target_weights.parquet"))}]}]}))
+    with pytest.raises(FileNotFoundError):
+        replay._source_ledger_signal_artifacts(tmp_path, {("2026-08-13", "mode_a"): "id"})
+
+
+def test_conflicting_accepted_artifacts_with_same_id_are_rejected(tmp_path):
+    day = date(2026, 8, 13)
+    rows = []
+    for name in ("first", "second"):
+        spec = _write_signal_candidate(tmp_path / name, market="mode_a", trading_date=day,
+            generated_at=datetime(2026, 8, 20, 20, 0, tzinfo=TAIPEI), counterfactual=True)
+        path = next(spec.live_output_dir.rglob("summary.json"))
+        data = json.loads(path.read_text()) | {"signal_id": "id", "version": name}
+        path.write_text(json.dumps(data))
+        rows.append({"market": "mode_a", "signal_id": "id", "summary_path": str(path),
+                     "weights_path": str(path.with_name("target_weights.parquet"))})
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({"sessions": [
+        {"session_date": str(day), "modes": rows}]}))
+    with pytest.raises(ValueError, match="conflicting accepted signal artifacts"):
+        replay._source_ledger_signal_artifacts(tmp_path, {(str(day), "mode_a"): "id"})
+
+
+def test_current_session_uses_state_artifact_when_no_history_receipt_exists(tmp_path):
+    day = date(2026, 8, 13)
+    spec = _write_signal_candidate(tmp_path / "live", market="mode_a", trading_date=day,
+        generated_at=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI))
+    path = next(spec.live_output_dir.rglob("summary.json"))
+    data = json.loads(path.read_text()) | {"signal_id": "current"}
+    path.write_text(json.dumps(data))
+    (tmp_path / "state.json").write_text(json.dumps({"modes": {"mode_a": {
+        "session_date": str(day), "signal_id": "current", "signal_source_path": str(path),
+        "target_weights_path": str(path.with_name("target_weights.parquet"))}}}))
+    pins = replay._source_ledger_signal_artifacts(tmp_path, {(str(day), "mode_a"): "current"})
+    result = replay._latest_valid_signal(spec, day, preferred_signal_id="current",
+                                        pinned_artifact=pins[(str(day), "mode_a")])
+    assert result[3]["signal_id"] == "current"
+
+
+def test_realistic_replay_policy_preflight_rejects_unversioned_signal():
+    spec = type("Spec", (), {"market": "mode_a", "uses_realistic_execution": True})()
+    with pytest.raises(RuntimeError, match="exact-session policy mask"):
+        replay._validate_replay_policy_summary(spec, date(2026, 8, 13), {})
+    replay._validate_replay_policy_summary(spec, date(2026, 8, 13), {
+        "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1"})
 
 
 def test_retained_twse_openapi_rule_receipt_uses_exact_parser() -> None:

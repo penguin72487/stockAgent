@@ -146,6 +146,17 @@ coordinated code, config, test, and documentation change.
   Folder IDs.  Never recreate or accept them.  `stockagent-artifacts-hot` is a
   non-canonical low-latency channel for an explicitly bounded penguin/lab203
   artifact set; vastai1T must not join it with its complete `artifacts` tree.
+- The explicitly authorized `stockagent-artifact-ingress-vastai1t` folder is a
+  separate, bounded **quarantine transport**, not another cold authority or hot
+  artifact mirror. `configs/data_sync/artifact_ingress.json` pins its sole model
+  root, checkpoint digest, resource bounds, origin and receiver. Vast sends only
+  completed deterministic bucket packs / blobs and a hash-pinned envelope;
+  penguin is receive-only. Reuse canonical packing primitives, reject source
+  changes/process references and unsafe paths, and verify every received file
+  plus training lifecycle before accepting into node-local quarantine. Only
+  penguin may subsequently publish through the registered cold-artifact path.
+  Do not change Vast's index-only role, sync raw artifacts, create release heads
+  in the ingress folder, auto-activate models, or delete either source copy.
 - Each machine owns one permanent release node ID and one unique Syncthing
   identity, currently named `penguin`, `lab203`, and `vastai1T`.  Never copy
   Syncthing certificates, keys, device IDs, databases, or
@@ -175,9 +186,37 @@ coordinated code, config, test, and documentation change.
   leases are capped at seven days; live references renew that seven-day window,
   while intentional longer retention must use a pin.
 
+### Penguin authority and independent cold backup
+
+- Current deployment authority is **penguin**. Its accepted cold store at
+  `/srv/stockagent-packed` is the sole source for the local disaster-recovery
+  backup. A producer node ID in an immutable manifest is provenance, not a
+  competing data authority. Retain existing per-node heads for compatibility;
+  never rename historical publishers or copy their identity files.
+- `configs/data_sync/packed_backup.json` enrolls penguin's independent Windows
+  D: volume. `stockagent-packed-backup.service` copies cold objects, inventories,
+  manifests, and validated heads one-way to `D:\stockagent-backup\packed`.
+  This destination is not a Syncthing folder, producer workspace, materialized
+  cache, or publication target. Do not copy `.local-state` or node credentials.
+- Backup is additive: preserve historical manifests, unreferenced immutable
+  objects, and replaced head history. Source deletion must not propagate to D:.
+  Any backup pruning needs a separately approved retention/reachability policy.
+- Require the enrolled D: mount and volume marker, separate source filesystem,
+  SHA-256 streaming copy plus destination readback, stable source signatures,
+  and atomic finalization. Commit a head only after all its referenced objects
+  verify. Interrupted partial copies may resume only after prefix verification;
+  mismatches remain visible and must never overwrite an existing backup.
+- Watch atomic cold-store arrivals and reconcile periodically; never run
+  materialization from the backup service. Missing disks, disk pressure,
+  conflicts, corruption, or incomplete historical releases are degraded/blocked,
+  not a complete backup. Report actual verified bytes and remaining backlog.
+  WSL must be running for this service to operate. See
+  `docs/packed_cold_backup.md` for commands, restore, and acceptance.
+
 ### Multi-writer publication and conflict resolution
 
-- There is no single publisher among full-replica publishing nodes.  They publish
+- The format supports multiple producers, distinct from penguin's deployment
+  authority. Full-replica publishing nodes publish
   immutable releases under their own permanent node IDs.  An index-only edge is
   a consumer and may not publish until it is explicitly returned to full-replica
   mode.  Per-node heads plus the deterministic HLC/LWW resolver choose the newest
@@ -653,6 +692,19 @@ Guidelines:
   every available minute, including multi-month selections, and rebase each
   series at its first selected valid mark without modifying absolute equity.
 
+- TW day-trade discipline (user correction, 2026-09-10): same-day liquidation
+  is mandatory whenever executable evidence permits it. The staged live
+  `day_trade_strict_intraday` contract keeps unfilled entry targets working,
+  latches triggered stops, and observes actual closing auction prints through
+  the 13:33 delayed auction (bounded receipt deadline 13:35). Missing quotes,
+  ordinary capacity exhaustion, and program errors are unresolved exits, not
+  authorization for general margin carry. Only evidenced adverse limit-lock
+  with zero counterparty depth can be an exceptional paper carry; it remains
+  critical and reduction-only at the next opportunity, never a new model's
+  retained inventory or proof of broker financing approval. Do not retrofit
+  today's failed fills or change old replay/training semantics silently.
+  See `docs/DAY_TRADE_INTRADAY_DISCIPLINE_2026-09-10.md` for activation status.
+
 - Dashboard strategy names come from the active mode descriptor (`label`), not
   the stable ledger `market` key. Use the shared TW presentation and detail
   components; never hard-code model aliases in individual tables or rename
@@ -812,7 +864,10 @@ Rules:
   oracle and processes fixed 32-session blocks by reusing one
   `fullgraph=True, dynamic=False` daily kernel with CUDA graphs disabled.
   Recurrent cash, T+2 queues, due cohorts, collateral, alive state, and
-  autograd remain connected across all 32 calls; only a non-aligned tail is
+  autograd remain connected across all 32 calls. Batches shorter than 32 rows
+  reuse the same daily compiled kernel, including the batch-16 overnight
+  baseline; they must pass the strict compiled-loss probe without changing
+  optimizer cadence. Only a non-aligned tail after a complete block is
   eager. Do not replace this with a fully unrolled 32-day FX graph: its
   Inductor scheduling/codegen cost is pathological, while measured two-day and
   four-day kernels were slower or much more expensive to compile.

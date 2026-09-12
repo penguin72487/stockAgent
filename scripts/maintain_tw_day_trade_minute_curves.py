@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.promote_tw_day_trade_replay import (  # noqa: E402
+    _validate_benchmarks,
     _validate_minute_curve_coverage,
 )
 from scripts.rebuild_tw_day_trade_minute_curves import (  # noqa: E402
@@ -31,6 +32,7 @@ from stockagent.live.shioaji_schedule import (  # noqa: E402
     TAIPEI,
     historical_query_is_protected,
 )
+from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -96,9 +98,10 @@ def _completed_scope(
         len(session_dates) == 1
         and all(
             isinstance(mode, dict)
-            and int(mode.get("open_position_count") or 0) == 0
             and not any(
-                int(position.get("signed_shares") or 0) != 0
+                int(position.get("signed_shares") or 0) != 0 and not (
+                    mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                    and position.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT)
                 for position in (mode.get("positions") or {}).values()
                 if isinstance(position, dict)
             )
@@ -184,62 +187,6 @@ def _inspect_strategy_price_provenance(
             f"{session_date}:{market}:{minute.isoformat(timespec='minutes')}"
             for session_date, market, minute in sorted(unverified)[:20]
         ],
-    }
-
-
-def _validate_benchmarks(
-    state_dir: Path,
-    *,
-    completed_session_dates: list[str],
-) -> dict[str, Any]:
-    payload = _object(state_dir / "benchmark_history.json")
-    marks = payload.get("marks")
-    if not isinstance(marks, list):
-        raise RuntimeError("benchmark history has no marks")
-    expected_sessions = set(completed_session_dates)
-    contracts = {
-        "benchmark_0050": ("09:00", "13:30", 271),
-        "benchmark_2330": ("09:00", "13:30", 271),
-        "benchmark_tx_continuous": ("08:45", "13:44", 300),
-    }
-    counts: dict[str, int] = {}
-    for benchmark_id, (first_clock, last_clock, expected_points) in contracts.items():
-        rows = [
-            row
-            for row in marks
-            if isinstance(row, dict)
-            and row.get("benchmark_id") == benchmark_id
-            and str(row.get("session_date") or "") in expected_sessions
-        ]
-        by_session: dict[str, list[str]] = {}
-        for row in rows:
-            session_date = str(row.get("session_date") or "")
-            by_session.setdefault(session_date, []).append(str(row.get("minute") or ""))
-        if set(by_session) != expected_sessions:
-            missing = sorted(expected_sessions - set(by_session))
-            raise RuntimeError(
-                f"{benchmark_id} missing completed sessions: {missing[:20]}"
-            )
-        for session_date, minutes in by_session.items():
-            if len(minutes) != expected_points or len(set(minutes)) != expected_points:
-                raise RuntimeError(
-                    f"{benchmark_id}:{session_date} minute count "
-                    f"{len(minutes)}/{len(set(minutes))} != {expected_points}"
-                )
-            clocks = sorted(value[11:16] for value in minutes)
-            if clocks[0] != first_clock or clocks[-1] != last_clock:
-                raise RuntimeError(
-                    f"{benchmark_id}:{session_date} minute boundary "
-                    f"{clocks[0]}..{clocks[-1]} != {first_clock}..{last_clock}"
-                )
-        counts[benchmark_id] = len(rows)
-    return {
-        "completed_session_dates": completed_session_dates,
-        "points_per_session": {
-            benchmark_id: contract[2]
-            for benchmark_id, contract in contracts.items()
-        },
-        "rows": counts,
     }
 
 
@@ -452,8 +399,12 @@ def main() -> None:
         ]
         if not args.no_fetch:
             command.append("--fetch-missing-kbars")
-        if strategy_validation is not None and price_provenance_ready:
+        has_margin_carry = any(m.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                              for m in _object(state_dir / "state.json").get("modes", {}).values())
+        if price_provenance_ready and (strategy_validation is not None or has_margin_carry):
             command.append("--validate-existing-strategy-marks")
+        elif has_margin_carry:
+            command.append("--revalue-carried-marks")
         elif price_validation is not None and not price_provenance_ready:
             command.append("--repair-unverified-strategy-marks")
         started = datetime.now(TAIPEI)

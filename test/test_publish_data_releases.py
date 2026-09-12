@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 from pathlib import Path
 from types import ModuleType
 
@@ -9,6 +10,27 @@ from stockagent.data_sync.packed_snapshots import (
     initialize_packed_layout,
     publish_packed_snapshot,
 )
+
+
+def test_writer_gate_uses_script_argv_not_waiting_shell_text():
+    module = _module()
+    entry = {"active_process_substrings": ["download_tw_corporate_action_entitlements.py"]}
+    program = "python downloader/download_tw_corporate_action_entitlements.py --mode repair"
+    commands = [(1, shlex.join(["bash", "-c", program])),
+                (2, shlex.join(["python", "downloader/download_tw_corporate_action_entitlements.py", "--mode", "repair"]))]
+    assert [r["pid"] for r in module._blockers(entry, commands)] == [2]
+
+
+def test_missing_cold_bytes_do_not_erase_freshness_non_regression(tmp_path):
+    module = _module()
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="node-a")
+    published = publish_packed_snapshot(cold, "prices", _source(tmp_path, "2026-08-18"),
+        metadata={"freshness_value": "2026-08-18", "freshness_field": "end_date", "freshness_format": "iso-date"})
+    for obj in published.manifest["archive"]["objects"]:
+        (cold / obj["relpath"]).unlink()
+    status = module._status(_entry(_source(tmp_path, "2026-08-17")), [], sync_root=cold)
+    assert not status["freshness_non_regression"] and not status["publish_ready"]
 
 
 def _module() -> ModuleType:

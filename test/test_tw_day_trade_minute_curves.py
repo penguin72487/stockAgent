@@ -35,6 +35,21 @@ def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
     )
 
 
+def test_verified_minute_source_cannot_change_before_publication(tmp_path: Path) -> None:
+    path = tmp_path / "2026-09-01_2026-09-09.parquet"
+    receipt = path.with_suffix(".receipt.json")
+    path.write_bytes(b"original prices")
+    receipt.write_text("{}")
+    signature = tuple((p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                      for p in (path, receipt))
+    store = MinutePriceStore(tmp_path, [], require_receipts=True)
+    store._verified_chunk_dates[path] = (signature, {"2026-09-09"})
+    store.assert_sources_unchanged()
+    path.write_bytes(b"revised prices")
+    with pytest.raises(RuntimeError, match="source changed"):
+        store.assert_sources_unchanged()
+
+
 def test_prepare_does_not_read_a_lower_priority_duplicate_source(tmp_path: Path) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
     _minute_file(first, "2330", [(datetime(2026, 8, 13, 9, 1), 102.0)])
@@ -177,6 +192,31 @@ def test_existing_bracket_aware_strategy_marks_validate_without_rebuild() -> Non
     assert stats["generated_rows"] == 810
     assert stats["rows_with_carried_prices"] == 3
     assert stats["existing_bracket_aware_marks_preserved"] is True
+
+
+def test_carry_minute_validation_preserves_cash_income_and_cost_identity():
+    from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+    start = datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI)
+    rows = [{"session_date": "2026-08-13", "market": "a",
+             "minute": (start + timedelta(minutes=i)).isoformat(timespec="minutes"),
+             "margin_carry_contract": MARGIN_CARRY_CONTRACT,
+             "initial_capital_twd": 10000., "cumulative_realized_net_pnl_twd": 100.,
+             "open_net_liquidation_pnl_twd": -70., "cumulative_carry_cost_twd": 10.,
+             "cumulative_corporate_action_net_twd": 50., "total_equity_twd": 10070.,
+             "historical_minute_replay": True,
+             "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+             "valuation_source": "fixture_kbar", "valuation_executable": False,
+             "fresh_trade_notional_coverage_ratio": 1., "fresh_trade_position_count": 1,
+             "last_trade_carried_position_count": 0, "missing_price_position_count": 0}
+            for i in range(270)]
+    assert validate_existing_strategy_marks(rows, start=start.date(), end=start.date())[0] == rows
+    rows[42]["total_equity_twd"] += 1
+    with pytest.raises(RuntimeError, match="NAV mismatch"):
+        validate_existing_strategy_marks(rows, start=start.date(), end=start.date())
+    rows[42]["total_equity_twd"] -= 1
+    rows[42]["missing_price_position_count"] = 1
+    with pytest.raises(RuntimeError, match="unsourced"):
+        validate_existing_strategy_marks(rows, start=start.date(), end=start.date())
 
 
 def test_existing_mark_validation_does_not_require_preserved_benchmarks() -> None:

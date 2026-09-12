@@ -27,6 +27,8 @@ units=(
   stockagent-tw-public-source-events.service
   stockagent-tw-day-trade-eligibility.service
   stockagent-tw-day-trade-eligibility.timer
+  stockagent-tw-day-trade-margin-actions.service
+  stockagent-tw-day-trade-margin-actions.timer
   stockagent-tw-public-publication-sweep.service
   stockagent-tw-public-publication-sweep.timer
   stockagent-tw-public-0830-check.service
@@ -61,6 +63,7 @@ systemctl daemon-reload
 systemctl enable --now \
   stockagent-tw-public-source-events.service \
   stockagent-tw-day-trade-eligibility.timer \
+  stockagent-tw-day-trade-margin-actions.timer \
   stockagent-tw-public-publication-sweep.timer \
   stockagent-tw-public-0830-check.timer \
   stockagent-tw-public-cold-publish.timer

@@ -296,7 +296,8 @@ PY
   if (( download_rc == 0 )) \
     && [[ "$summary_state" == "ready=true "* ]]; then
     echo "[shioaji-minute-runner] building audited available-source research dataset"
-    run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
+    run_fintech_python scripts/build_shioaji_tw_minute_dataset.py \
+      --calendar-root data_tw_public
     latest_date="$(
       run_fintech_python - <<'PY'
 import json
@@ -309,6 +310,7 @@ PY
       --trade-date "$latest_date"
     run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
       --all-partitions \
+      --calendar-root data_tw_public \
       --output data_tw_minute/audits/full_latest.json
     run_fintech_python -m pytest -q \
       test/test_shioaji_tw_minute_kbars.py \
