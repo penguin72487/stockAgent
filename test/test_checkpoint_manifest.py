@@ -277,6 +277,24 @@ def test_strict_minute_tape_content_owns_resume_fingerprint() -> None:
     )
 
 
+def test_official_daily_proxy_price_contract_cannot_resume_adverse_tick_checkpoint(tmp_path) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_realistic.yaml")
+    panel = _day_trade_minute_panel()
+    legacy = _checkpoint_manifest(panel, config)
+    config.data.day_trade_minute_execution_daily_proxy_price_policy = "official_open_close"
+    official = _checkpoint_manifest(panel, config)
+    key = "day_trade_minute_execution_daily_proxy_price_policy"
+    assert key not in legacy["contracts"]["data"]["preprocessing"]
+    assert official["contracts"]["data"]["preprocessing"][key] == "official_open_close"
+    assert official["fingerprints"]["data"] != legacy["fingerprints"]["data"]
+    assert official["fingerprints"]["data_schema"] != legacy["fingerprints"]["data_schema"]
+    assert legacy["compatibility_fingerprints"]["schema_4_pre_minute_tape_fingerprint"]
+    assert not official["compatibility_fingerprints"]["schema_4_pre_minute_tape_fingerprint"]
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest({"experiment_manifest": legacy}, official,
+            checkpoint_path=tmp_path / "legacy_adverse_tick.pt", scope="resume")
+
+
 def test_hybrid_minute_checkpoint_before_tape_hash_remains_compatible(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,16 @@
+[Unit]
+Description=Retry TW overnight history maintenance after official close publication
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 14:10:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 16:10:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:25:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 20:25:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 22:10:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-overnight-history.service
+
+[Install]
+WantedBy=timers.target

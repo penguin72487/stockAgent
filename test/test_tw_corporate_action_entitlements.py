@@ -11,6 +11,7 @@ from downloader.download_tw_corporate_action_entitlements import (
     BulkDividendKey,
     DetailKey,
     ListingKey,
+    StockDeliveryDetailKey,
     _collapse_bulk_event_rows,
     _mops_throttle_response,
     _record_raw_receipt_request,
@@ -21,7 +22,97 @@ from downloader.download_tw_corporate_action_entitlements import (
     parse_mops_detail,
     parse_mops_bulk_dividends,
     parse_mops_listing,
+    parse_mops_stock_delivery_detail,
+    parse_mops_stock_delivery_listing,
+    parse_etf_distributions,
+    _collapse_etf_event_rows,
+    _recover_retained_bulk_rows,
 )
+
+
+def test_tpex_etf_exact_distribution_not_price_adjustment():
+    raw = [{"stockNo": "00755B", "divDate": "115年02月26日", "inDate": "115年03月25日",
+            "amount": "0.421", "year": "115", "inBaseDate": "115年03月07日"}]
+    rows = parse_etf_distributions(json.dumps(raw).encode(), key=BulkDividendKey("tpex", 115))
+    assert rows[0]["cash_dividend_per_share"] == .421
+    assert rows[0]["cash_payment_date"] == date(2026, 3, 25)
+    assert rows[0]["announcement_date"] is None  # no fabricated publication date
+
+
+def test_twse_etf_html_source_schema():
+    cells = ["00943", "ETF", "115年03月17日", "115年03月23日", "115年04月10日", "0.19", "details", "115"]
+    html = ('<table id="myTable"><thead><tr><th>收益分配發放日</th></tr></thead><tbody><tr>'
+            + ''.join(f'<td>{v}</td>' for v in cells) + '</tr></tbody></table>')
+    row = parse_etf_distributions(html.encode(), key=BulkDividendKey("twse", 115))[0]
+    assert row["cash_dividend_per_share"] == .19
+    assert row["date"] == date(2026, 3, 17)
+
+
+@pytest.mark.parametrize("field,value", [("year", "114"), ("amount", "0.1~0.2"),
+                                         ("amount", "-1"), ("inDate", "115年01月01日")])
+def test_etf_invalid_or_wrong_period_terms_fail_closed(field, value):
+    raw = dict(stockNo="00755B", divDate="115年02月26日", inDate="115年03月25日", amount=".421", year="115")
+    raw["amount"] = "0.421"
+    raw[field] = value
+    with pytest.raises(ValueError):
+        parse_etf_distributions(json.dumps([raw]).encode(), key=BulkDividendKey("tpex", 115))
+
+
+def test_etf_unannounced_amount_remains_unknown_and_conflicts_are_rejected():
+    raw = dict(stockNo="00755B", divDate="115年02月26日", inDate="115年03月25日", amount="", year="115")
+    key = BulkDividendKey("tpex", 115)
+    assert parse_etf_distributions(json.dumps([raw]).encode(), key=key)[0]["cash_dividend_per_share"] is None
+    for rows in ([raw, raw | {"amount": "0.421"}], [raw | {"amount": "0.421"}, raw]):
+        assert parse_etf_distributions(json.dumps(rows).encode(), key=key)[0]["cash_dividend_per_share"] == .421
+    with pytest.raises(ValueError, match="conflicting"):
+        parse_etf_distributions(json.dumps([raw | {"amount": "0.42"}, raw | {"amount": "0.421"}]).encode(), key=key)
+
+
+def test_etf_malformed_preliminary_date_remains_unknown_and_audited():
+    raw = dict(stockNo="00764B", divDate="190年06月16日", inDate="109年07月14日", amount="", year="109")
+    row = parse_etf_distributions(json.dumps([raw]).encode(), key=BulkDividendKey("tpex", 109))[0]
+    assert row["date"] == date(2101, 6, 16)  # never guess a corrected date
+    assert row["cash_payment_date"] is None
+    assert row["source_issue"] == "preliminary_payment_precedes_exdate"
+
+
+def test_etf_cross_year_final_over_preliminary_and_later_final_revision():
+    raw = dict(stockNo="0080", divDate="103年12月12日", inDate="104年01月02日", amount="5.8245", year="103")
+    old = parse_etf_distributions(json.dumps([raw]).encode(), key=BulkDividendKey("tpex", 103))[0]
+    new = old | {"source_disclosure_year": 104, "cash_dividend_per_share": 6.147}
+    for rows in ([old, new], [new, old]):
+        assert _collapse_etf_event_rows(rows) == [new]
+    assert _collapse_etf_event_rows([new, new | {"source_disclosure_year": 105, "cash_dividend_per_share": None}]) == [new]
+
+
+def test_disappeared_bulk_event_requires_verified_retained_receipt(tmp_path, monkeypatch):
+    from downloader import download_tw_corporate_action_entitlements as module
+    root = tmp_path / "raw/tw_corporate_action_entitlements"
+    raw = root / "bulk_dividends/tpex-115-asof-20260819-v3.html"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"historical official response")
+    module._reset_raw_receipt_requests()
+    module._record_raw_receipt_request(raw, url=module.MOPS_BULK_DIVIDEND_URL,
+                                      data={"year": "115", "TYPEK": "otc"}, content=raw.read_bytes())
+    module._write_content_addressed_receipt_manifest(output_dir=tmp_path, raw_root=root)
+    module._reset_raw_receipt_requests()
+    row = {"date": date(2026, 6, 17), "symbol": "5371"}
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends", lambda *_a, **_k: [row])
+    monkeypatch.setattr(module, "_collapse_bulk_event_rows", lambda rows: rows)
+    kwargs = dict(output_dir=tmp_path, missing={(row["date"], row["symbol"])}, end=date(2026, 9, 9))
+    assert _recover_retained_bulk_rows(root, **kwargs) == [row]
+    module._reset_raw_receipt_requests()
+    target = tmp_path / "isolated"
+    assert _recover_retained_bulk_rows(root, target_output_dir=target, **kwargs) == [row]
+    copied = target / raw.relative_to(tmp_path)
+    assert copied.read_bytes() == raw.read_bytes()
+    proof = module._write_content_addressed_receipt_manifest(
+        output_dir=target, raw_root=target / "raw/tw_corporate_action_entitlements")
+    assert proof["entries"] == 1
+    module._reset_raw_receipt_requests()
+    raw.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="receipt changed"):
+        _recover_retained_bulk_rows(root, **kwargs)
 
 
 def test_mops_http_200_throttle_body_is_not_an_official_receipt() -> None:
@@ -31,6 +122,61 @@ def test_mops_http_200_throttle_body_is_not_an_official_receipt() -> None:
         )
     )
     assert not _mops_throttle_response(b"<html>issuer disclosure</html>")
+
+
+@pytest.mark.parametrize("denial", [
+    b"<html>FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED.</html>",
+    "因為安全性考量，您所執行的頁面無法呈現。".encode("utf-8"),
+    b"Overrun - Too many query requests",
+])
+@pytest.mark.parametrize("cached", [False, True])
+def test_http_200_denial_is_never_a_successful_receipt_and_can_recover(tmp_path, monkeypatch, denial, cached):
+    from types import SimpleNamespace
+    from downloader import download_tw_corporate_action_entitlements as module
+
+    path = tmp_path / "raw/response.json"
+    path.parent.mkdir()
+    if cached:
+        path.write_bytes(denial)
+    calls, registrations = [], []
+    body = [denial]
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+        @property
+        def content(self):
+            return body[0]
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        return Response()
+
+    monkeypatch.setattr(module.requests, "get", get)
+    monkeypatch.setattr(module, "_global_tw_public_rate_limiter",
+        lambda: SimpleNamespace(wait=lambda: None, defer=lambda _: None))
+    monkeypatch.setattr(module, "_record_raw_receipt_request",
+        lambda *args, **kwargs: registrations.append(kwargs["content"]))
+    kwargs = dict(url="https://www.twse.com.tw/test", data={}, method="GET", timeout=1, retries=0)
+    with pytest.raises(RuntimeError, match="throttle/access-denial"):
+        module._cached_or_post(path, **kwargs)
+    assert len(calls) == 1 and registrations == []
+    if not cached:
+        assert not path.exists()
+    else:
+        rejected = path.parent / "rejected" / f"{hashlib.sha256(denial).hexdigest()}.response"
+        assert rejected.read_bytes() == denial
+    body[0] = b'{"stat": "OK", "data": []}'
+    assert module._cached_or_post(path, **kwargs) == body[0]
+    assert path.read_bytes() == body[0] and registrations == [body[0]]
+    assert len(calls) == 2  # a cached denial did not prevent a later valid retry
 
 
 def test_listing_workload_adds_prior_year_only_for_first_quarter() -> None:
@@ -91,6 +237,78 @@ def test_parse_mops_bulk_dividend_extracts_exact_cash_terms() -> None:
     assert row["stock_dividend_ratio"] == 0.0
     assert row["subscription_ratio"] == 0.0
     assert row["stop_transfer_start"] is None
+
+
+def test_mops_stock_dividend_uses_official_par_not_value_as_ratio() -> None:
+    cells = [
+        "8941",
+        "關中",
+        "108年度",
+        "109/09/02",
+        "1.0",
+        "0",
+        "109/08/27",
+        "0",
+        "0",
+        "",
+        "",
+        "",
+        "0",
+        "0",
+        "0",
+        "27,645,907",
+        "109/08/12",
+        "08:30:00",
+        "新台幣10.0000元",
+    ]
+    html = (
+        "<html><table><tr><th>公司代號</th><th>現金股利發放日</th></tr><tr>"
+        + "".join(f"<td>{value}</td>" for value in cells)
+        + "</tr></table></html>"
+    ).encode("utf-8")
+
+    rows = parse_mops_bulk_dividends(
+        html, key=BulkDividendKey(market="tpex", roc_year=109)
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["date"] == date(2020, 8, 27)
+    assert rows[0]["stock_dividend_value_per_share"] == 1.0
+    assert rows[0]["stock_par_value"] == 10.0
+    assert rows[0]["stock_dividend_ratio"] == pytest.approx(0.1)
+
+
+def test_mops_t59_stock_issue_and_delivery_are_independent_exact_receipts() -> None:
+    listing_html = """
+    <html><table>
+      <tr><td>109/08/11</td><td>109年分派108年盈餘轉增資發行新股公告</td>
+      <td><input onclick='document.fm.DATE1.value="20200811";document.fm.SKEY.value="1";'></td></tr>
+      <tr><td>109/10/08</td><td>109年增資發行新股發放暨上櫃買賣日期公告</td>
+      <td><input onclick='document.fm.DATE1.value="20201008";document.fm.SKEY.value="1";'></td></tr>
+    </table></html>
+    """.encode("utf-8")
+    listing_key = ListingKey("tpex", "8941", 109)
+    keys = parse_mops_stock_delivery_listing(listing_html, key=listing_key)
+    assert len(keys) == 2
+    assert all(isinstance(key, StockDeliveryDetailKey) for key in keys)
+
+    issue_html = """
+    <html>公司代號 8941 公告內容：計發行新股2,764,590股，每股面額新台幣10元。
+    按配股基準日股東名簿所載股東持有股數每仟股無償派發100股。
+    普通股增資配股基準日：本公司訂於民國109年09月02日。</html>
+    """.encode("utf-8")
+    delivery_html = """
+    <html>公司代號 8941，本次計發行新股2,764,590股。
+    本次增資股票訂於109年10月14日(星期三)起發放並上櫃買賣。</html>
+    """.encode("utf-8")
+    issue = parse_mops_stock_delivery_detail(issue_html, key=keys[0])
+    delivery = parse_mops_stock_delivery_detail(delivery_html, key=keys[1])
+
+    assert issue["issue_shares"] == 2_764_590
+    assert issue["stock_ratio"] == pytest.approx(0.1)
+    assert issue["record_date"] == date(2020, 9, 2)
+    assert delivery["issue_shares"] == 2_764_590
+    assert delivery["delivery_date"] == date(2020, 10, 14)
 
 
 @pytest.mark.parametrize(

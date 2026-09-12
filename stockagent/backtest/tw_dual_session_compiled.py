@@ -5,7 +5,8 @@ Compiling its Python loop as one 32-row FX graph makes Inductor scheduler work
 grow prohibitively large.  This module therefore compiles one complete
 exchange-session transition and reuses that fullgraph kernel for every row in
 a fixed 32-row block.  The recurrent state and autograd graph remain connected
-across calls; only a final non-aligned tail runs through the eager oracle.
+across calls. A batch shorter than 32 rows also reuses the same daily kernel;
+only a non-aligned tail after a complete block runs through the eager oracle.
 
 Inductor's per-day kernels deliberately keep their internal CUDA graphs
 disabled.  Training may optionally wrap the complete fixed-shape regional
@@ -1484,6 +1485,11 @@ def _run_prepared_regional(
 ) -> TaiwanDualSessionResult:
     total_rows = int(prepared.actions.size(0))
     full_stop = total_rows - total_rows % COMPILED_BLOCK_ROWS
+    # Compilation owns one daily transition, not a 32-row tensor shape. Small
+    # optimizer batches must execute that kernel too; otherwise batch 16 never
+    # compiles any settlement call and fails the trainer's strict compile probe.
+    if 0 < total_rows < COMPILED_BLOCK_ROWS:
+        full_stop = total_rows
     if (
         prepared.actions.device.type != "cuda"
         or full_stop == 0
@@ -1525,7 +1531,7 @@ def _run_prepared_regional(
         for block_start in range(0, full_stop, COMPILED_BLOCK_ROWS):
             for index in range(
                 block_start,
-                block_start + COMPILED_BLOCK_ROWS,
+                min(block_start + COMPILED_BLOCK_ROWS, full_stop),
             ):
                 if not rows:
                     # Current PyTorch probes ``.grad`` on non-leaf graph

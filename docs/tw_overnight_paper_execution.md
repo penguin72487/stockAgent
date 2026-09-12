@@ -9,7 +9,8 @@
 1. 13:25：使用最新同日行情更新模型輸入。現階段暫時沿用對應的當沖
    checkpoint；產物會明確標成「未針對隔夜風險訓練」。
 2. 13:25：多方以當日漲停價掛 `LMT_ROD` 買進，空方以當日跌停價掛
-   `LMT_ROD` 賣空。張數以 13:25 價格和各模式的獨立初始資金計算。
+   `LMT_ROD` 賣空。張數以 13:25 價格和該批進場前已對帳總權益計算；
+   權益非正時保留訊號但不增加曝險。
 3. 13:25–13:30：`simtrade=true` 只代表試撮，永遠不記為成交。
 4. 13:30：只在同一交易日、非試撮且帶交易所時間戳的實際收盤價出現後，
    才以該撮合價建立紙上部位。延緩收市的證券可等到 13:33。
@@ -42,7 +43,25 @@ Discord 13:25 排程（沿用模型）
   -> 隔日沖 append-only signals/orders/fills/marks
   -> 唯讀公開閘道 /tw-overnight/api/*
   -> /tw-overnight/
+
+官方收盤資料完成發布
+  -> stockagent-tw-overnight-history.timer
+  -> 只補尚未計算交易日的 13:25 訊號
+  -> 以官方 CLOSE／下一交易日 OPEN 重播完整帳戶
+  -> 原子發布 overnight_history.json 與壓縮 Parquet 明細
+  -> 同一組 /tw-overnight/api/* 合併即時與歷史資料
 ```
+
+歷史曲線固定從 `2026-02-25` 開始。每個完成交易日有兩個事件點：09:00
+官方開盤反事實沖銷、13:30 官方收盤反事實進場／估值；不插值成逐分鐘曲線。
+13:25 分鐘資料存在時使用該觀測做決策計價，缺少時依使用者授權改用同日收盤，
+並在來源統計中獨立揭露。官方日 OPEN/CLOSE 是歷史反事實價格來源；歷史重建
+漲跌幅只作資料品質稽核，不能因 ETF 規則誤分類而把已觀測的官方開盤價延到
+後一日。這些價格都沒有交易所成交時間戳或集合競價排隊證據。
+
+歷史訊號、委託／成交與持倉分別使用壓縮 Parquet 和不可變分區快照，避免把
+百萬筆完整股票權重塞進即時 JSONL。即時帳本仍只接受當時收到的正式行情，
+歷史反事實資料永遠不會回寫成即時成交。
 
 安裝或更新服務：
 
@@ -53,4 +72,13 @@ sudo scripts/install_public_dashboards_service.sh
 
 驗收至少要同時證明：服務 active、狀態 receipt 可讀、試撮不成交、收盤實際
 價格才建倉、次日試撮不平倉、09:00 實際開盤才沖銷、公開 API 不含內部路徑或
-憑證。新服務不回補不存在的歷史隔日沖成交。
+憑證；歷史另外驗證日期完整、每模式每日兩個事件、完整訊號可按日查詢、價格／
+方向／費稅／權益對帳，以及反事實標籤未被呈現成真實成交。
+
+手動補算與部署：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/maintain_tw_overnight_history.py --force
+systemctl list-timers stockagent-tw-overnight-history.timer --all
+```

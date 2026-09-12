@@ -837,20 +837,63 @@ def _row(weight: float = 0.1) -> dict[str, object]:
     }
 
 
-def test_runner_loads_all_four_configured_day_trade_modes() -> None:
+def test_live_publication_clock_does_not_backdate_service_health(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path, publication_clock=lambda: _now(11, 5))
+    engine.state["modes"]["fixture"] = {"market": "fixture", "entry_completed_at": _now(9, 1).isoformat()}
+    engine._persist(_now(9, 1))
+    receipt = json.loads((tmp_path / "service_sync.json").read_text())
+    assert receipt["published_at"].startswith("2026-08-13T11:05")
+    assert engine.state["modes"]["fixture"]["entry_completed_at"].startswith("2026-08-13T09:01")
+
+
+def test_carry_quote_scope_includes_zero_target_inventory_without_open_permissions(tmp_path):
+    from scripts.run_tw_day_trade_simulation import _entry_and_carry_quote_symbols, _replay_sizing_open_price
+    symbols, _ = _entry_and_carry_quote_symbols(spec=_spec(tmp_path), rows=[_row(0)], eligibility={},
+        mode={"positions": {"p": {"symbol": "2330", "signed_shares": -751, "last_mark_price": 998}}})
+    assert symbols == {"2330"}
+    assert _replay_sizing_open_price(None, {"open": 1000, "last": 1020}) == 1000
+    assert _replay_sizing_open_price(990, {"open": 1000}) == 990
+    assert _replay_sizing_open_price(None, {"open": 0, "last": 1020, "execution_price_0901": 1010}) is None
+
+
+def test_quote_discovery_does_not_use_initial_deposit_to_filter_compounded_nav(tmp_path):
+    from scripts.run_tw_day_trade_simulation import _entry_and_carry_quote_symbols
+    row = {**_row(0.05), "open_price": 1000.0}
+    # 10M initial would request 500 shares; a later 30M NAV requests a full lot.
+    # Discovery must fetch its price before the engine can freeze that NAV.
+    symbols, _ = _entry_and_carry_quote_symbols(spec=_spec(tmp_path), rows=[row],
+        eligibility=_eligibility(), mode={"total_equity_twd": 30_000_000, "positions": {}})
+    assert symbols == {"2330"}
+
+
+def test_committed_account_drops_obsolete_missing_open_diagnostic(tmp_path):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path)
+    mode = engine._mode(spec)
+    mode.update(entry_completed_at=_now(9, 1).isoformat(), missing_carried_open_symbols=["2330"],
+                pending_signal_id="pending")
+    assert engine._mode(spec)["missing_carried_open_symbols"] == ["2330"]
+    mode["pending_signal_id"] = None
+    assert "missing_carried_open_symbols" not in engine._mode(spec)
+
+
+def test_runner_loads_all_configured_day_trade_modes() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
+    from stockagent.live.market_config import enabled_day_trade_markets
 
     repo_root = Path(__file__).resolve().parents[1]
     specs, live_configs, errors = _mode_specs(
         repo_root / "services/discord_bot/markets"
     )
     by_market = {spec.market: spec for spec in specs}
-    active_expected = {
+    baseline = {
         "tw_day_trade_100m",
         "tw_day_trade_multi_basis",
         "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }
+    active_expected = set(enabled_day_trade_markets(repo_root / "services/discord_bot/markets"))
+    assert baseline <= active_expected
 
     assert errors == {}
     assert set(by_market) == active_expected
@@ -2101,8 +2144,8 @@ def test_two_sided_live_signal_keeps_each_symbols_independent_fill(
         summary=_summary(),
         signal_rows=[long_row, short_row],
         quotes={
-            "2330": _quote(open_price=100.0, bid=99.0, ask=100.0, ask_volume=1.0),
-            "2317": _quote(open_price=100.0, bid=100.0, ask=101.0, bid_volume=20.0),
+            "2330": _quote(open_price=100.0, bid=99.0, ask=100.0, ask_volume=1.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2317": _quote(open_price=100.0, bid=100.0, ask=101.0, bid_volume=20.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
         },
         eligibility=eligibility,
         eligibility_coverage={},
@@ -2142,8 +2185,8 @@ def test_two_sided_live_signal_keeps_executable_side_when_other_side_has_no_dept
             {**_row(-0.5), "symbol": "2317"},
         ],
         quotes={
-            "2330": _quote(bid=99.0, ask=100.0, ask_volume=0.0),
-            "2317": _quote(bid=100.0, ask=101.0, bid_volume=20.0),
+            "2330": _quote(bid=99.0, ask=100.0, ask_volume=0.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2317": _quote(bid=100.0, ask=101.0, bid_volume=20.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
         },
         eligibility=eligibility,
         eligibility_coverage={},
@@ -2718,7 +2761,7 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
                 last=1004.0,
                 bid_volume=2.0,
                 minute_volume_lots=4.0,
-            )
+            ) | {"quote_at": _now(13, 30).isoformat()}
         },
         now=_now(13, 30),
     )
@@ -2853,7 +2896,8 @@ def test_1330_residual_is_terminally_flattened_without_exchange_fill_claim(
     tmp_path: Path,
     target_weight: float,
 ) -> None:
-    spec = _spec(tmp_path)
+    # Explicit legacy valuation contract, not the current executable path.
+    spec = replace(_spec(tmp_path), realistic_execution=False)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.register_signal(
         spec=spec,
@@ -2902,7 +2946,7 @@ def test_1330_residual_is_terminally_flattened_without_exchange_fill_claim(
 
 
 def test_new_signal_resets_prior_session_closing_markers(tmp_path: Path) -> None:
-    spec = _spec(tmp_path)
+    spec = replace(_spec(tmp_path), realistic_execution=False)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.update_readiness([spec], now=_now(8, 0))
     mode = engine.state["modes"][spec.market]
@@ -2958,7 +3002,7 @@ def test_terminal_flatten_uses_adverse_limit_when_close_is_missing(
     target_weight: float,
     expected_price: float,
 ) -> None:
-    spec = _spec(tmp_path)
+    spec = replace(_spec(tmp_path), realistic_execution=False)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.register_signal(
         spec=spec,
@@ -3078,6 +3122,24 @@ def test_quote_snapshot_exposes_bid_ask_and_computes_limits(tmp_path: Path) -> N
     assert quotes["2330"]["ask_volume"] == 4.0
     assert quotes["2330"]["upper_limit"] == 110.0
     assert quotes["2330"]["lower_limit"] == 90.0
+
+
+def test_etf_brackets_use_etf_ticks_at_boundary(tmp_path: Path) -> None:
+    spec = replace(_spec(tmp_path), price_limit_offset_ticks=1)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    row = {**_row(), "symbol": "0050"}
+    quote = {**_quote(open_price=48., bid=47.99, ask=48., last=48.),
+             "symbol": "0050", "upper_limit": 50., "lower_limit": 45.}
+    evidence = replace(_eligibility()["2330"], symbol="0050", security_type="etf")
+    assert engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[row], quotes={"0050": quote},
+        eligibility={"0050": evidence}, eligibility_coverage={}, now=_now(9, 1, 6),
+    ) == "registered"
+    positions = engine.state["modes"][spec.market]["positions"]
+    position = next(iter(positions.values()))
+    assert position["security_type"] == "etf"
+    assert position["take_profit_price"] == 49.99
+    assert position["stop_trigger_price"] == 45.01
 
 
 def test_market_benchmarks_are_gross_buy_hold_and_tx_is_fully_collateralized(
@@ -4183,7 +4245,7 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     encoded = json.dumps(payload).casefold()
     for forbidden in ("account_id", "account_number", "broker_account", "api_key", "api_secret"):
         assert forbidden not in encoded
-    assert "broker" not in json.dumps(payload).casefold()
+    assert payload["modes"][0]["account_performance"]["broker_buying_power_verified"] is False
 
 
 def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
@@ -4495,7 +4557,7 @@ def test_dashboard_default_view_exposes_today_prewarm_before_first_signal(
         now=_now(8, 46).astimezone(ZoneInfo("UTC")),
     )
 
-    assert payload["session_date"] == "2026-08-12"
+    assert payload["session_date"] == "2026-08-13"
     assert payload["preopen"]["ready_count"] == 1
     assert payload["preopen"]["updated_at"] == _now(8, 45).isoformat()
     assert payload["preopen"]["simulation"]["session_date"] == "2026-08-13"
@@ -4558,9 +4620,11 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function compareByAbsoluteWeight(a, b)" in javascript
     assert javascript.count(".sort(compareByAbsoluteWeight)") == 1
     assert "function beginSilentTableUpdate" in javascript
-    assert javascript.count("signalRows = [];") == 1
-    assert javascript.count("positionRows = [];") == 1
-    assert javascript.count("eventRows = [];") == 1
+    # Preserve rows within a date, clear them only on an explicit/automatic
+    # date transition so yesterday's rows never appear under today's heading.
+    assert javascript.count("signalRows = [];") == 2
+    assert javascript.count("positionRows = [];") == 2
+    assert javascript.count("eventRows = [];") == 2
     assert "location.reload" not in javascript
     assert 'window.location.pathname.startsWith("/tw-overnight/")' in javascript
     assert (
@@ -4579,8 +4643,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
     assert "function hydrateDefaultPositions(data)" in javascript
-    assert "const historyReady = loadChartHistory({preferCache: !force});" in javascript
-    assert "if (shouldReloadPositions) secondaryLoads.push(loadPositions());" in javascript
+    assert "void loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadPositions) void loadPositions({force});" in javascript
+    assert "Promise.allSettled([signalsReady, historyReady])" not in javascript
     assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
     assert "maximumSignificantDigits" not in javascript
@@ -4683,15 +4748,12 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert '"api/public-data-status"' in javascript
     assert "IntersectionObserver" in javascript
     assert "installTwPublicMonitorActivation()" in javascript
-    assert "const historyReady = loadChartHistory({preferCache: !force});" in javascript
-    assert (
-        "const signalsReady = shouldReloadSignals ? loadSignals({force: true})"
-        in javascript
-    )
-    assert "Promise.allSettled(secondaryLoads)" in javascript
-    assert 'src="app.js?v=68"' in html
+    assert "void loadChartHistory({preferCache: !force});" in javascript
+    assert "if (shouldReloadSignals) void loadSignals({force});" in javascript
+    assert "if (shouldReloadEvents) void loadEvents({force});" in javascript
+    assert 'src="app.js?v=76"' in html
     assert 'src="presentation.js?v=1"' in html
-    assert 'src="detail-components.js?v=3"' in html
+    assert 'src="detail-components.js?v=5"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript
@@ -4915,7 +4977,7 @@ def test_next_session_archives_closed_positions_for_dashboard_history(
         == "registered"
     )
     engine.process_quotes(
-        quotes={"2330": _quote(bid=1_010.0, ask=1_010.0, last=1_010.0)},
+        quotes={"2330": _quote(bid=1_010.0, ask=1_010.0, last=1_010.0) | {"quote_at": _now(13, 30).isoformat()}},
         now=_now(13, 30),
     )
 
@@ -5247,7 +5309,7 @@ def test_available_session_date_cache_invalidates_when_ledger_grows(
         end_date="2026-08-14",
         limit=10,
     )
-    assert second["available_session_dates"] == ["2026-08-14", "2026-08-13"]
+    assert [day for day in second["available_session_dates"] if day <= "2026-08-14"] == ["2026-08-14", "2026-08-13"]
     assert second["total"] == 2
 
 

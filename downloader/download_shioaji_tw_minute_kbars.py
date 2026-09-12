@@ -278,6 +278,8 @@ def query_minute_chunk(
     expected_dates: set[date],
     provisional_dates: set[date] | None = None,
     request_started: Callable[[], None] | None = None,
+    tick_fallback_root: Path | None = None,
+    max_traffic_fraction: float = HISTORICAL_MAX_TRAFFIC_FRACTION,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     """Query one chunk and retain only causal regular-session minute bars.
 
@@ -447,11 +449,91 @@ def query_minute_chunk(
             raise
         except Exception as exc:
             last_error = exc
+            if tick_fallback_root is not None and "Data not found" in str(exc):
+                return query_tick_minute_fallback(
+                    api, contract, row, contract_unit=contract_unit,
+                    days=sorted(expected_dates | set(provisional_dates or ())),
+                    timeout_ms=timeout_ms, request_started=request_started,
+                    output_root=tick_fallback_root, max_traffic_fraction=max_traffic_fraction,
+                )
             if attempt >= max(0, retries):
                 break
             time.sleep(float(retry_backoff) * (2**attempt))
     assert last_error is not None
     raise last_error
+
+
+def ticks_to_minute_kbars(ticks: Any, *, symbol: str, market: str,
+                         session_date: str, contract_unit: float) -> pl.DataFrame:
+    """Regular-session observed trades only; 13:30 auction belongs to 13:30."""
+    frame = pl.DataFrame({"ts": ticks.ts, "price": ticks.close, "volume": ticks.volume}).with_columns(
+        pl.col("ts").cast(pl.Datetime("ns")), pl.col("price").cast(pl.Float64),
+        pl.col("volume").cast(pl.Float64))
+    start = datetime.fromisoformat(f"{session_date}T09:00:00")
+    end = datetime.fromisoformat(f"{session_date}T13:30:00")
+    if frame["ts"].null_count():
+        raise ValueError("historical tick has no timestamp")
+    frame = frame.filter(pl.col("ts").is_between(start, end)).sort("ts", maintain_order=True)
+    if frame.filter(pl.any_horizontal(pl.all().is_null())
+                    | ~pl.col("price").is_finite() | ~pl.col("volume").is_finite()
+                    | (pl.col("price") <= 0) | (pl.col("volume") <= 0)).height:
+        raise ValueError("invalid historical trade tick; refusing fabricated minute")
+    bars = (frame.with_columns(
+        pl.when(pl.col("ts") == end).then(pl.col("ts") - pl.duration(microseconds=1))
+        .otherwise(pl.col("ts")).alias("bucket_input"))
+        .with_columns((pl.col("bucket_input").dt.truncate("1m") + pl.duration(minutes=1)).alias("ts"))
+        .group_by("ts", maintain_order=True).agg(
+            pl.col("price").first().alias("Open"), pl.col("price").max().alias("High"),
+            pl.col("price").min().alias("Low"), pl.col("price").last().alias("Close"),
+            pl.col("volume").sum().alias("Volume"),
+            (pl.col("price") * pl.col("volume") * contract_unit).sum().alias("Amount"))
+        .sort("ts"))
+    # Polars duration arithmetic may downcast ns to us. Normalize before the
+    # integer ABI; otherwise normalize_kbars would interpret us as ns (1970).
+    payload = bars.with_columns(pl.col("ts").cast(pl.Datetime("ns")).cast(pl.Int64)).to_dict(as_series=False)
+    return normalize_kbars(payload, symbol=symbol, market=market, contract_unit=contract_unit)
+
+
+def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
+                              contract_unit: float, days: list[date], timeout_ms: int,
+                              request_started: Callable[[], None] | None,
+                              output_root: Path,
+                              max_traffic_fraction: float) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Fallback only after an explicit missing-KBar response, retaining raw trades."""
+    frames, sources = [], []
+    for day in days:
+        if _taiwan_market_hours_now():
+            raise MarketHoursReached("tick recovery reached protected live window")
+        if request_started:
+            request_started()
+        _check_traffic_budget(api, max_fraction=max_traffic_fraction)
+        with shioaji_query(api, consumer="stock_minute_tick_recovery", method="ticks",
+                          asset_class="stock", details={"contract": row.symbol, "date": str(day)}) as record:
+            ticks = api.ticks(contract=contract, date=str(day), timeout=timeout_ms)
+            record(ticks)
+        raw = pl.DataFrame(_payload_dict(ticks))
+        source = _write_minute_parquet(raw, output_root / row.symbol / f"{day}.parquet")
+        sources.append({**source, "session_date": str(day), "symbol": row.symbol})
+        bars = ticks_to_minute_kbars(ticks, symbol=row.symbol, market=row.market,
+                                    session_date=str(day), contract_unit=contract_unit)
+        if bars.height:
+            # The official day total includes additional trading mechanisms;
+            # regular-session tick volume cannot exceed that independent bound.
+            official = pl.read_parquet(row.base_path).filter(pl.col("date").cast(pl.Date) == day)
+            if (official.height != 1 or bars["Volume"].sum() * contract_unit
+                    > float(official["Trading_Volume"][0]) + 1e-6):
+                raise ValueError(f"tick volume exceeds official day volume: {row.symbol}/{day}")
+            frames.append(bars)
+    frame = pl.concat(frames, how="vertical_relaxed") if frames else ticks_to_minute_kbars(
+        type("EmptyTicks", (), {"ts": [], "close": [], "volume": []})(),
+        symbol=row.symbol, market=row.market, session_date=str(days[0]), contract_unit=contract_unit)
+    returned = set(frame["date"].to_list()) if frame.height else set()
+    return frame, {"zero_placeholder_rows_dropped": 0, "negative_correction_rows_dropped": 0,
+                   "out_of_session_rows_dropped": 0, "outside_reference_date_rows_dropped": 0,
+                   "single_day_fallback_queries": 0, "tick_fallback_queries": len(days),
+                   "underlying_data_method": "observed_ticks_aggregated_to_right_labelled_1m",
+                   "raw_tick_sources": sources,
+                   "source_gap_dates": [str(day) for day in days if day not in returned]}
 
 
 def provisional_publication_tail_dates(
@@ -460,6 +542,7 @@ def provisional_publication_tail_dates(
     start: date,
     end: date,
     expected_dates: set[date],
+    official_dates: set[date] | frozenset[date] | None = None,
 ) -> set[date]:
     """Return weekday tail dates newer than the latest daily reference row.
 
@@ -476,13 +559,25 @@ def provisional_publication_tail_dates(
             max(SHIOAJI_STOCK_HISTORY_START, start - timedelta(days=14)),
             end,
         )
+        if official_dates is not None:
+            recent_dates &= set(official_dates)
     if not recent_dates:
         return set()
     latest_reference = max(recent_dates)
     cursor = max(start, latest_reference + timedelta(days=1))
     provisional: set[date] = set()
+    last_official = max(official_dates) if official_dates else None
     while cursor <= end:
-        if cursor.weekday() < 5:
+        if official_dates is None and cursor.weekday() < 5:
+            provisional.add(cursor)
+        elif (
+            official_dates is not None
+            and cursor in official_dates
+        ) or (
+            cursor.weekday() < 5
+            and last_official is not None
+            and cursor > last_official
+        ):
             provisional.add(cursor)
         cursor += timedelta(days=1)
     return provisional
@@ -498,6 +593,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-stock-root", type=Path, default=Path("data_tw_public/stocks")
+    )
+    parser.add_argument(
+        "--calendar-root",
+        type=Path,
+        default=None,
+        help=(
+            "Receipt-backed TWSE calendar root. Defaults to the parent of "
+            "--base-stock-root."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -561,6 +665,14 @@ def parse_args() -> argparse.Namespace:
         default=HISTORICAL_MAX_TRAFFIC_FRACTION,
     )
     parser.add_argument("--simulation", action="store_true")
+    parser.add_argument("--fallback-missing-kbars-to-ticks", action="store_true",
+                        help="Recover explicit Data-not-found KBars from observed ticks; retain raw source hashes.")
+    parser.add_argument(
+        "--historical-stock-unit", action="append", default=[], metavar="SYMBOL=SHARES",
+        help=("Read-only historical identity fallback for an explicitly selected stock/ETF "
+              "missing from today's contract directory. Supply its independently verified "
+              "historical board unit; never changes live contracts or trading eligibility."),
+    )
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -687,6 +799,17 @@ def minute_receipt_valid(
         return int(payload.get("rows", -1)) == 0
     if payload["status"] == "source_gap" and not payload.get("source_gap_dates"):
         return False
+    if payload.get("underlying_data_method") == "observed_ticks_aggregated_to_right_labelled_1m":
+        sources = payload.get("raw_tick_sources")
+        if not isinstance(sources, list) or not sources:
+            return False
+        for source in sources:
+            if not isinstance(source, dict):
+                return False
+            raw = Path(str(source.get("path", "")))
+            if (source.get("symbol") != symbol or not raw.is_file()
+                    or raw.stat().st_size != source.get("size") or _sha256(raw) != source.get("sha256")):
+                return False
     if int(payload.get("rows", -1)) == 0:
         return payload["status"] == "source_gap"
     output = payload.get("output_receipt")
@@ -799,6 +922,50 @@ def contract_for_stock_symbol(
     return contract, unit, ""
 
 
+def historical_stock_units(values: list[str], selected: list[UniverseRow]) -> dict[str, float]:
+    """Explicit units, not an assumed 1000 for foreign or dual-currency products."""
+    known = {row.symbol for row in selected}
+    result: dict[str, float] = {}
+    for value in values:
+        symbol, separator, raw_unit = value.partition("=")
+        symbol = symbol.strip().upper()
+        unit = float(raw_unit) if separator else math.nan
+        if (symbol not in known or symbol in result or not math.isfinite(unit)
+                or unit <= 0 or unit != int(unit)):
+            raise ValueError(f"invalid or unselected historical stock unit: {value}")
+        result[symbol] = unit
+    return result
+
+
+def historical_stock_identity(row: UniverseRow, unit: float) -> tuple[Any, float, str]:
+    """Exact public historical identity for data queries only; no master mutation."""
+    import shioaji as sj
+    exchange = {"twse": "TSE", "tpex": "OTC"}.get(row.market)
+    if (exchange is None or row.security_type not in {"stock", "etf"}
+            or not row.base_path.is_file() or not math.isfinite(unit)
+            or unit <= 0 or unit != int(unit)):
+        raise ValueError(f"unverified historical stock identity: {row.symbol}")
+    return (sj.BaseContract(security_type="STK", region="TW", exchange=exchange, code=row.symbol),
+            unit, "explicit_public_historical_identity_read_only_v1")
+
+
+def validate_historical_unit_amount(frame: pl.DataFrame, unit: float) -> None:
+    """Reject a wrong volume unit before it becomes a capacity/price receipt."""
+    if not frame.height:
+        return
+    trades = frame.filter(pl.col("Volume") > 0)
+    if not trades.height:
+        return
+    vwap = pl.col("Amount") / (pl.col("Volume") * unit)
+    invalid = trades.filter(
+        pl.col("Amount").is_null() | ~pl.col("Amount").is_finite()
+        | (pl.col("Amount") <= 0) | ~vwap.is_finite()
+        | (vwap < pl.col("Low") - 1e-5) | (vwap > pl.col("High") + 1e-5)
+    )
+    if invalid.height:
+        raise ValueError(f"historical contract unit/amount inconsistent: {invalid.height} bars")
+
+
 def _write_symbol_manifest(
     output_dir: Path,
     row: UniverseRow,
@@ -847,6 +1014,7 @@ def _write_symbol_manifest(
                     else None
                 ),
                 "receipt_path": str(receipt_path),
+                "underlying_data_method": receipt.get("underlying_data_method", "provider_kbars"),
                 "source_gap_dates": list(receipt.get("source_gap_dates", [])),
             }
         )
@@ -1019,12 +1187,13 @@ def restore_extended_tail_from_archived_manifest(
     requested_end: date,
     simulation: bool,
     expected_dates: set[date],
+    official_dates: set[date] | frozenset[date] | None = None,
 ) -> bool:
     """Repack a covered archived tail when a delisted contract disappears.
 
     Contract V2 is a current contract directory, so a delisted symbol can
     disappear even though its already archived history remains valid. When an
-    end-date extension only changes the final chunk boundary and all expected
+    end-date extension changes one or more trailing chunk boundaries and all expected
     public trading dates are covered by the previous sealed tail (or its
     explicit source-gap dates), repack that immutable tail into the new chunk
     instead of relabeling the entire historical symbol as unavailable.
@@ -1044,6 +1213,17 @@ def restore_extended_tail_from_archived_manifest(
     old_chunks = archived.get("chunks", [])
     if not old_chunks or not chunks:
         return False
+    current_reference_dates = (
+        _positive_volume_dates(row.base_path, requested_start, requested_end)
+        if row.base_path.is_file()
+        else set()
+    )
+    if official_dates is not None:
+        current_reference_dates &= set(official_dates)
+    if not row.base_path.is_file() or expected_dates != current_reference_dates:
+        return False
+    reference_receipt = {"path": str(row.base_path), "size": row.base_path.stat().st_size,
+                         "sha256": _sha256(row.base_path)}
     missing = [
         (start, end)
         for start, end in chunks
@@ -1053,15 +1233,18 @@ def restore_extended_tail_from_archived_manifest(
             start=start,
             end=end,
             simulation=simulation,
+            required_dates={d for d in expected_dates if start <= d <= end},
         )
     ]
-    if len(missing) != 1 or missing[0] != chunks[-1]:
+    if not missing or missing != chunks[-len(missing):]:
         return False
     new_start, new_end = missing[0]
     old_tail = old_chunks[-1]
+    old_start = date.fromisoformat(str(old_tail.get("start_date")))
+    old_end = date.fromisoformat(str(old_tail.get("end_date")))
     if not (
-        old_tail.get("start_date") == new_start.isoformat()
-        and date.fromisoformat(str(old_tail.get("end_date"))) < new_end
+        old_start <= new_start
+        and old_end < new_end
         and old_tail.get("status") in {"ok", "source_gap"}
         and old_tail.get("data_path")
     ):
@@ -1071,20 +1254,48 @@ def restore_extended_tail_from_archived_manifest(
         old_tail.get("data_sha256", "")
     ):
         return False
+    old_receipt = old_path.with_suffix(".receipt.json")
+    old_proof = _read_json(old_receipt) or {}
+    if (not minute_receipt_valid(old_receipt, symbol=row.symbol, start=old_start,
+                                end=old_end, simulation=simulation)
+            or Path(str((old_proof.get("output_receipt") or {}).get("path", ""))).resolve() != old_path.resolve()):
+        return False
     frame = pl.read_parquet(old_path).filter(
-        (pl.col("date") >= pl.lit(new_start)) & (pl.col("date") <= pl.lit(new_end))
+        (pl.col("date") >= pl.lit(old_start)) & (pl.col("date") <= pl.lit(old_end))
     )
     returned = set(frame["date"].to_list()) if frame.height else set()
     source_gaps = {
         date.fromisoformat(str(value)) for value in old_tail.get("source_gap_dates", [])
     }
-    expected_tail = {value for value in expected_dates if new_start <= value <= new_end}
+    expected_tail = {value for value in expected_dates if new_start <= value <= requested_end}
     if not expected_tail.issubset(returned | source_gaps):
         return False
     units = frame["contract_unit"].unique().to_list() if frame.height else []
     if len(units) != 1 or not math.isfinite(float(units[0])) or float(units[0]) <= 0:
         return False
     unit = float(units[0])
+    if (_sha256(old_path) != old_tail['data_sha256']
+            or _sha256(row.base_path) != reference_receipt['sha256']):
+        return False
+    # Reuse the same single-tail implementation for each trailing bucket.
+    # Later buckets may be empty only because the independently observed public
+    # reference contains no required positive-volume session there. This does
+    # not assert an official halt, a provider no-data response or a fake bar.
+    for new_start, new_end in missing:
+        selected = frame.filter((pl.col('date') >= new_start) & (pl.col('date') <= new_end))
+        expected_part = {d for d in expected_dates if new_start <= d <= new_end}
+        _write_restored_tail(output_dir, row, selected, start=new_start, end=new_end,
+            unit=unit, expected_dates=expected_part, source_gaps=source_gaps,
+            old_path=old_path, old_proof=old_proof, simulation=simulation,
+            reference_receipt=reference_receipt)
+    return True
+
+
+def _write_restored_tail(output_dir, row, frame, *, start, end, unit, expected_dates,
+                         source_gaps, old_path, old_proof, simulation, reference_receipt):
+    new_start, new_end = start, end
+    returned = set(frame['date'].to_list())
+    expected_tail = expected_dates
     audit = validate_minute_kbars(
         frame,
         symbol=row.symbol,
@@ -1121,6 +1332,12 @@ def restore_extended_tail_from_archived_manifest(
             "query_performed": False,
             "query_skipped_reason": "archived_delisted_contract_tail_repacked",
             "restored_from": str(old_path),
+            "restored_source_receipt": old_proof["output_receipt"],
+            "expected_reference_receipt": reference_receipt,
+            "underlying_data_method": old_proof.get("underlying_data_method", "provider_kbars"),
+            "raw_tick_sources": old_proof.get("raw_tick_sources", []),
+            "contract_resolution": old_proof.get("contract_resolution", "archived_contract"),
+            "historical_unit_reference": old_proof.get("historical_unit_reference"),
             "zero_placeholder_rows_dropped": 0,
             "negative_correction_rows_dropped": 0,
             "out_of_session_rows_dropped": 0,
@@ -1134,7 +1351,6 @@ def restore_extended_tail_from_archived_manifest(
             .isoformat(),
         },
     )
-    return True
 
 
 def _write_run_summary(
@@ -1183,6 +1399,12 @@ def _write_run_summary(
             "storage_frequency": STORAGE_FREQUENCY,
             "start_date": str(args.start_date),
             "end_date": str(args.end_date),
+            "official_calendar_root": str(
+                getattr(args, "resolved_calendar_root", "")
+            ),
+            "official_calendar_sha256": str(
+                getattr(args, "official_calendar_sha256", "")
+            ),
             "chunk_days": int(args.chunk_days),
             "simulation": bool(args.simulation),
             "workers": int(args.workers),
@@ -1320,12 +1542,17 @@ def _download_symbol(
 ) -> SymbolResult:
     completed = 0
     try:
+        official_raw = getattr(args, "official_session_dates", None)
+        official_dates = set(official_raw) if official_raw is not None else None
         expected_all = _positive_volume_dates(row.base_path, start, end)
+        if official_dates is not None:
+            expected_all &= official_dates
         provisional_all = provisional_publication_tail_dates(
             row.base_path,
             start=start,
             end=end,
             expected_dates=expected_all,
+            official_dates=official_dates,
         )
         sealed_result = completed_symbol_manifest_result(
             args.output_dir,
@@ -1366,6 +1593,9 @@ def _download_symbol(
             contract, unit, contract_message = contract_for_stock_symbol(
                 api, row, contracts_by_code
             )
+            historical_unit = getattr(args, "historical_stock_units", {}).get(row.symbol)
+            if contract_message == "stock_contract_not_found" and historical_unit is not None:
+                contract, unit, contract_message = historical_stock_identity(row, historical_unit)
         if query_candidate_dates and contract is None:
             restored = restore_extended_tail_from_archived_manifest(
                 args.output_dir,
@@ -1375,6 +1605,7 @@ def _download_symbol(
                 requested_end=end,
                 simulation=bool(args.simulation),
                 expected_dates=expected_all,
+                official_dates=official_dates,
             )
             if restored:
                 _emit_worker_log(
@@ -1455,7 +1686,12 @@ def _download_symbol(
                     expected_dates=expected_dates,
                     provisional_dates=provisional_dates,
                     request_started=acquire_request_slot,
+                    tick_fallback_root=(args.output_dir / "raw_tick_recovery"
+                                        if getattr(args, "fallback_missing_kbars_to_ticks", False) else None),
+                    max_traffic_fraction=float(args.max_traffic_fraction),
                 )
+                if contract_message == "explicit_public_historical_identity_read_only_v1":
+                    validate_historical_unit_amount(frame, unit)
             else:
                 # The public point-in-time panel is the universe and coverage
                 # reference. With no positive-volume session, this chunk cannot
@@ -1500,6 +1736,14 @@ def _download_symbol(
                     "market": row.market,
                     "security_type": row.security_type,
                     "contract_unit": unit,
+                    "contract_resolution": contract_message or "current_contract_directory",
+                    "historical_unit_reference": (
+                        {"unit_source": "explicit_independently_verified_board_unit",
+                         "public_history_path": str(row.base_path.resolve()),
+                         "public_history_sha256": _sha256(row.base_path)}
+                        if contract_message == "explicit_public_historical_identity_read_only_v1"
+                        else None
+                    ),
                     "start_date": chunk_start.isoformat(),
                     "end_date": chunk_end.isoformat(),
                     "status": receipt_status,
@@ -1535,6 +1779,9 @@ def _download_symbol(
                     "single_day_fallback_queries": int(
                         query_audit.get("single_day_fallback_queries", 0)
                     ),
+                    "tick_fallback_queries": int(query_audit.get("tick_fallback_queries", 0)),
+                    "underlying_data_method": query_audit.get("underlying_data_method", "provider_kbars"),
+                    "raw_tick_sources": query_audit.get("raw_tick_sources", []),
                     "source_gap_dates": source_gap_dates,
                     "audit": audit,
                     "output_receipt": output_receipt,
@@ -1738,11 +1985,26 @@ def main() -> None:
         all_symbols=bool(args.all_symbols),
         max_symbols=int(args.max_symbols),
     )
+    args.historical_stock_units = historical_stock_units(args.historical_stock_unit, selected)
+    from downloader.download_tw_public_data import _validated_taiex_session_dates
+
+    calendar_root = args.calendar_root or args.base_stock_root.parent
+    official_sessions, calendar_sha256 = _validated_taiex_session_dates(
+        calendar_root,
+        start,
+        end,
+    )
+    if not official_sessions:
+        raise RuntimeError("receipt-backed official calendar has no selected sessions")
+    args.resolved_calendar_root = str(calendar_root.resolve())
+    args.official_calendar_sha256 = calendar_sha256
+    args.official_session_dates = frozenset(official_sessions)
     chunks = list(iter_date_chunks(start, end, int(args.chunk_days)))
     if args.dry_run:
         api_query_chunks = 0
         for row in selected:
             expected_dates = _positive_volume_dates(row.base_path, start, end)
+            expected_dates &= set(args.official_session_dates)
             api_query_chunks += len(
                 {
                     (value - start).days // int(args.chunk_days)
@@ -1922,6 +2184,9 @@ def main() -> None:
 
     deduplicated = {int(symbol_index): result for symbol_index, result in result_items}
     results = [deduplicated[index] for index in sorted(deduplicated)]
+    failed_symbols = [row.symbol for row in results if row.status == "failed"]
+    if failed_symbols and not fatal_error:
+        fatal_error = f"symbol downloads failed: count={len(failed_symbols)} sample={failed_symbols[:10]}"
     traffic = traffic_guard.last_usage()
     counter_snapshot = counters.snapshot()
     rate_snapshot = limiter.snapshot()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,6 +12,28 @@ from scripts import promote_tw_day_trade_replay as promotion
 
 
 MARKETS = {"mode_a", "mode_b", "mode_c"}
+
+
+def test_drain_runs_after_validation_and_changed_benchmark_blocks_exchange(tmp_path, monkeypatch):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "state.json").write_text('{"modes": {}}')
+    stages = []
+    def validate(*args, **kwargs):
+        stages.append("validated")
+        return {"promotion_input_hashes": promotion._promotion_input_hashes(candidate)}
+    def drain():
+        assert stages == ["validated"]
+        stages.append("drained")
+        (candidate / "benchmark_history.json").write_text('{"changed": true}')
+    monkeypatch.setattr(promotion, "_validate_rebuild", validate)
+    monkeypatch.setattr(promotion, "_exchange_directories", lambda *args: stages.append("exchanged"))
+    monkeypatch.setattr(sys, "argv", ["promote", "--live-dir", str(live), "--candidate-dir", str(candidate),
+                                    "--expected-market", "mode_a"])
+    with pytest.raises(RuntimeError, match="history changed after validation"):
+        promotion.main(before_exchange=drain)
+    assert stages == ["validated", "drained"]
 
 
 def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:
@@ -116,6 +139,94 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
         result["minute_curve_validation"]["unverified_historical_interior_rows"]
         == 0
     )
+
+
+def test_carry_promotion_is_explicit_and_requires_full_independent_audit(tmp_path, monkeypatch):
+    from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+    from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE
+    candidate = _candidate(tmp_path)
+    state_path, receipt_path = candidate / "state.json", candidate / "rebuild_receipt.json"
+    state, receipt = json.loads(state_path.read_text()), json.loads(receipt_path.read_text())
+    for mode in state["modes"].values():
+        mode.update(margin_carry_contract=MARGIN_CARRY_CONTRACT, odd_lot_execution_policy=ODD_LOT_BOARD_PRICE)
+        mode["positions"]["2330"]["signed_shares"] = 750
+    for row in receipt["sessions"][0]["modes"]:
+        row["after_close"]["open_position_rows"] = 1
+    receipt["sessions"][0]["close"]["status"] = "assumed_margin_inventory_carried"
+    receipt["replay_contract"] = {"residual": MARGIN_CARRY_CONTRACT, "odd_lot_execution_policy": ODD_LOT_BOARD_PRICE}
+    state_path.write_text(json.dumps(state)); receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="not flat"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+    monkeypatch.setattr("scripts.audit_tw_day_trade_margin_replay.audit",
+                        lambda *_: {"full_requested_range_passed": False, "errors": ["missing source"]})
+    with pytest.raises(RuntimeError, match="full source/accounting audit failed"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS, allow_margin_carry=True)
+    monkeypatch.setattr("scripts.audit_tw_day_trade_margin_replay.audit",
+                        lambda *_: {"full_requested_range_passed": True})
+    with pytest.raises(RuntimeError, match="requires independent minute valuation parity"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS, allow_margin_carry=True)
+    minute_path = candidate / "minute_curve_receipt.json"
+    minute = json.loads(minute_path.read_text())
+    fills = candidate / "fills.jsonl"
+    fills.touch()
+    minute.update(carried_inventory_revalued_from_unchanged_executions=True,
+                  independent_carried_valuation_parity_required=True,
+                  independent_carried_valuation_parity_passed=True,
+                  unchanged_fills_sha256=promotion._sha256(fills))
+    minute["strategy"].update(differing_original_equity_points=1,
+                              maximum_original_equity_difference_twd=500)
+    minute_path.write_text(json.dumps(minute))
+    with pytest.raises(RuntimeError, match="requires independent minute valuation parity"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS, allow_margin_carry=True)
+    minute["strategy"].update(differing_original_equity_points=0,
+                              maximum_original_equity_difference_twd=0.0)
+    minute_path.write_text(json.dumps(minute))
+    with pytest.raises(RuntimeError, match="benchmark minute coverage failed"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS, allow_margin_carry=True)
+    benchmark = candidate / "benchmark_history.json"
+    rows = []
+    for key, clock, count in (("benchmark_0050", "09:00", 271), ("benchmark_2330", "09:00", 271),
+                              ("benchmark_tx_continuous", "08:45", 300)):
+        start = datetime.fromisoformat(f"2026-08-13T{clock}:00+08:00")
+        rows.extend(dict(benchmark_id=key, session_date="2026-08-13",
+                         minute=(start + timedelta(minutes=i)).isoformat(timespec="minutes")) for i in range(count))
+    benchmark.write_text(json.dumps({"marks": rows}))
+    minute["outputs"]["benchmark_history"]["sha256"] = promotion._sha256(benchmark)
+    minute_path.write_text(json.dumps(minute))
+    accepted = promotion._validate_rebuild(candidate, expected_markets=MARKETS, allow_margin_carry=True)
+    assert accepted["final_open_positions"] == dict.fromkeys(MARKETS, 1)
+    assert accepted["margin_carry_audit"]["full_requested_range_passed"]
+    assert accepted["benchmark_minute_validation"]["rows"]["benchmark_0050"] == 271
+    # Same row count and endpoints are not proof of the interior minute grid.
+    rows[1]["minute"] = "2026-08-13T09:01:30+08:00"
+    benchmark.write_text(json.dumps({"marks": rows}))
+    with pytest.raises(RuntimeError, match="exact one-minute grid"):
+        promotion._validate_benchmarks(candidate, completed_session_dates=["2026-08-13"])
+
+
+@pytest.mark.parametrize("volume,passed", [(0., True), (1., False), (float("nan"), False)])
+def test_unfilled_open_requires_receipted_absent_or_zero_volume_minute(tmp_path, volume, passed):
+    import polars as pl
+    from downloader.download_shioaji_tw_minute_kbars import RECEIPT_SCHEMA_VERSION, SOURCE_NAME, STORAGE_FREQUENCY
+    path = tmp_path / "minute_chunks/2330/2026-08-13_2026-08-13.parquet"
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({"date": [datetime(2026, 8, 13).date()]*2,
+                  "ts": [datetime(2026, 8, 13, 9, 1), datetime(2026, 8, 13, 9, 3)],
+                  "Close": [100., 101.], "Volume": [volume, 1.]}).write_parquet(path)
+    proof = dict(schema_version=RECEIPT_SCHEMA_VERSION, source=SOURCE_NAME, storage_frequency=STORAGE_FREQUENCY,
+                 symbol="2330", start_date="2026-08-13", end_date="2026-08-13", status="ok", rows=2,
+                 returned_dates=["2026-08-13"], output_receipt=dict(path=str(path), size=path.stat().st_size,
+                     sha256=promotion._sha256(path)))
+    (tmp_path / "minute_curve_receipt.json").write_text(json.dumps({"local_minute_sources": [{"root": str(tmp_path)}]}))
+    pairs = {("2330", "2026-08-13")}
+    with pytest.raises(RuntimeError, match="missing=1"):
+        promotion._verify_absent_0901_prices(tmp_path, pairs)
+    path.with_suffix(".receipt.json").write_text(json.dumps(proof))
+    if passed:
+        assert promotion._verify_absent_0901_prices(tmp_path, pairs)["receipt_verified_absent_price_pairs"] == 1
+    else:
+        with pytest.raises(RuntimeError, match="positive_volume=1"):
+            promotion._verify_absent_0901_prices(tmp_path, pairs)
 
 
 def test_opening_revaluation_requires_unchanged_fills_and_sourced_opening(tmp_path: Path) -> None:
@@ -275,6 +386,9 @@ def test_validate_rebuild_accepts_0900_open_0901_kbar_close_contract(
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     common = {
         "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "minute_kbar_volume_lots": 2.0,
+        "sizing_nav_twd": 10_000_000.0,
+        "filled_weight_basis": "session_start_account_nav",
         "entry_price_offset_ticks": 0,
         "counterfactual_0901_price_fill": True,
         "counterfactual_open_price_fill": False,

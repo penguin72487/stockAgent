@@ -10,7 +10,8 @@ import time
 import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -1782,9 +1783,9 @@ def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date:
         encoding="utf-8",
     )
     (output_dir / "discord_message.md").write_text(result.message, encoding="utf-8")
-    pl.DataFrame(result.weights_rows).write_parquet(output_dir / "target_weights.parquet")
-    pl.DataFrame(result.rebalance_rows).write_parquet(output_dir / "rebalance.parquet")
-    pl.DataFrame(result.decision_rows).write_parquet(output_dir / "decision_explanations.parquet")
+    pl.DataFrame(result.weights_rows, infer_schema_length=None).write_parquet(output_dir / "target_weights.parquet")
+    pl.DataFrame(result.rebalance_rows, infer_schema_length=None).write_parquet(output_dir / "rebalance.parquet")
+    pl.DataFrame(result.decision_rows, infer_schema_length=None).write_parquet(output_dir / "decision_explanations.parquet")
     _write_text_artifacts(result, output_dir)
     return str(output_dir)
 
@@ -1803,9 +1804,12 @@ def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> s
     path.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(path / "summary.json", result.summary)
     (path / "discord_message.md").write_text(result.message, encoding="utf-8")
-    pl.DataFrame(result.weights_rows).write_parquet(path / "target_weights.parquet")
-    pl.DataFrame(result.rebalance_rows).write_parquet(path / "rebalance.parquet")
-    pl.DataFrame(result.decision_rows).write_parquet(path / "decision_explanations.parquet")
+    # Optional prices/explanation fields can be null throughout the first 100
+    # rows. Infer over the complete bounded universe, not a sampled prefix;
+    # strict typing still rejects incompatible values rather than dropping them.
+    pl.DataFrame(result.weights_rows, infer_schema_length=None).write_parquet(path / "target_weights.parquet")
+    pl.DataFrame(result.rebalance_rows, infer_schema_length=None).write_parquet(path / "rebalance.parquet")
+    pl.DataFrame(result.decision_rows, infer_schema_length=None).write_parquet(path / "decision_explanations.parquet")
     _write_text_artifacts(result, path)
     return str(path)
 
@@ -2179,6 +2183,66 @@ def _day_trade_live_model_window(
     gap[~np.isfinite(gap) | (np.abs(gap) > 0.5)] = 0.0
     window[-1, :, gap_idx] = gap
     return window, feature_cutoff, decision_time, True, observed_open
+
+
+@lru_cache(maxsize=16)
+def _cached_session_day_trade_rules(
+    rule_root: str,
+    parquet_root: str,
+    symbols: tuple[str, ...],
+    session_date: str,
+    source_identity: tuple[tuple[int, int, int], ...],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    # File identity is part of the key: source acceptance/replacement must
+    # invalidate the hot cache. Failures are never cached by lru_cache.
+    from stockagent.live.tw_day_trade_simulation import load_live_eligibility
+
+    rules, coverage = load_live_eligibility(
+        rule_data_dir=Path(rule_root), parquet_root=Path(parquet_root),
+        symbols=symbols, trading_date=date.fromisoformat(session_date),
+        require_latest=False,
+    )
+    if not all(bool(item.get("covered")) for item in coverage.values()):
+        raise RuntimeError(f"exact-session model eligibility unavailable: {coverage}")
+    eligible = np.asarray([rules[s].covered and rules[s].eligible for s in symbols], dtype=bool)
+    short = np.asarray([rules[s].short_open for s in symbols], dtype=bool)
+    return eligible, short, {"source": "official_exact_session", "coverage": coverage}
+
+
+def _day_trade_model_eligibility(
+    panel: PanelData, *, session_date: str, parquet_root: str | Path,
+    rule_data_dir: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Match training's policy universe, never a future fill-availability mask.
+
+    Completed-session inference uses that session, not tomorrow's eligibility.
+    Historical replay may use the exact dated panel row. Opening inference
+    loads the accepted same-session rules because its feature panel ends at t-1.
+    Observed opening prices/limits/depth remain separate executor constraints.
+    """
+    idx = _find_panel_date_index(panel, session_date)
+    if idx is not None and panel.day_trade_eligible_mask is not None:
+        eligible = np.asarray(panel.day_trade_eligible_mask[idx], dtype=bool).copy()
+        # A directional panel mask may also encode realized open/close limits.
+        # It is executor-only and MUST NOT change cross-stock model attention.
+        short = (
+            np.asarray(panel.day_trade_can_sell_open_mask[idx], dtype=bool).copy()
+            if panel.day_trade_can_sell_open_mask is not None else eligible.copy()
+        )
+        return eligible, short, {"source": "exact_session_panel", "session_date": session_date}
+    from stockagent.live.tw_day_trade_simulation import resolve_day_trade_rule_data_dir
+
+    root = resolve_day_trade_rule_data_dir(
+        rule_data_dir, parquet_root=Path(parquet_root), repo_root=Path(__file__).resolve().parents[2],
+    )
+    paths = [root / f"{v}_day_trade_eligibility.parquet" for v in ("twse", "tpex")]
+    paths.append(Path(parquet_root) / "symbols.csv")
+    identity = tuple((s.st_ino, s.st_size, s.st_mtime_ns) for p in paths for s in [p.stat()])
+    eligible, short, proof = _cached_session_day_trade_rules(
+        str(root.resolve()), str(Path(parquet_root).resolve()), tuple(panel.symbols),
+        str(session_date)[:10], identity,
+    )
+    return eligible.copy(), short.copy(), dict(proof)
 
 
 def _day_trade_same_session_quote_observed_mask(
@@ -2983,6 +3047,7 @@ def generate_live_signal(
     progress_label: str | None = None,
     include_unconstrained_raw_scores: bool = False,
     day_trade_model_observation: str = "session_open",
+    day_trade_rule_data_dir: str | Path | None = None,
     tw_latest_quote_cache_seconds: float = 0.0,
     tw_latest_quote_force_refresh: bool = False,
     _panel_override: PanelData | None = None,
@@ -3464,13 +3529,18 @@ def generate_live_signal(
         else np.zeros_like(mask_np, dtype=bool),
         dtype=bool,
     )
-    if execution_mode == "tw_day_trade" and day_trade_live_session:
-        mask_np = (
-            np.asarray(panel.alive_mask[panel_idx], dtype=bool)
-            & day_trade_observed_model_price
+    day_trade_policy_proof: dict[str, Any] | None = None
+    day_trade_short_allowed: np.ndarray | None = None
+    if execution_mode == "tw_day_trade":
+        mask_np, day_trade_short_allowed, day_trade_policy_proof = _day_trade_model_eligibility(
+            panel, session_date=panel_date_str[:10], parquet_root=config.data.parquet_root,
+            rule_data_dir=day_trade_rule_data_dir,
         )
-        can_buy_np = mask_np.copy()
-        can_sell_np = mask_np.copy()
+    if execution_mode == "tw_day_trade" and day_trade_live_session:
+        # Match the training policy mask BEFORE cross-stock attention/L1.
+        # Missing prints block execution, not redistribute the model's risk.
+        can_buy_np = mask_np & day_trade_observed_model_price
+        can_sell_np = mask_np & day_trade_observed_model_price
         constraint_prices = (
             np.asarray(price_snapshot.open_prices, dtype=np.float64)
             if normalized_day_trade_observation == "session_open"
@@ -3495,7 +3565,7 @@ def generate_live_signal(
             np.isfinite(lower_np)
             & np.isclose(constraint_prices, lower_np, rtol=0.0, atol=1e-8)
         )
-        can_short_open_np = can_sell_np.copy()
+        can_short_open_np = can_sell_np & day_trade_short_allowed
         force_short_cover_np = np.zeros_like(mask_np)
         force_exit_np = np.zeros_like(mask_np)
     execution_constraints_complete = True
@@ -3544,7 +3614,11 @@ def generate_live_signal(
         if execution_preview_only:
             target_weights = model_weights.copy()
             if execution_mode == "tw_day_trade":
-                if day_trade_live_session or panel.day_trade_eligible_mask is None:
+                if day_trade_live_session:
+                    target_weights[(target_weights > 0.0) & ~can_buy_np] = 0.0
+                    target_weights[(target_weights < 0.0) & ~can_short_open_np] = 0.0
+                    # Eligibility is proven; quote/depth/account/order receipts
+                    # still belong to the paper executor, not model inference.
                     execution_constraints_complete = False
                     has_limit_snapshot = bool(
                         price_snapshot.upper_limit_prices is not None
@@ -3554,12 +3628,10 @@ def generate_live_signal(
                             or np.any(np.isfinite(price_snapshot.lower_limit_prices))
                         )
                     )
-                    applied_limits = "與已取得的漲跌停限制" if has_limit_snapshot else ""
-                    missing_limits = "、完整漲跌停快照" if not has_limit_snapshot else ""
                     execution_constraints_notice = (
-                        f"盤中決策列尚未取得同日官方現股當沖資格{missing_limits}；"
-                        f"以下已套用同時點報價{applied_limits}，但保留未套用完整同日限制的模型目標，"
-                        "僅供研究，不能視為可執行委託。"
+                        "模型已於配重前套用同日當沖資格，執行目標另套用已知價格及賣先限制；"
+                        "仍須由執行器驗證成交深度與帳戶資金，訊號不是成交回報。"
+                        + ("漲跌停快照尚不完整。" if not has_limit_snapshot else "")
                     )
                 else:
                     eligible = np.asarray(
@@ -3915,6 +3987,8 @@ def generate_live_signal(
         "live_session_open_feature_applied": session_open_signal,
         "live_session_latest_quote_feature_applied": latest_quote_signal,
         "day_trade_model_observation": normalized_day_trade_observation,
+        "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1" if execution_mode == "tw_day_trade" else None,
+        "day_trade_policy_eligibility": day_trade_policy_proof,
         "weights_date": weights_timestamp,
         "trading_frequency": trading_frequency,
         "execution_mode": execution_mode,

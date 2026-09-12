@@ -345,6 +345,9 @@ class PanelData:
     # They are attached by train.py after panel-cache loading and never enter
     # model features or the ordinary panel cache.
     day_trade_minute_execution: np.ndarray | None = None
+    # Receipt-bound lazy physical FIFO sessions. Like the compressed tape,
+    # this is an executor label attached only after panel-cache loading.
+    day_trade_carry_source: Any | None = None
     # Exact logical-array hashes supplied only by an immutable panel-cache
     # generation. Synthetic or caller-mutated panels leave this unset and are
     # hashed directly by checkpoint construction.

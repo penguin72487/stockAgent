@@ -59,6 +59,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
+    dashboard_session_clock,
     warm_dashboard_session_indexes,
 )
 
@@ -917,6 +918,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 ("overnight", "tw_overnight_simulation"),
             )
         })
+        overnight_root = self.repo_root / "artifacts/live/tw_overnight_simulation"
+        self.update_hub.paths["overnight"] = (
+            *self.update_hub.paths["overnight"],
+            overnight_root / "overnight_history.json",
+            overnight_root / "overnight_signal_history.parquet",
+            overnight_root / "overnight_event_history.parquet",
+        )
 
     def server_close(self) -> None:
         self.update_hub.close()
@@ -1216,7 +1224,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # source ages.  A new signal/mark/pre-open revision still gets a new
         # key and starts a rebuild immediately; an existing timestamped,
         # verified response remains visible only during that bounded rebuild.
-        cache_prefix = f"tw-status:{normalized_date or 'latest'}:"
+        display_session = (revision.get("session_clock") or {}).get("display_session_date")
+        date_scope = normalized_date or (f"latest@{display_session}" if display_session else "latest")
+        cache_prefix = f"tw-status:{date_scope}:"
         cache_key = f"{cache_prefix}{revision_token}"
 
         def build_response() -> PreparedResponse:
@@ -1307,8 +1317,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def tw_revision(self) -> PreparedResponse:
         signature = tuple(file_signature(path) for path in self.update_hub.paths["tw"])
+        session_date = dashboard_session_clock(datetime.now(UTC)).get("display_session_date")
         return self.cached_local_json(
-            cache_key=f"tw-revision:{signature}",
+            cache_key=f"tw-revision:{signature}:{session_date}",
             ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
@@ -1346,19 +1357,31 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def overnight_revision(self) -> PreparedResponse:
         signature = tuple(file_signature(path) for path in self.update_hub.paths["overnight"])
-        return self.cached_local_json(
-            cache_key=f"overnight-revision:{signature}",
-            ttl_seconds=0.05,
-            cache_control="no-store",
-            stale_grace_seconds=0.0,
-            builder=lambda: build_dashboard_revision(
+
+        def build() -> Mapping[str, Any]:
+            payload = build_dashboard_revision(
                 state_dir=self.repo_root
                 / "artifacts/live/tw_overnight_simulation",
                 discord_service_status_path=self.repo_root
                 / "artifacts/discord_bot/service_status.json",
                 discord_markets_field="overnight_markets",
                 discord_engine_revision_field="overnight_engine_state_revision",
-            ),
+            )
+            history_revision = hashlib.sha256(
+                repr(signature[4:]).encode("utf-8")
+            ).hexdigest()[:16]
+            payload["history_revision"] = history_revision
+            payload["revision_token"] = (
+                f"{payload.get('revision_token') or 'missing'}:{history_revision}"
+            )
+            return payload
+
+        return self.cached_local_json(
+            cache_key=f"overnight-revision:{signature}",
+            ttl_seconds=0.05,
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
+            builder=build,
         )
 
     def overnight_status(self, session_date: str | None = None) -> PreparedResponse:
@@ -1391,14 +1414,43 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 "13:25 target weights temporarily reuse the day-trade checkpoint; "
                 "the model has not been trained for overnight risk"
             )
+            history_path = (
+                self.repo_root
+                / "artifacts/live/tw_overnight_simulation/overnight_history.json"
+            )
+            try:
+                history = json.loads(history_path.read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                history = {}
+            payload["historical_replay"] = {
+                key: history.get(key)
+                for key in (
+                    "status",
+                    "start_date",
+                    "end_date",
+                    "session_count",
+                    "mark_count",
+                    "signal_count",
+                    "event_count",
+                    "position_count",
+                    "generated_at",
+                    "missing_1325_count",
+                    "close_fallback_count",
+                    "valuation_stale_market_count",
+                )
+            }
+            service_sync = dict(payload.get("service_sync") or {})
+            service_sync["revision_token"] = revision_token
+            service_sync["history_revision"] = revision.get("history_revision")
+            payload["service_sync"] = service_sync
             payload["source_contract"] = {
                 "signal": "13:25 current quote and temporary day-trade model weights",
-                "replay": "13:25-13:30 and 08:30-09:00 simulated matching is indicative only",
+                "replay": "history uses prior-feature 13:25 targets, official close/open counterfactual prices, and a disclosed same-close fallback when 13:25 data are absent; it is not an exchange fill claim",
                 "entry_fill": "legal-limit LMT_ROD submitted at 13:25; fill uses the actual close auction print",
                 "fees": "ordinary cash-stock commission and ordinary stock or ETF transaction tax",
-                "comparison": "absolute equity remains ledger cumulative; selected-period percentage alone resets to zero",
+                "comparison": "history sizes each new cohort from pre-entry account equity; absolute equity remains cumulative and the selected-period percentage resets to zero",
                 "benchmarks": "this adapter has no day-trade benchmark ledger",
-                "benchmark_history": "no benchmark history is fabricated for the new product",
+                "benchmark_history": "the overnight curve contains two auction events per completed session and does not interpolate minute prices",
                 "eligibility": "buy permission and ordinary next-day short-open inventory are evaluated separately from day-trade eligibility",
                 "depth_limit": "full requested quantity is a paper-auction assumption; level-one data cannot prove queue allocation",
                 "bracket_fill": "orders use same-session legal price limits and are settled only by an actual auction print",

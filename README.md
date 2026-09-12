@@ -12,6 +12,7 @@
 - [第一性架構](#第一性架構)
 - [五分鐘開始](#五分鐘開始)
 - [資料冷庫與多機同步](#資料冷庫與多機同步)
+- [penguin 冷庫 D 槽備份](#penguin-冷庫-d-槽備份)
 - [資料冷庫完整指令](#資料冷庫完整指令)
 - [發布新資料](#發布新資料)
 - [Syncthing 驗收](#syncthing-驗收)
@@ -36,7 +37,7 @@ configs、Git refs 與 systemd 產生 AI 可讀清單的唯讀命令。
 2. Syncthing 的主要固定成本之一是路徑與小檔索引；只做 hard link 去重不會減少路徑數。
 3. 單一巨型壓縮檔雖然路徑少，但改一個檔案就可能重傳整包，損毀半徑也最大。
 4. 訓練需要可直接隨機讀取的目錄；傳輸層則需要少量、可驗證、可增量重用的大物件。
-5. 多台機器可以發布，但較晚的時鐘不能讓較舊資料覆蓋較新資料。
+5. penguin 是目前唯一資料權威；來源產生者可不同，但較晚的時鐘不能讓舊資料覆蓋新資料。
 
 因此資料生命週期固定為：
 
@@ -64,8 +65,10 @@ canonical 可讀資料
 - 接收節點預設只保留冷庫，沒有任何 timer、cron 或 service 自動執行 `fetch`、`use` 或
   materialize。解封只能是使用者明確要求的本機動作。
 - 冷庫 release 不可變。各節點使用永久名稱，例如 `penguin`、`lab203`、`vastai1T`。
-- 多寫者保留各自 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
+- 儲存格式仍保留各產生者的 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
   不舊於現有 release，否則 fail closed。
+- penguin 已接收的冷庫是 D 槽備份唯一來源。D 槽保持冷儲存，不加入 Syncthing、
+  不自動解封，也不跟著來源刪除；詳見下方備份指令。
 - 小檔依固定路徑 hash 分桶；大型或已壓縮檔使用 content-addressed blob。未變內容直接
   重用，所以增量發布只產生並傳送真正改變的物件。
 - `use` 只有在 manifest、inventory、pack/blob 與 materialized 檔案驗證成功後才切換
@@ -236,6 +239,43 @@ stockagent-data \
   --materialized-root /mnt/hot/stockagent-materialized \
   status --human
 ```
+
+## penguin 冷庫 D 槽備份
+
+權威冷庫 `/srv/stockagent-packed` 位於 C 槽 WSL 磁碟；獨立副本存放於
+`D:\stockagent-backup\packed`（WSL：`/mnt/d/stockagent-backup/packed`）。
+備份服務監看新物件並自動增量複製，30 秒週期補查漏掉的事件；不解壓、不連動刪除。
+完整操作、還原與驗收見 [冷庫備份 Runbook](docs/packed_cold_backup.md)。
+
+```bash
+# 日常：查看實際驗證進度；active 不等於首次備份完成
+./scripts/run_packed_backup.sh status
+systemctl status stockagent-packed-backup.service --no-pager
+journalctl -u stockagent-packed-backup.service -n 10 --no-pager
+
+# 唯讀盤點，不複製或刪除
+./scripts/run_packed_backup.sh plan
+
+# 首次部署：核對 config、D 槽 UUID／容量後才執行
+./scripts/run_packed_backup.sh init
+./scripts/run_packed_backup.sh install-service
+
+# 暫停／繼續；不會移除已備份資料
+sudo systemctl stop stockagent-packed-backup.service
+sudo systemctl start stockagent-packed-backup.service
+
+# 手動補齊或全量 checksum 複查：先停服務，避免重複工作
+sudo systemctl stop stockagent-packed-backup.service
+./scripts/run_packed_backup.sh once
+# 下列指令重讀 C 現存物件及其 D 副本，可能耗時數小時
+./scripts/run_packed_backup.sh once --verify-existing
+sudo systemctl start stockagent-packed-backup.service
+```
+
+`state=up_to_date`、`remaining_bytes=0`、`pending_objects=0`、`pending_heads=0`、
+`pending_releases=0`、`error_count=0` 才表示該次盤點全部完成。
+`last_complete_at` 是上次完整完成時間，不代表目前沒有新的待備份資料。
+只有一台主機內兩顆磁碟，仍不能防整機損壞、失竊或勒索軟體；不是離線／異地備份。
 
 ## 資料冷庫完整指令
 
