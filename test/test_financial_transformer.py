@@ -293,6 +293,57 @@ def test_causal_feature_rms_fit_uses_only_training_window_rows(tmp_path) -> None
     assert metadata["active_feature_count"] == 2
 
 
+def test_causal_feature_units_do_not_change_cash_actions_or_parameter_gradients() -> None:
+    """A change of units must not change the learned capital allocation.
+
+    Row RMSNorm alone lacks this invariance. Exercise the production multi-basis
+    model and its cash-preserving projection, including the upstream Jacobian
+    through which the whole-contract surrogate trains the score head.
+    """
+    options = dict(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        portfolio_output_mode="projection_l1",
+        projection_l1_scale_by_active_count=True,
+        center_long_short_logits=False,
+        causal_feature_rms_normalization=True,
+        return_aux=False,
+        return_aux_details=False,
+    )
+    first = _make_model(**options).cpu().eval()
+    rescaled = _make_model(**options).cpu().eval()
+    units = torch.logspace(-3, 3, 10)
+    active = torch.ones(10, dtype=torch.bool)
+    active[3] = False
+    first.set_causal_feature_rms_normalizer(torch.ones(10), active)
+    rescaled.set_causal_feature_rms_normalizer(units, active)
+    x = torch.randn(2, 8, 7, 10)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    mask[1, -2:] = False
+    upstream = torch.randn(2, 7)
+    outputs = []
+    for model, inputs in ((first, x), (rescaled, x * units)):
+        w = model(inputs, mask)
+        (w * upstream).sum().backward()
+        outputs.append(w)
+        assert (w.abs().sum(-1) <= 1 + 1e-6).all()
+        assert not w[~mask].any()
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=2e-5, atol=2e-6)
+    nonzero = 0
+    for (name, a), (other_name, b) in zip(first.named_parameters(), rescaled.named_parameters()):
+        assert name == other_name
+        if a.grad is None:
+            assert b.grad is None
+            continue
+        torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-6)
+        nonzero += int(bool(a.grad.count_nonzero()))
+    assert nonzero > 0
+
+
 def test_financial_transformer_decomposes_each_raw_feature_before_positions() -> None:
     device = _device()
     model = _make_model(

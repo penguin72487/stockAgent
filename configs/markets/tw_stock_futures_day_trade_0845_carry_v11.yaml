@@ -1,0 +1,10 @@
+base_config: tw_stock_futures_day_trade_0845_carry_v10.yaml
+experiment_name: tw-stock-futures-0845-carry-quarantine-hold-v11
+
+trading:
+  tw_stock_futures_day_trade_quarantined_carry_policy: hold_official_settlement
+  tw_stock_futures_day_trade_corporate_transition_path: artifacts/data_preparation/futures_corporate_transitions_v3_20260910/manifest.json
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_0845_carry_v11_vast5090
+  resume: true

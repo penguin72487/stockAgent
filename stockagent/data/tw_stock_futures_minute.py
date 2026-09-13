@@ -76,10 +76,13 @@ def validate_futures_minute_data(
     path: str | Path, *, daily_sha256: str, dates: np.ndarray | None = None,
     daily_proxy_before: str | None = None,
     participation: float | None = None,
+    capacity_rounding: str = "floor",
     quarantine_dates: tuple[str, ...] | list[str] = (),
     quarantine_contract_days: tuple[dict, ...] | list[dict] = (),
 ) -> tuple[pl.DataFrame, dict]:
     """Validate source facts without allocating a dense execution tensor."""
+    if capacity_rounding not in {"floor", "ceil"}:
+        raise ValueError("futures minute capacity rounding must be floor or ceil")
     path = Path(path)
     manifest_path = path.parent / "manifest.json"
     if not path.is_file() or not manifest_path.is_file():
@@ -115,6 +118,10 @@ def validate_futures_minute_data(
             raise ValueError("duplicate historical contract-day evidence")
         no_trade = coverage.filter(pl.col('status') == NO_TRADE)
         no_capacity = coverage.filter(pl.col('status') == NO_CAPACITY)
+        # A slice replay needs participation proofs only for its requested
+        # dates. Full preflight passes dates=None and still checks all history.
+        if dates is not None:
+            no_capacity = no_capacity.filter(pl.col('date').cast(pl.String).is_in(list(map(str, dates))))
         if set(receipt.get('quarantined_dates', [])) != set(quarantine_dates):
             raise ValueError('explicit quarantine dates differ from prepared source contract')
         unresolved = validate_contract_day_quarantine(coverage, contract_days, accepted=ACCEPTED)
@@ -148,6 +155,13 @@ def validate_futures_minute_data(
             if no_capacity.height:
                 if participation is None or not 0 < participation <= 1:
                     raise ValueError('integer-capacity proof requires actual execution participation')
+                if capacity_rounding == "ceil":
+                    keys = [(str(d), c) for d, c in no_capacity.select('date', 'physical_contract').iter_rows()]
+                    raise ValueError(
+                        f"ceil minute capacity invalidates {len(keys)} floor-only zero integer capacity proofs: "
+                        f"{keys[:10]}; supply verified one-minute bars for these contract-days; "
+                        "positive daily volume cannot prove zero minute capacity under ceil"
+                    )
                 zero_capacity = official.filter((pl.col('outright_volume') > 0)
                     & (pl.col('outright_volume') * participation < 1)
                     & (pl.col('official_day_sources') != '[]')).select('date','physical_contract')
@@ -270,13 +284,10 @@ def preflight_futures_minute_training(config, *, config_path: str | Path) -> dic
         "--output-dir", str(Path(source) / MINUTE_DATASET),
     ])
     daily_cutoff = config.trading.tw_stock_futures_day_trade_daily_proxy_before
-    if daily_cutoff is not None:
-        command = shlex.join([
-            "run_fintech_python", "scripts/build_tw_stock_futures_0900_entries.py", "--config", str(config_path),
-            "--shioaji-ticks-root", str(Path(source) / "shioaji_history"),
-            "--daily-proxy-before", daily_cutoff,
-        ])
     try:
+        if config.trading.tw_stock_futures_day_trade_corporate_transition_path:
+            from stockagent.data.tw_stock_futures_transition import load_transition_bundle
+            load_transition_bundle(config.trading.tw_stock_futures_day_trade_corporate_transition_path)
         missing = [str(p) for p in (daily, manifest, minute, minute.with_name("manifest.json"))
                    if not p.is_file()]
         if missing:
@@ -290,6 +301,7 @@ def preflight_futures_minute_training(config, *, config_path: str | Path) -> dic
             minute, daily_sha256=digest,
             daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
             participation=config.trading.max_volume_participation,
+            capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
             quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
             quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
         )
@@ -303,14 +315,31 @@ def preflight_futures_minute_training(config, *, config_path: str | Path) -> dic
                 f"in the configured first panel year {first_year}; "
                 "a complete recent-date build cannot satisfy this walk-forward config"
             )
+        if config.trading.tw_stock_futures_day_trade_residual_policy == "carry":
+            from stockagent.data.tw_stock_futures_carry import load_final_settlements, load_carry_corporate_actions
+            if not config.trading.tw_stock_futures_day_trade_corporate_action_path:
+                raise ValueError('carry requires the audited corporate-action source in carry_v9; old optimizers cannot resume')
+            events = load_carry_corporate_actions(config.trading.tw_stock_futures_day_trade_corporate_action_path)
+            settlements = load_final_settlements(config.trading.tw_futures_portfolio_final_settlement_path)
+            receipt = dict(receipt, residual_policy="carry", official_final_settlement_rows=settlements.height,
+                           corporate_action_events=events.height,
+                           carry_coverage_scope="selected_minutes_verified; held_physical_continuation_checked_by_ledger")
+            if config.trading.tw_stock_futures_day_trade_carry_evidence_path:
+                from stockagent.data.tw_stock_futures_carry import load_carry_no_trade_evidence, load_carry_daily_settlements
+                proof = load_carry_no_trade_evidence(config.trading.tw_stock_futures_day_trade_carry_evidence_path)
+                receipt['carry_proven_zero_outright_contract_days'] = proof.height
+                marks = load_carry_daily_settlements(config.trading.tw_stock_futures_day_trade_carry_evidence_path)
+                receipt['carry_official_daily_settlement_rows'] = marks.height
         return receipt
     except (OSError, ValueError) as exc:
         if daily_cutoff is not None:
             raise ValueError(
                 f"[futures-minute preflight] {exc}\n"
                 f"Historical daily OPEN/CLOSE approximation is authorized only before {daily_cutoff}.\n"
-                f"Prepare verified continuous ticks with:\n  source scripts/runtime_env.sh\n  {command}\n"
-                "Inspect coverage.parquet and gaps.parquet. Unresolved later observations block full-history training."
+                "Supply verified one-minute futures KBars for unresolved contract-days, then rebuild a new "
+                "receipt-backed minute snapshot. No tick download is required.\n"
+                "Inspect coverage.parquet and gaps.parquet; capacity-rounding proof failures are listed above. "
+                "Unresolved later observations block full-history training."
             ) from exc
         raise ValueError(
             f"[futures-minute preflight] {exc}\n"
@@ -330,6 +359,7 @@ def load_futures_minute_tape(
     path: str | Path, selected: pl.DataFrame, dates: np.ndarray,
     symbols: tuple[str, ...], *, daily_sha256: str, fee: float,
     participation: float,
+    capacity_rounding: str = "floor",
     daily_proxy_before: str | None = None,
     quarantine_dates: tuple[str, ...] | list[str] = (),
     quarantine_contract_days: tuple[dict, ...] | list[dict] = (),
@@ -343,6 +373,7 @@ def load_futures_minute_tape(
         raise ValueError("participation must be in (0,1]")
     frame, receipt = validate_futures_minute_data(path, daily_sha256=daily_sha256, dates=dates,
                                                 daily_proxy_before=daily_proxy_before, participation=participation,
+                                                capacity_rounding=capacity_rounding,
                                                 quarantine_dates=quarantine_dates,
                                                 quarantine_contract_days=quarantine_contract_days)
     selected = exclude_contract_days(selected, quarantine_contract_days)
@@ -380,6 +411,7 @@ def load_futures_minute_tape(
             tape[d, s, row["candidate_slot"], :3] = (
                 row["contract_multiplier"], fee, stock_index_futures_tax_rate(row["date"])
             )
+    round_capacity = np.ceil if capacity_rounding == "ceil" else np.floor
     aligned = frame.join(keys, on=["date", "physical_contract"], how="inner", validate="m:1")
     for row in aligned.iter_rows(named=True):
         d, s = di.get(str(row["date"])), si.get(row["underlying_symbol"])
@@ -388,7 +420,7 @@ def load_futures_minute_tape(
         offset = 3 + ei[row["minute"]] * len(BAR_FIELDS)
         tape[d, s, row["candidate_slot"], offset:offset + 5] = (
             row["vwap"], row["high"], row["low"], row["close"],
-            np.floor(row["volume"] * participation),
+            round_capacity(row["volume"] * participation),
         )
     if daily_keys:
         for row in selected.iter_rows(named=True):

@@ -139,6 +139,7 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
                 if key in records:
                     raise ValueError(f'duplicate official contract-day: {key}')
                 records[key] = dict(official_volume=volume, official_source_sha256=digest,
+                                   official_settlement=raw.get('結算價', '').strip(),
                                    **{f'official_{field}': raw[column].strip() for field, column in
                                       [('open','開盤價'),('high','最高價'),('low','最低價'),('close','收盤價')]})
         if sha256_file(path) != digest:
@@ -148,7 +149,8 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
         row = records.get((day, physical))
         spread = spreads.get((day, physical), 0)
         if row is None:
-            row = dict(official_volume=None, official_source_sha256='', **{f'official_{s}': '' for s in ['open','high','low','close']})
+            row = dict(official_volume=None, official_source_sha256='', official_settlement='',
+                       **{f'official_{s}': '' for s in ['open','high','low','close']})
             reason = 'absent_from_complete_day' if days.get(day) and not spread else 'missing_official_day'
             outright = 0 if reason == 'absent_from_complete_day' else None
         else:
@@ -171,9 +173,13 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
 
 
 class ExactMinuteRecovery:
-    def __init__(self, root: Path, official: pl.DataFrame, *, participation: float | None = None):
+    def __init__(self, root: Path, official: pl.DataFrame, *, participation: float | None = None,
+                 capacity_rounding: str = "floor"):
+        if capacity_rounding not in {"floor", "ceil"}:
+            raise ValueError('futures minute capacity rounding must be floor or ceil')
         self.root = root
         self.participation = participation
+        self.capacity_rounding = capacity_rounding
         self.official = {(r['date'], r['physical_contract']): r for r in official.to_dicts()}
         plan = json.loads((root/'repair_plan.json').read_text())
         self.chunks = {}
@@ -223,7 +229,8 @@ class ExactMinuteRecovery:
                 elif fact['outright_volume'] == 0:
                     evidence.update(status=NO_TRADE, detail='official_complete_day_and_exact_kbar_no_outright_trades',
                                     tick_volume=0, tick_rows=0)
-                elif (self.participation is not None and fact['outright_volume'] is not None
+                elif (self.capacity_rounding == 'floor'
+                      and self.participation is not None and fact['outright_volume'] is not None
                       and 0 < fact['outright_volume'] * self.participation < 1):
                     evidence.update(status=NO_CAPACITY, detail='daily_ordinary_volume_upper_bound_implies_zero_integer_capacity_at_every_minute',
                                     tick_volume=0, tick_rows=0)

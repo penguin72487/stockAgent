@@ -11,7 +11,7 @@ if (( EUID != 0 )); then
   echo "[tw-overnight-service] root privileges are required" >&2
   exit 2
 fi
-service_user="${TW_OVERNIGHT_SERVICE_USER:-$(stat -c '%U' "$repo_root")}" 
+service_user="${TW_OVERNIGHT_SERVICE_USER:-$(stat -c '%U' "$repo_root")}"
 service_group="$(id -gn "$service_user")"
 service_home="$(getent passwd "$service_user" | cut -d: -f6)"
 escape_replacement() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }

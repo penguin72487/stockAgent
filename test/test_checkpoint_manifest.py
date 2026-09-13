@@ -295,6 +295,95 @@ def test_official_daily_proxy_price_contract_cannot_resume_adverse_tick_checkpoi
             checkpoint_path=tmp_path / "legacy_adverse_tick.pt", scope="resume")
 
 
+def test_futures_minute_gradient_fix_rejects_old_optimizer_resume(tmp_path: Path) -> None:
+    config = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v2.yaml")
+    current = _checkpoint_manifest(_panel(), config)
+    old = copy.deepcopy(current)
+    contract = old["contracts"]["trading"]["taiwan_stock_futures_day_trade"]
+    assert contract["gradient_contract"] == "exact_integer_forward_executable_minute_quantity_shadow_v2"
+    contract["gradient_contract"] = "exact_integer_forward_fractional_quantity_shadow_v1"
+    old["fingerprints"]["trading"] = trainer_module._stable_fingerprint(old["contracts"]["trading"])
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": old}, current,
+            checkpoint_path=tmp_path / "old_gradient.pt", scope="resume",
+        )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": current}, current,
+        checkpoint_path=tmp_path / "new_gradient.pt", scope="resume",
+    )
+
+
+def test_futures_minute_recovery_rejects_v2_optimizer_resume(tmp_path: Path) -> None:
+    old_config = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v2.yaml")
+    new_config = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v3.yaml")
+    panel = _panel()
+    old = _checkpoint_manifest(panel, old_config)
+    new = _checkpoint_manifest(panel, new_config)
+    assert old["fingerprints"]["data"] == new["fingerprints"]["data"]
+    assert old["fingerprints"]["model"] == new["fingerprints"]["model"]
+    assert old["fingerprints"]["trading"] != new["fingerprints"]["trading"]
+    assert old["fingerprints"]["training"] != new["fingerprints"]["training"]
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": old}, new,
+            checkpoint_path=tmp_path / "gradient_v2.pt", scope="resume",
+        )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": new}, new,
+        checkpoint_path=tmp_path / "gradient_v3.pt", scope="resume",
+    )
+
+
+def test_futures_ceil_capacity_rejects_floor_resume(tmp_path: Path) -> None:
+    from dataclasses import asdict
+
+    before = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v4.yaml")
+    after = load_config("configs/markets/tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml")
+    assert after.trading.max_volume_participation == .5
+    # Epoch budgets are user-adjustable; isolate execution compatibility.
+    before.training.epochs = after.training.epochs
+    assert asdict(before.training) == asdict(after.training)
+    assert asdict(before.data) == asdict(after.data)
+    assert before.runner.output_dir != after.runner.output_dir
+    old, new = (_checkpoint_manifest(_panel(), c) for c in (before, after))
+    assert old['fingerprints']['model'] == new['fingerprints']['model']
+    assert old['fingerprints']['trading'] != new['fingerprints']['trading']
+    old_contract = old['contracts']['trading']['taiwan_stock_futures_day_trade']
+    assert 'minute_capacity_rounding' not in old_contract  # preserve historical floor ABI
+    assert new['contracts']['trading']['taiwan_stock_futures_day_trade']['minute_capacity_rounding'] == 'ceil'
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest({'experiment_manifest': old}, new,
+                                     checkpoint_path=tmp_path/'floor.pt', scope='resume')
+
+
+def test_futures_feature_conditioning_v4_rejects_v3_resume(tmp_path: Path) -> None:
+    from dataclasses import asdict
+
+    old_config = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v3.yaml")
+    new_config = load_config("configs/markets/tw_stock_futures_day_trade_0845_gradient_v4.yaml")
+    assert new_config.training.epochs == old_config.training.epochs == 1000
+    assert asdict(new_config.data) == asdict(old_config.data)
+    assert asdict(new_config.trading) == asdict(old_config.trading)
+    assert asdict(new_config.walk_forward) == asdict(old_config.walk_forward)
+    before, after = asdict(old_config.training), asdict(new_config.training)
+    before["financial_transformer"]["causal_feature_rms_normalization"] = True
+    # The config loader also derives the inactive executable-model defaults
+    # from FinancialTransformer; this experiment still selects only the latter.
+    before["executable_portfolio_transformer"]["causal_feature_rms_normalization"] = True
+    assert before == after
+    old = _checkpoint_manifest(_panel(), old_config)
+    new = _checkpoint_manifest(_panel(), new_config)
+    for domain in ("data", "trading", "training"):
+        assert old["fingerprints"][domain] == new["fingerprints"][domain]
+    assert old["fingerprints"]["model"] != new["fingerprints"]["model"]
+    with pytest.raises(RuntimeError, match="model"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": old}, new,
+            checkpoint_path=tmp_path / "gradient_v3.pt", scope="resume",
+        )
+
+
 def test_hybrid_minute_checkpoint_before_tape_hash_remains_compatible(
     tmp_path: Path,
 ) -> None:

@@ -441,6 +441,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     (HYBRID_TAPE_FIELDS if getattr(stock_futures_daily, "contract_version", 1) == 2
                      else TAPE_FIELDS) if self.execution_mode == MINUTE_MODE else 5,
                 )
+                from stockagent.data.tw_stock_futures_carry import (
+                    CARRY_TAPE_FIELDS_BY_VERSION,
+                )
+                if getattr(stock_futures_daily, "contract_version", 1) in CARRY_TAPE_FIELDS_BY_VERSION:
+                    expected_integer_shape = (panel.num_dates, panel.tradable_mask.shape[1],
+                                              stock_futures_daily.carry_metadata["lanes"], CARRY_TAPE_FIELDS_BY_VERSION[stock_futures_daily.contract_version])
                 if integer_execution is None or tuple(
                     np.asarray(integer_execution).shape
                 ) != expected_integer_shape:

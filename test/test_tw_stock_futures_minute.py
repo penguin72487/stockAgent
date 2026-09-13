@@ -1,5 +1,6 @@
 from datetime import date, datetime
 import json
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -122,6 +123,64 @@ def test_bar_boundaries_ignore_later_open_and_daily_close():
     assert set(frame["minute"].to_list()) <= set(EVENT_MINUTES)
 
 
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("rounding,quantity,alive", [("floor", 1, False), ("ceil", 2, True)])
+def test_minute_capacity_rounding_owns_entry_and_exit_without_rounding_cash(
+    tmp_path, direction, rounding, quantity, alive,
+):
+    # Three entry contracts, then one print in each of two exit minutes.
+    # Ceil permits two entries and one exit per minute; floor leaves one stuck.
+    day = date(2026, 9, 3)
+    frame = pl.DataFrame({
+        "date": [day] * 3, "physical_contract": ["CDF:202609"] * 3,
+        "minute": [526, 805, 810], "volume": [3., 1., 1.],
+        **{k: [100.] * 3 for k in ("vwap", "high", "low", "close")},
+        "source_file_sha256": ["a" * 64] * 3,
+    })
+    path = tmp_path / "minutes.parquet"
+    atomic_write_parquet(path, frame)
+    atomic_write_json(tmp_path / "manifest.json", {
+        "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
+        "status": "complete", "source_daily_sha256": "daily", "covered_dates": [str(day)],
+        "sources": [{"date": str(day), "sha256": "a" * 64,
+                     "day_session_rows": 5, "day_last_time": 134459}],
+        "outputs": {"minutes": {"sha256": sha256_file(path)}},
+    })
+    keys = pl.DataFrame({"date": [day], "physical_contract": ["CDF:202609"],
+                        "underlying_symbol": ["2330"], "candidate_slot": [0],
+                        "contract_multiplier": [2000.]})
+    x, _ = load_futures_minute_tape(
+        path, keys, np.array([str(day)], dtype="datetime64[D]"), ("2330",),
+        daily_sha256="daily", fee=40, participation=.5, capacity_rounding=rounding,
+    )
+    assert x[0, 0, 0, 7] == quantity
+    assert not x[0, 0, 0, 3 + 1 * 5:3 + 6 * 5].any()  # absent bars remain empty
+    forward_results = []
+    for training in (False, True):
+        w = torch.tensor([[direction * .49]], requires_grad=True)
+        result = execute(w, torch.from_numpy(x), recoverable_backward=training, use_compile=False)
+        assert result.contract_quantities_history.tolist() == [[[direction * quantity, 0]]]
+        assert bool(result.final_alive) == alive
+        assert result.residual_contract_quantities_history.tolist() == [[[0 if alive else direction, 0]]]
+        result.strategy_returns.sum().backward()
+        assert torch.isfinite(w.grad).all()
+        forward_results.append(result.strategy_returns.detach())
+    torch.testing.assert_close(*forward_results)
+    if alive:
+        # 2000*100*.00002 = 4 TWD tax per side, plus commission 40.
+        assert forward_results[0].item() == pytest.approx(np.log1p(-176 / 1e6), abs=1e-7)
+    small = execute(torch.tensor([[direction * 1e-4]]), torch.from_numpy(x), use_compile=False)
+    assert not small.contract_quantities_history.any() and small.final_alive
+
+
+def test_minute_capacity_rounding_config_rejects_unknown_policy(tmp_path):
+    path = tmp_path / "bad_rounding.yaml"
+    base = Path("configs/markets/tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml").resolve()
+    path.write_text(f"base_config: {base}\ntrading:\n  tw_stock_futures_day_trade_minute_capacity_rounding: nearest\n")
+    with pytest.raises(ValueError, match="capacity rounding"):
+        load_config(path)
+
+
 def test_receipt_identity_coverage_hash_and_duplicates(tmp_path):
     frame = build_futures_minute_bars(transactions())
     path = tmp_path / "minutes.parquet"
@@ -200,7 +259,8 @@ def test_canonical_training_loss_uses_scheduled_tape_and_backpropagates():
 
 
 @pytest.mark.parametrize('quarantine', [(), ('2026-09-04',)])
-def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quarantine):
+@pytest.mark.parametrize('carry', [False, True])
+def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quarantine, carry):
     from stockagent.data.panel import PanelData
     from stockagent.data.tw_stock_futures_day_trade import TaiwanStockFuturesDayTradeDaily
     from stockagent.training.dataset import CrossSectionalDataset
@@ -217,6 +277,9 @@ def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quaran
         close_prices=np.ones(shape, np.float32),
     )
     x = tape(rows=6, symbols=2).numpy()
+    if carry:
+        from stockagent.data.tw_stock_futures_carry import CARRY_CONTRACT_VERSION, CARRY_TAPE_FIELDS
+        x = np.pad(x, ((0, 0), (0, 0), (0, 0), (0, CARRY_TAPE_FIELDS - TAPE_FIELDS)))
     x[5, ..., 3:] = 0  # Known contracts, but no actual trades on the last day.
     available = ones.copy()
     available[5] = False
@@ -227,6 +290,8 @@ def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quaran
         benchmark_log_returns=np.zeros(6, np.float32), selected_rows=12, selected_underlyings=2,
         source_path="fixture", manifest_path="fixture", integer_candidate_execution=x,
         quarantined_decision_dates=quarantine,
+        contract_version=CARRY_CONTRACT_VERSION if carry else 1,
+        carry_metadata={"lanes": 2} if carry else None,
     )
     dataset = CrossSectionalDataset(panel, np.arange(6), 2, execution_mode=MINUTE_MODE)
     expected = [2, 4, 5] if quarantine else [2, 3, 4, 5]
@@ -242,7 +307,7 @@ def test_dataset_preserves_no_fill_sessions_and_prior_only_feature_window(quaran
     torch.testing.assert_close(dataset[0]["x"], before)
     windowed = dataset_to_windowed_tensors(dataset)
     assert windowed.valid_indices.tolist() == expected
-    assert windowed.overnight_log_returns.shape == (6, 2, 2, TAPE_FIELDS)
+    assert windowed.overnight_log_returns.shape == x.shape
     torch.testing.assert_close(windowed.overnight_log_returns, torch.from_numpy(x))
 
 

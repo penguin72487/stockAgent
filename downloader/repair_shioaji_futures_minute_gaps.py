@@ -12,6 +12,7 @@ from datetime import date, timedelta
 import json
 import os
 from pathlib import Path
+import re
 
 import polars as pl
 
@@ -20,18 +21,44 @@ from downloader.common import SharedRateLimiter
 from downloader.download_shioaji_historical_market_data import (
     HistoryContract, HistoryTask, _query_task, _kbar_paths, _tick_paths, _valid_receipt,
 )
-from stockagent.data.tw_stock_futures_day_trade import select_causal_front_stock_futures_candidates
 
 
 def repair_tasks(daily: pl.DataFrame, gaps: pl.DataFrame, *, method: str = 'kbars') -> list[HistoryTask]:
-    selected = select_causal_front_stock_futures_candidates(daily)
-    selected = selected.join(gaps.select('date', 'physical_contract'), on=['date', 'physical_contract'], how='semi')
-    # Query every unresolved identity, including carry rows. A carry row alone
-    # cannot prove that the official archive contains no trades.
+    """Repair requested physical identities, independent of policy eligibility.
+
+    Adjusted and older held contracts need their own observations even when
+    they are never eligible for new model orders. The official inventory owns
+    identity; the explicit gap table owns query dates. No gap may vanish in an
+    inner join with the policy's selected front contracts.
+    """
+    if method not in {'kbars', 'ticks'}:
+        raise ValueError('repair method must be kbars or ticks')
+    inventory = daily
+    if {'product', 'contract'} <= set(inventory.columns):
+        identity = pl.concat_str('product', pl.lit(':'), 'contract')
+        if ('physical_contract' in inventory.columns
+                and inventory.filter(pl.col('physical_contract').is_null()
+                                     | (pl.col('physical_contract') != identity)).height):
+            raise ValueError('official inventory physical identity mismatch')
+        inventory = inventory.with_columns(identity.alias('physical_contract'))
+    if 'physical_contract' not in inventory.columns:
+        raise ValueError('repair requires an official physical-contract inventory')
+    selected = gaps.select('date', 'physical_contract').unique().sort('date', 'physical_contract')
+    if selected.null_count().sum_horizontal().item():
+        raise ValueError('repair gap date and physical identity must not be null')
+    unknown = selected.join(inventory.select('physical_contract').unique(), on='physical_contract', how='anti')
+    if unknown.height:
+        raise ValueError(f'requested repair identities absent from official inventory: {unknown.head(10).to_dicts()}')
     tasks = []
     for (physical,), frame in selected.partition_by('physical_contract', as_dict=True).items():
+        if not re.fullmatch(r'[A-Z0-9]{3}:\d{6}', physical):
+            raise ValueError(f'invalid archived physical futures identity: {physical}')
         product, month = physical.split(':')
+        if not 1 <= int(month[4:]) <= 12:
+            raise ValueError(f'invalid physical delivery month: {physical}')
         dates = sorted(frame['date'].to_list())
+        if any(not isinstance(d, date) or not 0 <= int(month[:4]) - d.year <= 1 for d in dates):
+            raise ValueError(f'repair dates outside dated contract query range: {physical}')
         while dates:
             start = dates[0]
             included = [d for d in dates if d <= start + timedelta(days=28 if method == 'kbars' else 0)]
@@ -71,6 +98,10 @@ def main():
         print(json.dumps(dict(tasks=len(tasks), pending=len(pending))), flush=True)
         if args.dry_run:
             return
+        if not pending:
+            return
+        if not all(os.environ.get(k) for k in ('SHIOAJI_API_KEY', 'SHIOAJI_SECRET_KEY')):
+            raise SystemExit('repair plan saved; load the existing Shioaji environment file before downloading one-minute KBars')
         import shioaji as sj
         api = sj.Shioaji(simulation=True)
         api.set_event_callback(lambda *_: None)

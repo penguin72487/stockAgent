@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from pathlib import Path
 import select
+import stat as stat_module
 import threading
 from typing import Mapping
 
 
-def file_signature(path: Path) -> tuple[int, int, int, int] | None:
+def file_signature(path: Path) -> tuple[int, int, int, int, bytes] | None:
     try:
-        stat = path.stat()
-        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+        metadata = path.stat()
+        digest = (
+            hashlib.blake2b(path.read_bytes(), digest_size=16).digest()
+            if stat_module.S_ISREG(metadata.st_mode)
+            else b""
+        )
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            digest,
+        )
     except OSError:
         return None
 

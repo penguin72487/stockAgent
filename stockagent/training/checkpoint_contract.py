@@ -286,6 +286,10 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
         trading.pop('tw_stock_futures_day_trade_quarantine_dates', None)
     if isinstance(trading, dict) and not trading.get('tw_stock_futures_day_trade_quarantine_contract_days'):
         trading.pop('tw_stock_futures_day_trade_quarantine_contract_days', None)
+    if isinstance(trading, dict) and trading.get('tw_stock_futures_day_trade_corporate_transition_path') is None:
+        trading.pop('tw_stock_futures_day_trade_corporate_transition_path', None)
+    if isinstance(trading, dict) and trading.get('tw_stock_futures_day_trade_quarantined_carry_policy', 'reject') == 'reject':
+        trading.pop('tw_stock_futures_day_trade_quarantined_carry_policy', None)
     training = snapshot.get("training")
     if isinstance(training, dict):
         active_model_name = _normalized_model_name(config.training.model_name)
@@ -1365,14 +1369,41 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 entry_price_source="right_labelled_minute_vwap",
                 minute_data_path=str(minute_path),
                 minute_manifest_sha256=(hashlib.sha256(minute_manifest.read_bytes()).hexdigest() if minute_manifest.is_file() else None),
-                capacity="floor_each_completed_minute_matched_contracts_times_participation",
+                capacity=f"{trading.tw_stock_futures_day_trade_minute_capacity_rounding}_each_completed_minute_matched_contracts_times_participation",
                 limit_rule="1320_completed_close_strict_cross_in_1321_to_1324_bars",
                 market_rule="1324_replace_then_1325_to_1330_bars",
                 terminal_rule="residual_contracts_recorded_absorbing_execution_failure",
                 entry_fallback="none_no_daily_open_or_close_substitution",
-                gradient_contract="exact_integer_forward_fractional_quantity_shadow_v1",
+                gradient_contract=(
+                    "exact_integer_forward_adjacent_basket_recoverable_shadow_v3"
+                    if config.training.futures_portfolio_recoverable_backward
+                    else "exact_integer_forward_executable_minute_quantity_shadow_v2"
+                ),
                 sample_calendar="all_verified_panel_sessions_including_no_entry_fills",
             )
+            if config.training.futures_portfolio_recoverable_backward:
+                contract["taiwan_stock_futures_day_trade"].update(
+                    gradient_scope="training_only_counterfactual_days_after_exact_execution_failure",
+                    gradient_cash_reference="actual_live_equity_else_initial_capital",
+                    gradient_constraint="adjacent_integer_basket_residual_notional_L1_coefficient_one",
+                    gradient_zero_action="cost_and_residual_aware_one_sided_adjacent_basket_slope",
+                    day_trade_margin_discount_eligible=False,
+                    collateral_basis="full_notional_research_budget_not_exchange_margin",
+                    deadline_basis="user_required_1330_flat_strategy_constraint",
+                )
+                if config.training.futures_minute_saturation_recovery:
+                    contract["taiwan_stock_futures_day_trade"].update(
+                        gradient_contract="exact_integer_forward_adjacent_basket_inward_capacity_secant_v6",
+                        gradient_capacity_boundary="negative_inward_previous_allocator_basket_secant",
+                    )
+                if config.training.futures_minute_recovery_objective == "execution_utility":
+                    contract["taiwan_stock_futures_day_trade"].update(
+                        gradient_contract="exact_integer_forward_feasible_execution_utility_v7",
+                        gradient_constraint="exact_log_failure_utility_cash_restoration",
+                        gradient_zero_action="cost_aware_improving_first_basket_else_cash",
+                        gradient_local_optimum="no_update_if_cash_and_neighbours_do_not_improve",
+                        gradient_capacity_boundary="feasible_neighbours_and_cash_restoration",
+                    )
             if trading.tw_stock_futures_day_trade_quarantine_dates:
                 contract['taiwan_stock_futures_day_trade']['sample_calendar'] = 'verified_panel_sessions_except_explicit_quarantine; stock_feature_calendar_preserved'
             if daily_cutoff is not None:
@@ -1388,6 +1419,71 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                     daily_proxy_caveat="daily_CLOSE_is_not_a_1330_fill; no_minute_fill_or_exit_capacity_proof",
                     terminal_rule="pre_cutoff_daily_CLOSE_assumed_flat_else_residual_absorbing_execution_failure",
                     missing_source_policy="fail_closed_no_post_cutoff_daily_or_zero_return_substitution",
+                )
+            if trading.tw_stock_futures_day_trade_minute_capacity_rounding != "floor":
+                # The hybrid capacity description above is shared by both
+                # regimes. Bind rounding explicitly without changing the
+                # historical floor checkpoint fingerprint.
+                contract["taiwan_stock_futures_day_trade"].update(
+                    minute_capacity_rounding=trading.tw_stock_futures_day_trade_minute_capacity_rounding,
+                    daily_proxy_capacity_rounding="floor",
+                )
+        if is_minute and trading.tw_stock_futures_day_trade_residual_policy == "carry":
+            from stockagent.data.tw_stock_futures_carry import CARRY_EXTRA_CHANNELS
+            final_path = Path(trading.tw_futures_portfolio_final_settlement_path)
+            evidence_path = (Path(trading.tw_stock_futures_day_trade_carry_evidence_path)
+                             if trading.tw_stock_futures_day_trade_carry_evidence_path else None)
+            corporate_path = (Path(trading.tw_stock_futures_day_trade_corporate_action_path)
+                              if trading.tw_stock_futures_day_trade_corporate_action_path else None)
+            contract["taiwan_stock_futures_day_trade"].update(
+                data_contract_version=4, backtest_contract_version=4,
+                corporate_action_path=str(corporate_path) if corporate_path else None,
+                corporate_action_sha256=(hashlib.sha256(corporate_path.read_bytes()).hexdigest() if corporate_path and corporate_path.is_file() else None),
+                corporate_action_receipt_sha256=(hashlib.sha256(corporate_path.with_suffix('.summary.json').read_bytes()).hexdigest() if corporate_path and corporate_path.with_suffix('.summary.json').is_file() else None),
+                cash_dividend_rule='previous_signed_contracts_times_floor_per_contract_cash_adjustment_before_open',
+                unsupported_corporate_transition='held_position_data_error_before_new_orders_not_new_entry_mask',
+                execution_tensor_channels=list(TAPE_CHANNELS) + list(CARRY_EXTRA_CHANNELS),
+                residual_policy="carry", terminal_rule="mark_physical_residual_then_next_session_target_difference",
+                expiry_rule="official_physical_final_settlement_only",
+                daily_valuation_rule="verified_same_day_official_settlement_else_canonical_close_or_last_known",
+                daily_valuation_is_official_settlement_guaranteed=False,
+                carry_no_trade_evidence_path=(str(evidence_path) if evidence_path else None),
+                carry_no_trade_evidence_sha256=(hashlib.sha256(evidence_path.read_bytes()).hexdigest() if evidence_path and evidence_path.is_file() else None),
+                carry_no_trade_receipt_sha256=(hashlib.sha256(evidence_path.with_name('official_evidence_manifest.json').read_bytes()).hexdigest() if evidence_path and evidence_path.with_name('official_evidence_manifest.json').is_file() else None),
+                final_settlement_path=str(final_path),
+                final_settlement_sha256=(hashlib.sha256(final_path.read_bytes()).hexdigest() if final_path.is_file() else None),
+                final_settlement_manifest_sha256=(hashlib.sha256(final_path.with_name("manifest.json").read_bytes()).hexdigest() if final_path.with_name("manifest.json").is_file() else None),
+                gradient_contract="recurrent_quantity_STE_with_feasible_flat_first_basket_fee_secant_v9",
+                gradient_cash_reference="current_marked_equity_detached_for_cash_sizing",
+                collateral_basis="full_notional_new_order_budget_old_inventory_encumbered_not_exchange_margin",
+                day_trade_margin_discount_eligible=False,
+                execution_clock="0846_target_difference_1320_limit_1324_market_1330_residual_carry",
+                entry_fallback="none", daily_proxy_before=None,
+                missing_source_policy="raise_data_error_before_backward_selection_and_reporting_v9",
+                data_failure_return="undefined_nan_diagnostic_only_never_ruin_penalty",
+                nonfinite_account_policy="numerical_data_error_not_economic_insolvency",
+            )
+            if trading.tw_stock_futures_day_trade_corporate_transition_path:
+                from stockagent.data.tw_stock_futures_carry import CARRY_TRANSITION_EXTRA_CHANNELS
+                from stockagent.data.tw_stock_futures_transition import TRANSITION_POLICY
+                transition_path=Path(trading.tw_stock_futures_day_trade_corporate_transition_path)
+                contract['taiwan_stock_futures_day_trade'].update(
+                    data_contract_version=5,backtest_contract_version=5,
+                    execution_tensor_channels=list(TAPE_CHANNELS)+list(CARRY_TRANSITION_EXTRA_CHANNELS),
+                    corporate_transition_path=str(transition_path),
+                    corporate_transition_manifest_sha256=(hashlib.sha256(transition_path.read_bytes()).hexdigest() if transition_path.is_file() else None),
+                    corporate_transition_rule=TRANSITION_POLICY,
+                )
+            if trading.tw_stock_futures_day_trade_quarantined_carry_policy != 'reject':
+                from stockagent.data.tw_stock_futures_carry import CARRY_QUARANTINE_CONTRACT_VERSION, CARRY_QUARANTINE_EXTRA_CHANNELS
+                contract['taiwan_stock_futures_day_trade'].update(
+                    data_contract_version=CARRY_QUARANTINE_CONTRACT_VERSION,
+                    backtest_contract_version=CARRY_QUARANTINE_CONTRACT_VERSION,
+                    execution_tensor_channels=list(TAPE_CHANNELS) + list(CARRY_QUARANTINE_EXTRA_CHANNELS),
+                    quarantined_carry_policy=trading.tw_stock_futures_day_trade_quarantined_carry_policy,
+                    quarantine_valuation='verified_same_day_official_settlement_end_of_day_only',
+                    quarantine_execution='no_orders_no_fills_no_fees_preserve_signed_inventory',
+                    missing_source_policy='explicit_quarantine_hold_else_raise_data_error_before_backward_selection_and_reporting',
                 )
         if is_0900:
             contract["taiwan_stock_futures_day_trade"].update(

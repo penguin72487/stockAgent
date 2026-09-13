@@ -1,0 +1,9 @@
+# Physical corporate transfer repair. Keep v9 data/checkpoints reproducible;
+# changed trajectory semantics require a fresh optimizer and output root.
+base_config: tw_stock_futures_day_trade_0845_carry_v9.yaml
+experiment_name: tw-stock-futures-0845-carry-corporate-transfer-v10
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_0845_carry_v10_vast5090
+  resume: true
+trading:
+  tw_stock_futures_day_trade_corporate_transition_path: artifacts/data_preparation/futures_corporate_transitions_v2_20260910/manifest.json
