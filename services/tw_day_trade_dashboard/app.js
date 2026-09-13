@@ -6,6 +6,7 @@ const SERVICE_REVISION_REFRESH_MS = 1000; // fallback only; SSE owns normal deli
 const TW_PUBLIC_STATUS_REFRESH_MS = 30000;
 const Dashboard = window.StockAgentDashboard;
 const Presentation = window.StockAgentTwPresentation;
+const Chart = window.StockAgentTwChart;
 const strategyLabel = (value) => Presentation.strategyLabel(value, snapshot?.modes || []);
 const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
 // A full multi-month minute history is intentionally lossless and larger than
@@ -20,11 +21,6 @@ const DATA_MONITOR_STATUS_PATHS = [
   "../data-monitor/api/status",
 ];
 const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1", "#ff9f68"];
-const timeAxis = window.StockAgentTimeAxis;
-const TW_STOCK_SESSIONS = [
-  {label: "開", minute: 9 * 60},
-  {label: "收", minute: 13 * 60 + 30},
-];
 const HIDDEN_EQUITY_SERIES_STORAGE_KEY = IS_OVERNIGHT
   ? "tw-overnight-hidden-equity-series"
   : "tw-day-trade-hidden-equity-series";
@@ -33,8 +29,6 @@ const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 3;
 const DATE_FILTER_DEBOUNCE_MS = 180;
 let snapshot = null;
 let chartHistory = null;
-let renderedChartHistory = null;
-let renderedChartKey = "";
 let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
@@ -1452,170 +1446,26 @@ async function loadTwPublicMonitor() {
 }
 
 function renderChart(data) {
-  const svg = $("equity-chart");
-  const empty = $("chart-empty");
-  if (!chartHistoryMatchesSelection()) {
-    renderedChartHistory = null;
-    setHtml("chart-legend", "");
-    setHtml(svg, "");
-    svg.classList.add("hidden");
-    empty.classList.remove("hidden");
-    if (historyLoadError) {
-      empty.textContent = "歷史曲線載入失敗";
-      $("equity-range-note").textContent = `${chartWindowLabel()} · ${historyLoadError}`;
-    } else {
-      empty.textContent = "歷史曲線載入中…";
-      $("equity-range-note").textContent = `${chartWindowLabel()} · ${historyInFlight ? "正在讀取完整所選期間" : "等待完整所選期間資料"}；不以最新即時點代替歷史曲線。`;
-    }
-    return;
-  }
-  const renderKey = JSON.stringify([
-    selectedMode(), detailRangeKey(), [...hiddenEquitySeries],
-    data.modes.map((row) => [row.market, strategyLabel(row)]),
-    (data.benchmarks || []).map((row) => [row.benchmark_id, row.label]),
-  ]);
-  // Immutable history + identical controls produce identical SVG. Heartbeats,
-  // service acknowledgements and cached refreshes must not rebuild every point.
-  if (renderedChartHistory === chartHistory && renderedChartKey === renderKey) return;
-  const modes = selectedMode() === "all" ? data.modes.map((row) => row.market) : [selectedMode()];
-  const historyRows = chartHistory.history;
-  const modeRows = historyRows.filter((row) => row.series_type !== "benchmark" && modes.includes(row.market)).map((row) => ({...row, series_id: row.series_id || row.market}));
-  const benchmarkRows = historyRows.filter((row) => row.series_type === "benchmark").map((row) => ({...row, series_id: row.series_id || row.benchmark_id}));
-  const rows = modeRows.concat(benchmarkRows);
-  const byMode = new Map();
-  for (const row of rows) {
-    if (!byMode.has(row.series_id)) byMode.set(row.series_id, []);
-    byMode.get(row.series_id).push(row);
-  }
-  for (const values of byMode.values()) values.sort((a, b) => String(a.minute).localeCompare(String(b.minute)));
-  const labels = new Map([
-    ...data.modes.map((row) => [row.market, strategyLabel(row)]),
-    ...(data.benchmarks || []).map((row) => [row.benchmark_id, row.label || row.benchmark_id]),
-  ]);
-  const series = [...byMode.entries()].map(([seriesId, values], index) => ({
-    seriesId,
-    values,
-    index: labels.has(seriesId) ? [...labels.keys()].indexOf(seriesId) : index,
-    valid: values.filter((row) => row.return_pct != null && Number.isFinite(Number(row.return_pct))),
-  }));
-  const allPoints = series.flatMap((item) => item.valid);
-  const visibleSeries = series.filter((item) => !hiddenEquitySeries.has(item.seriesId));
-  const points = visibleSeries.flatMap((item) => item.valid);
-  setHtml("chart-legend", series.map((item) => {
-    const latest = item.valid.at(-1);
-    const latestText = latest ? `${Number(latest.return_pct) >= 0 ? "+" : ""}${sourceNumber(latest.return_pct)}%` : "—";
-    const label = labels.get(item.seriesId) || item.seriesId;
-    const hidden = hiddenEquitySeries.has(item.seriesId);
-    return `<button type="button" class="legend-toggle${hidden ? " is-hidden" : ""}" data-series-id="${esc(item.seriesId)}" aria-pressed="${String(!hidden)}" aria-label="${hidden ? "顯示" : "隱藏"}${esc(label)}曲線"><i class="series-${item.index % COLORS.length}" aria-hidden="true"></i>${esc(label)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></button>`;
-  }).join(""));
-  empty.textContent = allPoints.length ? "所有曲線已隱藏；點選圖例圓點可重新顯示。" : `目前尚無${IS_OVERNIGHT ? "集合競價事件" : "分鐘"}報酬率資料`;
-  empty.classList.toggle("hidden", points.length > 0);
-  svg.classList.toggle("hidden", points.length === 0);
-  if (!points.length) {
-    setHtml(svg, "");
-    $("equity-range-note").textContent = allPoints.length
-      ? `${chartWindowLabel()} · 目前 ${number(series.length)} 條曲線皆已隱藏。`
-      : `${chartWindowLabel()}內沒有可繪製資料。`;
-    return;
-  }
-  const width = 960, height = 360, left = 76, right = 22, top = 24, bottom = 70;
-  const times = [...new Set(allPoints.map((row) => String(row.minute)))].sort();
-  const oneSession = times[0].slice(0, 10) === times.at(-1).slice(0, 10);
-  const axis = timeAxis.buildTimeAxis({
-    range: oneSession ? "1d" : "all",
-    timestamps: times.map((value) => new Date(value).getTime()),
-    sessions: TW_STOCK_SESSIONS,
-    collapseEmptyIntervals: true,
+  Chart.render({
+    data,
+    history: chartHistory,
+    historyMatchesSelection: chartHistoryMatchesSelection(),
+    historyLoadError,
+    historyInFlight,
+    hiddenSeries: hiddenEquitySeries,
+    selectedMode: selectedMode(),
+    detailRangeKey: detailRangeKey(),
+    isOvernight: IS_OVERNIGHT,
+    strategyLabel,
+    chartWindowLabel: chartWindowLabel(),
+    formatNumber: sourceNumber,
+    formatCount: number,
+    pnlClass,
   });
-  if (!axis) return;
-  if (!oneSession) {
-    // Calendar-midnight ticks can snap to Friday's close while still showing
-    // Saturday's label on a compressed axis. Label actual observed sessions.
-    const firstBySession = new Map();
-    for (const value of times) {
-      const day = value.slice(0, 10);
-      if (!firstBySession.has(day)) firstBySession.set(day, value);
-    }
-    const sessionStarts = [...firstBySession.values()];
-    const step = Math.max(1, Math.ceil(sessionStarts.length / 10));
-    axis.ticks = sessionStarts.filter((_value, index) => index % step === 0 || index === sessionStarts.length - 1)
-      .map((value) => ({timestamp: Date.parse(value), label: value.slice(5, 10).replace("-", "/"), rotate: true, kind: "regular"}));
-  }
-  // A complete multi-month minute curve exceeds JavaScript's argument limit.
-  let ymin = 0, ymax = 0;
-  for (const row of points) {
-    ymin = Math.min(ymin, Number(row.return_pct));
-    ymax = Math.max(ymax, Number(row.return_pct));
-  }
-  const pad = Math.max(.01, (ymax - ymin) * .08); ymin -= pad; ymax += pad;
-  // Every model/benchmark shares its minute axis. Parse and project each time
-  // once instead of repeating date parsing and axis lookup for every series.
-  const minuteX = new Map(times.map((minute) => [minute, timeAxis.position(axis, Date.parse(minute), left, width - right)]));
-  const x = (minute) => minuteX.get(String(minute));
-  const y = (value) => top + (ymax - Number(value)) / (ymax - ymin) * (height - top - bottom);
-  let html = "";
-  for (let i = 0; i <= 4; i += 1) {
-    const yy = top + i / 4 * (height - top - bottom);
-    const value = ymax - i / 4 * (ymax - ymin);
-    html += `<line class="axis" x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}"></line><text class="axis-text" x="6" y="${yy+4}">${esc(sourceNumber(value))}%</text>`;
-  }
-  for (const tick of axis.ticks) {
-    const xx = timeAxis.position(axis, tick.timestamp, left, width - right);
-    const tickClass = tick.kind === "session" ? "axis-time session" : "axis-time";
-    const labelClass = tick.kind === "session" ? "axis-text axis-session-text" : "axis-text";
-    const anchor = tick.rotate ? "end" : "middle";
-    const labelY = tick.kind === "session" || tick.rotate ? height - 34 : height - 8;
-    const transform = tick.rotate ? ` transform="rotate(-45 ${xx} ${labelY})"` : "";
-    html += `<line class="${tickClass}" x1="${xx}" y1="${top}" x2="${xx}" y2="${height-bottom}"></line><text class="${labelClass}" text-anchor="${anchor}" x="${xx}" y="${labelY}"${transform}>${esc(tick.label)}</text>`;
-  }
-  visibleSeries.forEach((item) => {
-    const color = COLORS[item.index % COLORS.length];
-    const path = item.valid.map((row, i) => `${i ? "L" : "M"}${x(row.minute).toFixed(1)},${y(row.return_pct).toFixed(1)}`).join(" ");
-    html += `<path class="chart-line" stroke="${color}" d="${path}"></path>`;
-    for (const row of item.valid.filter((value) => value.valuation_stale && (!value.historical_minute_replay || Number(value.missing_price_position_count || 0) > 0))) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
-  });
-  setHtml(svg, html);
-  const start = new Date(times[0]).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
-  const end = new Date(times.at(-1)).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
-  const sampled = chartHistory?.downsampled ? `；已保留端點與區間極值縮圖（原 ${number(chartHistory.raw_points_in_range)} 點）` : "";
-  const replayPoints = Number(chartHistory?.historical_minute_replay_points || 0);
-  const replayMean = Number(chartHistory?.historical_minute_mean_fresh_trade_notional_coverage_ratio);
-  const replayMissing = Number(chartHistory?.historical_minute_missing_price_points || 0);
-  const replayQuality = replayPoints
-    ? IS_OVERNIGHT
-      ? `；歷史反事實集合競價事件 ${number(replayPoints)} 點，缺價／延用 ${number(replayMissing)} 點`
-      : `；歷史分鐘 ${number(replayPoints)} 點，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${sourceNumber(replayMean * 100)}%` : "—"}，缺價 ${number(replayMissing)} 點（其餘無成交分鐘延用上一筆）`
-    : "";
-  const coverageGaps = (chartHistory?.range_summary || []).filter((row) => Number(row.minute_coverage_ratio) < .999999);
-  const coverageQuality = coverageGaps.length
-    ? `；${IS_OVERNIGHT ? "事件來源未齊" : "分鐘來源未齊"}：${coverageGaps.map((row) => `${labels.get(row.series_id) || row.series_id} ${number(row.point_count)}/${number(row.expected_minute_points)}`).join("、")}`
-    : `；${IS_OVERNIGHT ? "集合競價事件" : "分鐘"}覆蓋完整`;
-  $("equity-range-note").textContent = `${chartWindowLabel()} · ${IS_OVERNIGHT ? "收盤／次日開盤事件曲線（歷史為反事實近似）" : "一分鐘曲線"} · 每條線第一個有效${IS_OVERNIGHT ? "事件" : "分鐘"}固定為 0%；期末權益與累積淨損益仍沿用原始帳本 · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}${coverageQuality}`;
-  renderedChartHistory = chartHistory;
-  renderedChartKey = renderKey;
 }
 
 function decodeChartHistory(payload) {
-  if (payload.history_encoding !== "minute_columns_v1") return payload;
-  const history = [];
-  for (const series of payload.minute_series || []) {
-    for (const [minute, periodReturn, cumulativeReturn, quality] of series.points) {
-      history.push({
-        series_id: series.series_id,
-        series_type: series.series_type,
-        market: series.series_type === "strategy" ? series.series_id : null,
-        benchmark_id: series.series_type === "benchmark" ? series.series_id : null,
-        minute: new Date(minute * 60000).toISOString(),
-        return_pct: periodReturn,
-        cumulative_return_pct: cumulativeReturn,
-        valuation_stale: Boolean(quality & 1),
-        historical_minute_replay: Boolean(quality & 2),
-        missing_price_position_count: quality & 4 ? 1 : 0,
-      });
-    }
-  }
-  const {minute_series: _encodedColumns, ...metadata} = payload;
-  return {...metadata, history};
+  return Chart.decodeHistory(payload);
 }
 
 function applyChartHistory(payload) {
@@ -1654,9 +1504,15 @@ async function loadChartHistory({preferCache = false} = {}) {
   historyLoadError = "";
   if (snapshot && !chartHistoryMatchesSelection()) renderChart(snapshot);
   try {
-    const params = new URLSearchParams({range: requestedRange, resolution: "1m"});
-    if (requestedStart) params.set("start_date", requestedStart);
-    if (requestedEnd) params.set("end_date", requestedEnd);
+    const params = new URLSearchParams({range: requestedRange, resolution: "1m", encoding: "v2"});
+    const coversAllAvailableDates = Boolean(
+      requestedStart
+      && requestedEnd
+      && requestedStart === availableDetailDates.at(-1)
+      && requestedEnd === availableDetailDates[0]
+    );
+    if (requestedStart && !coversAllAvailableDates) params.set("start_date", requestedStart);
+    if (requestedEnd && !coversAllAvailableDates) params.set("end_date", requestedEnd);
     const response = await fetchMinuteHistory(`api/history?${params.toString()}`, {cache:"default", signal: controller.signal});
     if (!response.ok) { Dashboard.cancelResponse(response); throw new Error(`HTTP ${response.status}`); }
     const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
@@ -1665,7 +1521,13 @@ async function loadChartHistory({preferCache = false} = {}) {
     if (!chartHistoryCache.has(requestedKey) && chartHistoryCache.size >= HISTORY_CLIENT_CACHE_MAX_ENTRIES) {
       chartHistoryCache.delete(chartHistoryCache.keys().next().value);
     }
-    const decoded = decodeChartHistory(payload);
+    const decodedPayload = decodeChartHistory(payload);
+    // The canonical unbounded projection is exactly the selected range when
+    // both calendar controls equal the available extrema. Reuse its startup-
+    // warmed cache key, while retaining the explicit client selection contract.
+    const decoded = coversAllAvailableDates
+      ? {...decodedPayload, start_date: requestedStart, end_date: requestedEnd}
+      : decodedPayload;
     chartHistoryCache.set(requestedKey, {payload: decoded, receivedAt: Date.now()});
     applyChartHistory(decoded);
   } catch (error) {

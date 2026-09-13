@@ -70,7 +70,7 @@
 
   function sanitizePerformanceMetric(row) {
     if (!row || typeof row !== "object") return null;
-    const kind = ["api", "interaction", "page_load"].includes(row.kind)
+    const kind = ["api", "interaction", "page_load", "render"].includes(row.kind)
       ? row.kind : null;
     if (!kind) return null;
     const observedAt = Number(row.observedAt);
@@ -92,6 +92,7 @@
       "durationMs", "inputDelayMs", "headersMs", "bodyMs", "parseMs",
       "serverMs", "paintMs", "domContentLoadedMs", "loadMs", "fcpMs",
       "lcpMs", "viewportWidth", "viewportHeight",
+      "prepareMs", "drawMs", "pointCount", "seriesCount",
     ];
     for (const field of numericFields) {
       const parsed = metricNumber(row[field]);
@@ -202,6 +203,10 @@
     if (global.document?.dispatchEvent && typeof global.CustomEvent === "function") {
       global.document.dispatchEvent(new global.CustomEvent("stockagent-performance-cleared"));
     }
+  }
+
+  function recordPerformanceMetric(row) {
+    return appendPerformanceMetric({...row, route: row?.route || currentRoute()});
   }
 
   function afterNextPaint(callback) {
@@ -870,7 +875,7 @@
   });
 
   const api = Object.freeze({
-    version: 3,
+    version: 4,
     DEFAULT_TIMEOUT_MS,
     PERFORMANCE_SCHEMA_VERSION,
     PERFORMANCE_HISTORY_LIMIT,
@@ -892,6 +897,7 @@
     performanceSnapshot,
     performanceHistorySnapshot,
     clearPerformanceHistory,
+    recordPerformanceMetric,
     createFetch,
     createJsonFetcher,
     createLatestRequest,

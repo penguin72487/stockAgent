@@ -477,6 +477,101 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             })
         output["history_encoding"] = "minute_columns_v1"
         output["minute_series"] = series
+    elif payload.get("history_encoding") == "minute_columns_v2":
+        raw_axis = payload.get("minute_axis")
+        if not isinstance(raw_axis, (list, tuple)):
+            raise UnsafePublicDashboardPayload("invalid minute axis")
+        minute_axis: list[int] = []
+        previous_minute: int | None = None
+        for raw_minute in raw_axis:
+            if (
+                type(raw_minute) not in (int, float)
+                or not math.isfinite(raw_minute)
+                or int(raw_minute) != raw_minute
+            ):
+                raise UnsafePublicDashboardPayload("invalid minute axis value")
+            minute = int(raw_minute)
+            if previous_minute is not None and minute <= previous_minute:
+                raise UnsafePublicDashboardPayload("minute axis must increase")
+            minute_axis.append(minute)
+            previous_minute = minute
+        series = []
+        observed_points = 0
+        observed_ids: set[str] = set()
+        for raw in payload.get("minute_series") or ():
+            if not isinstance(raw, Mapping):
+                raise UnsafePublicDashboardPayload("invalid minute series")
+            series_id = str(raw.get("series_id") or "")
+            if not series_id or series_id in observed_ids:
+                raise UnsafePublicDashboardPayload("invalid minute series id")
+            observed_ids.add(series_id)
+            raw_indexes = raw.get("minute_indexes")
+            raw_returns = raw.get("return_pct")
+            raw_cumulative = raw.get("cumulative_return_pct")
+            raw_quality = raw.get("quality_flags")
+            columns = (raw_indexes, raw_returns, raw_cumulative, raw_quality)
+            if any(not isinstance(column, (list, tuple)) for column in columns):
+                raise UnsafePublicDashboardPayload("invalid minute columns")
+            column_length = len(raw_indexes)
+            if any(len(column) != column_length for column in columns[1:]):
+                raise UnsafePublicDashboardPayload("unequal minute columns")
+            indexes: list[int] = []
+            previous_index: int | None = None
+            for raw_index in raw_indexes:
+                if (
+                    type(raw_index) not in (int, float)
+                    or not math.isfinite(raw_index)
+                    or int(raw_index) != raw_index
+                ):
+                    raise UnsafePublicDashboardPayload("invalid minute index")
+                index = int(raw_index)
+                if (
+                    index < 0
+                    or index >= len(minute_axis)
+                    or (previous_index is not None and index <= previous_index)
+                ):
+                    raise UnsafePublicDashboardPayload("minute index out of order")
+                indexes.append(index)
+                previous_index = index
+
+            def finite_numeric_column(values: list[Any] | tuple[Any, ...]) -> list[Any]:
+                if any(
+                    type(value) not in (int, float) or not math.isfinite(value)
+                    for value in values
+                ):
+                    raise UnsafePublicDashboardPayload("invalid numeric minute column")
+                return list(values)
+
+            quality: list[int] = []
+            for raw_flag in raw_quality:
+                if (
+                    type(raw_flag) not in (int, float)
+                    or not math.isfinite(raw_flag)
+                    or int(raw_flag) != raw_flag
+                    or not 0 <= raw_flag <= 7
+                ):
+                    raise UnsafePublicDashboardPayload("invalid minute quality flag")
+                quality.append(int(raw_flag))
+            observed_points += column_length
+            series.append(
+                {
+                    "series_id": _scrub_public_value(series_id),
+                    "series_type": (
+                        "benchmark"
+                        if raw.get("series_type") == "benchmark"
+                        else "strategy"
+                    ),
+                    "minute_indexes": indexes,
+                    "return_pct": finite_numeric_column(raw_returns),
+                    "cumulative_return_pct": finite_numeric_column(raw_cumulative),
+                    "quality_flags": quality,
+                }
+            )
+        if observed_points != int(payload.get("returned_points") or 0):
+            raise UnsafePublicDashboardPayload("minute point count mismatch")
+        output["history_encoding"] = "minute_columns_v2"
+        output["minute_axis"] = minute_axis
+        output["minute_series"] = series
     return output
 
 

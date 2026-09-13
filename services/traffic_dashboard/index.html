@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=1">
   <link rel="stylesheet" href="performance.css?v=3">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=8">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
@@ -74,7 +74,7 @@
       </div>
       <div class="browser-controls">
         <label>頁面<select id="browser-page-filter"><option value="all">所有頁面</option></select></label>
-        <label>類型<select id="browser-kind-filter"><option value="all">所有類型</option><option value="page_load">頁面載入</option><option value="interaction">操作到繪製</option><option value="api">API 到繪製</option></select></label>
+        <label>類型<select id="browser-kind-filter"><option value="all">所有類型</option><option value="page_load">頁面載入</option><option value="interaction">操作到繪製</option><option value="api">API 到繪製</option><option value="render">資料整理與繪圖</option></select></label>
         <button id="browser-copy" type="button" data-performance-ignore>複製 JSON</button>
         <button id="browser-clear" class="danger-quiet" type="button" data-performance-ignore>清除本機紀錄</button>
       </div>
@@ -126,7 +126,7 @@
       <dl id="definition-list"></dl>
     </details>
   </main>
-  <script src="../dashboard-core.js?v=7" defer></script>
-  <script src="app.js?v=8" defer></script>
+  <script src="../dashboard-core.js?v=8" defer></script>
+  <script src="app.js?v=9" defer></script>
 </body>
 </html>

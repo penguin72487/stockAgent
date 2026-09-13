@@ -99,15 +99,18 @@ def test_process_quotes_can_isolate_one_replay_market(tmp_path: Path) -> None:
     first = _spec(tmp_path)
     second = replace(first, market="tw_day_trade_second", label="second")
     for spec, signal_id in ((first, "signal-first"), (second, "signal-second")):
-        assert engine.register_signal(
-            spec=spec,
-            summary=_summary(signal_id),
-            signal_rows=[_row()],
-            quotes={"2330": _quote()},
-            eligibility=_eligibility(),
-            eligibility_coverage={},
-            now=_now(9, 1, 6),
-        ) == "registered"
+        assert (
+            engine.register_signal(
+                spec=spec,
+                summary=_summary(signal_id),
+                signal_rows=[_row()],
+                quotes={"2330": _quote()},
+                eligibility=_eligibility(),
+                eligibility_coverage={},
+                now=_now(9, 1, 6),
+            )
+            == "registered"
+        )
 
     exit_quote = _quote(bid=1_001.0, ask=1_002.0)
     exit_quote["minute_volume_lots"] = 10_000.0
@@ -185,7 +188,10 @@ def test_historical_replay_ledgers_flush_once_at_session_boundary(
 
     engine.flush_deferred_ledger_writes()
 
-    rows = [json.loads(line) for line in (state_dir / "events.jsonl").read_text().splitlines()]
+    rows = [
+        json.loads(line)
+        for line in (state_dir / "events.jsonl").read_text().splitlines()
+    ]
     assert [row["event"] for row in rows] == ["historical_minute"]
 
 
@@ -839,30 +845,61 @@ def _row(weight: float = 0.1) -> dict[str, object]:
 
 def test_live_publication_clock_does_not_backdate_service_health(tmp_path):
     engine = TwDayTradeSimulationEngine(tmp_path, publication_clock=lambda: _now(11, 5))
-    engine.state["modes"]["fixture"] = {"market": "fixture", "entry_completed_at": _now(9, 1).isoformat()}
+    engine.state["modes"]["fixture"] = {
+        "market": "fixture",
+        "entry_completed_at": _now(9, 1).isoformat(),
+    }
     engine._persist(_now(9, 1))
     receipt = json.loads((tmp_path / "service_sync.json").read_text())
     assert receipt["published_at"].startswith("2026-08-13T11:05")
-    assert engine.state["modes"]["fixture"]["entry_completed_at"].startswith("2026-08-13T09:01")
+    assert engine.state["modes"]["fixture"]["entry_completed_at"].startswith(
+        "2026-08-13T09:01"
+    )
 
 
-def test_carry_quote_scope_includes_zero_target_inventory_without_open_permissions(tmp_path):
-    from scripts.run_tw_day_trade_simulation import _entry_and_carry_quote_symbols, _replay_sizing_open_price
-    symbols, _ = _entry_and_carry_quote_symbols(spec=_spec(tmp_path), rows=[_row(0)], eligibility={},
-        mode={"positions": {"p": {"symbol": "2330", "signed_shares": -751, "last_mark_price": 998}}})
+def test_carry_quote_scope_includes_zero_target_inventory_without_open_permissions(
+    tmp_path,
+):
+    from scripts.run_tw_day_trade_simulation import (
+        _entry_and_carry_quote_symbols,
+        _replay_sizing_open_price,
+    )
+
+    symbols, _ = _entry_and_carry_quote_symbols(
+        spec=_spec(tmp_path),
+        rows=[_row(0)],
+        eligibility={},
+        mode={
+            "positions": {
+                "p": {"symbol": "2330", "signed_shares": -751, "last_mark_price": 998}
+            }
+        },
+    )
     assert symbols == {"2330"}
     assert _replay_sizing_open_price(None, {"open": 1000, "last": 1020}) == 1000
     assert _replay_sizing_open_price(990, {"open": 1000}) == 990
-    assert _replay_sizing_open_price(None, {"open": 0, "last": 1020, "execution_price_0901": 1010}) is None
+    assert (
+        _replay_sizing_open_price(
+            None, {"open": 0, "last": 1020, "execution_price_0901": 1010}
+        )
+        is None
+    )
 
 
-def test_quote_discovery_does_not_use_initial_deposit_to_filter_compounded_nav(tmp_path):
+def test_quote_discovery_does_not_use_initial_deposit_to_filter_compounded_nav(
+    tmp_path,
+):
     from scripts.run_tw_day_trade_simulation import _entry_and_carry_quote_symbols
+
     row = {**_row(0.05), "open_price": 1000.0}
     # 10M initial would request 500 shares; a later 30M NAV requests a full lot.
     # Discovery must fetch its price before the engine can freeze that NAV.
-    symbols, _ = _entry_and_carry_quote_symbols(spec=_spec(tmp_path), rows=[row],
-        eligibility=_eligibility(), mode={"total_equity_twd": 30_000_000, "positions": {}})
+    symbols, _ = _entry_and_carry_quote_symbols(
+        spec=_spec(tmp_path),
+        rows=[row],
+        eligibility=_eligibility(),
+        mode={"total_equity_twd": 30_000_000, "positions": {}},
+    )
     assert symbols == {"2330"}
 
 
@@ -870,8 +907,11 @@ def test_committed_account_drops_obsolete_missing_open_diagnostic(tmp_path):
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path)
     mode = engine._mode(spec)
-    mode.update(entry_completed_at=_now(9, 1).isoformat(), missing_carried_open_symbols=["2330"],
-                pending_signal_id="pending")
+    mode.update(
+        entry_completed_at=_now(9, 1).isoformat(),
+        missing_carried_open_symbols=["2330"],
+        pending_signal_id="pending",
+    )
     assert engine._mode(spec)["missing_carried_open_symbols"] == ["2330"]
     mode["pending_signal_id"] = None
     assert "missing_carried_open_symbols" not in engine._mode(spec)
@@ -892,7 +932,9 @@ def test_runner_loads_all_configured_day_trade_modes() -> None:
         "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }
-    active_expected = set(enabled_day_trade_markets(repo_root / "services/discord_bot/markets"))
+    active_expected = set(
+        enabled_day_trade_markets(repo_root / "services/discord_bot/markets")
+    )
     assert baseline <= active_expected
 
     assert errors == {}
@@ -1506,9 +1548,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     summary = {
         **_summary(),
         "simulation_replay": True,
-        "entry_fill_contract": (
-            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
-        ),
+        "entry_fill_contract": (REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE),
     }
     quote = _quote(open_price=1_000.0, bid=900.0, ask=1_100.0)
     quote.update(
@@ -1565,13 +1605,9 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
         now=_now(9, 2),
     )
     restarted_mode = restarted.state["modes"][spec.market]
+    assert restarted_mode["entry_fill_policy"] == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
     assert (
-        restarted_mode["entry_fill_policy"]
-        == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
-    )
-    assert (
-        restarted_mode["configured_entry_fill_policy"]
-        == ENTRY_FILL_POLICY_CAUSAL_BOOK
+        restarted_mode["configured_entry_fill_policy"] == ENTRY_FILL_POLICY_CAUSAL_BOOK
     )
     assert restarted_mode["counterfactual_0901_price_fill"] is True
 
@@ -1587,9 +1623,7 @@ def test_missed_opening_replay_blocks_only_when_0901_minute_price_is_missing(
     summary = {
         **_summary(),
         "simulation_replay": True,
-        "entry_fill_contract": (
-            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
-        ),
+        "entry_fill_contract": (REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE),
     }
     quote = _quote(open_price=1_000.0, bid=999.0, ask=1_001.0)
     quote["execution_price_0901"] = None
@@ -1889,9 +1923,10 @@ def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
     assert page["rows"][0]["target_weight"] == pytest.approx(0.00001)
     assert page["rows"][0]["requested_shares"] == 0
     assert page["rows"][0]["reason"] == "below_one_board_lot"
-    assert page["opening_execution_audit"][spec.market][
-        "model_signal_rows_complete"
-    ] is True
+    assert (
+        page["opening_execution_audit"][spec.market]["model_signal_rows_complete"]
+        is True
+    )
     snapshot = build_dashboard_snapshot(
         state_dir=engine.state_dir,
         now=_now(9, 1, 11).astimezone(ZoneInfo("UTC")),
@@ -1902,7 +1937,9 @@ def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
     )
 
 
-def test_operational_issues_expose_intraday_residual_but_not_overnight_inventory() -> None:
+def test_operational_issues_expose_intraday_residual_but_not_overnight_inventory() -> (
+    None
+):
     modes = [
         {
             "market": "tw_day_trade_100m",
@@ -2176,8 +2213,10 @@ def test_two_sided_live_signal_keeps_each_symbols_independent_fill(
         summary=_summary(),
         signal_rows=[long_row, short_row],
         quotes={
-            "2330": _quote(open_price=100.0, bid=99.0, ask=100.0, ask_volume=1.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
-            "2317": _quote(open_price=100.0, bid=100.0, ask=101.0, bid_volume=20.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2330": _quote(open_price=100.0, bid=99.0, ask=100.0, ask_volume=1.0)
+            | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2317": _quote(open_price=100.0, bid=100.0, ask=101.0, bid_volume=20.0)
+            | {"lower_limit": 90.0, "upper_limit": 110.0},
         },
         eligibility=eligibility,
         eligibility_coverage={},
@@ -2217,8 +2256,10 @@ def test_two_sided_live_signal_keeps_executable_side_when_other_side_has_no_dept
             {**_row(-0.5), "symbol": "2317"},
         ],
         quotes={
-            "2330": _quote(bid=99.0, ask=100.0, ask_volume=0.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
-            "2317": _quote(bid=100.0, ask=101.0, bid_volume=20.0) | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2330": _quote(bid=99.0, ask=100.0, ask_volume=0.0)
+            | {"lower_limit": 90.0, "upper_limit": 110.0},
+            "2317": _quote(bid=100.0, ask=101.0, bid_volume=20.0)
+            | {"lower_limit": 90.0, "upper_limit": 110.0},
         },
         eligibility=eligibility,
         eligibility_coverage={},
@@ -2793,7 +2834,8 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
                 last=1004.0,
                 bid_volume=2.0,
                 minute_volume_lots=4.0,
-            ) | {"quote_at": _now(13, 30).isoformat()}
+            )
+            | {"quote_at": _now(13, 30).isoformat()}
         },
         now=_now(13, 30),
     )
@@ -3160,13 +3202,25 @@ def test_etf_brackets_use_etf_ticks_at_boundary(tmp_path: Path) -> None:
     spec = replace(_spec(tmp_path), price_limit_offset_ticks=1)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     row = {**_row(), "symbol": "0050"}
-    quote = {**_quote(open_price=48., bid=47.99, ask=48., last=48.),
-             "symbol": "0050", "upper_limit": 50., "lower_limit": 45.}
+    quote = {
+        **_quote(open_price=48.0, bid=47.99, ask=48.0, last=48.0),
+        "symbol": "0050",
+        "upper_limit": 50.0,
+        "lower_limit": 45.0,
+    }
     evidence = replace(_eligibility()["2330"], symbol="0050", security_type="etf")
-    assert engine.register_signal(
-        spec=spec, summary=_summary(), signal_rows=[row], quotes={"0050": quote},
-        eligibility={"0050": evidence}, eligibility_coverage={}, now=_now(9, 1, 6),
-    ) == "registered"
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=_summary(),
+            signal_rows=[row],
+            quotes={"0050": quote},
+            eligibility={"0050": evidence},
+            eligibility_coverage={},
+            now=_now(9, 1, 6),
+        )
+        == "registered"
+    )
     positions = engine.state["modes"][spec.market]["positions"]
     position = next(iter(positions.values()))
     assert position["security_type"] == "etf"
@@ -3227,9 +3281,7 @@ def test_market_benchmarks_are_gross_buy_hold_and_tx_is_fully_collateralized(
     assert tx["contract_code"] == "TXFH6"
     assert tx["fixed_fees_twd"] == 0.0
     assert tx["estimated_fixed_fees_twd"] == 60.0
-    assert tx["daily_return_pct"] == pytest.approx(
-        (45_000.0 / 44_900.0 - 1.0) * 100.0
-    )
+    assert tx["daily_return_pct"] == pytest.approx((45_000.0 / 44_900.0 - 1.0) * 100.0)
     assert tx["return_pct"] == pytest.approx(
         tx["net_pnl_twd"] / tx["initial_capital_twd"] * 100.0
     )
@@ -3915,9 +3967,7 @@ def test_dashboard_history_rebases_only_selected_return_not_cumulative_assets(
     assert summary["range_net_pnl_twd"] == 1.0
     assert summary["cumulative_net_pnl_twd"] == 3.0
     assert summary["cumulative_return_pct"] == pytest.approx(3.0)
-    assert summary["period_return_pct"] == pytest.approx(
-        103.0 / 102.0 * 100.0 - 100.0
-    )
+    assert summary["period_return_pct"] == pytest.approx(103.0 / 102.0 * 100.0 - 100.0)
     assert summary["return_pct"] == pytest.approx(summary["period_return_pct"])
     assert summary["point_count"] == 2
     assert summary["expected_minute_points"] == 270
@@ -3955,9 +4005,7 @@ def test_dashboard_history_excludes_pre_0901_strategy_operational_mark(
     )
 
     assert payload["raw_points_in_range"] == 1
-    assert [row["minute"] for row in payload["history"]] == [
-        "2026-09-03T01:01+00:00"
-    ]
+    assert [row["minute"] for row in payload["history"]] == ["2026-09-03T01:01+00:00"]
 
 
 def test_dashboard_history_cache_ignores_repairs_before_selected_start(
@@ -4098,9 +4146,15 @@ def test_dashboard_history_memory_cache_can_be_disabled_for_gateway(
             dashboard_module._HISTORY_SNAPSHOT_CACHE.clear()
 
 
+@pytest.mark.parametrize(
+    ("history_encoding", "cache_version"),
+    (("minute_columns_v1", "v1"), ("minute_columns_v2", "v2")),
+)
 def test_lossless_history_projection_survives_process_memory_cache_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    history_encoding: str,
+    cache_version: str,
 ) -> None:
     root = tmp_path / "state"
     root.mkdir()
@@ -4124,10 +4178,11 @@ def test_lossless_history_projection_survives_process_memory_cache_loss(
         state_dir=root,
         range_key="all",
         resolution="1m",
+        history_encoding=history_encoding,
         use_memory_cache=False,
     )
     assert first["returned_points"] == 1
-    assert list(cache_dir.glob("history-projection-all-1m-v1-*.json.gz"))
+    assert list(cache_dir.glob(f"history-projection-all-1m-{cache_version}-*.json.gz"))
 
     with dashboard_module._HISTORY_SNAPSHOT_CACHE_LOCK:
         dashboard_module._HISTORY_SNAPSHOT_CACHE.clear()
@@ -4140,6 +4195,7 @@ def test_lossless_history_projection_survives_process_memory_cache_loss(
         state_dir=root,
         range_key="all",
         resolution="1m",
+        history_encoding=history_encoding,
         use_memory_cache=False,
     )
     assert restored == first
@@ -4184,12 +4240,8 @@ def test_dashboard_history_keeps_leveraged_reference_below_zero(
     )
 
     assert result["raw_points_in_range"] == 2
-    assert [row["return_pct"] for row in result["history"]] == pytest.approx(
-        [0.0, 5.0]
-    )
-    assert [
-        row["cumulative_return_pct"] for row in result["history"]
-    ] == pytest.approx(
+    assert [row["return_pct"] for row in result["history"]] == pytest.approx([0.0, 5.0])
+    assert [row["cumulative_return_pct"] for row in result["history"]] == pytest.approx(
         [-110.0, -105.0]
     )
 
@@ -4339,13 +4391,10 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     assert payload["simulation_only"] is True
     assert payload["production_order_possible"] is False
     assert "live execution starts at 09:00" in payload["source_contract"]["entry_fill"]
-    assert "source-backed 09:01 minute price" in payload["source_contract"][
-        "entry_fill"
-    ]
     assert (
-        "without open-price fill"
-        in payload["source_contract"]["entry_fill"]
+        "source-backed 09:01 minute price" in payload["source_contract"]["entry_fill"]
     )
+    assert "without open-price fill" in payload["source_contract"]["entry_fill"]
     assert "live entry quantity is bounded" in payload["source_contract"]["depth_limit"]
     assert (
         "Missed-opening replay uses the official open only for sizing"
@@ -4356,9 +4405,18 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     # Public paper-account arithmetic is not a broker identity. Check secrets
     # explicitly instead of rejecting the ordinary word "account".
     encoded = json.dumps(payload).casefold()
-    for forbidden in ("account_id", "account_number", "broker_account", "api_key", "api_secret"):
+    for forbidden in (
+        "account_id",
+        "account_number",
+        "broker_account",
+        "api_key",
+        "api_secret",
+    ):
         assert forbidden not in encoded
-    assert payload["modes"][0]["account_performance"]["broker_buying_power_verified"] is False
+    assert (
+        payload["modes"][0]["account_performance"]["broker_buying_power_verified"]
+        is False
+    )
 
 
 def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
@@ -4710,9 +4768,15 @@ def test_simulation_executor_preopen_receipt_requires_both_components(
 def test_dashboard_html_is_local_and_refreshes_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "tw_day_trade_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
-    javascript = "\n".join((root / filename).read_text(encoding="utf-8") for filename in (
-        "app.js", "presentation.js", "detail-components.js",
-    ))
+    javascript = "\n".join(
+        (root / filename).read_text(encoding="utf-8")
+        for filename in (
+            "app.js",
+            "presentation.js",
+            "detail-components.js",
+            "chart-renderer.js",
+        )
+    )
     assert "http://" not in html and "https://" not in html
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
@@ -4868,10 +4932,15 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=80"' in html
+    assert 'src="app.js?v=82"' in html
+    assert 'src="chart-renderer.js?v=1"' in html
+    assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript
     assert "function decodeChartHistory(payload)" in javascript
-    assert "minute_series: _encodedColumns" in javascript
+    assert 'encoding: "v2"' in javascript
+    assert 'history_encoding: "minute_columns_v2"' in javascript
+    assert "new global.uPlot(options, plotData, host)" in javascript
+    assert "createElementNS" not in javascript
     assert "function matchesMode(" not in javascript
     assert "function matchesSymbol(" not in javascript
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
@@ -4881,13 +4950,13 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript
     assert "historyRows || data.benchmark_marks" not in javascript
-    assert 'href="styles.css?v=24"' in html
+    assert 'href="styles.css?v=25"' in html
     assert 'class="compact-table event-table"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
     assert "button[data-series-id]" in javascript
-    assert 'aria-pressed="${String(!hidden)}"' in javascript
+    assert 'button.setAttribute("aria-pressed", String(!hidden))' in javascript
     assert "refreshSummary" not in javascript
 
 
@@ -5101,7 +5170,10 @@ def test_next_session_archives_closed_positions_for_dashboard_history(
         == "registered"
     )
     engine.process_quotes(
-        quotes={"2330": _quote(bid=1_010.0, ask=1_010.0, last=1_010.0) | {"quote_at": _now(13, 30).isoformat()}},
+        quotes={
+            "2330": _quote(bid=1_010.0, ask=1_010.0, last=1_010.0)
+            | {"quote_at": _now(13, 30).isoformat()}
+        },
         now=_now(13, 30),
     )
 
@@ -5384,9 +5456,9 @@ def test_latest_session_signal_page_skips_full_ledger_index(
 
     assert page["source_rows_scanned"] == 2
     assert {row["symbol"] for row in page["rows"]} == {"2330", "2317"}
-    assert page["opening_execution_audit"]["mode_a"][
-        "model_signal_rows_complete"
-    ] is True
+    assert (
+        page["opening_execution_audit"]["mode_a"]["model_signal_rows_complete"] is True
+    )
 
 
 def test_available_session_date_cache_invalidates_when_ledger_grows(
@@ -5433,7 +5505,9 @@ def test_available_session_date_cache_invalidates_when_ledger_grows(
         end_date="2026-08-14",
         limit=10,
     )
-    assert [day for day in second["available_session_dates"] if day <= "2026-08-14"] == ["2026-08-14", "2026-08-13"]
+    assert [
+        day for day in second["available_session_dates"] if day <= "2026-08-14"
+    ] == ["2026-08-14", "2026-08-13"]
     assert second["total"] == 2
 
 
@@ -5456,9 +5530,7 @@ def test_ledger_session_index_survives_process_cache_loss(
     )
     cache_key = (ledger.resolve(), False)
 
-    first = dashboard_module._ledger_session_index(
-        ledger, recorded_at_fallback=False
-    )
+    first = dashboard_module._ledger_session_index(ledger, recorded_at_fallback=False)
     assert first is not None
     assert set(first.spans) == {"2026-08-13", "2026-08-14"}
     assert len(list(cache_dir.glob("ledger-session-index-v1-*.json"))) == 1
@@ -5489,9 +5561,7 @@ def test_persistent_ledger_session_index_scans_only_an_appended_tail(
         encoding="utf-8",
     )
     cache_key = (ledger.resolve(), False)
-    first = dashboard_module._ledger_session_index(
-        ledger, recorded_at_fallback=False
-    )
+    first = dashboard_module._ledger_session_index(ledger, recorded_at_fallback=False)
     assert first is not None
     first_size = first.observed_size
 
@@ -5505,13 +5575,9 @@ def test_persistent_ledger_session_index_scans_only_an_appended_tail(
 
     def observe_tail(line: bytes, *, recorded_at_fallback: bool) -> str:
         observed_lines.append(line)
-        return original_extract(
-            line, recorded_at_fallback=recorded_at_fallback
-        )
+        return original_extract(line, recorded_at_fallback=recorded_at_fallback)
 
-    monkeypatch.setattr(
-        dashboard_module, "_ledger_line_session_date", observe_tail
-    )
+    monkeypatch.setattr(dashboard_module, "_ledger_line_session_date", observe_tail)
     extended = dashboard_module._ledger_session_index(
         ledger, recorded_at_fallback=False
     )
@@ -5520,6 +5586,125 @@ def test_persistent_ledger_session_index_scans_only_an_appended_tail(
     assert set(extended.spans) == {"2026-08-13", "2026-08-14"}
     assert len(observed_lines) == 1
     assert b"2026-08-14" in observed_lines[0]
+
+
+def test_complete_ledger_native_reader_matches_strict_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = tmp_path / "marks.jsonl"
+    rows = [
+        {
+            "session_date": "2026-08-13",
+            "market": "mode_a",
+            "minute": f"2026-08-13T09:{minute:02d}+08:00",
+            "total_equity_twd": 100.0 + minute,
+        }
+        for minute in range(1, 4)
+    ]
+    ledger.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+
+    assert list(dashboard_module._all_ledger_objects(ledger)) == list(
+        dashboard_module._all_json_objects(ledger)
+    )
+
+
+def test_complete_ledger_native_reader_falls_back_on_schema_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import polars as pl
+
+    ledger = tmp_path / "marks.jsonl"
+    rows = [
+        {"session_date": "2026-08-13", "value": 1},
+        {"session_date": "2026-08-14", "value": {"nested": 2}},
+    ]
+    ledger.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        pl,
+        "read_ndjson",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pl.exceptions.ComputeError("mixed schema")
+        ),
+    )
+
+    assert list(dashboard_module._all_ledger_objects(ledger)) == rows
+
+
+def test_complete_ledger_native_reader_retries_late_typed_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import polars as pl
+
+    ledger = tmp_path / "benchmark_marks.jsonl"
+    rows = [
+        {"session_date": "2026-08-13", "contract_code": None},
+        {"session_date": "2026-08-14", "contract_code": "TXFH6"},
+    ]
+    ledger.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    original = pl.read_ndjson
+    observed_inference: list[int | None] = []
+
+    def read_with_late_schema_retry(*args, **kwargs):
+        infer_schema_length = kwargs.get("infer_schema_length")
+        observed_inference.append(infer_schema_length)
+        if infer_schema_length == 1_000:
+            raise pl.exceptions.ComputeError("late non-null value")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "read_ndjson", read_with_late_schema_retry)
+
+    assert list(dashboard_module._all_ledger_objects(ledger)) == rows
+    assert observed_inference == [1_000, None]
+
+
+def test_complete_history_skips_redundant_session_index_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "marks.jsonl").write_text(
+        json.dumps(
+            {
+                "market": "tw_day_trade",
+                "minute": "2026-08-13T09:01+08:00",
+                "initial_capital_twd": 100.0,
+                "total_equity_twd": 101.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "_ledger_session_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("complete history must not scan a date index first")
+        ),
+    )
+
+    payload = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        resolution="1m",
+        use_memory_cache=False,
+        use_persistent_cache=False,
+    )
+
+    assert payload["available_start_date"] == "2026-08-13"
+    assert payload["available_end_date"] == "2026-08-13"
+    assert payload["returned_points"] == 1
 
 
 def test_compact_benchmark_history_index_survives_process_cache_loss(

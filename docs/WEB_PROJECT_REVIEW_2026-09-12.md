@@ -346,3 +346,200 @@ POST 405，未知 query 400；gzip、representation ETag、immutable cache、CSP
 - Live 安全重驗：八頁與兩個共用資源皆 200；`/.env`、`/README.md`、`/api/order` 404，POST 405，未知 query 400；同 representation ETag 為 304，gzip、immutable asset cache、CSP、HSTS、`nosniff`、`Vary: Accept-Encoding` 均存在。origin 服務仍只監聽 127.0.0.1:8765/8766/8770。
 - OpenBB L1 壓縮不是卡死：目前每次正常工作都要先驗證 16 GiB SQLite manifest 與約 250 萬筆既有 membership，舊的 `TimeoutStartSec=20min` 已連續把仍有進度的工作誤殺。短期可靠性修正把 timeout 改為 40 分鐘，保留單一 instance lock、2,048 source-file 上限、3 GiB `MemoryMax` 與低 IO/CPU 權重。安裝後的正式週期在 12 分 14.28 秒完成：20 個新 segment、0 stale、0 failed、42 個 views、2,516,371 個已壓縮 source files，服務 `Result=success`、`NRestarts=0`。這只修正 supervisor 邊界；4,801,271 個 pending files 與每輪全 manifest 驗證仍需後續以 task-mutation 增量失效索引處理，不能把加 timeout 寫成延遲優化。
 - 最後一次 `systemctl --failed` 只剩 `stockagent-registered-data-daily.service`；其 `dune_crypto_history` 仍需有效 entitlement／query source 才能修復。全 Python suite 的 `5,401 passed` 是 OpenBB systemd template 最後調整之前執行；template 調整後另跑其 boot/data-monitor contract focused tests（6 passed），沒有把未重跑的完整 suite 說成最後一個位元都重新驗證。
+
+## 2026-09-13 全歷史熱點、繁中字型與可重測基線續審
+
+本輪從責任邊界重新拆解頁面延遲：來源建置、服務端序列化、HTTP 傳輸、JSON 解碼與畫面更新
+分開量測；不以頁面已顯示、熱快取命中或刪除分鐘點代替正確性。`cProfile` 顯示真正的來源重建
+會逐行做約 20 萬次 Python `json.loads`，而完整 `marks.jsonl` 約 219 MB、
+`benchmark_history.json` 約 291 MB、即時基準 ledger 約 28 MB。這是本輪優先處理的 CPU/GIL 熱點。
+
+- 全期間策略與即時基準 ledger 改走 Polars native NDJSON reader；小檔、缺少 Polars 或混合 schema
+  仍回退既有嚴格逐行 decoder，不改來源權威、時間粒度或錯誤語意。獨立程序 A/B 為
+  15.749 秒降至 13.629 秒，點數同為 300,304、序列化長度同為 15,125,865 bytes，SHA-256
+  同為 `e94814a9ee84dd3e440f29ed5c55444888a944b4b6941c2107d2055f39dc797c`；這約 13.5%
+  改善，不宣稱已達完整歷史的最終目標。
+- 測速工具新增 `--profile-history-source-rebuild`。它明確關閉最終記憶／持久 projection，仍保留
+  OS page cache 與 helper indexes 的邊界說明，並只以真正影響 builder 的來源判定量測期間是否穩定；
+  `state.json` 只比較實際使用的 `product`，不再因無關的即時 receipt 原子更新產生假失敗。可重測
+  receipt `artifacts/benchmarks/dashboards/2026-09-13-native-ledger-source-rebuild-final.json`
+  實測 13.053 秒、來源穩定、300,304 點、8 條序列且 hash 相同。
+- 七份實體 shell（隔日沖重用當沖 shell）改用同一繁中字型 fallback token，明列 Noto Sans TC、
+  PingFang TC 與 Microsoft JhengHei，且不連第三方字型服務。Linux 驗收主機原只有 DejaVu 與一份
+  Chromium 未採用的 TTC，畫面雖通過 DOM 稽核卻實際出現 tofu；安裝開源 Noto CJK、重開全新
+  Chromium 後已用截圖確認繁中可讀。這項發現也證明 DOM/console 零錯誤不能取代視覺驗收。
+- 使用實際 CJK glyph metrics 重跑 11 種 CSS viewport/DPR × 8 頁，共 88/88 通過；document、
+  navigation、table overflow、small/mobile touch target、clipping、overlap、console、API 與 timing
+  gate 全為 0。receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-native-ledger-responsive-noto-v9/responsive-audit.json`。
+  1366×768 八頁獨立驗收也全通過；當沖 status 首次可見樣本 11.7 ms、事件區延後載入至可繪製
+  426.5 ms，這是同主機公網/hairpin 當次觀測，不是外部 ISP SLA。
+- 公開 gateway 部署後維持 `active/running`、`Result=success`、`NRestarts=0`，origin 只監聽
+  `127.0.0.1:8765/8766/8770`。八頁與共用資源 200；`/.env`、`README.md`、`/api/order`
+  404，POST 405，未知 history query 400，CSP/HSTS/`nosniff` 與 immutable asset cache 仍存在。
+  本輪只重啟唯讀公開 gateway，沒有重啟交易、Discord 或資料擷取服務。
+- 目前狀態沒有被 UI 改綠：資料監控 active scope 為 286，其中 35 unable、46 catching up、
+  205 complete；另有 49 deferred 與 18 reference 完整保留。當沖仍為 `degraded`，5 個模式中
+  `tw_day_trade_100m` 有 1 筆收盤後異常殘餘及過期估值；隔日沖與 TAIFEX 在休市日維持
+  `waiting`。這些需要上游資料或執行證據修復，不是前端刪除警示能解決。
+
+下一個最大效能缺口仍是 source rebuild 約 13 秒及 15.1 MB JSON 本文。正確的下一步是把
+canonical minute projection 依 session/series 做不可變分片與 append-only delta 更新，再比較
+相同 300,304 點與 hash/語意 receipt；不是縮短歷史、降低分鐘粒度或把持久快取命中寫成重建速度。
+
+## 2026-09-13 完整歷史來源重建優化
+
+本輪把上述約 13 秒再拆成 ledger 日期索引、NDJSON schema 推斷、Python row projection、時間解析、
+去重／排序與輸出編碼。修改仍只針對唯讀 projection；canonical ledger、每分鐘粒度、帳務計算與
+成交證據都沒有改動。
+
+- `benchmark_marks.jsonl` 的前段有欄位全為 null、後段才出現字串。原生 bounded schema 推斷失敗時，
+  過去會把整檔退回逐列 `json.loads`；現在先做一次 native full-schema retry，真正格式錯誤才回到嚴格
+  decoder。`marks.jsonl` 則維持較快的 bounded inference。
+- 完整策略 ledger 只投影曲線需要的 18 欄，經 Polars positional rows 進入 Python；不再為 184,950 列
+  建立 28 欄 named dict。相同的 `add_values` 契約仍負責時區、09:01--13:30、資本報酬、估值來源與
+  canonical benchmark 優先權，避免快路徑產生第二套財務語意。
+- 全歷史本來就會讀每一列，不再先額外掃描 246 MB NDJSON 建日期 byte-span index；日期直接由同一批
+  已解析分鐘列取得。起訖日篩選仍使用持久 span index，因此舊日期 append 隔離與範圍正確性不變。
+- 同一 history query 出現新 revision 時，gateway 只在有限 stale window 內立即回傳上一份帶時間戳、
+  已驗證 response，並以 single background rebuild 建立新版；第一個冷 build、逾期內容與不同查詢不共用。
+  啟動預熱也在首頁、當日狀態與 TAIFEX 首要資料就緒後建立完整 1m history，避免瀏覽器成為付首次成本者。
+
+同一份穩定來源、同一個新 CLI process、關閉 final memory/persistent projection 的單次重測如下；
+它是可重現樣本，不是長期 SLA：
+
+- 無 helper-index 環境：13,052.73 ms 降至 9,698.07 ms（25.7%）；receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-history-no-double-scan-final.json`。
+- 正式服務的 `/var/cache/stockagent-public-dashboards` helper-index 環境：7,632.66 ms 降至
+  6,318.10 ms（17.2%）；receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-history-source-rebuild-optimized-final.json`。
+- 四份比較輸出均為 300,304 點、8 序列、15,125,865 bytes，canonical SHA-256 均為
+  `e94814a9ee84dd3e440f29ed5c55444888a944b4b6941c2107d2055f39dc797c`，來源量測期間穩定。
+
+部署後完整 history 已預熱；loopback 實際回應的 `Server-Timing app` 為 1.539 ms，gzip 傳輸
+91.6 ms，解碼後仍是相同 300,304 點與 canonical hash。外部 IPv4 HTTPS 單次完整本文為 400.0 ms；
+它包含網路與 3.59 MB gzip 本文，不是 source rebuild。224 個 Python 與 29 個 Node regression 全通過；
+真 Chromium 對當沖頁跑 11 種手機／平板／筆電／1080p／2K profile，11/11 通過且 overflow、touch、
+clipping、overlap、console、API、timing gate 均為 0。receipt：
+`artifacts/benchmarks/dashboards/2026-09-13-history-optimization-browser/responsive-audit.json`。
+
+公開 gateway 只監聽 `127.0.0.1:8770`，部署後 PID 2413325、`NRestarts=0`；當沖、隔日沖與 Discord
+服務沒有重啟。13 秒已不是正式服務條件下的現況，但 6.3 秒仍是完整 source rebuild 成本；下一階段若要
+繼續壓低計算本身，應將 canonical projection 改成 session/series immutable shards 加 append tail，
+並繼續用完整點數與 hash 驗收，不能用 stale response 或熱快取數字冒充來源重建。
+
+## 2026-09-13 繪圖架構、明細索引與互動延遲收斂
+
+本輪沒有改 canonical 帳本、財務語意、分鐘粒度或交易服務；調整範圍是唯讀 projection、公開 gateway
+與瀏覽器呈現。第一性拆解後，完整歷史的使用者延遲其實由四個獨立問題組成：傳輸結構、瀏覽器物件
+配置、SVG DOM 數量，以及日期控制器重複要求語意相同的全期間資料。明細頁另有寬列解碼與泛用物件
+快取放大問題，不能只靠替換前端框架處理。
+
+- 新增相容的 `minute_columns_v2`：一份排序後 epoch-minute axis 加每條序列的 index/value/quality 欄，
+  舊 v1 API 維持預設。v1/v2 對 8 條序列逐點比對皆為 300,304 點。raw JSON 由 15,125,865 降至
+  13,913,805 bytes（約 8.0%）；gzip 則由 3,593,127 增至約 3,628,851 bytes，因此本輪主要收益是
+  瀏覽器配置與 DOM，不把 gzip 寫成改善。
+- 完整曲線改用本機 vendored、MIT 授權的 uPlot 1.6.32 Canvas renderer；沒有 CDN、eval 或外站依賴。
+  renderer、資料解碼、legend、缺值／過期品質與 resize 被拆成可重用 `chart-renderer.js`，並沿用共享
+  dashboard core。舊實測 SVG 流程總計約 940.8 ms、heap 110.7 MB；新架構的 11-profile Chromium
+  實測完整互動中位數 802.1 ms，其中 API 328.3 ms、JSON parse 40.8 ms、資料對齊 45.3 ms、Canvas
+  construct 0.8 ms、paint opportunity 138.2 ms。每次都真的繪出 300,304 點且 Canvas 1、SVG path 0。
+- 日期起訖等於完整可用邊界時，前端改重用同一個無界、啟動已預熱的 canonical cache key，再在 client
+  保留明確的起訖語意。這修正了完全相同資料因 explicit-date key 再建一次的錯誤；1366×768 loopback
+  互動由舊 receipt 的 17.708 秒降至 744.6 ms，公網 HTTPS 為 827.9 ms。公網樣本的 server 7.083 ms、
+  body 165.8 ms、parse 43.0 ms、prepare 84.1 ms、Canvas 1.0 ms，console/API error 皆為 0。
+- 瀏覽器效能紀錄新增 `render` 類別，保留 prepare/draw/paint、點數、序列數與 viewport；流量頁可直接
+  篩選「資料整理與繪圖」。資料只留在該瀏覽器的 bounded localStorage，不上傳查詢文字、帳號或輸入值。
+- 持倉歷史不再讓泛用 `_object` cache 長期保留 690 份寬 JSON。新增以 inode/size/mtime 驗證的 9 欄
+  locator index，先排序／篩選 compact entries，再只回讀畫面實際需要的來源列。真實 203 MB source
+  第一次建立 4.257 秒；1.25 MB 持久索引完成後的新程序為 0.911 秒，輸出仍是 44,930 筆中的相同頁面。
+- 訊號全期間仍忠實掃描 bounded 最新 100,000 列，但先倒序定位原始列，再由 native reader 只投影公開
+  與稽核需要欄位；冷請求由 7.393 秒降至 2.105--2.293 秒。事件改成 Arrow batch projection、去重計數
+  與 bounded page heap，不再同時展開 20 萬份完整 Python dict；冷請求由 9.520 秒降至 2.531--2.679 秒。
+  後續同 revision 的公開回應中位數為持倉 1.860 ms、事件 2.296 ms、訊號 1.983 ms；receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-final-uplot-targeted.json`。
+- 改版前一次全頁稽核令 gateway 常駐 RSS 升至約 2.54 GiB、cgroup peak 3.58 GB；根因不是 55 MB 的
+  HTTP response cache，而是歷史 JSON 寬物件與 native allocator。乾淨部署預熱後 RSS 約 604 MB；
+  全期間三明細、重複模式篩選與瀏覽器矩陣後穩定約 0.93--1.02 GiB，沒有線性成長，cgroup peak
+  1.257 GB。這是約 2.8 倍 peak 降幅，不把它寫成零記憶體成本。
+- 最終 responsive receipt：`artifacts/benchmarks/dashboards/2026-09-13-final-responsive/responsive-audit.json`。
+  11 種 320px 手機至 2K／超寬 viewport 的當沖與隔日沖全部 status 0；overflow、navigation、table、
+  touch target、clipping、overlap、console、API、timing gate 全為 0。公網 1366 receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-final-postrestart-public/report-1366x768.json`；重啟後完整互動
+  769.7 ms、API 323.3 ms、prepare 65.8 ms、Canvas 0.7 ms、paint opportunity 127.5 ms。
+- 本輪聚焦回歸為 308 個 Python tests 與 30 個 Node tests 全通過，focused Ruff、所有修改 JS syntax、
+  `git diff --check` 皆通過；沒有把先前的全庫測試結果冒充成這次修改後重新執行 5,401 個測試。
+- 部署只重啟 `stockagent-public-dashboards.service`。最終 PID 2509479、active/running、`NRestarts=0`，
+  來源仍只監聽 `127.0.0.1:8765/8766/8770`。公網 shell/vendor/traffic 均 200，`/.env`、`README.md`、
+  `/api/order` 為 404，POST 為 405，未知 encoding 為 400；CSP、HSTS、`nosniff` 與 `Vary` 仍存在。
+- 狀態沒有被效能優化改綠：當沖仍 `degraded`（包含 1 筆異常殘餘）、隔日沖與休市 TAIFEX 為
+  `waiting`；資料監控為 `degraded`，active scope 286 中 35 unable、58 catching up、193 complete。
+
+完整 canonical source rebuild 在 helper-index 條件下仍約 6.3 秒，這和已預熱公開回應是兩個不同指標。
+若來源重建也必須進一步下降，下一階段才應實作 immutable per-session projection shards 與 append delta；
+目前前端不需要為此導入一套新的 SPA build/runtime framework，否則增加冷啟動與供應鏈面，卻不會移除
+Python canonical join 的主要成本。
+
+## 2026-09-13 immutable session projection 與 append-only delta
+
+前一節留下的 6.3 秒問題已實作，不需要全面重寫前端。資料流現在分成三個可獨立驗證的層次：
+
+1. `benchmark_history.json` 保留為相容的 canonical 單體來源；正式重建器另外發布
+   `benchmark_history_projection/v1`。每個交易日是 SHA-256 content-addressed gzip shard，`head.json`
+   原子切換目前版本，`delta.jsonl` 只追加實際新增、替換或移除的交易日。來源欄位壓縮與 dashboard
+   使用同一份 contract；每個 interior minute 只保留投影需要欄位，每個 benchmark/session 的末列仍保留
+   完整 audit 欄位。所有檔案為 0600，讀取時逐 shard 驗證路徑、schema、日期、筆數及內容 hash；任一
+   不符就 fail closed 回退 canonical JSON。
+2. 策略 `marks.jsonl` 與 live `benchmark_marks.jsonl` 保留 append-only canonical ledger。既有 byte-span
+   index 現在額外記住每個 session 的內容 digest；同 inode append 時只重新 hash span 有變化的日期，
+   原子換檔則重新 hash bytes 但不重新配置所有 JSON row。benchmark source session hash、live rebasing
+   origin hash、product/schema contract 一起形成 session source fingerprint，避免錯誤重用。
+3. 唯讀 dashboard cache 以該 fingerprint 發布第二層 `history-session-projection-v2` immutable shard 與
+   append-only delta。最終 all-history cache 失效時直接合併未變日；最多 8 個變更日才逐日走原本的
+   時區、09:01--13:30、資本報酬、canonical benchmark 優先權與品質旗標邏輯，異常大量變更則回到完整
+   rebuild。日分片只儲存共同 minute axis 的 indexes、原始 cumulative return、品質旗標與精確 aggregate，
+   全期間選定起點 0% 與絕對權益累積仍在 merge 時按原 contract 計算，沒有插值、刪分鐘或改成交證據。
+
+完整 300,304 點、8 序列的舊路徑與新路徑逐欄序列化後 SHA-256 都是
+`d82297cf36c91bab7f022573535467beef02268fdfd8519331fca1aba8240811`；包含浮點 aggregate、日期、
+品質旗標與 range summary 都完全相同。量測邊界仍是新 CLI process、OS/helper index 可熱，不冒充磁碟
+cold SLA：
+
+- 同時 bypass final cache 與 session projection 的完整 canonical control：7,043.51 ms；receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-full-source-rebuild-control.json`。
+- 只 bypass final cache、保留可驗證 session projection：第一次 859.94 ms，後續 722.13／745.63 ms，
+  對 control 首樣本減少 87.8%；receipt：
+  `artifacts/benchmarks/dashboards/2026-09-13-session-shard-source-rebuild-v2.json`。
+- 在獨立 cache copy 刻意刪除最新 `2026-09-11` shard，確認只回讀該日 strategy/live spans 並合併其餘
+  136 日；新 process 建置 1,070.40 ms、peak RSS 240,620 KiB，輸出 hash 仍相同。這是一次受控故障
+  樣本，不是未來每個新增日的 SLA。
+
+首次完全沒有任何 session projection 時仍需真實掃過 canonical rows；同步建立 137 份分片的本次樣本
+約 8.0 秒，之後才進入增量路徑。公開 gateway 本來就在 listener 啟動後的背景預熱 worker 建 full history，
+因此不阻塞 socket bind 或首頁／當日狀態；benchmark projection head 也加入小檔 watcher 和 revision token，
+不需要每秒 hash 218--291 MB 大檔。基準重建、分鐘曲線候選、直接 publish 與 open-price replay candidate
+現在都共用同一 projection writer，避免不同維護入口產生風格或語意分叉。
+
+效能工具也把兩個事實分開：`--profile-history-source-rebuild` 測「final cache 失效、session projection
+有效」，新增 `--profile-history-full-source-rebuild` 才同時 bypass session shards，保留真正全掃描 control。
+本輪另移除 benchmark script 重複／含混的量測語意，未導入新的前端框架或 CDN；UI、Canvas renderer、
+共用 components、responsive 規則及公開 DTO 都維持上一節已驗證的一致 contract。
+
+部署只重啟 `stockagent-public-dashboards.service`；最終 PID 2529907、active/running、`NRestarts=0`，
+8765、8766、8770 仍只監聽 `127.0.0.1`。重啟後在完整 final projection 尚未預熱完成時，公網第一個
+all-history request 實際走 session merge，`Server-Timing build=1263.378 ms`，仍回傳相同 300,304 點與
+SHA-256；預熱後 1366×768 真 Chromium 完整曲線互動為 609.4 ms（API 223.3、parse 37.8、prepare
+35.2、Canvas 0.5、paint opportunity 92.3 ms），Canvas 1、SVG path 0、console/API error 0。receipt：
+`artifacts/benchmarks/dashboards/2026-09-13-session-shards-final/report-1366x768.json`。
+
+11 種 320px 手機至 2K／超寬螢幕的當沖與隔日沖重新驗收，11/11 status 0；document/navigation/table
+overflow、small/touch target、clipping、overlap、console、API、timing gate 均為 0。receipt：
+`artifacts/benchmarks/dashboards/2026-09-13-session-shards-responsive/responsive-audit.json`。本輪相關
+回歸共 344 個 Python、30 個 Node tests，Ruff 與 `git diff --check` 全通過。公網 `/.env`、`README.md`、
+`/api/order` 為 404，POST 為 405，未知 encoding 為 400；CSP、HSTS、`nosniff`、same-origin policy
+與 `Vary` 都存在。本輪產生後已被 v2 取代的 3,406,884-byte 私有 v1 cache 已移出 active cache 到
+`/tmp/stockagent-obsolete-history-session-projection-v1-20260913`，可復原也可由 canonical source 重建。
+
+效能修改沒有把營運狀態改綠：最終公網仍忠實顯示當沖 `degraded`（1 個 open position）、隔日沖與
+休市 TAIFEX `waiting`；data monitor `degraded`，286 個 active endpoint 中 35 unable、56 catching up、
+195 complete。這些上游資料／部位問題不是投影分片能消除的。

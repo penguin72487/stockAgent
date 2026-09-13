@@ -9,6 +9,16 @@
 :root {
   --dashboard-wide-content: 1500px;
   --dashboard-mobile-gutter: 12px;
+  --dashboard-font-family: Inter, "Noto Sans TC", "PingFang TC",
+    "Microsoft JhengHei UI", "Microsoft JhengHei", system-ui, sans-serif;
+}
+
+/* Keep the seven shells on one Traditional-Chinese-capable fallback chain.
+ * Linux and Windows viewers do not have the same system-ui font. Prefer their
+ * local CJK faces explicitly; no page makes a third-party font request. */
+html:root,
+body {
+  font-family: var(--dashboard-font-family);
 }
 
 html[data-dashboard-page="overview"] { --dashboard-wide-content: 1400px; }

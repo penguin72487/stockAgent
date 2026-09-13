@@ -71,6 +71,9 @@ from stockagent.data.tw_price_rules import (  # noqa: E402
     move_price_ticks_numpy,
 )
 from stockagent.data.tw_security import classify_tw_stock_or_etf  # noqa: E402
+from stockagent.live.benchmark_history_projection import (  # noqa: E402
+    write_benchmark_projection,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -146,12 +149,21 @@ def _retain_benchmark_history(source_path: Path, state_dir: Path) -> dict[str, A
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.write_bytes(raw)
     temporary.replace(destination)
+    projection = write_benchmark_projection(
+        state_dir=state_dir,
+        source_path=destination,
+        source_sha256=hashlib.sha256(raw).hexdigest(),
+        origins=origins,
+        marks=payload["marks"],
+        created_at=str(payload.get("created_at") or datetime.now(TAIPEI).isoformat()),
+    )
     return {
         "path": str(source_path),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "marks": len(payload["marks"]),
         "origins": sorted(origins),
         "destination": str(destination),
+        **projection,
     }
 
 

@@ -434,7 +434,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=7"' in html
+    assert 'src="../dashboard-core.js?v=8"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript

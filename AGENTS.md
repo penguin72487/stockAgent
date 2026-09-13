@@ -111,7 +111,8 @@ coordinated code, config, test, and documentation change.
 |---|---|---:|---:|
 | Code, configs, contracts | Git working tree | yes, through Git | no data folder |
 | Canonical producer workspace | catalog-resolved `source`, including `/srv/stockagent-live/data_tw_public` for `tw-public` | yes | no |
-| Durable fleet cold store | `/srv/stockagent-packed` | immutable releases only | yes, Folder ID `stockagent-packed` |
+| Fleet current cold store | `/srv/stockagent-packed` | immutable current/protected releases | yes, Folder ID `stockagent-packed` |
+| Penguin historical archive | `D:\stockagent-backup\packed` | additive immutable history | no |
 | Replaceable local hot cache | `/srv/stockagent-packed-materialized` | only lifecycle metadata; materialized data is immutable | no |
 | In-progress training artifacts | node-local `artifacts` workspace | yes | no |
 | Optional operational artifact transport | `/srv/stockagent-artifacts-hot` | yes | separate, explicitly scoped folder only |
@@ -135,8 +136,9 @@ coordinated code, config, test, and documentation change.
 
 - The canonical data namespace is `stockagent-packed` at
   `/srv/stockagent-packed`, configured Send & Receive, filesystem watcher on,
-  and not paused.  Durable nodes retain manifests, per-node heads, inventories,
-  packs, blobs, and their proofs.  An explicitly enrolled ephemeral compute node
+  and not paused.  Full-replica nodes retain the rolling current/protected
+  manifests, per-node heads, inventories, packs, blobs, and their proofs.  An
+  explicitly enrolled ephemeral compute node
   may use index-only edge mode: it still synchronizes heads/manifests/inventories
   in real time, ignores local blob/pack payload copies, and hydrates the exact
   objects for a selected release before use.  Repositories, mutable `data_*`
@@ -201,6 +203,18 @@ coordinated code, config, test, and documentation change.
 - Backup is additive: preserve historical manifests, unreferenced immutable
   objects, and replaced head history. Source deletion must not propagate to D:.
   Any backup pruning needs a separately approved retention/reachability policy.
+- `configs/data_sync/packed_retention.json` defines the approved penguin-only
+  rolling-current policy for C:. Preserve all valid current heads, local pins,
+  active READY/leases/quarantine, their complete object graphs, and a 24-hour
+  release grace window. Historical manifests and objects not reachable from
+  that set may leave C only after every candidate has a fresh D checksum receipt,
+  every configured fleet peer is fully converged, there are no conflict files or
+  process references, and a global publish-retention lock plus unchanged plan
+  fingerprint are held. Stop local Syncthing and backup only around the final
+  recheck/unlink, then restart and require post-delete convergence. This policy
+  never deletes D, heads, producer sources, materialized data, or active artifacts.
+  A `snapshot_id` is a backward-compatible atomic release identifier, not a full
+  copied tree; do not remove manifests from the publication protocol.
 - Require the enrolled D: mount and volume marker, separate source filesystem,
   SHA-256 streaming copy plus destination readback, stable source signatures,
   and atomic finalization. Commit a head only after all its referenced objects
@@ -265,8 +279,10 @@ coordinated code, config, test, and documentation change.
   lease age only; it may not bypass those safety proofs.
 - Cache GC may delete only managed materialized versions.  It must never delete
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
-  an unmanaged directory.  Cold-object GC stays report-only unless the user has
-  explicitly approved a retention policy and fleet-wide reachability proof.
+  an unmanaged directory.  It must never act as cold-object GC. The only approved
+  C cold deletion path is `scripts/run_packed_retention.sh`: it applies the exact
+  D-backed rolling-current and fleet-wide proof above. Other nodes and the D
+  archive remain report-only unless the user separately changes their policy.
 - Compiler caches are a separate rebuildable layer.  Under disk pressure, use
   `scripts/maintain_storage_pressure.py`: it may prune only allowlisted old
   TorchInductor/Triton/CUDA cache files after fd/mmap and signature rechecks.  It

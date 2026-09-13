@@ -1,0 +1,25 @@
+[Unit]
+Description=StockAgent rolling packed retention on penguin
+After=local-fs.target network-online.target syncthing@root.service stockagent-packed-backup.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+ExecStart=/bin/bash "@REPO_ROOT@/scripts/run_packed_retention.sh" apply --defer-if-blocked
+TimeoutStartSec=1800
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=10
+IOWeight=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/stockagent-packed /var/lib/stockagent-packed-retention
+ReadOnlyPaths=/mnt/d/stockagent-backup /var/lib/stockagent-packed-backup
+StandardOutput=journal
+StandardError=journal
+

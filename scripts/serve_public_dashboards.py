@@ -38,7 +38,14 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_tw_signals,
     sanitize_tw_status,
 )
-from stockagent.live.dashboard_updates import DashboardUpdateHub, file_signature, metadata_signature  # noqa: E402
+from stockagent.live.dashboard_updates import (
+    DashboardUpdateHub,
+    file_signature,
+    metadata_signature,
+)  # noqa: E402
+from stockagent.live.benchmark_history_projection import (  # noqa: E402
+    projection_head_path as benchmark_projection_head_path,
+)
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
 )
@@ -138,14 +145,24 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/traffic/",
     }
 )
-_QUERY_API_ROUTES: Final[frozenset[str]] = frozenset({
-    "/taifex/api/history", "/tw-day-trade/api/status", "/tw-day-trade/api/history",
-    "/tw-day-trade/api/summary", "/tw-day-trade/api/positions",
-    "/tw-day-trade/api/signals", "/tw-day-trade/api/events", "/openbb/api/history",
-    "/tw-overnight/api/status", "/tw-overnight/api/history",
-    "/tw-overnight/api/summary", "/tw-overnight/api/positions",
-    "/tw-overnight/api/signals", "/tw-overnight/api/events",
-})
+_QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
+    {
+        "/taifex/api/history",
+        "/tw-day-trade/api/status",
+        "/tw-day-trade/api/history",
+        "/tw-day-trade/api/summary",
+        "/tw-day-trade/api/positions",
+        "/tw-day-trade/api/signals",
+        "/tw-day-trade/api/events",
+        "/openbb/api/history",
+        "/tw-overnight/api/status",
+        "/tw-overnight/api/history",
+        "/tw-overnight/api/summary",
+        "/tw-overnight/api/positions",
+        "/tw-overnight/api/signals",
+        "/tw-overnight/api/events",
+    }
+)
 
 
 class InvalidPublicRequest(ValueError):
@@ -533,7 +550,9 @@ def _prepared(
     cache_control: str,
 ) -> PreparedResponse:
     digest = hashlib.sha256(body).hexdigest()
-    compressed = gzip.compress(body, compresslevel=5, mtime=0) if len(body) >= 1_024 else body
+    compressed = (
+        gzip.compress(body, compresslevel=5, mtime=0) if len(body) >= 1_024 else body
+    )
     return PreparedResponse(
         body=body,
         gzip_body=compressed,
@@ -558,8 +577,11 @@ def _preferred_encoding(header: str | None, *, gzip_available: bool) -> str | No
         for parameter in parameters:
             name, separator, value = parameter.strip().partition("=")
             if (
-                name.strip() != "q" or not separator or seen_quality
-                or re.fullmatch(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)", value.strip()) is None
+                name.strip() != "q"
+                or not separator
+                or seen_quality
+                or re.fullmatch(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)", value.strip())
+                is None
             ):
                 quality = 0.0
                 break
@@ -567,8 +589,12 @@ def _preferred_encoding(header: str | None, *, gzip_available: bool) -> str | No
             quality = float(value)
         # Repeated contradictory values are malformed; never override q=0.
         qualities[coding] = min(quality, qualities.get(coding, quality))
-    gzip_quality = qualities.get("gzip", qualities.get("*", 0.0)) if gzip_available else 0.0
-    identity_quality = qualities.get("identity", 0.0 if qualities.get("*") == 0.0 else 1.0)
+    gzip_quality = (
+        qualities.get("gzip", qualities.get("*", 0.0)) if gzip_available else 0.0
+    )
+    identity_quality = qualities.get(
+        "identity", 0.0 if qualities.get("*") == 0.0 else 1.0
+    )
     if gzip_quality > 0 and (
         "identity" not in qualities or gzip_quality >= identity_quality
     ):
@@ -667,9 +693,7 @@ def build_compact_tw_overview_status(
     if status.get("simulation_only") is not True:
         raise UnsafePublicDashboardPayload("simulation_only must be true")
     if status.get("production_order_possible") is not False:
-        raise UnsafePublicDashboardPayload(
-            "production_order_possible must be false"
-        )
+        raise UnsafePublicDashboardPayload("production_order_possible must be false")
 
     observed = (now or datetime.now(UTC)).astimezone(UTC)
     source_updated_at = status.get("updated_at")
@@ -690,9 +714,7 @@ def build_compact_tw_overview_status(
     ):
         health = "stale"
 
-    local_session_date = (
-        observed.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat()
-    )
+    local_session_date = observed.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat()
     try:
         opening_gate = json.loads(Path(opening_gate_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -722,8 +744,7 @@ def build_compact_tw_overview_status(
             entry_incomplete = (
                 product != "tw_overnight"
                 and requested_shares > filled_shares
-                and str(mode.get("entry_fill_outcome") or "")
-                in {"partial", "no_fill"}
+                and str(mode.get("entry_fill_outcome") or "") in {"partial", "no_fill"}
             )
             if (
                 stale_position_count
@@ -754,9 +775,7 @@ def build_compact_tw_overview_status(
         "health": health,
         "source_updated_at": source_updated_at,
         "source_age_seconds": (
-            round(source_age_seconds, 3)
-            if source_age_seconds is not None
-            else None
+            round(source_age_seconds, 3) if source_age_seconds is not None else None
         ),
         "simulation_only": True,
         "production_order_possible": False,
@@ -831,9 +850,7 @@ def build_public_overview(
         "overnight": {
             "health": overnight.get("health"),
             "source_age_seconds": overnight.get("source_age_seconds"),
-            "modes": (
-                len(overnight_modes) if isinstance(overnight_modes, list) else 0
-            ),
+            "modes": (len(overnight_modes) if isinstance(overnight_modes, list) else 0),
             "open_positions": overnight_open,
         },
         "shioaji": {
@@ -928,23 +945,30 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self._cache_lock = threading.Lock()
         # Builders and waiters hold strong references. A lock disappears only
         # after its last user, independently of success, failure or LRU eviction.
-        self._cache_key_locks: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
+        self._cache_key_locks: WeakValueDictionary[str, threading.Lock] = (
+            WeakValueDictionary()
+        )
         self._refreshing: set[str] = set()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
         bot = self.repo_root / "artifacts/discord_bot"
-        self.update_hub = DashboardUpdateHub({
-            topic: (
-                self.repo_root / f"artifacts/live/{directory}/service_sync.json",
-                self.repo_root / f"artifacts/live/{directory}/status.json",
-                bot / "service_status.json",
-                bot / "preopen_readiness.json",
-            )
-            for topic, directory in (
-                ("tw", "tw_day_trade_simulation"),
-                ("overnight", "tw_overnight_simulation"),
-            )
-        })
+        self.update_hub = DashboardUpdateHub(
+            {
+                topic: (
+                    self.repo_root / f"artifacts/live/{directory}/service_sync.json",
+                    self.repo_root / f"artifacts/live/{directory}/status.json",
+                    benchmark_projection_head_path(
+                        self.repo_root / f"artifacts/live/{directory}"
+                    ),
+                    bot / "service_status.json",
+                    bot / "preopen_readiness.json",
+                )
+                for topic, directory in (
+                    ("tw", "tw_day_trade_simulation"),
+                    ("overnight", "tw_overnight_simulation"),
+                )
+            }
+        )
         overnight_root = self.repo_root / "artifacts/live/tw_overnight_simulation"
         self.update_hub.paths["overnight"] = (
             *self.update_hub.paths["overnight"],
@@ -963,7 +987,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         if metrics is not None:
             metrics["cache"].add(kind)
 
-    def _measured_build(self, builder: Callable[[], PreparedResponse]) -> PreparedResponse:
+    def _measured_build(
+        self, builder: Callable[[], PreparedResponse]
+    ) -> PreparedResponse:
         metrics = getattr(self.request_metrics, "current", None)
         if metrics is None:
             return builder()
@@ -979,7 +1005,19 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def content_token(self, topic: str = "tw") -> str:
         response = self.tw_revision() if topic == "tw" else self.overnight_revision()
-        return str(_response_json(response).get("revision_token") or "missing")
+        revision = str(_response_json(response).get("revision_token") or "missing")
+        directory = (
+            "tw_day_trade_simulation" if topic == "tw" else "tw_overnight_simulation"
+        )
+        projection_head = benchmark_projection_head_path(
+            self.repo_root / f"artifacts/live/{directory}"
+        )
+        try:
+            stat = projection_head.stat()
+            projection_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except FileNotFoundError:
+            projection_revision = "none"
+        return f"{revision}:{projection_revision}"
 
     def cached_static(
         self,
@@ -993,10 +1031,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         signature = metadata_signature(target.stat())
         with self._static_cache_lock:
             cached = self._static_cache.get(target)
-            if (
-                cached is not None
-                and cached.signature == signature
-            ):
+            if cached is not None and cached.signature == signature:
                 self._cache_observation("static_hit")
                 return cached.response
         response = _prepared(
@@ -1006,7 +1041,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         )
         if metadata_signature(target.stat()) == signature:
             with self._static_cache_lock:
-                self._static_cache[target] = StaticCacheEntry(signature=signature, response=response)
+                self._static_cache[target] = StaticCacheEntry(
+                    signature=signature, response=response
+                )
         self._cache_observation("static_build")
         return response
 
@@ -1255,6 +1292,64 @@ class PublicDashboardServer(ThreadingHTTPServer):
             builder=build,
         )
 
+    def _revision_stale_or_build(
+        self,
+        *,
+        cache_prefix: str,
+        cache_key: str,
+        revision_token: str,
+        builder: Callable[[], PreparedResponse],
+    ) -> PreparedResponse:
+        """Serve the last verified revision while one replacement is built.
+
+        Revision-bearing keys preserve immediate source invalidation, but a
+        large immutable projection should not turn that invalidation into a
+        blank page for every viewer.  The prior response is reused only for the
+        exact query prefix and only inside its bounded stale window.
+        """
+
+        start_refresh = False
+        fallback: PreparedResponse | None = None
+        with self._cache_lock:
+            if cache_key not in self._cache:
+                observed = time.monotonic()
+                candidates = [
+                    entry
+                    for key, entry in self._cache.items()
+                    if key.startswith(cache_prefix) and entry.stale_until > observed
+                ]
+                if candidates:
+                    latest = max(candidates, key=lambda entry: entry.last_accessed_at)
+                    latest.last_accessed_at = observed
+                    fallback = latest.response
+                    if cache_key not in self._refreshing:
+                        self._refreshing.add(cache_key)
+                        start_refresh = True
+        if fallback is None:
+            return builder()
+
+        self._cache_observation("revision_stale_hit")
+        if start_refresh:
+
+            def refresh_revision() -> None:
+                try:
+                    builder()
+                except Exception as error:
+                    sys.stderr.write(
+                        "public-dashboard revision_refresh_failed "
+                        f"key={cache_key} error={type(error).__name__}\n"
+                    )
+                finally:
+                    with self._cache_lock:
+                        self._refreshing.discard(cache_key)
+
+            threading.Thread(
+                target=refresh_revision,
+                name=f"public-revision-{revision_token[:32]}",
+                daemon=True,
+            ).start()
+        return fallback
+
     def tw_status(self, session_date: str | None = None) -> PreparedResponse:
         normalized_date = str(session_date or "").strip()
         revision = _response_json(self.tw_revision())
@@ -1271,8 +1366,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # source ages.  A new signal/mark/pre-open revision still gets a new
         # key and starts a rebuild immediately; an existing timestamped,
         # verified response remains visible only during that bounded rebuild.
-        display_session = (revision.get("session_clock") or {}).get("display_session_date")
-        date_scope = normalized_date or (f"latest@{display_session}" if display_session else "latest")
+        display_session = (revision.get("session_clock") or {}).get(
+            "display_session_date"
+        )
+        date_scope = normalized_date or (
+            f"latest@{display_session}" if display_session else "latest"
+        )
         cache_prefix = f"tw-status:{date_scope}:"
         cache_key = f"{cache_prefix}{revision_token}"
 
@@ -1302,54 +1401,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
             )
 
         # An atomic history promotion can change the content revision and the
-        # 358 MiB benchmark inode together.  The previous verified response is
-        # still explicitly timestamped and safe to display while one thread
-        # rebuilds the new revision; blocking every viewer behind that parse
-        # created 10+ second blank-page spikes.  Never use this fallback on the
-        # first cold build, after its bounded stale window, or across dates.
-        start_refresh = False
-        fallback: PreparedResponse | None = None
-        with self._cache_lock:
-            if cache_key not in self._cache:
-                observed = time.monotonic()
-                candidates = [
-                    entry
-                    for key, entry in self._cache.items()
-                    if key.startswith(cache_prefix) and entry.stale_until > observed
-                ]
-                if candidates:
-                    latest = max(
-                        candidates, key=lambda entry: entry.last_accessed_at
-                    )
-                    latest.last_accessed_at = observed
-                    fallback = latest.response
-                    if cache_key not in self._refreshing:
-                        self._refreshing.add(cache_key)
-                        start_refresh = True
-        if fallback is not None:
-            self.traffic_observer.record_cache("revision_stale_hit")
-            if start_refresh:
-
-                def refresh_revision() -> None:
-                    try:
-                        build_response()
-                    except Exception as error:
-                        sys.stderr.write(
-                            "public-dashboard revision_refresh_failed "
-                            f"key={cache_key} error={type(error).__name__}\n"
-                        )
-                    finally:
-                        with self._cache_lock:
-                            self._refreshing.discard(cache_key)
-
-                threading.Thread(
-                    target=refresh_revision,
-                    name=f"public-revision-{revision_token[:32]}",
-                    daemon=True,
-                ).start()
-            return fallback
-
-        return build_response()
+        # 358 MiB benchmark inode together.  Never use the fallback on the first
+        # cold build, after its bounded stale window, or across dates.
+        return self._revision_stale_or_build(
+            cache_prefix=cache_prefix,
+            cache_key=cache_key,
+            revision_token=revision_token,
+            builder=build_response,
+        )
 
     def tw_public_data_status(self) -> PreparedResponse:
         """Return only official TW source progress used by the day-trade page."""
@@ -1364,7 +1423,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def tw_revision(self) -> PreparedResponse:
         signature = tuple(file_signature(path) for path in self.update_hub.paths["tw"])
-        session_date = dashboard_session_clock(datetime.now(UTC)).get("display_session_date")
+        session_date = dashboard_session_clock(datetime.now(UTC)).get(
+            "display_session_date"
+        )
         return self.cached_local_json(
             cache_key=f"tw-revision:{signature}:{session_date}",
             ttl_seconds=0.05,
@@ -1384,35 +1445,53 @@ class PublicDashboardServer(ThreadingHTTPServer):
         start_date: str | None = None,
         end_date: str | None = None,
         resolution: str = "sampled",
+        history_encoding: str = "minute_columns_v1",
     ) -> PreparedResponse:
-        date_key = f"{start_date or ''}:{end_date or ''}:{resolution}"
-        return self.cached_local_json(
-            cache_key=f"tw-history:{range_key}:{date_key}:{self.content_token()}",
-            ttl_seconds=55.0,
-            cache_control="no-cache",
-            stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
-            builder=lambda: sanitize_tw_history(
-                build_dashboard_history_snapshot(
-                    state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
-                    range_key=range_key,
-                    start_date=start_date,
-                    end_date=end_date,
-                    resolution=resolution,
-                    # The gateway already retains the serialized and compressed
-                    # response. Keeping the decoded graph too doubles the
-                    # largest dashboard allocation without reducing latency.
-                    use_memory_cache=False,
-                )
-            ),
+        date_key = (
+            f"{start_date or ''}:{end_date or ''}:{resolution}:{history_encoding}"
+        )
+        revision_token = self.content_token()
+        cache_prefix = f"tw-history:{range_key}:{date_key}:"
+        cache_key = f"{cache_prefix}{revision_token}"
+
+        def build_response() -> PreparedResponse:
+            return self.cached_local_json(
+                cache_key=cache_key,
+                ttl_seconds=55.0,
+                cache_control="no-cache",
+                stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
+                builder=lambda: sanitize_tw_history(
+                    build_dashboard_history_snapshot(
+                        state_dir=self.repo_root
+                        / "artifacts/live/tw_day_trade_simulation",
+                        range_key=range_key,
+                        start_date=start_date,
+                        end_date=end_date,
+                        resolution=resolution,
+                        history_encoding=history_encoding,
+                        # The gateway already retains the serialized and compressed
+                        # response. Keeping the decoded graph too doubles the
+                        # largest dashboard allocation without reducing latency.
+                        use_memory_cache=False,
+                    )
+                ),
+            )
+
+        return self._revision_stale_or_build(
+            cache_prefix=cache_prefix,
+            cache_key=cache_key,
+            revision_token=revision_token,
+            builder=build_response,
         )
 
     def overnight_revision(self) -> PreparedResponse:
-        signature = tuple(file_signature(path) for path in self.update_hub.paths["overnight"])
+        signature = tuple(
+            file_signature(path) for path in self.update_hub.paths["overnight"]
+        )
 
         def build() -> Mapping[str, Any]:
             payload = build_dashboard_revision(
-                state_dir=self.repo_root
-                / "artifacts/live/tw_overnight_simulation",
+                state_dir=self.repo_root / "artifacts/live/tw_overnight_simulation",
                 discord_service_status_path=self.repo_root
                 / "artifacts/discord_bot/service_status.json",
                 discord_markets_field="overnight_markets",
@@ -1447,8 +1526,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         def build() -> Mapping[str, Any]:
             payload = sanitize_tw_status(
                 build_dashboard_snapshot(
-                    state_dir=self.repo_root
-                    / "artifacts/live/tw_overnight_simulation",
+                    state_dir=self.repo_root / "artifacts/live/tw_overnight_simulation",
                     discord_service_status_path=self.repo_root
                     / "artifacts/discord_bot/service_status.json",
                     session_date=normalized_date or None,
@@ -1530,8 +1608,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
         start_date: str | None = None,
         end_date: str | None = None,
         resolution: str = "sampled",
+        history_encoding: str = "minute_columns_v1",
     ) -> PreparedResponse:
-        date_key = f"{start_date or ''}:{end_date or ''}:{resolution}"
+        date_key = (
+            f"{start_date or ''}:{end_date or ''}:{resolution}:{history_encoding}"
+        )
         return self.cached_local_json(
             cache_key=f"overnight-history:{range_key}:{date_key}:{self.content_token('overnight')}",
             ttl_seconds=55.0,
@@ -1539,12 +1620,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
             stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
             builder=lambda: sanitize_tw_history(
                 build_dashboard_history_snapshot(
-                    state_dir=self.repo_root
-                    / "artifacts/live/tw_overnight_simulation",
+                    state_dir=self.repo_root / "artifacts/live/tw_overnight_simulation",
                     range_key=range_key,
                     start_date=start_date,
                     end_date=end_date,
                     resolution=resolution,
+                    history_encoding=history_encoding,
                     use_memory_cache=False,
                 )
             ),
@@ -1803,8 +1884,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         try:
             warmed_tw_status = self.tw_status()
             current_tw_session_date = (
-                str(_response_json(warmed_tw_status).get("session_date") or "")
-                or None
+                str(_response_json(warmed_tw_status).get("session_date") or "") or None
             )
         except Exception as error:
             sys.stderr.write(
@@ -1821,6 +1901,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "all",
                     start_date=current_tw_session_date,
                     end_date=current_tw_session_date,
+                    resolution="1m",
+                    history_encoding="minute_columns_v2",
                 )
             except Exception as error:
                 sys.stderr.write(
@@ -1835,6 +1917,21 @@ class PublicDashboardServer(ThreadingHTTPServer):
         except Exception as error:
             sys.stderr.write(
                 "public-dashboard critical_view_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+        # Complete history is the largest optional TW view.  Build it on the
+        # existing asynchronous startup worker after critical first-paint data
+        # is ready, so a browser opening the full range does not become the
+        # process that pays the one-time source reconstruction cost.
+        try:
+            self.tw_history(
+                "all",
+                resolution="1m",
+                history_encoding="minute_columns_v2",
+            )
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard full_history_prewarm_failed "
                 f"error={type(error).__name__}\n"
             )
         # The overview already indexes the TW ledger dates. Prebuilding raw
@@ -1869,8 +1966,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     )
         try:
             warm_dashboard_session_indexes(
-                state_dir=self.repo_root
-                / "artifacts/live/tw_day_trade_simulation"
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation"
             )
         except Exception as error:
             sys.stderr.write(
@@ -1905,10 +2001,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             fields = [f"app;dur={elapsed_ms:.3f}"]
             metrics = getattr(self.server.request_metrics, "current", None)
             if metrics is not None:
-                fields.extend((f"cache_wait;dur={metrics['cache_wait_ms']:.3f}",
-                               f"build;dur={metrics['build_ms']:.3f}"))
+                fields.extend(
+                    (
+                        f"cache_wait;dur={metrics['cache_wait_ms']:.3f}",
+                        f"build;dur={metrics['build_ms']:.3f}",
+                    )
+                )
                 if metrics["cache"]:
-                    fields.append('cache;desc="' + "+".join(sorted(metrics["cache"])) + '"')
+                    fields.append(
+                        'cache;desc="' + "+".join(sorted(metrics["cache"])) + '"'
+                    )
             self.send_header("Server-Timing", ", ".join(fields))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-XSS-Protection", "0")
@@ -1964,12 +2066,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.NOT_ACCEPTABLE
             response = _prepared(
                 b'{"error":"no_acceptable_content_encoding"}\n',
-                content_type="application/json; charset=utf-8", cache_control="no-store",
+                content_type="application/json; charset=utf-8",
+                cache_control="no-store",
             )
         use_gzip = encoding == "gzip"
         body = response.gzip_body if use_gzip else response.body
         etag = response.gzip_etag if use_gzip else response.etag
-        if status == HTTPStatus.OK and _etag_matches(self.headers.get("If-None-Match"), etag):
+        if status == HTTPStatus.OK and _etag_matches(
+            self.headers.get("If-None-Match"), etag
+        ):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", response.cache_control)
@@ -2060,6 +2165,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/javascript; charset=utf-8",
                 IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
+            "/vendor/uplot/uPlot.iife.min.js": (
+                self.server.public_static_root / "vendor/uplot/uPlot.iife.min.js",
+                "text/javascript; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
+            "/vendor/uplot/uPlot.min.css": (
+                self.server.public_static_root / "vendor/uplot/uPlot.min.css",
+                "text/css; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
             "/robots.txt": (
                 self.server.public_static_root / "robots.txt",
                 "text/plain; charset=utf-8",
@@ -2082,9 +2197,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "public, max-age=60",
                 )
-            elif suffix == "app.js" or (prefix in {"/tw-day-trade/", "/tw-overnight/"} and suffix in {
-                "presentation.js", "detail-components.js",
-            }):
+            elif suffix == "app.js" or (
+                prefix in {"/tw-day-trade/", "/tw-overnight/"}
+                and suffix
+                in {
+                    "presentation.js",
+                    "detail-components.js",
+                    "chart-renderer.js",
+                }
+            ):
                 routes[path] = (
                     root / suffix,
                     "text/javascript; charset=utf-8",
@@ -2224,16 +2345,27 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=4,
+                max_num_fields=5,
             )
-            if set(query) - {"range", "start_date", "end_date", "resolution"} or any(
+            if set(query) - {
+                "range", "start_date", "end_date", "resolution", "encoding"
+            } or any(
                 len(values) != 1 for values in query.values()
             ):
                 raise InvalidPublicRequest("unsupported or repeated query field")
             range_key = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
             resolution = str(query.get("resolution", ["sampled"])[0])
+            encoding_key = str(query.get("encoding", ["v1"])[0]).strip().lower()
+            history_encoding = {
+                "v1": "minute_columns_v1",
+                "v2": "minute_columns_v2",
+            }.get(encoding_key)
             if resolution not in {"sampled", "1m"}:
                 raise InvalidPublicRequest("unsupported history resolution")
+            if history_encoding is None:
+                raise InvalidPublicRequest("unsupported history encoding")
+            if resolution != "1m" and "encoding" in query:
+                raise InvalidPublicRequest("history encoding requires 1m resolution")
             if range_key not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
                 raise InvalidPublicRequest("unsupported chart range")
             start_date = str(query.get("start_date", [""])[0]).strip() or None
@@ -2255,6 +2387,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "start_date": start_date,
                 "end_date": end_date,
                 "resolution": resolution,
+                "history_encoding": history_encoding,
             }
         except InvalidPublicRequest:
             raise
@@ -2368,6 +2501,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 start_date=history_query["start_date"],
                 end_date=history_query["end_date"],
                 resolution=history_query["resolution"],
+                history_encoding=history_query["history_encoding"],
             )
         if path == "/tw-day-trade/api/public-data-status":
             if raw_query:
@@ -2474,6 +2608,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 start_date=history_query["start_date"],
                 end_date=history_query["end_date"],
                 resolution=history_query["resolution"],
+                history_encoding=history_query["history_encoding"],
             )
         if path == "/tw-overnight/api/public-data-status":
             if raw_query:
@@ -2609,14 +2744,26 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
 
     def _stream_updates(self, topic: str, *, head_only: bool) -> None:
         # SSE uses identity with immediate flush, not a buffered gzip response.
-        if _preferred_encoding(
-            ",".join(self.headers.get_all("Accept-Encoding", [])), gzip_available=False,
-        ) is None:
-            self._send_json(HTTPStatus.NOT_ACCEPTABLE, {"error": "no_acceptable_content_encoding"}, head_only=head_only)
+        if (
+            _preferred_encoding(
+                ",".join(self.headers.get_all("Accept-Encoding", [])),
+                gzip_available=False,
+            )
+            is None
+        ):
+            self._send_json(
+                HTTPStatus.NOT_ACCEPTABLE,
+                {"error": "no_acceptable_content_encoding"},
+                head_only=head_only,
+            )
             return
         hub = self.server.update_hub
         if not head_only and not hub.acquire(topic):
-            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "update_stream_capacity"}, head_only=False)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "update_stream_capacity"},
+                head_only=False,
+            )
             return
         self.close_connection = True
         try:
@@ -2636,17 +2783,29 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 if hub.closed:
                     break
                 if current != version:
-                    revision = self.server.tw_revision() if topic == "tw" else self.server.overnight_revision()
+                    revision = (
+                        self.server.tw_revision()
+                        if topic == "tw"
+                        else self.server.overnight_revision()
+                    )
                     payload = _response_json(revision)
                     payload["view_generation"] = current
-                    frame = b"event: revision\ndata: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"
+                    frame = (
+                        b"event: revision\ndata: "
+                        + json.dumps(
+                            payload, ensure_ascii=False, separators=(",", ":")
+                        ).encode()
+                        + b"\n\n"
+                    )
                     version = current
                 else:
                     frame = b": heartbeat\n\n"
                 self.wfile.write(frame)
                 self.wfile.flush()
                 if not hasattr(self, "_stream_first_frame_ms"):
-                    self._stream_first_frame_ms = (time.perf_counter_ns() - self._request_started_ns) / 1_000_000
+                    self._stream_first_frame_ms = (
+                        time.perf_counter_ns() - self._request_started_ns
+                    ) / 1_000_000
                 self._response_body_bytes += len(frame)
         except (OSError, ValueError):
             # Disconnects/timeouts and transient invalid source receipts close
@@ -2661,11 +2820,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         # and ambiguous framing without consuming or reinterpreting their bytes.
         lengths = self.headers.get_all("Content-Length", [])
         if self.headers.get("Transfer-Encoding") is not None or (
-            lengths and (len(lengths) != 1 or re.fullmatch(r"0+", lengths[0].strip()) is None)
+            lengths
+            and (len(lengths) != 1 or re.fullmatch(r"0+", lengths[0].strip()) is None)
         ):
             self.close_connection = True
             self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "request_body_not_supported"},
+                HTTPStatus.BAD_REQUEST,
+                {"error": "request_body_not_supported"},
                 head_only=head_only,
             )
             return
@@ -2680,7 +2841,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
         except ValueError:
             self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}, head_only=head_only,
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_request"},
+                head_only=head_only,
             )
             return
         path = parsed.path
@@ -2714,9 +2877,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         is_api = "/api/" in path
         if path in {"/tw-day-trade/api/updates", "/tw-overnight/api/updates"}:
             if parsed.query:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}, head_only=head_only)
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_request"},
+                    head_only=head_only,
+                )
             else:
-                self._stream_updates("tw" if path.startswith("/tw-day-trade/") else "overnight", head_only=head_only)
+                self._stream_updates(
+                    "tw" if path.startswith("/tw-day-trade/") else "overnight",
+                    head_only=head_only,
+                )
             return
         if is_api:
             try:
@@ -2769,9 +2939,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path
         except ValueError:
-            path = "<invalid>"  # _handle returns a sanitized 400; keep telemetry bounded.
+            path = (
+                "<invalid>"  # _handle returns a sanitized 400; keep telemetry bounded.
+            )
         self._request_started_ns = time.perf_counter_ns()
-        self.server.request_metrics.current = {"cache": set(), "cache_wait_ms": 0., "build_ms": 0., "depth": 0}
+        self.server.request_metrics.current = {
+            "cache": set(),
+            "cache_wait_ms": 0.0,
+            "build_ms": 0.0,
+            "depth": 0,
+        }
         self.__dict__.pop("_stream_first_frame_ms", None)
         self._response_status = int(HTTPStatus.INTERNAL_SERVER_ERROR)
         self._response_body_bytes = 0
@@ -2783,7 +2960,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             # An SSE connection's lifetime is not an HTTP response latency.
             elapsed_ms = getattr(self, "_stream_first_frame_ms", None)
             if elapsed_ms is None:
-                elapsed_ms = (time.perf_counter_ns() - self._request_started_ns) / 1_000_000
+                elapsed_ms = (
+                    time.perf_counter_ns() - self._request_started_ns
+                ) / 1_000_000
             self.server.traffic_observer.request_finished(
                 observed=observed,
                 path=path,

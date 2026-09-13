@@ -301,3 +301,29 @@ test("browser performance history bounds a noisy metric series", async () => {
   assert.equal(core.PERFORMANCE_HISTORY_LIMIT, 256);
   assert.equal(core.PERFORMANCE_SCHEMA_VERSION, 1);
 });
+
+test("explicit chart rendering metrics preserve bounded phase and size evidence", () => {
+  const {core} = loadCore();
+  const metric = core.recordPerformanceMetric({
+    kind: "render",
+    action: "equity_chart",
+    eventType: "history_update",
+    durationMs: 22.1254,
+    prepareMs: 15.4,
+    drawMs: 6.7,
+    paintMs: 31.2,
+    pointCount: 300304,
+    seriesCount: 8,
+    privateValue: "must-not-survive",
+  });
+  assert.equal(metric.kind, "render");
+  assert.equal(metric.action, "equity_chart");
+  assert.equal(metric.durationMs, 22.125);
+  assert.equal(metric.pointCount, 300304);
+  assert.equal(metric.seriesCount, 8);
+  assert.equal("privateValue" in metric, false);
+  const recorded = core.performanceHistorySnapshot();
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].kind, metric.kind);
+  assert.equal(recorded[0].pointCount, metric.pointCount);
+});

@@ -172,6 +172,23 @@ def test_lossless_minute_history_keeps_every_point_beyond_chart_sample_limit(tmp
     assert sampled["downsampled"] is True
     assert len(sampled["history"]) <= 2000
 
+    full_v2 = build_dashboard_history_snapshot(
+        state_dir=tmp_path,
+        range_key="all",
+        resolution="1m",
+        history_encoding="minute_columns_v2",
+    )
+    public_v2 = sanitize_tw_history(full_v2)
+    encoded = public_v2["minute_series"][0]
+    assert public_v2["history_encoding"] == "minute_columns_v2"
+    assert len(public_v2["minute_axis"]) == 2700
+    assert len(encoded["minute_indexes"]) == 2700
+    assert encoded["minute_indexes"] == list(range(2700))
+    assert encoded["return_pct"] == pytest.approx([point[1] for point in points])
+    assert public_v2["returned_points"] == sum(
+        len(series["minute_indexes"]) for series in public_v2["minute_series"]
+    )
+
 
 def test_public_minute_columns_refuse_non_numeric_embedded_data() -> None:
     from stockagent.live.public_dashboards import sanitize_tw_history, UnsafePublicDashboardPayload
@@ -181,6 +198,19 @@ def test_public_minute_columns_refuse_non_numeric_embedded_data() -> None:
             "simulation_only": True, "production_order_possible": False,
             "history_encoding": "minute_columns_v1",
             "minute_series": [{"series_id": "a", "points": [[1, 0, "secret", 0]]}],
+        })
+
+    with pytest.raises(UnsafePublicDashboardPayload, match="unequal minute columns"):
+        sanitize_tw_history({
+            "simulation_only": True, "production_order_possible": False,
+            "returned_points": 2,
+            "history_encoding": "minute_columns_v2",
+            "minute_axis": [1, 2],
+            "minute_series": [{
+                "series_id": "a", "series_type": "strategy",
+                "minute_indexes": [0, 1], "return_pct": [0.0],
+                "cumulative_return_pct": [0.0, 1.0], "quality_flags": [0, 0],
+            }],
         })
 
 

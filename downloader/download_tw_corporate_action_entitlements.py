@@ -362,6 +362,7 @@ def _cached_or_post(
     timeout: int,
     retries: int,
     method: str = "POST",
+    verify: bool | str | Path = True,
 ) -> bytes:
     if method not in {"GET", "POST"}:
         raise ValueError("unsupported public-data request method")
@@ -396,9 +397,13 @@ def _cached_or_post(
     for attempt in range(max(0, int(retries)) + 1):
         try:
             limiter.wait()
-            response = (requests.get(url, params=data, headers=headers, timeout=(int(timeout), int(timeout)))
+            response = (requests.get(
+                            url, params=data, headers=headers,
+                            timeout=(int(timeout), int(timeout)), verify=verify,
+                        )
                         if method == "GET" else requests.post(url, data=data, headers=headers,
-                                                             timeout=(int(timeout), int(timeout))))
+                                                             timeout=(int(timeout), int(timeout)),
+                                                             verify=verify))
             if response.status_code in {403, 408, 429, 500, 502, 503, 504}:
                 retry_after = response.headers.get("Retry-After", "").strip()
                 delay = (

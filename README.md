@@ -277,6 +277,37 @@ sudo systemctl start stockagent-packed-backup.service
 `last_complete_at` 是上次完整完成時間，不代表目前沒有新的待備份資料。
 只有一台主機內兩顆磁碟，仍不能防整機損壞、失竊或勒索軟體；不是離線／異地備份。
 
+### C 槽 rolling-current：避免歷史版本長期重複佔位
+
+「release／manifest」是原子一致性描述，不是每版複製一份資料；實際內容以 SHA-256
+物件去重，來源未變時也不會產生新 release。penguin 的 C 槽只需保存目前 heads、pin／
+使用中的版本及 24 小時安全窗；更舊且不再引用的物件只保留在 D 槽 additive archive。
+這樣新資料仍是即時增量發布與 Syncthing 同步，不把 mutable 來源直接拿去互相覆蓋。
+
+```bash
+# 唯讀：列出精確候選、D checksum 證明、peer 狀態與可回收配置量
+./scripts/run_packed_retention.sh plan
+
+# 查看最近計畫與最近一次實際清理 receipt
+./scripts/run_packed_retention.sh status
+
+# penguin 一次性安裝每日 reconcile timer
+./scripts/run_packed_retention.sh install-service
+systemctl status stockagent-packed-retention.timer --no-pager
+```
+
+`apply` 不是一般的 `rm`：只有 lab203、vastai1T 與本機全部收斂、D 槽存在且每個候選
+都有未過期 SHA-256 receipt、沒有 conflict、pin、熱快取或程序引用時才會 unlink C 候選；
+先刪歷史 manifest，再刪其已無引用的 objects。D 不刪，current heads 不刪。清理期間會
+短暫停止本機 backup/Syncthing，完成後立即重啟並等待同步刪除收斂。人工執行方式：
+
+```bash
+./scripts/run_packed_retention.sh apply
+```
+
+目前任何 blocker 都會 fail closed；timer 使用 `--defer-if-blocked`，只留下計畫而不刪檔。
+完整架構、恢復與安全門檻見 [packed 冷庫 Runbook](docs/packed_dataset_storage.md)。
+
 ## 資料冷庫完整指令
 
 ### `status`：查冷／熱狀態
@@ -544,8 +575,9 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 penguin 的官方 TW 驗收 service 使用同一原則：主工作成功後才由 `ExecStartPost` 發布
 `tw-public`。若 receipt 的 `end_date` 比冷庫現有版本舊，即使本機 HLC 較新仍拒絕發布。
 
-冷庫物件 GC 目前只有 `objects` 報告，沒有自動刪除。熱快取 GC 不等於冷庫 GC；在所有
-節點 retention 與 manifest 引用關係未確認前，不可手動刪 cold objects。
+不要手動刪 cold objects。penguin 已有 D-backed rolling retention；它只會處理 D 已驗證、
+不被 current／pin／lease／安全窗引用且全 fleet 已收斂的候選。其他節點及 D archive
+仍不得自行做 cold GC。熱快取 GC 與這個冷庫 retention 是兩套不同生命週期。
 
 ## Syncthing 驗收
 

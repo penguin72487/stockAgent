@@ -31,7 +31,11 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
 .signal-table th:nth-child(1){width:12%}.signal-table th:nth-child(2){width:16%}.signal-table th:nth-child(3){width:14%}.signal-table th:nth-child(4){width:22%}.signal-table th:nth-child(5){width:20%}.signal-table th:nth-child(6){width:16%}
 .legend .legend-toggle{display:inline-flex;align-items:center;min-height:30px;margin:0;padding:4px 6px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;font:inherit;font-size:10px;white-space:nowrap}.legend .legend-toggle:hover{border-color:var(--line);color:var(--text)}.legend .legend-toggle:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}.legend .legend-toggle.is-hidden{opacity:.48;text-decoration:line-through}.legend .legend-toggle.is-hidden i{filter:saturate(.2)}
 .axis-time{stroke:rgba(140,160,180,.18);stroke-width:1}.axis-time.session{stroke:var(--amber);stroke-width:1.4;stroke-dasharray:4 3}.axis-session-text{fill:var(--amber);font-weight:700}
-.chart-scroll{overflow-x:auto}@media(max-width:700px){.chart-scroll #equity-chart{min-width:860px}}
+.chart-scroll{width:100%;overflow:hidden}
+.chart-host{width:100%;height:300px;min-width:0;padding:4px 8px 0}
+.chart-host>.uplot{max-width:100%;font-family:var(--dashboard-font-family,Inter,"Noto Sans TC","PingFang TC",sans-serif)}
+.chart-host .u-legend{display:none}
+@media(max-width:700px){.chart-host{height:270px;padding-inline:2px}}
 .healthbox>small:first-child,.controls-title span,.benchmark-facts span,.benchmark-facts small{font-size:10px}
 .compact-table td small{font-size:10px}
 /* Reuse the same wrapping contract for the narrower event pane. No fields are hidden. */

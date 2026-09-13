@@ -11,9 +11,11 @@ import argparse
 from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 import re
+import ssl
 import sys
 import unicodedata
 
@@ -23,10 +25,12 @@ if str(ROOT) not in sys.path:
 
 from bs4 import BeautifulSoup
 import polars as pl
+import requests
 
 from downloader.download_tw_corporate_action_entitlements import (
     _cached_or_post, _configure_tw_public_rate_limiter, _file_receipt,
-    _reset_raw_receipt_requests, _write_content_addressed_receipt_manifest,
+    _record_raw_receipt_request, _reset_raw_receipt_requests,
+    _write_bytes_atomic, _write_content_addressed_receipt_manifest,
     _write_json_atomic, _write_parquet_atomic, _public_access_denial_response,
     _mops_throttle_response,
 )
@@ -35,10 +39,52 @@ LIST_URL = "https://www.twse.com.tw/exchangeReport/TWTAUU"
 DETAIL_URL = "https://www.twse.com.tw/rwd/zh/reducation/TWTAVUDetail"
 MOPS_ANNOUNCEMENT_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st01"
 TPEX_URL = "https://www.tpex.org.tw/www/zh-tw/bulletin/revivt"
+TPEX_INTERMEDIATE_URL = "http://sslserver.twca.com.tw/cacert/Cyber_SSL_2023.crt"
+TPEX_INTERMEDIATE_SHA256 = (
+    "01af2324d098098f5e0cdf6faabada430b21cce777f47eacb26248b2fda3e531"
+)
 _ISSUER_DATE = r"(?:民國)?([0-9]{3,4})[年/]([0-9]{1,2})[月/]([0-9]{1,2})日?"
 _RESUMPTION_LABELS = (r"新股預計上[市櫃]日|換發新股暨上[市櫃]買賣日(?:期)?(?:\(即舊股票終止上[市櫃]日\))?"
     r"|新股票上[市櫃]開始買賣日期暨舊股票終止上[市櫃]日期|新股票上[市櫃]買賣日期(?:預訂為)?"
     r"|開始換發新股票及新股票上[市櫃]買賣日期預訂為")
+
+
+def _tpex_verify_bundle(output_dir: Path, *, timeout: int) -> Path:
+    """Repair TPEx's omitted intermediate without disabling TLS validation."""
+    raw = (
+        output_dir / "raw/tw_share_replacement_reference/ca"
+        / f"twca-ssl-2023-{TPEX_INTERMEDIATE_SHA256}.der"
+    )
+    if raw.is_file():
+        content = raw.read_bytes()
+    else:
+        response = requests.get(
+            TPEX_INTERMEDIATE_URL, timeout=(int(timeout), int(timeout))
+        )
+        response.raise_for_status()
+        content = response.content
+        response.close()
+        if hashlib.sha256(content).hexdigest() != TPEX_INTERMEDIATE_SHA256:
+            raise ValueError("TPEx official intermediate certificate hash changed")
+        _write_bytes_atomic(raw, content)
+    if hashlib.sha256(content).hexdigest() != TPEX_INTERMEDIATE_SHA256:
+        raise ValueError("cached TPEx intermediate certificate hash mismatch")
+    _record_raw_receipt_request(
+        raw, url=TPEX_INTERMEDIATE_URL, data={}, content=content, method="GET"
+    )
+    try:
+        intermediate = ssl.DER_cert_to_PEM_cert(content).encode("ascii")
+    except (ValueError, ssl.SSLError) as exc:
+        raise ValueError("TPEx intermediate certificate is not valid DER") from exc
+    base_content = Path(requests.certs.where()).resolve().read_bytes()
+    payload = base_content.rstrip(b"\n") + b"\n" + intermediate
+    bundle = (
+        output_dir / "state/ca"
+        / f"requests-plus-twca-ssl-2023-{TPEX_INTERMEDIATE_SHA256}.pem"
+    )
+    if not bundle.is_file() or bundle.read_bytes() != payload:
+        _write_bytes_atomic(bundle, payload)
+    return bundle
 
 
 def _issuer_text(content: bytes, symbol: str) -> str:
@@ -51,7 +97,12 @@ def _issuer_text(content: bytes, symbol: str) -> str:
 
 def _issuer_dates(text: str, labels: str) -> set[date]:
     found = set()
-    for match in re.finditer(r"(?:" + labels + r")(?:[:：]|為|自){0,2}" + _ISSUER_DATE, text):
+    # Issuers use several explicit connectors before an exact ROC date.  Keep
+    # this list finite and semantic: accepting ``訂於民國`` / ``預定於民國`` is
+    # still a stated date, while an arbitrary wildcard could accidentally bind
+    # an unrelated date later in the announcement.
+    connector = r"(?:[:：]|為|自|訂於|預定於){0,2}"
+    for match in re.finditer(r"(?:" + labels + r")" + connector + _ISSUER_DATE, text):
         year, month, day = map(int, match.groups())
         found.add(date(year + 1911 if year < 1911 else year, month, day))
     return found
@@ -287,7 +338,7 @@ def parse_list(payload: dict, *, start: date, end: date) -> list[dict]:
     required = {"恢復買賣日期", "股票代號", "名稱", "減資原因", "詳細資料"}
     if not required <= set(fields):
         raise ValueError("TWSE capital-reduction list schema changed")
-    rows, seen = [], set()
+    rows: dict[tuple[str, date], dict] = {}
     for values in payload.get("data", []):
         if len(values) != len(fields):
             raise ValueError("TWSE capital-reduction row length mismatch")
@@ -297,13 +348,28 @@ def parse_list(payload: dict, *, start: date, end: date) -> list[dict]:
         detail = re.fullmatch(r"([0-9A-Z]{4,6})\s*,(\d{8})", row["詳細資料"])
         if not re.fullmatch(r"[0-9A-Z]{4,6}", symbol) or not detail or detail[1] != symbol:
             raise ValueError("TWSE share-replacement identity mismatch")
-        if not start <= resumed <= end or (symbol, resumed) in seen:
-            raise ValueError("duplicate or out-of-range share-replacement event")
-        seen.add((symbol, resumed))
-        rows.append({"symbol": symbol, "name": row["名稱"], "market": "twse",
+        if not start <= resumed <= end:
+            raise ValueError("out-of-range share-replacement event")
+        candidate = {"symbol": symbol, "name": row["名稱"], "market": "twse",
             "resume_date": resumed, "reason": row["減資原因"],
-            "detail_file_date": detail[2], "source_url": LIST_URL})
-    return rows
+            "detail_file_date": detail[2], "source_url": LIST_URL,
+            "list_revision_count": 1}
+        key = (symbol, resumed)
+        previous = rows.get(key)
+        if previous is not None:
+            if (
+                previous["reason"] != candidate["reason"]
+                or previous["detail_file_date"] == candidate["detail_file_date"]
+            ):
+                raise ValueError("conflicting duplicate share-replacement event")
+            candidate["list_revision_count"] = (
+                int(previous["list_revision_count"]) + 1
+            )
+            if candidate["detail_file_date"] < previous["detail_file_date"]:
+                previous["list_revision_count"] = candidate["list_revision_count"]
+                continue
+        rows[key] = candidate
+    return sorted(rows.values(), key=lambda item: (item["resume_date"], item["symbol"]))
 
 
 def parse_detail(payload: dict, event: dict) -> dict:
@@ -347,14 +413,14 @@ def run(args: argparse.Namespace) -> dict:
     _reset_raw_receipt_requests()
     raw = args.output_dir / "raw" / "tw_share_replacement_reference"
     output = args.output_dir / "tw_share_replacement_reference.parquet"
-    summary = {"schema_version": 2, "issuer_parser_contract_version": 2,
+    summary = {"schema_version": 3, "issuer_parser_contract_version": 3,
         "coverage_start": str(start), "coverage_end": str(end),
         "announced_resumption_query_end": str(query_end),
         "future_market_observations_claimed": False,
         "covered_markets": [], "uncovered_markets": ["twse", "tpex"],
         "complete_all_markets": False, "accounting_ready": False,
         "generated_at_utc": datetime.now(timezone.utc).isoformat()}
-    rows, failures, recovered = [], [], []
+    rows, failures, accounting_failures, recovered = [], [], [], []
 
     def failed(stage: str, exc: Exception, event: dict | None = None) -> None:
         identity = {} if event is None else {
@@ -363,17 +429,52 @@ def run(args: argparse.Namespace) -> dict:
         failures.append({"stage": stage, **identity,
                          "error": f"{type(exc).__name__}: {exc}"})
 
+    def accounting_failed(stage: str, exc: Exception, event: dict) -> dict:
+        """Retain a complete exchange-list identity without inventing terms.
+
+        A detail-page/WAF/parser failure is not the same thing as a missing
+        capital-reduction event.  The accepted catalogue may safely preserve
+        the exchange's symbol and resumption date while downstream physical
+        accounting keeps that lifecycle fail-closed.  Only a list/source
+        failure makes the market coverage incomplete.
+        """
+        identity = {
+            key: str(event[key]) for key in ("market", "symbol", "resume_date")
+        }
+        error = f"{type(exc).__name__}: {exc}"
+        accounting_failures.append({"stage": stage, **identity, "error": error})
+        return event | {
+            "suspension_date": None,
+            "new_shares_per_1000_old": None,
+            "cash_return_per_old_share": None,
+            "cash_dividend_per_old_share": None,
+            "subscription_shares_per_1000": None,
+            "cash_payment_date": None,
+            "subscription_terms_present": None,
+            "accounting_terms_complete": False,
+            "unresolved_terms": "official_detail_or_issuer_terms_unavailable",
+            "detail_source_url": None,
+            "detail_source_sha256": None,
+            "historical_halt_evidence": False,
+            "executable_price": False,
+            "reference_only": True,
+            "detail_error": error,
+            "contract": "exchange_share_replacement_reference_v1",
+        }
+
     def covered(market: str) -> None:
         summary["covered_markets"].append(market)
         summary["uncovered_markets"].remove(market)
 
     try:
         listing_path = raw / f"twse-{start}-{query_end}-asof-{end}-v2.json"
+        twse_list_complete = False
         try:
             content = _cached_or_post(listing_path, url=LIST_URL,
                 data={"startDate": start.strftime("%Y%m%d"), "endDate": query_end.strftime("%Y%m%d"), "response": "json"},
                 method="GET", timeout=args.timeout, retries=args.retries)
             events = parse_list(json.loads(content), start=start, end=query_end)
+            twse_list_complete = True
         except Exception as exc:
             failed("twse_list", exc)
             events = []
@@ -407,18 +508,28 @@ def run(args: argparse.Namespace) -> dict:
                         "replacement_source": MOPS_ANNOUNCEMENT_URL,
                         "replacement_sha256": row["detail_source_sha256"]})
                 except Exception as fallback_exc:
-                    failed("twse_detail", RuntimeError(f"{exc}; issuer fallback: {fallback_exc}"), event)
+                    rows.append(accounting_failed(
+                        "twse_detail",
+                        RuntimeError(f"{exc}; issuer fallback: {fallback_exc}"),
+                        event,
+                    ) | {
+                        "list_source_sha256": _file_receipt(listing_path)["sha256"]
+                    })
             if len(rows) % 25 == 0 and rows:
                 print(f"[share-replacement] reference_rows={len(rows)} recovered={len(recovered)} failures={len(failures)}", flush=True)
         summary["recovered_exchange_detail_failures"] = recovered
         summary["official_issuer_reference_recovery_count"] = len(recovered)
-        if not failures:
+        if twse_list_complete:
             covered("twse")
         tpex_path = raw / f"tpex-{start}-{query_end}-asof-{end}-v2.json"
         try:
+            tpex_verify = _tpex_verify_bundle(
+                args.output_dir, timeout=args.timeout
+            )
             content = _cached_or_post(tpex_path, url=TPEX_URL,
                 data={"startDate": start.strftime("%Y/%m/%d"), "endDate": query_end.strftime("%Y/%m/%d"), "response": "json"},
-                method="GET", timeout=args.timeout, retries=args.retries)
+                method="GET", timeout=args.timeout, retries=args.retries,
+                verify=tpex_verify)
             rows.extend(row | {"list_source_sha256": _file_receipt(tpex_path)["sha256"],
                                 "detail_source_sha256": _file_receipt(tpex_path)["sha256"]}
                         for row in parse_tpex(json.loads(content), start=start, end=query_end))
@@ -426,11 +537,23 @@ def run(args: argparse.Namespace) -> dict:
         except Exception as exc:
             failed("tpex_reference", exc)
         for row in rows:
-            if row["cash_return_per_old_share"] > 0:
+            if (row.get("cash_return_per_old_share") or 0) > 0:
                 try:
                     row.update(fetch_issuer_payment(raw, row, args))
                 except Exception as exc:
-                    failed("issuer_payment", exc, row)
+                    identity = {
+                        key: str(row[key])
+                        for key in ("market", "symbol", "resume_date")
+                    }
+                    accounting_failures.append({
+                        "stage": "issuer_payment", **identity,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    row["cash_payment_date"] = None
+                    row["accounting_terms_complete"] = False
+                    row["unresolved_terms"] = (
+                        "issuer_cash_payment_date_unavailable"
+                    )
         if failures:
             # Successful raw requests remain content-addressed and resumable,
             # but a partial attempt may NEVER replace the last accepted table.
@@ -447,6 +570,8 @@ def run(args: argparse.Namespace) -> dict:
                 _write_parquet_atomic(partial_frame, partial_path)
                 partial_receipt = _file_receipt(partial_path)
             summary.update(completed_reference_rows=len(rows), failures=failures,
+                accounting_failures=accounting_failures,
+                accounting_failure_count=len(accounting_failures),
                 partial_reference_contract=(
                     "successful_rows_only_not_complete_or_accepted"
                     if partial_receipt is not None else None
@@ -460,8 +585,30 @@ def run(args: argparse.Namespace) -> dict:
         frame = pl.from_dicts(rows, infer_schema_length=None).sort(["resume_date", "symbol"])
         manifest = _write_content_addressed_receipt_manifest(output_dir=args.output_dir, raw_root=raw)
         _write_parquet_atomic(frame, output)
+        exact_core = sum(
+            row.get("suspension_date") is not None
+            and row.get("new_shares_per_1000_old") is not None
+            and abs(
+                float(row["new_shares_per_1000_old"])
+                - round(float(row["new_shares_per_1000_old"]))
+            ) <= 1e-8
+            and row.get("cash_return_per_old_share") is not None
+            and not (row.get("cash_dividend_per_old_share") or 0)
+            and not (row.get("subscription_shares_per_1000") or 0)
+            and not row.get("subscription_terms_present")
+            and (
+                (row.get("cash_return_per_old_share") or 0) == 0
+                or row.get("cash_payment_date") is not None
+            )
+            for row in rows
+        )
         summary.update(rows=frame.height, source_download_complete=True, failure_count=0,
             complete_all_markets=True,
+            lifecycle_catalog_complete=True,
+            exact_physical_core_events=exact_core,
+            unresolved_physical_accounting_events=frame.height - exact_core,
+            accounting_failure_count=len(accounting_failures),
+            accounting_failures=accounting_failures,
             exact_cash_return_payment_events=sum(row.get("cash_payment_date") is not None for row in rows),
             raw_receipt_manifest=manifest, output_receipt=_file_receipt(output))
         _write_json_atomic(output.with_suffix(".summary.json"), summary)
