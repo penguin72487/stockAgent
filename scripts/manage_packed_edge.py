@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -164,6 +165,19 @@ def _load_state(path: Path) -> dict[str, Any]:
     return state
 
 
+def _acquire_operation_lock(state_root: Path, *, nonblocking: bool):
+    """Serialize hydration/materialization against scheduled edge cleanup."""
+    state_root.mkdir(parents=True, exist_ok=True)
+    handle = (state_root / "operation.lock").open("a")
+    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(handle, flags)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
 def _allowed_relpaths(sync_root: Path, state: dict[str, Any]) -> set[str]:
     result: set[str] = set()
     for dataset, snapshot_id in sorted(dict(state.get("hydrating", {})).items()):
@@ -227,7 +241,25 @@ def main() -> int:
     state_root = args.state_root.resolve()
     state_path = state_root / "state.json"
     receipt_root = state_root / "receipts"
+    _operation_lock_handle = None
     try:
+        if args.command != "audit":
+            try:
+                # Scheduled GC must never prune a release while an interactive
+                # use is hydrating, hashing, or materializing it. Other
+                # mutations wait for the current owner; GC records a clean
+                # defer so its next timer run can retry.
+                _operation_lock_handle = _acquire_operation_lock(
+                    state_root, nonblocking=args.command == "gc"
+                )
+            except BlockingIOError:
+                payload = {
+                    "mode": "index-only-gc",
+                    "deferred": "edge_operation_locked",
+                }
+                receipt = write_edge_receipt(receipt_root, payload)
+                _print(payload | {"receipt": str(receipt)})
+                return 0
         peer = _convergence(
             args.syncthing_url, api_key, args.folder, args.peer_name
         )
