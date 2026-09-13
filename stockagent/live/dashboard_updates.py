@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import OrderedDict
 import hashlib
 import os
 from pathlib import Path
@@ -11,22 +12,48 @@ import stat as stat_module
 import threading
 from typing import Mapping
 
+_SIGNATURE_CACHE: OrderedDict[Path, tuple[tuple[int, ...], bytes]] = OrderedDict()
+_SIGNATURE_CACHE_LOCK = threading.Lock()
+_MAX_SIGNATURES = 512
 
-def file_signature(path: Path) -> tuple[int, int, int, int, bytes] | None:
+
+def metadata_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    # ctime changes on in-place writes and mtime restoration on our POSIX
+    # producer filesystem. Inode/device also bind atomic file replacement.
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def file_signature(path: Path) -> tuple[object, ...] | None:
+    """Retain a content digest without re-reading unchanged history per visitor.
+
+    This is an invalidation hint, not a persisted data-integrity receipt.
+    Cache a digest only after stable descriptor and path metadata agree.
+    """
     try:
         metadata = path.stat()
-        digest = (
-            hashlib.blake2b(path.read_bytes(), digest_size=16).digest()
-            if stat_module.S_ISREG(metadata.st_mode)
-            else b""
-        )
-        return (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_size,
-            metadata.st_mtime_ns,
-            digest,
-        )
+        signature = metadata_signature(metadata)
+        if not stat_module.S_ISREG(metadata.st_mode):
+            return (*signature, b"")
+        with _SIGNATURE_CACHE_LOCK:
+            cached = _SIGNATURE_CACHE.get(path)
+            if cached is not None and cached[0] == signature:
+                _SIGNATURE_CACHE.move_to_end(path)
+                return (*signature, cached[1])
+        digest = hashlib.blake2b(digest_size=16)
+        with path.open("rb") as stream:
+            opened = metadata_signature(os.fstat(stream.fileno()))
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            finished = metadata_signature(os.fstat(stream.fileno()))
+        value = digest.digest()
+        if signature == opened == finished == metadata_signature(path.stat()):
+            with _SIGNATURE_CACHE_LOCK:
+                _SIGNATURE_CACHE[path] = (signature, value)
+                _SIGNATURE_CACHE.move_to_end(path)
+                while len(_SIGNATURE_CACHE) > _MAX_SIGNATURES:
+                    _SIGNATURE_CACHE.popitem(last=False)
+        return (*opened, value)
     except OSError:
         return None
 

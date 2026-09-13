@@ -19,6 +19,7 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     DEFAULT_LOCAL_MINUTE_ROOTS,
     MinutePriceStore,
     _benchmark_minute_row,
+    _is_terminal_carry_cost,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
     missing_accepted_endpoints,
@@ -26,13 +27,42 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     rebuild_strategy_marks,
     required_symbol_dates,
     validate_existing_strategy_marks,
+    verified_manual_no_trade_pairs,
 )
+
+
+def test_same_day_conversion_reversal_shares_terminal_accounting_clock() -> None:
+    original = {"kind": "short_conversion_tax_and_handling"}
+    reversal = {
+        "kind": "manual_same_day_close_conversion_reversal",
+        "reverses_cost_id": "original",
+    }
+    interest = {"kind": "margin_short_borrow_interest"}
+
+    assert _is_terminal_carry_cost(original) is True
+    assert _is_terminal_carry_cost(reversal) is True
+    assert _is_terminal_carry_cost(interest) is False
 
 
 def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
     assert DEFAULT_LOCAL_MINUTE_ROOTS[0] == Path(
         "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
     )
+
+
+def test_verified_minute_source_cannot_change_before_publication(tmp_path: Path) -> None:
+    path = tmp_path / "2026-09-01_2026-09-09.parquet"
+    receipt = path.with_suffix(".receipt.json")
+    path.write_bytes(b"original prices")
+    receipt.write_text("{}")
+    signature = tuple((p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                      for p in (path, receipt))
+    store = MinutePriceStore(tmp_path, [], require_receipts=True)
+    store._verified_chunk_dates[path] = (signature, {"2026-09-09"})
+    store.assert_sources_unchanged()
+    path.write_bytes(b"revised prices")
+    with pytest.raises(RuntimeError, match="source changed"):
+        store.assert_sources_unchanged()
 
 
 def test_prepare_does_not_read_a_lower_priority_duplicate_source(tmp_path: Path) -> None:
@@ -142,6 +172,23 @@ def test_lossless_minute_history_keeps_every_point_beyond_chart_sample_limit(tmp
     assert sampled["downsampled"] is True
     assert len(sampled["history"]) <= 2000
 
+    full_v2 = build_dashboard_history_snapshot(
+        state_dir=tmp_path,
+        range_key="all",
+        resolution="1m",
+        history_encoding="minute_columns_v2",
+    )
+    public_v2 = sanitize_tw_history(full_v2)
+    encoded = public_v2["minute_series"][0]
+    assert public_v2["history_encoding"] == "minute_columns_v2"
+    assert len(public_v2["minute_axis"]) == 2700
+    assert len(encoded["minute_indexes"]) == 2700
+    assert encoded["minute_indexes"] == list(range(2700))
+    assert encoded["return_pct"] == pytest.approx([point[1] for point in points])
+    assert public_v2["returned_points"] == sum(
+        len(series["minute_indexes"]) for series in public_v2["minute_series"]
+    )
+
 
 def test_public_minute_columns_refuse_non_numeric_embedded_data() -> None:
     from stockagent.live.public_dashboards import sanitize_tw_history, UnsafePublicDashboardPayload
@@ -151,6 +198,19 @@ def test_public_minute_columns_refuse_non_numeric_embedded_data() -> None:
             "simulation_only": True, "production_order_possible": False,
             "history_encoding": "minute_columns_v1",
             "minute_series": [{"series_id": "a", "points": [[1, 0, "secret", 0]]}],
+        })
+
+    with pytest.raises(UnsafePublicDashboardPayload, match="unequal minute columns"):
+        sanitize_tw_history({
+            "simulation_only": True, "production_order_possible": False,
+            "returned_points": 2,
+            "history_encoding": "minute_columns_v2",
+            "minute_axis": [1, 2],
+            "minute_series": [{
+                "series_id": "a", "series_type": "strategy",
+                "minute_indexes": [0, 1], "return_pct": [0.0],
+                "cumulative_return_pct": [0.0, 1.0], "quality_flags": [0, 0],
+            }],
         })
 
 
@@ -179,6 +239,31 @@ def test_existing_bracket_aware_strategy_marks_validate_without_rebuild() -> Non
     assert stats["existing_bracket_aware_marks_preserved"] is True
 
 
+def test_carry_minute_validation_preserves_cash_income_and_cost_identity():
+    from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+    start = datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI)
+    rows = [{"session_date": "2026-08-13", "market": "a",
+             "minute": (start + timedelta(minutes=i)).isoformat(timespec="minutes"),
+             "margin_carry_contract": MARGIN_CARRY_CONTRACT,
+             "initial_capital_twd": 10000., "cumulative_realized_net_pnl_twd": 100.,
+             "open_net_liquidation_pnl_twd": -70., "cumulative_carry_cost_twd": 10.,
+             "cumulative_corporate_action_net_twd": 50., "total_equity_twd": 10070.,
+             "historical_minute_replay": True,
+             "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+             "valuation_source": "fixture_kbar", "valuation_executable": False,
+             "fresh_trade_notional_coverage_ratio": 1., "fresh_trade_position_count": 1,
+             "last_trade_carried_position_count": 0, "missing_price_position_count": 0}
+            for i in range(270)]
+    assert validate_existing_strategy_marks(rows, start=start.date(), end=start.date())[0] == rows
+    rows[42]["total_equity_twd"] += 1
+    with pytest.raises(RuntimeError, match="NAV mismatch"):
+        validate_existing_strategy_marks(rows, start=start.date(), end=start.date())
+    rows[42]["total_equity_twd"] -= 1
+    rows[42]["missing_price_position_count"] = 1
+    with pytest.raises(RuntimeError, match="unsourced"):
+        validate_existing_strategy_marks(rows, start=start.date(), end=start.date())
+
+
 def test_existing_mark_validation_does_not_require_preserved_benchmarks() -> None:
     positions = {
         "2026-08-13": {
@@ -193,6 +278,55 @@ def test_existing_mark_validation_does_not_require_preserved_benchmarks() -> Non
     )
 
     assert required == {"2317": {"2026-08-13"}}
+
+
+def test_manual_no_trade_pair_requires_complete_hash_verified_receipt(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    raw = tmp_path / "raw"
+    receipts = state / "settlement_receipts"
+    day_source = raw / "tpex_daily_ohlcv/2026-09-10.json"
+    prior_source = raw / "tpex_daily_ohlcv/2026-09-09.json"
+    receipts.mkdir(parents=True)
+    day_source.parent.mkdir(parents=True)
+    day_source.write_text('{"date":"2026-09-10","rows":[]}', encoding="utf-8")
+    prior_source.write_text('{"date":"2026-09-09","rows":[]}', encoding="utf-8")
+
+    import hashlib
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    receipt = {
+        "status": "applied",
+        "simulation_only": True,
+        "contract": "user_authorized_last_traded_price_paper_settlement_v1",
+        "session_date": "2026-09-10",
+        "raw_root": str(raw),
+        "last_traded_price_for": ["6680"],
+        "sources": [
+            {"path": str(day_source), "sha256": digest(day_source)},
+            {"path": str(prior_source), "sha256": digest(prior_source)},
+        ],
+        "entries": [
+            {
+                "symbol": "6680",
+                "price_basis": "last_available_trade",
+                "price_date": "2026-09-09",
+                "official_date": "2026-09-09",
+                "source_sha256": digest(prior_source),
+            }
+        ],
+    }
+    receipt_path = receipts / "2026-09-10-test.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    assert verified_manual_no_trade_pairs(state) == {
+        ("6680", "2026-09-10"): "manual_last_trade_settlement:2026-09-10-test.json"
+    }
+
+    prior_source.write_text("damaged", encoding="utf-8")
+    assert verified_manual_no_trade_pairs(state) == {}
 
 
 def _write_maintenance_scope(
@@ -522,6 +656,46 @@ def test_fetch_missing_kbars_delegates_only_true_gap_to_canonical_collector(
     assert result["missing_before"] == 1
     assert result["missing_after"] == 0
     assert result["api_requests_started"] == 1
+
+
+def test_fetch_missing_kbars_failure_names_the_remaining_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetched = tmp_path / "fetched"
+    required = {"5314": {"2026-09-11"}}
+    store = MinutePriceStore([tmp_path / "local", fetched], tmp_path / "ticks")
+    store.prepare(required)
+
+    def fake_run(command: list[str], *, cwd: Path, check: bool) -> SimpleNamespace:
+        fetched.mkdir(parents=True, exist_ok=True)
+        (fetched / "download_summary.json").write_text(
+            json.dumps(
+                {
+                    "api_requests_started_this_run": 1,
+                    "stopped_for_traffic": False,
+                    "stopped_for_market_hours": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        "scripts.rebuild_tw_day_trade_minute_curves.subprocess.run", fake_run
+    )
+    with pytest.raises(RuntimeError, match='"symbol": "5314"') as caught:
+        fetch_missing_kbars(
+            store,
+            required,
+            output_root=fetched,
+            simulation=True,
+            workers=1,
+            requests_per_second=5.0,
+            max_traffic_fraction=0.90,
+        )
+
+    assert '"session_date": "2026-09-11"' in str(caught.value)
 
 
 def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(

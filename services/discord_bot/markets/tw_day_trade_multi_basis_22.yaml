@@ -16,6 +16,9 @@ initial_capital: 10000000.0
 day_trade_simulation_enabled: true
 day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
 day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_residual_margin_conversion: true
+day_trade_odd_lot_execution_policy: assumed_odd_lot_at_regular_board_price_v1
+day_trade_margin_action_data_dir: /srv/stockagent-live/data_tw_public/execution_actions
 day_trade_quote_interval_seconds: 60
 
 # Live 09:00 signals execute at the first strictly later causal best Ask/Bid.

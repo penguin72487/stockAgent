@@ -10,6 +10,14 @@ import torch
 from stockagent.backtest.tw_commission_rebate import (
     normalize_commission_rebate_timing,
 )
+from stockagent.backtest.tw_day_trade_contract import (
+    BOARD_LOT_SHARES,
+    MARGIN_FINANCING_ANNUAL_RATE,
+    MARGIN_FINANCING_PRINCIPAL_RATIO,
+    MARGIN_SHORT_ANNUAL_BORROW_RATE,
+    MARGIN_SHORT_HANDLING_FEE_RATE,
+    MINUTE_VOLUME_PARTICIPATION,
+)
 from stockagent.data.tw_day_trade_execution import (
     DAY_TRADE_FULL_SESSION_FIELDS,
     DAY_TRADE_FULL_SESSION_MINUTES,
@@ -20,10 +28,6 @@ from stockagent.data.tw_day_trade_execution import (
 )
 
 
-MINUTE_VOLUME_PARTICIPATION = 0.50
-BOARD_LOT_SHARES = 1_000.0
-MARGIN_FINANCING_PRINCIPAL_RATIO = 0.60
-MARGIN_FINANCING_ANNUAL_RATE = 0.16
 MARGIN_FINANCING_ONE_DAY_RATE = (
     MARGIN_FINANCING_PRINCIPAL_RATIO * MARGIN_FINANCING_ANNUAL_RATE / 365.0
 )
@@ -32,8 +36,6 @@ MARGIN_FINANCING_ONE_DAY_RATE = (
 # deliberately selects both upper endpoints while assuming inventory is
 # unlimited.  It is not the separate day-trade securities-shortfall borrowing
 # mechanism, whose one-day fee can be much larger.
-MARGIN_SHORT_HANDLING_FEE_RATE = 0.0010
-MARGIN_SHORT_ANNUAL_BORROW_RATE = 0.20
 MARGIN_SHORT_ONE_DAY_BORROW_RATE = MARGIN_SHORT_ANNUAL_BORROW_RATE / 365.0
 COMPILED_BLOCK_ROWS = 4
 

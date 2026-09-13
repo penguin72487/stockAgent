@@ -720,11 +720,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             close_tradable = np.asarray(panel.alive_mask, dtype=bool).copy()
         elif day_trade_eligible is not None:
             close_tradable = close_tradable & day_trade_eligible
-            # The model target is committed before the opening auction.  Even
-            # today's realized open price/limit state is therefore execution
-            # information, not a portfolio-selection mask.  Only the official
-            # point-in-time eligibility gate is visible to the model; the
-            # signed open-side fill masks are applied later by the executor.
+            # The policy universe is exact-session official eligibility, as
+            # in live.signal_engine. A configured observed opening-gap input
+            # does not make current/future fill availability a token mask.
+            # Signed price/limit/liquidity gates are executor-only and must not
+            # renormalize cross-stock attention or L1 policy allocations.
             tradable = day_trade_eligible.copy()
         elif carrying_execution:
             # The cash signal is committed before session-t close.  Its outer

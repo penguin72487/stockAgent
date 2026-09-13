@@ -1,0 +1,15 @@
+[Unit]
+Description=Prepare physical-share actions before the protected opening path
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 06:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 07:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-day-trade-margin-actions.service
+
+[Install]
+WantedBy=timers.target

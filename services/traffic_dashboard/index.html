@@ -7,6 +7,8 @@
   <title>網站流量與延遲｜StockAgent</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=1">
+  <link rel="stylesheet" href="performance.css?v=3">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
@@ -54,14 +56,42 @@
     <div class="section-intro"><div><span>02</span><h2>這台瀏覽器的互動延遲</h2></div><p>從按下刷新或排程發出 fetch，到資料解析及 DOM 更新</p></div>
     <section class="local-grid" aria-label="本次瀏覽器資料取得延遲">
       <article class="local-metric"><span>伺服器處理</span><strong id="local-server">—</strong><small>Server-Timing</small></article>
-      <article class="local-metric"><span>收到 headers</span><strong id="local-network">—</strong><small>fetch 至 response</small></article>
+      <article class="local-metric"><span>收到回應標頭</span><strong id="local-network">—</strong><small>包含伺服器處理，不可重複加總</small></article>
       <article class="local-metric"><span>下載 body</span><strong id="local-download">—</strong><small>response.text</small></article>
       <article class="local-metric"><span>JSON 解析</span><strong id="local-parse">—</strong><small>JSON.parse</small></article>
       <article class="local-metric"><span>DOM 更新</span><strong id="local-render">—</strong><small>render 函式</small></article>
-      <article class="local-metric accent"><span>請求到下一幀</span><strong id="local-total">—</strong><small>使用者感知總延遲</small></article>
+      <article class="local-metric accent"><span>請求到繪製機會</span><strong id="local-total">—</strong><small>rAF 觀測，不代表已完成螢幕呈現</small></article>
     </section>
 
-    <div class="section-intro"><div><span>03</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
+    <div class="section-intro"><div><span>03</span><h2>各頁功能反應測速</h2></div><p>這台瀏覽器最近 256 筆；每一功能最多保留 32 筆</p></div>
+    <section class="panel browser-performance-panel" aria-labelledby="browser-performance-title">
+      <div class="panel-head browser-performance-head">
+        <div>
+          <h2 id="browser-performance-title">跨頁互動與請求</h2>
+          <p>頁面載入依序採 LCP、FCP、load 的可用值；操作與 API 採第二次 requestAnimationFrame 的繪製機會。這是瀏覽器觀測，不是螢幕像素完成或交易執行延遲。</p>
+        </div>
+        <span id="browser-group-count" class="count">—</span>
+      </div>
+      <div class="browser-controls">
+        <label>頁面<select id="browser-page-filter"><option value="all">所有頁面</option></select></label>
+        <label>類型<select id="browser-kind-filter"><option value="all">所有類型</option><option value="page_load">頁面載入</option><option value="interaction">操作到繪製</option><option value="api">API 到繪製</option><option value="render">資料整理與繪圖</option></select></label>
+        <button id="browser-copy" type="button" data-performance-ignore>複製 JSON</button>
+        <button id="browser-clear" class="danger-quiet" type="button" data-performance-ignore>清除本機紀錄</button>
+      </div>
+      <div class="browser-summary" aria-label="所選本機測速摘要">
+        <article><span>樣本</span><strong id="browser-samples">—</strong></article>
+        <article><span>頁面</span><strong id="browser-pages">—</strong></article>
+        <article><span>p50</span><strong id="browser-p50">—</strong></article>
+        <article><span>p95</span><strong id="browser-p95">—</strong></article>
+        <article><span>最大</span><strong id="browser-max">—</strong></article>
+      </div>
+      <p id="browser-action-status" class="privacy-note" role="status" aria-live="polite">只儲存在這台瀏覽器的同源 localStorage，不上傳；不記錄輸入值、查詢字串、IP、User-Agent、Cookie 或帳號。</p>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="各頁功能反應測速，可水平捲動">
+        <table class="browser-performance-table"><thead><tr><th>頁面</th><th>功能</th><th>口徑</th><th>成功／全部</th><th>主要耗時</th><th>最近</th><th>p50</th><th>p95</th><th>最大</th><th>最後觀測</th></tr></thead><tbody id="browser-action-rows"></tbody></table>
+      </div>
+    </section>
+
+    <div class="section-intro"><div><span>04</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
     <section class="grid-two">
       <article class="panel">
         <div class="panel-head"><div><h2>時間窗比較</h2><p>1 分鐘、5 分鐘與 1 小時</p></div></div>
@@ -96,7 +126,7 @@
       <dl id="definition-list"></dl>
     </details>
   </main>
-  <script src="../dashboard-core.js?v=4" defer></script>
-  <script src="app.js?v=3" defer></script>
+  <script src="../dashboard-core.js?v=8" defer></script>
+  <script src="app.js?v=9" defer></script>
 </body>
 </html>

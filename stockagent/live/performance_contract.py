@@ -81,6 +81,18 @@ def simple_return_frame(frame):
     return frame.with_columns(pl.lit("simple").alias("return_type"))
 
 
+def capital_return(initial: Any, equity: Any) -> tuple[float | None, float | None]:
+    """Allocation-free arithmetic shared by minute curves and account DTOs."""
+    try:
+        initial, equity = float(initial), float(equity)
+    except (TypeError, ValueError):
+        return None, None
+    if not math.isfinite(initial) or initial <= 0 or not math.isfinite(equity):
+        return None, None
+    pnl = equity - initial
+    return pnl / initial, 100.0 * pnl / initial
+
+
 def paper_account_performance(mode: Mapping[str, Any], *, revision: Any = None) -> dict[str, Any]:
     """One arithmetic owner for web and Discord's cumulative paper account.
 
@@ -98,18 +110,36 @@ def paper_account_performance(mode: Mapping[str, Any], *, revision: Any = None) 
     initial = finite("initial_capital_twd")
     equity = finite("total_equity_twd")
     valid = initial is not None and initial > 0 and equity is not None
+    margin_action_receipt = mode.get("margin_corporate_action_receipt") or {}
+    margin_accounting_blocked = margin_action_receipt.get("status") == "blocked"
     pnl = equity - initial if valid else None
+    fraction, percent = capital_return(initial, equity)
     return {
         "schema_version": PERFORMANCE_SCHEMA_VERSION,
         "kind": "paper_account", "source": "paper_execution_ledger",
+        "capital_sizing_basis": mode.get("capital_sizing_basis") or "legacy_fixed_initial_capital",
+        "execution_realism_contract": mode.get("execution_realism_contract"),
+        "funding_assumption": mode.get("funding_assumption") or "legacy_paper_account",
+        "broker_buying_power_verified": False,
+        "margin_carry_contract": mode.get("margin_carry_contract"),
+        "odd_lot_execution_policy": mode.get("odd_lot_execution_policy"),
+        "odd_lot_exchange_fill_verified": False,
+        "share_replacement_count": len(mode.get("share_replacement_ledger") or []),
+        "margin_corporate_action_receipt": margin_action_receipt or None,
+        "margin_cost_assumptions": mode.get("margin_cost_assumptions"),
+        "cumulative_carry_cost_twd": finite("cumulative_carry_cost_twd") or 0.0,
+        "cumulative_corporate_action_net_twd": finite("cumulative_corporate_action_net_twd") or 0.0,
+        "corporate_action_receivable_twd": finite("corporate_action_receivable_twd") or 0.0,
+        "corporate_action_payable_twd": finite("corporate_action_payable_twd") or 0.0,
+        "training_return_comparability": "requires_same_signal_inputs_and_execution_ledger",
         "basis": "initial_capital_to_latest_net_liquidation", "return_type": "simple",
         "session_date": mode.get("session_date"),
         "asof": mode.get("last_mark_at") or mode.get("closing_auction_settled_at"),
         "state_revision": revision,
         "initial_capital_twd": initial, "total_equity_twd": equity,
-        "net_pnl_twd": pnl, "return_fraction": pnl / initial if valid else None,
-        "return_pct": 100.0 * pnl / initial if valid else None,
+        "net_pnl_twd": pnl, "return_fraction": fraction,
+        "return_pct": percent,
         "valuation_stale": bool(mode.get("valuation_stale") or mode.get("stale_position_count")),
-        "status": "available" if valid else "unavailable",
+        "status": "available" if valid and not margin_accounting_blocked else "unavailable",
         "simulation_only": True,
     }

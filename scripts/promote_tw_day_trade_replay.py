@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -13,7 +13,7 @@ import math
 import os
 from pathlib import Path
 import sys
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -50,11 +50,12 @@ MINUTE_VWAP_0901_REPLAY_CONTRACT = (
 )
 MINUTE_PRICE_0901_REPLAY_CONTRACT = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_"
-    "minute_price_counterfactual_v2"
+    "minute_price_volume_capped_nav_counterfactual_v3"
 )
 MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
     MINUTE_VWAP_0901_REPLAY_CONTRACT,
     MINUTE_PRICE_0901_REPLAY_CONTRACT,
+    "retrospective_official_open_signal_at_09_00_observed_09_01_minute_price_counterfactual_v2",
 }
 MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 MINUTE_CURVE_SESSION_POINTS = 270
@@ -85,12 +86,20 @@ def _load_object(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _promotion_input_hashes(candidate: Path) -> dict[str, str]:
+    """Bind the complete promoted history, not only its terminal state."""
+    return {str(path.relative_to(candidate)): _sha256(path)
+            for path in sorted(candidate.rglob("*"))
+            if path.is_file() and not path.name.startswith(".")}
+
+
 def _validate_minute_curve_coverage(
     candidate: Path,
     *,
     completed_session_dates: list[str],
     expected_markets: set[str],
     failures: list[str],
+    require_carried_parity: bool = False,
 ) -> dict[str, Any]:
     """Require every completed replay session to ship a minute-grain curve."""
 
@@ -128,6 +137,21 @@ def _validate_minute_curve_coverage(
     coverage = coverage if isinstance(coverage, dict) else {}
     outputs = receipt.get("outputs")
     outputs = outputs if isinstance(outputs, dict) else {}
+    if require_carried_parity:
+        # Ledger arithmetic alone cannot detect using an execution High/Low
+        # instead of the retained minute Close for inventory valuation.
+        if not (
+            receipt.get("carried_inventory_revalued_from_unchanged_executions") is True
+            and receipt.get("independent_carried_valuation_parity_required") is True
+            and receipt.get("independent_carried_valuation_parity_passed") is True
+            and strategy.get("differing_original_equity_points") == 0
+            and isinstance(strategy.get("maximum_original_equity_difference_twd"), (float, int))
+            and 0 <= strategy["maximum_original_equity_difference_twd"] <= 1e-6
+        ):
+            failures.append("carried-history promotion requires independent minute valuation parity")
+        fills_path = candidate / "fills.jsonl"
+        if not fills_path.is_file() or receipt.get("unchanged_fills_sha256") != _sha256(fills_path):
+            failures.append("carried minute valuation changed the accepted fills ledger")
     expected_rows = (
         len(completed_session_dates)
         * len(expected_markets)
@@ -239,6 +263,47 @@ def _validate_minute_curve_coverage(
         "unverified_historical_interior_rows": unverified_interior_rows,
         "receipt_sha256": _sha256(receipt_path),
     }
+
+
+def _validate_benchmarks(
+    state_dir: Path, *, completed_session_dates: list[str],
+) -> dict[str, Any]:
+    """Shared maintenance/promotion gate: date coverage is not an envelope claim."""
+    marks = _load_object(state_dir / "benchmark_history.json").get("marks")
+    if not isinstance(marks, list):
+        raise RuntimeError("benchmark history has no marks")
+    expected_sessions = set(completed_session_dates)
+    contracts = {
+        "benchmark_0050": ("09:00", "13:30", 271),
+        "benchmark_2330": ("09:00", "13:30", 271),
+        "benchmark_tx_continuous": ("08:45", "13:44", 300),
+    }
+    counts = {}
+    for benchmark_id, (first_clock, last_clock, expected_points) in contracts.items():
+        by_session: dict[str, list[str]] = {}
+        for row in marks:
+            if (isinstance(row, dict) and row.get("benchmark_id") == benchmark_id
+                    and str(row.get("session_date") or "") in expected_sessions):
+                by_session.setdefault(str(row["session_date"]), []).append(str(row.get("minute") or ""))
+        if set(by_session) != expected_sessions:
+            raise RuntimeError(f"{benchmark_id} missing completed sessions: {sorted(expected_sessions - set(by_session))[:20]}")
+        for session_date, minutes in by_session.items():
+            if len(minutes) != expected_points or len(set(minutes)) != expected_points:
+                raise RuntimeError(f"{benchmark_id}:{session_date} minute count {len(minutes)}/{len(set(minutes))} != {expected_points}")
+            clocks = sorted(value[11:16] for value in minutes)
+            if clocks[0] != first_clock or clocks[-1] != last_clock:
+                raise RuntimeError(f"{benchmark_id}:{session_date} minute boundary {clocks[0]}..{clocks[-1]} != {first_clock}..{last_clock}")
+            first = datetime.fromisoformat(f"{session_date}T{first_clock}:00+08:00")
+            expected = {first + timedelta(minutes=i) for i in range(expected_points)}
+            try:
+                observed = {datetime.fromisoformat(value) for value in minutes}
+            except ValueError as exc:
+                raise RuntimeError(f"{benchmark_id}:{session_date} invalid minute timestamp") from exc
+            if observed != expected:
+                raise RuntimeError(f"{benchmark_id}:{session_date} incomplete exact one-minute grid")
+        counts[benchmark_id] = sum(map(len, by_session.values()))
+    return {"completed_session_dates": completed_session_dates,
+            "points_per_session": {key: value[2] for key, value in contracts.items()}, "rows": counts}
 
 
 def _validate_hybrid_signal_ledger(
@@ -479,17 +544,60 @@ def _validate_official_open_fill_ledger(
     return {"fill_ledger_official_open_fills": fill_count}
 
 
+def _verify_absent_0901_prices(candidate: Path, pairs: set[tuple[str, str]]) -> dict[str, Any]:
+    """No execution quote is not a download failure, but must have source proof.
+
+    A returned, receipt-verified session may start trading after 09:01. Never
+    backdate its later first trade. Missing session receipts still fail closed.
+    """
+    from collections import defaultdict
+    import polars as pl
+    from scripts.rebuild_tw_day_trade_minute_curves import MinutePriceStore
+    receipt = _load_object(candidate / "minute_curve_receipt.json")
+    roots = [Path(row["root"]) for row in receipt.get("local_minute_sources", [])]
+    store = MinutePriceStore(roots, (), require_receipts=True)
+    path_pairs: dict[Path, set[tuple[str, str]]] = defaultdict(set)
+    found, executable = set(), set()
+    for symbol, day in sorted(pairs):
+        for root in store.kbar_roots:
+            for path in store._chunk_paths(root, symbol, day):
+                path_pairs[path].add((symbol, day))
+                found.add((symbol, day))
+    for path, selected in path_pairs.items():
+        days = sorted({date.fromisoformat(day) for _, day in selected})
+        schema = pl.read_parquet_schema(path)
+        volume = "volume_shares" if "volume_shares" in schema else "Volume"
+        observed = (pl.scan_parquet(path).filter(pl.col("date").is_in(days)
+            & (pl.col("ts").dt.hour() == 9) & (pl.col("ts").dt.minute() == 1)
+            & (pl.col(volume).is_null() | ~pl.col(volume).is_finite() | (pl.col(volume) != 0)))
+            .select("date").unique().collect())
+        # A positive-volume row with a corrupt price is also a repair, not an
+        # accepted absence. Do not filter it out just because Close is invalid.
+        executable.update((path.parent.name, str(day)) for day in observed["date"].to_list())
+    store.assert_sources_unchanged()
+    missing, contradicting = pairs - found, pairs & executable
+    if missing or contradicting:
+        raise RuntimeError(f"09:01 unavailable-price source proof failed: missing={len(missing)} {sorted(missing)[:10]}; positive_volume={len(contradicting)} {sorted(contradicting)[:10]}")
+    return {"receipt_verified_absent_price_pairs": len(pairs), "source_files_checked": len(path_pairs),
+            "contract": "receipt_verified_session_without_0901_trade_no_fill_v1",
+            "raw_tick_source_signatures": {str(path): signature for path, signature in store._verified_raw_tick_signatures.items()},
+            "source_signatures": {str(path): signature for path, (signature, _) in store._verified_chunk_dates.items()}}
+
+
 def _validate_0901_minute_price_signal_ledger(
     candidate: Path,
     *,
     expected_fills: int,
     failures: list[str],
-) -> dict[str, int]:
+    require_capacity: bool = False,
+    allow_receipted_absence: bool = False,
+) -> dict[str, Any]:
     path = candidate / "signals.jsonl"
     if not path.is_file():
         failures.append("09:01 minute-price replay has no signals.jsonl audit ledger")
         return {"minute_price_0901_fills": 0, "minute_vwap_0901_fills": 0}
     fill_count = 0
+    absent_pairs: set[tuple[str, str]] = set()
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -499,9 +607,33 @@ def _validate_0901_minute_price_signal_ledger(
                 continue
             if str(row.get("entry_fill_policy") or "") != MINUTE_VWAP_0901_ENTRY_POLICY:
                 continue
+            if require_capacity and int(row.get("requested_shares") or 0) > 0 and row.get("reason") in {
+                "observed_09_01_minute_price_unavailable", "observed_09_01_minute_liquidity_unavailable",
+            }:
+                # A verified zero-volume minute can legitimately have no fill;
+                # absent price/volume evidence is a separate data-health gate.
+                volume = row.get("minute_kbar_volume_lots")
+                if volume is None or row.get("execution_price") is None:
+                    if (allow_receipted_absence and int(row.get("filled_shares") or 0) == 0
+                            and int(row.get("reduction_filled_shares") or 0) == 0):
+                        absent_pairs.add((str(row.get("symbol") or ""), str(row.get("session_date") or "")))
+                    else:
+                        failures.append(f"signals.jsonl:{line_number}: unresolved v3 entry source")
             if int(row.get("filled_shares") or 0) <= 0:
                 continue
             fill_count += 1
+            if require_capacity:
+                try:
+                    volume = float(row.get("minute_kbar_volume_lots"))
+                    nav = float(row.get("sizing_nav_twd"))
+                    capacity = int(math.floor(volume * .5)) * 1000
+                    valid = (math.isfinite(volume) and volume >= 0 and math.isfinite(nav) and nav > 0
+                             and int(row["filled_shares"]) <= capacity
+                             and row.get("filled_weight_basis") == "session_start_account_nav")
+                except (TypeError, ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    failures.append(f"signals.jsonl:{line_number}: missing or exceeded v3 NAV/liquidity proof")
             try:
                 execution_price = float(row.get("execution_price"))
                 sizing_open = float(row.get("sizing_open_price"))
@@ -536,9 +668,16 @@ def _validate_0901_minute_price_signal_ledger(
         failures.append(
             f"signals ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
         )
+    absence = None
+    if absent_pairs:
+        try:
+            absence = _verify_absent_0901_prices(candidate, absent_pairs)
+        except (OSError, ValueError, RuntimeError) as exc:
+            failures.append(str(exc))
     return {
         "minute_price_0901_fills": fill_count,
         "minute_vwap_0901_fills": fill_count,
+        "absent_execution_price_validation": absence,
     }
 
 
@@ -611,7 +750,9 @@ def _validate_rebuild(
     *,
     expected_markets: set[str],
     allow_current_open_session: bool = False,
+    allow_margin_carry: bool = False,
 ) -> dict[str, Any]:
+    input_hashes = _promotion_input_hashes(candidate)
     receipt_path = candidate / "rebuild_receipt.json"
     state_path = candidate / "state.json"
     receipt = _load_object(receipt_path)
@@ -633,6 +774,22 @@ def _validate_rebuild(
         modes = {}
     if set(modes) != expected_markets:
         failures.append(f"mode set={sorted(modes)} expected={sorted(expected_markets)}")
+    margin_audit = None
+    if allow_margin_carry:
+        from scripts.audit_tw_day_trade_margin_replay import audit
+        from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+        from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE
+        if allow_current_open_session:
+            failures.append("carried-history promotion requires completed sessions")
+        if (not isinstance(replay_contract, dict) or replay_contract.get("residual") != MARGIN_CARRY_CONTRACT
+                or replay_contract.get("odd_lot_execution_policy") != ODD_LOT_BOARD_PRICE
+                or any(m.get("margin_carry_contract") != MARGIN_CARRY_CONTRACT
+                       or m.get("odd_lot_execution_policy") != ODD_LOT_BOARD_PRICE for m in modes.values())):
+            failures.append("carried-history promotion requires the explicit margin and odd-lot contracts")
+        else:
+            margin_audit = audit(candidate)
+            if not margin_audit.get("full_requested_range_passed"):
+                failures.append(f"carried-history full source/accounting audit failed: {margin_audit.get('errors')}")
 
     sessions = receipt.get("sessions")
     if not isinstance(sessions, list) or not sessions:
@@ -663,7 +820,10 @@ def _validate_rebuild(
         )
         if is_allowed_current_open:
             current_open_session = session_date
-        elif close_status != "settled_official_close":
+        elif close_status != "settled_official_close" and not (
+            allow_margin_carry and close_status == "assumed_margin_inventory_carried"
+            and margin_audit and margin_audit.get("full_requested_range_passed")
+        ):
             failures.append(f"{session_date}: session is not settled at official close")
         mode_rows = session.get("modes")
         if not isinstance(mode_rows, list):
@@ -725,7 +885,7 @@ def _validate_rebuild(
                             f"{session_date}/{market}: 09:01 minute-price fill counts do not reconcile"
                         )
                     if (
-                        receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT
+                        receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT
                         and minute_vwap_0901_count + minute_close_0901_count
                         != minute_price_0901_count
                     ):
@@ -783,9 +943,12 @@ def _validate_rebuild(
                 after_close = row.get("after_close")
                 if (
                     not isinstance(after_close, dict)
-                    or int(after_close.get("open_position_rows") or 0) != 0
+                    or (int(after_close.get("open_position_rows") or 0) != 0 and not allow_margin_carry)
                 ):
                     failures.append(f"{session_date}/{market}: not flat after close")
+                if receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT and isinstance(after_close, dict):
+                    if int(after_close.get("terminal_flatten_count") or 0):
+                        failures.append(f"{session_date}/{market}: v3 uses synthetic terminal flatten")
 
     if session_dates != sorted(set(session_dates)):
         failures.append("session dates are duplicated or not strictly increasing")
@@ -838,7 +1001,7 @@ def _validate_rebuild(
             if isinstance(position, dict)
         )
         final_open_positions[str(market)] = open_count
-        if current_open_session is None and open_count:
+        if current_open_session is None and open_count and not allow_margin_carry:
             failures.append(f"{market}: final open positions={open_count}")
         if current_open_session is not None:
             if str(mode.get("session_date") or "") != current_open_session:
@@ -931,13 +1094,15 @@ def _validate_rebuild(
     elif receipt_entry_contract in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
         expected_minute_price_fills = (
             minute_price_0901_fills
-            if receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT
+            if receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT
             else minute_vwap_0901_fills
         )
         signal_ledger_validation = _validate_0901_minute_price_signal_ledger(
             candidate,
             expected_fills=expected_minute_price_fills,
             failures=failures,
+            require_capacity=receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT,
+            allow_receipted_absence=allow_margin_carry,
         )
         signal_ledger_validation.update(
             _validate_0901_minute_price_fill_ledger(
@@ -957,12 +1122,22 @@ def _validate_rebuild(
         completed_session_dates=completed_session_dates,
         expected_markets=expected_markets,
         failures=failures,
+        require_carried_parity=allow_margin_carry,
     )
+    benchmark_validation = None
+    if allow_margin_carry:
+        try:
+            benchmark_validation = _validate_benchmarks(candidate, completed_session_dates=completed_session_dates)
+        except (OSError, ValueError, RuntimeError) as exc:
+            failures.append(f"carried-history benchmark minute coverage failed: {exc}")
 
+    if input_hashes != _promotion_input_hashes(candidate):
+        failures.append("candidate history changed during validation")
     if failures:
-        raise RuntimeError("replay promotion validation failed: " + "; ".join(failures))
+        raise RuntimeError(f"replay promotion validation failed ({len(failures)} failures): " + "; ".join(failures[:50]))
     return {
         "session_dates": session_dates,
+        "promotion_input_hashes": input_hashes,
         "session_count": len(session_dates),
         "registrations": registrations,
         "best_quote_fills": best_quote_fills,
@@ -972,8 +1147,10 @@ def _validate_rebuild(
         "minute_price_0901_fills": minute_price_0901_fills,
         "signal_ledger_validation": signal_ledger_validation,
         "minute_curve_validation": minute_curve_validation,
+        "benchmark_minute_validation": benchmark_validation,
         "mode_set": sorted(expected_markets),
         "final_open_positions": final_open_positions,
+        "margin_carry_audit": margin_audit,
         "ending_equity_twd": ending_equity,
         "allow_current_open_session": bool(allow_current_open_session),
         "current_open_session": current_open_session,
@@ -1042,10 +1219,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate the candidate and print acceptance without exchanging directories.",
     )
+    parser.add_argument("--allow-margin-carry", action="store_true",
+                        help="Explicit user-approved carried-history contract; requires full source/accounting audit and a flat old live account.")
     return parser
 
 
-def main() -> None:
+def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> None:
+    """Recheck the exact source evidence after expensive validation and drain."""
+    audit = acceptance["margin_carry_audit"]
+    for name, digest in audit["source_hashes"].items():
+        if _sha256(candidate / name) != digest:
+            raise RuntimeError(f"audited carried candidate changed: {name}")
+    for name, digest in audit["corporate_action_source_hashes"].items():
+        if _sha256(Path(name)) != digest:
+            raise RuntimeError(f"audited corporate-action source changed: {name}")
+    for name, expected in audit.get("minute_source_signatures", {}).items():
+        stat = Path(name).stat()
+        if [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns] != list(expected):
+            raise RuntimeError(f"audited fill-minute source changed: {name}")
+    absence = acceptance["signal_ledger_validation"].get("absent_execution_price_validation") or {}
+    for name, expected in absence.get("source_signatures", {}).items():
+        path = Path(name)
+        actual = [[p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns]
+                  for p in (path, path.with_suffix(".receipt.json"))]
+        if actual != [list(value) for value in expected]:
+            raise RuntimeError(f"audited absent-minute source changed: {name}")
+    for name, expected in absence.get("raw_tick_source_signatures", {}).items():
+        stat = Path(name).stat()
+        if [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns] != list(expected):
+            raise RuntimeError(f"audited raw tick source changed: {name}")
+
+
+def main(*, before_exchange: Callable[[], None] | None = None) -> None:
     args = build_parser().parse_args()
     live = args.live_dir.resolve(strict=True)
     candidate = args.candidate_dir.resolve(strict=True)
@@ -1060,6 +1265,7 @@ def main() -> None:
         candidate,
         expected_markets=expected_markets,
         allow_current_open_session=bool(args.allow_current_open_session),
+        allow_margin_carry=bool(args.allow_margin_carry),
     )
     if args.validate_only:
         print(
@@ -1072,10 +1278,33 @@ def main() -> None:
         )
         return
 
+    # The service coordinator can drain writers only AFTER expensive source
+    # validation, avoiding minutes of needless Gateway downtime. The callback
+    # cannot bypass validation; the exact inputs are rechecked under locks.
+    if before_exchange is not None:
+        before_exchange()
     live_lock = _acquire_engine_lock(live)
     candidate_lock = _acquire_engine_lock(candidate)
     exchanged = False
     try:
+        # Recheck under both writer locks. A source-backed carried candidate
+        # must never erase a still-open pre-existing live account.
+        if acceptance["promotion_input_hashes"] != _promotion_input_hashes(candidate):
+            raise RuntimeError("candidate history changed after validation")
+        old_state = _load_object(live / "state.json")
+        if any(int(p.get("signed_shares") or 0) for m in old_state.get("modes", {}).values()
+               for p in m.get("positions", {}).values()):
+            raise RuntimeError("refusing promotion over open live paper inventory")
+        if _sha256(candidate / "state.json") != acceptance["state_sha256"] or _sha256(candidate / "rebuild_receipt.json") != acceptance["rebuild_receipt_sha256"]:
+            raise RuntimeError("candidate changed after validation")
+        if args.allow_margin_carry:
+            _revalidate_margin_sources(candidate, acceptance)
+            from stockagent.live.market_config import load_market_config
+            from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE
+            for market in expected_markets:
+                config = load_market_config(REPO_ROOT / "services/discord_bot/markets" / f"{market}.yaml")
+                if not config.day_trade_residual_margin_conversion or config.day_trade_odd_lot_execution_policy != ODD_LOT_BOARD_PRICE:
+                    raise RuntimeError(f"runtime margin/odd-lot policy not enabled: {market}")
         _exchange_directories(live, candidate)
         exchanged = True
         promotion_receipt = {

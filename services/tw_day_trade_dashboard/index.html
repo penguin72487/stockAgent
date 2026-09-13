@@ -6,8 +6,10 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股多模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=22">
+  <link rel="stylesheet" href="styles.css?v=25">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="../vendor/uplot/uPlot.min.css?v=1.6.32">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -27,7 +29,7 @@
       <span id="health" class="pill">載入中</span>
       <small id="freshness">—</small>
       <strong>僅模擬，絕不送正式單</strong>
-      <button id="force-refresh" class="secondary" type="button">強制重整</button>
+      <button id="force-refresh" class="secondary" type="button">立即更新資料</button>
     </div>
   </header>
 
@@ -105,6 +107,7 @@
       <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
       <label>起始日<input id="detail-start-date" type="date"></label>
       <label>終止日<input id="detail-end-date" type="date"></label>
+      <button id="follow-latest-session" class="secondary" type="button" aria-pressed="true">跟隨最新交易日（08:30 切換）</button>
       <label>模式<select id="mode-filter"><option value="all">全部模式</option></select></label>
       <label>股票<input id="symbol-filter" type="search" placeholder="輸入代號或名稱" autocomplete="off"></label>
       <label>狀態<select id="status-filter"><option value="all">全部狀態</option><option value="open">持倉中</option><option value="closed">已平倉</option><option value="blocked">未執行</option></select></label>
@@ -117,7 +120,7 @@
         <div class="panel-head"><div><h2>每分鐘所選期間報酬率（%）</h2><p>每條線第一個有效分鐘固定為 0%；這只改變百分比顯示，不改動帳本的絕對權益與累積損益。即時點使用 bid／ask，歷史回補點使用右標一分鐘最後成交價，無成交分鐘延用上一筆並揭露覆蓋率，絕不線性插值。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
         <div class="time-range-control" aria-label="權益曲線日期來源"><span>日期範圍跟隨上方「明細篩選」；所選期間第一個有效分鐘就是 0%。</span></div>
         <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
-        <div class="chart-scroll" tabindex="0" aria-label="台股所選期間報酬曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘所選期間報酬率百分比曲線"></svg></div>
+        <div class="chart-scroll" tabindex="0" aria-label="台股所選期間報酬曲線"><div id="equity-chart" class="chart-host" role="img" aria-label="每分鐘所選期間報酬率百分比曲線"></div></div>
         <p id="equity-range-note" class="time-range-note" aria-live="polite"></p>
       </article>
       <article class="panel timeline-panel">
@@ -165,7 +168,7 @@
     <section class="grid-two compact">
       <article class="panel table-panel">
         <div class="panel-head"><div><h2>委託與成交事件</h2><p>伺服器分頁呈現所選交易日的全部模擬委託、成交、撤單替換與 OCO 原因</p></div><div class="table-actions"><span id="event-count" class="count"></span><button id="load-more-events" class="secondary hidden" type="button">載入更多</button></div></div>
-        <div class="table-scroll short" tabindex="0" role="region" aria-label="模擬委託與成交事件，可用方向鍵水平捲動"><table><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
+        <div class="table-scroll short" tabindex="0" role="region" aria-label="模擬委託與成交事件"><table class="compact-table event-table"><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
       </article>
       <article class="panel">
         <div class="panel-head"><div><h2>稽核與就緒狀態</h2><p>checkpoint、資料日期、事件筆數與關鍵失敗會留在這裡</p></div></div>
@@ -193,10 +196,11 @@
       <div id="tw-public-monitor-list" class="tw-public-monitor-list"><div class="tw-public-empty">資料尚未載入，請稍後重整。</div></div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=4" defer></script>
-  <script src="../time-axis.js?v=4" defer></script>
+  <script src="../dashboard-core.js?v=8" defer></script>
+  <script src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32" defer></script>
   <script src="presentation.js?v=1" defer></script>
-  <script src="detail-components.js?v=3" defer></script>
-  <script src="app.js?v=68" defer></script>
+  <script src="detail-components.js?v=5" defer></script>
+  <script src="chart-renderer.js?v=1" defer></script>
+  <script src="app.js?v=82" defer></script>
 </body>
 </html>

@@ -10,10 +10,10 @@ selected_python="$(resolve_fintech_python)"
 # glibc from retaining one large malloc arena per short-lived worker thread.
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 # This read-only HTTP process does not need numerical-kernel thread affinity.
-# The hardened systemd unit intentionally blocks sched_setaffinity; disabling
-# OpenMP binding keeps imported analytics libraries from aborting on that EPERM.
+# The hardened systemd unit intentionally blocks sched_setaffinity. Intel
+# libomp still calls pthread_setaffinity_np with OMP_PROC_BIND=false here, so
+# disable its affinity implementation directly and do not set both variables.
 export KMP_AFFINITY="${KMP_AFFINITY:-disabled}"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"

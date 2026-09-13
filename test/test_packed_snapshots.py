@@ -97,6 +97,43 @@ def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
     assert by_id.manifest["snapshot_id"] == published.manifest["snapshot_id"]
 
 
+def test_explicit_missing_object_recovery_publishes_current_bytes_under_new_identity(tmp_path):
+    source = _source_tree(tmp_path)
+    root = tmp_path / "cold"
+    initialize_packed_layout(root, node_id="node-a")
+    original = publish_packed_snapshot(root, "prices", source, pack_buckets=1)
+    original_manifest = original.manifest_path.read_bytes()
+    old = original.manifest["archive"]["objects"][0]
+    (root / old["relpath"]).unlink()
+    (source / "text/first.json").write_text('{"first": 2}\n')
+    with pytest.raises(SnapshotError):
+        publish_packed_snapshot(root, "prices", source)
+    repaired = publish_packed_snapshot(root, "prices", source, pack_buckets=1,
+                                      recover_missing_base_objects=True)
+    assert repaired.manifest["snapshot_id"] != original.manifest["snapshot_id"]
+    assert original.manifest_path.read_bytes() == original_manifest
+    assert not (root / old["relpath"]).exists()  # newer bytes never pretend to be the lost old version
+    assert repaired.manifest["archive"]["base_missing_objects_repacked_from_current_source"][0]["sha256"] == old["sha256"]
+    verify_packed_snapshot(root, repaired)
+    assert resolve_latest_packed(root, "prices").manifest["snapshot_id"] == repaired.manifest["snapshot_id"]
+
+
+def test_recovery_checks_corrupt_reused_objects_before_head_update(tmp_path):
+    source = _source_tree(tmp_path)
+    root = tmp_path / "cold"
+    initialize_packed_layout(root, node_id="node-a")
+    original = publish_packed_snapshot(root, "prices", source, loose_file_threshold_bytes=1024)
+    head = original.head_path.read_bytes()
+    blob = next(o for o in original.manifest["archive"]["objects"] if o["kind"] == "blob")
+    original_size = (root / blob["relpath"]).stat().st_size
+    (root / blob["relpath"]).write_bytes(b"X" * original_size)
+    (source / "text/first.json").write_text('{"first": 2}\n')
+    with pytest.raises(SnapshotError, match="checksum mismatch"):
+        publish_packed_snapshot(root, "prices", source, loose_file_threshold_bytes=1024,
+                                recover_missing_base_objects=True)
+    assert original.head_path.read_bytes() == head
+
+
 def test_full_store_audit_hashes_all_objects_without_deleting(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"

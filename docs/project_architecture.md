@@ -24,8 +24,9 @@ flowchart LR
   M --> I[訊號推論]
   I --> E[模擬執行引擎與帳戶 ledger]
   E --> U[Discord / 唯讀 Dashboard]
-  D --> C[審核後 immutable 冷庫]
+  D --> C[審核後 C current CAS]
   M --> C
+  C --> A[D additive 歷史 archive]
   C --> H[明確 use 後的本機唯讀熱快取]
   H --> P
 ```
@@ -42,7 +43,7 @@ flowchart LR
 | `stockagent/backtest/` | 損益、交易成本、限制與帳戶狀態；必須與訓練 loss、線上輸出語意對齊 |
 | `stockagent/live/` | 資料就緒、訊號與 paper engine、服務狀態、唯讀 dashboard |
 | `services/discord_bot/markets/`、`services/discord_bot/models/` | 已部署的模式與模型選擇，連到 config、fold 與 checkpoint |
-| `stockagent/data_sync/` | 冷庫發布、materialization、lease、GC、完成 artifact 維護 |
+| `stockagent/data_sync/` | 增量冷庫發布、C rolling retention、D archive、materialization、lease、GC、完成 artifact 維護 |
 | `stockagent/research/`、`stockagent/evaluation/`、`explainability*.py` | 研究比較、評估、可解釋性；不另建帳務或 checkpoint 權威 |
 | `scripts/`、`deploy/systemd/` | 編排、修復、稽核與部署模板；服務成功仍要核對成果 receipt |
 | `stockagent/strategies/` | 目前只是保留的 package，並非策略 registry；策略身分由上述 config/model/fold/模式共同定義 |
@@ -58,7 +59,7 @@ flowchart LR
 - 執行：`tw-day-trade-simulation` 與 TAIFEX BidAsk worker 的 paper engine。
 - 互動與觀察：`discord-bot`、`public-dashboards`、TAIFEX dashboard、status snapshots。
 - 維護：minute curves、eligibility、preopen gate、unattended guardian、Discord artifact maintenance。
-- 儲存：data cache GC、storage pressure、hot artifact sync、artifact dedup、cold artifact maintenance。
+- 儲存：packed backup/retention、data cache GC、storage pressure、hot artifact sync、artifact dedup、cold artifact maintenance。
 
 這是責任分類，不是 systemd 啟停 target。需安裝哪些服務取決於節點角色；特別是
 `cold-artifact-maintenance` 包含符合條件後的原始 artifact eviction，缺少此 optional

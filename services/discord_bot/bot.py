@@ -5446,6 +5446,11 @@ def _is_scheduled_day_trade_opening_signal(
 ) -> bool:
     """Reject same-day artifacts that were not produced by the 09:00 gate."""
 
+    effective = summary.get("replay_effective_signal_at")
+    if effective and not _summary_date_matches(effective, session_date):
+        # Historical artifacts retain their real creation time. Creating a
+        # yesterday replay today must never suppress today's opening signal.
+        return False
     contract = summary.get("signal_price_contract") or {}
     if not isinstance(contract, dict):
         return False
@@ -5485,12 +5490,6 @@ def _day_trade_schedule_state(
 ) -> str:
     """Reconcile the scheduler with the paper engine, not only artifacts."""
 
-    latest = _latest_market_signal(cfg)
-    if latest is None:
-        return "retry"
-    _summary_path, summary = latest
-    if not _summary_date_matches(summary.get("generated_at"), session_date):
-        return "retry"
     receipt = load_service_sync(_day_trade_state_dir())
     raw_mode = mode_from_service_sync(receipt, str(cfg.market))
     if raw_mode is None:
@@ -5505,21 +5504,47 @@ def _day_trade_schedule_state(
         raw_mode = (state.get("modes") or {}).get(str(cfg.market))
     if not isinstance(raw_mode, dict):
         return "retry"
+    if raw_mode.get("ledger_state_divergence") or str(raw_mode.get("engine_status") or "").startswith("critical"):
+        return "blocked_open_position"
     positions = raw_mode.get("positions") or {}
     legacy_open = isinstance(positions, dict) and any(
         int(position.get("signed_shares") or 0) != 0
         for position in positions.values()
         if isinstance(position, dict)
     )
-    if int(raw_mode.get("open_position_count") or 0) > 0 or legacy_open:
+    # Legacy state.json stored the complete position map.  An open position in
+    # that authoritative map must never be hidden by entry_completed_at: the
+    # scheduler has to stop and surface the unresolved day-trade inventory.
+    # Compact service-sync receipts intentionally omit the map and report only
+    # open_position_count; a current-session committed entry is allowed to keep
+    # running because the independent paper engine, not Discord, owns its exits.
+    if legacy_open:
         return "blocked_open_position"
     if (
         str(raw_mode.get("session_date") or "") == session_date
-        and _summary_date_matches(
-            raw_mode.get("entry_completed_at"), session_date
-        )
+        and _summary_date_matches(raw_mode.get("entry_completed_at"), session_date)
     ):
         return "completed"
+    if int(raw_mode.get("open_position_count") or 0) > 0:
+        from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+        previous_session = str(raw_mode.get("session_date") or "")
+        accepted_carry = bool(
+            getattr(cfg, "day_trade_residual_margin_conversion", False)
+            and previous_session and previous_session < session_date
+            and raw_mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+            and int(raw_mode.get("margin_carry_position_count") or 0)
+                == int(raw_mode.get("open_position_count") or 0) > 0
+            and _summary_date_matches(raw_mode.get("closing_auction_settled_at"), previous_session)
+            and _summary_date_matches(raw_mode.get("residual_conversion_completed_at"), previous_session)
+        )
+        if not accepted_carry:
+            return "blocked_open_position"
+        # This permits inference, not a fill. The canonical engine still owns
+        # corporate-action, source, capacity, and next-target-minus-stock gates.
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return "retry"
+    _summary_path, summary = latest
     if not _is_scheduled_day_trade_opening_signal(cfg, summary, session_date):
         # A manual pre-open panel signal or an intraday ``latest_quote`` signal
         # is not the immutable scheduled opening artifact.  It must never make
@@ -7118,6 +7143,7 @@ def _guide_message() -> str:
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "`tw_day_trade_multi_basis_22` 多基底22 現股當沖（初始 1,000 萬）；使用 22 組 effective-rank 時間基底與 Projection-L1 fold 11。",
         "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 LayerNorm v12 現股當沖（初始 1,000 萬）。",
+        "`tw_day_trade_attention_layernorm` Attention Full-Then-Last LayerNorm v12（獨立模擬 1,000 萬）；原 v12 帳戶與持倉另行保留。",
         "",
         "**日常看盤**",
         "`/latest market:<市場>` 最新訊號，不重跑模型。",

@@ -132,11 +132,13 @@ Kbars，不載入憑證、不送單。
 
 ```bash
 source scripts/runtime_env.sh
-run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
+run_fintech_python scripts/build_shioaji_tw_minute_dataset.py \
+  --calendar-root data_tw_public
 run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
   --trade-date YYYY-MM-DD
 run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
-  --all-partitions
+  --all-partitions \
+  --calendar-root data_tw_public
 ```
 
 輸出依交易日分區：

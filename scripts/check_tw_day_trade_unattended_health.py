@@ -31,14 +31,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
+from stockagent.live.market_config import enabled_day_trade_markets  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-EXPECTED_MARKETS = (
-    "tw_day_trade_100m",
-    "tw_day_trade_multi_basis",
-    "tw_day_trade_multi_basis_22",
-    "tw_day_trade_multi_basis_projection_l1_gelu",
+EXPECTED_MARKETS = enabled_day_trade_markets(
+    REPO_ROOT / "services/discord_bot/markets"
 )
 REQUIRED_SERVICES = (
     "stockagent-tw-day-trade-simulation.service",
@@ -55,6 +53,7 @@ REQUIRED_TIMERS = (
     "stockagent-discord-artifact-maintenance.timer",
     "stockagent-tw-day-trade-unattended-guardian.timer",
     "stockagent-tw-day-trade-minute-curves.timer",
+    "stockagent-tw-day-trade-margin-actions.timer",
 )
 
 
@@ -71,6 +70,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-free-percent", type=float, default=5.0)
     parser.add_argument("--observed-at", default=None)
     return parser.parse_args()
+
+
+def _accepted_margin_residual(mode: dict[str, Any], session_date: str) -> bool:
+    from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT, STRICT_INTRADAY_CONTRACT
+    from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE
+    count = int(mode.get("open_position_count") or 0)
+    if mode.get("configured_intraday_contract") == STRICT_INTRADAY_CONTRACT or mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
+        # Exceptional risk is still degraded, never an unattended-health pass.
+        return False
+    receipt = mode.get("margin_corporate_action_receipt") or {}
+    return bool(count > 0 and mode.get("session_date") == session_date
+                and mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                and mode.get("odd_lot_execution_policy") == ODD_LOT_BOARD_PRICE
+                and int(mode.get("margin_carry_position_count") or 0) == count
+                and mode.get("valuation_complete") is True
+                and str(mode.get("closing_auction_settled_at") or "").startswith(session_date)
+                and str(mode.get("residual_conversion_completed_at") or "").startswith(session_date)
+                and receipt.get("status") != "blocked")
 
 
 def _repo_path(path: Path) -> Path:
@@ -623,12 +640,15 @@ def main() -> int:
                 for market in EXPECTED_MARKETS
                 if int((modes.get(market) or {}).get("open_position_count") or 0) != 0
             ]
-            if open_markets:
+            accepted_carry_markets = [m for m in open_markets if _accepted_margin_residual(modes[m], session_date)]
+            unaccepted_open_markets = [m for m in open_markets if m not in accepted_carry_markets]
+            if unaccepted_open_markets:
                 failures.append(
-                    "post-close paper positions are not flat: " + ",".join(open_markets)
+                    "post-close residuals violate the configured accounting contract: " + ",".join(unaccepted_open_markets)
                 )
         else:
             open_markets = []
+            accepted_carry_markets, unaccepted_open_markets = [], []
 
         dashboard_status = _public_endpoint("/tw-day-trade/api/status")
         dashboard_revision = _public_endpoint("/tw-day-trade/api/revision")
@@ -740,6 +760,12 @@ def main() -> int:
                 "post_close_flat": {
                     "ready": not open_markets,
                     "open_markets": open_markets,
+                },
+                "post_close_accounting": {
+                    "ready": not unaccepted_open_markets,
+                    "accepted_assumed_margin_markets": accepted_carry_markets,
+                    "unaccepted_open_markets": unaccepted_open_markets,
+                    "exchange_fill_or_margin_approval_proven": False,
                 },
                 "public_dashboard": {
                     "ready": public_surface_ready,

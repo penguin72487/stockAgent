@@ -19,6 +19,7 @@ html{scroll-behavior:smooth}.skip-link{position:fixed;top:8px;left:8px;z-index:3
 .alert span{display:block}.alert span+span{margin-top:4px}.mode-glance{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:13px}.mode-glance div{min-width:0;padding:8px;background:#091522;border-radius:8px}.mode-glance span{display:block;color:var(--muted);font-size:10px}.mode-glance strong{display:block;margin-top:3px;overflow-wrap:anywhere;font-size:12px}@media(max-width:700px){.mode-glance{grid-template-columns:1fr 1fr}.mode-glance div:last-child{grid-column:1/-1}}
 .legend strong{font-size:10px;margin-left:2px}.legend i.series-0{background:#37d3ff}.legend i.series-1{background:#5ee0a0}.legend i.series-2{background:#a98cff}.legend i.series-3{background:#f5bd4f}.legend i.series-4{background:#ff7ac8}.legend i.series-5{background:#73e6d1}.legend i.series-6{background:#ff9f68}
 .alert span,.signal-load-error td{overflow-wrap:anywhere}.signal-load-error td{color:var(--amber);white-space:normal}
+.alert details{margin-top:7px;border-top:1px solid rgba(255,179,189,.28)}.alert summary{padding-top:7px;color:#ffd0d6;font-weight:750;cursor:pointer}.alert details div{margin-top:7px}.alert details span{font-size:12px}
 main{grid-template-columns:minmax(0,1fr)}main>*,.grid-two>*{min-width:0}
 
 /* Dense desktop layout: comparison first, with no horizontal table hunting. */
@@ -30,9 +31,20 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
 .signal-table th:nth-child(1){width:12%}.signal-table th:nth-child(2){width:16%}.signal-table th:nth-child(3){width:14%}.signal-table th:nth-child(4){width:22%}.signal-table th:nth-child(5){width:20%}.signal-table th:nth-child(6){width:16%}
 .legend .legend-toggle{display:inline-flex;align-items:center;min-height:30px;margin:0;padding:4px 6px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;font:inherit;font-size:10px;white-space:nowrap}.legend .legend-toggle:hover{border-color:var(--line);color:var(--text)}.legend .legend-toggle:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}.legend .legend-toggle.is-hidden{opacity:.48;text-decoration:line-through}.legend .legend-toggle.is-hidden i{filter:saturate(.2)}
 .axis-time{stroke:rgba(140,160,180,.18);stroke-width:1}.axis-time.session{stroke:var(--amber);stroke-width:1.4;stroke-dasharray:4 3}.axis-session-text{fill:var(--amber);font-weight:700}
-.chart-scroll{overflow-x:auto}@media(max-width:700px){.chart-scroll #equity-chart{min-width:860px}}
+.chart-scroll{width:100%;overflow:hidden}
+.chart-host{width:100%;height:300px;min-width:0;padding:4px 8px 0}
+.chart-host>.uplot{max-width:100%;font-family:var(--dashboard-font-family,Inter,"Noto Sans TC","PingFang TC",sans-serif)}
+.chart-host .u-legend{display:none}
+@media(max-width:700px){.chart-host{height:270px;padding-inline:2px}}
 .healthbox>small:first-child,.controls-title span,.benchmark-facts span,.benchmark-facts small{font-size:10px}
 .compact-table td small{font-size:10px}
+/* Reuse the same wrapping contract for the narrower event pane. No fields are hidden. */
+.event-table th:nth-child(1){width:15%}
+.event-table th:nth-child(2){width:26%}
+.event-table th:nth-child(3){width:12%}
+.event-table th:nth-child(4){width:17%}
+.event-table th:nth-child(5){width:15%}
+.event-table th:nth-child(6){width:15%}
 .time-range-control{padding:10px 14px;border-bottom:1px solid var(--line)}.date-range-picker{display:flex;align-items:center;gap:6px;margin-left:auto}.date-range-picker>span{color:var(--muted);font-size:10px}.date-range-picker label{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:10px}.date-range-picker input{width:132px;min-height:32px;padding:4px 7px;border:1px solid var(--line);border-radius:8px;background:#08131e;color:var(--text);color-scheme:dark;font:inherit;font-size:11px}.date-range-picker input:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}.time-range-control .clear-date-range{border-radius:8px}@media(max-width:1050px){.date-range-picker{width:100%;margin-left:0}}@media(max-width:520px){.date-range-picker{display:grid;grid-template-columns:1fr auto 1fr}.date-range-picker label{display:grid;gap:3px}.date-range-picker input{width:100%}.date-range-picker .clear-date-range{grid-column:1/-1}}
 .controls input[type="date"]{color-scheme:dark}
 .metric-context{display:block;margin:0 0 4px;color:var(--muted);font-size:10px}

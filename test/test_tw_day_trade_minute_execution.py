@@ -159,6 +159,52 @@ def test_pre_minute_daily_proxy_is_directional_adverse_and_does_not_fill_later_g
     assert np.isnan(tape[1, 0, F.ENTRY_VWAP_0901])
 
 
+def test_official_daily_proxy_has_no_adverse_tick_and_separate_cache(tmp_path) -> None:
+    partition = tmp_path / "minute" / "trade_date=2020-03-02"
+    partition.mkdir(parents=True)
+    (partition / "data.parquet").touch()
+    args = dict(panel_dates=np.array(["2014-01-06", "2020-03-03"], dtype="datetime64[D]"),
+        panel_symbols=["2330"], official_open_prices=np.array([[100.], [200.]]),
+        official_close_prices=np.array([[110.], [210.]]),
+        daily_volume_shares=np.full((2, 1), 1_000_000.), cache_dir=tmp_path / "cache")
+    legacy = load_tw_day_trade_execution_tape(tmp_path / "minute", **args)
+    official = load_tw_day_trade_execution_tape(tmp_path / "minute", **args,
+        daily_proxy_price_policy="official_open_close")
+    assert official[0, 0, F.DAILY_PROXY_LONG_ENTRY_PRICE] == 100.
+    assert official[0, 0, F.DAILY_PROXY_SHORT_ENTRY_PRICE] == 100.
+    assert official[0, 0, F.DAILY_PROXY_LONG_EXIT_PRICE] == 110.
+    assert official[0, 0, F.DAILY_PROXY_SHORT_EXIT_PRICE] == 110.
+    assert legacy[0, 0, F.DAILY_PROXY_LONG_ENTRY_PRICE] == 100.5
+    assert official[0, 0, F.DAILY_PROXY_VOLUME] == pytest.approx(1_000_000 / 271)
+    assert official[1, 0, F.DAILY_PROXY_FLAG] == 0  # later gaps are not silently authorized
+    assert len(list((tmp_path / "cache").glob("tape-*.npy"))) == 2
+    cached = load_tw_day_trade_execution_tape(tmp_path / "minute", **args,
+        daily_proxy_price_policy="official_open_close")
+    np.testing.assert_array_equal(cached, official)
+    args["official_open_prices"][0, 0] = 100.0000001  # same float32 hash, invalid double quote
+    with pytest.raises(ValueError, match="dated product tick grid"):
+        load_tw_day_trade_execution_tape(tmp_path / "minute", **args,
+            daily_proxy_price_policy="official_open_close")
+
+
+def test_official_daily_proxy_uses_product_tick_and_source_precision() -> None:
+    from stockagent.data.tw_day_trade_execution import daily_proxy_price_arrays
+
+    opens = np.array([[25.01, 99.9]], dtype=np.float32)
+    close = np.array([[25.02, 100.]], dtype=np.float32)
+    dates = np.array(["2018-01-02"], dtype="datetime64[D]")
+    values = daily_proxy_price_arrays(opens, close, dates, ["0050", "2330"],
+        price_policy="official_open_close")
+    np.testing.assert_array_equal(values[0], opens)
+    np.testing.assert_array_equal(values[1], opens)
+    np.testing.assert_array_equal(values[2], close)
+    with pytest.raises(ValueError, match="dated product tick grid"):
+        daily_proxy_price_arrays(opens, close, dates, ["2330", "0050"],
+            price_policy="official_open_close")
+    with pytest.raises(ValueError, match="price policy"):
+        daily_proxy_price_arrays(opens, close, dates, ["0050", "2330"], price_policy="guess")
+
+
 def test_strict_minute_tape_rejects_any_pre_partition_proxy_row(tmp_path) -> None:
     partition = tmp_path / "minute" / "trade_date=2020-03-02"
     partition.mkdir(parents=True)
@@ -718,7 +764,7 @@ def test_stateful_carry_rejects_legacy_minute_executor_that_drops_residuals() ->
     mask = torch.ones_like(weights, dtype=torch.bool)
     zeros_mask = torch.zeros_like(mask)
     zeros = torch.zeros(1)
-    with pytest.raises(ValueError, match="discards per-symbol residual holdings"):
+    with pytest.raises(ValueError, match="discards per-symbol residual holdings") as error:
         run_backtest_torch(
             weights,
             torch.zeros_like(weights),
@@ -747,6 +793,15 @@ def test_stateful_carry_rejects_legacy_minute_executor_that_drops_residuals() ->
             day_trade_unlimited_margin_conversion=True,
             overnight_returns=_tape(days=1),
         )
+    assert "not a web-paper parity fallback" in str(error.value)
+
+
+def test_attention_training_requires_official_proxy_contract_before_margin_carry(tmp_path):
+    base = Path("configs/markets/tw_day_trade_1m_hybrid_v12_attention_full_then_last_layernorm.yaml").resolve()
+    path = tmp_path / "requested_paper_contract.yaml"
+    path.write_text(f"base_config: {base}\ntrading:\n  tw_day_trade_unlimited_margin_conversion: true\n")
+    with pytest.raises(ValueError, match="physical FIFO daily proxy"):
+        load_config(path)
 
 
 def test_t_profit_settles_after_t_plus_2_close_and_sizes_only_t_plus_3() -> None:

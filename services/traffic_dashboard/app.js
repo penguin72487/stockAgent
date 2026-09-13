@@ -142,6 +142,215 @@ function renderLocalTiming(timing) {
   requestAnimationFrame(() => { $("local-total").textContent = milliseconds(performance.now() - timing.started); });
 }
 
+const PAGE_LABELS = new Map([
+  ["/", "總覽"],
+  ["/taifex/", "TAIFEX"],
+  ["/tw-day-trade/", "台股當沖"],
+  ["/tw-overnight/", "隔日沖"],
+  ["/shioaji/", "永豐 API"],
+  ["/openbb/", "OpenBB"],
+  ["/data-monitor/", "全資料"],
+  ["/traffic/", "流量"],
+]);
+const KIND_LABELS = Object.freeze({
+  page_load: "頁面載入",
+  interaction: "操作到繪製",
+  api: "API 到繪製",
+  render: "資料整理與繪圖",
+});
+let browserRenderQueued = false;
+
+function pageLabel(route) {
+  return PAGE_LABELS.get(route) || String(route || "—");
+}
+
+function percentileValue(values, quantile) {
+  const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (!sorted.length) return null;
+  const position = (sorted.length - 1) * quantile;
+  const lower = Math.floor(position); const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+function observedMetricValue(row) {
+  if (row.kind === "page_load") {
+    return finite(row.lcpMs) ?? finite(row.fcpMs) ?? finite(row.loadMs) ?? finite(row.durationMs);
+  }
+  if (row.kind === "api") return finite(row.paintMs) ?? finite(row.durationMs);
+  if (row.kind === "render") return finite(row.paintMs) ?? finite(row.durationMs);
+  const durationMs = finite(row.durationMs);
+  return durationMs === null ? null : (finite(row.inputDelayMs) ?? 0) + durationMs;
+}
+
+function dominantPhase(rows) {
+  if (!rows.length) return "—";
+  if (rows[0].kind === "page_load") {
+    if (rows.some((row) => finite(row.lcpMs) !== null)) return "LCP";
+    if (rows.some((row) => finite(row.fcpMs) !== null)) return "FCP";
+    return "load";
+  }
+  const phases = rows[0].kind === "api"
+    ? [
+        ["伺服器", (row) => finite(row.serverMs)],
+        ["網路／代理", (row) => {
+          const headers = finite(row.headersMs); const server = finite(row.serverMs);
+          return headers === null ? null : Math.max(0, headers - (server ?? 0));
+        }],
+        ["body", (row) => finite(row.bodyMs)],
+        ["JSON", (row) => finite(row.parseMs)],
+        ["DOM／排程", (row) => {
+          const paint = finite(row.paintMs); const request = finite(row.durationMs);
+          return paint === null || request === null ? null : Math.max(0, paint - request);
+        }],
+      ]
+    : rows[0].kind === "render"
+      ? [
+          ["資料對齊", (row) => finite(row.prepareMs)],
+          ["Canvas", (row) => finite(row.drawMs)],
+          ["繪製排程", (row) => {
+            const paint = finite(row.paintMs); const duration = finite(row.durationMs);
+            return paint === null || duration === null ? null : Math.max(0, paint - duration);
+          }],
+        ]
+      : [
+        ["輸入排隊", (row) => finite(row.inputDelayMs)],
+        ["處理／繪製", (row) => finite(row.durationMs)],
+      ];
+  const medians = phases.map(([label, getter]) => [
+    label,
+    percentileValue(rows.map(getter).filter(Number.isFinite), 0.5),
+  ]).filter(([, value]) => value !== null);
+  if (!medians.length) return "—";
+  const [label, value] = medians.sort((left, right) => right[1] - left[1])[0];
+  return `${label} ${milliseconds(value)}`;
+}
+
+function isSuccessfulMetric(row) {
+  return row.kind !== "api" || row.outcome === "ok";
+}
+
+function actionLabel(row) {
+  if (row.kind === "page_load") return "頁面載入";
+  if (row.kind === "render" && row.action === "equity_chart") return "完整分鐘權益曲線";
+  const action = row.action === "automatic" ? "自動更新" : row.action || "—";
+  return row.kind === "api" && row.requestPath ? `${action} → ${row.requestPath}` : action;
+}
+
+function metricGroupKey(row) {
+  return [row.route, row.kind, row.action, row.eventType || "", row.requestPath || ""].join("|");
+}
+
+function updateBrowserPageFilter(records) {
+  const select = $("browser-page-filter");
+  const routes = [...new Set(records.map((row) => row.route))].sort();
+  const signature = routes.join("|");
+  if (select.dataset.routes === signature) return;
+  const selected = select.value;
+  const fragment = document.createDocumentFragment();
+  const all = document.createElement("option"); all.value = "all"; all.textContent = "所有頁面"; fragment.append(all);
+  for (const route of routes) {
+    const option = document.createElement("option"); option.value = route; option.textContent = pageLabel(route); fragment.append(option);
+  }
+  select.replaceChildren(fragment);
+  select.value = routes.includes(selected) ? selected : "all";
+  select.dataset.routes = signature;
+}
+
+function renderBrowserPerformance() {
+  const records = Dashboard.performanceHistorySnapshot();
+  updateBrowserPageFilter(records);
+  const pageFilter = $("browser-page-filter").value;
+  const kindFilter = $("browser-kind-filter").value;
+  const filtered = records.filter((row) => (
+    (pageFilter === "all" || row.route === pageFilter)
+    && (kindFilter === "all" || row.kind === kindFilter)
+  ));
+  const successful = filtered.filter(isSuccessfulMetric);
+  const allValues = successful.map(observedMetricValue).filter(Number.isFinite);
+  $("browser-samples").textContent = count(filtered.length);
+  $("browser-pages").textContent = count(new Set(filtered.map((row) => row.route)).size);
+  $("browser-p50").textContent = milliseconds(percentileValue(allValues, 0.5));
+  $("browser-p95").textContent = milliseconds(percentileValue(allValues, 0.95));
+  $("browser-max").textContent = milliseconds(allValues.length ? Math.max(...allValues) : null);
+
+  const groups = new Map();
+  for (const row of filtered) {
+    const key = metricGroupKey(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const summaries = [...groups.values()].map((rows) => {
+    const validRows = rows.filter(isSuccessfulMetric);
+    const values = validRows.map(observedMetricValue).filter(Number.isFinite);
+    const latest = [...validRows].sort((left, right) => right.observedAt - left.observedAt)[0] || rows.at(-1);
+    return {
+      sample: rows[0],
+      total: rows.length,
+      successful: validRows.length,
+      dominant: dominantPhase(validRows),
+      latest: observedMetricValue(latest),
+      p50: percentileValue(values, 0.5),
+      p95: percentileValue(values, 0.95),
+      maximum: values.length ? Math.max(...values) : null,
+      observedAt: Math.max(...rows.map((row) => Number(row.observedAt || 0))),
+    };
+  }).sort((left, right) => (right.p95 ?? -1) - (left.p95 ?? -1));
+
+  const fragment = document.createDocumentFragment();
+  for (const summary of summaries) {
+    const tr = document.createElement("tr");
+    const values = [
+      pageLabel(summary.sample.route),
+      actionLabel(summary.sample),
+      KIND_LABELS[summary.sample.kind] || summary.sample.kind,
+      `${count(summary.successful)}／${count(summary.total)}`,
+      summary.dominant,
+      milliseconds(summary.latest),
+      milliseconds(summary.p50),
+      milliseconds(summary.p95),
+      milliseconds(summary.maximum),
+      localTime(summary.observedAt),
+    ];
+    values.forEach((value, index) => {
+      const td = document.createElement("td"); td.textContent = value;
+      if (index === 3 && summary.successful !== summary.total) td.className = "negative";
+      tr.append(td);
+    });
+    fragment.append(tr);
+  }
+  if (!summaries.length) {
+    const tr = document.createElement("tr"); const td = document.createElement("td");
+    td.colSpan = 10; td.className = "empty-cell"; td.textContent = "尚無符合條件的本機測速；操作任一面板後會自動出現。";
+    tr.append(td); fragment.append(tr);
+  }
+  $("browser-action-rows").replaceChildren(fragment);
+  $("browser-group-count").textContent = `${count(summaries.length)} 組功能`;
+}
+
+function scheduleBrowserPerformanceRender() {
+  if (browserRenderQueued) return;
+  browserRenderQueued = true;
+  requestAnimationFrame(() => {
+    browserRenderQueued = false;
+    renderBrowserPerformance();
+  });
+}
+
+async function copyBrowserPerformance() {
+  const payload = JSON.stringify({
+    schemaVersion: Dashboard.PERFORMANCE_SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    records: Dashboard.performanceHistorySnapshot(),
+  }, null, 2);
+  try {
+    await navigator.clipboard.writeText(payload);
+    $("browser-action-status").textContent = `已複製 ${count(Dashboard.performanceHistorySnapshot().length)} 筆 JSON。`;
+  } catch (_error) {
+    $("browser-action-status").textContent = "瀏覽器拒絕剪貼簿權限，未複製任何資料。";
+  }
+}
+
 async function refresh({manual = false} = {}) {
   if (activeController && !manual) return;
   if (activeController) activeController.abort();
@@ -155,7 +364,7 @@ async function refresh({manual = false} = {}) {
       timeoutMs: FETCH_TIMEOUT_MS,
     });
     const headersAt = performance.now();
-    const text = await response.text();
+    const text = await Dashboard.readTextResponse(response);
     const downloadedAt = performance.now();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const parsedAtStart = performance.now();
@@ -173,5 +382,16 @@ async function refresh({manual = false} = {}) {
 }
 
 $("refresh-now").addEventListener("click", () => void refresh({manual: true}));
+$("browser-page-filter").addEventListener("change", renderBrowserPerformance);
+$("browser-kind-filter").addEventListener("change", renderBrowserPerformance);
+$("browser-copy").addEventListener("click", () => void copyBrowserPerformance());
+$("browser-clear").addEventListener("click", () => {
+  Dashboard.clearPerformanceHistory();
+  $("browser-action-status").textContent = "已清除這台瀏覽器的測速紀錄；後續操作會重新累積。";
+  renderBrowserPerformance();
+});
+document.addEventListener("stockagent-performance-recorded", scheduleBrowserPerformanceRender);
+document.addEventListener("stockagent-performance-cleared", scheduleBrowserPerformanceRender);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({manual: true}); });
+renderBrowserPerformance();
 Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS, refreshOnVisible: false});

@@ -25,9 +25,12 @@ from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
 from stockagent.data.tw_day_trade_execution import (
+    DAILY_PROXY_PRICE_LEGACY,
+    DAILY_PROXY_PRICE_OFFICIAL,
     DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
     DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
     normalize_day_trade_minute_execution_policy,
+    normalize_day_trade_daily_proxy_price_policy,
 )
 from stockagent.data.walkforward import normalize_lookback_context
 from stockagent.portfolio_contract import (
@@ -1523,6 +1526,7 @@ class DataConfig:
     # minute experiment sets this false and therefore fails before training if
     # any requested panel row predates the first canonical minute partition.
     day_trade_minute_execution_allow_daily_proxy: bool = True
+    day_trade_minute_execution_daily_proxy_price_policy: str = DAILY_PROXY_PRICE_LEGACY
     minute_require_research_ready: bool = True
     minute_verify_partition_sha256: bool = True
     # Optional immutable daily-panel cache metadata used as causal context by
@@ -2329,6 +2333,10 @@ class TrainingConfig:
     pretrained_initialization_root: str | None = None
     pretrained_initialization_fold_policy: str = "matching_train_and_validation_years"
     pretrained_initialization_feature_adapter: str = "none"
+    # Symbol-axis drift is rejected by default. The explicit permutation-
+    # invariant superset mode is legal only when both source and target prove
+    # that learned symbol-position identity is disabled.
+    pretrained_initialization_symbol_adapter: str = "exact"
     pretrained_initialization_require_exact_backbone: bool = True
     pretrained_initialization_validation_guard: bool = False
     # A solvent transferred exact-account policy can still be strictly worse
@@ -4263,6 +4271,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["day_trade_minute_execution_allow_daily_proxy"] = bool(
         data["day_trade_minute_execution_allow_daily_proxy"]
     )
+    data["day_trade_minute_execution_daily_proxy_price_policy"] = (
+        normalize_day_trade_daily_proxy_price_policy(
+            data["day_trade_minute_execution_daily_proxy_price_policy"])
+    )
     data["day_trade_minute_execution_policy"] = (
         normalize_day_trade_minute_execution_policy(
             data["day_trade_minute_execution_policy"]
@@ -4308,10 +4320,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "trading.execution_mode='tw_day_trade'"
             )
         if data["day_trade_minute_execution_root"] is not None:
-            raise ValueError(
-                "daily unlimited-margin conversion and minute execution are "
-                "mutually exclusive contracts"
-            )
+            if data["day_trade_minute_execution_policy"] != (
+                DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+            ):
+                raise ValueError(
+                    "physical FIFO day trade requires scheduled_events_50pct"
+                )
+            if data["day_trade_minute_execution_daily_proxy_price_policy"] != (
+                DAILY_PROXY_PRICE_OFFICIAL
+            ):
+                raise ValueError(
+                    "physical FIFO daily proxy requires official OPEN/CLOSE "
+                    "without an adverse tick"
+                )
         if _normalized_contract_name(trading["frequency"]) != "daily":
             raise ValueError(
                 "daily unlimited-margin conversion requires frequency='daily'"
@@ -4934,6 +4955,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             pretrained_initialization_feature_adapter=str(
                 training_raw.get("pretrained_initialization_feature_adapter", "none")
+            ),
+            pretrained_initialization_symbol_adapter=str(
+                training_raw.get("pretrained_initialization_symbol_adapter", "exact")
             ),
             pretrained_initialization_require_exact_backbone=bool(
                 training_raw.get(

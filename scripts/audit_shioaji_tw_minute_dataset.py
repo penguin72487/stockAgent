@@ -40,6 +40,16 @@ def parse_args() -> argparse.Namespace:
         help="Audit every partition and its manifest fingerprint.",
     )
     parser.add_argument(
+        "--calendar-root",
+        type=Path,
+        help=(
+            "Compare date partitions to the receipt-backed official TAIEX calendar. "
+            "Required for a full research_ready audit."
+        ),
+    )
+    parser.add_argument('--allow-research-subset', action='store_true',
+                        help='Audit an explicitly selected repair subset without marking it research_ready.')
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("data_tw_minute/audits/latest.json"),
@@ -53,6 +63,26 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _partition_path(dataset_root: Path, date_text: str) -> Path:
+    """Audit the selected release, never a manifest's producer workspace.
+
+    ``output`` is provenance from the build host. After materialization it can
+    still name an existing, mutable or stale file on either host. The explicit
+    dataset root owns every partition being certified by this audit.
+    """
+    trade_date = date.fromisoformat(date_text)
+    if trade_date.isoformat() != date_text:
+        raise RuntimeError(f"noncanonical minute partition date: {date_text}")
+    root = dataset_root.resolve(strict=True)
+    path = root / f"trade_date={date_text}" / "data.parquet"
+    if not path.is_file():
+        raise RuntimeError(f"minute partition is missing from selected release: {path}")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise RuntimeError(f"minute partition escapes selected release: {path}")
+    return resolved
 
 
 def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
@@ -240,24 +270,80 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
     }
 
 
+def _audit_manifest_status(manifest: dict, *, allow_subset: bool) -> str:
+    if manifest.get('schema_version') == SCHEMA_VERSION:
+        if manifest.get('research_ready') is True and manifest.get('status') == 'research_ready':
+            return 'research_ready'
+        if (allow_subset and manifest.get('research_ready') is False
+                and manifest.get('status') == 'research_subset'
+                and isinstance(manifest.get('symbols'), list) and manifest['symbols']
+                and len(set(manifest['symbols'])) == len(manifest['symbols'])):
+            return 'research_subset'
+    raise RuntimeError(f'minute full audit requires a schema-{SCHEMA_VERSION} research_ready manifest'
+                       ' or an explicitly permitted research_subset')
+
+
 def main() -> None:
     args = parse_args()
     if bool(args.all_partitions):
         manifest_path = args.dataset_root / "manifest.json"
         if not manifest_path.is_file():
             raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not (
-            manifest.get("schema_version") == SCHEMA_VERSION
-            and manifest.get("research_ready") is True
-            and manifest.get("status") == "research_ready"
-        ):
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        manifest = json.loads(manifest_bytes)
+        audit_status = _audit_manifest_status(manifest,
+            allow_subset=bool(getattr(args, 'allow_research_subset', False)))
+        if audit_status == "research_ready" and args.calendar_root is None:
             raise RuntimeError(
-                "minute full audit requires a schema-3 research_ready manifest"
+                "minute research_ready audit requires --calendar-root; "
+                "partition integrity alone cannot prove trading-session identity"
             )
         partitions = manifest.get("partitions", [])
         if not partitions or len(partitions) != len(manifest.get("dates", [])):
             raise RuntimeError("minute manifest partition accounting is incomplete")
+        declared_dates = {str(value) for value in manifest.get("dates", [])}
+        stored_dates = {
+            path.name.removeprefix("trade_date=")
+            for path in args.dataset_root.glob("trade_date=*")
+        }
+        if stored_dates != declared_dates:
+            raise RuntimeError(
+                "stored minute partitions differ from manifest: "
+                f"undeclared={sorted(stored_dates - declared_dates)} "
+                f"missing={sorted(declared_dates - stored_dates)}"
+            )
+        calendar = {"checked": False}
+        if args.calendar_root is not None:
+            from downloader.download_tw_public_data import (
+                _validated_taiex_session_dates,
+            )
+
+            sessions, calendar_sha256 = _validated_taiex_session_dates(
+                args.calendar_root,
+                date.fromisoformat(min(declared_dates)),
+                date.fromisoformat(max(declared_dates)),
+            )
+            expected_dates = {day.isoformat() for day in sessions}
+            missing = sorted(expected_dates - declared_dates)
+            if missing:
+                raise RuntimeError(
+                    f"official sessions lack minute partitions: {missing}"
+                )
+            extra = sorted(declared_dates - expected_dates)
+            if extra:
+                raise RuntimeError(
+                    f"minute dataset contains non-session partitions: {extra}"
+                )
+            calendar = {
+                "checked": True,
+                "root": str(args.calendar_root.resolve()),
+                "sha256": calendar_sha256,
+                "official_session_count": len(sessions),
+                "missing_session_partitions": missing,
+                "extra_non_session_partitions": extra,
+                "per_symbol_session_completeness_checked": False,
+            }
         totals = {
             "rows": 0,
             "feature_valid_rows": 0,
@@ -277,15 +363,7 @@ def main() -> None:
             if date_text in seen_dates:
                 raise RuntimeError(f"duplicate minute partition date: {date_text}")
             seen_dates.add(date_text)
-            path = Path(str(summary["output"]))
-            if not path.is_absolute():
-                working_path = (Path.cwd() / path).resolve()
-                portable_path = (
-                    args.dataset_root / f"trade_date={date_text}" / "data.parquet"
-                ).resolve()
-                path = working_path if working_path.is_file() else portable_path
-            if not path.is_file():
-                raise RuntimeError(f"minute partition is missing: {path}")
+            path = _partition_path(args.dataset_root, date_text)
             actual_sha256 = _sha256(path)
             if actual_sha256 != str(summary.get("output_sha256", "")):
                 raise RuntimeError(f"minute partition fingerprint mismatch: {path}")
@@ -303,9 +381,19 @@ def main() -> None:
                     f"date={date_text} rows={totals['rows']}",
                     flush=True,
                 )
+        if seen_dates != set(manifest.get("dates", [])):
+            raise RuntimeError("minute manifest dates differ from audited partitions")
+        if _sha256(manifest_path) != manifest_sha256:
+            raise RuntimeError("minute manifest changed during audit")
         result = {
             "schema_version": SCHEMA_VERSION,
-            "status": "research_ready",
+            "status": audit_status,
+            "audited_symbols": manifest.get('symbols', []),
+            "audit_scope": "partition_integrity_and_row_semantics_not_full_training_readiness",
+            "dataset_root": str(args.dataset_root.resolve()),
+            "manifest_sha256": manifest_sha256,
+            "calendar": calendar,
+            "corporate_action_completeness_checked": False,
             "source": "shioaji_kbars_1m",
             "partitions": len(partitions),
             "first_date": min(seen_dates),
@@ -332,7 +420,7 @@ def main() -> None:
         )
         os.replace(temporary, output)
         print(
-            f"[tw-minute-audit] status=research_ready "
+            f"[tw-minute-audit] status={audit_status} "
             f"partitions={len(partitions)} rows={totals['rows']} output={output}",
             flush=True,
         )

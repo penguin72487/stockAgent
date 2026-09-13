@@ -1,0 +1,20 @@
+[Unit]
+Description=Prepare receipt-backed current-session carried-share actions separately from model features
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_margin_actions.sh"
+Nice=10
+CPUWeight=20
+IOWeight=20
+TimeoutStartSec=50min
+Restart=on-failure
+RestartSec=5min

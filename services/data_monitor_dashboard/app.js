@@ -2,18 +2,31 @@
 
 const REFRESH_MS = 10000;
 const FULL_REFRESH_TICKS = 6;
-const SOURCE_PAGE_SIZE = 100;
+const SOURCE_PAGE_SIZE = 25;
+const MOBILE_SOURCE_PAGE_SIZE = 10;
 const Dashboard = window.StockAgentDashboard;
 const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store", expectedRoot: "object"});
 const state = {
   data: null,
+  sortedSources: [],
   refreshInFlight: false,
   refreshTick: 0,
   visibleRows: SOURCE_PAGE_SIZE,
   heavyRevision: "",
+  groupRevision: "",
+  detailsActivated: false,
+  detailsQueued: false,
 };
 const $ = Dashboard.byId;
 const DETAIL_LINKS = new Set(["../shioaji/", "../openbb/"]);
+const INTEGER_FORMATTER = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 0});
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("zh-TW", {
+  timeZone: "Asia/Taipei", hour12: false,
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit",
+});
+const ROW_COLLATOR = new Intl.Collator("zh-Hant", {numeric: true});
+const timeLabelCache = new Map();
 
 const STATUS_LABELS = {
   current: "正常", updating: "更新中", complete: "完成", waiting: "等待",
@@ -44,7 +57,7 @@ function number(value) {
 
 function formatInteger(value) {
   const parsed = number(value);
-  return parsed === null ? "—" : Math.round(parsed).toLocaleString("zh-TW");
+  return parsed === null ? "—" : INTEGER_FORMATTER.format(Math.round(parsed));
 }
 
 function compact(value) {
@@ -68,13 +81,14 @@ function durationLabel(seconds) {
 }
 
 function timeLabel(value) {
+  const key = String(value || "");
+  if (timeLabelCache.has(key)) return timeLabelCache.get(key);
   const parsed = new Date(value || "");
   if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toLocaleString("zh-TW", {
-    timeZone: "Asia/Taipei", hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit",
-  });
+  const label = DATE_TIME_FORMATTER.format(parsed);
+  if (timeLabelCache.size >= 2048) timeLabelCache.clear();
+  timeLabelCache.set(key, label);
+  return label;
 }
 
 function futureLabel(value) {
@@ -399,31 +413,35 @@ function tableRow(row) {
 }
 
 function sortedRows(rows) {
-  return [...rows].sort((left, right) => {
-    const stateDiff = (OPERATION_ORDER[left.operation_state] ?? 99) - (OPERATION_ORDER[right.operation_state] ?? 99);
+  return rows.map((row) => ({
+    row,
+    operation: OPERATION_ORDER[row.operation_state] ?? 99,
+    execution: EXECUTION_ORDER[row.execution_state] ?? 99,
+    eta: number(row.eta?.remaining_seconds) ?? Number.POSITIVE_INFINITY,
+    next: (() => {
+      const value = new Date(row.automation?.next_run_at_utc || "").getTime();
+      return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+    })(),
+    label: String(row.sort_index || row.endpoint_id || ""),
+  })).sort((left, right) => {
+    const stateDiff = left.operation - right.operation;
     if (stateDiff) return stateDiff;
-    const executionDiff = (EXECUTION_ORDER[left.execution_state] ?? 99) - (EXECUTION_ORDER[right.execution_state] ?? 99);
+    const executionDiff = left.execution - right.execution;
     if (executionDiff) return executionDiff;
-    const leftEta = number(left.eta?.remaining_seconds) ?? Number.POSITIVE_INFINITY;
-    const rightEta = number(right.eta?.remaining_seconds) ?? Number.POSITIVE_INFINITY;
-    if (leftEta !== rightEta) return leftEta - rightEta;
-    const leftNext = new Date(left.automation?.next_run_at_utc || "").getTime();
-    const rightNext = new Date(right.automation?.next_run_at_utc || "").getTime();
-    const safeLeftNext = Number.isFinite(leftNext) ? leftNext : Number.POSITIVE_INFINITY;
-    const safeRightNext = Number.isFinite(rightNext) ? rightNext : Number.POSITIVE_INFINITY;
-    if (safeLeftNext !== safeRightNext) return safeLeftNext - safeRightNext;
-    return String(left.sort_index || left.endpoint_id || "").localeCompare(String(right.sort_index || right.endpoint_id || ""), "zh-Hant", {numeric: true});
-  });
+    if (left.eta !== right.eta) return left.eta - right.eta;
+    if (left.next !== right.next) return left.next - right.next;
+    return ROW_COLLATOR.compare(left.label, right.label);
+  }).map(({row}) => row);
 }
 
 function filteredRows() {
-  const rows = state.data?.sources || [];
+  const rows = state.sortedSources;
   const query = $("search").value.trim().toLocaleLowerCase("zh-Hant");
   const provider = $("provider-filter").value;
   const status = $("status-filter").value;
   const scope = $("scope-filter").value;
   const granularity = $("granularity-filter").value;
-  return sortedRows(rows.filter((row) => {
+  return rows.filter((row) => {
     if (provider !== "all" && row.provider !== provider) return false;
     if (status !== "all" && row.operation_state !== status) return false;
     if (scope === "storage_group" && row.scope !== "storage_group") return false;
@@ -435,11 +453,15 @@ function filteredRows() {
     if (!query) return true;
     return [row.title, row.provider, row.update_owner, row.category, row.granularity, row.availability, row.detail]
       .some((value) => String(value || "").toLocaleLowerCase("zh-Hant").includes(query));
-  }));
+  });
+}
+
+function sourcePageSize() {
+  return window.innerWidth <= 700 ? MOBILE_SOURCE_PAGE_SIZE : SOURCE_PAGE_SIZE;
 }
 
 function renderRows({reset = false} = {}) {
-  if (reset) state.visibleRows = SOURCE_PAGE_SIZE;
+  if (reset) state.visibleRows = sourcePageSize();
   const rows = filteredRows();
   const visible = rows.slice(0, state.visibleRows);
   const fragment = document.createDocumentFragment();
@@ -451,30 +473,33 @@ function renderRows({reset = false} = {}) {
 }
 
 function heavyRevision(data) {
-  return JSON.stringify([
-    data.groups,
-    (data.sources || []).map((row) => [
-      row.endpoint_id, row.id, row.status, row.operation_state,
-      row.execution_state, row.coverage, row.eta, row.data_through,
-      row.rows, row.last_verified_at_utc, row.automation, row.publication,
-      row.acquisition_progress, row.warnings,
-    ]),
-  ]);
+  return `${data.schema_version || ""}|${data.generated_at_utc || ""}|${data.sources?.length || 0}`;
 }
 
 async function refresh({details = false} = {}) {
-  if (document.hidden || state.refreshInFlight) return;
+  if (document.hidden) return;
+  if (state.refreshInFlight) {
+    state.detailsQueued ||= details;
+    return;
+  }
   state.refreshInFlight = true;
   try {
-    const data = await fetchJson(details ? "api/status" : "api/summary");
-    renderSummary(data);
+    const data = await fetchJson(details ? "api/details" : "api/summary");
+    if (!details) renderSummary(data);
+    if (Array.isArray(data.groups)) {
+      const groupRevision = JSON.stringify(data.groups);
+      if (groupRevision !== state.groupRevision) {
+        state.groupRevision = groupRevision;
+        renderGroups(data.groups);
+      }
+    }
     if (details) {
       state.data = data;
       const revision = heavyRevision(data);
       if (revision !== state.heavyRevision) {
         state.heavyRevision = revision;
-        renderGroups(data.groups || []);
-        populateProviders(data.sources || []);
+        state.sortedSources = sortedRows(data.sources || []);
+        populateProviders(state.sortedSources);
         renderRows({reset: true});
       }
     }
@@ -482,6 +507,43 @@ async function refresh({details = false} = {}) {
     setHealth($("overall-health"), "unavailable", "監控 API 暫時離線");
   } finally {
     state.refreshInFlight = false;
+    if (state.detailsQueued && !document.hidden) {
+      state.detailsQueued = false;
+      void refresh({details: true});
+    }
+  }
+}
+
+function activateDetails() {
+  if (state.detailsActivated) return;
+  state.detailsActivated = true;
+  void refresh({details: true});
+}
+
+function installDetailsActivation() {
+  const target = $("source-list");
+  if ("IntersectionObserver" in window && target) {
+    const activate = () => {
+      observer.disconnect();
+      window.removeEventListener("scroll", checkDistance);
+      activateDetails();
+    };
+    const checkDistance = () => {
+      const bounds = target.getBoundingClientRect();
+      if (bounds.top <= window.innerHeight + 160 && bounds.bottom >= -160) activate();
+    };
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      activate();
+    }, {rootMargin: "160px"});
+    observer.observe(target);
+    window.addEventListener("scroll", checkDistance, {passive: true});
+    return;
+  }
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(activateDetails, {timeout: 2000});
+  } else {
+    window.setTimeout(activateDetails, 1000);
   }
 }
 
@@ -489,13 +551,18 @@ for (const id of ["search", "provider-filter", "status-filter", "granularity-fil
   $(id).addEventListener(id === "search" ? "input" : "change", () => renderRows({reset: true}));
 }
 $("load-more").addEventListener("click", () => {
-  state.visibleRows += SOURCE_PAGE_SIZE;
+  state.visibleRows += sourcePageSize();
   renderRows();
 });
 $("filters").addEventListener("submit", (event) => event.preventDefault());
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({details: true}); });
-void refresh({details: true});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void refresh({details: state.detailsActivated});
+});
+// Install the viewport trigger only after summary groups have been painted.
+// Otherwise the initially empty group container leaves the detail section in
+// view and defeats the summary-first transfer boundary.
+void refresh().finally(installDetailsActivation);
 Dashboard.scheduleRefresh(() => {
   state.refreshTick += 1;
-  return refresh({details: state.refreshTick % FULL_REFRESH_TICKS === 0});
+  return refresh({details: state.detailsActivated && state.refreshTick % FULL_REFRESH_TICKS === 0});
 }, {intervalMs: REFRESH_MS, immediate: false, refreshOnVisible: false});

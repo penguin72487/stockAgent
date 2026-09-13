@@ -59,6 +59,38 @@ def require_overnight_dates(manifest: dict, dates: np.ndarray) -> None:
         )
 
 
+def read_overnight_1325_partition(
+    path: Path, day: str, expected_sha256: str,
+) -> dict[str, float]:
+    """Read one verified decision observation for training or historical inference."""
+    if not path.is_file() or not expected_sha256 or _sha256(path) != expected_sha256:
+        raise RuntimeError(f"13:25 partition SHA256 mismatch or missing: {path}")
+    table = pq.read_table(
+        path, columns=["ts", "symbol", "Close", "minutes_from_open"],
+        filters=[("minutes_from_open", "=", 265)],
+    )
+    seen: set[str] = set()
+    prices: dict[str, float] = {}
+    for row in table.to_pylist():
+        ts = row["ts"]
+        if (ts is None or str(ts.date()) != day
+                or (ts.hour, ts.minute, ts.second, ts.microsecond) != (13, 25, 0, 0)):
+            raise RuntimeError(f"13:25 timestamp disagrees with partition: {path}")
+        if ts.tzinfo is not None and ts.utcoffset().total_seconds() != 8 * 3600:
+            raise RuntimeError("13:25 timestamps must use Asia/Taipei exchange time")
+        symbol = str(row["symbol"])
+        if symbol in seen:
+            raise RuntimeError(f"duplicate 13:25 observation: {day}/{symbol}")
+        seen.add(symbol)
+        if row["Close"] is not None:
+            value = float(row["Close"])
+            if np.isfinite(value) and value > 0:
+                prices[symbol] = value
+    if _sha256(path) != expected_sha256:
+        raise RuntimeError(f"13:25 source changed while reading: {path}")
+    return prices
+
+
 def attach_overnight_1325(panel: PanelData, root: str | Path, *,
                           missing_price_policy: str = "reject") -> PanelData:
     allow_fallback = _validate_missing_policy(missing_price_policy)
@@ -91,28 +123,9 @@ def attach_overnight_1325(panel: PanelData, root: str | Path, *,
             missing_partitions.append(day)
             continue
         expected = summaries[day].get("output_sha256")
-        if not path.is_file() or not expected or _sha256(path) != expected:
-            raise RuntimeError(f"13:25 partition SHA256 mismatch or missing: {path}")
-        table = pq.read_table(path, columns=["ts", "symbol", "Close", "minutes_from_open"],
-                              filters=[("minutes_from_open", "=", 265)])
-        seen = set()
-        for row in table.to_pylist():
-            ts = row["ts"]
-            if (str(ts.date()) != day or (ts.hour, ts.minute, ts.second, ts.microsecond)
-                    != (13, 25, 0, 0)):
-                raise RuntimeError(f"13:25 timestamp disagrees with partition: {path}")
-            if ts.tzinfo is not None and ts.utcoffset().total_seconds() != 8 * 3600:
-                raise RuntimeError("13:25 timestamps must use Asia/Taipei exchange time")
-            symbol = str(row["symbol"])
-            if symbol in seen:
-                raise RuntimeError(f"duplicate 13:25 observation: {day}/{symbol}")
-            seen.add(symbol)
-            if symbol in symbols and row["Close"] is not None:
-                value = float(row["Close"])
-                if np.isfinite(value) and value > 0:
-                    prices[index, symbols[symbol]] = value
-        if _sha256(path) != expected:
-            raise RuntimeError(f"13:25 source changed while reading: {path}")
+        for symbol, value in read_overnight_1325_partition(path, day, expected).items():
+            if symbol in symbols:
+                prices[index, symbols[symbol]] = value
         verified_partitions += 1
         if verified_partitions == 1 or index % 100 == 0 or index == panel.num_dates - 1:
             print(f"[overnight] verified 13:25 partitions={verified_partitions} "

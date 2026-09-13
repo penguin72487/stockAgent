@@ -2,6 +2,11 @@
 
 ## 結論
 
+目前部署以 penguin 為唯一資料權威；檔案格式中的多產生者 head 是來源與版本資訊，
+不代表多個權威庫。penguin 的 C 槽 cold store 另有單向、只增不刪的 D 槽備份，
+不影響下列 Syncthing／按需解封契約。日常操作見
+[冷庫 D 槽備份](packed_cold_backup.md)。
+
 不要讓 Syncthing 直接索引下載器的工作碎片，也不要把所有資料硬塞進一個
 不可增量更新的巨型檔案。資料分成四層：
 
@@ -43,6 +48,10 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 
 預設門檻是 8 MiB；文字類小檔用 Deflate，Parquet、NPY、ZIP、Zstd 等已壓縮
 格式用 Stored。每個來源檔、pack、blob、inventory 與 manifest 都有 SHA-256。
+
+這裡的 `snapshot_id` 是向後相容的 release ID 名稱；它不代表每次發布都完整複製一棵
+資料樹。真正佔空間的是 content-addressed objects。相同 inventory 會直接重用既有
+release；部分變更只新增改變的固定桶／blob，未變資料繼續指向同一物件。
 
 ## 現況與目標
 
@@ -332,8 +341,65 @@ blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
 冷庫 manifest、objects、heads 不受工作集 GC 影響；GC 不會刪
 `/srv/stockagent-packed` 內任何資料。
 
-垃圾回收目前刻意只有報告，沒有自動刪除。必須先確認所有節點已收到所有 manifests、
-保留版本政策已決定，才可另行加入可恢復的 GC。
+## Penguin C 槽 rolling-current retention
+
+### 保留集合
+
+penguin 的 Syncthing 冷庫是 fleet 的快速 current replica，不再同時扮演完整歷史 archive。
+保留集合由引用圖決定，不看檔名相似度、mtime 或目錄大小：
+
+1. 所有有效 per-node current heads；
+2. penguin 本機 pin、有效 materialized READY／hot lease 與 materialize quarantine；
+3. 發布未滿 24 小時的 release 安全窗；
+4. 上述 release 引用的 inventory、pack 與 blob。
+
+其餘歷史 manifest 及只被這些歷史 manifest 引用的 objects 才是候選。manifest 本身很小，
+保留它卻代表必須同時保留完整 object graph；所以 C 槽歷史釋放與 D 槽完整 archive 必須
+視為同一個有證明的狀態轉換。
+
+```text
+mutable source -> audited atomic release -> C current CAS -> Syncthing peers
+                                         \
+                                          -> D additive historical CAS
+
+C 保留：current + pin/use + 24h grace
+D 保留：所有已接收歷史；不接收 C 的 delete
+```
+
+### 刪除門檻
+
+`configs/data_sync/packed_retention.json` 只適用於 penguin。每次 apply 都重新建立引用圖，
+並且必須同時通過：
+
+- authority node ID 與 C/D config、D mount marker、不同 filesystem 完全相符；
+- 每個 current head 可解析且 objects 完整，沒有 invalid manifest 或 Syncthing conflict；
+- lab203、vastai1T 當下 connected、completion 100%、need bytes/items/deletes 為 0、
+  `remoteState=valid`；本機 folder idle 且 error/pull/watch/system error 都為 0；
+- 每個 C 候選在 D 有同 digest、未過期的 SHA-256 readback receipt，且來源／目標 signature
+  都未變；
+- 停止本機 backup 與 Syncthing 後，沒有任何程序以 fd、mmap、cwd、root 或 executable
+  引用 packed root；
+- 持有全域 publish-retention lock 後重建的 plan fingerprint 與 dry-run 完全一致。
+
+任一條不成立就不刪任何檔。apply 先刪歷史 manifest，再 unlink 無引用物件，保留 intent／
+result receipt，重啟服務後等待 peer 再次收斂。D 的 manifests、head-history 及 objects 不會
+被這個工具修改，因此每份被移出 C 的資料仍可用標準 `verify`／`fetch` 從 D 還原。
+
+```bash
+./scripts/run_packed_retention.sh plan
+./scripts/run_packed_retention.sh status
+./scripts/run_packed_retention.sh apply
+
+# penguin 安裝每日 04:20（另有 0-10 分鐘 jitter）的 fail-closed reconcile
+./scripts/run_packed_retention.sh install-service
+systemctl list-timers stockagent-packed-retention.timer --all
+journalctl -u stockagent-packed-retention.service -n 50 --no-pager
+```
+
+timer 遇到 blocker 時回報 deferred，不會把「沒清到」誤當刪除成功。不要在 lab203／Vast
+安裝此 timer，也不要手動 `find ... -delete` 或以 Syncthing ignore 偽裝 rolling retention。
+需要復原舊版本時，依 [D 槽備份文件](packed_cold_backup.md) 從獨立目錄驗證還原；若要把
+它重新放回 current，必須經 catalog 發布門檻建立新的有效 release，不能手改 head。
 
 ## 歷史 smoke 證據（2026-08-11）
 

@@ -19,6 +19,33 @@ from typing import Any, Final
 PUBLIC_MAX_EVENT_ROWS: Final[int] = 250
 PUBLIC_INITIAL_POSITION_ROWS: Final[int] = 100
 PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
+_TAIFEX_HISTORY_ROW_FIELDS: Final[tuple[str, ...]] = (
+    "cumulative_pnl_twd",
+    "decision_ts_ns",
+    "fixed_capital_return",
+    "initial_capital_twd",
+    "cumulative_contributed_capital_twd",
+    "strategy_id",
+    "total_equity_twd",
+    "capital_contribution_count",
+    "recapitalization_count",
+    "bankruptcy_count",
+    "entry_state",
+    "alive",
+    "valuation_carried_forward",
+    "history_source",
+    "replay_id",
+    "replay_contract_version",
+    "history_event",
+)
+_TAIFEX_TWD_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "cumulative_pnl_twd",
+        "initial_capital_twd",
+        "cumulative_contributed_capital_twd",
+        "total_equity_twd",
+    }
+)
 
 
 class UnsafePublicDashboardPayload(ValueError):
@@ -154,52 +181,36 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "downsampled",
         "backfills",
     }
+    # History is the only large field. Project its fixed public contract before
+    # recursive credential scrubbing: scanning every already-allowlisted key
+    # with a regular expression made cold requests CPU-bound. Unexpected nested
+    # values still take the conservative recursive scrub path.
     output = {
         key: _scrub_public_value(value)
         for key, value in payload.items()
-        if key in allowed
+        if key in allowed and key != "history"
     }
-    _project_rows(
-        output,
-        "history",
-        allowed_fields={
-            "cumulative_pnl_twd",
-            "decision_ts_ns",
-            "fixed_capital_return",
-            "initial_capital_twd",
-            "cumulative_contributed_capital_twd",
-            "strategy_id",
-            "total_equity_twd",
-            "capital_contribution_count",
-            "recapitalization_count",
-            "bankruptcy_count",
-            "entry_state",
-            "alive",
-            "valuation_carried_forward",
-            "history_source",
-            "replay_id",
-            "replay_contract_version",
-            "history_event",
-        },
-    )
-    history = output.get("history")
-    if isinstance(history, list):
-        # Public charts render TWD to at most two decimals.  Keep eight decimal
-        # places for the fractional return (sub-basis-point precision after
-        # conversion to percent) while the private ledger remains untouched.
-        for row in history:
-            if not isinstance(row, dict):
+    rows = payload.get("history")
+    if isinstance(rows, list):
+        history: list[dict[str, Any]] = []
+        for source_row in rows:
+            if not isinstance(source_row, Mapping):
                 continue
-            for field in (
-                "cumulative_pnl_twd",
-                "initial_capital_twd",
-                "cumulative_contributed_capital_twd",
-                "total_equity_twd",
-            ):
-                if isinstance(row.get(field), float):
-                    row[field] = round(row[field], 2)
-            if isinstance(row.get("fixed_capital_return"), float):
-                row["fixed_capital_return"] = round(row["fixed_capital_return"], 8)
+            row: dict[str, Any] = {}
+            for field in _TAIFEX_HISTORY_ROW_FIELDS:
+                if field not in source_row:
+                    continue
+                value = source_row[field]
+                if isinstance(value, float):
+                    value = None if not math.isfinite(value) else value
+                    if value is not None:
+                        if field in _TAIFEX_TWD_FIELDS:
+                            value = round(value, 2)
+                        elif field == "fixed_capital_return":
+                            value = round(value, 8)
+                elif isinstance(value, (Mapping, list)):
+                    value = _scrub_public_value(value)
+                row[field] = value
             for optional_field in (
                 "history_source",
                 "replay_id",
@@ -210,6 +221,8 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
                     row.pop(optional_field, None)
             if row.get("history_source") == "live_forward_ledger":
                 row.pop("history_source", None)
+            history.append(row)
+        output["history"] = history
     return output
 
 
@@ -231,6 +244,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         allowed_fields={
             "counterfactual_open_replay",
             "counterfactual_0901_price_fill",
+            "counterfactual_overnight_replay",
             "closing_auction_limit_price",
             "closing_auction_order_status",
             "entry_at",
@@ -238,6 +252,10 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "entry_fee_twd",
             "entry_price",
             "entry_price_source",
+            "inventory_basis_price",
+            "odd_lot_execution_policy",
+            "share_replacement_contract",
+            "share_replacement_halted_until",
             "eod_limit_order_status",
             "eod_limit_price",
             "eod_limit_submitted_at",
@@ -365,10 +383,12 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "returned_points",
         "downsampled",
         "curve_granularity",
+        "history_contract",
         "expected_right_labelled_session_minute_points",
         "expected_strategy_session_points_from_09_01",
         "expected_stock_benchmark_session_points_including_09_00",
         "expected_tx_day_session_points",
+        "expected_overnight_auction_event_points",
         "return_basis",
         "cumulative_return_basis",
         "period_return_basis",
@@ -457,6 +477,101 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             })
         output["history_encoding"] = "minute_columns_v1"
         output["minute_series"] = series
+    elif payload.get("history_encoding") == "minute_columns_v2":
+        raw_axis = payload.get("minute_axis")
+        if not isinstance(raw_axis, (list, tuple)):
+            raise UnsafePublicDashboardPayload("invalid minute axis")
+        minute_axis: list[int] = []
+        previous_minute: int | None = None
+        for raw_minute in raw_axis:
+            if (
+                type(raw_minute) not in (int, float)
+                or not math.isfinite(raw_minute)
+                or int(raw_minute) != raw_minute
+            ):
+                raise UnsafePublicDashboardPayload("invalid minute axis value")
+            minute = int(raw_minute)
+            if previous_minute is not None and minute <= previous_minute:
+                raise UnsafePublicDashboardPayload("minute axis must increase")
+            minute_axis.append(minute)
+            previous_minute = minute
+        series = []
+        observed_points = 0
+        observed_ids: set[str] = set()
+        for raw in payload.get("minute_series") or ():
+            if not isinstance(raw, Mapping):
+                raise UnsafePublicDashboardPayload("invalid minute series")
+            series_id = str(raw.get("series_id") or "")
+            if not series_id or series_id in observed_ids:
+                raise UnsafePublicDashboardPayload("invalid minute series id")
+            observed_ids.add(series_id)
+            raw_indexes = raw.get("minute_indexes")
+            raw_returns = raw.get("return_pct")
+            raw_cumulative = raw.get("cumulative_return_pct")
+            raw_quality = raw.get("quality_flags")
+            columns = (raw_indexes, raw_returns, raw_cumulative, raw_quality)
+            if any(not isinstance(column, (list, tuple)) for column in columns):
+                raise UnsafePublicDashboardPayload("invalid minute columns")
+            column_length = len(raw_indexes)
+            if any(len(column) != column_length for column in columns[1:]):
+                raise UnsafePublicDashboardPayload("unequal minute columns")
+            indexes: list[int] = []
+            previous_index: int | None = None
+            for raw_index in raw_indexes:
+                if (
+                    type(raw_index) not in (int, float)
+                    or not math.isfinite(raw_index)
+                    or int(raw_index) != raw_index
+                ):
+                    raise UnsafePublicDashboardPayload("invalid minute index")
+                index = int(raw_index)
+                if (
+                    index < 0
+                    or index >= len(minute_axis)
+                    or (previous_index is not None and index <= previous_index)
+                ):
+                    raise UnsafePublicDashboardPayload("minute index out of order")
+                indexes.append(index)
+                previous_index = index
+
+            def finite_numeric_column(values: list[Any] | tuple[Any, ...]) -> list[Any]:
+                if any(
+                    type(value) not in (int, float) or not math.isfinite(value)
+                    for value in values
+                ):
+                    raise UnsafePublicDashboardPayload("invalid numeric minute column")
+                return list(values)
+
+            quality: list[int] = []
+            for raw_flag in raw_quality:
+                if (
+                    type(raw_flag) not in (int, float)
+                    or not math.isfinite(raw_flag)
+                    or int(raw_flag) != raw_flag
+                    or not 0 <= raw_flag <= 7
+                ):
+                    raise UnsafePublicDashboardPayload("invalid minute quality flag")
+                quality.append(int(raw_flag))
+            observed_points += column_length
+            series.append(
+                {
+                    "series_id": _scrub_public_value(series_id),
+                    "series_type": (
+                        "benchmark"
+                        if raw.get("series_type") == "benchmark"
+                        else "strategy"
+                    ),
+                    "minute_indexes": indexes,
+                    "return_pct": finite_numeric_column(raw_returns),
+                    "cumulative_return_pct": finite_numeric_column(raw_cumulative),
+                    "quality_flags": quality,
+                }
+            )
+        if observed_points != int(payload.get("returned_points") or 0):
+            raise UnsafePublicDashboardPayload("minute point count mismatch")
+        output["history_encoding"] = "minute_columns_v2"
+        output["minute_axis"] = minute_axis
+        output["minute_series"] = series
     return output
 
 
@@ -479,6 +594,8 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
         "total",
         "has_more",
         "source_rows_scanned",
+        "scan_limit",
+        "scan_limit_reached",
         "record_count",
         "direction_summary_scope",
         "direction_summary",
@@ -502,6 +619,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "bid",
             "counterfactual_open_replay",
             "counterfactual_0901_price_fill",
+            "counterfactual_overnight_replay",
             "day_trade_eligible",
             "execution_price",
             "exchange_quote_at",
@@ -522,6 +640,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "simtrade",
             "simulation_replay",
             "sizing_open_price",
+            "sizing_capital_twd",
             "sizing_price_at_13_25",
             "source_signal_at",
             "status",
@@ -584,6 +703,10 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
             "entry_fee_twd",
             "entry_price",
             "entry_price_source",
+            "inventory_basis_price",
+            "odd_lot_execution_policy",
+            "share_replacement_contract",
+            "share_replacement_halted_until",
             "eod_limit_order_status",
             "eod_limit_price",
             "eod_limit_submitted_at",
@@ -679,6 +802,7 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
             "status",
             "symbol",
             "depth_assumption",
+            "odd_lot_execution_policy",
         },
     )
     return output

@@ -665,6 +665,9 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "pretrained_initialization_feature_adapter": str(
             training.pretrained_initialization_feature_adapter
         ),
+        "pretrained_initialization_symbol_adapter": str(
+            training.pretrained_initialization_symbol_adapter
+        ),
         "pretrained_initialization_require_exact_backbone": bool(
             training.pretrained_initialization_require_exact_backbone
         ),
@@ -2030,6 +2033,13 @@ def _checkpoint_manifest(
                         panel.day_trade_minute_execution
                     )
                 )
+            carry_source = getattr(panel, "day_trade_carry_source", None)
+            if carry_source is not None:
+                panel_arrays["day_trade_carry_source"] = {
+                    "release_id": str(carry_source.release_id),
+                    "universe": _stable_fingerprint(list(carry_source.universe)),
+                    "rows": int(len(carry_source)),
+                }
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
             futures_market = panel.index_futures_day_session
             if futures_market is None:
@@ -2298,6 +2308,9 @@ def _checkpoint_manifest(
         preprocessing_contract["day_trade_minute_execution_allow_daily_proxy"] = (
             False
         )
+    proxy_price_policy = config.data.day_trade_minute_execution_daily_proxy_price_policy
+    if proxy_price_policy != "legacy_adverse_tick":
+        preprocessing_contract["day_trade_minute_execution_daily_proxy_price_policy"] = proxy_price_policy
     if config.data.feature_zero_fill:
         preprocessing_contract["feature_zero_fill"] = list(
             config.data.feature_zero_fill
@@ -2380,6 +2393,7 @@ def _checkpoint_manifest(
     schema_4_pre_external_and_minute_tape_fingerprints: dict[str, str] = {}
     if (
         bool(config.data.day_trade_minute_execution_allow_daily_proxy)
+        and proxy_price_policy == "legacy_adverse_tick"
         and "day_trade_minute_execution" in panel_arrays
     ):
         # Hybrid v8 checkpoints predate content-addressing of the minute label.

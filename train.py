@@ -811,7 +811,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/markets/tw.yaml", help="Path to experiment config")
     parser.add_argument(
         "--check-data-only", action="store_true",
-        help="Validate 08:45 futures minute sources and exact stock-panel date coverage, then exit before training.",
+        help="Build and validate the configured exact panel/execution sources, then exit before model or optimizer work.",
     )
     parser.add_argument("--output-dir", default=None, help="Directory for training outputs (override config.runner.output_dir)")
     parser.add_argument(
@@ -1181,13 +1181,12 @@ def main() -> None:
                 return
         except (OSError, ValueError) as exc:
             raise SystemExit(str(exc)) from exc
-    elif args.check_data_only:
-        raise SystemExit("--check-data-only currently requires the 08:45 futures minute execution mode")
-    _maybe_relaunch_for_ddp(config, args)
+    if not args.check_data_only:
+        _maybe_relaunch_for_ddp(config, args)
     _install_graceful_termination_handlers()
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
-    active_strategy = cli_strategy or config_strategy
+    active_strategy = "none" if args.check_data_only else (cli_strategy or config_strategy)
     _configure_local_rank_cpu_affinity(active_strategy)
     configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
     compile_threads = (
@@ -1225,7 +1224,12 @@ def main() -> None:
 
     if args.seed is not None:
         config.training.seed = int(args.seed)
-    if args.multi_gpu_strategy is not None:
+    if args.check_data_only:
+        # Data acceptance is intentionally one process.  The resolved training
+        # strategy remains in the YAML and is exercised by the bounded DDP
+        # integration gate, but must not make a read-only preflight relaunch.
+        pass
+    elif args.multi_gpu_strategy is not None:
         config.training.multi_gpu_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
     else:
         # Downstream trainer code consumes the concrete runtime strategy.
@@ -1581,6 +1585,7 @@ def main() -> None:
                 allow_daily_proxy=(
                     config.data.day_trade_minute_execution_allow_daily_proxy
                 ),
+                daily_proxy_price_policy=config.data.day_trade_minute_execution_daily_proxy_price_policy,
                 policy=config.data.day_trade_minute_execution_policy,
             )
 
@@ -1604,6 +1609,46 @@ def main() -> None:
             )
         else:
             panel.day_trade_minute_execution = _load_execution_tape()
+        if config.trading.tw_day_trade_unlimited_margin_conversion:
+            from stockagent.data.tw_day_trade_carry_source import (
+                build_prepared_day_trade_carry_source,
+            )
+
+            def _load_physical_source():
+                return build_prepared_day_trade_carry_source(
+                    panel=panel,
+                    minute_root=config.data.day_trade_minute_execution_root,
+                    public_feature_path=config.data.tw_public_feature_path,
+                    cache_dir=config.data.day_trade_minute_execution_cache_dir,
+                    allow_daily_proxy=(
+                        config.data.day_trade_minute_execution_allow_daily_proxy
+                    ),
+                    daily_proxy_price_policy=(
+                        config.data.day_trade_minute_execution_daily_proxy_price_policy
+                    ),
+                    corporate_action_mode=config.trading.tw_corporate_action_mode,
+                )
+
+            if _distributed_ready() and _distributed_world_size() > 1:
+                source_error = None
+                if _distributed_rank() == 0:
+                    try:
+                        panel.day_trade_carry_source = _load_physical_source()
+                    except Exception as exc:
+                        source_error = exc
+                _raise_if_distributed_phase_failed(
+                    "rank0_day_trade_physical_source", source_error
+                )
+                if _distributed_rank() != 0:
+                    try:
+                        panel.day_trade_carry_source = _load_physical_source()
+                    except Exception as exc:
+                        source_error = exc
+                _raise_if_distributed_phase_failed(
+                    "worker_day_trade_physical_source", source_error
+                )
+            else:
+                panel.day_trade_carry_source = _load_physical_source()
     if str(config.trading.execution_mode) in {
         "tw_index_futures_day",
         "tw_index_derivatives_day",
@@ -1922,6 +1967,27 @@ def main() -> None:
         mode=str(mode),
         resume=bool(resume),
     )
+    if args.check_data_only:
+        source = getattr(panel, "day_trade_carry_source", None)
+        source_payload = (
+            None
+            if source is None
+            else {
+                "release_id": str(source.release_id),
+                "sessions": int(len(source)),
+                "symbols": int(len(source.universe)),
+                "audit_receipt": source.audit_receipt,
+            }
+        )
+        print(
+            "[data preflight] accepted exact configured sources; "
+            f"panel_sessions={panel.num_dates} panel_symbols={panel.num_symbols} "
+            f"panel_features={len(panel.feature_names)} folds={len(folds)} "
+            f"physical_carry={json.dumps(source_payload, sort_keys=True)}; "
+            "no model, optimizer, checkpoint, or fold-completion marker was started.",
+            flush=True,
+        )
+        return
     isolate_this_run = _should_isolate_selected_folds(
         mode=str(mode),
         isolate_train_folds=bool(isolate_train_folds),

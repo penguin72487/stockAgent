@@ -5,6 +5,7 @@ import argparse
 from datetime import date
 import json
 import os
+import shlex
 from pathlib import Path, PurePosixPath
 import sys
 from typing import Any, Mapping
@@ -57,9 +58,8 @@ def _running_commands() -> list[tuple[int, str]]:
             pid = int(path.parent.name)
             if pid == own_pid:
                 continue
-            command = path.read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", errors="replace"
-            )
+            command = shlex.join([value.decode("utf-8", errors="replace")
+                                  for value in path.read_bytes().split(b"\0") if value])
         except (OSError, ValueError):
             continue
         if command:
@@ -69,11 +69,21 @@ def _running_commands() -> list[tuple[int, str]]:
 
 def _blockers(entry: Mapping[str, Any], commands: list[tuple[int, str]]) -> list[dict[str, Any]]:
     patterns = [str(item) for item in entry.get("active_process_substrings", [])]
+    def matches(command: str, pattern: str) -> bool:
+        # A waiting shell wrapper may mention an already-finished downloader
+        # inside its -c program. Match actual script argv, not quoted programs.
+        if pattern.endswith(".py") and "/" not in pattern:
+            try:
+                return any(Path(arg).name == pattern and not any(c.isspace() for c in arg)
+                           for arg in shlex.split(command))
+            except ValueError:
+                return pattern in command  # malformed evidence fails closed
+        return pattern in command
     return [
         {"pid": pid, "pattern": pattern, "command": command}
         for pid, command in commands
         for pattern in patterns
-        if pattern in command
+        if matches(command, pattern)
     ]
 
 
@@ -139,7 +149,9 @@ def _latest_cold_freshness(
     if sync_root is None:
         return None
     try:
-        resolved = resolve_latest_packed(sync_root, dataset)
+        # Freshness non-regression is metadata-backed even while an object's
+        # payload is missing. Missing bytes cannot erase a newer date gate.
+        resolved = resolve_latest_packed(sync_root, dataset, require_objects=False)
     except SnapshotError:
         return None
     metadata = resolved.manifest.get("metadata", {})
@@ -209,6 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--sync-root", type=Path)
     parser.add_argument("--node-id")
+    parser.add_argument("--recover-missing-base-objects", action="store_true",
+        help="Explicit repair: retain damaged history; repack current source members into verified objects before updating the head.")
     parser.add_argument(
         "--all-ready",
         action="store_true",
@@ -247,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.sync_root is None:
             raise SnapshotError("publish requires --sync-root")
+        if args.recover_missing_base_objects and args.all_ready:
+            raise SnapshotError("missing-object recovery requires one explicit dataset")
         if bool(args.dataset) == bool(args.all_ready):
             raise SnapshotError("select exactly one dataset or --all-ready")
         selected = (
@@ -309,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 },
                 repo_root=REPO_ROOT,
+                **({"recover_missing_base_objects": True} if args.recover_missing_base_objects else {}),
             )
             results.append(
                 {

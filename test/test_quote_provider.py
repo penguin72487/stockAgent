@@ -881,6 +881,22 @@ def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:
     assert np.isnan(snapshot.open_prices[2])
     assert snapshot.available_mask.tolist() == [True, True, False]
     assert snapshot.available_count == 2
+    assert snapshot.timestamps_ms is None
+
+
+def test_load_prices_csv_uses_only_explicit_observation_timestamps(tmp_path) -> None:
+    path = tmp_path / 'history.csv'
+    path.write_text(
+        'symbol,price,effective_timestamp_ms\n'
+        '2330,100,1771997100000\n2317,200,1771997400000\n'
+        'BAD,10,-1\nFRACTION,20,12.5\n',
+    )
+    snapshot = load_prices_csv(
+        path, ['2317', '2330', 'MISSING', 'BAD', 'FRACTION'], np.ones(5),
+    )
+    assert snapshot.timestamps_ms.tolist() == [1771997400000, 1771997100000, 0, 0, 0]
+    assert snapshot.available_mask.tolist() == [True, True, False, True, True]
+    assert snapshot.source.startswith('csv:')
 
 
 def test_fetch_yahoo_last_prices_runs_requests_in_parallel(monkeypatch, tmp_path) -> None:

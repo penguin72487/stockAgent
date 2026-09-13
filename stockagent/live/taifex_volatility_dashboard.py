@@ -57,6 +57,8 @@ HISTORY_RANGE_SECONDS: Final[dict[str, int | None]] = {
 
 _LINE_COUNT_LOCK = threading.Lock()
 _LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
+_DURABLE_CACHE_ENV: Final[str] = "STOCKAGENT_TAIFEX_DASHBOARD_CACHE_DIR"
+_DURABLE_CACHE_SCHEMA_VERSION: Final[int] = 1
 
 _VERIFIED_HASH_LOCK = threading.Lock()
 _VERIFIED_HASH_CACHE: dict[
@@ -141,6 +143,96 @@ def _optional_float(value: object) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def _durable_cache_path(source: Path, *, kind: str) -> Path | None:
+    cache_root = str(os.environ.get(_DURABLE_CACHE_ENV) or "").strip()
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    if not root.is_dir():
+        return None
+    identity = f"{source.resolve()}\0{kind}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return root / f"{kind}-v{_DURABLE_CACHE_SCHEMA_VERSION}-{digest}.json"
+
+
+def _write_durable_cache(path: Path | None, payload: Mapping[str, Any]) -> None:
+    """Atomically publish a private derived index without touching its source."""
+
+    if path is None:
+        return
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        encoded = (
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_durable_line_count(
+    source: Path, *, stat: os.stat_result
+) -> tuple[int, int, int, int, int] | None:
+    cache_path = _durable_cache_path(source, kind="ledger-line-count")
+    if cache_path is None or not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_bytes())
+        if (
+            not isinstance(payload, Mapping)
+            or int(payload.get("schema_version") or 0)
+            != _DURABLE_CACHE_SCHEMA_VERSION
+            or payload.get("kind") != "ledger-line-count"
+            or str(payload.get("source") or "") != str(source.resolve())
+        ):
+            return None
+        device = int(payload.get("device"))
+        inode = int(payload.get("inode"))
+        observed_size = int(payload.get("observed_size"))
+        modified_ns = int(payload.get("modified_ns"))
+        count = int(payload.get("count"))
+        if (device, inode) != (stat.st_dev, stat.st_ino):
+            return None
+        if not 0 <= observed_size <= stat.st_size or count < 0:
+            return None
+        if observed_size == stat.st_size and modified_ns != stat.st_mtime_ns:
+            return None
+        return device, inode, observed_size, modified_ns, count
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _persist_durable_line_count(
+    source: Path,
+    *,
+    signature: tuple[int, int, int, int, int],
+) -> None:
+    device, inode, observed_size, modified_ns, count = signature
+    _write_durable_cache(
+        _durable_cache_path(source, kind="ledger-line-count"),
+        {
+            "schema_version": _DURABLE_CACHE_SCHEMA_VERSION,
+            "kind": "ledger-line-count",
+            "source": str(source.resolve()),
+            "device": device,
+            "inode": inode,
+            "observed_size": observed_size,
+            "modified_ns": modified_ns,
+            "count": count,
+        },
+    )
+
+
 def _line_count(path: Path) -> int:
     """Count append-only rows while only reading bytes added since last refresh."""
 
@@ -151,6 +243,10 @@ def _line_count(path: Path) -> int:
         stat = os.fstat(handle.fileno())
         with _LINE_COUNT_LOCK:
             cached = _LINE_COUNT_CACHE.get(cache_key)
+            if cached is None:
+                cached = _load_durable_line_count(path, stat=stat)
+                if cached is not None:
+                    _LINE_COUNT_CACHE[cache_key] = cached
             if cached and cached[:4] == (
                 stat.st_dev,
                 stat.st_ino,
@@ -169,14 +265,16 @@ def _line_count(path: Path) -> int:
         handle.seek(append_offset)
         appended = handle.read(stat.st_size - append_offset)
         count = previous_count + appended.count(b"\n")
-    with _LINE_COUNT_LOCK:
-        _LINE_COUNT_CACHE[cache_key] = (
+    signature = (
             stat.st_dev,
             stat.st_ino,
             stat.st_size,
             stat.st_mtime_ns,
             count,
         )
+    with _LINE_COUNT_LOCK:
+        _LINE_COUNT_CACHE[cache_key] = signature
+    _persist_durable_line_count(path, signature=signature)
     return count
 
 
@@ -755,6 +853,99 @@ def _cold_daily_pnl_endpoints_polars(
     return output
 
 
+def _load_durable_daily_endpoints(
+    source: Path,
+    *,
+    stat: os.stat_result,
+    strategy_ids: tuple[str, ...],
+) -> _DailyEndpointCache | None:
+    cache_path = _durable_cache_path(source, kind="daily-pnl-endpoints")
+    if cache_path is None or not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_bytes())
+        if (
+            not isinstance(payload, Mapping)
+            or int(payload.get("schema_version") or 0)
+            != _DURABLE_CACHE_SCHEMA_VERSION
+            or payload.get("kind") != "daily-pnl-endpoints"
+            or str(payload.get("source") or "") != str(source.resolve())
+            or tuple(payload.get("strategy_ids") or ()) != tuple(strategy_ids)
+        ):
+            return None
+        device = int(payload.get("device"))
+        inode = int(payload.get("inode"))
+        offset = int(payload.get("offset"))
+        observed_size = int(payload.get("observed_size"))
+        modified_ns = int(payload.get("modified_ns"))
+        if (device, inode) != (stat.st_dev, stat.st_ino):
+            return None
+        if not 0 <= offset <= observed_size <= stat.st_size:
+            return None
+        if observed_size == stat.st_size and modified_ns != stat.st_mtime_ns:
+            return None
+        raw_endpoints = payload.get("endpoints")
+        if not isinstance(raw_endpoints, Mapping):
+            return None
+        endpoints: dict[
+            str,
+            dict[str, tuple[int, float] | tuple[int, float, float]],
+        ] = {strategy_id: {} for strategy_id in strategy_ids}
+        for strategy_id in strategy_ids:
+            raw_dates = raw_endpoints.get(strategy_id)
+            if not isinstance(raw_dates, Mapping):
+                return None
+            for trading_date, raw_value in raw_dates.items():
+                date.fromisoformat(str(trading_date))
+                if not isinstance(raw_value, list) or len(raw_value) not in {2, 3}:
+                    return None
+                decision_ts_ns = int(raw_value[0])
+                pnl = _optional_float(raw_value[1])
+                capital = (
+                    _optional_float(raw_value[2]) if len(raw_value) == 3 else None
+                )
+                if decision_ts_ns <= 0 or pnl is None:
+                    return None
+                endpoints[strategy_id][str(trading_date)] = (
+                    (decision_ts_ns, pnl, capital)
+                    if capital is not None and capital > 0.0
+                    else (decision_ts_ns, pnl)
+                )
+        return _DailyEndpointCache(
+            device=device,
+            inode=inode,
+            offset=offset,
+            file_size=observed_size,
+            mtime_ns=modified_ns,
+            endpoints=endpoints,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _persist_durable_daily_endpoints(
+    source: Path,
+    *,
+    strategy_ids: tuple[str, ...],
+    cache: _DailyEndpointCache,
+) -> None:
+    _write_durable_cache(
+        _durable_cache_path(source, kind="daily-pnl-endpoints"),
+        {
+            "schema_version": _DURABLE_CACHE_SCHEMA_VERSION,
+            "kind": "daily-pnl-endpoints",
+            "source": str(source.resolve()),
+            "strategy_ids": list(strategy_ids),
+            "device": cache.device,
+            "inode": cache.inode,
+            "offset": cache.offset,
+            "observed_size": cache.file_size,
+            "modified_ns": cache.mtime_ns,
+            "endpoints": cache.endpoints,
+        },
+    )
+
+
 def _daily_pnl_endpoints(
     path: Path,
     *,
@@ -772,6 +963,14 @@ def _daily_pnl_endpoints(
     with _PERFORMANCE_LOCK, path.open("rb") as handle:
         stat = os.fstat(handle.fileno())
         cached = _PERFORMANCE_CACHE.get(cache_key)
+        if cached is None:
+            cached = _load_durable_daily_endpoints(
+                path,
+                stat=stat,
+                strategy_ids=strategy_ids,
+            )
+            if cached is not None:
+                _PERFORMANCE_CACHE[cache_key] = cached
         if (
             cached is None
             or (cached.device, cached.inode) != (stat.st_dev, stat.st_ino)
@@ -851,6 +1050,11 @@ def _daily_pnl_endpoints(
             cached.mtime_ns = stat.st_mtime_ns
         for strategy_id in strategy_ids:
             output[strategy_id] = dict(cached.endpoints.get(strategy_id, {}))
+        _persist_durable_daily_endpoints(
+            path,
+            strategy_ids=strategy_ids,
+            cache=cached,
+        )
     return output
 
 

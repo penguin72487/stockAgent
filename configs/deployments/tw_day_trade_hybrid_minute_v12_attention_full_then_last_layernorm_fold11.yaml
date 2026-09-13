@@ -1,0 +1,13 @@
+base_config: ../markets/tw_day_trade_1m_hybrid_v12_attention_full_then_last_layernorm.yaml
+
+# Staged only: not referenced by a live model selector. Import the exact
+# lifecycle-verified artifact via Syncthing and pass the strategy-switch gates
+# before activation. This is the OLD training contract's checkpoint, not a
+# claim that its training executor has the paper engine's cross-day inventory.
+# Vast fold_11 SHA256:
+# 12a46eb8d1ceac2a54a3bcfa15250f6ca6eb63d39ffbacb8977772b767a1d012
+experiment_name: tw-day-trade-hybrid-minute-v12-attention-layernorm-fold11-deployment
+
+runner:
+  resume: false
+  post_train_infer: false
