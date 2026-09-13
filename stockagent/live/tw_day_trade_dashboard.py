@@ -84,7 +84,7 @@ _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
 _AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = {}
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
-_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any]]] = {}
+_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, bytes, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
@@ -460,13 +460,20 @@ def build_dashboard_revision(
 
 def _object(path: Path) -> dict[str, Any]:
     cache_key = path.resolve()
+    raw = path.read_bytes()
     stat = path.stat()
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    signature = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        hashlib.blake2b(raw, digest_size=16).digest(),
+    )
     with _OBJECT_CACHE_LOCK:
         cached = _OBJECT_CACHE.get(cache_key)
-        if cached is not None and cached[:4] == signature:
-            return dict(cached[4])
-    payload = json.loads(path.read_text(encoding="utf-8"))
+        if cached is not None and cached[:5] == signature:
+            return dict(cached[5])
+    payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     final_stat = path.stat()
@@ -475,7 +482,7 @@ def _object(path: Path) -> dict[str, Any]:
         final_stat.st_ino,
         final_stat.st_size,
         final_stat.st_mtime_ns,
-    ) == signature:
+    ) == signature[:4]:
         with _OBJECT_CACHE_LOCK:
             _OBJECT_CACHE[cache_key] = (*signature, payload)
     return dict(payload)

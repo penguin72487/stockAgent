@@ -179,8 +179,11 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
             official, block_receipt = apply_block_evidence(official, block_manifest)
             evidence_receipt['block_evidence'] = block_receipt
         recovery = ExactMinuteRecovery(Path(args.repair_root), official,
-                                       participation=getattr(args, 'capacity_participation', None))
+                                       participation=getattr(args, 'capacity_participation', None),
+                                       capacity_rounding=getattr(args, 'capacity_rounding', 'floor'))
         cache = cache.with_name(cache.name + '-exact-v1-' + official_sha[:16])
+        if getattr(args, 'capacity_rounding', 'floor') != 'floor':
+            cache = cache.with_name(cache.name + '-' + args.capacity_rounding)
     cache.mkdir(parents=True, exist_ok=True)
     frames, inventories = [], []
     refresh_dates = set(getattr(args, 'refresh_dates', None) or [])
@@ -301,6 +304,8 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
                         official_evidence=evidence_receipt,
                         mapping='dated_R1_OHLC_or_exact_physical_month_with_official_outright_evidence',
                         capacity='observed_source_volume_only; official_spread_only_or_empty_days_have_zero_outright_capacity')
+        if getattr(args, 'capacity_rounding', 'floor') != 'floor':
+            manifest['capacity_rounding'] = args.capacity_rounding
     manifest_path = output / "manifest.json"
     previous_manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else None
     # Preserve the exact manifest bytes for an identical inventory. JSON key

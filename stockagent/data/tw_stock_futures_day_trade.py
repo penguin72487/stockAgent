@@ -142,6 +142,7 @@ class TaiwanStockFuturesDayTradeDaily:
     integer_candidate_multipliers: tuple[float, ...] = ()
     integer_candidate_selection: str | None = None
     contract_version: int = TAIFEX_STOCK_FUTURES_DAY_TRADE_DATA_CONTRACT_VERSION
+    carry_metadata: dict | None = None
 
 
 def _require_dependencies() -> None:
@@ -669,9 +670,16 @@ def attach_stock_futures_day_trade_daily(
     integer_contracts: bool = False,
     max_volume_participation: float = 0.5,
     minute_data_path: str | Path | None = None,
+    minute_capacity_rounding: str = "floor",
     daily_proxy_before: str | None = None,
     quarantine_dates: tuple[str, ...] | list[str] = (),
     quarantine_contract_days: tuple[dict, ...] | list[dict] = (),
+    residual_policy: str = "fail",
+    final_settlement_path: str | Path | None = None,
+    carry_evidence_path: str | Path | None = None,
+    corporate_action_path: str | Path | None = None,
+    corporate_transition_path: str | Path | None = None,
+    quarantined_carry_policy: str = 'reject',
 ) -> PanelData:
     """Attach nearby-futures labels without changing model input symbol axes."""
 
@@ -705,7 +713,7 @@ def attach_stock_futures_day_trade_daily(
 
     table = pq.read_table(
         data_path,
-        columns=list(_REQUIRED_COLUMNS),
+        columns=list(_REQUIRED_COLUMNS) + (["valuation_settlement"] if residual_policy == "carry" else []),
         filters=[
             ("date", ">=", date.fromisoformat(str(dates[0]))),
             ("date", "<=", date.fromisoformat(str(dates[-1]))),
@@ -729,20 +737,53 @@ def attach_stock_futures_day_trade_daily(
             minute_data_path, selected, dates, symbols,
             daily_sha256=expected_hash, fee=fee_per_contract_per_side_twd,
             participation=max_volume_participation,
+            capacity_rounding=minute_capacity_rounding,
             daily_proxy_before=daily_proxy_before,
             quarantine_dates=quarantine_dates,
             quarantine_contract_days=quarantine_contract_days,
         )
-        policy = (tape[..., 0] > 0).any(axis=-1)
+        carry_metadata = None
+        if residual_policy == "carry":
+            from stockagent.data.tw_stock_futures_carry import (
+                build_carry_tape, load_final_settlements, load_carry_no_trade_evidence, add_carry_no_trade_evidence,
+                load_carry_corporate_actions, load_carry_daily_settlements, CARRY_CONTRACT_VERSION,
+            )
+            if corporate_action_path is None:
+                raise ValueError('carry requires receipt-verified corporate actions; use the carry_v9 config in a fresh output root')
+            # The normal loader above has verified the exact source and receipt.
+            minutes = pl.read_parquet(minute_data_path)
+            coverage = pl.read_parquet(Path(minute_data_path).parent / "coverage.parquet")
+            if carry_evidence_path:
+                coverage = add_carry_no_trade_evidence(coverage, minutes, load_carry_no_trade_evidence(carry_evidence_path))
+            final_settlements=load_final_settlements(final_settlement_path)
+            transition_bundle=None
+            if corporate_transition_path:
+                from stockagent.data.tw_stock_futures_transition import load_transition_bundle, merge_transition_observations
+                transition_bundle=load_transition_bundle(corporate_transition_path)
+                minutes,coverage,final_settlements=merge_transition_observations(minutes,coverage,final_settlements,transition_bundle)
+            tape, carry_metadata = build_carry_tape(
+                source, selected, minutes, coverage,
+                dates, symbols, final_settlements,
+                fee=fee_per_contract_per_side_twd, participation=max_volume_participation,
+                capacity_rounding=minute_capacity_rounding,
+                quarantine_contract_days=quarantine_contract_days,
+                corporate_actions=load_carry_corporate_actions(corporate_action_path, dates),
+                daily_settlements=load_carry_daily_settlements(carry_evidence_path) if carry_evidence_path else None,
+                transition_bundle=transition_bundle,
+                quarantined_carry_policy=quarantined_carry_policy,
+            )
+        policy = ((tape[..., TAPE_FIELDS + 2] > 0) if carry_metadata else (tape[..., 0] > 0)).any(axis=-1)
         entry = tape[..., 3]
         terminal = tape[..., TAPE_FIELDS - 5]
         capacity = tape[..., 7]
-        if daily_proxy_before is not None:
+        if daily_proxy_before is not None and carry_metadata is None:
             daily = tape[..., TAPE_FIELDS] == 1
             entry = np.where(daily, tape[..., TAPE_FIELDS + 1], entry)
             terminal = np.where(daily, tape[..., TAPE_FIELDS + 2], terminal)
             capacity = np.where(daily, tape[..., TAPE_FIELDS + 3], capacity)
         entry_available = (entry > 0) & (capacity > 0)
+        if carry_metadata is not None:
+            entry_available &= tape[..., TAPE_FIELDS + 2] > 0
         marked = entry_available & (terminal > 0)
         simple = np.divide(terminal, entry, out=np.ones_like(entry), where=marked) - 1
         count = marked.sum(axis=-1)
@@ -772,7 +813,8 @@ def attach_stock_futures_day_trade_daily(
             integer_candidate_execution=tape,
             integer_candidate_multipliers=STOCK_FUTURES_INTEGER_CANDIDATE_MULTIPLIERS,
             integer_candidate_selection="causal_standard_and_mini_prior_session_liquidity",
-            contract_version=HYBRID_CONTRACT_VERSION if daily_proxy_before else MINUTE_CONTRACT_VERSION,
+            contract_version=carry_metadata['contract_version'] if carry_metadata else (HYBRID_CONTRACT_VERSION if daily_proxy_before else MINUTE_CONTRACT_VERSION),
+            carry_metadata=carry_metadata,
         )
         return panel
     normalized_entry_source = str(entry_price_source).strip().lower()

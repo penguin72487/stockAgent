@@ -1,0 +1,16 @@
+# 2026-09-09: retain unfilled physical contracts and rebalance target differences.
+base_config: tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml
+experiment_name: tw-stock-futures-0845-unfilled-carry-delta-v8
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_0845_carry_v8_vast5090
+  resume: true
+training:
+  epochs: 1000
+  futures_portfolio_recoverable_backward: false
+  futures_minute_saturation_recovery: false
+  futures_minute_recovery_objective: residual_notional
+  futures_portfolio_optimizer_step_per_trajectory: true
+trading:
+  tw_stock_futures_day_trade_residual_policy: carry
+  tw_stock_futures_day_trade_carry_evidence_path: artifacts/data_preparation/futures_carry_evidence_v1_20260909/official_evidence.parquet
+  tw_futures_portfolio_final_settlement_path: data_tw_futures/final_settlement_v1/futures_final_settlement_history.parquet

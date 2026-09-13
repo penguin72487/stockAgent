@@ -1,0 +1,19 @@
+# Same exact-minute ledger and adjacent-basket backward as v3. Fix the input
+# conditioning with the existing train-only normalizer used by the stock 1m
+# pipeline; a row RMSNorm cannot remove differences between feature units.
+base_config: tw_stock_futures_day_trade_0845_gradient_v3.yaml
+
+experiment_name: tw-stock-futures-0845-1330-causal-feature-rms-v4
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v1_gradient_v4_vast5090
+  resume: true
+
+training:
+  financial_transformer:
+    # Fit only the feature rows visible to this fold's training windows.
+    # Preserve missing-value zeros; keep train-unseen columns inactive for the
+    # fold. Save fitted scales/masks in the checkpoint for identical inference.
+    causal_feature_rms_normalization: true
+    causal_feature_min_active_dates: 1
+    causal_feature_scale_epsilon: 1.0e-6

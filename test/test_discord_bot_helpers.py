@@ -28,15 +28,28 @@ def test_guide_lists_all_tw_execution_modes() -> None:
     assert "`tw_day_trade_multi_basis_projection_l1_gelu`" in guide
 
 
-def test_both_enabled_multi_basis_day_trades_are_available_in_market_autocomplete() -> (
+def test_both_enabled_multi_basis_day_trades_are_available_in_market_autocomplete(
+    monkeypatch,
+) -> (
     None
 ):
+    expected = {
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_multi_basis_22",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
+    }
+    # Autocomplete availability must be deterministic in a clean checkout;
+    # ignored deployment artifacts are tested separately by the missing-model
+    # filter test below.
+    monkeypatch.setattr(
+        discord_bot,
+        "_market_has_model",
+        lambda cfg: cfg.market in expected,
+    )
     choices = asyncio.run(discord_bot.market_autocomplete(None, "multi_basis"))
 
     values = {choice.value for choice in choices}
-    assert "tw_day_trade_multi_basis_22" in values
-    assert "tw_day_trade_multi_basis_projection_l1_gelu" in values
-    assert "tw_day_trade_multi_basis" in values
+    assert values == expected
 
 
 def test_market_autocomplete_omits_enabled_mode_without_checkpoint(monkeypatch) -> None:

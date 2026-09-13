@@ -1,0 +1,10 @@
+base_config: tw_stock_futures_day_trade_0845_capacity_ceil_v5.yaml
+experiment_name: tw-stock-futures-0845-1330-minute-inward-capacity-gradient-v6
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0845_from_20200323_v2_contract_quarantine_v2_gradient_v6_vast5090
+  resume: true
+
+training:
+  epochs: 10000
+  futures_minute_saturation_recovery: true

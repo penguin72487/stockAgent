@@ -192,6 +192,36 @@ run_fintech_python train.py \
 新的盲測；若要歸因 optimizer cadence，需在相同修正版帳本下另做控制比較，
 不能把舊帳本到新帳本的全部差異都算成優化效果。
 
+### DDP 重跑時的超大配置錯誤
+
+若在 `resume_epoch_curve_trim` 的 `all_gather_object` 看到
+`Tried to allocate more than 1EB memory`，不能直接解讀成模型需要更多 VRAM。
+2026-09-08 的現場已有同次嘗試留下的 validation-best 與 epoch-curve 封存檔；
+檢查程式發現封存同步被包在 `checkpoint_best_path.exists()` 裡。rank 0 先
+搬走檔案後，較慢的 rank 1 會跳過該次同步，讓後續不同階段的通訊錯位。
+這是可重現的競態；缺少現場 rank 1 stack，不能宣稱已還原它當時的每一次通訊。
+
+修正後只有 rank 0 檢查／搬移檔案，每個 pending fold 的所有 rank 都參與
+封存階段，即使檔案本來不存在；狀態交換另核對 rank 與 phase 名稱。
+兩程序測試刻意讓 worker 等到封存完成才到達，並驗證下一個曲線階段與
+tensor collective；也驗證封存錯誤和階段不一致能讓兩邊一起失敗。
+這是同步修正，沒有改變模型、資料或帳本契約，不需新建 snapshot 或輸出根。
+
+2026-09-08 驗證：一般相關回歸 372 passed；另在雙 RTX 5090、PyTorch
+2.11.0+cu128 跑 Gloo/NCCL 各三種通訊情境，共 6 passed。這些測試不載入
+策略資料、不建模型、不更新 optimizer，不等於正式訓練完成。
+可重跑 `test/test_ddp_restart_coordination.py`；GPU 通訊測試需明確設定
+`STOCKAGENT_TEST_NCCL=1`，平常測試預設跳過 NCCL，避免占用訓練 GPU。
+PyTorch 的 [object collectives 說明](https://docs.pytorch.org/docs/stable/distributed.html#object-collectives)
+說明它會先交換序列化物件大小、再傳送物件；此處的超大配置位於大小處理階段，
+不是策略模型前向／反向的工作張量。
+
+封存訊息是保留舊檔的通知，本身不是錯誤，也不一定代表 checkpoint 損毀：
+`--no-resume` 會明確要求從 epoch 1 重跑，即使舊 checkpoint 仍可讀。
+一般同版本續跑應移除 `--no-resume`；有意重跑第 2 折才使用
+`--start-fold 2 --max-folds 1 --no-resume`。重啟前先確認舊 rank 已退出，
+不要刪除 `.unresumable_*` 封存證據或同組 `checkpoint_last.pt`。
+
 ## 重建命令
 
 正式資料至少需保留約 32 日的 panel 前置期，因此從 `2020-02-24` 開始抓取，

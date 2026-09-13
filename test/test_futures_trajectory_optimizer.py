@@ -58,13 +58,15 @@ def _split() -> WindowedSplitTensors:
     )
 
 
-def test_trajectory_cadence_keeps_parameters_fixed_until_all_batches_finish() -> None:
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
+def test_trajectory_cadence_keeps_parameters_fixed_until_all_batches_finish(batch_size) -> None:
     split = _split()
     model = _RecordedScalarPolicy()
     optimizer = _CountingSGD(model.parameters())
     scheduler = _CountingScheduler()
+    reference_scale = model.scale.detach().clone().requires_grad_()
     expected_loss = risk_aware_loss(
-        model.scale.detach() * split.features[:, :, 0],
+        reference_scale * split.features[:, :, 0],
         split.future_log_returns,
         split.tradable_mask,
         benchmark_returns=split.benchmark,
@@ -104,7 +106,7 @@ def test_trajectory_cadence_keeps_parameters_fixed_until_all_batches_finish() ->
         split,
         optimizer,
         GradScaler("cpu", enabled=False),
-        batch_size=2,
+        batch_size=batch_size,
         device=torch.device("cpu"),
         amp_dtype=None,
         non_blocking=False,
@@ -143,6 +145,9 @@ def test_trajectory_cadence_keeps_parameters_fixed_until_all_batches_finish() ->
     assert loss.item() == pytest.approx(expected_loss.item(), abs=1.0e-7)
     assert optimizer.step_calls == 1
     assert scheduler.step_calls == 1
-    assert model.forward_parameter_values == pytest.approx([0.1, 0.1])
-    assert timing.batches == 2
+    batches = (4 + batch_size - 1) // batch_size
+    assert model.forward_parameter_values == pytest.approx([0.1] * batches)
+    assert timing.batches == batches
     assert timing.gradient_norm_observations == 1
+    expected_gradient = torch.autograd.grad(expected_loss, reference_scale)[0]
+    assert model.scale.item() == pytest.approx(.1 - .1 * expected_gradient.clamp(-1, 1).item(), abs=1e-7)

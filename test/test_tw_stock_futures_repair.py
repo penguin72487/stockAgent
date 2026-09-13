@@ -13,16 +13,47 @@ from stockagent.data.tw_stock_futures_repair import official_day_evidence, Exact
 from stockagent.data.tw_stock_futures_history import MINUTE_SCHEMA
 
 
+def test_repair_tasks_keep_adjusted_and_unobserved_held_contract_days():
+    inventory = pl.DataFrame({'product':['PLF', 'PL1'], 'contract':['202410']*2})
+    gaps = pl.DataFrame({'date':[date(2024,9,24), date(2024,9,25), date(2024,9,25)],
+                         'physical_contract':['PL1:202410', 'PL1:202410', 'PL1:202410']})
+    tasks = repair_tasks(inventory, gaps)
+    assert len(tasks) == 1
+    assert tasks[0].code == 'PL1J4'
+    assert tasks[0].contract.delivery_month == '202410'
+    assert (tasks[0].start, tasks[0].end) == (date(2024,9,24), date(2024,9,25))
+    assert tasks[0].method == 'kbars'
+    assert len(repair_tasks(inventory, gaps, method='ticks')) == 2
+
+
+def test_repair_tasks_never_silently_drop_unknown_identity():
+    inventory = pl.DataFrame({'physical_contract':['PLF:202410']})
+    gaps = pl.DataFrame({'date':[date(2024,9,24)], 'physical_contract':['PL1:202410']})
+    with pytest.raises(ValueError, match='absent from official inventory'):
+        repair_tasks(inventory, gaps)
+
+
+def test_repair_tasks_validate_identity_and_bounded_archived_queries():
+    inventory = pl.DataFrame({'physical_contract':['PL1:202410']})
+    gaps = pl.DataFrame({'date':[date(2024,9,1), date(2024,9,30)], 'physical_contract':['PL1:202410']*2})
+    assert len(repair_tasks(inventory, gaps)) == 2
+    with pytest.raises(ValueError, match='identity mismatch'):
+        repair_tasks(inventory.with_columns(pl.lit('PLF').alias('product'), pl.lit('202410').alias('contract')), gaps)
+    with pytest.raises(ValueError, match='query range'):
+        repair_tasks(inventory, gaps.with_columns(pl.lit(date(2026,9,24)).alias('date')))
+    assert repair_tasks(inventory, gaps.head(0)) == []
+
+
 def test_official_zero_spread_only_and_absence_are_independent_of_carried_prices(tmp_path):
     raw = tmp_path/'all.csv'
-    columns=['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段']
+    columns=['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段','結算價']
     with raw.open('w',encoding='cp950',newline='') as f:
         writer=csv.writer(f);writer.writerow(columns)
         writer.writerows([
-            ['2020/03/23','CDF','202004',4,100,'-','-',100,'一般'],
-            ['2020/03/23','CDF','202004/202005',4,1,1,1,1,'一般'],
-            ['2020/03/23','DDF','202004',0,'-','-','-','-','一般'],
-            ['2020/03/23','FCF','202004',7,100,101,99,100,'一般'],
+            ['2020/03/23','CDF','202004',4,100,'-','-',100,'一般',100.5],
+            ['2020/03/23','CDF','202004/202005',4,1,1,1,1,'一般','-'],
+            ['2020/03/23','DDF','202004',0,'-','-','-','-','一般',99],
+            ['2020/03/23','FCF','202004',7,100,101,99,100,'一般',100],
         ])
     manifest=tmp_path/'source.json'
     atomic_write_json(manifest,dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
@@ -34,6 +65,20 @@ def test_official_zero_spread_only_and_absence_are_independent_of_carried_prices
     assert got['DDF:202004']['official_reason']=='zero_total_volume'
     assert got['MYF:202004']['official_reason']=='absent_from_complete_day'
     assert got['FCF:202004']['outright_volume']==7
+    from stockagent.data.tw_stock_futures_carry import load_carry_daily_settlements
+    marks = load_carry_daily_settlements(tmp_path/'proof/official_evidence.parquet')
+    assert dict(marks.select('physical_contract','official_daily_settlement').iter_rows()) == {
+        'CDF:202004':100.5, 'DDF:202004':99., 'FCF:202004':100.}
+    # A full-calendar valuation audit must not enlarge the originally absent
+    # minute-proof scope. A reported quote remains usable independently.
+    from stockagent.data.tw_stock_futures_carry import load_carry_no_trade_evidence
+    proof_path = tmp_path/'proof/official_evidence.parquet'
+    result.with_columns(pl.lit(False).alias('no_trade_proof_eligible')).write_parquet(proof_path)
+    receipt_path = proof_path.with_name('official_evidence_manifest.json')
+    receipt = json.loads(receipt_path.read_text()); receipt['sha256'] = sha256_file(proof_path)
+    atomic_write_json(receipt_path, receipt)
+    assert load_carry_no_trade_evidence(proof_path).is_empty()
+    assert load_carry_daily_settlements(proof_path).height == 3
     raw.write_bytes(raw.read_bytes()+b'\n')
     with pytest.raises(ValueError,match='SHA mismatch'):
         official_day_evidence(manifest,keys,tmp_path/'proof')
@@ -137,6 +182,10 @@ def test_official_no_trade_tape_preserves_candidate_and_needs_independent_proof(
     if status==NO_CAPACITY:
         with pytest.raises(ValueError,match='zero integer capacity'):
             validate_futures_minute_data(path,daily_sha256='daily',daily_proxy_before='2020-01-01',participation=1.)
+        with pytest.raises(ValueError,match='ceil minute capacity invalidates'):
+            validate_futures_minute_data(path,daily_sha256='daily',daily_proxy_before='2020-01-01',participation=.5,capacity_rounding='ceil')
+    else:
+        validate_futures_minute_data(path,daily_sha256='daily',daily_proxy_before='2020-01-01',participation=.5,capacity_rounding='ceil')
     atomic_write_parquet(tmp_path/'official_evidence.parquet',official.with_columns(pl.lit(7).alias('outright_volume')))
     manifest['outputs']['official_evidence']['sha256']=sha256_file(tmp_path/'official_evidence.parquet')
     atomic_write_json(tmp_path/'manifest.json',manifest)
@@ -172,6 +221,15 @@ def test_empty_source_capacity_proof_uses_actual_integer_participation(tmp_path,
     recovery.participation=participation
     bars,evidence=recovery.recover(row,pl.DataFrame(schema=MINUTE_SCHEMA),dict(status='missing_receipt'))
     assert bars.is_empty() and evidence['status']==expected
+
+
+def test_ceil_repair_requires_minute_evidence_for_one_official_contract(tmp_path):
+    recovery, row, _ = recovery_fixture(tmp_path, volume=1)
+    recovery.participation = .5
+    recovery.capacity_rounding = 'ceil'
+    bars, evidence = recovery.recover(row, pl.DataFrame(schema=MINUTE_SCHEMA), dict(status='missing_receipt'))
+    assert bars.is_empty()
+    assert evidence['status'] == 'source_empty_unresolved'
 
 
 def test_block_proof_rejects_html_wrong_hash_and_excess_quantity(tmp_path):
