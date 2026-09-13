@@ -434,16 +434,17 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=4"' in html
+    assert 'src="../dashboard-core.js?v=7"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript
     assert 'id="overall-progress"' in html
     assert 'id="source-rows"' in html
     assert "http://" not in html and "https://" not in html
-    assert 'details ? "api/status" : "api/summary"' in javascript
+    assert 'details ? "api/details" : "api/summary"' in javascript
     assert "FULL_REFRESH_TICKS = 6" in javascript
-    assert "SOURCE_PAGE_SIZE = 100" in javascript
+    assert "SOURCE_PAGE_SIZE = 25" in javascript
+    assert "MOBILE_SOURCE_PAGE_SIZE = 10" in javascript
     assert 'id="load-more"' in html
     assert "textContent" in javascript
     assert "remaining_seconds" in javascript
@@ -461,8 +462,12 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "已延後／未啟用" in html
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
-    assert "styles.css?v=9" in html
-    assert "app.js?v=14" in html
+    assert "styles.css?v=10" in html
+    assert "app.js?v=21" in html
+    assert "void refresh().finally(installDetailsActivation);" in javascript
+    assert 'const target = $("source-list");' in javascript
+    assert "IntersectionObserver" in javascript
+    assert "state.detailsActivated" in javascript
     assert 'id="overall-denominator"' in html
     assert 'id="deferred-items"' in html
     assert 'id="control-items"' in html
@@ -1347,6 +1352,49 @@ def test_registry_alias_is_reference_and_excluded_from_denominator() -> None:
     assert enriched["in_active_scope"] is False
     assert enriched["eta"]["state"] == "reference"
     assert enriched["acquisition_progress"]["state"] == "reference"
+    assert enriched["acquisition_progress"]["ratio"] is None
+
+
+@pytest.mark.parametrize(
+    ("implementation", "credential_state", "expected_operation", "expected_execution"),
+    [
+        ("not_available", "not_required", "reference", "not_applicable"),
+        ("registered_credential_gate", "missing", "deferred", "waiting_credential"),
+        ("implemented_credential_gate", "unknown", "deferred", "waiting_credential"),
+        ("registered_source_contract_pending", "not_required", "unable", "not_configured"),
+    ],
+)
+def test_product_capability_boundaries_do_not_create_false_active_failures(
+    implementation: str,
+    credential_state: str,
+    expected_operation: str,
+    expected_execution: str,
+) -> None:
+    row = {
+        "id": "product:fixture:tick",
+        "parent_id": "group:fixture",
+        "scope": "product_granularity",
+        "title": "fixture tick",
+        "provider": "fixture",
+        "status": "unavailable" if expected_operation != "unable" else "waiting",
+        "status_label": "explicit capability boundary",
+        "freshness": {"state": "unknown", "age_seconds": None},
+        "coverage": None,
+        "eta": dashboard._unknown_eta("blocked", "fixture"),
+        "implementation": implementation,
+        "credential_state": credential_state,
+        "automation_eligible": False,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+
+    assert enriched["operation_state"] == expected_operation
+    assert enriched["execution_state"] == expected_execution
+    assert enriched["in_active_scope"] is (expected_operation == "unable")
     assert enriched["acquisition_progress"]["ratio"] is None
 
 

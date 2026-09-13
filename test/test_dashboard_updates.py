@@ -95,6 +95,7 @@ def test_history_cache_invalidates_immediately_on_content_revision(monkeypatch, 
         assert method("all", resolution="1m") is not first
         assert len(calls) == 2
         assert all(call["resolution"] == "1m" for call in calls)
+        assert all(call["use_memory_cache"] is False for call in calls)
     finally:
         server.server_close()
 

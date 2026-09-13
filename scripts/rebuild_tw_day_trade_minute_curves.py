@@ -44,6 +44,9 @@ SESSION_OPEN = datetime_time(9, 0)
 STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
+LAST_TRADE_SETTLEMENT_CONTRACT = (
+    "user_authorized_last_traded_price_paper_settlement_v1"
+)
 DEFAULT_LOCAL_MINUTE_ROOTS = (
     Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
     Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
@@ -614,6 +617,77 @@ def required_symbol_dates(
     return required
 
 
+def verified_manual_no_trade_pairs(
+    state_dir: Path,
+) -> dict[tuple[str, str], str]:
+    """Load only hash-verified user-authorized no-print settlement evidence.
+
+    These receipts do not manufacture a same-day price. They prove that the
+    accepted paper endpoint intentionally used the last earlier official trade
+    because the completed session had no daily print. Interior minute marks may
+    therefore retain the prior observed trade and remain explicitly stale.
+    """
+
+    output: dict[tuple[str, str], str] = {}
+    receipt_root = state_dir / "settlement_receipts"
+    for path in sorted(receipt_root.glob("*.json")):
+        try:
+            payload = _read_json(path)
+            session_date = str(payload.get("session_date") or "")
+            raw_root = Path(str(payload.get("raw_root") or "")).resolve(strict=True)
+            if (
+                payload.get("status") != "applied"
+                or payload.get("simulation_only") is not True
+                or payload.get("contract") != LAST_TRADE_SETTLEMENT_CONTRACT
+                or not session_date
+            ):
+                continue
+            verified_hashes: set[str] = set()
+            current_day_source = False
+            sources = payload.get("sources") or []
+            if not isinstance(sources, list) or not sources:
+                continue
+            for source in sources:
+                source_path = Path(str(source["path"])).resolve(strict=True)
+                expected_hash = str(source["sha256"])
+                if (
+                    not source_path.is_relative_to(raw_root)
+                    or _sha256(source_path) != expected_hash
+                ):
+                    raise ValueError("manual settlement source receipt mismatch")
+                verified_hashes.add(expected_hash)
+                current_day_source = current_day_source or (
+                    source_path.name == f"{session_date}.json"
+                    and source_path.parent.name
+                    in {"twse_daily_ohlcv", "tpex_daily_ohlcv"}
+                )
+            if not current_day_source:
+                continue
+            declared = {
+                str(symbol) for symbol in payload.get("last_traded_price_for", [])
+            }
+            for entry in payload.get("entries") or []:
+                symbol = str(entry.get("symbol") or "")
+                price_date = str(entry.get("price_date") or "")
+                if (
+                    symbol in declared
+                    and price_date
+                    and price_date < session_date
+                    and str(entry.get("official_date") or "") == price_date
+                    and str(entry.get("price_basis") or "")
+                    == "last_available_trade"
+                    and str(entry.get("source_sha256") or "") in verified_hashes
+                ):
+                    output[(symbol, session_date)] = (
+                        f"manual_last_trade_settlement:{path.name}"
+                    )
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            # Optional evidence is fail-closed: a damaged receipt cannot exempt
+            # the pair from normal minute-source requirements.
+            continue
+    return output
+
+
 def _ticks_to_minute_frame(
     ticks: Any, *, symbol: str, session_date: str
 ) -> pl.DataFrame:
@@ -690,6 +764,10 @@ def fetch_missing_kbars(
         "requested_end_date": end,
         "missing_before": len(missing),
         "missing_after": len(missing_after),
+        "missing_after_sample": [
+            {"symbol": symbol, "session_date": session_date}
+            for symbol, session_date in missing_after[:20]
+        ],
         "api_requests_started": int(summary.get("api_requests_started_this_run") or 0),
         "stopped_for_traffic": bool(summary.get("stopped_for_traffic")),
         "stopped_for_market_hours": bool(summary.get("stopped_for_market_hours")),
@@ -1025,6 +1103,18 @@ def rebuild_strategy_marks(
     }
 
 
+def _is_terminal_carry_cost(cost: Mapping[str, Any]) -> bool:
+    """Return whether a carry-ledger row becomes effective at 13:30."""
+
+    # Offline same-day close reconciliation appends an immutable reversal of
+    # the 13:30 conversion debit.  Both sides belong to the same accounting
+    # instant; applying only the reversal at 09:01 corrupts that endpoint.
+    return (
+        cost.get("kind") == "short_conversion_tax_and_handling"
+        or bool(cost.get("reverses_cost_id"))
+    )
+
+
 def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill_rows, start, end, preserve_sourced=True):
     """Revalue an immutable carried fill/action book, never re-execute trades.
 
@@ -1055,9 +1145,9 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
             paid = sum(float(c["amount_twd"]) for c in claims if c["payment_date"] <= day)
             costs = mode.get("carry_cost_ledger", [])
             charges = sum(float(c["amount_twd"]) for c in costs if c["date"] < day or
-                          (c["date"] == day and c["kind"] != "short_conversion_tax_and_handling"))
+                          (c["date"] == day and not _is_terminal_carry_cost(c)))
             terminal_charges = sum(float(c["amount_twd"]) for c in costs
-                                   if c["date"] == day and c["kind"] == "short_conversion_tax_and_handling")
+                                   if c["date"] == day and _is_terminal_carry_cost(c))
             for minute in _session_minutes(date.fromisoformat(day))[1:]:
                 key, clock = minute.isoformat(timespec="minutes"), minute.isoformat(timespec="seconds")
                 existing = selected.get((market, key))
@@ -1767,10 +1857,49 @@ def main() -> None:
         replay = _read_json(replay_path) if replay_path.exists() else {}
         for session in replay.get("sessions", ()):
             day = str(session.get("session_date") or "")
-            for symbol in (session.get("intraday_replay") or {}).get("official_no_trade_carried_symbols", ()):
-                if day in required.get(symbol, set()):
-                    required[symbol].remove(day)
-                    official_no_trade_pairs.append({"symbol": symbol, "session_date": day})
+            evidence_sets = (
+                (
+                    "intraday_replay",
+                    (session.get("intraday_replay") or {}).get(
+                        "official_no_trade_carried_symbols", ()
+                    ),
+                ),
+                (
+                    "official_close",
+                    (session.get("close") or {}).get(
+                        "official_no_trade_carried_symbols", ()
+                    ),
+                ),
+                (
+                    "official_daily_absence",
+                    (session.get("canonical_open") or {}).get(
+                        "official_no_trade_print_symbols", ()
+                    ),
+                ),
+            )
+            for evidence, symbols in evidence_sets:
+                for symbol in symbols:
+                    if day in required.get(symbol, set()):
+                        required[symbol].remove(day)
+                        official_no_trade_pairs.append(
+                            {
+                                "symbol": symbol,
+                                "session_date": day,
+                                "evidence": evidence,
+                            }
+                        )
+        for (symbol, day), evidence in verified_manual_no_trade_pairs(
+            args.state_dir
+        ).items():
+            if day in required.get(symbol, set()):
+                required[symbol].remove(day)
+                official_no_trade_pairs.append(
+                    {
+                        "symbol": symbol,
+                        "session_date": day,
+                        "evidence": evidence,
+                    }
+                )
         from stockagent.live.tw_share_replacement import halted_symbols
         action_roots = {Path(m["margin_corporate_action_reference_path"]).parent
                         for m in _read_json(args.state_dir / "state.json")["modes"].values()
@@ -1780,7 +1909,13 @@ def main() -> None:
             for symbol in halted:
                 if day in required.get(symbol, set()):
                     required[symbol].remove(day)
-                    official_no_trade_pairs.append({"symbol": symbol, "session_date": day})
+                    official_no_trade_pairs.append(
+                        {
+                            "symbol": symbol,
+                            "session_date": day,
+                            "evidence": "official_halt",
+                        }
+                    )
         required = {symbol: days for symbol, days in required.items() if days}
     store.prepare(required)
     coverage_before = store.coverage(required)

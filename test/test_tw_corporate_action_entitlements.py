@@ -311,6 +311,29 @@ def test_mops_t59_stock_issue_and_delivery_are_independent_exact_receipts() -> N
     assert delivery["delivery_date"] == date(2020, 10, 14)
 
 
+def test_mops_t59_stock_ratio_ignores_sentence_dot_before_share_unit() -> None:
+    key = StockDeliveryDetailKey(
+        market="twse",
+        symbol="4306",
+        roc_year=103,
+        announcement_date=date(2014, 8, 4),
+        sequence=1,
+        subject="盈餘轉增資發行新股公告",
+    )
+    content = """
+    <html>公司代號 4306，計發行新股46,290,088股。
+    普通股增資配股基準日：本公司訂於民國103年08月24日。
+    按配股基準日股東名簿所記載持有股份比例每仟股無償配發99.2436.股。
+    </html>
+    """.encode("utf-8")
+
+    parsed = parse_mops_stock_delivery_detail(content, key=key)
+
+    assert parsed["issue_shares"] == 46_290_088
+    assert parsed["stock_ratio"] == pytest.approx(0.0992436)
+    assert parsed["record_date"] == date(2014, 8, 24)
+
+
 @pytest.mark.parametrize(
     ("cells", "expected_cash", "expected_ex_date", "expected_payment"),
     [

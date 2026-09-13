@@ -19,6 +19,7 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     DEFAULT_LOCAL_MINUTE_ROOTS,
     MinutePriceStore,
     _benchmark_minute_row,
+    _is_terminal_carry_cost,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
     missing_accepted_endpoints,
@@ -26,7 +27,21 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     rebuild_strategy_marks,
     required_symbol_dates,
     validate_existing_strategy_marks,
+    verified_manual_no_trade_pairs,
 )
+
+
+def test_same_day_conversion_reversal_shares_terminal_accounting_clock() -> None:
+    original = {"kind": "short_conversion_tax_and_handling"}
+    reversal = {
+        "kind": "manual_same_day_close_conversion_reversal",
+        "reverses_cost_id": "original",
+    }
+    interest = {"kind": "margin_short_borrow_interest"}
+
+    assert _is_terminal_carry_cost(original) is True
+    assert _is_terminal_carry_cost(reversal) is True
+    assert _is_terminal_carry_cost(interest) is False
 
 
 def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
@@ -233,6 +248,55 @@ def test_existing_mark_validation_does_not_require_preserved_benchmarks() -> Non
     )
 
     assert required == {"2317": {"2026-08-13"}}
+
+
+def test_manual_no_trade_pair_requires_complete_hash_verified_receipt(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    raw = tmp_path / "raw"
+    receipts = state / "settlement_receipts"
+    day_source = raw / "tpex_daily_ohlcv/2026-09-10.json"
+    prior_source = raw / "tpex_daily_ohlcv/2026-09-09.json"
+    receipts.mkdir(parents=True)
+    day_source.parent.mkdir(parents=True)
+    day_source.write_text('{"date":"2026-09-10","rows":[]}', encoding="utf-8")
+    prior_source.write_text('{"date":"2026-09-09","rows":[]}', encoding="utf-8")
+
+    import hashlib
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    receipt = {
+        "status": "applied",
+        "simulation_only": True,
+        "contract": "user_authorized_last_traded_price_paper_settlement_v1",
+        "session_date": "2026-09-10",
+        "raw_root": str(raw),
+        "last_traded_price_for": ["6680"],
+        "sources": [
+            {"path": str(day_source), "sha256": digest(day_source)},
+            {"path": str(prior_source), "sha256": digest(prior_source)},
+        ],
+        "entries": [
+            {
+                "symbol": "6680",
+                "price_basis": "last_available_trade",
+                "price_date": "2026-09-09",
+                "official_date": "2026-09-09",
+                "source_sha256": digest(prior_source),
+            }
+        ],
+    }
+    receipt_path = receipts / "2026-09-10-test.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    assert verified_manual_no_trade_pairs(state) == {
+        ("6680", "2026-09-10"): "manual_last_trade_settlement:2026-09-10-test.json"
+    }
+
+    prior_source.write_text("damaged", encoding="utf-8")
+    assert verified_manual_no_trade_pairs(state) == {}
 
 
 def _write_maintenance_scope(
@@ -562,6 +626,46 @@ def test_fetch_missing_kbars_delegates_only_true_gap_to_canonical_collector(
     assert result["missing_before"] == 1
     assert result["missing_after"] == 0
     assert result["api_requests_started"] == 1
+
+
+def test_fetch_missing_kbars_failure_names_the_remaining_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetched = tmp_path / "fetched"
+    required = {"5314": {"2026-09-11"}}
+    store = MinutePriceStore([tmp_path / "local", fetched], tmp_path / "ticks")
+    store.prepare(required)
+
+    def fake_run(command: list[str], *, cwd: Path, check: bool) -> SimpleNamespace:
+        fetched.mkdir(parents=True, exist_ok=True)
+        (fetched / "download_summary.json").write_text(
+            json.dumps(
+                {
+                    "api_requests_started_this_run": 1,
+                    "stopped_for_traffic": False,
+                    "stopped_for_market_hours": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        "scripts.rebuild_tw_day_trade_minute_curves.subprocess.run", fake_run
+    )
+    with pytest.raises(RuntimeError, match='"symbol": "5314"') as caught:
+        fetch_missing_kbars(
+            store,
+            required,
+            output_root=fetched,
+            simulation=True,
+            workers=1,
+            requests_per_second=5.0,
+            max_traffic_fraction=0.90,
+        )
+
+    assert '"session_date": "2026-09-11"' in str(caught.value)
 
 
 def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(

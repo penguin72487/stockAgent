@@ -19,6 +19,33 @@ from typing import Any, Final
 PUBLIC_MAX_EVENT_ROWS: Final[int] = 250
 PUBLIC_INITIAL_POSITION_ROWS: Final[int] = 100
 PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
+_TAIFEX_HISTORY_ROW_FIELDS: Final[tuple[str, ...]] = (
+    "cumulative_pnl_twd",
+    "decision_ts_ns",
+    "fixed_capital_return",
+    "initial_capital_twd",
+    "cumulative_contributed_capital_twd",
+    "strategy_id",
+    "total_equity_twd",
+    "capital_contribution_count",
+    "recapitalization_count",
+    "bankruptcy_count",
+    "entry_state",
+    "alive",
+    "valuation_carried_forward",
+    "history_source",
+    "replay_id",
+    "replay_contract_version",
+    "history_event",
+)
+_TAIFEX_TWD_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "cumulative_pnl_twd",
+        "initial_capital_twd",
+        "cumulative_contributed_capital_twd",
+        "total_equity_twd",
+    }
+)
 
 
 class UnsafePublicDashboardPayload(ValueError):
@@ -154,52 +181,36 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "downsampled",
         "backfills",
     }
+    # History is the only large field. Project its fixed public contract before
+    # recursive credential scrubbing: scanning every already-allowlisted key
+    # with a regular expression made cold requests CPU-bound. Unexpected nested
+    # values still take the conservative recursive scrub path.
     output = {
         key: _scrub_public_value(value)
         for key, value in payload.items()
-        if key in allowed
+        if key in allowed and key != "history"
     }
-    _project_rows(
-        output,
-        "history",
-        allowed_fields={
-            "cumulative_pnl_twd",
-            "decision_ts_ns",
-            "fixed_capital_return",
-            "initial_capital_twd",
-            "cumulative_contributed_capital_twd",
-            "strategy_id",
-            "total_equity_twd",
-            "capital_contribution_count",
-            "recapitalization_count",
-            "bankruptcy_count",
-            "entry_state",
-            "alive",
-            "valuation_carried_forward",
-            "history_source",
-            "replay_id",
-            "replay_contract_version",
-            "history_event",
-        },
-    )
-    history = output.get("history")
-    if isinstance(history, list):
-        # Public charts render TWD to at most two decimals.  Keep eight decimal
-        # places for the fractional return (sub-basis-point precision after
-        # conversion to percent) while the private ledger remains untouched.
-        for row in history:
-            if not isinstance(row, dict):
+    rows = payload.get("history")
+    if isinstance(rows, list):
+        history: list[dict[str, Any]] = []
+        for source_row in rows:
+            if not isinstance(source_row, Mapping):
                 continue
-            for field in (
-                "cumulative_pnl_twd",
-                "initial_capital_twd",
-                "cumulative_contributed_capital_twd",
-                "total_equity_twd",
-            ):
-                if isinstance(row.get(field), float):
-                    row[field] = round(row[field], 2)
-            if isinstance(row.get("fixed_capital_return"), float):
-                row["fixed_capital_return"] = round(row["fixed_capital_return"], 8)
+            row: dict[str, Any] = {}
+            for field in _TAIFEX_HISTORY_ROW_FIELDS:
+                if field not in source_row:
+                    continue
+                value = source_row[field]
+                if isinstance(value, float):
+                    value = None if not math.isfinite(value) else value
+                    if value is not None:
+                        if field in _TAIFEX_TWD_FIELDS:
+                            value = round(value, 2)
+                        elif field == "fixed_capital_return":
+                            value = round(value, 8)
+                elif isinstance(value, (Mapping, list)):
+                    value = _scrub_public_value(value)
+                row[field] = value
             for optional_field in (
                 "history_source",
                 "replay_id",
@@ -210,6 +221,8 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
                     row.pop(optional_field, None)
             if row.get("history_source") == "live_forward_ledger":
                 row.pop("history_source", None)
+            history.append(row)
+        output["history"] = history
     return output
 
 

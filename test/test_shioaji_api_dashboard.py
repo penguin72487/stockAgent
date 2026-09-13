@@ -718,6 +718,84 @@ def test_minute_pipeline_uses_rolling_target_and_ignores_stale_partial_run(
     assert stock["data_through"] == "2026-08-26"
 
 
+def test_minute_pipeline_separates_latest_date_from_masked_source_gaps(
+    tmp_path: Path,
+) -> None:
+    minute_summary = tmp_path / "download_summary.json"
+    target = tmp_path / "target.txt"
+    minute_manifest = tmp_path / "research_manifest.json"
+    minute_audit = tmp_path / "full_audit.json"
+    minute_summary.write_text(
+        json.dumps(
+            {
+                "selected_symbols": 2754,
+                "reported_symbols": 2754,
+                "end_date": "2026-09-11",
+                "resumable_collection_complete": True,
+                "selected_coverage_complete": False,
+                "stopped_for_traffic": False,
+                "stopped_for_market_hours": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    target.write_text("2026-09-11\n", encoding="utf-8")
+    minute_manifest.write_text(
+        json.dumps({"research_ready": True, "full_market_selected_symbols": 2754}),
+        encoding="utf-8",
+    )
+    minute_audit.write_text(
+        json.dumps(
+            {
+                "status": "research_ready",
+                "last_date": "2026-09-11",
+                "available_source_symbols": 2627,
+                "source_gap_symbols": 89,
+                "contract_unavailable_symbols": 127,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(args):
+        command = list(args)
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 9, 13, 0, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=missing,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=missing,
+            capture_root=missing,
+            minute_summary=minute_summary,
+            minute_manifest=minute_manifest,
+            minute_audit=minute_audit,
+            minute_target_end_date=target,
+        ),
+    )
+
+    stock = next(item for item in payload["pipelines"] if item["id"] == "stock_minute")
+    research = next(
+        item for item in payload["pipelines"] if item["id"] == "minute_research"
+    )
+    assert stock["status"] == "partial"
+    assert stock["status_label"] == "已追到最新交易日；來源缺口已遮罩"
+    assert stock["eta"]["state"] == "source_gaps"
+    assert research["status"] == "partial"
+    assert research["status_label"] == "研究稽核已追到最新；來源缺口已遮罩"
+    assert research["eta"]["state"] == "source_gaps"
+
+
 def test_minute_research_coverage_does_not_use_incremental_run_denominator(
     tmp_path: Path,
 ) -> None:

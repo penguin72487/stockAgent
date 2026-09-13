@@ -872,8 +872,12 @@ async function refreshHistory({preferCache = false} = {}) {
       signal: request.signal,
     });
     const etag = response.headers.get("ETag") || "";
-    if (!request.isCurrent() || requestedRange !== selectedTimeRange) return;
+    if (!request.isCurrent() || requestedRange !== selectedTimeRange) {
+      Dashboard.cancelResponse(response);
+      return;
+    }
     if (etag && cached?.etag === etag) {
+      Dashboard.cancelResponse(response);
       cached.receivedAt = Date.now();
       return;
     }

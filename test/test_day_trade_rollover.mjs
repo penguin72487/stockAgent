@@ -70,7 +70,7 @@ test("08:30 timer uses server clock, fresh revisions advance a stale timer", () 
   assert.equal(timers.size, 1);
 });
 
-test("a never-finishing history cannot delay signals, positions, or events", async () => {
+test("a never-finishing history cannot delay core details and events stay deferred", async () => {
   const {context, run, data} = harness();
   const started = [];
   Object.assign(context, {
@@ -84,6 +84,13 @@ test("a never-finishing history cannot delay signals, positions, or events", asy
   });
   run(app.slice(app.indexOf("async function refresh({"), app.indexOf("function activateTwPublicMonitor()")));
   await run("refresh()");
-  assert.deepEqual(started, ["signals", "positions", "events", "history"]);
+  assert.deepEqual(started, ["signals", "positions", "history"]);
   assert.equal(run("refreshInFlight"), false);
+
+  run("eventViewActivated = true");
+  await run("refresh({force: true})");
+  assert.deepEqual(started, [
+    "signals", "positions", "history",
+    "signals", "positions", "events", "history",
+  ]);
 });

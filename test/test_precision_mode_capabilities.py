@@ -72,7 +72,11 @@ def test_precision_benchmark_uses_native_low_bit_backends_only() -> None:
 
 @pytest.mark.skipif(not _cuda_supports_nvfp4(), reason="NVFP4 execution requires CUDA compute capability 10.0+")
 def test_nvfp4_adapter_pads_project_linear_shapes_without_fallback() -> None:
-    pytest.importorskip("transformer_engine")
+    if precision_benchmark.te is None:
+        pytest.skip(
+            "Transformer Engine PyTorch backend unavailable: "
+            f"{precision_benchmark.TRANSFORMER_ENGINE_IMPORT_ERROR}"
+        )
     device = torch.device("cuda")
     plan = precision_plan("fp4")
 

@@ -104,6 +104,111 @@ def test_history_server_returns_verified_stale_curve_while_refreshing(
         server.server_close()
 
 
+def test_history_server_restores_bounded_projected_disk_cache_before_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_dir = tmp_path / "cache"
+    snapshot = {
+        "dashboard_schema_version": 7,
+        "generated_at_utc": "2026-08-17T00:00:00+00:00",
+        "source_updated_at_utc": "2026-08-17T00:00:00+00:00",
+        "range": "1h",
+        "range_seconds": 3600,
+        "anchor_at_utc": "2026-08-17T00:00:00+00:00",
+        "coverage_start_utc": "2026-08-16T23:00:00+00:00",
+        "coverage_end_utc": "2026-08-17T00:00:00+00:00",
+        "downsampled": False,
+        "backfills": [],
+        "history": [
+            {
+                "strategy_id": "fixture",
+                "decision_ts_ns": 1,
+                "fixed_capital_return": 0.1,
+                "private": "must-not-survive",
+            }
+        ],
+        "record_counts": {"history_rows_returned": 1},
+        "private": "must-not-survive",
+    }
+    seed = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0),
+        state_dir=tmp_path,
+        api_receipt_dir=tmp_path,
+        static_root=tmp_path,
+        mark_limit_per_strategy=10,
+        history_cache_dir=cache_dir,
+    )
+    try:
+        seed._persist_history(range_key="1h", snapshot=snapshot)
+    finally:
+        seed.server_close()
+
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    refreshed = {**snapshot, "generated_at_utc": "2026-08-17T00:01:00+00:00"}
+
+    def rebuild(**_kwargs: object) -> dict[str, object]:
+        refresh_started.set()
+        assert release_refresh.wait(timeout=2.0)
+        return refreshed
+
+    monkeypatch.setattr(
+        dashboard_server, "build_dashboard_history_snapshot", rebuild
+    )
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0),
+        state_dir=tmp_path,
+        api_receipt_dir=tmp_path,
+        static_root=tmp_path,
+        mark_limit_per_strategy=10,
+        history_cache_dir=cache_dir,
+    )
+    try:
+        started = time.perf_counter()
+        restored = server.history_snapshot(range_key="1h")
+        assert time.perf_counter() - started < 0.2
+        assert restored["history"] == [
+            {
+                "strategy_id": "fixture",
+                "decision_ts_ns": 1,
+                "fixed_capital_return": 0.1,
+            }
+        ]
+        assert "private" not in restored
+        assert refresh_started.wait(timeout=1.0)
+        release_refresh.set()
+        deadline = time.monotonic() + 1.0
+        while server._history_cache["1h"][1]["generated_at_utc"] != (
+            "2026-08-17T00:01:00+00:00"
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        release_refresh.set()
+        server.server_close()
+
+
+def test_history_server_memory_cache_is_lru_bounded(tmp_path: Path) -> None:
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0),
+        state_dir=tmp_path,
+        api_receipt_dir=tmp_path,
+        static_root=tmp_path,
+        mark_limit_per_strategy=10,
+    )
+    try:
+        for index, range_key in enumerate(("1h", "1d", "1w", "1mo")):
+            server._remember_history(
+                range_key=range_key,
+                snapshot={"range": range_key},
+                observed_at=float(index),
+            )
+        assert list(server._history_cache) == ["1d", "1w", "1mo"]
+        assert len(server._history_cache) == dashboard_server.HISTORY_MEMORY_CACHE_ENTRIES
+    finally:
+        server.server_close()
+
+
 def test_direct_history_projection_omits_default_and_null_fields() -> None:
     assert dashboard_server._display_history_row(
         {
@@ -935,6 +1040,67 @@ def test_native_cold_daily_endpoints_match_incremental_canonical_reader(
     assert native == canonical
 
 
+def test_taifex_durable_indexes_survive_process_cache_loss_and_extend_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_TAIFEX_DASHBOARD_CACHE_DIR", str(cache_dir))
+    mark_path = state_dir / "marks.jsonl"
+    strategy_ids = (
+        "classic_opening_straddle",
+        "daily_vol_model_gamma__black_scholes",
+    )
+
+    expected_count = taifex_dashboard._line_count(mark_path)
+    expected_endpoints = taifex_dashboard._daily_pnl_endpoints(
+        mark_path,
+        strategy_ids=strategy_ids,
+    )
+    assert list(cache_dir.glob("ledger-line-count-v1-*.json"))
+    assert list(cache_dir.glob("daily-pnl-endpoints-v1-*.json"))
+
+    taifex_dashboard._LINE_COUNT_CACHE.pop(mark_path.resolve(), None)
+    taifex_dashboard._PERFORMANCE_CACHE.pop(mark_path.resolve(), None)
+
+    def fail_cold_scan(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("an unchanged canonical ledger must use its durable index")
+
+    monkeypatch.setattr(
+        taifex_dashboard,
+        "_cold_daily_pnl_endpoints_polars",
+        fail_cold_scan,
+    )
+    assert taifex_dashboard._line_count(mark_path) == expected_count
+    assert taifex_dashboard._daily_pnl_endpoints(
+        mark_path,
+        strategy_ids=strategy_ids,
+    ) == expected_endpoints
+
+    last = json.loads(mark_path.read_text(encoding="utf-8").splitlines()[-1])
+    last.update(
+        decision_ts_ns=int(last["decision_ts_ns"]) + 60_000_000_000,
+        cumulative_pnl_twd=321.0,
+        valuation_available=True,
+    )
+    with mark_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(last) + "\n")
+    taifex_dashboard._LINE_COUNT_CACHE.pop(mark_path.resolve(), None)
+    taifex_dashboard._PERFORMANCE_CACHE.pop(mark_path.resolve(), None)
+    assert taifex_dashboard._line_count(mark_path) == expected_count + 1
+    extended = taifex_dashboard._daily_pnl_endpoints(
+        mark_path,
+        strategy_ids=strategy_ids,
+    )
+    trading_date = taifex_dashboard._trading_date_from_ns(last["decision_ts_ns"])
+    assert trading_date is not None
+    assert extended[last["strategy_id"]][trading_date][1] == 321.0
+
+
 def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "taifex_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
@@ -999,7 +1165,7 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=14"' in html
     assert 'src="../time-axis.js?v=4"' in html
-    assert 'src="app.js?v=23"' in html
+    assert 'src="app.js?v=24"' in html
     assert "collapseEmptyIntervals: true" in javascript
     assert "全策略皆無資料的區段已略過、不補 0" in javascript
     assert 'id="equity-time-range"' in html

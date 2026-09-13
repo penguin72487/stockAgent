@@ -1902,6 +1902,38 @@ def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
     )
 
 
+def test_operational_issues_expose_intraday_residual_but_not_overnight_inventory() -> None:
+    modes = [
+        {
+            "market": "tw_day_trade_100m",
+            "label": "當沖",
+            "engine_status": "margin_carried_waiting_next_signal",
+            "open_position_count": 1,
+            "stale_position_count": 1,
+            "force_exit_failures": 1,
+            "last_mark_at": _now(13, 30).isoformat(),
+        },
+        {
+            "market": "tw_overnight_100m",
+            "label": "隔日沖",
+            "engine_status": "waiting_next_open",
+            "open_position_count": 1,
+        },
+    ]
+
+    issues = dashboard_module._operational_issues(
+        modes=modes,
+        preopen={},
+        observed=_now(13, 31),
+    )
+
+    residuals = [row for row in issues if row["code"] == "intraday_residual_open"]
+    assert len(residuals) == 1
+    assert residuals[0]["market"] == "tw_day_trade_100m"
+    assert residuals[0]["severity"] == "error"
+    assert "強制退出失敗 1 次" in residuals[0]["detail"]
+
+
 def test_entry_sizes_at_open_and_caps_fill_at_half_minute_kbar(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -4032,6 +4064,87 @@ def test_dashboard_history_cache_ignores_appends_after_an_old_selected_day(
     assert second == first
 
 
+def test_dashboard_history_memory_cache_can_be_disabled_for_gateway(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "marks.jsonl").write_text(
+        json.dumps(
+            {
+                "market": "tw_day_trade",
+                "minute": "2026-08-13T09:01+08:00",
+                "initial_capital_twd": 100.0,
+                "total_equity_twd": 101.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with dashboard_module._HISTORY_SNAPSHOT_CACHE_LOCK:
+        dashboard_module._HISTORY_SNAPSHOT_CACHE.clear()
+    try:
+        payload = build_dashboard_history_snapshot(
+            state_dir=root,
+            range_key="all",
+            resolution="1m",
+            use_memory_cache=False,
+        )
+        assert payload["returned_points"] == 1
+        with dashboard_module._HISTORY_SNAPSHOT_CACHE_LOCK:
+            assert dashboard_module._HISTORY_SNAPSHOT_CACHE == {}
+    finally:
+        with dashboard_module._HISTORY_SNAPSHOT_CACHE_LOCK:
+            dashboard_module._HISTORY_SNAPSHOT_CACHE.clear()
+
+
+def test_lossless_history_projection_survives_process_memory_cache_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache_dir))
+    (root / "marks.jsonl").write_text(
+        json.dumps(
+            {
+                "market": "tw_day_trade",
+                "session_date": "2026-08-13",
+                "minute": "2026-08-13T09:01+08:00",
+                "initial_capital_twd": 100.0,
+                "total_equity_twd": 101.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        resolution="1m",
+        use_memory_cache=False,
+    )
+    assert first["returned_points"] == 1
+    assert list(cache_dir.glob("history-projection-all-1m-v1-*.json.gz"))
+
+    with dashboard_module._HISTORY_SNAPSHOT_CACHE_LOCK:
+        dashboard_module._HISTORY_SNAPSHOT_CACHE.clear()
+
+    def fail_raw_scan(_path: Path) -> object:
+        raise AssertionError("an unchanged canonical projection must be restored")
+
+    monkeypatch.setattr(dashboard_module, "_all_json_objects", fail_raw_scan)
+    restored = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        resolution="1m",
+        use_memory_cache=False,
+    )
+    assert restored == first
+
+
 def test_dashboard_history_keeps_leveraged_reference_below_zero(
     tmp_path: Path,
 ) -> None:
@@ -4750,15 +4863,26 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "installTwPublicMonitorActivation()" in javascript
     assert "void loadChartHistory({preferCache: !force});" in javascript
     assert "if (shouldReloadSignals) void loadSignals({force});" in javascript
-    assert "if (shouldReloadEvents) void loadEvents({force});" in javascript
-    assert 'src="app.js?v=76"' in html
+    assert (
+        "if (shouldReloadEvents && eventViewActivated) void loadEvents({force});"
+        in javascript
+    )
+    assert "function installEventViewActivation()" in javascript
+    assert 'src="app.js?v=80"' in html
+    assert "decodedMinuteHistory" not in javascript
+    assert "function decodeChartHistory(payload)" in javascript
+    assert "minute_series: _encodedColumns" in javascript
+    assert "function matchesMode(" not in javascript
+    assert "function matchesSymbol(" not in javascript
+    assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
     assert 'src="presentation.js?v=1"' in html
     assert 'src="detail-components.js?v=5"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript
     assert "historyRows || data.benchmark_marks" not in javascript
-    assert 'href="styles.css?v=22"' in html
+    assert 'href="styles.css?v=24"' in html
+    assert 'class="compact-table event-table"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript

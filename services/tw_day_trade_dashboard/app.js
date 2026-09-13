@@ -33,7 +33,6 @@ const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 3;
 const DATE_FILTER_DEBOUNCE_MS = 180;
 let snapshot = null;
 let chartHistory = null;
-const decodedMinuteHistory = new WeakMap();
 let renderedChartHistory = null;
 let renderedChartKey = "";
 let hiddenEquitySeries = new Set();
@@ -84,6 +83,7 @@ let eventLoadError = "";
 let eventRequestSequence = 0;
 let eventRequestRevisionInFlight = "";
 let eventAbortController = null;
+let eventViewActivated = false;
 let positionRows = [];
 let positionTotal = 0;
 let positionHasMore = false;
@@ -535,11 +535,6 @@ function rangeSummaryFor(seriesId) {
   if (!chartHistoryMatchesSelection()) return null;
   return (chartHistory.range_summary || []).find((row) => row.series_id === seriesId) || null;
 }
-function matchesMode(row) { return selectedMode() === "all" || row.market === selectedMode(); }
-function matchesSymbol(row) {
-  const q = textFilter();
-  return !q || String(row.symbol || "").toLowerCase().includes(q) || String(row.name || "").toLowerCase().includes(q);
-}
 function compareByAbsoluteWeight(a, b) {
   const aWeight = Number(a.target_weight);
   const bWeight = Number(b.target_weight);
@@ -781,7 +776,11 @@ function renderHeader(data) {
     const signature = messages.join("|");
     alert.classList.remove("hidden");
     if (alert.dataset.signature !== signature) {
-      setHtml(alert, `<strong>需要注意</strong>${messages.map((message) => `<span>${esc(message)}</span>`).join("")}`);
+      const [primaryMessage, ...remainingMessages] = messages;
+      const remaining = remainingMessages.length
+        ? `<details><summary>查看其餘 ${number(remainingMessages.length)} 項完整說明</summary><div>${remainingMessages.map((message) => `<span>${esc(message)}</span>`).join("")}</div></details>`
+        : "";
+      setHtml(alert, `<strong>需要注意 · ${number(messages.length)} 項</strong><span>${esc(primaryMessage)}</span>${remaining}`);
       alert.dataset.signature = signature;
     }
   } else {
@@ -1411,6 +1410,7 @@ async function loadTwPublicMonitorWithFallback(controller) {
         signal: controller.signal,
       });
       if (!response.ok) {
+        Dashboard.cancelResponse(response);
         failures.push(`${candidate}: HTTP ${response.status}`);
         continue;
       }
@@ -1595,12 +1595,12 @@ function renderChart(data) {
   renderedChartKey = renderKey;
 }
 
-function applyChartHistory(payload) {
-  const encoded = payload;
-  if (decodedMinuteHistory.has(encoded)) payload = decodedMinuteHistory.get(encoded);
-  else if (payload.history_encoding === "minute_columns_v1") {
-    payload = {...payload, history: (payload.minute_series || []).flatMap((series) => (
-      series.points.map(([minute, periodReturn, cumulativeReturn, quality]) => ({
+function decodeChartHistory(payload) {
+  if (payload.history_encoding !== "minute_columns_v1") return payload;
+  const history = [];
+  for (const series of payload.minute_series || []) {
+    for (const [minute, periodReturn, cumulativeReturn, quality] of series.points) {
+      history.push({
         series_id: series.series_id,
         series_type: series.series_type,
         market: series.series_type === "strategy" ? series.series_id : null,
@@ -1611,10 +1611,14 @@ function applyChartHistory(payload) {
         valuation_stale: Boolean(quality & 1),
         historical_minute_replay: Boolean(quality & 2),
         missing_price_position_count: quality & 4 ? 1 : 0,
-      }))
-    ))};
-    decodedMinuteHistory.set(encoded, payload);
+      });
+    }
   }
+  const {minute_series: _encodedColumns, ...metadata} = payload;
+  return {...metadata, history};
+}
+
+function applyChartHistory(payload) {
   chartHistory = payload;
   historyLoadError = "";
   if (snapshot) {
@@ -1654,15 +1658,16 @@ async function loadChartHistory({preferCache = false} = {}) {
     if (requestedStart) params.set("start_date", requestedStart);
     if (requestedEnd) params.set("end_date", requestedEnd);
     const response = await fetchMinuteHistory(`api/history?${params.toString()}`, {cache:"default", signal: controller.signal});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) { Dashboard.cancelResponse(response); throw new Error(`HTTP ${response.status}`); }
     const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== historyRequestSequence) return;
     if (requestedKey !== chartRequestKey()) return;
     if (!chartHistoryCache.has(requestedKey) && chartHistoryCache.size >= HISTORY_CLIENT_CACHE_MAX_ENTRIES) {
       chartHistoryCache.delete(chartHistoryCache.keys().next().value);
     }
-    chartHistoryCache.set(requestedKey, {payload, receivedAt: Date.now()});
-    applyChartHistory(payload);
+    const decoded = decodeChartHistory(payload);
+    chartHistoryCache.set(requestedKey, {payload: decoded, receivedAt: Date.now()});
+    applyChartHistory(decoded);
   } catch (error) {
     if (sequence !== historyRequestSequence || error?.name === "AbortError") return;
     historyLoadError = `歷史載入失敗：${error}`;
@@ -1772,7 +1777,10 @@ function renderEvents() {
     id: "event", rows: eventRows, total: eventTotal, loading: eventLoading,
     hasMore: eventHasMore, error: eventLoadError,
     countDetail: `（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）`,
-    renderRow: detailComponents.eventRow, emptyText: "尚無委託／成交事件",
+    renderRow: detailComponents.eventRow,
+    emptyText: eventViewActivated
+      ? "尚無委託／成交事件"
+      : "捲動到本區時載入完整委託與成交事件。",
   });
 }
 
@@ -2094,7 +2102,7 @@ async function refresh({force = false} = {}) {
     // neither a cold historical signal query nor a curve may gate the other.
     if (shouldReloadSignals) void loadSignals({force});
     if (shouldReloadPositions) void loadPositions({force});
-    if (shouldReloadEvents) void loadEvents({force});
+    if (shouldReloadEvents && eventViewActivated) void loadEvents({force});
     void loadChartHistory({preferCache: !force});
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
@@ -2135,6 +2143,31 @@ function installTwPublicMonitorActivation() {
     ? (callback) => window.requestIdleCallback(callback, {timeout: 2500})
     : (callback) => window.setTimeout(callback, 1500);
   defer(activateTwPublicMonitor);
+}
+
+function activateEventView() {
+  if (eventViewActivated) return;
+  eventViewActivated = true;
+  renderEvents();
+  if (snapshot) void loadEvents();
+}
+
+function installEventViewActivation() {
+  const target = $("event-body")?.closest("section");
+  if (!target) return;
+  if (typeof IntersectionObserver === "function") {
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      activateEventView();
+    }, {rootMargin: "600px 0px"});
+    observer.observe(target);
+    return;
+  }
+  const defer = window.requestIdleCallback
+    ? (callback) => window.requestIdleCallback(callback, {timeout: 3000})
+    : (callback) => window.setTimeout(callback, 1200);
+  defer(activateEventView);
 }
 
 function acceptServiceRevision(serviceSync) {
@@ -2179,12 +2212,12 @@ function filtersChanged({debounceSignals = false, includeChart = false, reloadEv
   if (debounceSignals) signalFilterTimer = window.setTimeout(() => {
     void loadPositions();
     void loadSignals();
-    if (reloadEvents) void loadEvents();
+    if (reloadEvents && eventViewActivated) void loadEvents();
   }, 80);
   else {
     void loadPositions();
     void loadSignals();
-    if (reloadEvents) void loadEvents();
+    if (reloadEvents && eventViewActivated) void loadEvents();
   }
 }
 
@@ -2267,10 +2300,14 @@ $("chart-legend").addEventListener("click", (event) => {
   try { localStorage.setItem(HIDDEN_EQUITY_SERIES_STORAGE_KEY, JSON.stringify([...hiddenEquitySeries])); } catch (_error) { /* optional */ }
   if (snapshot) renderChart(snapshot);
 });
-setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
+function updateClock() {
+  $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
+}
+Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});
 Dashboard.scheduleRefresh(() => {
   void refresh();
 }, {intervalMs: PRICE_REFRESH_MS});
 Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, refreshServiceRevision, {fallbackMs: SERVICE_REVISION_REFRESH_MS});
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
 installTwPublicMonitorActivation();
+installEventViewActivation();
