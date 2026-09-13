@@ -116,16 +116,34 @@ D 保留標準 packed 格式，不需要原 C 的 SQLite、node ID 或 Syncthing
 C 完全故障時應先保存 D，於重建環境中用上述唯讀驗證／人工還原，不要 `init` D 為
 另一個 Syncthing publisher，也不要用 `rsync --delete` 重建或清理備份。
 
+### 與 C 槽 rolling-current 的關係
+
+D 是 additive historical archive；C 是 Syncthing 快速 current replica。penguin 的
+`stockagent-packed-retention` 只有在 D 已有候選物件的有效 SHA-256 readback receipt、
+所有 current heads 完整、所有 fleet peers 收斂且本機沒有使用中引用時，才會移除 C 上
+已超過安全窗的歷史 manifest 與無引用物件。它永遠不對 D 執行刪除，也不把 D 加入
+Syncthing。
+
+```bash
+./scripts/run_packed_retention.sh plan    # 唯讀候選與安全門檻
+./scripts/run_packed_retention.sh status  # 最近 plan/apply receipt
+```
+
+所以 `run_packed_backup.sh once` 的 C 來源總 bytes 之後可能下降；這不是 D 遺失資料。
+D 的舊 release 仍可依上面的 `verify`／`fetch` 流程還原。若 retention 報
+`D archive proof incomplete`，先讓 backup 補齊或執行 checksum 複查，不可繞過門檻。
+
 ## 驗收與限制
 
-測試：`source scripts/runtime_env.sh && run_fintech_python -m pytest -q test/test_packed_backup.py test/test_packed_snapshots.py`。
+測試：`source scripts/runtime_env.sh && run_fintech_python -m pytest -q test/test_packed_backup.py test/test_packed_snapshots.py test/test_packed_retention.py`。
 包含標準還原、只增不刪、head 等候物件、歷史缺物件、校驗失敗、續傳、掛載／容量
 防護與原子接收事件。實機另應確認進度持續增加，並抽一個已完成的 release 做獨立
 `verify`；首次全量完成前只報告實際進度，不宣稱 C/D 已有兩份完整資料。
 
 兩顆磁碟仍在同一台主機且持續可寫，不能抵禦整機災害、失竊或勒索軟體；這一份是
-本機磁碟故障／來源誤刪復原層，不替代離線或異地備份。保留舊資料使 D 用量可能
-大於 C；空間需要清理時必須另訂使用者核准的保留政策，禁止偷偷鏡像刪除。
+本機磁碟故障／來源誤刪復原層，不替代離線或異地備份。保留舊資料使 D 用量預期大於
+C。D 的刪除仍未獲授權；rolling-current 的使用者核准只涵蓋已由本工具證明可從 D 恢復
+的 C 槽候選，禁止把同一政策擴張成 D 鏡像刪除。
 
 ### 2026-09-10 初次部署觀察（非永久數字）
 

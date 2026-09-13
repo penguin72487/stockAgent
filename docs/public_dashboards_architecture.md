@@ -111,6 +111,14 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
   變動時才計算 digest；讀取前後核對 descriptor 與 pathname，避免原子替換競態。
   這是本機 Linux 檔案變動偵測，不是冷庫完整性證明，也不承諾任意遠端檔案系統語意。
 - 完整分鐘曲線在同一份投影內共用時間轉換，沿用已排序順序；不刪分鐘、不改報酬或品質旗標。
+- `benchmark_history.json` 保留 canonical 相容來源；其重建器同步發布
+  `benchmark_history_projection/v1/{head.json,delta.jsonl,shards/...}`。日分片不可變且以內容 hash
+  定址，head 原子切換，delta 只追加實際改變的 session。dashboard 必須逐 shard 驗證 schema、日期、
+  筆數、路徑與 SHA-256；companion 缺漏或不符時回退 canonical JSON，不得把快取當真值。
+- all-history final projection 失效時，`history-session-projection-v2` 以策略/live ledger session span
+  digest、benchmark session digest、origin、product 與 schema 組合 fingerprint。未變日直接合併；少量
+  變更只重建該日，超過安全界線則完整重建。任何快路徑輸出都須和 full-source control 點數及 hash
+  相同。
 - gateway 的 history 回應快取已保存序列化本文與 gzip 表示，因此公開 history 建置不得再把
   同一份大型 decoded Python object 留在 builder cache。直接使用 builder 的私有服務仍可選擇
   程序內物件快取；兩層責任不能同時保留同一份完整歷史。
@@ -135,6 +143,21 @@ first/new-session/warm-reuse、吞吐、JSON 正確性、隔離 SSE、可選原�
 以及 `scripts/audit_public_dashboards_browser.mjs`（八頁、Resource Timing、long tasks、
 更新按鈕、無重載、截圖、API／版面錯誤）。測速工具遇錯仍留 receipt，HTTP／瀏覽器驗收失敗
 回傳非零。HTTP timeout 是 connect/read inactivity timeout，不是單次完整下載的硬期限。
+
+history profiler 的兩個 source 邊界不得混稱：
+
+```bash
+# final cache 失效，但允許驗證過的 immutable session projections
+run_fintech_python scripts/benchmark_dashboard_latency.py \
+  --profile-history artifacts/live/tw_day_trade_simulation \
+  --profile-history-source-rebuild
+
+# 同時 bypass session projections，保留真正完整 canonical scan control
+run_fintech_python scripts/benchmark_dashboard_latency.py \
+  --profile-history artifacts/live/tw_day_trade_simulation \
+  --profile-history-source-rebuild \
+  --profile-history-full-source-rebuild
+```
 
 數值、證據限制與可直接重跑的命令見
 [`WEB_PROJECT_REVIEW_2026-09-12.md`](WEB_PROJECT_REVIEW_2026-09-12.md)。
@@ -174,8 +197,9 @@ first/new-session/warm-reuse、吞吐、JSON 正確性、隔離 SSE、可選原�
 
 快取只改善重複投影與傳輸，不能改變資料真值。快取鍵必須包含所有會影響輸出的日期、範圍、篩選、分頁與來源 revision。
 
-當沖曲線預設前端選用 `resolution=1m`，以 `minute_columns_v1` 數字欄位傳輸全部分鐘，
-不得把長區間的抽樣點稱為完整分鐘。日期區間、期間歸零基準與完整點數須一起驗證；
+當沖曲線預設前端選用 `resolution=1m&encoding=v2`，以一份共同 minute axis、每序列 indexes 與平行
+數值／品質欄傳輸全部分鐘；`minute_columns_v1` 僅保留相容。不得把長區間的抽樣點稱為完整分鐘。
+日期區間、期間歸零基準與完整點數須一起驗證；
 大範圍極值計算不得使用 `Math.min(...points)` 等有參數數量上限的做法。
 已回補的 `benchmark_history.json` 同分鐘優先於舊 `benchmark_marks.jsonl`，
 即時帳本只能補尚未回補的分鐘，避免歷史 Close 與 Bid/Ask 因讀檔順序混接。

@@ -32,7 +32,7 @@ DEFAULT_PATHS = (
     *tuple(path for prefix in ("tw-day-trade", "tw-overnight") for path in (
         f"/{prefix}/", f"/{prefix}/api/revision", f"/{prefix}/api/status",
         f"/{prefix}/api/signals?limit=100", f"/{prefix}/api/positions?limit=100",
-        f"/{prefix}/api/events?limit=100", f"/{prefix}/api/history?range=all&resolution=1m",
+        f"/{prefix}/api/events?limit=100", f"/{prefix}/api/history?range=all&resolution=1m&encoding=v2",
         f"/{prefix}/api/public-data-status",
     )),
     "/shioaji/", "/shioaji/api/status", "/openbb/", "/openbb/api/status",
@@ -143,32 +143,68 @@ def measure_http(base_url, paths, *, repeats, concurrency, timeout):
     return rows
 
 
-def profile_history(state_dir, repeats):
+def profile_history(
+    state_dir, repeats, *, source_rebuild=False, full_source_rebuild=False
+):
     """Profile the canonical builder in this fresh CLI process, not the service.
 
-    This does not flush OS or persisted indexes and is not a disk-cold test.
-    Checksums are outside the measured build and prove equality only if source
-    metadata remained stable. Existing canonical cache persistence may occur.
+    ``source_rebuild`` bypasses the final combined projection while retaining
+    verified immutable session projections. ``full_source_rebuild`` also
+    bypasses those shards and measures the complete canonical scan. Neither
+    mode flushes the OS page cache or compact helper indexes.
     """
     from stockagent.live.dashboard_updates import file_signature, metadata_signature
-    from stockagent.live.tw_day_trade_dashboard import build_dashboard_history_snapshot
+    from stockagent.live.tw_day_trade_dashboard import (
+        OVERNIGHT_HISTORY_FILENAME,
+        build_dashboard_history_snapshot,
+    )
 
     root = state_dir.resolve(strict=True)
+    source_names = {
+        "marks.jsonl",
+        "benchmark_history.json",
+        "benchmark_marks.jsonl",
+        OVERNIGHT_HISTORY_FILENAME,
+    }
+
     def inventory():
-        return {p.name: metadata_signature(p.stat()) for p in sorted(root.iterdir())
-                if p.is_file() and p.suffix in {".json", ".jsonl", ".parquet"}}
+        # Stability must cover the builder's inputs, not unrelated live status,
+        # latency, order or fill receipts that legitimately change in parallel.
+        result = {}
+        for name in sorted(source_names):
+            path = root / name
+            try:
+                result[name] = metadata_signature(path.stat())
+            except FileNotFoundError:
+                continue
+        try:
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            result["state.product"] = str(state.get("product") or "tw_day_trade")
+        except (OSError, ValueError, AttributeError):
+            result["state.product"] = "invalid"
+        return result
     before = inventory()
     samples = []
     for _ in range(repeats):
         started = time.perf_counter()
-        payload = build_dashboard_history_snapshot(state_dir=root, range_key="all", resolution="1m")
+        build_options = dict(
+            state_dir=root,
+            range_key="all",
+            resolution="1m",
+            history_encoding="minute_columns_v2",
+            use_memory_cache=not source_rebuild,
+            use_persistent_cache=not source_rebuild,
+        )
+        if full_source_rebuild:
+            build_options["use_session_projection"] = False
+        payload = build_dashboard_history_snapshot(**build_options)
         elapsed = (time.perf_counter() - started) * 1000
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         samples.append({"build_ms": elapsed, "sha256": hashlib.sha256(body).hexdigest(),
                         "decoded_bytes": len(body), "point_count": payload.get("returned_points"),
                         "series_count": len(payload.get("minute_series", []))})
     signature_samples = []
-    for name in before:
+    for name in sorted(source_names & before.keys()):
         path = root / name
         size = path.stat().st_size
         if size > 16 * 1024 * 1024:
@@ -185,7 +221,20 @@ def profile_history(state_dir, repeats):
         signature_samples.append({"file": name, "bytes": size,
                                   "first_ms": first_ms, "hot": summarize(timings)})
     stable = before == inventory()
-    return {"boundary": "fresh CLI process; OS/persisted cache may be warm; no production cache flush",
+    boundary = (
+        "fresh CLI process; final projection and immutable session projection "
+        "bypassed; OS page cache and helper indexes may be warm"
+        if full_source_rebuild
+        else "fresh CLI process; final memory/persisted projection bypassed; "
+        "verified immutable session projection enabled; OS page cache and helper "
+        "indexes may be warm"
+        if source_rebuild
+        else "fresh CLI process; OS/persisted cache may be warm; no production cache flush"
+    )
+    return {"boundary": boundary,
+            "source_rebuild": bool(source_rebuild),
+            "full_source_rebuild": bool(full_source_rebuild),
+            "session_projection_enabled": not full_source_rebuild,
             "state_dir": str(root), "source_stable": stable, "samples": samples,
             "outputs_identical": len({s["sha256"] for s in samples}) == 1,
             "signature": signature_samples}
@@ -248,9 +297,32 @@ def main():
     parser.add_argument("--path", action="append", help="Repeat to select routes; default covers all eight pages")
     parser.add_argument("--skip-notification", action="store_true")
     parser.add_argument("--profile-history", type=Path, help="Optional canonical state directory; profile all-minute history locally, no service restart")
+    parser.add_argument(
+        "--profile-history-source-rebuild",
+        action="store_true",
+        help=(
+            "With --profile-history, bypass the final memory/persisted projection; "
+            "does not flush OS cache or helper indexes"
+        ),
+    )
+    parser.add_argument(
+        "--profile-history-full-source-rebuild",
+        action="store_true",
+        help=(
+            "With --profile-history-source-rebuild, also bypass immutable session "
+            "projections to retain an honest complete-scan baseline"
+        ),
+    )
     parser.add_argument("--compare", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.profile_history_source_rebuild and not args.profile_history:
+        parser.error("--profile-history-source-rebuild requires --profile-history")
+    if args.profile_history_full_source_rebuild and not args.profile_history_source_rebuild:
+        parser.error(
+            "--profile-history-full-source-rebuild requires "
+            "--profile-history-source-rebuild"
+        )
     if not 1 <= args.repeats <= 1000:
         parser.error("repeats must be 1..1000")
     if not 1 <= args.concurrency <= 32 or not 0 < args.timeout <= 60:
@@ -273,7 +345,14 @@ def main():
                           "SSE benchmark uses isolated synthetic receipts, not trading or broker latency"],
               "notification": None if args.skip_notification else capture_measurement(lambda: isolated_notification(args.repeats))}
     if args.profile_history:
-        result["local_history"] = capture_measurement(lambda: profile_history(args.profile_history, min(args.repeats, 3)))
+        result["local_history"] = capture_measurement(
+            lambda: profile_history(
+                args.profile_history,
+                min(args.repeats, 3),
+                source_rebuild=args.profile_history_source_rebuild,
+                full_source_rebuild=args.profile_history_full_source_rebuild,
+            )
+        )
     result["http"] = measure_http(args.base_url, paths, repeats=args.repeats,
                                   concurrency=args.concurrency, timeout=args.timeout)
     if args.compare:

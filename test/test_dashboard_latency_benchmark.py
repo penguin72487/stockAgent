@@ -73,7 +73,7 @@ def test_http_benchmark_preserves_errors_and_exact_sample_counts(monkeypatch):
 def test_local_profile_reports_points_and_avoids_large_signature_scans(tmp_path, monkeypatch):
     from scripts.benchmark_dashboard_latency import profile_history
     from stockagent.live import dashboard_updates, tw_day_trade_dashboard
-    path = tmp_path / "large.jsonl"
+    path = tmp_path / "marks.jsonl"
     with path.open("wb") as stream:
         stream.truncate(17 * 1024 * 1024)
     monkeypatch.setattr(tw_day_trade_dashboard, "build_dashboard_history_snapshot", lambda **kw: {
@@ -88,3 +88,56 @@ def test_local_profile_reports_points_and_avoids_large_signature_scans(tmp_path,
     assert report["samples"][0]["point_count"] == 2
     assert report["samples"][0]["series_count"] == 1
     assert report["signature"][0]["skipped"]
+
+
+def test_local_profile_can_bypass_final_projection_caches(tmp_path, monkeypatch):
+    from scripts.benchmark_dashboard_latency import profile_history
+    from stockagent.live import tw_day_trade_dashboard
+
+    observed = []
+
+    def build(**kwargs):
+        observed.append(kwargs)
+        return {"returned_points": 1, "minute_series": [{"points": [[1]]}]}
+
+    monkeypatch.setattr(tw_day_trade_dashboard, "build_dashboard_history_snapshot", build)
+
+    report = profile_history(tmp_path, 1, source_rebuild=True)
+
+    assert report["source_rebuild"] is True
+    assert "projection bypassed" in report["boundary"]
+    assert observed == [
+        {
+            "state_dir": tmp_path.resolve(),
+            "range_key": "all",
+            "resolution": "1m",
+            "history_encoding": "minute_columns_v2",
+            "use_memory_cache": False,
+            "use_persistent_cache": False,
+        }
+    ]
+
+
+def test_local_profile_retains_separate_full_source_baseline(tmp_path, monkeypatch):
+    from scripts.benchmark_dashboard_latency import profile_history
+    from stockagent.live import tw_day_trade_dashboard
+
+    observed = []
+
+    def build(**kwargs):
+        observed.append(kwargs)
+        return {"returned_points": 1, "minute_series": [{"minute_indexes": [0]}]}
+
+    monkeypatch.setattr(tw_day_trade_dashboard, "build_dashboard_history_snapshot", build)
+
+    report = profile_history(
+        tmp_path,
+        1,
+        source_rebuild=True,
+        full_source_rebuild=True,
+    )
+
+    assert report["full_source_rebuild"] is True
+    assert report["session_projection_enabled"] is False
+    assert "session projection bypassed" in report["boundary"]
+    assert observed[0]["use_session_projection"] is False

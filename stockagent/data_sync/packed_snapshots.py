@@ -824,8 +824,14 @@ def publish_packed_snapshot(
     )
     publisher_node = _resolve_node_id(sync_root, node_id)
     lock_path = sync_root / ".local-state" / "locks" / f"publish-{dataset}.lock"
+    retention_lock = (
+        sync_root / ".local-state" / "locks" / "publish-retention-global.lock"
+    )
 
-    with _exclusive_lock(lock_path):
+    # Publication and rolling-retention deletion must never race. Serializing
+    # local publishes is cheap compared with hashing/packing and makes the
+    # atomic head/object boundary explicit.
+    with _exclusive_lock(retention_lock), _exclusive_lock(lock_path):
         entries, before = _collect_entries(
             source,
             excluded_subtrees=excluded,

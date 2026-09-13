@@ -38,6 +38,9 @@ from stockagent.live.benchmark_accounting import (  # noqa: E402
     TX_FULLY_COLLATERALIZED_CAPITAL_BASIS,
     previous_close_return,
 )
+from stockagent.live.benchmark_history_projection import (  # noqa: E402
+    write_benchmark_projection,
+)
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     BENCHMARK_HISTORY_FILENAME,
 )
@@ -1505,11 +1508,20 @@ def main() -> None:
         )
     destination = state_dir / BENCHMARK_HISTORY_FILENAME
     changed = _write_json_if_semantically_changed(destination, output, compact=True)
+    source_sha256 = _sha256(destination)
+    projection = write_benchmark_projection(
+        state_dir=state_dir,
+        source_path=destination,
+        source_sha256=source_sha256,
+        origins=origins,
+        marks=marks,
+        created_at=str(output["created_at"]),
+    )
     print(
         json.dumps(
             {
                 "destination": str(destination),
-                "sha256": _sha256(destination),
+                "sha256": source_sha256,
                 "start_date": start.isoformat(),
                 "end_date": end.isoformat(),
                 "contract_codes": sorted(
@@ -1525,6 +1537,7 @@ def main() -> None:
                 **output["counts"],
                 "additional_shioaji_requests": 0,
                 "changed": changed,
+                **projection,
             },
             ensure_ascii=False,
             sort_keys=True,

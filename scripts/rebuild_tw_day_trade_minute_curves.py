@@ -37,6 +37,7 @@ from stockagent.live.tw_day_trade_simulation import (
     minute_curve_write_lock,
 )
 from stockagent.live.benchmark_accounting import previous_close_return
+from stockagent.live.benchmark_history_projection import write_benchmark_projection
 from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
 
 
@@ -1996,6 +1997,15 @@ def main() -> None:
     benchmark_path = args.output_dir / "benchmark_history.json"
     _atomic_jsonl(marks_path, rebuilt_marks)
     _atomic_json(benchmark_path, rebuilt_benchmarks, compact=True)
+    benchmark_sha256 = _sha256(benchmark_path)
+    benchmark_projection = write_benchmark_projection(
+        state_dir=args.output_dir,
+        source_path=benchmark_path,
+        source_sha256=benchmark_sha256,
+        origins=rebuilt_benchmarks.get("origins") or {},
+        marks=rebuilt_benchmarks.get("marks") or (),
+        created_at=datetime.now(TAIPEI).isoformat(timespec="seconds"),
+    )
     receipt = {
         "schema_version": 2,
         "created_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
@@ -2096,7 +2106,8 @@ def main() -> None:
             "benchmark_history": {
                 "path": str(benchmark_path.resolve()),
                 "rows": len(rebuilt_benchmarks.get("marks") or ()),
-                "sha256": _sha256(benchmark_path),
+                "sha256": benchmark_sha256,
+                **benchmark_projection,
             },
         },
     }
@@ -2113,6 +2124,14 @@ def main() -> None:
                 raise RuntimeError("carried accounting changed during minute reconstruction; publication refused")
             _atomic_text(args.state_dir / "marks.jsonl", marks_path.read_text(encoding="utf-8"))
             _atomic_text(args.state_dir / "benchmark_history.json", benchmark_path.read_text(encoding="utf-8"))
+            write_benchmark_projection(
+                state_dir=args.state_dir,
+                source_path=args.state_dir / "benchmark_history.json",
+                source_sha256=benchmark_sha256,
+                origins=rebuilt_benchmarks.get("origins") or {},
+                marks=rebuilt_benchmarks.get("marks") or (),
+                created_at=str(receipt["created_at"]),
+            )
             _atomic_text(args.state_dir / "minute_curve_receipt.json", receipt_path.read_text(encoding="utf-8"))
     print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
 

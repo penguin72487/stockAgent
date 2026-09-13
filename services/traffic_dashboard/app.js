@@ -156,6 +156,7 @@ const KIND_LABELS = Object.freeze({
   page_load: "頁面載入",
   interaction: "操作到繪製",
   api: "API 到繪製",
+  render: "資料整理與繪圖",
 });
 let browserRenderQueued = false;
 
@@ -177,6 +178,7 @@ function observedMetricValue(row) {
     return finite(row.lcpMs) ?? finite(row.fcpMs) ?? finite(row.loadMs) ?? finite(row.durationMs);
   }
   if (row.kind === "api") return finite(row.paintMs) ?? finite(row.durationMs);
+  if (row.kind === "render") return finite(row.paintMs) ?? finite(row.durationMs);
   const durationMs = finite(row.durationMs);
   return durationMs === null ? null : (finite(row.inputDelayMs) ?? 0) + durationMs;
 }
@@ -202,7 +204,16 @@ function dominantPhase(rows) {
           return paint === null || request === null ? null : Math.max(0, paint - request);
         }],
       ]
-    : [
+    : rows[0].kind === "render"
+      ? [
+          ["資料對齊", (row) => finite(row.prepareMs)],
+          ["Canvas", (row) => finite(row.drawMs)],
+          ["繪製排程", (row) => {
+            const paint = finite(row.paintMs); const duration = finite(row.durationMs);
+            return paint === null || duration === null ? null : Math.max(0, paint - duration);
+          }],
+        ]
+      : [
         ["輸入排隊", (row) => finite(row.inputDelayMs)],
         ["處理／繪製", (row) => finite(row.durationMs)],
       ];
@@ -221,6 +232,7 @@ function isSuccessfulMetric(row) {
 
 function actionLabel(row) {
   if (row.kind === "page_load") return "頁面載入";
+  if (row.kind === "render" && row.action === "equity_chart") return "完整分鐘權益曲線";
   const action = row.action === "automatic" ? "自動更新" : row.action || "—";
   return row.kind === "api" && row.requestPath ? `${action} → ${row.requestPath}` : action;
 }

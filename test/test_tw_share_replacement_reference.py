@@ -3,8 +3,19 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import polars as pl
 
 from downloader.download_tw_share_replacement_reference import parse_detail, parse_list, parse_issuer_payment, parse_tpex
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tpex_ca_bootstrap(monkeypatch, tmp_path):
+    from downloader import download_tw_share_replacement_reference as collector
+
+    monkeypatch.setattr(
+        collector, "_tpex_verify_bundle",
+        lambda *_args, **_kwargs: tmp_path / "test-ca-bundle.pem",
+    )
 
 
 def issuer_fixture():
@@ -249,6 +260,11 @@ def test_issuer_payment_requires_company_and_matching_resumption():
     with pytest.raises(ValueError, match="conflicting"):
         parse_issuer_payment((text + "退還股款發放日:115/08/14").encode(), event)
     assert parse_issuer_payment(text.replace("上市", "上櫃").encode(), event) == date(2026, 8, 13)
+    amended = text.replace(
+        "發放日：民國115年08月13日",
+        "發放日訂於民國115年08月13日",
+    )
+    assert parse_issuer_payment(amended.encode(), event) == date(2026, 8, 13)
 
 
 def test_tpex_detail_is_separate_physical_share_evidence():
@@ -268,7 +284,7 @@ def test_tpex_detail_is_separate_physical_share_evidence():
         parse_tpex(data, start=date(2026, 1, 1), end=date(2026, 9, 10))
 
 
-@pytest.mark.parametrize("broken_stage", ["twse_list", "twse_detail", "tpex_reference", "issuer_payment"])
+@pytest.mark.parametrize("broken_stage", ["twse_list", "tpex_reference"])
 def test_source_failure_is_isolated_and_never_replaces_accepted_output(tmp_path, monkeypatch, broken_stage):
     from downloader import download_tw_share_replacement_reference as collector
     from downloader.download_tw_corporate_action_entitlements import _record_raw_receipt_request
@@ -329,14 +345,71 @@ def test_source_failure_is_isolated_and_never_replaces_accepted_output(tmp_path,
     assert any(url == collector.TPEX_URL for url, _ in calls)
     if broken_stage != "twse_list":
         assert "2330" in payments  # later healthy event was not starved
-    if broken_stage == "twse_detail":
-        assert failed["failures"][0]["symbol"] == "1459"
-        assert failed["completed_reference_rows"] == 1
-        assert failed["covered_markets"] == ["tpex"]
     broken[0] = False
     ready = collector.run(args)
     assert ready["source_download_complete"] and ready["complete_all_markets"]
     assert ready["failure_count"] == 0 and ready["rows"] == 2
+
+
+@pytest.mark.parametrize("broken_stage", ["twse_detail", "issuer_payment"])
+def test_accounting_failure_preserves_complete_lifecycle_catalogue(
+    tmp_path, monkeypatch, broken_stage,
+):
+    from downloader import download_tw_share_replacement_reference as collector
+    from downloader.download_tw_corporate_action_entitlements import (
+        _record_raw_receipt_request,
+    )
+
+    def fetch(path, *, url, data, **kwargs):
+        if url == collector.DETAIL_URL and broken_stage == "twse_detail":
+            raise RuntimeError("HTTP 428 fixture")
+        payload = listing() if url == collector.LIST_URL else detail()
+        if url == collector.TPEX_URL:
+            payload = {
+                "stat": "ok", "date": "20260101~20261022",
+                "tables": [{"fields": listing()["fields"], "data": []}],
+            }
+        content = json.dumps(payload).encode()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        _record_raw_receipt_request(
+            path, url=url, data=data, content=content, method="GET"
+        )
+        return content
+
+    def payment(raw, row, args):
+        if broken_stage == "issuer_payment":
+            raise RuntimeError("issuer unavailable fixture")
+        return {}
+
+    monkeypatch.setattr(collector, "_cached_or_post", fetch)
+    monkeypatch.setattr(collector, "fetch_issuer_payment", payment)
+    monkeypatch.setattr(
+        collector, "fetch_issuer_replacement",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("issuer unavailable fixture")),
+    )
+    monkeypatch.setattr(
+        collector, "_configure_tw_public_rate_limiter", lambda *_: None
+    )
+    ready = collector.run(SimpleNamespace(
+        start_date="2026-01-01", end_date="2026-07-24",
+        output_dir=tmp_path, timeout=1, retries=0, request_interval=0,
+    ))
+    assert ready["source_download_complete"]
+    assert ready["complete_all_markets"]
+    assert ready["lifecycle_catalog_complete"]
+    assert ready["failure_count"] == 0
+    assert ready["accounting_failure_count"] == 1
+    row = pl.read_parquet(
+        tmp_path / "tw_share_replacement_reference.parquet"
+    ).to_dicts()[0]
+    if broken_stage == "twse_detail":
+        assert row["suspension_date"] is None
+        assert row["new_shares_per_1000_old"] is None
+        assert row["detail_error"]
+    else:
+        assert row["suspension_date"] == date(2026, 7, 23)
+        assert row["cash_payment_date"] is None
 
 
 def test_official_issuer_recovery_preserves_provenance_and_bounds_primary_retries(tmp_path, monkeypatch):

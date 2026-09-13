@@ -251,16 +251,21 @@ const expression = `(() => {
     }))
     .filter((row) => Number.isFinite(row.size) && row.size < 10)
     .slice(0, 20);
-  const chartAudit = [...document.querySelectorAll("svg[role='img']")]
+  const chartAudit = [...document.querySelectorAll("[role='img']")]
     .filter(visible)
-    .map((svg) => {
-      const rect = svg.getBoundingClientRect();
+    .map((chart) => {
+      const rect = chart.getBoundingClientRect();
+      const canvas = chart.matches("canvas") ? chart : chart.querySelector("canvas");
+      const svg = chart.matches("svg") ? chart : chart.querySelector("svg");
       return {
-        id: svg.id || null,
+        id: chart.id || null,
+        renderer: canvas ? "canvas" : svg ? "svg" : "unknown",
         width: Math.round(rect.width),
         height: Math.round(rect.height),
-        markCount: svg.querySelectorAll("path,polyline,circle,rect").length,
-        textCount: svg.querySelectorAll("text").length,
+        pixelWidth: canvas?.width || null,
+        pixelHeight: canvas?.height || null,
+        markCount: svg?.querySelectorAll("path,polyline,circle,rect").length || 0,
+        textCount: svg?.querySelectorAll("text").length || 0,
       };
     });
   const viewportMeta = document.querySelector('meta[name="viewport"]')?.content || "";
@@ -301,6 +306,8 @@ const expression = `(() => {
     } : null,
     requestTimings: window.StockAgentDashboard?.performanceSnapshot?.() || [],
     browserPerformanceHistory: window.StockAgentDashboard?.performanceHistorySnapshot?.() || [],
+    chartPerformance: (window.StockAgentDashboard?.performanceHistorySnapshot?.() || [])
+      .filter(row => row.kind === "render" && row.action === "equity_chart"),
     apiTimingErrors: (window.StockAgentDashboard?.performanceSnapshot?.() || []).filter(row =>
       row.outcome !== 'AbortError' && (row.outcome !== 'ok' || row.status >= 400)),
     apiResources: resources.filter(row => row.name.includes('/api/') && !row.name.includes('/updates')).map(row => ({
@@ -495,6 +502,44 @@ for (const [name, suffix] of pages) {
     const eventScreenshot = await send("Page.captureScreenshot", {format:"png",captureBeyondViewport:false});
     fs.writeFileSync(path.join(outputDir, `${name}-events-${width}x${height}.png`), Buffer.from(eventScreenshot.data,"base64"));
     await send("Runtime.evaluate", {expression:"scrollTo({top:0,behavior:'instant'})"});
+    if (name === "tw-day-trade") {
+      const fullHistory = await send("Runtime.evaluate", {
+        expression: `new Promise(resolve => {
+          const startInput=document.getElementById('detail-start-date');
+          const endInput=document.getElementById('detail-end-date');
+          if(!startInput||!endInput||!startInput.min||!endInput.max) {
+            resolve({error:'missing full-history date boundaries'}); return;
+          }
+          const startedAt=Date.now(); const started=performance.now();
+          const priorRequests=StockAgentDashboard.performanceSnapshot().length;
+          startInput.value=startInput.min; endInput.value=endInput.max;
+          endInput.dispatchEvent(new Event('change',{bubbles:true}));
+          const check=()=>{
+            const requests=StockAgentDashboard.performanceSnapshot().slice(priorRequests);
+            const api=requests.find(row=>row.path.endsWith('/api/history')&&row.outcome==='ok');
+            const render=StockAgentDashboard.performanceHistorySnapshot()
+              .filter(row=>row.observedAt>=startedAt&&row.kind==='render'&&row.action==='equity_chart'&&row.pointCount>10000)
+              .at(-1);
+            if(api&&render) requestAnimationFrame(()=>requestAnimationFrame(()=>resolve({
+              milliseconds:performance.now()-started, api, render,
+              canvasCount:document.querySelectorAll('#equity-chart canvas').length,
+              svgPathCount:document.querySelectorAll('#equity-chart path').length,
+              startDate:startInput.value, endDate:endInput.value,
+            })));
+            else if(performance.now()-started>30000) resolve({
+              error:'full history render deadline', requests,
+              recentRenders:StockAgentDashboard.performanceHistorySnapshot().filter(row=>row.observedAt>=startedAt&&row.kind==='render'),
+            });
+            else setTimeout(check,25);
+          }; check();
+        })`, awaitPromise:true, returnByValue:true,
+      });
+      interactionLatency = {
+        ...interactionLatency,
+        fullHistory: fullHistory.result?.value || {error:"evaluation failed"},
+      };
+      await waitUntilReady(send, pendingApi);
+    }
   }
   let representativeAction = null;
   const representative = representativeControls[name];
