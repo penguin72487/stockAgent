@@ -12,6 +12,7 @@
 - [第一性架構](#第一性架構)
 - [五分鐘開始](#五分鐘開始)
 - [資料冷庫與多機同步](#資料冷庫與多機同步)
+- [penguin 冷庫 D 槽備份](#penguin-冷庫-d-槽備份)
 - [資料冷庫完整指令](#資料冷庫完整指令)
 - [發布新資料](#發布新資料)
 - [Syncthing 驗收](#syncthing-驗收)
@@ -36,7 +37,7 @@ configs、Git refs 與 systemd 產生 AI 可讀清單的唯讀命令。
 2. Syncthing 的主要固定成本之一是路徑與小檔索引；只做 hard link 去重不會減少路徑數。
 3. 單一巨型壓縮檔雖然路徑少，但改一個檔案就可能重傳整包，損毀半徑也最大。
 4. 訓練需要可直接隨機讀取的目錄；傳輸層則需要少量、可驗證、可增量重用的大物件。
-5. 多台機器可以發布，但較晚的時鐘不能讓較舊資料覆蓋較新資料。
+5. penguin 是目前唯一資料權威；來源產生者可不同，但較晚的時鐘不能讓舊資料覆蓋新資料。
 
 因此資料生命週期固定為：
 
@@ -64,8 +65,10 @@ canonical 可讀資料
 - 接收節點預設只保留冷庫，沒有任何 timer、cron 或 service 自動執行 `fetch`、`use` 或
   materialize。解封只能是使用者明確要求的本機動作。
 - 冷庫 release 不可變。各節點使用永久名稱，例如 `penguin`、`lab203`、`vastai1T`。
-- 多寫者保留各自 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
+- 儲存格式仍保留各產生者的 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
   不舊於現有 release，否則 fail closed。
+- penguin 已接收的冷庫是 D 槽備份唯一來源。D 槽保持冷儲存，不加入 Syncthing、
+  不自動解封，也不跟著來源刪除；詳見下方備份指令。
 - 小檔依固定路徑 hash 分桶；大型或已壓縮檔使用 content-addressed blob。未變內容直接
   重用，所以增量發布只產生並傳送真正改變的物件。
 - `use` 只有在 manifest、inventory、pack/blob 與 materialized 檔案驗證成功後才切換
@@ -236,6 +239,74 @@ stockagent-data \
   --materialized-root /mnt/hot/stockagent-materialized \
   status --human
 ```
+
+## penguin 冷庫 D 槽備份
+
+權威冷庫 `/srv/stockagent-packed` 位於 C 槽 WSL 磁碟；獨立副本存放於
+`D:\stockagent-backup\packed`（WSL：`/mnt/d/stockagent-backup/packed`）。
+備份服務監看新物件並自動增量複製，30 秒週期補查漏掉的事件；不解壓、不連動刪除。
+完整操作、還原與驗收見 [冷庫備份 Runbook](docs/packed_cold_backup.md)。
+
+```bash
+# 日常：查看實際驗證進度；active 不等於首次備份完成
+./scripts/run_packed_backup.sh status
+systemctl status stockagent-packed-backup.service --no-pager
+journalctl -u stockagent-packed-backup.service -n 10 --no-pager
+
+# 唯讀盤點，不複製或刪除
+./scripts/run_packed_backup.sh plan
+
+# 首次部署：核對 config、D 槽 UUID／容量後才執行
+./scripts/run_packed_backup.sh init
+./scripts/run_packed_backup.sh install-service
+
+# 暫停／繼續；不會移除已備份資料
+sudo systemctl stop stockagent-packed-backup.service
+sudo systemctl start stockagent-packed-backup.service
+
+# 手動補齊或全量 checksum 複查：先停服務，避免重複工作
+sudo systemctl stop stockagent-packed-backup.service
+./scripts/run_packed_backup.sh once
+# 下列指令重讀 C 現存物件及其 D 副本，可能耗時數小時
+./scripts/run_packed_backup.sh once --verify-existing
+sudo systemctl start stockagent-packed-backup.service
+```
+
+`state=up_to_date`、`remaining_bytes=0`、`pending_objects=0`、`pending_heads=0`、
+`pending_releases=0`、`error_count=0` 才表示該次盤點全部完成。
+`last_complete_at` 是上次完整完成時間，不代表目前沒有新的待備份資料。
+只有一台主機內兩顆磁碟，仍不能防整機損壞、失竊或勒索軟體；不是離線／異地備份。
+
+### C 槽 rolling-current：避免歷史版本長期重複佔位
+
+「release／manifest」是原子一致性描述，不是每版複製一份資料；實際內容以 SHA-256
+物件去重，來源未變時也不會產生新 release。penguin 的 C 槽只需保存目前 heads、pin／
+使用中的版本及 24 小時安全窗；更舊且不再引用的物件只保留在 D 槽 additive archive。
+這樣新資料仍是即時增量發布與 Syncthing 同步，不把 mutable 來源直接拿去互相覆蓋。
+
+```bash
+# 唯讀：列出精確候選、D checksum 證明、peer 狀態與可回收配置量
+./scripts/run_packed_retention.sh plan
+
+# 查看最近計畫與最近一次實際清理 receipt
+./scripts/run_packed_retention.sh status
+
+# penguin 一次性安裝每日 reconcile timer
+./scripts/run_packed_retention.sh install-service
+systemctl status stockagent-packed-retention.timer --no-pager
+```
+
+`apply` 不是一般的 `rm`：只有 lab203、vastai1T 與本機全部收斂、D 槽存在且每個候選
+都有未過期 SHA-256 receipt、沒有 conflict、pin、熱快取或程序引用時才會 unlink C 候選；
+先刪歷史 manifest，再刪其已無引用的 objects。D 不刪，current heads 不刪。清理期間會
+短暫停止本機 backup/Syncthing，完成後立即重啟並等待同步刪除收斂。人工執行方式：
+
+```bash
+./scripts/run_packed_retention.sh apply
+```
+
+目前任何 blocker 都會 fail closed；timer 使用 `--defer-if-blocked`，只留下計畫而不刪檔。
+完整架構、恢復與安全門檻見 [packed 冷庫 Runbook](docs/packed_dataset_storage.md)。
 
 ## 資料冷庫完整指令
 
@@ -504,8 +575,9 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 penguin 的官方 TW 驗收 service 使用同一原則：主工作成功後才由 `ExecStartPost` 發布
 `tw-public`。若 receipt 的 `end_date` 比冷庫現有版本舊，即使本機 HLC 較新仍拒絕發布。
 
-冷庫物件 GC 目前只有 `objects` 報告，沒有自動刪除。熱快取 GC 不等於冷庫 GC；在所有
-節點 retention 與 manifest 引用關係未確認前，不可手動刪 cold objects。
+不要手動刪 cold objects。penguin 已有 D-backed rolling retention；它只會處理 D 已驗證、
+不被 current／pin／lease／安全窗引用且全 fleet 已收斂的候選。其他節點及 D archive
+仍不得自行做 cold GC。熱快取 GC 與這個冷庫 retention 是兩套不同生命週期。
 
 ## Syncthing 驗收
 
@@ -1069,6 +1141,7 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | 文件總索引 | [docs/README.md](docs/README.md) | 區分現行契約、runbook、研究與歷史文件 |
 | 訓練架構 | [training_spec.md](docs/training_spec.md) | 訓練、評估、artifact 驗收 |
 | 公開面板 | [public_dashboards_architecture.md](docs/public_dashboards_architecture.md) | 唯讀資料流、快取、前端競態、安全與上線驗收 |
+| 網站 review／重測速 | [WEB_PROJECT_REVIEW_2026-09-12.md](docs/WEB_PROJECT_REVIEW_2026-09-12.md) | 八頁驗收、HTTP／瀏覽器／SSE 測速、原始樣本與未解限制 |
 | packed 冷庫 | [packed_dataset_storage.md](docs/packed_dataset_storage.md) | pack/blob、manifest、lease 與 smoke 證據 |
 | 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |

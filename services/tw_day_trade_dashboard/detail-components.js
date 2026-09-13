@@ -62,15 +62,18 @@
       const result = badge(row.status, row.status === "ready" ? "good" : row.status === "partial_depth" ? "warn" : row.status === "hold" ? "" : "bad");
       const selected = signalRowKey(row) === selectedKey ? " is-selected" : "";
       if (product === "tw_overnight") {
+        const historical = row.counterfactual_overnight_replay === true;
         const sizingPrice = row.sizing_price_at_13_25 ?? row.sizing_open_price;
         const orderPrice = row.order_limit_price;
         const eligibility = row.side === "short"
           ? badge(row.status === "working" || hasPosition ? "隔夜放空已通過" : "隔夜放空未通過", row.status === "working" || hasPosition ? "good" : "bad")
           : badge("現股買進", "good");
-        const result = badge(hasFill ? "收盤已成交" : row.status || "等待", hasFill ? "good" : row.status === "working" ? "warn" : row.status === "hold" ? "" : "bad");
+        const result = badge(hasFill ? (historical ? "歷史收盤近似" : "收盤已成交") : row.status || "等待", hasFill ? "good" : row.status === "working" ? "warn" : row.status === "hold" ? "" : "bad");
         const currentPrice = isOpen ? position.last_mark_price : position?.exit_price ?? position?.last_exit_price;
         const currentAt = isOpen ? position.last_quote_at : position?.exit_exchange_at ?? position?.exit_at;
-        const modeTotalEquity = row.session_date === sessionDate ? Number(mode?.total_equity_twd) : NaN;
+        const modeTotalEquity = historical
+          ? Number(row.sizing_capital_twd)
+          : row.session_date === sessionDate ? Number(mode?.total_equity_twd) : NaN;
         const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
           ? Number(positionPnl.total) / modeTotalEquity * 100
           : null;
@@ -79,8 +82,8 @@
           <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
           <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(signalReasonLabel(row.reason || row.status))}</small></td>
           <td><strong>13:25 計價 ${money(sizingPrice)}</strong><small>${row.side === "long" ? "漲停買進" : row.side === "short" ? "跌停賣空" : "零權重"} · ${money(orderPrice)}</small><small>目標 ${number(row.requested_shares)} 股 · ${row.simtrade === true ? "目前為試撮" : "等待／已見正式行情"}</small></td>
-          <td><strong>${hasFill ? `收盤成交 ${money(position.entry_price)}` : "尚無實際收盤成交"}</strong><small>${hasPosition ? `${isOpen ? "可清算" : "開盤沖銷"} ${money(currentPrice)} · ${shortTime(currentAt)}` : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
-          <td><strong class="${pnlClass(positionPnl?.total)}">佔模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>當沖模型暫時轉接 · 非隔夜訓練</small></td>
+          <td><strong>${hasFill ? `${historical ? "官方收盤反事實" : "收盤成交"} ${money(position.entry_price)}` : historical ? "歷史反事實未成交" : "尚無實際收盤成交"}</strong><small>${hasPosition ? `${isOpen ? (historical ? "期末估值" : "可清算") : (historical ? "官方開盤反事實沖銷" : "開盤沖銷")} ${money(currentPrice)} · ${shortTime(currentAt)}` : historical ? "不補造歷史成交" : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
+          <td><strong class="${pnlClass(positionPnl?.total)}">佔模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>${historical ? "進場前權益" : "模式總權益"} ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${historical ? "歷史反事實 · 無交易所成交證據" : "當沖模型暫時轉接 · 非隔夜訓練"}</small></td>
         </tr>`;
       }
       return `<tr data-signal-key="${esc(signalRowKey(row))}" class="signal-row${selected}">

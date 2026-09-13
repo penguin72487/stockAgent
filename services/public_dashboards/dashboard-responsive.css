@@ -1,0 +1,330 @@
+/*
+ * Cross-dashboard responsive shell.
+ *
+ * Market-specific CSS owns meaning and visual identity.  This final shared
+ * layer owns only viewport adaptation: navigation, touch targets, wide-screen
+ * use and lossless table reflow.  Keep it loaded after page-specific styles.
+ */
+
+:root {
+  --dashboard-wide-content: 1500px;
+  --dashboard-mobile-gutter: 12px;
+  --dashboard-font-family: Inter, "Noto Sans TC", "PingFang TC",
+    "Microsoft JhengHei UI", "Microsoft JhengHei", system-ui, sans-serif;
+}
+
+/* Keep the seven shells on one Traditional-Chinese-capable fallback chain.
+ * Linux and Windows viewers do not have the same system-ui font. Prefer their
+ * local CJK faces explicitly; no page makes a third-party font request. */
+html:root,
+body {
+  font-family: var(--dashboard-font-family);
+}
+
+html[data-dashboard-page="overview"] { --dashboard-wide-content: 1400px; }
+html[data-dashboard-page="taifex"] { --dashboard-wide-content: 1760px; }
+html[data-dashboard-page="tw-day-trade"],
+html[data-dashboard-page="tw-overnight"] { --dashboard-wide-content: 1600px; }
+html[data-dashboard-page="shioaji"] { --dashboard-wide-content: 1600px; }
+html[data-dashboard-page="openbb"] { --dashboard-wide-content: 1500px; }
+html[data-dashboard-page="data-monitor"] { --dashboard-wide-content: 1720px; }
+html[data-dashboard-page="traffic"] { --dashboard-wide-content: 1500px; }
+
+nav[data-dashboard-nav] a {
+  min-inline-size: 44px;
+  min-block-size: 44px;
+  padding: 7px 10px;
+  justify-content: center;
+  text-align: center;
+}
+
+.dashboard-nav-toggle {
+  display: none;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border: 1px solid var(--line, var(--dashboard-line));
+  border-radius: 9px;
+  color: var(--text, var(--ink, var(--dashboard-text)));
+  background: var(--surface, var(--dashboard-surface));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+@media (min-width: 1600px) {
+  body > .public-nav,
+  body > .site-header,
+  body > .shell,
+  body > main,
+  body > footer,
+  body > .jump-nav {
+    width: min(var(--dashboard-wide-content), calc(100% - 64px));
+  }
+}
+
+/* Dense tables stop being scan-friendly before the rest of the page becomes
+ * "mobile".  Reflow them at tablet/laptop widths instead of requiring a
+ * horizontal hunt; every source column remains present in each row card. */
+@media (max-width: 1100px) {
+  body button,
+  body select,
+  body input,
+  body summary,
+  .jump-nav a,
+  .detail-link,
+  .source-list a,
+  .technical-details a {
+    min-height: 44px !important;
+  }
+
+  .jump-nav a { min-width: 44px; }
+
+  body .range-buttons button,
+  body .range-picker button,
+  body .time-range-control button {
+    min-width: 40px;
+  }
+
+  body details > summary { padding-block: 10px !important; }
+
+  .detail-link,
+  .source-list a,
+  .technical-details a {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .table-wrap:has(> table.dashboard-responsive-table),
+  .table-scroll:has(> table.dashboard-responsive-table) {
+    overflow: visible;
+    border: 0;
+    background: transparent;
+  }
+
+  table.dashboard-responsive-table,
+  table.dashboard-responsive-table tbody {
+    width: 100%;
+    min-width: 0;
+    display: block;
+  }
+
+  table.dashboard-responsive-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  table.dashboard-responsive-table tr {
+    width: 100%;
+    display: grid;
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    overflow: hidden;
+    border: 1px solid var(--line, var(--dashboard-line));
+    border-radius: 11px;
+    background: var(--surface, rgba(8, 23, 34, .82));
+  }
+
+  table.dashboard-responsive-table td,
+  table.dashboard-responsive-table td:first-child {
+    width: 100%;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(100px, 24%) minmax(0, 1fr);
+    gap: 10px;
+    padding: 8px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line, rgba(41, 68, 91, .58));
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  table.dashboard-responsive-table td:last-child { border-bottom: 0; }
+
+  table.dashboard-responsive-table td::before {
+    content: attr(data-label);
+    min-width: 0;
+    color: var(--muted, var(--dashboard-muted));
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .02em;
+    overflow-wrap: anywhere;
+  }
+
+  table.dashboard-responsive-table td[colspan] {
+    display: block;
+    text-align: center;
+  }
+
+  table.dashboard-responsive-table td[colspan]::before { display: none; }
+
+  .scroll-hint:has(+ .table-scroll > table.dashboard-responsive-table) {
+    display: none;
+  }
+}
+
+@media (max-width: 700px) {
+  body > .public-nav,
+  body > .site-header {
+    width: calc(100% - 2 * var(--dashboard-mobile-gutter));
+    min-height: 64px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 10px 0;
+  }
+
+  .dashboard-nav-toggle { display: inline-flex; }
+
+  body > .public-nav nav[data-dashboard-nav],
+  body > .site-header nav[data-dashboard-nav] {
+    grid-column: 1 / -1;
+    width: 100%;
+    max-width: none;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    overflow: visible;
+  }
+
+  body > .public-nav nav[data-dashboard-nav]:not([data-expanded="true"]),
+  body > .site-header nav[data-dashboard-nav]:not([data-expanded="true"]) {
+    display: none;
+  }
+
+  nav[data-dashboard-nav] a {
+    min-width: 0;
+    min-height: 44px !important;
+    padding: 8px 10px;
+    border: 1px solid var(--line, var(--dashboard-line));
+    border-radius: 9px;
+    white-space: normal;
+  }
+
+  .jump-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .jump-nav a {
+    flex: 1 1 calc(33.333% - 6px);
+    min-width: 88px;
+    min-height: 44px !important;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px;
+    text-align: center;
+    white-space: normal;
+  }
+
+  .pipeline-toolbar,
+  .legend {
+    max-width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    overflow: visible;
+  }
+
+  .pipeline-toolbar > button {
+    flex: 1 1 calc(50% - 8px);
+  }
+
+  body .legend button,
+  .legend .legend-toggle {
+    min-height: 44px;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+
+  body button,
+  body select,
+  body input,
+  body summary,
+  .filter,
+  .load-more,
+  .secondary,
+  .range-picker button,
+  .time-range-control button {
+    min-height: 44px;
+  }
+
+  body .range-buttons button,
+  body .range-picker button,
+  body .time-range-control button {
+    min-width: 44px;
+  }
+
+  body details > summary { padding-block: 12px !important; }
+
+  h1 {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    font-size: clamp(30px, 10vw, 44px);
+    line-height: 1.04;
+  }
+
+  body > main,
+  body > .shell {
+    width: calc(100% - 2 * var(--dashboard-mobile-gutter));
+    padding-top: 24px;
+  }
+
+  table.dashboard-responsive-table td,
+  table.dashboard-responsive-table td:first-child {
+    grid-template-columns: minmax(86px, 32%) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 380px) {
+  body > .public-nav nav[data-dashboard-nav],
+  body > .site-header nav[data-dashboard-nav] {
+    grid-template-columns: 1fr;
+  }
+
+  .jump-nav a { flex-basis: calc(50% - 6px); }
+
+  table.dashboard-responsive-table td,
+  table.dashboard-responsive-table td:first-child {
+    grid-template-columns: minmax(78px, 30%) minmax(0, 1fr);
+    gap: 8px;
+  }
+}
+
+@media (max-height: 500px) and (orientation: landscape) {
+  body > main,
+  body > .shell { padding-top: 16px; }
+
+  .hero {
+    gap: 16px;
+    margin-bottom: 16px;
+    padding-block: 12px 18px;
+  }
+
+  .hero h1,
+  h1 { font-size: clamp(28px, 6vw, 40px); }
+
+  .lead,
+  .subtitle { line-height: 1.55; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-nav-toggle { transition: none; }
+}

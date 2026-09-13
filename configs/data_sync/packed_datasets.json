@@ -13,6 +13,10 @@
       ],
       "active_process_substrings": [
         "download_tw_public_data.py",
+        "download_tw_corporate_action_entitlements.py",
+        "download_tw_corporate_action_reference.py",
+        "download_tw_share_replacement_reference.py",
+        "refresh_tw_day_trade_margin_actions.py",
         "rebuild_tw_public_data_layer.py",
         "build_tw_public_training_features.py"
       ],

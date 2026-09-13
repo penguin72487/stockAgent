@@ -13,6 +13,7 @@ from stockagent.backtest.simulator import (
     _resolve_exposure_budget,
     run_backtest_torch,
 )
+from stockagent.backtest.tw_day_trade_carry import DayTradeCarrySession, DayTradeCarryState
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
@@ -1286,6 +1287,7 @@ def risk_aware_loss(
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
+    day_trade_carry_sessions: tuple[DayTradeCarrySession, ...] | None = None,
     futures_minute_saturation_recovery: bool = False,
     futures_minute_recovery_objective: str = "residual_notional",
 ) -> Tensor:
@@ -1303,6 +1305,10 @@ def risk_aware_loss(
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if day_trade_carry_sessions is not None and objective_norm not in {
+        "log_utility", "log_util", "kelly", "growth", "mean_log_return",
+    }:
+        raise ValueError("physical FIFO sessions currently require canonical log utility")
     if mode == "tw_index_derivatives_day":
         if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
             raise ValueError(
@@ -1657,7 +1663,13 @@ def risk_aware_loss(
     initial_short_sale_collateral = None
     initial_short_margin_collateral = None
     initial_long_margin_debt = None
+    initial_day_trade_carry_state = None
     if aux_outputs:
+        initial_day_trade_carry_state = aux_outputs.get("initial_day_trade_carry_state")
+        if initial_day_trade_carry_state is not None:
+            if not isinstance(initial_day_trade_carry_state, DayTradeCarryState):
+                raise ValueError("initial physical carry state has an incompatible type")
+            initial_day_trade_carry_state = initial_day_trade_carry_state.detached()
         initial_weights = aux_outputs.get("initial_weights")
         if isinstance(initial_weights, torch.Tensor):
             # Keep a private, contiguous buffer for recurrent state so we don't
@@ -1846,6 +1858,8 @@ def risk_aware_loss(
             day_trade_execution_volume_participation
         ),
         symbol_sharded_ledger=symbol_sharded_ledger,
+        day_trade_carry_sessions=day_trade_carry_sessions,
+        initial_day_trade_carry_state=initial_day_trade_carry_state,
         futures_portfolio_training_surrogate_only=(
             futures_portfolio_training_surrogate_only
         ),
@@ -1868,6 +1882,8 @@ def risk_aware_loss(
 
     if aux_outputs is not None and backtest.final_weights is not None:
         state_update_start = _loss_timer_start()
+        if backtest.day_trade_carry_state is not None:
+            aux_outputs["_final_day_trade_carry_state"] = backtest.day_trade_carry_state.detached()
         if backtest.final_futures_carry_state is not None:
             aux_outputs["_final_futures_carry_state"] = _clone_portfolio_state_for_loss(
                 backtest.final_futures_carry_state, stat_prefix="final_futures_carry_state_clone")
@@ -1970,7 +1986,8 @@ def risk_aware_loss(
     if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
         graph_start = _loss_timer_start()
         nan_start = _loss_timer_start()
-        clean_returns = torch.nan_to_num(backtest.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        clean_returns = (backtest.strategy_returns if day_trade_carry_sessions is not None
+            else torch.nan_to_num(backtest.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0))
         _loss_timer_stop("nan_to_num", nan_start)
 
         mask_start = _loss_timer_start()

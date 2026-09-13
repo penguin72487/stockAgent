@@ -55,11 +55,11 @@ penguin72487.ddnsgeek.com {
 
 	reverse_proxy 127.0.0.1:8770 {
 		health_uri /healthz
-		health_interval 30s
-		health_timeout 2s
+		health_interval 5s
+		health_timeout 1s
 		health_passes 1
 		health_fails 3
-		fail_duration 10s
+		fail_duration 2s
 		max_fails 3
 		unhealthy_status 500 502 503 504
 		transport http {

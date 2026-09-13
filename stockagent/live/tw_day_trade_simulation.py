@@ -18,17 +18,32 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Final, Iterable, Mapping, Sequence
+from typing import Any, Callable, Final, Iterable, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from stockagent.backtest.tw_day_trade_contract import (
+    AUCTION_SUBMIT_MINUTE,
+    CLOSE_AUCTION_MINUTE,
+    ENTRY_MINUTE,
+    LIMIT_SUBMIT_MINUTE,
+    MARGIN_CARRY_CONTRACT,
+    MARGIN_FINANCING_ANNUAL_RATE,
+    MARGIN_FINANCING_PRINCIPAL_RATIO as MARGIN_FINANCING_RATIO,
+    MARKET_SUBMIT_MINUTE,
+    MINUTE_VOLUME_PARTICIPATION,
+    inventory_carry_interest,
+    net_liquidation_pnl,
+    session_time,
+)
 from stockagent.backtest.tw_execution import (
     TaiwanFeeSchedule,
     commission_rebate_rate_vector,
@@ -37,13 +52,20 @@ from stockagent.backtest.tw_execution import (
 )
 from stockagent.backtest.tw_integer_execution import (
     _commission_fees_by_symbol,
+    _scale_lot_buys_to_budget_with_fixed_fees,
     _tax_fees_by_symbol,
 )
 from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD,
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
 )
-from stockagent.data.tw_price_rules import limit_price_numpy, move_price_ticks_numpy
+from stockagent.data.tw_price_rules import (
+    TW_ORDER_PRICE_CONTRACT_VERSION,
+    limit_price_numpy,
+    move_price_ticks_numpy,
+    price_on_tick_grid_numpy,
+)
+from stockagent.data.tw_security import classify_tw_stock_or_etf
 from stockagent.live.benchmark_accounting import (
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
     MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION,
@@ -73,13 +95,14 @@ TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 3
 # is strictly later than the immutable signal publication.  ENTRY_GATE remains
 # the historical-replay boundary for compatibility with existing replay tools.
 LIVE_ENTRY_GATE: Final[time] = time(9, 0)
-ENTRY_GATE: Final[time] = time(9, 1)
-FIRST_MINUTE_EXECUTION_TIME: Final[time] = time(9, 1)
-EXIT_LIMIT_TIME: Final[time] = time(13, 20)
-FORCE_EXIT_TIME: Final[time] = time(13, 24)
-CLOSING_AUCTION_TIME: Final[time] = time(13, 25)
-SESSION_CLOSE: Final[time] = time(13, 30)
-MINUTE_VOLUME_PARTICIPATION: Final[float] = 0.50
+ENTRY_GATE: Final[time] = session_time(ENTRY_MINUTE)
+FIRST_MINUTE_EXECUTION_TIME: Final[time] = ENTRY_GATE
+EXIT_LIMIT_TIME: Final[time] = session_time(LIMIT_SUBMIT_MINUTE)
+FORCE_EXIT_TIME: Final[time] = session_time(MARKET_SUBMIT_MINUTE)
+CLOSING_AUCTION_TIME: Final[time] = session_time(AUCTION_SUBMIT_MINUTE)
+SESSION_CLOSE: Final[time] = session_time(CLOSE_AUCTION_MINUTE)
+AUCTION_OBSERVATION_DEADLINE: Final[time] = time(13, 35)
+STRICT_INTRADAY_CONTRACT: Final[str] = "flatten_same_day_adverse_limit_exception_only_v1"
 ENTRY_FILL_POLICY_CAUSAL_BOOK: Final[str] = "causal_best_quote"
 ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
 ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
@@ -100,8 +123,10 @@ ENTRY_FILL_POLICY_0901_MINUTE_PRICE: Final[str] = (
 )
 REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE: Final[str] = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_"
-    "minute_price_counterfactual_v2"
+    "minute_price_volume_capped_nav_counterfactual_v3"
 )
+EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
+HISTORICAL_MINUTE_MARK_CONTRACT: Final[str] = "right_labelled_historical_last_trade_mark_v1"
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
         ENTRY_FILL_POLICY_CAUSAL_BOOK,
@@ -119,8 +144,6 @@ ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
 # than a claim about a broker's current customer rate.
 DAY_TRADE_SHORTFALL_BORROW_FEE_RATE: Final[float] = 0.07
 DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION: Final[float] = 0.10
-MARGIN_FINANCING_ANNUAL_RATE: Final[float] = 0.16
-MARGIN_FINANCING_RATIO: Final[float] = 0.60
 MARGIN_SHORT_INITIAL_MARGIN_RATE: Final[float] = 0.90
 DEFAULT_LIVE_RULE_DATA_DIR: Final[Path] = Path("/srv/stockagent-live/data_tw_public")
 STOCK_BENCHMARKS: Final[tuple[tuple[str, str, str, str], ...]] = (
@@ -235,11 +258,9 @@ def position_net_liquidation_pnl(
     if signed == 0:
         return 0.0
     side = str(position.get("side") or ("long" if signed > 0 else "short"))
-    exit_rate = float(
-        position["sell_fee_rate"] if side == "long" else position["buy_fee_rate"]
-    )
+    prefix = "cash_" if position.get("margin_carry_contract") else ""
+    exit_rate = float(position[f"{prefix}sell_fee_rate"] if side == "long" else position[f"{prefix}buy_fee_rate"])
     rebate_rate = float(position.get("commission_rebate_rate") or 0.0)
-    exit_fee = abs(signed) * price * (exit_rate - rebate_rate)
     entry_fee = (
         float(
             position.get(
@@ -251,7 +272,13 @@ def position_net_liquidation_pnl(
         if remaining_entry_fee_twd is None
         else float(remaining_entry_fee_twd)
     )
-    return signed * (price - float(position["entry_price"])) - entry_fee - exit_fee
+    return net_liquidation_pnl(
+        signed,
+        float(position.get("inventory_basis_price", position["entry_price"])),
+        price,
+        entry_fee,
+        exit_rate - rebate_rate,
+    )
 
 
 def _date_value(value: object) -> date | None:
@@ -416,6 +443,9 @@ def _prepare_entry_plan(
     observation_at: datetime,
     spec: ModeSpec,
     allow_quote_at_signal: bool = False,
+    sizing_nav_twd: float | None = None,
+    requested_shares_override: int | None = None,
+    reduce_only: bool = False,
 ) -> dict[str, Any]:
     """Resolve one symbol's admissible entry independently."""
 
@@ -465,17 +495,17 @@ def _prepare_entry_plan(
         )
     if side == "flat":
         status, reason = "hold", "zero_target_weight"
-    elif not bool(row.get("tradable")):
+    elif not reduce_only and not bool(row.get("tradable")):
         status, reason = "blocked", "model_tradable_mask_false"
-    elif side == "long" and not bool(row.get("can_buy")):
+    elif not reduce_only and side == "long" and not bool(row.get("can_buy")):
         status, reason = "blocked", "cannot_buy_open"
-    elif side == "short" and not bool(row.get("can_sell")):
+    elif not reduce_only and side == "short" and not bool(row.get("can_sell")):
         status, reason = "blocked", "cannot_sell_open"
-    elif evidence is None or not evidence.covered:
+    elif not reduce_only and (evidence is None or not evidence.covered):
         status, reason = "blocked", "exact_session_eligibility_missing"
-    elif not evidence.eligible:
+    elif not reduce_only and not evidence.eligible:
         status, reason = "blocked", "not_day_trade_eligible"
-    elif side == "short" and not evidence.short_open:
+    elif not reduce_only and side == "short" and not evidence.short_open:
         status, reason = "blocked", "sell_first_suspended"
     elif sizing_price is None:
         status, reason = (
@@ -492,11 +522,16 @@ def _prepare_entry_plan(
         requested_shares = int(
             math.floor(
                 abs(target_weight)
-                * float(spec.initial_capital_twd)
+                * float(spec.initial_capital_twd if sizing_nav_twd is None else sizing_nav_twd)
                 / sizing_price
                 / int(spec.lot_size)
             )
         ) * int(spec.lot_size)
+        if requested_shares_override is not None:
+            requested_shares = int(requested_shares_override)
+            if requested_shares < 0 or (requested_shares % spec.lot_size and not (
+                    reduce_only and spec.odd_lot_execution_policy == "assumed_odd_lot_at_regular_board_price_v1")):
+                raise ValueError("override must be nonnegative whole-lot shares")
         if requested_shares <= 0:
             status, reason = "skipped", "below_one_board_lot"
     if status == "ready":
@@ -519,7 +554,11 @@ def _prepare_entry_plan(
                 lower_limit=lower,
                 upper_limit=upper,
             )
-        if entry_price is None:
+        if (spec.strict_intraday and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+                and (quote_values.get("simtrade") is not False or quote_at is None
+                     or not 0 <= (observation_at - quote_at).total_seconds() <= 10)):
+            status, reason = "blocked", "waiting_non_trial_quote"
+        elif entry_price is None:
             status, reason = (
                 ("blocked", "observed_09_01_minute_price_unavailable")
                 if minute_price_at_0901
@@ -530,6 +569,8 @@ def _prepare_entry_plan(
             )
         elif upper is None or lower is None:
             status, reason = "blocked", "price_limit_unavailable"
+        elif spec.uses_realistic_execution and not (lower - 1e-8 <= entry_price <= upper + 1e-8):
+            status, reason = "blocked", "execution_price_outside_daily_limits"
         elif minute_price_at_0901:
             # Missed-opening recovery separates the two causal roles that the
             # legacy replay conflated. The official session open sizes the
@@ -539,8 +580,13 @@ def _prepare_entry_plan(
             # admissible when no tick/VWAP exists. A missing minute bar remains
             # blocked and is never replaced by the open, a carried last price,
             # a best quote, or an adverse tick.
-            filled_shares = requested_shares
+            minute_kbar_capacity_shares = _minute_kbar_capacity_shares(quote_values, lot_size=spec.lot_size)
+            filled_shares = min(requested_shares, minute_kbar_capacity_shares)
             reason = "counterfactual_observed_09_01_minute_price_fill"
+            if filled_shares <= 0:
+                status, reason = "blocked", "observed_09_01_minute_liquidity_unavailable"
+            elif filled_shares < requested_shares:
+                status, reason = "partial_depth", "observed_09_01_minute_capacity_exhausted"
         elif official_open_at_0901:
             # User-selected paper convention: at 09:01 use the already observed
             # official session open for both directions.  This is deterministic
@@ -690,6 +736,29 @@ def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     _append_jsonl_many(path, (payload,))
 
 
+@contextmanager
+def minute_curve_write_lock(root: Path):
+    """Serialize the minute ledger append with background atomic replacement."""
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".minute_curve_write.lock").open("a+") as lock:
+        if os.name == "nt":
+            import msvcrt
+            if lock.tell() == 0:
+                lock.write("0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+
 def _append_jsonl_many(
     path: Path,
     payloads: Sequence[Mapping[str, Any]],
@@ -709,17 +778,18 @@ def _append_jsonl_many(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
         for payload in payloads
     ).encode("utf-8")
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        view = memoryview(encoded)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError(f"short append to {path}")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    with minute_curve_write_lock(path.parent) if path.name == "marks.jsonl" else nullcontext():
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError(f"short append to {path}")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,8 +807,36 @@ class ModeSpec:
     price_limit_offset_ticks: int = 0
     entry_fill_policy: str = ENTRY_FILL_POLICY_CAUSAL_BOOK
     entry_price_offset_ticks: int = 0
+    realistic_execution: bool = True
+    residual_margin_conversion: bool = False
+    strict_intraday: bool = False
+    odd_lot_execution_policy: str = "reject"
+    margin_corporate_action_reference_path: Path | None = None
+    margin_financing_ratio: float = 0.60
+    margin_financing_annual_rate: float = 0.16
+    margin_short_annual_borrow_rate: float = 0.20
+    margin_short_handling_fee_rate: float = 0.001
+
+    @property
+    def uses_realistic_execution(self) -> bool:
+        return self.realistic_execution and self.entry_fill_policy in {
+            ENTRY_FILL_POLICY_CAUSAL_BOOK, ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+        }
 
     def __post_init__(self) -> None:
+        if self.strict_intraday and not self.uses_realistic_execution:
+            raise ValueError("strict intraday requires source-backed realistic execution")
+        if self.odd_lot_execution_policy not in {"reject", "assumed_odd_lot_at_regular_board_price_v1"}:
+            raise ValueError("unknown odd-lot execution policy")
+        if self.odd_lot_execution_policy != "reject" and not self.residual_margin_conversion:
+            raise ValueError("odd-lot board-price assumption requires margin carry")
+        if self.residual_margin_conversion and not self.uses_realistic_execution:
+            raise ValueError("margin carry requires causal-book or source-backed 09:01 volume-capped execution")
+        for field in ("margin_financing_ratio", "margin_financing_annual_rate",
+                      "margin_short_annual_borrow_rate", "margin_short_handling_fee_rate"):
+            value = float(getattr(self, field))
+            if not math.isfinite(value) or value < 0 or (field == "margin_financing_ratio" and value > 1):
+                raise ValueError(f"invalid {field}")
         if (
             isinstance(self.price_limit_offset_ticks, bool)
             or int(self.price_limit_offset_ticks) != self.price_limit_offset_ticks
@@ -808,6 +906,7 @@ def load_live_eligibility(
     parquet_root: Path,
     symbols: Sequence[str],
     trading_date: date,
+    require_latest: bool = True,
 ) -> tuple[dict[str, LiveEligibility], dict[str, Any]]:
     """Resolve exact-session membership; a missing venue/date fails closed."""
 
@@ -859,7 +958,7 @@ def load_live_eligibility(
             "path": str(path),
             "target_date": target_date,
             "latest_date": latest_date,
-            "covered": bool(venue_members) and latest_date == target_date,
+            "covered": bool(venue_members) and (not require_latest or latest_date == target_date),
             "member_count": len(venue_members),
             "error": error,
         }
@@ -938,7 +1037,7 @@ def quote_map_from_snapshot(
     def values(source: np.ndarray | None) -> np.ndarray:
         if source is None:
             return np.full((count,), np.nan, dtype=np.float64)
-        array = np.asarray(source, dtype=np.float64)
+        array = np.array(source, dtype=np.float64, copy=True)
         if array.shape != (count,):
             raise ValueError(f"quote array shape {array.shape} != {(count,)}")
         return array
@@ -976,10 +1075,33 @@ def quote_map_from_snapshot(
         if array.shape != (count,):
             raise ValueError(f"{name} shape {array.shape} != {(count,)}")
     date_values = np.full((count,), np.datetime64(trading_date.isoformat(), "D"))
+    classified = [classify_tw_stock_or_etf(s) for s in symbols]
+    product_types = np.asarray([kind or "stock" for kind in classified])
+    known_products = np.asarray([kind is not None for kind in classified])
     computed_upper = limit_price_numpy(reference, 1.10, date_values)
     computed_lower = limit_price_numpy(reference, 0.90, date_values)
+    # ETF tick schedules do NOT imply a 10% price limit. Leveraged and foreign
+    # products require their actual exchange limits; never fabricate them from
+    # a stock's reference-price formula.
+    computed_upper = np.where(known_products & (product_types == "stock"), computed_upper, np.nan)
+    computed_lower = np.where(known_products & (product_types == "stock"), computed_lower, np.nan)
     upper = np.where(np.isfinite(upper), upper, computed_upper)
     lower = np.where(np.isfinite(lower), lower, computed_lower)
+    invalid_price_fields: dict[str, np.ndarray] = {}
+    for name, array, raw in (
+        ("bid", bid, snapshot.bid_prices), ("ask", ask, snapshot.ask_prices),
+        ("upper_limit", upper, upper), ("lower_limit", lower, lower),
+    ):
+        legal = known_products & price_on_tick_grid_numpy(
+            raw if raw is not None else array, date_values, security_types=product_types,
+        )
+        invalid_price_fields[name] = np.isfinite(array) & (array > 0) & ~legal
+        # Preserve the original evidence in the provider. Reject invalid
+        # executable prices here instead of snapping an observed quote.
+        array[~legal] = np.nan
+        # Only already-validated representation noise is normalized to cents.
+        # A float32 49.9000015 can denote 49.90; an actual 49.91 stock bid cannot.
+        array[legal] = np.rint(array[legal] * 100.0) / 100.0
 
     output: dict[str, dict[str, Any]] = {}
     for idx, raw_symbol in enumerate(symbols):
@@ -1023,6 +1145,9 @@ def quote_map_from_snapshot(
                 else bool(simtrade_flags[idx])
             ),
             "source": snapshot.source,
+            "invalid_order_price_fields": [
+                name for name, invalid in invalid_price_fields.items() if invalid[idx]
+            ],
         }
     return output
 
@@ -1035,7 +1160,9 @@ class TwDayTradeSimulationEngine:
         state_dir: Path,
         *,
         final_settlement_path: str | Path = DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
+        publication_clock: Callable[[], datetime] | None = None,
     ) -> None:
+        self._publication_clock = publication_clock
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
@@ -1056,6 +1183,7 @@ class TwDayTradeSimulationEngine:
         self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
         self._corporate_action_load_error: str | None = None
         self._corporate_action_coverage_end: date | None = None
+        self._margin_action_cache: dict[tuple[Any, ...], Any] = {}
         self._engine_run_id = uuid.uuid4().hex
         self._deferred_ledger_rows: dict[Path, list[Mapping[str, Any]]] | None = None
         self.state = self._load_state()
@@ -1063,6 +1191,11 @@ class TwDayTradeSimulationEngine:
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
         self._audit_signal_commit_state()
+        for mode in self.state.get("modes", {}).values():
+            if mode.get("entry_retry_pending_commit"):
+                mode["ledger_state_divergence"] = {"kind": "entry_retry_commit_interrupted",
+                    "signal_id": mode.get("signal_id")}
+                mode["engine_status"] = "critical_ledger_state_divergence"
         self._restore_position_artifact_paths()
         if stock_benchmarks_migrated or tx_benchmark_migrated:
             _atomic_json(self.state_path, self.state)
@@ -1575,13 +1708,16 @@ class TwDayTradeSimulationEngine:
             if isinstance(position, Mapping)
         ]
         session_date = str(mode.get("session_date") or "").strip()
-        if not session_date or not positions:
+        if not session_date:
             return
         destination = (
             self.position_history_dir
             / session_date
             / self._position_history_filename(mode.get("market"))
         )
+        if (mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                and archived_at.date().isoformat() > session_date and destination.is_file()):
+            return  # freeze prior-close inventory before next-day interest/marks
         _atomic_json(
             destination,
             {
@@ -1590,6 +1726,13 @@ class TwDayTradeSimulationEngine:
                 "market": mode.get("market"),
                 "signal_id": mode.get("signal_id"),
                 "archived_at": archived_at.isoformat(timespec="seconds"),
+                "checkpoint_fingerprint": mode.get("checkpoint_fingerprint"),
+                "config_fingerprint": mode.get("config_fingerprint"),
+                "execution_realism_contract": mode.get("execution_realism_contract"),
+                "margin_carry_contract": mode.get("margin_carry_contract"),
+                "cumulative_carry_cost_twd": mode.get("cumulative_carry_cost_twd", 0),
+                "cumulative_corporate_action_net_twd": mode.get("cumulative_corporate_action_net_twd", 0),
+                "entry_fill_count": mode.get("entry_fill_count"),
                 "simulation_only": True,
                 "production_order_possible": False,
                 "positions": positions,
@@ -1676,16 +1819,31 @@ class TwDayTradeSimulationEngine:
                 cumulative = math.nan
 
             previous = ledger.get(symbol) or {}
+            if (previous.get("session_date") == session_date and math.isfinite(cumulative)
+                    and previous.get("cumulative_volume_lots") is not None
+                    and cumulative < float(previous["cumulative_volume_lots"])):
+                # A stale/out-of-order message must not lower the durable
+                # baseline and inflate the capacity of a subsequent message.
+                quote["minute_volume_lots"] = None
+                quote["minute_volume_source"] = "rejected_cumulative_regression"
+                prepared[symbol] = quote
+                continue
             minute_lots: float | None = None
+            baseline = None
             if (
                 str(previous.get("session_date") or "") == session_date
                 and str(previous.get("minute") or "") == minute_key
             ):
                 cached = previous.get("minute_volume_lots")
                 if cached is not None:
-                    minute_lots = float(cached)
+                    baseline = previous.get("baseline_cumulative_volume_lots")
+                    if baseline is None and previous.get("cumulative_volume_lots") is not None:
+                        baseline = float(previous["cumulative_volume_lots"]) - float(cached)
+                    if baseline is not None and math.isfinite(cumulative) and cumulative >= float(previous.get("cumulative_volume_lots") or 0):
+                        minute_lots = cumulative - float(baseline)
             elif math.isfinite(cumulative):
                 if minute.timetz().replace(tzinfo=None) == FIRST_MINUTE_EXECUTION_TIME:
+                    baseline = 0.0
                     minute_lots = cumulative
                 elif str(previous.get("session_date") or "") == session_date:
                     previous_at = _parse_timestamp(previous.get("minute"))
@@ -1697,13 +1855,22 @@ class TwDayTradeSimulationEngine:
                     ):
                         delta = cumulative - float(previous_cumulative)
                         if math.isfinite(delta) and delta >= 0.0:
+                            baseline = float(previous_cumulative)
                             minute_lots = delta
+            if math.isfinite(cumulative):
+                auction_baseline = previous.get("auction_baseline_cumulative_volume_lots") if previous.get("session_date") == session_date else None
+                if CLOSING_AUCTION_TIME <= observed.time() < SESSION_CLOSE:
+                    auction_baseline = cumulative
                 ledger[symbol] = {
                     "session_date": session_date,
                     "minute": minute_key,
                     "cumulative_volume_lots": cumulative,
                     "minute_volume_lots": minute_lots,
+                    "baseline_cumulative_volume_lots": baseline,
+                    "auction_baseline_cumulative_volume_lots": auction_baseline,
                 }
+                if "auction_volume_lots" not in quote and auction_baseline is not None and cumulative >= float(auction_baseline):
+                    quote["auction_volume_lots"] = cumulative - float(auction_baseline)
             quote["minute_volume_lots"] = minute_lots
             quote["minute_volume_source"] = (
                 "adjacent_cumulative_snapshot_delta"
@@ -2726,7 +2893,10 @@ class TwDayTradeSimulationEngine:
         # it to rewrite a completed counterfactual replay makes state and the
         # append-only fill ledger disagree immediately after a service restart.
         mode["configured_entry_fill_policy"] = spec.entry_fill_policy
+        mode["configured_intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
         if mode.get("entry_completed_at"):
+            if not mode.get("pending_signal_id"):
+                mode.pop("missing_carried_open_symbols", None)
             committed_policies = {
                 str(position.get("entry_fill_policy") or "")
                 for position in (mode.get("positions") or {}).values()
@@ -2794,12 +2964,19 @@ class TwDayTradeSimulationEngine:
             )
             if isinstance(divergence, Mapping):
                 mode["engine_status"] = "critical_ledger_state_divergence"
+            elif (mode.get("margin_corporate_action_receipt") or {}).get("status") == "blocked":
+                mode["engine_status"] = "waiting_margin_corporate_action"
             elif bool(mode.get("legacy_execution_contract")) and has_open_position:
                 mode["engine_status"] = (
                     "critical_legacy_position_requires_reconciliation"
                 )
             elif has_open_position:
                 mode["engine_status"] = (
+                    "margin_carried_waiting_next_signal"
+                    if mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT and (
+                        str(mode.get("session_date") or "") != observed.date().isoformat()
+                        or observed.time() >= SESSION_CLOSE)
+                    else
                     "critical_unflattened_after_13_24"
                     if observed.timetz().replace(tzinfo=None) >= FORCE_EXIT_TIME
                     else "active"
@@ -2827,6 +3004,10 @@ class TwDayTradeSimulationEngine:
                 mode["engine_status"] = "session_complete"
             else:
                 mode["engine_status"] = "waiting_signal"
+            if not divergence and not mode.get("readiness_error") and (mode.get("margin_corporate_action_receipt") or {}).get("status") != "blocked":
+                strict_status = self._intraday_status(mode, observed)
+                if strict_status:
+                    mode["engine_status"] = strict_status
         self._persist(observed)
 
     def rearm_flat_session(
@@ -3162,6 +3343,13 @@ class TwDayTradeSimulationEngine:
                     and opening_gate_to_ledger_ms <= opening_commit_slo_ms
                 ),
                 "signal_compute_total_ms": signal_total_ms,
+                # Keep the original local callback/response evidence even if
+                # Discord's later rich-artifact delivery fails. Never infer
+                # exchange receipt time from the execution loop's clock.
+                "price_request_started_at": summary.get("price_request_started_at"),
+                "price_response_received_at": summary.get("price_response_received_at"),
+                "price_receipt_timing": dict(summary.get("price_receipt_timing") or {}),
+                "quote_transport": dict(live_latency.get("quote_transport") or {}),
                 "opening_signal_batch": {
                     "observed_mode_count": max(0, int(opening_signal_batch_mode_count)),
                     "expected_mode_count": max(
@@ -3322,7 +3510,25 @@ class TwDayTradeSimulationEngine:
             return self._block_signal(
                 mode, signal_id, "daily_signal_already_consumed", observed
             )
-        if any(
+        carrying_positions = [p for p in (mode.get("positions") or {}).values() if int(p.get("signed_shares") or 0)]
+        if spec.strict_intraday and carrying_positions:
+            # A prior-day failure is a liquidation obligation, not today's
+            # target inventory. Preserve its ledger and close it before any
+            # new risk, even if today's model requests the same direction.
+            if not self._margin_corporate_action_gate(mode, observed):
+                return "waiting_quote"
+            self._accrue_margin_carry_cost(mode, observed)
+            self._liquidate_prior_inventory(mode, quotes, observed)
+            if any(p.get("signed_shares") for p in carrying_positions):
+                mode["engine_status"] = "critical_prior_inventory_liquidation"
+                mode["pending_signal_id"] = signal_id
+                self._persist(observed)
+                return "waiting_prior_liquidation"
+            self._archive_mode_positions(mode, archived_at=observed)
+            carrying_positions = []
+        margin_rebalance = bool(carrying_positions and spec.residual_margin_conversion
+            and all(p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT for p in carrying_positions))
+        if not margin_rebalance and any(
             int(position.get("signed_shares") or 0) != 0
             for position in (mode.get("positions") or {}).values()
         ):
@@ -3333,6 +3539,57 @@ class TwDayTradeSimulationEngine:
                 observed,
                 engine_status="critical_prior_position_unflattened",
             )
+
+        row_symbols = [str(row.get("symbol") or "") for row in signal_rows if str(row.get("symbol") or "")]
+        if len(row_symbols) != len(set(row_symbols)):
+            return self._block_signal(mode, signal_id, "duplicate_signal_symbols", observed)
+
+        if spec.residual_margin_conversion:
+            mode["odd_lot_execution_policy"] = spec.odd_lot_execution_policy
+            mode["margin_corporate_action_reference_path"] = (
+                str(spec.margin_corporate_action_reference_path)
+                if spec.margin_corporate_action_reference_path is not None else None
+            )
+            self._settle_corporate_action_claims(mode, observed)
+        if margin_rebalance and not self._margin_corporate_action_gate(mode, observed):
+            # Recoverable source/accounting wait: do not consume this signal,
+            # overwrite the old inventory, or size from an ex-date NAV gap.
+            mode["pending_signal_id"] = signal_id
+            self._persist(observed)
+            return "waiting_margin_corporate_action"
+
+        # Freeze economic NAV once per session, including pending-quote retries
+        # and restart. The initial capital remains the reporting denominator.
+        sizing_date = observed.date().isoformat()
+        if mode.get("sizing_session_date") != sizing_date:
+            sizing_nav = (float(mode["initial_capital_twd"])
+                          + float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
+                          + float(mode.get("cumulative_corporate_action_net_twd") or 0.0))
+            if margin_rebalance:
+                # Only observed opening prices, not the completed 09:01 fill,
+                # may value the pre-decision inventory used for target sizing.
+                missing = [p["symbol"] for p in carrying_positions
+                           if _finite(quotes.get(p["symbol"], {}).get("open")) is None
+                           and not (quotes.get(p["symbol"], {}).get("official_session_no_trade_print")
+                                    and _finite(p.get("last_mark_price")) is not None)]
+                if missing:
+                    mode["pending_signal_id"] = signal_id
+                    mode["engine_status"] = "waiting_carried_position_open_price"
+                    mode["missing_carried_open_symbols"] = sorted(set(missing))
+                    self._persist(observed)
+                    return "waiting_quote"
+                self._accrue_margin_carry_cost(mode, observed)
+                mode["sizing_nav_carried_price_symbols"] = sorted({p["symbol"] for p in carrying_positions if _finite(quotes[p["symbol"]].get("open")) is None})
+                sizing_nav += sum(position_net_liquidation_pnl(p,
+                    _finite(quotes[p["symbol"]].get("open")) or float(p["last_mark_price"])) for p in carrying_positions)
+            sizing_nav -= float(mode.get("cumulative_carry_cost_twd") or 0.0)
+            if not math.isfinite(sizing_nav) or sizing_nav <= 0.0:
+                return self._block_signal(mode, signal_id, "nonpositive_account_nav", observed)
+            mode["sizing_session_date"] = sizing_date
+            mode["session_sizing_nav_twd"] = sizing_nav
+        sizing_nav = float(mode["session_sizing_nav_twd"])
+        if not math.isfinite(sizing_nav) or sizing_nav <= 0.0:
+            return self._block_signal(mode, signal_id, "invalid_session_sizing_nav", observed)
 
         actionable_symbols: list[str] = []
         for row in signal_rows:
@@ -3360,7 +3617,7 @@ class TwDayTradeSimulationEngine:
             requested_shares = int(
                 math.floor(
                     abs(weight)
-                    * float(spec.initial_capital_twd)
+                    * sizing_nav
                     / sizing_price
                     / int(spec.lot_size)
                 )
@@ -3437,8 +3694,14 @@ class TwDayTradeSimulationEngine:
             security_type = evidence.security_type if evidence else None
             symbols.append(symbol)
             security_types.append(
-                security_type if security_type in {"stock", "etf"} else "stock"
+                security_type if security_type in {"stock", "etf"}
+                else classify_tw_stock_or_etf(symbol) or "stock"
             )
+        for position in carrying_positions:
+            if position["symbol"] not in symbols:
+                symbols.append(position["symbol"])
+                security_types.append(position.get("security_type") or "stock")
+        security_types_by_symbol = dict(zip(symbols, security_types))
         fee_rates = self._entry_and_exit_rates(
             symbols=symbols,
             security_types=security_types,
@@ -3479,6 +3742,7 @@ class TwDayTradeSimulationEngine:
         mode["config_fingerprint"] = summary.get("config_fingerprint")
         mode["eligibility_coverage"] = dict(eligibility_coverage)
         mode["simulation_replay"] = bool(summary.get("simulation_replay", False))
+        mode["historical_minute_valuation"] = bool(summary.get("historical_minute_valuation", False))
         mode["replay_basis"] = summary.get("replay_basis")
         mode["replay_source"] = summary.get("replay_source")
         mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
@@ -3497,7 +3761,7 @@ class TwDayTradeSimulationEngine:
         ) or (
             "counterfactual_unbounded_no_exchange_fill_claim"
             if synthetic_open_fill
-            else "observed_09_01_minute_price_full_requested_paper_quantity_no_exchange_fill_claim"
+            else "observed_09_01_minute_price_50pct_volume_capped_no_exchange_fill_claim"
             if deterministic_0901_minute_price_fill
             else "official_open_price_full_requested_paper_quantity_no_exchange_fill_claim"
             if deterministic_official_open_fill
@@ -3506,6 +3770,23 @@ class TwDayTradeSimulationEngine:
             else "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         )
         mode["entry_fill_policy"] = spec.entry_fill_policy
+        mode["execution_realism_contract"] = EXECUTION_REALISM_CONTRACT if spec.uses_realistic_execution else None
+        mode["intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
+        mode["capital_sizing_basis"] = "session_start_account_nav"
+        mode["funding_assumption"] = "paper_nav_risk_budget_not_verified_broker_buying_power"
+        mode["margin_carry_contract"] = MARGIN_CARRY_CONTRACT if spec.residual_margin_conversion else None
+        mode["margin_cost_assumptions"] = {
+            "financing_ratio": spec.margin_financing_ratio,
+            "financing_annual_rate": spec.margin_financing_annual_rate,
+            "short_annual_borrow_rate": spec.margin_short_annual_borrow_rate,
+            "short_handling_fee_rate": spec.margin_short_handling_fee_rate,
+            "day_count": "actual_calendar_days_365",
+            "source": "configured_stress_assumptions_not_broker_quote",
+        }
+        if spec.residual_margin_conversion:
+            mode["funding_assumption"] = "assumed_all_marginable_residual_no_inventory_or_credit_gate_gross_target_nav_budget"
+        if spec.strict_intraday:
+            mode["funding_assumption"] = "same_day_flatten_required_adverse_limit_exception_only_no_broker_credit_claim"
         mode["entry_price_offset_ticks"] = int(spec.entry_price_offset_ticks)
         mode["entry_fill_is_synthetic"] = bool(synthetic_open_fill)
         mode["counterfactual_0901_price_fill"] = bool(
@@ -3514,7 +3795,8 @@ class TwDayTradeSimulationEngine:
         mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
-        mode["positions"] = {}
+        mode["positions"] = {p["position_id"]: p for p in carrying_positions} if margin_rebalance else {}
+        mode["pending_entry_orders"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode.pop("pending_wait_reason", None)
         mode["exit_limit_submitted_at"] = None
@@ -3523,6 +3805,10 @@ class TwDayTradeSimulationEngine:
         mode["closing_auction_settled_at"] = None
         mode["residual_conversion_completed_at"] = None
         mode["force_exit_failures"] = 0
+        mode["pending_entry_shares"] = 0
+        mode["margin_exception_count"] = 0
+        mode["unresolved_exit_count"] = 0
+        mode["closing_auction_pending_count"] = 0
         mode["terminal_flatten_count"] = 0
         mode["terminal_flatten_degraded_count"] = 0
         counts: dict[str, int] = {}
@@ -3539,11 +3825,48 @@ class TwDayTradeSimulationEngine:
                 observation_at=observed,
                 spec=spec,
                 allow_quote_at_signal=counterfactual_open_replay,
+                sizing_nav_twd=sizing_nav,
             )
             for row in signal_rows
             if str(row.get("symbol") or "")
         ]
+        if margin_rebalance:
+            plans = self._reconcile_margin_targets(
+                mode, plans, quotes=quotes, spec=spec, signal_at=signal_at,
+                observed=observed, allow_quote_at_signal=counterfactual_open_replay,
+                order_records=order_records, fill_records=fill_records,
+            )
+        if spec.uses_realistic_execution and plans:
+            # Reserve full notional for BOTH directions: short-sale proceeds
+            # are never buying power. Reuse the canonical integer budget
+            # scaler; do not renormalize unfilled targets into other names.
+            prices = np.asarray([float(p["entry_price"] or 0.0) for p in plans])
+            desired = np.asarray([p["filled_shares"] for p in plans], dtype=np.int64)
+            rates = np.asarray([
+                fee_rates[p["symbol"]][0 if p["side"] == "long" else 1]
+                for p in plans
+            ])
+            funded = _scale_lot_buys_to_budget_with_fixed_fees(
+                desired, prices, np.asarray([p.get("quantity_step_shares", spec.lot_size) for p in plans]), rates,
+                budget=max(0.0, sizing_nav - sum(
+                    abs(int(p.get("signed_shares") or 0)) * (_finite(quotes[p["symbol"]].get("open")) or float(p["last_mark_price"]))
+                    for p in carrying_positions
+                ) - sum(float(r.get("fee_and_tax_twd") or 0) for r in fill_records)
+                    - float(mode.get("corporate_action_receivable_twd") or 0.0)),
+                minimum_commission=0.0, commission_rounding="none",
+            )
+            for plan, quantity in zip(plans, funded):
+                if int(quantity) < plan["filled_shares"]:
+                    plan["filled_shares"] = int(quantity)
+                    plan["status"] = "partial_depth" if quantity else "blocked"
+                    plan["reason"] = "account_nav_budget_exhausted"
         for plan in plans:
+            # Flags describe actual additions after inventory netting and
+            # funding, not the now-superseded flat-account preview quantity.
+            if not int(plan["filled_shares"]):
+                for key in ("synthetic_fill", "synthetic_fallback_fill", "paper_market_fill",
+                            "counterfactual_0901_price_fill", "counterfactual_open_price_fill"):
+                    plan[key] = False
             row = plan["row"]
             symbol = plan["symbol"]
             target_weight = float(plan["target_weight"])
@@ -3566,7 +3889,7 @@ class TwDayTradeSimulationEngine:
                 (1.0 if side == "long" else -1.0)
                 * filled_shares
                 * entry_price
-                / float(spec.initial_capital_twd)
+                / sizing_nav
                 if filled_shares > 0 and entry_price is not None
                 else 0.0
             )
@@ -3593,6 +3916,14 @@ class TwDayTradeSimulationEngine:
                 "raw_score": row.get("raw_score"),
                 "target_weight": target_weight,
                 "requested_shares": requested_shares,
+                "previous_signed_shares": plan.get("previous_signed_shares", 0),
+                "target_signed_shares": plan.get("target_signed_shares"),
+                "reduction_requested_shares": plan.get("reduction_requested_shares", 0),
+                "reduction_filled_shares": plan.get("reduction_filled_shares", 0),
+                "margin_carry_contract": mode.get("margin_carry_contract"),
+                "sizing_nav_twd": sizing_nav,
+                "filled_weight_basis": "session_start_account_nav",
+                "execution_realism_contract": mode.get("execution_realism_contract"),
                 "executable_order_shares": filled_shares,
                 "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "sizing_open_price": sizing_price,
@@ -3636,6 +3967,13 @@ class TwDayTradeSimulationEngine:
             }
             signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
+            retryable = (spec.strict_intraday and not counterfactual_open_replay
+                         and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+                         and requested_shares > filled_shares and upper is not None and lower is not None
+                         and reason in {"marketable_depth_exhausted", "marketable_depth_unavailable",
+                                        "no_executable_best_quote", "quote_not_after_signal",
+                                        "quote_after_local_observation", "account_nav_budget_exhausted",
+                                        "waiting_non_trial_quote"})
             if (
                 status
                 not in {
@@ -3644,14 +3982,18 @@ class TwDayTradeSimulationEngine:
                     "forced_synthetic_fill",
                 }
                 or entry_price is None
-            ):
+            ) and not retryable:
                 continue
+            # A zero-fill template is private pending-order metadata. It never
+            # enters positions/fills until an actual causal quote is consumed.
+            entry_price = entry_price if entry_price is not None else sizing_price
 
             upper_bracket = float(
                 move_price_ticks_numpy(
                     np.asarray([upper], dtype=np.float64),
                     -offset_ticks,
                     np.asarray([observed.date()]),
+                    security_types=security_types_by_symbol[symbol],
                 )[0]
             )
             lower_bracket = float(
@@ -3659,6 +4001,7 @@ class TwDayTradeSimulationEngine:
                     np.asarray([lower], dtype=np.float64),
                     offset_ticks,
                     np.asarray([observed.date()]),
+                    security_types=security_types_by_symbol[symbol],
                 )[0]
             )
 
@@ -3695,6 +4038,7 @@ class TwDayTradeSimulationEngine:
                 "filled_shares": filled_shares,
                 "signed_shares": signed_shares,
                 "lot_size": int(spec.lot_size),
+                "odd_lot_execution_policy": spec.odd_lot_execution_policy,
                 "entry_order_id": entry_order_id,
                 "entry_at": observed.isoformat(timespec="seconds"),
                 "entry_quote_at": quote.get("quote_at"),
@@ -3710,11 +4054,7 @@ class TwDayTradeSimulationEngine:
                 "commission_rebate_rate": rebate_rate,
                 "cash_buy_fee_rate": cash_buy_rate,
                 "cash_sell_fee_rate": cash_sell_rate,
-                "security_type": (
-                    evidence.security_type
-                    if evidence and evidence.security_type in {"stock", "etf"}
-                    else "stock"
-                ),
+                "security_type": security_types_by_symbol[symbol],
                 "upper_limit": upper,
                 "lower_limit": lower,
                 "take_profit_price": upper_bracket if side == "long" else lower_bracket,
@@ -3758,6 +4098,16 @@ class TwDayTradeSimulationEngine:
                     plan["counterfactual_open_price_fill"]
                 ),
             }
+            if retryable:
+                mode["pending_entry_orders"][symbol] = {
+                    "position": dict(position), "remaining_shares": requested_shares - filled_shares,
+                    "last_cumulative_volume_lots": quote.get("cumulative_volume_lots"),
+                    "minute": observed.strftime("%Y-%m-%dT%H:%M"),
+                    "minute_used_shares": filled_shares,
+                    "status": "working", "sequence": 0,
+                }
+            if filled_shares <= 0:
+                continue
             mode["positions"][position_id] = position
             mode["cumulative_commission_rebate_accrued_twd"] = (
                 float(mode.get("cumulative_commission_rebate_accrued_twd") or 0.0)
@@ -3776,6 +4126,7 @@ class TwDayTradeSimulationEngine:
                 "symbol": symbol,
                 "quantity": filled_shares,
                 "simulation_only": True,
+                "odd_lot_execution_policy": spec.odd_lot_execution_policy if filled_shares % spec.lot_size else None,
             }
             order_records.append(
                 {
@@ -3869,6 +4220,21 @@ class TwDayTradeSimulationEngine:
                     }
                 )
 
+        if spec.residual_margin_conversion:
+            inventory: dict[str, int] = {}
+            inventory_marks: dict[str, float] = {}
+            for p in mode["positions"].values():
+                symbol = str(p["symbol"])
+                inventory[symbol] = inventory.get(symbol, 0) + int(p["signed_shares"])
+                quote = quotes.get(symbol) or {}
+                inventory_marks[symbol] = (_finite(quote.get("execution_price_0901"))
+                    or _finite(quote.get("bid" if int(p["signed_shares"]) > 0 else "ask"))
+                    or float(p["last_mark_price"]))
+            for record in signal_records:
+                symbol = str(record["symbol"])
+                record["inventory_signed_shares_after"] = inventory.get(symbol, 0)
+                record["inventory_weight_after"] = inventory.get(symbol, 0) * inventory_marks.get(symbol, 0.0) / sizing_nav
+                record["inventory_weight_basis"] = "session_nav_observed_execution_or_last_mark"
         reason_counts: dict[str, int] = {}
         for plan in plans:
             reason = str(plan.get("reason") or "none")
@@ -3878,7 +4244,8 @@ class TwDayTradeSimulationEngine:
         )
         entry_filled_shares = sum(int(plan.get("filled_shares") or 0) for plan in plans)
         entry_unfilled_shares = max(0, entry_requested_shares - entry_filled_shares)
-        entry_fill_count = len(fill_records)
+        entry_fill_count = sum(r.get("purpose") == "entry" for r in fill_records)
+        mode["rebalance_reduction_fill_count"] = sum(r.get("purpose") == "next_signal_inventory_delta" for r in fill_records)
         entry_best_quote_fill_count = sum(
             int(plan.get("filled_shares") or 0) > 0
             and not bool(plan.get("synthetic_fill"))
@@ -3926,6 +4293,11 @@ class TwDayTradeSimulationEngine:
         mode["entry_requested_shares"] = entry_requested_shares
         mode["entry_filled_shares"] = entry_filled_shares
         mode["entry_unfilled_shares"] = entry_unfilled_shares
+        mode["pending_entry_shares"] = sum(
+            int(order["remaining_shares"])
+            for order in (mode.get("pending_entry_orders") or {}).values()
+            if order.get("status") == "working"
+        )
         mode["entry_fill_outcome"] = entry_fill_outcome
         mode["entry_best_quote_fill_count"] = entry_best_quote_fill_count
         mode["entry_synthetic_fallback_fill_count"] = (
@@ -4046,6 +4418,165 @@ class TwDayTradeSimulationEngine:
             raise
         return "registered"
 
+    def _liquidate_prior_inventory(self, mode, quotes, now):
+        """Old inventory is reduction-only, independently of today's inference."""
+        if not LIVE_ENTRY_GATE <= now.time() < AUCTION_OBSERVATION_DEADLINE:
+            return
+        for p in (mode.get("positions") or {}).values():
+            if not p.get("signed_shares") or str(p.get("session_date") or "") >= now.date().isoformat():
+                continue
+            quote = quotes.get(p["symbol"]) or {}
+            side = "sell" if int(p["signed_shares"]) > 0 else "buy"
+            lower, upper = _finite(quote.get("lower_limit")), _finite(quote.get("upper_limit"))
+            if lower is None or upper is None:
+                continue
+            p.update(lower_limit=lower, upper_limit=upper, bracket_prices_current=True, mandatory_exit_pending=True)
+            if now.time() >= CLOSING_AUCTION_TIME:
+                if p.get("mandatory_auction_session_date") != now.date().isoformat():
+                    self._order({"recorded_at": now.isoformat(), "session_date": now.date().isoformat(),
+                        "market": mode["market"], "position_id": p["position_id"], "symbol": p["symbol"],
+                        "order_id": f"{p['position_id']}:mandatory_auction:{now.date()}",
+                        "purpose": "prior_day_mandatory_liquidation", "side": side,
+                        "order_type": "LMT_ROD", "price": lower if side == "sell" else upper,
+                        "quantity": abs(int(p["signed_shares"])), "status": "working", "simulation_only": True})
+                    p["mandatory_auction_session_date"] = now.date().isoformat()
+                    p["mandatory_auction_submitted_at"] = now.isoformat()
+                if now.time() < SESSION_CLOSE:
+                    continue
+                quote = self._auction_execution_quote(quote)
+                exchange_at = _parse_timestamp(quote.get("exchange_quote_at"))
+                submitted_at = _parse_timestamp(p.get("mandatory_auction_submitted_at"))
+                if (exchange_at is None or exchange_at.date() != now.date() or exchange_at > now
+                        or submitted_at is None or exchange_at <= submitted_at
+                        or not SESSION_CLOSE <= exchange_at.time() < time(13, 34)):
+                    continue
+                quote["minute_volume_lots"] = quote.get("auction_volume_lots")
+                quote["capacity_bucket"] = f"{now.date()}:closing_auction:{p['symbol']}"
+                price = _finite(quote.get("last"))
+                capacity = _minute_kbar_capacity_shares(quote, lot_size=int(p["lot_size"]))
+                order_type = "LMT_ROD"
+            else:
+                price = _finite(quote.get("bid" if side == "sell" else "ask"))
+                capacity_fn = _top_book_capacity_shares if now.time() < FIRST_MINUTE_EXECUTION_TIME else _executable_capacity_shares
+                capacity = capacity_fn(quote, transaction_side=side, lot_size=int(p["lot_size"]))
+                order_type = "MKT"
+            if (not self._fresh_regular_quote(quote, now) or price is None or not lower <= price <= upper
+                    or not bool(price_on_tick_grid_numpy(np.array([price]), np.array([now.date()]),
+                        security_types=p.get("security_type") or "stock")[0])):
+                continue
+            self._close_position(p, mode, price=price, quote=quote, now=now,
+                reason="prior_day_mandatory_liquidation", order_type=order_type, quantity=capacity,
+                ledger_session_date=now.date().isoformat(),
+                ledger_order_id=f"{p['position_id']}:mandatory_exit:{now.isoformat()}")
+
+    def _retry_entry_orders(self, mode, quotes, now):
+        """Continue a frozen daily target; never re-infer, re-size, or reopen exits.
+
+        Replenishment requires new cumulative trade volume, not another poll of
+        identical depth. Fees, acquisition cost and the NAV budget are retained.
+        A durable intent marker quarantines an interrupted append on restart.
+        """
+        orders = mode.get("pending_entry_orders") or {}
+        if not orders or mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
+            return
+        for symbol, order in orders.items():
+            if order.get("status") != "working":
+                continue
+            template = order["position"]
+            p = mode["positions"].get(template["position_id"])
+            if (mode.get("session_date") != now.date().isoformat() or now.time() >= EXIT_LIMIT_TIME
+                    or p and (p.get("last_exit_at") or p.get("stop_triggered_at"))):
+                order["status"] = "cancelled_exit_priority"
+                continue
+            quote = quotes.get(symbol) or {}
+            signal_at = _parse_timestamp(mode.get("signal_at"))
+            quote_at = _parse_timestamp(quote.get("quote_at"))
+            if not self._fresh_regular_quote(quote, now) or signal_at is None or quote_at <= signal_at:
+                continue
+            side = template["side"]
+            price = _finite(quote.get("ask" if side == "long" else "bid"))
+            if price is None or not template["lower_limit"] <= price <= template["upper_limit"]:
+                continue
+            if not bool(price_on_tick_grid_numpy(np.array([price]), np.array([now.date()]),
+                    security_types=template.get("security_type") or "stock")[0]):
+                continue
+            lot = int(template["lot_size"])
+            cumulative = quote.get("cumulative_volume_lots")
+            previous = order.get("last_cumulative_volume_lots")
+            if cumulative is None or previous is None:
+                order["last_cumulative_volume_lots"] = cumulative
+                if p is not None or cumulative is None:
+                    continue
+                # This zero-fill target has never consumed an executable book.
+                capacity = _top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot)
+            else:
+                delta = float(cumulative) - float(previous)
+                if not math.isfinite(delta) or delta <= 0:
+                    continue
+                capacity = min(_top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot),
+                               int(math.floor(delta * MINUTE_VOLUME_PARTICIPATION)) * lot)
+            minute = now.strftime("%Y-%m-%dT%H:%M")
+            used = int(order.get("minute_used_shares") or 0) if minute == order.get("minute") else 0
+            if now.time() >= FIRST_MINUTE_EXECUTION_TIME:
+                capacity = min(capacity, max(0, _minute_kbar_capacity_shares(quote, lot_size=lot) - used))
+            rate = float(template["buy_fee_rate"] if side == "long" else template["sell_fee_rate"])
+            rebate = float(template["commission_rebate_rate"])
+            reserved = sum(abs(int(x.get("filled_shares") or 0)) * float(x["entry_price"])
+                           + float(x.get("entry_fee_twd") or 0) for x in mode["positions"].values())
+            budget = max(0., float(mode["session_sizing_nav_twd"]) - reserved
+                         - float(mode.get("corporate_action_receivable_twd") or 0))
+            affordable = int(budget / (price * (1 + rate - rebate)) / lot) * lot
+            quantity = min(int(order["remaining_shares"]), capacity, affordable)
+            if quantity <= 0:
+                continue
+            sequence = int(order["sequence"]) + 1
+            order_id = f"{template['position_id']}:entry_retry:{sequence}"
+            mode["entry_retry_pending_commit"] = order_id
+            self._persist(now)
+            # State is committed only after both append-only ledgers succeed.
+            gross_fee, rebate_amount = quantity * price * rate, quantity * price * rebate
+            fee = gross_fee - rebate_amount
+            if p is None:
+                p = dict(template)
+                p.update(entry_at=now.isoformat(), entry_quote_at=quote.get("quote_at"), entry_price=price,
+                         filled_shares=0, signed_shares=0, entry_fee_twd=0., remaining_entry_fee_twd=0.,
+                         entry_gross_fee_and_tax_twd=0., entry_commission_rebate_accrued_twd=0.)
+                mode["positions"][p["position_id"]] = p
+            old = int(p["filled_shares"])
+            p["entry_price"] = (old * float(p["entry_price"]) + quantity * price) / (old + quantity)
+            p["filled_shares"] = old + quantity
+            p["signed_shares"] = (1 if side == "long" else -1) * (old + quantity)
+            p["executable_order_shares"] = old + quantity
+            p["target_unsubmitted_shares"] = int(order["remaining_shares"]) - quantity
+            for key, amount in (("entry_fee_twd", fee), ("remaining_entry_fee_twd", fee),
+                                ("entry_gross_fee_and_tax_twd", gross_fee),
+                                ("entry_commission_rebate_accrued_twd", rebate_amount)):
+                p[key] = float(p.get(key) or 0) + amount
+            common = {"recorded_at": now.isoformat(), "session_date": now.date().isoformat(),
+                      "market": mode["market"], "signal_id": mode["signal_id"], "symbol": symbol,
+                      "position_id": p["position_id"], "order_id": order_id, "purpose": "entry",
+                      "quantity": quantity, "simulation_only": True, "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_BOOK}
+            self._order(common | {"order_type": "MKT", "price": None, "status": "filled",
+                                  "side": "buy" if side == "long" else "sell_short"})
+            self._fill(common | {"fill_at": now.isoformat(), "quote_at": quote.get("quote_at"),
+                                 "price": price, "fee_and_tax_twd": fee,
+                                 "gross_fee_and_tax_twd": gross_fee, "commission_rebate_accrued_twd": rebate_amount,
+                                 "fill_contract": "causal_best_quote_remaining_order",
+                                 "depth_assumption": "new_volume_replenishment_and_minute_budget"})
+            mode["cumulative_commission_rebate_accrued_twd"] += rebate_amount
+            mode["entry_fill_count"] += 1
+            mode["entry_best_quote_fill_count"] += 1
+            mode["entry_filled_shares"] += quantity
+            mode["entry_unfilled_shares"] -= quantity
+            mode["entry_fill_outcome"] = "filled" if not mode["entry_unfilled_shares"] else "partial"
+            order.update(remaining_shares=int(order["remaining_shares"]) - quantity, sequence=sequence,
+                         last_cumulative_volume_lots=cumulative, minute=minute, minute_used_shares=used + quantity)
+            if not order["remaining_shares"]:
+                order["status"] = "filled"
+            mode.pop("entry_retry_pending_commit", None)
+            self._persist(now)
+        mode["pending_entry_shares"] = sum(int(o["remaining_shares"]) for o in orders.values() if o["status"] == "working")
+
     def _block_signal(
         self,
         mode: dict[str, Any],
@@ -4099,7 +4630,31 @@ class TwDayTradeSimulationEngine:
         for market, mode in self.state.get("modes", {}).items():
             if selected_markets is not None and str(market) not in selected_markets:
                 continue
+            if mode.get("ledger_state_divergence") or mode.get("entry_retry_pending_commit"):
+                mode["engine_status"] = "critical_ledger_state_divergence"
+                continue
             positions = mode.get("positions") or {}
+            if (mode.get("configured_intraday_contract") == STRICT_INTRADAY_CONTRACT
+                    and str(mode.get("session_date") or "") < observed.date().isoformat()):
+                if not self._margin_corporate_action_gate(mode, observed):
+                    continue
+                self._accrue_margin_carry_cost(mode, observed)
+                self._liquidate_prior_inventory(mode, quotes, observed)
+                self._mark_mode(market, observed, quotes, append_history=False)
+                if any(p.get("signed_shares") for p in positions.values()):
+                    mode["engine_status"] = "critical_prior_inventory_liquidation"
+                continue
+            if mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT:
+                self._settle_corporate_action_claims(mode, observed)
+                if not self._margin_corporate_action_gate(mode, observed):
+                    continue
+                self._accrue_margin_carry_cost(mode, observed)
+                if str(mode.get("session_date") or "") != observed.date().isoformat():
+                    # No stale prior-session brackets before the next decision.
+                    self._mark_mode(market, observed, quotes, append_history=False)
+                    if any(int(p.get("signed_shares") or 0) for p in positions.values()):
+                        mode["engine_status"] = "margin_carried_waiting_next_signal"
+                    continue
             if bool(mode.get("legacy_execution_contract")) and any(
                 int(position.get("signed_shares") or 0) != 0
                 for position in positions.values()
@@ -4149,6 +4704,9 @@ class TwDayTradeSimulationEngine:
             elif not mode.get("exit_limit_submitted_at"):
                 self._submit_exit_limits(market, mode, quotes, observed)
             if EXIT_LIMIT_TIME <= wall_time < FORCE_EXIT_TIME:
+                if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
+                    for position in positions.values():
+                        self._apply_bracket(position, mode, quotes.get(position.get("symbol")) or {}, observed)
                 self._fill_crossed_exit_limits(mode, quotes, observed)
             if FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME:
                 self._force_exit(market, mode, quotes, observed)
@@ -4158,12 +4716,18 @@ class TwDayTradeSimulationEngine:
                 self._submit_closing_auction_limits(market, mode, observed)
                 self._settle_closing_auction(market, mode, quotes, observed)
                 self._convert_residual_to_carry(market, mode, quotes, observed)
+            self._retry_entry_orders(mode, quotes, observed)
             self._mark_mode(
                 market,
                 observed,
                 quotes,
-                append_history=append_mark_history,
+                append_history=(append_mark_history or (
+                    mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
+                    and wall_time >= SESSION_CLOSE)),
             )
+            if (mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                    and wall_time >= SESSION_CLOSE):
+                self._archive_mode_positions(mode, archived_at=observed)
         if persist:
             self._persist(observed)
 
@@ -4175,7 +4739,13 @@ class TwDayTradeSimulationEngine:
         now: datetime,
     ) -> None:
         signed = int(position.get("signed_shares") or 0)
+        if position.get("bracket_prices_current") is False:
+            return
         if signed == 0:
+            return
+        strict = mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
+        if strict and not self._fresh_regular_quote(quote, now):
+            position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
             return
         bid = _finite(quote.get("bid"))
         ask = _finite(quote.get("ask"))
@@ -4183,9 +4753,18 @@ class TwDayTradeSimulationEngine:
         side = str(position.get("side"))
         take_profit = float(position["take_profit_price"])
         stop = float(position["stop_trigger_price"])
+        if strict:
+            # A last trade can lag the executable side; either adverse price
+            # triggers the stop. Once triggered, recovery cannot disarm it.
+            adverse_prices = [p for p in (last, bid if side == "long" else ask) if p is not None]
+            if any(p <= stop if side == "long" else p >= stop for p in adverse_prices):
+                position.setdefault("stop_triggered_at", now.isoformat(timespec="seconds"))
+                position["stop_order_status"] = "triggered_waiting_liquidity"
         tp_hit = (side == "long" and bid is not None and bid >= take_profit) or (
             side == "short" and ask is not None and ask <= take_profit
         )
+        if strict and (position.get("stop_triggered_at") or now.time() >= EXIT_LIMIT_TIME):
+            tp_hit = False
         if tp_hit:
             capacity = _executable_capacity_shares(
                 quote,
@@ -4221,8 +4800,10 @@ class TwDayTradeSimulationEngine:
         ):
             return
         position["stop_order_status"] = "triggered_waiting_liquidity"
+        position.setdefault("stop_triggered_at", now.isoformat(timespec="seconds"))
         executable = bid if side == "long" else ask
-        capacity = _executable_capacity_shares(
+        capacity_fn = _top_book_capacity_shares if strict and now.time() < FIRST_MINUTE_EXECUTION_TIME else _executable_capacity_shares
+        capacity = capacity_fn(
             quote,
             transaction_side="sell" if side == "long" else "buy",
             lot_size=int(position.get("lot_size") or 1_000),
@@ -4318,6 +4899,10 @@ class TwDayTradeSimulationEngine:
             if int(position.get("signed_shares") or 0) == 0:
                 continue
             quote = quotes.get(str(position.get("symbol"))) or {}
+            if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT and position.get("stop_triggered_at"):
+                # Stop orders remain aggressive; do not replace them with a
+                # passive 13:20 order after only a partial stop execution.
+                continue
             if position.get("eod_limit_order_status") == "not_submitted_no_quote":
                 self._place_exit_limit(
                     market=str(mode.get("market")),
@@ -4337,6 +4922,23 @@ class TwDayTradeSimulationEngine:
                 side == "short" and ask is not None and ask <= limit_price
             )
             if crossed:
+                execution_price = limit_price
+                if str(quote.get("fill_contract") or "").startswith("historical_1m_ohlcv_"):
+                    submitted = _parse_timestamp(position.get("eod_limit_submitted_at"))
+                    # Right-labelled bars contain trades BEFORE their label.
+                    # An order submitted at that label cannot match them.
+                    if submitted is None or (now - submitted).total_seconds() < 60:
+                        continue
+                    opening = _finite(quote.get("historical_bar_open"))
+                    high = _finite(quote.get("historical_bar_high"))
+                    low = _finite(quote.get("historical_bar_low"))
+                    if opening is None or high is None or low is None or not low <= opening <= high:
+                        position["eod_limit_liquidity_status"] = "invalid_historical_price_range"
+                        continue
+                    execution_price = max(limit_price, opening) if side == "long" else min(limit_price, opening)
+                    if not low <= execution_price <= high:
+                        position["eod_limit_liquidity_status"] = "limit_not_reached_in_historical_range"
+                        continue
                 capacity = _executable_capacity_shares(
                     quote,
                     transaction_side="sell" if side == "long" else "buy",
@@ -4348,7 +4950,7 @@ class TwDayTradeSimulationEngine:
                 self._close_position(
                     position,
                     mode,
-                    price=limit_price,
+                    price=execution_price,
                     quote=quote,
                     now=now,
                     reason="13_20_limit_filled",
@@ -4464,15 +5066,19 @@ class TwDayTradeSimulationEngine:
         """
 
         session_date = str(mode.get("session_date") or now.date().isoformat())
-        if _timestamp_is_for_session(
+        already_submitted = _timestamp_is_for_session(
             mode.get("closing_auction_submitted_at"), session_date
-        ):
+        )
+        if already_submitted and mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
             return
-        mode["closing_auction_submitted_at"] = now.isoformat(timespec="seconds")
+        if not already_submitted:
+            mode["closing_auction_submitted_at"] = now.isoformat(timespec="seconds")
         submitted = 0
         for position in (mode.get("positions") or {}).values():
             signed = int(position.get("signed_shares") or 0)
             if signed == 0:
+                continue
+            if already_submitted and position.get("closing_auction_order_status") != "not_submitted_price_limit_unavailable":
                 continue
             side = str(position.get("side"))
             limit_price = _finite(
@@ -4485,6 +5091,7 @@ class TwDayTradeSimulationEngine:
                 )
                 continue
             position["closing_auction_limit_price"] = limit_price
+            position["closing_auction_order_submitted_at"] = now.isoformat()
             position["closing_auction_order_status"] = "working"
             submitted += 1
             self._order(
@@ -4507,12 +5114,13 @@ class TwDayTradeSimulationEngine:
                     ),
                 }
             )
-        self._event(
-            "closing_auction_limits_submitted",
-            recorded_at=now,
-            market=market,
-            submitted=submitted,
-        )
+        if submitted or not already_submitted:
+            self._event(
+                "closing_auction_limits_submitted",
+                recorded_at=now,
+                market=market,
+                submitted=submitted,
+            )
 
     def _settle_closing_auction(
         self,
@@ -4521,6 +5129,9 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
+        if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
+            self._settle_intraday_auction(market, mode, quotes, now)
+            return
         session_date = str(mode.get("session_date") or now.date().isoformat())
         if _timestamp_is_for_session(
             mode.get("closing_auction_settled_at"), session_date
@@ -4533,6 +5144,14 @@ class TwDayTradeSimulationEngine:
             if position.get("closing_auction_order_status") != "working":
                 continue
             quote = quotes.get(str(position.get("symbol"))) or {}
+            if mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
+                quote_time = _parse_timestamp(quote.get("quote_at"))
+                if (quote_time is None or quote_time.date() != now.date()
+                        or quote_time.timetz().replace(tzinfo=None) < SESSION_CLOSE
+                        or quote_time > now
+                        or "no_historical_auction_depth_claim" in str(quote.get("depth_assumption") or "")):
+                    position["closing_auction_order_status"] = "unfilled_no_causal_auction_evidence"
+                    continue
             close_price = _finite(quote.get("last"))
             capacity = _minute_kbar_capacity_shares(
                 quote,
@@ -4559,6 +5178,459 @@ class TwDayTradeSimulationEngine:
                 position["closing_auction_order_status"] = "part_filled"
         self._event("closing_auction_settled", recorded_at=now, market=market)
 
+    @staticmethod
+    def _fresh_regular_quote(quote: Mapping[str, Any], now: datetime) -> bool:
+        """Receipt freshness is not exchange event time, nor trial matching."""
+        received = _parse_timestamp(quote.get("quote_at"))
+        return bool(received is not None and received.date() == now.date()
+                    and 0 <= (now - received).total_seconds() <= 10
+                    and quote.get("simtrade") is False)
+
+    @staticmethod
+    def _auction_execution_quote(quote: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(quote)
+        if result.get("auction_volume_source") == "exchange_non_trial_tick":
+            result["quote_at"] = result.get("trade_quote_at")
+            result["simtrade"] = result.get("trade_simtrade")
+        return result
+
+    @staticmethod
+    def _intraday_status(mode: Mapping[str, Any], now: datetime) -> str | None:
+        if mode.get("configured_intraday_contract") != STRICT_INTRADAY_CONTRACT and mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
+            return None
+        opened = [p for p in (mode.get("positions") or {}).values() if p.get("signed_shares")]
+        if opened and str(mode.get("session_date") or "") < now.date().isoformat():
+            return "critical_prior_inventory_liquidation"
+        if mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
+            return "critical_legacy_carry_requires_review" if opened and now.time() >= SESSION_CLOSE else None
+        if opened and now.time() >= SESSION_CLOSE:
+            if not mode.get("closing_auction_settled_at"):
+                return "waiting_closing_auction_evidence"
+            if any(not p.get("margin_exception_evidence") for p in opened):
+                return "critical_day_trade_exit_unresolved"
+            return "critical_adverse_limit_exception"
+        if int(mode.get("pending_entry_shares") or 0):
+            return "entry_partial_retrying"
+        return None
+
+    def _settle_intraday_auction(self, market, mode, quotes, now) -> None:
+        """Observe each auction until it is evidenced, including 13:33 delays.
+
+        Never seal the session on the first empty response. Each symbol owns
+        one auction capacity budget, shared across all acquisition cohorts.
+        The observation deadline expires orders; it never manufactures fills.
+        """
+        if str(mode.get("session_date")) != now.date().isoformat():
+            return
+        expired = now.time() >= AUCTION_OBSERVATION_DEADLINE
+        for p in (mode.get("positions") or {}).values():
+            if not int(p.get("signed_shares") or 0):
+                continue
+            if expired:
+                p["closing_auction_order_status"] = "expired_unresolved"
+                continue
+            quote = self._auction_execution_quote(quotes.get(p["symbol"]) or {})
+            exchange_at = _parse_timestamp(quote.get("exchange_quote_at"))
+            submitted_at = _parse_timestamp(p.get("closing_auction_order_submitted_at") or mode.get("closing_auction_submitted_at"))
+            valid = (self._fresh_regular_quote(quote, now) and exchange_at is not None
+                     and exchange_at.date() == now.date() and exchange_at <= now
+                     and submitted_at is not None and exchange_at > submitted_at
+                     and SESSION_CLOSE <= exchange_at.time() < time(13, 34))
+            price = _finite(quote.get("last"))
+            limit = _finite(p.get("closing_auction_limit_price"))
+            volume = quote.get("auction_volume_lots")
+            if not valid or price is None or limit is None or volume is None:
+                if limit is not None:
+                    p["closing_auction_order_status"] = "waiting_auction_evidence"
+                continue
+            if not (float(p["lower_limit"]) <= price <= float(p["upper_limit"])) or (
+                int(p["signed_shares"]) > 0 and price < limit
+                or int(p["signed_shares"]) < 0 and price > limit
+            ):
+                p["closing_auction_order_status"] = "waiting_legal_auction_price"
+                continue
+            if not bool(price_on_tick_grid_numpy(np.array([price]), np.array([now.date()]),
+                    security_types=p.get("security_type") or "stock")[0]):
+                p["closing_auction_order_status"] = "waiting_legal_auction_price"
+                continue
+            quote["minute_volume_lots"] = volume
+            quote["exchange_match_at"] = exchange_at.isoformat()
+            # One auction bucket also covers late delivery of the SAME print.
+            quote["capacity_bucket"] = f"{now.date()}:closing_auction:{p['symbol']}"
+            capacity = _minute_kbar_capacity_shares(quote, lot_size=int(p["lot_size"]))
+            if capacity <= 0:
+                p["closing_auction_order_status"] = "waiting_auction_volume"
+                continue
+            self._close_position(p, mode, price=price, quote=quote, now=now,
+                reason="13_30_closing_auction_fill", order_type="LMT_ROD", quantity=capacity)
+            p["closing_auction_order_status"] = "filled" if not p["signed_shares"] else "part_filled"
+        residuals = [p for p in (mode.get("positions") or {}).values() if p.get("signed_shares")]
+        mode["closing_auction_pending_count"] = len(residuals)
+        if not residuals or expired:
+            if not mode.get("closing_auction_settled_at"):
+                mode["closing_auction_settled_at"] = now.isoformat(timespec="seconds")
+                self._event("closing_auction_observation_completed", recorded_at=now,
+                            market=market, residual_count=len(residuals), expired=expired)
+
+    def _adverse_limit_carry_evidence(self, position, quote, now):
+        """Missing quotes/capacity or a missed stop alone never authorize carry."""
+        received = _parse_timestamp(quote.get("quote_at"))
+        closed_book = (received is not None and received.date() == now.date()
+                       and SESSION_CLOSE <= received.time() <= AUCTION_OBSERVATION_DEADLINE
+                       and 0 <= (now - received).total_seconds() <= 300
+                       and quote.get("simtrade") is False)
+        if (not (self._fresh_regular_quote(quote, now) or closed_book)
+                or position.get("bracket_prices_current") is False
+                or quote.get("trade_simtrade", False) is not False
+                or position.get("closing_auction_limit_price") is None):
+            return None
+        signed = int(position["signed_shares"])
+        boundary = _finite(position.get("lower_limit" if signed > 0 else "upper_limit"))
+        last = _finite(quote.get("last"))
+        raw_depth = quote.get("bid_volume" if signed > 0 else "ask_volume")
+        try:
+            zero_depth = math.isfinite(float(raw_depth)) and float(raw_depth) == 0
+        except (TypeError, ValueError):
+            zero_depth = False
+        if boundary is None or last is None or not math.isclose(last, boundary, abs_tol=1e-8, rel_tol=0) or not zero_depth:
+            return None
+        return {"reason": "adverse_limit_locked_no_counterparty", "observed_at": now.isoformat(),
+                "quote_at": quote.get("quote_at"), "exchange_quote_at": quote.get("exchange_quote_at"),
+                "limit_price": boundary, "last": last, "counterparty_volume_lots": 0,
+                "stop_triggered_at": position.get("stop_triggered_at"),
+                "stop_missed_before_limit": not bool(position.get("stop_triggered_at")),
+                "simulation_only": True, "broker_conversion_confirmed": False}
+
+    @staticmethod
+    def _charge_margin_cost(mode: dict[str, Any], position: dict[str, Any], *,
+                            amount: float, kind: str, charged_date: date) -> None:
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError("invalid margin carry charge")
+        if not amount:
+            return
+        # Cost receipt and its accumulator are one atomic state.json commit.
+        # Conversion is not a transaction and must never manufacture a fill.
+        row = {"cost_id": f"{position['position_id']}:{kind}:{charged_date}",
+               "position_id": position["position_id"], "symbol": position["symbol"],
+               "date": charged_date.isoformat(), "kind": kind, "amount_twd": amount,
+               "simulation_only": True, "assumption_contract": MARGIN_CARRY_CONTRACT}
+        mode.setdefault("carry_cost_ledger", []).append(row)
+        mode["cumulative_carry_cost_twd"] = float(mode.get("cumulative_carry_cost_twd") or 0) + amount
+        position["margin_cost_twd"] = float(position.get("margin_cost_twd") or 0) + amount
+
+    def _accrue_margin_carry_cost(self, mode: dict[str, Any], now: datetime) -> None:
+        rates = mode.get("margin_cost_assumptions") or {}
+        for position in (mode.get("positions") or {}).values():
+            signed = int(position.get("signed_shares") or 0)
+            if not signed or position.get("margin_carry_contract") != MARGIN_CARRY_CONTRACT:
+                continue
+            last = date.fromisoformat(position["margin_cost_accrued_through"])
+            days = (now.date() - last).days
+            if days <= 0:
+                continue
+            rate = (float(rates["financing_ratio"]) * float(rates["financing_annual_rate"])) if signed > 0 else float(rates["short_annual_borrow_rate"])
+            amount = inventory_carry_interest(
+                signed,
+                float(position.get("inventory_basis_price", position["entry_price"])),
+                rate,
+                days,
+            )
+            self._charge_margin_cost(mode, position, amount=amount,
+                kind="financing_interest" if signed > 0 else "margin_short_borrow_interest", charged_date=now.date())
+            position["margin_cost_accrued_through"] = now.date().isoformat()
+
+    def _margin_corporate_action_gate(self, mode: dict[str, Any], now: datetime) -> bool:
+        """Never silently value carried physical shares through an ex-date.
+
+        Recognize signed exact cash claims before the ex-date opening rebalance.
+        Benchmark factors are not physical-share entitlements. Unknown/noncash
+        actions remain a recoverable accounting wait, never an invented amount.
+        """
+        carried = [p for p in (mode.get("positions") or {}).values()
+                   if int(p.get("signed_shares") or 0)
+                   and p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                   and str(p.get("session_date") or "") < now.date().isoformat()]
+        if not carried:
+            return True
+        receipt: dict[str, Any] = {"checked_session": now.date().isoformat(),
+                                   "status": "blocked", "events": []}
+        try:
+            raw_path = mode.get("margin_corporate_action_reference_path")
+            if not raw_path:
+                raise ValueError("margin corporate-action reference not configured")
+            path = Path(raw_path).resolve()
+            from stockagent.live.tw_share_replacement import (
+                ODD_LOT_BOARD_PRICE, SHARE_REPLACEMENT_CONTRACT, load_share_replacements,
+            )
+            # Stage physical changes until EVERY encountered action validates.
+            # A later missing term must not leave a half-converted account.
+            staged = [dict(p) for p in carried]
+            share_actions, share_claims = [], []
+            known_actions = {r["action_id"]: r for r in mode.get("share_replacement_ledger", [])}
+            strict_physical = mode.get("odd_lot_execution_policy") == ODD_LOT_BOARD_PRICE
+            replacements = load_share_replacements(
+                path.parent,
+                required_start=min(date.fromisoformat(p["session_date"]) for p in carried) if strict_physical else None,
+                required_end=now.date() if strict_physical else None,
+            )
+            for p in staged:
+                for event in replacements:
+                    if (event["symbol"] != p["symbol"] or not
+                            str(p["session_date"]) < str(event["suspension_date"]) <= now.date().isoformat()):
+                        continue
+                    receipt["blocking_domain"] = "corporate_action_accounting_not_quote_download"
+                    if mode.get("odd_lot_execution_policy") != ODD_LOT_BOARD_PRICE:
+                        raise ValueError("physical_share_replacement_requires_share_cash_and_odd_lot_accounting")
+                    p["share_replacement_halted_until"] = str(event["resume_date"])
+                    if now.date() < event["resume_date"]:
+                        continue
+                    if event.get("reference_only"):
+                        raise ValueError(f"issuer replacement reference lacks complete physical accounting terms: {p['symbol']}")
+                    action_id = f"{p['position_id']}:{event['resume_date']}:share_replacement"
+                    ratio = float(event["new_shares_per_1000_old"]) / 1000.
+                    cash = float(event["cash_return_per_old_share"])
+                    if action_id in known_actions:
+                        old = known_actions[action_id]
+                        if old["ratio"] != ratio or old["cash_per_old_share"] != cash:
+                            raise ValueError("previously applied share replacement terms revised")
+                        if cash:
+                            existing_cash = [c for c in mode.get("corporate_action_ledger", [])
+                                             if c.get("share_action_id") == action_id]
+                            if len(existing_cash) != 1 or existing_cash[0]["payment_date"] != str(event.get("cash_payment_date")):
+                                raise ValueError("previously applied capital-return payment revised")
+                        continue
+                    payment = event.get("cash_payment_date")
+                    if (not math.isfinite(ratio) or ratio <= 0 or not math.isfinite(cash) or cash < 0
+                            or event.get("cash_dividend_per_old_share", 0) or event.get("subscription_shares_per_1000", 0)
+                            or event.get("subscription_terms_present")
+                            or (cash and (payment is None or payment < event["resume_date"]))):
+                        raise ValueError(f"incomplete share replacement cash/subscription terms: {p['symbol']}")
+                    old_quantity = int(p["signed_shares"])
+                    new_quantity = old_quantity * ratio
+                    if not math.isclose(new_quantity, round(new_quantity), abs_tol=1e-8, rel_tol=0):
+                        raise ValueError("fraction below one share requires issuer cash-in-lieu terms")
+                    new_quantity = int(round(new_quantity))
+                    old_basis = float(p.get("inventory_basis_price", p["entry_price"]))
+                    # Keep original invested principal; the cash return is a
+                    # separate signed claim. Subtracting it from basis as well
+                    # would count the same return of capital twice in NAV.
+                    p["signed_shares"], p["inventory_basis_price"] = new_quantity, old_basis / ratio
+                    p["odd_lot_execution_policy"] = ODD_LOT_BOARD_PRICE
+                    p["share_replacement_contract"] = SHARE_REPLACEMENT_CONTRACT
+                    last = _finite(p.get("last_mark_price"))
+                    if last is not None:
+                        p["last_mark_price"] = (last - cash) / ratio
+                        if p["last_mark_price"] <= 0:
+                            raise ValueError("share replacement creates invalid carried valuation")
+                        p["last_complete_net_pnl_twd"] = position_net_liquidation_pnl(p, p["last_mark_price"])
+                    p["valuation_stale"] = True
+                    share_actions.append({"action_id": action_id, "position_id": p["position_id"],
+                        "symbol": p["symbol"], "effective_date": str(event["resume_date"]),
+                        "recorded_at": now.isoformat(), "old_signed_shares": old_quantity,
+                        "new_signed_shares": new_quantity, "old_entry_price": old_basis,
+                        "new_entry_price": p["inventory_basis_price"], "ratio": ratio,
+                        "cash_per_old_share": cash, "contract": SHARE_REPLACEMENT_CONTRACT,
+                        "source": str(path.parent / "tw_share_replacement_reference.parquet"),
+                        "simulation_only": True, "is_fill": False})
+                    if cash:
+                        share_claims.append({"claim_id": action_id + ":cash_return",
+                            "position_id": p["position_id"], "symbol": p["symbol"],
+                            "ex_date": str(event["resume_date"]), "payment_date": str(payment),
+                            "entitled_signed_shares": old_quantity, "cash_per_share": cash,
+                            "amount_twd": old_quantity * cash, "kind": "signed_return_of_capital",
+                            "recognized_at": now.isoformat(), "paid_at": None,
+                            "contract": SHARE_REPLACEMENT_CONTRACT, "share_action_id": action_id})
+            summary_path = path.with_suffix(".summary.json")
+            entitlement_path = path.parent / "tw_corporate_action_entitlements.parquet"
+            entitlement_summary = entitlement_path.with_suffix(".summary.json")
+            has_entitlements = entitlement_path.is_file() or entitlement_summary.is_file()
+            sources = [path, summary_path]
+            if has_entitlements:
+                sources += [entitlement_path, entitlement_summary]
+            signature = (str(path), *[(p.stat().st_size, p.stat().st_mtime_ns,
+                                      p.stat().st_ctime_ns) for p in sources])
+            reference = self._margin_action_cache.get(signature)
+            if reference is None:
+                from stockagent.data.panel import (
+                    _CorporateActionReferencePaths, _load_corporate_action_reference,
+                )
+                reference = _load_corporate_action_reference(
+                    _CorporateActionReferencePaths(path, summary_path,
+                        entitlement_path if has_entitlements else None,
+                        entitlement_summary if has_entitlements else None))
+                self._margin_action_cache = {signature: reference}
+            today = np.datetime64(now.date(), "D")
+            earliest = min(np.datetime64(str(p["session_date"]), "D") for p in carried)
+            if reference.coverage_start > earliest or reference.coverage_end < today:
+                raise ValueError("margin corporate-action coverage does not cover carried interval")
+            events = set()
+            claims = {str(row["claim_id"]): row for row in mode.get("corporate_action_ledger", ())}
+            new_claims = []
+            unresolved = []
+            for p in staged:
+                entry_day = np.datetime64(str(p["session_date"]), "D")
+                for exdate in reference.event_dates_by_symbol.get(p["symbol"], ()):
+                    if entry_day < exdate <= today:
+                        day = str(exdate.astype("datetime64[D]"))
+                        events.add((p["symbol"], day))
+                        terms = (reference.exact_cash_terms_by_symbol or {}).get(p["symbol"])
+                        matches = np.flatnonzero(terms[0] == exdate) if terms is not None else []
+                        if (len(matches) != 1 or reference.exact_coverage_start is None
+                                or not reference.exact_coverage_start <= exdate <= reference.exact_coverage_end):
+                            unresolved.append({"symbol": p["symbol"], "ex_date": day})
+                            continue
+                        index = int(matches[0])
+                        amount_per_share, payment = float(terms[1][index]), str(terms[2][index])
+                        if payment < day:
+                            raise ValueError("cash entitlement payment precedes ex-date")
+                        claim_id = f"{p['position_id']}:{day}:cash_distribution"
+                        existing = claims.get(claim_id)
+                        if existing:
+                            if (existing["cash_per_share"] != amount_per_share or existing["payment_date"] != payment):
+                                raise ValueError(f"earned entitlement revised; reconciliation required: {claim_id}")
+                            continue
+                        new_claims.append({"claim_id": claim_id, "position_id": p["position_id"],
+                            "symbol": p["symbol"], "ex_date": day, "payment_date": payment,
+                            "entitled_signed_shares": int(p["signed_shares"]), "cash_per_share": amount_per_share,
+                            "amount_twd": int(p["signed_shares"]) * amount_per_share,
+                            "kind": "cash_distribution_receivable" if int(p["signed_shares"]) > 0 else "assumed_short_distribution_compensation",
+                            "recognized_at": now.isoformat(), "paid_at": None,
+                            "source": str(entitlement_path), "contract": "signed_cash_entitlement_exdate_paydate_v1",
+                            "investor_personal_tax_included": False})
+            receipt.update(reference_path=str(path), coverage_end=str(reference.coverage_end),
+                           events=[{"symbol": symbol, "ex_date": day} for symbol, day in sorted(events)])
+            if unresolved:
+                receipt["unresolved_events"] = unresolved
+                raise ValueError("physical_inventory_corporate_action_terms_unavailable_or_noncash")
+            for original, updated in zip(carried, staged, strict=True):
+                original.update(updated)
+            mode.setdefault("share_replacement_ledger", []).extend(share_actions)
+            mode.setdefault("corporate_action_ledger", []).extend([*share_claims, *new_claims])
+            self._settle_corporate_action_claims(mode, now)
+            receipt["new_cash_claims"] = len(new_claims)
+            receipt["new_share_replacements"] = len(share_actions)
+            receipt["status"] = "ready"
+            mode["margin_corporate_action_receipt"] = receipt
+            return True
+        except (OSError, ValueError, RuntimeError) as exc:
+            receipt["error"] = f"{type(exc).__name__}: {exc}"
+            mode["margin_corporate_action_receipt"] = receipt
+            mode["engine_status"] = "waiting_margin_corporate_action"
+            mode["valuation_stale"] = True
+            mode["valuation_complete"] = False
+            return False
+
+    @staticmethod
+    def _settle_corporate_action_claims(mode: dict[str, Any], now: datetime) -> None:
+        """Claims affect NAV once at ex-date; paying one only changes liquidity."""
+        claims = mode.get("corporate_action_ledger") or []
+        for claim in claims:
+            if not claim.get("paid_at") and claim["payment_date"] <= now.date().isoformat():
+                claim["paid_at"] = now.isoformat()
+        mode["cumulative_corporate_action_net_twd"] = sum(float(c["amount_twd"]) for c in claims)
+        mode["corporate_action_cash_net_twd"] = sum(float(c["amount_twd"]) for c in claims if c.get("paid_at"))
+        mode["corporate_action_receivable_twd"] = sum(max(0.0, float(c["amount_twd"])) for c in claims if not c.get("paid_at"))
+        mode["corporate_action_payable_twd"] = sum(max(0.0, -float(c["amount_twd"])) for c in claims if not c.get("paid_at"))
+
+    def _reconcile_margin_targets(
+        self, mode: dict[str, Any], plans: list[dict[str, Any]], *,
+        quotes: Mapping[str, Mapping[str, Any]], spec: ModeSpec,
+        signal_at: datetime, observed: datetime, allow_quote_at_signal: bool,
+        order_records: list[dict[str, Any]], fill_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """FIFO reductions before additions, one capacity budget per symbol.
+
+        Existing financed lots retain basis, fees and entry identity. Reducing
+        owned exposure needs an executable price, not new-entry eligibility.
+        """
+        by_symbol = {p["symbol"]: p for p in plans}
+        holdings: dict[str, list[dict[str, Any]]] = {}
+        for p in mode["positions"].values():
+            if int(p.get("signed_shares") or 0):
+                holdings.setdefault(p["symbol"], []).append(p)
+        nav = float(mode["session_sizing_nav_twd"])
+        for symbol, lots in holdings.items():
+            quote = quotes.get(symbol) or {}
+            plan = by_symbol.get(symbol)
+            if plan is None:
+                plan = _prepare_entry_plan({"symbol": symbol, "target_weight": 0.0},
+                    quote=quote, evidence=None, signal_at=signal_at, observation_at=observed,
+                    spec=spec, sizing_nav_twd=nav, allow_quote_at_signal=allow_quote_at_signal)
+                plans.append(plan)
+            held = sum(int(p["signed_shares"]) for p in lots)
+            if held % spec.lot_size and spec.odd_lot_execution_policy == "assumed_odd_lot_at_regular_board_price_v1":
+                plan["quantity_step_shares"] = 1
+            if any(int(p["signed_shares"]) * held <= 0 for p in lots):
+                raise ValueError(f"opposed inventory cohorts: {symbol}")
+            target = int(plan["requested_shares"]) * (1 if plan["side"] == "long" else -1)
+            plan.update(previous_signed_shares=held, target_signed_shares=target)
+            reduce = max(0, abs(held) - abs(target)) if held * target > 0 else abs(held)
+            reduction_filled = 0
+            if reduce:
+                reducing = _prepare_entry_plan({"symbol": symbol, "target_weight": -1.0 if held > 0 else 1.0},
+                    quote=quote, evidence=None, signal_at=signal_at, observation_at=observed,
+                    spec=spec, sizing_nav_twd=nav, allow_quote_at_signal=allow_quote_at_signal,
+                    requested_shares_override=reduce, reduce_only=True)
+                left = int(reducing["filled_shares"])
+                for p in sorted(lots, key=lambda p: str(p["entry_at"])):
+                    take = min(left, abs(int(p["signed_shares"])))
+                    if take:
+                        before = abs(int(p["signed_shares"]))
+                        self._close_position(p, mode, price=float(reducing["entry_price"]),
+                            quote=({**quote, "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+                                   if allow_quote_at_signal else quote),
+                            now=observed, reason="next_signal_inventory_delta",
+                            order_type="PAPER_0901_MINUTE_PRICE" if allow_quote_at_signal else "MKT",
+                            quantity=take, ledger_session_date=observed.date().isoformat(),
+                            ledger_order_id=f"{p['position_id']}:{observed.date()}:target_delta",
+                            ledger_rows=(order_records, fill_records))
+                        actual = before - abs(int(p["signed_shares"]))
+                        reduction_filled += actual
+                        left -= actual
+                plan["reduction_block_reason"] = reducing["reason"] if reduction_filled < reduce else None
+            remaining = held - (reduction_filled if held > 0 else -reduction_filled)
+            addition = max(0, abs(target) - abs(remaining)) if target * remaining >= 0 else 0
+            # A failed reduction may not be bypassed by opening the other side.
+            if remaining and target * remaining < 0:
+                addition = 0
+            plan.update(reduction_requested_shares=reduce, reduction_filled_shares=reduction_filled)
+            plan["requested_shares"] = addition
+            capacity = int(plan["minute_kbar_capacity_shares"])
+            if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK:
+                capacity = int(plan["top_book_capacity_shares"]) if observed.time() < time(9, 1) else min(capacity, int(plan["top_book_capacity_shares"]))
+            if plan["status"] not in {"ready", "partial_depth"}:
+                capacity = 0
+            capacity = max(0, capacity - reduction_filled)
+            plan["filled_shares"] = min(addition, capacity)
+            if not plan["filled_shares"]:
+                plan["status"] = "hold" if reduction_filled == reduce else "blocked"
+                plan["reason"] = "inventory_target_retained" if reduction_filled == reduce else "inventory_reduction_incomplete"
+            elif plan["filled_shares"] < addition:
+                plan["status"] = "partial_depth"
+            for p in lots:
+                if not int(p.get("signed_shares") or 0):
+                    continue
+                p["current_target_signal_id"] = mode["signal_id"]
+                p["target_weight"] = plan["target_weight"]
+                p["status"] = "margin_inventory_active"
+                p["take_profit_order_status"] = "working"
+                p["stop_order_status"] = "armed_local_trigger"
+                p["eod_limit_order_status"] = None
+                p["closing_auction_order_status"] = None
+                # Today's limits, never yesterday's bracket across a gap.
+                upper, lower = _finite(quote.get("upper_limit")), _finite(quote.get("lower_limit"))
+                if upper is None or lower is None:
+                    p["bracket_prices_current"] = False
+                    continue
+                p["bracket_prices_current"] = True
+                p["upper_limit"], p["lower_limit"] = upper, lower
+                security_type = p.get("security_type") or classify_tw_stock_or_etf(p["symbol"]) or "stock"
+                upper_inner = float(move_price_ticks_numpy(np.array([upper]), -spec.price_limit_offset_ticks, np.array([observed.date()]), security_types=security_type)[0])
+                lower_inner = float(move_price_ticks_numpy(np.array([lower]), spec.price_limit_offset_ticks, np.array([observed.date()]), security_types=security_type)[0])
+                p["take_profit_price"] = upper_inner if int(p["signed_shares"]) > 0 else lower_inner
+                p["stop_trigger_price"] = lower_inner if int(p["signed_shares"]) > 0 else upper_inner
+        return plans
+
     def _convert_residual_to_carry(
         self,
         market: str,
@@ -4566,21 +5638,53 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
-        """Close every residual in the simulation's terminal ledger pass.
+        """Preserve residuals, optionally under the explicit margin assumption.
 
-        The executable auction path remains separately audited above.  This
-        final simulation-only pass enforces the product contract requested by
-        the operator: a day-trade mode cannot carry an open position past the
-        session close.  Residuals are valued at the observed close when
-        available, otherwise at a conservative adverse legal limit, the last
-        complete mark, or finally the entry price.  These rows are explicitly
-        labelled as terminal ledger settlement rather than exchange fills.
+        Only obsolete compatibility contracts use synthetic terminal valuation.
+        Conversion retains quantity, acquisition basis and mark-to-market risk.
         """
 
         session_date = str(mode.get("session_date") or now.date().isoformat())
         if _timestamp_is_for_session(
             mode.get("residual_conversion_completed_at"), session_date
         ):
+            return
+        strict = mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
+        if strict and not _timestamp_is_for_session(mode.get("closing_auction_settled_at"), session_date):
+            return
+        if mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
+            residuals = [p for p in (mode.get("positions") or {}).values() if int(p.get("signed_shares") or 0)]
+            for position in residuals:
+                exception = self._adverse_limit_carry_evidence(position, quotes.get(position["symbol"]) or {}, now) if strict else None
+                if strict:
+                    position["margin_exception_evidence"] = exception
+                    position["mandatory_exit_pending"] = True
+                if mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT and (not strict or exception):
+                    if position.get("margin_carry_contract") != MARGIN_CARRY_CONTRACT:
+                        signed = int(position["signed_shares"])
+                        notional = abs(signed) * float(position["entry_price"])
+                        if signed < 0:
+                            tax_delta = max(0.0, float(position["cash_sell_fee_rate"]) - float(position["sell_fee_rate"]))
+                            self._charge_margin_cost(mode, position,
+                                amount=notional * (tax_delta + float(mode["margin_cost_assumptions"]["short_handling_fee_rate"])),
+                                kind="short_conversion_tax_and_handling", charged_date=now.date())
+                        position["margin_carry_contract"] = MARGIN_CARRY_CONTRACT
+                        position["margin_converted_at"] = now.isoformat(timespec="seconds")
+                        position["margin_cost_accrued_through"] = now.date().isoformat()
+                    position["carry_type"] = "assumed_margin_financing" if int(position["signed_shares"]) > 0 else "assumed_margin_short"
+                    position["status"] = "exception_adverse_limit_carry" if strict else "margin_carried_waiting_next_signal"
+                else:
+                    position["carry_type"] = "unresolved_day_trade_delivery_obligation"
+                    position["status"] = "unfilled_at_session_close"
+                position["fill_guaranteed"] = False
+            mode["residual_conversion_completed_at"] = now.isoformat(timespec="seconds")
+            mode["force_exit_failures"] = len(residuals)
+            mode["execution_evidence_complete"] = not residuals
+            mode["margin_carry_position_count"] = sum(p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT for p in residuals)
+            mode["margin_exception_count"] = sum(bool(p.get("margin_exception_evidence")) for p in residuals)
+            mode["unresolved_exit_count"] = sum(not p.get("margin_exception_evidence") for p in residuals) if strict else 0
+            self._event("residual_delivery_obligation_unresolved" if residuals else "session_closed_with_observed_fills",
+                        recorded_at=now, market=market, residual_count=len(residuals), simulation_only=True)
             return
         flattened = 0
         degraded = 0
@@ -4649,25 +5753,75 @@ class TwDayTradeSimulationEngine:
         quantity: int,
         ledger_order_id: str | None = None,
         ledger_session_date: str | None = None,
+        ledger_rows: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> None:
         signed = int(position.get("signed_shares") or 0)
         if signed == 0:
             return
+        if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
+            if not self._fresh_regular_quote(quote, now):
+                position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
+                return
+            lower, upper = _finite(position.get("lower_limit")), _finite(position.get("upper_limit"))
+            if lower is None or upper is None or not lower <= price <= upper:
+                position["exit_quote_status"] = "invalid_execution_price_limits"
+                return
+        if str(position.get("share_replacement_halted_until") or "") > now.date().isoformat():
+            return
+        if (position.get("bracket_prices_current") is False
+                and reason.startswith(("take_profit", "stop_loss"))):
+            return
         remaining_before = abs(signed)
         fill_quantity = min(max(int(quantity), 0), remaining_before)
+        if mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT or mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
+            # Multiple carried acquisition cohorts share ONE source budget.
+            quote_at = _parse_timestamp(quote.get("quote_at"))
+            if quote_at is None or quote_at.date() != now.date() or quote_at > now:
+                return
+            key = str(quote.get("capacity_bucket") or f"{now.date()}:{quote_at.strftime('%H:%M')}:{position['symbol']}")
+            budget = _minute_kbar_capacity_shares(quote, lot_size=int(position["lot_size"]))
+            if now.time() < time(9, 1):
+                key += quote_at.isoformat()
+                budget = _top_book_capacity_shares(quote, transaction_side="sell" if signed > 0 else "buy", lot_size=int(position["lot_size"]))
+            usage = mode.setdefault("margin_exit_capacity_used", {})
+            fill_quantity = min(fill_quantity, max(0, budget - int(usage.get(key) or 0)))
+            usage[key] = int(usage.get(key) or 0) + fill_quantity
         if fill_quantity <= 0:
             return
+        self._book_position_close(
+            position, mode, price=price, quote=quote, now=now, reason=reason,
+            order_type=order_type, quantity=fill_quantity, ledger_order_id=ledger_order_id,
+            ledger_session_date=ledger_session_date, ledger_rows=ledger_rows,
+        )
+
+    def _book_position_close(
+        self, position: dict[str, Any], mode: dict[str, Any], *, price: float,
+        quote: Mapping[str, Any], now: datetime, reason: str, order_type: str,
+        quantity: int, ledger_order_id: str | None = None,
+        ledger_session_date: str | None = None,
+        ledger_rows: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None,
+    ) -> None:
+        """Accounting only, after execution or an explicit offline settlement gate.
+
+        Live execution must use _close_position for causal/liquidity checks.
+        The offline official-close reconciliation records its distinct contract,
+        never a quote, broker order, or historically observable exchange fill.
+        """
+        signed = int(position.get("signed_shares") or 0)
+        remaining_before = abs(signed)
+        fill_quantity = int(quantity)
+        if not math.isfinite(price) or price <= 0 or not 0 < fill_quantity <= remaining_before:
+            raise ValueError("invalid close accounting quantity or price")
         side = str(position.get("side"))
         direction = 1 if signed > 0 else -1
-        exit_rate = float(
-            position["sell_fee_rate"] if side == "long" else position["buy_fee_rate"]
-        )
+        prefix = "cash_" if position.get("margin_carry_contract") else ""
+        exit_rate = float(position[f"{prefix}sell_fee_rate"] if side == "long" else position[f"{prefix}buy_fee_rate"])
         rebate_rate = float(position.get("commission_rebate_rate") or 0.0)
         exit_gross_fee = fill_quantity * float(price) * exit_rate
         exit_rebate = fill_quantity * float(price) * rebate_rate
         exit_fee = exit_gross_fee - exit_rebate
         gross_pnl = (
-            direction * fill_quantity * (float(price) - float(position["entry_price"]))
+            direction * fill_quantity * (float(price) - float(position.get("inventory_basis_price", position["entry_price"])))
         )
         remaining_entry_fee = float(
             position.get("remaining_entry_fee_twd", position.get("entry_fee_twd", 0.0))
@@ -4770,8 +5924,12 @@ class TwDayTradeSimulationEngine:
             "remaining_quantity": remaining_after,
             "simulation_only": True,
             "synthetic_terminal_ledger": (reason == "13_30_terminal_ledger_flatten"),
+            "odd_lot_execution_policy": (position.get("odd_lot_execution_policy")
+                                         if fill_quantity % int(position.get("lot_size") or 1000) else None),
         }
-        self._order(
+        append_order = self._order if ledger_rows is None else ledger_rows[0].append
+        append_fill = self._fill if ledger_rows is None else ledger_rows[1].append
+        append_order(
             {
                 **common,
                 "side": "sell" if side == "long" else "buy_to_cover",
@@ -4780,7 +5938,7 @@ class TwDayTradeSimulationEngine:
                 "status": "filled" if fully_closed else "part_filled",
             }
         )
-        self._fill(
+        append_fill(
             {
                 **common,
                 "fill_at": now.isoformat(timespec="seconds"),
@@ -4824,6 +5982,9 @@ class TwDayTradeSimulationEngine:
         open_net = 0.0
         stale_count = 0
         open_count = 0
+        total_notional = 0.0
+        fresh_notional = 0.0
+        missing_count = 0
         for position in (mode.get("positions") or {}).values():
             signed = int(position.get("signed_shares") or 0)
             if signed == 0:
@@ -4831,12 +5992,29 @@ class TwDayTradeSimulationEngine:
             open_count += 1
             quote = quotes.get(str(position.get("symbol"))) or {}
             side = str(position.get("side"))
+            if str(position.get("share_replacement_halted_until") or "") > now.date().isoformat():
+                quote = {}
             liquidation = _finite(quote.get("bid" if side == "long" else "ask"))
+            if mode.get("historical_minute_valuation") and quote.get("historical_minute_valuation"):
+                liquidation = _finite(quote.get("valuation_price_0901"))
+            mark_price = liquidation or _finite(position.get("last_mark_price"))
+            if mark_price is not None:
+                total_notional += abs(signed) * mark_price
+            else:
+                missing_count += 1
             if liquidation is None:
                 stale_count += 1
                 position["valuation_stale"] = True
-                open_net += float(position.get("last_complete_net_pnl_twd") or 0.0)
+                # A stale PRICE can be carried, but its cached PnL cannot:
+                # quantity, allocated entry fees or the cash fee regime may
+                # have changed since the last quote.
+                stale_net = (position_net_liquidation_pnl(position, mark_price)
+                             if mark_price is not None else float(position.get("last_complete_net_pnl_twd") or 0.0))
+                position["last_complete_net_pnl_twd"] = stale_net
+                position["total_net_pnl_twd"] = float(position.get("realized_net_pnl_twd") or 0.0) + stale_net
+                open_net += stale_net
                 continue
+            fresh_notional += abs(signed) * liquidation
             net_pnl = position_net_liquidation_pnl(position, liquidation)
             position["last_mark_at"] = now.isoformat(timespec="seconds")
             position["last_quote_at"] = quote.get("quote_at")
@@ -4850,6 +6028,8 @@ class TwDayTradeSimulationEngine:
         cumulative = float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
         total_equity = (
             float(mode.get("initial_capital_twd") or 0.0) + cumulative + open_net
+            + float(mode.get("cumulative_corporate_action_net_twd") or 0.0)
+            - float(mode.get("cumulative_carry_cost_twd") or 0.0)
         )
         flat_status = "flat"
         if str(mode.get("session_date") or "") == now.date().isoformat() and mode.get(
@@ -4872,11 +6052,16 @@ class TwDayTradeSimulationEngine:
                 "total_equity_twd": total_equity,
                 "last_mark_at": now.isoformat(timespec="seconds"),
                 "valuation_stale": stale_count > 0,
+                "valuation_complete": missing_count == 0,
                 "engine_status": (
+                    "margin_carried_waiting_next_signal"
+                    if open_count and mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                    and now.timetz().replace(tzinfo=None) >= SESSION_CLOSE
+                    else
                     "critical_residual_carried_after_13_30"
                     if open_count
                     and any(
-                        position.get("carry_type")
+                        position.get("carry_type") == "unresolved_day_trade_delivery_obligation"
                         for position in (mode.get("positions") or {}).values()
                         if int(position.get("signed_shares") or 0) != 0
                     )
@@ -4889,6 +6074,9 @@ class TwDayTradeSimulationEngine:
                 ),
             }
         )
+        strict_status = self._intraday_status(mode, now)
+        if strict_status:
+            mode["engine_status"] = strict_status
         if not append_history:
             return
         mark_at = now.replace(second=0, microsecond=0)
@@ -4928,18 +6116,38 @@ class TwDayTradeSimulationEngine:
                 "market": market,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "cumulative_realized_net_pnl_twd": cumulative,
+                "cumulative_carry_cost_twd": float(mode.get("cumulative_carry_cost_twd") or 0),
+                "cumulative_corporate_action_net_twd": float(mode.get("cumulative_corporate_action_net_twd") or 0),
+                "corporate_action_cash_net_twd": float(mode.get("corporate_action_cash_net_twd") or 0),
+                "corporate_action_receivable_twd": float(mode.get("corporate_action_receivable_twd") or 0),
+                "corporate_action_payable_twd": float(mode.get("corporate_action_payable_twd") or 0),
+                "margin_carry_contract": mode.get("margin_carry_contract"),
+                "odd_lot_execution_policy": mode.get("odd_lot_execution_policy"),
                 "open_net_liquidation_pnl_twd": open_net,
                 "total_equity_twd": total_equity,
                 "open_position_count": open_count,
                 "stale_position_count": stale_count,
                 "valuation_stale": stale_count > 0,
+                **({
+                    "historical_minute_replay": True,
+                    "minute_valuation_contract": HISTORICAL_MINUTE_MARK_CONTRACT,
+                    "valuation_source": "retained_1m_close_with_explicit_last_trade_carry",
+                    "valuation_executable": False,
+                    "fresh_trade_position_count": open_count - stale_count,
+                    "last_trade_carried_position_count": stale_count,
+                    "missing_price_position_count": missing_count,
+                    "fresh_trade_notional_coverage_ratio": fresh_notional / total_notional if total_notional else 1.0,
+                } if mode.get("historical_minute_valuation") else {}),
             },
         )
         if terminal:
             mode["terminal_curve_mark"] = terminal_signature
 
     def _persist(self, now: datetime | None = None) -> None:
-        observed = _now_taipei(now)
+        # A live process can replay a 09:01 financial event at 11:00. Its
+        # liveness/commit publication time is not that historical event time.
+        # Offline replay keeps its explicit deterministic clock by default.
+        observed = _now_taipei(self._publication_clock() if self._publication_clock else now)
         revision = int(self.state.get("state_revision") or 0) + 1
         configured_markets = self.state.get("enabled_markets")
         active_markets = [
@@ -5072,6 +6280,7 @@ class TwDayTradeSimulationEngine:
             self.status_path,
             {
                 "schema_version": SIMULATION_SCHEMA_VERSION,
+                "order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
                 "state_revision": revision,
                 "content_revision": content_revision,
                 "engine_run_id": self._engine_run_id,
@@ -5114,7 +6323,7 @@ class TwDayTradeSimulationEngine:
                     "exit_limit": "13:20 passive top-of-book limit",
                     "continuous_force_exit": "13:24<=t<13:25 market retry every service poll while residual exists",
                     "closing_auction": "13:25 long sell at lower limit and short cover at upper limit using LMT_ROD; settle at 13:30 call auction",
-                    "residual": "13:30 simulation-only terminal ledger flatten; no overnight position",
+                    "residual": "strict_intraday: same-day flatten required; only evidenced adverse limit-lock permits exceptional paper margin carry; every prior residual is liquidation-only; legacy contracts retain their recorded semantics",
                     "stress_rates": {
                         "financing_annual_rate": MARGIN_FINANCING_ANNUAL_RATE,
                         "shortfall_borrow_fee_rate_per_day": DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
@@ -5143,6 +6352,11 @@ class TwDayTradeSimulationEngine:
                             "entry_synthetic_fallback_fill_count",
                             "entry_paper_market_fill_count",
                             "entry_fill_contract",
+                            "execution_realism_contract",
+                            "capital_sizing_basis",
+                            "session_sizing_nav_twd",
+                            "funding_assumption",
+                            "execution_evidence_complete",
                             "entry_liquidity_assumption",
                             "engine_status",
                             "checkpoint_ready",
@@ -5161,6 +6375,13 @@ class TwDayTradeSimulationEngine:
                             "entry_requested_shares",
                             "entry_filled_shares",
                             "entry_unfilled_shares",
+                            "intraday_contract",
+                            "configured_intraday_contract",
+                            "pending_entry_shares",
+                            "manual_close_settlement",
+                            "closing_auction_pending_count",
+                            "margin_exception_count",
+                            "unresolved_exit_count",
                             "entry_fill_outcome",
                             "initial_capital_twd",
                             "total_equity_twd",
@@ -5172,6 +6393,16 @@ class TwDayTradeSimulationEngine:
                             "terminal_flatten_count",
                             "terminal_flatten_degraded_count",
                             "cumulative_carry_cost_twd",
+                            "cumulative_corporate_action_net_twd",
+                            "corporate_action_cash_net_twd",
+                            "corporate_action_receivable_twd",
+                            "corporate_action_payable_twd",
+                            "margin_carry_contract",
+                            "odd_lot_execution_policy",
+                            "margin_cost_assumptions",
+                            "margin_carry_position_count",
+                            "margin_corporate_action_receipt",
+                            "rebalance_reduction_fill_count",
                             "ledger_state_divergence",
                         )
                     }
@@ -5206,6 +6437,13 @@ class TwDayTradeSimulationEngine:
                             "engine_status",
                             "checkpoint_ready",
                             "open_position_count",
+                            "margin_carry_contract",
+                            "odd_lot_execution_policy",
+                            "margin_carry_position_count",
+                            "margin_corporate_action_receipt",
+                            "valuation_complete",
+                            "closing_auction_settled_at",
+                            "residual_conversion_completed_at",
                         )
                     }
                     for item in mode_rows

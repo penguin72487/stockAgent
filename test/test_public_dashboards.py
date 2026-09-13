@@ -77,14 +77,31 @@ def test_taifex_public_projection_removes_local_receipts() -> None:
 
 
 @pytest.mark.parametrize("sanitizer", [sanitize_tw_status, sanitize_taifex_status])
-def test_public_status_scrubs_nested_credential_fields_without_hiding_revision(sanitizer):
+def test_public_status_scrubs_nested_credential_fields_without_hiding_revision(
+    sanitizer,
+):
     source = {
-        "simulation_only": True, "production_order_possible": False,
-        "revision_token": "safe-revision", "health": "ok",
-        "diagnostics": [{key: "DO-NOT-PUBLISH" for key in (
-            "api_key", "apiSecret", "Authorization", "Cookie", "password",
-            "access_token", "refreshToken", "private_key", "account_id", "broker_id",
-        )}],
+        "simulation_only": True,
+        "production_order_possible": False,
+        "revision_token": "safe-revision",
+        "health": "ok",
+        "diagnostics": [
+            {
+                key: "DO-NOT-PUBLISH"
+                for key in (
+                    "api_key",
+                    "apiSecret",
+                    "Authorization",
+                    "Cookie",
+                    "password",
+                    "access_token",
+                    "refreshToken",
+                    "private_key",
+                    "account_id",
+                    "broker_id",
+                )
+            }
+        ],
     }
     public = sanitizer(source)
     assert "DO-NOT-PUBLISH" not in json.dumps(public)
@@ -135,6 +152,37 @@ def test_taifex_history_is_an_explicit_allowlist() -> None:
             "source_coverage": [],
         }
     ]
+
+
+def test_taifex_history_scrubs_unexpected_nested_values_without_mutating_source() -> (
+    None
+):
+    nested = {
+        "visible": "ok",
+        "api_key": "DO-NOT-PUBLISH",
+        "child": {"access_token": "DO-NOT-PUBLISH", "value": 3},
+    }
+    source = {
+        "history": [
+            {
+                "strategy_id": nested,
+                "total_equity_twd": float("nan"),
+                "private": "DO-NOT-PUBLISH",
+            }
+        ]
+    }
+
+    public = sanitize_taifex_history(source)
+
+    assert public == {
+        "history": [
+            {
+                "strategy_id": {"visible": "ok", "child": {"value": 3}},
+                "total_equity_twd": None,
+            }
+        ]
+    }
+    assert nested["api_key"] == "DO-NOT-PUBLISH"
 
 
 def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> None:
@@ -204,9 +252,7 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
     assert public["events"] == []
     assert public["payload_window"]["orders"] == 0
     assert "artifacts/" not in public["source_contract"]["preopen"]
-    assert public["operational_issues"][0]["code"] == (
-        "preopen_data_update_failed"
-    )
+    assert public["operational_issues"][0]["code"] == ("preopen_data_update_failed")
     assert public["operational_issues"][0]["public_error_message"] == (
         "可公開的安全說明"
     )
@@ -263,6 +309,8 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                     "signal_id": "private",
                     "symbol": "2330",
                     "bid": float("nan"),
+                    "counterfactual_overnight_replay": True,
+                    "sizing_capital_twd": 10_000_000.0,
                     "sizing_open_price": 100.0,
                     "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
                 }
@@ -288,6 +336,8 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
             {
                 "symbol": "2330",
                 "bid": None,
+                "counterfactual_overnight_replay": True,
+                "sizing_capital_twd": 10_000_000.0,
                 "sizing_open_price": 100.0,
                 "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
             }
@@ -448,7 +498,11 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
         "start_date": "2026-08-13",
         "end_date": "2026-08-14",
         "resolution": "sampled",
+        "history_encoding": "minute_columns_v1",
     }
+    assert PublicDashboardHandler._tw_history_query(
+        "range=all&resolution=1m&encoding=v2"
+    )["history_encoding"] == "minute_columns_v2"
     with pytest.raises(ValueError):
         PublicDashboardHandler._history_range_query("range=5y")
     with pytest.raises(ValueError):
@@ -494,7 +548,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=4"' in html
+    assert 'src="dashboard-core.js?v=8"' in html
     assert 'src="public.js?v=10"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
@@ -619,7 +673,12 @@ def test_compact_tw_overview_reads_atomic_status_and_current_failed_gate(
                 "simulation_only": True,
                 "production_order_possible": False,
                 "modes": {
-                    "a": {"open_position_count": 2},
+                    "a": {
+                        "open_position_count": 2,
+                        "entry_requested_shares": 10_000,
+                        "entry_filled_shares": 1_000,
+                        "entry_fill_outcome": "partial",
+                    },
                     "b": {"open_position_count": 0, "stale_position_count": 1},
                 },
                 "private_path": "/private/state.json",
@@ -647,7 +706,44 @@ def test_compact_tw_overview_reads_atomic_status_and_current_failed_gate(
         {"market": "a", "open_position_count": 2, "stale_position_count": 0},
         {"market": "b", "open_position_count": 0, "stale_position_count": 1},
     ]
+    assert payload["operational_issue_modes"] == 2
     assert "private_path" not in payload
+
+
+def test_compact_overnight_waiting_does_not_treat_scheduled_unfilled_entry_as_error(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "overnight"
+    state_dir.mkdir()
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "health": "waiting",
+                "updated_at": "2026-09-01T01:00:00+00:00",
+                "simulation_only": True,
+                "production_order_possible": False,
+                "modes": {
+                    "overnight": {
+                        "product": "tw_overnight",
+                        "open_position_count": 0,
+                        "entry_requested_shares": 10_000,
+                        "entry_filled_shares": 0,
+                        "entry_fill_outcome": "close_auction_fill_unproven",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_compact_tw_overview_status(
+        state_dir,
+        opening_gate_path=tmp_path / "missing-gate.json",
+        now=datetime.fromisoformat("2026-09-01T01:00:10+00:00"),
+    )
+
+    assert payload["health"] == "waiting"
+    assert payload["operational_issue_modes"] == 0
 
 
 def test_compact_tw_overview_fails_closed_on_unsafe_receipt(tmp_path: Path) -> None:
@@ -673,8 +769,15 @@ def test_public_pages_share_visual_tokens() -> None:
     shared = (root / "public_dashboards" / "dashboard-core.css").read_text(
         encoding="utf-8"
     )
+    responsive = (root / "public_dashboards" / "dashboard-responsive.css").read_text(
+        encoding="utf-8"
+    )
     assert "--dashboard-cyan" in shared
     assert "content-visibility: auto" in shared
+    assert ".dashboard-nav-toggle" in responsive
+    assert "table.dashboard-responsive-table" in responsive
+    assert "--dashboard-font-family" in responsive
+    assert '"Microsoft JhengHei"' in responsive
     pages = {
         "public_dashboards/index.html": "overview",
         "taifex_dashboard/index.html": "taifex",
@@ -687,26 +790,30 @@ def test_public_pages_share_visual_tokens() -> None:
     for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=6" in html
+        assert "dashboard-responsive.css?v=9" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=4" defer' in html
-        assert html.index("dashboard-core.js?v=4") < html.index(
+        assert 'dashboard-core.js?v=8" defer' in html
+        assert html.index("dashboard-core.js?v=8") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
     time_axis_versions = {
         "taifex_dashboard/index.html": 4,
-        "tw_day_trade_dashboard/index.html": 4,
         "openbb_archive_dashboard/index.html": 3,
     }
     for relative, version in time_axis_versions.items():
         html = (root / relative).read_text(encoding="utf-8")
         assert f'src="../time-axis.js?v={version}"' in html
+    tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
+    assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
+    assert 'src="chart-renderer.js?v=1"' in tw_html
+    assert "https://" not in tw_html and "http://" not in tw_html
 
-    shared_javascript = (
-        root / "public_dashboards" / "dashboard-core.js"
-    ).read_text(encoding="utf-8")
+    shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
+        encoding="utf-8"
+    )
     assert "Public dashboard requests must stay on the same origin" in shared_javascript
-    assert "credentials: \"same-origin\"" in shared_javascript
+    assert 'credentials: "same-origin"' in shared_javascript
     assert "upstreamSignal?.addEventListener" in shared_javascript
     assert "scheduleRefresh" in shared_javascript
     assert "escapeHtml" in shared_javascript
@@ -716,6 +823,11 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "validateJsonRoot" in shared_javascript
     assert "expectedRoot" in shared_javascript
     assert "NAV_ITEMS" in shared_javascript
+    assert "enhanceResponsiveTables" in shared_javascript
+    assert "performanceHistorySnapshot" in shared_javascript
+    assert "clearPerformanceHistory" in shared_javascript
+    assert "PERFORMANCE_HISTORY_LIMIT = 256" in shared_javascript
+    assert "private=secret" not in shared_javascript
 
     for relative in (
         "public_dashboards/public.js",
@@ -733,14 +845,26 @@ def test_public_pages_share_visual_tokens() -> None:
     )
     assert "FETCH_TIMEOUT_MS = 5000" in traffic_javascript
     assert "Dashboard.fetchWithTimeout" in traffic_javascript
+    assert "Dashboard.performanceHistorySnapshot()" in traffic_javascript
+    assert "function renderBrowserPerformance" in traffic_javascript
     assert '$("cache-resident")' in traffic_javascript
-    assert 'id="cache-resident"' in (
-        root / "traffic_dashboard" / "index.html"
-    ).read_text(encoding="utf-8")
+    traffic_html = (root / "traffic_dashboard" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="cache-resident"' in traffic_html
+    assert 'id="browser-action-rows"' in traffic_html
+    assert 'id="browser-page-filter"' in traffic_html
+    assert "不上傳" in traffic_html
+    assert 'href="performance.css?v=3"' in traffic_html
+    assert 'src="app.js?v=9"' in traffic_html
+    assert '<option value="render">資料整理與繪圖</option>' in traffic_html
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
     )
+    tw_chart_javascript = (
+        root / "tw_day_trade_dashboard" / "chart-renderer.js"
+    ).read_text(encoding="utf-8")
     tw_html = (root / "tw_day_trade_dashboard" / "index.html").read_text(
         encoding="utf-8"
     )
@@ -752,15 +876,16 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "alert.textContent = `訊號分頁" not in tw_javascript
     assert 'id="benchmark-cards"' in tw_html
     assert "function renderBenchmarks" in tw_javascript
-    assert "timeAxis.buildTimeAxis" in tw_javascript
-    assert "collapseEmptyIntervals: true" in tw_javascript
-    assert "TW_STOCK_SESSIONS" in tw_javascript
+    assert "timeAxis.buildTimeAxis" not in tw_javascript
+    assert "new global.uPlot(options, plotData, host)" in tw_chart_javascript
+    assert "function tickPlan(minutes)" in tw_chart_javascript
+    assert "selectedMinuteMask" in tw_chart_javascript
     assert 'id="detail-start-date" type="date"' in tw_html
     assert 'id="detail-end-date" type="date"' in tw_html
     assert 'id="equity-start-date"' not in tw_html
     assert "rangeSummaryFor" in tw_javascript
     assert "Dashboard.setTrustedHtml" in tw_javascript
-    assert ".innerHTML =" not in tw_javascript
+    assert ".innerHTML =" not in tw_javascript + tw_chart_javascript
     assert "renderOverview(snapshot);" in tw_javascript
     assert "renderModes(snapshot);" in tw_javascript
     assert "renderBenchmarks(snapshot);" in tw_javascript
@@ -768,9 +893,9 @@ def test_public_pages_share_visual_tokens() -> None:
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
 
-    openbb_javascript = (
-        root / "openbb_archive_dashboard" / "app.js"
-    ).read_text(encoding="utf-8")
+    openbb_javascript = (root / "openbb_archive_dashboard" / "app.js").read_text(
+        encoding="utf-8"
+    )
     assert "Dashboard.createLatestRequest()" in openbb_javascript
     assert "requestedRange !== range" in openbb_javascript
 
@@ -843,8 +968,11 @@ def _test_server() -> PublicDashboardServer:
         ("/dashboard-core.js", b"StockAgentDashboard"),
         ("/tw-day-trade/presentation.js", b"StockAgentTwPresentation"),
         ("/tw-day-trade/detail-components.js", b"StockAgentTwDetailComponents"),
+        ("/tw-day-trade/chart-renderer.js", b"StockAgentTwChart"),
+        ("/vendor/uplot/uPlot.iife.min.js", b"uPlot"),
         ("/tw-overnight/presentation.js", b"StockAgentTwPresentation"),
         ("/tw-overnight/detail-components.js", b"StockAgentTwDetailComponents"),
+        ("/tw-overnight/chart-renderer.js", b"StockAgentTwChart"),
     ],
 )
 def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> None:
@@ -856,6 +984,52 @@ def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> No
         assert response.content_type == "text/javascript; charset=utf-8"
         assert response.cache_control == "public, max-age=31536000, immutable"
         assert needle in response.body
+    finally:
+        server.server_close()
+
+
+def test_public_gateway_serves_traffic_performance_stylesheet() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        response = PublicDashboardHandler._static_response(
+            handler, "/traffic/performance.css"
+        )
+        assert response is not None
+        assert response.content_type == "text/css; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
+        assert b"browser-performance-table" in response.body
+    finally:
+        server.server_close()
+
+
+def test_public_gateway_serves_local_uplot_stylesheet() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        response = PublicDashboardHandler._static_response(
+            handler, "/vendor/uplot/uPlot.min.css"
+        )
+        assert response is not None
+        assert response.content_type == "text/css; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
+        assert b".uplot" in response.body
+    finally:
+        server.server_close()
+
+
+def test_public_gateway_serves_shared_responsive_stylesheet() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        response = PublicDashboardHandler._static_response(
+            handler, "/dashboard-responsive.css"
+        )
+        assert response is not None
+        assert response.content_type == "text/css; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
+        assert b"dashboard-responsive-table" in response.body
+        assert b"dashboard-nav-toggle" in response.body
     finally:
         server.server_close()
 
@@ -884,9 +1058,13 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         server.data_monitor_status = lambda **_kwargs: full  # type: ignore[method-assign]
         summary = json.loads(server.data_monitor_summary().body)
         assert summary["summary"]["registered_items"] == 390
-        assert "groups" not in summary
+        assert summary["groups"] == [{"id": "large"}]
         assert "sources" not in summary
         assert "private-heavy-row" not in json.dumps(summary)
+        details = json.loads(server.data_monitor_details().body)
+        assert details["sources"] == [{"endpoint_id": "private-heavy-row"}]
+        assert "summary" not in details
+        assert "groups" not in details
     finally:
         server.server_close()
 
@@ -1016,6 +1194,35 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         server.server_close()
 
 
+def test_tw_status_never_reuses_yesterday_cache_after_rollover(monkeypatch):
+    server = _test_server()
+    day = ["2026-09-08"]
+    server.tw_revision = lambda: server.cached_local_json(
+        cache_key=f"rollover-fixture-{day[0]}",
+        ttl_seconds=60,
+        cache_control="no-store",
+        builder=lambda: {
+            "revision_token": day[0],
+            "session_clock": {"display_session_date": day[0]},
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_dashboard_snapshot",
+        lambda **kw: {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "modes": [],
+            "session_date": day[0],
+        },
+    )
+    try:
+        assert json.loads(server.tw_status().body)["session_date"] == "2026-09-08"
+        day[0] = "2026-09-09"
+        assert json.loads(server.tw_status().body)["session_date"] == "2026-09-09"
+    finally:
+        server.server_close()
+
+
 def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None:
     server = _test_server()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1120,11 +1327,12 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     assert "@write_methods not method GET HEAD" in caddy
     assert 'header @write_methods Allow "GET, HEAD"' in caddy
     assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
+    assert 'KMP_AFFINITY="${KMP_AFFINITY:-disabled}"' in launcher
+    assert "export OMP_PROC_BIND=" not in launcher
     assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
     assert "systemctl restart stockagent-public-dashboards.service" in installer
     snapshot_unit = (
-        root
-        / "deploy/systemd/stockagent-data-refresh-status-snapshot.service.in"
+        root / "deploy/systemd/stockagent-data-refresh-status-snapshot.service.in"
     ).read_text(encoding="utf-8")
     assert "RestrictAddressFamilies=AF_UNIX" in snapshot_unit
     assert "ReadWritePaths=__REPO_ROOT__/artifacts/live/data_monitor" in snapshot_unit
@@ -1166,6 +1374,54 @@ def test_expired_cache_returns_stale_while_refreshing_in_background() -> None:
             assert time.monotonic() < deadline
             time.sleep(0.01)
     finally:
+        server.server_close()
+
+
+def test_new_history_revision_returns_verified_prior_body_while_rebuilding() -> None:
+    server = _test_server()
+    cache_prefix = "tw-history:all:::1m:"
+    old_key = f"{cache_prefix}revision-1"
+    new_key = f"{cache_prefix}revision-2"
+    rebuilt = threading.Event()
+    release_rebuild = threading.Event()
+    try:
+        first = server.cached_local_json(
+            cache_key=old_key,
+            ttl_seconds=55.0,
+            stale_grace_seconds=60.0,
+            cache_control="no-cache",
+            builder=lambda: {"revision": 1},
+        )
+
+        def build_new_revision():
+            rebuilt.set()
+            assert release_rebuild.wait(1.0)
+            return server.cached_local_json(
+                cache_key=new_key,
+                ttl_seconds=55.0,
+                stale_grace_seconds=60.0,
+                cache_control="no-cache",
+                builder=lambda: {"revision": 2},
+            )
+
+        started = time.perf_counter()
+        stale = server._revision_stale_or_build(
+            cache_prefix=cache_prefix,
+            cache_key=new_key,
+            revision_token="revision-2",
+            builder=build_new_revision,
+        )
+        assert (time.perf_counter() - started) < 0.1
+        assert stale.body == first.body
+        assert rebuilt.wait(0.5)
+        release_rebuild.set()
+        deadline = time.monotonic() + 1.0
+        while new_key not in server._cache:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert json.loads(server._cache[new_key].response.body) == {"revision": 2}
+    finally:
+        release_rebuild.set()
         server.server_close()
 
 
@@ -1313,7 +1569,9 @@ def test_single_oversized_response_does_not_defeat_cache_limit(monkeypatch):
     monkeypatch.setattr("scripts.serve_public_dashboards.MAX_CACHE_BYTES", 100)
     try:
         response = server.cached_local_json(
-            cache_key="oversized", ttl_seconds=60, cache_control="no-store",
+            cache_key="oversized",
+            ttl_seconds=60,
+            cache_control="no-store",
             builder=lambda: {"payload": "x" * 1000},
         )
         assert len(json.loads(response.body)["payload"]) == 1000
@@ -1324,14 +1582,18 @@ def test_single_oversized_response_does_not_defeat_cache_limit(monkeypatch):
 
 def test_failed_unique_keys_do_not_leave_permanent_locks():
     server = _test_server()
+
     def fail():
         raise ValueError("fixture build failure")
+
     try:
         for index in range(50):
             with pytest.raises(ValueError, match="fixture build failure"):
                 server.cached_local_json(
-                    cache_key=f"failed-{index}", ttl_seconds=60,
-                    cache_control="no-store", builder=fail,
+                    cache_key=f"failed-{index}",
+                    ttl_seconds=60,
+                    cache_control="no-store",
+                    builder=fail,
                 )
         assert not server._cache_key_locks
         assert not server._cache
@@ -1345,7 +1607,10 @@ def test_lru_evicts_active_entry_without_replacing_waiters_lock(monkeypatch):
     key_lock = threading.Lock()
     try:
         response = server.cached_local_json(
-            cache_key="old", ttl_seconds=60, cache_control="no-store", builder=lambda: {},
+            cache_key="old",
+            ttl_seconds=60,
+            cache_control="no-store",
+            builder=lambda: {},
         )
         with key_lock:
             server._cache_key_locks["old"] = key_lock
@@ -1372,9 +1637,13 @@ def protocol_server():
         thread.join(timeout=2)
 
 
-@pytest.mark.parametrize("encoding", ["gzip;q=0", "notgzip", "gzip;q=0, *;q=1", "gzip;q=0.2, identity;q=1"])
+@pytest.mark.parametrize(
+    "encoding", ["gzip;q=0", "notgzip", "gzip;q=0, *;q=1", "gzip;q=0.2, identity;q=1"]
+)
 def test_http_respects_unaccepted_or_less_preferred_gzip(protocol_server, encoding):
-    protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding})
+    protocol_server.request(
+        "GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding}
+    )
     response = protocol_server.getresponse()
     body = response.read()
     assert response.status == 200
@@ -1386,15 +1655,22 @@ def test_http_respects_unaccepted_or_less_preferred_gzip(protocol_server, encodi
 def test_encoding_variants_have_distinct_validators_and_valid_304(protocol_server):
     tags = {}
     for encoding in ("identity", "gzip"):
-        protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding})
+        protocol_server.request(
+            "GET", "/dashboard-core.js", headers={"Accept-Encoding": encoding}
+        )
         response = protocol_server.getresponse()
         response.read()
         assert response.status == 200
         tags[encoding] = response.getheader("ETag")
     assert tags["identity"] != tags["gzip"]
-    protocol_server.request("GET", "/dashboard-core.js", headers={
-        "Accept-Encoding": "gzip", "If-None-Match": f'"different", W/{tags["gzip"]}',
-    })
+    protocol_server.request(
+        "GET",
+        "/dashboard-core.js",
+        headers={
+            "Accept-Encoding": "gzip",
+            "If-None-Match": f'"different", W/{tags["gzip"]}',
+        },
+    )
     response = protocol_server.getresponse()
     assert response.read() == b""
     assert response.status == 304
@@ -1402,8 +1678,57 @@ def test_encoding_variants_have_distinct_validators_and_valid_304(protocol_serve
     assert response.getheader("Content-Length") is None
 
 
+def test_server_timing_is_request_local_on_same_keepalive_connection(protocol_server):
+    timings = []
+    for _ in range(2):
+        protocol_server.request("GET", "/dashboard-core.js")
+        response = protocol_server.getresponse()
+        response.read()
+        timings.append(response.getheader("Server-Timing"))
+    assert 'cache;desc="static_build"' in timings[0]
+    assert 'cache;desc="static_hit"' in timings[1]
+    for timing in timings:
+        assert re.search(r"app;dur=[\d.]+", timing)
+        assert "cache_wait;dur=" in timing
+        assert "build;dur=" in timing
+        assert "/root/" not in timing
+    protocol_server.request("GET", "/not-a-route")
+    response = protocol_server.getresponse()
+    response.read()
+    assert "cache;desc=" not in response.getheader("Server-Timing")
+
+
+def test_static_cache_detects_same_size_restored_mtime(tmp_path):
+    import os
+
+    server = _test_server()
+    try:
+        path = tmp_path / "asset.js"
+        path.write_bytes(b"old")
+        before = path.stat()
+
+        def read():
+            return server.cached_static(
+                path, content_type="text/javascript", cache_control="no-store"
+            )
+
+        first = read()
+        path.write_bytes(b"new")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        second = read()
+        assert first.body == b"old"
+        assert second.body == b"new"
+        assert first.etag != second.etag
+    finally:
+        server.server_close()
+
+
 def test_http_rejects_when_all_supported_encodings_are_forbidden(protocol_server):
-    protocol_server.request("GET", "/dashboard-core.js", headers={"Accept-Encoding": "identity;q=0, gzip;q=0"})
+    protocol_server.request(
+        "GET",
+        "/dashboard-core.js",
+        headers={"Accept-Encoding": "identity;q=0, gzip;q=0"},
+    )
     response = protocol_server.getresponse()
     response.read()
     assert response.status == 406
@@ -1418,7 +1743,9 @@ def test_rejected_post_body_cannot_be_parsed_as_next_request(protocol_server):
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
-def test_read_only_request_body_is_rejected_and_connection_closed(protocol_server, method):
+def test_read_only_request_body_is_rejected_and_connection_closed(
+    protocol_server, method
+):
     protocol_server.request(method, "/healthz", body=b"unexpected body")
     response = protocol_server.getresponse()
     body = response.read()
@@ -1438,7 +1765,15 @@ def test_read_only_chunked_request_is_rejected_without_reading_body(protocol_ser
     response.read()
 
 
-@pytest.mark.parametrize("path", ["/api/overview", "/taifex/api/status", "/data-monitor/api/status", "/traffic/api/status"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/overview",
+        "/taifex/api/status",
+        "/data-monitor/api/status",
+        "/traffic/api/status",
+    ],
+)
 def test_parameterless_public_routes_reject_unknown_query(protocol_server, path):
     protocol_server.request("GET", path + "?unexpected=fixture")
     response = protocol_server.getresponse()
@@ -1455,12 +1790,21 @@ def test_malformed_request_target_returns_sanitized_400(protocol_server):
     assert json.loads(response.read()) == {"error": "invalid_request"}
 
 
-@pytest.mark.parametrize(("header", "expected"), [
-    (None, "identity"), ("", "identity"), ("*", "gzip"), ("*;q=0", None),
-    ("gzip;q=0, *;q=1", "identity"), ("gzip;q=0.5, identity;q=0", "gzip"),
-    ("gzip;q=0;q=1", "identity"), ("gzip;q=NaN", "identity"),
-    ("gzip;q=1.1", "identity"), ("gzip;q=0.8, identity;q=0.9", "identity"),
-])
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (None, "identity"),
+        ("", "identity"),
+        ("*", "gzip"),
+        ("*;q=0", None),
+        ("gzip;q=0, *;q=1", "identity"),
+        ("gzip;q=0.5, identity;q=0", "gzip"),
+        ("gzip;q=0;q=1", "identity"),
+        ("gzip;q=NaN", "identity"),
+        ("gzip;q=1.1", "identity"),
+        ("gzip;q=0.8, identity;q=0.9", "identity"),
+    ],
+)
 def test_encoding_quality_contract(header, expected):
     from scripts.serve_public_dashboards import _preferred_encoding
 
@@ -1486,18 +1830,19 @@ def test_overview_prewarms_before_large_history_scans() -> None:
     tw_status_call = method.index("            warmed_tw_status = self.tw_status()")
     tw_history_call = method.index("                self.tw_history(")
     history_call = method.index("            taifex_history_builder()")
-    detail_pool = method.index(
-        "        builders: tuple[Callable[[], object], ...] = ("
-    )
+    full_history_call = method.index("            self.tw_history(\n                \"all\",")
+    detail_pool = method.index("        builders: tuple[Callable[[], object], ...] = (")
     assert (
         overview_call
         < tw_status_call
         < tw_history_call
         < history_call
+        < full_history_call
         < detail_pool
     )
-    assert 'start_date=current_tw_session_date' in method
-    assert 'end_date=current_tw_session_date' in method
+    assert "start_date=current_tw_session_date" in method
+    assert 'history_encoding="minute_columns_v2"' in method
+    assert "end_date=current_tw_session_date" in method
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:

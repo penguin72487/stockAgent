@@ -1,0 +1,11 @@
+[Unit]
+Description=StockAgent rolling packed retention daily reconcile
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 Asia/Taipei
+RandomizedDelaySec=10m
+Persistent=true
+Unit=stockagent-packed-retention.service
+
+[Install]
+WantedBy=timers.target

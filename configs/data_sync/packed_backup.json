@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "source": "/srv/stockagent-packed",
+  "destination": "/mnt/d/stockagent-backup/packed",
+  "mount_point": "/mnt/d",
+  "mount_source": "D:\\",
+  "volume_id": "9ba6ab87-3889-40e7-90e4-9597dc88abaf",
+  "state_dir": "/var/lib/stockagent-packed-backup",
+  "reserve_bytes": 21474836480,
+  "batch_objects": 32,
+  "poll_seconds": 30,
+  "checksum_recheck_days": 30
+}

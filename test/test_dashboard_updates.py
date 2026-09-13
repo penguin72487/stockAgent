@@ -95,6 +95,7 @@ def test_history_cache_invalidates_immediately_on_content_revision(monkeypatch, 
         assert method("all", resolution="1m") is not first
         assert len(calls) == 2
         assert all(call["resolution"] == "1m" for call in calls)
+        assert all(call["use_memory_cache"] is False for call in calls)
     finally:
         server.server_close()
 
@@ -122,11 +123,18 @@ def test_signals_are_requested_before_lossless_history_and_client_keys_include_r
     start = source.index("async function refresh(")
     end = source.index("function activateTwPublicMonitor", start)
     refresh = source[start:end]
-    assert refresh.index("loadSignals({force: true})") < refresh.index("loadChartHistory")
-    assert "Promise.allSettled([signalsReady, historyReady])" in refresh
+    assert refresh.index("loadSignals({force})") < refresh.index("loadChartHistory")
+    assert "Promise.allSettled([signalsReady, historyReady])" not in refresh
+    assert refresh.index("loadPositions({force})") < refresh.index("loadChartHistory")
+    assert refresh.index("loadEvents({force})") < refresh.index("loadChartHistory")
     assert "await loadSignals" not in refresh
-    key = source[source.index("function chartRequestKey"):source.index("function chartHistoryMatchesSelection")]
-    assert "lastServiceRevision" in key
+    key = source[source.index("function detailDataRevision"):source.index("function chartHistoryMatchesSelection")]
+    assert "service.content_revision" in key
+    assert "history.generated_at" in key
+    assert 'return detailDataRevision("history")' in key
+    assert "signalLoading && signalRequestRevisionInFlight === requestRevision" in source
+    assert "positionLoading && positionRequestRevisionInFlight === requestRevision" in source
+    assert "eventLoading && eventRequestRevisionInFlight === requestRevision" in source
 
 
 @pytest.mark.parametrize("method,path,headers,status", [

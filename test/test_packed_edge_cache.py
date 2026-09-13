@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 from pathlib import Path
 
 import pytest
 
+from scripts.manage_packed_edge import _acquire_operation_lock
 from stockagent.data_sync.desync_snapshots import ResolvedSnapshot, SnapshotError
 from stockagent.data_sync.packed_edge_cache import (
     ensure_edge_include,
@@ -15,6 +17,20 @@ from stockagent.data_sync.packed_edge_cache import (
     verify_payload_relpaths,
     write_edge_ignore,
 )
+
+
+def test_edge_operation_lock_defers_concurrent_gc(tmp_path: Path) -> None:
+    first = _acquire_operation_lock(tmp_path, nonblocking=False)
+    try:
+        with pytest.raises(BlockingIOError):
+            _acquire_operation_lock(tmp_path, nonblocking=True)
+    finally:
+        fcntl.flock(first, fcntl.LOCK_UN)
+        first.close()
+
+    second = _acquire_operation_lock(tmp_path, nonblocking=True)
+    fcntl.flock(second, fcntl.LOCK_UN)
+    second.close()
 
 
 def _object(root: Path, kind: str, payload: bytes) -> tuple[Path, str]:

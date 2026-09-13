@@ -201,6 +201,62 @@ def test_compiled_overnight_wrapper_rejects_malformed_phase_actions(
     not torch.cuda.is_available(),
     reason="CUDA fixed-block compile contract",
 )
+@pytest.mark.parametrize("rows", [1, 16, 31])
+def test_short_overnight_batch_compiles_and_preserves_ledger_and_gradient(
+    monkeypatch: pytest.MonkeyPatch, rows: int,
+) -> None:
+    real_compile = torch.compile
+    graphs = []
+
+    def backend(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def compile_for_test(function, **kwargs):
+        kwargs.pop("options")
+        return real_compile(function, backend=backend, **kwargs)
+
+    def case():
+        result = _case(mode="tw_overnight", rows=rows, symbols=5,
+                       device="cuda", requires_grad=False)
+        actions = result["actions"]
+        actions[:, 0] = 1.0
+        actions[:, 1] = 0.0
+        actions[:, 2] = 0.1
+        actions.requires_grad_(True)
+        return result
+
+    expected_inputs = case()
+    expected = run_tw_overnight_dual_session(**expected_inputs)
+    def objective(result):
+        return (result.strategy_returns.sum()
+                + 0.03 * result.turnovers.sum()
+                + 0.01 * result.final_weights.square().sum())
+    objective(expected).backward()
+    actual_inputs = case()
+    torch._dynamo.reset()
+    clear_tw_dual_session_compile_cache()
+    get_tw_dual_session_compile_stats(reset=True)
+    monkeypatch.setattr(torch, "compile", compile_for_test)
+    actual = run_tw_overnight_dual_session_compiled(**actual_inputs, strict_compile=True)
+    objective(actual).backward()
+    _assert_result_close(actual, expected)
+    torch.testing.assert_close(actual_inputs["actions"].grad,
+                               expected_inputs["actions"].grad, rtol=3e-5, atol=3e-6)
+    assert bool(actual_inputs["actions"].grad.abs().any())
+    stats = get_tw_dual_session_compile_stats()
+    assert len(graphs) == 1
+    assert stats["compiled_block_calls"] == 1
+    assert stats["compiled_day_calls"] == rows
+    assert stats["eager_tail_calls"] == stats["eager_fallback_calls"] == 0
+    torch._dynamo.reset()
+    clear_tw_dual_session_compile_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA fixed-block compile contract",
+)
 def test_fixed_block_and_eager_tail_match_and_preserve_gradient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

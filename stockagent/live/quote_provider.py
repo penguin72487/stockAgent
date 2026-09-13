@@ -39,6 +39,10 @@ _SHIOAJI_STOCK_CACHE: dict[str, tuple[float, dict[str, float | int | None]]] = {
 _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
 _SHIOAJI_STOCK_LAST_LOGIN_ERROR: str | None = None
 _SHIOAJI_STOCK_LOGIN_FAILURES = 0
+_SHIOAJI_STREAM_LOCK = threading.RLock()
+_SHIOAJI_STREAM_API: object | None = None
+_SHIOAJI_STREAM_SUBSCRIPTIONS: set[tuple[str, str]] = set()
+_SHIOAJI_STREAM_ROWS: dict[str, dict[str, dict[str, Any]]] = {}
 _TW_LIMIT_CACHE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
 _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
@@ -976,6 +980,111 @@ def _contract_positive(contract: object, *names: str) -> float | None:
     return None
 
 
+def _record_stock_stream_event(kind: str, event: object, *, received: datetime | None = None) -> None:
+    """Retain exchange time and trial flags; never relabel a cache read as receipt."""
+    if getattr(event, "intraday_odd", False):
+        return
+    code = str(getattr(event, "code", ""))
+    exchange_at = getattr(event, "datetime", None)
+    if not code or not isinstance(exchange_at, datetime):
+        return
+    zone = ZoneInfo("Asia/Taipei")
+    exchange_at = exchange_at.replace(tzinfo=zone) if exchange_at.tzinfo is None else exchange_at.astimezone(zone)
+    observed = received or datetime.now(zone)
+    row: dict[str, Any] = {"exchange_at": exchange_at.isoformat(), "received_at": observed.isoformat(),
+                           "simtrade": getattr(event, "simtrade", None)}
+    if row["simtrade"] is not None:
+        row["simtrade"] = bool(row["simtrade"])
+    def number(value: object) -> float | None:
+        try:
+            result = float(value)
+            return result if np.isfinite(result) and result >= 0 else None
+        except (ValueError, TypeError):
+            return None
+    if kind == "tick":
+        for field in ("open", "close", "high", "low", "volume", "total_volume"):
+            row[field] = number(getattr(event, field, None))
+    else:
+        for target, field in (("bid", "bid_price"), ("ask", "ask_price"),
+                              ("bid_volume", "bid_volume"), ("ask_volume", "ask_volume")):
+            values = getattr(event, field, None)
+            row[target] = number(values[0]) if values is not None and len(values) else None
+    with _SHIOAJI_STREAM_LOCK:
+        previous = _SHIOAJI_STREAM_ROWS.get(code, {}).get(kind, {})
+        if previous.get("exchange_at", "") > row["exchange_at"]:
+            return
+        _SHIOAJI_STREAM_ROWS.setdefault(code, {})[kind] = row
+
+
+def fetch_shioaji_stock_live_quotes(symbols: list[str], *, trading_date: date) -> dict[str, dict[str, Any]]:
+    """Subscribe once on the existing market-data login, then read pushed state.
+
+    This owns callbacks only on the dedicated stock quote client. It never
+    registers order callbacks, creates another login, polls snapshots, or
+    infers non-trial status from missing fields. Subscriptions are reconciled
+    against the current execution universe so completed symbols release quota.
+    """
+    import shioaji as sj
+    global _SHIOAJI_STREAM_API
+    api = _shioaji_stock_api()
+    with _SHIOAJI_STREAM_LOCK:
+        if _SHIOAJI_STREAM_API is not api:
+            _SHIOAJI_STREAM_SUBSCRIPTIONS.clear()
+            _SHIOAJI_STREAM_ROWS.clear()
+            api.set_on_tick_stk_v1_callback(lambda *args: _record_stock_stream_event("tick", args[-1]))
+            api.set_on_bidask_stk_v1_callback(lambda *args: _record_stock_stream_event("book", args[-1]))
+            _SHIOAJI_STREAM_API = api
+    desired = {(str(s), kind) for s in symbols for kind in ("tick", "book")}
+    kinds = {"tick": sj.QuoteType.Tick, "book": sj.QuoteType.BidAsk}
+    # API calls stay outside the callback lock (a native subscribe may deliver
+    # the first event synchronously). Only this engine thread owns subscriptions.
+    for code, kind in sorted(_SHIOAJI_STREAM_SUBSCRIPTIONS - desired):
+        contract = api.contracts.get(code)
+        if contract is not None:
+            api.unsubscribe(contract, quote_type=kinds[kind])
+        _SHIOAJI_STREAM_SUBSCRIPTIONS.discard((code, kind))
+        with _SHIOAJI_STREAM_LOCK:
+            _SHIOAJI_STREAM_ROWS.pop(code, None)
+    for code, kind in sorted(desired - _SHIOAJI_STREAM_SUBSCRIPTIONS):
+        contract = api.contracts.get(code)
+        if contract is None:
+            continue
+        api.subscribe(contract, quote_type=kinds[kind])
+        _SHIOAJI_STREAM_SUBSCRIPTIONS.add((code, kind))
+    limits, _ = _load_prepared_tw_price_limits(trading_date.isoformat())
+    quotes = {}
+    for code in symbols:
+        with _SHIOAJI_STREAM_LOCK:
+            rows = {kind: dict(row) for kind, row in _SHIOAJI_STREAM_ROWS.get(code, {}).items()}
+        tick, book = rows.get("tick", {}), rows.get("book", {})
+        if not tick.get("exchange_at", "").startswith(trading_date.isoformat()):
+            tick = {}
+        if not book.get("exchange_at", "").startswith(trading_date.isoformat()):
+            book = {}
+        contract = api.contracts.get(code)
+        reference, upper, lower = limits.get(code, (None, None, None))
+        upper = upper or _contract_positive(contract, "limit_up")
+        lower = lower or _contract_positive(contract, "limit_down")
+        reference = reference or _contract_positive(contract, "reference")
+        q = {"symbol": code, "source": "shioaji_stock_stream", "available": bool(tick or book),
+             "last": tick.get("close"), "open": tick.get("open"),
+             "high": tick.get("high"), "low": tick.get("low"),
+             "bid": book.get("bid"), "ask": book.get("ask"),
+             "bid_volume": book.get("bid_volume"), "ask_volume": book.get("ask_volume"),
+             "upper_limit": upper, "lower_limit": lower, "reference_price": reference,
+             "cumulative_volume_lots": tick.get("total_volume") if tick.get("simtrade") is False else None,
+             "quote_at": book.get("received_at"), "book_exchange_at": book.get("exchange_at"),
+             "exchange_quote_at": tick.get("exchange_at"), "simtrade": book.get("simtrade"),
+             "trade_simtrade": tick.get("simtrade"), "trade_quote_at": tick.get("received_at")}
+        if tick.get("exchange_at") and tick.get("simtrade") is False:
+            exchange_time = datetime.fromisoformat(tick["exchange_at"]).time()
+            if datetime_time(13, 30) <= exchange_time < datetime_time(13, 34):
+                q["auction_volume_lots"] = tick.get("volume")
+                q["auction_volume_source"] = "exchange_non_trial_tick"
+        quotes[code] = q
+    return quotes
+
+
 def _shioaji_snapshot_values(
     row: object,
     contract: object,
@@ -1696,6 +1805,7 @@ def _fetch_shioaji_stock_snapshots_once(
     # If the official reference is absent, leave both limits missing so the
     # execution layer fails closed; never fabricate them from panel fallback.
     from stockagent.data.tw_price_rules import limit_price_numpy
+    from stockagent.data.tw_security import classify_tw_stock_or_etf
 
     trading_date = np.datetime64(
         datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat(), "D"
@@ -1705,7 +1815,9 @@ def _fetch_shioaji_stock_snapshots_once(
     derived_lower = limit_price_numpy(official_reference, 0.90, trading_date)
     derived_count = 0
     for idx in range(len(requested)):
-        if not available[idx]:
+        # ETF limits can be leveraged or absent. A stock's 10% formula is not
+        # an admissible fallback even when the ETF auction reference exists.
+        if not available[idx] or classify_tw_stock_or_etf(requested[idx]) != "stock":
             continue
         if np.isfinite(arrays["upper"][idx]) and np.isfinite(arrays["lower"][idx]):
             continue
@@ -2100,6 +2212,9 @@ def load_prices_csv(
     bid_volume_col = columns.get("bid_volume")
     ask_volume_col = columns.get("ask_volume")
     reference_col = columns.get("reference_price") or columns.get("reference")
+    # An explicit CSV observation clock is caller-declared research/input
+    # provenance. It is never an independently verified exchange print.
+    timestamp_col = columns.get("effective_timestamp_ms") or columns.get("timestamp_ms")
     if symbol_col is None or price_col is None:
         raise ValueError(
             "prices CSV must contain symbol/code/ticker and price/close/last/current_price columns"
@@ -2121,6 +2236,7 @@ def load_prices_csv(
             bid_volume_col,
             ask_volume_col,
             reference_col,
+            timestamp_col,
         )
         if column is not None
     ]
@@ -2142,6 +2258,7 @@ def load_prices_csv(
     bid_volumes = np.full((len(symbols),), np.nan, dtype=np.float64)
     ask_volumes = np.full((len(symbols),), np.nan, dtype=np.float64)
     reference_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    timestamps_ms = np.zeros((len(symbols),), dtype=np.int64)
     count = 0
     for idx, symbol in enumerate(symbols):
         row = lookup.get(str(symbol))
@@ -2153,6 +2270,10 @@ def load_prices_csv(
         prices[idx] = value
         available[idx] = True
         count += 1
+        if timestamp_col is not None:
+            stamp = _float_or_none(row.get(timestamp_col))
+            if stamp is not None and stamp.is_integer() and stamp < np.iinfo(np.int64).max:
+                timestamps_ms[idx] = int(stamp)
         for column, target in (
             (open_col, open_prices),
             (high_col, high_prices),
@@ -2187,6 +2308,7 @@ def load_prices_csv(
         bid_volumes=bid_volumes,
         ask_volumes=ask_volumes,
         reference_prices=reference_prices,
+        timestamps_ms=timestamps_ms if timestamp_col is not None else None,
     )
 
 

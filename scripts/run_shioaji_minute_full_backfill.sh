@@ -296,7 +296,12 @@ PY
   if (( download_rc == 0 )) \
     && [[ "$summary_state" == "ready=true "* ]]; then
     echo "[shioaji-minute-runner] building audited available-source research dataset"
-    run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
+    # Run repository-owned programs as modules.  Executing a file below
+    # scripts/ directly makes that directory sys.path[0] and drops the repo
+    # root, so the late downloader import fails only after the expensive
+    # collection pass has completed.
+    run_fintech_python -m scripts.build_shioaji_tw_minute_dataset \
+      --calendar-root data_tw_public
     latest_date="$(
       run_fintech_python - <<'PY'
 import json
@@ -305,10 +310,11 @@ payload = json.loads(Path("data_tw_minute/research_dataset/manifest.json").read_
 print(payload["dates"][-1])
 PY
     )"
-    run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
+    run_fintech_python -m scripts.audit_shioaji_tw_minute_dataset \
       --trade-date "$latest_date"
-    run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
+    run_fintech_python -m scripts.audit_shioaji_tw_minute_dataset \
       --all-partitions \
+      --calendar-root data_tw_public \
       --output data_tw_minute/audits/full_latest.json
     run_fintech_python -m pytest -q \
       test/test_shioaji_tw_minute_kbars.py \

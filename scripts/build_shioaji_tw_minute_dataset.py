@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import csv
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -67,6 +67,15 @@ def parse_args() -> argparse.Namespace:
         default=Path("data_tw_minute/research_dataset"),
     )
     parser.add_argument(
+        "--calendar-root",
+        type=Path,
+        default=Path("data_tw_public"),
+        help=(
+            "Receipt-backed TWSE calendar root. A research dataset is never "
+            "built from weekday guesses or provider-only dates."
+        ),
+    )
+    parser.add_argument(
         "--symbols",
         default="",
         help="Optional comma-separated completed symbols. Default: all manifests.",
@@ -106,6 +115,56 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def _split_official_session_rows(
+    frame: pl.DataFrame,
+    official_dates: set[date],
+) -> tuple[pl.DataFrame, dict[str, int]]:
+    """Exclude provider rows whose date is not an accepted exchange session."""
+
+    observed = set(frame["date"].cast(pl.Date).to_list()) if frame.height else set()
+    rejected_dates = observed - official_dates
+    if not rejected_dates:
+        return frame, {}
+    rejected = frame.filter(pl.col("date").is_in(sorted(rejected_dates)))
+    counts = {
+        str(key): int(value)
+        for key, value in rejected.group_by("date").len().iter_rows()
+    }
+    return frame.filter(pl.col("date").is_in(sorted(official_dates))), counts
+
+
+def _quarantine_stale_partitions(
+    output_root: Path,
+    accepted_dates: set[str],
+) -> list[dict[str, str]]:
+    """Move unreferenced output partitions aside; never silently delete them."""
+
+    stale = sorted(
+        path
+        for path in output_root.glob("trade_date=*")
+        if path.name.removeprefix("trade_date=") not in accepted_dates
+    )
+    if not stale:
+        return []
+    quarantine = (
+        output_root.parent
+        / "quarantine"
+        / (
+            f"{output_root.name}-"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        )
+    )
+    moved: list[dict[str, str]] = []
+    for source in stale:
+        if source.is_symlink() or not source.is_dir():
+            raise RuntimeError(f"unsafe stale minute partition: {source}")
+        destination = quarantine / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+        moved.append({"source": str(source), "quarantine": str(destination)})
+    return moved
 
 
 def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
@@ -551,6 +610,17 @@ def main() -> None:
         selected_symbols=None,
         subset_requested=bool(requested),
     )
+    from downloader.download_tw_public_data import _validated_taiex_session_dates
+
+    collection_start = date.fromisoformat(str(collection["start_date"]))
+    collection_end = date.fromisoformat(str(collection["end_date"]))
+    official_sessions, calendar_sha256 = _validated_taiex_session_dates(
+        args.calendar_root,
+        collection_start,
+        collection_end,
+    )
+    if not official_sessions:
+        raise RuntimeError("receipt-backed official calendar has no selected sessions")
     available_symbols = _available_collection_symbols(
         download_summary_path,
         collection,
@@ -571,10 +641,14 @@ def main() -> None:
         subset_requested=bool(requested),
     )
     date_summaries: dict[str, dict[str, Any]] = {}
+    rejected_non_session_rows: dict[str, int] = defaultdict(int)
     for (chunk_start, chunk_end), paths in groups.items():
         frame = build_research_frame(
             pl.scan_parquet([str(path) for path in paths])
         ).collect(engine="streaming")
+        frame, rejected = _split_official_session_rows(frame, official_sessions)
+        for date_text, rows in rejected.items():
+            rejected_non_session_rows[date_text] += rows
         for key, day_frame in frame.partition_by(
             "date", as_dict=True, maintain_order=True
         ).items():
@@ -618,6 +692,12 @@ def main() -> None:
             f"inputs={len(paths)} rows={frame.height}",
             flush=True,
         )
+    quarantined_output_partitions = []
+    if not requested:
+        quarantined_output_partitions = _quarantine_stale_partitions(
+            args.output_root,
+            set(date_summaries),
+        )
     _atomic_json(
         args.output_root / "manifest.json",
         {
@@ -629,6 +709,17 @@ def main() -> None:
             "decision_clock": "completed_right_labelled_1m_bar",
             "execution_clock": "next_1m_bar_open_proxy",
             "timezone": "Asia/Taipei",
+            "official_calendar": {
+                "root": str(args.calendar_root.resolve()),
+                "sha256": calendar_sha256,
+                "first_session": min(official_sessions).isoformat(),
+                "last_session": max(official_sessions).isoformat(),
+                "sessions": len(official_sessions),
+            },
+            "quarantined_non_session_source_rows": dict(
+                sorted(rejected_non_session_rows.items())
+            ),
+            "quarantined_stale_output_partitions": quarantined_output_partitions,
             "download_summary": str(download_summary_path),
             "download_start_date": collection.get("start_date"),
             "download_end_date": collection.get("end_date"),

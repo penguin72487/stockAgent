@@ -217,6 +217,26 @@ def test_stateful_day_trade_preflight_monitors_dual_session_executor() -> None:
     )
 
 
+def test_physical_fifo_preflight_does_not_monitor_legacy_executor() -> None:
+    runtime = _ExecutionRuntime(
+        mode="tw_day_trade",
+        buy_fee_rates=None,
+        sell_fee_rates=None,
+        lot_sizes=None,
+        settlement_lag_sessions=2,
+        day_trade_unlimited_margin_conversion=True,
+        day_trade_carry_source=object(),
+    )
+
+    assert (
+        _tw_settlement_compile_backend(
+            runtime,
+            day_trade_minute_compile=True,
+        )
+        == "physical_fifo"
+    )
+
+
 def test_factory_builds_independent_executable_model() -> None:
     config = load_config(CONFIG_PATH)
     model_cfg = config.training.executable_portfolio_transformer

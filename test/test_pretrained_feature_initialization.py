@@ -241,6 +241,79 @@ def test_same_feature_abi_preserves_learned_bottleneck_checkpoint_exactly() -> N
     )
 
 
+def test_financial_transfer_allows_explicit_position_free_symbol_superset() -> None:
+    source = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target.use_symbol_pos = False
+    initialization = _PretrainedInitialization(
+        checkpoint_path=Path("source.pt"),
+        checkpoint={"model_state_dict": source.state_dict()},
+        source_feature_names=["a", "b", "c", "d"],
+        provenance={"source_checkpoint_sha256": "unit-test"},
+        source_symbol_names=["2317", "2330"],
+        source_uses_symbol_position=False,
+    )
+
+    report = _transfer_pretrained_feature_identity(
+        target,
+        initialization,
+        target_feature_names=["a", "b", "c", "d"],
+        target_symbol_names=["0050", "2317", "2330"],
+        symbol_axis_adapter="permutation_invariant_superset",
+        require_exact_backbone=True,
+        trainable_parameter_prefixes=(),
+    )
+
+    assert report["symbol_axis_adapter"] == "permutation_invariant_superset"
+    assert report["common_symbol_count"] == 2
+    assert report["target_only_symbols"] == ["0050"]
+    assert report["epoch_zero_revaluation_required_for_expanded_cross_section"]
+
+
+@pytest.mark.parametrize("source_uses,target_uses", [(True, False), (None, False), (False, True)])
+def test_symbol_superset_transfer_requires_both_position_free_proofs(
+    source_uses: bool | None,
+    target_uses: bool,
+) -> None:
+    source = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target.use_symbol_pos = target_uses
+    initialization = _PretrainedInitialization(
+        checkpoint_path=Path("source.pt"),
+        checkpoint={"model_state_dict": source.state_dict()},
+        source_feature_names=["a", "b", "c", "d"],
+        provenance={"source_checkpoint_sha256": "unit-test"},
+        source_symbol_names=["2330"],
+        source_uses_symbol_position=source_uses,
+    )
+    with pytest.raises(RuntimeError, match="symbol positions|use_symbol_pos"):
+        _transfer_pretrained_feature_identity(
+            target,
+            initialization,
+            target_feature_names=["a", "b", "c", "d"],
+            target_symbol_names=["0050", "2330"],
+            symbol_axis_adapter="permutation_invariant_superset",
+            require_exact_backbone=True,
+            trainable_parameter_prefixes=(),
+        )
+
+
 class _TinyTransformerFuturesStem(nn.Module):
     def __init__(self, *, num_features: int, with_execution_residuals: bool) -> None:
         super().__init__()

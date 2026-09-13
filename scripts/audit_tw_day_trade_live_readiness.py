@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the shared data and distinct model artifacts for four TW day trades."""
+"""Audit the shared data and distinct artifacts for configured TW accounts."""
 
 from __future__ import annotations
 
@@ -18,22 +18,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stockagent.live.market_config import load_market_configs  # noqa: E402
+from stockagent.live.market_config import enabled_day_trade_markets, load_market_configs  # noqa: E402
 from stockagent.live.market_status import runtime_status  # noqa: E402
 from stockagent.config import load_config  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     load_live_eligibility,
     resolve_day_trade_rule_data_dir,
 )
+from stockagent.live.tw_stock_simulation_execution import legacy_inventory_cutover_gate  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-MARKETS = (
-    "tw_day_trade_multi_basis",
-    "tw_day_trade_100m",
-    "tw_day_trade_multi_basis_22",
-    "tw_day_trade_multi_basis_projection_l1_gelu",
-)
+MARKETS = enabled_day_trade_markets(REPO_ROOT / "services/discord_bot/markets")
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -178,6 +174,7 @@ def main() -> int:
         "generated_at_taipei": datetime.now(TAIPEI).isoformat(),
         "shared_data_contract": {
             "one_refresh_command_for_four_modes": len(shared_commands) == 1,
+            "one_refresh_command_for_enabled_modes": len(shared_commands) == 1,
             "refresh_command": list(next(iter(shared_commands)))
             if shared_commands
             else [],
@@ -229,7 +226,11 @@ def main() -> int:
                 operation="position_restore",
             ),
             "portfolio_route": (
-                "discord_signal_artifacts_only; no stock portfolio order router"
+                "existing_local_paper; staged_stock_simulation_router_not_activated"
+            ),
+            "stock_simulation_cutover": legacy_inventory_cutover_gate(
+                _read_json(REPO_ROOT / "artifacts/live/tw_day_trade_simulation/state.json") or {},
+                list(MARKETS),
             ),
         },
         "markets": rows,
@@ -258,13 +259,14 @@ def main() -> int:
     )
 
     lines = [
-        "# 台股四個當沖模式 readiness",
+        f"# 台股 {len(rows)} 個當沖模式 readiness",
         "",
         f"更新時間：{payload['generated_at_taipei']}",
         "",
-        "四個模式共用同一份已驗證的台股資料快照；模型 checkpoint 與資金契約各自獨立。",
+        "各模式沿用 canonical 台股資料來源；模型 checkpoint 與資金契約各自獨立。",
+        "以下資料／模型前提通過，不等於券商 simulation 成交路由已啟用或驗收。",
         "",
-        "| 模式 | 排程 | 日資料 | 今日資格 | Checkpoint | 權重歷史 | 可執行 | 資料日期 / 期望日期 |",
+        "| 模式 | 排程 | 日資料 | 今日資格 | Checkpoint | 權重歷史 | 資料模型前提 | 資料日期 / 期望日期 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
@@ -301,7 +303,7 @@ def main() -> int:
             f"- Checkpoint ready：{counts['checkpoint_ready']}/{counts['markets']}。",
             "- 今日 TWSE/TPEx 當沖資格 ready："
             f"{counts['same_session_eligibility_ready']}/{counts['markets']}。",
-            f"- 端到端可執行：{counts['execution_ready']}/{counts['markets']}。",
+            f"- 資料／資格／模型前提通過：{counts['execution_ready']}/{counts['markets']}（非券商成交驗收）。",
             "- 缺 checkpoint 時維持 fail-closed，不會拿別的模型冒充該資金模式。",
             "- Staging：end={end} close_ready={close} coverage={coverage} "
             "missing={missing} publication_lag={lag} blocking_failed={blocking}；"
@@ -325,7 +327,9 @@ def main() -> int:
             f"- 股票 lifecycle：{simulation_api['stock_lifecycle']}",
             f"- 期貨 round-trip：{simulation_api['futures_round_trip']}",
             f"- 期貨部位恢復：{simulation_api['futures_position_restore']}",
-            "- 四策略目前只有 Discord 訊號／目標持倉產物；尚未接股票組合下單 router。",
+            "- 現行帳本仍為本機 paper 成交；新的股票 simulation adapter 為 staged，尚未接管帳本。",
+            f"- 庫存交接檢查：{simulation_api['stock_simulation_cutover']['status']}；"
+            "舊本機成交不可改標為券商成交，帳戶為空也不等於券商驗收通過。",
             "",
         ]
     )

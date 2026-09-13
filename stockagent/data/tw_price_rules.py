@@ -1,4 +1,4 @@
-"""Versioned Taiwan regular-equity tick and daily price-limit rules.
+"""Versioned Taiwan regular-equity and ETF order-price rules.
 
 The model archive starts in 2000, so two historical rule boundaries matter:
 
@@ -18,6 +18,9 @@ import numpy as np
 
 
 TW_PRICE_RULE_CONTRACT_VERSION = 3
+# Optional product-aware order pricing is independently versioned: the
+# unchanged regular-stock panel limit contract above must remain reproducible.
+TW_ORDER_PRICE_CONTRACT_VERSION = 1
 TW_TICK_RULE_2005_EFFECTIVE_DATE = np.datetime64("2005-03-01", "D")
 TW_LIMIT_10_PERCENT_EFFECTIVE_DATE = np.datetime64("2015-06-01", "D")
 TW_TICK_RULE_2005_EFFECTIVE_ORDINAL = int(
@@ -55,8 +58,22 @@ def trade_date_ordinals(values: Any | None, shape: tuple[int, ...]) -> np.ndarra
     )
 
 
-def tick_size_numpy(price: np.ndarray, dates: Any | None = None) -> np.ndarray:
-    """Vectorized regular-stock tick size under the rule active on each date."""
+def _security_types(values: Any, shape: tuple[int, ...]) -> np.ndarray:
+    kinds = np.broadcast_to(np.asarray(values), shape)
+    if not np.all(np.isin(kinds, ["stock", "etf"])):
+        raise ValueError("TW order-price security_types must be stock or etf")
+    return kinds
+
+
+def tick_size_numpy(
+    price: np.ndarray, dates: Any | None = None, *, security_types: Any = "stock"
+) -> np.ndarray:
+    """Dated stock buckets; ETFs use 0.01 below 50 and 0.05 at/above 50.
+
+    The ETF schedule is not a claim about its daily price-limit percentage.
+    Callers retain exchange-supplied limits (including leveraged/no-limit ETFs).
+    See https://www.twse.com.tw/zh/products/system/trading.html .
+    """
 
     values = np.asarray(price, dtype=np.float64)
     ordinals = trade_date_ordinals(dates, values.shape)
@@ -64,6 +81,12 @@ def tick_size_numpy(price: np.ndarray, dates: Any | None = None) -> np.ndarray:
     valid = np.isfinite(values) & (values > 0.0)
     old = valid & (ordinals < TW_TICK_RULE_2005_EFFECTIVE_ORDINAL)
     current = valid & ~old
+    # Most historical panel callers are stock-only. Preserve that hot path
+    # without allocating a universe-sized string mask on every invocation.
+    kinds = (
+        None if isinstance(security_types, str) and security_types == "stock"
+        else _security_types(security_types, values.shape)
+    )
 
     out[old] = 5.0
     out[old & (values < 1000.0)] = 1.0
@@ -78,15 +101,62 @@ def tick_size_numpy(price: np.ndarray, dates: Any | None = None) -> np.ndarray:
     out[current & (values < 100.0)] = 0.1
     out[current & (values < 50.0)] = 0.05
     out[current & (values < 10.0)] = 0.01
+    if kinds is not None:
+        etf = valid & (kinds == "etf")
+        out[etf] = np.where(values[etf] < 50.0, 0.01, 0.05)
     return out
+
+
+def price_on_tick_grid_numpy(
+    price: np.ndarray, dates: Any | None = None, *, security_types: Any = "stock"
+) -> np.ndarray:
+    """Validate an individual quote/order; never use this to round a VWAP.
+
+    A tiny absolute/ULP tolerance absorbs representation error, not a fraction
+    of a legal tick. The source dtype matters for float32 quotation arrays.
+    """
+    raw = np.asarray(price)
+    values = np.asarray(raw, dtype=np.float64)
+    tick = tick_size_numpy(values, dates, security_types=security_types)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nearest = np.rint(values / tick) * tick
+        tolerance = np.maximum(1e-9, np.abs(np.spacing(values)) * 4)
+        if raw.dtype.kind == "f" and raw.dtype.itemsize <= 4:
+            tolerance = np.maximum(tolerance, np.abs(np.spacing(raw)).astype(np.float64) * 2)
+        # Never let low precision make an economically different price legal.
+        tolerance = np.minimum(tolerance, tick * 0.001)
+        return np.isfinite(values) & (values > 0) & (np.abs(values - nearest) <= tolerance)
+
+
+def quantize_order_price_numpy(
+    price: np.ndarray, rounding: str, dates: Any | None = None, *,
+    security_types: Any = "stock",
+) -> np.ndarray:
+    """Round a CALCULATED order bound directionally to a legal cent grid.
+
+    Passive sells round up, passive buys round down. This must not rewrite a
+    source quote, a VWAP, an inventory cost basis, a fee or an account NAV.
+    """
+    if rounding not in {"up", "down"}:
+        raise ValueError("TW order-price rounding must be up or down")
+    values = np.asarray(price, dtype=np.float64)
+    tick = tick_size_numpy(values, dates, security_types=security_types)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        scaled = values * 100.0 / np.rint(tick * 100.0)
+        tolerance = np.abs(np.spacing(scaled)) * 4
+        units = np.ceil(scaled - tolerance) if rounding == "up" else np.floor(scaled + tolerance)
+        result = units * np.rint(tick * 100.0) / 100.0
+    return np.where(np.isfinite(values) & (values > 0) & (result > 0), result, np.nan)
 
 
 def move_price_ticks_numpy(
     price: np.ndarray,
     ticks: int,
     dates: Any | None = None,
+    *,
+    security_types: Any = "stock",
 ) -> np.ndarray:
-    """Move legal regular-stock prices by an integer number of dated ticks.
+    """Move legal stock/ETF prices by an integer number of dated ticks.
 
     Downward moves probe immediately below the current price before resolving
     the tick size.  This matters at bucket boundaries: the legal price one
@@ -104,7 +174,7 @@ def move_price_ticks_numpy(
     direction = 1.0 if steps > 0 else -1.0
     for _ in range(abs(steps)):
         probe = out if direction > 0.0 else np.nextafter(out, -np.inf)
-        tick = tick_size_numpy(probe, dates)
+        tick = tick_size_numpy(probe, dates, security_types=security_types)
         valid = np.isfinite(out) & (out > 0.0) & np.isfinite(tick) & (tick > 0.0)
         shifted = out + direction * tick
         shifted = np.floor(shifted * 100.0 + 0.5) / 100.0

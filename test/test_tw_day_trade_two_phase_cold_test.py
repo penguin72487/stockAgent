@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.tw_day_trade_simulation import (
@@ -19,9 +21,20 @@ from scripts.run_tw_day_trade_two_phase_cold_test import (
 )
 
 
+@pytest.mark.parametrize("margin_enabled", [False, True])
 def test_two_phase_cold_start_repairs_then_executes_all_modes(
     tmp_path: Path,
+    monkeypatch,
+    margin_enabled: bool,
 ) -> None:
+    from scripts import run_tw_day_trade_two_phase_cold_test as cold_test
+
+    original_specs = cold_test._enabled_specs
+    monkeypatch.setattr(cold_test, "_enabled_specs", lambda sandbox: [
+        replace(spec, residual_margin_conversion=margin_enabled,
+                odd_lot_execution_policy=(spec.odd_lot_execution_policy if margin_enabled else "reject"))
+        for spec in original_specs(sandbox)
+    ])
     report = run_two_phase_cold_test(
         session_date=date(2026, 8, 26),
         output_root=tmp_path / "cold-test",
@@ -46,7 +59,13 @@ def test_two_phase_cold_start_repairs_then_executes_all_modes(
         "registered"
     }
     assert report["phases"]["opening_executed"]["post_open_gate_ready"] is True
-    assert report["phases"]["intraday_postclose"]["all_modes_flat"] is True
+    assert report["phases"]["intraday_postclose"]["all_modes_flat"] is False
+    assert report["phases"]["intraday_postclose"]["margin_conversion_enabled"] is margin_enabled
+    assert report["phases"]["intraday_postclose"]["residual_contract_valid"] is True
+    assert report["phases"]["intraday_postclose"]["residual_status"] == (
+        "margin_carried_waiting_next_signal" if margin_enabled
+        else "critical_residual_carried_after_13_30"
+    )
     assert report["phases"]["intraday_postclose"]["restart_count"] == 2
     assert (
         report["phases"]["intraday_postclose"][
@@ -54,9 +73,8 @@ def test_two_phase_cold_start_repairs_then_executes_all_modes(
         ]
         == 0
     )
-    assert report["phases"]["intraday_postclose"]["terminal_fill_contract"] == (
-        "simulation_terminal_ledger_not_exchange_fill"
-    )
+    assert report["phases"]["intraday_postclose"]["terminal_fill_contract"] is None
+    assert report["phases"]["intraday_postclose"]["terminal_ledger_fill_count"] == 0
     assert Path(report["artifacts"]["phase3_intraday_postclose"]).is_file()
     assert all(row["passed"] for row in report["checks"])
 

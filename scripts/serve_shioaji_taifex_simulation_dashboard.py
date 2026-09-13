@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -18,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from downloader.artifact_io import atomic_write_bytes  # noqa: E402
 from stockagent.live.taifex_volatility_dashboard import (  # noqa: E402
     DEFAULT_MARK_LIMIT_PER_STRATEGY,
     build_dashboard_history_snapshot,
@@ -30,6 +32,28 @@ DEFAULT_STATE_DIR: Final[Path] = Path(
 )
 DEFAULT_API_RECEIPTS: Final[Path] = Path("artifacts/orders/shioaji_futures_simulation")
 DEFAULT_STATIC_ROOT: Final[Path] = Path("services/taifex_dashboard")
+DEFAULT_HISTORY_CACHE_DIR: Final[Path] = Path(
+    "artifacts/cache/shioaji_taifex_volatility_dashboard"
+)
+HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 1
+HISTORY_MEMORY_CACHE_ENTRIES: Final[int] = 3
+HISTORY_RANGE_KEYS: Final[frozenset[str]] = frozenset(
+    {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}
+)
+HISTORY_SNAPSHOT_FIELDS: Final[tuple[str, ...]] = (
+    "dashboard_schema_version",
+    "generated_at_utc",
+    "source_updated_at_utc",
+    "range",
+    "range_seconds",
+    "anchor_at_utc",
+    "coverage_start_utc",
+    "coverage_end_utc",
+    "downsampled",
+    "backfills",
+    "history",
+    "record_counts",
+)
 HISTORY_DISPLAY_FIELDS: Final[tuple[str, ...]] = (
     "strategy_id",
     "decision_ts_ns",
@@ -95,18 +119,104 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         api_receipt_dir: Path,
         static_root: Path,
         mark_limit_per_strategy: int,
+        history_cache_dir: Path | None = None,
     ) -> None:
         super().__init__(server_address, DashboardRequestHandler)
         self.state_dir = state_dir
         self.api_receipt_dir = api_receipt_dir
         self.static_root = static_root
         self.mark_limit_per_strategy = mark_limit_per_strategy
+        self.history_cache_dir = (
+            Path(history_cache_dir) if history_cache_dir is not None else None
+        )
         self._snapshot_cache: tuple[float, dict[str, object]] | None = None
         self._snapshot_lock = threading.Lock()
-        self._history_cache: dict[str, tuple[float, dict[str, object]]] = {}
+        self._history_cache: OrderedDict[
+            str, tuple[float, dict[str, object]]
+        ] = OrderedDict()
+        self._history_disk_checked: set[str] = set()
         self._history_state_lock = threading.Lock()
         self._history_build_lock = threading.Lock()
         self._history_refreshing: set[str] = set()
+
+    def _history_cache_path(self, range_key: str) -> Path | None:
+        if self.history_cache_dir is None or range_key not in HISTORY_RANGE_KEYS:
+            return None
+        return self.history_cache_dir / f"history-{range_key}.json"
+
+    def _read_persisted_history(
+        self, *, range_key: str
+    ) -> dict[str, object] | None:
+        path = self._history_cache_path(range_key)
+        if path is None:
+            return None
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(envelope, dict):
+            return None
+        if int(envelope.get("cache_schema_version") or 0) != (
+            HISTORY_CACHE_SCHEMA_VERSION
+        ):
+            return None
+        if envelope.get("range") != range_key or int(
+            envelope.get("mark_limit_per_strategy") or 0
+        ) != self.mark_limit_per_strategy:
+            return None
+        snapshot = envelope.get("snapshot")
+        if not isinstance(snapshot, dict) or snapshot.get("range") != range_key:
+            return None
+        history = snapshot.get("history")
+        if not isinstance(history, list) or any(
+            not isinstance(row, dict) for row in history
+        ):
+            return None
+        # Reapply the explicit display projection when loading mutable local
+        # cache bytes. A cache file can never widen the localhost API schema.
+        restored = {
+            field: snapshot[field]
+            for field in HISTORY_SNAPSHOT_FIELDS
+            if field in snapshot and field != "history"
+        }
+        restored["history"] = [_display_history_row(row) for row in history]
+        return restored
+
+    def _persist_history(
+        self, *, range_key: str, snapshot: dict[str, object]
+    ) -> None:
+        path = self._history_cache_path(range_key)
+        if path is None:
+            return
+        envelope = {
+            "cache_schema_version": HISTORY_CACHE_SCHEMA_VERSION,
+            "range": range_key,
+            "mark_limit_per_strategy": self.mark_limit_per_strategy,
+            "snapshot": snapshot,
+        }
+        try:
+            encoded = (
+                json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+            atomic_write_bytes(path, encoded, durable=False)
+        except (OSError, TypeError, ValueError) as error:
+            sys.stderr.write(
+                "taifex-dashboard history_cache_write_failed "
+                f"range={range_key} error={type(error).__name__}\n"
+            )
+
+    def _remember_history(
+        self,
+        *,
+        range_key: str,
+        snapshot: dict[str, object],
+        observed_at: float,
+    ) -> None:
+        self._history_cache[range_key] = (observed_at, snapshot)
+        self._history_cache.move_to_end(range_key)
+        while len(self._history_cache) > HISTORY_MEMORY_CACHE_ENTRIES:
+            self._history_cache.popitem(last=False)
 
     def snapshot(self) -> dict[str, object]:
         now_monotonic = time.monotonic()
@@ -133,10 +243,23 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def history_snapshot(self, *, range_key: str) -> dict[str, object]:
         now_monotonic = time.monotonic()
         with self._history_state_lock:
+            if range_key not in self._history_disk_checked:
+                self._history_disk_checked.add(range_key)
+                persisted = self._read_persisted_history(range_key=range_key)
+                if persisted is not None:
+                    self._remember_history(
+                        range_key=range_key,
+                        snapshot=persisted,
+                        # A disk cache is verified but may trail the append-only
+                        # ledger. Return it now and refresh in the background.
+                        observed_at=now_monotonic - 56.0,
+                    )
             cached = self._history_cache.get(range_key)
             if cached is not None and now_monotonic - cached[0] < 55.0:
+                self._history_cache.move_to_end(range_key)
                 return cached[1]
             if cached is not None:
+                self._history_cache.move_to_end(range_key)
                 if range_key not in self._history_refreshing:
                     self._history_refreshing.add(range_key)
                     threading.Thread(
@@ -182,8 +305,13 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 "record_counts": full["record_counts"],
             }
             with self._history_state_lock:
-                self._history_cache[range_key] = (time.monotonic(), snapshot)
+                self._remember_history(
+                    range_key=range_key,
+                    snapshot=snapshot,
+                    observed_at=time.monotonic(),
+                )
                 self._history_refreshing.discard(range_key)
+            self._persist_history(range_key=range_key, snapshot=snapshot)
             return snapshot
 
     def _refresh_history_snapshot(self, *, range_key: str) -> None:
@@ -348,6 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-receipt-dir", type=Path, default=DEFAULT_API_RECEIPTS)
     parser.add_argument("--static-root", type=Path, default=DEFAULT_STATIC_ROOT)
     parser.add_argument(
+        "--history-cache-dir", type=Path, default=DEFAULT_HISTORY_CACHE_DIR
+    )
+    parser.add_argument(
         "--mark-limit-per-strategy",
         type=int,
         default=DEFAULT_MARK_LIMIT_PER_STRATEGY,
@@ -367,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         api_receipt_dir=Path(args.api_receipt_dir),
         static_root=Path(args.static_root),
         mark_limit_per_strategy=int(args.mark_limit_per_strategy),
+        history_cache_dir=Path(args.history_cache_dir),
     )
     print(
         f"[taifex-dashboard] listening=http://{args.host}:{args.port} "

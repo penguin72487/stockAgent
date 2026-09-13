@@ -8,6 +8,7 @@ import pickle
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import warnings
@@ -19,7 +20,7 @@ import random
 from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -92,6 +93,16 @@ from stockagent.backtest.tw_futures_portfolio import (
 from stockagent.backtest.tw_day_trade_minute import (
     COMPILED_BLOCK_ROWS as TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS,
     get_tw_day_trade_minute_compile_stats,
+)
+from stockagent.backtest.tw_day_trade_carry import DayTradeCarryState
+from stockagent.training.day_trade_carry_bridge import (
+    PreparedDayTradeCarrySource, bind_physical_carry_loss, bind_physical_carry_backtest,
+)
+from stockagent.training.day_trade_carry_artifact import (
+    DayTradeCarryArtifactContext,
+    PHYSICAL_CARRY_ARCHIVE_SCHEMA,
+    carry_artifact_from_payload,
+    carry_artifact_payload,
 )
 from stockagent.backtest.tw_dual_session_compiled import (
     COMPILED_BLOCK_ROWS as TW_DUAL_SESSION_COMPILED_BLOCK_ROWS,
@@ -1019,6 +1030,7 @@ class _PretrainedInitialization:
     source_feature_names: list[str]
     provenance: dict[str, Any]
     source_symbol_names: list[str] | None = None
+    source_uses_symbol_position: bool | None = None
 
 
 class _PretrainedEpochZeroAccountInvalid(RuntimeError):
@@ -1255,6 +1267,26 @@ def _resolve_pretrained_initialization(
         .lower()
         .replace("-", "_")
     )
+    source_training_config = (
+        source_manifest.get("configuration", {}).get("training", {})
+        if isinstance(source_manifest.get("configuration"), Mapping)
+        else {}
+    )
+    source_model_config = (
+        source_training_config.get(source_model_name, {})
+        if isinstance(source_training_config, Mapping)
+        else {}
+    )
+    raw_source_symbol_position = (
+        source_model_config.get("use_symbol_pos")
+        if isinstance(source_model_config, Mapping)
+        else None
+    )
+    source_uses_symbol_position = (
+        raw_source_symbol_position
+        if isinstance(raw_source_symbol_position, bool)
+        else None
+    )
     feature_adapter = (
         str(config.training.pretrained_initialization_feature_adapter)
         .strip()
@@ -1356,6 +1388,7 @@ def _resolve_pretrained_initialization(
         ),
         "source_feature_count": len(source_feature_names),
         "source_symbol_count": len(source_symbol_names),
+        "source_uses_symbol_position": source_uses_symbol_position,
         "target_fold_ids": [int(fold.fold_id) for fold in group_folds],
         "target_train_years": target_train_years,
         "target_validation_years": target_val_years,
@@ -1369,7 +1402,90 @@ def _resolve_pretrained_initialization(
         source_feature_names=source_feature_names,
         provenance=provenance,
         source_symbol_names=source_symbol_names,
+        source_uses_symbol_position=source_uses_symbol_position,
     )
+
+
+def _pretrained_symbol_axis_report(
+    model: nn.Module,
+    initialization: _PretrainedInitialization,
+    *,
+    target_symbol_names: Sequence[str] | None,
+    adapter: str,
+) -> dict[str, Any]:
+    """Prove when an expanded symbol axis cannot relabel learned identity.
+
+    The model still sees a larger cross-section, so this does not claim equal
+    portfolio outputs. It proves only that transferred parameters do not bind
+    to symbol positions; the mandatory epoch-zero account replay owns the
+    changed-domain acceptance decision.
+    """
+
+    source = initialization.source_symbol_names
+    if source is None or target_symbol_names is None:
+        return {
+            "symbol_axis_adapter": "not_recorded",
+            "source_symbol_count": 0 if source is None else len(source),
+            "target_symbol_count": (
+                0 if target_symbol_names is None else len(target_symbol_names)
+            ),
+        }
+    target = [str(value) for value in target_symbol_names]
+    if len(set(source)) != len(source) or len(set(target)) != len(target):
+        raise RuntimeError("pretrained symbol-axis names must be unique")
+    if source == target:
+        return {
+            "symbol_axis_adapter": "exact",
+            "source_symbol_count": len(source),
+            "target_symbol_count": len(target),
+            "common_symbol_count": len(source),
+            "target_only_symbols": [],
+        }
+
+    mode = str(adapter).strip().lower().replace("-", "_")
+    if mode != "permutation_invariant_superset":
+        raise RuntimeError(
+            "pretrained source and target symbol axes differ; exact policy "
+            "identity cannot be guaranteed"
+        )
+    raw_model = _unwrap_model(model)
+    if initialization.source_uses_symbol_position is not False:
+        raise RuntimeError(
+            "pretrained symbol-axis expansion lacks source proof that learned "
+            "symbol positions were disabled"
+        )
+    if getattr(raw_model, "use_symbol_pos", None) is not False:
+        raise RuntimeError(
+            "pretrained symbol-axis expansion requires target use_symbol_pos=false"
+        )
+    source_set, target_set = set(source), set(target)
+    missing = sorted(source_set - target_set)
+    if missing:
+        raise RuntimeError(
+            "pretrained symbol-axis target is not a source superset: "
+            f"missing={missing[:20]}"
+        )
+    unexpected_symbol_parameters = sorted(
+        name
+        for name, _parameter in raw_model.named_parameters()
+        if "symbol" in name.lower() and name != "symbol_position"
+    )
+    if unexpected_symbol_parameters:
+        raise RuntimeError(
+            "permutation-invariant symbol transfer found unproven symbol-specific "
+            f"parameters: {unexpected_symbol_parameters}"
+        )
+    target_only = sorted(target_set - source_set)
+    return {
+        "symbol_axis_adapter": "permutation_invariant_superset",
+        "source_symbol_count": len(source),
+        "target_symbol_count": len(target),
+        "common_symbol_count": len(source_set),
+        "target_only_symbols": target_only,
+        "source_uses_symbol_position": False,
+        "target_uses_symbol_position": False,
+        "epoch_zero_revaluation_required_for_expanded_cross_section": True,
+    }
 
 
 def _pretrained_temporal_basis(
@@ -1506,6 +1622,7 @@ def _transfer_pretrained_feature_identity(
     *,
     target_feature_names: Sequence[str],
     target_symbol_names: Sequence[str] | None = None,
+    symbol_axis_adapter: str = "exact",
     require_exact_backbone: bool,
     trainable_parameter_prefixes: Sequence[str],
 ) -> dict[str, Any]:
@@ -1535,16 +1652,12 @@ def _transfer_pretrained_feature_identity(
 
     source_features = list(initialization.source_feature_names)
     target_features = [str(value) for value in target_feature_names]
-    if (
-        initialization.source_symbol_names is not None
-        and target_symbol_names is not None
-        and [str(value) for value in target_symbol_names]
-        != initialization.source_symbol_names
-    ):
-        raise RuntimeError(
-            "pretrained source and target symbol axes differ; exact policy "
-            "identity cannot be guaranteed"
-        )
+    symbol_axis_report = _pretrained_symbol_axis_report(
+        raw_model,
+        initialization,
+        target_symbol_names=target_symbol_names,
+        adapter=symbol_axis_adapter,
+    )
     if len(set(target_features)) != len(target_features):
         raise RuntimeError("target feature names are not unique")
     source_state = initialization.checkpoint["model_state_dict"]
@@ -1622,6 +1735,7 @@ def _transfer_pretrained_feature_identity(
         report = deepcopy(initialization.provenance)
         report.update(
             {
+                **symbol_axis_report,
                 "feature_adapter": "exact_state_by_feature_name",
                 "target_feature_count": len(target_features),
                 "adapter_output_features": int(adapter_module.out_features),
@@ -1734,6 +1848,7 @@ def _transfer_pretrained_feature_identity(
     report = deepcopy(initialization.provenance)
     report.update(
         {
+            **symbol_axis_report,
             "feature_adapter": "identity_by_feature_name",
             "target_feature_count": len(target_features),
             "adapter_output_features": len(source_features),
@@ -1761,6 +1876,7 @@ def _transfer_pretrained_transformer_feature_projection(
     *,
     target_feature_names: Sequence[str],
     target_symbol_names: Sequence[str] | None = None,
+    symbol_axis_adapter: str = "exact",
     require_exact_backbone: bool,
     trainable_parameter_prefixes: Sequence[str],
 ) -> dict[str, Any]:
@@ -1784,16 +1900,12 @@ def _transfer_pretrained_transformer_feature_projection(
 
     source_features = [str(value) for value in initialization.source_feature_names]
     target_features = [str(value) for value in target_feature_names]
-    if (
-        initialization.source_symbol_names is not None
-        and target_symbol_names is not None
-        and [str(value) for value in target_symbol_names]
-        != initialization.source_symbol_names
-    ):
-        raise RuntimeError(
-            "pretrained source and target symbol axes differ; exact policy "
-            "identity cannot be guaranteed"
-        )
+    symbol_axis_report = _pretrained_symbol_axis_report(
+        raw_model,
+        initialization,
+        target_symbol_names=target_symbol_names,
+        adapter=symbol_axis_adapter,
+    )
     if len(set(source_features)) != len(source_features):
         raise RuntimeError("pretrained source feature names are not unique")
     if len(set(target_features)) != len(target_features):
@@ -1980,6 +2092,7 @@ def _transfer_pretrained_transformer_feature_projection(
     report = deepcopy(initialization.provenance)
     report.update(
         {
+            **symbol_axis_report,
             "feature_adapter": "transformer_feature_projection_by_name",
             "target_feature_count": len(target_features),
             "adapter_output_features": int(feature_projection.out_features),
@@ -2070,6 +2183,7 @@ class _ExecutionRuntime:
     derivatives_day_candidates: TaiwanIndexDerivativeDayCandidates | None = None
     option_day_cost_schedule: OptionDayCostSchedule | None = None
     derivatives_maximum_capital_fraction: float = 0.98
+    day_trade_carry_source: PreparedDayTradeCarrySource | None = None
 
 
 def _is_stateful_security_carry(
@@ -2121,12 +2235,16 @@ def _tw_settlement_compile_backend(
 ) -> str:
     """Return the bounded executor whose compile counters are authoritative.
 
-    Stateful day-trade carry is implemented by the same dual-session ledger as
-    ``tw_cash``/``tw_overnight``. Keeping this selection in one place prevents
-    strict preflight from checking counters for a different executor than the
-    one that actually ran.
+    A prepared physical FIFO source owns a distinct minute-inventory executor;
+    it must never be classified as either the legacy compressed minute tape or
+    the daily dual-session ledger merely because those compatibility tensors
+    remain attached to the training split. Keeping this selection in one place
+    prevents strict preflight from checking counters for an executor that did
+    not actually run.
     """
 
+    if execution_runtime.day_trade_carry_source is not None:
+        return "physical_fifo"
     if day_trade_minute_compile:
         return "day_trade_minute"
     if stock_context_integer_compile:
@@ -2460,6 +2578,12 @@ def _build_execution_runtime(
         ),
         corporate_action_mode=corporate_action_mode,
         claim_queue_sessions=claim_queue_sessions,
+        day_trade_carry_source=(
+            panel.day_trade_carry_source
+            if mode == "tw_day_trade"
+            and config.trading.tw_day_trade_unlimited_margin_conversion
+            else None
+        ),
     )
 
 
@@ -2700,6 +2824,16 @@ def _canonical_tensor_day_trade_enabled(
     )
 
 
+def _canonical_tensor_day_trade_report_label(runtime: _ExecutionRuntime) -> str:
+    """Name the canonical account without implying the legacy T+2 ledger."""
+
+    return (
+        "physical-fifo-margin-carry"
+        if runtime.day_trade_unlimited_margin_conversion
+        else "exact-minute"
+    )
+
+
 def _mode_artifact_contract_for_config(
     config: ExperimentConfig,
 ) -> dict[str, Any]:
@@ -2718,7 +2852,9 @@ def _mode_artifact_contract_for_config(
     # Artifact-only callers may provide a minimal compatibility namespace.
     # A missing overnight flag means that the legacy/non-overnight contract
     # applies; it must not make artifact serialization fail.
-    if bool(getattr(config.trading, "tw_overnight_fixed_close_to_open", False)):
+    if mode == "tw_overnight" and bool(
+        getattr(config.trading, "tw_overnight_fixed_close_to_open", False)
+    ):
         payload.update(
             decision_clock="1325_completed_minute_close_plus_prior_completed_daily_features",
             execution_clock="same_session_close_then_next_session_open_auctions",
@@ -2813,6 +2949,7 @@ def _mode_artifact_contract_for_config(
         return payload
     if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
         return payload
+    physical_fifo = bool(config.trading.tw_day_trade_unlimited_margin_conversion)
     payload.update(
         {
             "frequency": "daily_policy_exact_minute_execution",
@@ -2821,19 +2958,40 @@ def _mode_artifact_contract_for_config(
                 "official_open_sizing_then_0901_minute_price_entry_1320_limit_"
                 "1324_market_1330_auction"
             ),
-            "recurrent_state_scope": "cross_session_t_plus_2_net_claim_account",
+            "recurrent_state_scope": (
+                "cross_session_physical_fifo_margin_inventory_and_dated_cash_claims"
+                if physical_fifo
+                else "cross_session_t_plus_2_net_claim_account"
+            ),
             "terminal_policy": (
-                "flat_after_1330_margin_conversion_with_t_plus_2_net_claim"
+                "marked_physical_margin_inventory_after_1330_or_absorbing_default"
+                if physical_fifo
+                else "flat_after_1330_margin_conversion_with_t_plus_2_net_claim"
             ),
             "sample_order_contract": "strict_chronological_sessions",
             "weight_snapshot_contract": "exact_filled_entry_notional_over_nav",
             "turnover_contract": "sum_exact_minute_fill_notional_over_nav",
             "mode_details": {
-                "execution_variant": "exact_board_lot_minute_event_tape_v1",
+                "execution_variant": (
+                    "exact_board_lot_minute_physical_fifo_v1"
+                    if physical_fifo
+                    else "exact_board_lot_minute_event_tape_v1"
+                ),
                 "daily_policy_decisions_per_session": 1,
                 "daily_proxy_allowed": bool(
                     config.data.day_trade_minute_execution_allow_daily_proxy
                 ),
+                **(
+                    {
+                        "residual_position_policy": "margin_inventory_fifo_carry",
+                        "cash_claim_policy": "exact_dated_corporate_action_claims",
+                        "legacy_tplus_cash_queue": "not_applicable",
+                    }
+                    if physical_fifo
+                    else {}
+                ),
+                **({"daily_proxy_price_policy": config.data.day_trade_minute_execution_daily_proxy_price_policy}
+                   if config.data.day_trade_minute_execution_daily_proxy_price_policy != "legacy_adverse_tick" else {}),
             },
         }
     )
@@ -4927,12 +5085,20 @@ def _backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "test_backtest.npz"
 
 
+def _test_symbols_path(fold_dir: Path) -> Path:
+    return fold_dir / "test_backtest_symbols.json"
+
+
 def _deployment_backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "deployment_test_backtest.npz"
 
 
 def _deployment_symbols_path(fold_dir: Path) -> Path:
     return fold_dir / "deployment_test_symbols.json"
+
+
+def _deployment_dates_path(fold_dir: Path) -> Path:
+    return fold_dir / "deployment_test_dates.json"
 
 
 def _walkforward_deployment_backtest_path(output_path: Path) -> Path:
@@ -7972,15 +8138,65 @@ def _validate_futures_minute_audit(result: BacktestResult, rows: int, symbols: i
         raise ValueError("futures carry terminal inventory differs from its history")
 
 
+def _atomic_numpy_archive_save(
+    output_path: Path,
+    payload: Mapping[str, np.ndarray],
+    *,
+    compression: str,
+    validate: Callable[[Path], object] | None = None,
+) -> None:
+    """Keep the prior backtest until a complete replacement is flushed."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False,
+    ) as handle:
+        temporary_path = Path(handle.name)
+        try:
+            writer(handle, **payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+    try:
+        if validate is not None:
+            validate(temporary_path)
+        os.replace(temporary_path, output_path)
+        directory_fd = os.open(output_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _save_backtest_artifact(
     output_path: Path,
     result: BacktestResult,
     dates: np.ndarray,
     *,
     compression: str = "none",
+    day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
 ) -> None:
     if not _distributed_should_write():
         return
+    if result.day_trade_carry_state is not None or result.minute_nav is not None:
+        if day_trade_carry_context is None:
+            raise ValueError(
+                "physical FIFO minute history cannot use the legacy NPZ writer: "
+                "an exact universe/release and segment initial NAV context are required"
+            )
+        payload = carry_artifact_payload(result, dates, day_trade_carry_context)
+        _atomic_numpy_archive_save(output_path, payload, compression=compression,
+            validate=lambda path: _load_backtest_artifact(
+                path, day_trade_carry_context=day_trade_carry_context))
+        return
+    if day_trade_carry_context is not None:
+        raise ValueError(
+            "physical FIFO source context cannot label a legacy backtest result"
+        )
     dates_array = np.asarray(dates)
     if dates_array.ndim != 1:
         raise ValueError("backtest artifact dates must be one-dimensional")
@@ -8677,7 +8893,6 @@ def _save_backtest_artifact(
                 raise ValueError(
                     "tw_overnight final due cohort must equal final carried weights"
                 )
-    writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
     payload: dict[str, np.ndarray] = {
         "artifact_schema_version": np.asarray(
             (
@@ -8838,7 +9053,7 @@ def _save_backtest_artifact(
                     integer_short_margin_collateral, dtype=np.float64
                 ),
             )
-    writer(output_path, **payload)
+    _atomic_numpy_archive_save(output_path, payload, compression=compression)
 
 
 def _realized_leverage_backtest(
@@ -9186,6 +9401,7 @@ def _save_deployment_test_artifacts(
     backtest_artifact_compression: str = "none",
     write_plots: bool = False,
     benchmark_label: str = "Benchmark",
+    day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
 ) -> dict[str, float | int | str]:
     """Persist the non-overlapping deployment view separately from full test."""
     date_values = np.asarray(dates)
@@ -9205,6 +9421,13 @@ def _save_deployment_test_artifacts(
             f"turnover={int(result.turnovers.shape[0])}, "
             f"weights={int(result.weights_history.shape[0])}"
         )
+    _deployment_dates_path(fold_dir).write_text(
+        json.dumps(
+            [np.datetime_as_string(value, unit="D") for value in date_values],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     if symbols is not None:
         symbol_values = [str(symbol) for symbol in symbols]
         if len(symbol_values) != int(result.weights_history.shape[1]):
@@ -9230,6 +9453,7 @@ def _save_deployment_test_artifacts(
         result,
         date_values,
         compression=backtest_artifact_compression,
+        day_trade_carry_context=day_trade_carry_context,
     )
     timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     timing["backtest_artifact_compression"] = str(backtest_artifact_compression)
@@ -9365,6 +9589,7 @@ def _save_fold_output_artifacts(
     print_report: bool = True,
     write_plots: bool = True,
     mark_complete: bool = False,
+    day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
 ) -> tuple[dict[str, float | int | str], dict[str, float | str]]:
     if not _distributed_should_write():
         return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
@@ -9419,7 +9644,20 @@ def _save_fold_output_artifacts(
         fold_result.test_metrics = compute_metrics(test_backtest)
         fold_result.test_integer_metrics = None
         fold_result.test_continuous_surrogate_metrics = None
-        if deployment_dates is not None:
+        physical_fifo = bool(
+            test_backtest.day_trade_carry_state is not None
+            or test_backtest.minute_nav is not None
+        )
+        if physical_fifo and day_trade_carry_context is None:
+            raise RuntimeError(
+                "physical FIFO fold artifacts require their pinned source context"
+            )
+        if deployment_dates is not None and physical_fifo:
+            if deployment_backtest is None:
+                raise RuntimeError(
+                    "physical FIFO deployment prefix must be replayed to its exact endpoint"
+                )
+        elif deployment_dates is not None:
             deployment_backtest = _prefix_backtest_result(
                 test_backtest,
                 int(np.asarray(deployment_dates).size),
@@ -9507,11 +9745,16 @@ def _save_fold_output_artifacts(
         if backtest_artifact_compression is not None
         else getattr(config.training, "backtest_artifact_compression", "none")
     )
+    _test_symbols_path(fold_dir).write_text(
+        json.dumps([str(symbol) for symbol in symbols], ensure_ascii=False),
+        encoding="utf-8",
+    )
     _save_backtest_artifact(
         _backtest_path(fold_dir),
         test_backtest,
         test_dates,
         compression=compression,
+        day_trade_carry_context=day_trade_carry_context,
     )
     save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     save_timing["backtest_artifact_compression"] = compression
@@ -9616,6 +9859,7 @@ def _save_fold_output_artifacts(
             deployment_dates,
             symbols=symbols,
             backtest_artifact_compression=compression,
+            day_trade_carry_context=day_trade_carry_context,
         )
         for key, value in deployment_timing.items():
             save_timing[f"deployment_{key}"] = value
@@ -9898,6 +10142,153 @@ def _save_settlement_audit_artifacts(
         _unlink_table_variants(base_path)
         base_path.with_name(base_path.name + "_summary").with_suffix(".json").unlink(
             missing_ok=True
+        )
+        return
+    physical_fifo = bool(
+        result.day_trade_carry_state is not None or result.minute_nav is not None
+    )
+    if physical_fifo:
+        # The physical carry executor converts unresolved day-trade positions
+        # to margin inventory. It therefore has no T+1/T+2 cash queues. Never
+        # manufacture zero queues merely to satisfy the legacy cash-settlement
+        # table: the exact audit is its minute NAV, physical shares, FIFO lots,
+        # financing costs and dated corporate-action claims.
+        if result.day_trade_carry_state is None or result.minute_nav is None:
+            raise RuntimeError(
+                "physical FIFO settlement audit requires both terminal inventory "
+                "and minute NAV history"
+            )
+        if (
+            execution_mode != "tw_day_trade"
+            or result.settlement_ledger_unit != "currency"
+            or result.shares_history is None
+            or result.settlement_default is None
+        ):
+            raise RuntimeError(
+                "physical FIFO settlement audit requires its currency day-trade ledger"
+            )
+        date_values = np.asarray(dates)
+        minute_nav = np.asarray(result.minute_nav, dtype=np.float64)
+        shares = np.asarray(result.shares_history, dtype=np.float64)
+        defaults = np.asarray(result.settlement_default, dtype=bool).reshape(-1)
+        turnovers = np.asarray(result.turnovers, dtype=np.float64).reshape(-1)
+        rows = int(date_values.size)
+        if (
+            date_values.ndim != 1
+            or not rows
+            or date_values.dtype.kind != "M"
+            or np.isnat(date_values).any()
+            or minute_nav.shape != (rows, 270)
+            or shares.ndim != 2
+            or shares.shape[0] != rows
+            or defaults.shape != (rows,)
+            or turnovers.shape != (rows,)
+            or not np.isfinite(minute_nav).all()
+            or not np.isfinite(shares).all()
+            or not np.isfinite(turnovers).all()
+            or np.any(minute_nav < 0.0)
+            or np.any(turnovers < 0.0)
+            or np.any(np.abs(shares - shares.round()) > 1.0e-8)
+        ):
+            raise ValueError(
+                "physical FIFO settlement audit requires aligned finite dates, "
+                "270-minute NAV, integer shares and turnover histories"
+            )
+        state = result.day_trade_carry_state
+        expected_last_day = (
+            int(date_values.astype("datetime64[D]")[-1].astype(np.int64))
+            + date(1970, 1, 1).toordinal()
+        )
+        if (
+            expected_last_day != state.last_session_day
+            or not bool(
+                state.validate(
+                    symbols=shares.shape[1],
+                    device=state.last_nav.device,
+                    initial_capital=state.initial_capital,
+                )
+                .detach()
+                .cpu()
+            )
+            or not np.allclose(
+                minute_nav[-1, -1],
+                state.last_nav.detach().cpu().item(),
+                rtol=1.0e-12,
+                atol=1.0e-10,
+            )
+        ):
+            raise ValueError(
+                "physical FIFO settlement audit terminal date/NAV differs from inventory"
+            )
+        close_nav = minute_nav[:, -1]
+        data = {
+            "date": date_values,
+            "execution_mode": np.full(rows, execution_mode, dtype="U32"),
+            "settlement_ledger_unit": np.full(rows, "currency", dtype="U32"),
+            "audit_kind": np.full(rows, "physical_fifo_margin_carry", dtype="U32"),
+            "close_nav": close_nav,
+            "equity_scale_vs_initial_capital": close_nav / state.initial_capital,
+            "turnover": turnovers,
+            "open_position_count": (shares != 0).sum(axis=1),
+            "gross_physical_shares": np.abs(shares).sum(axis=1),
+            "net_physical_shares": shares.sum(axis=1),
+            "settlement_default": defaults,
+        }
+        output_path = _table_path(base_path, table_output_format)
+        _write_dataframe_table(data, output_path)
+        for suffix in (".csv", ".parquet"):
+            stale_path = base_path.with_suffix(suffix)
+            if stale_path != output_path and stale_path.exists():
+                stale_path.unlink()
+
+        inventory = state.inventory
+        claims = inventory.claims.detach().cpu()
+        claim_amount = claims[..., 0] if claims.numel() else claims.new_empty((0,))
+        claim_paid = claims[..., 2] if claims.numel() else claims.new_empty((0,))
+        summary_path = base_path.with_name(base_path.name + "_summary").with_suffix(
+            ".json"
+        )
+        summary = {
+            "execution_mode": execution_mode,
+            "settlement_ledger_unit": "currency",
+            "audit_kind": "physical_fifo_margin_carry",
+            "rows": rows,
+            "cash_settlement_queues_applicable": False,
+            "cash_settlement_queue_reason": (
+                "residual positions convert to physical margin inventory; "
+                "the canonical archive retains FIFO lots and dated cash claims"
+            ),
+            "final_session": np.datetime_as_string(
+                date_values.astype("datetime64[D]")[-1], unit="D"
+            ),
+            "initial_capital": state.initial_capital,
+            "final_nav": float(state.last_nav.detach().cpu().item()),
+            "final_alive": bool(state.alive.detach().cpu().item()),
+            "cumulative_realized_net_pnl": float(
+                inventory.realized_net_pnl.detach().cpu().item()
+            ),
+            "cumulative_carry_cost": float(inventory.carry_cost.detach().cpu().item()),
+            "corporate_action_cash": float(
+                inventory.corporate_action_cash.detach().cpu().item()
+            ),
+            "corporate_action_receivable": float(
+                inventory.corporate_action_receivable.detach().cpu().item()
+            ),
+            "corporate_action_payable": float(
+                inventory.corporate_action_payable.detach().cpu().item()
+            ),
+            "open_fifo_lot_count": int(
+                (inventory.cohorts[..., 0] != 0).sum().detach().cpu().item()
+            ),
+            "outstanding_cash_claim_count": int(
+                ((claim_amount != 0) & (claim_paid == 0)).sum().item()
+            ),
+            "canonical_detail": (
+                "test_backtest.npz minute_nav, shares_history and carry_inventory_*"
+            ),
+        }
+        summary_path.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         return
     if result.settlement_ledger_unit not in {"currency", "nav_ratio"}:
@@ -10343,7 +10734,11 @@ def _save_integer_share_audit_artifacts(
     return timing
 
 
-def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
+def _load_backtest_artifact(
+    output_path: Path,
+    *,
+    day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+) -> tuple[BacktestResult, np.ndarray]:
     with np.load(output_path, allow_pickle=False) as data:
         keys = set(data.files)
         required = {
@@ -10363,6 +10758,12 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             if "artifact_schema_version" in keys
             else 1
         )
+        if schema_version == PHYSICAL_CARRY_ARCHIVE_SCHEMA:
+            if day_trade_carry_context is None:
+                raise ValueError("physical FIFO load requires the caller's pinned source context")
+            return carry_artifact_from_payload(data, day_trade_carry_context)
+        if day_trade_carry_context is not None or any(k.startswith("carry_") for k in keys) or "minute_nav" in keys:
+            raise ValueError("physical FIFO source context/state cannot use a legacy archive schema")
         if schema_version < 1 or schema_version > 7:
             raise ValueError(
                 f"unsupported backtest artifact schema version {schema_version}"
@@ -11818,9 +12219,17 @@ def _index_futures_flat_terminal_state_at_row(
     return final_weights, final_alive, final_scale
 
 
-def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult:
+def _prefix_backtest_result(
+    result: BacktestResult, rows: int, *,
+    day_trade_carry_terminal_state: DayTradeCarryState | None = None,
+) -> BacktestResult:
     total_rows = int(result.strategy_returns.shape[0])
     rows = max(0, min(int(rows), total_rows))
+    if result.day_trade_carry_state is not None or result.minute_nav is not None:
+        return _slice_backtest_rows(result, 0, rows, preserve_terminal_state=True,
+            day_trade_carry_terminal_state=day_trade_carry_terminal_state)
+    if day_trade_carry_terminal_state is not None:
+        raise ValueError("physical FIFO prefix state cannot label a legacy result")
     preserves_terminal_state = rows == total_rows
     mode = normalize_execution_mode(result.execution_mode)
 
@@ -12088,6 +12497,255 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
     )
 
 
+def _physical_carry_artifact_context(
+    *,
+    runtime: _ExecutionRuntime,
+    symbols: Sequence[str],
+    config: ExperimentConfig,
+    initial_nav: float,
+) -> DayTradeCarryArtifactContext | None:
+    source = runtime.day_trade_carry_source
+    if source is None:
+        return None
+    initial_capital = float(config.trading.volume_participation_equity)
+    return DayTradeCarryArtifactContext(
+        universe=tuple(str(symbol) for symbol in symbols),
+        release_id=source.release_id,
+        initial_capital=initial_capital,
+        initial_nav=float(initial_nav),
+    )
+
+
+def _replay_physical_carry_split_prefix(
+    result: BacktestResult,
+    split: WindowedSplitTensors,
+    rows: int,
+    *,
+    runtime: _ExecutionRuntime,
+    config: ExperimentConfig,
+    initial_state: DayTradeCarryState | None = None,
+) -> BacktestResult:
+    """Revalue stored model requests through the physical FIFO source.
+
+    A saved requested-weight row is already post-activation and post-causal
+    policy masks.  Replaying it with ``pre_normalized`` is therefore the only
+    valid way to recover a prefix terminal inventory; slicing the full-test
+    terminal state would leak future lots, cash and borrowing dates.
+    """
+    source = runtime.day_trade_carry_source
+    if source is None:
+        raise ValueError("physical prefix replay requires a pinned carry source")
+    requested = result.requested_weights_history
+    if requested is None:
+        raise ValueError("physical prefix replay requires stored model requests")
+    total = int(np.asarray(requested).shape[0])
+    count = max(0, min(int(rows), total))
+    if count <= 0:
+        raise ValueError("physical prefix replay requires at least one owned session")
+    device = torch.device("cpu")
+    sessions, source_count = source.batch(split, 0, count, device)
+    if source_count != count:
+        raise ValueError("physical prefix replay lost a source session")
+    valid_indices = split.valid_indices[:count].detach().to(
+        device="cpu", dtype=torch.long
+    )
+
+    def selected(value: torch.Tensor | None, name: str) -> torch.Tensor:
+        if value is None:
+            raise ValueError(f"physical prefix replay requires {name}")
+        return value.detach().to(device="cpu").index_select(0, valid_indices)
+
+    symbol_indices = (
+        None
+        if split.symbol_indices is None
+        else split.symbol_indices.detach().to(device="cpu", dtype=torch.long)
+    )
+    with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
+        replay = run_backtest_torch(
+            torch.as_tensor(np.asarray(requested)[:count], dtype=torch.float64),
+            selected(split.future_log_returns, "future_log_returns").to(torch.float64),
+            selected(split.tradable_mask, "tradable_mask").to(torch.bool),
+            selected(split.benchmark, "benchmark").to(torch.float64),
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            long_only=config.trading.long_only,
+            max_turnover_ratio=config.trading.max_turnover_ratio,
+            gross_leverage=1.0,
+            min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation="pre_normalized",
+            can_buy_mask=selected(split.can_buy_mask, "can_buy_mask").to(torch.bool),
+            can_sell_mask=selected(split.can_sell_mask, "can_sell_mask").to(torch.bool),
+            can_short_open_mask=selected(
+                split.can_short_open_mask, "can_short_open_mask"
+            ).to(torch.bool),
+            execution_mode=runtime.mode,
+            buy_fee_rates=runtime.buy_fee_rates.detach().to(device="cpu"),
+            sell_fee_rates=runtime.sell_fee_rates.detach().to(device="cpu"),
+            normal_sell_fee_rates=runtime.normal_sell_fee_rates.detach().to(
+                device="cpu"
+            ),
+            day_trade_unlimited_margin_conversion=(
+                runtime.day_trade_unlimited_margin_conversion
+            ),
+            day_trade_margin_financing_ratio=runtime.day_trade_margin_financing_ratio,
+            day_trade_margin_financing_annual_rate=(
+                runtime.day_trade_margin_financing_annual_rate
+            ),
+            day_trade_margin_short_handling_fee_rate=(
+                runtime.day_trade_margin_short_handling_fee_rate
+            ),
+            day_trade_margin_short_annual_borrow_rate=(
+                runtime.day_trade_margin_short_annual_borrow_rate
+            ),
+            commission_rebate_rates=runtime.commission_rebate_rates.detach().to(
+                device="cpu"
+            ),
+            commission_rebate_timing=runtime.commission_rebate_timing,
+            day_trade_eligible_mask=selected(
+                split.day_trade_eligible_mask, "day_trade_eligible_mask"
+            ).to(torch.bool),
+            day_trade_can_buy_open_mask=selected(
+                split.day_trade_can_buy_open_mask, "day_trade_can_buy_open_mask"
+            ).to(torch.bool),
+            day_trade_can_sell_open_mask=selected(
+                split.day_trade_can_sell_open_mask, "day_trade_can_sell_open_mask"
+            ).to(torch.bool),
+            symbol_indices=symbol_indices,
+            day_trade_execution_initial_capital=float(
+                config.trading.volume_participation_equity
+            ),
+            day_trade_execution_volume_participation=float(
+                config.trading.max_volume_participation
+            ),
+            day_trade_carry_sessions=sessions,
+            initial_day_trade_carry_state=initial_state,
+        )
+    return replay.to_numpy()
+
+
+def _replay_physical_carry_panel_segment(
+    requests: np.ndarray,
+    panel_rows: np.ndarray,
+    *,
+    dataset: CrossSectionalDataset,
+    runtime: _ExecutionRuntime,
+    config: ExperimentConfig,
+    initial_state: DayTradeCarryState | None,
+) -> BacktestResult:
+    """Replay one contiguous deployment segment and return its real endpoint."""
+    source = runtime.day_trade_carry_source
+    rows = np.asarray(panel_rows, dtype=np.int64).reshape(-1)
+    requested = np.asarray(requests, dtype=np.float64)
+    if source is None or rows.size == 0 or requested.shape != (
+        rows.size, len(source.universe)
+    ):
+        raise ValueError("physical stitched segment differs from its source universe")
+    if np.any(np.diff(rows) != 1):
+        raise ValueError("physical stitched segment must own every exchange session")
+    sessions = source.rows(
+        rows.tolist(), list(range(len(source.universe))), torch.device("cpu")
+    )
+    index = torch.from_numpy(rows)
+
+    def selected(value: torch.Tensor | None, name: str) -> torch.Tensor:
+        if value is None:
+            raise ValueError(f"physical stitched replay requires {name}")
+        return value.detach().to(device="cpu").index_select(0, index)
+
+    with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
+        replay = run_backtest_torch(
+            torch.from_numpy(requested),
+            selected(dataset.future_log_returns_t, "future_log_returns").to(torch.float64),
+            selected(dataset.tradable_mask_t, "tradable_mask").to(torch.bool),
+            selected(dataset.benchmark_t, "benchmark").to(torch.float64),
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            long_only=config.trading.long_only,
+            max_turnover_ratio=config.trading.max_turnover_ratio,
+            gross_leverage=1.0,
+            min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation="pre_normalized",
+            can_buy_mask=selected(dataset.can_buy_mask_t, "can_buy_mask").to(torch.bool),
+            can_sell_mask=selected(dataset.can_sell_mask_t, "can_sell_mask").to(torch.bool),
+            can_short_open_mask=selected(
+                dataset.can_short_open_mask_t, "can_short_open_mask"
+            ).to(torch.bool),
+            execution_mode=runtime.mode,
+            buy_fee_rates=runtime.buy_fee_rates.detach().to(device="cpu"),
+            sell_fee_rates=runtime.sell_fee_rates.detach().to(device="cpu"),
+            normal_sell_fee_rates=runtime.normal_sell_fee_rates.detach().to(
+                device="cpu"
+            ),
+            day_trade_unlimited_margin_conversion=True,
+            day_trade_margin_financing_ratio=runtime.day_trade_margin_financing_ratio,
+            day_trade_margin_financing_annual_rate=(
+                runtime.day_trade_margin_financing_annual_rate
+            ),
+            day_trade_margin_short_handling_fee_rate=(
+                runtime.day_trade_margin_short_handling_fee_rate
+            ),
+            day_trade_margin_short_annual_borrow_rate=(
+                runtime.day_trade_margin_short_annual_borrow_rate
+            ),
+            commission_rebate_rates=runtime.commission_rebate_rates.detach().to(
+                device="cpu"
+            ),
+            commission_rebate_timing=runtime.commission_rebate_timing,
+            day_trade_eligible_mask=selected(
+                dataset.day_trade_eligible_mask_t, "day_trade_eligible_mask"
+            ).to(torch.bool),
+            day_trade_can_buy_open_mask=selected(
+                dataset.day_trade_can_buy_open_mask_t,
+                "day_trade_can_buy_open_mask",
+            ).to(torch.bool),
+            day_trade_can_sell_open_mask=selected(
+                dataset.day_trade_can_sell_open_mask_t,
+                "day_trade_can_sell_open_mask",
+            ).to(torch.bool),
+            day_trade_execution_initial_capital=float(
+                config.trading.volume_participation_equity
+            ),
+            day_trade_execution_volume_participation=float(
+                config.trading.max_volume_participation
+            ),
+            day_trade_carry_sessions=sessions,
+            initial_day_trade_carry_state=initial_state,
+        )
+    return replay.to_numpy()
+
+
+def _concatenate_physical_carry_segments(
+    segments: Sequence[BacktestResult],
+) -> BacktestResult:
+    if not segments:
+        raise ValueError("physical stitched replay produced no segments")
+    last = segments[-1]
+
+    def joined(name: str) -> np.ndarray:
+        values = [getattr(segment, name) for segment in segments]
+        if any(value is None for value in values):
+            raise ValueError(f"physical stitched segment omitted {name}")
+        return np.concatenate([np.asarray(value) for value in values], axis=0)
+
+    return BacktestResult(
+        strategy_returns=joined("strategy_returns"),
+        benchmark_returns=joined("benchmark_returns"),
+        turnovers=joined("turnovers"),
+        weights_history=joined("weights_history"),
+        requested_weights_history=joined("requested_weights_history"),
+        shares_history=joined("shares_history"),
+        settlement_default=joined("settlement_default"),
+        equity_scale_history=joined("equity_scale_history"),
+        minute_nav=joined("minute_nav"),
+        final_weights=np.asarray(last.final_weights).copy(),
+        final_alive=np.asarray(last.final_alive).copy(),
+        final_equity_scale=np.asarray(last.final_equity_scale).copy(),
+        execution_mode=last.execution_mode,
+        settlement_ledger_unit=last.settlement_ledger_unit,
+        day_trade_carry_state=last.day_trade_carry_state,
+    )
+
+
 def _upgrade_full_horizon_artifacts_without_inference(
     *,
     panel: PanelData,
@@ -12104,6 +12762,10 @@ def _upgrade_full_horizon_artifacts_without_inference(
     Truncated legacy artifacts return ``False`` and must be rebuilt by the
     normal inference path.
     """
+    if getattr(panel, "day_trade_carry_source", None) is not None:
+        # Physical FIFO state cannot be reconstructed from a legacy return
+        # prefix.  Its inventory lots and borrowing dates require exact replay.
+        return False
     fold_dir = _fold_dir(output_path, fold.fold_id)
     backtest_path = _backtest_path(fold_dir)
     metrics_path = _metrics_path(fold_dir)
@@ -13704,10 +14366,32 @@ def _run_eval_backtest_from_weight_buffers(
     session_month_ids_all: torch.Tensor | None = None,
     commission_rebate_payment_eligible_mask_all: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
+    physical_split: WindowedSplitTensors | None = None,
+    initial_day_trade_carry_state: DayTradeCarryState | None = None,
     panel_row_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
+    physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    physical_previous = initial_day_trade_carry_state
+    if physical_source is not None:
+        internal_resets = tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in (reset_at_rows or ())
+                    if 0 < int(value) < total_rows
+                }
+            )
+        )
+        if (
+            physical_split is None
+            or len(physical_split) != total_rows
+            or internal_resets
+        ):
+            raise ValueError("physical evaluation requires its exact owned rows without implicit account resets")
+    elif physical_previous is not None:
+        raise ValueError("physical eval state requires its prepared source")
     integer_stock_context_execution = bool(
         execution_mode == "tw_stock_context_futures_portfolio"
         and overnight_log_returns_all is not None
@@ -13736,7 +14420,8 @@ def _run_eval_backtest_from_weight_buffers(
     backtest_chunk_rows = max(1, int(backtest_chunk_rows))
     backtest_ranges = _eval_ranges_by_reset(total_rows, backtest_chunk_rows, reset_at_rows)
     total_backtest_chunks = max(1, len(backtest_ranges))
-    output_dtype = torch.float32 if execution_mode != "naive" else weights_all.dtype
+    output_dtype = (torch.float64 if physical_source is not None
+                    else torch.float32 if execution_mode != "naive" else weights_all.dtype)
     strategy_returns_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
     benchmark_returns_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
     turnovers_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
@@ -13776,6 +14461,10 @@ def _run_eval_backtest_from_weight_buffers(
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
     commission_rebate_due_history_out: torch.Tensor | None = None
+    physical_minute_nav = (torch.empty((total_rows, 270), device=device, dtype=torch.float64)
+                           if physical_source is not None else None)
+    physical_shares = (torch.empty((total_rows, num_symbols), device=device, dtype=torch.float64)
+                       if physical_source is not None else None)
     equity_scaled_execution = bool(
         execution_mode in TW_STOCK_EXECUTION_MODES
         or execution_mode == "tw_index_futures_day"
@@ -13807,7 +14496,9 @@ def _run_eval_backtest_from_weight_buffers(
         default_reason_history_out = torch.empty(
             (total_rows,), device=device, dtype=torch.int64
         )
-    if execution_mode in TW_STOCK_EXECUTION_MODES:
+    if physical_source is not None:
+        settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
+    if execution_mode in TW_STOCK_EXECUTION_MODES and physical_source is None:
         lag = int(execution_runtime.settlement_lag_sessions) if execution_runtime is not None else 2
         cash_history_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
         payables_history_out = torch.empty((total_rows, lag), device=device, dtype=output_dtype)
@@ -14216,7 +14907,11 @@ def _run_eval_backtest_from_weight_buffers(
         )
         try:
             with compile_context:
-                backtest_chunk = run_backtest_torch(
+                backtest_runner = (run_backtest_torch if physical_source is None
+                    else bind_physical_carry_backtest(run_backtest_torch,
+                        source=physical_source, split=physical_split, start=start, end=end,
+                        device=device, previous=physical_previous))
+                backtest_chunk = backtest_runner(
                     weights_chunk,
                     returns_chunk,
                     mask_chunk,
@@ -14380,6 +15075,10 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
 
         backtest_finalize_start = time.perf_counter()
+        if physical_source is not None:
+            physical_previous = backtest_chunk.day_trade_carry_state.detached()
+            physical_minute_nav[start:end].copy_(backtest_chunk.minute_nav[:valid_rows])
+            physical_shares[start:end].copy_(backtest_chunk.shares_history[:valid_rows])
         prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
         prev_futures_carry_state = _detach_portfolio_state(backtest_chunk.final_futures_carry_state)
         prev_alive = _detach_portfolio_state(backtest_chunk.final_alive)
@@ -14538,6 +15237,8 @@ def _run_eval_backtest_from_weight_buffers(
                 long_margin_debt_history_out[start:end].copy_(
                     backtest_chunk.long_margin_debt_history[:valid_rows]
                 )
+        elif settlement_default_out is not None and physical_source is not None:
+            settlement_default_out[start:end].copy_(backtest_chunk.settlement_default[:valid_rows])
         elif settlement_default_out is not None:
             if (
                 backtest_chunk.settlement_default is None
@@ -14558,6 +15259,9 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_s += time.perf_counter() - backtest_start
 
     backtest = BacktestResultTensor(
+        day_trade_carry_state=physical_previous,
+        minute_nav=physical_minute_nav,
+        shares_history=physical_shares,
         futures_contract_quantities_history=futures_quantities_out,
         futures_residual_contract_quantities_history=futures_residuals_out,
         final_futures_carry_state=prev_futures_carry_state,
@@ -14584,7 +15288,7 @@ def _run_eval_backtest_from_weight_buffers(
         final_alive=prev_alive,
         execution_mode=execution_mode,
         settlement_ledger_unit=(
-            "nav_ratio"
+            "currency" if physical_source is not None else "nav_ratio"
             if execution_mode in TW_STOCK_EXECUTION_MODES
             else "contract_quantity"
             if integer_stock_context_execution
@@ -15149,6 +15853,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
     max_volume_participation: float = 0.0,
     volume_participation_equity: float = 1_000_000.0,
     execution_runtime: _ExecutionRuntime | None = None,
+    initial_day_trade_carry_state: DayTradeCarryState | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     if split.execution_mode != "naive":
         if execution_runtime is None:
@@ -15165,6 +15870,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
         panel_slab_model.eval()
     total_rows = len(split)
     if total_rows <= 0:
+        if initial_day_trade_carry_state is not None:
+            raise ValueError("empty physical evaluation cannot discard an existing account")
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
         empty_weights = torch.empty(
             (0, _split_recurrent_symbol_count(split)),
@@ -15649,6 +16356,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 commission_rebate_payment_all
             ),
             symbol_indices=split.symbol_indices,
+            physical_split=split,
+            initial_day_trade_carry_state=initial_day_trade_carry_state,
             panel_row_indices=split._valid_indices_cpu,
         )
 
@@ -15856,6 +16565,7 @@ def _slice_backtest_rows(
     row_end: int,
     *,
     preserve_terminal_state: bool = False,
+    day_trade_carry_terminal_state: DayTradeCarryState | None = None,
 ) -> BacktestResult:
     """Copy one chronological row interval without fabricating ledger state."""
 
@@ -15863,6 +16573,21 @@ def _slice_backtest_rows(
     start = max(0, min(int(row_start), total_rows))
     end = max(start, min(int(row_end), total_rows))
     keep_terminal = bool(preserve_terminal_state and end == total_rows)
+    physical = result.day_trade_carry_state is not None or result.minute_nav is not None
+    if day_trade_carry_terminal_state is not None and not physical:
+        raise ValueError("physical FIFO slice state cannot label a legacy result")
+    physical_terminal = (day_trade_carry_terminal_state if day_trade_carry_terminal_state is not None
+                         else result.day_trade_carry_state if keep_terminal else None)
+    if physical_terminal is not None:
+        if start == end or result.minute_nav is None or result.shares_history is None:
+            raise ValueError("physical FIFO slice requires nonempty minute and shares history")
+        physical_terminal = physical_terminal.detached(device="cpu")
+        physical_terminal.validate(symbols=result.weights_history.shape[1], device=torch.device("cpu"),
+            initial_capital=physical_terminal.initial_capital)
+        if (not np.allclose(physical_terminal.last_nav.numpy(), result.minute_nav[end - 1, -1],
+                            rtol=1e-12, atol=1e-10)
+                or not np.array_equal(physical_terminal.inventory.shares.numpy(), result.shares_history[end - 1])):
+            raise ValueError("physical FIFO slice endpoint differs from supplied inventory/NAV")
 
     def rows(value: np.ndarray | None) -> np.ndarray | None:
         return None if value is None else np.asarray(value[start:end]).copy()
@@ -15873,6 +16598,12 @@ def _slice_backtest_rows(
     slice_final_weights = terminal(result.final_weights)
     slice_final_alive = terminal(result.final_alive)
     slice_final_equity_scale = terminal(result.final_equity_scale)
+    if physical:
+        slice_final_weights = (None if physical_terminal is None
+                               else np.asarray(result.weights_history[end - 1]).copy())
+        slice_final_alive = (None if physical_terminal is None else physical_terminal.alive.numpy().copy())
+        slice_final_equity_scale = (None if physical_terminal is None else np.asarray(
+            physical_terminal.last_nav.item() / physical_terminal.initial_capital, dtype=np.float64))
     sliced_mode = normalize_execution_mode(result.execution_mode)
     if not keep_terminal and (
         sliced_mode == "tw_index_futures_day"
@@ -16001,10 +16732,14 @@ def _slice_backtest_rows(
         ),
         final_long_margin_debt=terminal(result.final_long_margin_debt),
         final_integer_state=integer_state,
+        day_trade_carry_state=physical_terminal,
+        minute_nav=rows(result.minute_nav),
     )
 
 
-def _load_deployment_symbols(fold_dir: Path, expected_count: int) -> list[str]:
+def _load_deployment_symbols(
+    fold_dir: Path, expected_count: int | None
+) -> list[str]:
     path = _deployment_symbols_path(fold_dir)
     if not path.exists():
         raise RuntimeError(
@@ -16018,12 +16753,33 @@ def _load_deployment_symbols(fold_dir: Path, expected_count: int) -> list[str]:
     if not isinstance(payload, list) or any(not isinstance(item, str) for item in payload):
         raise RuntimeError(f"deployment symbol sidecar must be a JSON string list: {path}")
     symbols = [str(item) for item in payload]
-    if len(symbols) != int(expected_count) or len(set(symbols)) != len(symbols):
+    if (
+        (expected_count is not None and len(symbols) != int(expected_count))
+        or len(set(symbols)) != len(symbols)
+    ):
         raise RuntimeError(
             "deployment symbol sidecar is not a unique one-to-one mapping: "
-            f"path={path}, symbols={len(symbols)}, expected={int(expected_count)}"
+            f"path={path}, symbols={len(symbols)}, expected={expected_count}"
         )
     return symbols
+
+
+def _load_test_symbols(fold_dir: Path) -> list[str]:
+    path = _test_symbols_path(fold_dir)
+    if not path.is_file():
+        raise RuntimeError(f"physical fold test is missing its symbol sidecar: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid physical test symbol sidecar: {path}") from exc
+    if (
+        not isinstance(payload, list)
+        or not payload
+        or any(not isinstance(item, str) for item in payload)
+        or len(set(payload)) != len(payload)
+    ):
+        raise RuntimeError(f"physical test symbol sidecar is not a unique string list: {path}")
+    return [str(item) for item in payload]
 
 
 def _replay_taiwan_stitched_deployment(
@@ -16077,6 +16833,12 @@ def _replay_taiwan_stitched_deployment(
         panel_dates[1:] <= panel_dates[:-1]
     ):
         raise RuntimeError("panel dates must be finite and strictly increasing")
+    physical_source = (
+        panel.day_trade_carry_source
+        if mode == "tw_day_trade"
+        and config.trading.tw_day_trade_unlimited_margin_conversion
+        else None
+    )
 
     request_parts: list[np.ndarray] = []
     date_parts: list[np.ndarray] = []
@@ -16087,7 +16849,45 @@ def _replay_taiwan_stitched_deployment(
         artifact_path = _deployment_backtest_path(fold_dir)
         if not artifact_path.exists():
             continue
-        fold_backtest, fold_dates_raw = _load_backtest_artifact(artifact_path)
+        local_symbols: list[str] | None = None
+        if physical_source is not None:
+            local_symbols = _load_test_symbols(fold_dir)
+            dates_path = _deployment_dates_path(fold_dir)
+            if not dates_path.is_file():
+                raise RuntimeError(
+                    "physical deployment is missing its owned-date sidecar: "
+                    f"{dates_path}"
+                )
+            try:
+                owned_dates = np.asarray(
+                    json.loads(dates_path.read_text(encoding="utf-8")),
+                    dtype="datetime64[D]",
+                )
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"invalid physical deployment date sidecar: {dates_path}"
+                ) from exc
+            fold_backtest, fold_dates_raw = _load_backtest_artifact(
+                _backtest_path(fold_dir),
+                day_trade_carry_context=DayTradeCarryArtifactContext(
+                    universe=tuple(local_symbols),
+                    release_id=physical_source.release_id,
+                    initial_capital=float(config.trading.volume_participation_equity),
+                    initial_nav=float(config.trading.volume_participation_equity),
+                ),
+            )
+            full_dates = np.asarray(fold_dates_raw, dtype="datetime64[D]")
+            if (
+                owned_dates.ndim != 1
+                or owned_dates.size > full_dates.size
+                or not np.array_equal(owned_dates, full_dates[: owned_dates.size])
+            ):
+                raise RuntimeError(
+                    "physical deployment owned dates are not a full-test prefix"
+                )
+            fold_dates_raw = owned_dates
+        else:
+            fold_backtest, fold_dates_raw = _load_backtest_artifact(artifact_path)
         fold_mode = normalize_execution_mode(fold_backtest.execution_mode)
         if fold_mode != mode:
             raise RuntimeError(
@@ -16104,7 +16904,7 @@ def _replay_taiwan_stitched_deployment(
                 f"{mode} stitched deployment requires original model requests; "
                 f"fold {fold_result.fold_id} artifact has none"
             )
-        requests_array = np.asarray(requests, dtype=np.float64)
+        requests_array = np.asarray(requests, dtype=np.float64)[:rows]
         if requests_array.ndim not in {2, 3} or requests_array.shape[0] != rows:
             raise RuntimeError("deployment requested-weight history has invalid shape")
         if mode in {
@@ -16132,10 +16932,15 @@ def _replay_taiwan_stitched_deployment(
             fold_segments.append((fold_dir, cursor, cursor + rows))
             cursor += rows
             continue
-        local_symbols = _load_deployment_symbols(
-            fold_dir,
-            int(requests_array.shape[-1]),
+        local_symbols = (
+            _load_deployment_symbols(fold_dir, int(requests_array.shape[-1]))
+            if local_symbols is None
+            else local_symbols
         )
+        if len(local_symbols) != int(requests_array.shape[-1]):
+            raise RuntimeError(
+                "physical deployment request width differs from its symbol sidecar"
+            )
         unknown = sorted(set(local_symbols) - set(global_index))
         if unknown:
             raise RuntimeError(
@@ -16255,7 +17060,41 @@ def _replay_taiwan_stitched_deployment(
         # Their exact integer continuation remains close[t] -> close[t+1];
         # the phase dataset's intraday leg is not that legacy forward label.
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
-    if tensor_stitched_replay:
+    physical_segments: list[BacktestResult] = []
+    physical_segment_contexts: list[DayTradeCarryArtifactContext] = []
+    if physical_source is not None:
+        if runtime.day_trade_carry_source is not physical_source:
+            raise RuntimeError("stitched physical source differs from execution runtime")
+        previous: DayTradeCarryState | None = None
+        initial_capital = float(config.trading.volume_participation_equity)
+        for _segment_fold_dir, start, end in fold_segments:
+            initial_nav = (
+                initial_capital
+                if previous is None
+                else float(previous.last_nav.detach().cpu().item())
+            )
+            segment = _replay_physical_carry_panel_segment(
+                full_requests[start:end],
+                panel_rows[start:end],
+                dataset=execution_dataset,
+                runtime=runtime,
+                config=config,
+                initial_state=previous,
+            )
+            if segment.day_trade_carry_state is None:
+                raise RuntimeError("physical stitched segment lost its terminal state")
+            previous = segment.day_trade_carry_state.detached(device="cpu")
+            physical_segments.append(segment)
+            physical_segment_contexts.append(
+                DayTradeCarryArtifactContext(
+                    universe=tuple(global_symbols),
+                    release_id=physical_source.release_id,
+                    initial_capital=initial_capital,
+                    initial_nav=initial_nav,
+                )
+            )
+        stitched = _concatenate_physical_carry_segments(physical_segments)
+    elif tensor_stitched_replay:
         request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
         volume_limit_weights = _volume_limit_weights_from_notional(
             (
@@ -16488,6 +17327,16 @@ def _replay_taiwan_stitched_deployment(
         stitched,
         stitched_dates,
         compression=compression,
+        day_trade_carry_context=(
+            None
+            if physical_source is None
+            else DayTradeCarryArtifactContext(
+                universe=tuple(global_symbols),
+                release_id=physical_source.release_id,
+                initial_capital=float(config.trading.volume_participation_equity),
+                initial_nav=float(config.trading.volume_participation_equity),
+            )
+        ),
     )
     (output_path / "walkforward_deployment_symbols.json").write_text(
         json.dumps(global_symbols, ensure_ascii=False),
@@ -16524,12 +17373,17 @@ def _replay_taiwan_stitched_deployment(
     )
 
     for segment_index, (fold_dir, start, end) in enumerate(fold_segments):
-        segment = _slice_backtest_rows(
-            stitched,
-            start,
-            end,
-            preserve_terminal_state=segment_index == len(fold_segments) - 1,
-        )
+        if physical_source is None:
+            segment = _slice_backtest_rows(
+                stitched,
+                start,
+                end,
+                preserve_terminal_state=segment_index == len(fold_segments) - 1,
+            )
+            segment_context = None
+        else:
+            segment = physical_segments[segment_index]
+            segment_context = physical_segment_contexts[segment_index]
         _save_deployment_test_artifacts(
             fold_dir,
             segment,
@@ -16538,6 +17392,7 @@ def _replay_taiwan_stitched_deployment(
             backtest_artifact_compression=compression,
             write_plots=True,
             benchmark_label=_benchmark_plot_label(config),
+            day_trade_carry_context=segment_context,
         )
     return stitched
 
@@ -16600,6 +17455,19 @@ def _refresh_walkforward_artifacts(
     all_deployment_baseline_log: list[np.ndarray] = []
     all_deployment_turnovers: list[np.ndarray] = []
     all_deployment_weights: list[np.ndarray] = []
+    physical_source = (
+        panel.day_trade_carry_source
+        if panel is not None
+        and config is not None
+        and normalize_execution_mode(config.trading.execution_mode) == "tw_day_trade"
+        and config.trading.tw_day_trade_unlimited_margin_conversion
+        else None
+    )
+    deployment_initial_nav = (
+        float(config.trading.volume_participation_equity)
+        if physical_source is not None and config is not None
+        else None
+    )
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -16607,7 +17475,19 @@ def _refresh_walkforward_artifacts(
         backtest_path = _backtest_path(fold_dir)
         if not backtest_path.exists():
             continue
-        fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
+        if physical_source is None:
+            fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
+        else:
+            fold_symbols = _load_test_symbols(fold_dir)
+            fold_backtest, fold_dates = _load_backtest_artifact(
+                backtest_path,
+                day_trade_carry_context=DayTradeCarryArtifactContext(
+                    universe=tuple(fold_symbols),
+                    release_id=physical_source.release_id,
+                    initial_capital=float(config.trading.volume_participation_equity),
+                    initial_nav=float(config.trading.volume_participation_equity),
+                ),
+            )
         if int(fold_dates.size) == 0:
             continue
         all_strategy_returns.append(fold_backtest.strategy_returns)
@@ -16651,9 +17531,27 @@ def _refresh_walkforward_artifacts(
         # cash, and settlement state continue across fold boundaries.  Never
         # substitute it for the reset-at-fold-start test ledger above.
         if deployment_path.exists():
-            deployment_backtest, deployment_dates = _load_backtest_artifact(
-                deployment_path
-            )
+            if physical_source is None:
+                deployment_backtest, deployment_dates = _load_backtest_artifact(
+                    deployment_path
+                )
+            else:
+                if deployment_initial_nav is None or panel is None or config is None:
+                    raise RuntimeError("physical deployment reporting lost its account context")
+                deployment_backtest, deployment_dates = _load_backtest_artifact(
+                    deployment_path,
+                    day_trade_carry_context=DayTradeCarryArtifactContext(
+                        universe=tuple(str(symbol) for symbol in panel.symbols),
+                        release_id=physical_source.release_id,
+                        initial_capital=float(config.trading.volume_participation_equity),
+                        initial_nav=float(deployment_initial_nav),
+                    ),
+                )
+                if deployment_backtest.day_trade_carry_state is None:
+                    raise RuntimeError("physical deployment report lost terminal state")
+                deployment_initial_nav = float(
+                    deployment_backtest.day_trade_carry_state.last_nav.item()
+                )
             if int(deployment_dates.size) > 0:
                 all_deployment_fold_ids.append(int(result.fold_id))
                 all_deployment_dates.append(deployment_dates)
@@ -17587,8 +18485,32 @@ def _probe_compiled_loss_forward_backward(
                 aux_outputs["initial_long_margin_debt"] = torch.zeros_like(
                     aux_outputs["initial_short_sale_collateral"]
                 )
+        probed_loss_fn = loss_fn
+        physical_source = (
+            None
+            if execution_runtime is None
+            else execution_runtime.day_trade_carry_source
+        )
+        if physical_source is not None:
+            if symbol_sharded_ledger:
+                raise ValueError(
+                    "physical FIFO loss probe requires the replicated full-symbol ledger"
+                )
+            # The probe must exercise the same source-backed FIFO adapter as
+            # epoch 1. Calling the bare risk loss here would route the retained
+            # compatibility tape into the legacy minute executor and test a
+            # different accounting contract from the one training will use.
+            probed_loss_fn = bind_physical_carry_loss(
+                loss_fn,
+                source=physical_source,
+                split=split,
+                start=0,
+                end=int(batch_size),
+                device=device,
+                previous=None,
+            )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
-            loss = loss_fn(
+            loss = probed_loss_fn(
                 weights,
                 future_log_returns,
                 tradable_mask,
@@ -18284,6 +19206,13 @@ def _train_epoch_windowed_tensor(
     model.train()
     if panel_slab_model is not None:
         panel_slab_model.train()
+    physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    physical_previous: DayTradeCarryState | None = None
+    if physical_source is not None and (
+        split.execution_mode != "tw_day_trade" or objective != "log_utility"
+        or max_volume_participation != 0.5 or not execution_runtime.day_trade_unlimited_margin_conversion
+    ):
+        raise ValueError("physical training requires the configured chronological 50%-minute carry contract")
     total_rows = len(split)
     if total_rows == 0:
         return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
@@ -18386,6 +19315,9 @@ def _train_epoch_windowed_tensor(
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
+        batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
+            loss_fn, source=physical_source, split=split, start=start, end=end,
+            device=device, previous=physical_previous))
         if progress_label:
             _progress(f"{progress_label}: batch {step_idx}/{num_batches} gather rows=[{start},{end})")
         _maybe_sync_cuda(device, profile_timing)
@@ -18654,8 +19586,10 @@ def _train_epoch_windowed_tensor(
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 loss_context = profile_range("train.forward.loss") if PROFILE_RANGES_ENABLED else nullcontext()
-                with loss_context, _carry_loss_data_guard(split, optimizer, device, start):
-                    loss = loss_fn(
+                with loss_context, _carry_loss_data_guard(
+                    split, optimizer, device, start
+                ):
+                    loss = batch_loss_fn(
                         weights,
                         batch_ret,
                         batch_mask,
@@ -18733,11 +19667,13 @@ def _train_epoch_windowed_tensor(
                         regime_up_threshold=regime_up_threshold,
                         regime_down_threshold=regime_down_threshold,
                     )
+                    if physical_source is not None:
+                        physical_previous = aux_outputs["_final_day_trade_carry_state"]
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = optimizer_step_per_trajectory or _should_check_finite(
+        should_check_finite = physical_source is not None or optimizer_step_per_trajectory or _should_check_finite(
             step_idx,
             finite_check_interval_steps,
             final_step=step_idx >= num_batches,
@@ -18917,6 +19853,8 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if physical_source is not None:
+                    raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite gradient during full-trajectory accumulation"
@@ -18971,6 +19909,8 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if physical_source is not None:
+                    raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite gradient during full-trajectory accumulation"
@@ -19111,6 +20051,14 @@ def _train_epoch_windowed_tensor_ddp(
         raise RuntimeError("DDP windowed hotpath requires log_utility, sharpe, sortino, or another return-series objective")
     world_size = _distributed_world_size()
     rank = _distributed_rank()
+    physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    physical_previous: DayTradeCarryState | None = None
+    if physical_source is not None and (
+        split.execution_mode != "tw_day_trade" or objective != "log_utility"
+        or max_volume_participation != 0.5 or symbol_sharded_ledger
+        or not execution_runtime.day_trade_unlimited_margin_conversion
+    ):
+        raise ValueError("physical DDP requires chronological replicated 50%-minute carry accounting")
     if world_size <= 1 or not _distributed_is_initialized():
         raise RuntimeError("DDP windowed hotpath requires an initialized distributed process group")
     if int(batch_size) % world_size != 0:
@@ -19239,6 +20187,9 @@ def _train_epoch_windowed_tensor_ddp(
         global_start = (step_idx - 1) * int(batch_size)
         local_start = global_start + rank * local_batch_size
         local_end = local_start + local_batch_size
+        batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
+            loss_fn, source=physical_source, split=split, start=global_start,
+            end=global_start + int(batch_size), device=device, previous=physical_previous))
         if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} "
@@ -19485,7 +20436,7 @@ def _train_epoch_windowed_tensor_ddp(
                     aux_outputs["initial_long_margin_debt"] = (
                         portfolio_prev_long_margin_debt
                     )
-                loss = loss_fn(
+                loss = batch_loss_fn(
                     weights,
                     future_returns,
                     tradable_mask,
@@ -19549,11 +20500,13 @@ def _train_epoch_windowed_tensor_ddp(
                     regime_down_threshold=regime_down_threshold,
                     symbol_sharded_ledger=symbol_sharded_ledger,
                 )
+                if physical_source is not None:
+                    physical_previous = aux_outputs["_final_day_trade_carry_state"]
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = optimizer_step_per_trajectory or _should_check_finite(
+        should_check_finite = physical_source is not None or optimizer_step_per_trajectory or _should_check_finite(
             step_idx,
             finite_check_interval_steps,
             final_step=step_idx >= num_batches,
@@ -19722,6 +20675,8 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if physical_source is not None:
+                    raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite gradient during full-trajectory accumulation"
@@ -19773,6 +20728,8 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if physical_source is not None:
+                    raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite gradient during full-trajectory accumulation"
@@ -20417,9 +21374,9 @@ def _run_training_tree_models(
                         test_integer_metrics=test_integer_met,
                         canonical_tensor_exact=canonical_tensor_day_trade,
                         canonical_tensor_label=(
-                            "daily-tplus2-close"
-                            if execution_runtime.day_trade_unlimited_margin_conversion
-                            else "exact-minute"
+                            _canonical_tensor_day_trade_report_label(
+                                execution_runtime
+                            )
                         ),
                     )
                 )
@@ -23087,6 +24044,9 @@ def _run_training_impl(
                         pretrained_initialization,
                         target_feature_names=panel.feature_names,
                         target_symbol_names=panel.symbols,
+                        symbol_axis_adapter=(
+                            config.training.pretrained_initialization_symbol_adapter
+                        ),
                         require_exact_backbone=bool(
                             config.training.pretrained_initialization_require_exact_backbone
                         ),
@@ -23102,6 +24062,9 @@ def _run_training_impl(
                         pretrained_initialization,
                         target_feature_names=panel.feature_names,
                         target_symbol_names=panel.symbols,
+                        symbol_axis_adapter=(
+                            config.training.pretrained_initialization_symbol_adapter
+                        ),
                         require_exact_backbone=bool(
                             config.training.pretrained_initialization_require_exact_backbone
                         ),
@@ -23500,8 +24463,12 @@ def _run_training_impl(
         compile_loss_requested = _env_truthy(
             "STOCKAGENT_COMPILE_LOSS", default_compile_loss
         )
+        physical_fifo_loss = bool(
+            execution_runtime.day_trade_carry_source is not None
+        )
         tw_day_trade_minute_compile = bool(
             execution_runtime.mode == "tw_day_trade"
+            and not physical_fifo_loss
             and train_windowed is not None
             and train_windowed.overnight_log_returns is not None
             and train_windowed.overnight_log_returns.dim() in {3, 4}
@@ -23520,7 +24487,9 @@ def _run_training_impl(
             stock_context_integer_compile=tw_stock_context_integer_loss,
         )
         tw_settlement_compiled_rows = (
-            int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
+            0
+            if tw_settlement_compile_backend == "physical_fifo"
+            else int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
             if tw_settlement_compile_backend == "day_trade_minute"
             else int(TW_DUAL_SESSION_COMPILED_BLOCK_ROWS)
             if tw_settlement_compile_backend == "dual_session"
@@ -23538,6 +24507,7 @@ def _run_training_impl(
         )
         tw_settlement_chunk_compile = bool(
             will_train_epochs
+            and not physical_fifo_loss
             and (
                 execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
                 or execution_runtime.mode == "tw_day_trade"
@@ -23846,7 +24816,9 @@ def _run_training_impl(
                             )
                         else:
                             loss_compile_status = (
-                                "off:tw_outer_compile_guard:eager"
+                                "off:physical_fifo_exact_eager"
+                                if physical_fifo_loss
+                                else "off:tw_outer_compile_guard:eager"
                                 if (
                                     execution_runtime.mode
                                     in TW_CARRYING_EXECUTION_MODES
@@ -23903,6 +24875,8 @@ def _run_training_impl(
             loss_compile_status = "off:model_compile_disabled"
         elif tw_settlement_chunk_compile:
             loss_compile_status = f"enabled:{execution_runtime.mode}_chunked"
+        elif physical_fifo_loss:
+            loss_compile_status = "off:physical_fifo_exact_eager"
         elif (
             execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
             or execution_runtime.mode == "tw_day_trade"
@@ -24167,7 +25141,9 @@ def _run_training_impl(
         tw_compiled_calls_delta = 0
         tw_compiled_day_calls_delta = 0
         tw_fallback_calls_delta = 0
-        if loss_compile_status.startswith("enabled") and not aux_training_required:
+        if (
+            loss_compile_status.startswith("enabled") or physical_fifo_loss
+        ) and not aux_training_required:
             loss_probe_kwargs = {
                 "long_only": config.trading.long_only,
                 "buy_fee_rate": config.trading.buy_fee_rate,
@@ -24225,9 +25201,13 @@ def _run_training_impl(
                 device=device,
                 rank_ordered=loss_probe_rank_ordered,
             )
-            loss_still_compiled = not (
-                isinstance(compiled_loss_fn, _CompiledLossFallback)
-                and compiled_loss_fn.disabled
+            loss_still_compiled = (
+                True
+                if physical_fifo_loss
+                else not (
+                    isinstance(compiled_loss_fn, _CompiledLossFallback)
+                    and compiled_loss_fn.disabled
+                )
             )
             tw_compile_stats_after = get_tw_continuous_compile_stats()
             tw_minute_stats_after = get_tw_day_trade_minute_compile_stats()
@@ -24313,16 +25293,21 @@ def _run_training_impl(
             if distributed_loss_probe_ok:
                 loss_compile_status += ":probe_passed"
                 print(
-                    f"[Train {train_years}] compiled canonical loss forward/backward probe passed "
+                    f"[Train {train_years}] "
+                    f"{'physical FIFO exact' if physical_fifo_loss else 'compiled canonical'} "
+                    "loss forward/backward probe passed "
                     f"(rows={train_batch_size}, objective={loss_objective})"
                 )
             else:
                 if loss_probe_error is None:
                     loss_probe_error = "compiled loss failed or fell back on another distributed rank"
-                if bool(config.training.strict_no_fallback):
+                if physical_fifo_loss or bool(config.training.strict_no_fallback):
                     raise RuntimeError(
-                        f"[Train {train_years}] compiled loss probe failed before epoch 1: "
-                        f"{loss_probe_error}. strict_no_fallback=true."
+                        f"[Train {train_years}] "
+                        f"{'physical FIFO exact' if physical_fifo_loss else 'compiled'} "
+                        "loss probe failed before epoch 1: "
+                        f"{loss_probe_error}. "
+                        f"strict_no_fallback={str(bool(config.training.strict_no_fallback)).lower()}."
                     )
                 compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                 if compile_loss_dynamic_symbols:
@@ -24340,6 +25325,7 @@ def _run_training_impl(
         pre_epoch_timing.checkpoint(
             "compiled_loss_forward_backward_probe",
             active=bool(loss_compile_status.startswith("enabled")),
+            physical_fifo_exact=bool(physical_fifo_loss),
             status=str(loss_compile_status),
             measured_s=float(time.perf_counter() - loss_probe_started),
             rank_ordered=bool(loss_probe_rank_ordered),
@@ -25143,7 +26129,18 @@ def _run_training_impl(
             )
             test_bt = test_bt_t.to_numpy()
             deployment_test_rows = int(context.deployment_test_rows)
-            deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+            if execution_runtime.day_trade_carry_source is not None:
+                deployment_test_bt = _replay_physical_carry_split_prefix(
+                    test_bt,
+                    test_windowed,
+                    deployment_test_rows,
+                    runtime=execution_runtime,
+                    config=config,
+                )
+            else:
+                deployment_test_bt = _prefix_backtest_result(
+                    test_bt, deployment_test_rows
+                )
             deployment_test_dates = test_dates[:deployment_test_rows]
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
@@ -25252,6 +26249,12 @@ def _run_training_impl(
                 backtest_artifact_compression="compressed",
                 print_report=False,
                 write_plots=bool(getattr(config.training, "save_best_val_fold_plots", True)),
+                day_trade_carry_context=_physical_carry_artifact_context(
+                    runtime=execution_runtime,
+                    symbols=test_symbols,
+                    config=config,
+                    initial_nav=float(config.trading.volume_participation_equity),
+                ),
             )
             print(
                 f"[Fold {fold.fold_id}] best-val fold artifacts written in "
@@ -26325,7 +27328,18 @@ def _run_training_impl(
                 )
                 test_bt = test_bt_t.to_numpy()
                 deployment_test_rows = int(context.deployment_test_rows)
-                deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+                if execution_runtime.day_trade_carry_source is not None:
+                    deployment_test_bt = _replay_physical_carry_split_prefix(
+                        test_bt,
+                        test_windowed,
+                        deployment_test_rows,
+                        runtime=execution_runtime,
+                        config=config,
+                    )
+                else:
+                    deployment_test_bt = _prefix_backtest_result(
+                        test_bt, deployment_test_rows
+                    )
                 deployment_test_dates = test_dates[:deployment_test_rows]
                 write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
                 test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
@@ -26421,9 +27435,9 @@ def _run_training_impl(
                                 )
                             ),
                             canonical_tensor_label=(
-                                "daily-tplus2-close"
-                                if execution_runtime.day_trade_unlimited_margin_conversion
-                                else "exact-minute"
+                                _canonical_tensor_day_trade_report_label(
+                                    execution_runtime
+                                )
                             ),
                         )
                     )
@@ -26473,6 +27487,12 @@ def _run_training_impl(
                     print_report=True,
                     write_plots=True,
                     mark_complete=True,
+                    day_trade_carry_context=_physical_carry_artifact_context(
+                        runtime=execution_runtime,
+                        symbols=test_symbols,
+                        config=config,
+                        initial_nav=float(config.trading.volume_participation_equity),
+                    ),
                 )
                 plot_total = float(plot_timing.get("total_s", 0.0))
 

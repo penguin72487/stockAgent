@@ -55,6 +55,8 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+    MARGIN_CARRY_CONTRACT,
+    EXECUTION_REALISM_CONTRACT,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
 )
@@ -64,7 +66,14 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_stock_snapshots,
     resolve_observed_minute_execution_price,
 )
-from stockagent.data.tw_price_rules import move_price_ticks_numpy  # noqa: E402
+from stockagent.data.tw_price_rules import (  # noqa: E402
+    TW_ORDER_PRICE_CONTRACT_VERSION,
+    move_price_ticks_numpy,
+)
+from stockagent.data.tw_security import classify_tw_stock_or_etf  # noqa: E402
+from stockagent.live.benchmark_history_projection import (  # noqa: E402
+    write_benchmark_projection,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -140,12 +149,21 @@ def _retain_benchmark_history(source_path: Path, state_dir: Path) -> dict[str, A
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.write_bytes(raw)
     temporary.replace(destination)
+    projection = write_benchmark_projection(
+        state_dir=state_dir,
+        source_path=destination,
+        source_sha256=hashlib.sha256(raw).hexdigest(),
+        origins=origins,
+        marks=payload["marks"],
+        created_at=str(payload.get("created_at") or datetime.now(TAIPEI).isoformat()),
+    )
     return {
         "path": str(source_path),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "marks": len(payload["marks"]),
         "origins": sorted(origins),
         "destination": str(destination),
+        **projection,
     }
 
 
@@ -184,10 +202,27 @@ def _latest_valid_signal(
     trading_date: date,
     *,
     preferred_signal_id: str | None = None,
+    pinned_artifact: Mapping[str, Any] | None = None,
 ) -> tuple[datetime, Path, Path, dict[str, Any], list[dict[str, Any]]]:
     ranked: list[tuple[datetime, Path, Path, dict[str, Any]]] = []
     day = trading_date.isoformat()
-    for summary_path in spec.live_output_dir.glob(f"{day}*/**/summary.json"):
+    if pinned_artifact is not None:
+        summary_path = Path(str(pinned_artifact["summary_path"]))
+        weights_path = Path(str(pinned_artifact["weights_path"]))
+        if (not preferred_signal_id or not summary_path.is_absolute()
+                or weights_path != summary_path.with_name("target_weights.parquet")):
+            raise ValueError("invalid pinned signal artifact identity")
+        for key, path in (("summary", summary_path), ("weights", weights_path)):
+            if _sha256(path) != pinned_artifact[f"{key}_sha256"]:
+                raise ValueError(f"pinned signal {key} hash changed: {path}")
+        if pinned_artifact.get("open_input_path"):
+            path = Path(pinned_artifact["open_input_path"])
+            if _sha256(path) != pinned_artifact["open_input_sha256"]:
+                raise ValueError(f"pinned signal open input hash changed: {path}")
+        candidates = [summary_path]
+    else:
+        candidates = spec.live_output_dir.glob(f"{day}*/**/summary.json")
+    for summary_path in candidates:
         try:
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             generated_at = datetime.fromisoformat(str(summary.get("generated_at")))
@@ -242,9 +277,82 @@ def _latest_valid_signal(
         ranked, key=lambda item: item[0]
     )
     rows = pl.read_parquet(weights_path).to_dicts()
+    if pinned_artifact is not None:
+        for key, path in (("summary", summary_path), ("weights", weights_path)):
+            if _sha256(path) != pinned_artifact[f"{key}_sha256"]:
+                raise ValueError(f"pinned signal {key} changed during read: {path}")
+        if pinned_artifact.get("open_input_path"):
+            path = Path(pinned_artifact["open_input_path"])
+            if _sha256(path) != pinned_artifact["open_input_sha256"]:
+                raise ValueError(f"pinned signal open input changed during read: {path}")
     if not rows:
         raise ValueError(f"{weights_path} contains no target rows")
     return generated_at, summary_path, weights_path, summary, rows
+
+
+def _source_ledger_signal_artifacts(
+    source_ledger_dir: Path,
+    signal_ids: Mapping[tuple[str, str], str],
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Resolve accepted artifact bytes, not a same-named regeneration.
+
+    Replay receipts may reference isolated signals outside today's live output.
+    Added accounts have their own receipts. Missing legacy receipt entries may
+    still use ID lookup, but a declared missing/changed/conflicting artifact is
+    never replaced with a newer file that happens to reuse its signal_id.
+    """
+    artifacts: dict[tuple[str, str], dict[str, str]] = {}
+
+    def accept(day: str, row: Mapping[str, Any]) -> None:
+        key = (day, str(row.get("market") or ""))
+        if key not in signal_ids or row.get("signal_id") != signal_ids[key]:
+            return
+        summary = row.get("summary_path") or row.get("signal_source_path")
+        weights = row.get("weights_path") or row.get("target_weights_path")
+        if not summary or not weights:
+            return
+        proof = {}
+        for name, raw in (("summary", summary), ("weights", weights)):
+            path = Path(str(raw)).resolve(strict=True)
+            digest = _sha256(path)
+            expected = row.get(f"{name}_sha256")
+            if expected and expected != digest:
+                raise ValueError(f"accepted signal {name} hash changed: {key}: {path}")
+            proof[f"{name}_path"] = str(path)
+            proof[f"{name}_sha256"] = digest
+        summary_payload = json.loads(Path(proof["summary_path"]).read_text(encoding="utf-8"))
+        if summary_payload.get("counterfactual_signal_regeneration"):
+            provenance = summary_payload.get("counterfactual_open_provenance") or {}
+            raw_input = provenance.get("input_path")
+            if not raw_input or not provenance.get("input_sha256"):
+                raise ValueError(f"accepted counterfactual signal has no open input proof: {key}")
+            input_path = Path(str(raw_input)).resolve(strict=True)
+            digest = _sha256(input_path)
+            if digest != provenance["input_sha256"]:
+                raise ValueError(f"accepted signal open input hash changed: {key}: {input_path}")
+            proof["open_input_path"] = str(input_path)
+            proof["open_input_sha256"] = digest
+        previous = artifacts.get(key)
+        if previous and any(previous[f"{name}_sha256"] != proof[f"{name}_sha256"]
+                            for name in ("summary", "weights")):
+            raise ValueError(f"conflicting accepted signal artifacts: {key}")
+        artifacts[key] = proof
+
+    receipts = [source_ledger_dir / "rebuild_receipt.json"]
+    receipts.extend(sorted((source_ledger_dir / "account_receipts").glob("*/rebuild_receipt.json")))
+    for path in receipts:
+        if not path.is_file():
+            continue
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        for session in receipt.get("sessions", []):
+            for row in session.get("modes", []):
+                accept(str(session["session_date"]), row)
+    state_path = source_ledger_dir / "state.json"
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for market, row in state.get("modes", {}).items():
+            accept(str(row.get("session_date") or ""), {**row, "market": market})
+    return artifacts
 
 
 def _source_ledger_signal_ids(
@@ -285,6 +393,12 @@ def _source_ledger_signal_ids(
         "sha256": _sha256(path),
         "signal_registrations": len(resolved),
     }
+
+
+def _validate_replay_policy_summary(spec: ModeSpec, day: date, summary: Mapping[str, Any]) -> None:
+    if (spec.uses_realistic_execution
+            and summary.get("day_trade_policy_mask_contract") != "exact_session_eligibility_before_forward_v1"):
+        raise RuntimeError(f"{day}/{spec.market}: regenerate isolated signals with exact-session policy mask before v3 replay")
 
 
 def _resolve_source_signal_pins(
@@ -423,6 +537,9 @@ def _local_0901_vwap_rows(
             resolved[symbol] = {
                 "symbol": symbol,
                 "execution_price_0901": float(price),
+                "valuation_price_0901": (_finite(row.get("Close")) if _finite(
+                    row.get("volume_shares") if row.get("volume_shares") is not None
+                    else row.get("Volume")) is not None else None),
                 "execution_price_0901_method": price_method,
                 "tick_volume_units_0901": float(volume_shares or 0.0),
                 "tick_count_0901": 0,
@@ -687,8 +804,7 @@ def _entry_quotes(
         except (TypeError, ValueError):
             execution_price_0901 = math.nan
         has_0901_price = bool(
-            potentially_executable
-            and math.isfinite(execution_price_0901)
+            math.isfinite(execution_price_0901)
             and execution_price_0901 > 0.0
         )
         use_adverse_tick_fallback = bool(
@@ -742,10 +858,15 @@ def _entry_quotes(
             "ask": book.get("ask") if has_required_best_quote else None,
             "bid_volume": (book.get("bid_volume") if has_required_best_quote else None),
             "ask_volume": (book.get("ask_volume") if has_required_best_quote else None),
-            "minute_volume_lots": None,
+            "minute_volume_lots": (
+                float(book.get("tick_volume_units_0901") or 0.0) / 1000.0
+                if is_0901_vwap_policy else book.get("minute_volume_lots")
+            ),
             "execution_price_0901": (
                 execution_price_0901 if has_0901_price else None
             ),
+            "historical_minute_valuation": is_0901_vwap_policy,
+            "valuation_price_0901": book.get("valuation_price_0901"),
             "execution_price_0901_method": (
                 execution_price_0901_method if has_0901_price else None
             ),
@@ -918,6 +1039,7 @@ def _persist_historical_entry_books(
         "ask_source_row_index": pl.Int64,
         "last": pl.Float64,
         "execution_price_0901": pl.Float64,
+        "valuation_price_0901": pl.Float64,
         "tick_volume_units_0901": pl.Float64,
         "tick_count_0901": pl.Int64,
         "source_window_start": pl.String,
@@ -1052,10 +1174,15 @@ def _official_open_map(
     *,
     twse_daily_ohlcv_path: Path,
     tpex_daily_ohlcv_path: Path,
+    carried_symbols: Mapping[str, set[str]] | None = None,
 ) -> tuple[dict[str, float], dict[str, int], set[str]]:
     opens: dict[str, float] = {}
     source_counts: dict[str, int] = {}
     no_trade_symbols: set[str] = set()
+    from stockagent.live.tw_share_replacement import halted_symbols
+    for root in {twse_daily_ohlcv_path.parent, *(s.margin_corporate_action_reference_path.parent
+                 for s in specs if s.margin_corporate_action_reference_path is not None)}:
+        no_trade_symbols.update(halted_symbols(root, trading_date))
     # The venue aggregates are the direct official authority and already carry
     # the complete date slice.  Load each venue once instead of opening one
     # derived per-symbol parquet for every market row.  The per-symbol path is
@@ -1066,10 +1193,11 @@ def _official_open_map(
         trading_date,
     )
     for spec in specs:
-        rows = selected[spec.market][4]
+        rows = [*selected[spec.market][4],
+                *({"symbol": symbol} for symbol in sorted((carried_symbols or {}).get(spec.market, set())))]
         for row in rows:
             symbol = str(row.get("symbol") or "")
-            if not symbol or symbol in opens:
+            if not symbol or symbol in opens or symbol in no_trade_symbols:
                 continue
             daily = aggregate_rows.get(symbol)
             if daily is None:
@@ -1426,6 +1554,11 @@ def _close_quotes(
     open_mismatches: list[dict[str, Any]] = []
     observed_symbols: set[str] = set()
     source_counts: dict[str, int] = {}
+    official_no_trade_carried: list[str] = []
+    from stockagent.live.tw_share_replacement import halted_symbols
+    halted = set().union(*(halted_symbols(root, trading_date) for root in {
+        twse_daily_ohlcv_path.parent, *(s.margin_corporate_action_reference_path.parent
+            for s in specs_by_market.values() if s.margin_corporate_action_reference_path is not None)}))
     for market, mode in (engine.state.get("modes") or {}).items():
         if str(mode.get("session_date") or "") != trading_date.isoformat():
             continue
@@ -1445,11 +1578,16 @@ def _close_quotes(
                 tpex_daily_ohlcv_path,
             )
             if row is None or not math.isfinite(float(row.get("close") or math.nan)):
+                if (position.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                        and (symbol in halted or (row is not None and
+                        all(_finite(row.get(key)) is None for key in ("open", "max", "min", "close"))))):
+                    official_no_trade_carried.append(symbol)
+                    continue
                 missing.append(symbol)
                 continue
             entry_open = float(position.get("sizing_open_price") or math.nan)
             official_open = float(row.get("open") or math.nan)
-            if not math.isclose(entry_open, official_open, rel_tol=0.0, abs_tol=1e-9):
+            if str(position.get("entry_at") or "")[:10] == trading_date.isoformat() and not math.isclose(entry_open, official_open, rel_tol=0.0, abs_tol=1e-9):
                 open_mismatches.append(
                     {
                         "symbol": symbol,
@@ -1464,11 +1602,11 @@ def _close_quotes(
                 "symbol": symbol,
                 "open": official_open,
                 "last": close_price,
-                "bid": close_price,
-                "ask": close_price,
-                "minute_volume_lots": PAPER_LIQUIDITY_LOTS,
-                "bid_volume": PAPER_LIQUIDITY_LOTS,
-                "ask_volume": PAPER_LIQUIDITY_LOTS,
+                "bid": None if spec.realistic_execution else close_price,
+                "ask": None if spec.realistic_execution else close_price,
+                "minute_volume_lots": None if spec.realistic_execution else PAPER_LIQUIDITY_LOTS,
+                "bid_volume": None if spec.realistic_execution else PAPER_LIQUIDITY_LOTS,
+                "ask_volume": None if spec.realistic_execution else PAPER_LIQUIDITY_LOTS,
                 "quote_at": quote_at.isoformat(timespec="seconds"),
                 "source": f"{official_source}:session_close_replay",
                 "fill_contract": HISTORICAL_OFFICIAL_CLOSE_FILL_CONTRACT,
@@ -1486,6 +1624,7 @@ def _close_quotes(
         "recorded_open_matches_official": not open_mismatches,
         "recorded_open_mismatches": open_mismatches,
         "official_source_counts": source_counts,
+        "official_no_trade_carried_symbols": sorted(official_no_trade_carried),
     }
 
 
@@ -1507,6 +1646,15 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
             max(-int(row.get("signed_shares") or 0), 0) for row in positions
         ),
         "engine_status": mode.get("engine_status"),
+        "execution_realism_contract": mode.get("execution_realism_contract"),
+        "margin_carry_contract": mode.get("margin_carry_contract"),
+        "margin_carry_position_count": mode.get("margin_carry_position_count", 0),
+        "cumulative_carry_cost_twd": mode.get("cumulative_carry_cost_twd", 0.0),
+        "capital_sizing_basis": mode.get("capital_sizing_basis"),
+        "session_sizing_nav_twd": mode.get("session_sizing_nav_twd"),
+        "funding_assumption": mode.get("funding_assumption"),
+        "execution_evidence_complete": mode.get("execution_evidence_complete"),
+        "terminal_flatten_count": int(mode.get("terminal_flatten_count") or 0),
         "entry_fill_policy": mode.get("entry_fill_policy"),
         "entry_fill_contract": mode.get("entry_fill_contract"),
         "entry_fill_is_synthetic": bool(mode.get("entry_fill_is_synthetic", False)),
@@ -1549,9 +1697,10 @@ def _minute_bar_rows(
     unresolved = set(symbols)
     output: dict[str, dict[str, dict[str, float]]] = {}
     source_counts: dict[str, int] = {}
+    zero_volume_rows = 0
 
     def accept(frame: pl.DataFrame, source: Path) -> None:
-        nonlocal unresolved
+        nonlocal unresolved, zero_volume_rows
         if not frame.height:
             return
         schema = set(frame.columns)
@@ -1600,6 +1749,12 @@ def _minute_bar_rows(
             if stamp.date() != trading_date:
                 continue
             volume = max(0.0, float(row.get("volume_shares") or 0.0))
+            if not math.isfinite(volume) or volume <= 0.0:
+                # Some source KBars pad the clock with yesterday's/reference
+                # price even before the first trade. Those rows must neither
+                # refresh inventory marks nor trigger a resting stop/limit.
+                zero_volume_rows += 1
+                continue
             amount = _finite(row.get("Amount"))
             vwap = amount / volume if amount is not None and volume > 0.0 else close
             output.setdefault(symbol, {})[stamp.isoformat(timespec="minutes")] = {
@@ -1677,6 +1832,7 @@ def _minute_bar_rows(
             accept(frame, root)
     return output, {
         "requested_symbols": len(symbols),
+        "ignored_zero_volume_rows": zero_volume_rows,
         "resolved_symbols": len(output),
         "missing_symbols": sorted(unresolved),
         "source_counts": dict(sorted(source_counts.items())),
@@ -1705,6 +1861,13 @@ def _bar_quote(
         "source": "retained_right_labelled_1m_ohlcv_counterfactual",
         "fill_contract": HISTORICAL_KBAR_FILL_CONTRACT,
         "depth_assumption": "50pct_observed_minute_volume_no_level_one_depth_claim",
+        "historical_bar_open": float(bar["open"]),
+        "historical_bar_high": float(bar["high"]),
+        "historical_bar_low": float(bar["low"]),
+        # High/Low may prove a resting limit was touched; neither is the
+        # minute-end inventory valuation. Keep execution and marking separate.
+        "historical_minute_valuation": True,
+        "valuation_price_0901": float(bar["close"]),
     }
 
 
@@ -1785,17 +1948,21 @@ def _apply_historical_kbar_brackets(
                     quantity=capacity,
                 )
         elif take_profit_hit and capacity > 0:
+            # A resting limit crossed by the first trade receives the bar's
+            # opening price, not a limit outside the observed minute range.
+            execution = (max(take_profit, float(bar["open"])) if side == "long"
+                         else min(take_profit, float(bar["open"])))
             quote = _bar_quote(
                 position,
                 bar,
                 observed=observed,
-                bid=take_profit if side == "long" else None,
-                ask=take_profit if side == "short" else None,
+                bid=execution if side == "long" else None,
+                ask=execution if side == "short" else None,
             )
             engine._close_position(  # noqa: SLF001 - canonical ledger writer
                 position,
                 mode,
-                price=take_profit,
+                price=execution,
                 quote=quote,
                 now=observed,
                 reason=(
@@ -1841,13 +2008,19 @@ def _eod_kbar_quotes(
         close = float(bar["close"])
         if observed.time() == time(13, 20):
             day_array = np.asarray([np.datetime64(observed.date().isoformat(), "D")])
+            security_type = position.get("security_type") or classify_tw_stock_or_etf(symbol) or "stock"
+            lower, upper = _finite(position.get("lower_limit")), _finite(position.get("upper_limit"))
+            if lower is None or upper is None or not 0 < lower <= close <= upper:
+                raise ValueError(f"{symbol}: historical passive exit requires exact daily limits")
             if side == "long":
                 bid = close
-                ask = float(move_price_ticks_numpy(np.asarray([close]), 1, day_array)[0])
+                ask = min(upper, float(move_price_ticks_numpy(np.asarray([close]), 1, day_array, security_types=security_type)[0]))
             else:
-                bid = float(move_price_ticks_numpy(np.asarray([close]), -1, day_array)[0])
+                bid = max(lower, float(move_price_ticks_numpy(np.asarray([close]), -1, day_array, security_types=security_type)[0]))
                 ask = close
-        elif time(13, 20) < observed.time() < time(13, 24):
+        elif time(13, 20) < observed.time() < time(13, 24) or (
+            observed.time() == time(13, 24) and mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT
+        ):
             bid = float(bar["high"]) if side == "long" else close
             ask = float(bar["low"]) if side == "short" else close
         else:
@@ -1889,18 +2062,39 @@ def _replay_historical_intraday(
         if observed.time() < time(13, 25):
             for market in markets:
                 mode = engine.state["modes"][market]
+                quotes = _eod_kbar_quotes(mode, bars, observed=observed)
+                if observed.time() == time(13, 24) and mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
+                    # The right-labelled 13:24 bar precedes the 13:24 market
+                    # submission. Only its already-working passive order may
+                    # fill here. The market leg consumes the 13:25 bar next.
+                    engine._fill_crossed_exit_limits(mode, quotes, observed)
+                    mode["force_exit_started_at"] = observed.isoformat(timespec="seconds")
+                    engine._event("force_exit_started", recorded_at=observed, market=market)
+                    for position in (mode.get("positions") or {}).values():
+                        if int(position.get("signed_shares") or 0):
+                            position["eod_limit_order_status"] = "cancelled_at_13_24"
+                    engine._mark_mode(market, observed, quotes)
+                    continue
                 engine.process_quotes(
-                    quotes=_eod_kbar_quotes(mode, bars, observed=observed),
+                    quotes=quotes,
                     now=observed,
                     markets=[market],
                     persist=False,
                 )
             continue
-        if observed.time() < time(13, 30):
-            for market in markets:
-                engine.process_quotes(
-                    quotes={}, now=observed, markets=[market], persist=False
-                )
+        # Preserve real 13:25–13:30 marks and the auction minute's observed
+        # volume. An official daily close alone is valuation, not capacity.
+        for market in markets:
+            mode = engine.state["modes"][market]
+            quotes = _eod_kbar_quotes(mode, bars, observed=observed)
+            if observed.time() == time(13, 25) and mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
+                # Counterfactual completed 13:24–13:25 continuous interval,
+                # distinct from a live market order submitted during auction.
+                engine._force_exit(market, mode, quotes, observed)
+            engine.process_quotes(
+                quotes=quotes,
+                now=observed, markets=[market], persist=False,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1911,6 +2105,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--signal-root", type=Path, help="Isolated candidate signals, with one subdirectory per stable market ID.")
+    parser.add_argument("--local-only", action="store_true", help="Audit retained minute evidence without broker login or historical quota use.")
     parser.add_argument(
         "--price-limit-dir",
         type=Path,
@@ -2009,8 +2205,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Replay the retained right-labelled 1m OHLCV path: conservative "
             "stop-before-profit bracket ordering through 13:19, a replay-only "
-            "13:20 passive-price proxy, 13:24 minute VWAP market attempt, then "
-            "the ordinary 13:30 auction/terminal flatten. The proxy is never "
+            "13:20 passive-price proxy, 13:24 market submission executed from "
+            "the right-labelled 13:25 minute, then observed 13:30 auction volume. "
+            "Unfilled delivery obligations remain visible. The proxy is never "
             "labelled as an executable historical Bid/Ask."
         ),
     )
@@ -2035,6 +2232,14 @@ def build_parser() -> argparse.ArgumentParser:
             "exchange-fill claim."
         ),
     )
+    parser.add_argument(
+        "--assume-margin-conversion", action="store_true",
+        help="Assume every unfilled residual can convert to margin and rebalance inventory to the next daily target; costs use configured stress rates, not broker availability.",
+    )
+    parser.add_argument("--assume-odd-lot-board-price", action="store_true",
+                        help="User-authorized paper assumption: converted odd shares execute at sourced regular-board prices, not observed odd-lot fills.")
+    parser.add_argument("--margin-action-data-dir", type=Path,
+                        help="Explicit dated execution-action workspace, separate from model features.")
     parser.add_argument(
         "--max-shioaji-traffic-fraction",
         type=float,
@@ -2103,6 +2308,16 @@ def main() -> None:
         raise RuntimeError(f"mode configuration errors: {errors}")
     if not specs:
         raise RuntimeError("no enabled day-trade simulation modes")
+    if args.signal_root is not None:
+        specs = [replace(spec, live_output_dir=args.signal_root.resolve() / spec.market) for spec in specs]
+    if args.assume_margin_conversion:
+        specs = [replace(spec, residual_margin_conversion=True) for spec in specs]
+    if args.assume_odd_lot_board_price:
+        from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE
+        specs = [replace(spec, odd_lot_execution_policy=ODD_LOT_BOARD_PRICE) for spec in specs]
+    if args.margin_action_data_dir is not None:
+        reference = args.margin_action_data_dir.resolve() / "tw_corporate_action_reference.parquet"
+        specs = [replace(spec, margin_corporate_action_reference_path=reference) for spec in specs]
     if args.paper_market_at_best:
         specs = [
             replace(
@@ -2177,6 +2392,7 @@ def main() -> None:
         current_session_appended = True
     engine = TwDayTradeSimulationEngine(state_dir)
     source_signal_ids: dict[tuple[str, str], str] = {}
+    source_signal_artifacts: dict[tuple[str, str], dict[str, str]] = {}
     source_ledger_provenance: dict[str, Any] | None = None
     if args.source_ledger_dir is not None:
         source_signal_ids, source_ledger_provenance = _source_ledger_signal_ids(
@@ -2210,6 +2426,24 @@ def main() -> None:
             **(source_ledger_provenance or {}),
             **pin_provenance,
         }
+        # Replacement/addition exceptions have already removed their old IDs;
+        # only unchanged accepted signals are eligible for artifact pinning.
+        if args.signal_root is None:
+            source_signal_artifacts = _source_ledger_signal_artifacts(
+                args.source_ledger_dir.resolve(),
+                {key: value for key, value in source_signal_ids.items()
+                 if key in expected_signal_keys},
+            )
+            for (session, market), proof in source_signal_artifacts.items():
+                _validate_replay_policy_summary(
+                    specs_by_market[market], date.fromisoformat(session),
+                    json.loads(Path(proof["summary_path"]).read_text(encoding="utf-8")),
+                )
+            source_ledger_provenance["artifact_pins"] = [
+                {"session_date": key[0], "market": key[1],
+                 "signal_id": source_signal_ids[key], **proof}
+                for key, proof in sorted(source_signal_artifacts.items())
+            ]
     elif args.allow_unpinned_market or args.replace_signal_market:
         raise ValueError(
             "--allow-unpinned-market and --replace-signal-market require "
@@ -2274,7 +2508,10 @@ def main() -> None:
         "simulation_only": True,
         "production_order_possible": False,
         "replay_contract": {
+            "order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
             "entry": replay_entry_contract,
+            "residual": MARGIN_CARRY_CONTRACT if all(s.residual_margin_conversion for s in specs) else "unresolved_delivery_obligation",
+            "odd_lot_execution_policy": specs[0].odd_lot_execution_policy,
             "entry_price": (
                 "the official 09:00 open is used only for inference/sizing and every "
                 "direction executes at the source-backed right-labelled 09:01 minute "
@@ -2290,8 +2527,8 @@ def main() -> None:
                 "side uses official session open moved one adverse legal tick"
             ),
             "entry_liquidity": (
-                "complete independently legal whole-lot paper quantity at the observed "
-                "09:01 minute price without any exchange-fill or queue claim"
+                "whole lots capped at 50pct observed 09:01 volume and session NAV "
+                "including entry charges; no exchange-fill or queue claim"
                 if minute_price_at_0901
                 else
                 "complete independently legal whole-lot paper quantity at the official "
@@ -2307,11 +2544,12 @@ def main() -> None:
             ),
             "whole_lot_execution": (
                 "each symbol is executed independently after eligibility, legal-price, "
-                "whole-lot, and available-liquidity constraints; no cross-symbol "
-                "direction balancing or fill reduction"
+                "whole-lot, and available-liquidity constraints; pro-rata board-lot "
+                "reduction only when the total exceeds NAV; no direction balancing"
             ),
             "completed_session_exit": (
-                "13:20 passive proxy, 13:24 minute VWAP, 13:30 official auction and terminal flatten"
+                "13:20 passive proxy; 13:24 market submission uses right-labelled 13:25 VWAP; "
+                "13:30 observed auction volume only; unfilled delivery obligations retained"
                 if args.replay_intraday_kbars
                 else "official daily close"
             ),
@@ -2393,6 +2631,7 @@ def main() -> None:
                 preferred_signal_id=source_signal_ids.get(
                     (day.isoformat(), spec.market)
                 ),
+                pinned_artifact=source_signal_artifacts.get((day.isoformat(), spec.market)),
             )
             for spec in specs
         }
@@ -2412,6 +2651,9 @@ def main() -> None:
                 day,
                 twse_daily_ohlcv_path=twse_daily_ohlcv_path,
                 tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+                carried_symbols={spec.market: {str(p["symbol"])
+                    for p in engine.state.get("modes", {}).get(spec.market, {}).get("positions", {}).values()
+                    if int(p.get("signed_shares") or 0)} for spec in specs},
             )
             canonical_open_source = "official_daily_session_open"
             session_receipt["canonical_open"] = {
@@ -2507,6 +2749,17 @@ def main() -> None:
                 canonical_open_by_symbol,
             )
         )
+        # NAV may exceed the original capital; source discovery must not prune
+        # names using the old fixed-capital lot threshold. Carried zero-target
+        # names also need the execution source to reduce, not a new entry.
+        requested_book_symbols = sorted(set(requested_book_symbols) | {
+            str(row["symbol"]) for *_, rows, _eligibility, _coverage in prepared_modes
+            for row in rows if abs(float(row.get("target_weight") or 0)) > 0
+        } | {
+            str(p["symbol"]) for spec in specs
+            for p in engine.state.get("modes", {}).get(spec.market, {}).get("positions", {}).values()
+            if int(p.get("signed_shares") or 0)
+        })
         if official_open_at_0901:
             historical_books = {}
             historical_book_query = {
@@ -2554,7 +2807,9 @@ def main() -> None:
                     "error_counts": {},
                     "stopped_for_traffic": False,
                 }
-                if unresolved:
+                if unresolved and args.local_only:
+                    remote_query.update(source="local_only_unresolved", requested_symbols=len(unresolved), unqueried_symbols=len(unresolved))
+                if unresolved and not args.local_only:
                     try:
                         remote_books, remote_query = (
                             fetch_shioaji_historical_stock_0901_vwaps(
@@ -2676,6 +2931,7 @@ def main() -> None:
             coverage,
         ) in prepared_modes:
             observed = datetime.combine(day, time(9, 1), tzinfo=TAIPEI)
+            _validate_replay_policy_summary(spec, day, summary)
             replay_summary = dict(summary)
             replay_summary.update(
                 {
@@ -2689,6 +2945,7 @@ def main() -> None:
                     "summary_path": str(summary_path.resolve()),
                     "weights_path": str(weights_path.resolve()),
                     "simulation_replay": True,
+                    "historical_minute_valuation": bool(args.replay_intraday_kbars),
                     "replay_basis": (
                         "official_09_00_open_inference_to_observed_09_01_minute_price_to_intraday_kbar_schedule"
                         if minute_price_at_0901 and should_close and args.replay_intraday_kbars
@@ -2713,7 +2970,7 @@ def main() -> None:
                     ),
                     "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
-                        "observed_09_01_minute_price_full_requested_paper_quantity_no_exchange_fill_claim"
+                        "observed_09_01_minute_price_50pct_volume_capped_no_exchange_fill_claim"
                         if minute_price_at_0901
                         else "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
                         if official_open_at_0901
@@ -2733,8 +2990,18 @@ def main() -> None:
                     "source_signal_ready_at": summary.get("signal_ready_at"),
                 }
             )
+            quote_rows = list(rows)
+            signal_symbols = {str(row.get("symbol") or "") for row in rows}
+            for position in engine.state["modes"].get(spec.market, {}).get("positions", {}).values():
+                symbol = str(position.get("symbol") or "")
+                if int(position.get("signed_shares") or 0) and symbol not in signal_symbols:
+                    # Removal from the model universe requests a reduction,
+                    # not disappearance of owned inventory or its quote.
+                    quote_rows.append({"symbol": symbol, "target_weight": 0.0,
+                                       "open_price": canonical_open_by_symbol.get(symbol)})
+                    signal_symbols.add(symbol)
             entry_quotes, entry_price_quality = _entry_quotes(
-                rows,
+                quote_rows,
                 limits,
                 quote_at=observed,
                 spec=spec,
@@ -2781,6 +3048,14 @@ def main() -> None:
                     "entry": _position_stats(mode),
                 }
             )
+            if result not in {"registered", "already_processed"}:
+                receipt["failure"] = {"session_date": day.isoformat(), "market": spec.market,
+                                      "register_result": result,
+                                      "margin_corporate_action_receipt": mode.get("margin_corporate_action_receipt")}
+                session_receipt["close"] = {"status": "blocked_entry_not_promotable"}
+                receipt["sessions"].append(session_receipt)
+                _atomic_json(state_dir / "rebuild_receipt.json", receipt)
+                raise RuntimeError(f"replay entry failed closed: {day} {spec.market}: {result}")
 
         if should_close and args.replay_intraday_kbars:
             position_symbols = {
@@ -2797,10 +3072,22 @@ def main() -> None:
                 trading_date=day,
                 symbols={symbol for symbol in position_symbols if symbol},
             )
-            if minute_coverage["missing_symbols"]:
+            no_trade_carries = {
+                symbol for symbol in minute_coverage["missing_symbols"]
+                if symbol in official_no_trade_symbols and all(
+                    str(p.get("entry_at") or "")[:10] < day.isoformat()
+                    and p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
+                    for market in specs_by_market
+                    for p in engine.state["modes"][market].get("positions", {}).values()
+                    if p.get("symbol") == symbol and int(p.get("signed_shares") or 0)
+                )
+            }
+            unresolved_paths = set(minute_coverage["missing_symbols"]) - no_trade_carries
+            minute_coverage["official_no_trade_carried_symbols"] = sorted(no_trade_carries)
+            if unresolved_paths:
                 raise RuntimeError(
                     f"missing retained minute path for {day}: "
-                    f"{minute_coverage['missing_symbols'][:30]}"
+                    f"{sorted(unresolved_paths)[:30]}"
                 )
             session_receipt["intraday_replay"] = {
                 **minute_coverage,
@@ -2827,11 +3114,8 @@ def main() -> None:
                 twse_daily_ohlcv_path=twse_daily_ohlcv_path,
                 tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
             )
-            engine.process_quotes(
-                quotes=close_quotes,
-                now=close_at,
-                persist=not bool(args.replay_intraday_kbars),
-            )
+            if not args.replay_intraday_kbars:
+                engine.process_quotes(quotes=close_quotes, now=close_at)
             if args.replay_intraday_kbars:
                 # Commit all append-only ledgers before advancing state.json.
                 # The live process still fsyncs each call; only this isolated
@@ -2839,7 +3123,15 @@ def main() -> None:
                 engine.flush_deferred_ledger_writes()
                 engine._persist(close_at)  # noqa: SLF001 - session transaction
             session_receipt["close"] = {
-                "status": "settled_official_close",
+                "status": (
+                    "assumed_margin_inventory_carried"
+                    if any(int(engine.state["modes"][m].get("open_position_count") or 0) for m in specs_by_market)
+                    and all(engine.state["modes"][m].get("margin_carry_contract") == MARGIN_CARRY_CONTRACT for m in specs_by_market)
+                    else
+                    "unresolved_delivery_obligation_at_close"
+                    if any(int(engine.state["modes"][m].get("open_position_count") or 0) for m in specs_by_market)
+                    else "settled_official_close"
+                ),
                 **close_quality,
             }
             for mode_receipt in session_receipt["modes"]:
@@ -2851,6 +3143,9 @@ def main() -> None:
                 "status": "current_session_left_open_for_live_service"
             }
         receipt["sessions"].append(session_receipt)
+        # A failed later day must retain its completed-prefix audit. Never
+        # restart a failed replay by pretending an unresolved carry is flat.
+        _atomic_json(state_dir / "rebuild_receipt.json", receipt)
         day += timedelta(days=1)
 
     _atomic_json(state_dir / "rebuild_receipt.json", receipt)

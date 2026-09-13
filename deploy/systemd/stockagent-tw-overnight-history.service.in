@@ -1,0 +1,21 @@
+[Unit]
+Description=Extend and atomically publish TW overnight dashboard history
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target stockagent-tw-public-publication-sweep.service
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-@REPO_ROOT@/.env
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_overnight_history_maintenance.sh"
+TimeoutStartSec=3h
+Nice=10
+CPUWeight=50
+IOWeight=50
+NoNewPrivileges=true
+PrivateTmp=true
+
