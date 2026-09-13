@@ -137,6 +137,35 @@ def test_taifex_history_is_an_explicit_allowlist() -> None:
     ]
 
 
+def test_taifex_history_scrubs_unexpected_nested_values_without_mutating_source() -> None:
+    nested = {
+        "visible": "ok",
+        "api_key": "DO-NOT-PUBLISH",
+        "child": {"access_token": "DO-NOT-PUBLISH", "value": 3},
+    }
+    source = {
+        "history": [
+            {
+                "strategy_id": nested,
+                "total_equity_twd": float("nan"),
+                "private": "DO-NOT-PUBLISH",
+            }
+        ]
+    }
+
+    public = sanitize_taifex_history(source)
+
+    assert public == {
+        "history": [
+            {
+                "strategy_id": {"visible": "ok", "child": {"value": 3}},
+                "total_equity_twd": None,
+            }
+        ]
+    }
+    assert nested["api_key"] == "DO-NOT-PUBLISH"
+
+
 def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> None:
     rows = [
         {
@@ -498,7 +527,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=4"' in html
+    assert 'src="dashboard-core.js?v=7"' in html
     assert 'src="public.js?v=10"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
@@ -623,7 +652,12 @@ def test_compact_tw_overview_reads_atomic_status_and_current_failed_gate(
                 "simulation_only": True,
                 "production_order_possible": False,
                 "modes": {
-                    "a": {"open_position_count": 2},
+                    "a": {
+                        "open_position_count": 2,
+                        "entry_requested_shares": 10_000,
+                        "entry_filled_shares": 1_000,
+                        "entry_fill_outcome": "partial",
+                    },
                     "b": {"open_position_count": 0, "stale_position_count": 1},
                 },
                 "private_path": "/private/state.json",
@@ -651,7 +685,44 @@ def test_compact_tw_overview_reads_atomic_status_and_current_failed_gate(
         {"market": "a", "open_position_count": 2, "stale_position_count": 0},
         {"market": "b", "open_position_count": 0, "stale_position_count": 1},
     ]
+    assert payload["operational_issue_modes"] == 2
     assert "private_path" not in payload
+
+
+def test_compact_overnight_waiting_does_not_treat_scheduled_unfilled_entry_as_error(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "overnight"
+    state_dir.mkdir()
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "health": "waiting",
+                "updated_at": "2026-09-01T01:00:00+00:00",
+                "simulation_only": True,
+                "production_order_possible": False,
+                "modes": {
+                    "overnight": {
+                        "product": "tw_overnight",
+                        "open_position_count": 0,
+                        "entry_requested_shares": 10_000,
+                        "entry_filled_shares": 0,
+                        "entry_fill_outcome": "close_auction_fill_unproven",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_compact_tw_overview_status(
+        state_dir,
+        opening_gate_path=tmp_path / "missing-gate.json",
+        now=datetime.fromisoformat("2026-09-01T01:00:10+00:00"),
+    )
+
+    assert payload["health"] == "waiting"
+    assert payload["operational_issue_modes"] == 0
 
 
 def test_compact_tw_overview_fails_closed_on_unsafe_receipt(tmp_path: Path) -> None:
@@ -677,8 +748,13 @@ def test_public_pages_share_visual_tokens() -> None:
     shared = (root / "public_dashboards" / "dashboard-core.css").read_text(
         encoding="utf-8"
     )
+    responsive = (
+        root / "public_dashboards" / "dashboard-responsive.css"
+    ).read_text(encoding="utf-8")
     assert "--dashboard-cyan" in shared
     assert "content-visibility: auto" in shared
+    assert ".dashboard-nav-toggle" in responsive
+    assert "table.dashboard-responsive-table" in responsive
     pages = {
         "public_dashboards/index.html": "overview",
         "taifex_dashboard/index.html": "taifex",
@@ -691,9 +767,10 @@ def test_public_pages_share_visual_tokens() -> None:
     for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=6" in html
+        assert "dashboard-responsive.css?v=8" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=4" defer' in html
-        assert html.index("dashboard-core.js?v=4") < html.index(
+        assert 'dashboard-core.js?v=7" defer' in html
+        assert html.index("dashboard-core.js?v=7") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -720,6 +797,11 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "validateJsonRoot" in shared_javascript
     assert "expectedRoot" in shared_javascript
     assert "NAV_ITEMS" in shared_javascript
+    assert "enhanceResponsiveTables" in shared_javascript
+    assert "performanceHistorySnapshot" in shared_javascript
+    assert "clearPerformanceHistory" in shared_javascript
+    assert "PERFORMANCE_HISTORY_LIMIT = 256" in shared_javascript
+    assert "private=secret" not in shared_javascript
 
     for relative in (
         "public_dashboards/public.js",
@@ -737,10 +819,18 @@ def test_public_pages_share_visual_tokens() -> None:
     )
     assert "FETCH_TIMEOUT_MS = 5000" in traffic_javascript
     assert "Dashboard.fetchWithTimeout" in traffic_javascript
+    assert "Dashboard.performanceHistorySnapshot()" in traffic_javascript
+    assert "function renderBrowserPerformance" in traffic_javascript
     assert '$("cache-resident")' in traffic_javascript
-    assert 'id="cache-resident"' in (
-        root / "traffic_dashboard" / "index.html"
-    ).read_text(encoding="utf-8")
+    traffic_html = (root / "traffic_dashboard" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="cache-resident"' in traffic_html
+    assert 'id="browser-action-rows"' in traffic_html
+    assert 'id="browser-page-filter"' in traffic_html
+    assert "不上傳" in traffic_html
+    assert 'href="performance.css?v=3"' in traffic_html
+    assert 'src="app.js?v=8"' in traffic_html
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
@@ -864,6 +954,37 @@ def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> No
         server.server_close()
 
 
+def test_public_gateway_serves_traffic_performance_stylesheet() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        response = PublicDashboardHandler._static_response(
+            handler, "/traffic/performance.css"
+        )
+        assert response is not None
+        assert response.content_type == "text/css; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
+        assert b"browser-performance-table" in response.body
+    finally:
+        server.server_close()
+
+
+def test_public_gateway_serves_shared_responsive_stylesheet() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        response = PublicDashboardHandler._static_response(
+            handler, "/dashboard-responsive.css"
+        )
+        assert response is not None
+        assert response.content_type == "text/css; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
+        assert b"dashboard-responsive-table" in response.body
+        assert b"dashboard-nav-toggle" in response.body
+    finally:
+        server.server_close()
+
+
 def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
     server = _test_server()
     try:
@@ -888,9 +1009,13 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         server.data_monitor_status = lambda **_kwargs: full  # type: ignore[method-assign]
         summary = json.loads(server.data_monitor_summary().body)
         assert summary["summary"]["registered_items"] == 390
-        assert "groups" not in summary
+        assert summary["groups"] == [{"id": "large"}]
         assert "sources" not in summary
         assert "private-heavy-row" not in json.dumps(summary)
+        details = json.loads(server.data_monitor_details().body)
+        assert details["sources"] == [{"endpoint_id": "private-heavy-row"}]
+        assert "summary" not in details
+        assert "groups" not in details
     finally:
         server.server_close()
 
@@ -1142,6 +1267,8 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     assert "@write_methods not method GET HEAD" in caddy
     assert 'header @write_methods Allow "GET, HEAD"' in caddy
     assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
+    assert 'KMP_AFFINITY="${KMP_AFFINITY:-disabled}"' in launcher
+    assert "export OMP_PROC_BIND=" not in launcher
     assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
     assert "systemctl restart stockagent-public-dashboards.service" in installer
     snapshot_unit = (
@@ -1422,6 +1549,46 @@ def test_encoding_variants_have_distinct_validators_and_valid_304(protocol_serve
     assert response.status == 304
     assert response.getheader("Vary") == "Accept-Encoding"
     assert response.getheader("Content-Length") is None
+
+
+def test_server_timing_is_request_local_on_same_keepalive_connection(protocol_server):
+    timings = []
+    for _ in range(2):
+        protocol_server.request("GET", "/dashboard-core.js")
+        response = protocol_server.getresponse()
+        response.read()
+        timings.append(response.getheader("Server-Timing"))
+    assert 'cache;desc="static_build"' in timings[0]
+    assert 'cache;desc="static_hit"' in timings[1]
+    for timing in timings:
+        assert re.search(r"app;dur=[\d.]+", timing)
+        assert "cache_wait;dur=" in timing
+        assert "build;dur=" in timing
+        assert "/root/" not in timing
+    protocol_server.request("GET", "/not-a-route")
+    response = protocol_server.getresponse()
+    response.read()
+    assert 'cache;desc=' not in response.getheader("Server-Timing")
+
+
+def test_static_cache_detects_same_size_restored_mtime(tmp_path):
+    import os
+    server = _test_server()
+    try:
+        path = tmp_path / "asset.js"
+        path.write_bytes(b"old")
+        before = path.stat()
+        def read():
+            return server.cached_static(path, content_type="text/javascript", cache_control="no-store")
+        first = read()
+        path.write_bytes(b"new")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        second = read()
+        assert first.body == b"old"
+        assert second.body == b"new"
+        assert first.etag != second.etag
+    finally:
+        server.server_close()
 
 
 def test_http_rejects_when_all_supported_encodings_are_forbidden(protocol_server):

@@ -5506,20 +5506,26 @@ def _day_trade_schedule_state(
         return "retry"
     if raw_mode.get("ledger_state_divergence") or str(raw_mode.get("engine_status") or "").startswith("critical"):
         return "blocked_open_position"
-    if (
-        str(raw_mode.get("session_date") or "") == session_date
-        and _summary_date_matches(raw_mode.get("entry_completed_at"), session_date)
-    ):
-        # A committed session remains committed even with working inventory or
-        # after a later manual artifact replaces the latest-signal pointer.
-        return "completed"
     positions = raw_mode.get("positions") or {}
     legacy_open = isinstance(positions, dict) and any(
         int(position.get("signed_shares") or 0) != 0
         for position in positions.values()
         if isinstance(position, dict)
     )
-    if int(raw_mode.get("open_position_count") or 0) > 0 or legacy_open:
+    # Legacy state.json stored the complete position map.  An open position in
+    # that authoritative map must never be hidden by entry_completed_at: the
+    # scheduler has to stop and surface the unresolved day-trade inventory.
+    # Compact service-sync receipts intentionally omit the map and report only
+    # open_position_count; a current-session committed entry is allowed to keep
+    # running because the independent paper engine, not Discord, owns its exits.
+    if legacy_open:
+        return "blocked_open_position"
+    if (
+        str(raw_mode.get("session_date") or "") == session_date
+        and _summary_date_matches(raw_mode.get("entry_completed_at"), session_date)
+    ):
+        return "completed"
+    if int(raw_mode.get("open_position_count") or 0) > 0:
         from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
         previous_session = str(raw_mode.get("session_date") or "")
         accepted_carry = bool(

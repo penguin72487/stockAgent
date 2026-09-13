@@ -38,7 +38,7 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_tw_signals,
     sanitize_tw_status,
 )
-from stockagent.live.dashboard_updates import DashboardUpdateHub, file_signature  # noqa: E402
+from stockagent.live.dashboard_updates import DashboardUpdateHub, file_signature, metadata_signature  # noqa: E402
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
 )
@@ -122,6 +122,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/openbb/api/history",
         "/data-monitor/api/status",
         "/data-monitor/api/summary",
+        "/data-monitor/api/details",
         "/traffic/api/status",
     }
 )
@@ -183,8 +184,7 @@ class CacheEntry:
 
 @dataclass
 class StaticCacheEntry:
-    modified_ns: int
-    size: int
+    signature: tuple[int, ...]
     response: PreparedResponse
 
 
@@ -707,21 +707,46 @@ def build_compact_tw_overview_status(
         health = "degraded"
 
     modes: list[dict[str, Any]] = []
+    compact_operational_issue_count = 0
     raw_modes = status.get("modes")
     if isinstance(raw_modes, Mapping):
         for market, raw_mode in raw_modes.items():
             mode = raw_mode if isinstance(raw_mode, Mapping) else {}
+            open_position_count = int(mode.get("open_position_count") or 0)
+            stale_position_count = int(mode.get("stale_position_count") or 0)
+            force_exit_failures = int(mode.get("force_exit_failures") or 0)
+            unresolved_exit_count = int(mode.get("unresolved_exit_count") or 0)
+            product = str(mode.get("product") or "tw_day_trade")
+            requested_shares = int(mode.get("entry_requested_shares") or 0)
+            filled_shares = int(mode.get("entry_filled_shares") or 0)
+            entry_incomplete = (
+                product != "tw_overnight"
+                and requested_shares > filled_shares
+                and str(mode.get("entry_fill_outcome") or "")
+                in {"partial", "no_fill"}
+            )
+            if (
+                stale_position_count
+                or force_exit_failures
+                or unresolved_exit_count
+                or entry_incomplete
+            ):
+                compact_operational_issue_count += 1
             modes.append(
                 {
                     "market": str(market),
-                    "open_position_count": int(
-                        mode.get("open_position_count") or 0
-                    ),
-                    "stale_position_count": int(
-                        mode.get("stale_position_count") or 0
-                    ),
+                    "open_position_count": open_position_count,
+                    "stale_position_count": stale_position_count,
                 }
             )
+
+    # ``status.json`` describes the engine's current schedule state, so a
+    # closed market can legitimately be ``waiting`` while its latest execution
+    # still contains a partial entry or an unflattened stale position.  The
+    # detail endpoint already degrades for those facts; keep the inexpensive
+    # landing-card projection consistent without loading the large ledgers.
+    if compact_operational_issue_count and health not in {"stale", "critical"}:
+        health = "degraded"
 
     return {
         "schema_version": 1,
@@ -736,6 +761,7 @@ def build_compact_tw_overview_status(
         "simulation_only": True,
         "production_order_possible": False,
         "modes": modes,
+        "operational_issue_modes": compact_operational_issue_count,
     }
 
 
@@ -896,6 +922,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
         self.traffic_observer = PublicTrafficObserver()
+        self.request_metrics = threading.local()
         self._cache: dict[str, CacheEntry] = {}
         self._cache_bytes = 0
         self._cache_lock = threading.Lock()
@@ -930,6 +957,26 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.update_hub.close()
         super().server_close()
 
+    def _cache_observation(self, kind: str) -> None:
+        self.traffic_observer.record_cache(kind)
+        metrics = getattr(self.request_metrics, "current", None)
+        if metrics is not None:
+            metrics["cache"].add(kind)
+
+    def _measured_build(self, builder: Callable[[], PreparedResponse]) -> PreparedResponse:
+        metrics = getattr(self.request_metrics, "current", None)
+        if metrics is None:
+            return builder()
+        outer = metrics["depth"] == 0
+        metrics["depth"] += 1
+        started = time.perf_counter()
+        try:
+            return builder()
+        finally:
+            metrics["depth"] -= 1
+            if outer:
+                metrics["build_ms"] += (time.perf_counter() - started) * 1000
+
     def content_token(self, topic: str = "tw") -> str:
         response = self.tw_revision() if topic == "tw" else self.overnight_revision()
         return str(_response_json(response).get("revision_token") or "missing")
@@ -941,30 +988,26 @@ class PublicDashboardServer(ThreadingHTTPServer):
         content_type: str,
         cache_control: str,
     ) -> PreparedResponse:
-        """Return a precompressed static response and invalidate it by mtime."""
+        """Reuse immutable bytes until metadata changes, including atomic swaps."""
 
-        metadata = target.stat()
+        signature = metadata_signature(target.stat())
         with self._static_cache_lock:
             cached = self._static_cache.get(target)
             if (
                 cached is not None
-                and cached.modified_ns == metadata.st_mtime_ns
-                and cached.size == metadata.st_size
+                and cached.signature == signature
             ):
-                self.traffic_observer.record_cache("static_hit")
+                self._cache_observation("static_hit")
                 return cached.response
         response = _prepared(
             target.read_bytes(),
             content_type=content_type,
             cache_control=cache_control,
         )
-        with self._static_cache_lock:
-            self._static_cache[target] = StaticCacheEntry(
-                modified_ns=metadata.st_mtime_ns,
-                size=metadata.st_size,
-                response=response,
-            )
-        self.traffic_observer.record_cache("static_build")
+        if metadata_signature(target.stat()) == signature:
+            with self._static_cache_lock:
+                self._static_cache[target] = StaticCacheEntry(signature=signature, response=response)
+        self._cache_observation("static_build")
         return response
 
     def _store_cached_response(
@@ -1079,7 +1122,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             if cached is not None:
                 cached.last_accessed_at = observed
                 if cached.expires_at > observed:
-                    self.traffic_observer.record_cache("fresh_hit")
+                    self._cache_observation("fresh_hit")
                     return cached.response
                 key_lock = self._cache_key_locks.setdefault(cache_key, threading.Lock())
                 if cached.stale_until > observed:
@@ -1094,7 +1137,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 stale_response = None
 
         if stale_response is not None:
-            self.traffic_observer.record_cache("stale_hit")
+            self._cache_observation("stale_hit")
             if start_background:
                 threading.Thread(
                     target=self._background_refresh,
@@ -1110,16 +1153,20 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 ).start()
             return stale_response
 
+        lock_started = time.perf_counter()
         with key_lock:
+            metrics = getattr(self.request_metrics, "current", None)
+            if metrics is not None:
+                metrics["cache_wait_ms"] += (time.perf_counter() - lock_started) * 1000
             with self._cache_lock:
                 observed = time.monotonic()
                 cached = self._cache.get(cache_key)
                 if cached is not None and cached.expires_at > observed:
                     cached.last_accessed_at = observed
-                    self.traffic_observer.record_cache("coalesced_hit")
+                    self._cache_observation("coalesced_hit")
                     return cached.response
-            self.traffic_observer.record_cache("build")
-            response = builder()
+            self._cache_observation("build")
+            response = self._measured_build(builder)
             self._store_cached_response(
                 cache_key,
                 response,
@@ -1351,6 +1398,10 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     start_date=start_date,
                     end_date=end_date,
                     resolution=resolution,
+                    # The gateway already retains the serialized and compressed
+                    # response. Keeping the decoded graph too doubles the
+                    # largest dashboard allocation without reducing latency.
+                    use_memory_cache=False,
                 )
             ),
         )
@@ -1494,6 +1545,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     start_date=start_date,
                     end_date=end_date,
                     resolution=resolution,
+                    use_memory_cache=False,
                 )
             ),
         )
@@ -1596,12 +1648,41 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "provider_summaries",
                     "integrity_checks",
                     "definitions",
+                    # Physical groups are the overview immediately above the
+                    # registry. They are small enough for first paint; the
+                    # per-source records remain on the deferred detail route.
+                    "groups",
                 )
                 if key in payload
             }
 
         return self.cached_local_json(
             cache_key="data-monitor-summary",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=build,
+        )
+
+    def data_monitor_details(self) -> PreparedResponse:
+        """Return the deferred source registry without repeating the overview."""
+
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            return {
+                key: payload[key]
+                for key in (
+                    "schema_version",
+                    "generated_at_utc",
+                    "read_only",
+                    "production_control_possible",
+                    "sources",
+                )
+                if key in payload
+            }
+
+        return self.cached_local_json(
+            cache_key="data-monitor-details",
             ttl_seconds=8.0,
             cache_control="no-store",
             stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
@@ -1821,7 +1902,14 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         request_started_ns = getattr(self, "_request_started_ns", None)
         if isinstance(request_started_ns, int):
             elapsed_ms = (time.perf_counter_ns() - request_started_ns) / 1_000_000
-            self.send_header("Server-Timing", f"app;dur={elapsed_ms:.3f}")
+            fields = [f"app;dur={elapsed_ms:.3f}"]
+            metrics = getattr(self.server.request_metrics, "current", None)
+            if metrics is not None:
+                fields.extend((f"cache_wait;dur={metrics['cache_wait_ms']:.3f}",
+                               f"build;dur={metrics['build_ms']:.3f}"))
+                if metrics["cache"]:
+                    fields.append('cache;desc="' + "+".join(sorted(metrics["cache"])) + '"')
+            self.send_header("Server-Timing", ", ".join(fields))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-XSS-Protection", "0")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -1962,6 +2050,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/javascript; charset=utf-8",
                 IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
+            "/dashboard-responsive.css": (
+                self.server.public_static_root / "dashboard-responsive.css",
+                "text/css; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
             "/time-axis.js": (
                 self.server.public_static_root / "time-axis.js",
                 "text/javascript; charset=utf-8",
@@ -1997,9 +2090,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/javascript; charset=utf-8",
                     IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
-            elif suffix == "styles.css":
+            elif suffix == "styles.css" or (
+                prefix == "/traffic/" and suffix == "performance.css"
+            ):
                 routes[path] = (
-                    root / "styles.css",
+                    root / suffix,
                     "text/css; charset=utf-8",
                     IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
@@ -2481,6 +2576,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_status()
         if path == "/data-monitor/api/summary":
             return self.server.data_monitor_summary()
+        if path == "/data-monitor/api/details":
+            return self.server.data_monitor_details()
         if path == "/traffic/api/status":
             payload = self.server.traffic_observer.snapshot(
                 exclude_current_request=True
@@ -2674,6 +2771,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             path = "<invalid>"  # _handle returns a sanitized 400; keep telemetry bounded.
         self._request_started_ns = time.perf_counter_ns()
+        self.server.request_metrics.current = {"cache": set(), "cache_wait_ms": 0., "build_ms": 0., "depth": 0}
         self.__dict__.pop("_stream_first_frame_ms", None)
         self._response_status = int(HTTPStatus.INTERNAL_SERVER_ERROR)
         self._response_body_bytes = 0
@@ -2681,6 +2779,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         try:
             callback()
         finally:
+            self.server.request_metrics.current = None
             # An SSE connection's lifetime is not an HTTP response latency.
             elapsed_ms = getattr(self, "_stream_first_frame_ms", None)
             if elapsed_ms is None:

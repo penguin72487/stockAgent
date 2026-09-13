@@ -9,6 +9,7 @@ const SOURCE = readFileSync(
 );
 
 function fakeDocument(current = "tw-day-trade") {
+  const listeners = new Map();
   const nav = {
     dataset: {dashboardNav: current},
     children: [],
@@ -34,14 +35,21 @@ function fakeDocument(current = "tw-day-trade") {
     createElementNS(_namespace, tagName) {
       return this.createElement(tagName);
     },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(name, listener) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(listener);
+    },
+    removeEventListener(name, listener) { listeners.get(name)?.delete(listener); },
+    dispatchEvent(event) {
+      for (const listener of listeners.get(event.type) || []) listener(event);
+      return true;
+    },
   };
-  return {document, nav};
+  return {document, nav, listeners};
 }
 
-function loadCore({current = "tw-day-trade", fetchImpl} = {}) {
-  const {document, nav} = fakeDocument(current);
+function loadCore({current = "tw-day-trade", fetchImpl, localStorage} = {}) {
+  const {document, nav, listeners} = fakeDocument(current);
   const requests = [];
   const sandbox = {
     AbortController,
@@ -54,13 +62,14 @@ function loadCore({current = "tw-day-trade", fetchImpl} = {}) {
       requests.push({input, options});
       return {ok: true, status: 200, json: async () => ({ok: true})};
     }),
-    location: {href: "https://dashboard.example/tw-day-trade/", origin: "https://dashboard.example"},
+    location: {href: "https://dashboard.example/tw-day-trade/", origin: "https://dashboard.example", pathname: "/tw-day-trade/"},
+    localStorage,
     setInterval,
     setTimeout,
   };
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox, {filename: "dashboard-core.js"});
-  return {core: sandbox.StockAgentDashboard, nav, requests, sandbox};
+  return {core: sandbox.StockAgentDashboard, document, listeners, nav, requests, sandbox};
 }
 
 test("shared navigation renders one canonical route list and current page", () => {
@@ -199,4 +208,96 @@ test("revision subscription keeps polling when EventSource is unavailable", () =
   const subscription = core.subscribeRevisions("api/updates", () => assert.fail("no stream"), () => { fallbacks++; });
   assert.equal(fallbacks, 1);
   subscription.dispose();
+});
+
+function stalledBodyFetch(_input, {signal}) {
+  return Promise.resolve({ok: true, status: 200, json: () => new Promise((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener("abort", () => reject(signal.reason), {once: true});
+  })});
+}
+
+test("body timeout remains armed after headers arrive", async () => {
+  const {core} = loadCore({fetchImpl: stalledBodyFetch});
+  await assert.rejects(core.fetchJson("/api/status", {timeoutMs: 20}), e => e.name === "TimeoutError");
+  assert.equal(core.performanceSnapshot().at(-1).outcome, "TimeoutError");
+});
+
+test("superseding a request aborts body consumption after headers", async () => {
+  const {core} = loadCore({fetchImpl: stalledBodyFetch});
+  const controller = new AbortController();
+  const response = await core.fetchWithTimeout("/api/status", {signal: controller.signal});
+  const pending = core.readJsonResponse(response);
+  controller.abort(new DOMException("superseded", "AbortError"));
+  await assert.rejects(pending, e => e.name === "AbortError");
+});
+
+test("JSON completion cleans up cancellation and captures bounded non-query metrics", async () => {
+  let signal;
+  const {core} = loadCore({fetchImpl: async (_input, options) => {
+    signal = options.signal;
+    return {ok: true, status: 200, json: async () => ({}), text: async () => '{"ok":true}'};
+  }});
+  const controller = new AbortController();
+  for (let n=0; n<140; n++) await core.fetchJson("/api/status?private=secret", {signal: controller.signal});
+  controller.abort();
+  assert.equal(signal.aborted, false);
+  const metrics = core.performanceSnapshot();
+  assert.equal(metrics.length, 128);
+  assert.equal(metrics[0].path, "/api/status");
+  assert.ok(metrics[0].headersMs >= 0 && metrics[0].bodyMs >= 0 && metrics[0].parseMs >= 0);
+  metrics[0].path = "changed";
+  assert.equal(core.performanceSnapshot()[0].path, "/api/status");
+});
+
+test("same-origin protection also rejects URL objects and blocks redirects", async () => {
+  const {core, requests} = loadCore();
+  await assert.rejects(core.fetchJson(new URL("https://evil.example/")), /same origin/);
+  await core.fetchJson(new URL("https://dashboard.example/api/status"));
+  assert.equal(requests[0].options.redirect, "error");
+});
+
+test("browser performance history attributes actions without persisting private values", async () => {
+  const stored = new Map();
+  const localStorage = {
+    getItem(key) { return stored.get(key) ?? null; },
+    setItem(key, value) { stored.set(key, String(value)); },
+    removeItem(key) { stored.delete(key); },
+  };
+  const {core, document} = loadCore({localStorage});
+  const target = {
+    tagName: "BUTTON",
+    id: "force-refresh",
+    value: "DO-NOT-STORE",
+    dataset: {},
+    getAttribute() { return null; },
+    closest(selector) { return selector === "[data-performance-ignore]" ? null : this; },
+  };
+  document.dispatchEvent({type: "click", target, timeStamp: Date.now()});
+  await core.fetchJson("/api/status?private=secret");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const history = core.performanceHistorySnapshot();
+  assert.ok(history.some((row) => row.kind === "interaction" && row.action === "button:force-refresh"));
+  assert.ok(history.some((row) => row.kind === "api" && row.action === "button:force-refresh" && row.requestPath === "/api/status"));
+  const serialized = JSON.stringify([...stored.values()]);
+  assert.doesNotMatch(serialized, /DO-NOT-STORE|private=secret/);
+  history[0].route = "/changed/";
+  assert.notEqual(core.performanceHistorySnapshot()[0].route, "/changed/");
+
+  core.clearPerformanceHistory();
+  assert.equal(core.performanceHistorySnapshot().length, 0);
+  assert.equal(stored.size, 0);
+});
+
+test("browser performance history bounds a noisy metric series", async () => {
+  const {core} = loadCore();
+  for (let index = 0; index < 40; index += 1) {
+    await core.fetchJson("/api/status");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const apiRows = core.performanceHistorySnapshot().filter((row) => row.kind === "api");
+  assert.equal(apiRows.length, 32);
+  assert.equal(core.PERFORMANCE_HISTORY_LIMIT, 256);
+  assert.equal(core.PERFORMANCE_SCHEMA_VERSION, 1);
 });

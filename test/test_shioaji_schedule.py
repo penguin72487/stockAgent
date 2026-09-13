@@ -161,6 +161,9 @@ def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
     assert 'not bool(run_payload.get("stopped_for_traffic"))' in minute_runner
     assert "run_payload = payload" in minute_runner
     assert "latest_run_summary.json" not in minute_runner
+    assert "run_fintech_python -m scripts.build_shioaji_tw_minute_dataset" in minute_runner
+    assert "run_fintech_python scripts/build_shioaji_tw_minute_dataset.py" not in minute_runner
+    assert "run_fintech_python -m scripts.audit_shioaji_tw_minute_dataset" in minute_runner
 
 
 def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) -> None:

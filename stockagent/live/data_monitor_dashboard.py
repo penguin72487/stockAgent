@@ -4139,6 +4139,32 @@ def _operation_state(
             str(row.get("status_label") or "API 憑證存在性稽核"),
         )
 
+    # Product inventory rows describe both executable acquisitions and explicit
+    # capability boundaries.  A provider that does not offer a grain is a
+    # reference fact, not a failed download.  Likewise, a product held behind
+    # an unconfigured credential is deferred by that control gate; the separate
+    # credential row remains visible.  Counting either case as an active
+    # ``unable`` endpoint made the overall monitor critical even though there
+    # was no runnable job that could succeed.
+    if scope == "product_granularity":
+        implementation = str(row.get("implementation") or "")
+        if implementation == "not_available":
+            return (
+                "reference",
+                "not_applicable",
+                str(row.get("status_label") or "供應商不提供此資料粒度"),
+            )
+        credential_state = str(row.get("credential_state") or "not_required")
+        if (
+            "credential_gate" in implementation
+            and credential_state not in {"configured", "not_required"}
+        ):
+            return (
+                "deferred",
+                "waiting_credential",
+                str(row.get("status_label") or "等待必要憑證設定"),
+            )
+
     if row.get("registry_alias") is True:
         return (
             "reference",
@@ -4483,14 +4509,15 @@ def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
         "waiting": 4,
         "idle_current": 5,
         "on_demand": 6,
-        "deferred": 7,
-        "control": 8,
-        "registry_alias": 9,
-        "not_applicable": 10,
-        "not_configured": 11,
-        "failed": 12,
-        "blocked": 13,
-        "unknown": 14,
+        "waiting_credential": 7,
+        "deferred": 8,
+        "control": 9,
+        "registry_alias": 10,
+        "not_applicable": 11,
+        "not_configured": 12,
+        "failed": 13,
+        "blocked": 14,
+        "unknown": 15,
     }
     eta = _number((row.get("eta") or {}).get("remaining_seconds"))
     next_run = _parse_time((row.get("automation") or {}).get("next_run_at_utc"))

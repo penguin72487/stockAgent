@@ -1540,19 +1540,25 @@ def _build_pipelines(
         else None
     )
     minute_data_through = str((minute_audit or {}).get("last_date") or "")
-    minute_run_complete = bool(
+    minute_run_terminal = bool(
         (minute_run_summary or {}).get("resumable_collection_complete")
-        and (minute_run_summary or {}).get("selected_coverage_complete")
         and not (minute_run_summary or {}).get("stopped_for_traffic")
         and not (minute_run_summary or {}).get("stopped_for_market_hours")
         and int((minute_run_summary or {}).get("selected_symbols") or 0)
         == int((minute_run_summary or {}).get("reported_symbols") or -1)
     )
-    minute_current = bool(
+    minute_run_complete = bool(
+        minute_run_terminal
+        and (minute_run_summary or {}).get("selected_coverage_complete")
+    )
+    minute_target_reached = bool(
         minute_research_ready
-        and minute_run_complete
+        and minute_run_terminal
         and minute_target_date
         and minute_data_through >= minute_target_date
+    )
+    minute_current = bool(
+        minute_target_reached and minute_run_complete
     )
     minute_total = int(
         (minute_run_summary or {}).get("selected_symbols")
@@ -1715,6 +1721,13 @@ def _build_pipelines(
     if minute_current:
         minute_state, minute_label = "ready", "已追到最新交易日"
         minute_eta = _complete_eta("分鐘來源與 research_ready 稽核皆已追到目標交易日。")
+    elif minute_target_reached:
+        minute_state, minute_label = "partial", "已追到最新交易日；來源缺口已遮罩"
+        minute_eta = _eta(
+            "source_gaps",
+            confidence="none",
+            basis="目標交易日已完成；來源缺口與不可用合約仍保留為降級證據。",
+        )
     elif (minute_run_summary or {}).get("stopped_for_traffic"):
         minute_state, minute_label = "waiting", "流量保護暫停"
         minute_eta = _eta(
@@ -1877,6 +1890,8 @@ def _build_pipelines(
             "status_label": (
                 "研究稽核已追到最新"
                 if minute_current
+                else "研究稽核已追到最新；來源缺口已遮罩"
+                if minute_target_reached
                 else "既有研究資料可用；等待最新來源"
                 if minute_research_ready
                 else "等待完整稽核"
@@ -1892,6 +1907,12 @@ def _build_pipelines(
             "eta": (
                 _complete_eta("本機分鐘研究資料的全量稽核已通過。")
                 if minute_current
+                else _eta(
+                    "source_gaps",
+                    confidence="none",
+                    basis="研究資料已到目標交易日；來源缺口與不可用合約仍明列。",
+                )
+                if minute_target_reached
                 else _eta(
                     "waiting_upstream",
                     confidence="none",

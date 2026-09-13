@@ -682,7 +682,15 @@ def parse_mops_stock_delivery_detail(
     if key.symbol not in compact[:1000]:
         raise ValueError(f"MOPS stock-delivery detail symbol differs for {key}")
     issued = re.search(r"(?:計)?發行新股([0-9,]+)股", compact)
-    ratio = re.search(r"每[仟千]股(?:無償)?(?:派發|配發)([0-9,.]+)股", compact)
+    # Historical issuer notices occasionally put a sentence dot directly
+    # between the decimal and the unit (for example ``99.2436.股``).  Keep
+    # that punctuation outside the captured number instead of handing an
+    # invalid trailing dot to ``float``.
+    ratio = re.search(
+        r"每[仟千]股(?:無償)?(?:派發|配發)"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)(?:\.)?股",
+        compact,
+    )
     record = re.search(
         r"(?:普通股)?增資配股基準日[：:]?(?:本公司訂於)?"
         r"(?:民國)?([0-9]{2,3}年[0-9]{1,2}月[0-9]{1,2}日)",

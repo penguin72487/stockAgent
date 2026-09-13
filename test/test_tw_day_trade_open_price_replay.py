@@ -23,6 +23,41 @@ from stockagent.live.tw_day_trade_simulation import (
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_benchmark_history_timestamp_only_rebuild_is_a_noop(tmp_path: Path) -> None:
+    destination = tmp_path / "benchmark_history.json"
+    original = {
+        "schema_version": 1,
+        "created_at": "2026-09-12T13:30:00+08:00",
+        "marks": [{"benchmark_id": "benchmark_0050", "last_mark_price": 61.2}],
+    }
+    assert benchmark_replay._write_json_if_semantically_changed(
+        destination,
+        original,
+        compact=True,
+    ) is True
+    before = destination.stat()
+    before_bytes = destination.read_bytes()
+
+    rebuilt = {**original, "created_at": "2026-09-13T13:30:00+08:00"}
+    assert benchmark_replay._write_json_if_semantically_changed(
+        destination,
+        rebuilt,
+        compact=True,
+    ) is False
+
+    assert destination.read_bytes() == before_bytes
+    assert destination.stat().st_mtime_ns == before.st_mtime_ns
+
+
+def test_benchmark_history_real_change_is_published(tmp_path: Path) -> None:
+    destination = tmp_path / "benchmark_history.json"
+    first = {"created_at": "first", "marks": [{"last_mark_price": 61.2}]}
+    second = {"created_at": "second", "marks": [{"last_mark_price": 61.3}]}
+    assert benchmark_replay._write_json_if_semantically_changed(destination, first)
+    assert benchmark_replay._write_json_if_semantically_changed(destination, second)
+    assert json.loads(destination.read_text(encoding="utf-8")) == second
+
+
 def test_replay_checks_receipt_backed_repair_kbars_before_bulk_minute_data() -> None:
     roots = replay.DEFAULT_MINUTE_DATA_ROOTS
 

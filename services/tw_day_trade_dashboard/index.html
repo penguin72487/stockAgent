@@ -6,8 +6,9 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股多模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=22">
+  <link rel="stylesheet" href="styles.css?v=24">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=8">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -27,7 +28,7 @@
       <span id="health" class="pill">載入中</span>
       <small id="freshness">—</small>
       <strong>僅模擬，絕不送正式單</strong>
-      <button id="force-refresh" class="secondary" type="button">強制重整</button>
+      <button id="force-refresh" class="secondary" type="button">立即更新資料</button>
     </div>
   </header>
 
@@ -166,7 +167,7 @@
     <section class="grid-two compact">
       <article class="panel table-panel">
         <div class="panel-head"><div><h2>委託與成交事件</h2><p>伺服器分頁呈現所選交易日的全部模擬委託、成交、撤單替換與 OCO 原因</p></div><div class="table-actions"><span id="event-count" class="count"></span><button id="load-more-events" class="secondary hidden" type="button">載入更多</button></div></div>
-        <div class="table-scroll short" tabindex="0" role="region" aria-label="模擬委託與成交事件，可用方向鍵水平捲動"><table><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
+        <div class="table-scroll short" tabindex="0" role="region" aria-label="模擬委託與成交事件"><table class="compact-table event-table"><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
       </article>
       <article class="panel">
         <div class="panel-head"><div><h2>稽核與就緒狀態</h2><p>checkpoint、資料日期、事件筆數與關鍵失敗會留在這裡</p></div></div>
@@ -194,10 +195,10 @@
       <div id="tw-public-monitor-list" class="tw-public-monitor-list"><div class="tw-public-empty">資料尚未載入，請稍後重整。</div></div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=4" defer></script>
+  <script src="../dashboard-core.js?v=7" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
   <script src="presentation.js?v=1" defer></script>
   <script src="detail-components.js?v=5" defer></script>
-  <script src="app.js?v=76" defer></script>
+  <script src="app.js?v=80" defer></script>
 </body>
 </html>

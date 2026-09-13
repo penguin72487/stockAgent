@@ -140,6 +140,37 @@ def _atomic_json(
     os.replace(temporary, path)
 
 
+def _write_json_if_semantically_changed(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    compact: bool = False,
+    volatile_fields: frozenset[str] = frozenset({"created_at"}),
+) -> bool:
+    """Avoid invalidating downstream caches for a timestamp-only rebuild."""
+
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, Mapping):
+            previous = {
+                key: value
+                for key, value in existing.items()
+                if key not in volatile_fields
+            }
+            current = {
+                key: value
+                for key, value in payload.items()
+                if key not in volatile_fields
+            }
+            if previous == current:
+                return False
+    _atomic_json(path, payload, compact=compact)
+    return True
+
+
 def _finite(value: object) -> float | None:
     try:
         number = float(value)
@@ -1473,7 +1504,7 @@ def main() -> None:
             f"TX benchmark minute cardinality mismatch: {tx_rows} != {expected_tx_rows}"
         )
     destination = state_dir / BENCHMARK_HISTORY_FILENAME
-    _atomic_json(destination, output, compact=True)
+    changed = _write_json_if_semantically_changed(destination, output, compact=True)
     print(
         json.dumps(
             {
@@ -1493,6 +1524,7 @@ def main() -> None:
                 ),
                 **output["counts"],
                 "additional_shioaji_requests": 0,
+                "changed": changed,
             },
             ensure_ascii=False,
             sort_keys=True,

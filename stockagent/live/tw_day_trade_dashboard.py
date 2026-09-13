@@ -20,6 +20,7 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
+from stockagent.live.dashboard_updates import metadata_signature
 from stockagent.live.performance_contract import capital_return, paper_account_performance
 from stockagent.live.market_status import _tw_holiday_schedule_path, verified_tw_stock_session_day
 
@@ -84,13 +85,15 @@ _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
 _AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = {}
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
-_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, bytes, dict[str, Any]]] = {}
+_OBJECT_CACHE: dict[Path, tuple[tuple[int, ...], bytes, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
+_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 1
+_HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
 _COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
 _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
@@ -460,31 +463,25 @@ def build_dashboard_revision(
 
 def _object(path: Path) -> dict[str, Any]:
     cache_key = path.resolve()
-    raw = path.read_bytes()
-    stat = path.stat()
-    signature = (
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-        hashlib.blake2b(raw, digest_size=16).digest(),
-    )
+    signature = metadata_signature(path.stat())
     with _OBJECT_CACHE_LOCK:
         cached = _OBJECT_CACHE.get(cache_key)
-        if cached is not None and cached[:5] == signature:
-            return dict(cached[5])
+        if cached is not None and cached[0] == signature:
+            return dict(cached[2])
+    # Bind bytes to the open descriptor, not a new pathname after replacement.
+    with path.open("rb") as stream:
+        opened = metadata_signature(os.fstat(stream.fileno()))
+        raw = stream.read()
+        finished = metadata_signature(os.fstat(stream.fileno()))
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
-    final_stat = path.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) == signature[:4]:
+    if signature == opened == finished == metadata_signature(path.stat()):
+        digest = hashlib.blake2b(raw, digest_size=16).digest()
         with _OBJECT_CACHE_LOCK:
-            _OBJECT_CACHE[cache_key] = (*signature, payload)
+            _OBJECT_CACHE[cache_key] = (signature, digest, payload)
+            while len(_OBJECT_CACHE) > 512:
+                _OBJECT_CACHE.pop(next(iter(_OBJECT_CACHE)))
     return dict(payload)
 
 
@@ -1863,6 +1860,116 @@ def _persistent_benchmark_history_path(source: Path) -> Path | None:
     return root / f"benchmark-history-index-v1-{digest}.json.gz"
 
 
+def _persistent_history_projection_path(state_dir: Path) -> Path | None:
+    cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256(str(Path(state_dir).resolve()).encode("utf-8")).hexdigest()
+    return root / f"history-projection-all-1m-v1-{digest}.json.gz"
+
+
+def _history_projection_source_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_persistent_history_projection(
+    state_dir: Path,
+    *,
+    source_fingerprint: str,
+) -> dict[str, Any] | None:
+    cache_path = _persistent_history_projection_path(state_dir)
+    if cache_path is None or not cache_path.is_file():
+        return None
+    try:
+        if cache_path.stat().st_size > _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES:
+            return None
+        envelope = json.loads(gzip.decompress(cache_path.read_bytes()))
+        if (
+            not isinstance(envelope, Mapping)
+            or int(envelope.get("cache_schema_version") or 0)
+            != _HISTORY_PROJECTION_CACHE_SCHEMA_VERSION
+            or envelope.get("source_fingerprint") != source_fingerprint
+        ):
+            return None
+        snapshot = envelope.get("snapshot")
+        if (
+            not isinstance(snapshot, dict)
+            or int(snapshot.get("schema_version") or 0) != DASHBOARD_SCHEMA_VERSION
+            or snapshot.get("range") != "all"
+            or snapshot.get("history_encoding") != "minute_columns_v1"
+            or snapshot.get("history") != []
+            or not isinstance(snapshot.get("minute_series"), list)
+        ):
+            return None
+        returned_points = int(snapshot.get("returned_points") or 0)
+        observed_points = sum(
+            len(series.get("points") or ())
+            for series in snapshot["minute_series"]
+            if isinstance(series, Mapping)
+        )
+        if returned_points < 0 or observed_points != returned_points:
+            return None
+        return snapshot
+    except (
+        EOFError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        gzip.BadGzipFile,
+    ):
+        return None
+
+
+def _persist_history_projection(
+    state_dir: Path,
+    *,
+    source_fingerprint: str,
+    snapshot: Mapping[str, Any],
+) -> None:
+    cache_path = _persistent_history_projection_path(state_dir)
+    if cache_path is None:
+        return
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        encoded = json.dumps(
+            {
+                "cache_schema_version": _HISTORY_PROJECTION_CACHE_SCHEMA_VERSION,
+                "source_fingerprint": source_fingerprint,
+                "snapshot": snapshot,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        compressed = gzip.compress(encoded, compresslevel=1)
+        if len(compressed) > _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES:
+            return
+        with temporary.open("xb") as handle:
+            handle.write(compressed)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, cache_path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _make_benchmark_history_index(
     payload: Mapping[str, Any], *, stat: os.stat_result
 ) -> _BenchmarkHistoryIndex:
@@ -2702,6 +2809,30 @@ def _operational_issues(
                 detail=execution_details.get(engine_status, "執行器偵測到安全性或資料契約錯誤，未繼續建立新部位。"),
                 observed_at=mode.get("signal_at"),
             )
+        open_position_count = int(mode.get("open_position_count") or 0)
+        if market and market.startswith("tw_day_trade") and open_position_count:
+            stale_position_count = int(mode.get("stale_position_count") or 0)
+            force_exit_failures = int(mode.get("force_exit_failures") or 0)
+            add(
+                severity="error",
+                scope="mode",
+                market=market,
+                code="intraday_residual_open",
+                title=f"{label} 仍有當日殘餘部位",
+                detail=(
+                    f"仍有 {open_position_count} 筆模擬持倉未於當日清倉；"
+                    f"其中 {stale_position_count} 筆估值已過期，"
+                    f"強制退出失敗 {force_exit_failures} 次。"
+                    f"執行器狀態：{engine_status or 'unknown'}。"
+                    "這是必須優先沖銷的異常殘餘，不是正常隔夜持倉或券商成交保證。"
+                ),
+                count=open_position_count,
+                observed_at=(
+                    mode.get("residual_conversion_completed_at")
+                    or mode.get("closing_auction_settled_at")
+                    or mode.get("last_mark_at")
+                ),
+            )
         outcome = str(mode.get("today_execution_outcome") or "")
         if outcome in {"no_fill", "partial", "blocked"}:
             add(
@@ -2991,6 +3122,8 @@ def build_dashboard_history_snapshot(
     end_date: str | datetime_date | None = None,
     maximum_points_per_series: int = 2_000,
     resolution: str = "sampled",
+    use_memory_cache: bool = True,
+    use_persistent_cache: bool = True,
 ) -> dict[str, Any]:
     """Return cross-session strategy and total-return benchmark curves.
 
@@ -3169,10 +3302,59 @@ def build_dashboard_history_snapshot(
         overnight_history_signature,
         selected_span_signature(live_benchmark_index),
     )
-    with _HISTORY_SNAPSHOT_CACHE_LOCK:
-        cached_history = _HISTORY_SNAPSHOT_CACHE.get(history_cache_key)
-        if cached_history is not None:
-            return dict(cached_history)
+    persistent_projection_eligible = bool(
+        use_persistent_cache
+        and normalized_range == "all"
+        and resolution == "1m"
+        and selected_start is None
+        and selected_end is None
+    )
+    projection_source_fingerprint = _history_projection_source_fingerprint(
+        {
+            "dashboard_schema_version": DASHBOARD_SCHEMA_VERSION,
+            "product": str(state.get("product") or "tw_day_trade"),
+            "marks": selected_span_signature(marks_index),
+            "benchmark_history": (
+                benchmark_history.device,
+                benchmark_history.inode,
+                benchmark_history.size,
+                benchmark_history.modified_ns,
+            ),
+            "overnight_history": overnight_history_signature,
+            "live_benchmark": selected_span_signature(live_benchmark_index),
+        }
+    )
+    if use_memory_cache:
+        with _HISTORY_SNAPSHOT_CACHE_LOCK:
+            cached_history = _HISTORY_SNAPSHOT_CACHE.get(history_cache_key)
+            if cached_history is not None:
+                return dict(cached_history)
+    if persistent_projection_eligible:
+        persisted_history = _load_persistent_history_projection(
+            root,
+            source_fingerprint=projection_source_fingerprint,
+        )
+        if persisted_history is not None:
+            if use_memory_cache:
+                with _HISTORY_SNAPSHOT_CACHE_LOCK:
+                    if (
+                        len(_HISTORY_SNAPSHOT_CACHE)
+                        >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES
+                    ):
+                        _HISTORY_SNAPSHOT_CACHE.pop(
+                            next(iter(_HISTORY_SNAPSHOT_CACHE))
+                        )
+                    _HISTORY_SNAPSHOT_CACHE[history_cache_key] = persisted_history
+            return dict(persisted_history)
+
+    # Several accounts and all benchmarks share the same observed minute.
+    # Convert its clock once; do not infer missing minutes or alter timezone rules.
+    @lru_cache(maxsize=32768)
+    def observed_clock(timestamp_seconds: float):
+        utc = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+        local = utc.astimezone(TAIPEI)
+        return (local.timetz().replace(tzinfo=None), utc.isoformat(timespec="minutes"),
+                local.date().isoformat())
 
     def add(source: Mapping[str, Any], *, series_type: str, canonical: bool = False) -> None:
         row = source  # read-only projection: no copy of discarded private fields
@@ -3184,10 +3366,7 @@ def build_dashboard_history_snapshot(
         timestamp_seconds = _chart_timestamp(row)
         if not series_id or timestamp_seconds is None:
             return
-        local_observed = datetime.fromtimestamp(
-            timestamp_seconds, tz=timezone.utc
-        ).astimezone(TAIPEI)
-        local_clock = local_observed.timetz().replace(tzinfo=None)
+        local_clock, minute, session_date = observed_clock(timestamp_seconds)
         if series_type == "strategy" and not (
             (
                 local_clock.hour == 9
@@ -3223,10 +3402,6 @@ def build_dashboard_history_snapshot(
             return
         if total_equity is None and initial_capital is not None:
             total_equity = initial_capital * wealth_index
-        minute = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc).isoformat(
-            timespec="minutes"
-        )
-        session_date = local_observed.date().isoformat()
         point_key = (series_id, minute)
         if not canonical and point_key in canonical_benchmark_keys:
             # A historical Close/reference mark and an old live Bid/Ask mark
@@ -3373,7 +3548,7 @@ def build_dashboard_history_snapshot(
         grouped.setdefault(str(row["series_id"]), []).append(row)
     range_summary: list[dict[str, Any]] = []
     for series_id, series_rows in sorted(grouped.items()):
-        series_rows.sort(key=lambda row: float(row["timestamp_seconds"]))
+        # Grouping preserves the already sorted global chronology.
         first = series_rows[0]
         last = series_rows[-1]
         baseline_wealth = float(first["_wealth_index"])
@@ -3464,15 +3639,13 @@ def build_dashboard_history_snapshot(
             series_rows, maximum_points=int(maximum_points_per_series)
         )
     ]
-    sampled.sort(key=lambda row: (float(row["timestamp_seconds"]), row["series_id"]))
-    for row in sampled:
-        for internal_key in (
-            "timestamp_seconds",
-            "_initial_capital_twd",
-            "_total_equity_twd",
-            "_wealth_index",
-        ):
-            row.pop(internal_key, None)
+    if resolution != "1m":
+        sampled.sort(key=lambda row: (float(row["timestamp_seconds"]), row["series_id"]))
+        for row in sampled:
+            for internal_key in (
+                "timestamp_seconds", "_initial_capital_twd", "_total_equity_twd", "_wealth_index",
+            ):
+                row.pop(internal_key, None)
     coverage_start = sampled[0]["minute"] if sampled else None
     coverage_end = sampled[-1]["minute"] if sampled else None
     payload = {
@@ -3557,7 +3730,7 @@ def build_dashboard_history_snapshot(
                 "series_type": values[0]["series_type"],
                 "points": [
                     [
-                        int(_timestamp(row["minute"]).timestamp() // 60),
+                        int(row["timestamp_seconds"] // 60),
                         row["return_pct"],
                         row["cumulative_return_pct"],
                         int(row["valuation_stale"])
@@ -3570,10 +3743,17 @@ def build_dashboard_history_snapshot(
             for series_id, values in grouped.items()
         ]
         payload["history"] = []
-    with _HISTORY_SNAPSHOT_CACHE_LOCK:
-        if len(_HISTORY_SNAPSHOT_CACHE) >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES:
-            _HISTORY_SNAPSHOT_CACHE.pop(next(iter(_HISTORY_SNAPSHOT_CACHE)))
-        _HISTORY_SNAPSHOT_CACHE[history_cache_key] = payload
+    if persistent_projection_eligible:
+        _persist_history_projection(
+            root,
+            source_fingerprint=projection_source_fingerprint,
+            snapshot=payload,
+        )
+    if use_memory_cache:
+        with _HISTORY_SNAPSHOT_CACHE_LOCK:
+            if len(_HISTORY_SNAPSHOT_CACHE) >= _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES:
+                _HISTORY_SNAPSHOT_CACHE.pop(next(iter(_HISTORY_SNAPSHOT_CACHE)))
+            _HISTORY_SNAPSHOT_CACHE[history_cache_key] = payload
     return dict(payload)
 
 
