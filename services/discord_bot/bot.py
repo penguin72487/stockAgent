@@ -4,6 +4,7 @@ import asyncio
 import copy
 import csv
 import fcntl
+import importlib.metadata
 import json
 import math
 import os
@@ -1217,7 +1218,7 @@ def _preopen_market_ready_for_session(
         return False
     if bool(getattr(cfg, "overnight_simulation_enabled", False)):
         return bool(
-            row.get("warm_contract") == "overnight_13_25_model_cache"
+            row.get("warm_contract") == "overnight_13_20_model_cache"
             and row.get("panel_date")
             and row.get("checkpoint_fingerprint")
             and int(row.get("symbol_count") or 0) > 0
@@ -1271,7 +1272,7 @@ def _preopen_market_final_armed_for_session(
     if bool(getattr(cfg, "overnight_simulation_enabled", False)):
         return bool(
             common_ready
-            and final_arm.get("warm_contract") == "overnight_13_25_model_cache"
+            and final_arm.get("warm_contract") == "overnight_13_20_model_cache"
         )
     return bool(
         common_ready
@@ -1593,6 +1594,49 @@ def _write_artifact_backfill_status(payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _record_artifact_maintenance_run(
+    status: str,
+    *,
+    reason: str | None = None,
+    attempted: int = 0,
+    failures: int = 0,
+    deferred: int = 0,
+) -> dict[str, Any]:
+    """Persist worker state without rewriting per-market success or failure."""
+
+    observed = datetime.now().astimezone()
+    with _artifact_backfill_status_guard():
+        payload = _load_artifact_backfill_status()
+        previous = payload.get("maintenance_run")
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        row = {
+            "status": str(status),
+            "reason": str(reason) if reason else None,
+            "attempted": int(attempted),
+            "failures": int(failures),
+            "deferred": int(deferred),
+            "run_id": _BOT_RUN_ID,
+            "updated_at": observed.isoformat(timespec="seconds"),
+        }
+        if status == "running":
+            row["started_at"] = (
+                previous["started_at"]
+                if previous.get("run_id") == _BOT_RUN_ID
+                and previous.get("started_at")
+                else observed.isoformat(timespec="seconds")
+            )
+        elif previous.get("run_id") == _BOT_RUN_ID and previous.get("started_at"):
+            row["started_at"] = previous["started_at"]
+            row["completed_at"] = observed.isoformat(timespec="seconds")
+        else:
+            row["completed_at"] = observed.isoformat(timespec="seconds")
+        payload["maintenance_run"] = row
+        payload["schema_version"] = max(2, int(payload.get("schema_version") or 1))
+        payload["updated_at"] = observed.isoformat(timespec="seconds")
+        _write_artifact_backfill_status(payload)
+    return dict(row)
+
+
 def _artifact_backfill_retry_delay_seconds(attempt: int) -> float:
     base = max(
         60.0,
@@ -1654,7 +1698,7 @@ def _begin_artifact_backfill(key: str, market: str) -> dict[str, Any]:
         if len(jobs) > 64:
             for stale_key in list(jobs)[:-64]:
                 jobs.pop(stale_key, None)
-        payload["schema_version"] = 1
+        payload["schema_version"] = max(2, int(payload.get("schema_version") or 1))
         payload["updated_at"] = observed.isoformat(timespec="seconds")
         _write_artifact_backfill_status(payload)
     return dict(job)
@@ -1706,7 +1750,7 @@ def _finish_artifact_backfill(
                 }
             )
         jobs[str(key)] = job
-        payload["schema_version"] = 1
+        payload["schema_version"] = max(2, int(payload.get("schema_version") or 1))
         payload["updated_at"] = observed.isoformat(timespec="seconds")
         _write_artifact_backfill_status(payload)
     return dict(job)
@@ -1733,12 +1777,29 @@ def _artifact_backfill_health_summary() -> dict[str, Any]:
     current = list(latest_by_market.values())
     failures = [row for row in current if row.get("status") == "failed"]
     running = [row for row in current if row.get("status") == "running"]
+    maintenance_run = payload.get("maintenance_run")
+    maintenance_run = (
+        dict(maintenance_run) if isinstance(maintenance_run, dict) else {}
+    )
+    worker_status = str(maintenance_run.get("status") or "")
+    if failures or worker_status == "degraded":
+        aggregate_status = "degraded"
+    elif running or worker_status == "running":
+        aggregate_status = "running"
+    elif worker_status in {"waiting_source", "deferred"}:
+        aggregate_status = worker_status
+    else:
+        aggregate_status = "ready"
     return {
-        "status": "degraded" if failures else "running" if running else "ready",
+        "status": aggregate_status,
         "failed_count": len(failures),
+        "failed_markets": sorted(str(row.get("market")) for row in failures),
         "running_count": len(running),
         "market_count": len(current),
         "updated_at": payload.get("updated_at"),
+        "worker_status": maintenance_run.get("status"),
+        "worker_reason": maintenance_run.get("reason"),
+        "worker_updated_at": maintenance_run.get("updated_at"),
     }
 
 
@@ -3783,7 +3844,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
         if not status.data.fresh:
             _require_fresh_data_for_artifact_generation(cfg, status)
         if bool(getattr(cfg, "overnight_simulation_enabled", False)):
-            # The 13:25 adapter needs the completed panel, checkpoint, model,
+            # The 13:20 adapter needs the completed panel, checkpoint, model,
             # and CUDA kernels hot.  Same-session day-trade eligibility and
             # the 09:00 MIS opening receipt are unrelated to a close-auction
             # decision and must not delay or falsely gate this product.
@@ -3806,7 +3867,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
                 ),
                 progress_label=f"preclose:{cfg.market}",
                 # This pass is cache preparation only.  The immutable signal
-                # still uses the latest-quote observation at 13:25.
+                # still uses the latest-quote observation at 13:20.
                 day_trade_model_observation="session_open",
             )
             kwargs.update(
@@ -3816,7 +3877,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
             )
             with _MODEL_INFERENCE_LOCK:
                 result = generate_live_signal(**kwargs)
-            result.summary["warm_contract"] = "overnight_13_25_model_cache"
+            result.summary["warm_contract"] = "overnight_13_20_model_cache"
             update_progress(progress_total, "overnight model cache ready")
             _write_preopen_readiness(
                 cfg,
@@ -3992,7 +4053,7 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
         if missing:
             raise RuntimeError(f"preopen final arm cache proof failed: {missing}")
         if overnight:
-            result.summary["warm_contract"] = "overnight_13_25_model_cache"
+            result.summary["warm_contract"] = "overnight_13_20_model_cache"
         else:
             result.summary["opening_source_prewarm"] = opening_source_prewarm
             result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
@@ -6543,6 +6604,24 @@ def _formal_history_timeout_seconds(cfg: LiveMarketConfig) -> int:
     return max(60, int(configured))
 
 
+def _formal_history_compile_cache_namespace() -> str:
+    """Separate operational compiler caches at every relevant ABI boundary."""
+
+    def distribution_version(name: str) -> str:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return "missing"
+
+    epoch = _env("STOCKAGENT_FORMAL_HISTORY_COMPILE_CACHE_EPOCH", "v1") or "v1"
+    identity = (
+        f"formal-history-{epoch}-py{sys.version_info.major}.{sys.version_info.minor}"
+        f"-torch{distribution_version('torch')}"
+        f"-triton{distribution_version('triton')}"
+    )
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", identity).strip(".-")
+
+
 def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> bool:
     target_date = (
         getattr(status.data, "expected_latest_date", None)
@@ -6598,7 +6677,13 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
         completed = subprocess.run(
             command,
             cwd=ROOT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+                "STOCKAGENT_COMPILE_CACHE_NAMESPACE": (
+                    _formal_history_compile_cache_namespace()
+                ),
+            },
             timeout=timeout_seconds,
             check=False,
         )

@@ -18,6 +18,16 @@ ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_services.sh"
 Nice=-5
 CPUWeight=100
 IOWeight=100
+# Preserve the stateful paper execution engine ahead of reproducible bulk
+# refresh/audit workers when the kernel must select an OOM victim.
+OOMScoreAdjust=-500
+# Measured peak was below 1 GiB.  Keep wide headroom for model/config growth,
+# but contain a leak inside this restartable cgroup instead of the whole host.
+MemoryAccounting=true
+MemoryHigh=8G
+MemoryMax=16G
+MemorySwapMax=2G
+TasksMax=2048
 Restart=always
 RestartSec=1s
 # Historical 09:01 recovery is a bounded request/reply batch.  Individual

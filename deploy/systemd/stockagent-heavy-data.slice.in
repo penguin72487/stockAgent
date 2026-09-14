@@ -1,0 +1,14 @@
+[Unit]
+Description=Aggregate memory safety boundary for resumable heavy data work
+
+[Slice]
+MemoryAccounting=true
+# The host has 94 GiB RAM.  The 08:30 audit has peaked near 59 GiB and the
+# historical backfill near 75 GiB.  Constrain their aggregate, not just each
+# child, so delayed retries cannot sum to host-wide OOM pressure.  Core paper
+# execution, Discord, source events and the public gateway are outside this
+# slice and retain at least roughly 18 GiB plus their bounded swap allowance.
+MemoryHigh=64G
+MemoryMax=76G
+MemorySwapMax=12G
+TasksMax=8192

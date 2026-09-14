@@ -261,14 +261,8 @@ def _build_commands(
         live_root=live_root,
         expected_latest=expected_date,
         workers=workers,
+        public_feature_incremental_days=public_feature_incremental_days,
     )
-    if public_feature_incremental_days:
-        commands[-1].extend(
-            [
-                "--incremental-tail-days",
-                str(int(public_feature_incremental_days)),
-            ]
-        )
     return commands
 
 

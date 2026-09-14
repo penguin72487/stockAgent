@@ -844,7 +844,9 @@ def _load_exact_cash_entitlements(
     )
     if bool((np.isnat(dates) | (symbols == "")).any()):
         raise ValueError("TW exact entitlement archive contains invalid event keys")
-    if not bool(np.isin(handling, ["exact_cash", "avoid"]).all()):
+    if not bool(
+        np.isin(handling, ["exact_cash", "exact_inventory", "avoid"]).all()
+    ):
         raise ValueError("TW exact entitlement archive contains an unknown handling mode")
     order = np.lexsort((dates, symbols))
     if dates.size > 1:

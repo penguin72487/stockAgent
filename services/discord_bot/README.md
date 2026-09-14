@@ -218,6 +218,15 @@ Operational files:
     not masquerade as errors from the current process.
 - Durable artifact-maintenance receipt:
   `artifacts/discord_bot/artifact_backfill_status.json`
+  - The isolated worker records `maintenance_run` separately from per-market
+    jobs. A source-writer collision becomes `waiting_source` and is retried for
+    up to 15 minutes by default instead of dropping the scheduled run. Override
+    only when needed with `STOCKAGENT_ARTIFACT_SOURCE_WAIT_SECONDS` and
+    `STOCKAGENT_ARTIFACT_SOURCE_POLL_SECONDS`.
+  - Formal-history subprocesses use a Python/PyTorch/Triton-versioned compiler
+    cache namespace. Increment `STOCKAGENT_FORMAL_HISTORY_COMPILE_CACHE_EPOCH`
+    after a compiler/toolchain ABI change that is not reflected in those
+    package versions; never reuse an incompatible generated CUDA module.
   - Interactive `/signal_now` jobs share this receipt under
     `signal_now_jobs`. A stale job is persisted as `waiting_source`, survives
     bot restarts, and resumes only after canonical source acceptance is fresh.

@@ -1971,6 +1971,25 @@ def test_operational_issues_expose_intraday_residual_but_not_overnight_inventory
     assert "強制退出失敗 1 次" in residuals[0]["detail"]
 
 
+def test_operational_issues_do_not_call_live_intraday_positions_residual() -> None:
+    issues = dashboard_module._operational_issues(
+        modes=[
+            {
+                "market": "tw_day_trade_100m",
+                "label": "當沖",
+                "session_date": "2026-08-13",
+                "engine_status": "active",
+                "open_position_count": 3,
+                "stale_position_count": 0,
+            }
+        ],
+        preopen={},
+        observed=_now(9, 35),
+    )
+
+    assert not any(row["code"] == "intraday_residual_open" for row in issues)
+
+
 def test_entry_sizes_at_open_and_caps_fill_at_half_minute_kbar(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -4932,7 +4951,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=82"' in html
+    assert 'src="app.js?v=84"' in html
     assert 'src="chart-renderer.js?v=1"' in html
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript
@@ -4944,8 +4963,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function matchesMode(" not in javascript
     assert "function matchesSymbol(" not in javascript
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
-    assert 'src="presentation.js?v=1"' in html
-    assert 'src="detail-components.js?v=5"' in html
+    assert 'src="presentation.js?v=2"' in html
+    assert 'src="detail-components.js?v=6"' in html
+    assert "let followLatestSession = true;" in javascript
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript

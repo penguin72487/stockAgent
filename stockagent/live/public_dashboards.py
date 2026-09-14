@@ -641,6 +641,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "simulation_replay",
             "sizing_open_price",
             "sizing_capital_twd",
+            "sizing_price_at_decision",
             "sizing_price_at_13_25",
             "source_signal_at",
             "status",

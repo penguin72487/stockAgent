@@ -45,12 +45,12 @@ def _spec(tmp_path: Path) -> ModeSpec:
 def _summary() -> dict[str, object]:
     return {
         "signal_id": "close-signal-1",
-        "generated_at": _at(9, 13, 25, 1).isoformat(),
-        "signal_ready_at": _at(9, 13, 25, 1).isoformat(),
-        "signal_started_at": _at(9, 13, 25, 0).isoformat(),
+        "generated_at": _at(9, 13, 20, 1).isoformat(),
+        "signal_ready_at": _at(9, 13, 20, 1).isoformat(),
+        "signal_started_at": _at(9, 13, 20, 0).isoformat(),
         "execution_mode": "tw_day_trade",
         "live_session_latest_quote_feature_applied": True,
-        "feature_cutoff_date": "2026-09-09 13:25:00",
+        "feature_cutoff_date": "2026-09-09 13:20:00",
         "checkpoint_fingerprint": "checkpoint-sha",
         "config_fingerprint": "config-sha",
         "weights_path": "artifacts/live_signals/unit/target_weights.parquet",
@@ -169,6 +169,60 @@ def test_close_to_next_open_lifecycle_rejects_both_trial_matches(
     assert position["sell_fee_rate"] > 0.003
 
 
+def test_1300_switch_1320_decision_and_1330_order_deadline(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwOvernightSimulationEngine(tmp_path / "state")
+
+    engine.update_readiness([spec], now=_at(9, 12, 59, 59))
+    assert engine.state["modes"][spec.market]["engine_status"] == (
+        "waiting_13_00_switch"
+    )
+    engine.update_readiness([spec], now=_at(9, 13, 0))
+    assert engine.state["modes"][spec.market]["engine_status"] == (
+        "armed_waiting_13_20_calculation"
+    )
+
+    early = {**_summary(), "signal_id": "early"}
+    early["signal_ready_at"] = _at(9, 13, 19, 59).isoformat()
+    assert engine.register_close_signal(
+        spec=spec,
+        summary=early,
+        signal_rows=[_row()],
+        quotes={"2330": _quote(day=9, hour=13, minute=20)},
+        now=_at(9, 13, 20),
+    ) == "blocked"
+    assert engine.state["modes"][spec.market]["blocked_reason"] == (
+        "signal_before_13_20_decision_gate"
+    )
+
+    late = {**_summary(), "signal_id": "late"}
+    assert engine.register_close_signal(
+        spec=spec,
+        summary=late,
+        signal_rows=[_row()],
+        quotes={"2330": _quote(day=9, hour=13, minute=29)},
+        now=_at(9, 13, 30),
+    ) == "blocked"
+    assert engine.state["modes"][spec.market]["blocked_reason"] == (
+        "outside_13_20_close_order_window"
+    )
+
+    on_time = {**_summary(), "signal_id": "on-time"}
+    assert engine.register_close_signal(
+        spec=spec,
+        summary=on_time,
+        signal_rows=[_row()],
+        quotes={"2330": _quote(day=9, hour=13, minute=29)},
+        now=_at(9, 13, 29, 59),
+    ) == "registered"
+    signal = _jsonl(engine.signals_path)[-1]
+    assert signal["decision_clock"] == "13:20 Asia/Taipei"
+    assert signal["sizing_price_at_decision"] == 100.0
+    assert "sizing_price_at_13_25" not in signal
+
+
 def test_missing_full_short_inventory_blocks_instead_of_shrinking(
     tmp_path: Path,
 ) -> None:
@@ -255,6 +309,8 @@ def test_close_print_after_delayed_close_deadline_is_not_a_fill(
     order = next(iter(mode["pending_entry_orders"].values()))
     assert order["status"] == "expired_without_actual_close_print"
     assert mode["positions"] == {}
+    assert mode["engine_status"] == "critical_actual_close_print_missing"
+    engine.update_readiness([spec], now=_at(9, 13, 35))
     assert mode["engine_status"] == "critical_actual_close_print_missing"
 
 
@@ -343,15 +399,19 @@ def test_dashboard_uses_explicit_discord_status_for_overnight_ack(
 
     assert snapshot["service_sync"]["synchronized"] is True
     assert snapshot["service_sync"]["discord"]["markets"] == [spec.market]
+    assert snapshot["service_sync"]["session_clock"]["rollover_local_time"] == (
+        "13:00"
+    )
+    assert snapshot["session_progress"]["phase"] == "armed_waiting_calculation"
 
 
-def test_close_signal_latency_uses_1325_gate_and_separate_stages(
+def test_close_signal_latency_uses_1320_gate_and_separate_stages(
     tmp_path: Path,
 ) -> None:
     engine = TwOvernightSimulationEngine(tmp_path / "state")
     summary = {
         **_summary(),
-        "artifact_published_at": _at(9, 13, 25, 1).isoformat(),
+        "artifact_published_at": _at(9, 13, 20, 1).isoformat(),
         "live_latency": {
             "quote_fetch_ms": 20.0,
             "model_inference_ms": 30.0,
@@ -363,8 +423,8 @@ def test_close_signal_latency_uses_1325_gate_and_separate_stages(
         signal_id="close-signal-1",
         result="registered",
         summary=summary,
-        consumer_detected_at=_at(9, 13, 25, 1),
-        ledger_persisted_at=_at(9, 13, 25, 2),
+        consumer_detected_at=_at(9, 13, 20, 1),
+        ledger_persisted_at=_at(9, 13, 20, 2),
         executor_quote_fetch_ms=12.0,
         security_metadata_load_ms=2.0,
         ledger_compute_persist_ms=5.0,
@@ -372,7 +432,7 @@ def test_close_signal_latency_uses_1325_gate_and_separate_stages(
     )
 
     row = _jsonl(engine.latency_path)[0]
-    assert row["decision_clock"] == "13:25 close-auction target"
+    assert row["decision_clock"] == "13:20 close-auction target"
     assert row["decision_gate_to_ledger_ms"] == 2_000.0
     assert row["input_to_ledger_ms"] == 2_000.0
     assert row["ready_to_ledger_ms"] == 1_000.0

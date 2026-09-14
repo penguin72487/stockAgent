@@ -24,6 +24,7 @@ escape_replacement() {
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 units=(
+  stockagent-heavy-data.slice
   stockagent-tw-public-source-events.service
   stockagent-tw-day-trade-eligibility.service
   stockagent-tw-day-trade-eligibility.timer
@@ -45,7 +46,10 @@ for unit in "${units[@]}"; do
     "$repo_root/deploy/systemd/${unit}.in" > "$temporary_dir/$unit"
 done
 
-systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
+systemd-analyze verify \
+  "$temporary_dir"/*.service \
+  "$temporary_dir"/*.timer \
+  "$temporary_dir"/*.slice
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
   "$repo_root/scripts/fetch_tw_day_trade_eligibility_on_publish.py" \

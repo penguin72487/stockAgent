@@ -59,9 +59,19 @@ def test_rollover_invalidates_revision_and_date_cache_without_writes(calendar, t
     second = dashboard.build_dashboard_revision(state_dir=tmp_path, now=after)
     assert first["revision_token"] != second["revision_token"]
     assert first["state_revision"] == second["state_revision"]
-    for observed in (before, after):
-        overnight = dashboard.build_dashboard_revision(state_dir=tmp_path, now=observed, discord_markets_field="overnight_markets")
-        assert not overnight["session_clock"]
+    overnight_before = dashboard.build_dashboard_revision(
+        state_dir=tmp_path,
+        now=at("2026-09-09T12:59:59"),
+        discord_markets_field="overnight_markets",
+    )
+    overnight_after = dashboard.build_dashboard_revision(
+        state_dir=tmp_path,
+        now=at("2026-09-09T13:00:00"),
+        discord_markets_field="overnight_markets",
+    )
+    assert overnight_before["session_clock"]["display_session_date"] == "2026-09-08"
+    assert overnight_after["session_clock"]["display_session_date"] == "2026-09-09"
+    assert overnight_after["session_clock"]["rollover_local_time"] == "13:00"
 
 
 def test_preopen_carries_account_not_previous_signal_or_fill(calendar, tmp_path):

@@ -32,6 +32,16 @@ def _configure_compile_cache_paths(
     cuda_cache_path: object = "~/.cache/nv_cuda",
     force: bool = False,
 ) -> None:
+    namespace = os.environ.get("STOCKAGENT_COMPILE_CACHE_NAMESPACE", "").strip()
+    if namespace and (
+        namespace in {".", ".."}
+        or Path(namespace).name != namespace
+        or "/" in namespace
+        or "\\" in namespace
+    ):
+        raise ValueError(
+            "STOCKAGENT_COMPILE_CACHE_NAMESPACE must be one path component"
+        )
     for env_name, raw_path in (
         ("TORCHINDUCTOR_CACHE_DIR", torchinductor_cache_dir),
         ("TRITON_CACHE_DIR", triton_cache_dir),
@@ -40,6 +50,13 @@ def _configure_compile_cache_paths(
         path = _runtime_cache_path(raw_path)
         if path is None:
             continue
+        if namespace:
+            # Compiled CUDA artifacts are rebuildable but not ABI-stable across
+            # Python, PyTorch, Triton, CUDA or compiler changes.  A caller-owned
+            # namespace prevents a stale shared module from being imported by a
+            # long-lived operational worker while preserving warm reuse inside
+            # one known-compatible runtime.
+            path = path / namespace
         try:
             path.mkdir(parents=True, exist_ok=True)
         except Exception:

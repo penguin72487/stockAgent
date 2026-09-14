@@ -1,7 +1,7 @@
 """Durable Taiwan close-to-next-open paper execution.
 
 The model and execution clocks are intentionally separate.  A temporary
-``tw_day_trade`` checkpoint may produce the 13:25 target weights, but this
+``tw_day_trade`` checkpoint may produce the 13:20 target weights, but this
 engine only submits legal-limit closing-auction orders, recognizes a fill from
 an actual (non-simulated) closing print, carries that cohort overnight, and
 closes it only after the next valid session's actual opening print.
@@ -37,13 +37,14 @@ from stockagent.live.tw_day_trade_simulation import (
 )
 
 
-CLOSE_ORDER_GATE: Final[time] = time(13, 25)
+OVERNIGHT_SWITCH_GATE: Final[time] = time(13, 0)
+CLOSE_ORDER_GATE: Final[time] = time(13, 20)
 REGULAR_CLOSE: Final[time] = time(13, 30)
 DELAYED_CLOSE_DEADLINE: Final[time] = time(13, 33, 59, 999_999)
 OPEN_ORDER_GATE: Final[time] = time(8, 30)
 OPEN_MATCH_GATE: Final[time] = time(9, 0)
 OPEN_OBSERVATION_DEADLINE: Final[time] = time(9, 10)
-OVERNIGHT_CONTRACT_VERSION: Final[int] = 1
+OVERNIGHT_CONTRACT_VERSION: Final[int] = 2
 
 
 def _clock(value: datetime) -> time:
@@ -94,7 +95,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         self.state["product"] = "tw_overnight"
         self.state["overnight_contract_version"] = OVERNIGHT_CONTRACT_VERSION
         # A brand-new product has a valid zero-row ledger before its first
-        # 13:25 decision.  Materialize those append-only files immediately so
+        # 13:20 decision.  Materialize those append-only files immediately so
         # bounded public readers return an empty page instead of treating
         # normal first-day state as a missing-source failure.
         for path in (
@@ -132,7 +133,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
     def _mode(self, spec: ModeSpec) -> dict[str, Any]:
         mode = super()._mode(spec)
         mode["product"] = "tw_overnight"
-        mode["model_adapter"] = "tw_day_trade_checkpoint_at_13_25"
+        mode["model_adapter"] = "tw_day_trade_checkpoint_at_13_20"
         mode["model_trained_for_overnight"] = False
         mode.setdefault("pending_entry_orders", {})
         return mode
@@ -211,7 +212,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         ledger_compute_persist_ms: float,
         shared_quote_batch_mode_count: int,
     ) -> None:
-        """Persist the 13:25 input-to-paper-ledger critical path."""
+        """Persist the 13:20 input-to-paper-ledger critical path."""
 
         started_at = _parse_timestamp(
             summary.get("signal_started_at") or summary.get("generated_at")
@@ -266,7 +267,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         local_persisted_at = ledger_persisted_at.astimezone(TAIPEI)
         decision_gate = local_persisted_at.replace(
             hour=13,
-            minute=25,
+            minute=20,
             second=0,
             microsecond=0,
         )
@@ -284,7 +285,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "result": result,
                 "simulation_only": True,
                 "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
-                "decision_clock": "13:25 close-auction target",
+                "decision_clock": "13:20 close-auction target",
                 "signal_started_at": (
                     started_at.isoformat(timespec="microseconds")
                     if started_at
@@ -343,6 +344,14 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 row.get("status") == "working"
                 for row in (mode.get("pending_entry_orders") or {}).values()
             )
+            expired_close = any(
+                row.get("status") == "expired_without_actual_close_print"
+                for row in (mode.get("pending_entry_orders") or {}).values()
+            )
+            current_session = (
+                str(mode.get("session_date") or "")
+                == observed.date().isoformat()
+            )
             if mode.get("readiness_error"):
                 mode["engine_status"] = "blocked_readiness"
             elif not mode["checkpoint_ready"]:
@@ -362,10 +371,19 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 )
             elif pending:
                 mode["engine_status"] = "waiting_close_auction_match"
+            elif current_session and expired_close:
+                mode["engine_status"] = "critical_actual_close_print_missing"
+            elif (
+                current_session
+                and mode.get("entry_fill_outcome") == "no_executable_signal"
+            ):
+                mode["engine_status"] = "flat_no_executable_signal"
             elif observed.weekday() >= 5:
                 mode["engine_status"] = "waiting_trading_day"
+            elif _clock(observed) < OVERNIGHT_SWITCH_GATE:
+                mode["engine_status"] = "waiting_13_00_switch"
             elif _clock(observed) < CLOSE_ORDER_GATE:
-                mode["engine_status"] = "waiting_13_25_signal"
+                mode["engine_status"] = "armed_waiting_13_20_calculation"
             elif _clock(observed) < REGULAR_CLOSE:
                 mode["engine_status"] = "waiting_signal"
             else:
@@ -396,8 +414,28 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         signal_at = self._signal_timestamp(summary)
         if signal_at is None or signal_at.date() != observed.date():
             return self._block_signal(mode, signal_id, "signal_not_current_session", observed)
+        signal_started_at = _parse_timestamp(summary.get("signal_started_at"))
+        if signal_started_at is not None and signal_started_at.date() != observed.date():
+            return self._block_signal(
+                mode,
+                signal_id,
+                "signal_not_current_session",
+                observed,
+            )
+        signal_ready_too_early = _clock(signal_at) < CLOSE_ORDER_GATE
+        signal_started_too_early = bool(
+            signal_started_at is not None
+            and _clock(signal_started_at) < CLOSE_ORDER_GATE
+        )
+        if signal_ready_too_early or signal_started_too_early:
+            return self._block_signal(
+                mode,
+                signal_id,
+                "signal_before_13_20_decision_gate",
+                observed,
+            )
         if not CLOSE_ORDER_GATE <= _clock(observed) < REGULAR_CLOSE:
-            return self._block_signal(mode, signal_id, "outside_13_25_close_order_window", observed)
+            return self._block_signal(mode, signal_id, "outside_13_20_close_order_window", observed)
         if any(
             int(position.get("signed_shares") or 0) != 0
             for position in (mode.get("positions") or {}).values()
@@ -473,7 +511,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             elif side == "short" and not bool(row.get("overnight_can_short_open")):
                 status, reason = "blocked", "ordinary_short_open_not_allowed"
             elif sizing_price is None:
-                status, reason = "blocked", "13_25_sizing_price_missing"
+                status, reason = "blocked", "decision_sizing_price_missing"
             elif sizing_capital_twd <= 0.0:
                 status, reason = "blocked", "nonpositive_equity_no_new_exposure"
             elif lower is None or upper is None:
@@ -526,7 +564,8 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "filled_shares": 0,
                 "execution_price": None,
                 "sizing_open_price": sizing_price,
-                "sizing_price_at_13_25": sizing_price,
+                "sizing_price_at_decision": sizing_price,
+                "decision_clock": "13:20 Asia/Taipei",
                 "order_limit_price": limit_price,
                 "upper_limit": upper,
                 "lower_limit": lower,
@@ -1193,8 +1232,9 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             else "waiting"
         )
         status["schedule"] = {
-            "model_decision": "13:25 current quote using temporary day-trade checkpoint adapter",
-            "close_entry_order": "13:25 LMT_ROD; long buy at upper limit, short sell at lower limit",
+            "switch_and_wait": "13:00 Asia/Taipei",
+            "model_decision": "13:20 current quote using temporary day-trade checkpoint adapter",
+            "close_entry_order": "after 13:20 and before 13:30 LMT_ROD; long buy at upper limit, short sell at lower limit",
             "close_fill": "actual 13:30 closing-auction print; delayed symbols may settle at 13:33",
             "overnight": "one strict cohort; no same-session exit and no overlapping cohort",
             "opening_exit_order": "08:30 LMT_ROD; long sell at lower limit, short cover at upper limit",
@@ -1223,6 +1263,7 @@ __all__ = [
     "DELAYED_CLOSE_DEADLINE",
     "OPEN_MATCH_GATE",
     "OPEN_ORDER_GATE",
+    "OVERNIGHT_SWITCH_GATE",
     "REGULAR_CLOSE",
     "TwOvernightSimulationEngine",
 ]

@@ -22,6 +22,7 @@ escape_replacement() {
 }
 
 units=(
+  stockagent-heavy-data.slice
   stockagent-registered-data-daily.service
   stockagent-registered-data-daily.timer
   stockagent-registered-data-intraday.service
@@ -48,9 +49,14 @@ for unit in "${units[@]}"; do
     "$template" > "$target"
 done
 
-systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
+systemd-analyze verify \
+  "$temporary_dir"/*.service \
+  "$temporary_dir"/*.timer \
+  "$temporary_dir"/*.slice
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
+  "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
+  "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
   "$repo_root/scripts/run_registered_data_refresh.sh" \
   "$repo_root/scripts/run_downloader_with_release.sh" \
   "$repo_root/scripts/run_binance_public_archive.sh" \

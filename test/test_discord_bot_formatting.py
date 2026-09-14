@@ -38,9 +38,11 @@ from services.discord_bot.bot import (
     _send_signal_response,
     _ensure_signal_ready,
     _filter_watchlist_rows,
+    _formal_history_compile_cache_namespace,
     _formal_history_latest_date,
     _formal_history_timeout_seconds,
     _finish_artifact_backfill,
+    _record_artifact_maintenance_run,
     _guide_message,
     _handle_signal_now_command,
     _latest_changes_pages,
@@ -904,6 +906,62 @@ def test_artifact_backfill_failure_uses_durable_bounded_retry(
     assert _artifact_backfill_health_summary()["status"] == "ready"
 
 
+def test_artifact_maintenance_worker_state_is_durable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+
+    running = _record_artifact_maintenance_run("running")
+    deferred = _record_artifact_maintenance_run(
+        "deferred", reason="tw_public_refresh_wait_timeout"
+    )
+    resumed = _record_artifact_maintenance_run("running")
+    health = _artifact_backfill_health_summary()
+
+    assert deferred["started_at"] == running["started_at"]
+    assert deferred["completed_at"]
+    assert resumed["started_at"] == running["started_at"]
+    assert health["status"] == "running"
+    assert health["worker_status"] == "running"
+    assert health["worker_reason"] is None
+
+    _record_artifact_maintenance_run(
+        "degraded", reason="unhandled_RuntimeError", failures=1
+    )
+    health = _artifact_backfill_health_summary()
+    assert health["status"] == "degraded"
+    assert health["failed_count"] == 0
+    assert health["worker_status"] == "degraded"
+
+
+def test_artifact_job_updates_preserve_worker_receipt_schema(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+
+    _record_artifact_maintenance_run("running")
+    _begin_artifact_backfill("2026-09-11:tw:artifact_backfill", "tw")
+    _finish_artifact_backfill(
+        "2026-09-11:tw:artifact_backfill",
+        "tw",
+        status="ready",
+    )
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 2
+    assert payload["maintenance_run"]["status"] == "running"
+
+
 def test_error_log_rotates_at_startup_and_leaves_fresh_current_path(
     monkeypatch,
     tmp_path,
@@ -1534,6 +1592,9 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(
     assert command[command.index("--start-fold") + 1] == "11"
     assert command[command.index("--multi-gpu-strategy") + 1] == "none"
     assert kwargs["timeout"] == 456
+    assert kwargs["env"]["STOCKAGENT_COMPILE_CACHE_NAMESPACE"] == (
+        _formal_history_compile_cache_namespace()
+    )
     assert _formal_history_timeout_seconds(cfg) == 456
 
 

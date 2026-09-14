@@ -14,13 +14,26 @@ Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
 Environment="MALLOC_ARENA_MAX=2"
 Environment="STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR=/var/cache/stockagent-public-dashboards"
+Environment="STOCKAGENT_DASHBOARD_PERFORMANCE_DIR=/var/lib/stockagent-public-dashboards/performance"
 CacheDirectory=stockagent-public-dashboards
 CacheDirectoryMode=0700
+StateDirectory=stockagent-public-dashboards
+StateDirectoryMode=0700
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_public_dashboards.sh"
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
 KillMode=control-group
+# Full history is bounded and the measured process peak is below 1 GiB.  This
+# leaves broad burst headroom without allowing one public request path to take
+# down the host.  TasksMax is an OS safety boundary, not an application rate or
+# 32-request concurrency limiter.
+MemoryAccounting=true
+MemoryHigh=4G
+MemoryMax=8G
+MemorySwapMax=1G
+TasksMax=4096
+OOMScoreAdjust=-250
 UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=

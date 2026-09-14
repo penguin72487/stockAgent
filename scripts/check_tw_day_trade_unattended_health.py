@@ -55,6 +55,20 @@ REQUIRED_TIMERS = (
     "stockagent-tw-day-trade-minute-curves.timer",
     "stockagent-tw-day-trade-margin-actions.timer",
 )
+BEST_EFFORT_MAINTENANCE_UNITS = {
+    "stockagent-registered-data-backfill.service": (
+        "stockagent-registered-data-backfill.timer"
+    ),
+    "stockagent-registered-data-daily.service": (
+        "stockagent-registered-data-daily.timer"
+    ),
+    "stockagent-registered-data-intraday.service": (
+        "stockagent-registered-data-intraday.timer"
+    ),
+}
+BEST_EFFORT_MAINTENANCE_SERVICES = tuple(BEST_EFFORT_MAINTENANCE_UNITS)
+OPENING_RESOURCE_GUARD_START = datetime_time(8, 20)
+OPENING_RESOURCE_GUARD_END = datetime_time(9, 10)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-cooldown-seconds", type=float, default=300.0)
     parser.add_argument("--minimum-free-gib", type=float, default=5.0)
     parser.add_argument("--minimum-free-percent", type=float, default=5.0)
+    parser.add_argument("--warning-free-percent", type=float, default=15.0)
     parser.add_argument("--observed-at", default=None)
     return parser.parse_args()
 
@@ -104,6 +119,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -189,7 +209,9 @@ def _systemctl_show(unit: str) -> dict[str, str]:
             "systemctl",
             "show",
             unit,
-            "--property=LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts",
+            "--property="
+            "LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,"
+            "MemoryCurrent,MemoryHigh,MemoryMax,TasksCurrent,TasksMax",
         ],
         check=False,
         capture_output=True,
@@ -203,6 +225,54 @@ def _systemctl_show(unit: str) -> dict[str, str]:
             rows[key] = value
     rows["show_returncode"] = str(completed.returncode)
     return rows
+
+
+def _unit_resource_pressure(row: dict[str, str]) -> dict[str, Any]:
+    def integer(name: str) -> int | None:
+        try:
+            return int(row.get(name, ""))
+        except (TypeError, ValueError):
+            return None
+
+    memory_current = integer("MemoryCurrent")
+    memory_high = integer("MemoryHigh")
+    memory_max = integer("MemoryMax")
+    tasks_current = integer("TasksCurrent")
+    tasks_max = integer("TasksMax")
+    memory_high_ratio = (
+        memory_current / memory_high
+        if memory_current is not None and memory_high not in {None, 0}
+        else None
+    )
+    memory_max_ratio = (
+        memory_current / memory_max
+        if memory_current is not None and memory_max not in {None, 0}
+        else None
+    )
+    tasks_ratio = (
+        tasks_current / tasks_max
+        if tasks_current is not None and tasks_max not in {None, 0}
+        else None
+    )
+    return {
+        "memory_current_bytes": memory_current,
+        "memory_high_bytes": memory_high,
+        "memory_max_bytes": memory_max,
+        "memory_high_ratio": (
+            round(memory_high_ratio, 4) if memory_high_ratio is not None else None
+        ),
+        "memory_max_ratio": (
+            round(memory_max_ratio, 4) if memory_max_ratio is not None else None
+        ),
+        "tasks_current": tasks_current,
+        "tasks_max": tasks_max,
+        "tasks_ratio": round(tasks_ratio, 4) if tasks_ratio is not None else None,
+        "warning": bool(
+            (memory_high_ratio is not None and memory_high_ratio >= 0.8)
+            or (memory_max_ratio is not None and memory_max_ratio >= 0.9)
+            or (tasks_ratio is not None and tasks_ratio >= 0.8)
+        ),
+    }
 
 
 def _run_systemctl(*arguments: str) -> dict[str, Any]:
@@ -335,6 +405,177 @@ def _clear_receipted_oneshot_failure(
     return [result]
 
 
+def _protect_opening_resources(
+    *,
+    observed: datetime,
+    repair: bool,
+    action_state: dict[str, Any],
+    action_path: Path | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    """Pause only resumable bulk jobs across the opening critical path."""
+
+    def persist_action_state() -> None:
+        if action_path is not None:
+            _atomic_json(action_path, action_state)
+
+    def is_running(row: dict[str, Any]) -> bool:
+        # Type=oneshot remains ``activating/start`` for its entire long run.
+        # Looking only for ``active`` misses exactly the bulk jobs we need to
+        # drain before the opening critical path.
+        return row.get("ActiveState") in {"active", "activating", "reloading"}
+
+    wall = observed.timetz().replace(tzinfo=None)
+    protected = bool(
+        observed.weekday() < 5
+        and OPENING_RESOURCE_GUARD_START <= wall < OPENING_RESOURCE_GUARD_END
+    )
+    session_date = observed.date().isoformat()
+    actions: list[dict[str, Any]] = []
+    failures: list[str] = []
+    units: dict[str, Any] = {}
+    for service_unit, timer_unit in BEST_EFFORT_MAINTENANCE_UNITS.items():
+        service_row = _systemctl_show(service_unit)
+        timer_row = _systemctl_show(timer_unit)
+        key = f"opening-resource-pause:{service_unit}"
+        pause = action_state.get(key)
+        pause = dict(pause) if isinstance(pause, dict) else {}
+        pending = bool(pause.get("resume_pending"))
+        service_was_active = is_running(service_row)
+        timer_was_active = is_running(timer_row)
+        if protected and (service_was_active or timer_was_active) and not pending:
+            if repair:
+                targets = [
+                    unit
+                    for unit in (
+                        timer_unit if timer_was_active else None,
+                        service_unit if service_was_active else None,
+                    )
+                    if unit is not None
+                ]
+                # Write the recovery intent before mutating systemd.  If this
+                # guardian is killed after stopping a timer, the next minute or
+                # next boot can still resume exactly what used to be active.
+                action_state[key] = {
+                    "paused_at_taipei": observed.isoformat(timespec="seconds"),
+                    "session_date": session_date,
+                    "resume_pending": True,
+                    "service_was_active": service_was_active,
+                    "timer_was_active": timer_was_active,
+                    "stop_requested_units": targets,
+                    "stopped_units": [],
+                }
+                persist_action_state()
+                requested: list[str] = []
+                succeeded = True
+                # Stop the controller first.  In particular, the intraday
+                # timer otherwise starts its service again one minute later.
+                for unit in targets:
+                    result = _run_systemctl("stop", "--no-block", unit)
+                    result.update(
+                        {
+                            "action_key": key,
+                            "reason": "protect_0820_0910_tw_opening_resources",
+                        }
+                    )
+                    actions.append(result)
+                    requested.append(unit)
+                    succeeded = succeeded and result.get("returncode") == 0
+                action_state[key]["stopped_units"] = requested
+                action_state[key]["stop_succeeded"] = succeeded
+                persist_action_state()
+                pending = True
+                if not succeeded:
+                    failures.append(
+                        f"failed to pause opening competitor: {service_unit}"
+                    )
+        elif protected and pending and repair:
+            # A no-block stop can still be draining at the next heartbeat.
+            # Keep the controller down and retry the bounded stop instead of
+            # assuming the first request completed.
+            for unit, row in (
+                (timer_unit, timer_row),
+                (service_unit, service_row),
+            ):
+                if not is_running(row):
+                    continue
+                result = _run_systemctl("stop", "--no-block", unit)
+                result.update(
+                    {
+                        "action_key": key,
+                        "reason": "continue_opening_resource_pause",
+                    }
+                )
+                actions.append(result)
+                if result.get("returncode") != 0:
+                    failures.append(
+                        f"failed to keep opening competitor stopped: {unit}"
+                    )
+        elif not protected and pending:
+            if repair:
+                requested = []
+                succeeded = True
+                # Resume the interrupted work before its scheduler.  Starting
+                # the timer first can race OnUnitInactiveSec and double-trigger.
+                for unit, was_active, row in (
+                    (
+                        service_unit,
+                        bool(pause.get("service_was_active")),
+                        service_row,
+                    ),
+                    (
+                        timer_unit,
+                        bool(pause.get("timer_was_active")),
+                        timer_row,
+                    ),
+                ):
+                    if not was_active or is_running(row):
+                        continue
+                    result = _run_systemctl("start", "--no-block", unit)
+                    result.update(
+                        {
+                            "action_key": key,
+                            "reason": "resume_after_tw_opening_resource_guard",
+                        }
+                    )
+                    actions.append(result)
+                    requested.append(unit)
+                    succeeded = succeeded and result.get("returncode") == 0
+                if succeeded:
+                    action_state[key] = {
+                        **pause,
+                        "resumed_at_taipei": observed.isoformat(timespec="seconds"),
+                        "resume_pending": False,
+                        "started_units": requested,
+                    }
+                    persist_action_state()
+                    pending = False
+                else:
+                    persist_action_state()
+                    failures.append(
+                        f"failed to resume opening competitor: {service_unit}"
+                    )
+        units[service_unit] = {
+            "active_state": service_row.get("ActiveState"),
+            "sub_state": service_row.get("SubState"),
+            "result": service_row.get("Result"),
+            "restart_count": service_row.get("NRestarts"),
+            "timer": timer_unit,
+            "timer_active_state": timer_row.get("ActiveState"),
+            "timer_sub_state": timer_row.get("SubState"),
+            "resume_pending": pending,
+        }
+    return (
+        {
+            "protected": protected,
+            "window": "08:20:00..09:10:00 Asia/Taipei",
+            "policy": "pause_and_resume_only_resumable_best_effort_maintenance",
+            "units": units,
+        },
+        actions,
+        failures,
+    )
+
+
 def _run_time_check(*, repair: bool) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -379,7 +620,13 @@ def _public_endpoint(path: str) -> dict[str, Any]:
         }
 
 
-def _disk_health(path: Path, *, minimum_gib: float, minimum_percent: float) -> dict[str, Any]:
+def _disk_health(
+    path: Path,
+    *,
+    minimum_gib: float,
+    minimum_percent: float,
+    warning_percent: float,
+) -> dict[str, Any]:
     try:
         usage = shutil.disk_usage(path)
     except OSError as exc:
@@ -390,6 +637,7 @@ def _disk_health(path: Path, *, minimum_gib: float, minimum_percent: float) -> d
             "policy": {
                 "minimum_free_gib": minimum_gib,
                 "minimum_free_percent": minimum_percent,
+                "warning_free_percent": warning_percent,
                 "automatic_deletion": False,
             },
         }
@@ -400,9 +648,11 @@ def _disk_health(path: Path, *, minimum_gib: float, minimum_percent: float) -> d
         "free_gib": round(free_gib, 3),
         "free_percent": round(free_percent, 3),
         "ready": free_gib >= minimum_gib and free_percent >= minimum_percent,
+        "warning": free_percent < warning_percent,
         "policy": {
             "minimum_free_gib": minimum_gib,
             "minimum_free_percent": minimum_percent,
+            "warning_free_percent": warning_percent,
             "automatic_deletion": False,
         },
     }
@@ -435,6 +685,27 @@ def main() -> int:
         if not time_health["ready"]:
             failures.append("schedule clock is not verified")
 
+        opening_resource_guard, resource_actions, resource_failures = (
+            _protect_opening_resources(
+                observed=observed,
+                repair=repair,
+                action_state=action_state,
+                action_path=action_path,
+            )
+        )
+        actions.extend(resource_actions)
+        failures.extend(resource_failures)
+        failed_maintenance = [
+            unit
+            for unit, row in opening_resource_guard["units"].items()
+            if row.get("active_state") == "failed"
+        ]
+        if failed_maintenance:
+            warnings.append(
+                "best-effort data maintenance is failed but isolated from the "
+                "opening path: " + ",".join(failed_maintenance)
+            )
+
         services: dict[str, Any] = {}
         for unit in REQUIRED_SERVICES:
             row = _systemctl_show(unit)
@@ -451,6 +722,31 @@ def main() -> int:
                         cooldown_seconds=float(args.action_cooldown_seconds),
                     )
                 )
+
+        restarted_services = [
+            unit
+            for unit, row in services.items()
+            if str(row.get("NRestarts") or "0").isdigit()
+            and int(row.get("NRestarts") or 0) > 0
+        ]
+        if restarted_services:
+            warnings.append(
+                "required services have auto-restarted in the current activation: "
+                + ",".join(restarted_services)
+            )
+        service_resource_pressure = {
+            unit: _unit_resource_pressure(row) for unit, row in services.items()
+        }
+        pressured_services = [
+            unit
+            for unit, row in service_resource_pressure.items()
+            if row.get("warning")
+        ]
+        if pressured_services:
+            warnings.append(
+                "required services are approaching cgroup resource bounds: "
+                + ",".join(pressured_services)
+            )
 
         timers: dict[str, Any] = {}
         for unit in REQUIRED_TIMERS:
@@ -606,15 +902,17 @@ def main() -> int:
             failures.append("paper engine and Discord revisions are not synchronized")
         maintenance = discord_status.get("background_maintenance")
         maintenance = dict(maintenance) if isinstance(maintenance, dict) else {}
-        maintenance_degraded = bool(
-            maintenance.get("status") == "degraded"
-            or int(maintenance.get("failed_count") or 0) > 0
+        maintenance_ready = bool(
+            maintenance.get("status") == "ready"
+            and int(maintenance.get("failed_count") or 0) == 0
+            and int(maintenance.get("running_count") or 0) == 0
         )
+        maintenance_degraded = not maintenance_ready
         if maintenance_degraded:
             # Formal-history maintenance is intentionally a separate health
             # domain: make failure visible without declaring the Gateway or
             # the independent opening execution engine disconnected.
-            warnings.append("post-close Discord artifact maintenance is degraded")
+            warnings.append("post-close Discord artifact maintenance is not ready")
 
         if weekday and wall >= datetime_time(9, 0, 15):
             missing_signals, noncausal_recovery_markets = (
@@ -673,15 +971,21 @@ def main() -> int:
                 REPO_ROOT,
                 minimum_gib=float(args.minimum_free_gib),
                 minimum_percent=float(args.minimum_free_percent),
+                warning_percent=float(args.warning_free_percent),
             ),
             "tw_public_live": _disk_health(
                 Path("/srv/stockagent-live/data_tw_public"),
                 minimum_gib=float(args.minimum_free_gib),
                 minimum_percent=float(args.minimum_free_percent),
+                warning_percent=float(args.warning_free_percent),
             ),
         }
         if any(not row["ready"] for row in disks.values()):
             failures.append("disk free-space guard is below threshold; no data was deleted")
+        elif any(row.get("warning") for row in disks.values()):
+            warnings.append(
+                "disk free space is inside the early-warning band; no data was deleted"
+            )
 
         if actions:
             status = "repairing"
@@ -706,7 +1010,9 @@ def main() -> int:
             "actions": actions,
             "components": {
                 "time_sync": time_health,
+                "opening_resource_guard": opening_resource_guard,
                 "services": services,
+                "service_resource_pressure": service_resource_pressure,
                 "weekly_timers": timers,
                 "source_events": {
                     "ready": event_ready,

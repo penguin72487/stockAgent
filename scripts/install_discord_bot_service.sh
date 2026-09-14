@@ -7,6 +7,7 @@ MAINTENANCE_SERVICE_NAME="stockagent-discord-artifact-maintenance.service"
 MAINTENANCE_TIMER_NAME="stockagent-discord-artifact-maintenance.timer"
 MAINTENANCE_PATH_NAME="stockagent-discord-artifact-maintenance.path"
 POSTCLOSE_CACHE_SERVICE_NAME="stockagent-discord-postclose-cache.service"
+HEAVY_DATA_SLICE_NAME="stockagent-heavy-data.slice"
 START_NOW=true
 
 if [[ "${1:-}" == "--no-start" ]]; then
@@ -19,7 +20,7 @@ if (( EUID != 0 )); then
   echo "[discord-service] root privileges are required" >&2
   exit 2
 fi
-for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME"; do
+for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME"; do
   if [[ ! -f "$REPO_ROOT/deploy/systemd/$unit_name.in" ]]; then
     echo "[discord-service] unit template is missing: $unit_name.in" >&2
     exit 2
@@ -48,7 +49,7 @@ escape_replacement() {
 
 rendered_dir="$(mktemp -d)"
 trap 'rm -rf -- "$rendered_dir"' EXIT
-for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME"; do
+for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME"; do
   sed \
     -e "s|@REPO_ROOT@|$(escape_replacement "$REPO_ROOT")|g" \
     -e "s|@SERVICE_USER@|$(escape_replacement "$SERVICE_USER")|g" \
@@ -62,12 +63,14 @@ systemd-analyze verify \
   "$rendered_dir/$MAINTENANCE_SERVICE_NAME" \
   "$rendered_dir/$MAINTENANCE_TIMER_NAME" \
   "$rendered_dir/$MAINTENANCE_PATH_NAME" \
-  "$rendered_dir/$POSTCLOSE_CACHE_SERVICE_NAME"
+  "$rendered_dir/$POSTCLOSE_CACHE_SERVICE_NAME" \
+  "$rendered_dir/$HEAVY_DATA_SLICE_NAME"
 install -m 0644 "$rendered_dir/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
 install -m 0644 "$rendered_dir/$MAINTENANCE_SERVICE_NAME" "/etc/systemd/system/$MAINTENANCE_SERVICE_NAME"
 install -m 0644 "$rendered_dir/$MAINTENANCE_TIMER_NAME" "/etc/systemd/system/$MAINTENANCE_TIMER_NAME"
 install -m 0644 "$rendered_dir/$MAINTENANCE_PATH_NAME" "/etc/systemd/system/$MAINTENANCE_PATH_NAME"
 install -m 0644 "$rendered_dir/$POSTCLOSE_CACHE_SERVICE_NAME" "/etc/systemd/system/$POSTCLOSE_CACHE_SERVICE_NAME"
+install -m 0644 "$rendered_dir/$HEAVY_DATA_SLICE_NAME" "/etc/systemd/system/$HEAVY_DATA_SLICE_NAME"
 chmod 0600 "$REPO_ROOT/services/discord_bot/.env"
 chmod 0755 \
   "$REPO_ROOT/scripts/run_discord_bot.sh" \

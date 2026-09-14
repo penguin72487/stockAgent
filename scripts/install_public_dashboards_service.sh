@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+restart_gateway=true
+if [[ "${1:-}" == "--no-restart" ]]; then
+    restart_gateway=false
+elif [[ -n "${1:-}" ]]; then
+    echo "Usage: sudo bash scripts/install_public_dashboards_service.sh [--no-restart]" >&2
+    exit 2
+fi
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 
@@ -26,7 +33,9 @@ systemctl daemon-reload
 systemctl enable --now stockagent-data-refresh-status-snapshot.timer
 systemctl start stockagent-data-refresh-status-snapshot.service
 systemctl enable stockagent-public-dashboards.service
-systemctl restart stockagent-public-dashboards.service
+if [[ "$restart_gateway" == "true" ]]; then
+    systemctl restart stockagent-public-dashboards.service
+fi
 ready=false
 for _attempt in $(seq 1 10); do
     if systemctl is-active --quiet stockagent-public-dashboards.service \

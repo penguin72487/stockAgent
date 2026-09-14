@@ -1,0 +1,22 @@
+# Sparse-event OFAT candidate for the canonical dual-RTX-5090 benchmark.
+# The event tensor keeps one fixed 262144-slot ABI on every rank and batch so
+# TorchInductor compiles one shape instead of a graph per dynamic power-of-two
+# bucket.  All model, optimizer, market, fee, capacity, and FIFO state rules
+# remain inherited from the active v4 deployment.
+base_config: tw_day_trade_last_last_only_training_vastai1t.yaml
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v5_sparse_event_fixed_abi_candidate
+
+training:
+  # The benchmark must reach epoch 3 even if floating-point reduction order
+  # changes the first validation comparison.  Formal 1000-epoch policy is not
+  # changed; this override exists only in the isolated throughput candidate.
+  early_stopping_no_improve_ratio: 1.0
+  day_trade_cohort_bucket_mode: batch_maximum
+  day_trade_prepared_batch_cache_gb: 0.0
+  day_trade_source_decode_workers: 4
+  day_trade_prefetch_depth: 2
+  day_trade_sparse_events: true
+  day_trade_sparse_event_slots: 262144
+  day_trade_sparse_event_bucket_mode: fixed_maximum

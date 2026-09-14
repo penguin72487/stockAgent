@@ -64,7 +64,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_historical_stock_entry_books,
     fetch_shioaji_stock_snapshots,
-    resolve_observed_minute_execution_price,
+    load_local_stock_0901_vwaps,
 )
 from stockagent.data.tw_price_rules import (  # noqa: E402
     TW_ORDER_PRICE_CONTRACT_VERSION,
@@ -87,8 +87,8 @@ DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
 DEFAULT_MINUTE_DATA_ROOTS = (
     Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
     Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
-    Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
+    Path("data_tw_minute/shioaji_1m"),
 )
 MINUTE_VOLUME_PARTICIPATION = 0.50
 HISTORICAL_KBAR_FILL_CONTRACT = (
@@ -495,154 +495,11 @@ def _local_0901_vwap_rows(
     trading_date: date,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Resolve source-backed 09:01 minute prices locally before Shioaji."""
-
-    requested = set(symbols)
-    resolved: dict[str, dict[str, Any]] = {}
-    source_counts: dict[str, int] = {}
-    price_method_counts: dict[str, int] = {}
-
-    def accept(frame: pl.DataFrame, source: Path) -> None:
-        if not frame.height:
-            return
-        names = set(frame.columns)
-        if "minutes_from_open" in names:
-            frame = frame.filter(pl.col("minutes_from_open") == 1)
-        elif "ts" in names:
-            frame = frame.with_columns(pl.col("ts").cast(pl.Datetime("ns"))).filter(
-                (pl.col("ts").dt.hour() == 9) & (pl.col("ts").dt.minute() == 1)
-            )
-        if "date" in frame.columns:
-            frame = frame.filter(pl.col("date").cast(pl.Date) == trading_date)
-        for row in frame.iter_rows(named=True):
-            symbol = str(row.get("symbol") or "")
-            if symbol not in requested or symbol in resolved:
-                continue
-            price, price_method, volume_shares = (
-                resolve_observed_minute_execution_price(
-                    amount=row.get("Amount"),
-                    volume_shares=row.get("volume_shares"),
-                    raw_volume=row.get("Volume"),
-                    contract_unit=row.get("contract_unit"),
-                    low=row.get("Low"),
-                    high=row.get("High"),
-                    close=row.get("Close"),
-                )
-            )
-            if price is None or price_method is None:
-                continue
-            row_source = Path(str(row.get("_source_path") or source))
-            source_text = (
-                f"local_minute_parquet_0901_{price_method}:{row_source.resolve()}"
-            )
-            resolved[symbol] = {
-                "symbol": symbol,
-                "execution_price_0901": float(price),
-                "valuation_price_0901": (_finite(row.get("Close")) if _finite(
-                    row.get("volume_shares") if row.get("volume_shares") is not None
-                    else row.get("Volume")) is not None else None),
-                "execution_price_0901_method": price_method,
-                "tick_volume_units_0901": float(volume_shares or 0.0),
-                "tick_count_0901": 0,
-                "source_window_start": datetime.combine(
-                    trading_date, time(9, 0), tzinfo=TAIPEI
-                ).isoformat(timespec="seconds"),
-                "source_window_end": datetime.combine(
-                    trading_date, time(9, 0, 59), tzinfo=TAIPEI
-                ).isoformat(timespec="seconds"),
-                "quote_at": datetime.combine(
-                    trading_date, time(9, 1), tzinfo=TAIPEI
-                ).isoformat(timespec="seconds"),
-                "source": source_text,
-            }
-            source_counts[source_text] = source_counts.get(source_text, 0) + 1
-            price_method_counts[price_method] = (
-                price_method_counts.get(price_method, 0) + 1
-            )
-
-    for root in minute_roots:
-        unresolved = requested - set(resolved)
-        if not unresolved:
-            break
-        # Canonical receipt-backed source chunks are checked before the
-        # materialized research partition, matching the storage contract.
-        chunk_paths: list[Path] = []
-        for symbol in sorted(unresolved):
-            for path in sorted((root / "minute_chunks" / symbol).glob("*.parquet")):
-                boundaries = path.stem.split("_")
-                day_text = trading_date.isoformat()
-                if len(boundaries) != 2 or not (
-                    boundaries[0] <= day_text <= boundaries[1]
-                ):
-                    continue
-                chunk_paths.append(path)
-        schema_groups: dict[tuple[str, ...], list[Path]] = {}
-        for path in chunk_paths:
-            schema_groups.setdefault(
-                tuple(pl.read_parquet_schema(path).names()), []
-            ).append(path)
-        for schema_tuple, paths in schema_groups.items():
-            schema = set(schema_tuple)
-            columns = [
-                name
-                for name in (
-                    "symbol",
-                    "date",
-                    "ts",
-                    "Amount",
-                    "Volume",
-                    "volume_shares",
-                    "contract_unit",
-                    "Low",
-                    "High",
-                    "Close",
-                )
-                if name in schema
-            ]
-            lazy = pl.scan_parquet(
-                sorted(paths), include_file_paths="_source_path"
-            )
-            if "date" in schema:
-                lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
-            chunk_frame = lazy.select(*columns, "_source_path").collect(
-                engine="streaming"
-            )
-            accept(chunk_frame, root)
-        unresolved = requested - set(resolved)
-        partition = root / f"trade_date={trading_date.isoformat()}" / "data.parquet"
-        if unresolved and partition.is_file():
-            schema = pl.scan_parquet(partition).collect_schema().names()
-            columns = [
-                name
-                for name in (
-                    "symbol",
-                    "date",
-                    "ts",
-                    "minutes_from_open",
-                    "Amount",
-                    "Volume",
-                    "volume_shares",
-                    "contract_unit",
-                    "Low",
-                    "High",
-                    "Close",
-                )
-                if name in schema
-            ]
-            frame = (
-                pl.scan_parquet(partition)
-                .filter(pl.col("symbol").is_in(sorted(unresolved)))
-                .select(columns)
-                .collect()
-            )
-            accept(frame, partition)
-    return resolved, {
-        "source": "local_minute_data_0901_price",
-        "requested_symbols": len(requested),
-        "resolved_symbols": len(resolved),
-        "source_counts": source_counts,
-        "price_method_counts": price_method_counts,
-        "additional_shioaji_requests": 0,
-    }
+    return load_local_stock_0901_vwaps(
+        minute_roots,
+        symbols,
+        trading_date=trading_date,
+    )
 
 
 def _load_price_limits(path: Path) -> dict[str, dict[str, Any]]:

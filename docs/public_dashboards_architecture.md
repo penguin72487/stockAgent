@@ -41,7 +41,7 @@ services/public_dashboards/dashboard-core.js
 | `/shioaji/` | `/shioaji/api/status` | 永豐資料流程、配額、流量與儲存量 |
 | `/openbb/` | `/openbb/api/status`, `/openbb/api/history` | OpenBB 封存與歷史進度 |
 | `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋與 freshness |
-| `/traffic/` | `/traffic/api/status` | 匿名請求延遲、吞吐、錯誤率及回應快取容量 |
+| `/traffic/` | `/traffic/api/status`, `/traffic/api/history` | 匿名請求延遲、分階段耗時、吞吐、錯誤率、快取容量及 90 天趨勢 |
 
 新增欄位時，應先在資料建置層定義語意，再加入公開 allowlist，最後才渲染。前端不得從名稱猜測單位、時區、成交狀態或資料完整性。
 
@@ -107,6 +107,23 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
 - `Server-Timing` 的 `app` 是回應標頭前的應用耗時，`cache_wait` 是同步 cache-key 等待，
   `build` 是最外層同步 JSON 建置，`cache` 是固定結果名稱。背景刷新不冒充本次建置；
   各欄可能包含／重疊，不能全部相加。每個 keep-alive 請求都重設，不混入上一筆。
+- 公開閘道另將每筆完成請求拆成互斥的 `cache_wait`、`build`、`write` 與 `other`；總和近似從
+  handler 開始到 body 寫完的 wall time。每個階段與 allowlist 路由都保存 count、sum、max 及
+  固定 histogram，因此 `/traffic/api/history?range=1h|24h|7d|30d|90d` 可比較 p50／p95／p99。
+  分位數不是可加總量；找總延遲來源先比較各階段平均，再回到該路由的冷／熱實測。
+- 持久監測只在 request path 更新有界記憶體計數；背景 writer 每分鐘將匿名聚合 append 到
+  `/var/lib/stockagent-public-dashboards/performance/YYYY-MM-DD.jsonl` 並 fsync。systemd
+  `StateDirectory` 以 0700 建立目錄、檔案為 0600；不保存 query、IP、User-Agent、Cookie、帳號、
+  payload 或輸入內容。佇列丟棄及寫入錯誤必須顯示為 degraded，不能用記憶體成功冒充持久化成功。
+- 程序內只保留兩天分鐘列與 90 天小時 rollup；7／30／90 天查詢不反覆展開十萬個 Python row。
+  第一個不足一小時的邊界從對應日 JSONL 精確讀取，其餘合併 hour rollup。歷史 API 另有 55 秒
+  single-flight response cache，避免無應用層 rate limit 時被相同長區間查詢拖垮。
+- 每個存活分鐘都有 heartbeat aggregate；服務停止期間沒有 row。UI 以 coverage 顯示實際觀測分鐘，
+  trend 遇未觀測 bucket 中斷折線，不得把缺口補成零流量或零延遲。服務正常重啟會先 flush 當前分鐘，
+  新程序以不同 process key 接續；同分鐘各程序區段可加總，coverage 仍只算一分鐘。
+- 瀏覽器頁面載入、互動、API、JSON、DOM／Canvas 與繪製機會仍只存在該瀏覽器的有界 localStorage，
+  可在流量頁查看或手動複製 JSON。公開閘道維持 GET／HEAD-only，不為集中 RUM 新增寫入端點；因此
+  90 天全站歷史是伺服器與路由真實樣本，不冒充所有訪客裝置的像素呈現時間。
 - 本地 receipt 的熱快取以 dev/inode/size/mtime_ns/ctime_ns 檢查，不反覆讀取整份檔案。
   變動時才計算 digest；讀取前後核對 descriptor 與 pathname，避免原子替換競態。
   這是本機 Linux 檔案變動偵測，不是冷庫完整性證明，也不承諾任意遠端檔案系統語意。

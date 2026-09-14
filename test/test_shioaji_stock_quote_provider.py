@@ -727,3 +727,84 @@ def test_prepare_tw_price_limits_persists_only_static_metadata(monkeypatch, tmp_
     assert first["prepared_count"] == 2
     assert second["missing_count"] == 0
     assert (tmp_path / "2026-08-12.parquet").is_file()
+
+
+def test_prepare_tw_price_limits_repairs_truncated_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    target = tmp_path / "2026-09-14.parquet"
+    target.write_bytes(b"PAR1truncated")
+
+    def fake_mis(symbols, fallback_prices, **_kwargs):
+        count = len(symbols)
+        return quote_provider.PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=count,
+            reference_prices=np.full((count,), 100.0),
+            upper_limit_prices=np.full((count,), 110.0),
+            lower_limit_prices=np.full((count,), 90.0),
+        )
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_mis)
+    receipt = quote_provider.prepare_tw_price_limit_snapshot(
+        ["2330"],
+        np.asarray([100.0]),
+        parquet_root=tmp_path,
+        trading_date="2026-09-14",
+    )
+
+    assert receipt["prepared_count"] == 1
+    loaded, _ = quote_provider._load_prepared_tw_price_limits("2026-09-14")
+    assert loaded["2330"] == (100.0, 110.0, 90.0)
+
+
+def test_prepare_tw_price_limits_serializes_concurrent_builds(monkeypatch, tmp_path):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
+    calls: list[list[str]] = []
+
+    def fake_mis(symbols, fallback_prices, **_kwargs):
+        calls.append(list(symbols))
+        fetch_started.set()
+        assert release_fetch.wait(timeout=2.0)
+        count = len(symbols)
+        return quote_provider.PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=count,
+            reference_prices=np.full((count,), 100.0),
+            upper_limit_prices=np.full((count,), 110.0),
+            lower_limit_prices=np.full((count,), 90.0),
+        )
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_mis)
+    results: list[dict[str, object]] = []
+
+    def prepare():
+        results.append(
+            quote_provider.prepare_tw_price_limit_snapshot(
+                ["2330", "2317"],
+                np.asarray([100.0, 100.0]),
+                parquet_root=tmp_path,
+                trading_date="2026-09-15",
+            )
+        )
+
+    first = threading.Thread(target=prepare)
+    second = threading.Thread(target=prepare)
+    first.start()
+    assert fetch_started.wait(timeout=2.0)
+    second.start()
+    release_fetch.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == [["2330", "2317"]]
+    assert len(results) == 2
+    assert all(result["missing_count"] == 0 for result in results)

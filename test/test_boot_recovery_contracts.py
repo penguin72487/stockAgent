@@ -12,9 +12,13 @@ def test_windows_public_gateway_does_not_block_or_kill_wsl_bootstrap() -> None:
     launcher = _read("scripts/start_windows_public_caddy.ps1")
     installer = _read("scripts/install_windows_public_caddy.ps1")
 
-    assert "systemctl start --no-block stockagent-public-dashboards.service" in launcher
+    assert "systemctl $verb --no-block stockagent-public-dashboards.service" in launcher
     assert 'Request-WslGateway "backend_unhealthy"' in launcher
     assert "Test-GatewayBackend" in launcher
+    assert "Test-GatewayListener" in launcher
+    assert "$consecutiveBackendFailures -ge $restartAfterFailures" in launcher
+    assert '"backend_sustained_unresponsive" $true' in launcher
+    assert '$verb = if ($RestartService) { "restart" } else { "start" }' in launcher
     assert "WSL gateway dispatch failed" in launcher
     assert "$wslBootstrapProcess.HasExited" in launcher
     assert "Get-CaddyProcesses" in launcher

@@ -17,10 +17,12 @@ from scripts.serve_public_dashboards import (
     PublicDashboardHandler,
     PublicDashboardServer,
     PublicTrafficObserver,
+    TrafficAggregate,
     build_compact_tw_overview_status,
     build_public_overview,
     summarize_tw_status,
 )
+from stockagent.live.public_performance_history import PublicPerformanceHistoryStore
 from stockagent.live.public_dashboards import (
     PUBLIC_INITIAL_POSITION_ROWS,
     PUBLIC_MAX_EVENT_ROWS,
@@ -855,8 +857,18 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="browser-action-rows"' in traffic_html
     assert 'id="browser-page-filter"' in traffic_html
     assert "不上傳" in traffic_html
-    assert 'href="performance.css?v=3"' in traffic_html
-    assert 'src="app.js?v=9"' in traffic_html
+    assert 'href="performance.css?v=4"' in traffic_html
+    assert 'src="app.js?v=10"' in traffic_html
+    assert 'id="history-range"' in traffic_html
+    assert 'id="history-phase-rows"' in traffic_html
+    assert 'id="history-route-rows"' in traffic_html
+    assert "function refreshHistory" in traffic_javascript
+    browser_audit = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/audit_public_dashboards_browser.mjs"
+    ).read_text(encoding="utf-8")
+    assert "traffic-history-${width}x${height}.png" in browser_audit
+    assert "persistent history panel deadline" in browser_audit
     assert '<option value="render">資料整理與繪圖</option>' in traffic_html
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
@@ -1294,6 +1306,21 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
         assert "cache_resident_bytes" in traffic["definitions"]
         assert "cache_capacity" in traffic["definitions"]
         assert response.getheader("Server-Timing") is not None
+
+        connection.request("GET", "/traffic/api/history?range=24h")
+        response = connection.getresponse()
+        assert response.status == 200
+        history = json.loads(response.read())
+        assert history["range"] == "24h"
+        assert history["read_only"] is True
+        assert history["coverage"]["observed_minutes"] == 1
+        assert history["summary"]["requests"] >= 1
+        assert len(history["trend"]) >= 90
+
+        connection.request("GET", "/traffic/api/history?range=1y")
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read()) == {"error": "invalid_request"}
     finally:
         connection.close()
         server.shutdown()
@@ -1305,6 +1332,9 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     root = Path(__file__).resolve().parents[1]
     gateway = (root / "scripts/serve_public_dashboards.py").read_text(encoding="utf-8")
     caddy = (root / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
+    windows_supervisor = (root / "scripts/start_windows_public_caddy.ps1").read_text(
+        encoding="utf-8"
+    )
     launcher = (root / "scripts/run_public_dashboards.sh").read_text(encoding="utf-8")
     installer = (root / "scripts/install_public_dashboards_service.sh").read_text(
         encoding="utf-8"
@@ -1324,13 +1354,25 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     assert "max_header_size 16KB" in caddy
     assert "read_header 5s" in caddy
     assert "max_conns_per_host" not in caddy
+    assert "health_uri /healthz" not in caddy
+    assert '$gatewayHealthUri = "http://127.0.0.1:8770/healthz"' in windows_supervisor
+    assert "Request-WslGateway \"backend_unhealthy\"" in windows_supervisor
     assert "@write_methods not method GET HEAD" in caddy
     assert 'header @write_methods Allow "GET, HEAD"' in caddy
     assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
     assert 'KMP_AFFINITY="${KMP_AFFINITY:-disabled}"' in launcher
     assert "export OMP_PROC_BIND=" not in launcher
     assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
+    assert "STOCKAGENT_DASHBOARD_PERFORMANCE_DIR" in unit
+    assert "StateDirectory=stockagent-public-dashboards" in unit
+    assert "StateDirectoryMode=0700" in unit
+    assert "MemoryHigh=4G" in unit
+    assert "MemoryMax=8G" in unit
+    assert "MemorySwapMax=1G" in unit
+    assert "TasksMax=4096" in unit
+    assert "OOMScoreAdjust=-250" in unit
     assert "systemctl restart stockagent-public-dashboards.service" in installer
+    assert '"--no-restart"' in installer
     snapshot_unit = (
         root / "deploy/systemd/stockagent-data-refresh-status-snapshot.service.in"
     ).read_text(encoding="utf-8")
@@ -1895,6 +1937,118 @@ def test_public_traffic_observer_is_bounded_anonymous_and_reconcilable() -> None
     assert "user-agent" in snapshot["definitions"]["visitor"].lower()
     assert "127.0.0.1" not in encoded
     assert "private-looking" not in encoded
+
+
+def test_public_traffic_history_persists_phases_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    observer = PublicTrafficObserver(history_root=tmp_path)
+    observed = observer.request_started("/tw-day-trade/api/status")
+    observer.request_finished(
+        observed=observed,
+        path="/tw-day-trade/api/status",
+        status=200,
+        latency_ms=12.5,
+        response_body_bytes=321,
+        phase_durations_ms={
+            "cache_wait": 0.5,
+            "build": 8.0,
+            "write": 1.0,
+            "other": 3.0,
+            "not_allowlisted": 99.0,
+        },
+    )
+    observer.record_cache("build")
+
+    live = observer.history_snapshot("24h")
+    assert live["summary"]["requests"] == 1
+    assert live["summary"]["response_body_bytes"] == 321
+    assert live["coverage"]["observed_minutes"] == 1
+    assert {row["phase"] for row in live["server_phases"]} == {
+        "cache_wait",
+        "build",
+        "write",
+        "other",
+    }
+    assert all(row["samples"] == 1 for row in live["server_phases"])
+    assert live["routes"][0]["route"] == "/tw-day-trade/api/status"
+    assert live["history_storage"]["health"] == "ready"
+    observer.close()
+
+    files = list(tmp_path.glob("*.jsonl"))
+    assert len(files) == 1
+    assert files[0].stat().st_mode & 0o777 == 0o600
+
+    restarted = PublicTrafficObserver(history_root=tmp_path)
+    try:
+        persisted = restarted.history_snapshot("24h")
+        assert persisted["summary"]["requests"] == 1
+        assert persisted["history_storage"]["loaded_rows"] == 1
+        assert persisted["coverage"]["process_segments"] >= 1
+        assert persisted["cache"]["builds"] == 1
+        request_buckets = [
+            row for row in persisted["trend"] if row["requests"] == 1
+        ]
+        assert len(request_buckets) == 1
+        assert request_buckets[0]["observed_minutes"] == 1
+    finally:
+        restarted.close()
+
+
+def test_public_performance_history_compacts_old_minutes_without_losing_counts(
+    tmp_path: Path,
+) -> None:
+    old_hour = (int(time.time()) - 3 * 86_400) // 3_600 * 3_600
+    aggregate = TrafficAggregate()
+    aggregate.record(
+        latency_ms=4.0,
+        response_body_bytes=50,
+        status=200,
+        route_kind="api",
+        phase_durations_ms={"build": 3.0, "other": 1.0},
+    )
+    store = PublicPerformanceHistoryStore(
+        tmp_path,
+        allowed_routes={"/traffic/api/status"},
+        allowed_cache_outcomes={"fresh_hit"},
+    )
+    for offset in (0, 60):
+        assert store.enqueue(
+            {
+                "schema_version": 1,
+                "minute_epoch": old_hour + offset,
+                "process_key": "0123456789abcdef",
+                "aggregate": aggregate.to_payload(),
+                "routes": {
+                    "/traffic/api/status": aggregate.to_payload(),
+                    "/private/query?token=secret": aggregate.to_payload(),
+                },
+                "cache": {"fresh_hit": 1, "secret-token": 99},
+            }
+        )
+    assert store.status()["resident_rows"] == 0
+    assert store.status()["resident_hour_rollups"] == 1
+    rows = store.rows_since(old_hour)
+    assert len(rows) == 1
+    assert rows[0]["rollup_seconds"] == 3_600
+    assert rows[0]["observed_minute_mask"].bit_count() == 2
+    assert rows[0]["aggregate"]["requests"] == 2
+    assert rows[0]["routes"].keys() == {"/traffic/api/status"}
+    assert rows[0]["cache"] == {"fresh_hit": 2}
+    store.close()
+
+    restored = PublicPerformanceHistoryStore(
+        tmp_path,
+        allowed_routes={"/traffic/api/status"},
+        allowed_cache_outcomes={"fresh_hit"},
+    )
+    try:
+        rows = restored.rows_since(old_hour)
+        assert len(rows) == 1
+        assert rows[0]["aggregate"]["requests"] == 2
+        assert restored.status()["loaded_rows"] == 2
+    finally:
+        restored.close()
 
 
 def test_public_gateway_has_no_global_rate_or_fixed_concurrency_ceiling() -> None:

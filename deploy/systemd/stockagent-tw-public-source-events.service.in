@@ -20,6 +20,14 @@ TimeoutStartSec=1min
 Nice=5
 CPUWeight=50
 IOWeight=50
+# Prefer killing/restarting reproducible bulk maintenance before this
+# stateful event monitor when the host is under memory pressure.
+OOMScoreAdjust=-250
+MemoryAccounting=true
+MemoryHigh=6G
+MemoryMax=12G
+MemorySwapMax=2G
+TasksMax=2048
 TimeoutStopSec=2min
 
 [Install]

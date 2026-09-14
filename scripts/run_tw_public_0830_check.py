@@ -370,13 +370,17 @@ def _audit_revision_errors(
 
 
 def _derived_data_commands(
-    *, live_root: Path, expected_latest: str, workers: int = 8
+    *,
+    live_root: Path,
+    expected_latest: str,
+    workers: int = 8,
+    public_feature_incremental_days: int = 14,
 ) -> list[list[str]]:
     """Build every dated derived layer consumed by live model inference."""
 
     stock_root = live_root / "stocks"
     public_feature_path = live_root / "features" / "tw_public_stock_daily.parquet"
-    return [
+    commands = [
         [
             sys.executable,
             str(
@@ -452,6 +456,14 @@ def _derived_data_commands(
             "--allow-daily-publication-lag",
         ],
     ]
+    if int(public_feature_incremental_days) > 0:
+        commands[-1].extend(
+            [
+                "--incremental-tail-days",
+                str(int(public_feature_incremental_days)),
+            ]
+        )
+    return commands
 
 
 def _derived_data_dates(live_root: Path) -> dict[str, str | None]:
@@ -637,13 +649,19 @@ def _derived_data_status(
             ),
         )
     )
-    if (
-        _taipei_receipt_date(entitlement_summary.get("generated_at_utc"))
-        != session_date
-    ):
-        errors["corporate_action_entitlements"].append(
-            "entitlement endpoints were not refreshed in this weekly session"
-        )
+    # The complete entitlement ledger is a derived historical projection, not
+    # an opening quote.  Requiring a new wall-clock timestamp on every session
+    # forced thousands of mutable MOPS issuer pages to be re-downloaded while
+    # holding the global TW public-data write lock, even when the exact
+    # reference/universe bytes were unchanged.  That blocked the 08:15 warmup
+    # and 09:00 signal path without adding information.
+    #
+    # Reuse is still fail-closed below: coverage must end on the latest
+    # completed session, the prior build must be complete, and every recorded
+    # reference, universe and raw-response manifest dependency must still match
+    # by size/SHA-256.  Current-session carried-position actions are refreshed
+    # and checked separately under ``execution_actions``; they are deliberately
+    # not inferred from this model-feature projection.
     if entitlement_summary.get("coverage_complete") is not True or int(
         entitlement_summary.get("failure_count") or 0
     ):
@@ -771,6 +789,7 @@ def main() -> int:
     # the bounded 09:05 lease expires.
     opening_gate_handle = None
     opening_revision_freeze: dict[str, Any] = {}
+    opening_revision_handoff_complete = False
     if not failures:
         gate_path = opening_revision_gate_path(live_root)
         gate_path.parent.mkdir(parents=True, exist_ok=True)
@@ -795,6 +814,7 @@ def main() -> int:
                 observed=datetime.now(TAIPEI),
                 owner={"service": "tw-public-0830-check", "pid": os.getpid()},
             )
+            opening_revision_handoff_complete = True
             steps.append(
                 {
                     "step": "freeze_opening_source_revision",
@@ -810,6 +830,13 @@ def main() -> int:
                     ),
                 }
             )
+            # The lock protects only the atomic handoff.  The persisted lease
+            # now prevents source application through the opening boundary;
+            # retaining this fd across the multi-minute panel audit used to
+            # block the source monitor without adding consistency.
+            fcntl.flock(opening_gate_handle.fileno(), fcntl.LOCK_UN)
+            opening_gate_handle.close()
+            opening_gate_handle = None
 
     eligibility_receipt = _json(eligibility_path)
     try:
@@ -1003,7 +1030,7 @@ def main() -> int:
 
     # Reload the heartbeat at the acceptance boundary so the receipt describes
     # current monitor state instead of the pre-audit snapshot.
-    if opening_gate_handle is not None:
+    if opening_revision_handoff_complete:
         event_receipt = _json(event_path)
         final_event_failures = _event_monitor_errors(
             event_receipt, observed=datetime.now(TAIPEI)

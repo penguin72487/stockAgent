@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
 from pathlib import Path
@@ -494,6 +494,7 @@ def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
     assert commands[3][commands[3].index("--output-path") + 1] == str(
         tmp_path / "features" / "tw_public_stock_daily.parquet"
     )
+    assert commands[3][commands[3].index("--incremental-tail-days") + 1] == "14"
     assert "--allow-daily-publication-lag" in commands[1]
     assert "--allow-daily-publication-lag" in commands[3]
 
@@ -532,6 +533,90 @@ def test_0830_detects_same_date_source_content_revision(tmp_path: Path) -> None:
         keys=("source_receipts",),
     )
     assert errors == ["source_receipts: sha256 mismatch tdcc_shareholding_distribution.parquet"]
+
+
+def test_0830_reuses_hash_bound_entitlements_without_timestamp_refresh(
+    tmp_path: Path,
+) -> None:
+    import polars as pl
+
+    live_root = tmp_path / "live"
+    stock_root = live_root / "stocks"
+    feature_root = live_root / "features"
+    stock_root.mkdir(parents=True)
+    feature_root.mkdir(parents=True)
+
+    reference = live_root / "tw_corporate_action_reference.parquet"
+    entitlements = live_root / "tw_corporate_action_entitlements.parquet"
+    universe = stock_root / "official_symbol_build_report.csv"
+    pl.DataFrame({"date": [date(2026, 8, 21)]}).write_parquet(reference)
+    pl.DataFrame({"date": [date(2026, 8, 21)]}).write_parquet(entitlements)
+    pl.DataFrame({"date": [date(2026, 8, 21)]}).write_parquet(
+        stock_root / "2330_features.parquet"
+    )
+    pl.DataFrame({"date": [date(2026, 8, 21)]}).write_parquet(
+        feature_root / "tw_public_stock_daily.parquet"
+    )
+    universe.write_text("symbol,security_type,market\n2330,stock,twse\n", encoding="utf-8")
+
+    def receipt(path: Path) -> dict[str, object]:
+        return {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    (live_root / "tw_corporate_action_reference.summary.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-08-24T00:00:00+00:00",
+                "end_date": "2026-08-21",
+                "coverage_complete": True,
+                "failure_count": 0,
+                "source_receipts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (live_root / "tw_corporate_action_entitlements.summary.json").write_text(
+        json.dumps(
+            {
+                # An older generation clock is valid when the complete
+                # content-addressed dependency graph is unchanged.
+                "generated_at_utc": "2026-08-22T00:00:00+00:00",
+                "coverage_end": "2026-08-21",
+                "coverage_complete": True,
+                "failure_count": 0,
+                "reference_receipt": receipt(reference),
+                "universe_receipt": receipt(universe),
+                "raw_receipt_manifest": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stock_root / "official_symbol_build_summary.json").write_text(
+        json.dumps(
+            {
+                "source_receipts": [],
+                "fallback_source_receipts": [],
+                "legacy_source_receipts": [],
+                "lifecycle_source_receipts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (feature_root / "tw_public_stock_daily.summary.json").write_text(
+        json.dumps({"source_receipts": []}), encoding="utf-8"
+    )
+
+    status = run_tw_public_0830_check._derived_data_status(
+        live_root,
+        expected_latest="2026-08-21",
+        session_date="2026-08-24",
+    )
+
+    assert status["current"] is True
+    assert status["errors"]["corporate_action_entitlements"] == []
 
 
 def test_preopen_full_sweep_requires_zero_lag_before_live_metadata_promotion() -> None:
@@ -1181,6 +1266,11 @@ def test_source_event_service_is_persistent_and_restarting() -> None:
     assert "NotifyAccess=main" in service
     assert "WatchdogSec=5min" in service
     assert "Restart=always" in service
+    assert "OOMScoreAdjust=-250" in service
+    assert "MemoryHigh=6G" in service
+    assert "MemoryMax=12G" in service
+    assert "MemorySwapMax=2G" in service
+    assert "TasksMax=2048" in service
     assert "watch_tw_public_source_events" not in service
     assert "run_tw_public_source_event_monitor.sh" in service
 
@@ -1205,6 +1295,14 @@ def test_0830_acceptance_uses_bounded_timer_retries() -> None:
     assert "08:29:00 Asia/Taipei" in timer
     assert "09:15:00 Asia/Taipei" in timer
     assert "ExecStartPost" not in service
+    assert "Nice=10" in service
+    assert "CPUWeight=25" in service
+    assert "IOWeight=25" in service
+    assert "MemoryHigh=64G" in service
+    assert "MemoryMax=72G" in service
+    assert "OOMScoreAdjust=500" in service
+    assert "TasksMax=4096" in service
+    assert "Slice=stockagent-heavy-data.slice" in service
 
 
 def test_0830_derived_warmup_does_not_wait_for_same_session_eligibility() -> None:

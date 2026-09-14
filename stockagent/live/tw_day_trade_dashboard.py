@@ -159,6 +159,7 @@ _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "simulation_replay": "bool",
     "sizing_capital_twd": "float",
     "sizing_open_price": "float",
+    "sizing_price_at_decision": "float",
     "sizing_price_at_13_25": "float",
     "source_signal_at": "string",
     "status": "string",
@@ -424,6 +425,7 @@ def _session_clock_cached(
     after_rollover: bool,
     parquet_root: Path,
     calendar_signature: tuple,
+    rollover_local_time: datetime_time,
 ) -> dict[str, Any]:
     """Presentation clock only: a verified session is not a readiness/fill claim."""
     today = datetime_date.fromisoformat(local_date)
@@ -443,7 +445,7 @@ def _session_clock_cached(
         valid, reason = verified_tw_stock_session_day(day, parquet_root=parquet_root)
         if valid:
             next_rollover = datetime.combine(
-                day, datetime_time(8, 30), tzinfo=TAIPEI
+                day, rollover_local_time, tzinfo=TAIPEI
             ).isoformat()
             break
         if "missing" in reason or "unverified" in reason:
@@ -451,14 +453,18 @@ def _session_clock_cached(
     return {
         "display_session_date": display_date,
         "next_rollover_at": next_rollover,
-        "rollover_local_time": "08:30",
+        "rollover_local_time": rollover_local_time.strftime("%H:%M"),
         "timezone": "Asia/Taipei",
         "calendar_verified": display_date is not None and next_rollover is not None,
         "readiness_implied": False,
     }
 
 
-def dashboard_session_clock(observed: datetime) -> dict[str, Any]:
+def dashboard_session_clock(
+    observed: datetime,
+    *,
+    rollover_local_time: datetime_time = datetime_time(8, 30),
+) -> dict[str, Any]:
     parquet_root = DEFAULT_CALENDAR_PARQUET_ROOT
     path = _tw_holiday_schedule_path(parquet_root)
     try:
@@ -474,9 +480,10 @@ def dashboard_session_clock(observed: datetime) -> dict[str, Any]:
     return dict(
         _session_clock_cached(
             local.date().isoformat(),
-            local.time() >= datetime_time(8, 30),
+            local.time() >= rollover_local_time,
             parquet_root,
             signature,
+            rollover_local_time,
         )
     )
 
@@ -557,9 +564,17 @@ def build_dashboard_revision(
         except OSError:
             preopen_revision = "missing"
 
+    session_rollover_time = (
+        datetime_time(13, 0)
+        if discord_markets_field == "overnight_markets"
+        else datetime_time(8, 30)
+    )
     session_clock = (
-        dashboard_session_clock(observed)
-        if discord_markets_field == "day_trade_markets"
+        dashboard_session_clock(
+            observed,
+            rollover_local_time=session_rollover_time,
+        )
+        if discord_markets_field in {"day_trade_markets", "overnight_markets"}
         else {}
     )
     session_token = session_clock.get("display_session_date") or "unverified"
@@ -3831,6 +3846,11 @@ def _operational_issues(
 
     issues: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    observed_taipei = (
+        observed.astimezone(TAIPEI)
+        if observed.tzinfo is not None
+        else observed.replace(tzinfo=TAIPEI)
+    )
 
     def add(
         *,
@@ -4010,7 +4030,26 @@ def _operational_issues(
                 observed_at=mode.get("signal_at"),
             )
         open_position_count = int(mode.get("open_position_count") or 0)
-        if market and market.startswith("tw_day_trade") and open_position_count:
+        try:
+            mode_session_date = datetime_date.fromisoformat(
+                str(mode.get("session_date") or observed_taipei.date().isoformat())
+            )
+        except ValueError:
+            mode_session_date = observed_taipei.date()
+        position_is_residual = (
+            mode_session_date < observed_taipei.date()
+            or (
+                mode_session_date == observed_taipei.date()
+                and observed_taipei.timetz().replace(tzinfo=None)
+                >= datetime_time(13, 30)
+            )
+        )
+        if (
+            market
+            and market.startswith("tw_day_trade")
+            and open_position_count
+            and position_is_residual
+        ):
             stale_position_count = int(mode.get("stale_position_count") or 0)
             force_exit_failures = int(mode.get("force_exit_failures") or 0)
             add(
@@ -4090,11 +4129,15 @@ def _available_session_dates(
     include_ledger_dates: bool = True,
     include_benchmark_history_dates: bool = True,
     include_preopen_session: bool = False,
+    session_rollover_time: datetime_time = datetime_time(8, 30),
     ledger_filenames: tuple[str, ...] | None = None,
 ) -> list[str]:
     root = Path(root)
     display_session = (
-        dashboard_session_clock(observed).get("display_session_date")
+        dashboard_session_clock(
+            observed,
+            rollover_local_time=session_rollover_time,
+        ).get("display_session_date")
         if include_preopen_session
         else None
     )
@@ -4217,7 +4260,10 @@ def _available_session_dates(
     elif not dates:
         # Empty ledgers still need a dated waiting view. Require the same
         # verified calendar rather than accepting a bare weekday guess.
-        verified_session = dashboard_session_clock(observed).get("display_session_date")
+        verified_session = dashboard_session_clock(
+            observed,
+            rollover_local_time=session_rollover_time,
+        ).get("display_session_date")
         if verified_session:
             dates.add(verified_session)
     result = sorted(dates, reverse=True)
@@ -5814,6 +5860,105 @@ def _session_progress(
     }
 
 
+def _overnight_session_progress(
+    *,
+    observed: datetime,
+    mode_count: int,
+    modes: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Present the close-to-next-open clock without day-trade phase leakage."""
+
+    local = observed.astimezone(TAIPEI)
+    day = local.date()
+
+    def at(hour: int, minute: int) -> datetime:
+        return datetime.combine(day, datetime_time(hour, minute), tzinfo=TAIPEI)
+
+    switch_at = at(13, 0)
+    decision_at = at(13, 20)
+    close_at = at(13, 30)
+    delayed_close_deadline = at(13, 34)
+    if local < switch_at:
+        phase = "waiting_switch"
+        label = "等待 13:00 切換"
+        phase_start, phase_end = at(0, 0), switch_at
+        next_label, next_at = "切換並等待", switch_at
+    elif local < decision_at:
+        phase = "armed_waiting_calculation"
+        label = "已切換・等待 13:20 計算"
+        phase_start, phase_end = switch_at, decision_at
+        next_label, next_at = "開始計算", decision_at
+    elif local < close_at:
+        phase = "calculation_and_order_submission"
+        label = "計算完成即送收盤模擬單"
+        phase_start, phase_end = decision_at, close_at
+        next_label, next_at = "13:30 正式收盤撮合", close_at
+    elif local < delayed_close_deadline:
+        phase = "close_auction_settlement"
+        label = "核對正式收盤撮合證據"
+        phase_start, phase_end = close_at, delayed_close_deadline
+        next_label, next_at = "延緩收市證據截止", delayed_close_deadline
+    else:
+        phase = "complete"
+        label = "本日收盤進場流程結束"
+        phase_start, phase_end = decision_at, delayed_close_deadline
+        next_label, next_at = "已完成", delayed_close_deadline
+
+    session_date = day.isoformat()
+    signal_completed = sum(
+        str(mode.get("session_date") or "") == session_date
+        and bool(mode.get("signal_id"))
+        for mode in modes
+    )
+    terminal_statuses = {
+        "carrying_to_next_open",
+        "flat_no_executable_signal",
+        "flat_close_orders_expired",
+        "critical_actual_close_print_missing",
+        "session_complete",
+    }
+    entry_completed = sum(
+        str(mode.get("session_date") or "") == session_date
+        and str(mode.get("engine_status") or "") in terminal_statuses
+        for mode in modes
+    )
+    unique_mode_minutes = {
+        (str(row.get("market")), str(row.get("minute")))
+        for row in marks
+        if row.get("market") and row.get("minute")
+    }
+    return {
+        "phase": phase,
+        "label": label,
+        "phase_progress_ratio": _ratio(
+            (min(max(local, phase_start), phase_end) - phase_start).total_seconds(),
+            (phase_end - phase_start).total_seconds(),
+        ),
+        "session_progress_ratio": _ratio(
+            (min(max(local, switch_at), delayed_close_deadline) - switch_at).total_seconds(),
+            (delayed_close_deadline - switch_at).total_seconds(),
+        ),
+        "next_milestone_label": next_label,
+        "next_milestone_at": next_at.isoformat(timespec="seconds"),
+        "seconds_to_next_milestone": max(0.0, (next_at - local).total_seconds()),
+        "decision_interval_seconds": 60,
+        "signal_completed_modes": signal_completed,
+        "entry_completed_modes": entry_completed,
+        "exit_started_modes": 0,
+        "mode_count": mode_count,
+        "signal_progress_ratio": _ratio(signal_completed, mode_count),
+        "entry_progress_ratio": _ratio(entry_completed, mode_count),
+        "exit_progress_ratio": 0.0,
+        "observed_mode_minutes": len(unique_mode_minutes),
+        "expected_mode_minutes": 0,
+        "mark_tracking_completed_modes": entry_completed,
+        "mark_tracking_complete": bool(mode_count and entry_completed == mode_count),
+        "mark_progress_ratio": 1.0 if entry_completed == mode_count and mode_count else 0.0,
+        "mark_rows_per_minute": 0.0,
+    }
+
+
 def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
     allowed = (
         "position_id",
@@ -6279,6 +6424,11 @@ def build_dashboard_snapshot(
         discord_engine_revision_field=discord_engine_revision_field,
         now=observed,
     )
+    session_rollover_time = (
+        datetime_time(13, 0)
+        if discord_markets_field == "overnight_markets"
+        else datetime_time(8, 30)
+    )
     unattended_guardian = _unattended_guardian_status(
         path=Path(unattended_guardian_path), observed=observed
     )
@@ -6288,7 +6438,9 @@ def build_dashboard_snapshot(
         observed=observed,
         include_ledger_dates=include_ledger_session_dates,
         include_benchmark_history_dates=include_ledger_session_dates,
-        include_preopen_session=discord_markets_field == "day_trade_markets",
+        include_preopen_session=discord_markets_field
+        in {"day_trade_markets", "overnight_markets"},
+        session_rollover_time=session_rollover_time,
     )
     clock_session = service_sync.get("session_clock", {}).get("display_session_date")
     selected_session_date = _select_session_date(
@@ -6417,6 +6569,10 @@ def build_dashboard_snapshot(
                     or 0
                 ),
                 "engine_status": mode.get("engine_status"),
+                "model_adapter": mode.get("model_adapter"),
+                "model_trained_for_overnight": mode.get(
+                    "model_trained_for_overnight"
+                ),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
                 "checkpoint_path": mode.get("checkpoint_path"),
@@ -7046,7 +7202,12 @@ def build_dashboard_snapshot(
         issue.get("severity") in {"error", "warning"} for issue in operational_issues
     ):
         health = "degraded"
-    session_progress = _session_progress(
+    progress_builder = (
+        _overnight_session_progress
+        if discord_markets_field == "overnight_markets"
+        else _session_progress
+    )
+    session_progress = progress_builder(
         observed=selected_observed,
         mode_count=len(modes),
         modes=modes,

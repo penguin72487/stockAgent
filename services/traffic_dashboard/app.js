@@ -2,10 +2,13 @@
 
 const FETCH_TIMEOUT_MS = 5000;
 const REFRESH_MS = 2000;
+const HISTORY_REFRESH_MS = 60000;
 const Dashboard = window.StockAgentDashboard;
 const $ = Dashboard.byId;
 let activeController = null;
 let requestSequence = 0;
+let historyController = null;
+let historyRequestSequence = 0;
 
 const integer = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 0});
 const decimal = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 2});
@@ -32,6 +35,16 @@ function localTime(value) {
 }
 function svgElement(name, attributes = {}) {
   return Dashboard.svgElement(name, attributes);
+}
+
+function emptyTableRow(columnCount, message) {
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = columnCount;
+  td.className = "empty-cell";
+  td.textContent = message;
+  tr.append(td);
+  return tr;
 }
 
 function renderChart(rows) {
@@ -95,11 +108,160 @@ function renderRoutes(routes) {
   $("route-count").textContent = `${count(rows.length)} 組路由`;
 }
 
+function appendObservedSegments(lines, samples, valueKey, x, y, className) {
+  let segment = [];
+  const flush = () => {
+    if (!segment.length) return;
+    if (segment.length === 1) {
+      lines.append(svgElement("circle", {
+        cx: x(segment[0].index),
+        cy: y(segment[0].value),
+        r: 2.8,
+        class: className,
+      }));
+    } else {
+      lines.append(svgElement("polyline", {
+        points: segment.map((point) => `${x(point.index).toFixed(2)},${y(point.value).toFixed(2)}`).join(" "),
+        class: className,
+      }));
+    }
+    segment = [];
+  };
+  samples.forEach((row, index) => {
+    const value = finite(row?.[valueKey]);
+    if (Number(row?.observed_minutes || 0) <= 0 || value === null) {
+      flush();
+      return;
+    }
+    segment.push({index, value});
+  });
+  flush();
+}
+
+function historyAxisTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  const range = $("history-range").value;
+  const options = range === "1h" || range === "24h"
+    ? {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false}
+    : {year: "2-digit", month: "2-digit", day: "2-digit"};
+  return date.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", ...options});
+}
+
+function renderHistoryChart(rows) {
+  const grid = $("history-chart-grid");
+  const lines = $("history-chart-lines");
+  grid.replaceChildren();
+  lines.replaceChildren();
+  const samples = Array.isArray(rows) ? rows : [];
+  const values = samples.flatMap((row) => [
+    finite(row?.latency_p50_ms),
+    finite(row?.latency_p95_ms),
+  ]).filter(Number.isFinite);
+  const hasSamples = samples.some((row) => Number(row?.observed_minutes || 0) > 0 && Number(row?.requests || 0) > 0);
+  $("history-chart-empty").hidden = hasSamples;
+  const left = 54; const right = 906; const top = 22; const bottom = 232;
+  const maxLatency = Math.max(1, ...values);
+  for (let index = 0; index <= 4; index += 1) {
+    const y = top + (bottom - top) * index / 4;
+    grid.append(svgElement("line", {x1: left, y1: y, x2: right, y2: y, class: "grid-line"}));
+    const label = svgElement("text", {x: left - 7, y: y + 4, class: "grid-label", "text-anchor": "end"});
+    label.textContent = milliseconds(maxLatency * (4 - index) / 4);
+    grid.append(label);
+  }
+  if (!samples.length) return;
+  const x = (index) => left + (right - left) * index / Math.max(1, samples.length - 1);
+  const y = (value) => bottom - Number(value || 0) / maxLatency * (bottom - top);
+  appendObservedSegments(lines, samples, "latency_p50_ms", x, y, "history-p50-line");
+  appendObservedSegments(lines, samples, "latency_p95_ms", x, y, "history-p95-line");
+  for (const [index, label] of [[0, samples[0]?.bucket_start_utc], [samples.length - 1, samples.at(-1)?.bucket_start_utc]]) {
+    const text = svgElement("text", {x: x(index), y: 253, class: "grid-label", "text-anchor": index === 0 ? "start" : "end"});
+    text.textContent = historyAxisTime(label);
+    grid.append(text);
+  }
+}
+
+function renderHistoryPhases(phases) {
+  const rows = Array.isArray(phases) ? phases : [];
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const values = [
+      row.label || row.phase || "—",
+      count(row.samples),
+      milliseconds(row.latency_average_ms),
+      milliseconds(row.latency_p50_ms),
+      milliseconds(row.latency_p95_ms),
+      milliseconds(row.latency_p99_ms),
+      milliseconds(row.latency_max_ms),
+    ];
+    values.forEach((value) => { const td = document.createElement("td"); td.textContent = value; tr.append(td); });
+    fragment.append(tr);
+  }
+  if (!rows.some((row) => Number(row.samples || 0) > 0)) {
+    fragment.replaceChildren(emptyTableRow(7, "所選期間尚無伺服器步驟樣本。"));
+  }
+  $("history-phase-rows").replaceChildren(fragment);
+}
+
+function renderHistoryRoutes(routes) {
+  const rows = (Array.isArray(routes) ? [...routes] : []).sort((left, right) => {
+    const leftP95 = finite(left?.latency_p95_ms) ?? -1;
+    const rightP95 = finite(right?.latency_p95_ms) ?? -1;
+    return rightP95 - leftP95 || Number(right?.requests || 0) - Number(left?.requests || 0);
+  });
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const values = [
+      row.route || "—",
+      count(row.requests),
+      ratio(row.share),
+      milliseconds(row.latency_p50_ms),
+      milliseconds(row.latency_p95_ms),
+      milliseconds(row.latency_p99_ms),
+      milliseconds(row.latency_max_ms),
+      ratio(row.error_ratio),
+    ];
+    values.forEach((value, index) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      if (index === 7 && Number(row.error_ratio || 0) > 0) td.className = "negative";
+      tr.append(td);
+    });
+    fragment.append(tr);
+  }
+  if (!rows.length) fragment.append(emptyTableRow(8, "所選期間尚無路由樣本。"));
+  $("history-route-rows").replaceChildren(fragment);
+  $("history-route-count").textContent = `${count(rows.length)} 組路由`;
+}
+
+function renderHistory(data) {
+  const summary = data.summary || {};
+  const coverage = data.coverage || {};
+  $("history-requests").textContent = count(summary.requests);
+  $("history-coverage").textContent = ratio(coverage.ratio);
+  $("history-p50").textContent = milliseconds(summary.latency_p50_ms);
+  $("history-p95").textContent = milliseconds(summary.latency_p95_ms);
+  $("history-errors").textContent = ratio(summary.error_ratio);
+  $("history-cache").textContent = ratio(data.cache?.hit_ratio);
+  $("history-coverage-detail").textContent = `觀測 ${count(coverage.observed_minutes)}／${count(coverage.expected_minutes)} 分鐘 · ${count(coverage.process_segments)} 個程序區段；缺口不連線、不補零。`;
+  renderHistoryChart(data.trend);
+  renderHistoryPhases(data.server_phases);
+  renderHistoryRoutes(data.routes);
+  const storage = data.history_storage || {};
+  $("history-status").textContent = storage.health === "ready"
+    ? `持久監測正常 · 保留 ${count(storage.retention_days)} 天 · 記憶體索引 ${count(storage.resident_rows)} 個分鐘區段 · 待寫入 ${count(storage.queued_writes)}`
+    : storage.enabled
+      ? `持久監測有缺口 · 丟棄 ${count(storage.dropped_rows)} · 寫入錯誤 ${count(storage.write_errors)}${storage.last_error_type ? ` · ${storage.last_error_type}` : ""}`
+      : `持久監測未啟用${storage.last_error_type ? `：${storage.last_error_type}` : ""}`;
+}
+
 function renderDefinitions(definitions) {
   const fragment = document.createDocumentFragment();
   for (const [term, definition] of Object.entries(definitions || {})) {
     const row = document.createElement("div"); const dt = document.createElement("dt"); const dd = document.createElement("dd");
-    const labels = {request: "請求", response_body_bytes: "回應 body", latency: "延遲", percentile: "分位數", error_ratio: "錯誤率", visitor: "訪客隱私", cache_hit_ratio: "快取命中率", cache_resident_bytes: "常駐回應 bytes", cache_capacity: "快取容量契約", retention: "保留範圍"};
+    const labels = {request: "請求", response_body_bytes: "回應 body", latency: "延遲", percentile: "分位數", error_ratio: "錯誤率", visitor: "訪客隱私", cache_hit_ratio: "快取命中率", cache_resident_bytes: "常駐回應 bytes", cache_capacity: "快取容量契約", server_phases: "伺服器步驟", retention: "保留範圍"};
     dt.textContent = labels[term] || term; dd.textContent = String(definition || "—"); row.append(dt, dd); fragment.append(row);
   }
   $("definition-list").replaceChildren(fragment);
@@ -381,7 +543,35 @@ async function refresh({manual = false} = {}) {
   }
 }
 
-$("refresh-now").addEventListener("click", () => void refresh({manual: true}));
+async function refreshHistory({manual = false} = {}) {
+  if (historyController && !manual) return;
+  if (historyController) historyController.abort();
+  const controller = new AbortController(); historyController = controller;
+  const sequence = ++historyRequestSequence;
+  const range = $("history-range").value;
+  try {
+    const response = await Dashboard.fetchWithTimeout(`api/history?range=${encodeURIComponent(range)}`, {
+      cache: "no-store",
+      signal: controller.signal,
+      timeoutMs: FETCH_TIMEOUT_MS,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
+    if (sequence !== historyRequestSequence || range !== $("history-range").value) return;
+    renderHistory(data);
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    $("history-status").textContent = `歷史測速讀取失敗：${error}`;
+  } finally {
+    if (historyController === controller) historyController = null;
+  }
+}
+
+$("refresh-now").addEventListener("click", () => {
+  void refresh({manual: true});
+  void refreshHistory({manual: true});
+});
+$("history-range").addEventListener("change", () => void refreshHistory({manual: true}));
 $("browser-page-filter").addEventListener("change", renderBrowserPerformance);
 $("browser-kind-filter").addEventListener("change", renderBrowserPerformance);
 $("browser-copy").addEventListener("click", () => void copyBrowserPerformance());
@@ -392,6 +582,12 @@ $("browser-clear").addEventListener("click", () => {
 });
 document.addEventListener("stockagent-performance-recorded", scheduleBrowserPerformanceRender);
 document.addEventListener("stockagent-performance-cleared", scheduleBrowserPerformanceRender);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({manual: true}); });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    void refresh({manual: true});
+    void refreshHistory({manual: true});
+  }
+});
 renderBrowserPerformance();
 Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS, refreshOnVisible: false});
+Dashboard.scheduleRefresh(refreshHistory, {intervalMs: HISTORY_REFRESH_MS, refreshOnVisible: false});

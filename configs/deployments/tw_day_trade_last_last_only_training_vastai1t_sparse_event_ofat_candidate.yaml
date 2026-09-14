@@ -1,0 +1,13 @@
+# Sparse-event algorithm candidate for dual-RTX-5090 profiling.  The fixed
+# maximum remains a fail-closed bound while each batch selects the smallest
+# power-of-two event ABI.  Keep the legacy single cohort ABI so this test
+# isolates event-domain reduction from cohort-shape dispatch.
+base_config: tw_day_trade_last_last_only_training_vastai1t_prepared_cache_candidate.yaml
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v5_sparse_event_ofat_candidate
+
+training:
+  day_trade_sparse_events: true
+  day_trade_sparse_event_slots: 262144
+  day_trade_sparse_event_bucket_mode: batch_minimum
