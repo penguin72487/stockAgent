@@ -5230,6 +5230,163 @@ def _write_temporal_basis_metadata(
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
+_TRAINING_TRANSFORM_CACHE_SCHEMA_VERSION = 1
+
+
+def _array_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    return hashlib.sha256(memoryview(array).cast("B")).hexdigest()
+
+
+def _panel_training_transform_fingerprint(
+    panel: PanelData,
+    name: str,
+    value: np.ndarray,
+) -> dict[str, Any]:
+    """Use the immutable panel-cache digest, or hash a non-cached test panel."""
+
+    array = np.asarray(value)
+    cached = getattr(panel, "content_fingerprints", None)
+    item = None if not isinstance(cached, Mapping) else cached.get(name)
+    if (
+        isinstance(item, Mapping)
+        and item.get("present") is True
+        and item.get("shape") == [int(size) for size in array.shape]
+        and item.get("dtype") == str(array.dtype)
+        and isinstance(item.get("sha256"), str)
+    ):
+        return dict(item)
+    return {
+        "present": True,
+        "shape": [int(size) for size in array.shape],
+        "dtype": str(array.dtype),
+        "sha256": _array_sha256(array),
+    }
+
+
+def _training_transform_cache_key(
+    *,
+    kind: str,
+    panel: PanelData | None,
+    train_ds: CrossSectionalDataset,
+    contract: Mapping[str, Any],
+    include_alive_mask: bool,
+) -> dict[str, Any]:
+    indices = np.asarray(train_ds.valid_indices, dtype="<i8").reshape(-1)
+    if panel is None:
+        features = train_ds.features_t.detach().to(device="cpu").numpy()
+        feature_fingerprint = {
+            "present": True,
+            "shape": [int(size) for size in features.shape],
+            "dtype": str(features.dtype),
+            "sha256": _array_sha256(features),
+        }
+    else:
+        feature_fingerprint = _panel_training_transform_fingerprint(
+            panel, "features", panel.features
+        )
+    payload: dict[str, Any] = {
+        "cache_schema_version": _TRAINING_TRANSFORM_CACHE_SCHEMA_VERSION,
+        "kind": str(kind),
+        "features": feature_fingerprint,
+        "valid_indices": {
+            "count": int(indices.size),
+            "sha256": _array_sha256(indices),
+        },
+        "contract": dict(contract),
+    }
+    if include_alive_mask:
+        if panel is None:
+            raise ValueError("alive-mask training transform cache requires PanelData")
+        payload["alive_mask"] = _panel_training_transform_fingerprint(
+            panel, "alive_mask", panel.alive_mask
+        )
+    return payload
+
+
+def _training_transform_cache_path(
+    output_path: Path,
+    *,
+    kind: str,
+    cache_key: Mapping[str, Any],
+) -> Path:
+    cache_root = Path(
+        os.environ.get(
+            "STOCKAGENT_TRAINING_TRANSFORM_CACHE_DIR",
+            str(output_path.parent / ".training_transform_cache_v1"),
+        )
+    ).expanduser()
+    return cache_root / str(kind) / f"{_stable_fingerprint(cache_key)}.json"
+
+
+def _load_training_transform_cache(
+    output_path: Path,
+    *,
+    kind: str,
+    cache_key: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    path = _training_transform_cache_path(
+        output_path, kind=kind, cache_key=cache_key
+    )
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        warnings.warn(f"Ignoring invalid training transform cache {path}: {exc}")
+        return None
+    if not isinstance(envelope, Mapping):
+        return None
+    payload = envelope.get("payload")
+    if (
+        envelope.get("schema_version") != _TRAINING_TRANSFORM_CACHE_SCHEMA_VERSION
+        or envelope.get("kind") != str(kind)
+        or envelope.get("cache_key") != dict(cache_key)
+        or not isinstance(payload, Mapping)
+        or envelope.get("payload_fingerprint") != _stable_fingerprint(payload)
+    ):
+        warnings.warn(f"Ignoring mismatched training transform cache {path}")
+        return None
+    return deepcopy(dict(payload))
+
+
+def _store_training_transform_cache(
+    output_path: Path,
+    *,
+    kind: str,
+    cache_key: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> None:
+    path = _training_transform_cache_path(
+        output_path, kind=kind, cache_key=cache_key
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        "schema_version": _TRAINING_TRANSFORM_CACHE_SCHEMA_VERSION,
+        "kind": str(kind),
+        "cache_key": dict(cache_key),
+        "payload": dict(payload),
+        "payload_fingerprint": _stable_fingerprint(payload),
+    }
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(envelope, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _fit_group_temporal_basis(
     *,
     config: ExperimentConfig,
@@ -5237,6 +5394,7 @@ def _fit_group_temporal_basis(
     train_years: Sequence[int],
     group_folds: Sequence[WalkForwardFold],
     output_path: Path,
+    panel: PanelData | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None]:
     """Fit only data-dependent bases from this group's training windows."""
 
@@ -5269,9 +5427,40 @@ def _fit_group_temporal_basis(
     )
 
     payload: dict[str, Any] | None = None
+    cache_key = _training_transform_cache_key(
+        kind="temporal_basis",
+        panel=panel,
+        train_ds=train_ds,
+        contract={
+            "schema_version": 1,
+            "families": [str(name) for name in families],
+            "components": int(components),
+            "components_by_family": {
+                str(name): int(value)
+                for name, value in sorted(components_by_family.items())
+            },
+            "novelty_threshold": float(novelty_threshold),
+            "lookback": int(lookback),
+            "feature_lag": int(execution_feature_lag(train_ds.execution_mode)),
+            "uses_pca": bool(uses_pca),
+            "train_years": [int(year) for year in train_years],
+            "fold_ids": [int(fold.fold_id) for fold in group_folds],
+        },
+        include_alive_mask=False,
+    )
+    cache_status = "miss"
 
     def _fit_on_rank0() -> None:
-        nonlocal payload
+        nonlocal payload, cache_status
+        payload = _load_training_transform_cache(
+            output_path,
+            kind="temporal_basis",
+            cache_key=cache_key,
+        )
+        if payload is not None:
+            cache_status = "hit"
+            return
+        started = time.perf_counter()
         overrides: dict[str, torch.Tensor] = {}
         covariance: torch.Tensor | None = None
         pca_metadata: dict[str, Any] | None = None
@@ -5313,6 +5502,16 @@ def _fit_group_temporal_basis(
             },
             "metadata": metadata,
         }
+        _store_training_transform_cache(
+            output_path,
+            kind="temporal_basis",
+            cache_key=cache_key,
+            payload=payload,
+        )
+        print(
+            f"[training transform] temporal_basis cache=miss "
+            f"elapsed={time.perf_counter() - started:.3f}s"
+        )
 
     # Rank 0 may spend substantial time fitting a training-only PCA basis, or
     # it may fail validation before producing a payload.  Keep nonzero ranks on
@@ -5326,6 +5525,8 @@ def _fit_group_temporal_basis(
         payload = objects[0]
     if payload is None:
         raise RuntimeError("Temporal basis fit did not produce a distributed payload")
+    if cache_status == "hit" and _distributed_should_write():
+        print("[training transform] temporal_basis cache=hit")
 
     overrides = {
         name: torch.tensor(matrix, dtype=torch.float32)
@@ -5412,9 +5613,40 @@ def _fit_group_causal_feature_rms(
         raise ValueError("causal feature RMS training window is empty")
     feature_count = len(panel.feature_names)
     payload: dict[str, Any] | None = None
+    cache_key = _training_transform_cache_key(
+        kind="causal_feature_rms",
+        panel=panel,
+        train_ds=train_ds,
+        contract={
+            "schema_version": 1,
+            "feature_row_start": int(row_start),
+            "feature_row_end_inclusive": int(row_end),
+            "feature_lag": int(feature_lag),
+            "lookback": int(train_ds.lookback),
+            "minimum_active_dates": int(minimum_dates),
+            "scale_epsilon": float(epsilon),
+            "categorical_feature_names": sorted(
+                str(name) for name in model_config.categorical_feature_names
+            ),
+            "feature_names": [str(name) for name in panel.feature_names],
+            "train_years": [int(year) for year in train_years],
+            "fold_ids": [int(fold.fold_id) for fold in group_folds],
+        },
+        include_alive_mask=True,
+    )
+    cache_status = "miss"
 
     def _fit_on_rank0() -> None:
-        nonlocal payload
+        nonlocal payload, cache_status
+        payload = _load_training_transform_cache(
+            output_path,
+            kind="causal_feature_rms",
+            cache_key=cache_key,
+        )
+        if payload is not None:
+            cache_status = "hit"
+            return
+        started = time.perf_counter()
         squared_sum = np.zeros(feature_count, dtype=np.float64)
         active_date_count = np.zeros(feature_count, dtype=np.int64)
         alive_cell_count = 0
@@ -5511,6 +5743,16 @@ def _fit_group_causal_feature_rms(
             "active": active.tolist(),
             "metadata": metadata,
         }
+        _store_training_transform_cache(
+            output_path,
+            kind="causal_feature_rms",
+            cache_key=cache_key,
+            payload=payload,
+        )
+        print(
+            f"[training transform] causal_feature_rms cache=miss "
+            f"elapsed={time.perf_counter() - started:.3f}s"
+        )
 
     _run_rank0_store_synchronized_phase("causal_feature_rms_fit", _fit_on_rank0)
     if _distributed_is_initialized() and _distributed_world_size() > 1:
@@ -5519,6 +5761,8 @@ def _fit_group_causal_feature_rms(
         payload = objects[0]
     if payload is None:
         raise RuntimeError("causal feature RMS fit produced no distributed payload")
+    if cache_status == "hit" and _distributed_should_write():
+        print("[training transform] causal_feature_rms cache=hit")
 
     scale = torch.tensor(payload["scale"], dtype=torch.float32)
     active = torch.tensor(payload["active"], dtype=torch.bool)
@@ -16782,6 +17026,65 @@ def _load_test_symbols(fold_dir: Path) -> list[str]:
     return [str(item) for item in payload]
 
 
+def _try_load_fresh_fold_physical_deployment_segment(
+    fold_dir: Path,
+    *,
+    expected_dates: np.ndarray,
+    expected_symbols: Sequence[str],
+    expected_requests: np.ndarray,
+    release_id: str,
+    initial_capital: float,
+) -> BacktestResult | None:
+    """Verify and reuse the first fold's just-written exact deployment prefix.
+
+    The isolated child already evaluated and persisted this prefix with the
+    canonical GPU FIFO ledger. Replaying the same first segment eagerly on CPU
+    before writing its stitched marker is redundant. Later folds cannot use
+    this shortcut because their persisted prefix starts from reset capital,
+    while the stitched account starts from the previous fold's terminal NAV.
+    """
+
+    artifact_path = _deployment_backtest_path(fold_dir)
+    if not artifact_path.is_file():
+        return None
+    try:
+        dates = np.asarray(expected_dates, dtype="datetime64[D]").reshape(-1)
+        symbols = [str(symbol) for symbol in expected_symbols]
+        if _load_deployment_symbols(fold_dir, len(symbols)) != symbols:
+            raise ValueError("stored global symbol order differs")
+        stored, stored_dates = _load_backtest_artifact(
+            artifact_path,
+            day_trade_carry_context=DayTradeCarryArtifactContext(
+                universe=tuple(symbols),
+                release_id=str(release_id),
+                initial_capital=float(initial_capital),
+                initial_nav=float(initial_capital),
+            ),
+        )
+        stored_dates = np.asarray(stored_dates, dtype="datetime64[D]").reshape(-1)
+        if not np.array_equal(stored_dates, dates):
+            raise ValueError("stored dates differ")
+        requests = stored.requested_weights_history
+        if requests is None or _array_sha256(
+            np.asarray(requests, dtype=np.float64)
+        ) != _array_sha256(np.asarray(expected_requests, dtype=np.float64)):
+            raise ValueError("stored model requests differ")
+        terminal = stored.day_trade_carry_state
+        expected_last_day = date.fromisoformat(
+            np.datetime_as_string(dates[-1], unit="D")
+        ).toordinal()
+        if terminal is None or terminal.last_session_day != expected_last_day:
+            raise ValueError("stored physical terminal state differs")
+        return stored
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        print(
+            "[WalkForward] fresh physical deployment prefix rejected; "
+            f"reason={exc}; replaying canonical ledger",
+            flush=True,
+        )
+        return None
+
+
 def _replay_taiwan_stitched_deployment(
     output_path: Path,
     results: list[FoldResult],
@@ -17067,20 +17370,31 @@ def _replay_taiwan_stitched_deployment(
             raise RuntimeError("stitched physical source differs from execution runtime")
         previous: DayTradeCarryState | None = None
         initial_capital = float(config.trading.volume_participation_equity)
-        for _segment_fold_dir, start, end in fold_segments:
+        for segment_fold_dir, start, end in fold_segments:
             initial_nav = (
                 initial_capital
                 if previous is None
                 else float(previous.last_nav.detach().cpu().item())
             )
-            segment = _replay_physical_carry_panel_segment(
-                full_requests[start:end],
-                panel_rows[start:end],
-                dataset=execution_dataset,
-                runtime=runtime,
-                config=config,
-                initial_state=previous,
-            )
+            segment = None
+            if previous is None and initial_nav == initial_capital:
+                segment = _try_load_fresh_fold_physical_deployment_segment(
+                    segment_fold_dir,
+                    expected_dates=stitched_dates[start:end],
+                    expected_symbols=global_symbols,
+                    expected_requests=full_requests[start:end],
+                    release_id=physical_source.release_id,
+                    initial_capital=initial_capital,
+                )
+            if segment is None:
+                segment = _replay_physical_carry_panel_segment(
+                    full_requests[start:end],
+                    panel_rows[start:end],
+                    dataset=execution_dataset,
+                    runtime=runtime,
+                    config=config,
+                    initial_state=previous,
+                )
             if segment.day_trade_carry_state is None:
                 raise RuntimeError("physical stitched segment lost its terminal state")
             previous = segment.day_trade_carry_state.detached(device="cpu")
@@ -23669,6 +23983,7 @@ def _run_training_impl(
             temporal_basis_overrides, temporal_basis_metadata = (
                 _fit_group_temporal_basis(
                     config=config,
+                    panel=panel,
                     train_ds=train_ds,
                     train_years=train_years,
                     group_folds=group_folds,

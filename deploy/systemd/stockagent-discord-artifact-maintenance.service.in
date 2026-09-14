@@ -5,6 +5,7 @@ After=network-online.target time-sync.target
 
 [Service]
 Type=oneshot
+Slice=stockagent-heavy-data.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
@@ -19,6 +20,11 @@ Nice=15
 CPUWeight=10
 IOWeight=10
 OOMScoreAdjust=500
+MemoryAccounting=true
+MemoryHigh=48G
+MemoryMax=64G
+MemorySwapMax=4G
+TasksMax=4096
 
 [Install]
 WantedBy=multi-user.target

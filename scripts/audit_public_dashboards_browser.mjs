@@ -415,6 +415,43 @@ for (const [name, suffix] of pages) {
       path.join(outputDir, `traffic-performance-${width}x${height}.png`),
       Buffer.from(performanceScreenshot.data, "base64"),
     );
+    const historyPanel = await send("Runtime.evaluate", {
+      expression: `new Promise(resolve => {
+        const started=performance.now();
+        const check=()=>{
+          const status=document.getElementById('history-status')?.textContent?.trim()||'';
+          const requests=document.getElementById('history-requests')?.textContent?.trim()||'';
+          const coverage=document.getElementById('history-coverage')?.textContent?.trim()||'';
+          const phaseRows=document.querySelectorAll('#history-phase-rows tr').length;
+          const routeRows=document.querySelectorAll('#history-route-rows tr').length;
+          if(status.startsWith('持久監測正常')&&requests&&requests!=='—'&&coverage&&coverage!=='—'&&phaseRows>=4&&routeRows>0) {
+            resolve({status,requests,coverage,phaseRows,routeRows});
+          } else if(performance.now()-started>5000) {
+            resolve({error:'persistent history panel deadline',status,requests,coverage,phaseRows,routeRows});
+          } else setTimeout(check,25);
+        }; check();
+      })`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const historyPanelValue = historyPanel.result?.value || {error:"persistent history panel evaluation failed"};
+    interactionLatency = {...interactionLatency, historyPanel:historyPanelValue};
+    if (historyPanelValue.error) interactionLatency.error = historyPanelValue.error;
+    await send("Runtime.evaluate", {
+      expression: `new Promise(resolve => {
+        document.getElementById('history-title')?.scrollIntoView({behavior:'instant',block:'start'});
+        requestAnimationFrame(()=>requestAnimationFrame(resolve));
+      })`,
+      awaitPromise: true,
+    });
+    const historyScreenshot = await send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: false,
+    });
+    fs.writeFileSync(
+      path.join(outputDir, `traffic-history-${width}x${height}.png`),
+      Buffer.from(historyScreenshot.data, "base64"),
+    );
     await send("Runtime.evaluate", {expression: "scrollTo({top:0,behavior:'instant'})"});
   }
   if (name === "data-monitor") {

@@ -5,6 +5,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
 import json
@@ -44,6 +45,7 @@ _SHIOAJI_STREAM_API: object | None = None
 _SHIOAJI_STREAM_SUBSCRIPTIONS: set[tuple[str, str]] = set()
 _SHIOAJI_STREAM_ROWS: dict[str, dict[str, dict[str, Any]]] = {}
 _TW_LIMIT_CACHE_LOCK = threading.Lock()
+_TW_LIMIT_PREPARE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
 _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
 _TW_MIS_BOOTSTRAP_LOCK = threading.Lock()
@@ -674,6 +676,174 @@ def resolve_observed_minute_execution_price(
     return None, None, parsed_shares
 
 
+def load_local_stock_0901_vwaps(
+    minute_roots: tuple[Path, ...],
+    symbols: list[str],
+    *,
+    trading_date: date,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Resolve right-labelled 09:01 prices from downloaded minute Parquet.
+
+    Local immutable/source-backed data is cheaper and faster than issuing one
+    historical broker request per symbol.  Roots retain caller priority;
+    unresolved symbols alone flow to later roots and then to the broker.
+    """
+
+    import polars as pl
+
+    requested = set(dict.fromkeys(str(symbol).strip() for symbol in symbols))
+    requested.discard("")
+    resolved: dict[str, dict[str, Any]] = {}
+    source_counts: dict[str, int] = {}
+    price_method_counts: dict[str, int] = {}
+    error_counts: dict[str, int] = {}
+
+    def accept(frame: Any, source: Path) -> None:
+        if not frame.height:
+            return
+        names = set(frame.columns)
+        if "minutes_from_open" in names:
+            frame = frame.filter(pl.col("minutes_from_open") == 1)
+        elif "ts" in names:
+            frame = frame.with_columns(pl.col("ts").cast(pl.Datetime("ns"))).filter(
+                (pl.col("ts").dt.hour() == 9) & (pl.col("ts").dt.minute() == 1)
+            )
+        if "date" in frame.columns:
+            frame = frame.filter(pl.col("date").cast(pl.Date) == trading_date)
+        for row in frame.iter_rows(named=True):
+            symbol = str(row.get("symbol") or "")
+            if symbol not in requested or symbol in resolved:
+                continue
+            price, price_method, volume_shares = resolve_observed_minute_execution_price(
+                amount=row.get("Amount"),
+                volume_shares=row.get("volume_shares"),
+                raw_volume=row.get("Volume"),
+                contract_unit=row.get("contract_unit"),
+                low=row.get("Low"),
+                high=row.get("High"),
+                close=row.get("Close"),
+            )
+            if price is None or price_method is None:
+                continue
+            row_source = Path(str(row.get("_source_path") or source))
+            source_text = (
+                f"local_minute_parquet_0901_{price_method}:{row_source.resolve()}"
+            )
+            close = _float_or_none(row.get("Close"))
+            observed_volume = _float_or_none(
+                row.get("volume_shares")
+                if row.get("volume_shares") is not None
+                else row.get("Volume")
+            )
+            resolved[symbol] = {
+                "symbol": symbol,
+                "execution_price_0901": float(price),
+                "valuation_price_0901": (
+                    close if observed_volume is not None and observed_volume > 0.0 else None
+                ),
+                "execution_price_0901_method": price_method,
+                "tick_volume_units_0901": float(volume_shares or 0.0),
+                "tick_count_0901": 0,
+                "source_window_start": datetime.combine(
+                    trading_date,
+                    datetime_time(9, 0),
+                    tzinfo=ZoneInfo("Asia/Taipei"),
+                ).isoformat(timespec="seconds"),
+                "source_window_end": datetime.combine(
+                    trading_date,
+                    datetime_time(9, 0, 59),
+                    tzinfo=ZoneInfo("Asia/Taipei"),
+                ).isoformat(timespec="seconds"),
+                "quote_at": datetime.combine(
+                    trading_date,
+                    datetime_time(9, 1),
+                    tzinfo=ZoneInfo("Asia/Taipei"),
+                ).isoformat(timespec="seconds"),
+                "source": source_text,
+            }
+            source_counts[source_text] = source_counts.get(source_text, 0) + 1
+            price_method_counts[price_method] = (
+                price_method_counts.get(price_method, 0) + 1
+            )
+
+    for raw_root in minute_roots:
+        root = Path(raw_root)
+        unresolved = requested - set(resolved)
+        if not unresolved or not root.is_dir():
+            continue
+        chunk_paths: list[Path] = []
+        day_text = trading_date.isoformat()
+        for symbol in sorted(unresolved):
+            for path in sorted((root / "minute_chunks" / symbol).glob("*.parquet")):
+                boundaries = path.stem.split("_")
+                if len(boundaries) == 2 and boundaries[0] <= day_text <= boundaries[1]:
+                    chunk_paths.append(path)
+        schema_groups: dict[tuple[str, ...], list[Path]] = {}
+        for path in chunk_paths:
+            try:
+                schema_groups.setdefault(
+                    tuple(pl.read_parquet_schema(path).names()), []
+                ).append(path)
+            except Exception as exc:
+                key = type(exc).__name__
+                error_counts[key] = error_counts.get(key, 0) + 1
+        for schema_tuple, paths in schema_groups.items():
+            schema = set(schema_tuple)
+            columns = [
+                name
+                for name in (
+                    "symbol", "date", "ts", "Amount", "Volume",
+                    "volume_shares", "contract_unit", "Low", "High", "Close",
+                )
+                if name in schema
+            ]
+            try:
+                lazy = pl.scan_parquet(sorted(paths), include_file_paths="_source_path")
+                if "date" in schema:
+                    lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
+                accept(
+                    lazy.select(*columns, "_source_path").collect(engine="streaming"),
+                    root,
+                )
+            except Exception as exc:
+                key = type(exc).__name__
+                error_counts[key] = error_counts.get(key, 0) + 1
+        unresolved = requested - set(resolved)
+        partition = root / f"trade_date={day_text}" / "data.parquet"
+        if unresolved and partition.is_file():
+            try:
+                schema = pl.scan_parquet(partition).collect_schema().names()
+                columns = [
+                    name
+                    for name in (
+                        "symbol", "date", "ts", "minutes_from_open", "Amount",
+                        "Volume", "volume_shares", "contract_unit", "Low", "High",
+                        "Close",
+                    )
+                    if name in schema
+                ]
+                accept(
+                    pl.scan_parquet(partition)
+                    .filter(pl.col("symbol").is_in(sorted(unresolved)))
+                    .select(columns)
+                    .collect(),
+                    partition,
+                )
+            except Exception as exc:
+                key = type(exc).__name__
+                error_counts[key] = error_counts.get(key, 0) + 1
+    return resolved, {
+        "source": "local_minute_data_0901_price",
+        "requested_symbols": len(requested),
+        "resolved_symbols": len(resolved),
+        "unresolved_symbols": len(requested - set(resolved)),
+        "source_counts": source_counts,
+        "price_method_counts": price_method_counts,
+        "error_counts": error_counts,
+        "additional_shioaji_requests": 0,
+    }
+
+
 def fetch_shioaji_historical_stock_0901_vwaps(
     symbols: list[str],
     *,
@@ -1157,6 +1327,36 @@ def _tw_price_limit_snapshot_path(trading_date: str | None = None) -> Path:
     return root / f"{date_text}.parquet"
 
 
+@contextmanager
+def _tw_price_limit_prepare_lock(path: Path):
+    """Serialize one daily snapshot build across threads and live processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with _TW_LIMIT_PREPARE_LOCK, lock_path.open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _load_prepared_tw_price_limits(
     trading_date: str | None = None,
 ) -> tuple[dict[str, tuple[float | None, float | None, float | None]], Path]:
@@ -1171,7 +1371,14 @@ def _load_prepared_tw_price_limits(
             return dict(_TW_LIMIT_CACHE), path
     import polars as pl
 
-    frame = pl.read_parquet(path)
+    try:
+        frame = pl.read_parquet(path)
+    except (OSError, ValueError, pl.exceptions.PolarsError):
+        # This file is a reproducible same-session cache.  A truncated file
+        # must behave like a cache miss so the preparation path can repair it;
+        # execution still fails closed when neither this cache nor the broker
+        # contract supplies authoritative limits.
+        return {}, path
     lookup: dict[str, tuple[float | None, float | None, float | None]] = {}
     for row in frame.iter_rows(named=True):
         symbol = str(row.get("symbol") or "").strip()
@@ -1188,7 +1395,7 @@ def _load_prepared_tw_price_limits(
     return lookup, path
 
 
-def prepare_tw_price_limit_snapshot(
+def _prepare_tw_price_limit_snapshot_locked(
     symbols: list[str],
     fallback_prices: np.ndarray,
     *,
@@ -1259,9 +1466,14 @@ def prepare_tw_price_limit_snapshot(
         for symbol, values in sorted(existing.items())
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".parquet.tmp")
-    pl.DataFrame(rows).write_parquet(temporary)
-    os.replace(temporary, path)
+    temporary = path.with_suffix(
+        path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    )
+    try:
+        pl.DataFrame(rows).write_parquet(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     # Reload via the stat-keyed cache so readers never retain the pre-replace map.
     loaded, _ = _load_prepared_tw_price_limits(date_text)
     return {
@@ -1271,6 +1483,25 @@ def prepare_tw_price_limit_snapshot(
         "prepared_count": len(loaded),
         "missing_count": max(0, len(set(symbols)) - len(loaded)),
     }
+
+
+def prepare_tw_price_limit_snapshot(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    parquet_root: str | Path,
+    trading_date: str | None = None,
+) -> dict[str, object]:
+    """Build or extend one valid daily price-limit snapshot exactly once."""
+
+    path = _tw_price_limit_snapshot_path(trading_date)
+    with _tw_price_limit_prepare_lock(path):
+        return _prepare_tw_price_limit_snapshot_locked(
+            symbols,
+            fallback_prices,
+            parquet_root=parquet_root,
+            trading_date=trading_date,
+        )
 
 
 def fetch_shioaji_stock_snapshots(

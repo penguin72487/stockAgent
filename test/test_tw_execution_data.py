@@ -1333,6 +1333,14 @@ def test_exact_entitlement_loader_verifies_raw_mops_manifest(tmp_path) -> None:
                     "cash_dividend_per_share": 10.0,
                     "cash_payment_date": date(2024, 7, 31),
                     "stop_transfer_start": date(2024, 7, 5),
+                },
+                {
+                    "date": date(2024, 8, 1),
+                    "symbol": "1101",
+                    "handling": "exact_inventory",
+                    "cash_dividend_per_share": None,
+                    "cash_payment_date": None,
+                    "stop_transfer_start": None,
                 }
             ],
             schema=pa.schema(
@@ -1369,8 +1377,8 @@ def test_exact_entitlement_loader_verifies_raw_mops_manifest(tmp_path) -> None:
                 "schema_version": 3,
                 "coverage_start": "2024-01-01",
                 "coverage_end": "2024-12-31",
-                "rows": 1,
-                "reference_rows": 1,
+                "rows": 2,
+                "reference_rows": 2,
                 "reference_receipt": {
                     "size": reference_path.stat().st_size,
                     "sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
@@ -1399,6 +1407,7 @@ def test_exact_entitlement_loader_verifies_raw_mops_manifest(tmp_path) -> None:
     terms, short_terms, start, end = _load_exact_cash_entitlements(paths)
 
     assert terms is not None and terms["2330"][1].tolist() == [10.0]
+    assert "1101" not in terms
     assert short_terms is not None
     assert start == np.datetime64("2024-01-01")
     assert end == np.datetime64("2024-12-31")

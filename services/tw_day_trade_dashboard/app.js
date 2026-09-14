@@ -61,7 +61,7 @@ let featurePanelSignalKey = "";
 let featurePanelScopeText = "";
 let signalFilterTimer = null;
 let dateFilterTimer = null;
-let followLatestSession = !IS_OVERNIGHT;
+let followLatestSession = true;
 let sessionRolloverTimer = null;
 let sessionRolloverDeadline = "";
 let sessionRolloverDue = Infinity;
@@ -112,11 +112,13 @@ function installProductCopy() {
   const subtitle = document.querySelector(".topbar .subtitle");
   if (eyebrow) eyebrow.textContent = "TW STOCKS · CLOSE-TO-NEXT-OPEN · PUBLIC READ-ONLY";
   if (title) title.textContent = "台股隔日沖模擬";
-  if (subtitle) subtitle.textContent = "13:25 產生目標並參與收盤集合競價；只在次一交易日實際開盤撮合後沖銷。";
+  if (subtitle) subtitle.textContent = "13:00 切換並等待，13:20 開始計算且在 13:30 前送出模擬單；只在次一交易日實際開盤撮合後沖銷。";
+  const followButton = document.querySelector("#follow-latest-session");
+  if (followButton) followButton.textContent = "跟隨最新交易日（13:00 切換）";
 
   const operationHead = document.querySelector(".operations-panel .panel-head h2");
   const operationNote = document.querySelector(".operations-panel .panel-head p");
-  if (operationHead) operationHead.textContent = "13:25 訊號、收盤進場與次日開盤沖銷進度";
+  if (operationHead) operationHead.textContent = "13:00 等待、13:20 計算、收盤進場與次日開盤沖銷進度";
   if (operationNote) operationNote.textContent = "試撮只供觀察；收盤與開盤都必須有交易所時間戳的非試撮價格才記為模擬成交";
   const operationColumns = document.querySelectorAll(".operation-body h3");
   ["跨日工作流程", "各模式收盤進場證據", "次日開盤沖銷證據", "模型與行情準備"].forEach((label, index) => {
@@ -147,8 +149,9 @@ function installProductCopy() {
 
   const timeline = document.querySelector(".timeline");
   if (timeline) setHtml(timeline, `
-    <li><time>13:25</time><div><strong>鎖定訊號並送收盤集合競價限價單</strong><span>先沿用當沖 checkpoint，以 13:25 最新行情計算整張目標；多單掛當日漲停買進、空單掛當日跌停賣出，皆為 LMT_ROD。</span></div></li>
-    <li><time>13:25–13:30</time><div><strong>收盤試撮只觀察，不成交</strong><span>simtrade 與預估成交價不是實際成交；沒有非試撮且帶交易所時間戳的收盤價就保持未成交。</span></div></li>
+    <li><time>13:00</time><div><strong>切換至今日隔日沖並等待</strong><span>先驗證交易日、panel、checkpoint、模型與 CUDA cache；這個階段不產生正式訊號，也不送模擬單。</span></div></li>
+    <li><time>13:20</time><div><strong>開始計算並送收盤集合競價限價單</strong><span>先沿用當沖 checkpoint，以計算當下最新行情決定整張目標；完成後立即以 LMT_ROD 送出，多單掛當日漲停買進、空單掛當日跌停賣出。</span></div></li>
+    <li><time>13:20–13:30</time><div><strong>收盤試撮只觀察，不成交</strong><span>13:30 前必須完成模擬委託；simtrade 與預估成交價不是實際成交，沒有非試撮且帶交易所時間戳的收盤價就保持未成交。</span></div></li>
     <li><time>13:30／13:33</time><div><strong>按實際收盤撮合價建立隔夜部位</strong><span>一般股票 13:30 撮合；觸發延緩收市者最晚依 13:33 實際撮合價。全量成交只是紙上假設，不宣稱取得交易所排隊份額。</span></div></li>
     <li><time>隔夜</time><div><strong>逐分鐘依可清算 bid／ask 估值</strong><span>使用一般現股交易成本；多單以 bid、空單以 ask 評價，缺價時清楚標示估值延用。</span></div></li>
     <li><time>次日 08:30</time><div><strong>送開盤集合競價沖銷單</strong><span>多單掛當日跌停賣出、空單掛當日漲停回補；開盤前試撮只更新觀察，不記成交。</span></div></li>
@@ -170,10 +173,10 @@ function installProductCopy() {
     });
   }
   if (signalPanel) {
-    signalPanel.querySelector(".panel-head h2").textContent = "13:25 所有模型訊號";
+    signalPanel.querySelector(".panel-head h2").textContent = "13:20 所有即時模型訊號";
     signalPanel.querySelector(".panel-head p").textContent = "保留所有模型目標；當沖 checkpoint 目前只作暫時權重轉接，不代表已針對隔夜風險訓練。";
     const headers = signalPanel.querySelectorAll("thead th");
-    ["時間／模式", "股票／方向／結果", "分數／持倉 %", "13:25 計價／收盤委託", "收盤成交／目前估值", "損益／模式總權益"].forEach((label, index) => {
+    ["時間／模式", "股票／方向／結果", "分數／持倉 %", "決策計價／收盤委託", "收盤成交／目前估值", "損益／模式總權益"].forEach((label, index) => {
       if (headers[index]) headers[index].textContent = label;
     });
   }
@@ -579,10 +582,12 @@ function engineStatusLabel(value) {
     waiting: "等待時段",
     waiting_open: "盤前準備中・等待開盤",
     waiting_signal: "等待當日訊號",
+    waiting_13_00_switch: "等待 13:00 切換",
+    armed_waiting_13_20_calculation: "已切換・等待 13:20 計算",
     critical_unflattened_after_13_24: "13:24 市價重試後有殘餘，已轉 13:25 集合競價",
     blocked_missing_eligibility: "缺少當日當沖資格資料，已停止執行",
     blocked_missing_checkpoint: "缺少模型權重，已停止執行",
-    waiting_13_25_signal: "等待 13:25 訊號",
+    waiting_13_25_signal: "等待舊版 13:25 訊號",
     waiting_close_auction_match: "等待實際收盤撮合",
     carrying_to_next_open: "持有至次一交易日開盤",
     flat_after_next_open: "次日開盤已沖銷",
@@ -816,7 +821,8 @@ function syncFilters(data) {
   const followButton = $("follow-latest-session");
   if (followButton) {
     followButton.setAttribute("aria-pressed", String(followLatestSession));
-    followButton.textContent = followLatestSession ? "跟隨最新交易日（08:30 切換）" : "回到最新交易日";
+    const rollover = data.service_sync?.session_clock?.rollover_local_time || (IS_OVERNIGHT ? "13:00" : "08:30");
+    followButton.textContent = followLatestSession ? `跟隨最新交易日（${rollover} 切換）` : "回到最新交易日";
   }
 }
 
@@ -1033,7 +1039,8 @@ function renderOvernightOperations(data) {
   setHtml("latency-kpis", [
     ["面板請求 → 顯示", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, "同源唯讀 API；畫面局部更新、不整頁重載"],
     ["狀態帳本年齡", Number.isFinite(sourceAge) ? duration(sourceAge) : "—", "引擎心跳與市場價格新鮮度分開解讀"],
-    ["模型決策時點", "13:25", "以當下行情特徵執行暫時的當沖模型轉接"],
+    ["策略切換時點", "13:00", "切換至當日交易日、完成預熱後等待"],
+    ["模型計算時點", "13:20", "以當下行情特徵執行暫時的當沖模型轉接"],
     ["正式收盤撮合", "13:30／13:33", "試撮不列成交；延緩收市才可能到 13:33"],
     ["開盤委託時點", "次日 08:30", "以當日合法漲跌停價格參與集合競價"],
     ["正式開盤沖銷", "次日 09:00", "僅接受非試撮實際 open"],
@@ -1041,7 +1048,7 @@ function renderOvernightOperations(data) {
     ["安全邊界", "正式下單不可用", "不呼叫券商 order API"],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join(""));
   setHtml("operation-kpis", [
-    ["等待收盤撮合", `${number(workingModes)} 模式`, "已有 13:25 極限價委託，等待實際 close", workingModes ? "warn" : "good"],
+    ["等待收盤撮合", `${number(workingModes)} 模式`, "已有 13:20 計算後送出的極限價委託，等待實際 close", workingModes ? "warn" : "good"],
     ["持有至次日開盤", `${number(carriedModes)} 模式 · ${number(openPositions)} 檔`, "已由實際收盤撮合價建立部位", carriedModes ? "good" : ""],
     ["次日已沖銷", `${number(closedModes)} 模式`, "實際開盤價已寫入成交帳", closedModes ? "good" : ""],
     ["阻擋／異常", `${number(blockedModes)} 模式`, blockedModes ? "詳見上方警示與稽核" : "沒有執行阻擋", blockedModes ? "bad" : "good"],
@@ -1049,13 +1056,13 @@ function renderOvernightOperations(data) {
   ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join(""));
 
   const workflow = [
-    ["13:25 目標與極限價委託", modes.filter((mode) => mode.signal_id).length, modes.length, "當沖 checkpoint 暫時轉接；訊號與委託原子落盤"],
+    ["13:20 計算與極限價委託", modes.filter((mode) => mode.signal_id).length, modes.length, "計算完成即送單；訊號與委託原子落盤"],
     ["實際收盤撮合", modes.filter((mode) => Number(mode.entry_filled_shares || 0) > 0).length, modes.length, "simtrade 不算成交"],
     ["隔夜持有", carriedModes, modes.length, "只允許一個未平 cohort，不重疊加倉"],
     ["次日實際開盤沖銷", closedModes, modes.length, "缺 actual open 則保持未平並揭露"],
   ];
   setHtml("workflow-progress", workflow.map(([label, completed, total, note]) => `<div class="progress-row"><div class="progress-title"><strong>${esc(label)}</strong><span>${number(completed)} / ${number(total)}</span></div>${progress(total ? completed / total : 0, completed === total && total ? "good" : "warn")}<small>${esc(note)}</small></div>`).join(""));
-  setHtml("opening-stage-progress", modes.map((mode) => `<div class="progress-row"><div class="progress-title"><strong>${esc(strategyLabel(mode))}</strong>${badge(engineStatusShortLabel(mode.engine_status), String(mode.engine_status || "").startsWith("blocked") ? "bad" : "warn")}</div><small>訊號 ${shortTime(mode.signal_at)} · 目標 ${number(mode.entry_requested_shares || 0)} 股 · 收盤成交 ${number(mode.entry_filled_shares || 0)} 股 · ${esc(mode.entry_fill_outcome || "等待 13:25")}</small></div>`).join("") || `<div class="empty-inline">尚無啟用模式。</div>`);
+  setHtml("opening-stage-progress", modes.map((mode) => `<div class="progress-row"><div class="progress-title"><strong>${esc(strategyLabel(mode))}</strong>${badge(engineStatusShortLabel(mode.engine_status), String(mode.engine_status || "").startsWith("blocked") ? "bad" : "warn")}</div><small>訊號 ${shortTime(mode.signal_at)} · 目標 ${number(mode.entry_requested_shares || 0)} 股 · 收盤成交 ${number(mode.entry_filled_shares || 0)} 股 · ${esc(mode.entry_fill_outcome || "等待 13:20 計算")}</small></div>`).join("") || `<div class="empty-inline">尚無啟用模式。</div>`);
   setHtml("opening-latency-trend", `<div class="progress-row"><div class="progress-title"><strong>開盤試撮不算成交</strong>${badge("FAIL-CLOSED", "good")}</div><small>08:30–09:00 只更新預估價格；09:00 後必須讀到同日、非 simtrade 且帶交易所時間戳的 open。</small></div>`);
   setHtml("preopen-progress", modes.map((mode) => `<div class="progress-row"><div class="progress-title"><strong>${esc(strategyLabel(mode))}</strong>${badge(mode.checkpoint_ready ? "CHECKPOINT READY" : "CHECKPOINT MISSING", mode.checkpoint_ready ? "good" : "bad")}</div><small>${mode.model_trained_for_overnight === false ? "當沖模型暫時轉接，未針對隔夜報酬訓練" : "模型契約待確認"}</small></div>`).join(""));
   $("operation-source").textContent = `狀態 ${shortTime(data.source_updated_at)}`;

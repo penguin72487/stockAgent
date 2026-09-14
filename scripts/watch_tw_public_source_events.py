@@ -980,7 +980,25 @@ def _refresh_pending(
     gate_path = opening_revision_gate_path(live_root)
     gate_path.parent.mkdir(parents=True, exist_ok=True)
     with gate_path.open("a+", encoding="utf-8") as gate_handle:
-        fcntl.flock(gate_handle.fileno(), fcntl.LOCK_EX)
+        gate_started = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(
+                    gate_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                break
+            except BlockingIOError:
+                notify_systemd(
+                    "WATCHDOG=1\n"
+                    "STATUS=waiting for stable TW public opening revision gate "
+                    f"elapsed={time.monotonic() - gate_started:.1f}s"
+                )
+                if _STOP.wait(
+                    max(1.0, min(10.0, float(args.heartbeat_seconds) / 2.0))
+                ):
+                    raise RuntimeError(
+                        "source-event monitor stopped while waiting for opening gate"
+                    )
         freeze = active_opening_revision_freeze(
             live_root, observed=datetime.now(TAIPEI)
         )

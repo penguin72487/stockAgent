@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Consume 13:25 model signals and maintain close-to-next-open paper ledgers."""
+"""Consume 13:20 model signals and maintain close-to-next-open paper ledgers."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 from stockagent.live.tw_overnight_simulation import (  # noqa: E402
     CLOSE_ORDER_GATE,
     OPEN_ORDER_GATE,
+    OVERNIGHT_SWITCH_GATE,
     REGULAR_CLOSE,
     TwOvernightSimulationEngine,
 )
@@ -53,6 +54,29 @@ from stockagent.live.tw_overnight_simulation import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 DAY_TRADE_QUOTE_BROKER_STATE = Path("artifacts/live/tw_day_trade_simulation")
+
+
+def _service_status_text(
+    engine: TwOvernightSimulationEngine,
+    observed: datetime,
+) -> str:
+    wall = observed.time()
+    if wall < OVERNIGHT_SWITCH_GATE:
+        phase = "waiting for 13:00 switch"
+    elif wall < CLOSE_ORDER_GATE:
+        phase = "armed; waiting for 13:20 calculation"
+    elif wall < REGULAR_CLOSE:
+        phase = "13:20 calculation/order window"
+    else:
+        phase = "post-close audit"
+    states = sorted(
+        {
+            str(mode.get("engine_status") or "unknown")
+            for mode in (engine.state.get("modes") or {}).values()
+        }
+    )
+    state_text = ",".join(states) if states else "no-modes"
+    return f"TW overnight paper executor ready; {phase}; modes={state_text}"
 
 
 def _mode_specs(
@@ -152,7 +176,9 @@ def _ledger_symbols(
             if symbol:
                 symbols.add(symbol)
                 fallback[symbol] = float(
-                    order.get("sizing_price_at_13_25") or 1.0
+                    order.get("sizing_price_at_decision")
+                    or order.get("sizing_price_at_13_25")
+                    or 1.0
                 )
         for position in (mode.get("positions") or {}).values():
             if int(position.get("signed_shares") or 0) == 0:
@@ -251,12 +277,14 @@ def main(argv: list[str] | None = None) -> int:
             last_readiness = monotonic
             if not ready_notified:
                 notify_systemd(
-                    "READY=1\nSTATUS=TW overnight paper executor ready; "
-                    "waiting for 13:25 signals"
+                    f"READY=1\nSTATUS={_service_status_text(engine, observed)}"
                 )
                 ready_notified = True
+            else:
+                notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
         elif monotonic - last_readiness >= 10.0:
             engine.update_readiness(specs, now=observed)
+            notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
             last_readiness = monotonic
 
         wall = observed.time()

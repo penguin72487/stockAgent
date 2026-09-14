@@ -5,11 +5,13 @@ After=network-online.target time-sync.target
 
 [Service]
 Type=oneshot
+Slice=stockagent-heavy-data.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_registered_data_refresh.sh" backfill
 Nice=15
 CPUWeight=10
@@ -18,6 +20,9 @@ MemoryAccounting=true
 MemoryHigh=64G
 MemoryMax=80G
 MemorySwapMax=16G
+# This dataset can be resumed from its receipts.  It must lose an OOM victim
+# election to the opening executor, Discord gateway and source-event monitor.
+OOMScoreAdjust=750
 TimeoutStartSec=infinity
 
 [Install]

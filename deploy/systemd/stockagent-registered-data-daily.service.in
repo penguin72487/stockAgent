@@ -5,11 +5,13 @@ After=network-online.target time-sync.target
 
 [Service]
 Type=oneshot
+Slice=stockagent-heavy-data.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_registered_data_refresh.sh" daily
 Nice=10
 CPUWeight=20
@@ -18,6 +20,7 @@ MemoryAccounting=true
 MemoryHigh=48G
 MemoryMax=64G
 MemorySwapMax=8G
+OOMScoreAdjust=750
 TimeoutStartSec=infinity
 
 [Install]

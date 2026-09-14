@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -52,6 +55,9 @@ from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
 from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
     build_openbb_public_history,
     build_openbb_public_status,
+)
+from stockagent.live.public_performance_history import (  # noqa: E402
+    PublicPerformanceHistoryStore,
 )
 from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     build_data_monitor_public_status,
@@ -101,6 +107,31 @@ _LATENCY_BUCKETS_MS: Final[tuple[float, ...]] = (
     10_000.0,
     30_000.0,
 )
+_SERVER_PHASES: Final[tuple[str, ...]] = (
+    "cache_wait",
+    "build",
+    "write",
+    "other",
+)
+_CACHE_OUTCOMES: Final[frozenset[str]] = frozenset(
+    {
+        "background_build",
+        "build",
+        "coalesced_hit",
+        "fresh_hit",
+        "revision_stale_hit",
+        "stale_hit",
+        "static_build",
+        "static_hit",
+    }
+)
+_TRAFFIC_HISTORY_RANGES: Final[dict[str, tuple[int, int]]] = {
+    "1h": (3_600, 60),
+    "24h": (86_400, 900),
+    "7d": (7 * 86_400, 3_600),
+    "30d": (30 * 86_400, 6 * 3_600),
+    "90d": (90 * 86_400, 86_400),
+}
 _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
     {
         "/api/overview",
@@ -131,6 +162,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/data-monitor/api/summary",
         "/data-monitor/api/details",
         "/traffic/api/status",
+        "/traffic/api/history",
     }
 )
 _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
@@ -161,6 +193,7 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-overnight/api/positions",
         "/tw-overnight/api/signals",
         "/tw-overnight/api/events",
+        "/traffic/api/history",
     }
 )
 
@@ -206,6 +239,62 @@ class StaticCacheEntry:
 
 
 @dataclass
+class LatencyAggregate:
+    samples: int = 0
+    latency_sum_ms: float = 0.0
+    latency_max_ms: float = 0.0
+    latency_histogram: list[int] = field(
+        default_factory=lambda: [0] * (len(_LATENCY_BUCKETS_MS) + 1)
+    )
+
+    def record(self, latency_ms: float) -> None:
+        value = max(0.0, float(latency_ms))
+        self.samples += 1
+        self.latency_sum_ms += value
+        self.latency_max_ms = max(self.latency_max_ms, value)
+        bucket_index = bisect_left(_LATENCY_BUCKETS_MS, value)
+        self.latency_histogram[bucket_index] += 1
+
+    def merge(self, other: LatencyAggregate) -> None:
+        self.samples += other.samples
+        self.latency_sum_ms += other.latency_sum_ms
+        self.latency_max_ms = max(self.latency_max_ms, other.latency_max_ms)
+        for index, value in enumerate(other.latency_histogram):
+            self.latency_histogram[index] += value
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "samples": self.samples,
+            "latency_sum_ms": round(self.latency_sum_ms, 6),
+            "latency_max_ms": round(self.latency_max_ms, 6),
+            "latency_histogram": list(self.latency_histogram),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> LatencyAggregate:
+        result = cls()
+        try:
+            histogram = [max(0, int(value)) for value in payload.get("latency_histogram", [])]
+            if len(histogram) != len(_LATENCY_BUCKETS_MS) + 1:
+                return result
+            result.samples = max(0, int(payload.get("samples") or 0))
+            result.latency_sum_ms = max(0.0, float(payload.get("latency_sum_ms") or 0.0))
+            result.latency_max_ms = max(0.0, float(payload.get("latency_max_ms") or 0.0))
+            if (
+                not math.isfinite(result.latency_sum_ms)
+                or not math.isfinite(result.latency_max_ms)
+                or result.samples != sum(histogram)
+                or (result.samples == 0 and (result.latency_sum_ms or result.latency_max_ms))
+                or (result.samples > 0 and result.latency_sum_ms < result.latency_max_ms)
+            ):
+                return cls()
+            result.latency_histogram = histogram
+        except (TypeError, ValueError, OverflowError):
+            return cls()
+        return result
+
+
+@dataclass
 class TrafficAggregate:
     requests: int = 0
     response_body_bytes: int = 0
@@ -218,6 +307,7 @@ class TrafficAggregate:
     latency_histogram: list[int] = field(
         default_factory=lambda: [0] * (len(_LATENCY_BUCKETS_MS) + 1)
     )
+    phases: dict[str, LatencyAggregate] = field(default_factory=dict)
 
     def record(
         self,
@@ -226,21 +316,23 @@ class TrafficAggregate:
         response_body_bytes: int,
         status: int,
         route_kind: str,
+        phase_durations_ms: Mapping[str, float] | None = None,
     ) -> None:
         self.requests += 1
         self.response_body_bytes += max(0, int(response_body_bytes))
-        self.latency_sum_ms += max(0.0, float(latency_ms))
-        self.latency_max_ms = max(self.latency_max_ms, float(latency_ms))
+        latency_value = max(0.0, float(latency_ms))
+        self.latency_sum_ms += latency_value
+        self.latency_max_ms = max(self.latency_max_ms, latency_value)
         self.errors += int(status >= 400)
         self.api_requests += int(route_kind == "api")
         self.page_requests += int(route_kind == "page")
         self.asset_requests += int(route_kind == "asset")
-        bucket_index = len(_LATENCY_BUCKETS_MS)
-        for index, boundary in enumerate(_LATENCY_BUCKETS_MS):
-            if latency_ms <= boundary:
-                bucket_index = index
-                break
+        bucket_index = bisect_left(_LATENCY_BUCKETS_MS, latency_value)
         self.latency_histogram[bucket_index] += 1
+        for phase, phase_latency in (phase_durations_ms or {}).items():
+            if phase not in _SERVER_PHASES:
+                continue
+            self.phases.setdefault(phase, LatencyAggregate()).record(phase_latency)
 
     def merge(self, other: TrafficAggregate) -> None:
         self.requests += other.requests
@@ -253,6 +345,63 @@ class TrafficAggregate:
         self.asset_requests += other.asset_requests
         for index, value in enumerate(other.latency_histogram):
             self.latency_histogram[index] += value
+        for phase, aggregate in other.phases.items():
+            self.phases.setdefault(phase, LatencyAggregate()).merge(aggregate)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "requests": self.requests,
+            "response_body_bytes": self.response_body_bytes,
+            "latency_sum_ms": round(self.latency_sum_ms, 6),
+            "latency_max_ms": round(self.latency_max_ms, 6),
+            "errors": self.errors,
+            "api_requests": self.api_requests,
+            "page_requests": self.page_requests,
+            "asset_requests": self.asset_requests,
+            "latency_histogram": list(self.latency_histogram),
+            "phases": {
+                phase: aggregate.to_payload()
+                for phase, aggregate in sorted(self.phases.items())
+            },
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> TrafficAggregate:
+        result = cls()
+        try:
+            histogram = [max(0, int(value)) for value in payload.get("latency_histogram", [])]
+            if len(histogram) != len(_LATENCY_BUCKETS_MS) + 1:
+                return result
+            result.requests = max(0, int(payload.get("requests") or 0))
+            result.response_body_bytes = max(0, int(payload.get("response_body_bytes") or 0))
+            result.latency_sum_ms = max(0.0, float(payload.get("latency_sum_ms") or 0.0))
+            result.latency_max_ms = max(0.0, float(payload.get("latency_max_ms") or 0.0))
+            result.errors = max(0, int(payload.get("errors") or 0))
+            result.api_requests = max(0, int(payload.get("api_requests") or 0))
+            result.page_requests = max(0, int(payload.get("page_requests") or 0))
+            result.asset_requests = max(0, int(payload.get("asset_requests") or 0))
+            if (
+                not math.isfinite(result.latency_sum_ms)
+                or not math.isfinite(result.latency_max_ms)
+                or result.requests != sum(histogram)
+                or (result.requests == 0 and (result.latency_sum_ms or result.latency_max_ms))
+                or (result.requests > 0 and result.latency_sum_ms < result.latency_max_ms)
+                or result.errors > result.requests
+                or result.api_requests + result.page_requests + result.asset_requests
+                > result.requests
+            ):
+                return cls()
+            result.latency_histogram = histogram
+            phases = payload.get("phases") or {}
+            if isinstance(phases, Mapping):
+                result.phases = {
+                    str(phase): LatencyAggregate.from_payload(row)
+                    for phase, row in phases.items()
+                    if phase in _SERVER_PHASES and isinstance(row, Mapping)
+                }
+        except (TypeError, ValueError, OverflowError):
+            return cls()
+        return result
 
 
 @dataclass
@@ -266,15 +415,44 @@ class TrafficSecondBucket:
 class PublicTrafficObserver:
     """Bounded, anonymous request telemetry for the public reader dashboard."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, history_root: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._started_monotonic = time.monotonic()
         self._started_at_utc = datetime.now(UTC)
+        self._process_key = hashlib.sha256(
+            f"{time.time_ns()}:{id(self)}".encode("ascii")
+        ).hexdigest()[:16]
         self._seconds: deque[TrafficSecondBucket] = deque(maxlen=3_600)
         self._lifetime = TrafficAggregate()
         self._cache_lifetime: dict[str, int] = {}
         self._in_flight = 0
         self._peak_in_flight = 0
+        current_minute = int(time.time()) // 60 * 60
+        self._current_minute = TrafficSecondBucket(epoch_second=current_minute)
+        self._history_store = (
+            PublicPerformanceHistoryStore(
+                history_root,
+                allowed_routes={
+                    *_PUBLIC_API_ROUTES,
+                    *_PUBLIC_PAGE_ROUTES,
+                    "靜態資源",
+                    "其他／未命中",
+                },
+                allowed_cache_outcomes=_CACHE_OUTCOMES,
+            )
+            if history_root is not None
+            else None
+        )
+        self._rollover_stop = threading.Event()
+        self._rollover_thread: threading.Thread | None = None
+        self._closed = False
+        if self._history_store is not None:
+            self._rollover_thread = threading.Thread(
+                target=self._rollover_loop,
+                name="public-traffic-minute-rollover",
+                daemon=True,
+            )
+            self._rollover_thread.start()
 
     @staticmethod
     def _route(path: str) -> tuple[str, str]:
@@ -293,6 +471,50 @@ class PublicTrafficObserver:
         self._seconds.append(bucket)
         return bucket
 
+    def _minute_payload_locked(
+        self, bucket: TrafficSecondBucket
+    ) -> dict[str, Any]:
+        aggregate = TrafficAggregate()
+        routes: dict[str, TrafficAggregate] = {}
+        cache: dict[str, int] = {}
+        for second in reversed(self._seconds):
+            if second.epoch_second < bucket.epoch_second:
+                break
+            if second.epoch_second >= bucket.epoch_second + 60:
+                continue
+            aggregate.merge(second.aggregate)
+            for route, timing in second.routes.items():
+                routes.setdefault(route, TrafficAggregate()).merge(timing)
+            for outcome, count in second.cache.items():
+                cache[outcome] = cache.get(outcome, 0) + count
+        return {
+            "schema_version": 1,
+            "minute_epoch": bucket.epoch_second,
+            "minute_utc": datetime.fromtimestamp(bucket.epoch_second, UTC).isoformat(),
+            "process_key": self._process_key,
+            "aggregate": aggregate.to_payload(),
+            "routes": {
+                route: aggregate.to_payload()
+                for route, aggregate in sorted(routes.items())
+            },
+            "cache": dict(sorted(cache.items())),
+        }
+
+    def _roll_minute_locked(self, epoch_second: int) -> None:
+        minute = int(epoch_second) // 60 * 60
+        if minute == self._current_minute.epoch_second:
+            return
+        if self._history_store is not None:
+            self._history_store.enqueue(
+                self._minute_payload_locked(self._current_minute)
+            )
+        self._current_minute = TrafficSecondBucket(epoch_second=minute)
+
+    def _rollover_loop(self) -> None:
+        while not self._rollover_stop.wait(1.0):
+            with self._lock:
+                self._roll_minute_locked(int(time.time()))
+
     def request_started(self, path: str) -> bool:
         if path == "/healthz":
             return False
@@ -309,11 +531,13 @@ class PublicTrafficObserver:
         status: int,
         latency_ms: float,
         response_body_bytes: int,
+        phase_durations_ms: Mapping[str, float] | None = None,
     ) -> None:
         if not observed:
             return
         route, route_kind = self._route(path)
         with self._lock:
+            self._roll_minute_locked(int(time.time()))
             self._in_flight = max(0, self._in_flight - 1)
             bucket = self._bucket_locked(int(time.time()))
             bucket.aggregate.record(
@@ -321,6 +545,7 @@ class PublicTrafficObserver:
                 response_body_bytes=response_body_bytes,
                 status=status,
                 route_kind=route_kind,
+                phase_durations_ms=phase_durations_ms,
             )
             route_aggregate = bucket.routes.setdefault(route, TrafficAggregate())
             route_aggregate.record(
@@ -328,16 +553,19 @@ class PublicTrafficObserver:
                 response_body_bytes=response_body_bytes,
                 status=status,
                 route_kind=route_kind,
+                phase_durations_ms=phase_durations_ms,
             )
             self._lifetime.record(
                 latency_ms=latency_ms,
                 response_body_bytes=response_body_bytes,
                 status=status,
                 route_kind=route_kind,
+                phase_durations_ms=phase_durations_ms,
             )
 
     def record_cache(self, outcome: str) -> None:
         with self._lock:
+            self._roll_minute_locked(int(time.time()))
             bucket = self._bucket_locked(int(time.time()))
             bucket.cache[outcome] = bucket.cache.get(outcome, 0) + 1
             self._cache_lifetime[outcome] = self._cache_lifetime.get(outcome, 0) + 1
@@ -359,6 +587,58 @@ class PublicTrafficObserver:
                 )
             return round(aggregate.latency_max_ms, 3)
         return round(aggregate.latency_max_ms, 3)
+
+    @staticmethod
+    def _phase_percentile(
+        aggregate: LatencyAggregate, quantile: float
+    ) -> float | None:
+        if aggregate.samples <= 0:
+            return None
+        target = max(1, int(aggregate.samples * quantile + 0.999999))
+        cumulative = 0
+        for index, count in enumerate(aggregate.latency_histogram):
+            cumulative += count
+            if cumulative < target:
+                continue
+            if index < len(_LATENCY_BUCKETS_MS):
+                return round(
+                    min(_LATENCY_BUCKETS_MS[index], aggregate.latency_max_ms),
+                    3,
+                )
+            return round(aggregate.latency_max_ms, 3)
+        return round(aggregate.latency_max_ms, 3)
+
+    def _phase_payload(self, aggregate: TrafficAggregate) -> list[dict[str, Any]]:
+        labels = {
+            "cache_wait": "等待相同快取鍵",
+            "build": "來源讀取、資料整理與序列化",
+            "write": "回應 body 寫入",
+            "other": "路由、headers 與其他框架成本",
+        }
+        rows: list[dict[str, Any]] = []
+        for phase in _SERVER_PHASES:
+            timing = aggregate.phases.get(phase, LatencyAggregate())
+            rows.append(
+                {
+                    "phase": phase,
+                    "label": labels[phase],
+                    "samples": timing.samples,
+                    "latency_average_ms": (
+                        round(timing.latency_sum_ms / timing.samples, 3)
+                        if timing.samples
+                        else None
+                    ),
+                    "latency_p50_ms": self._phase_percentile(timing, 0.50),
+                    "latency_p95_ms": self._phase_percentile(timing, 0.95),
+                    "latency_p99_ms": self._phase_percentile(timing, 0.99),
+                    "latency_max_ms": (
+                        round(timing.latency_max_ms, 3)
+                        if timing.samples
+                        else None
+                    ),
+                }
+            )
+        return rows
 
     def _window_payload(
         self,
@@ -391,6 +671,66 @@ class PublicTrafficObserver:
             "api_requests": aggregate.api_requests,
             "page_requests": aggregate.page_requests,
             "asset_requests": aggregate.asset_requests,
+        }
+
+    def _route_payload(
+        self,
+        routes: Mapping[str, TrafficAggregate],
+        *,
+        total_requests: int,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for route, aggregate in sorted(
+            routes.items(), key=lambda item: item[1].requests, reverse=True
+        ):
+            requests = aggregate.requests
+            result.append(
+                {
+                    "route": route,
+                    "requests": requests,
+                    "share": round(requests / total_requests, 6)
+                    if total_requests
+                    else 0.0,
+                    "latency_average_ms": (
+                        round(aggregate.latency_sum_ms / requests, 3)
+                        if requests
+                        else None
+                    ),
+                    "latency_p50_ms": self._percentile(aggregate, 0.50),
+                    "latency_p95_ms": self._percentile(aggregate, 0.95),
+                    "latency_p99_ms": self._percentile(aggregate, 0.99),
+                    "latency_max_ms": (
+                        round(aggregate.latency_max_ms, 3)
+                        if requests
+                        else None
+                    ),
+                    "response_body_bytes": aggregate.response_body_bytes,
+                    "errors": aggregate.errors,
+                    "error_ratio": round(aggregate.errors / requests, 6)
+                    if requests
+                    else 0.0,
+                    "phases": self._phase_payload(aggregate),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _cache_payload(outcomes: Mapping[str, int]) -> dict[str, Any]:
+        hits = sum(
+            int(outcomes.get(key, 0))
+            for key in ("fresh_hit", "stale_hit", "coalesced_hit", "static_hit")
+        )
+        builds = sum(
+            int(outcomes.get(key, 0))
+            for key in ("build", "background_build", "static_build")
+        )
+        total = hits + builds
+        return {
+            "lookups": total,
+            "hits": hits,
+            "builds": builds,
+            "hit_ratio": round(hits / total, 6) if total else None,
+            "outcomes": dict(sorted(outcomes.items())),
         }
 
     def snapshot(self, *, exclude_current_request: bool = False) -> dict[str, Any]:
@@ -448,45 +788,14 @@ class PublicTrafficObserver:
                 }
             )
 
-        hour_requests = windows[3_600].requests
-        routes = []
-        for route, aggregate in sorted(
-            route_hour.items(), key=lambda item: item[1].requests, reverse=True
-        ):
-            requests = aggregate.requests
-            routes.append(
-                {
-                    "route": route,
-                    "requests": requests,
-                    "share": round(requests / hour_requests, 6)
-                    if hour_requests
-                    else 0.0,
-                    "latency_average_ms": round(aggregate.latency_sum_ms / requests, 3)
-                    if requests
-                    else None,
-                    "latency_p95_ms": self._percentile(aggregate, 0.95),
-                    "latency_max_ms": round(aggregate.latency_max_ms, 3)
-                    if requests
-                    else None,
-                    "response_body_bytes": aggregate.response_body_bytes,
-                    "errors": aggregate.errors,
-                    "error_ratio": round(aggregate.errors / requests, 6)
-                    if requests
-                    else 0.0,
-                }
-            )
-
-        cache_hits = sum(
-            cache_lifetime.get(key, 0)
-            for key in ("fresh_hit", "stale_hit", "coalesced_hit", "static_hit")
+        routes = self._route_payload(
+            route_hour,
+            total_requests=windows[3_600].requests,
         )
-        cache_builds = sum(
-            cache_lifetime.get(key, 0)
-            for key in ("build", "background_build", "static_build")
-        )
-        cache_total = cache_hits + cache_builds
+        cache_payload = self._cache_payload(cache_lifetime)
+        cache_payload["last_1m_outcomes"] = cache_minute
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at_utc": datetime.now(UTC).isoformat(),
             "process_started_at_utc": self._started_at_utc.isoformat(),
             "uptime_seconds": round(uptime_seconds, 3),
@@ -517,18 +826,15 @@ class PublicTrafficObserver:
                     windows[3_600], seconds=3_600, uptime_seconds=uptime_seconds
                 ),
             },
-            "cache": {
-                "lookups": cache_total,
-                "hits": cache_hits,
-                "builds": cache_builds,
-                "hit_ratio": round(cache_hits / cache_total, 6)
-                if cache_total
-                else None,
-                "outcomes": cache_lifetime,
-                "last_1m_outcomes": cache_minute,
-            },
+            "cache": cache_payload,
             "route_window": "1h",
             "routes": routes,
+            "server_phases": self._phase_payload(windows[3_600]),
+            "history_storage": (
+                self._history_store.status()
+                if self._history_store is not None
+                else {"enabled": False, "retention_days": 0}
+            ),
             "trend": trend,
             "definitions": {
                 "request": "公開閘道完成的一次 GET 或 HEAD；Caddy 健康檢查不列入。",
@@ -538,9 +844,172 @@ class PublicTrafficObserver:
                 "error_ratio": "HTTP 4xx 與 5xx 回應數除以完成請求數。",
                 "visitor": "此記憶體計量不依 IP 或 User-Agent 分群，也不公開訪客識別；request 不等於人數。",
                 "cache_hit_ratio": "伺服器 JSON 與靜態資源快取查找命中數除以命中加建置數。",
-                "retention": "一秒桶只保留最近一小時；lifetime 自本次程序啟動起算，服務重啟後歸零。",
+                "server_phases": "cache_wait、build、write 與 other 互不重疊；其總和近似閘道 wall time，histogram 分位數不可逐項相加。",
+                "retention": "一秒桶保留最近一小時；每分鐘匿名聚合由背景執行緒非同步保存 90 天，服務停止的分鐘保留為未觀測而不是零流量。",
             },
         }
+
+    def history_snapshot(self, range_key: str) -> dict[str, Any]:
+        if range_key not in _TRAFFIC_HISTORY_RANGES:
+            raise InvalidPublicRequest("unsupported traffic history range")
+        range_seconds, bin_seconds = _TRAFFIC_HISTORY_RANGES[range_key]
+        now_epoch = int(time.time())
+        expected_minutes = max(1, range_seconds // 60)
+        current_minute = now_epoch - now_epoch % 60
+        since_epoch = current_minute - (expected_minutes - 1) * 60
+        rows = (
+            self._history_store.rows_since(since_epoch)
+            if self._history_store is not None
+            else []
+        )
+        with self._lock:
+            if self._current_minute.epoch_second >= since_epoch:
+                rows.append(self._minute_payload_locked(self._current_minute))
+
+        aggregate = TrafficAggregate()
+        routes: dict[str, TrafficAggregate] = {}
+        cache_outcomes: dict[str, int] = {}
+        bins: dict[int, TrafficAggregate] = {}
+        bin_observed_minutes: dict[int, set[int]] = {}
+        observed_minutes: set[int] = set()
+        process_keys: set[str] = set()
+        for row in rows:
+            minute = int(row.get("minute_epoch") or 0)
+            if minute < since_epoch:
+                continue
+            row_aggregate = TrafficAggregate.from_payload(row.get("aggregate") or {})
+            aggregate.merge(row_aggregate)
+            minute_mask = max(0, int(row.get("observed_minute_mask") or 0))
+            row_minutes = (
+                {
+                    minute + offset * 60
+                    for offset in range(60)
+                    if minute_mask & (1 << offset)
+                }
+                if int(row.get("rollup_seconds") or 0) == 3_600
+                else {minute}
+            )
+            observed_minutes.update(row_minutes)
+            persisted_process_keys = row.get("process_keys") or ()
+            if isinstance(persisted_process_keys, (list, tuple, set)) and persisted_process_keys:
+                process_keys.update(str(value) for value in persisted_process_keys)
+            else:
+                process_keys.add(str(row.get("process_key") or ""))
+            for route, payload in (row.get("routes") or {}).items():
+                if not isinstance(payload, Mapping):
+                    continue
+                routes.setdefault(str(route), TrafficAggregate()).merge(
+                    TrafficAggregate.from_payload(payload)
+                )
+            for outcome, count in (row.get("cache") or {}).items():
+                try:
+                    cache_outcomes[str(outcome)] = (
+                        cache_outcomes.get(str(outcome), 0) + max(0, int(count))
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            bin_epoch = minute - minute % bin_seconds
+            bins.setdefault(bin_epoch, TrafficAggregate()).merge(row_aggregate)
+            bin_observed_minutes.setdefault(bin_epoch, set()).update(row_minutes)
+
+        first_bin = (since_epoch // bin_seconds) * bin_seconds
+        last_bin = (now_epoch // bin_seconds) * bin_seconds
+        trend: list[dict[str, Any]] = []
+        for bin_epoch in range(first_bin, last_bin + 1, bin_seconds):
+            row_aggregate = bins.get(bin_epoch, TrafficAggregate())
+            trend.append(
+                {
+                    "bucket_start_utc": datetime.fromtimestamp(
+                        bin_epoch, UTC
+                    ).isoformat(),
+                    "bucket_seconds": bin_seconds,
+                    "observed_minutes": len(
+                        bin_observed_minutes.get(bin_epoch, set())
+                    ),
+                    "requests": row_aggregate.requests,
+                    "requests_per_second": (
+                        round(
+                            row_aggregate.requests
+                            / (
+                                len(bin_observed_minutes.get(bin_epoch, set()))
+                                * 60
+                            ),
+                            6,
+                        )
+                        if bin_observed_minutes.get(bin_epoch)
+                        else None
+                    ),
+                    "latency_p50_ms": self._percentile(row_aggregate, 0.50),
+                    "latency_p95_ms": self._percentile(row_aggregate, 0.95),
+                    "latency_p99_ms": self._percentile(row_aggregate, 0.99),
+                    "response_body_bytes": row_aggregate.response_body_bytes,
+                    "errors": row_aggregate.errors,
+                }
+            )
+
+        return {
+            "schema_version": 1,
+            "generated_at_utc": datetime.now(UTC).isoformat(),
+            "range": range_key,
+            "range_seconds": range_seconds,
+            "bucket_seconds": bin_seconds,
+            "read_only": True,
+            "production_control_possible": False,
+            "summary": self._window_payload(
+                aggregate,
+                seconds=range_seconds,
+                uptime_seconds=float(range_seconds),
+            ),
+            "coverage": {
+                "observed_minutes": len(observed_minutes),
+                "expected_minutes": expected_minutes,
+                "ratio": round(len(observed_minutes) / expected_minutes, 6),
+                "first_observed_minute_utc": (
+                    datetime.fromtimestamp(min(observed_minutes), UTC).isoformat()
+                    if observed_minutes
+                    else None
+                ),
+                "last_observed_minute_utc": (
+                    datetime.fromtimestamp(max(observed_minutes), UTC).isoformat()
+                    if observed_minutes
+                    else None
+                ),
+                "process_segments": len(process_keys - {""}),
+                "meaning": "有 gateway 心跳聚合的分鐘；未觀測不等於零請求。",
+            },
+            "cache": self._cache_payload(cache_outcomes),
+            "server_phases": self._phase_payload(aggregate),
+            "routes": self._route_payload(
+                routes,
+                total_requests=aggregate.requests,
+            ),
+            "trend": trend,
+            "history_storage": (
+                self._history_store.status()
+                if self._history_store is not None
+                else {"enabled": False, "retention_days": 0}
+            ),
+            "definitions": {
+                "source": "公開 gateway 的實際完成請求與每分鐘存活心跳；不含虛構或補零樣本。",
+                "latency": "從 Python gateway 開始處理至 body 寫入完成；Caddy、WAN 與瀏覽器繪製另由瀏覽器測速觀察。",
+                "percentile": "由固定 histogram 對實際樣本估計的保守上界；不同階段的分位數不可相加。",
+                "coverage": "服務有寫出分鐘聚合的時間比例，不是網站可用率 SLA。",
+                "privacy": "只保存 allowlist 路由與聚合數值；不保存 query、IP、User-Agent、Cookie、帳號或輸入內容。",
+            },
+        }
+
+    def close(self) -> None:
+        if self._history_store is None or self._closed:
+            return
+        self._closed = True
+        self._rollover_stop.set()
+        if self._rollover_thread is not None:
+            self._rollover_thread.join(timeout=2.0)
+        with self._lock:
+            self._history_store.enqueue(
+                self._minute_payload_locked(self._current_minute)
+            )
+        self._history_store.close()
 
 
 def _prepared(
@@ -925,6 +1394,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         taifex_upstream: str,
         tw_upstream: str,
         overnight_static_root: Path | None = None,
+        traffic_history_root: Path | None = None,
     ) -> None:
         super().__init__(address, PublicDashboardHandler)
         self.public_static_root = Path(public_static_root)
@@ -938,7 +1408,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.repo_root = Path(repo_root)
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
-        self.traffic_observer = PublicTrafficObserver()
+        self.traffic_observer = PublicTrafficObserver(
+            history_root=traffic_history_root
+        )
         self.request_metrics = threading.local()
         self._cache: dict[str, CacheEntry] = {}
         self._cache_bytes = 0
@@ -979,6 +1451,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self.update_hub.close()
+        self.traffic_observer.close()
         super().server_close()
 
     def _cache_observation(self, kind: str) -> None:
@@ -1477,12 +1950,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 ),
             )
 
-        return self._revision_stale_or_build(
-            cache_prefix=cache_prefix,
-            cache_key=cache_key,
-            revision_token=revision_token,
-            builder=build_response,
-        )
+        # History is revision-addressed and drives the visible equity curve.
+        # Returning the prior revision here can leave a tab permanently one
+        # commit behind: the SSE notification has already been consumed and a
+        # completed background history build does not create a new engine
+        # revision. Coalesce concurrent readers on the new key, but make the
+        # first reader wait for that exact immutable revision.
+        return build_response()
 
     def overnight_revision(self) -> PreparedResponse:
         signature = tuple(
@@ -1540,7 +2014,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             )
             payload["product"] = "tw_overnight"
             payload["model_adapter_notice"] = (
-                "13:25 target weights temporarily reuse the day-trade checkpoint; "
+                "13:20 target weights temporarily reuse the day-trade checkpoint; "
                 "the model has not been trained for overnight risk"
             )
             history_path = (
@@ -1573,9 +2047,10 @@ class PublicDashboardServer(ThreadingHTTPServer):
             service_sync["history_revision"] = revision.get("history_revision")
             payload["service_sync"] = service_sync
             payload["source_contract"] = {
-                "signal": "13:25 current quote and temporary day-trade model weights",
-                "replay": "history uses prior-feature 13:25 targets, official close/open counterfactual prices, and a disclosed same-close fallback when 13:25 data are absent; it is not an exchange fill claim",
-                "entry_fill": "legal-limit LMT_ROD submitted at 13:25; fill uses the actual close auction print",
+                "switch": "the dashboard and executor roll to the current verified session at 13:00 Asia/Taipei, then wait",
+                "signal": "calculation starts at 13:20 using the current quote and temporary day-trade model weights",
+                "replay": "history before this live clock change retains prior-feature 13:25 targets, official close/open counterfactual prices, and a disclosed same-close fallback when 13:25 data are absent; it is not an exchange fill claim",
+                "entry_fill": "legal-limit LMT_ROD is submitted after the 13:20 calculation and before 13:30; fill uses the actual close auction print",
                 "fees": "ordinary cash-stock commission and ordinary stock or ETF transaction tax",
                 "comparison": "history sizes each new cohort from pre-entry account equity; absolute equity remains cumulative and the selected-period percentage resets to zero",
                 "benchmarks": "this adapter has no day-trade benchmark ledger",
@@ -1585,7 +2060,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 "bracket_fill": "orders use same-session legal price limits and are settled only by an actual auction print",
                 "terminal_flatten": "no same-day terminal flatten; a proven close fill must remain open overnight",
                 "exit_schedule": "next-session legal-limit LMT_ROD from 08:30; fill uses the actual opening auction print at or after 09:00",
-                "latency": "13:25 signal publication, consumer discovery and ledger timestamps are recorded separately",
+                "latency": "13:20 calculation start, signal publication, consumer discovery and ledger timestamps are recorded separately",
                 "simtrade": "indicative matching is displayed as waiting and is never a fill",
                 "queue": "paper quantity assumes full auction allocation and makes no exchange fill claim",
             }
@@ -2040,11 +2515,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _write_body(self, body: bytes) -> None:
+        started = time.perf_counter()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             # Browser navigation and aborted fetches are normal client events.
             return
+        finally:
+            metrics = getattr(self.server.request_metrics, "current", None)
+            if metrics is not None:
+                metrics["write_ms"] += (time.perf_counter() - started) * 1000
         self._response_body_bytes += len(body)
 
     def send_response(self, code: int, message: str | None = None) -> None:
@@ -2337,6 +2817,28 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise
         except (ValueError, OverflowError) as error:
             raise InvalidPublicRequest("invalid history query") from error
+
+    @staticmethod
+    def _traffic_history_query(raw_query: str) -> str:
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=1,
+            )
+            if set(query) - {"range"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            value = str(query.get("range", ["24h"])[0]).strip().lower() or "24h"
+            if value not in _TRAFFIC_HISTORY_RANGES:
+                raise InvalidPublicRequest("unsupported traffic history range")
+            return value
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid traffic history query") from error
 
     @staticmethod
     def _tw_history_query(raw_query: str) -> dict[str, str | None]:
@@ -2740,6 +3242,17 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 content_type="application/json; charset=utf-8",
                 cache_control="no-store",
             )
+        if path == "/traffic/api/history":
+            range_key = self._traffic_history_query(raw_query)
+            return self.server.cached_local_json(
+                cache_key=f"traffic-history:{range_key}",
+                ttl_seconds=55.0,
+                cache_control="no-store",
+                stale_grace_seconds=120.0,
+                builder=lambda: self.server.traffic_observer.history_snapshot(
+                    range_key
+                ),
+            )
         raise PublicRouteNotFound(path)
 
     def _stream_updates(self, topic: str, *, head_only: bool) -> None:
@@ -2947,6 +3460,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "cache": set(),
             "cache_wait_ms": 0.0,
             "build_ms": 0.0,
+            "write_ms": 0.0,
             "depth": 0,
         }
         self.__dict__.pop("_stream_first_frame_ms", None)
@@ -2956,19 +3470,33 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         try:
             callback()
         finally:
-            self.server.request_metrics.current = None
             # An SSE connection's lifetime is not an HTTP response latency.
             elapsed_ms = getattr(self, "_stream_first_frame_ms", None)
             if elapsed_ms is None:
                 elapsed_ms = (
                     time.perf_counter_ns() - self._request_started_ns
                 ) / 1_000_000
+            metrics = getattr(self.server.request_metrics, "current", None) or {}
+            cache_wait_ms = max(0.0, float(metrics.get("cache_wait_ms") or 0.0))
+            build_ms = max(0.0, float(metrics.get("build_ms") or 0.0))
+            write_ms = max(0.0, float(metrics.get("write_ms") or 0.0))
+            phase_durations_ms = {
+                "cache_wait": cache_wait_ms,
+                "build": build_ms,
+                "write": write_ms,
+                "other": max(
+                    0.0,
+                    float(elapsed_ms) - cache_wait_ms - build_ms - write_ms,
+                ),
+            }
+            self.server.request_metrics.current = None
             self.server.traffic_observer.request_finished(
                 observed=observed,
                 path=path,
                 status=self._response_status,
                 latency_ms=elapsed_ms,
                 response_body_bytes=self._response_body_bytes,
+                phase_durations_ms=phase_durations_ms,
             )
 
     def do_GET(self) -> None:  # noqa: N802
@@ -3051,6 +3579,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--taifex-upstream", default="http://127.0.0.1:8765")
     parser.add_argument("--tw-upstream", default="http://127.0.0.1:8766")
+    parser.add_argument(
+        "--traffic-history-root",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "STOCKAGENT_DASHBOARD_PERFORMANCE_DIR",
+                "/var/lib/stockagent-public-dashboards/performance",
+            )
+        ),
+        help="private append-only directory for anonymous minute timing aggregates",
+    )
     return parser
 
 
@@ -3071,6 +3610,7 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=Path(args.repo_root),
         taifex_upstream=str(args.taifex_upstream),
         tw_upstream=str(args.tw_upstream),
+        traffic_history_root=Path(args.traffic_history_root),
     )
     threading.Thread(
         target=server.prewarm_default_views,

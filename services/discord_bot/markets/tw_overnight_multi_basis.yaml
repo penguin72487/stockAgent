@@ -4,11 +4,11 @@ enabled: true
 market_type: tw
 timezone: Asia/Taipei
 # These are source-availability hours for the signal engine.  The separate
-# overnight paper executor owns the 13:25 close-entry and next-day 09:00 exit.
+# overnight paper executor owns the 13:20 close-entry decision and next-day 09:00 exit.
 open_time: "09:00"
 close_time: "13:30"
-schedule_time: "13:25"
-preopen_prepare_time: "13:15"
+schedule_time: "13:20"
+preopen_prepare_time: "13:00"
 summary_time: "09:05"
 data_ready_time: "13:15"
 freshness_max_lag_days: 3

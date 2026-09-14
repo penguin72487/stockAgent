@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from stockagent.training.runtime import (
     unwrap_model,
 )
 from stockagent.training.runtime_configuration import (
+    _configure_compile_cache_paths,
     configure_inference_runtime as canonical_configure_runtime,
 )
 
@@ -184,3 +186,38 @@ def test_shared_precision_contract() -> None:
     with autocast_context(torch.device("cpu"), torch.bfloat16):
         result = torch.ones(1) + 1
     assert result.dtype is torch.float32
+
+
+def test_compile_cache_namespace_is_abi_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_COMPILE_CACHE_NAMESPACE", "formal-history-v1")
+    _configure_compile_cache_paths(
+        torchinductor_cache_dir=tmp_path / "inductor",
+        triton_cache_dir=tmp_path / "triton",
+        cuda_cache_path=tmp_path / "cuda",
+        force=True,
+    )
+
+    assert Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]) == (
+        tmp_path / "inductor" / "formal-history-v1"
+    )
+    assert Path(os.environ["TRITON_CACHE_DIR"]) == (
+        tmp_path / "triton" / "formal-history-v1"
+    )
+    assert Path(os.environ["CUDA_CACHE_PATH"]) == (
+        tmp_path / "cuda" / "formal-history-v1"
+    )
+
+
+def test_compile_cache_namespace_rejects_path_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_COMPILE_CACHE_NAMESPACE", "../shared")
+    with pytest.raises(ValueError, match="one path component"):
+        _configure_compile_cache_paths(
+            torchinductor_cache_dir=tmp_path / "inductor",
+            force=True,
+        )

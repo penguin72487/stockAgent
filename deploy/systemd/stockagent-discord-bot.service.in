@@ -32,6 +32,13 @@ CPUWeight=200
 IOWeight=200
 # The Gateway and live command plane must survive best-effort maintenance OOM.
 OOMScoreAdjust=-500
+# The observed peak is about 5 GiB including formal-history work.  These bounds
+# preserve substantial headroom while preventing a leak from exhausting WSL.
+MemoryAccounting=true
+MemoryHigh=12G
+MemoryMax=24G
+MemorySwapMax=4G
+TasksMax=2048
 
 [Install]
 WantedBy=multi-user.target

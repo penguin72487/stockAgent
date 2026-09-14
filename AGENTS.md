@@ -27,6 +27,11 @@ changes, and follow the user's latest explicit experiment settings.
 - Do not assume `python` exists on PATH or hard-code one user's home directory.
   Run `run_fintech_python scripts/check_environment.py --require-cuda --strict` before expensive jobs.
 - CUDA is expected for training. If CUDA is unavailable and `runner.require_cuda` is true, do not silently fall back to CPU.
+- For vastai1T TW day-trade training performance work, the acceptance baseline is
+  two-GPU DistributedDataParallel with the resolved formal global batch and a
+  complete fold lifecycle. Single-GPU runs may diagnose correctness only. Treat
+  epoch 1 as compiler warm-up; compare steady epoch 3+ maximum-rank wall time,
+  and require exact artifact/metric parity before promoting an optimization.
 - Use `rg` / `rg --files` for search.
 - Use `apply_patch` for manual file edits.
 - Do not revert user changes or unrelated dirty files.

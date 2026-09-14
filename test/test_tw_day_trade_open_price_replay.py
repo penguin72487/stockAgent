@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -113,6 +114,14 @@ def test_live_missed_opening_retries_source_empty_during_settle_window(
         "fetch_shioaji_historical_stock_0901_vwaps",
         fake_fetch,
     )
+    monkeypatch.setattr(
+        live_runner,
+        "load_local_stock_0901_vwaps",
+        lambda *_args, **_kwargs: (
+            {},
+            {"requested_symbols": 2, "resolved_symbols": 0, "error_counts": {}},
+        ),
+    )
     first_prices, first_receipt = live_runner._resolve_missed_opening_prices(
         tmp_path,
         datetime(2026, 8, 13, 9, 1, 5, tzinfo=TAIPEI),
@@ -141,6 +150,14 @@ def test_live_missed_opening_finalizes_empty_source_after_settle_deadline(
         lambda symbols, **_kwargs: (
             {},
             _complete_0901_query_receipt(resolved=0, requested=len(symbols)),
+        ),
+    )
+    monkeypatch.setattr(
+        live_runner,
+        "load_local_stock_0901_vwaps",
+        lambda *_args, **_kwargs: (
+            {},
+            {"requested_symbols": 1, "resolved_symbols": 0, "error_counts": {}},
         ),
     )
     _prices, settling = live_runner._resolve_missed_opening_prices(
@@ -174,6 +191,14 @@ def test_completed_0901_query_is_scoped_and_new_account_symbols_are_queried(tmp_
         calls.append(list(symbols))
         return {}, _complete_0901_query_receipt(resolved=0, requested=len(symbols))
     monkeypatch.setattr(live_runner, "fetch_shioaji_historical_stock_0901_vwaps", fetch)
+    monkeypatch.setattr(
+        live_runner,
+        "load_local_stock_0901_vwaps",
+        lambda *_args, **_kwargs: (
+            {},
+            {"requested_symbols": 1, "resolved_symbols": 0, "error_counts": {}},
+        ),
+    )
     now = datetime(2026, 8, 13, 11, 0, tzinfo=TAIPEI)
     live_runner._resolve_missed_opening_prices(tmp_path, now, {"2330"})
     live_runner._resolve_missed_opening_prices(tmp_path, now, {"2330", "4905"})
@@ -181,6 +206,95 @@ def test_completed_0901_query_is_scoped_and_new_account_symbols_are_queried(tmp_
     assert calls == [["2330"], ["4905"]]
     _, receipt = live_runner._load_missed_opening_prices(tmp_path, now)
     assert receipt["attempted_symbols"] == ["2330", "4905"]
+
+
+def test_live_missed_opening_reads_local_minutes_before_remote_gaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        live_runner,
+        "load_local_stock_0901_vwaps",
+        lambda _roots, symbols, **_kwargs: (
+            {
+                "2330": {
+                    "symbol": "2330",
+                    "execution_price_0901": 101.0,
+                    "source": "local_minute_parquet_0901_minute_close:fixture",
+                }
+            },
+            {
+                "requested_symbols": len(symbols),
+                "resolved_symbols": 1,
+                "error_counts": {},
+            },
+        ),
+    )
+
+    def fetch(symbols, **_kwargs):
+        remote_calls.append(list(symbols))
+        return (
+            {
+                "4905": {
+                    "symbol": "4905",
+                    "execution_price_0901": 50.0,
+                    "source": "fixture_remote_0901_vwap",
+                }
+            },
+            _complete_0901_query_receipt(resolved=1, requested=len(symbols)),
+        )
+
+    monkeypatch.setattr(
+        live_runner,
+        "fetch_shioaji_historical_stock_0901_vwaps",
+        fetch,
+    )
+
+    prices, receipt = live_runner._resolve_missed_opening_prices(
+        tmp_path,
+        datetime(2026, 8, 13, 9, 3, tzinfo=TAIPEI),
+        {"2330", "4905"},
+    )
+
+    assert set(prices) == {"2330", "4905"}
+    assert remote_calls == [["4905"]]
+    assert receipt["source"] == "local_first_then_shioaji_0901_minute_price"
+    assert receipt["local"]["resolved_symbols"] == 1
+    assert receipt["remote"]["queried_symbols"] == 1
+
+
+def test_executor_runtime_status_reports_registered_entries_not_waiting() -> None:
+    class Engine:
+        state = {
+            "modes": {
+                "mode_a": {
+                    "session_date": "2026-08-13",
+                    "entry_completed_at": "2026-08-13T09:01:00+08:00",
+                    "positions": {"2330": {"signed_shares": 1_000}},
+                },
+                "mode_b": {
+                    "session_date": "2026-08-13",
+                    "entry_completed_at": "2026-08-13T09:01:01+08:00",
+                    "positions": {},
+                },
+            }
+        }
+
+    specs = [
+        SimpleNamespace(market="mode_a"),
+        SimpleNamespace(market="mode_b"),
+    ]
+    status = live_runner._executor_runtime_status(
+        Engine(),
+        specs,
+        datetime(2026, 8, 13, 9, 10, tzinfo=TAIPEI),
+    )
+
+    assert "entries registered=2/2" in status
+    assert "open positions=1" in status
+    assert "waiting" not in status
 
 
 def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:

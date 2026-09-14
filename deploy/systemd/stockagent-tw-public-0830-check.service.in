@@ -10,15 +10,27 @@ StartLimitBurst=2
 
 [Service]
 Type=oneshot
+Slice=stockagent-heavy-data.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_0830_check.sh"
-Nice=0
-CPUWeight=100
-IOWeight=100
+# The Discord scheduler and paper executor own the 09:00 latency SLO.  A full
+# source audit may use tens of GiB, so keep it best-effort under contention.
+Nice=10
+CPUWeight=25
+IOWeight=25
+MemoryAccounting=true
+# The observed strict audit peaked near 55 GiB on this 94 GiB host.  Reserve a
+# deterministic floor for the executor/Gateway instead of letting this one
+# reproducible audit consume an arbitrary percentage of all host memory.
+MemoryHigh=64G
+MemoryMax=72G
+MemorySwapMax=4G
+OOMScoreAdjust=500
+TasksMax=4096
 TimeoutStartSec=4h
 Restart=on-failure
 RestartSec=30s

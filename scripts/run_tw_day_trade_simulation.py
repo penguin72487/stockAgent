@@ -40,6 +40,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_stock_snapshots,
     fetch_shioaji_stock_live_quotes,
+    load_local_stock_0901_vwaps,
     prepare_tw_price_limit_snapshot,
     serve_shared_day_trade_quote_requests,
     warm_shioaji_stock_quote_client,
@@ -81,6 +82,12 @@ MISSED_OPENING_SOURCE_SETTLE_DEADLINE = datetime_time(9, 3)
 MISSED_OPENING_REPLAY_CONTRACT = (
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
 )
+DEFAULT_MISSED_OPENING_MINUTE_ROOTS = (
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
+    Path("data_tw_minute/research_dataset"),
+    Path("data_tw_minute/shioaji_1m"),
+)
 
 
 def _opening_batch_max_wait_seconds() -> float:
@@ -115,6 +122,50 @@ def _pending_signal_retry_delay_seconds(result: str, observed: datetime) -> floa
 def _repo_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _missed_opening_minute_roots() -> tuple[Path, ...]:
+    configured = os.getenv("STOCKAGENT_TW_DAY_TRADE_MINUTE_ROOTS", "").strip()
+    values = (
+        tuple(Path(value) for value in configured.split(os.pathsep) if value)
+        if configured
+        else DEFAULT_MISSED_OPENING_MINUTE_ROOTS
+    )
+    return tuple(dict.fromkeys(_repo_path(value).resolve() for value in values))
+
+
+def _executor_runtime_status(
+    engine: TwDayTradeSimulationEngine,
+    specs: list[ModeSpec],
+    observed: datetime,
+) -> str:
+    session_date = observed.date().isoformat()
+    modes = engine.state.get("modes", {})
+    completed = 0
+    open_positions = 0
+    for spec in specs:
+        mode = modes.get(spec.market, {})
+        if (
+            str(mode.get("session_date") or "") == session_date
+            and bool(mode.get("entry_completed_at"))
+        ):
+            completed += 1
+        open_positions += sum(
+            bool(int(row.get("signed_shares") or 0))
+            for row in mode.get("positions", {}).values()
+        )
+    if completed:
+        return (
+            "TW day-trade executor ready; "
+            f"today entries registered={completed}/{len(specs)}; "
+            f"open positions={open_positions}; monitoring exits"
+        )
+    if observed.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
+        return "TW day-trade executor ready; pre-open sources and signals armed"
+    return (
+        "TW day-trade executor ready; "
+        f"waiting/recovering today's signals={completed}/{len(specs)}"
+    )
 
 
 def _missed_opening_recovery_required(observed: datetime) -> bool:
@@ -226,19 +277,45 @@ def _resolve_missed_opening_prices(
     unseen = sorted(set(missing) - attempted)
     if missing and (not prior_complete or source_is_settling or unseen):
         query_symbols = missing if not prior_complete or source_is_settling else unseen
-        fetched, receipt = fetch_shioaji_historical_stock_0901_vwaps(
+        local, local_receipt = load_local_stock_0901_vwaps(
+            _missed_opening_minute_roots(),
             query_symbols,
             trading_date=observed.date(),
-            max_traffic_fraction=0.90,
-            progress_callback=lambda index, total, queried, resolved: notify_systemd(
-                "WATCHDOG=1\n"
-                "STATUS=missed-opening 09:01 recovery "
-                f"{index}/{total}; queried={queried}; resolved={resolved}"
-            ),
         )
-        cached.update({symbol: dict(row) for symbol, row in fetched.items()})
+        cached.update({symbol: dict(row) for symbol, row in local.items()})
+        remote_symbols = sorted(set(query_symbols) - set(local))
+        if remote_symbols:
+            fetched, remote_receipt = fetch_shioaji_historical_stock_0901_vwaps(
+                remote_symbols,
+                trading_date=observed.date(),
+                max_traffic_fraction=0.90,
+                progress_callback=lambda index, total, queried, resolved: notify_systemd(
+                    "WATCHDOG=1\n"
+                    "STATUS=missed-opening 09:01 recovery "
+                    f"{index}/{total}; queried={queried}; resolved={resolved}"
+                ),
+            )
+            cached.update({symbol: dict(row) for symbol, row in fetched.items()})
+        else:
+            remote_receipt = {
+                "source": "not_required_local_0901_price_complete",
+                "requested_symbols": 0,
+                "queried_symbols": 0,
+                "resolved_symbols": 0,
+                "unqueried_symbols": 0,
+                "error_counts": {},
+                "stopped_for_traffic": False,
+            }
         receipt = {
-            **receipt,
+            "source": "local_first_then_shioaji_0901_minute_price",
+            "local": local_receipt,
+            "remote": remote_receipt,
+            "requested_symbols": len(query_symbols),
+            "queried_symbols": int(remote_receipt.get("queried_symbols") or 0),
+            "resolved_symbols": len(set(query_symbols) & set(cached)),
+            "unqueried_symbols": int(remote_receipt.get("unqueried_symbols") or 0),
+            "error_counts": dict(remote_receipt.get("error_counts") or {}),
+            "stopped_for_traffic": bool(remote_receipt.get("stopped_for_traffic")),
             "attempted_symbols": sorted(attempted | set(query_symbols)),
             "requested_union_symbols": len(symbols),
             "resolved_union_symbols": len(set(symbols) & set(cached)),
@@ -1556,7 +1633,7 @@ def main(argv: list[str] | None = None) -> int:
             last_readiness = monotonic_now
             if not ready_notified:
                 notify_systemd(
-                    "READY=1\nSTATUS=TW day-trade executor ready; waiting for 09:00 live signal and causal best quote"
+                    f"READY=1\nSTATUS={_executor_runtime_status(engine, specs, observed)}"
                 )
                 ready_notified = True
         session_open, session_errors = _verified_stock_session(
@@ -1617,6 +1694,9 @@ def main(argv: list[str] | None = None) -> int:
         last_session_gate_log = None
         if monotonic_now - last_readiness >= 10.0:
             engine.update_readiness(specs, now=observed)
+            notify_systemd(
+                f"STATUS={_executor_runtime_status(engine, specs, observed)}"
+            )
             last_readiness = monotonic_now
 
         broker_wall_time = observed.timetz().replace(tzinfo=None)

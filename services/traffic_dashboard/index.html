@@ -7,7 +7,7 @@
   <title>網站流量與延遲｜StockAgent</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=1">
-  <link rel="stylesheet" href="performance.css?v=3">
+  <link rel="stylesheet" href="performance.css?v=4">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
@@ -91,7 +91,50 @@
       </div>
     </section>
 
-    <div class="section-intro"><div><span>04</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
+    <div class="section-intro"><div><span>04</span><h2>長期真實測速</h2></div><p>背景按分鐘保存 90 天；服務中斷保留為未觀測</p></div>
+    <section class="panel history-panel" aria-labelledby="history-title">
+      <div class="panel-head history-head">
+        <div>
+          <h2 id="history-title">閘道延遲、步驟與路由趨勢</h2>
+          <p>只保存 allowlist 路由與聚合數值，不保存 query、IP、User-Agent、Cookie、帳號或輸入內容。</p>
+        </div>
+        <label class="history-range">期間<select id="history-range"><option value="1h">1 小時</option><option value="24h" selected>24 小時</option><option value="7d">7 天</option><option value="30d">30 天</option><option value="90d">90 天</option></select></label>
+      </div>
+      <div class="history-summary" aria-label="長期測速摘要">
+        <article><span>真實請求樣本</span><strong id="history-requests">—</strong></article>
+        <article><span>觀測覆蓋</span><strong id="history-coverage">—</strong></article>
+        <article><span>延遲 p50</span><strong id="history-p50">—</strong></article>
+        <article><span>延遲 p95</span><strong id="history-p95">—</strong></article>
+        <article><span>錯誤率</span><strong id="history-errors">—</strong></article>
+        <article><span>快取命中率</span><strong id="history-cache">—</strong></article>
+      </div>
+      <div class="history-chart-head">
+        <p id="history-coverage-detail">—</p>
+        <div class="legend" aria-label="長期延遲圖例"><span><i class="history-p50-key"></i>p50</span><span><i class="history-p95-key"></i>p95</span></div>
+      </div>
+      <svg id="history-chart" viewBox="0 0 960 270" role="img" aria-label="所選期間閘道 p50 與 p95 延遲趨勢；缺口不連線">
+        <g id="history-chart-grid"></g><g id="history-chart-lines"></g>
+      </svg>
+      <p id="history-chart-empty" class="empty" hidden>所選期間尚無真實請求樣本；未觀測區間不會畫成零延遲。</p>
+
+      <div class="history-tables">
+        <article>
+          <div class="panel-head compact"><div><h3>伺服器步驟</h3><p>各步驟分位數不可相加；平均值可用來找主要成本。</p></div></div>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="伺服器各步驟耗時，可水平捲動">
+            <table><thead><tr><th>步驟</th><th>樣本</th><th>平均</th><th>p50</th><th>p95</th><th>p99</th><th>最大</th></tr></thead><tbody id="history-phase-rows"></tbody></table>
+          </div>
+        </article>
+        <article>
+          <div class="panel-head compact"><div><h3>路由排名</h3><p>依 p95 由慢到快，區分高頻與長尾瓶頸。</p></div><span id="history-route-count" class="count">—</span></div>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="長期路由延遲排名，可水平捲動">
+            <table><thead><tr><th>路由</th><th>請求</th><th>占比</th><th>p50</th><th>p95</th><th>p99</th><th>最大</th><th>錯誤率</th></tr></thead><tbody id="history-route-rows"></tbody></table>
+          </div>
+        </article>
+      </div>
+      <p id="history-status" class="privacy-note" role="status" aria-live="polite">正在讀取持久測速資料。</p>
+    </section>
+
+    <div class="section-intro"><div><span>05</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
     <section class="grid-two">
       <article class="panel">
         <div class="panel-head"><div><h2>時間窗比較</h2><p>1 分鐘、5 分鐘與 1 小時</p></div></div>
@@ -127,6 +170,6 @@
     </details>
   </main>
   <script src="../dashboard-core.js?v=8" defer></script>
-  <script src="app.js?v=9" defer></script>
+  <script src="app.js?v=10" defer></script>
 </body>
 </html>

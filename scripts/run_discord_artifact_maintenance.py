@@ -13,6 +13,7 @@ import argparse
 import fcntl
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,42 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
     return attempted, failures
 
 
+def _wait_for_tw_public_refresh() -> bool:
+    """Wait through a transient writer collision instead of losing the run."""
+
+    timeout = max(
+        0.0,
+        discord_bot._env_float("STOCKAGENT_ARTIFACT_SOURCE_WAIT_SECONDS", 900.0),
+    )
+    poll = max(
+        0.1,
+        discord_bot._env_float("STOCKAGENT_ARTIFACT_SOURCE_POLL_SECONDS", 5.0),
+    )
+    started = time.monotonic()
+    first = True
+    while discord_bot._tw_public_refresh_in_progress():
+        elapsed = time.monotonic() - started
+        if first:
+            discord_bot._record_artifact_maintenance_run(
+                "waiting_source",
+                reason="tw_public_refresh_in_progress",
+            )
+            _emit(
+                status="waiting_source",
+                reason="tw_public_refresh_in_progress",
+                timeout_seconds=timeout,
+            )
+            first = False
+        if elapsed >= timeout:
+            return False
+        time.sleep(min(poll, max(0.0, timeout - elapsed)))
+    if not first:
+        # The source became available; make the durable worker state match the
+        # work that is about to resume rather than leaving it at waiting_source.
+        discord_bot._record_artifact_maintenance_run("running")
+    return True
+
+
 def run_once(*, signal_cache_only: bool = False) -> int:
     discord_bot._rotate_error_log_if_needed()
     status_path = discord_bot._artifact_backfill_status_path()
@@ -78,14 +115,24 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             _emit(status="already_running", lock_path=str(worker_lock_path))
             return 0
 
+        discord_bot._record_artifact_maintenance_run("running")
         if discord_bot._opening_critical_work_pending():
+            discord_bot._record_artifact_maintenance_run(
+                "deferred", reason="opening_critical_work_pending"
+            )
             _emit(status="deferred", reason="opening_critical_work_pending")
             return 0
         if discord_bot._interactive_signal_work_pending():
+            discord_bot._record_artifact_maintenance_run(
+                "deferred", reason="interactive_signal_work_pending"
+            )
             _emit(status="deferred", reason="interactive_signal_work_pending")
             return 0
-        if discord_bot._tw_public_refresh_in_progress():
-            _emit(status="deferred", reason="tw_public_refresh_in_progress")
+        if not _wait_for_tw_public_refresh():
+            discord_bot._record_artifact_maintenance_run(
+                "deferred", reason="tw_public_refresh_wait_timeout"
+            )
+            _emit(status="deferred", reason="tw_public_refresh_wait_timeout")
             return 0
 
         markets = discord_bot._artifact_maintenance_markets()
@@ -96,12 +143,20 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 attempted=cache_attempted,
                 failures=cache_failures,
             )
+            discord_bot._record_artifact_maintenance_run(
+                "complete" if cache_failures == 0 else "degraded",
+                attempted=cache_attempted,
+                failures=cache_failures,
+            )
             return 0 if cache_failures == 0 else 1
 
         with cache_worker_lock_path.open("a+", encoding="utf-8") as cache_lock:
             try:
                 fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                discord_bot._record_artifact_maintenance_run(
+                    "deferred", reason="postclose_signal_cache_in_progress"
+                )
                 _emit(
                     status="deferred",
                     reason="postclose_signal_cache_in_progress",
@@ -111,6 +166,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
         attempted = 0
         failures = 0
+        deferred = 0
         for market in markets:
             cfg = discord_bot._resolve_market(market)
             if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
@@ -119,6 +175,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     not runtime_status.data.fresh
                     or not discord_bot._completed_session_receipt_ready(runtime_status)
                 ):
+                    deferred += 1
                     _emit(
                         status="deferred",
                         reason="completed_session_not_ready",
@@ -179,10 +236,20 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 output_dir=str(result.output_dir) if result is not None else None,
             )
 
+        final_status = (
+            "degraded" if failures else "waiting_source" if deferred else "complete"
+        )
         _emit(
-            status="complete" if failures == 0 else "degraded",
+            status=final_status,
             attempted=attempted,
             failures=failures,
+            deferred=deferred,
+        )
+        discord_bot._record_artifact_maintenance_run(
+            final_status,
+            attempted=attempted,
+            failures=failures,
+            deferred=deferred,
         )
         return 0 if failures == 0 else 1
 
@@ -195,7 +262,24 @@ def main() -> None:
         help="Generate bounded latest-close caches without formal-history inference.",
     )
     args = parser.parse_args()
-    raise SystemExit(run_once(signal_cache_only=bool(args.signal_cache_only)))
+    try:
+        return_code = run_once(signal_cache_only=bool(args.signal_cache_only))
+    except Exception as exc:
+        # A worker-level crash must not leave the durable state stuck at
+        # `running`; per-market receipts remain untouched for diagnosis/retry.
+        discord_bot._record_artifact_maintenance_run(
+            "degraded",
+            reason=f"unhandled_{type(exc).__name__}",
+            failures=1,
+        )
+        discord_bot._log_exception("artifact_maintenance_worker", exc)
+        _emit(
+            status="degraded",
+            reason=f"unhandled_{type(exc).__name__}",
+            error_message=str(exc)[:500],
+        )
+        raise
+    raise SystemExit(return_code)
 
 
 if __name__ == "__main__":

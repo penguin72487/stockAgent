@@ -126,7 +126,7 @@ def test_all_four_day_trade_modes_are_in_the_runtime_schedule() -> None:
     }.issubset(scheduled)
 
 
-def test_all_four_overnight_adapters_use_1325_latest_quote_schedule(
+def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
     monkeypatch,
 ) -> None:
     configs = discord_bot._market_configs()
@@ -141,7 +141,8 @@ def test_all_four_overnight_adapters_use_1325_latest_quote_schedule(
 
     for market in markets:
         config = configs[market]
-        assert config.schedule_time == "13:25"
+        assert config.schedule_time == "13:20"
+        assert config.preopen_prepare_time == "13:00"
         assert config.open_time == "09:00"
         assert config.close_time == "13:30"
         assert config.overnight_simulation_enabled is True
@@ -168,7 +169,7 @@ def test_overnight_scheduler_catches_up_only_before_close(monkeypatch) -> None:
     timezone = ZoneInfo("Asia/Taipei")
 
     assert discord_bot._scheduled_signal_key(
-        cfg, datetime(2026, 9, 9, 13, 25, 0, tzinfo=timezone)
+        cfg, datetime(2026, 9, 9, 13, 20, 0, tzinfo=timezone)
     ) == "2026-09-09:tw_overnight_100m"
     assert discord_bot._scheduled_signal_key(
         cfg, datetime(2026, 9, 9, 13, 29, 59, tzinfo=timezone)
@@ -178,7 +179,9 @@ def test_overnight_scheduler_catches_up_only_before_close(monkeypatch) -> None:
     ) is None
 
 
-def test_overnight_preclose_prepare_uses_1325_decision_gate(monkeypatch) -> None:
+def test_overnight_preclose_prepare_uses_1300_switch_and_1320_decision_gate(
+    monkeypatch,
+) -> None:
     cfg = discord_bot._market_configs()["tw_overnight_100m"]
     timezone = ZoneInfo("Asia/Taipei")
     monkeypatch.setattr(
@@ -198,13 +201,13 @@ def test_overnight_preclose_prepare_uses_1325_decision_gate(monkeypatch) -> None
     )
 
     assert discord_bot._preopen_prepare_key(
-        cfg, datetime(2026, 9, 9, 13, 15, tzinfo=timezone)
+        cfg, datetime(2026, 9, 9, 13, 0, tzinfo=timezone)
     ) == "2026-09-09:tw_overnight_100m:preopen"
     assert discord_bot._preopen_prepare_key(
-        cfg, datetime(2026, 9, 9, 13, 24, tzinfo=timezone)
+        cfg, datetime(2026, 9, 9, 13, 19, tzinfo=timezone)
     ) == "2026-09-09:tw_overnight_100m:preopen"
     assert discord_bot._preopen_prepare_key(
-        cfg, datetime(2026, 9, 9, 13, 25, tzinfo=timezone)
+        cfg, datetime(2026, 9, 9, 13, 20, tzinfo=timezone)
     ) is None
 
 
@@ -223,7 +226,7 @@ def test_overnight_preclose_readiness_does_not_require_daytrade_gates(
                         "panel_date": "2026-09-08",
                         "checkpoint_fingerprint": "sha256:test",
                         "symbol_count": 2744,
-                        "warm_contract": "overnight_13_25_model_cache",
+                        "warm_contract": "overnight_13_20_model_cache",
                         "preopen_price_limits": None,
                         "same_session_eligibility": None,
                     }
@@ -284,7 +287,7 @@ def test_overnight_preclose_warmup_skips_opening_and_daytrade_proofs(
 
     assert discord_bot._prewarm_market_signal_serialized(cfg) is result
     assert calls["signal_kwargs"]["day_trade_model_observation"] == "session_open"
-    assert result.summary["warm_contract"] == "overnight_13_25_model_cache"
+    assert result.summary["warm_contract"] == "overnight_13_20_model_cache"
     assert calls["readiness"]["status"] == "ready"
 
 
@@ -812,6 +815,11 @@ def test_postclose_artifact_maintenance_isolated_from_discord_cgroup() -> None:
     assert "CPUWeight=10" in service
     assert "IOWeight=10" in service
     assert "OOMScoreAdjust=500" in service
+    assert "Slice=stockagent-heavy-data.slice" in service
+    assert "MemoryHigh=48G" in service
+    assert "MemoryMax=64G" in service
+    assert "MemorySwapMax=4G" in service
+    assert "TasksMax=4096" in service
     assert "run_discord_artifact_maintenance.sh" in service
     assert "OnCalendar=Mon..Fri" in timer
     assert "RandomizedDelaySec=0" in timer
@@ -830,6 +838,10 @@ def test_postclose_artifact_maintenance_isolated_from_discord_cgroup() -> None:
     assert "Nice=-5" in gateway
     assert "CPUWeight=200" in gateway
     assert "IOWeight=200" in gateway
+    assert "MemoryHigh=12G" in gateway
+    assert "MemoryMax=24G" in gateway
+    assert "MemorySwapMax=4G" in gateway
+    assert "TasksMax=2048" in gateway
 
 
 def test_event_driven_postclose_service_never_runs_formal_history(
@@ -868,6 +880,38 @@ def test_event_driven_postclose_service_never_runs_formal_history(
 
     assert runner.run_once(signal_cache_only=True) == 0
     assert calls == [("tw_day_trade_multi_basis",)]
+
+
+def test_artifact_maintenance_waits_through_transient_public_writer(
+    monkeypatch,
+) -> None:
+    from scripts import run_discord_artifact_maintenance as runner
+
+    states = iter((True, True, False))
+    clocks = iter((0.0, 0.0, 0.1))
+    sleeps: list[float] = []
+    records: list[tuple[str, str | None]] = []
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_SOURCE_WAIT_SECONDS", "1")
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_SOURCE_POLL_SECONDS", "0.1")
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_tw_public_refresh_in_progress",
+        lambda: next(states),
+    )
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clocks))
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_record_artifact_maintenance_run",
+        lambda status, **kwargs: records.append((status, kwargs.get("reason"))),
+    )
+
+    assert runner._wait_for_tw_public_refresh()
+    assert sleeps == [0.1, 0.1]
+    assert records == [
+        ("waiting_source", "tw_public_refresh_in_progress"),
+        ("running", None),
+    ]
 
 
 def test_opening_watchdog_cannot_undercut_bounded_quote_io(

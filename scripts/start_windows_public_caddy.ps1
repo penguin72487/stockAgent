@@ -25,7 +25,11 @@ $gatewayHealthUri = "http://127.0.0.1:8770/healthz"
 $escapedConfig = [Regex]::Escape($config)
 $wslBootstrapProcess = $null
 $lastWslAttempt = [DateTime]::MinValue
+$lastGatewayRestartAttempt = [DateTime]::MinValue
 $lastBackendHealthy = $null
+$consecutiveBackendFailures = 0
+$restartAfterFailures = 6
+$restartCooldownSeconds = 120
 
 function Write-StartupLog([string]$Message) {
     Add-Content -Path $startupLog -Value "$(Get-Date -Format o) $Message"
@@ -78,18 +82,37 @@ function Test-GatewayBackend {
     }
 }
 
-function Request-WslGateway([string]$Reason) {
+function Test-GatewayListener {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $connect = $client.ConnectAsync("127.0.0.1", 8770)
+        if (-not $connect.Wait(500)) {
+            return $false
+        }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Request-WslGateway(
+    [string]$Reason,
+    [bool]$RestartService = $false
+) {
     $now = Get-Date
     if ($wslBootstrapProcess -and -not $wslBootstrapProcess.HasExited) {
-        return
+        return $false
     }
     if (($now - $lastWslAttempt).TotalSeconds -lt $wslRetry) {
-        return
+        return $false
     }
+    $verb = if ($RestartService) { "restart" } else { "start" }
     $arguments = if ($DistroName) {
-        "--distribution `"$DistroName`" --exec /bin/sh -lc `"systemctl start --no-block stockagent-public-dashboards.service`""
+        "--distribution `"$DistroName`" --exec /bin/sh -lc `"systemctl $verb --no-block stockagent-public-dashboards.service`""
     } else {
-        "--exec /bin/sh -lc `"systemctl start --no-block stockagent-public-dashboards.service`""
+        "--exec /bin/sh -lc `"systemctl $verb --no-block stockagent-public-dashboards.service`""
     }
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -99,15 +122,17 @@ function Request-WslGateway([string]$Reason) {
         $startInfo.CreateNoWindow = $true
         $script:wslBootstrapProcess = [System.Diagnostics.Process]::Start($startInfo)
         $script:lastWslAttempt = $now
-        Write-StartupLog "WSL gateway start dispatched pid=$($wslBootstrapProcess.Id) distro=$DistroName reason=$Reason"
+        Write-StartupLog "WSL gateway $verb dispatched pid=$($wslBootstrapProcess.Id) distro=$DistroName reason=$Reason"
+        return $true
     } catch {
         $script:lastWslAttempt = $now
         Write-StartupLog "WSL gateway dispatch failed distro=$DistroName reason=$Reason error=$($_.Exception.Message)"
+        return $false
     }
 }
 
 Set-Location $InstallRoot
-Request-WslGateway "supervisor_start"
+$null = Request-WslGateway "supervisor_start"
 while ($true) {
     try {
         Start-CaddyIfNeeded
@@ -119,8 +144,29 @@ while ($true) {
         Write-StartupLog "gateway backend healthy=$backendHealthy uri=$gatewayHealthUri"
         $lastBackendHealthy = $backendHealthy
     }
-    if (-not $backendHealthy) {
-        Request-WslGateway "backend_unhealthy"
+    if ($backendHealthy) {
+        $consecutiveBackendFailures = 0
+    } else {
+        $consecutiveBackendFailures += 1
+        $listenerAlive = Test-GatewayListener
+        if (-not $listenerAlive) {
+            $null = Request-WslGateway "backend_unhealthy"
+        } elseif (
+            $consecutiveBackendFailures -ge $restartAfterFailures -and
+            ((Get-Date) - $lastGatewayRestartAttempt).TotalSeconds -ge
+                $restartCooldownSeconds
+        ) {
+            # A listener that accepts TCP but cannot answer /healthz is a
+            # different failure from an inactive WSL service.  Allow brief
+            # CPU/GIL stalls to recover, then restart exactly the read-only
+            # gateway; never restart the trading engine or Discord here.
+            $dispatched = Request-WslGateway `
+                "backend_sustained_unresponsive" $true
+            if ($dispatched) {
+                $lastGatewayRestartAttempt = Get-Date
+                $consecutiveBackendFailures = 0
+            }
+        }
     }
     Start-Sleep -Seconds $probeInterval
 }
