@@ -19,9 +19,12 @@ from stockagent.backtest.tw_day_trade_inventory import (
     convert_inventory_to_margin,
     inventory_nav,
     inventory_path_nav,
+    inventory_intraday_nav_lower_bound,
     inventory_target_delta,
     rebalance_inventory_at_open,
     reduce_inventory_fifo,
+    reduce_inventory_fifo_liquidity,
+    reduce_inventory_fifo_sparse_liquidity,
     reduce_inventory_fifo_path,
     settle_inventory_claims,
     validate_inventory_state,
@@ -115,6 +118,179 @@ def assert_paper(state, mode, mark):
         state, initial_capital=10_000_000, marks=v(mark, device=state.cohorts.device)
     ).item() == pytest.approx(expected, abs=1e-7)
     validate_inventory_state(state, symbols=1)
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_liquidity_curve_endpoint_matches_full_minute_fifo(direction):
+    state = add(DayTradeInventoryState.empty(1), q=2000 * direction, p=1000)
+    # 4,500 shares forces a partial fill inside the fifth price bucket.
+    state = add(state, q=2500 * direction, p=1010, day=DAY + 1)
+    prices = torch.full((1, 270), float("nan"), dtype=torch.float64)
+    capacity = torch.zeros((1, 270), dtype=torch.float64)
+    prices[0, [1, 20, 260, 264, 269]] = v([980, 990, 1005, 995, 1015])
+    capacity[0, [1, 20, 260, 264, 269]] = v([1000, 1000, 1000, 1000, 1000])
+
+    minute = reduce_inventory_fifo_path(
+        state, prices=prices, capacity_shares=capacity
+    )
+    compact = reduce_inventory_fifo_liquidity(
+        state, prices=prices, capacity_shares=capacity
+    )
+    for name in state.__dataclass_fields__:
+        torch.testing.assert_close(
+            getattr(compact.reduction.state, name),
+            getattr(minute.reduction.state, name),
+            rtol=0,
+            atol=1e-10,
+        )
+    torch.testing.assert_close(
+        compact.reduction.filled_shares,
+        minute.reduction.filled_shares,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        compact.executed_notional.sum(),
+        (minute.minute_filled_shares * torch.nan_to_num(prices, nan=0)).sum(),
+        rtol=0,
+        atol=1e-10,
+    )
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_sparse_liquidity_matches_dense_multisymbol_value_and_gradient(seed):
+    """The sparse CSR ABI is the dense side-selected FIFO integral, exactly."""
+    generator = torch.Generator().manual_seed(seed)
+    symbols, events, cohorts = 7, 19, 4
+    directions = torch.where(
+        torch.arange(symbols).remainder(2) == 0,
+        torch.ones(symbols, dtype=torch.float64),
+        -torch.ones(symbols, dtype=torch.float64),
+    )
+    state = DayTradeInventoryState.empty(symbols)
+    for cohort in range(cohorts):
+        shares = (
+            torch.randint(0, 5, (symbols,), generator=generator).double()
+            * 1000
+            * directions
+        )
+        state = append_inventory_fill(
+            state,
+            signed_shares=shares,
+            price=800 + 400 * torch.rand(symbols, generator=generator),
+            buy_fee_rate=torch.full((symbols,), 0.001425),
+            day_sell_fee_rate=torch.full((symbols,), 0.002925),
+            normal_sell_fee_rate=torch.full((symbols,), 0.004425),
+            rebate_rate=torch.full((symbols,), 0.00114),
+            day=DAY + cohort,
+        )
+
+    dense_prices = 700 + 600 * torch.rand(
+        (symbols, events, 2), generator=generator
+    )
+    dense_capacity = (
+        torch.randint(0, 4, (symbols, events, 2), generator=generator).double()
+        * 1000
+    )
+    # Explicit zero-liquidity plateaus and absent scheduler cells exercise
+    # searchsorted ties and CSR gaps at symbol boundaries.
+    dense_capacity[:, ::3] = 0
+    dense_prices[:, ::5] = float("nan")
+    held_short = state.shares < 0
+    side = held_short.long().view(symbols, 1, 1).expand(-1, events, 1)
+    selected_prices = dense_prices.gather(2, side).squeeze(2)
+    selected_capacity = dense_capacity.gather(2, side).squeeze(2)
+
+    flat_prices = dense_prices.reshape(-1)
+    flat_capacity = dense_capacity.reshape(-1)
+    event_symbols = torch.arange(symbols, dtype=torch.int64).repeat_interleave(
+        events * 2
+    )
+    event_sides = torch.arange(2, dtype=torch.int64).repeat(symbols * events)
+    starts = torch.arange(symbols, dtype=torch.int64) * events * 2
+    ends = starts + events * 2
+
+    dense_cohorts = state.cohorts.detach().clone().requires_grad_()
+    sparse_cohorts = state.cohorts.detach().clone().requires_grad_()
+    dense_state = replace(state, cohorts=dense_cohorts)
+    sparse_state = replace(state, cohorts=sparse_cohorts)
+    dense = reduce_inventory_fifo_liquidity(
+        dense_state,
+        prices=selected_prices,
+        capacity_shares=selected_capacity,
+    )
+    sparse = reduce_inventory_fifo_sparse_liquidity(
+        sparse_state,
+        prices=flat_prices,
+        capacity_shares=flat_capacity,
+        event_symbol_indices=event_symbols,
+        event_sides=event_sides,
+        symbol_event_starts=starts,
+        symbol_event_ends=ends,
+    )
+    for name in dense.reduction.state.__dataclass_fields__:
+        torch.testing.assert_close(
+            getattr(sparse.reduction.state, name),
+            getattr(dense.reduction.state, name),
+            rtol=0,
+            atol=1e-8,
+        )
+    for name in (
+        "filled_shares",
+        "gross_pnl",
+        "entry_fee_allocated",
+        "exit_fee",
+        "net_pnl",
+    ):
+        torch.testing.assert_close(
+            getattr(sparse.reduction, name),
+            getattr(dense.reduction, name),
+            rtol=0,
+            atol=1e-8,
+        )
+    torch.testing.assert_close(
+        sparse.executed_notional, dense.executed_notional, rtol=0, atol=1e-8
+    )
+
+    dense_objective = (
+        dense.reduction.state.realized_net_pnl
+        + dense.reduction.state.cohorts.sum() * 1e-6
+        + dense.executed_notional.sum() * 1e-7
+    )
+    sparse_objective = (
+        sparse.reduction.state.realized_net_pnl
+        + sparse.reduction.state.cohorts.sum() * 1e-6
+        + sparse.executed_notional.sum() * 1e-7
+    )
+    dense_objective.backward()
+    sparse_objective.backward()
+    torch.testing.assert_close(
+        sparse_cohorts.grad, dense_cohorts.grad, rtol=1e-10, atol=1e-10
+    )
+
+
+def test_positive_intraday_lower_bound_is_a_valid_solvency_certificate():
+    state = add(DayTradeInventoryState.empty(1), q=2000, p=1000)
+    prices = torch.full((1, 270), float("nan"), dtype=torch.float64)
+    capacity = torch.zeros((1, 270), dtype=torch.float64)
+    prices[0, [20, 264, 269]] = v([900, 950, 1000])
+    capacity[0, [20, 264, 269]] = v([1000, 1000, 1000])
+    marks = torch.linspace(900, 1100, 270, dtype=torch.float64).reshape(1, -1)
+    path = reduce_inventory_fifo_path(
+        state, prices=prices, capacity_shares=capacity
+    )
+    exact = inventory_path_nav(
+        state,
+        prices=prices,
+        minute_filled_shares=path.minute_filled_shares,
+        marks=marks,
+        initial_capital=10_000_000,
+    )
+    bound = inventory_intraday_nav_lower_bound(
+        state, prices=prices, marks=marks, initial_capital=10_000_000
+    )
+    assert bound > 0
+    assert bound <= exact.amin()
 
 
 @pytest.mark.parametrize("direction", [1, -1])

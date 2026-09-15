@@ -35,7 +35,7 @@ from stockagent.backtest.tw_day_trade_contract import (
 )
 
 
-INVENTORY_STATE_ABI = "tw_day_trade_fifo_physical_inventory_v2"
+INVENTORY_STATE_ABI = "tw_day_trade_fifo_physical_inventory_v3_pending_stock"
 
 
 class CohortField(IntEnum):
@@ -49,6 +49,11 @@ class CohortField(IntEnum):
     ACQUIRED_DAY = 7  # Gregorian ordinal, exactly representable in float64
     CONVERTED = 8
     ACCRUED_THROUGH = 9
+    # Signed economic shares received through a stock dividend but not yet
+    # broker-deliverable.  They belong in NAV and carry principal, but cannot
+    # be sold/covered before LOCKED_UNTIL_DAY.
+    LOCKED_SHARES = 10
+    LOCKED_UNTIL_DAY = 11
 
 
 F = CohortField
@@ -119,6 +124,14 @@ class DayTradeInventoryState:
     @property
     def shares(self) -> Tensor:
         return self.cohorts[..., F.SHARES].sum(dim=0)
+
+    @property
+    def locked_shares(self) -> Tensor:
+        return self.cohorts[..., F.LOCKED_SHARES].sum(dim=0)
+
+    @property
+    def tradable_shares(self) -> Tensor:
+        return self.shares - self.locked_shares
 
     @property
     def corporate_action_net(self) -> Tensor:
@@ -284,7 +297,16 @@ def validate_inventory_state(state: DayTradeInventoryState, *, symbols: int) -> 
         _require(torch.isfinite(tensor), f"nonfinite inventory state: {n}")
     _require(state.failed == 0, "inventory trajectory failed validation")
     _physical_shares(c[..., F.SHARES])
+    _physical_shares(c[..., F.LOCKED_SHARES])
     _require(c[..., F.SHARES] * state.shares >= 0, "opposed FIFO acquisition cohorts")
+    _require(
+        c[..., F.LOCKED_SHARES] * c[..., F.SHARES] >= 0,
+        "pending stock entitlement opposes its acquisition cohort",
+    )
+    _require(
+        c[..., F.LOCKED_SHARES].abs() <= c[..., F.SHARES].abs(),
+        "pending stock entitlement exceeds its acquisition cohort",
+    )
     active = c[..., F.SHARES] != 0
     _require(
         ~active | ((c[..., F.BASIS] > 0) & (c[..., F.ENTRY_PRICE] > 0)),
@@ -312,6 +334,18 @@ def validate_inventory_state(state: DayTradeInventoryState, *, symbols: int) -> 
             "invalid inventory calendar cursor",
         )
         _require(values <= state.observed_day, "inventory state contains future events")
+    locked = c[..., F.LOCKED_SHARES] != 0
+    locked_until = c[..., F.LOCKED_UNTIL_DAY]
+    _require(
+        (locked_until >= 0)
+        & (locked_until <= 3652059)
+        & (locked_until == locked_until.round()),
+        "invalid pending-stock delivery cursor",
+    )
+    _require(
+        locked == (locked_until > state.observed_day),
+        "pending stock entitlement has inconsistent delivery state",
+    )
     _require(
         ~active | (c[..., F.ACCRUED_THROUGH] >= c[..., F.ACQUIRED_DAY]),
         "inventory accrual predates acquisition",
@@ -428,6 +462,8 @@ def append_inventory_fill(
             torch.full_like(q, day),
             torch.zeros_like(q),
             torch.full_like(q, day),
+            torch.zeros_like(q),
+            torch.zeros_like(q),
         ],
         dim=-1,
     )
@@ -474,11 +510,14 @@ def reduce_inventory_fifo(
         valid = _finite_nonnegative(quantity, "reduction quantity/capacity") & valid
     q = state.cohorts[..., F.SHARES]
     absolute = q.abs()
+    tradable = (
+        absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
+    ).clamp_min(0)
     executable = torch.isfinite(p) & (p > 0)
-    filled = torch.minimum(torch.minimum(desired, capacity), absolute.sum(0))
+    filled = torch.minimum(torch.minimum(desired, capacity), tradable.sum(0))
     filled = torch.where(executable & valid, filled, torch.zeros_like(filled))
-    before = fifo_cumsum(absolute, 0) - absolute
-    taken = torch.minimum(absolute, (filled - before).clamp_min(0))
+    before = fifo_cumsum(tradable, 0) - tradable
+    taken = torch.minimum(tradable, (filled - before).clamp_min(0))
     remaining_absolute = (absolute - taken).clamp_min(0)
     remaining_entry_cost = (
         state.cohorts[..., F.ENTRY_COST]
@@ -531,6 +570,19 @@ class InventoryPathReduction:
     minute_filled_shares: Tensor  # [symbol, chronological right-labelled minute]
 
 
+@dataclass(frozen=True)
+class InventoryLiquidityReduction:
+    """FIFO endpoint from an exogenous intraday liquidity curve.
+
+    Unlike :class:`InventoryPathReduction`, this representation deliberately
+    does not materialize a minute-by-minute account trajectory.  The source
+    price/capacity curve is integrated exactly and the ledger is updated once.
+    """
+
+    reduction: InventoryReduction
+    executed_notional: Tensor
+
+
 def inventory_path_nav(
     state: DayTradeInventoryState,
     *,
@@ -572,10 +624,18 @@ def inventory_path_nav(
     )
     q = state.cohorts[..., F.SHARES]
     absolute = q.abs()
+    tradable = (
+        absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
+    ).clamp_min(0)
     closed = fifo_cumsum(filled, -1)
     total = absolute.sum(0)
+    tradable_total = tradable.sum(0)
     valid = (
-        _require(closed <= total[:, None], "minute exits exceed held inventory") & valid
+        _require(
+            closed <= tradable_total[:, None],
+            "minute exits exceed deliverable held inventory",
+        )
+        & valid
     )
     remaining = total[:, None] - closed
     observed = torch.isfinite(marks) & (marks > 0)
@@ -596,8 +656,8 @@ def inventory_path_nav(
         state.cohorts[..., F.CARRY_EXIT_RATE],
         state.cohorts[..., F.DAY_EXIT_RATE],
     )
-    boundary = fifo_cumsum(absolute, 0).transpose(0, 1).contiguous()
-    before = boundary - absolute.transpose(0, 1)
+    boundary = fifo_cumsum(tradable, 0).transpose(0, 1).contiguous()
+    before = boundary - tradable.transpose(0, 1)
     zero = cash.new_zeros((cash.shape[0], 1))
 
     # Cash integral at cohort starts/ends, bounded by the final filled amount.
@@ -617,7 +677,8 @@ def inventory_path_nav(
     cohort_paid = cohort_cash * rate
     paid_before = fifo_cumsum(cohort_paid, -1) - cohort_paid
     quantity_rates = absolute.transpose(0, 1) * rate
-    rate_before = fifo_cumsum(quantity_rates, -1) - quantity_rates
+    tradable_rates = tradable.transpose(0, 1) * rate
+    rate_before = fifo_cumsum(tradable_rates, -1) - tradable_rates
     index = torch.searchsorted(boundary, closed.contiguous()).clamp_max(q.shape[0] - 1)
     marginal_rate = rate.gather(1, index)
     paid = (
@@ -671,14 +732,17 @@ def reduce_inventory_fifo_path(
     cumulative = fifo_cumsum(capacity, -1)
     q = state.cohorts[..., F.SHARES]
     absolute = q.abs()
-    total = absolute.sum(0)
+    tradable = (
+        absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
+    ).clamp_min(0)
+    total = tradable.sum(0)
     minute_fills = torch.minimum(
         capacity, (total[:, None] - (cumulative - capacity)).clamp_min(0)
     )
     closed = minute_fills.sum(-1)
-    cohort_end = fifo_cumsum(absolute, 0)
-    cohort_start = cohort_end - absolute
-    taken = torch.minimum(absolute, (closed - cohort_start).clamp_min(0))
+    cohort_end = fifo_cumsum(tradable, 0)
+    cohort_start = cohort_end - tradable
+    taken = torch.minimum(tradable, (closed - cohort_start).clamp_min(0))
 
     # F(x) is the exact cash integral over the first x shares of capacity.
     # Searchsorted selects exogenous volume buckets, not future model inputs.
@@ -733,6 +797,454 @@ def reduce_inventory_fifo_path(
             updated, closed, gross.sum(0), entry_fee.sum(0), exit_fee.sum(0), net.sum(0)
         ),
         minute_fills,
+    )
+
+
+def reduce_inventory_fifo_liquidity(
+    state: DayTradeInventoryState,
+    *,
+    prices: Tensor,
+    capacity_shares: Tensor,
+) -> InventoryLiquidityReduction:
+    """Integrate all executable events without constructing 270 ledger marks.
+
+    ``prices`` and ``capacity_shares`` retain every scheduler-owned stop,
+    take-profit, passive-limit, market and auction opportunity.  Their prefix
+    liquidity curve is a sufficient statistic for the final FIFO allocation:
+    for an arbitrary model quantity, one ``searchsorted`` locates the last
+    partially consumed event and the cash integral supplies the exact proceeds.
+    This removes the minute axis from differentiable inventory state while
+    preserving partial fills and cohort-specific fees.
+    """
+    if prices.ndim != 2 or prices.shape[0] != state.cohorts.shape[1]:
+        raise ValueError("FIFO liquidity requires [symbol,event] prices")
+    if capacity_shares.shape != prices.shape or prices.shape[1] == 0:
+        raise ValueError("FIFO liquidity requires matching nonempty capacities")
+    prices = prices.to(device=state.cohorts.device, dtype=torch.float64)
+    capacity = capacity_shares.to(device=prices.device, dtype=torch.float64)
+    valid = _physical_shares(capacity) & _finite_nonnegative(
+        capacity, "liquidity capacity"
+    )
+    valid = valid & (state.failed == 0)
+    price_ok = torch.isfinite(prices) & (prices > 0)
+    capacity = torch.where(price_ok & valid, capacity, 0)
+    safe_price = torch.where(price_ok, prices, 0)
+    cumulative = fifo_cumsum(capacity, -1)
+    cash_prefix = fifo_cumsum(capacity * safe_price, -1)
+
+    q = state.cohorts[..., F.SHARES]
+    absolute = q.abs()
+    tradable = (
+        absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
+    ).clamp_min(0)
+    total = tradable.sum(0)
+    closed = torch.minimum(total, cumulative[:, -1])
+    cohort_end = fifo_cumsum(tradable, 0)
+    cohort_start = cohort_end - tradable
+    taken = torch.minimum(tradable, (closed - cohort_start).clamp_min(0))
+
+    zero = capacity.new_zeros((capacity.shape[0], 1))
+    volume_left = torch.cat((zero, cumulative[:, :-1]), dim=-1)
+    cash_left = torch.cat((zero, cash_prefix[:, :-1]), dim=-1)
+
+    def integral(quantity: Tensor) -> Tensor:
+        x = torch.minimum(quantity, closed).transpose(0, 1).contiguous()
+        index = torch.searchsorted(
+            cumulative.contiguous(), x, right=False
+        ).clamp_max(prices.shape[1] - 1)
+        amount = cash_left.gather(1, index) + (
+            x - volume_left.gather(1, index)
+        ) * safe_price.gather(1, index)
+        return amount.transpose(0, 1)
+
+    proceeds = integral(cohort_end) - integral(cohort_start)
+    executed_notional = integral(total.unsqueeze(0)).squeeze(0)
+    remaining_absolute = (absolute - taken).clamp_min(0)
+    remaining_entry_cost = (
+        state.cohorts[..., F.ENTRY_COST]
+        * remaining_absolute
+        / absolute.clamp_min(1)
+    )
+    entry_fee = state.cohorts[..., F.ENTRY_COST] - remaining_entry_cost
+    exit_rate = torch.where(
+        state.cohorts[..., F.CONVERTED] != 0,
+        state.cohorts[..., F.CARRY_EXIT_RATE],
+        state.cohorts[..., F.DAY_EXIT_RATE],
+    )
+    gross = q.sign() * (proceeds - taken * state.cohorts[..., F.BASIS])
+    exit_fee = proceeds * exit_rate
+    net = gross - entry_fee - exit_fee
+    updated = _commit_inventory(
+        state,
+        replace(
+            state,
+            realized_net_pnl=state.realized_net_pnl + net.sum(),
+            cohorts=_columns(
+                state.cohorts,
+                {
+                    F.SHARES: q.sign() * remaining_absolute,
+                    F.ENTRY_COST: remaining_entry_cost,
+                },
+            ),
+        ),
+        valid,
+    )
+    return InventoryLiquidityReduction(
+        InventoryReduction(
+            updated,
+            closed,
+            gross.sum(0),
+            entry_fee.sum(0),
+            exit_fee.sum(0),
+            net.sum(0),
+        ),
+        executed_notional,
+    )
+
+
+def reduce_inventory_fifo_sparse_liquidity(
+    state: DayTradeInventoryState,
+    *,
+    prices: Tensor,
+    capacity_shares: Tensor,
+    event_symbol_indices: Tensor,
+    event_sides: Tensor,
+    symbol_event_starts: Tensor,
+    symbol_event_ends: Tensor,
+) -> InventoryLiquidityReduction:
+    """Exact FIFO endpoint over a CSR-like scheduler event stream.
+
+    The dense ``[symbol, 270, side]`` tape contains mostly absent events.  This
+    sufficient statistic retains every finite-price or non-zero-capacity cell in
+    the same symbol/minute/side order.  Prefix capacity remains globally sorted;
+    per-symbol prefix offsets therefore turn one global ``searchsorted`` into the
+    same piecewise-linear cash integral as :func:`reduce_inventory_fifo_liquidity`.
+
+    ``event_sides`` is 0 for a long-position sell and 1 for a short-position
+    cover.  The held direction selects a side on device; no model-dependent
+    event is discarded by the source adapter.
+    """
+    symbols = int(state.cohorts.shape[1])
+    if (
+        prices.ndim != 1
+        or prices.numel() == 0
+        or capacity_shares.shape != prices.shape
+        or event_symbol_indices.shape != prices.shape
+        or event_sides.shape != prices.shape
+    ):
+        raise ValueError("sparse FIFO liquidity requires matching nonempty event vectors")
+    if (
+        symbol_event_starts.shape != (symbols,)
+        or symbol_event_ends.shape != (symbols,)
+    ):
+        raise ValueError("sparse FIFO liquidity requires one CSR interval per symbol")
+    if event_symbol_indices.dtype != torch.int64 or event_sides.dtype != torch.int64:
+        raise ValueError("sparse FIFO event identity requires int64 tensors")
+    if symbol_event_starts.dtype != torch.int64 or symbol_event_ends.dtype != torch.int64:
+        raise ValueError("sparse FIFO CSR intervals require int64 tensors")
+
+    device = state.cohorts.device
+    prices = prices.to(device=device, dtype=torch.float64)
+    capacity = capacity_shares.to(device=device, dtype=torch.float64)
+    event_symbol_indices = event_symbol_indices.to(device=device)
+    event_sides = event_sides.to(device=device)
+    starts = symbol_event_starts.to(device=device)
+    ends = symbol_event_ends.to(device=device)
+
+    event_count = int(prices.shape[0])
+    identity_valid = _require(
+        (event_symbol_indices >= 0)
+        & (event_symbol_indices < symbols)
+        & ((event_sides == 0) | (event_sides == 1)),
+        "invalid sparse FIFO event identity",
+    )
+    interval_valid = _require(
+        (starts >= 0)
+        & (starts <= ends)
+        & (ends <= event_count),
+        "invalid sparse FIFO CSR interval",
+    )
+    valid = _physical_shares(capacity) & _finite_nonnegative(
+        capacity, "sparse liquidity capacity"
+    )
+    valid = valid & identity_valid & interval_valid & (state.failed == 0)
+
+    price_ok = torch.isfinite(prices) & (prices > 0)
+    safe_price = torch.where(price_ok, prices, 0)
+    held_short = state.shares < 0
+    selected = event_sides.bool() == held_short.index_select(
+        0, event_symbol_indices
+    )
+    capacity = torch.where(selected & price_ok & valid, capacity, 0)
+    cumulative = fifo_cumsum(capacity, 0)
+    cash_prefix = fifo_cumsum(capacity * safe_price, 0)
+    zero = capacity.new_zeros((1,))
+    capacity_before = torch.cat((zero, cumulative[:-1]), dim=0)
+    cash_before = torch.cat((zero, cash_prefix[:-1]), dim=0)
+
+    clamped_starts = starts.clamp_max(event_count - 1)
+    clamped_last = (ends - 1).clamp(min=0, max=event_count - 1)
+    base_capacity = capacity_before.index_select(0, clamped_starts)
+    base_cash = cash_before.index_select(0, clamped_starts)
+    has_events = ends > starts
+    total_capacity = torch.where(
+        has_events,
+        cumulative.index_select(0, clamped_last) - base_capacity,
+        torch.zeros_like(base_capacity),
+    )
+
+    q = state.cohorts[..., F.SHARES]
+    absolute = q.abs()
+    tradable = (
+        absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
+    ).clamp_min(0)
+    total = tradable.sum(0)
+    closed = torch.minimum(total, total_capacity)
+    cohort_end = fifo_cumsum(tradable, 0)
+    cohort_start = cohort_end - tradable
+    taken = torch.minimum(tradable, (closed - cohort_start).clamp_min(0))
+
+    def integral(quantity: Tensor) -> Tensor:
+        x = torch.minimum(quantity, closed)
+        positive = x > 0
+        query = (x + base_capacity).contiguous()
+        index = torch.searchsorted(
+            cumulative.contiguous(), query, right=False
+        ).clamp_max(event_count - 1)
+        left_volume = capacity_before.gather(0, index.reshape(-1)).reshape(index.shape)
+        left_cash = cash_before.gather(0, index.reshape(-1)).reshape(index.shape)
+        event_price = safe_price.gather(0, index.reshape(-1)).reshape(index.shape)
+        amount = (
+            left_cash
+            - base_cash
+            + (query - left_volume) * event_price
+        )
+        return torch.where(positive, amount, torch.zeros_like(amount))
+
+    proceeds = integral(cohort_end) - integral(cohort_start)
+    executed_notional = integral(total.unsqueeze(0)).squeeze(0)
+    remaining_absolute = (absolute - taken).clamp_min(0)
+    remaining_entry_cost = (
+        state.cohorts[..., F.ENTRY_COST]
+        * remaining_absolute
+        / absolute.clamp_min(1)
+    )
+    entry_fee = state.cohorts[..., F.ENTRY_COST] - remaining_entry_cost
+    exit_rate = torch.where(
+        state.cohorts[..., F.CONVERTED] != 0,
+        state.cohorts[..., F.CARRY_EXIT_RATE],
+        state.cohorts[..., F.DAY_EXIT_RATE],
+    )
+    gross = q.sign() * (proceeds - taken * state.cohorts[..., F.BASIS])
+    exit_fee = proceeds * exit_rate
+    net = gross - entry_fee - exit_fee
+    updated = _commit_inventory(
+        state,
+        replace(
+            state,
+            realized_net_pnl=state.realized_net_pnl + net.sum(),
+            cohorts=_columns(
+                state.cohorts,
+                {
+                    F.SHARES: q.sign() * remaining_absolute,
+                    F.ENTRY_COST: remaining_entry_cost,
+                },
+            ),
+        ),
+        valid,
+    )
+    return InventoryLiquidityReduction(
+        InventoryReduction(
+            updated,
+            closed,
+            gross.sum(0),
+            entry_fee.sum(0),
+            exit_fee.sum(0),
+            net.sum(0),
+        ),
+        executed_notional,
+    )
+
+
+def inventory_intraday_nav_lower_bound_from_extrema(
+    state: DayTradeInventoryState,
+    *,
+    minimum_marks: Tensor,
+    maximum_marks: Tensor,
+    mark_path_valid: Tensor,
+    minimum_prices: Tensor,
+    maximum_prices: Tensor,
+    initial_capital: float,
+) -> Tensor:
+    """Evaluate the conservative solvency proof from exact source extrema."""
+    if not math.isfinite(initial_capital) or initial_capital <= 0:
+        raise ValueError("initial capital must be finite and positive")
+    symbols = int(state.cohorts.shape[1])
+    values = (
+        minimum_marks,
+        maximum_marks,
+        mark_path_valid,
+        minimum_prices,
+        maximum_prices,
+    )
+    if any(value.shape != (symbols,) for value in values):
+        raise ValueError("intraday NAV extrema must match the pinned universe")
+    minimum_mark, maximum_mark, path_valid, minimum_price, maximum_price = [
+        value.to(device=state.cohorts.device, dtype=torch.float64)
+        for value in values
+    ]
+    path_flag_valid = _require(
+        torch.isfinite(path_valid) & ((path_valid == 0) | (path_valid == 1)),
+        "intraday mark-path validity must be exact binary values",
+    )
+
+    q = state.cohorts[..., F.SHARES]
+    absolute = q.abs()
+    locked = state.cohorts[..., F.LOCKED_SHARES].abs()
+    tradable = (absolute - locked).clamp_min(0)
+    total = absolute.sum(0)
+    locked_total = locked.sum(0)
+    tradable_total = tradable.sum(0)
+    active = total > 0
+    source_valid = ((~active) | path_valid.bool()).all() & path_flag_valid
+    valid_marks = (
+        torch.isfinite(minimum_mark)
+        & torch.isfinite(maximum_mark)
+        & (minimum_mark > 0)
+        & (maximum_mark >= minimum_mark)
+    )
+    source_valid = source_valid & ((~active) | valid_marks).all()
+    minimum_mark = torch.where(
+        active & valid_marks, minimum_mark, torch.ones_like(minimum_mark)
+    )
+    maximum_mark = torch.where(
+        active & valid_marks, maximum_mark, torch.ones_like(maximum_mark)
+    )
+
+    price_valid = (
+        torch.isfinite(minimum_price)
+        & torch.isfinite(maximum_price)
+        & (minimum_price > 0)
+        & (maximum_price >= minimum_price)
+    )
+    has_execution = price_valid
+    minimum_price = torch.where(
+        has_execution, minimum_price, torch.zeros_like(minimum_price)
+    )
+    maximum_price = torch.where(
+        has_execution, maximum_price, torch.zeros_like(maximum_price)
+    )
+
+    rate = torch.where(
+        state.cohorts[..., F.CONVERTED] != 0,
+        state.cohorts[..., F.CARRY_EXIT_RATE],
+        state.cohorts[..., F.DAY_EXIT_RATE],
+    )
+    active_cohort = absolute > 0
+    rate_valid = ((~active_cohort) | (torch.isfinite(rate) & (rate >= 0))).all()
+    maximum_rate = torch.where(active_cohort, rate, 0).amax(0)
+
+    # Pending stock rights remain economic exposure but cannot be part of an
+    # executable endpoint.  Bound them at the worst mark and optimize only the
+    # delivered portion over the hold-vs-liquidate affine endpoints.
+    long_locked = (
+        locked_total * minimum_mark
+        - locked_total * maximum_mark * maximum_rate
+    )
+    long_holding = (
+        tradable_total * minimum_mark
+        - tradable_total * maximum_mark * maximum_rate
+    )
+    long_sold = (
+        tradable_total * minimum_price
+        - tradable_total * maximum_price * maximum_rate
+    )
+    short_locked = (
+        -locked_total * maximum_mark
+        - locked_total * maximum_mark * maximum_rate
+    )
+    short_holding = (
+        -tradable_total * maximum_mark
+        - tradable_total * maximum_mark * maximum_rate
+    )
+    short_sold = (
+        -tradable_total * maximum_price
+        - tradable_total * maximum_price * maximum_rate
+    )
+    long_bound = long_locked + torch.minimum(
+        long_holding, torch.where(has_execution, long_sold, long_holding)
+    )
+    short_bound = short_locked + torch.minimum(
+        short_holding, torch.where(has_execution, short_sold, short_holding)
+    )
+    direction = state.shares.sign()
+    position_bound = torch.where(
+        direction > 0,
+        long_bound,
+        torch.where(direction < 0, short_bound, 0),
+    )
+    basis = (q * state.cohorts[..., F.BASIS]).sum(0)
+    entry_cost = state.cohorts[..., F.ENTRY_COST].sum(0)
+    scalar = (
+        initial_capital
+        + state.realized_net_pnl
+        + state.corporate_action_net
+        - state.carry_cost
+    )
+    lower_bound = scalar + (position_bound - basis - entry_cost).sum()
+    valid = source_valid & rate_valid & (state.failed == 0)
+    return torch.where(valid, lower_bound, torch.full_like(lower_bound, float("nan")))
+
+
+def inventory_intraday_nav_lower_bound(
+    state: DayTradeInventoryState,
+    *,
+    prices: Tensor,
+    marks: Tensor,
+    initial_capital: float,
+) -> Tensor:
+    """Conservative proof that no omitted minute can bankrupt the account.
+
+    Holdings never reverse inside the exit-only path.  For each symbol, the
+    worst possible partial-liquidation value is bounded by the worse endpoint
+    of an affine interval: keep all shares at the worst observed mark, or sell
+    all shares at the worst executable price.  Fees use independent maxima.
+    Summing per-symbol extrema is intentionally more adverse than any actual
+    co-timed portfolio mark.  Therefore a positive result proves every true
+    minute NAV is positive; a non-positive/invalid result is *inconclusive* and
+    the caller must replay the authoritative full path.
+    """
+    if not math.isfinite(initial_capital) or initial_capital <= 0:
+        raise ValueError("initial capital must be finite and positive")
+    if prices.ndim != 2 or prices.shape[0] != state.cohorts.shape[1]:
+        raise ValueError("intraday NAV proof requires [symbol,event] prices")
+    if marks.shape != prices.shape or prices.shape[1] == 0:
+        raise ValueError("intraday NAV proof requires matching nonempty marks")
+    prices, marks = [
+        value.to(device=state.cohorts.device, dtype=torch.float64)
+        for value in (prices, marks)
+    ]
+    mark_ok = torch.isfinite(marks) & (marks > 0)
+    # This deliberately requires a valid mark at every omitted minute for an
+    # exposed symbol.  If a position actually closes before a later gap, the
+    # proof may be inconclusive, but the full fallback resolves it exactly.
+    positive_inf = torch.full_like(marks, float("inf"))
+    negative_inf = torch.full_like(marks, float("-inf"))
+    minimum_mark = torch.where(mark_ok, marks, positive_inf).amin(-1)
+    maximum_mark = torch.where(mark_ok, marks, negative_inf).amax(-1)
+    mark_path_valid = mark_ok.all(-1).to(dtype=torch.float64)
+
+    price_ok = torch.isfinite(prices) & (prices > 0)
+    minimum_price = torch.where(price_ok, prices, positive_inf).amin(-1)
+    maximum_price = torch.where(price_ok, prices, 0).amax(-1)
+    return inventory_intraday_nav_lower_bound_from_extrema(
+        state,
+        minimum_marks=minimum_mark,
+        maximum_marks=maximum_mark,
+        mark_path_valid=mark_path_valid,
+        minimum_prices=minimum_price,
+        maximum_prices=maximum_price,
+        initial_capital=initial_capital,
     )
 
 
@@ -876,16 +1388,18 @@ def apply_inventory_action(
     share_ratio: Tensor,
     cash_per_old_share: Tensor,
     payment_day: Tensor,
+    stock_delivery_day: Tensor | None = None,
 ) -> DayTradeInventoryState:
     """Apply a source-verified physical/cash action at its effective instant.
 
     The data adapter must resolve suspensions, exact terms and receipts before
-    this call. For a physical replacement event_day is the resumption day, not
-    the announcement or ex-date. Cash is signed on OLD physical quantities;
-    basis is divided by the ratio without also subtracting cash. No shares
-    acquired on/after the effective date receive an entitlement. One aggregated
-    event per symbol/date is required; duplicate/revised events are rejected,
-    not silently reapplied. Caller checkpointing makes retry idempotent.
+    this call. Replacement actions use their effective resumption day; stock
+    dividends use the ex-date and supply the later issuer delivery/listing day.
+    Cash is signed on OLD physical quantities; basis is divided by the ratio
+    without also subtracting cash. New stock is economic exposure immediately
+    but non-executable until delivery. No shares acquired on/after the effective
+    date receive an entitlement. One aggregated event per symbol/date is
+    required; duplicate/revised events are rejected, not silently reapplied.
     """
     valid = _calendar_day(state, as_of_day)
     if (
@@ -903,8 +1417,17 @@ def apply_inventory_action(
         & valid
     )
     mask = _vector(state, event_mask).bool()
-    ratio, cash, payment = [
-        _vector(state, x) for x in (share_ratio, cash_per_old_share, payment_day)
+    delivery_value: Tensor | float = (
+        0 if stock_delivery_day is None else stock_delivery_day
+    )
+    ratio, cash, payment, delivery = [
+        _vector(state, x)
+        for x in (
+            share_ratio,
+            cash_per_old_share,
+            payment_day,
+            delivery_value,
+        )
     ]
     valid = (
         _require(
@@ -926,6 +1449,20 @@ def apply_inventory_action(
     valid = (
         _require(
             ~mask
+            | (
+                torch.isfinite(delivery)
+                & (delivery >= 0)
+                & (delivery == delivery.round())
+                & (delivery <= 3652059)
+                & ((delivery == 0) | (delivery >= event_day))
+            ),
+            "stock entitlement requires an exact delivery date",
+        )
+        & valid
+    )
+    valid = (
+        _require(
+            ~mask
             | (cash == 0)
             | (
                 torch.isfinite(payment)
@@ -939,6 +1476,7 @@ def apply_inventory_action(
     # Ignore absent symbols before arithmetic: 0 * NaN is still NaN.
     ratio = torch.where(mask, ratio, torch.ones_like(ratio))
     cash = torch.where(mask, cash, torch.zeros_like(cash))
+    delivery = torch.where(mask, delivery, torch.zeros_like(delivery))
     c = state.cohorts
     entitled = mask & (c[..., F.SHARES] != 0) & (c[..., F.ACQUIRED_DAY] < event_day)
     valid = (
@@ -954,6 +1492,23 @@ def apply_inventory_action(
         & valid
     )
     new_q = changed_q + (changed_q.round() - changed_q).detach()
+    added_q = new_q - c[..., F.SHARES]
+    creates_pending_stock = entitled & (added_q != 0) & (delivery > event_day)
+    valid = (
+        _require(
+            ~entitled
+            | (c[..., F.LOCKED_SHARES] == 0),
+            "overlapping undelivered stock entitlements require separate cohorts",
+        )
+        & valid
+    )
+    valid = (
+        _require(
+            ~creates_pending_stock | (added_q * c[..., F.SHARES] > 0),
+            "share contraction cannot create a pending stock entitlement",
+        )
+        & valid
+    )
     signed_claim = torch.where(entitled, c[..., F.SHARES] * cash, 0).sum(dim=0)
     paid = (payment <= as_of_day).to(dtype=c.dtype)
     claim = torch.stack(
@@ -975,6 +1530,16 @@ def apply_inventory_action(
                     F.BASIS: torch.where(
                         entitled, c[..., F.BASIS] / ratio, c[..., F.BASIS]
                     ),
+                    F.LOCKED_SHARES: torch.where(
+                        creates_pending_stock,
+                        added_q,
+                        c[..., F.LOCKED_SHARES],
+                    ),
+                    F.LOCKED_UNTIL_DAY: torch.where(
+                        creates_pending_stock,
+                        delivery.expand_as(c[..., F.LOCKED_UNTIL_DAY]),
+                        c[..., F.LOCKED_UNTIL_DAY],
+                    ),
                 },
             ),
             claims=torch.cat((state.claims, claim.unsqueeze(0)), dim=0),
@@ -984,6 +1549,46 @@ def apply_inventory_action(
                 torch.full_like(state.action_cursor, event_day),
                 state.action_cursor,
             ),
+        ),
+        valid,
+    )
+
+
+def release_inventory_stock_deliveries(
+    state: DayTradeInventoryState, *, day: int
+) -> DayTradeInventoryState:
+    """Make receipt-dated stock entitlements executable at session start."""
+    valid = _calendar_day(state, day)
+    c = state.cohorts
+    locked = c[..., F.LOCKED_SHARES] != 0
+    due = locked & (c[..., F.LOCKED_UNTIL_DAY] <= day)
+    valid = (
+        _require(
+            ~locked | (c[..., F.LOCKED_UNTIL_DAY] > state.observed_day),
+            "pending stock delivery cursor is stale",
+        )
+        & valid
+    )
+    return _commit_inventory(
+        state,
+        replace(
+            state,
+            cohorts=_columns(
+                c,
+                {
+                    F.LOCKED_SHARES: torch.where(
+                        due,
+                        torch.zeros_like(c[..., F.LOCKED_SHARES]),
+                        c[..., F.LOCKED_SHARES],
+                    ),
+                    F.LOCKED_UNTIL_DAY: torch.where(
+                        due,
+                        torch.zeros_like(c[..., F.LOCKED_UNTIL_DAY]),
+                        c[..., F.LOCKED_UNTIL_DAY],
+                    ),
+                },
+            ),
+            observed_day=state.observed_day.new_tensor(day),
         ),
         valid,
     )
@@ -1017,7 +1622,10 @@ class InventoryTargetDelta:
 
 
 def inventory_target_delta(
-    held: Tensor, target: Tensor, capacity: Tensor
+    held: Tensor,
+    target: Tensor,
+    capacity: Tensor,
+    reducible: Tensor | None = None,
 ) -> InventoryTargetDelta:
     """Reduce first, then add, sharing a single symbol-minute capacity budget.
 
@@ -1025,16 +1633,23 @@ def inventory_target_delta(
     outside this algebra. A blocked reduction cannot authorize an opposite
     side opening. No whole-lot rounding is applied to real odd residuals.
     """
-    if held.shape != target.shape or held.shape != capacity.shape:
+    executable = held.abs() if reducible is None else reducible
+    if (
+        held.shape != target.shape
+        or held.shape != capacity.shape
+        or executable.shape != held.shape
+    ):
         raise ValueError("target delta requires matching symbol vectors")
     valid = _finite_nonnegative(capacity, "minute capacity")
-    for quantity in (held, target, capacity):
+    valid = _finite_nonnegative(executable, "deliverable reduction quantity") & valid
+    for quantity in (held, target, capacity, executable):
         valid = _physical_shares(quantity) & valid
+    valid = _require(executable <= held.abs(), "deliverable shares exceed holdings") & valid
     same_side = held * target > 0
     requested_reduce = torch.where(
         same_side, (held.abs() - target.abs()).clamp_min(0), held.abs()
     )
-    reduction = torch.minimum(requested_reduce, capacity)
+    reduction = torch.minimum(torch.minimum(requested_reduce, capacity), executable)
     remainder = held - held.sign() * reduction
     unused = capacity - reduction
     addition = torch.where(
@@ -1079,6 +1694,7 @@ def rebalance_inventory_at_open(
     day: int,
     halted: Tensor | None = None,
     daily_proxy_mask: Tensor | None = None,
+    state_already_advanced: bool = False,
 ) -> InventoryOpeningResult:
     """One daily decision and its 09:01 historical inventory-delta execution.
 
@@ -1132,7 +1748,16 @@ def rebalance_inventory_at_open(
         )
         & valid
     )
-    state = settle_inventory_claims(accrue_inventory_interest(state, day=day), day=day)
+    if state_already_advanced:
+        valid = (
+            _require(
+                state.observed_day == day,
+                "pre-advanced opening inventory must already be at the session day",
+            )
+            & valid
+        )
+    else:
+        state = settle_inventory_claims(accrue_inventory_interest(state, day=day), day=day)
     valuation = opening if opening_marks is None else _vector(state, opening_marks)
     nav = inventory_nav(state, initial_capital=initial_capital, marks=valuation)
     valid = (
@@ -1188,7 +1813,12 @@ def rebalance_inventory_at_open(
     capacity = torch.where(
         price_ok & valid, _capacity(volume), torch.zeros_like(volume)
     )
-    delta = inventory_target_delta(state.shares, target, capacity)
+    delta = inventory_target_delta(
+        state.shares,
+        target,
+        capacity,
+        state.tradable_shares.abs(),
+    )
     valid = valid & delta.valid
     reduction = reduce_inventory_fifo(
         state, requested_shares=delta.reduction, price=price, capacity_shares=capacity
@@ -1197,7 +1827,10 @@ def rebalance_inventory_at_open(
     # Reductions and additions share ONE observed-minute bucket. Failed exits
     # cannot free capacity or reserve short proceeds as purchasing power.
     wanted = inventory_target_delta(
-        remaining, target, capacity - reduction.filled_shares
+        remaining,
+        target,
+        capacity - reduction.filled_shares,
+        reduction.state.tradable_shares.abs(),
     ).addition
     wanted = torch.where(enter, wanted, torch.zeros_like(wanted))
     budget = (

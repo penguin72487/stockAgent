@@ -412,16 +412,32 @@ Rules:
 ### Default Training Baseline And Immediate Fold Reports
 
 Unless the user explicitly selects another baseline, new strategy training
-configs must use
+configs use the architecture/data baseline in
 `configs/markets/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml`
 and its completed OFAT control at
 `artifacts/ablations/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_commission20_panel_history_v3_ofat_capital10m/baseline`
 as the default training standard. Inherit its model, multi-basis inputs,
-projection-L1 output, TWD 10M execution capital, panel-history walk-forward,
+TWD 10M execution capital, panel-history walk-forward,
 BF16/DDP, fee, settlement, 1000-epoch, and epoch-curve settings unless the
 strategy or the user explicitly overrides a field. Product-specific data,
 execution, eligibility, settlement, and accounting contracts remain
 authoritative and must not be replaced by Taiwan stock-day-trade semantics.
+
+For new single-target Taiwan stock day-trade training, the historical
+`projection_l1` output is no longer the active policy contract. Use
+`portfolio_output_mode: learned_cash` with
+`center_long_short_logits: false`, as pinned by
+`configs/deployments/tw_day_trade_last_last_only_training_vastai1t.yaml`.
+This mode uses a zero-initialized contextual cash gate to scale a signed
+unit-L1 stock direction, so the model—not failed fills, whole-lot rounding, or
+volume capacity—chooses long gross, short gross, net exposure, total gross, and
+cash. Candidate count and arbitrary stock-logit scale therefore cannot force
+gross to one. Do not substitute legacy `cash_l1`: its one cash score still
+competes against an unscaled sum over S stocks. Preserve old projection/cash-L1
+code and configs only for exact historical artifact replay;
+do not start new stock day-trade experiments from them. Product-specific models
+whose validated action ABI still requires projection-L1 are not silently
+migrated by this stock-policy rule.
 
 For full-stock-context nearby single-stock-futures day trade, the product-
 specific default is

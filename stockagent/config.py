@@ -183,7 +183,13 @@ def _validate_crypto_perpetual_mode_contract(
     if bool(use_tw_public_rules):
         raise ValueError("crypto_perpetual cannot consume Taiwan execution rules")
     output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
-    if output_mode not in {"logits", "l1", "cash_l1", "projection_l1"}:
+    if output_mode not in {
+        "logits",
+        "l1",
+        "cash_l1",
+        "learned_cash",
+        "projection_l1",
+    }:
         raise ValueError(
             "crypto_perpetual requires a signed target-weight compatible model output"
         )
@@ -246,10 +252,16 @@ def _validate_tw_minute_mode_contract(
             "sell-first eligibility backward"
         )
     output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
-    if output_mode not in {"logits", "l1", "cash_l1", "projection_l1"}:
+    if output_mode not in {
+        "logits",
+        "l1",
+        "cash_l1",
+        "learned_cash",
+        "projection_l1",
+    }:
         raise ValueError(
             "tw_minute requires the active model portfolio_output_mode to be "
-            "'logits', 'l1', 'cash_l1', or 'projection_l1'"
+            "'logits', 'l1', 'cash_l1', 'learned_cash', or 'projection_l1'"
         )
     guided = bool(str(daily_guidance_path or "").strip())
     if guided:
@@ -276,7 +288,7 @@ def _validate_tw_minute_mode_contract(
                 "tw_minute daily-model guidance must preserve the daily target "
                 "weights; disable the minute per-name cap and outside-cash logit"
             )
-    if output_mode in {"l1", "cash_l1", "projection_l1"}:
+    if output_mode in {"l1", "cash_l1", "learned_cash", "projection_l1"}:
         if float(gross_exposure) != 1.0:
             raise ValueError(
                 "tw_minute pre-normalized portfolio output already emits the "
@@ -2308,6 +2320,12 @@ class TrainingConfig:
     # account trajectory. Batches remain bounded truncated-BPTT chunks, while
     # AdamW and the step scheduler advance exactly once after the full epoch.
     futures_portfolio_optimizer_step_per_trajectory: bool = False
+    # The physical Taiwan day-trade account is recurrent whenever an unfilled
+    # position becomes margin inventory.  Keep one policy parameter vector for
+    # the complete chronological epoch so every bounded FIFO chunk belongs to
+    # the same policy that validation replays.  This is deliberately opt-in so
+    # historical batch-cadence artifacts remain reproducible.
+    day_trade_optimizer_step_per_trajectory: bool = False
     # Daily crypto shares the bounded recurrent executor. Keep one policy for
     # all training dates and weight each chunk by its valid-date count before
     # one optimizer update; this is an opt-in optimization-semantic change.
@@ -2374,6 +2392,13 @@ class TrainingConfig:
     backtest_verbose: bool = False
     strict_no_fallback: bool = False
     backtest_checkpoint_chunk_rows: int = 0
+    # Omit the redundant insolvency-mask replay only after the exact first-pass
+    # intraday NAV is certified positive for the whole truncated-BPTT batch.
+    day_trade_event_compression: bool = True
+    # Sparse event packing changes FP64 reduction order and remains opt-in.
+    day_trade_sparse_events: bool = False
+    # Fixed compile ABI used only by the sparse-event experiment.
+    day_trade_sparse_event_slots: int = 262144
     runtime_shape_check: bool = False
     allow_dynamic_symbols: bool = True
     lookback: int = 1
@@ -2835,6 +2860,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     training["minute_cpu_cache_gb"] = max(0.0, float(training["minute_cpu_cache_gb"]))
     training["minute_data_workers"] = max(1, int(training["minute_data_workers"]))
+    training["day_trade_event_compression"] = bool(
+        training["day_trade_event_compression"]
+    )
+    training["day_trade_sparse_events"] = bool(training["day_trade_sparse_events"])
+    day_trade_sparse_event_slots = int(training["day_trade_sparse_event_slots"])
+    if (
+        day_trade_sparse_event_slots <= 0
+        or day_trade_sparse_event_slots & (day_trade_sparse_event_slots - 1)
+    ):
+        raise ValueError(
+            "training.day_trade_sparse_event_slots must be a positive power of two"
+        )
+    training["day_trade_sparse_event_slots"] = day_trade_sparse_event_slots
     tw_compile_rows = training["tw_continuous_compile_chunk_rows"]
     tw_gradient_rows = training["tw_continuous_gradient_horizon_rows"]
     if (
@@ -4355,6 +4393,34 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    if bool(training["day_trade_optimizer_step_per_trajectory"]):
+        if trading["execution_mode"] != "tw_day_trade":
+            raise ValueError(
+                "day_trade_optimizer_step_per_trajectory requires "
+                "trading.execution_mode='tw_day_trade'"
+            )
+        if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
+            raise ValueError(
+                "day_trade_optimizer_step_per_trajectory requires the "
+                "recurrent physical FIFO margin-carry account"
+            )
+        if data["day_trade_minute_execution_root"] is None:
+            raise ValueError(
+                "day_trade_optimizer_step_per_trajectory requires explicit "
+                "minute/daily-proxy physical sessions"
+            )
+        if _normalized_contract_name(training["loss_type"]) not in (
+            _TW_PHASE_RETURN_OBJECTIVES
+        ):
+            raise ValueError(
+                "day_trade_optimizer_step_per_trajectory requires decomposable "
+                "exact log utility"
+            )
+        if bool(training["compile_loss"]):
+            raise ValueError(
+                "day_trade_optimizer_step_per_trajectory requires "
+                "compile_loss=false; the physical session kernels remain compiled"
+            )
     if (
         trading["execution_mode"] == "tw_minute"
         and data["minute_daily_context_panel_meta"] is not None
@@ -4935,6 +5001,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             futures_portfolio_optimizer_step_per_trajectory=training_raw[
                 "futures_portfolio_optimizer_step_per_trajectory"
             ],
+            day_trade_optimizer_step_per_trajectory=training_raw[
+                "day_trade_optimizer_step_per_trajectory"
+            ],
             crypto_optimizer_step_per_trajectory=training_raw[
                 "crypto_optimizer_step_per_trajectory"
             ],
@@ -5010,6 +5079,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
             strict_no_fallback=training_raw["strict_no_fallback"],
             backtest_checkpoint_chunk_rows=training_raw[
                 "backtest_checkpoint_chunk_rows"
+            ],
+            day_trade_event_compression=training_raw[
+                "day_trade_event_compression"
+            ],
+            day_trade_sparse_events=training_raw["day_trade_sparse_events"],
+            day_trade_sparse_event_slots=training_raw[
+                "day_trade_sparse_event_slots"
             ],
             runtime_shape_check=training_raw["runtime_shape_check"],
             allow_dynamic_symbols=training_raw["allow_dynamic_symbols"],

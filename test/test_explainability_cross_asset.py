@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
@@ -112,6 +113,42 @@ def _symbols(symbols: int = 5) -> list[str]:
 
 def _dates(rows: int = 4) -> list[str]:
     return [f"2026-01-{idx + 1:02d}" for idx in range(rows)]
+
+
+def test_score_reallocation_preserves_learned_cash_contract() -> None:
+    model = SimpleNamespace(
+        default_temperature=1.0,
+        portfolio_activation="identity",
+        portfolio_mode="long_short",
+        portfolio_output_mode="learned_cash",
+        center_long_short_logits=False,
+        projection_l1_scale_by_active_count=False,
+    )
+    scores = torch.tensor([[3.0, -1.0, 2.0], [0.5, 4.0, -9.0]])
+    mask = torch.tensor([[True, True, True], [True, True, False]])
+    cash_logits = torch.tensor([0.25, -0.75])
+
+    actual = cross_asset_module._portfolio_weights_from_scores(
+        model,
+        scores,
+        mask,
+        cash_target_logits=cash_logits,
+    )
+    expected, expected_cash, _cash_gate_risky_gross = (
+        cross_asset_module.masked_learned_cash_weights(
+            scores,
+            cash_logits,
+            mask,
+            long_only=False,
+        )
+    )
+
+    assert torch.allclose(actual, expected)
+    expected_gross = actual.abs().sum(dim=1)
+    assert torch.allclose(expected_gross + expected_cash, torch.ones(2))
+    assert not torch.allclose(actual.sum(dim=1), torch.zeros(2))
+    with pytest.raises(ValueError, match="contextual cash target logit"):
+        cross_asset_module._portfolio_weights_from_scores(model, scores, mask)
 
 
 def _matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray]:
@@ -445,7 +482,11 @@ def test_lazy_row_major_oom_halves_source_chunk_without_rematerializing_rows(
     assert lazy.materialize_calls == [(0, 2), (2, 4), (0, 2), (2, 4)]
 
 
-def _tiny_transformer() -> TransformerBasePortfolioModel:
+def _tiny_transformer(
+    *,
+    portfolio_output_mode: str = "activation_l1",
+    center_long_short_logits: bool = True,
+) -> TransformerBasePortfolioModel:
     return TransformerBasePortfolioModel(
         lookback=3,
         num_features=5,
@@ -482,6 +523,8 @@ def _tiny_transformer() -> TransformerBasePortfolioModel:
         dropout=0.0,
         default_temperature=1.0,
         portfolio_mode="long_short",
+        portfolio_output_mode=portfolio_output_mode,
+        center_long_short_logits=center_long_short_logits,
         max_full_tokens=256,
         checkpoint_blocks=False,
         return_aux=True,
@@ -489,6 +532,42 @@ def _tiny_transformer() -> TransformerBasePortfolioModel:
         runtime_shape_check=True,
         allow_dynamic_symbols=True,
     ).eval()
+
+
+def test_learned_cash_cross_asset_explainability_keeps_contextual_cash(
+    tmp_path: Path,
+) -> None:
+    model = _tiny_transformer(
+        portfolio_output_mode="learned_cash",
+        center_long_short_logits=False,
+    )
+    summary = abstract_cross_asset_transmission(
+        model,
+        _batch(rows=2, lookback=3, symbols=4, features=5),
+        feature_names=_feature_names(4) + ["liquidity_feature"],
+        symbols=_symbols(4),
+        dates=_dates(2),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=2,
+            max_targets=2,
+            source_chunk_size=1,
+            shocks=("zero",),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+            graph_explainability=False,
+            progress_enabled=False,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert summary["shock_summaries"][0]["shock"] == "zero"
+    edges = pl.read_csv(
+        tmp_path / MODULE_NAME / "tables" / "edge_metrics.csv"
+    )
+    assert edges.height == 4
+    assert edges["weight_reallocation_abs"].is_finite().all()
 
 
 def test_attention_capture_smoke() -> None:

@@ -1,0 +1,38 @@
+# Active v6 successor to the immutable trajectory-cadence v5 control.
+#
+# The legacy projection-L1 output is retired from this training project: with
+# O(1) logits over S stocks its pre-projection gross grows as O(S), pinning
+# almost every row to gross=1. The learned_cash contract instead separates a
+# normalized signed stock direction from an independent contextual cash gate.
+# The model therefore owns long, short, net, gross and cash; execution merely
+# applies legal masks, whole lots and 50% capacity.
+#
+# All user-authoritative data/execution assumptions remain inherited unchanged:
+# 99 point-in-time features, lookback/gradient horizon 32, TWD 10M, touch-is-fill
+# limit orders, 50% minute capacity, visible epoch test curves, fees/tax,
+# margin/borrow and the exact physical FIFO loss. The 22-family per-family
+# effective-rank/novelty map is the same one recorded by the named old artifact.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v5.yaml
+
+experiment_name: tw-day-trade-last-last-only-layernorm-learned-cash-v6
+
+runner:
+  # Output/checkpoint semantics changed. Never resume the v4/v5 optimizer.
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_learned_cash_22_effective_rank_v6
+  resume: true
+
+training:
+  # Preserve the user's original stopping design.
+  early_stopping_no_improve_ratio: 0.1
+
+  # Keep both inherited model sections coherent. FinancialTransformer is the
+  # active model, while the base section remains the source of merged defaults.
+  transformer_base_portfolio:
+    portfolio_output_mode: learned_cash
+    center_long_short_logits: false
+  financial_transformer:
+    portfolio_output_mode: learned_cash
+    # Do not force equal long and short gross by de-meaning every row.
+    center_long_short_logits: false
+    temporal_pooling: last
+    temporal_query_mode: last_only
