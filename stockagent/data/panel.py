@@ -130,7 +130,10 @@ BASE_PANEL_FEATURE_COLUMNS = [
 # keeps forward valuation returns across rows that have a real execution mark
 # even when their feature window is policy-ineligible. v54 invalidates cached
 # feature tensors after the Bybit public-web input schema expansion.
-PANEL_CACHE_VERSION = 54
+# v55 starts unresolved corporate-action avoidance on the first session after
+# the receipt-verified issuer announcement.  The previous last-cum-right-only
+# mask could leave a capacity-limited physical residual crossing an action.
+PANEL_CACHE_VERSION = 55
 # v2 distinguishes the cumulative corporate-action archive coverage from the
 # latest incremental downloader request.  Keep this in the backend contract so
 # panels built with the old requested_start_year interpretation are never
@@ -138,7 +141,7 @@ PANEL_CACHE_VERSION = 54
 CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION = 2
 # Separates the full avoidance interval for every official action from the
 # unresolved-only interval used when exact cash entitlements are enabled.
-CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION = 2
+CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION = 3
 FEATURE_FILE_SUFFIX = "_features.parquet"
 HOT_TAIL_DIRNAME = "_hot_tail"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
@@ -614,6 +617,13 @@ class _CorporateActionReference:
     margin_short_stop_transfer_by_symbol: dict[
         str, tuple[np.ndarray, np.ndarray]
     ] | None = None
+    # Event date -> issuer-announcement date from the same receipt-verified
+    # entitlement archive.  Avoidance begins only on the next exchange session:
+    # bulk MOPS rows retain a date but not a trustworthy intraday availability
+    # timestamp, so same-day use would be look-ahead.
+    avoidance_announcements_by_symbol: dict[
+        str, tuple[np.ndarray, np.ndarray]
+    ] | None = None
 
 
 def _symbol_name_from_path(path: Path) -> str:
@@ -844,9 +854,7 @@ def _load_exact_cash_entitlements(
     )
     if bool((np.isnat(dates) | (symbols == "")).any()):
         raise ValueError("TW exact entitlement archive contains invalid event keys")
-    if not bool(
-        np.isin(handling, ["exact_cash", "exact_inventory", "avoid"]).all()
-    ):
+    if not bool(np.isin(handling, ["exact_cash", "exact_inventory", "avoid"]).all()):
         raise ValueError("TW exact entitlement archive contains an unknown handling mode")
     order = np.lexsort((dates, symbols))
     if dates.size > 1:
@@ -916,6 +924,81 @@ def _load_exact_cash_entitlements(
         f"events={int(exact.sum())} symbols={len(terms)} path={parquet_path}"
     )
     return terms, short_terms, coverage_start, coverage_end
+
+
+def _load_corporate_action_avoidance_announcements(
+    paths: _CorporateActionReferencePaths,
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | None:
+    """Load causal issuer notice dates from the already-verified ledger.
+
+    ``_load_exact_cash_entitlements`` is called immediately before this helper
+    and verifies the parquet, summary, reference and raw-manifest receipts.  We
+    deliberately do not accept an announcement dated on/after the ex-date as
+    advance notice: it cannot provide a causal liquidation window.
+    """
+
+    parquet_path = paths.entitlements_parquet
+    if parquet_path is None:
+        return None
+    available = set(pq.read_schema(parquet_path).names)
+    required = {"date", "symbol", "announcement_date", "handling"}
+    if not required.issubset(available):
+        return None
+    table = pq.read_table(
+        parquet_path,
+        columns=["date", "symbol", "announcement_date", "handling"],
+        memory_map=True,
+    )
+    event_dates = table["date"].combine_chunks().to_numpy(
+        zero_copy_only=False
+    ).astype("datetime64[D]", copy=False)
+    symbols = np.asarray(
+        [
+            str(value).strip().upper() if value is not None else ""
+            for value in table["symbol"].to_pylist()
+        ],
+        dtype=str,
+    )
+    announcement_dates = np.asarray(
+        [
+            np.datetime64("NaT", "D")
+            if value is None
+            else np.datetime64(value, "D")
+            for value in table["announcement_date"].to_pylist()
+        ],
+        dtype="datetime64[D]",
+    )
+    handling = np.asarray(
+        [
+            str(value).strip() if value is not None else ""
+            for value in table["handling"].to_pylist()
+        ],
+        dtype=str,
+    )
+    if not bool(np.isin(handling, ["exact_cash", "exact_inventory", "avoid"]).all()):
+        raise ValueError(
+            "TW exact entitlement archive contains an unknown handling mode"
+        )
+    usable = (
+        ~np.isnat(event_dates)
+        & ~np.isnat(announcement_dates)
+        & (symbols != "")
+        & np.isin(handling, ["avoid", "exact_inventory"])
+        & (announcement_dates < event_dates)
+    )
+    notices: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for symbol in np.unique(symbols[usable]):
+        selected = usable & (symbols == symbol)
+        order = np.argsort(event_dates[selected])
+        notices[str(symbol)] = (
+            event_dates[selected][order],
+            announcement_dates[selected][order],
+        )
+    print(
+        "[panel] attached causal corporate-action announcement windows "
+        f"events={int(usable.sum())} symbols={len(notices)}"
+    )
+    return notices
 
 
 def _load_corporate_action_reference(
@@ -1067,6 +1150,9 @@ def _load_corporate_action_reference(
     exact_terms, short_terms, exact_start, exact_end = (
         _load_exact_cash_entitlements(paths)
     )
+    avoidance_announcements = _load_corporate_action_avoidance_announcements(
+        paths
+    )
     return _CorporateActionReference(
         event_dates_by_symbol=event_dates_by_symbol,
         coverage_start=coverage_start,
@@ -1075,6 +1161,7 @@ def _load_corporate_action_reference(
         exact_coverage_start=exact_start,
         exact_coverage_end=exact_end,
         margin_short_stop_transfer_by_symbol=short_terms,
+        avoidance_announcements_by_symbol=avoidance_announcements,
     )
 
 
@@ -3363,11 +3450,14 @@ def _apply_corporate_action_avoidance_transitions(
     reference: _CorporateActionReference | None,
     official_session_dates: np.ndarray | None = None,
 ) -> PanelData:
-    """Mark the close immediately before every official ex-date.
+    """Mark the causal liquidation interval before every official ex-date.
 
-    The mask is an execution-only safety rule.  The cash executor liquidates at
-    that prior close and refuses a new position for the transition, avoiding a
-    fabricated dividend/share ledger while keeping raw-price accounting exact.
+    The mask is an execution-only safety rule.  When the receipt includes an
+    issuer announcement, the interval starts on the following exchange session
+    and remains active through the last cum-right close.  This gives the
+    capacity-limited executor every causally available session to liquidate;
+    the physical source still fails closed if actual capacity leaves a residual.
+    Older/missing notice data retains the last-executable-close fallback.
     """
 
     if reference is None:
@@ -3434,17 +3524,53 @@ def _apply_corporate_action_avoidance_transitions(
         dtype=bool,
     )
 
-    def avoidance_start(transition: int, sym_idx: int) -> int:
+    def avoidance_start(
+        transition: int,
+        sym_idx: int,
+        *,
+        symbol: str,
+        event_date: np.datetime64,
+    ) -> int:
         # A single shared mask protects both cash longs and margin shorts.
-        # Anchor it at the latest close where either position can be flattened,
-        # then keep the entry ban active through the last cum-right close.
+        # With no causal announcement evidence, anchor it at the latest close
+        # where either position can be flattened.  This preserves the prior
+        # fail-closed contract for old archives.
         executable = np.flatnonzero(
             can_sell[: transition + 1, sym_idx]
             & can_buy[: transition + 1, sym_idx]
             & np.isfinite(panel.close_prices[: transition + 1, sym_idx])
             & (panel.close_prices[: transition + 1, sym_idx] > 0.0)
         )
-        return int(executable[-1]) if executable.size else 0
+        fallback = int(executable[-1]) if executable.size else 0
+        notice_terms = (
+            reference.avoidance_announcements_by_symbol or {}
+        ).get(symbol)
+        if notice_terms is None:
+            return fallback
+        notice_events, notice_dates = notice_terms
+        normalized_event = np.datetime64(event_date, "D")
+        notice_index = int(
+            np.searchsorted(notice_events, normalized_event, side="left")
+        )
+        if (
+            notice_index >= int(notice_events.size)
+            or notice_events[notice_index] != normalized_event
+        ):
+            return fallback
+        # The bulk receipt has only a disclosure date, not a reliable market-
+        # time timestamp.  Starting strictly after that date avoids look-ahead.
+        first_causally_known = int(
+            np.searchsorted(
+                panel_dates,
+                notice_dates[notice_index],
+                side="right",
+            )
+        )
+        return (
+            first_causally_known
+            if first_causally_known <= transition
+            else fallback
+        )
 
     applied_events = 0
     for symbol, event_dates_ns in reference.event_dates_by_symbol.items():
@@ -3473,9 +3599,16 @@ def _apply_corporate_action_avoidance_transitions(
         transition_rows = (
             np.searchsorted(panel_dates, selected_dates, side="left") - 1
         )
-        for transition in transition_rows:
+        for event_date, transition in zip(
+            selected_dates, transition_rows, strict=True
+        ):
             transition = int(transition)
-            start = avoidance_start(transition, sym_idx)
+            start = avoidance_start(
+                transition,
+                sym_idx,
+                symbol=symbol,
+                event_date=event_date,
+            )
             avoidance_counts[start : transition + 1, sym_idx] += 1
             applied_events += 1
     # Preserve the complete interval before exact entitlements remove their
@@ -3536,7 +3669,12 @@ def _apply_corporate_action_avoidance_transitions(
                         float(cash_amount) / close
                     )
                     delays[transition, sym_idx] = np.int32(delay)
-                    start = avoidance_start(transition, sym_idx)
+                    start = avoidance_start(
+                        transition,
+                        sym_idx,
+                        symbol=symbol,
+                        event_date=event_date,
+                    )
                     avoidance_counts[start : transition + 1, sym_idx] -= 1
                     if bool(
                         (avoidance_counts[start : transition + 1, sym_idx] < 0).any()

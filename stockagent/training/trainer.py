@@ -37,6 +37,7 @@ from torch import nn
 from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
+from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.backtest.futures_data_validity import FuturesCarryDataError
 
 from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
@@ -1037,6 +1038,30 @@ class _PretrainedEpochZeroAccountInvalid(RuntimeError):
     """The transferred policy produced an invalid exact validation account."""
 
 
+class _PretrainedEpochZeroUnderperformsFlatCash(
+    _PretrainedEpochZeroAccountInvalid
+):
+    """A solvent transferred policy is worse than the exact flat account."""
+
+    def __init__(
+        self,
+        *,
+        fold_id: int,
+        validation_loss: float,
+        required_loss_below: float,
+    ) -> None:
+        self.fold_id = int(fold_id)
+        self.validation_loss = float(validation_loss)
+        self.required_loss_below = float(required_loss_below)
+        super().__init__(
+            "pretrained epoch-zero exact validation policy does not improve on "
+            f"flat cash for fold {self.fold_id}: "
+            f"validation_loss={self.validation_loss} "
+            f"required_loss_below={self.required_loss_below}. "
+            "A solvent but inferior policy is not an acceptable checkpoint seed."
+        )
+
+
 def _reset_pretrained_futures_action_head_to_flat_(
     model: nn.Module,
 ) -> dict[str, Any]:
@@ -1079,6 +1104,114 @@ def _reset_pretrained_futures_action_head_to_flat_(
         "preserved_pretrained_backbone": True,
         "optimizer_state_imported": False,
     }
+
+
+def _reset_pretrained_exact_account_action_head_to_flat_(
+    model: nn.Module,
+) -> dict[str, Any]:
+    """Reset only a proven flat-output final head for an exact account.
+
+    Futures models retain their established dedicated-head contract.  A stock
+    portfolio model is eligible only when a proven zero-score output owns the
+    action and its shared score head ends in a scalar ``Linear`` layer. Zeroing
+    only that final layer produces identically zero requested weights while
+    preserving the preceding representation. Its neural parameters remain trainable,
+    but a caller must not mistake that for a nonzero gradient through the exact
+    whole-share ledger near zero; stock training uses this only temporarily
+    while writing the analytical flat-cash checkpoint.
+    """
+
+    raw_model = _unwrap_model(model)
+    if isinstance(getattr(raw_model, "futures_action_head", None), nn.Module):
+        return _reset_pretrained_futures_action_head_to_flat_(model)
+    output_mode = normalize_portfolio_output_mode(
+        str(getattr(raw_model, "portfolio_output_mode", ""))
+    )
+    if output_mode not in {"projection_l1", "learned_cash"}:
+        raise RuntimeError(
+            "pretrained exact-account stock fallback requires a proven "
+            "zero-score output mode"
+        )
+    score_head = getattr(raw_model, "score_head", None)
+    if not isinstance(score_head, nn.Sequential) or not score_head:
+        raise RuntimeError(
+            "pretrained exact-account stock fallback requires a sequential score_head"
+        )
+    final_name = str(len(score_head) - 1)
+    final_layer = score_head[-1]
+    if not isinstance(final_layer, nn.Linear) or int(final_layer.out_features) != 1:
+        raise RuntimeError(
+            "pretrained exact-account stock fallback requires a scalar final score head"
+        )
+    reset_names: list[str] = []
+    reset_parameter_count = 0
+    trainable_parameter_count = 0
+    with torch.no_grad():
+        for name, parameter in final_layer.named_parameters(recurse=False):
+            parameter.zero_()
+            reset_names.append(f"score_head.{final_name}.{name}")
+            reset_parameter_count += int(parameter.numel())
+            if parameter.requires_grad:
+                trainable_parameter_count += int(parameter.numel())
+    if not reset_names:
+        raise RuntimeError("final score-head layer has no parameters to reset")
+    if trainable_parameter_count <= 0:
+        raise RuntimeError(
+            "flat score-head fallback would be frozen and unable to learn"
+        )
+    legacy_projection = output_mode == "projection_l1"
+    return {
+        "schema_version": 1 if legacy_projection else 2,
+        "method": (
+            "zero_score_head_final_linear_flat_projection_l1_v1"
+            if legacy_projection
+            else "zero_score_head_final_linear_flat_learned_cash_v2"
+        ),
+        **({} if legacy_projection else {"portfolio_output_mode": output_mode}),
+        "reset_parameter_names": reset_names,
+        "reset_parameter_count": reset_parameter_count,
+        "trainable_parameter_count": trainable_parameter_count,
+        "preserved_pretrained_backbone": True,
+        "optimizer_state_imported": False,
+    }
+
+
+@contextmanager
+def _temporary_pretrained_exact_account_flat_checkpoint(
+    model: nn.Module,
+) -> Iterable[dict[str, Any]]:
+    """Expose a flat model only while writing an analytical cash checkpoint.
+
+    Whole-share execution has a dead zone around zero requested weights.  A
+    permanently zeroed stock score head can therefore be an absorbing
+    zero-gradient initialization even though the neural score head itself is
+    differentiable.  Snapshotting and restoring the complete model state makes
+    flat cash a checkpoint-selection floor without replacing the transferred
+    policy that will receive the first optimizer update.
+    """
+
+    raw_model = _unwrap_model(model)
+    original_state = {
+        name: value.detach().clone(memory_format=torch.preserve_format)
+        for name, value in raw_model.state_dict().items()
+    }
+    receipt: dict[str, Any] | None = None
+    try:
+        receipt = _reset_pretrained_exact_account_action_head_to_flat_(model)
+        receipt.update(
+            {
+                "checkpoint_only": True,
+                "training_initialization_preserved": True,
+                "restore_scope": "complete_model_state_dict",
+                "reason": (
+                    "exact whole-share projection has a zero-action "
+                    "zero-gradient dead zone"
+                ),
+            }
+        )
+        yield receipt
+    finally:
+        raw_model.load_state_dict(original_state, strict=True)
 
 
 def _validate_pretrained_epoch_zero_account_segment(
@@ -1155,11 +1288,10 @@ def _validate_pretrained_epoch_zero_improves_flat_cash(
         )
     flat_cash_loss = 0.0
     if value >= flat_cash_loss - required_delta:
-        raise _PretrainedEpochZeroAccountInvalid(
-            "pretrained epoch-zero exact validation policy does not improve on "
-            f"flat cash for fold {fold_id}: validation_loss={value} "
-            f"required_loss_below={flat_cash_loss - required_delta}. "
-            "A solvent but inferior policy is not an acceptable initialization guard."
+        raise _PretrainedEpochZeroUnderperformsFlatCash(
+            fold_id=fold_id,
+            validation_loss=value,
+            required_loss_below=flat_cash_loss - required_delta,
         )
     return flat_cash_loss - value
 
@@ -10372,6 +10504,52 @@ def _save_daily_portfolio_returns_table(
             stale_path.unlink()
 
 
+def _requested_vs_executed_allocation_summary(
+    result: BacktestResult,
+) -> dict[str, float | str]:
+    """Separate model-requested cash from executor-created unfilled cash."""
+
+    requested = result.requested_weights_history
+    if requested is None:
+        return {}
+    requested_array = np.asarray(requested, dtype=np.float64)
+    if requested_array.ndim not in {2, 3} or requested_array.shape[0] == 0:
+        return {}
+    requested_gross = np.abs(requested_array).sum(axis=-1).reshape(-1)
+    if not np.all(np.isfinite(requested_gross)):
+        raise ValueError("requested gross exposure must be finite")
+    requested_cash = np.clip(1.0 - requested_gross, 0.0, 1.0)
+    summary: dict[str, float | str] = {
+        "model_requested_allocation_definition": (
+            "gross=sum_abs_requested_weights; cash=max(0,1-gross); "
+            "computed_before execution masks, whole-lot rounding and capacity"
+        ),
+        "model_requested_gross_mean": float(requested_gross.mean()),
+        "model_requested_gross_min": float(requested_gross.min()),
+        "model_requested_gross_median": float(np.median(requested_gross)),
+        "model_requested_gross_max": float(requested_gross.max()),
+        "model_requested_cash_mean": float(requested_cash.mean()),
+        "model_requested_cash_median": float(np.median(requested_cash)),
+        "model_requested_full_gross_fraction": float(
+            np.mean(requested_gross >= 1.0 - 1.0e-6)
+        ),
+    }
+    executed_array = np.asarray(result.weights_history, dtype=np.float64)
+    if executed_array.ndim in {2, 3} and executed_array.shape[0] > 0:
+        executed_gross = np.abs(executed_array).sum(axis=-1).reshape(-1)
+        if np.all(np.isfinite(executed_gross)):
+            summary.update(
+                {
+                    "executor_realized_gross_mean": float(executed_gross.mean()),
+                    "executor_realized_gross_median": float(
+                        np.median(executed_gross)
+                    ),
+                    "executor_realized_gross_max": float(executed_gross.max()),
+                }
+            )
+    return summary
+
+
 def _save_settlement_audit_artifacts(
     base_path: Path,
     result: BacktestResult,
@@ -10531,6 +10709,7 @@ def _save_settlement_audit_artifacts(
                 "test_backtest.npz minute_nav, shares_history and carry_inventory_*"
             ),
         }
+        summary.update(_requested_vs_executed_allocation_summary(result))
         summary_path.write_text(
             json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -10789,6 +10968,7 @@ def _save_settlement_audit_artifacts(
             else float(np.asarray(result.final_equity_scale).item())
         ),
     }
+    summary.update(_requested_vs_executed_allocation_summary(result))
     if stateful_carry_audit:
         def collateral_total(value: np.ndarray | None) -> float | None:
             if value is None:
@@ -24526,6 +24706,12 @@ def _run_training_impl(
                          and config.trading.tw_futures_portfolio_integer_contracts))
             )
             or (
+                config.training.day_trade_optimizer_step_per_trajectory
+                and execution_runtime.mode == "tw_day_trade"
+                and execution_runtime.day_trade_unlimited_margin_conversion
+                and execution_runtime.day_trade_carry_source is not None
+            )
+            or (
                 config.training.crypto_optimizer_step_per_trajectory
                 and execution_runtime.mode == "crypto_perpetual"
             )
@@ -26074,16 +26260,140 @@ def _run_training_impl(
                         f"validation loss={val_loss:.8f}; seeded checkpoint_best.pt"
                     )
                 del epoch_zero_backtest, epoch_zero_losses
+            except _PretrainedEpochZeroUnderperformsFlatCash as rejected:
+                try:
+                    # Flat cash is a model-selection floor, not the stock
+                    # model's trainable initialization.  In the exact
+                    # whole-share ledger a permanently zero score head cannot
+                    # cross the first-board-lot dead zone and has zero policy
+                    # gradient.  Save the analytical flat checkpoint while the
+                    # head is temporarily zero, then restore the transferred
+                    # policy before epoch 1.
+                    epoch_zero_backtest = None
+                    epoch_zero_losses = None
+                    with _temporary_pretrained_exact_account_flat_checkpoint(
+                        model
+                    ) as fallback_receipt:
+                        fallback_receipt["trigger"] = str(rejected)
+                        fallback_receipt["source_validation_loss"] = (
+                            rejected.validation_loss
+                        )
+                        fallback_receipt["validation_loss_source"] = (
+                            "analytical_flat_exact_account"
+                        )
+                        pretrained_initialization_report[
+                            "epoch_zero_guard_fallback"
+                        ] = deepcopy(fallback_receipt)
+                        print(
+                            f"[Train {train_years}] epoch 0 transferred "
+                            f"strategy rejected ({rejected}); temporarily "
+                            f"applied {fallback_receipt['method']} for the "
+                            "checkpoint floor"
+                        )
+                        for context in fold_contexts.values():
+                            val_loss = 0.0
+                            context.best_val_loss = val_loss
+                            guard_payload = {
+                                "schema_version": 4,
+                                "fold_id": int(context.fold.fold_id),
+                                "epoch": 0,
+                                "validation_loss": val_loss,
+                                "source_validation_loss": (
+                                    rejected.validation_loss
+                                ),
+                                "validation_loss_source": (
+                                    "analytical_flat_exact_account"
+                                ),
+                                "objective": str(loss_objective),
+                                "execution_mode": str(execution_runtime.mode),
+                                "source_checkpoint": (
+                                    pretrained_initialization_report[
+                                        "source_checkpoint"
+                                    ]
+                                ),
+                                "source_checkpoint_sha256": (
+                                    pretrained_initialization_report[
+                                        "source_checkpoint_sha256"
+                                    ]
+                                ),
+                                "test_split_used_for_selection": False,
+                                "settlement_default_count": 0,
+                                "final_alive": True,
+                                "final_equity_scale": 1.0,
+                                "initialization_fallback": deepcopy(
+                                    fallback_receipt
+                                ),
+                                "training_initialization": (
+                                    "transferred_policy_restored_after_"
+                                    "checkpoint_write"
+                                ),
+                                "replacement_rule": (
+                                    "later checkpoint must improve target "
+                                    "exact validation loss over flat cash"
+                                ),
+                            }
+                            _save_fold_checkpoint(
+                                context.checkpoint_best_path,
+                                fold=context.fold,
+                                epoch=0,
+                                best_val_loss=val_loss,
+                                model=model,
+                                optimizer=optimizer,
+                                scaler=scaler,
+                                experiment_manifest=experiment_manifest,
+                                extra_payload={
+                                    "pretrained_initialization": deepcopy(
+                                        pretrained_initialization_report
+                                    ),
+                                    "pretrained_epoch_zero_validation": (
+                                        guard_payload
+                                    ),
+                                },
+                                check_finite=(
+                                    config.training.checkpoint_finite_check
+                                ),
+                            )
+                            if _distributed_should_write():
+                                receipt_path = (
+                                    context.fold_dir
+                                    / "pretrained_epoch0_validation.json"
+                                )
+                                with receipt_path.open(
+                                    "w", encoding="utf-8"
+                                ) as handle:
+                                    json.dump(
+                                        guard_payload,
+                                        handle,
+                                        indent=2,
+                                        sort_keys=True,
+                                    )
+                            print(
+                                f"[Fold {context.fold.fold_id}] epoch 0 "
+                                "checkpoint floor=flat cash "
+                                "loss=0.00000000"
+                            )
+                    pretrained_initialization_report[
+                        "epoch_zero_guard_fallback"
+                    ]["training_initialization_restored"] = True
+                    _write_pretrained_initialization_metadata(
+                        output_path,
+                        train_years=train_years,
+                        group_folds=group_folds,
+                        report=pretrained_initialization_report,
+                    )
+                    print(
+                        f"[Train {train_years}] restored transferred policy "
+                        "for epoch 1 training; flat cash remains only in "
+                        "checkpoint_best.pt"
+                    )
+                except BaseException as fallback_error:
+                    epoch_zero_error = fallback_error
             except _PretrainedEpochZeroAccountInvalid as rejected:
                 try:
-                    # A transferred representation can remain useful even when
-                    # its old execution head ruins the target exact account.
-                    # Replace only that final head with the analytically flat
-                    # portfolio.  This imports no optimizer state, preserves
-                    # all causal backbone features, and provides a valid cash
-                    # checkpoint from which recoverable-backward training can
-                    # learn.  Do not weaken the account guard or accept the
-                    # finite ruin-clamped source loss.
+                    # The established dedicated futures head has a proven
+                    # differentiable flat recovery path.  Do not generalize
+                    # this permanent reset to stock whole-share execution,
+                    # whose zero-action region can have zero policy gradient.
                     epoch_zero_backtest = None
                     epoch_zero_losses = None
                     fallback_receipt = (

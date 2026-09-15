@@ -10,8 +10,12 @@ import pyarrow.parquet as pq
 import torch
 
 from stockagent.data.tw_day_trade_carry_source import (
+    PHYSICAL_SOURCE_RUN_RECEIPT_ENV,
+    _exact_inventory_action_arrays,
+    _share_replacement_arrays,
     build_prepared_day_trade_carry_source,
 )
+from stockagent.training.day_trade_carry_bridge import PreparedDayTradeCarryBatch
 
 
 def _write_parquet(path, payload):
@@ -29,6 +33,9 @@ def _write_action_receipts(public, rows):
         "handling": [row.get("handling", "avoid") for row in rows],
         "cash_dividend_per_share": [row.get("cash") for row in rows],
         "cash_payment_date": [row.get("payment") for row in rows],
+        "stock_dividend_ratio": [row.get("stock_ratio", 0.0) for row in rows],
+        "stock_delivery_date": [row.get("stock_delivery") for row in rows],
+        "subscription_ratio": [0.0 for _row in rows],
         "stop_transfer_start": [None for _row in rows],
     })
     raw = b'{"receipt":"test"}\n'
@@ -40,7 +47,7 @@ def _write_action_receipts(public, rows):
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_bytes(raw)
     summary = {
-        "schema_version": 4,
+        "schema_version": 5,
         "baseline_established": True,
         "coverage_complete": True,
         "failure_count": 0,
@@ -68,7 +75,213 @@ def _write_action_receipts(public, rows):
     )
 
 
-def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(tmp_path):
+def _write_share_replacement_receipts(public, rows=None):
+    rows = rows or [{
+        "symbol": "9999", "market": "twse",
+        "resume_date": date(2029, 1, 2), "suspension_date": None,
+        "new_shares_per_1000_old": None,
+        "cash_return_per_old_share": None,
+        "cash_payment_date": None,
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": None,
+        "historical_halt_evidence": False, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }]
+    output = public / "tw_share_replacement_reference.parquet"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.from_dicts(rows, infer_schema_length=None).write_parquet(output)
+    output.with_suffix(".summary.json").write_text(json.dumps({
+        "schema_version": 3,
+        "coverage_start": "2014-01-01",
+        "coverage_end": "2030-12-31",
+        "source_download_complete": True,
+        "failure_count": 0,
+        "complete_all_markets": True,
+        "lifecycle_catalog_complete": True,
+        "covered_markets": ["twse", "tpex"],
+        "rows": len(rows),
+        "output_receipt": {
+            "size": output.stat().st_size,
+            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        },
+    }), encoding="utf-8")
+
+
+def test_share_replacement_maps_halt_conversion_and_unresolved_prefix(tmp_path):
+    public = tmp_path / "public-release"
+    _write_share_replacement_receipts(public, [{
+        "symbol": "5493", "market": "tpex",
+        "resume_date": date(2020, 10, 19),
+        "suspension_date": date(2020, 10, 7),
+        "new_shares_per_1000_old": 940.0,
+        "cash_return_per_old_share": 0.6,
+        "cash_payment_date": date(2020, 10, 23),
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": False,
+        "historical_halt_evidence": True, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }, {
+        "symbol": "9998", "market": "twse",
+        "resume_date": date(2020, 10, 19), "suspension_date": None,
+        "new_shares_per_1000_old": None,
+        "cash_return_per_old_share": None, "cash_payment_date": None,
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": None,
+        "historical_halt_evidence": False, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }])
+    dates = np.asarray(
+        ["2020-10-06", "2020-10-07", "2020-10-08", "2020-10-19"],
+        dtype="datetime64[D]",
+    )
+    halted, action, ratio, cash, payment, delivery, block, counts = (
+        _share_replacement_arrays(
+            public_root=public, dates=dates, symbols=("5493", "9998")
+        )
+    )
+    assert halted[:, 0].tolist() == [False, True, True, False]
+    assert action[:, 0].tolist() == [False, False, False, True]
+    assert ratio[-1, 0] == 0.94
+    assert cash[-1, 0] == 0.6
+    assert payment[-1, 0] == date(2020, 10, 23).toordinal()
+    assert not delivery.any()
+    assert block[:, 1].tolist() == [True, True, True, False]
+    assert counts["mapped_exact_events"] == 1
+    assert counts["unresolved_events"] == 1
+
+
+def test_share_replacement_future_resume_never_masks_prior_history(tmp_path):
+    public = tmp_path / "public-release"
+    _write_share_replacement_receipts(public, [{
+        "symbol": "5493", "market": "tpex",
+        "resume_date": date(2020, 10, 19),
+        "suspension_date": date(2020, 10, 7),
+        "new_shares_per_1000_old": 940.0,
+        "cash_return_per_old_share": 0.6,
+        "cash_payment_date": date(2020, 10, 23),
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": False,
+        "historical_halt_evidence": True, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }, {
+        "symbol": "9998", "market": "twse",
+        "resume_date": date(2020, 11, 2),
+        "suspension_date": date(2020, 10, 30),
+        "new_shares_per_1000_old": None,
+        "cash_return_per_old_share": None, "cash_payment_date": None,
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": None,
+        "historical_halt_evidence": True, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }])
+    dates = np.asarray(
+        ["2020-10-06", "2020-10-07", "2020-10-08"],
+        dtype="datetime64[D]",
+    )
+
+    halted, action, _ratio, _cash, _payment, _delivery, block, counts = (
+        _share_replacement_arrays(
+            public_root=public, dates=dates, symbols=("5493", "9998")
+        )
+    )
+
+    assert halted[:, 0].tolist() == [False, True, True]
+    assert not halted[:, 1].any()
+    assert not action.any()
+    assert not block.any()
+    assert counts["outside_horizon_events"] == 2
+    assert counts["mapped_exact_events"] == 0
+    assert counts["unresolved_events"] == 0
+
+
+def test_share_replacement_closed_resume_maps_to_next_panel_session(tmp_path):
+    public = tmp_path / "public-release"
+    _write_share_replacement_receipts(public, [{
+        "symbol": "2314", "market": "twse",
+        "resume_date": date(2016, 9, 28),
+        "suspension_date": date(2016, 9, 20),
+        "new_shares_per_1000_old": 900.0,
+        "cash_return_per_old_share": 1.0,
+        "cash_payment_date": date(2016, 10, 5),
+        "cash_dividend_per_old_share": None,
+        "subscription_shares_per_1000": None,
+        "subscription_terms_present": False,
+        "historical_halt_evidence": True, "executable_price": False,
+        "contract": "exchange_share_replacement_reference_v1",
+    }])
+    dates = np.asarray(
+        ["2016-09-19", "2016-09-20", "2016-09-26", "2016-09-29"],
+        dtype="datetime64[D]",
+    )
+
+    halted, action, ratio, cash, payment, _delivery, block, counts = (
+        _share_replacement_arrays(
+            public_root=public, dates=dates, symbols=("2314",)
+        )
+    )
+
+    assert halted[:, 0].tolist() == [False, True, True, False]
+    assert action[:, 0].tolist() == [False, False, False, True]
+    assert ratio[-1, 0] == 0.9
+    assert cash[-1, 0] == 1.0
+    assert payment[-1, 0] == date(2016, 10, 5).toordinal()
+    assert not block.any()
+    assert counts["mapped_after_closed_date"] == 1
+
+
+def test_exact_pending_stock_action_maps_ratio_and_delivery_without_price_proxy(
+    tmp_path,
+):
+    public = tmp_path / "public-release"
+    _write_parquet(
+        public / "features/tw_public_stock_daily.parquet", {"x": [1]}
+    )
+    _write_parquet(
+        public / "tw_corporate_action_reference.parquet",
+        {
+            "date": [date(2020, 8, 27)],
+            "symbol": ["8941"],
+            "reference_price": [36.09],
+        },
+    )
+    _write_action_receipts(
+        public,
+        [
+            {
+                "date": date(2020, 8, 27),
+                "symbol": "8941",
+                "handling": "exact_inventory",
+                "stock_ratio": 0.1,
+                "stock_delivery": date(2020, 10, 14),
+            }
+        ],
+    )
+
+    mask, ratio, cash, payment, delivery, counts = (
+        _exact_inventory_action_arrays(
+            public_feature_path=public
+            / "features/tw_public_stock_daily.parquet",
+            dates=np.asarray(["2020-08-27"], dtype="datetime64[D]"),
+            symbols=("8941",),
+        )
+    )
+
+    assert mask.tolist() == [[True]]
+    assert ratio.tolist() == [[1.1]]
+    assert cash.tolist() == [[0.0]]
+    assert payment.tolist() == [[0]]
+    assert delivery.tolist() == [[date(2020, 10, 14).toordinal()]]
+    assert counts["mapped_pending_stock_events"] == 1
+
+
+def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
+    tmp_path, monkeypatch,
+):
     public = tmp_path / "public-release"
     _write_parquet(public / "features/tw_public_stock_daily.parquet", {"x": [1]})
     _write_parquet(
@@ -97,6 +310,7 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(tmp_path
         public,
         [{"date": date(2019, 1, 2), "symbol": "2330"}],
     )
+    _write_share_replacement_receipts(public)
     minute = tmp_path / "minute-release"
     minute.mkdir()
     (minute / "manifest.json").write_text(
@@ -171,7 +385,12 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(tmp_path
         }],
         "unselected_outside_panel_horizon_partitions": [],
     }
-    # A second construction must validate/reuse the completed cache.
+    # A child in the same orchestration run must reuse the parent's completed
+    # byte verification only while the parent PID/file identities remain live.
+    monkeypatch.setenv(
+        PHYSICAL_SOURCE_RUN_RECEIPT_ENV,
+        source.audit_receipt["run_verification_receipt"],
+    )
     again = build_prepared_day_trade_carry_source(
         panel=panel, minute_root=minute,
         public_feature_path=public / "features/tw_public_stock_daily.parquet",
@@ -180,6 +399,11 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(tmp_path
         corporate_action_mode="avoid",
     )
     assert again.release_id == source.release_id
+    assert again.audit_receipt["run_verification_mode"] == "run_receipt"
+    price_limit_caches = list(
+        (tmp_path / "cache").glob("physical-price-limits-*/READY.json")
+    )
+    assert len(price_limit_caches) == 1
 
 
 def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(tmp_path):
@@ -207,6 +431,7 @@ def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(t
         public,
         [{"date": date(2020, 3, 2), "symbol": "2330"}],
     )
+    _write_share_replacement_receipts(public)
     minute = tmp_path / "minute-release"
     minute.mkdir()
     (minute / "manifest.json").write_text(
@@ -250,6 +475,24 @@ def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(t
         daily_proxy_price_policy="official_open_close", corporate_action_mode="avoid",
     )
     session = source.session_at(0)
+    assert source.packed_session_loader is not None
+    packed = source.packed_session_loader(0)
+    rebuilt = PreparedDayTradeCarryBatch.from_packed_sessions(
+        (packed,), 1, event_compression=True
+    ).sessions(torch.device("cpu"))[0]
+    for field in session.__dataclass_fields__:
+        expected = getattr(session, field)
+        actual = getattr(rebuilt, field)
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        else:
+            assert actual == expected
+    compact = source.compact_session_at(0)
+    assert compact.uses_sparse_events
+    assert compact.exit_prices.ndim == 1
+    assert compact.exit_prices.numel() < session.exit_prices.numel()
+    assert compact.marks.shape == (3, 1)
+    assert compact.mark_path_valid.tolist() == [1.0, 1.0, 1.0]
     assert session.source_gap_mask.tolist() == [0.0, 0.0, 0.0]
     assert session.daily_proxy_mask.tolist() == [0.0, 1.0, 1.0]
     assert np.isfinite(session.exit_prices.numpy()[0]).any()
@@ -296,6 +539,7 @@ def test_exact_cash_action_accounts_for_unliquidated_avoid_mode_residual(tmp_pat
         "handling": "exact_cash", "cash": 0.997,
         "payment": date(2020, 4, 28),
     }])
+    _write_share_replacement_receipts(public)
     minute = tmp_path / "minute-release"
     partition = minute / "trade_date=2020-03-19/data.parquet"
     partition.parent.mkdir(parents=True)
@@ -355,6 +599,8 @@ def test_exact_cash_action_accounts_for_unliquidated_avoid_mode_residual(tmp_pat
         "twse_symbol_days": 0,
         "tpex_symbol_days": 1,
         "total_symbol_days": 1,
+        "share_replacement_symbol_days": 0,
+        "combined_total_symbol_days": 1,
         "valuation": "carry_previous_observable_regular_market_mark",
         "entry_exit_capacity": "zero",
         "absent_official_row": "not_classified_and_never_auto_filled",

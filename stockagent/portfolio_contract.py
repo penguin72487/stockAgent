@@ -31,10 +31,17 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
     if normalized in {
         "cash_l1",
         "explicit_cash_l1",
-        "learned_cash_l1",
         "cash_asset_l1",
     }:
         return "cash_l1"
+    if normalized in {
+        "learned_cash",
+        "learned_cash_l1",
+        "free_gross",
+        "free_gross_l1",
+        "dimension_invariant_cash_l1",
+    }:
+        return "learned_cash"
     if normalized in {
         "cash_entmax",
         "cash_entmax15",
@@ -72,7 +79,8 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
     }:
         return "projection_l1"
     raise ValueError(
-        "portfolio_output_mode must be 'activation_l1', 'l1', 'cash_l1', 'logits', "
+        "portfolio_output_mode must be 'activation_l1', 'l1', 'cash_l1', "
+        "'learned_cash', 'logits', "
         "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', "
         "'cash_entmax15', or 'projection_l1'"
     )

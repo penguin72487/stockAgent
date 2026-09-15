@@ -1288,6 +1288,7 @@ def risk_aware_loss(
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
     day_trade_carry_sessions: tuple[DayTradeCarrySession, ...] | None = None,
+    day_trade_carry_event_compression: bool = False,
     futures_minute_saturation_recovery: bool = False,
     futures_minute_recovery_objective: str = "residual_notional",
 ) -> Tensor:
@@ -1860,6 +1861,7 @@ def risk_aware_loss(
         symbol_sharded_ledger=symbol_sharded_ledger,
         day_trade_carry_sessions=day_trade_carry_sessions,
         initial_day_trade_carry_state=initial_day_trade_carry_state,
+        day_trade_carry_event_compression=day_trade_carry_event_compression,
         futures_portfolio_training_surrogate_only=(
             futures_portfolio_training_surrogate_only
         ),
