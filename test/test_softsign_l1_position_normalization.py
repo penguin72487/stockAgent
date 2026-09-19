@@ -9,6 +9,7 @@ from stockagent.models.normalization import (
     dual_branch_softmax,
     masked_activation_l1_weights,
     masked_cash_entmax15_weights,
+    masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
     masked_softmax,
@@ -185,6 +186,58 @@ def test_cash_entmax_zero_evidence_is_cash_and_candidate_count_is_invariant() ->
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_learned_cash_is_free_gross_and_candidate_count_invariant() -> None:
+    base_scores = torch.tensor([[2.0, -1.0]], requires_grad=True)
+    base_cash_logit = torch.tensor([0.0], requires_grad=True)
+    base_mask = torch.ones_like(base_scores, dtype=torch.bool)
+    base_weights, base_cash, _ = masked_learned_cash_weights(
+        base_scores,
+        base_cash_logit,
+        base_mask,
+    )
+
+    repeated_scores = base_scores.detach().repeat(1, 2_051).requires_grad_(True)
+    repeated_cash_logit = base_cash_logit.detach().clone().requires_grad_(True)
+    repeated_mask = torch.ones_like(repeated_scores, dtype=torch.bool)
+    repeated_weights, repeated_cash, _ = masked_learned_cash_weights(
+        repeated_scores,
+        repeated_cash_logit,
+        repeated_mask,
+    )
+
+    base_gross = base_weights.abs().sum(dim=1)
+    repeated_gross = repeated_weights.abs().sum(dim=1)
+    torch.testing.assert_close(base_gross, repeated_gross)
+    torch.testing.assert_close(base_cash, repeated_cash)
+    torch.testing.assert_close(base_gross + base_cash, torch.ones_like(base_cash))
+    assert 0.0 < base_gross.item() < 1.0
+    assert base_weights.sum().item() > 0.0
+
+    flat_weights, flat_cash, flat_gate = masked_learned_cash_weights(
+        torch.zeros_like(base_scores),
+        torch.tensor([-20.0]),
+        base_mask,
+    )
+    assert torch.count_nonzero(flat_weights).item() == 0
+    torch.testing.assert_close(flat_cash, torch.ones_like(flat_cash))
+    assert flat_gate.item() > 0.99
+
+    high_cash_weights, high_cash, _ = masked_learned_cash_weights(
+        base_scores,
+        torch.tensor([8.0]),
+        base_mask,
+    )
+    assert high_cash.item() > base_cash.item()
+    assert high_cash_weights.abs().sum().item() < base_gross.item()
+
+    objective = base_weights[0, 0] - base_weights[0, 1] + base_cash.square().sum()
+    objective.backward()
+    assert base_scores.grad is not None
+    assert base_cash_logit.grad is not None
+    assert bool(torch.isfinite(base_scores.grad).all())
+    assert bool(torch.isfinite(base_cash_logit.grad).all())
 
 
 def test_signed_action_entmax_amplifies_uniform_large_universe_gradient_vs_softmax() -> None:
@@ -428,6 +481,8 @@ def test_portfolio_mode_contract_normalizes_shared_aliases() -> None:
     assert normalize_portfolio_mode("long-and-short") == "long_short"
     assert normalize_portfolio_output_mode("raw_scores") == "logits"
     assert normalize_portfolio_output_mode("explicit_cash_l1") == "cash_l1"
+    assert normalize_portfolio_output_mode("learned_cash_l1") == "learned_cash"
+    assert normalize_portfolio_output_mode("free_gross") == "learned_cash"
     assert normalize_portfolio_output_mode("differentiable_projection") == "projection_l1"
     assert normalize_portfolio_output_mode("signed_action_entmax15") == "signed_entmax15"
 

@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date
 
 import numpy as np
@@ -6,12 +6,24 @@ import pytest
 import torch
 
 from stockagent.backtest.tw_day_trade_carry import (
-    DayTradeCarrySession, DayTradeCarryState, run_day_trade_carry_sessions,
+    DayTradeCarrySession, DayTradeCarryState, compact_day_trade_carry_session,
+    run_day_trade_carry_sessions,
 )
 from stockagent.data.tw_day_trade_schedule import paper_minute_opportunities
 from stockagent.data.tw_price_rules import limit_price_numpy
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.training.loss import risk_aware_loss
+from stockagent.backtest.tw_day_trade_inventory import (
+    DayTradeInventoryState,
+    accrue_inventory_interest,
+    append_inventory_fill,
+    apply_inventory_action,
+    convert_inventory_to_margin,
+    inventory_nav,
+    reduce_inventory_fifo,
+    release_inventory_stock_deliveries,
+    validate_inventory_state,
+)
 
 
 DAY = date(2026, 8, 13).toordinal()
@@ -35,13 +47,14 @@ def session(day=DAY, price=1000., volume=6000., exits=False):
         torch.from_numpy(schedule.capacity_shares), torch.from_numpy(schedule.marks))
 
 
-def run(weights, sessions, state=None, fees=True):
+def run(weights, sessions, state=None, fees=True, event_compression=False):
     return run_day_trade_carry_sessions(weights, tuple(sessions), can_enter=torch.ones_like(weights),
         buy_fee_rate=v(.001425 if fees else 0).expand(weights.shape[-1]),
         day_sell_fee_rate=v(.002925 if fees else 0).expand(weights.shape[-1]),
         normal_sell_fee_rate=v(.004425 if fees else 0).expand(weights.shape[-1]),
         rebate_rate=v(.00114 if fees else 0).expand(weights.shape[-1]),
-        initial_capital=10_000_000., initial_state=state)
+        initial_capital=10_000_000., initial_state=state,
+        event_compression=event_compression)
 
 
 def assert_state(a, b):
@@ -69,6 +82,182 @@ def test_full_run_equals_chunked_physical_inventory_and_all_minute_marks():
     assert weights.grad.abs().sum() > 0
 
 
+def test_event_compression_preserves_daily_return_state_turnover_and_gradient():
+    sessions = [session(), session(DAY + 1, 1010), session(DAY + 4, 1020, exits=True)]
+    full_weights = v(.21, -.21, .1).reshape(-1, 1).requires_grad_()
+    compact_weights = full_weights.detach().clone().requires_grad_()
+    full = run(full_weights, sessions)
+    compact = run(compact_weights, sessions, event_compression=True)
+
+    assert compact.minute_nav.shape == (3, 2)
+    torch.testing.assert_close(compact.strategy_returns, full.strategy_returns, rtol=0, atol=1e-12)
+    torch.testing.assert_close(compact.turnovers, full.turnovers, rtol=0, atol=1e-10)
+    assert_state(compact.final_state, full.final_state)
+    (-full.strategy_returns.mean()).backward()
+    (-compact.strategy_returns.mean()).backward()
+    torch.testing.assert_close(compact_weights.grad, full_weights.grad, rtol=1e-10, atol=1e-12)
+
+
+def test_sparse_event_sufficient_statistic_preserves_endpoint_and_gradient():
+    dense_sessions = [
+        session(),
+        session(DAY + 1, 1010),
+        session(DAY + 4, 1020, exits=True),
+    ]
+    sparse_sessions = [compact_day_trade_carry_session(x) for x in dense_sessions]
+    assert all(x.uses_sparse_events for x in sparse_sessions)
+    assert sum(x.exit_prices.numel() for x in sparse_sessions) < 3 * 270 * 2
+
+    dense_weights = v(.21, -.21, .1).reshape(-1, 1).requires_grad_()
+    sparse_weights = dense_weights.detach().clone().requires_grad_()
+    dense = run(dense_weights, dense_sessions, event_compression=True)
+    sparse = run(sparse_weights, sparse_sessions, event_compression=True)
+
+    torch.testing.assert_close(sparse.strategy_returns, dense.strategy_returns, rtol=0, atol=1e-12)
+    torch.testing.assert_close(sparse.turnovers, dense.turnovers, rtol=0, atol=1e-10)
+    # The sparse ABI stores [intraday certificate bound, exact close], whereas
+    # the dense compressed ABI stores [exact minute minimum, exact close].
+    # Compare the quantity consumed by the batch solvency certificate, not the
+    # intentionally different first-slot representation.
+    assert bool(sparse.minute_nav.amin(dim=-1).le(
+        dense.minute_nav.amin(dim=-1) + 1e-8
+    ).all())
+    torch.testing.assert_close(
+        sparse.minute_nav[:, -1], dense.minute_nav[:, -1], rtol=0, atol=1e-8
+    )
+    assert_state(sparse.final_state, dense.final_state)
+    (-dense.strategy_returns.mean()).backward()
+    (-sparse.strategy_returns.mean()).backward()
+    torch.testing.assert_close(sparse_weights.grad, dense_weights.grad, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_sparse_event_multisymbol_multiday_matches_full_path_and_gradient(seed):
+    """Exercise recurrent reversals/cohorts, not only a one-symbol endpoint."""
+    generator = torch.Generator().manual_seed(seed)
+    symbols, days = 7, 5
+    sessions = []
+    prior_close = 500 + 1000 * torch.rand(
+        symbols, generator=generator, dtype=torch.float64
+    )
+    for offset in range(days):
+        official_open = prior_close * (
+            0.98
+            + 0.04
+            * torch.rand(symbols, generator=generator, dtype=torch.float64)
+        )
+        entry_price = official_open * (
+            0.999
+            + 0.002
+            * torch.rand(symbols, generator=generator, dtype=torch.float64)
+        )
+        entry_volume = (
+            50 + torch.randint(0, 100, (symbols,), generator=generator)
+        ).double() * 1000
+        marks = official_open[:, None] * (
+            0.97
+            + 0.06
+            * torch.rand(
+                (symbols, 270), generator=generator, dtype=torch.float64
+            )
+        )
+        exit_prices = torch.full(
+            (symbols, 270, 2), float("nan"), dtype=torch.float64
+        )
+        exit_capacity = torch.zeros_like(exit_prices)
+        event_minutes = torch.tensor([1, 17, 83, 260, 264, 269])
+        for event in event_minutes:
+            exit_prices[:, event, :] = official_open[:, None] * (
+                0.96
+                    + 0.08
+                    * torch.rand(
+                        (symbols, 2), generator=generator, dtype=torch.float64
+                    )
+            )
+            exit_capacity[:, event, :] = (
+                torch.randint(0, 5, (symbols, 2), generator=generator).double()
+                * 1000
+            )
+        # Preserve explicit searchsorted plateaus and a missing event cell.
+        exit_capacity[:, event_minutes[1], :] = 0
+        exit_prices[::2, event_minutes[2], 1] = float("nan")
+        session_row = DayTradeCarrySession(
+            DAY + offset,
+            official_open,
+            prior_close,
+            entry_price,
+            entry_volume,
+            official_open * 0.8,
+            official_open * 1.2,
+            torch.zeros(symbols, dtype=torch.float64),
+            exit_prices,
+            exit_capacity,
+            marks,
+        )
+        sessions.append(session_row)
+        prior_close = marks[:, -1]
+
+    raw_weights = 0.08 * (
+        2
+        * torch.rand(
+            (days, symbols), generator=generator, dtype=torch.float64
+        )
+        - 1
+    )
+    # Guaranteed sign changes create reduction plus opening on the same budget.
+    raw_weights[1] = -raw_weights[0]
+    raw_weights[3] = -raw_weights[2]
+    full_weights = raw_weights.clone().requires_grad_()
+    sparse_weights = raw_weights.clone().requires_grad_()
+    full = run(full_weights, sessions)
+    sparse = run(
+        sparse_weights,
+        [compact_day_trade_carry_session(row) for row in sessions],
+        event_compression=True,
+    )
+    torch.testing.assert_close(
+        sparse.strategy_returns, full.strategy_returns, rtol=0, atol=1e-10
+    )
+    torch.testing.assert_close(sparse.turnovers, full.turnovers, rtol=0, atol=1e-8)
+    torch.testing.assert_close(
+        sparse.minute_nav[:, -1], full.minute_nav[:, -1], rtol=0, atol=1e-7
+    )
+    assert bool(sparse.minute_nav.amin(dim=-1).le(
+        full.minute_nav.amin(dim=-1) + 1e-7
+    ).all())
+    assert_state(sparse.final_state, full.final_state)
+    (-full.strategy_returns.mean()).backward()
+    (-sparse.strategy_returns.mean()).backward()
+    torch.testing.assert_close(
+        sparse_weights.grad, full_weights.grad, rtol=1e-9, atol=1e-11
+    )
+
+
+def test_inconclusive_event_certificate_falls_back_to_full_minute_default():
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    carry.reset_day_trade_carry_compile_stats()
+    first = run(v(-.9).reshape(1, 1), [session(volume=20_000)], fees=False)
+    stress = session(DAY + 1, 1000, volume=0)
+    stress.marks[0, 20] = 3000
+    expected = run(v(-.9).reshape(1, 1), [stress], first.final_state, fees=False)
+    compact = run(
+        v(-.9).reshape(1, 1),
+        [stress],
+        first.final_state,
+        fees=False,
+        event_compression=True,
+    )
+    # The fallback computes the authoritative full curve but returns the fixed
+    # compact ABI: exact worst NAV and exact closing NAV.
+    assert compact.minute_nav.shape == (1, 2)
+    torch.testing.assert_close(compact.strategy_returns, expected.strategy_returns)
+    torch.testing.assert_close(compact.minute_nav[:, 0], expected.minute_nav.amin(-1))
+    torch.testing.assert_close(compact.minute_nav[:, 1], expected.minute_nav[:, -1])
+    assert_state(compact.final_state, expected.final_state)
+    assert carry.get_day_trade_carry_compile_stats()["event_compression_fallback_batches"] == 1
+
+
 def test_overnight_move_is_measured_from_previous_close_not_reset_open():
     weights = v(.21, .21).reshape(-1, 1)
     result = run(weights, [session(), session(DAY + 1, 1100, volume=0)], fees=False)
@@ -86,6 +275,63 @@ def test_physical_action_and_dated_cash_claim_survive_the_session_boundary():
     third = run(v(.21).reshape(-1, 1), [session(DAY + 4, 2000, volume=0)], result.final_state)
     assert third.final_state.inventory.corporate_action_receivable.item() == 0
     assert third.final_state.inventory.corporate_action_cash.item() == 2000
+
+
+@pytest.mark.parametrize("direction", [1.0, -1.0])
+def test_pending_stock_entitlement_is_valued_but_not_executable_until_delivery(
+    direction,
+):
+    state = DayTradeInventoryState.empty(1)
+    zero = v(0)
+    state = append_inventory_fill(
+        state,
+        signed_shares=v(direction * 2000),
+        price=v(100),
+        buy_fee_rate=zero,
+        day_sell_fee_rate=zero,
+        normal_sell_fee_rate=zero,
+        rebate_rate=zero,
+        day=DAY,
+    )
+    state = convert_inventory_to_margin(state, day=DAY)
+    before_nav = inventory_nav(
+        state, initial_capital=10_000_000.0, marks=v(100)
+    )
+    state = apply_inventory_action(
+        state,
+        event_day=DAY + 1,
+        as_of_day=DAY + 1,
+        event_mask=v(1),
+        share_ratio=v(1.1),
+        cash_per_old_share=zero,
+        payment_day=zero,
+        stock_delivery_day=v(DAY + 10),
+    )
+    after_nav = inventory_nav(
+        state, initial_capital=10_000_000.0, marks=v(100 / 1.1)
+    )
+    torch.testing.assert_close(after_nav, before_nav, rtol=0, atol=1e-8)
+    assert state.shares.item() == direction * 2200
+    assert state.locked_shares.item() == direction * 200
+    assert state.tradable_shares.item() == direction * 2000
+
+    reduced = reduce_inventory_fifo(
+        state,
+        requested_shares=v(3000),
+        price=v(100 / 1.1),
+        capacity_shares=v(3000),
+    )
+    assert reduced.filled_shares.item() == 2000
+    assert reduced.state.shares.item() == direction * 200
+    assert reduced.state.locked_shares.item() == direction * 200
+    delivered = release_inventory_stock_deliveries(
+        reduced.state,
+        day=DAY + 10,
+    )
+    delivered = accrue_inventory_interest(delivered, day=DAY + 10)
+    assert delivered.locked_shares.item() == 0
+    assert delivered.tradable_shares.item() == direction * 200
+    validate_inventory_state(delivered, symbols=1)
 
 
 def test_proven_halt_uses_separate_valuation_never_executable_open():
@@ -277,6 +523,68 @@ def test_cuda_unknown_held_action_is_atomic_and_does_not_poison_device():
     assert torch.ones(3, device='cuda').sum().item() == 3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
+def test_cuda_compiled_pending_stock_delivery_matches_cpu_and_gradient():
+    from dataclasses import fields
+
+    pending = replace(
+        session(DAY + 1, 800, volume=0),
+        action_mask=v(1),
+        share_ratio=v(1.25),
+        cash_per_old_share=v(0),
+        payment_day=v(0),
+        stock_delivery_day=v(DAY + 10),
+    )
+    sessions = [
+        session(),
+        pending,
+        session(DAY + 2, 800, volume=6000, exits=True),
+        session(DAY + 10, 800, volume=6000, exits=True),
+    ]
+    cpu_weights = v(.21, .21, 0, 0).reshape(-1, 1).requires_grad_()
+    expected = run(cpu_weights, sessions, fees=False)
+    cuda_sessions = [
+        DayTradeCarrySession(
+            **{
+                field.name: (
+                    getattr(row, field.name).cuda()
+                    if isinstance(getattr(row, field.name), torch.Tensor)
+                    else getattr(row, field.name)
+                )
+                for field in fields(row)
+            }
+        )
+        for row in sessions
+    ]
+    cuda_weights = cpu_weights.detach().cuda().requires_grad_()
+    actual = run_day_trade_carry_sessions(
+        cuda_weights,
+        tuple(cuda_sessions),
+        can_enter=torch.ones_like(cuda_weights),
+        buy_fee_rate=v(0).cuda(),
+        day_sell_fee_rate=v(0).cuda(),
+        normal_sell_fee_rate=v(0).cuda(),
+        rebate_rate=v(0).cuda(),
+        initial_capital=10_000_000.0,
+    )
+
+    torch.testing.assert_close(
+        actual.strategy_returns.cpu(), expected.strategy_returns, rtol=0, atol=1e-12
+    )
+    torch.testing.assert_close(
+        actual.final_state.inventory.cohorts.cpu(),
+        expected.final_state.inventory.cohorts,
+        rtol=0,
+        atol=1e-8,
+    )
+    assert actual.shares_history[:, 0].cpu().tolist() == [2000, 2500, 500, 0]
+    (-expected.strategy_returns.sum()).backward()
+    (-actual.strategy_returns.sum()).backward()
+    torch.testing.assert_close(
+        cuda_weights.grad.cpu(), cpu_weights.grad, rtol=1e-8, atol=1e-10
+    )
+
+
 def test_financial_default_is_absorbing_and_does_not_invalidate_source():
     first = run(v(-.9).reshape(-1, 1), [session(volume=20_000)], fees=False)
     # An extreme source-backed move is a solvency stress, not a data NaN.
@@ -290,6 +598,50 @@ def test_financial_default_is_absorbing_and_does_not_invalidate_source():
     assert later.turnovers.item() == 0
     assert later.final_state.last_nav.item() == 0
     torch.testing.assert_close(later.final_state.inventory.shares, first.final_state.inventory.shares)
+
+
+def test_solvent_session_reuses_the_exact_first_fifo_path(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    calls = 0
+    original = carry.reduce_inventory_fifo_path
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(carry, "reduce_inventory_fifo_path", counted)
+    result = run(v(.21).reshape(1, 1), [session(exits=True)])
+    assert result.final_state.alive
+    assert calls == 1
+
+
+def test_intraday_insolvency_keeps_the_capacity_cutoff_replay(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    first = run(v(-.9).reshape(1, 1), [session(volume=20_000)], fees=False)
+    stress = session(DAY + 1, 1000, volume=0)
+    # The account is solvent at the open, then a source-backed intraday spike
+    # bankrupts the short inventory.  This is distinct from an opening default.
+    stress.marks[0, 20] = 3000
+    calls = 0
+    original = carry.reduce_inventory_fifo_path
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(carry, "reduce_inventory_fifo_path", counted)
+    result = run(
+        v(-.9).reshape(1, 1),
+        [stress],
+        first.final_state,
+        fees=False,
+    )
+    assert result.settlement_default.item()
+    assert calls == 2
 
 
 def test_source_precision_chronology_and_actions_fail_closed():
@@ -345,6 +697,128 @@ def test_canonical_simulator_and_loss_share_exact_minute_ledger_and_chunk_state(
         **canonical_kwargs(weights[1:], sessions[1:]), **{**options, "aux_outputs": tail_aux})
     torch.testing.assert_close(tail_loss, -252 * expected.strategy_returns[1:].mean())
     assert_state(tail_aux["_final_day_trade_carry_state"], expected.final_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+def test_power_of_two_compiled_fifo_path_matches_eager_forward_state_and_gradient(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    def on_cuda(value):
+        return replace(value, **{
+            field.name: getattr(value, field.name).cuda()
+            for field in fields(value)
+            if isinstance(getattr(value, field.name), torch.Tensor)
+        })
+
+    sessions = tuple(on_cuda(value) for value in (
+        session(), session(DAY + 1, 1010), session(DAY + 4, 1020, exits=True)
+    ))
+    eager_weights = v(.21, -.21, .1).cuda().reshape(-1, 1).requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "0")
+    eager = run(eager_weights, sessions)
+    (-eager.strategy_returns.mean()).backward()
+
+    compiled_weights = eager_weights.detach().clone().requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    compiled = run(compiled_weights, sessions)
+    (-compiled.strategy_returns.mean()).backward()
+
+    torch.testing.assert_close(compiled.strategy_returns, eager.strategy_returns, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(compiled.minute_nav, eager.minute_nav, rtol=1e-12, atol=1e-7)
+    torch.testing.assert_close(compiled.turnovers, eager.turnovers, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(compiled_weights.grad, eager_weights.grad, rtol=1e-7, atol=1e-10)
+    assert_state(compiled.final_state, eager.final_state)
+    assert compiled.final_state.inventory.cohorts.shape == eager.final_state.inventory.cohorts.shape
+    stats = carry.get_day_trade_carry_compile_stats()
+    assert stats["compiled_session_calls"] == len(sessions)
+    assert stats["session_compile_constructors"] == 1
+    assert stats["compile_failures"] == 0
+    assert stats["eager_fallback_calls"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+def test_compiled_event_compression_matches_eager_state_return_and_gradient(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    def on_cuda(value):
+        return replace(value, **{
+            field.name: getattr(value, field.name).cuda()
+            for field in fields(value)
+            if isinstance(getattr(value, field.name), torch.Tensor)
+        })
+
+    sessions = tuple(on_cuda(value) for value in (
+        session(), session(DAY + 1, 1010), session(DAY + 4, 1020, exits=True)
+    ))
+    eager_weights = v(.21, -.21, .1).cuda().reshape(-1, 1).requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "0")
+    eager = run(eager_weights, sessions, event_compression=True)
+    (-eager.strategy_returns.mean()).backward()
+
+    compiled_weights = eager_weights.detach().clone().requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    compiled = run(compiled_weights, sessions, event_compression=True)
+    (-compiled.strategy_returns.mean()).backward()
+
+    assert compiled.minute_nav.shape == (3, 2)
+    torch.testing.assert_close(compiled.strategy_returns, eager.strategy_returns, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(compiled.minute_nav, eager.minute_nav, rtol=1e-12, atol=1e-7)
+    torch.testing.assert_close(compiled.turnovers, eager.turnovers, rtol=1e-12, atol=1e-10)
+    torch.testing.assert_close(compiled_weights.grad, eager_weights.grad, rtol=1e-7, atol=1e-10)
+    assert_state(compiled.final_state, eager.final_state)
+    stats = carry.get_day_trade_carry_compile_stats()
+    assert stats["compiled_session_calls"] == len(sessions)
+    assert stats["session_compile_constructors"] == 1
+    assert stats["compile_failures"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+def test_compiled_sparse_event_stream_matches_dense_endpoint_and_gradient(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    def on_cuda(value):
+        return replace(value, **{
+            field.name: getattr(value, field.name).cuda()
+            for field in fields(value)
+            if isinstance(getattr(value, field.name), torch.Tensor)
+        })
+
+    dense_sessions = tuple(on_cuda(value) for value in (
+        session(), session(DAY + 1, 1010), session(DAY + 4, 1020, exits=True)
+    ))
+    sparse_sessions = tuple(
+        compact_day_trade_carry_session(value) for value in dense_sessions
+    )
+    dense_weights = v(.21, -.21, .1).cuda().reshape(-1, 1).requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "0")
+    dense = run(dense_weights, dense_sessions, event_compression=True)
+    (-dense.strategy_returns.mean()).backward()
+
+    sparse_weights = dense_weights.detach().clone().requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    sparse = run(sparse_weights, sparse_sessions, event_compression=True)
+    (-sparse.strategy_returns.mean()).backward()
+
+    torch.testing.assert_close(sparse.strategy_returns, dense.strategy_returns, rtol=1e-12, atol=1e-12)
+    assert bool(sparse.minute_nav.amin(dim=-1).le(
+        dense.minute_nav.amin(dim=-1) + 1e-7
+    ).all())
+    torch.testing.assert_close(
+        sparse.minute_nav[:, -1], dense.minute_nav[:, -1], rtol=1e-12, atol=1e-7
+    )
+    torch.testing.assert_close(sparse.turnovers, dense.turnovers, rtol=1e-12, atol=1e-10)
+    torch.testing.assert_close(sparse_weights.grad, dense_weights.grad, rtol=1e-7, atol=1e-10)
+    assert_state(sparse.final_state, dense.final_state)
+    stats = carry.get_day_trade_carry_compile_stats()
+    assert stats["compiled_session_calls"] == len(sparse_sessions)
+    assert stats["session_compile_constructors"] == 1
+    assert stats["compile_failures"] == 0
 
 
 def test_checkpoint_binds_capital_release_universe_and_default_chronology(tmp_path):

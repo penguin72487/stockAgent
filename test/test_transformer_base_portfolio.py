@@ -29,6 +29,7 @@ from stockagent.models.normalization import (
     masked_activation_l1_weights,
     masked_cash_asset_l1_weights,
     masked_cash_entmax15_weights,
+    masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
 )
@@ -2103,6 +2104,57 @@ def test_transformer_cash_l1_scores_cash_as_contextual_extra_asset() -> None:
     loss.backward()
     assert model.cash_asset_token.grad is not None
     assert bool(torch.isfinite(model.cash_asset_token.grad).all())
+
+
+def test_transformer_learned_cash_exposes_model_chosen_gross_and_cash() -> None:
+    device = _device()
+    model = _make_model(
+        portfolio_output_mode="learned_cash",
+        center_long_short_logits=False,
+        use_symbol_pos=False,
+        return_aux=True,
+        return_aux_details=True,
+    ).train()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+
+    weights, _, aux = model(x, mask, return_aux=True)
+
+    expected_weights, expected_cash, _ = masked_learned_cash_weights(
+        aux["centered_score_logits"],
+        aux["cash_target_logits"],
+        mask,
+        long_only=False,
+    )
+    assert model.portfolio_output_mode == "learned_cash"
+    torch.testing.assert_close(
+        aux["cash_target_logits"],
+        torch.zeros_like(aux["cash_target_logits"]),
+    )
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(aux["cash_weight"], expected_cash)
+    torch.testing.assert_close(
+        weights.abs().sum(dim=1),
+        torch.full((2,), 0.5, device=device),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        weights.abs().sum(dim=1) + aux["cash_weight"],
+        torch.ones(2, device=device),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert bool(torch.all(weights.abs().sum(dim=1) < 1.0))
+    loss = weights.square().sum() + aux["cash_weight"].square().sum()
+    loss.backward()
+    assert model.cash_asset_token is not None
+    assert model.cash_asset_token.grad is not None
+    assert bool(torch.isfinite(model.cash_asset_token.grad).all())
+    assert model.learned_cash_score_head is not None
+    assert model.learned_cash_score_head.weight.grad is not None
+    assert bool(torch.isfinite(model.learned_cash_score_head.weight.grad).all())
 
 
 def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:

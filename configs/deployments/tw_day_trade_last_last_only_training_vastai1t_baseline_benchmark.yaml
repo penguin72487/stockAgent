@@ -1,7 +1,7 @@
 # Measurement-only wrapper around the active dual-RTX-5090 deployment.  It
 # changes no model, execution, optimizer, or data rule; it only prevents a
 # five-epoch profiling run from stopping before three zero-graph samples exist.
-base_config: tw_day_trade_last_last_only_training_vastai1t.yaml
+base_config: tw_day_trade_last_last_only_training_vastai1t_v4.yaml
 
 runner:
   output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v4_baseline_benchmark

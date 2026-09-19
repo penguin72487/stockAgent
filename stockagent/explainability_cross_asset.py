@@ -18,12 +18,15 @@ from tqdm.auto import tqdm
 
 from stockagent.models.normalization import (
     dual_branch_softmax,
+    masked_cash_asset_l1_weights,
     masked_cross_sectional_mean,
     masked_cash_entmax15_weights,
+    masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
     masked_softmax,
 )
+from stockagent.portfolio_contract import normalize_portfolio_output_mode
 
 
 MODULE_NAME = "abstract_cross_asset_transmission"
@@ -304,11 +307,26 @@ def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
     _pad_saved_image_to_17_6(output_path)
 
 
-def _call_model(model: nn.Module, x: torch.Tensor, mask: torch.Tensor, *, return_aux: bool = True) -> Any:
+def _call_model(
+    model: nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    return_aux: bool = True,
+    return_scores: bool = False,
+) -> Any:
     try:
-        return model(x, mask, return_aux=return_aux)
+        return model(
+            x,
+            mask,
+            return_aux=return_aux,
+            return_scores=return_scores,
+        )
     except TypeError:
-        return model(x, mask)
+        try:
+            return model(x, mask, return_aux=return_aux)
+        except TypeError:
+            return model(x, mask)
 
 
 def _normalize_output(output: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -344,8 +362,15 @@ def _forward_outputs(
     mask: torch.Tensor,
     *,
     return_aux: bool = True,
+    return_scores: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    output = _call_model(model, x, mask, return_aux=return_aux)
+    output = _call_model(
+        model,
+        x,
+        mask,
+        return_aux=return_aux,
+        return_scores=return_scores,
+    )
     return _normalize_output(output)
 
 
@@ -404,11 +429,19 @@ def _forward_embedded_outputs(
     if compile_forward and callable(getattr(model, "forward_from_embedded_explainability_compiled", None)):
         output = model.forward_from_embedded_explainability_compiled(embedded, mask)
     else:
-        output = model.forward_from_embedded_explainability(
-            embedded,
-            mask,
-            return_aux=False,
-        )
+        try:
+            output = model.forward_from_embedded_explainability(
+                embedded,
+                mask,
+                return_aux=False,
+                return_scores=True,
+            )
+        except TypeError:
+            output = model.forward_from_embedded_explainability(
+                embedded,
+                mask,
+                return_aux=True,
+            )
     return _normalize_output(output)
 
 
@@ -431,25 +464,53 @@ def _forward_stock_embedding_outputs(
             stock_embeddings,
             mask,
             return_aux=False,
+            return_scores=True,
         )
     return _normalize_output(output)
 
 
-def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _portfolio_weights_from_scores(
+    model: nn.Module,
+    scores: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    cash_target_logits: torch.Tensor | None = None,
+) -> torch.Tensor:
     scores = _sanitize_tensor(scores)
     mask = mask.to(device=scores.device, dtype=torch.bool)
-    temp = float(getattr(model, "default_temperature", 1.0))
+    raw_model = getattr(model, "module", model)
+    temp = float(getattr(raw_model, "default_temperature", 1.0))
     temp = max(0.05, temp)
-    activation = str(getattr(model, "portfolio_activation", "identity"))
-    mode = str(getattr(model, "portfolio_mode", "long_short")).strip().lower()
-    output_mode = str(getattr(model, "portfolio_output_mode", "activation_l1")).strip().lower().replace("-", "_")
+    activation = str(getattr(raw_model, "portfolio_activation", "identity"))
+    mode = str(getattr(raw_model, "portfolio_mode", "long_short")).strip().lower()
+    output_mode = normalize_portfolio_output_mode(
+        str(getattr(raw_model, "portfolio_output_mode", "activation_l1"))
+    )
     scale_projection_by_active_count = bool(
-        getattr(model, "projection_l1_scale_by_active_count", False)
+        getattr(raw_model, "projection_l1_scale_by_active_count", False)
     )
     if mode in {"long", "long_only", "longonly"}:
         target_logits = (scores / temp).masked_fill(~mask, 0.0)
         if output_mode == "logits":
             return target_logits
+        if output_mode in {"cash_l1", "learned_cash"}:
+            if cash_target_logits is None:
+                raise ValueError(
+                    f"{output_mode} score reallocation requires the contextual "
+                    "cash target logit"
+                )
+            allocator = (
+                masked_learned_cash_weights
+                if output_mode == "learned_cash"
+                else masked_cash_asset_l1_weights
+            )
+            weights, _, _ = allocator(
+                target_logits,
+                cash_target_logits,
+                mask,
+                long_only=True,
+            )
+            return weights.masked_fill(~mask, 0.0)
         if output_mode == "signed_softmax":
             return masked_signed_action_weights(target_logits, mask, transform="softmax", long_only=True).masked_fill(~mask, 0.0)
         if output_mode == "signed_sparsemax":
@@ -473,12 +534,30 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
         return masked_softmax(scores / temp, mask, activation=weight_activation).masked_fill(~mask, 0.0)
     centered = (
         scores - masked_cross_sectional_mean(scores, mask)
-        if bool(getattr(model, "center_long_short_logits", True))
+        if bool(getattr(raw_model, "center_long_short_logits", True))
         else scores
     )
     target_logits = (centered / temp).masked_fill(~mask, 0.0)
     if output_mode == "logits":
         return target_logits
+    if output_mode in {"cash_l1", "learned_cash"}:
+        if cash_target_logits is None:
+            raise ValueError(
+                f"{output_mode} score reallocation requires the contextual "
+                "cash target logit"
+            )
+        allocator = (
+            masked_learned_cash_weights
+            if output_mode == "learned_cash"
+            else masked_cash_asset_l1_weights
+        )
+        weights, _, _ = allocator(
+            target_logits,
+            cash_target_logits,
+            mask,
+            long_only=False,
+        )
+        return weights.masked_fill(~mask, 0.0)
     if output_mode == "signed_softmax":
         return masked_signed_action_weights(target_logits, mask, transform="softmax", long_only=False).masked_fill(~mask, 0.0)
     if output_mode == "signed_sparsemax":
@@ -639,6 +718,7 @@ def _shock_source_chunk_metrics(
     base_weights_row: torch.Tensor,
     base_scores_row: torch.Tensor,
     base_rank_pos_row: torch.Tensor,
+    base_cash_target_logits_row: torch.Tensor | None,
     feature_std: torch.Tensor,
     selected_targets: torch.Tensor,
     chunk_sources: list[int],
@@ -754,6 +834,7 @@ def _shock_source_chunk_metrics(
                 x_rep,
                 mask_rep,
                 return_aux=False,
+                return_scores=True,
             )
         weights_p = weights_p.reshape(work_repeats, row_count, n_symbols)[:repeats]
         scores_p = scores_p.reshape(work_repeats, row_count, n_symbols)[:repeats]
@@ -787,6 +868,13 @@ def _shock_source_chunk_metrics(
             model,
             norm_scores.reshape(repeats * row_count, n_symbols),
             mask_rep,
+            cash_target_logits=(
+                None
+                if base_cash_target_logits_row is None
+                else base_cash_target_logits_row.unsqueeze(0)
+                .expand(repeats, -1)
+                .reshape(repeats * row_count)
+            ),
         ).reshape(repeats, row_count, n_symbols)
         realloc_delta = norm_weights - base_weights_row.unsqueeze(0)
         residual_delta = weight_delta - realloc_delta
@@ -2154,7 +2242,18 @@ def abstract_cross_asset_transmission(
     score_parts: list[torch.Tensor] = []
     rank_parts: list[torch.Tensor] = []
     mask_parts: list[torch.Tensor] = []
+    cash_target_logit_parts: list[torch.Tensor] = []
     aux_parts: dict[str, list[torch.Tensor]] = {}
+    explainability_model = getattr(model, "module", model)
+    cash_aware_output = normalize_portfolio_output_mode(
+        str(
+            getattr(
+                explainability_model,
+                "portfolio_output_mode",
+                "activation_l1",
+            )
+        )
+    ) in {"cash_l1", "learned_cash"}
     attention_flow_sum: np.ndarray | None = None
     attention_rows_seen = 0
     attention_rows: list[dict[str, Any]] = []
@@ -2226,7 +2325,11 @@ def abstract_cross_asset_transmission(
                     model,
                     x_row,
                     mask_row,
-                    return_aux=bool(settings.role_embedding or capture_enabled),
+                    return_aux=bool(
+                        settings.role_embedding
+                        or capture_enabled
+                        or cash_aware_output
+                    ),
                 )
             finally:
                 if capture_enabled:
@@ -2263,6 +2366,16 @@ def abstract_cross_asset_transmission(
             weight_parts.append(weights_row.detach().cpu())
             score_parts.append(scores_row.detach().cpu())
             rank_parts.append(rank_row.detach().cpu())
+            if cash_aware_output:
+                cash_target_logits = aux_row.get("cash_target_logits")
+                if not torch.is_tensor(cash_target_logits):
+                    raise RuntimeError(
+                        "cash-aware cross-asset explainability requires "
+                        "cash_target_logits from model forward"
+                    )
+                cash_target_logit_parts.append(
+                    cash_target_logits.detach().reshape(-1).cpu()
+                )
             if bool(settings.role_embedding):
                 for key, value in aux_row.items():
                     if torch.is_tensor(value):
@@ -2281,6 +2394,11 @@ def abstract_cross_asset_transmission(
     base_scores = torch.cat(score_parts, dim=0).masked_fill(~mask_cpu, 0.0)
     base_rank = torch.cat(rank_parts, dim=0)
     base_rank_pos = _rank_positions(base_rank, mask_cpu)
+    base_cash_target_logits = (
+        torch.cat(cash_target_logit_parts, dim=0)
+        if cash_target_logit_parts
+        else None
+    )
     timing["base_forward_s"] = float(time.perf_counter() - base_forward_start)
     pipeline_progress.update(1)
     pipeline_progress.set_postfix(stage="attention", refresh=True)
@@ -2395,6 +2513,14 @@ def abstract_cross_asset_transmission(
         base_rank_pos_row = base_rank_pos[row_start:row_end].to(
             device=device, non_blocking=(device.type == "cuda")
         )
+        base_cash_target_logits_row = (
+            None
+            if base_cash_target_logits is None
+            else base_cash_target_logits[row_start:row_end].to(
+                device=device,
+                non_blocking=(device.type == "cuda"),
+            )
+        )
         with torch.no_grad():
             if embedded_api is not None:
                 base_projected_row = embedded_api.project_features_for_explainability(x_row)
@@ -2434,6 +2560,7 @@ def abstract_cross_asset_transmission(
                         base_weights_row,
                         base_scores_row,
                         base_rank_pos_row,
+                        base_cash_target_logits_row,
                         feature_std_device,
                         selected_targets,
                         chunk_sources,

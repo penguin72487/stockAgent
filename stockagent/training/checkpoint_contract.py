@@ -700,6 +700,7 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 {"step_cadence": "full_chronological_trajectory"}
                 if (
                     training.futures_portfolio_optimizer_step_per_trajectory
+                    or training.day_trade_optimizer_step_per_trajectory
                     or training.crypto_optimizer_step_per_trajectory
                 )
                 else {}
@@ -799,6 +800,7 @@ def _training_checkpoint_contract_schema_3(
     # constraint below separately prevents unsafe optimizer resume when enabled.
     contract.pop("cache_train_features_in_amp_dtype", None)
     contract.pop("compile_eval_model", None)
+    contract.pop("day_trade_optimizer_step_per_trajectory", None)
     contract.pop("crypto_optimizer_step_per_trajectory", None)
     # This decoupling control did not exist in schema 3; historical runs always
     # used trading.min_trade_weight in the loss.
@@ -1806,6 +1808,10 @@ def _transformer_base_checkpoint_model_values(
         "portfolio_mode": portfolio_mode,
         "portfolio_output_mode": output_mode,
     }
+    if output_mode == "learned_cash":
+        contract["portfolio_output_contract"] = (
+            "contextual_cash_gate_signed_direction_v1"
+        )
     if not bool(values.get("sanitize_inputs", True)):
         contract["sanitize_inputs"] = False
     if bool(values.get("amp_native_position_add", False)):
@@ -1932,6 +1938,10 @@ def _checkpoint_model_values(
             str(contract["portfolio_output_mode"])
         )
         contract["portfolio_output_mode"] = output_mode
+        if output_mode == "learned_cash":
+            contract["portfolio_output_contract"] = (
+                "contextual_cash_gate_signed_direction_v1"
+            )
     if output_mode in {None, "activation_l1"}:
         contract["portfolio_activation"] = normalize_portfolio_activation(
             config.trading.portfolio_activation

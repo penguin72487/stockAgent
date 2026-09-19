@@ -226,14 +226,21 @@ class _MinuteSlabForwardAdapter(nn.Module):
                 flat_mask,
                 gate_logits=model_output,
             )
-        if self.portfolio_output_mode in {"l1", "cash_l1", "projection_l1"}:
+        if self.portfolio_output_mode in {
+            "l1",
+            "cash_l1",
+            "learned_cash",
+            "projection_l1",
+        }:
             # Match the canonical daily tw_day_trade ordering exactly: the
-            # model first resolves its L1 allocation using only its causal
-            # feature/tradability mask. Cash-L1 includes one model-scored cash
-            # asset in that same normalization; projection-L1 may also leave
-            # part of the budget unused. Directional eligibility, close
-            # availability, and volume capacity are executor facts applied
-            # afterwards; blocked requests are never redistributed.
+            # model first resolves its allocation using only its causal
+            # feature/tradability mask. Cash-aware modes include one
+            # model-scored cash asset; learned_cash uses that score as an
+            # independent cash/gross gate, invariant to candidate count and
+            # stock-logit scale. Projection-L1 may also leave part of the budget
+            # unused. Directional eligibility, close availability, and volume
+            # capacity are executor facts applied afterwards; blocked requests
+            # are never redistributed.
             return model_output.float().masked_fill(~flat_mask, 0.0)
         if shortable_mask is None:
             shortable_mask = mask
@@ -524,11 +531,12 @@ def _minute_artifact_contract(
             else dataset.daily_feature_context.benchmark_fingerprint
         ),
         "portfolio_output_mode": output_mode,
-        "cash_allocation_contract": (
-            "contextual_cash_asset_joint_signed_l1_v1"
-            if output_mode == "cash_l1"
-            else None
-        ),
+        "cash_allocation_contract": {
+            "cash_l1": "contextual_cash_asset_joint_signed_l1_v1",
+            "learned_cash": (
+                "contextual_cash_gate_signed_direction_v1"
+            ),
+        }.get(output_mode),
         **(
             {
                 "daily_guidance_policy_contract": MINUTE_DAILY_GUIDANCE_CONTRACT,
@@ -1242,7 +1250,7 @@ def _run_day_batch(
     record_model_cash = (
         not training
         and normalize_portfolio_output_mode(active_model_config.portfolio_output_mode)
-        == "cash_l1"
+        in {"cash_l1", "learned_cash"}
     )
     record_guided_exposure = bool(
         not training and config.data.minute_daily_guidance_path is not None

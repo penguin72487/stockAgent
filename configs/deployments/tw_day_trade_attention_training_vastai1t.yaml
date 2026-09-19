@@ -3,11 +3,24 @@
 base_config: tw_day_trade_attention_parity_vastai1t_candidate.yaml
 
 runner:
-  output_dir: /root/stockAgent-daytrade-training-20260910/artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_candidate_v1
+  # Physical-source/accounting ABI changed. Keep every earlier trajectory
+  # immutable and start this measured batch32 recipe under a fresh root.
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v4
 
 data:
-  panel_cache_root: /root/stockAgent-daytrade-training-20260910/artifacts/cache/tw_public_paper_parity_234efa703efde4b2/stocks
-  day_trade_minute_execution_cache_dir: /root/stockAgent-daytrade-training-20260910/artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_paper_parity_248d0869d7d53be4_share_replacement_v4/stocks
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39
 
 training:
+  # Measured on this dual-RTX-5090 host using fold 11 epoch 2, after all model
+  # and exact physical-session graphs were warm. Global 32 (local 16) completed
+  # in 57.69s at 45.99 valid rows/s. Global 64 OOMed in the exact FIFO prefix
+  # scan near 31.3GiB/card, so 32 remains the measured power-of-two optimum.
+  batch_size_train: 32
+  batch_size_eval: 16
+  day_trade_event_compression: true
+  # Keep the production loss on the original per-symbol FP64 reduction order.
+  # Sparse packing changes reduction order and remains an explicit ablation.
+  day_trade_sparse_events: false
+  day_trade_sparse_event_slots: 262144
   pretrained_initialization_root: /root/stockAgent/artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12

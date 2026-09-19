@@ -4,7 +4,7 @@
 base_config: ../markets/tw_day_trade_attention_layernorm_paper_parity_candidate.yaml
 
 runner:
-  output_dir: /root/stockAgent-daytrade-parity-20260910/artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_candidate_v1
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_share_replacement_v4_candidate
 
 environment:
   # Observed cgroup quota is ~53.76 CPUs, shared by both GPU ranks. These are
@@ -13,9 +13,9 @@ environment:
   torch_compile_threads: 8
 
 data:
-  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260910T100453368085496Z-l0-penguin-234efa703efde4b2/stocks
-  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260910T100453368085496Z-l0-penguin-234efa703efde4b2/features/tw_public_stock_daily.parquet
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260913T030921278338896Z-l0-penguin-248d0869d7d53be4/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260913T030921278338896Z-l0-penguin-248d0869d7d53be4/features/tw_public_stock_daily.parquet
   day_trade_minute_execution_root: /srv/stockagent-packed-materialized/tw-minute-train/tw-minute-train-20260910T121601063496311Z-l0-penguin-09bedd96a2f68c39
-  panel_cache_root: /root/stockAgent-daytrade-parity-20260910/artifacts/cache/tw_public_paper_parity_234efa703efde4b2/stocks
-  day_trade_minute_execution_cache_dir: /root/stockAgent-daytrade-parity-20260910/artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_paper_parity_248d0869d7d53be4_share_replacement_v4/stocks
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39
   panel_load_workers: 16

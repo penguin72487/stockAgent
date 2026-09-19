@@ -63,12 +63,14 @@ def fixture(rows=5, symbols=2, device='cpu', price=1000., price_step=5.):
 
 
 def train_epoch(split, runtime, loss_fn, model, *, device='cpu', ddp=False, lr=0., batch_size=2,
-                amp_dtype=None, optimizer=None, use_panel_slab=False):
+                amp_dtype=None, optimizer=None, use_panel_slab=False,
+                optimizer_step_per_trajectory=False):
     if optimizer is None:
         optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     options = dict(_LOSS_OPTIONS, batch_size=batch_size, device=torch.device(device),
         amp_dtype=amp_dtype, non_blocking=False, grad_clip_norm=10., execution_runtime=runtime,
-        max_volume_participation=.5, volume_participation_equity=10_000_000.)
+        max_volume_participation=.5, volume_participation_equity=10_000_000.,
+        optimizer_step_per_trajectory=optimizer_step_per_trajectory)
     if ddp:
         return trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split, optimizer,
             GradScaler(device, enabled=False), replicated_ledger_local_metadata=True,
@@ -122,6 +124,55 @@ def test_train_restarts_account_at_epoch_boundary_but_updates_model():
         loss, timing = train_epoch(split, runtime, loss_fn, model, lr=1e-4)
         assert torch.isfinite(loss) and timing.optimizer_steps == 3
     assert not torch.equal(before, model.action.detach())
+
+
+class _CountingSGD(torch.optim.SGD):
+    def __init__(self, params):
+        super().__init__(params, lr=1.0e-4)
+        self.step_calls = 0
+
+    def step(self, closure=None):
+        self.step_calls += 1
+        return super().step(closure)
+
+
+def test_physical_day_trade_trajectory_cadence_matches_one_fixed_policy_loss():
+    split, runtime, loss_fn = fixture()
+    model = Policy()
+    expected_loss, _ = reference(split, runtime, loss_fn, model)
+    optimizer = _CountingSGD(model.parameters())
+
+    actual_loss, timing = train_epoch(
+        split,
+        runtime,
+        loss_fn,
+        model,
+        batch_size=2,
+        optimizer=optimizer,
+        optimizer_step_per_trajectory=True,
+    )
+
+    torch.testing.assert_close(
+        actual_loss.double(), expected_loss.double(), rtol=0, atol=1.0e-6
+    )
+    assert optimizer.step_calls == 1
+    assert timing.optimizer_steps == 1
+    assert timing.batches == 3
+    assert timing.gradient_norm_observations == 1
+
+
+def test_exact_whole_share_flat_policy_is_a_zero_gradient_dead_zone():
+    split, runtime, loss_fn = fixture()
+    model = Policy()
+    with torch.no_grad():
+        model.action.zero_()
+
+    loss, _ = reference(split, runtime, loss_fn, model)
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0, atol=0)
+    assert model.action.grad is not None
+    assert torch.count_nonzero(model.action.grad).item() == 0
 
 
 def test_loss_preflight_uses_the_same_physical_fifo_adapter_as_epoch_one():
@@ -406,7 +457,10 @@ def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_accoun
 
 
 @pytest.mark.skipif(int(os.environ.get('WORLD_SIZE', '1')) != 2, reason='requires real two-rank torchrun')
-def test_real_ddp_physical_training_matches_single_device():
+@pytest.mark.parametrize('optimizer_step_per_trajectory', [False, True])
+def test_real_ddp_physical_training_matches_single_device(
+    optimizer_step_per_trajectory,
+):
     """Real NCCL/autograd/optimizer, not synthetic collective monkeypatches."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -423,22 +477,32 @@ def test_real_ddp_physical_training_matches_single_device():
         for _ in range(2):
             torch.cuda.synchronize()
             begin = time.perf_counter()
-            loss, timing = train_epoch(split, runtime, loss_fn, ddp, device=device, ddp=True, lr=1e-4)
+            loss, timing = train_epoch(
+                split, runtime, loss_fn, ddp, device=device, ddp=True, lr=1e-4,
+                optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+            )
             torch.cuda.synchronize()
             timings.append(time.perf_counter() - begin)
-            assert torch.isfinite(loss) and timing.batches == timing.optimizer_steps == 3
+            assert torch.isfinite(loss) and timing.batches == 3
+            assert timing.optimizer_steps == (
+                1 if optimizer_step_per_trajectory else 3
+            )
         # Same optimizer cadence and detached physical state on an independent
         # CPU reference, including the one-real-row padded final global batch.
         reference_split, reference_runtime, reference_fn = fixture()
         reference_model = Policy()
         for _ in range(2):
-            train_epoch(reference_split, reference_runtime, reference_fn, reference_model, lr=1e-4)
+            train_epoch(
+                reference_split, reference_runtime, reference_fn,
+                reference_model, lr=1e-4,
+                optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+            )
         torch.testing.assert_close(model.action.detach().cpu(), reference_model.action.detach(),
                                    rtol=1e-5, atol=1e-7)
         gathered = [torch.empty_like(model.action) for _ in range(2)]
         dist.all_gather(gathered, model.action.detach())
         torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
-        print(f'physical_ddp rank={rank} epochs_seconds={timings} '
+        print(f'physical_ddp rank={rank} trajectory={optimizer_step_per_trajectory} epochs_seconds={timings} '
               f'parameters={model.action.detach().cpu().tolist()} synthetic_source=true', flush=True)
     finally:
         dist.destroy_process_group()

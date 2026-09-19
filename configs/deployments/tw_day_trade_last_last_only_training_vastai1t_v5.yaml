@@ -1,0 +1,19 @@
+# Immutable reproduction config for the trajectory-cadence v5 experiment.
+# It preserves the completed v4 model/output ABI while moving AdamW and the
+# scheduler to one update per chronological physical-account trajectory.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v4.yaml
+
+experiment_name: tw-day-trade-last-last-only-layernorm-trajectory-v5
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_trajectory_v5
+  resume: true
+
+training:
+  day_trade_optimizer_step_per_trajectory: true
+  lr_scheduler_warmup_steps: 32
+  pretrained_initialization_require_improvement_over_flat_cash: true
+  early_stopping_no_improve_ratio: 0.1
+  financial_transformer:
+    temporal_pooling: last
+    temporal_query_mode: last_only
