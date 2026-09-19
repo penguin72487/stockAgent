@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from datetime import date
+from dataclasses import fields, replace
 import hashlib
 import json
 
@@ -7,13 +8,18 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
+from stockagent.backtest.tw_day_trade_carry import (
+    compact_day_trade_carry_session,
+)
 from stockagent.data.tw_day_trade_carry_source import (
     PHYSICAL_SOURCE_RUN_RECEIPT_ENV,
     _exact_inventory_action_arrays,
     _share_replacement_arrays,
     build_prepared_day_trade_carry_source,
+    compact_packed_day_trade_carry_session,
 )
 from stockagent.training.day_trade_carry_bridge import PreparedDayTradeCarryBatch
 
@@ -31,11 +37,24 @@ def _write_action_receipts(public, rows):
         "date": [row["date"] for row in rows],
         "symbol": [row["symbol"] for row in rows],
         "handling": [row.get("handling", "avoid") for row in rows],
-        "cash_dividend_per_share": [row.get("cash") for row in rows],
+        "handling_reason": [
+            row.get("handling_reason", "stock_or_subscription_action")
+            for row in rows
+        ],
+        "reference_price": [row.get("reference_price", 100.0) for row in rows],
+        "cash_dividend_per_share": [row.get("cash", 0.0) for row in rows],
         "cash_payment_date": [row.get("payment") for row in rows],
         "stock_dividend_ratio": [row.get("stock_ratio", 0.0) for row in rows],
         "stock_delivery_date": [row.get("stock_delivery") for row in rows],
-        "subscription_ratio": [0.0 for _row in rows],
+        "stock_terms_complete": [
+            row.get("stock_terms_complete", True) for row in rows
+        ],
+        "subscription_ratio": [
+            row.get("subscription_ratio", 0.0) for row in rows
+        ],
+        "subscription_price": [
+            row.get("subscription_price", 0.0) for row in rows
+        ],
         "stop_transfer_start": [None for _row in rows],
     })
     raw = b'{"receipt":"test"}\n'
@@ -279,6 +298,99 @@ def test_exact_pending_stock_action_maps_ratio_and_delivery_without_price_proxy(
     assert counts["mapped_pending_stock_events"] == 1
 
 
+def test_pure_subscription_right_maps_symmetric_official_reference_value(
+    tmp_path,
+):
+    public = tmp_path / "public-release"
+    _write_parquet(
+        public / "features/tw_public_stock_daily.parquet", {"x": [1]}
+    )
+    _write_parquet(
+        public / "tw_corporate_action_reference.parquet",
+        {
+            "date": [date(2020, 10, 23)],
+            "symbol": ["6625"],
+            "reference_price": [37.39],
+        },
+    )
+    _write_action_receipts(
+        public,
+        [
+            {
+                "date": date(2020, 10, 23),
+                "symbol": "6625",
+                "handling": "avoid",
+                "handling_reason": "stock_or_subscription_action",
+                "reference_price": 37.39,
+                "stock_terms_complete": True,
+                "subscription_ratio": 0.113576395,
+                "subscription_price": 30.0,
+            }
+        ],
+    )
+
+    mask, ratio, cash, payment, delivery, counts = (
+        _exact_inventory_action_arrays(
+            public_feature_path=public
+            / "features/tw_public_stock_daily.parquet",
+            dates=np.asarray(["2020-10-23"], dtype="datetime64[D]"),
+            symbols=("6625",),
+        )
+    )
+
+    expected = 0.113576395 * (37.39 - 30.0)
+    assert mask.tolist() == [[True]]
+    assert ratio.tolist() == [[1.0]]
+    assert cash[0, 0] == pytest.approx(expected)
+    assert payment.tolist() == [[date(2020, 10, 23).toordinal()]]
+    assert delivery.tolist() == [[0]]
+    assert counts["mapped_subscription_right_events"] == 1
+    assert counts["mapped_zero_value_subscription_right_events"] == 0
+    assert counts["_subscription_right_flat_indices"] == [0]
+
+
+def test_incomplete_subscription_right_remains_unresolved(tmp_path):
+    public = tmp_path / "public-release"
+    _write_parquet(
+        public / "features/tw_public_stock_daily.parquet", {"x": [1]}
+    )
+    _write_parquet(
+        public / "tw_corporate_action_reference.parquet",
+        {
+            "date": [date(2020, 10, 23)],
+            "symbol": ["6625"],
+            "reference_price": [37.39],
+        },
+    )
+    _write_action_receipts(
+        public,
+        [
+            {
+                "date": date(2020, 10, 23),
+                "symbol": "6625",
+                "handling": "avoid",
+                "handling_reason": "stock_or_subscription_action",
+                "reference_price": 37.39,
+                "stock_terms_complete": False,
+                "subscription_ratio": 0.113576395,
+                "subscription_price": 30.0,
+            }
+        ],
+    )
+
+    mask, _ratio, _cash, _payment, _delivery, counts = (
+        _exact_inventory_action_arrays(
+            public_feature_path=public
+            / "features/tw_public_stock_daily.parquet",
+            dates=np.asarray(["2020-10-23"], dtype="datetime64[D]"),
+            symbols=("6625",),
+        )
+    )
+
+    assert not mask.any()
+    assert counts["mapped_subscription_right_events"] == 0
+
+
 def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
     tmp_path, monkeypatch,
 ):
@@ -308,7 +420,18 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
     )
     _write_action_receipts(
         public,
-        [{"date": date(2019, 1, 2), "symbol": "2330"}],
+        [{
+            "date": date(2019, 1, 2),
+            "symbol": "2330",
+            "handling": "avoid",
+            "handling_reason": "stock_or_subscription_action",
+            "reference_price": 100.0,
+            "stock_terms_complete": True,
+            "subscription_ratio": 0.1,
+            # A complete right may be worth exactly zero. It remains a
+            # resolved source event, not an invalid sparse-cache record.
+            "subscription_price": 100.0,
+        }],
     )
     _write_share_replacement_receipts(public)
     minute = tmp_path / "minute-release"
@@ -371,9 +494,29 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
     first, second = source.rows([0, 1], [0, 1, 2], torch.device("cpu"))
     assert first.entry_price.tolist() == [100.0, 50.0, 120.0]
     assert first.exit_prices[:, -1, 0].tolist() == [100.0, 50.0, 120.0]
+    first_packed = source.packed_session_loader(0)
+    finite_flat = torch.nonzero(
+        torch.isfinite(first.exit_prices.reshape(-1)), as_tuple=False
+    ).flatten()
+    torch.testing.assert_close(first_packed.exit_flat, finite_flat, rtol=0, atol=0)
+    torch.testing.assert_close(
+        first_packed.exit_price,
+        first.exit_prices.reshape(-1)[finite_flat], rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        first_packed.exit_capacity,
+        first.exit_capacity.reshape(-1)[finite_flat], rtol=0, atol=0,
+    )
     assert second.entry_volume.tolist() == [2000.0, 2000.0, 5000.0 / 271.0]
     assert second.source_gap_mask.tolist() == [0.0, 0.0, 0.0]
     assert second.daily_proxy_mask.tolist() == [0.0, 0.0, 1.0]
+    assert first.terminal_liquidation_price is None
+    assert first.action_mask.tolist() == [1.0, 0.0, 0.0]
+    assert first.share_ratio.tolist() == [1.0, 1.0, 1.0]
+    assert first.cash_per_old_share.tolist() == [0.0, 0.0, 0.0]
+    assert source.audit_receipt["corporate_action_policy"][
+        "mapped_zero_value_subscription_right_events"
+    ] == 1
     assert source.audit_receipt["minute_partition_scope"] == {
         "selected_panel_partitions": 1,
         "quarantined_non_panel_session_partitions": [{
@@ -385,6 +528,79 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
         }],
         "unselected_outside_panel_horizon_partitions": [],
     }
+    terminal_source = build_prepared_day_trade_carry_source(
+        panel=panel,
+        minute_root=minute,
+        public_feature_path=public / "features/tw_public_stock_daily.parquet",
+        cache_dir=tmp_path / "cache",
+        allow_daily_proxy=True,
+        daily_proxy_price_policy="official_open_close",
+        corporate_action_mode="avoid",
+        terminal_liquidation_unlimited_capacity=True,
+        sparse_event_slots=1024,
+    )
+    terminal = terminal_source.session_at(1)
+    assert terminal.terminal_liquidation_price.tolist() == [100.0, 50.0, 120.0]
+    assert terminal_source.audit_receipt["terminal_liquidation_policy"] == (
+        "official_close_unlimited_capacity_reduction_only"
+    )
+    sparse_capacity = terminal_source.audit_receipt["sparse_event_capacity"]
+    assert sparse_capacity["configured_slots"] == 1024
+    assert sparse_capacity["required_slots"] >= 6
+    assert sparse_capacity["session_files_checked"] == 1
+    with pytest.raises(ValueError, match="fixed compiled ABI before training"):
+        build_prepared_day_trade_carry_source(
+            panel=panel,
+            minute_root=minute,
+            public_feature_path=public / "features/tw_public_stock_daily.parquet",
+            cache_dir=tmp_path / "cache",
+            allow_daily_proxy=True,
+            daily_proxy_price_policy="official_open_close",
+            corporate_action_mode="avoid",
+            terminal_liquidation_unlimited_capacity=True,
+            sparse_event_slots=1,
+        )
+    terminal_packed = terminal_source.packed_session_loader(1)
+    for row in (0, 1):
+        direct = terminal_source.compact_session_loader(row)
+        reference = compact_day_trade_carry_session(terminal_source.session_at(row))
+        direct.validate_shape(3, torch.device("cpu"))
+        for field in fields(direct):
+            actual = getattr(direct, field.name)
+            expected = getattr(reference, field.name)
+            if isinstance(actual, torch.Tensor):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+            else:
+                assert actual == expected
+
+    empty = replace(
+        terminal_packed,
+        exit_flat=terminal_packed.exit_flat[:0],
+        exit_price=terminal_packed.exit_price[:0],
+        exit_capacity=terminal_packed.exit_capacity[:0],
+    )
+    empty_compact = compact_packed_day_trade_carry_session(empty)
+    empty_compact.validate_shape(3, torch.device("cpu"))
+    assert empty_compact.symbol_event_ends.tolist() == [0, 0, 0]
+    assert empty_compact.exit_capacity.tolist() == [0.0]
+    if terminal_packed.exit_flat.numel() > 0:
+        invalid = replace(
+            terminal_packed,
+            exit_flat=terminal_packed.exit_flat[:1].repeat(2),
+            exit_price=terminal_packed.exit_price[:1].repeat(2),
+            exit_capacity=terminal_packed.exit_capacity[:1].repeat(2),
+        )
+        with pytest.raises(ValueError, match="strictly ordered"):
+            compact_packed_day_trade_carry_session(invalid)
+    terminal_rebuilt = PreparedDayTradeCarryBatch.from_packed_sessions(
+        (terminal_packed,), 1, event_compression=True
+    ).sessions(torch.device("cpu"))[0]
+    torch.testing.assert_close(
+        terminal_rebuilt.terminal_liquidation_price,
+        terminal.terminal_liquidation_price,
+        rtol=0,
+        atol=0,
+    )
     # A child in the same orchestration run must reuse the parent's completed
     # byte verification only while the parent PID/file identities remain live.
     monkeypatch.setenv(

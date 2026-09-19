@@ -277,6 +277,60 @@ def test_strict_minute_tape_content_owns_resume_fingerprint() -> None:
     )
 
 
+def test_physical_source_domain_extension_allows_only_pinned_predecessor_resume(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_realistic.yaml")
+    panel = _day_trade_minute_panel()
+    panel.day_trade_minute_execution = None
+    old_release = "tw-day-trade-carry:" + "1" * 64
+    new_release = "tw-day-trade-carry:" + "2" * 64
+    universe = tuple(panel.symbols)
+
+    class Source:
+        def __init__(self, release_id, predecessors=()):
+            self.release_id = release_id
+            self.universe = universe
+            self.audit_receipt = {
+                "resume_compatible_release_ids": list(predecessors)
+            }
+
+        def __len__(self):
+            return len(panel.dates)
+
+    panel.day_trade_carry_source = Source(old_release)
+    old = _checkpoint_manifest(panel, config)
+    panel.day_trade_carry_source = Source(new_release, (old_release,))
+    current = _checkpoint_manifest(panel, config)
+
+    assert old["fingerprints"]["data"] != current["fingerprints"]["data"]
+    assert current["compatibility_fingerprints"][
+        "schema_4_physical_source_domain_extensions"
+    ] == [{"data": old["fingerprints"]["data"]}]
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": old},
+        current,
+        checkpoint_path=tmp_path / "predecessor.pt",
+        scope="resume",
+    )
+
+    unrelated = copy.deepcopy(old)
+    unrelated_contract = unrelated["contracts"]["data"]["panel_arrays"][
+        "day_trade_carry_source"
+    ]
+    unrelated_contract["release_id"] = "tw-day-trade-carry:" + "3" * 64
+    unrelated["fingerprints"]["data"] = trainer_module._stable_fingerprint(
+        unrelated["contracts"]["data"]
+    )
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": unrelated},
+            current,
+            checkpoint_path=tmp_path / "unrelated.pt",
+            scope="resume",
+        )
+
+
 def test_official_daily_proxy_price_contract_cannot_resume_adverse_tick_checkpoint(tmp_path) -> None:
     config = load_config("configs/markets/tw_day_trade_1m_realistic.yaml")
     panel = _day_trade_minute_panel()

@@ -34,6 +34,28 @@
       "note": "Immutable public TW training tree plus official raw receipts; reproducible panel_cache_v2 stays node-local."
     },
     {
+      "dataset": "tw-public-research-wide-2014",
+      "source": "/srv/stockagent-live/data_tw_public_research_wide_2014_v1",
+      "role": "private-research-training-not-live-or-strict-pit",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "stage_tw_public_research_release.py"
+      ],
+      "freshness": {
+        "receipt": "release_receipt.json",
+        "field": "end_date",
+        "format": "iso-date",
+        "required_values": {
+          "status": "complete",
+          "research_only": true,
+          "model_channels": 143
+        }
+      },
+      "note": "Private derived 143-channel research feature table, receipt, and exact formal corporate-action companions; no raw XBRL redistribution or live/PIT claim."
+    },
+    {
       "dataset": "tw-minute-train",
       "source": "data_tw_minute/research_dataset",
       "role": "training",

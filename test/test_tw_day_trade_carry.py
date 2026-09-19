@@ -64,6 +64,183 @@ def assert_state(a, b):
         torch.testing.assert_close(getattr(a.inventory, name), getattr(b.inventory, name), rtol=0, atol=1e-8)
 
 
+@pytest.mark.parametrize("weight", [0.21, -0.21])
+def test_terminal_unlimited_liquidation_flattens_long_and_short_without_capacity(
+    weight,
+):
+    limited = session(volume=6000, exits=False)
+    guaranteed = replace(
+        limited,
+        terminal_liquidation_price=v(1000),
+    )
+
+    control = run(v(weight).reshape(1, 1), [limited], fees=False)
+    actual = run(v(weight).reshape(1, 1), [guaranteed], fees=False)
+
+    assert control.shares_history[0, 0].abs() == 2000
+    assert actual.shares_history[0, 0] == 0
+    assert actual.final_state.inventory.cohorts[..., 0].abs().sum() == 0
+    assert actual.turnovers[0] > control.turnovers[0]
+
+
+def test_terminal_unlimited_liquidation_preserves_earlier_minute_capacity():
+    base = session(volume=6000, exits=False)
+    prices = base.exit_prices.clone()
+    capacity = base.exit_capacity.clone()
+    prices[0, 264, 0] = 1100.0
+    capacity[0, 264, 0] = 1000.0
+    staged = replace(
+        base,
+        exit_prices=prices,
+        exit_capacity=capacity,
+        terminal_liquidation_price=v(900),
+    )
+
+    actual = run(v(0.4).reshape(1, 1), [staged], fees=False)
+
+    # Entry remains capped to 3,000 shares. Exactly 1,000 fills at the ordinary
+    # 13:25 opportunity; only the remaining 2,000 use the unlimited terminal
+    # official-close assumption: 10M + 1000*(1100-1000) + 2000*(900-1000).
+    torch.testing.assert_close(
+        actual.final_state.last_nav,
+        v(9_900_000).squeeze(),
+        rtol=0,
+        atol=1e-8,
+    )
+    assert actual.shares_history[0, 0] == 0
+
+
+def test_terminal_unlimited_liquidation_fails_without_official_close():
+    guaranteed = replace(
+        session(volume=6000, exits=False),
+        terminal_liquidation_price=v(float("nan")),
+    )
+
+    with pytest.raises(RuntimeError, match="terminal liquidation"):
+        run(v(0.21).reshape(1, 1), [guaranteed], fees=False)
+
+
+def test_terminal_unlimited_liquidation_sparse_and_dense_endpoints_match():
+    dense_session = replace(
+        session(volume=6000, exits=False),
+        terminal_liquidation_price=v(1010),
+    )
+    sparse_session = compact_day_trade_carry_session(dense_session)
+    dense_weights = v(0.21).reshape(1, 1).requires_grad_()
+    sparse_weights = dense_weights.detach().clone().requires_grad_()
+
+    dense = run(dense_weights, [dense_session], event_compression=True)
+    sparse = run(sparse_weights, [sparse_session], event_compression=True)
+    torch.testing.assert_close(
+        sparse.strategy_returns, dense.strategy_returns, rtol=0, atol=1e-12
+    )
+    torch.testing.assert_close(sparse.turnovers, dense.turnovers, rtol=0, atol=1e-10)
+    assert_state(sparse.final_state, dense.final_state)
+    (-dense.strategy_returns.mean()).backward()
+    (-sparse.strategy_returns.mean()).backward()
+    torch.testing.assert_close(
+        sparse_weights.grad, dense_weights.grad, rtol=1e-10, atol=1e-12
+    )
+
+
+def test_eager_chunk_boundary_compacts_flat_detached_fifo_without_changing_math(
+    monkeypatch,
+):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "0")
+    sessions = [
+        replace(
+            session(DAY, price=1000.0, volume=6000.0, exits=False),
+            terminal_liquidation_price=v(1005.0),
+        ),
+        replace(
+            session(DAY + 1, price=1010.0, volume=6000.0, exits=False),
+            terminal_liquidation_price=v(1000.0),
+        ),
+    ]
+    weights = v(0.21, -0.21).reshape(-1, 1)
+
+    full = run(weights, sessions, fees=False)
+    first = run(weights[:1], sessions[:1], fees=False)
+    assert first.final_state.inventory.cohorts.shape[0] == 1
+    second = run(
+        weights[1:],
+        sessions[1:],
+        state=first.final_state.detached(),
+        fees=False,
+    )
+
+    # The second eager segment drops the first segment's fully consumed row,
+    # then appends only its own acquisition row.  All observable accounting is
+    # exactly equal to the uninterrupted replay.
+    assert second.final_state.inventory.cohorts.shape[0] == 1
+    torch.testing.assert_close(
+        torch.cat((first.strategy_returns, second.strategy_returns)),
+        full.strategy_returns,
+        rtol=0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        torch.cat((first.minute_nav, second.minute_nav)),
+        full.minute_nav,
+        rtol=0,
+        atol=1e-8,
+    )
+    torch.testing.assert_close(
+        torch.cat((first.turnovers, second.turnovers)),
+        full.turnovers,
+        rtol=0,
+        atol=1e-12,
+    )
+    assert_state(
+        carry._compact_detached_carry_state(second.final_state),
+        carry._compact_detached_carry_state(full.final_state),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+def test_compiled_terminal_unlimited_liquidation_matches_eager(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    source = replace(
+        session(volume=6000, exits=False),
+        terminal_liquidation_price=v(1010),
+    )
+    cuda_session = replace(
+        source,
+        **{
+            field.name: getattr(source, field.name).cuda()
+            for field in fields(source)
+            if isinstance(getattr(source, field.name), torch.Tensor)
+        },
+    )
+    eager_weights = v(0.21).cuda().reshape(1, 1).requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "0")
+    eager = run(eager_weights, [cuda_session], event_compression=True)
+    (-eager.strategy_returns.mean()).backward()
+
+    compiled_weights = eager_weights.detach().clone().requires_grad_()
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CARRY_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    compiled = run(compiled_weights, [cuda_session], event_compression=True)
+    (-compiled.strategy_returns.mean()).backward()
+
+    torch.testing.assert_close(
+        compiled.strategy_returns, eager.strategy_returns, rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(compiled.turnovers, eager.turnovers, rtol=1e-12, atol=1e-10)
+    torch.testing.assert_close(
+        compiled_weights.grad, eager_weights.grad, rtol=1e-7, atol=1e-10
+    )
+    assert compiled.shares_history[0, 0] == 0
+    assert_state(compiled.final_state, eager.final_state)
+    stats = carry.get_day_trade_carry_compile_stats()
+    assert stats["compiled_session_calls"] == 1
+    assert stats["compile_failures"] == 0
+
+
 def test_full_run_equals_chunked_physical_inventory_and_all_minute_marks():
     sessions = [session(), session(DAY + 1, 1010), session(DAY + 4, 1020, exits=True)]
     weights = v(.21, -.21, .1).reshape(-1, 1).requires_grad_()

@@ -1,0 +1,148 @@
+# New, private research-only experiment: 143 research channels plus the v8
+# 09:00 opening-gap channel (144 model inputs). This is not an executable
+# PIT backtest: some macro values are revised and some XBRL filing dates are
+# estimated. Keep the v8 model, FIFO/terminal execution, 50% minute capacity,
+# full walk-forward schedule and two-GPU batch; never load v8 optimizer/weights.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_score_entmax_cash.yaml
+experiment_name: tw-day-trade-last-last-only-v9-research-143-fresh
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_terminal_unlimited_capital10m_batch32_score_entmax_cash_22_effective_rank_v9_research143_fresh_foreground
+  resume: false
+  post_train_infer: false
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260918T013010528444073Z-l0-penguin-ac1e4027dfa26b98/stocks
+  day_trade_physical_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260918T013010528444073Z-l0-penguin-ac1e4027dfa26b98/features/tw_public_stock_daily.parquet
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public-research-wide-2014/tw-public-research-wide-2014-20260918T015559385506194Z-l0-penguin-e54bba12a4f6cc9b/features/tw_public_research_wide_2014_v1.parquet
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_research_143_v9_fresh/stocks
+  feature_include:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+    - twpub_dividend_yield_pct_raw
+    - twpub_dividend_per_share_raw
+    - twpub_margin_balance_lots_raw
+    - twpub_short_balance_lots_raw
+    - twpub_margin_buy_lots_raw
+    - twpub_margin_sell_lots_raw
+    - twpub_short_sell_lots_raw
+    - twpub_short_buy_lots_raw
+    - twpub_foreign_net_buy_shares_raw
+    - twpub_investment_trust_net_buy_shares_raw
+    - twpub_dealer_net_buy_shares_raw
+    - twpub_institutional_net_buy_shares_raw
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
+    - twpub_dividend_yield
+    - twpub_attention_event_flag
+    - twpub_attention_source_covered
+    - twpub_disposal_event_flag
+    - twpub_disposal_source_covered
+    - twpub_twse_taiex_raw
+    - twpub_twse_taiex_pct
+    - twpub_usdtwd_raw
+    - twpub_cbc_overnight_pct_raw
+    - twpub_cbc_fx_reserves_usd_billion_raw
+    - twpub_cbc_m1b_raw
+    - twpub_cbc_m1b_yoy_pct_raw
+    - twpub_cbc_m1b_yoy
+    - twpub_cbc_m2_raw
+    - twpub_cbc_m2_yoy_pct_raw
+    - twpub_cbc_m2_yoy
+    - twpub_dgbas_cpi_raw
+    - twpub_dgbas_cpi_yoy_pct_raw
+    - twpub_dgbas_cpi_yoy
+    - twpub_dgbas_unemployment_pct_raw
+    - twpub_dgbas_unemployment_rate
+    - twpub_dgbas_gdp_raw
+    - twpub_dgbas_gdp_yoy_pct_raw
+    - twpub_dgbas_gdp_yoy
+    - twpub_mof_export_raw
+    - twpub_mof_import_raw
+    - twpub_mof_trade_balance_raw
+    - twpub_mof_tax_total_raw
+    - twpub_mof_securities_tax_raw
+    - twpub_mof_futures_tax_raw
+    - twpub_mof_business_tax_raw
+    - twpub_xbrl_assets_twd_raw
+    - twpub_xbrl_liabilities_twd_raw
+    - twpub_xbrl_equity_twd_raw
+    - twpub_xbrl_cash_twd_raw
+    - twpub_xbrl_current_assets_twd_raw
+    - twpub_xbrl_current_liabilities_twd_raw
+    - twpub_xbrl_inventories_twd_raw
+    - twpub_xbrl_revenue_twd_quarter_raw
+    - twpub_xbrl_revenue_twd_ytd_raw
+    - twpub_xbrl_profit_twd_quarter_raw
+    - twpub_xbrl_profit_twd_ytd_raw
+    - twpub_xbrl_gross_profit_twd_quarter_raw
+    - twpub_xbrl_gross_profit_twd_ytd_raw
+    - twpub_xbrl_operating_profit_twd_quarter_raw
+    - twpub_xbrl_operating_profit_twd_ytd_raw
+    - twpub_xbrl_basic_eps_quarter_raw
+    - twpub_xbrl_basic_eps_ytd_raw
+    - twpub_xbrl_operating_cash_flow_twd_quarter_raw
+    - twpub_xbrl_operating_cash_flow_twd_ytd_raw
+    - twpub_xbrl_debt_ratio
+    - twpub_xbrl_equity_ratio
+    - twpub_xbrl_current_ratio
+    - twpub_xbrl_inventory_to_assets_ratio
+    - twpub_xbrl_gross_margin
+    - twpub_xbrl_operating_margin
+    - twpub_xbrl_net_margin
+    - twpub_xbrl_tifrs_operating_revenue_twd_quarter_raw
+    - twpub_xbrl_tifrs_operating_revenue_twd_ytd_raw
+    - twpub_xbrl_tifrs_gross_profit_twd_quarter_raw
+    - twpub_xbrl_tifrs_gross_profit_twd_ytd_raw
+    - twpub_xbrl_tifrs_net_gross_profit_twd_quarter_raw
+    - twpub_xbrl_tifrs_net_gross_profit_twd_ytd_raw
+    - twpub_xbrl_tifrs_net_operating_income_twd_quarter_raw
+    - twpub_xbrl_tifrs_net_operating_income_twd_ytd_raw
+    - twpub_xbrl_tifrs_gross_margin
+    - twpub_xbrl_tifrs_net_gross_margin
+    - twpub_xbrl_tifrs_operating_margin
+  feature_availability_indicators:
+    - twpub_xbrl_*
+    - twpub_cbc_m1b_raw
+    - twpub_cbc_m2_raw
+    - twpub_dgbas_cpi_raw
+    - twpub_dgbas_gdp_raw
+    - twpub_mof_*_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+  feature_shift_next_session:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+    - twpub_dividend_yield_pct_raw
+    - twpub_dividend_per_share_raw
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
+    - twpub_dividend_yield
+    - twpub_twse_taiex_raw
+    - twpub_twse_taiex_pct
+
+training:
+  pretrained_initialization_root: null
+  day_trade_sparse_events: false
+  financial_transformer:
+    causal_feature_rms_normalization: true
+    causal_feature_min_active_dates: 2
+    categorical_feature_names: []

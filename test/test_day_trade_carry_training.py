@@ -3,6 +3,7 @@ from dataclasses import fields, replace
 from functools import partial
 import os
 import time
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,6 +16,7 @@ import stockagent.training.trainer as trainer
 from stockagent.training.day_trade_carry_bridge import PreparedDayTradeCarrySource
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors
+from stockagent.backtest.tw_day_trade_carry import _compact_detached_carry_state
 from test_crypto_trajectory_optimizer import _LOSS_OPTIONS
 from test_tw_day_trade_carry import DAY, session, v
 
@@ -108,9 +110,15 @@ def test_train_carries_fifo_between_batches_and_padding_does_not_trade(padding):
     assert timing.optimizer_steps == timing.batches == 3
     assert [state.last_session_day for state in observed] == [DAY + 2, DAY + 4, DAY + 5]
     torch.testing.assert_close(observed[-1].last_nav, expected.last_nav, rtol=0, atol=1e-8)
-    for field in fields(expected.inventory):
-        torch.testing.assert_close(getattr(observed[-1].inventory, field.name),
-                                   getattr(expected.inventory, field.name), rtol=0, atol=1e-8)
+    observed_compact = _compact_detached_carry_state(observed[-1].detached())
+    expected_compact = _compact_detached_carry_state(expected.detached())
+    for field in fields(expected_compact.inventory):
+        torch.testing.assert_close(
+            getattr(observed_compact.inventory, field.name),
+            getattr(expected_compact.inventory, field.name),
+            rtol=0,
+            atol=1e-8,
+        )
     assert torch.isfinite(model.action.grad).all()
     assert model.action.grad.abs().sum() > 0
 
@@ -158,6 +166,57 @@ def test_physical_day_trade_trajectory_cadence_matches_one_fixed_policy_loss():
     assert timing.optimizer_steps == 1
     assert timing.batches == 3
     assert timing.gradient_norm_observations == 1
+
+
+def test_physical_training_prefetches_each_chronological_batch(monkeypatch):
+    split, runtime, loss_fn = fixture()
+    calls = []
+    original = trainer.prefetch_physical_carry_batches
+
+    def observed_prefetch(source, current_split, batch_order, batch_size):
+        calls.append((list(batch_order), int(batch_size)))
+        yield from original(source, current_split, batch_order, batch_size)
+
+    monkeypatch.setattr(
+        trainer, "prefetch_physical_carry_batches", observed_prefetch
+    )
+    loss, timing = train_epoch(
+        split,
+        runtime,
+        loss_fn,
+        Policy(),
+        batch_size=2,
+        optimizer_step_per_trajectory=True,
+    )
+
+    assert torch.isfinite(loss)
+    assert timing.batches == 3
+    assert calls == [([0, 1, 2], 2)]
+
+
+def test_nonfinite_trajectory_gradient_fails_before_only_optimizer_step():
+    split, runtime, loss_fn = fixture()
+    model = Policy()
+    model.action.register_hook(
+        lambda grad: torch.full_like(grad, float("nan"))
+    )
+    optimizer = _CountingSGD(model.parameters())
+
+    with pytest.raises(
+        FloatingPointError,
+        match="non-finite gradient after full-trajectory accumulation",
+    ):
+        train_epoch(
+            split,
+            runtime,
+            loss_fn,
+            model,
+            batch_size=2,
+            optimizer=optimizer,
+            optimizer_step_per_trajectory=True,
+        )
+
+    assert optimizer.step_calls == 0
 
 
 def test_exact_whole_share_flat_policy_is_a_zero_gradient_dead_zone():
@@ -235,6 +294,120 @@ def test_canonical_eval_retains_float64_minute_curves_and_fifo_endpoint():
     torch.testing.assert_close(actual.day_trade_carry_state.last_nav, expected.last_nav, rtol=0, atol=1e-8)
     assert actual.day_trade_carry_state.last_session_day == DAY + 5
     assert metrics
+
+
+def test_physical_eval_releases_prior_dense_chunk_before_staging_next(monkeypatch):
+    split, runtime, _ = fixture(rows=5)
+    original_bind = trainer.bind_physical_carry_backtest
+    bound_refs = []
+
+    def tracked_bind(*args, **kwargs):
+        # The bound closure owns the staged dense physical sessions.  A live
+        # previous closure here would double the peak CUDA tape allocation.
+        assert not bound_refs or bound_refs[-1]() is None
+        bound = original_bind(*args, **kwargs)
+        bound_refs.append(weakref.ref(bound))
+        return bound
+
+    monkeypatch.setattr(trainer, "bind_physical_carry_backtest", tracked_bind)
+    result, _, _ = trainer._evaluate_windowed_tensor_batch_decoupled(
+        Policy(), None, split,
+        device=torch.device("cpu"), amp_dtype=None, non_blocking=False,
+        long_only=False, buy_fee_rate=.001425, sell_fee_rate=.002925,
+        max_turnover_ratio=0., gross_leverage=1., min_trade_weight=0.,
+        model_chunk_rows=2, backtest_chunk_rows=2,
+        portfolio_activation="pre_normalized",
+        max_volume_participation=.5, volume_participation_equity=10_000_000.,
+        execution_runtime=runtime,
+    )
+    assert len(bound_refs) == 3
+    assert all(ref() is None for ref in bound_refs)
+    assert result.day_trade_carry_state.last_session_day == DAY + 5
+
+
+def test_physical_formal_replay_caps_dense_chunk_size(monkeypatch):
+    split, runtime, _ = fixture(rows=5)
+    original_ranges = trainer._eval_ranges_by_reset
+    observed_chunk_rows = []
+
+    def tracked_ranges(total_rows, chunk_rows, reset_at_rows):
+        observed_chunk_rows.append(chunk_rows)
+        return original_ranges(total_rows, chunk_rows, reset_at_rows)
+
+    monkeypatch.setattr(trainer, "_eval_ranges_by_reset", tracked_ranges)
+    result, _, _ = trainer._evaluate_windowed_tensor_batch_decoupled(
+        Policy(), None, split,
+        device=torch.device("cpu"), amp_dtype=None, non_blocking=False,
+        long_only=False, buy_fee_rate=.001425, sell_fee_rate=.002925,
+        max_turnover_ratio=0., gross_leverage=1., min_trade_weight=0.,
+        model_chunk_rows=2, backtest_chunk_rows=512,
+        return_weights_history=True,
+        portfolio_activation="pre_normalized",
+        max_volume_participation=.5, volume_participation_equity=10_000_000.,
+        execution_runtime=runtime,
+    )
+    assert observed_chunk_rows == [128]
+    assert result.minute_nav.shape == (5, 270)
+
+
+def test_repeated_epoch_eval_compacts_only_minute_audit_not_account_math(
+    monkeypatch,
+):
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_EVENT_COMPRESSION", "1")
+    split, runtime, _ = fixture()
+    model = Policy()
+    options = dict(
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        long_only=False,
+        buy_fee_rate=0.001425,
+        sell_fee_rate=0.002925,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        model_chunk_rows=2,
+        backtest_chunk_rows=2,
+        portfolio_activation="pre_normalized",
+        max_volume_participation=0.5,
+        volume_participation_equity=10_000_000.0,
+        execution_runtime=runtime,
+    )
+    formal, formal_metrics, _ = (
+        trainer._evaluate_windowed_tensor_batch_decoupled(
+            model, None, split, return_weights_history=True, **options
+        )
+    )
+    repeated, repeated_metrics, _ = (
+        trainer._evaluate_windowed_tensor_batch_decoupled(
+            model, None, split, return_weights_history=False, **options
+        )
+    )
+
+    assert formal.minute_nav.shape == (len(split), 270)
+    assert repeated.minute_nav.shape == (len(split), 2)
+    torch.testing.assert_close(
+        repeated.minute_nav[:, 0], formal.minute_nav.amin(dim=-1), rtol=0, atol=1e-8
+    )
+    torch.testing.assert_close(
+        repeated.minute_nav[:, 1], formal.minute_nav[:, -1], rtol=0, atol=1e-8
+    )
+    torch.testing.assert_close(
+        repeated.strategy_returns, formal.strategy_returns, rtol=0, atol=1e-12
+    )
+    torch.testing.assert_close(
+        repeated.turnovers, formal.turnovers, rtol=0, atol=1e-10
+    )
+    torch.testing.assert_close(
+        repeated.shares_history, formal.shares_history, rtol=0, atol=1e-8
+    )
+    torch.testing.assert_close(
+        repeated.day_trade_carry_state.last_nav,
+        formal.day_trade_carry_state.last_nav,
+        rtol=0,
+        atol=1e-8,
+    )
+    assert repeated_metrics == formal_metrics
 
 
 def test_physical_eval_accepts_boundary_markers_and_rejects_internal_account_reset():

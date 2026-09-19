@@ -2020,3 +2020,17 @@ do not scale capacity to the daily total or weaken strict Tick equality checks.
 The other 12 days exactly reconcile to official outright volume and OHLC.
 No quarantine or calendar scope was added; 206 other potential corporate events
 remain unsupported. See `docs/FUTURES_MKF_TRANSITION_REPAIR_2026-09-10.md`.
+
+The user's 2026-09-16 stock day-trade v7 assumption makes only the final 13:30
+liquidation capacity-unbounded.  Preserve source-derived 50% capacity for entry
+and the ordinary 13:20/13:24 exit path; at the terminal step, close every
+remaining deliverable share at the official close by setting the reducer's
+quantity to the account's exact residual, not an arbitrary large capacity.
+This is reduction-only: it cannot open or reverse inventory.  Missing terminal
+price, source gaps, halts, and undelivered corporate-action shares remain
+fail-closed or legally locked; do not fabricate a quote or call this observed
+auction liquidity.  The flag
+`tw_day_trade_terminal_liquidation_unlimited_capacity` changes executed
+quantities, loss and the checkpoint fingerprint, so the active v7 config uses a
+fresh artifact root while the named v6 config preserves capacity-limited
+residual-to-margin replay.

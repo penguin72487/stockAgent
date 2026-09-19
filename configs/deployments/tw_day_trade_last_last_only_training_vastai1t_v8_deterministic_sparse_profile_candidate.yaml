@@ -1,0 +1,12 @@
+# Isolated OFAT probe: exact sparse events on the reproducible v8 baseline.
+# Do not promote unless complete two-GPU fold artifacts match the dense peer.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_deterministic_profile_candidate.yaml
+
+experiment_name: tw-day-trade-last-last-only-score-entmax-cash-v8-deterministic-sparse-profile
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_v8_deterministic_sparse_profile_candidate
+
+training:
+  day_trade_sparse_events: true
+  day_trade_sparse_event_slots: 262144

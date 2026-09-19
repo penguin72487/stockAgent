@@ -1,0 +1,15 @@
+# Isolated architecture experiment. The active sparse v8 run uses last/last_only;
+# attention/full_then_last changes the model checkpoint ABI and cannot resume it.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_sparse_profile_candidate.yaml
+
+experiment_name: tw-day-trade-score-entmax-cash-v8-sparse-attention-full-then-last-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_v8_sparse_attention_full_then_last_v1
+
+training:
+  # financial_transformer is the active model. The inherited inactive
+  # transformer_base_portfolio block already has these temporal settings.
+  financial_transformer:
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last

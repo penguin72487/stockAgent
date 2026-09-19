@@ -1484,10 +1484,15 @@ class DataConfig:
     tw_public_feature_path: str = (
         "data_tw_public/features/tw_public_stock_daily.parquet"
     )
+    # Physical FIFO needs the canonical public archive when model inputs
+    # come from a separate research-only feature table.
+    day_trade_physical_public_feature_path: str | None = None
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
     feature_zero_fill: list[str] = field(default_factory=list)
+    # Opt-in flags distinguish an observed zero from a missing source value.
+    feature_availability_indicators: list[str] = field(default_factory=list)
     # Explicitly append the open[t]/close[t-1] execution-context feature.  It
     # is valid only for tw_day_trade and is never part of the default schema.
     day_trade_open_feature: bool = False
@@ -1669,6 +1674,13 @@ class TradingConfig:
     # positions remain flat, while only the resulting net cash difference
     # enters the T+2-close claim ledger; no settlement default is modeled.
     tw_day_trade_unlimited_margin_conversion: bool = False
+    # Research execution assumption for the physical FIFO minute account.
+    # The ordinary 09:01/13:20/13:24 path keeps its source-derived 50%
+    # capacity.  At the final 13:30 liquidation only, every remaining
+    # deliverable share is filled at the official close without a capacity
+    # ceiling.  This is an explicit semantic/checkpoint boundary, not an
+    # observed auction-liquidity claim.
+    tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
     tw_day_trade_margin_financing_ratio: float = 0.60
     tw_day_trade_margin_financing_annual_rate: float = 0.16
     tw_day_trade_margin_short_handling_fee_rate: float = 0.001
@@ -3740,6 +3752,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
+    raw_physical_public_path = data["day_trade_physical_public_feature_path"]
+    data["day_trade_physical_public_feature_path"] = (
+        None
+        if raw_physical_public_path is None or not str(raw_physical_public_path).strip()
+        else str(raw_physical_public_path).strip()
+    )
     tw_public_market_symbol_default = _dataclass_default_values(DataConfig)[
         "tw_public_market_symbol"
     ]
@@ -3800,6 +3818,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     data["feature_zero_fill"] = _normalize_string_list(
         data["feature_zero_fill"], field_name="data.feature_zero_fill"
+    )
+    data["feature_availability_indicators"] = _normalize_string_list(
+        data["feature_availability_indicators"],
+        field_name="data.feature_availability_indicators",
     )
     data["feature_shift_next_session"] = _normalize_string_list(
         data["feature_shift_next_session"],
@@ -4351,6 +4373,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "non-default data.day_trade_minute_execution_policy requires "
             "data.day_trade_minute_execution_root"
         )
+    if (
+        data["day_trade_physical_public_feature_path"] is not None
+        and not (
+            trading["execution_mode"] == "tw_day_trade"
+            and trading["tw_day_trade_unlimited_margin_conversion"]
+        )
+    ):
+        raise ValueError(
+            "data.day_trade_physical_public_feature_path requires "
+            "physical-FIFO tw_day_trade"
+        )
     if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -4393,6 +4426,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
+        if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires the exact "
+                "physical FIFO minute account"
+            )
+        if data["day_trade_minute_execution_root"] is None:
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires explicit "
+                "minute/daily-proxy physical sessions"
+            )
+        if data["day_trade_minute_execution_policy"] != (
+            DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+        ):
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires the "
+                "scheduled 50%-minute execution policy"
+            )
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
