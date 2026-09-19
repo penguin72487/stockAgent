@@ -1,0 +1,17 @@
+# Reproduce the original, unsuffixed v8 artifact root.  That failed fold-11
+# startup was bound to the 2026-09-13 tw-public release below; the active v8
+# config now points to a different 2026-09-17 release and a different root.
+# Keep the original source and cache identity when resuming this experiment.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_score_entmax_cash.yaml
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_terminal_unlimited_capital10m_batch32_score_entmax_cash_22_effective_rank_v8
+  resume: true
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260913T030921278338896Z-l0-penguin-248d0869d7d53be4/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260913T030921278338896Z-l0-penguin-248d0869d7d53be4/features/tw_public_stock_daily.parquet
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_paper_parity_248d0869d7d53be4_share_replacement_v4/stocks
+
+environment:
+  cpu_threads: 112

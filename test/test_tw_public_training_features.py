@@ -306,7 +306,8 @@ def test_all_null_margin_short_schema_is_fail_closed_not_generic_sell_permission
 
 def _write_symbol(path: Path, closes: list[float]) -> None:
     rows = len(closes)
-    dates = np.arange(np.datetime64("2024-01-02"), np.datetime64("2024-01-02") + rows)
+    start = np.datetime64("2024-01-02", "D")
+    dates = np.arange(start, start + np.timedelta64(rows, "D"))
     close = np.asarray(closes, dtype=np.float64)
     table = pa.table(
         {

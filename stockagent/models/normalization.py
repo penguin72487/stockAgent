@@ -395,6 +395,7 @@ def masked_cash_entmax15_weights(
     radius: float = 1.0,
     eps: float = PORTFOLIO_L1_EPS,
     return_parts: bool = False,
+    preserve_fp32_output: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sparse signed allocation with dimension-invariant residual cash.
 
@@ -442,7 +443,13 @@ def masked_cash_entmax15_weights(
     weights = (
         relative * direction * conviction * radius_value
     ).masked_fill(~mask_bool, 0.0)
-    weights = weights.to(dtype=logits.dtype)
+    # The historical cash_entmax15 contract returns the input dtype.  Exact
+    # whole-lot ledgers need the new score_entmax_cash contract to retain the
+    # FP32 allocation computed above under BF16 autocast; casting it back can
+    # move a target across a 1,000-share boundary.  Keep the old default for
+    # checkpoint/artifact replay compatibility.
+    if not preserve_fp32_output:
+        weights = weights.to(dtype=logits.dtype)
     if not return_parts:
         return weights
     gross = weights.float().abs().sum(dim=1)

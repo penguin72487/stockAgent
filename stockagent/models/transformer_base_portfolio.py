@@ -3935,7 +3935,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 weights, output_aux = action_output
             else:
                 weights = action_output
-        elif resolved_mode == "cash_entmax15":
+        elif resolved_mode in {"cash_entmax15", "score_entmax_cash"}:
             cash_output = masked_cash_entmax15_weights(
                 target_logits,
                 mask_bool,
@@ -3943,6 +3943,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     torch.zeros_like(mask_bool) if long_only else mask_bool
                 ),
                 return_parts=return_parts,
+                preserve_fp32_output=(resolved_mode == "score_entmax_cash"),
             )
             if return_parts:
                 weights, output_aux = cash_output
@@ -4461,12 +4462,13 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = action_output
                 else:
                     weights = action_output
-            elif self.portfolio_output_mode == "cash_entmax15":
+            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash"}:
                 cash_output = masked_cash_entmax15_weights(
                     target_logits,
                     mask_bool,
                     short_mask=torch.zeros_like(mask_bool),
                     return_parts=include_action_aux,
+                    preserve_fp32_output=(self.portfolio_output_mode == "score_entmax_cash"),
                 )
                 if include_action_aux:
                     weights, output_aux = cash_output
@@ -4569,12 +4571,13 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = action_output
                 else:
                     weights = action_output
-            elif self.portfolio_output_mode == "cash_entmax15":
+            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash"}:
                 cash_output = masked_cash_entmax15_weights(
                     target_logits,
                     mask_bool,
                     short_mask=mask_bool,
                     return_parts=include_action_aux,
+                    preserve_fp32_output=(self.portfolio_output_mode == "score_entmax_cash"),
                 )
                 if include_action_aux:
                     weights, output_aux = cash_output

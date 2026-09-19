@@ -1,0 +1,15 @@
+# Fresh 144-channel research experiment without the legacy 24-dimensional
+# CandleEncoder feature adapter. Preserve v9 data, execution, model width,
+# optimizer schedule, and full walk-forward contract; do not resume v9 weights
+# or optimizer because removing the adapter changes the model ABI.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v9_research_143_fresh.yaml
+experiment_name: tw-day-trade-last-last-only-v10-research-143-no-bottleneck
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_terminal_unlimited_capital10m_batch32_score_entmax_cash_22_effective_rank_v10_research143_no_bottleneck
+  resume: false
+
+training:
+  pretrained_initialization_root: null
+  financial_transformer:
+    feature_bottleneck_dim: 0

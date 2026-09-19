@@ -396,6 +396,7 @@ def _compiled_session_execution(
         float(initial_capital),
         training_graph,
         session.daily_proxy_mask is not None,
+        session.terminal_liquidation_price is not None,
         bool(event_compression),
         bool(sparse_events),
         int(
@@ -429,6 +430,7 @@ def _compiled_session_execution(
                 exit_prices: Tensor,
                 exit_capacity: Tensor,
                 marks: Tensor,
+                terminal_liquidation_price: Tensor,
                 exit_symbol_indices: Tensor,
                 exit_sides: Tensor,
                 symbol_event_starts: Tensor,
@@ -596,6 +598,28 @@ def _compiled_session_execution(
                             marks=marks,
                             initial_capital=initial_capital,
                         )
+                        # The dense minute recurrence above is unchanged.  Its
+                        # training/eval caller needs only the exact minimum and
+                        # close to certify that the omitted insolvency replay is
+                        # an identity.  Compact before crossing the compiled
+                        # ABI so 270 differentiable scalars are not retained per
+                        # session.  Preserve any non-finite cell explicitly:
+                        # amin alone would hide a positive infinity.
+                        # execute_carry_session replaces the final raw minute
+                        # mark with the post-conversion closing NAV.  Retain
+                        # the exact minimum of only the preceding 269 values,
+                        # plus the raw final value needed by the validity/alive
+                        # predicate; the caller then performs that same close
+                        # replacement before its final two-point compaction.
+                        minute_minimum = minute_nav[:-1].amin()
+                        minute_minimum = torch.where(
+                            torch.isfinite(minute_nav).all(),
+                            minute_minimum,
+                            torch.full_like(minute_minimum, float("nan")),
+                        )
+                        minute_nav = torch.stack(
+                            (minute_minimum, minute_nav[-1])
+                        )
                         path_state = path.reduction.state
                         exit_notional = (
                             path.minute_filled_shares
@@ -642,6 +666,14 @@ def _compiled_session_execution(
                         path.minute_filled_shares
                         * torch.nan_to_num(prices, nan=0)
                     ).sum()
+                if session.terminal_liquidation_price is not None:
+                    path_state, terminal_notional = (
+                        _liquidate_terminal_inventory_without_capacity(
+                            path_state,
+                            terminal_price=terminal_liquidation_price,
+                        )
+                    )
+                    exit_notional = exit_notional + terminal_notional
                 converted = convert_inventory_to_margin(
                     path_state, day=normalized_day
                 )
@@ -723,6 +755,11 @@ def _compiled_session_execution(
                 session.exit_prices,
                 session.exit_capacity,
                 session.marks,
+                (
+                    torch.zeros_like(session.official_open)
+                    if session.terminal_liquidation_price is None
+                    else session.terminal_liquidation_price
+                ),
                 *sparse_values,
                 can_enter,
                 buy_fee_rate,
@@ -792,6 +829,50 @@ def _run_inventory_path(
         marks=marks,
         initial_capital=initial_capital,
     )
+
+
+def _liquidate_terminal_inventory_without_capacity(
+    state: DayTradeInventoryState,
+    *,
+    terminal_price: Tensor,
+) -> tuple[DayTradeInventoryState, Tensor]:
+    """Close every remaining deliverable share at one terminal price.
+
+    The capacity supplied to the FIFO reducer is exactly the account's own
+    remaining deliverable quantity.  It is therefore not a market-volume
+    estimate and cannot constrain the liquidation.  Locked corporate-action
+    shares remain unavailable until their receipt-backed delivery day.  A
+    required terminal close with no finite positive price fails the complete
+    session atomically instead of fabricating a fill.
+    """
+    price = terminal_price.to(device=state.cohorts.device, dtype=torch.float64)
+    if price.shape != (state.cohorts.shape[1],):
+        raise ValueError("terminal liquidation price differs from the universe")
+    absolute = state.cohorts[..., CohortField.SHARES].abs()
+    locked = state.cohorts[..., CohortField.LOCKED_SHARES].abs()
+    deliverable = (absolute - locked).clamp_min(0).sum(dim=0)
+    price_ok = torch.isfinite(price) & (price > 0)
+    valid = _require(
+        (deliverable == 0) | price_ok,
+        "terminal liquidation requires a finite positive official close",
+    )
+    reduction = reduce_inventory_fifo_path(
+        state,
+        prices=price[:, None],
+        capacity_shares=deliverable[:, None],
+    )
+    liquidated = replace(
+        reduction.reduction.state,
+        failed=torch.maximum(
+            reduction.reduction.state.failed,
+            (~valid).to(dtype=state.failed.dtype),
+        ),
+    )
+    filled = reduction.minute_filled_shares[:, 0]
+    notional = (
+        filled * torch.where(price_ok, price, torch.zeros_like(price))
+    ).sum()
+    return liquidated, torch.where(valid, notional, torch.zeros_like(notional))
 
 
 def _compact_detached_carry_state(state: DayTradeCarryState) -> DayTradeCarryState:
@@ -920,6 +1001,10 @@ class DayTradeCarrySession:
     mark_path_valid: Tensor | None = None
     minimum_exit_prices: Tensor | None = None
     maximum_exit_prices: Tensor | None = None
+    # Explicit research assumption: the final liquidation uses this official
+    # close and ignores market-volume capacity.  None preserves historical
+    # residual-to-margin behavior and old artifacts exactly.
+    terminal_liquidation_price: Tensor | None = None
 
     @property
     def uses_sparse_events(self) -> bool:
@@ -1403,6 +1488,14 @@ def execute_carry_session(
             exit_notional = (
                 path.minute_filled_shares * torch.nan_to_num(prices, nan=0)
             ).sum()
+        if session.terminal_liquidation_price is not None:
+            path_inventory, terminal_notional = (
+                _liquidate_terminal_inventory_without_capacity(
+                    path_inventory,
+                    terminal_price=session.terminal_liquidation_price,
+                )
+            )
+            exit_notional = exit_notional + terminal_notional
         converted = convert_inventory_to_margin(path_inventory, day=session.day)
         notional = ((opening.reduction.filled_shares + opening.addition_shares.abs())
                     * torch.nan_to_num(session.entry_price, nan=0)).sum()
@@ -1410,14 +1503,35 @@ def execute_carry_session(
     valid = valid & _require(torch.isfinite(marks), "carry account minute valuation is invalid")
     intraday_alive = trade_alive & (marks > 0).all()
     final_inventory = _choose_inventory(intraday_alive, converted, path_inventory)
+    closing_marks = session.marks[:, -1]
+    if session.terminal_liquidation_price is not None:
+        terminal_ok = (
+            torch.isfinite(session.terminal_liquidation_price)
+            & (session.terminal_liquidation_price > 0)
+        )
+        closing_marks = torch.where(
+            terminal_ok,
+            session.terminal_liquidation_price,
+            closing_marks,
+        )
     closing_nav = inventory_nav(final_inventory, initial_capital=initial_capital,
-                                marks=session.marks[:, -1])
+                                marks=closing_marks)
     valid = valid & _require(torch.isfinite(closing_nav), "carry account close valuation is invalid")
     final_alive = intraday_alive & (closing_nav > 0)
     raw_marks = torch.cat((marks[:-1], closing_nav.reshape(1)))
     mark_alive = trade_alive & (raw_marks > 0).cumprod(0).bool()
     committed_marks = torch.where(mark_alive, raw_marks, 0)
     committed_marks = torch.where(valid, committed_marks, float("nan"))
+    if event_compression:
+        exact_minimum = committed_marks.amin()
+        exact_minimum = torch.where(
+            torch.isfinite(committed_marks).all(),
+            exact_minimum,
+            torch.full_like(exact_minimum, float("nan")),
+        )
+        committed_marks = torch.stack(
+            (exact_minimum, committed_marks[-1])
+        )
     final_inventory = _choose_inventory(trade_alive, final_inventory, working)
     final_inventory = _choose_inventory(state.alive, final_inventory, inventory)
     # Source failure is atomic across the account, including malformed action
@@ -1450,9 +1564,16 @@ def run_day_trade_carry_sessions(
                                  initial_capital=initial_capital)
     state = replace(state, inventory=replace(state.inventory,
         failed=torch.maximum(state.inventory.failed, (~valid_state).to(torch.float64))))
+    # Chunk boundaries are truncated-BPTT boundaries.  Once the incoming
+    # inventory is detached, fully consumed FIFO/claim rows have no accounting
+    # meaning and only retain storage.  Formal artifact replay deliberately
+    # uses the eager path, so restricting this compaction to the compiled path
+    # made its state grow by one inert cohort row per session.  The helper is a
+    # no-op for any state that still participates in autograd and its stable
+    # packing preserves every active FIFO row and claim in chronological order.
+    state = _compact_detached_carry_state(state)
     compile_paths = _carry_path_compile_enabled(weights)
     if compile_paths:
-        state = _compact_detached_carry_state(state)
         # Every session appends exactly one acquisition row. Temporarily pad
         # each input to K-1 so every FIFO core in this truncated-BPTT call sees
         # the same power-of-two K; remove only those inert middle rows after it.
@@ -1638,7 +1759,19 @@ def run_day_trade_carry_sessions(
         curves.append(curve)
         holdings.append(state.inventory.shares)
         exposure.append(torch.where(state.alive,
-            state.inventory.shares * torch.nan_to_num(session.marks[:, -1], nan=0)
+            state.inventory.shares * torch.nan_to_num(
+                (
+                    torch.where(
+                        torch.isfinite(session.terminal_liquidation_price)
+                        & (session.terminal_liquidation_price > 0),
+                        session.terminal_liquidation_price,
+                        session.marks[:, -1],
+                    )
+                    if session.terminal_liquidation_price is not None
+                    else session.marks[:, -1]
+                ),
+                nan=0,
+            )
             / state.last_nav.clamp_min(1e-30), 0))
         defaults.append(~state.alive)
     result = DayTradeCarryResult(torch.stack(returns), torch.stack(turns), torch.stack(exposure),

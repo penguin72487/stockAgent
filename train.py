@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -25,6 +25,258 @@ import torch
 
 from stockagent.config import external_panel_data_kwargs, load_config
 from stockagent.runtime_env import normalize_cuda_env
+
+
+# Every subprocess started by the training entrypoint is placed in its own
+# session.  This process remains the one terminal-facing supervisor and owns
+# the exact invocation tree until every rank/compiler/helper has exited. Without
+# this boundary, KeyboardInterrupt can unwind a subprocess.run() caller while
+# torchrun or an Inductor worker is still draining in the shared terminal
+# process group.
+_ACTIVE_CHILD_PROCESS: subprocess.Popen[object] | None = None
+_ACTIVE_CHILD_SHUTTING_DOWN = False
+_TERMINATION_SIGNAL: int | None = None
+_ACTIVE_OUTPUT_DIR: Path | None = None
+
+
+def _child_shutdown_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if value < 0.0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return value
+
+
+def _child_process_group_exists(process: subprocess.Popen[object]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A group created by this process should remain signalable.  Fail
+        # closed if an unusual runtime changes credentials underneath us.
+        return True
+    return True
+
+
+def _owned_child_process_ids(process: subprocess.Popen[object]) -> set[int]:
+    """Find descendants by the per-invocation run id inherited through exec."""
+
+    result = set()
+    if process.poll() is None:
+        result.add(int(process.pid))
+    run_id = os.environ.get("STOCKAGENT_RUN_ID")
+    if not run_id:
+        return result
+    marker = f"STOCKAGENT_RUN_ID={run_id}".encode()
+    # Nested supervisors intentionally inherit the same invocation id.  Never
+    # signal an ancestor that happens to carry it: doing so could bounce a
+    # child's Ctrl+C back into the terminal-facing parent process group.
+    ancestors = set()
+    ancestor = os.getppid()
+    while ancestor > 1 and ancestor not in ancestors:
+        ancestors.add(ancestor)
+        try:
+            stat_fields = (Path("/proc") / str(ancestor) / "stat").read_text(
+                encoding="utf-8"
+            ).rsplit(")", 1)[1].split()
+            ancestor = int(stat_fields[1])
+        except (OSError, ValueError, IndexError):
+            break
+    proc_root = Path("/proc")
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid() or pid in ancestors:
+            continue
+        try:
+            environment = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if marker in environment:
+            result.add(pid)
+    return result
+
+
+def _owned_child_tree_exists(process: subprocess.Popen[object]) -> bool:
+    return bool(_owned_child_process_ids(process)) or _child_process_group_exists(
+        process
+    )
+
+
+def _signal_owned_child_tree(
+    process: subprocess.Popen[object], signum: int
+) -> None:
+    """Signal torchrun plus rank/compiler groups carrying this run identity."""
+
+    own_group = os.getpgrp()
+    groups = {int(process.pid)}
+    individual = set()
+    for pid in _owned_child_process_ids(process):
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        if group == own_group:
+            individual.add(pid)
+        else:
+            groups.add(group)
+    for group in sorted(groups):
+        try:
+            os.killpg(group, int(signum))
+        except ProcessLookupError:
+            continue
+    for pid in sorted(individual):
+        try:
+            os.kill(pid, int(signum))
+        except ProcessLookupError:
+            continue
+
+
+def _wait_owned_child_tree(
+    process: subprocess.Popen[object], timeout: float
+) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while _owned_child_tree_exists(process):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    # Reap the direct launcher even if its /proc entry vanished from the run-id
+    # scan first. Popen.wait is immediate after poll reports completion.
+    try:
+        process.wait(timeout=0.0)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _reap_owned_child_tree(
+    process: subprocess.Popen[object], *, initial_signal: int
+) -> None:
+    """Bounded INT -> TERM -> KILL shutdown for one exact invocation tree."""
+
+    global _ACTIVE_CHILD_SHUTTING_DOWN
+    _ACTIVE_CHILD_SHUTTING_DOWN = True
+    stages = (
+        (
+            int(initial_signal),
+            _child_shutdown_timeout(
+                "STOCKAGENT_CHILD_SHUTDOWN_GRACE_SECONDS", 15.0
+            ),
+        ),
+        (
+            signal.SIGTERM,
+            _child_shutdown_timeout(
+                "STOCKAGENT_CHILD_SHUTDOWN_TERM_SECONDS", 5.0
+            ),
+        ),
+    )
+    try:
+        for signum, timeout in stages:
+            if not _owned_child_tree_exists(process):
+                break
+            _signal_owned_child_tree(process, signum)
+            if _wait_owned_child_tree(process, timeout):
+                break
+        if _owned_child_tree_exists(process):
+            print(
+                "[runtime] child process tree did not drain; sending SIGKILL "
+                f"root_pid={process.pid}",
+                flush=True,
+            )
+            _signal_owned_child_tree(process, signal.SIGKILL)
+        if not _wait_owned_child_tree(process, 5.0):
+            # The session was already killed.  A remaining un-reapable leader
+            # is a kernel/provider fault and must stay visible to the caller.
+            raise RuntimeError(
+                "owned training process tree could not be reaped: "
+                f"root_pid={process.pid} remaining="
+                f"{sorted(_owned_child_process_ids(process))}"
+            )
+    finally:
+        _ACTIVE_CHILD_SHUTTING_DOWN = False
+
+
+def _run_managed_subprocess(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> subprocess.CompletedProcess[object]:
+    """Run and completely reap one isolated training process tree."""
+
+    global _ACTIVE_CHILD_PROCESS, _TERMINATION_SIGNAL
+    if _ACTIVE_CHILD_PROCESS is not None:
+        raise RuntimeError("only one managed training child may run at a time")
+    process: subprocess.Popen[object] = subprocess.Popen(
+        list(command),
+        env=None if env is None else dict(env),
+        cwd=cwd,
+        start_new_session=True,
+    )
+    _ACTIVE_CHILD_PROCESS = process
+    try:
+        returncode = process.wait()
+        # A launcher is not complete while any descendant in its owned session
+        # remains alive.  This catches helpers that outlive a successful or
+        # failed torchrun leader without touching unrelated machine jobs.
+        if _owned_child_tree_exists(process):
+            _reap_owned_child_tree(process, initial_signal=signal.SIGTERM)
+        return subprocess.CompletedProcess(list(command), returncode)
+    except BaseException:
+        requested = _TERMINATION_SIGNAL
+        if _owned_child_tree_exists(process):
+            _reap_owned_child_tree(
+                process,
+                initial_signal=(signal.SIGINT if requested is None else requested),
+            )
+        if requested is not None:
+            _mark_active_training_interrupted(requested)
+        raise
+    finally:
+        _ACTIVE_CHILD_PROCESS = None
+        _TERMINATION_SIGNAL = None
+
+
+def _mark_active_training_interrupted(signum: int) -> None:
+    """Replace a stale running receipt after the owned process tree is gone."""
+
+    root = _ACTIVE_OUTPUT_DIR
+    if root is None:
+        return
+    path = root / "progress.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("state") != "running":
+            return
+        payload["state"] = "failed"
+        payload["phase"] = "failed"
+        payload["message"] = "training interrupted; safe to resume"
+        payload["failure"] = {
+            "type": "KeyboardInterrupt" if int(signum) == signal.SIGINT else "TerminationSignal",
+            "message": f"received signal {int(signum)}; owned child process tree reaped",
+        }
+        payload["interrupted"] = True
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        temporary = path.with_name(f".{path.name}.interrupt-{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except (OSError, ValueError, TypeError):
+        # Signal cleanup must never hide the original exit status.  A child
+        # that reached its lifecycle handler already wrote the richer receipt.
+        return
 
 
 class _StartupTimingRecorder:
@@ -240,7 +492,8 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
         f"cmd={' '.join(cmd)}",
         flush=True,
     )
-    os.execvpe(sys.executable, cmd, env)
+    completed = _run_managed_subprocess(cmd, env=env)
+    raise SystemExit(int(completed.returncode))
 
 
 def _resolve_cpu_thread_count(raw: object | None) -> int | None:
@@ -439,9 +692,20 @@ def _configure_cpu_parallelism(
 
 
 def _install_graceful_termination_handlers() -> None:
-    """Let Python atexit clean Inductor workers after torchrun termination."""
+    """Forward terminal signals and let Python/torchrun clean every worker."""
 
     def _handle_termination(signum, _frame) -> None:
+        global _TERMINATION_SIGNAL
+        _TERMINATION_SIGNAL = int(signum)
+        child = _ACTIVE_CHILD_PROCESS
+        if child is not None:
+            # First Ctrl+C asks torchrun/ranks to unwind through Python and
+            # atexit. A second Ctrl+C during the bounded grace period forces
+            # the exact owned process tree down immediately.
+            forwarded = signal.SIGKILL if _ACTIVE_CHILD_SHUTTING_DOWN else signum
+            _signal_owned_child_tree(child, forwarded)
+            if _ACTIVE_CHILD_SHUTTING_DOWN:
+                return
         print(
             f"[runtime] received signal {signum}; exiting through atexit so "
             "TorchInductor/DDP workers are cleaned up",
@@ -536,6 +800,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_availability_indicators": config.data.feature_availability_indicators,
         "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
@@ -709,10 +974,9 @@ def _run_isolated_train_fold_processes(
             flush=True,
         )
         failure_before = _isolated_futures_failure_receipts(output_dir)
-        completed = subprocess.run(
+        completed = _run_managed_subprocess(
             _isolated_fold_command(argv, fold_id=fold_id),
             env=child_env,
-            check=False,
         )
         if completed.returncode != 0:
             details = _isolated_futures_failure_detail(output_dir, failure_before)
@@ -772,10 +1036,9 @@ def _run_isolated_post_train_inference(*, argv: Sequence[str]) -> None:
         "all isolated folds completed...",
         flush=True,
     )
-    completed = subprocess.run(
+    completed = _run_managed_subprocess(
         _isolated_inference_command(argv),
         env=_isolated_child_environment(),
-        check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -1126,10 +1389,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global _ACTIVE_OUTPUT_DIR
     startup_timing = _StartupTimingRecorder()
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    configured_output_dir = getattr(config.runner, "output_dir", None)
+    _ACTIVE_OUTPUT_DIR = (
+        None
+        if configured_output_dir is None
+        else Path(configured_output_dir).resolve()
+    )
+    # The outer launcher must own SIGINT before it starts an isolated fold or
+    # the torchrun supervisor.  Rank processes install the same handler after
+    # relaunch and unwind their own DDP/Inductor resources through atexit.
+    _install_graceful_termination_handlers()
     if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute":
         from stockagent.data.tw_stock_futures_minute import (
             preflight_futures_minute_training, validate_futures_minute_data,
@@ -1183,7 +1457,6 @@ def main() -> None:
             raise SystemExit(str(exc)) from exc
     if not args.check_data_only:
         _maybe_relaunch_for_ddp(config, args)
-    _install_graceful_termination_handlers()
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = "none" if args.check_data_only else (cli_strategy or config_strategy)
@@ -1618,7 +1891,10 @@ def main() -> None:
                 return build_prepared_day_trade_carry_source(
                     panel=panel,
                     minute_root=config.data.day_trade_minute_execution_root,
-                    public_feature_path=config.data.tw_public_feature_path,
+                    public_feature_path=(
+                        config.data.day_trade_physical_public_feature_path
+                        or config.data.tw_public_feature_path
+                    ),
                     cache_dir=config.data.day_trade_minute_execution_cache_dir,
                     allow_daily_proxy=(
                         config.data.day_trade_minute_execution_allow_daily_proxy
@@ -1627,6 +1903,14 @@ def main() -> None:
                         config.data.day_trade_minute_execution_daily_proxy_price_policy
                     ),
                     corporate_action_mode=config.trading.tw_corporate_action_mode,
+                    terminal_liquidation_unlimited_capacity=(
+                        config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+                    ),
+                    sparse_event_slots=(
+                        config.training.day_trade_sparse_event_slots
+                        if config.training.day_trade_sparse_events
+                        else None
+                    ),
                 )
 
             if _distributed_ready() and _distributed_world_size() > 1:
