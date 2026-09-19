@@ -144,3 +144,33 @@ def test_source_changed_during_final_verification_is_kept(
     assert source.is_dir()
     assert result["evicted"] == 0
     assert result["rows"][0]["reason"] == "source-changed-during-verification"
+
+
+def test_hot_transport_blocks_source_only_eviction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    source = artifact_root / "ablations" / "suite" / "complete"
+    source.mkdir(parents=True)
+    (source / "progress.json").write_text(
+        json.dumps({"state": "complete", "phase": "complete"}), encoding="utf-8"
+    )
+    hot_root = tmp_path / "hot"
+    hot_root.mkdir()
+    monkeypatch.setattr(maintenance, "_release_matches_source", lambda *args: _Resolved())
+    monkeypatch.setattr(maintenance, "artifact_process_references", lambda *args: [])
+    old_ns = time.time_ns() - 8 * 86_400 * 1_000_000_000
+    monkeypatch.setattr(maintenance, "newest_activity_ns", lambda path: old_ns)
+
+    result = maintain_completed_artifacts(
+        artifact_root,
+        tmp_path / "packed",
+        tmp_path / "state",
+        live_sync_root=hot_root,
+        apply=True,
+        peer_converged=lambda: {"ok": True},
+    )
+
+    assert source.is_dir()
+    assert result["evicted"] == 0
+    assert result["rows"][0]["reason"] == "hot-transport-retirement-required"

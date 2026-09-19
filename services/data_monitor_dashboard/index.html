@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=10">
+  <link rel="stylesheet" href="styles.css?v=15">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
@@ -43,7 +43,40 @@
       <article class="unable"><span>無法完成</span><strong id="unable-items">—</strong><small>缺管線、阻擋或完整性失敗</small></article>
       <article class="deferred"><span>已延後／未啟用</span><strong id="deferred-items">—</strong><small>保留登錄，但不冒充已完成</small></article>
       <article class="control"><span>設定／憑證閘門</span><strong id="control-items">—</strong><small id="control-detail">不進入資料完成率</small></article>
-      <article><span>已知資料列</span><strong id="known-rows">—</strong><small>只加總不重複的群組回執</small></article>
+      <article><span>實體資料集筆數核實</span><strong id="verified-inventory">—</strong><small id="inventory-detail">檢查實存 Parquet；衍生視圖不重複計入群組總筆數</small></article>
+    </section>
+
+    <section class="section-block" aria-labelledby="category-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">MARKET DATA INVENTORY</p>
+          <h2 id="category-title">依市場清點資料</h2>
+        </div>
+        <p>點選分類可檢視來源。核實數指實存檔案筆數已驗證；時間界限、歷史完整與當時可用性分開判定。</p>
+      </div>
+      <div id="category-grid" class="category-grid" aria-label="市場分類清冊"></div>
+    </section>
+
+    <section class="section-block acquisition" aria-labelledby="acquisition-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">TW OFFICIAL ACQUISITION</p>
+          <h2 id="acquisition-title">臺灣公開資料擴充進度</h2>
+        </div>
+        <p>逐關顯示來源觀測、live 下載、完整批次稽核與冷庫清冊；各關卡不能互相代替。</p>
+      </div>
+      <div id="acquisition-gates" class="acquisition-gates" aria-live="polite"></div>
+      <div class="acquisition-detail">
+        <div>
+          <h3>新增開放資料</h3>
+          <div id="acquisition-datasets" class="acquisition-datasets"></div>
+        </div>
+        <div>
+          <h3>下一批驗收</h3>
+          <div id="acquisition-next" class="acquisition-next"></div>
+        </div>
+      </div>
+      <p id="acquisition-boundary" class="acquisition-boundary">讀取收據中。</p>
     </section>
 
     <section class="section-block" aria-labelledby="groups-title">
@@ -52,9 +85,33 @@
           <p class="eyebrow">PHYSICAL DATA GROUPS</p>
           <h2 id="groups-title">實體資料群組</h2>
         </div>
-        <p>這些群組對應實際註冊、發佈與更新責任；點選有詳情頁的群組可深入查看。</p>
+        <p>依台股、加密貨幣、外匯等分類；首末筆與總筆數從實存檔案驗證，不能用下載目標日期替代。</p>
       </div>
       <div id="group-grid" class="group-grid" aria-live="polite"></div>
+    </section>
+
+    <section id="feature-list" class="section-block" aria-labelledby="features-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">FIELD / FEATURE INVENTORY</p>
+          <h2 id="features-title">逐資料來源、逐欄位清冊</h2>
+        </div>
+        <p id="feature-count">載入欄位清冊中。台股相關在前，加密貨幣在最後；每個已註冊實體資料集的每個欄位獨立列出。</p>
+      </div>
+      <p class="feature-boundary">清冊範圍是已註冊的實體 Parquet 主表與獨立衍生表；未去重的原始分片、非 Parquet 檔仍在上方來源清冊，不冒充已逐欄核實。非空值筆數只採完整的 row-group null 統計；首末時間屬於整個資料集，不是該欄位的首末有效值，也不是發布／訓練可用時間。原始表、衍生表不相加。</p>
+      <form id="feature-filters" class="feature-filters" role="search">
+        <label>搜尋欄位／資料來源<input id="feature-search" type="search" placeholder="例如 twpub_、成交量、Binance" autocomplete="off"></label>
+        <label>市場分類<select id="feature-category"><option value="all">全部分類</option></select></label>
+        <label>資料來源<select id="feature-source"><option value="all">全部來源</option></select></label>
+      </form>
+      <div class="table-scroll feature-scroll" tabindex="0" role="region" aria-label="逐欄位資料清冊，可用方向鍵水平捲動">
+        <table class="feature-table">
+          <thead><tr><th>欄位／Feature</th><th>型別／角色</th><th>實際非空值</th><th>欄位所在檔案／列數</th><th>資料集首末時間</th></tr></thead>
+          <tbody id="feature-rows"></tbody>
+        </table>
+      </div>
+      <div id="feature-empty" class="empty-state" hidden>沒有符合條件的欄位，或清冊尚未完成掃描。</div>
+      <button id="feature-more" class="load-more" type="button" hidden>載入更多欄位</button>
     </section>
 
     <section id="source-list" class="section-block" aria-labelledby="sources-title">
@@ -63,7 +120,7 @@
           <p class="eyebrow">SOURCE REGISTRY</p>
           <h2 id="sources-title">逐端點發布時間、取得進度與 ETA</h2>
         </div>
-        <p><span id="result-count">—</span><br><span class="sort-contract">固定排序：未最新 → 串流 → 完成 → 無法完成 → 延後 → 設定 → 清冊參照</span></p>
+        <p><span id="result-count">—</span><br><span class="sort-contract">先依市場與資料來源分類（台股在前、加密貨幣在後）；分類內：未最新 → 串流 → 完成 → 無法完成 → 延後 → 設定 → 清冊參照</span></p>
       </div>
 
       <form id="filters" class="filters" role="search">
@@ -72,6 +129,9 @@
         </label>
         <label>供應商
           <select id="provider-filter"><option value="all">全部供應商</option></select>
+        </label>
+        <label>市場分類
+          <select id="category-filter"><option value="all">全部分類</option></select>
         </label>
         <label>狀態
           <select id="status-filter">
@@ -83,6 +143,16 @@
             <option value="deferred">已延後／未啟用</option>
             <option value="control">設定／憑證閘門</option>
             <option value="reference">清冊參照／不重複計算</option>
+          </select>
+        </label>
+        <label>實存核實
+          <select id="inventory-filter">
+            <option value="all">全部核實狀態</option>
+            <option value="verified">筆數已核實</option>
+            <option value="invalid">檔案異常</option>
+            <option value="unverified">未核實／未收錄</option>
+            <option value="empty">尚無實存檔案</option>
+            <option value="not_applicable">不適用</option>
           </select>
         </label>
         <label>粒度
@@ -98,6 +168,7 @@
             <option value="all">全部項目</option>
             <option value="storage_group">只看資料群組</option>
             <option value="logical_source">只看逐來源</option>
+            <option value="physical_inventory">只看實體資料表</option>
             <option value="product_granularity">只看產品 × 粒度</option>
             <option value="credential_gate">只看 API 憑證</option>
             <option value="crypto_fact_family">只看加密唯一事實</option>
@@ -114,7 +185,7 @@
               <th>取得進度</th>
               <th>發布／偵測／下次取得</th>
               <th>預估完成</th>
-              <th>最近驗證／資料截至</th>
+              <th>實存最早／最新／總筆數</th>
               <th>責任／證據</th>
             </tr>
           </thead>
@@ -134,8 +205,8 @@
     </aside>
   </main>
 
-  <footer>StockAgent 全資料監控 · 台北時間 · 每 10 秒讀取最新回執</footer>
+  <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
   <script src="../dashboard-core.js?v=8" defer></script>
-  <script src="app.js?v=21" defer></script>
+  <script src="app.js?v=32" defer></script>
 </body>
 </html>

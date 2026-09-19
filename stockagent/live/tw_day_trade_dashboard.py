@@ -117,9 +117,9 @@ _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
-_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 1
+_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 2
 _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
-_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 2
+_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 3
 _HISTORY_SESSION_PROJECTION_MAX_COMPRESSED_BYTES: Final[int] = 4 * 1024 * 1024
 _HISTORY_SESSION_REBUILD_LIMIT: Final[int] = 8
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
@@ -2335,7 +2335,7 @@ def _history_session_projection_root(state_dir: Path) -> Path | None:
     if not root.is_dir():
         return None
     digest = hashlib.sha256(str(Path(state_dir).resolve()).encode("utf-8")).hexdigest()
-    return root / f"history-session-projection-v2-{digest}"
+    return root / f"history-session-projection-v3-{digest}"
 
 
 def _history_session_head(state_dir: Path) -> dict[str, Any] | None:
@@ -3447,6 +3447,33 @@ def _rebase_live_benchmark(
         if row.get("origin_entry_price") is not None
         else row.get("entry_price")
     )
+    if (
+        row.get("origin_entry_price") is None
+        and str(row.get("instrument_type") or "") == "continuous_long_future"
+        and int(row.get("benchmark_accounting_contract_version") or 0) >= 2
+        and int(row.get("roll_count") or 0) > 0
+        and observed_at == expected_at
+        and expected_price is not None
+    ):
+        # Older rolled TX ledger rows retained the immutable origin timestamp
+        # and capital, but wrote only the *new contract's* entry_price. Recover
+        # origin identity from the audited 1x notional; never equate the new
+        # contract price with the original buy-and-hold entry.
+        origin_multiplier = _finite_float(origin.get("gross_pnl_multiplier"))
+        observed_capital = _finite_float(row.get("initial_capital_twd"))
+        if (
+            origin_multiplier is not None
+            and origin_multiplier > 0.0
+            and observed_capital is not None
+            and math.isclose(
+                observed_capital,
+                expected_price * origin_multiplier,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            observed_price = expected_price
+            row["benchmark_origin_identity_source"] = "retained_origin_capital_after_roll"
     if observed_price is None and observed_at == expected_at:
         # Schema-3 benchmark marks retained entry_at but not entry_price.  The
         # audited live origin supplies that immutable value after identity is
@@ -7248,6 +7275,7 @@ def build_dashboard_snapshot(
         "ledger_integrity": status.get("ledger_integrity") or {},
         "simulation_only": True,
         "production_order_possible": False,
+        "execution_evidence": "local_paper_not_shioaji_order_api",
         "session_date": selected_session_date,
         "available_session_dates": available_session_dates,
         "schedule": status.get("schedule") or {},
@@ -7261,6 +7289,9 @@ def build_dashboard_snapshot(
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
+        # The public compact status omits position rows for latency. An empty
+        # positions array here is not evidence that the full lifecycle is empty.
+        "position_rows_included": bool(include_position_rows),
         "positions": positions if include_position_rows else [],
         "signals": signals,
         "orders": orders,
@@ -7286,7 +7317,7 @@ def build_dashboard_snapshot(
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
             "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the source-backed right-labelled 09:01 minute price (VWAP, otherwise that KBar's Close). It is explicitly counterfactual and is not a live quote or real order fill",
-            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline uses the source-backed 09:01 minute price; missing ticks alone do not block, but a missing minute bar is blocked without open-price fill, carried last-price, or adverse-tick substitution",
+            "entry_fill": "local paper execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline uses the source-backed 09:01 minute price; missing ticks alone do not block, but a missing minute bar is blocked without open-price fill, carried last-price, or adverse-tick substitution. This is not a Shioaji simulation order or StockDeal receipt",
             "latency": "opening telemetry separates 09:00 scheduler wake, local quote callback coverage, quote-service queue/provider/serialization, feature preparation, model lock/inference, atomic signal publication, consumer discovery, and ledger persistence; local callback receipt is not exchange matching time, order acknowledgement, or venue round-trip latency",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",

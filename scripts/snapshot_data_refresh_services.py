@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     _refresh_service_states,
+    build_data_monitor_feature_inventory,
     build_data_monitor_public_status,
 )
 
@@ -33,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         "--public-status-output",
         type=Path,
         default=Path("artifacts/live/data_monitor/public_status.json"),
+    )
+    parser.add_argument(
+        "--feature-inventory-output",
+        type=Path,
+        default=Path("artifacts/live/data_monitor/feature_inventory.json"),
     )
     return parser.parse_args()
 
@@ -59,6 +65,35 @@ def _atomic_json(
         temporary.unlink(missing_ok=True)
 
 
+def _current_feature_snapshot(path: Path) -> dict[str, object] | None:
+    """Reuse field statistics until a physical footer or its definition changes."""
+
+    dependencies = (
+        REPO_ROOT / "artifacts/live/data_monitor/record_inventory_cache.json",
+        REPO_ROOT / "stockagent/live/data_monitor_inventory.py",
+        REPO_ROOT / "stockagent/live/data_monitor_dashboard.py",
+        REPO_ROOT / "configs/data_sync/packed_datasets.json",
+        REPO_ROOT / "data_tw_public/dataset_manifest.json",
+        Path(__file__),
+    )
+    try:
+        snapshot_mtime = path.stat().st_mtime_ns
+        if any(dependency.stat().st_mtime_ns > snapshot_mtime for dependency in dependencies if dependency.exists()):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and payload.get("read_only") is True
+            and payload.get("production_control_possible") is False
+            and isinstance(payload.get("rows"), list)
+        ):
+            return payload
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return None
+
+
 def main() -> int:
     args = parse_args()
     output = args.output if args.output.is_absolute() else REPO_ROOT / args.output
@@ -66,6 +101,11 @@ def main() -> int:
         args.public_status_output
         if args.public_status_output.is_absolute()
         else REPO_ROOT / args.public_status_output
+    )
+    feature_inventory_output = (
+        args.feature_inventory_output
+        if args.feature_inventory_output.is_absolute()
+        else REPO_ROOT / args.feature_inventory_output
     )
     observed = datetime.now(UTC)
     services = _refresh_service_states(now=observed)
@@ -87,16 +127,24 @@ def main() -> int:
         REPO_ROOT,
         now=observed,
         refresh_services=services,
+        refresh_inventory=True,
     )
     # This snapshot is rebuilt and read every 30 seconds.  Compact encoding
     # lowers both atomic-write traffic and the request-path read without
     # changing any public fields; the small service-state receipt remains
     # indented for operator inspection.
     _atomic_json(public_status_output, public_status, compact=True)
+    feature_inventory = _current_feature_snapshot(feature_inventory_output)
+    if feature_inventory is None:
+        feature_inventory = build_data_monitor_feature_inventory(
+            REPO_ROOT, monitor_status=public_status
+        )
+        _atomic_json(feature_inventory_output, feature_inventory, compact=True)
     print(
         f"[data-refresh-status] services={len(services)} output={output} "
         f"public_status={public_status_output} "
         f"sources={len(public_status.get('sources') or ())}",
+        f"features={len(feature_inventory.get('rows') or ())}",
         flush=True,
     )
     return 0

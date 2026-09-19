@@ -135,6 +135,23 @@ def test_deal_before_ack_duplicates_and_restart_are_idempotent(tmp_path):
     journal.close()
 
 
+def test_broker_simulation_uses_reported_deals_without_local_capacity_limit(journal):
+    # Shioaji simulation owns fill decisions. Local L1 depth and completed-minute
+    # volume are deliberately absent from the broker order/receipt contract.
+    large = intent(shares=200_000)
+    row = claim(journal, large)
+    assert journal.stock_deal(deal(row["tag"], quantity=1), received_at=NOW)
+    assert journal.status()["orders"][0]["filled_shares"] == 1_000
+    assert journal.status()["orders"][0]["state"] == "partially_filled"
+    assert journal.stock_deal(
+        deal(row["tag"], quantity=199, exchange_seq="2"), received_at=NOW
+    )
+    assert journal.status()["orders"][0]["filled_shares"] == 200_000
+    assert journal.status()["orders"][0]["state"] == "filled"
+    assert sum(receipt["shares"] for receipt in journal.receipts()) == 200_000
+    assert all(receipt["broker_confirmed"] for receipt in journal.receipts())
+
+
 def test_unknown_submission_blocks_same_key_and_disguised_retry_across_restart(tmp_path):
     path = tmp_path / "sim.sqlite"
     journal = StockSimulationJournal(path, account_key=ACCOUNT)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
 import json
 from pathlib import Path
+from urllib.error import HTTPError
 
 import polars as pl
 import pytest
@@ -135,6 +137,40 @@ def test_progress_can_publish_external_block_without_fabricating_completion(
     assert payload["state"] == "blocked"
     assert payload["current"] == 1
     assert payload["ratio"] == 0.1
+
+
+def test_dune_subscription_tier_error_is_a_non_retryable_global_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = HTTPError(
+        "https://api.dune.com/api/v1/sql/execute",
+        400,
+        "Bad Request",
+        {},
+        BytesIO(
+            b'{"error":"This performance tier is not available with your '
+            b'subscription. Please upgrade your subscription plan"}'
+        ),
+    )
+    calls = 0
+
+    def fail_once(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(dune, "urlopen", fail_once)
+    client = dune.DuneClient(
+        "not-a-real-key",
+        max_retries=5,
+        retry_base=0.1,
+        poll_seconds=1,
+        page_size=100,
+    )
+
+    with pytest.raises(dune.DuneSubscriptionBlocked, match="subscription"):
+        client.execute("select 1", "small")
+    assert calls == 1
 
 
 def test_generic_public_context_cannot_reenable_non_selected_exchanges() -> None:

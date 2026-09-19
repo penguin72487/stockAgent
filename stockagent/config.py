@@ -1472,15 +1472,24 @@ class DataConfig:
     tw_public_feature_path: str = (
         "data_tw_public/features/tw_public_stock_daily.parquet"
     )
+    # Physical FIFO may need the canonical public archive even when model
+    # inputs come from a separate, research-only feature table.
+    day_trade_physical_public_feature_path: str | None = None
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
     feature_zero_fill: list[str] = field(default_factory=list)
+    # Opt-in availability channels preserve the distinction between a real
+    # zero and a value that was never observed for this symbol/session.
+    feature_availability_indicators: list[str] = field(default_factory=list)
     # Explicitly append the open[t]/close[t-1] execution-context feature.  It
     # is valid only for tw_day_trade and is never part of the default schema.
     day_trade_open_feature: bool = False
     # Receipt-verified 13:25 prices, appended after the immutable daily cache.
     overnight_1325_root: str | None = None
+    # Completed right-labelled intraday bar used for the close-auction decision.
+    # 13:25 is the legacy default; every non-default clock is checkpoint-bound.
+    overnight_decision_time: str = "13:25"
     # Explicit research exception: current close is not available at 13:25.
     overnight_1325_missing_price_policy: str = "reject"
     # Research-only 08:45 all-futures clock.  The same daily TAIFEX OPEN is
@@ -1501,6 +1510,9 @@ class DataConfig:
     # session-t decision.  Panel construction exposes that value on the next
     # panel session while preserving the source's original dated archive.
     feature_shift_next_session: list[str] = field(default_factory=list)
+    # Earliest information cutoff for TW public model inputs. This describes
+    # feature availability, not an assumed executable fill price.
+    tw_public_feature_cutoff: str = "regular_close"
     # Explicit research-only opt-in for using final session-t aggregates in a
     # model that approximates execution at that same close.
     allow_same_close_feature_approximation: bool = False
@@ -1591,6 +1603,7 @@ def external_panel_data_kwargs(data: DataConfig) -> dict[str, object]:
         "external_include_rules": tw_rules,
         "external_data_required": generic or tw_data,
         **({"overnight_1325_root": data.overnight_1325_root,
+            "overnight_decision_time": data.overnight_decision_time,
             "overnight_1325_missing_price_policy": data.overnight_1325_missing_price_policy}
            if data.overnight_1325_root else {}),
     }
@@ -3702,6 +3715,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
+    raw_physical_public_path = data["day_trade_physical_public_feature_path"]
+    data["day_trade_physical_public_feature_path"] = (
+        None
+        if raw_physical_public_path is None or not str(raw_physical_public_path).strip()
+        else str(raw_physical_public_path).strip()
+    )
     tw_public_market_symbol_default = _dataclass_default_values(DataConfig)[
         "tw_public_market_symbol"
     ]
@@ -3763,13 +3782,31 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["feature_zero_fill"] = _normalize_string_list(
         data["feature_zero_fill"], field_name="data.feature_zero_fill"
     )
+    data["feature_availability_indicators"] = _normalize_string_list(
+        data["feature_availability_indicators"],
+        field_name="data.feature_availability_indicators",
+    )
     data["feature_shift_next_session"] = _normalize_string_list(
         data["feature_shift_next_session"],
         field_name="data.feature_shift_next_session",
     )
+    data["tw_public_feature_cutoff"] = str(
+        data["tw_public_feature_cutoff"]
+    ).strip().lower()
+    if data["tw_public_feature_cutoff"] not in {"regular_close", "preopen_0900"}:
+        raise ValueError(
+            "data.tw_public_feature_cutoff must be regular_close or preopen_0900"
+        )
     data["allow_same_close_feature_approximation"] = bool(
         data["allow_same_close_feature_approximation"]
     )
+    if (
+        data["tw_public_feature_cutoff"] == "preopen_0900"
+        and data["allow_same_close_feature_approximation"]
+    ):
+        raise ValueError(
+            "preopen_0900 inputs cannot opt into same-close feature approximation"
+        )
     plot_backend = str(training["plot_backend"]).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
@@ -3975,13 +4012,21 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if overnight_missing_policy not in {"reject", "same_session_close"}:
         raise ValueError("overnight_1325_missing_price_policy must be reject or same_session_close")
     data["overnight_1325_missing_price_policy"] = overnight_missing_policy
+    from stockagent.data.tw_overnight import normalize_overnight_decision_time
+    overnight_decision_time, _ = normalize_overnight_decision_time(
+        data["overnight_decision_time"]
+    )
+    data["overnight_decision_time"] = overnight_decision_time
     if overnight_missing_policy != "reject" and not trading["tw_overnight_fixed_close_to_open"]:
         raise ValueError("overnight close fallback requires the fixed close-to-open research contract")
     if trading["tw_overnight_fixed_close_to_open"]:
         if trading["execution_mode"] != "tw_overnight" or not data["overnight_1325_root"]:
             raise ValueError("fixed overnight requires tw_overnight and data.overnight_1325_root")
         if data["day_trade_open_feature"] or DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]:
-            raise ValueError("13:25 overnight replaces the opening-gap feature; disable day_trade_open_feature")
+            raise ValueError(
+                f"{overnight_decision_time} overnight replaces the opening-gap feature; "
+                "disable day_trade_open_feature"
+            )
         if not trading["long_only"]:
             raise ValueError("fixed overnight v1 is long-only; a borrowed-short contract is required for shorts")
         if phase_model_config["portfolio_output_mode"] != "projection_l1":
@@ -4312,6 +4357,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "non-default data.day_trade_minute_execution_policy requires "
             "data.day_trade_minute_execution_root"
+        )
+    if (
+        data["day_trade_physical_public_feature_path"] is not None
+        and not (
+            trading["execution_mode"] == "tw_day_trade"
+            and trading["tw_day_trade_unlimited_margin_conversion"]
+        )
+    ):
+        raise ValueError(
+            "data.day_trade_physical_public_feature_path requires "
+            "physical-FIFO tw_day_trade"
         )
     if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
         if trading["execution_mode"] != "tw_day_trade":

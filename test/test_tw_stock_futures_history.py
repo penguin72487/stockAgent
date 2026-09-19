@@ -15,6 +15,7 @@ from stockagent.data.tw_stock_futures_history import (
 from stockagent.data.tw_stock_futures_minute import (
     TAPE_FIELDS, HYBRID_TAPE_FIELDS, load_futures_minute_tape, validate_futures_minute_data,
 )
+from stockagent.data.tw_price_rules import TW_DERIVATIVE_PRICE_CONTRACT_VERSION
 from stockagent.training.checkpoint_contract import _trading_checkpoint_contract, _configuration_fingerprint_snapshot
 from stockagent.training.trainer import _mode_artifact_contract_for_config
 from test_tw_stock_futures_minute import tape, execute
@@ -40,6 +41,23 @@ def test_wall_clock_sort_and_full_minutes():
     bad = ticks().with_columns(pl.lit("CDFR2").alias("query_contract"))
     with pytest.raises(ValueError, match="identity"):
         normalize_continuous_ticks(bad, day=date(2020, 3, 23), alias="CDFR1", physical="CDF:202004", digest="x")
+
+
+def test_historical_futures_print_uses_its_session_tick_before_vwap():
+    before = ticks(date(2026, 7, 3)).with_columns(
+        pl.when(pl.col("source_row_index") == 0).then(pl.lit(1001.))
+        .otherwise(pl.col("close")).alias("close")
+    )
+    with pytest.raises(ValueError, match="off-grid dated"):
+        normalize_continuous_ticks(before, day=date(2026, 7, 3), alias="CDFR1",
+                                   physical="CDF:202607", digest="a" * 64)
+    after = ticks(date(2026, 7, 6)).with_columns(
+        pl.when(pl.col("source_row_index") == 0).then(pl.lit(1001.))
+        .otherwise(pl.col("close")).alias("close")
+    )
+    frame, _ = normalize_continuous_ticks(after, day=date(2026, 7, 6), alias="CDFR1",
+                                          physical="CDF:202607", digest="a" * 64)
+    assert frame.filter(pl.col("minute") == 526)["close"].item() == 1001.
 
 
 def test_historical_mapping_ignores_current_target_and_rejects_mismatched_prices(tmp_path):
@@ -171,7 +189,7 @@ def test_unaccepted_historical_minutes_stay_out_of_cold_release():
     assert "taifex_stock_futures_minute_history_v2" in entry["excluded_subtrees"]
 
 
-@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "missing_price_contract"])
 def test_cached_assembly_preserves_snapshot_and_rejects_bad_shards(tmp_path, damage):
     from types import SimpleNamespace
     from test_tw_stock_futures_day_trade import _candidate
@@ -200,6 +218,9 @@ def test_cached_assembly_preserves_snapshot_and_rejects_bad_shards(tmp_path, dam
                            workers=2, assemble_cached=False)
     digest = sha256_file(daily_path)
     assert build_continuous_history(args, source, days, digest) == 0
+    assert json.loads((args.output_dir / "manifest.json").read_text())[
+        "price_rule_contract_version"
+    ] == TW_DERIVATIVE_PRICE_CONTRACT_VERSION
     hashes = {p.name: sha256_file(p) for p in args.output_dir.iterdir()
               if p.name != "build_progress.json"}
     # Assembly freezes an already verified snapshot; normal builds refresh raw evidence.
@@ -214,8 +235,13 @@ def test_cached_assembly_preserves_snapshot_and_rejects_bad_shards(tmp_path, dam
     shard = next(args.work_dir.rglob(f"{days[1]}.parquet"))
     if damage == "missing":
         shard.unlink()
-    else:
+    elif damage == "corrupt":
         shard.write_bytes(shard.read_bytes() + b"corruption")
+    else:
+        shard_receipt = next(args.work_dir.rglob(f"{days[1]}.json"))
+        payload = json.loads(shard_receipt.read_text())
+        payload.pop("price_rule_contract_version")
+        atomic_write_json(shard_receipt, payload)
     args.assemble_cached = True
     with pytest.raises(ValueError, match="missing/corrupt dated shard"):
         build_continuous_history(args, source, days, digest)

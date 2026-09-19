@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime, time
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -31,6 +32,49 @@ from stockagent.live.market_config import load_market_config
 from stockagent.live.signal_engine import _build_panel, generate_live_signal
 from stockagent.live.tw_day_trade_simulation import TAIPEI, load_symbol_metadata
 from stockagent.live.tw_overnight_replay import TwOvernightHistoricalReplayEngine
+
+
+HISTORY_LINEAGE_CONTRACT = "tw_overnight_counterfactual_history_v2"
+
+
+def _history_lineage(
+    start_date: str,
+    markets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    identity = {
+        "contract": HISTORY_LINEAGE_CONTRACT,
+        "start_date": start_date,
+        "execution_clock": "close_entry_next_session_open_exit",
+        "markets": [
+            {
+                "market": row["market"],
+                "checkpoint_sha256": row["checkpoint_sha256"],
+                "market_config_sha256": row["market_config_sha256"],
+            }
+            for row in sorted(markets, key=lambda value: value["market"])
+        ],
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return {**identity, "fingerprint_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def configured_history_lineage(markets_dir: Path, start_date: str) -> dict[str, Any]:
+    specs, _configs, errors = _mode_specs(markets_dir)
+    if errors:
+        raise ValueError(errors)
+    markets = []
+    for spec in specs:
+        market_path = markets_dir / f"{spec.market}.yaml"
+        markets.append(
+            {
+                "market": spec.market,
+                "checkpoint_sha256": _sha256(Path(spec.checkpoint_path)),
+                "market_config_sha256": _sha256(market_path),
+            }
+        )
+    if not markets:
+        raise ValueError("No enabled overnight market is configured")
+    return _history_lineage(start_date, markets)
 
 
 def _at(day: str, hour: int, minute: int) -> datetime:
@@ -150,6 +194,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         'latest_close_cohort': 'retain_open_until_next_observed_session_open',
         'model_scope': 'existing_four_day_trade_checkpoint_adapters_not_new_overnight_training',
     }
+    plan['history_lineage'] = _history_lineage(plan['start_date'], markets)
     args.output.mkdir(parents=True, exist_ok=True)
     old = args.output / 'plan.json'
     if old.is_file():
@@ -339,10 +384,24 @@ def replay(args: argparse.Namespace, plan: dict[str, Any]) -> None:
             receipt = json.loads((args.output / 'signals' / spec.market / day / 'replay_signal.json').read_text())
             summary = json.loads(Path(receipt['summary_path']).read_text())
             signal_rows = pl.read_parquet(receipt['weights_path']).to_dicts()
-            engine.register_close_signal(
+            if not signal_rows:
+                raise ValueError(f'Historical signal has no model rows: {spec.market}/{day}')
+            outcome = engine.register_close_signal(
                 spec=spec, summary=summary, signal_rows=signal_rows,
                 quotes=quotes('price'), security_types=metadata[spec.market], now=_at(day, 13, 25),
             )
+            if outcome != 'registered':
+                mode = engine.state['modes'][spec.market]
+                reason = mode.get('blocked_reason') or outcome
+                unresolved = [
+                    f"{row.get('session_date')}:{row.get('symbol')}:{row.get('opening_exit_order_status')}"
+                    for row in (mode.get('positions') or {}).values()
+                    if int(row.get('signed_shares') or 0) != 0
+                ]
+                detail = f"; unresolved={','.join(unresolved[:10])}" if unresolved else ''
+                raise ValueError(
+                    f'Historical signal rejected: {spec.market}/{day}: {reason}{detail}'
+                )
         engine.process_quotes(quotes=quotes('close'), now=_at(day, 13, 30))
         # Expire unfilled close orders without inventing an execution price.
         engine.process_quotes(quotes=quotes('close'), now=_at(day, 13, 34), append_mark_history=False)

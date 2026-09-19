@@ -9,7 +9,28 @@ from downloader.shioaji_history_repair import record_schedule
 record_schedule(Path(sys.argv[1]), reason=sys.argv[3], seconds=int(sys.argv[2]))
 PY
   echo "[shioaji-history-runner] waiting_seconds=$delay reason=$reason"
-  if (( delay > 0 )); then sleep "$delay"; fi
+  if (( delay > 0 )); then
+    # The official futures calendar can gain today's session while this
+    # runner is idle. Poll only its file signature, not the full 770-alias
+    # inventory, and resume within a minute of that dependency changing.
+    if [[ "$reason" == next_incremental_sweep && -n "${calendar:-}" ]]; then
+      local initial_signature remaining interval current_signature
+      initial_signature="$(stat -Lc '%Y:%s' "$calendar" 2>/dev/null || true)"
+      remaining="$delay"
+      while (( remaining > 0 )); do
+        interval=$(( remaining < 60 ? remaining : 60 ))
+        sleep "$interval"
+        remaining=$(( remaining - interval ))
+        current_signature="$(stat -Lc '%Y:%s' "$calendar" 2>/dev/null || true)"
+        if [[ "$current_signature" != "$initial_signature" ]]; then
+          echo '[shioaji-history-runner] official_calendar_changed=true resuming_now'
+          break
+        fi
+      done
+    else
+      sleep "$delay"
+    fi
+  fi
 }
 
 history_protected_delay() {

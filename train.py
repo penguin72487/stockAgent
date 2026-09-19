@@ -536,6 +536,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_availability_indicators": config.data.feature_availability_indicators,
         "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
@@ -1618,7 +1619,10 @@ def main() -> None:
                 return build_prepared_day_trade_carry_source(
                     panel=panel,
                     minute_root=config.data.day_trade_minute_execution_root,
-                    public_feature_path=config.data.tw_public_feature_path,
+                    public_feature_path=(
+                        config.data.day_trade_physical_public_feature_path
+                        or config.data.tw_public_feature_path
+                    ),
                     cache_dir=config.data.day_trade_minute_execution_cache_dir,
                     allow_daily_proxy=(
                         config.data.day_trade_minute_execution_allow_daily_proxy

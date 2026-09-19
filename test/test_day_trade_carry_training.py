@@ -3,6 +3,7 @@ from dataclasses import fields, replace
 from functools import partial
 import os
 import time
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -184,6 +185,60 @@ def test_canonical_eval_retains_float64_minute_curves_and_fifo_endpoint():
     torch.testing.assert_close(actual.day_trade_carry_state.last_nav, expected.last_nav, rtol=0, atol=1e-8)
     assert actual.day_trade_carry_state.last_session_day == DAY + 5
     assert metrics
+
+
+def test_physical_eval_releases_prior_dense_chunk_before_staging_next(monkeypatch):
+    split, runtime, _ = fixture(rows=5)
+    original_bind = trainer.bind_physical_carry_backtest
+    bound_refs = []
+
+    def tracked_bind(*args, **kwargs):
+        # The bound closure owns the staged dense physical sessions.  A live
+        # previous closure here would double the peak CUDA tape allocation.
+        assert not bound_refs or bound_refs[-1]() is None
+        bound = original_bind(*args, **kwargs)
+        bound_refs.append(weakref.ref(bound))
+        return bound
+
+    monkeypatch.setattr(trainer, "bind_physical_carry_backtest", tracked_bind)
+    result, _, _ = trainer._evaluate_windowed_tensor_batch_decoupled(
+        Policy(), None, split,
+        device=torch.device("cpu"), amp_dtype=None, non_blocking=False,
+        long_only=False, buy_fee_rate=.001425, sell_fee_rate=.002925,
+        max_turnover_ratio=0., gross_leverage=1., min_trade_weight=0.,
+        model_chunk_rows=2, backtest_chunk_rows=2,
+        portfolio_activation="pre_normalized",
+        max_volume_participation=.5, volume_participation_equity=10_000_000.,
+        execution_runtime=runtime,
+    )
+    assert len(bound_refs) == 3
+    assert all(ref() is None for ref in bound_refs)
+    assert result.day_trade_carry_state.last_session_day == DAY + 5
+
+
+def test_physical_formal_replay_caps_dense_chunk_size(monkeypatch):
+    split, runtime, _ = fixture(rows=5)
+    original_ranges = trainer._eval_ranges_by_reset
+    observed_chunk_rows = []
+
+    def tracked_ranges(total_rows, chunk_rows, reset_at_rows):
+        observed_chunk_rows.append(chunk_rows)
+        return original_ranges(total_rows, chunk_rows, reset_at_rows)
+
+    monkeypatch.setattr(trainer, "_eval_ranges_by_reset", tracked_ranges)
+    result, _, _ = trainer._evaluate_windowed_tensor_batch_decoupled(
+        Policy(), None, split,
+        device=torch.device("cpu"), amp_dtype=None, non_blocking=False,
+        long_only=False, buy_fee_rate=.001425, sell_fee_rate=.002925,
+        max_turnover_ratio=0., gross_leverage=1., min_trade_weight=0.,
+        model_chunk_rows=2, backtest_chunk_rows=512,
+        return_weights_history=True,
+        portfolio_activation="pre_normalized",
+        max_volume_participation=.5, volume_participation_equity=10_000_000.,
+        execution_runtime=runtime,
+    )
+    assert observed_chunk_rows == [128]
+    assert result.minute_nav.shape == (5, 270)
 
 
 def test_physical_eval_accepts_boundary_markers_and_rejects_internal_account_reset():

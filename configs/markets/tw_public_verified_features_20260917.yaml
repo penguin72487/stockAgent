@@ -1,0 +1,49 @@
+# Research-only same-close experiment on one verified official release.
+# Only source-backed active channels are selected. Unvintaged or unregistered
+# sources remain preserved in the release but are absent from the model panel.
+base_config: tw_public.yaml
+experiment_name: tw-stock-public-verified-features-20260917
+
+runner:
+  output_dir: artifacts/markets/tw_public_verified_features_20260917
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260916T171214687367304Z-l0-penguin-028dc00cc959f551/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260916T171214687367304Z-l0-penguin-028dc00cc959f551/features/tw_public_stock_daily.parquet
+  panel_cache_root: artifacts/cache/tw_public_verified_features_20260917
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - twpub_official_close_logret_1d
+    - twpub_official_trading_volume_log
+    - twpub_official_trading_value_log
+    - twpub_official_trades_log
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
+    - twpub_margin_balance_log
+    - twpub_margin_balance_chg
+    - twpub_short_balance_log
+    - twpub_short_balance_chg
+    - twpub_margin_buy_flow
+    - twpub_margin_sell_flow
+    - twpub_short_sell_flow
+    - twpub_short_buy_flow
+    - twpub_investment_trust_net_buy_flow
+    - twpub_dealer_net_buy_flow
+  feature_exclude: []
+  feature_zero_fill: []

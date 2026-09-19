@@ -24,7 +24,9 @@ from stockagent.data_sync.desync_snapshots import (
     sha256_file,
 )
 from stockagent.data_sync.materialized_cache import process_references
-from stockagent.data_sync.packed_backup import BackupConfig, VolumeGuard, safe_path, signature
+from stockagent.data_sync.packed_backup import (
+    BackupConfig, VolumeGuard, safe_path, same_file_signature, signature,
+)
 from stockagent.data_sync.packed_snapshots import (
     _validate_manifest,
     resolve_packed_snapshot_id,
@@ -146,7 +148,9 @@ def _backup_receipt_proves(
     try:
         source_sig = list(signature(source))
         target_sig = list(signature(archive))
-        if json.loads(row[1]) != source_sig or json.loads(row[2]) != target_sig:
+        if not same_file_signature(json.loads(row[1]), tuple(source_sig)) or not same_file_signature(
+            json.loads(row[2]), tuple(target_sig)
+        ):
             return False, "backup-signature-changed"
     except (OSError, ValueError, SnapshotError):
         return False, "backup-proof-unreadable"

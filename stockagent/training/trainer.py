@@ -2267,13 +2267,20 @@ def _build_execution_runtime(
     """Resolve one immutable execution schedule for the panel symbol order."""
 
     if config.trading.tw_overnight_fixed_close_to_open:
-        from stockagent.data.tw_overnight import OVERNIGHT_1325_FEATURE
+        from stockagent.data.tw_overnight import overnight_decision_feature
+        decision_time = config.data.overnight_decision_time
+        feature_name = overnight_decision_feature(decision_time)
         if (panel.overnight_1325_available is None
-                or OVERNIGHT_1325_FEATURE not in panel.feature_names):
-            raise ValueError("fixed overnight training requires verified 13:25 panel context")
+                or panel.overnight_decision_prices is None
+                or feature_name not in panel.feature_names):
+            raise ValueError(
+                f"fixed overnight training requires verified {decision_time} panel context"
+            )
         fallback_enabled = config.data.overnight_1325_missing_price_policy == "same_session_close"
         if fallback_enabled != (panel.overnight_1325_close_fallback_mask is not None):
-            raise ValueError("13:25 prepared-panel fallback policy disagrees with training config")
+            raise ValueError(
+                f"{decision_time} prepared-panel fallback policy disagrees with training config"
+            )
     mode = normalize_execution_mode(config.trading.execution_mode)
     lag = int(config.trading.tw_settlement_lag_sessions)
     if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
@@ -2601,6 +2608,7 @@ def _integer_execution_runtime_kwargs(
     can_short_open_open_mask: np.ndarray | None = None,
     short_capacity_shares: np.ndarray | None = None,
     short_margin_rate: np.ndarray | None = None,
+    overnight_decision_prices: np.ndarray | None = None,
     symbol_indices: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Bridge the differentiable runtime schedule into the exact CPU oracle."""
@@ -2643,6 +2651,14 @@ def _integer_execution_runtime_kwargs(
         or runtime.integer_commission_rebate_rates is None
     ):
         raise RuntimeError(f"{runtime.mode} integer audit schedule is incomplete")
+    if (
+        runtime.mode == "tw_overnight"
+        and runtime.overnight_fixed_close_to_open
+        and overnight_decision_prices is None
+    ):
+        raise RuntimeError(
+            "fixed overnight integer audit requires decision-time sizing prices"
+        )
     kwargs.update(
         buy_fee_rates=np.asarray(runtime.integer_buy_fee_rates, dtype=np.float64),
         sell_fee_rates=np.asarray(runtime.integer_sell_fee_rates, dtype=np.float64),
@@ -2721,6 +2737,12 @@ def _integer_execution_runtime_kwargs(
             short_maintenance_ratio=runtime.short_maintenance_ratio,
             short_handling_fee_rate=runtime.short_handling_fee_rate,
             overnight_fixed_close_to_open=runtime.overnight_fixed_close_to_open,
+            overnight_decision_prices=(
+                overnight_decision_prices
+                if runtime.mode == "tw_overnight"
+                and runtime.overnight_fixed_close_to_open
+                else None
+            ),
         )
     return kwargs
 
@@ -2855,27 +2877,42 @@ def _mode_artifact_contract_for_config(
     if mode == "tw_overnight" and bool(
         getattr(config.trading, "tw_overnight_fixed_close_to_open", False)
     ):
+        from stockagent.data.tw_overnight import (
+            normalize_overnight_decision_time,
+            overnight_close_fallback_caveat,
+        )
+        decision_time, _ = normalize_overnight_decision_time(
+            config.data.overnight_decision_time
+        )
+        decision_tag = decision_time.replace(":", "")
         payload.update(
-            decision_clock="1325_completed_minute_close_plus_prior_completed_daily_features",
+            decision_clock=(
+                f"{decision_tag}_completed_minute_close_plus_prior_completed_daily_features"
+            ),
             execution_clock="same_session_close_then_next_session_open_auctions",
             terminal_policy="mandatory_next_open_or_absorbing_failure; no_new_cohort_at_split_final_close",
             weight_snapshot_contract="post_close_cohort_notional_over_nav",
             turnover_contract="gross_close_entry_plus_next_open_exit_notional_over_daily_open_nav",
-            mode_details={"overnight_contract_version": 1,
-                          "auction_liquidity": "historical_price_reference_not_queue_fill_proof",
-                          "order_sizing": "auction_price_target_weight_research_approximation",
-                          "settlement": "t_plus_2_session_open_carrying_account",
-                          "bankruptcy_reporting": "zero_nav_retained_log_risk_underflow_floor_v1",
-                          "overnight_1325_root": config.data.overnight_1325_root},
+            mode_details={
+                "overnight_contract_version": 1 if decision_time == "13:25" else 3,
+                "auction_liquidity": "historical_price_reference_not_queue_fill_proof",
+                "order_sizing": "decision_price_fixed_board_lots_exact_integer_audit",
+                "training_surrogate": "close_auction_target_weight_continuous_ledger",
+                "settlement": "t_plus_2_session_open_carrying_account",
+                "bankruptcy_reporting": "zero_nav_retained_log_risk_underflow_floor_v1",
+                "overnight_1325_root": config.data.overnight_1325_root,
+                **({} if decision_time == "13:25" else {"decision_time": decision_time}),
+            },
         )
         if config.data.overnight_1325_missing_price_policy == "same_session_close":
-            from stockagent.data.tw_overnight import OVERNIGHT_CLOSE_FALLBACK_CAVEAT
-            payload["decision_clock"] = "1325_or_same_session_final_close_research_approximation"
+            payload["decision_clock"] = (
+                f"{decision_tag}_or_same_session_final_close_research_approximation"
+            )
             payload["mode_details"].update(
-                overnight_contract_version=2,
-                missing_1325_input="same_session_close",
+                overnight_contract_version=2 if decision_time == "13:25" else 3,
+                **{f"missing_{decision_tag}_input": "same_session_close"},
                 timing_assumption="user_authorized_same_close_lookahead_approximation",
-                caveat=OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
+                caveat=overnight_close_fallback_caveat(decision_time),
             )
     if mode == "tw_stock_futures_day_trade_0845_minute":
         cutoff = config.trading.tw_stock_futures_day_trade_daily_proxy_before
@@ -3158,6 +3195,23 @@ def _active_panel_execution_rows(
         ),
         symbols,
     )
+
+
+def _active_panel_overnight_decision_price_rows(
+    panel: PanelData,
+    date_indices: np.ndarray,
+    symbol_indices: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Slice prices that fixed the pre-close overnight order quantities."""
+
+    values = panel.overnight_decision_prices
+    if values is None:
+        return None
+    rows = np.asarray(date_indices, dtype=np.int64)
+    selected = np.asarray(values, dtype=np.float64)[rows]
+    if symbol_indices is None:
+        return selected
+    return selected[:, np.asarray(symbol_indices, dtype=np.int64)]
 
 
 def _active_panel_short_contract_rows(
@@ -14662,6 +14716,11 @@ def _run_eval_backtest_from_weight_buffers(
         )
 
     backtest_chunk_rows = max(1, int(backtest_chunk_rows))
+    if physical_source is not None and return_weights_history:
+        # A formal physical replay materializes all 270 FP64 minute marks and
+        # buy/sell price/capacity planes.  Bound its peak independently of the
+        # much lighter repeated-epoch two-mark evaluation.
+        backtest_chunk_rows = min(backtest_chunk_rows, 128)
     backtest_ranges = _eval_ranges_by_reset(total_rows, backtest_chunk_rows, reset_at_rows)
     total_backtest_chunks = max(1, len(backtest_ranges))
     output_dtype = (torch.float64 if physical_source is not None
@@ -15501,6 +15560,11 @@ def _run_eval_backtest_from_weight_buffers(
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
         timing.backtest_s += time.perf_counter() - backtest_start
+
+        # The physical adapter closes over this chunk's dense minute tape.
+        # Release it before staging the next chunk so two multi-GiB tapes do
+        # not overlap at the allocation peak of a long final-test replay.
+        del backtest_runner, backtest_chunk
 
     backtest = BacktestResultTensor(
         day_trade_carry_state=physical_previous,
@@ -17630,6 +17694,11 @@ def _replay_taiwan_stitched_deployment(
                 state_advance_mask=np.ones(stitched_dates.size, dtype=np.bool_),
                 short_capacity_shares=stitched_short_capacity_shares,
                 short_margin_rate=stitched_short_margin_rate,
+                overnight_decision_prices=(
+                    _active_panel_overnight_decision_price_rows(
+                        panel, panel_rows
+                    )
+                ),
             ),
         )
 
@@ -21654,6 +21723,11 @@ def _run_training_tree_models(
                     state_advance_mask=test_state_advance.detach().cpu().numpy(),
                     short_capacity_shares=test_integer_short_capacity_shares,
                     short_margin_rate=test_integer_short_margin_rate,
+                    overnight_decision_prices=(
+                        _active_panel_overnight_decision_price_rows(
+                            panel, test_eval_indices
+                        )
+                    ),
                 ),
             )
             test_integer_met = (
@@ -21847,7 +21921,11 @@ def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
         "feature_names": [str(name) for name in panel.feature_names],
     }
     if panel.overnight_1325_available is not None:
-        identity["overnight_1325"] = {
+        source = panel.overnight_1325_source or {}
+        decision_time = str(source.get("decision_time", "13:25"))
+        decision_tag = decision_time.replace(":", "")
+        identity_key = f"overnight_{decision_tag}"
+        identity[identity_key] = {
             "source": panel.overnight_1325_source,
             "available_symbol_sessions": int(np.count_nonzero(panel.overnight_1325_available)),
             "missing_symbol_sessions": int(np.count_nonzero(~panel.overnight_1325_available[1:])),
@@ -21855,16 +21933,18 @@ def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
         }
         fallback = panel.overnight_1325_close_fallback_mask
         if fallback is not None:
-            from stockagent.data.tw_overnight import OVERNIGHT_CLOSE_FALLBACK_CAVEAT
-            identity["overnight_1325"].update(
+            from stockagent.data.tw_overnight import overnight_close_fallback_caveat
+            identity[identity_key].update(
                 missing_price_policy="same_session_close",
-                observed_1325_symbol_sessions=int(np.count_nonzero(panel.overnight_1325_available & ~fallback)),
+                **{f"observed_{decision_tag}_symbol_sessions": int(np.count_nonzero(
+                    panel.overnight_1325_available & ~fallback
+                ))},
                 close_fallback_symbol_sessions=int(np.count_nonzero(fallback)),
                 close_fallback_sessions=int(np.count_nonzero(np.any(fallback, axis=1))),
                 close_fallback_by_year={str(year): int(np.count_nonzero(fallback[
                     np.asarray(panel.dates, dtype="datetime64[Y]") == year]))
                     for year in np.unique(np.asarray(panel.dates, dtype="datetime64[Y]"))},
-                caveat=OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
+                caveat=overnight_close_fallback_caveat(decision_time),
             )
     return identity
 
@@ -22428,6 +22508,11 @@ def _run_inference_tree_models(
                 state_advance_mask=test_state_advance.detach().cpu().numpy(),
                 short_capacity_shares=test_integer_short_capacity_shares,
                 short_margin_rate=test_integer_short_margin_rate,
+                overnight_decision_prices=(
+                    _active_panel_overnight_decision_price_rows(
+                        panel, test_eval_indices
+                    )
+                ),
             ),
         )
         test_integer_met = (
@@ -23104,6 +23189,13 @@ def _run_inference_neural_models(
                 ),
                 short_capacity_shares=test_integer_short_capacity_shares,
                 short_margin_rate=test_integer_short_margin_rate,
+                overnight_decision_prices=(
+                    _active_panel_overnight_decision_price_rows(
+                        fold_panel,
+                        test_eval_indices,
+                        test_symbol_indices,
+                    )
+                ),
                 symbol_indices=test_symbol_indices,
             ),
         )
@@ -26524,6 +26616,13 @@ def _run_training_impl(
                     ),
                     short_capacity_shares=test_integer_short_capacity_shares,
                     short_margin_rate=test_integer_short_margin_rate,
+                    overnight_decision_prices=(
+                        _active_panel_overnight_decision_price_rows(
+                            panel,
+                            test_eval_indices,
+                            test_symbol_indices,
+                        )
+                    ),
                     symbol_indices=test_symbol_indices,
                 ),
             )
@@ -27723,6 +27822,13 @@ def _run_training_impl(
                         ),
                         short_capacity_shares=test_integer_short_capacity_shares,
                         short_margin_rate=test_integer_short_margin_rate,
+                        overnight_decision_prices=(
+                            _active_panel_overnight_decision_price_rows(
+                                panel,
+                                test_eval_indices,
+                                test_symbol_indices,
+                            )
+                        ),
                         symbol_indices=test_symbol_indices,
                     ),
                 )

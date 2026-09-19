@@ -11886,6 +11886,7 @@ def load_explanation_context(
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
         feature_zero_fill=config.data.feature_zero_fill,
+        feature_availability_indicators=config.data.feature_availability_indicators,
         feature_shift_next_session=config.data.feature_shift_next_session,
         panel_start_date=config.data.panel_start_date,
     )
@@ -12441,6 +12442,7 @@ def _run_explainability_for_config(
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
+            feature_availability_indicators=config.data.feature_availability_indicators,
             feature_shift_next_session=config.data.feature_shift_next_session,
             panel_start_date=config.data.panel_start_date,
         )

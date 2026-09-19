@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.manage_packed_edge import _acquire_operation_lock
+from scripts.manage_packed_edge import (
+    _acquire_operation_lock,
+    _allowed_relpaths,
+    _can_resume_hydration,
+    _retained_snapshots,
+    _write_edge_ignore_if_changed,
+)
 from stockagent.data_sync.desync_snapshots import ResolvedSnapshot, SnapshotError
 from stockagent.data_sync.packed_edge_cache import (
     ensure_edge_include,
@@ -31,6 +37,64 @@ def test_edge_operation_lock_defers_concurrent_gc(tmp_path: Path) -> None:
     second = _acquire_operation_lock(tmp_path, nonblocking=True)
     fcntl.flock(second, fcntl.LOCK_UN)
     second.close()
+
+
+def test_retained_edge_payload_expires_and_rejects_malformed_state() -> None:
+    state = {
+        "retained_payloads": {
+            "tw-public": {"snapshot_id": "old", "expires_ns": 200},
+            "tw-minute": {"snapshot_id": "minute", "expires_ns": 100},
+        }
+    }
+    assert _retained_snapshots(state, now_ns=150) == {"tw-public": "old"}
+    assert _retained_snapshots(state, now_ns=200) == {}
+    with pytest.raises(SnapshotError, match="invalid retained"):
+        _retained_snapshots({"retained_payloads": {"tw-public": {}}})
+
+
+def test_exact_edge_hydration_can_resume_only_with_healthy_source() -> None:
+    state = {"hydrating": {"tw-public": "release-2"}}
+    peer = {
+        "checks": {
+            "folder_idle": False,
+            "need_bytes_zero": False,
+            "need_items_zero": False,
+            "peer_connected": True,
+            "peer_remote_state_valid": True,
+            "errors_zero": True,
+            "pull_errors_zero": True,
+        }
+    }
+    assert _can_resume_hydration(peer, state, "tw-public", "release-2")
+    assert not _can_resume_hydration(peer, state, "tw-public", "release-3")
+    peer["checks"]["pull_errors_zero"] = False
+    assert not _can_resume_hydration(peer, state, "tw-public", "release-2")
+
+
+def test_edge_hydration_keeps_old_retained_release_until_new_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.manage_packed_edge as edge
+
+    monkeypatch.setattr(edge, "_retained_snapshots", lambda state: {"tw-public": "old"})
+    monkeypatch.setattr(
+        edge,
+        "resolve_packed_snapshot_id",
+        lambda root, dataset, snapshot_id, require_objects: snapshot_id,
+    )
+    monkeypatch.setattr(edge, "release_payload_relpaths", lambda snapshot: {snapshot})
+    assert _allowed_relpaths(
+        tmp_path, {"hydrating": {"tw-public": "new"}}
+    ) == {"old", "new"}
+
+
+def test_unchanged_edge_allowlist_does_not_trigger_rescan(tmp_path: Path) -> None:
+    (tmp_path / ".stignore").write_text("", encoding="utf-8")
+    allowed = {"objects/blobs/aa/" + "a" * 64 + ".blob"}
+    assert _write_edge_ignore_if_changed(tmp_path, allowed)
+    first = (tmp_path / ".stignore-edge").stat().st_mtime_ns
+    assert not _write_edge_ignore_if_changed(tmp_path, allowed)
+    assert (tmp_path / ".stignore-edge").stat().st_mtime_ns == first
 
 
 def _object(root: Path, kind: str, payload: bytes) -> tuple[Path, str]:

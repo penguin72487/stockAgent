@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh rolling crypto historical features after TW market close
+
+[Timer]
+OnCalendar=*-*-* 14:00:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-registered-data-features.service
+
+[Install]
+WantedBy=timers.target

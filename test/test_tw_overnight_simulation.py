@@ -15,6 +15,7 @@ from stockagent.live.tw_overnight_simulation import (
     TwOvernightSimulationEngine,
     _auction_print,
 )
+from stockagent.live.tw_overnight_replay import TwOvernightHistoricalReplayEngine
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -100,6 +101,77 @@ def _quote(
 
 def _jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_historical_replay_uses_explicit_effective_clock_without_relabeling_generation(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwOvernightHistoricalReplayEngine(tmp_path / "historical_replay")
+    engine.update_readiness([spec], now=_at(9, 8, 30))
+    generated_at = _at(16, 20, 25).isoformat()
+
+    for day in (9, 10):
+        day_text = f"2026-09-{day:02d}"
+        source = {
+            "session_date": day_text,
+            "source_hashes": {"price_limits": "a" * 64},
+            "prices_sha256": "b" * 64,
+        }
+        engine.select_session(
+            day_text,
+            {"2330": {"date": day_text, "open": 103.0, "close": 101.0}},
+            source,
+        )
+        opening_quote = {
+            **_quote(day=day, hour=9, minute=0),
+            "historical_limits_session_date": day_text,
+            "historical_limits_sha256": "a" * 64,
+        }
+        engine.process_quotes(quotes={"2330": opening_quote}, now=_at(day, 9, 0))
+        summary = {
+            **_summary(),
+            "signal_id": f"replay-{day_text}",
+            "generated_at": generated_at,
+            "signal_ready_at": generated_at,
+            "signal_started_at": generated_at,
+            "counterfactual_signal_regeneration": True,
+            "replay_effective_signal_at": _at(day, 13, 25).isoformat(),
+        }
+        assert engine.register_close_signal(
+            spec=spec,
+            summary=summary,
+            signal_rows=[_row()],
+            quotes={"2330": opening_quote},
+            security_types={"2330": "stock"},
+            now=_at(day, 13, 25),
+        ) == "registered"
+        engine.process_quotes(
+            quotes={"2330": opening_quote}, now=_at(day, 13, 30)
+        )
+
+    signals = _jsonl(engine.signals_path)
+    assert {row["session_date"] for row in signals} == {
+        "2026-09-09", "2026-09-10"
+    }
+    assert all(row["source_signal_at"] == generated_at for row in signals)
+    assert all(row["counterfactual_generated_at"] for row in signals)
+
+
+def test_live_close_signal_still_rejects_a_future_generation_clock(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwOvernightSimulationEngine(tmp_path / "live_simulation")
+    engine.update_readiness([spec], now=_at(9, 13, 15))
+    summary = {**_summary(), "signal_started_at": _at(16, 20, 25).isoformat()}
+    assert engine.register_close_signal(
+        spec=spec,
+        summary=summary,
+        signal_rows=[_row()],
+        quotes={"2330": _quote(day=9, hour=13, minute=25)},
+        security_types={"2330": "stock"},
+        now=_at(9, 13, 25),
+    ) == "blocked"
+    assert engine.state["modes"][spec.market]["blocked_reason"] == "signal_not_current_session"
 
 
 def test_close_to_next_open_lifecycle_rejects_both_trial_matches(

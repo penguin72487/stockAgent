@@ -1,0 +1,60 @@
+# Raw-valued research inputs at the next 09:00 session boundary.
+# Inherited naive close-price execution remains a research proxy, not a fill claim.
+# New feature ABI; do not resume checkpoints built with engineered channels.
+base_config: tw_public_preopen_pit.yaml
+experiment_name: tw-public-preopen-raw-v1
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_raw_v1
+  resume: false
+  post_train_infer: false
+
+data:
+  # TWSE daily valuation begins in 2005-09 and TWSE T86 in 2012-05.
+  # Retain older source rows, but train this all-raw ABI only on complete years
+  # after both families exist; the 2005-2012 horizon needs a smaller schema.
+  panel_start_date: "2013-01-01"
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
+  feature_zero_fill: []
+  feature_exclude: []
+  feature_include:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+    - twpub_dividend_yield_pct_raw
+    - twpub_margin_balance_lots_raw
+    - twpub_short_balance_lots_raw
+    - twpub_margin_buy_lots_raw
+    - twpub_margin_sell_lots_raw
+    - twpub_short_sell_lots_raw
+    - twpub_short_buy_lots_raw
+    - twpub_foreign_net_buy_shares_raw
+    - twpub_investment_trust_net_buy_shares_raw
+    - twpub_dealer_net_buy_shares_raw
+    - twpub_institutional_net_buy_shares_raw
+    - twpub_twse_taiex_raw
+    - twpub_cbc_fx_reserves_usd_billion_raw
+  # The base OHLCV, daily valuation and TAIEX describe completed session t.
+  # Margin/institutional values have already been moved to session t+1 by the
+  # source builder. CBC original press-release values use their posting date.
+  feature_shift_next_session:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+    - twpub_dividend_yield_pct_raw
+    - twpub_twse_taiex_raw
+
+walk_forward:
+  expected_first_year: 2013

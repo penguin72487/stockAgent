@@ -863,32 +863,19 @@ def _tpex_margin_payload(day: date) -> dict[str, object]:
     }
 
 
-def test_tpex_margin_known_archive_gap_accepts_only_explicit_empty_inside_range():
+def test_tpex_margin_former_gap_rejects_explicit_empty_on_open_sessions():
     spec = twpub.DEFAULT_DATASETS["tpex_margin_balance"]
     no_data = json.dumps(
         {"stat": "很抱歉，沒有符合條件的資料!"},
         ensure_ascii=False,
     ).encode()
 
-    frame, suffix = twpub._parse_historical_response_content(
-        spec,
-        date(2007, 6, 1),
-        no_data,
-        "json",
-    )
-    assert frame.is_empty()
-    assert suffix == ".json"
-
-    with pytest.raises(
-        twpub.HistoricalResponseError,
-        match="validated open session",
-    ):
-        twpub._parse_historical_response_content(
-            spec,
-            date(2007, 5, 31),
-            no_data,
-            "json",
-        )
+    for day in (date(2007, 5, 31), date(2007, 6, 1)):
+        with pytest.raises(
+            twpub.HistoricalResponseError,
+            match="validated open session",
+        ):
+            twpub._parse_historical_response_content(spec, day, no_data, "json")
 
 
 def test_tpex_margin_known_archive_gap_keeps_nonempty_official_data():
@@ -909,7 +896,7 @@ def test_tpex_margin_known_archive_gap_keeps_nonempty_official_data():
     assert frame.get_column("代號").to_list() == ["4102"]
 
 
-def test_tpex_margin_gap_journals_immutable_receipt_and_resumes(
+def test_tpex_margin_former_gap_retries_empty_response_and_repairs(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -965,56 +952,30 @@ def test_tpex_margin_gap_journals_immutable_receipt_and_resumes(
 
     first = twpub._download_historical(spec, args, tmp_path)
 
-    assert first.status == "ok"
-    assert first.coverage_complete is True
-    assert first.source_unavailable_dates == 1
-    receipt = tmp_path / "raw_empty" / spec.name / f"{gap_day}.json"
-    assert receipt.read_bytes() == no_data
-    events = [
-        json.loads(line)
-        for line in twpub._historical_journal_path(
-            tmp_path,
-            spec,
-        )
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    empty_event = next(event for event in events if event["status"] == "empty")
-    assert empty_event["date"] == gap_day.isoformat()
-    assert empty_event["source_unavailable_reason"] == "official_endpoint_archive_gap"
-    assert empty_event["raw_sha256"] == hashlib.sha256(no_data).hexdigest()
-    assert empty_event["body_sha256"] == empty_event["raw_sha256"]
-    state = json.loads(
-        (tmp_path / "state" / f"{spec.name}.json").read_text(encoding="utf-8")
-    )
-    assert state["confirmed_source_unavailable_dates"] == [gap_day.isoformat()]
-    assert state["confirmed_empty_date_accounting"] == {
-        "other_confirmed_no_data": 0,
-        "source_unavailable": 1,
-        "total": 1,
-    }
-    assert state["source_unavailable_ranges"] == [
-        {
-            "confirmed_dates": 1,
-            "end": gap_day.isoformat(),
-            "expected_session_dates": 1,
-            "reason": "official_endpoint_archive_gap",
-            "start": gap_day.isoformat(),
-        }
-    ]
+    assert first.status == "failed"
+    assert first.coverage_complete is False
+    assert first.source_unavailable_dates == 0
 
     monkeypatch.setattr(
         twpub,
         "_http_get",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("receipt-verified data and empty dates must resume")
+        lambda url, **_kwargs: FakeResponse(
+            json.dumps(
+                _tpex_margin_payload(
+                    gap_day if "2007/06/01" in url else data_day
+                ),
+                ensure_ascii=False,
+            ).encode()
         ),
     )
     second = twpub._download_historical(spec, args, tmp_path)
 
-    assert second.status == "up_to_date"
+    assert second.status == "ok"
     assert second.coverage_complete is True
-    assert second.source_unavailable_dates == 1
+    assert second.source_unavailable_dates == 0
+    assert set(pl.read_parquet(tmp_path / f"{spec.name}.parquet")["date"].to_list()) == {
+        data_day.isoformat(), gap_day.isoformat()
+    }
 
 
 def test_tpex_margin_gap_validates_stage_relative_receipt_path(
@@ -1047,7 +1008,7 @@ def test_tpex_margin_gap_validates_stage_relative_receipt_path(
         source_unavailable_reason="official_endpoint_archive_gap",
     )
 
-    assert twpub._source_unavailable_result_receipt_is_valid(
+    assert not twpub._source_unavailable_result_receipt_is_valid(
         output_dir,
         spec,
         result,
@@ -2671,7 +2632,7 @@ def test_merged_writer_rewrites_real_value_change(tmp_path: Path) -> None:
     }
 
 
-def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
+def test_snapshot_download_preserves_same_day_corrections_and_immutable_raw(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2696,6 +2657,7 @@ def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
         b'[{"Code":"2330","value":"old"}]',
         b'[{"Code":"2330","value":"corrected"}]',
         b'[{"Code":"2330","value":"next"}]',
+        b'[{"Code":"2330","value":"next"}]',
     ]
 
     class FakeResponse:
@@ -2708,15 +2670,21 @@ def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
         "_http_get",
         lambda *args, **kwargs: FakeResponse(payloads.pop(0)),
     )
-    snapshot_days = iter(("2024-06-03", "2024-06-03", "2024-06-04"))
+    snapshot_days = iter(("2024-06-03", "2024-06-03", "2024-06-04", "2024-06-05"))
     monkeypatch.setattr(twpub, "_snapshot_as_of_date", lambda: next(snapshot_days))
 
     twpub._download_snapshot_url(spec, args, tmp_path)
     twpub._download_snapshot_url(spec, args, tmp_path)
     twpub._download_snapshot_url(spec, args, tmp_path)
+    twpub._download_snapshot_url(spec, args, tmp_path)
 
-    frame = pl.read_parquet(tmp_path / "sample_snapshot.parquet").sort("_as_of_date")
+    frame = pl.read_parquet(tmp_path / "sample_snapshot.parquet")
     assert frame.select("_as_of_date", "date", "value").to_dicts() == [
+        {
+            "_as_of_date": "2024-06-03",
+            "date": "2024-06-03",
+            "value": "old",
+        },
         {
             "_as_of_date": "2024-06-03",
             "date": "2024-06-03",
@@ -2726,7 +2694,102 @@ def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
     ]
     raw_paths = sorted((tmp_path / "raw" / "sample_snapshot").iterdir())
     assert len(raw_paths) == 3
-    assert all(path.name.startswith("2024-06-0") for path in raw_paths)
+    assert all(len(path.stem) == 16 for path in raw_paths)
+
+
+def test_payload_hash_prevents_unchanged_snapshot_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "snapshot.parquet"
+    row = pl.DataFrame(
+        {
+            "date": ["2024-06-03"],
+            "_as_of_date": ["2024-06-03"],
+            "_payload_sha256": ["same-hash"],
+            "_downloaded_at_utc": ["2024-06-03T00:00:00+00:00"],
+        }
+    )
+    twpub._write_parquet_merged(path, row, refresh=False)
+    before = path.stat()
+    later = row.with_columns(pl.lit("2024-06-04T00:00:00+00:00").alias("_downloaded_at_utc"))
+    twpub._write_parquet_merged(path, later, refresh=False)
+    assert path.stat().st_ino == before.st_ino
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    assert pl.read_parquet(path).height == 1
+
+
+def test_payload_hash_reversion_is_new_observed_vintage(tmp_path: Path) -> None:
+    path = tmp_path / "snapshot.parquet"
+    for day, digest in (
+        ("2024-06-03", "original"),
+        ("2024-06-04", "correction"),
+        ("2024-06-05", "original"),
+    ):
+        row = pl.DataFrame(
+            {
+                "date": [day],
+                "_as_of_date": [day],
+                "_payload_sha256": [digest],
+                "_downloaded_at_utc": [f"{day}T00:00:00+00:00"],
+            }
+        )
+        twpub._write_parquet_merged(path, row, refresh=False)
+    assert pl.read_parquet(path).get_column("_payload_sha256").to_list() == [
+        "original", "correction", "original"
+    ]
+
+
+def test_data_gov_keeps_first_seen_and_later_correction_vintages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spec = twpub.DatasetSpec(
+        name="sample_gov", kind="data_gov", source="official-test",
+        description="sample", tags=("test",), data_gov_id="123",
+    )
+    args = SimpleNamespace(
+        timeout=1, verify_ssl=True, retries=0, retry_backoff=0.0,
+        skip_raw=False,
+    )
+    payloads = iter((
+        b"Code,Value\n2330,old\n",
+        b"Code,Value\n2330,old\n",
+        b"Code,Value\n2330,corrected\n",
+    ))
+
+    class FakeResponse:
+        def __init__(self, content: bytes):
+            self.content = content
+            self.headers = {"content-type": "text/csv"}
+
+        def json(self):
+            return {"result": {
+                "title": "sample", "distribution": [{
+                    "resourceDownloadUrl": "https://example.test/sample.csv",
+                    "resourceDescription": "CSV", "resourceFormat": "CSV",
+                }],
+            }}
+
+    def fake_get(url, **_kwargs):
+        if "api/v2/rest/dataset" in url:
+            return FakeResponse(b"{}")
+        return FakeResponse(next(payloads))
+
+    monkeypatch.setattr(twpub, "_http_get", fake_get)
+    monkeypatch.setattr(twpub, "_snapshot_as_of_date", lambda: "2024-06-03")
+    observations = iter((
+        "2024-06-03T00:59:00+00:00",
+        "2024-06-03T00:59:30+00:00",
+        "2024-06-03T01:05:00+00:00",
+    ))
+    monkeypatch.setattr(twpub, "_now_utc", lambda: next(observations))
+
+    for _ in range(3):
+        assert twpub._download_data_gov(spec, args, tmp_path).status == "ok"
+
+    frame = pl.read_parquet(tmp_path / "sample_gov.parquet")
+    assert frame["Value"].to_list() == ["old", "corrected"]
+    assert frame["_downloaded_at_utc"].to_list() == [
+        "2024-06-03T00:59:00+00:00", "2024-06-03T01:05:00+00:00",
+    ]
+    assert len(list((tmp_path / "raw" / "sample_gov").iterdir())) == 2
 
 
 def test_parse_twse_delisted_company_payload():

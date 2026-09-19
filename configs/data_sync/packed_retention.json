@@ -7,7 +7,7 @@
   "backup_config": "configs/data_sync/packed_backup.json",
   "state_dir": "/var/lib/stockagent-packed-retention",
   "folder_id": "stockagent-packed",
-  "required_peer_names": ["lab203", "vastai1T"],
+  "required_peer_names": ["vastai1T"],
   "grace_hours": 24,
   "peer_proof_max_age_seconds": 300,
   "post_apply_convergence_timeout_seconds": 900

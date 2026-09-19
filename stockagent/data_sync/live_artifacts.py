@@ -71,7 +71,9 @@ def is_ignored_artifact(relative: str | Path) -> bool:
         return True
     if any(_is_temporary_name(part) for part in parts):
         return True
-    if parts[0] == "data_locks":
+    # Panel/tape/dashboard caches are derived, node-local working state.  They
+    # must not consume a second Syncthing index or be restored by the bridge.
+    if parts[0] in {"cache", "data_locks"}:
         return True
     if name.startswith(".syncthing.") or ".sync-conflict-" in name:
         return True
@@ -95,6 +97,16 @@ def cold_ignored_artifacts(sync_root: Path) -> frozenset[PurePosixPath]:
             raise ValueError(f"unsupported generated cold ignore pattern: {value}")
         ignored.add(_relative_path(value[len("(?d)/") :]))
     return frozenset(ignored)
+
+
+def _is_cold_ignored(
+    relative: PurePosixPath, ignored_paths: frozenset[PurePosixPath]
+) -> bool:
+    """A retired directory protects every descendant from hot rehydration."""
+
+    return relative in ignored_paths or any(
+        parent in ignored_paths for parent in relative.parents if parent.parts
+    )
 
 
 def _same_inode(first: Path, second: Path) -> bool:
@@ -174,7 +186,9 @@ def _iter_regular_files(
         return
     if start.is_file() and not start.is_symlink():
         relative = PurePosixPath(start.relative_to(root).as_posix())
-        if not is_ignored_artifact(relative) and relative not in ignored_paths:
+        if not is_ignored_artifact(relative) and not _is_cold_ignored(
+            relative, ignored_paths
+        ):
             yield relative, start
         return
     if not start.is_dir() or start.is_symlink():
@@ -185,14 +199,20 @@ def _iter_regular_files(
         for name in sorted(dirnames):
             child = directory_path / name
             relative = PurePosixPath(child.relative_to(root).as_posix())
-            if child.is_symlink() or is_ignored_artifact(relative):
+            if (
+                child.is_symlink()
+                or is_ignored_artifact(relative)
+                or _is_cold_ignored(relative, ignored_paths)
+            ):
                 continue
             kept_directories.append(name)
         dirnames[:] = kept_directories
         for name in sorted(filenames):
             path = directory_path / name
             relative = PurePosixPath(path.relative_to(root).as_posix())
-            if is_ignored_artifact(relative) or relative in ignored_paths:
+            if is_ignored_artifact(relative) or _is_cold_ignored(
+                relative, ignored_paths
+            ):
                 continue
             try:
                 if path.is_file() and not path.is_symlink():
@@ -221,7 +241,9 @@ def reconcile_artifacts(
     prefix = _relative_path(relative) if relative is not None else None
     result = ReconcileResult()
     ignored_paths = cold_ignored_artifacts(sync)
-    if prefix is not None and prefix in ignored_paths:
+    if prefix is not None and (
+        is_ignored_artifact(prefix) or _is_cold_ignored(prefix, ignored_paths)
+    ):
         result.ignored += 1
         return result
 

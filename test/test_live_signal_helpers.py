@@ -677,6 +677,33 @@ def test_opening_price_receipt_timing_separates_source_arrival_from_compute() ->
     assert timing["coverage_to_quote_response_ms"] == pytest.approx(650.0)
     assert timing["coverage_to_signal_ready_ms"] == pytest.approx(950.0)
 
+
+def test_reused_opening_snapshot_does_not_report_negative_transport_latency() -> None:
+    gate = datetime.fromisoformat("2026-09-09T09:00:00+08:00")
+    snapshot = PriceSnapshot(
+        prices=np.array([10.0]),
+        source="shioaji:shared_opening_snapshot",
+        available_count=1,
+        requested_count=1,
+        timestamps_ms=np.array([int(gate.timestamp() * 1000) + 100], dtype=np.int64),
+    )
+
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot,
+        observed_mask=np.array([True]),
+        required_count=1,
+        session_date="2026-09-09",
+        display_timezone="Asia/Taipei",
+        quote_requested_at="2026-09-09T09:00:01+08:00",
+        quote_received_at="2026-09-09T09:00:01.100000+08:00",
+        signal_ready_at="2026-09-09T09:00:01.200000+08:00",
+    )
+
+    assert timing["quality"] == "observed_reused_snapshot"
+    assert timing["quote_request_to_coverage_ms"] is None
+    assert timing["coverage_to_quote_response_ms"] is None
+    assert timing["coverage_to_signal_ready_ms"] == pytest.approx(1100.0)
+
 def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> None:
     message = format_signal_message(
         {

@@ -41,6 +41,7 @@ from stockagent.live.tw_day_trade_simulation import (
     LiveEligibility,
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
     quote_map_from_snapshot,
@@ -366,12 +367,20 @@ def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
         state_dir=engine.state_dir,
         now=_now(8, 59).astimezone(ZoneInfo("UTC")),
     )
+    compact = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(8, 59).astimezone(ZoneInfo("UTC")),
+        include_position_rows=False,
+    )
 
     assert sync["synchronized"] is True
     assert sync["status"] == "synchronized"
     assert sync["revision_lag"] == 0
     assert [row["market"] for row in snapshot["modes"]] == [spec.market]
     assert snapshot["ledger_integrity"]["ready"] is True
+    assert snapshot["position_rows_included"] is True
+    assert compact["position_rows_included"] is False
+    assert compact["positions"] == []
 
 
 def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> None:
@@ -1610,6 +1619,92 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
         restarted_mode["configured_entry_fill_policy"] == ENTRY_FILL_POLICY_CAUSAL_BOOK
     )
     assert restarted_mode["counterfactual_0901_price_fill"] is True
+
+
+def test_historical_full_target_0901_ignores_local_volume_but_not_price_or_nav(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+        historical_full_fill_at_0901=True,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "scenario")
+    quote = _quote(minute_volume_lots=0.0)
+    quote["execution_price_0901"] = 1_005.0
+    quote["quote_at"] = _now(9, 1).isoformat()
+    assert engine.register_signal(
+        spec=spec,
+        summary={
+            **_summary(),
+            "simulation_replay": True,
+            "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+        },
+        signal_rows=[{**_row(0.1), "open_price": 1_000.0}],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1),
+        counterfactual_open_replay=True,
+    ) == "registered"
+    signal = json.loads(engine.signals_path.read_text().splitlines()[0])
+    assert signal["requested_shares"] == signal["filled_shares"] == 1_000
+    assert signal["minute_kbar_capacity_shares"] == 0
+    assert signal["reason"] == "counterfactual_09_01_full_target_no_liquidity_claim"
+    assert json.loads(engine.fills_path.read_text().splitlines()[0]).get("exchange_match_at") is None
+
+    live_engine = TwDayTradeSimulationEngine(tmp_path / "live")
+    with pytest.raises(ValueError, match="forbidden for live signals"):
+        live_engine.register_signal(
+            spec=spec,
+            summary=_summary("live-signal"),
+            signal_rows=[_row()],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1),
+        )
+
+
+def test_historical_full_target_reuses_prior_paper_fill_clock_and_price(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+        historical_full_fill_at_0901=True,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "prior-fill-scenario")
+    quote = _quote(minute_volume_lots=0.0)
+    quote.update({
+        "execution_price_0901": None,
+        "quote_at": _now(9, 1).isoformat(),
+        "historical_prior_paper_fill": {
+            "fill_at": _now(9, 0, 11).isoformat(),
+            "price": 1_002.0,
+            "entry_price_source": "retained_local_paper_fill",
+        },
+    })
+    assert engine.register_signal(
+        spec=spec,
+        summary={**_summary(), "simulation_replay": True,
+                 "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL},
+        signal_rows=[{**_row(0.1), "open_price": 1_000.0}],
+        quotes={"2330": quote},
+        eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1), counterfactual_open_replay=True,
+    ) == "registered"
+    signal = json.loads(engine.signals_path.read_text().splitlines()[0])
+    order = next(json.loads(line) for line in engine.orders_path.read_text().splitlines()
+                 if json.loads(line)["purpose"] == "entry")
+    fill = json.loads(engine.fills_path.read_text().splitlines()[0])
+    assert signal["requested_shares"] == signal["filled_shares"] == 1_000
+    assert signal["reason"] == "counterfactual_full_target_from_prior_paper_fill"
+    assert signal["prior_paper_fill_reused"] is True
+    assert order["order_type"] == "PAPER_PRIOR_FILL_FULL_TARGET"
+    assert fill["fill_at"] == _now(9, 0, 11).isoformat()
+    assert fill["price"] == 1_002.0
+    assert fill["prior_paper_fill_reused"] is True
 
 
 def test_missed_opening_replay_blocks_only_when_0901_minute_price_is_missing(
@@ -3549,6 +3644,61 @@ def test_tx_benchmark_rebase_keeps_immutable_origin_across_contract_roll() -> No
     assert row.get("benchmark_origin_error") is None
 
 
+@pytest.mark.parametrize("origin_capital,expected_valid", [(8_961_200.0, True), (8_961_000.0, False)])
+def test_tx_rolled_legacy_mark_proves_origin_from_retained_capital(
+    origin_capital: float, expected_valid: bool
+) -> None:
+    source = {
+        "benchmark_id": "benchmark_tx_continuous",
+        "instrument_type": "continuous_long_future",
+        "benchmark_accounting_contract_version": 2,
+        "entry_at": "2026-08-20T12:18:43+08:00",
+        "entry_price": 45_759.0,  # Rolled contract, not original entry.
+        "roll_count": 1,
+        "initial_capital_twd": origin_capital,
+        "buy_hold_wealth_index": 1.04,
+    }
+    origin = {
+        "entry_at": "2026-08-13T08:45:00+08:00",
+        "entry_price": 34_827.0,
+        "initial_capital_twd": 6_965_400.0,
+        "gross_pnl_multiplier": 200.0,
+        "canonical_buy_hold_wealth_at_live_origin": 1.25,
+        "live_origin": {
+            "entry_at": "2026-08-20T12:18:43+08:00",
+            "entry_price": 44_806.0,
+        },
+    }
+
+    row = _rebase_live_benchmark(source, origin)
+    if expected_valid:
+        assert row["benchmark_origin_rebased"] is True
+        assert row["benchmark_origin_identity_source"] == "retained_origin_capital_after_roll"
+        assert row["total_equity_twd"] == pytest.approx(6_965_400.0 * 1.25 * 1.04)
+    else:
+        assert row["benchmark_origin_error"] == "live_entry_no_longer_matches_audited_origin"
+        assert row["total_equity_twd"] is None
+
+
+def test_tx_benchmark_mark_persists_immutable_origin_after_roll(tmp_path: Path) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine._append_benchmark_mark(
+        {
+            "benchmark_id": "benchmark_tx_continuous",
+            "entry_at": "2026-08-20T12:18:43+08:00",
+            "entry_price": 45_759.0,
+            "origin_entry_at": "2026-08-20T12:18:43+08:00",
+            "origin_entry_price": 44_806.0,
+            "roll_count": 1,
+        },
+        now=_now(9, 25),
+    )
+    row = json.loads(engine.benchmark_marks_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["entry_price"] == 45_759.0
+    assert row["origin_entry_price"] == 44_806.0
+    assert row["origin_entry_at"] == "2026-08-20T12:18:43+08:00"
+
+
 def test_tx_benchmark_rebase_uses_audited_roll_offset_without_calendar_gap() -> None:
     source = {
         "benchmark_id": "benchmark_tx_continuous",
@@ -4409,7 +4559,9 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     )
     assert payload["simulation_only"] is True
     assert payload["production_order_possible"] is False
-    assert "live execution starts at 09:00" in payload["source_contract"]["entry_fill"]
+    assert payload["execution_evidence"] == "local_paper_not_shioaji_order_api"
+    assert "local paper execution starts at 09:00" in payload["source_contract"]["entry_fill"]
+    assert "not a Shioaji simulation order" in payload["source_contract"]["entry_fill"]
     assert (
         "source-backed 09:01 minute price" in payload["source_contract"]["entry_fill"]
     )
@@ -4838,7 +4990,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "SIGNAL_PAGE_SIZE" in javascript
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
-    assert "function hydrateDefaultPositions(data)" in javascript
+    assert "function hydrateDefaultPositions(data)" not in javascript
+    assert 'const shouldReloadPositions = force || positionDataRevision !== detailDataRevision("positions");' in javascript
     assert "void loadChartHistory({preferCache: !force});" in javascript
     assert "if (shouldReloadPositions) void loadPositions({force});" in javascript
     assert "Promise.allSettled([signalsReady, historyReady])" not in javascript
@@ -4850,7 +5003,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "const replayTimingText" in javascript
     assert "const signalTimingText" in javascript
     assert "09-03 09:01:00 · 開盤價重建；原始訊號" not in javascript
-    assert "完整模型訊號已保留 · 0 股未成交" in javascript
+    assert "完整模型訊號已保留 · 0 股紙上成交" in javascript
     assert "資金不足一張（完整訊號已保留）" in javascript
     assert "所選交易日使用實際開盤價做反事實重建" not in javascript
     assert "maximumFractionDigits: 8" not in javascript
@@ -4900,7 +5053,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     )
     assert "Number(positionPnl.total) / modeTotalEquity * 100" in javascript
     assert "Number(positionPnl.total) / totalPortfolioPnl * 100" not in javascript
-    assert "完整模型訊號已保留 · 0 股未成交" in javascript
+    assert "完整模型訊號已保留 · 0 股紙上成交" in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "原子指標由 inotify 事件即時喚醒" in javascript
@@ -4951,8 +5104,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=84"' in html
-    assert 'src="chart-renderer.js?v=1"' in html
+    assert 'src="app.js?v=88"' in html
+    assert 'src="chart-renderer.js?v=3"' in html
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript
     assert "function decodeChartHistory(payload)" in javascript
@@ -4964,7 +5117,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function matchesSymbol(" not in javascript
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
     assert 'src="presentation.js?v=2"' in html
-    assert 'src="detail-components.js?v=6"' in html
+    assert 'src="detail-components.js?v=7"' in html
     assert "let followLatestSession = true;" in javascript
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript

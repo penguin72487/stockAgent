@@ -161,6 +161,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/data-monitor/api/status",
         "/data-monitor/api/summary",
         "/data-monitor/api/details",
+        "/data-monitor/api/features",
         "/traffic/api/status",
         "/traffic/api/history",
     }
@@ -2202,8 +2203,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "summary",
                     "endpoint_inventory",
                     "provider_summaries",
+                    "market_categories",
+                    "record_inventory_progress",
                     "integrity_checks",
                     "definitions",
+                    "tw_public_acquisition",
                     # Physical groups are the overview immediately above the
                     # registry. They are small enough for first paint; the
                     # per-source records remain on the deferred detail route.
@@ -2242,6 +2246,39 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ttl_seconds=8.0,
             cache_control="no-store",
             stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=build,
+        )
+
+    def data_monitor_features(self) -> PreparedResponse:
+        """Serve the separately materialized, read-only field inventory."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            stat = snapshot.stat()
+        except FileNotFoundError:
+            stat = None
+        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) if stat else None
+
+        def build() -> Mapping[str, Any]:
+            if stat is None:
+                return {
+                    "schema_version": 1, "read_only": True,
+                    "production_control_possible": False,
+                    "summary": {"state": "waiting_inventory", "fields": 0},
+                    "rows": [],
+                }
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping) or payload.get("read_only") is not True:
+                raise ValueError("data-monitor feature snapshot is not read-only")
+            if payload.get("production_control_possible") is not False or not isinstance(payload.get("rows"), list):
+                raise ValueError("data-monitor feature snapshot has invalid public contract")
+            return payload
+
+        return self.cached_local_json(
+            cache_key=f"data-monitor-features:{signature}",
+            ttl_seconds=45.0,
+            cache_control="no-store",
+            stale_grace_seconds=60.0,
             builder=build,
         )
 
@@ -3215,6 +3252,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_summary()
         if path == "/data-monitor/api/details":
             return self.server.data_monitor_details()
+        if path == "/data-monitor/api/features":
+            return self.server.data_monitor_features()
         if path == "/traffic/api/status":
             payload = self.server.traffic_observer.snapshot(
                 exclude_current_request=True

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import fcntl
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -12,6 +14,8 @@ import pytest
 from downloader.download_tw_public_data import DEFAULT_DATASETS
 from scripts.check_tw_day_trade_preopen_readiness import evaluate_readiness
 from scripts import run_tw_public_0830_check
+from scripts import publish_tw_public_cold_release as cold_publication
+from scripts import audit_tw_public_data_layer as public_audit
 from scripts import finalize_tw_public_completed_session as completed_session
 from scripts import watch_tw_public_publication_group as publication
 from scripts import watch_tw_public_source_events as source_events
@@ -25,7 +29,7 @@ def test_preopen_sweep_covers_every_registered_official_dataset() -> None:
     phase = publication.PUBLICATION_PHASES["preopen_all"]
     selected = publication._select_specs(list(phase.selectors))
     assert {spec.name for spec in selected} == set(DEFAULT_DATASETS)
-    assert len(selected) == 156
+    assert len(selected) == 159
 
 
 def test_auto_phase_accepts_two_minute_retry() -> None:
@@ -455,6 +459,59 @@ def test_0830_reuses_only_exact_dependency_audit_receipt(tmp_path: Path) -> None
     )
 
 
+def test_0830_reuses_completed_session_only_for_exact_source_revision() -> None:
+    datasets = {
+        name: {"applied_version": f"v-{index}"}
+        for index, name in enumerate(DEFAULT_DATASETS)
+    }
+    event = {
+        "status": "ok",
+        "coverage_complete": True,
+        "registered_dataset_count": len(DEFAULT_DATASETS),
+        "monitored_dataset_count": len(DEFAULT_DATASETS),
+        "observed_dataset_count": len(DEFAULT_DATASETS),
+        "failed_probe_count": 0,
+        "blocking_unapplied_event_count": 0,
+        "updated_at_taipei": datetime.now(TAIPEI).isoformat(),
+        "datasets": datasets,
+    }
+    candidate = {
+        "status": "ok",
+        "started_at_taipei": "2026-09-16T08:20:00+08:00",
+        "expected_latest_date": "2026-09-15",
+        "acceptance": {
+            "subprocess_ok": True,
+            "live_root_receipt_fresh": True,
+            "live_root_status_ok": True,
+            "live_root_verified": True,
+            "coverage_complete": True,
+            "same_session_eligibility": True,
+            "all_156_sources": True,
+            "source_event_monitor": True,
+            "strict_model_safety_audit": True,
+            "runtime_materialization_required": False,
+            "runtime_materialized_snapshot": False,
+        },
+        "final_audit_dependency_state": {"sha256": "same"},
+        "event_monitor": json.loads(json.dumps(event)),
+    }
+    assert run_tw_public_0830_check._reusable_session_acceptance(
+        candidate,
+        session_date="2026-09-16",
+        expected_latest="2026-09-15",
+        event_receipt=event,
+        dependency_sha256="same",
+    )
+    event["datasets"][next(iter(datasets))]["applied_version"] = "changed"
+    assert not run_tw_public_0830_check._reusable_session_acceptance(
+        candidate,
+        session_date="2026-09-16",
+        expected_latest="2026-09-15",
+        event_receipt=event,
+        dependency_sha256="same",
+    )
+
+
 def test_0830_final_revision_rejects_event_applied_after_audit() -> None:
     assert run_tw_public_0830_check._audit_revision_errors(
         derived_status={"current": True},
@@ -533,6 +590,40 @@ def test_0830_detects_same_date_source_content_revision(tmp_path: Path) -> None:
         keys=("source_receipts",),
     )
     assert errors == ["source_receipts: sha256 mismatch tdcc_shareholding_distribution.parquet"]
+
+
+def test_0830_verifies_release_semantics_not_parquet_file_size(tmp_path: Path) -> None:
+    import polars as pl
+
+    from stockagent.data.tw_public_features import _release_feature_content_receipt
+
+    source = tmp_path / "cbc_fx_reserve_release_vintages.parquet"
+    row = {
+        "period": "2026-07",
+        "published_on": "2026-08-05",
+        "metric": "fx_reserve_usd_100m",
+        "value": 5987.0,
+        "value_evidence": "official_release_headline",
+        "html_sha256": "a" * 64,
+        "html_path": "first.html",
+    }
+    pl.DataFrame([row]).write_parquet(source)
+    receipt = _release_feature_content_receipt(source)
+    assert receipt["size"] != source.stat().st_size
+    summary = tmp_path / "feature.summary.json"
+    summary.write_text(json.dumps({"source_receipts": [receipt]}), encoding="utf-8")
+    check = lambda: run_tw_public_0830_check._receipt_dependency_errors(
+        summary, live_root=tmp_path, keys=("source_receipts",)
+    )
+    assert check() == []
+
+    pl.DataFrame([{**row, "html_path": "rewrapped.html"}]).write_parquet(source)
+    assert check() == []
+
+    pl.DataFrame([{**row, "value": 5990.0}]).write_parquet(source)
+    assert check() == [
+        "source_receipts: sha256 mismatch cbc_fx_reserve_release_vintages.parquet"
+    ]
 
 
 def test_0830_reuses_hash_bound_entitlements_without_timestamp_refresh(
@@ -683,8 +774,11 @@ def test_systemd_timers_have_no_random_delay() -> None:
     assert "08:15:00 Asia/Taipei" in acceptance_timer
     assert "08:24:00 Asia/Taipei" in acceptance_timer
     assert "08:29:00 Asia/Taipei" in acceptance_timer
+    assert "09:10:00 Asia/Taipei" in acceptance_timer
     assert "09:15:00 Asia/Taipei" in acceptance_timer
     assert "08:30:00 Asia/Taipei" not in acceptance_timer
+    assert "09:00:05 Asia/Taipei" not in acceptance_timer
+    assert "09:05:00 Asia/Taipei" not in acceptance_timer
     assert "RandomizedDelaySec=0" in acceptance_timer
 
     cold_timer = Path(
@@ -704,6 +798,97 @@ def test_systemd_timers_have_no_random_delay() -> None:
     assert "publish_tw_public_cold_release.py" in cold_runner
     assert " use " not in cold_runner
 
+    margin_runner = Path("scripts/run_tw_day_trade_margin_actions.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "refresh_tw_day_trade_margin_actions.py" in margin_runner
+    assert "publish_tw_public_cold_release.py" in margin_runner
+    assert "run_downloader_with_release.sh" not in margin_runner
+
+
+def test_cold_publish_sanitizes_active_writer_preflight() -> None:
+    payload = {
+        "datasets": [
+            {
+                "active_blockers": [
+                    {
+                        "pid": 123,
+                        "pattern": "download_tw_public_data.py",
+                        "command": "secret command arguments must not persist",
+                    },
+                    {
+                        "pid": 456,
+                        "pattern": "download_tw_public_data.py",
+                        "command": "another command",
+                    },
+                    {"pid": 789, "pattern": "refresh_tw_day_trade_margin_actions.py"},
+                ]
+            }
+        ]
+    }
+    assert cold_publication._active_writer_labels(payload) == [
+        "download_tw_public_data.py",
+        "refresh_tw_day_trade_margin_actions.py",
+    ]
+
+
+def test_cold_publish_holds_canonical_refresh_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    live_root = tmp_path / "data_tw_public"
+    monkeypatch.setattr(cold_publication, "_live_root", lambda: live_root)
+    monkeypatch.setattr(cold_publication, "_check_training_receipts", lambda *_: None)
+    lock_path = tmp_path / ".locks/tw-public-refresh.lock"
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        with lock_path.open("a+", encoding="utf-8") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(cold_publication.subprocess, "run", run)
+    result = cold_publication._publish_while_source_stable(["publish"], 30)
+    assert result.returncode == 0
+    assert calls == [["publish"]]
+
+    with lock_path.open("a+", encoding="utf-8") as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="refresh is active"):
+            cold_publication._publish_while_source_stable(["publish"], 30)
+    assert calls == [["publish"]]
+
+
+def test_exact_release_audit_writes_panel_cache_outside_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(public_audit, "_panel_kwargs", lambda *_: {})
+    monkeypatch.setattr(public_audit, "load_cached_panel", lambda *a, **k: pytest.fail("must not load source cache"))
+
+    def build(root: Path, **kwargs: object) -> object:
+        calls.append((root, kwargs.get("panel_cache_root")))
+        return object()
+
+    monkeypatch.setattr(public_audit, "build_panel", build)
+    source = tmp_path / "immutable/stocks"
+    cache = tmp_path / "writable-cache"
+    _, origin = public_audit._load_or_build_panel(
+        object(), source, tmp_path / "immutable/features.parquet",
+        build_if_missing=True, panel_cache_root=cache,
+    )
+    assert origin == "built"
+    assert calls == [(source, cache)]
+
+
+def test_cold_publish_rejects_stale_training_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = type("Finding", (), {"severity": "critical", "code": "stale_feature_build_receipt"})()
+    monkeypatch.setattr(public_audit, "audit_official_symbol_build", lambda *a: ({}, []))
+    monkeypatch.setattr(public_audit, "audit_feature_build_receipt", lambda *a: ({}, [finding]))
+    with pytest.raises(RuntimeError, match="stale_feature_build_receipt"):
+        cold_publication._check_training_receipts(tmp_path)
+
 
 def test_source_event_registry_covers_all_official_datasets() -> None:
     args = type(
@@ -717,7 +902,7 @@ def test_source_event_registry_covers_all_official_datasets() -> None:
     )()
     digest, rows = source_events._registry(list(DEFAULT_DATASETS.values()), args)
     assert len(digest) == 64
-    assert len(rows) == 156
+    assert len(rows) == len(DEFAULT_DATASETS)
     assert {row["dataset"] for row in rows} == set(DEFAULT_DATASETS)
     assert {row["interval_seconds"] for row in rows} == {60.0, 300.0, 900.0}
 
@@ -1267,12 +1452,39 @@ def test_source_event_service_is_persistent_and_restarting() -> None:
     assert "WatchdogSec=5min" in service
     assert "Restart=always" in service
     assert "OOMScoreAdjust=-250" in service
-    assert "MemoryHigh=6G" in service
-    assert "MemoryMax=12G" in service
-    assert "MemorySwapMax=2G" in service
+    assert "MemoryHigh=48G" in service
+    assert "MemoryMax=64G" in service
+    assert "MemorySwapMax=8G" in service
     assert "TasksMax=2048" in service
     assert "watch_tw_public_source_events" not in service
     assert "run_tw_public_source_event_monitor.sh" in service
+
+
+def test_source_event_refresh_batches_prioritize_and_isolate_heavy_tables() -> None:
+    pending = [
+        "twse_api_opendata_t187ap31_l",
+        "tpex_daily_ohlcv",
+        "twse_day_trade_eligibility",
+        "twse_api_opendata_t187ap02_l",
+    ]
+    assert source_events._bounded_refresh_names(pending, maximum=12) == [
+        "twse_day_trade_eligibility"
+    ]
+    assert source_events._bounded_refresh_names(
+        ["tpex_day_trade_eligibility", "twse_day_trade_eligibility"],
+        maximum=12,
+    ) == ["twse_day_trade_eligibility", "tpex_day_trade_eligibility"]
+    assert source_events._bounded_refresh_names(
+        [
+            "twse_api_opendata_t187ap31_l",
+            "twse_api_opendata_t187ap02_l",
+            "twse_api_opendata_t187ap05_l",
+        ],
+        maximum=2,
+    ) == [
+        "twse_api_opendata_t187ap02_l",
+        "twse_api_opendata_t187ap05_l",
+    ]
 
 
 def test_0830_acceptance_uses_bounded_timer_retries() -> None:
@@ -1453,9 +1665,9 @@ def test_final_preopen_gate_rejects_unapplied_public_source_event() -> None:
     event = {
         "status": "ok",
         "coverage_complete": True,
-        "registered_dataset_count": 156,
-        "monitored_dataset_count": 156,
-        "observed_dataset_count": 156,
+        "registered_dataset_count": len(DEFAULT_DATASETS),
+        "monitored_dataset_count": len(DEFAULT_DATASETS),
+        "observed_dataset_count": len(DEFAULT_DATASETS),
         "failed_probe_count": 0,
         "unapplied_event_count": 1,
         "updated_at_taipei": "2026-08-17T08:58:30+08:00",
@@ -1475,7 +1687,7 @@ def test_final_preopen_gate_rejects_unapplied_public_source_event() -> None:
         event_receipt=event,
     )
     assert result["source_event_monitor"]["ready"] is False
-    assert "156-dataset source-event monitor is not healthy" in result["failures"]
+    assert f"{len(DEFAULT_DATASETS)}-dataset source-event monitor is not healthy" in result["failures"]
 
     event["blocking_unapplied_event_count"] = 0
     event["opening_apply_deferred"] = True
@@ -1664,6 +1876,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
     )
     assert late["opening_execution"]["ready"] is False
     assert late["opening_execution"]["modes"][market]["commit_slo_met"] is False
+    assert late["opening_execution"]["operational_ready"] is True
 
 
 def test_final_preopen_gate_timer_checks_until_085930() -> None:

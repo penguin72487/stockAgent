@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         help="incremental: reconcile missing head/tail coverage; daily-update: deprecated alias; full: reconcile requested coverage; --refresh forces rebuild.",
     )
     parser.add_argument(
-        "--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD"
+        "--start-date", default="2018-01-01", help="Inclusive start date YYYY-MM-DD; per-symbol listing time is the lower bound"
     )
     parser.add_argument(
         "--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'"
@@ -980,14 +980,32 @@ def main() -> None:
 
     historical_feature_results = []
     if not args.skip_historical_features:
+        # A tail-only cycle may update only a subset of instruments.  Never
+        # rewrite an unchanged multi-year base just to poll short-retention
+        # features; enrich the newly written hot tail instead.
+        updated_codes = {result.code for result in results if result.status == "updated"}
+        feature_symbols = (
+            [record for record in symbols if record.code in updated_codes]
+            if args.tail_only
+            else symbols
+        )
+        feature_symbols = [
+            record for record in feature_symbols
+            if (output_dir / f"{record.code}_features.parquet").is_file()
+        ]
+        pipeline_progress.revise_total(
+            len(symbols) + len(feature_symbols) * len(FEATURE_STAGE_IDS),
+            phase="historical-features",
+        )
         historical_feature_results = run_historical_feature_downloads(
             client,
-            symbols,
+            feature_symbols,
             output_dir,
             start_ms=start_ms,
             end_ms=end_ms,
             workers=args.feature_workers or args.workers,
             include_funding_archive=not args.skip_funding_archive,
+            tail_only=args.tail_only,
             stage_progress_callback=lambda _code, stage, status: (
                 pipeline_progress.update(stage, status)
             ),
@@ -1012,10 +1030,11 @@ def main() -> None:
             }
         )
     )
-    atomic_write_text(
-        historical_feature_report_path,
-        feature_report.write_csv(),
-    )
+    if not args.skip_historical_features or not historical_feature_report_path.is_file():
+        atomic_write_text(
+            historical_feature_report_path,
+            feature_report.write_csv(),
+        )
 
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
@@ -1070,6 +1089,7 @@ def main() -> None:
         "row_count": row_count,
         "status_counts": status_counts,
         "historical_features_enabled": not args.skip_historical_features,
+        "historical_feature_report_is_current_run": not args.skip_historical_features,
         "tail_only": args.tail_only,
         "funding_archive_enabled": (
             not args.skip_historical_features and not args.skip_funding_archive

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
+from stockagent.data.tw_public_features import _release_feature_content_receipt  # noqa: E402
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _latest_completed_taiex_session,
     _preopen_acceptance_errors,
@@ -369,6 +370,129 @@ def _audit_revision_errors(
     return errors
 
 
+def _event_applied_versions(receipt: Mapping[str, Any]) -> dict[str, str]:
+    """Return the stable source revision, excluding probe/heartbeat metadata."""
+
+    datasets = receipt.get("datasets")
+    if not isinstance(datasets, Mapping):
+        return {}
+    return {
+        str(name): str(row.get("applied_version") or "")
+        for name, row in datasets.items()
+        if isinstance(row, Mapping)
+    }
+
+
+def _reusable_session_acceptance(
+    candidate: Mapping[str, Any],
+    *,
+    session_date: str,
+    expected_latest: str,
+    event_receipt: Mapping[str, Any],
+    dependency_sha256: str,
+) -> bool:
+    """Prove a completed same-session acceptance still names this revision."""
+
+    acceptance = candidate.get("acceptance")
+    final_dependency = candidate.get("final_audit_dependency_state")
+    accepted_event = candidate.get("event_monitor")
+    if not all(
+        (
+            candidate.get("status") == "ok",
+            str(candidate.get("started_at_taipei") or "")[:10] == session_date,
+            candidate.get("expected_latest_date") == expected_latest,
+            isinstance(acceptance, Mapping),
+            isinstance(final_dependency, Mapping),
+            isinstance(accepted_event, Mapping),
+        )
+    ):
+        return False
+    required = (
+        "subprocess_ok",
+        "live_root_receipt_fresh",
+        "live_root_status_ok",
+        "live_root_verified",
+        "coverage_complete",
+        "same_session_eligibility",
+        "all_156_sources",
+        "source_event_monitor",
+        "strict_model_safety_audit",
+    )
+    current_versions = _event_applied_versions(event_receipt)
+    return bool(
+        all(acceptance.get(name) is True for name in required)
+        and acceptance.get("runtime_materialization_required") is False
+        and acceptance.get("runtime_materialized_snapshot") is False
+        and str(final_dependency.get("sha256") or "") == dependency_sha256
+        and not _event_monitor_errors(
+            event_receipt, observed=datetime.now(TAIPEI)
+        )
+        and current_versions == _event_applied_versions(accepted_event)
+        and len(current_versions) == len(DEFAULT_DATASETS)
+        and all(current_versions.values())
+    )
+
+
+def _accepted_session_candidates(receipt_path: Path) -> Iterator[dict[str, Any]]:
+    """Return newest receipts first, including a run hidden by a later retry."""
+
+    yield _json(receipt_path)
+    runs = receipt_path.parent / "runs"
+    if runs.is_dir():
+        for path in sorted(runs.glob("*.json"), reverse=True):
+            yield _json(path)
+
+
+def _reuse_accepted_session(
+    *,
+    receipt_path: Path,
+    started: datetime,
+    session_date: str,
+    expected_latest: str,
+    event_receipt: Mapping[str, Any],
+    dependency_sha256: str,
+) -> dict[str, Any] | None:
+    """Refresh the accepted receipt without repeating a full panel audit."""
+
+    for candidate in _accepted_session_candidates(receipt_path):
+        if not _reusable_session_acceptance(
+            candidate,
+            session_date=session_date,
+            expected_latest=expected_latest,
+            event_receipt=event_receipt,
+            dependency_sha256=dependency_sha256,
+        ):
+            continue
+        payload = json.loads(json.dumps(candidate, ensure_ascii=False))
+        verified_at = datetime.now(TAIPEI)
+        payload["last_verified_at_taipei"] = verified_at.isoformat()
+        payload["last_verification_elapsed_seconds"] = (
+            verified_at - started
+        ).total_seconds()
+        payload["event_monitor"] = dict(event_receipt)
+        payload["reuse"] = {
+            "status": "ok",
+            "reason": "same_session_source_and_dependency_revision_unchanged",
+            "original_completed_at_taipei": candidate.get(
+                "completed_at_taipei"
+            ),
+        }
+        payload["steps"] = [
+            {
+                "step": "reuse_accepted_session_revision",
+                "status": "ok",
+                "dependency_sha256": dependency_sha256,
+            }
+        ]
+        _atomic_json(receipt_path, payload)
+        run_path = receipt_path.parent / "runs" / (
+            started.strftime("%Y%m%dT%H%M%S%f") + ".json"
+        )
+        _atomic_json(run_path, payload)
+        return payload
+    return None
+
+
 def _derived_data_commands(
     *,
     live_root: Path,
@@ -558,6 +682,32 @@ def _receipt_dependency_errors(
             except OSError:
                 errors.append(f"{key}: missing dependency {path}")
                 continue
+            basis = str(receipt.get("basis") or "")
+            if basis:
+                if (
+                    basis != "feature_semantics_v1"
+                    or key != "source_receipts"
+                    or path.parent != live_root.resolve(strict=False)
+                    or path.name not in {
+                        "dgbas_release_vintages.parquet",
+                        "cbc_fx_reserve_release_vintages.parquet",
+                        "cbc_money_release_vintages.parquet",
+                    }
+                ):
+                    errors.append(f"{key}: unsupported receipt basis {basis}: {path.name}")
+                    continue
+                try:
+                    actual_receipt = _release_feature_content_receipt(path)
+                except Exception as exc:
+                    errors.append(f"{key}: unreadable semantic dependency {path}: {exc}")
+                    continue
+                if actual_receipt.get("basis") != basis:
+                    errors.append(f"{key}: semantic schema mismatch {path.name}")
+                    continue
+                actual_size = int(actual_receipt["size"])
+                actual_sha256 = str(actual_receipt["sha256"])
+            else:
+                actual_sha256 = ""
             if expected_size is not None and actual_size != int(expected_size):
                 errors.append(
                     f"{key}: size mismatch {path.name}: "
@@ -565,11 +715,12 @@ def _receipt_dependency_errors(
                 )
                 continue
             if expected_sha256:
-                try:
-                    actual_sha256 = _sha256_file(path)
-                except OSError as exc:
-                    errors.append(f"{key}: unreadable dependency {path}: {exc}")
-                    continue
+                if not basis:
+                    try:
+                        actual_sha256 = _sha256_file(path)
+                    except OSError as exc:
+                        errors.append(f"{key}: unreadable dependency {path}: {exc}")
+                        continue
                 if actual_sha256 != expected_sha256:
                     errors.append(f"{key}: sha256 mismatch {path.name}")
     return errors
@@ -750,6 +901,51 @@ def main() -> int:
     audit_dir = _repo_path(args.audit_root) / started.strftime("%Y%m%dT%H%M%S%f")
     expected_latest = _latest_completed_taiex_session(live_root, observed=started)
     steps: list[dict[str, Any]] = []
+
+    # A later catch-up timer must not repeat the 50+ GiB strict panel audit
+    # after this exact source and dependency revision has already passed.
+    # Heartbeat timestamps may change, so compare canonical applied versions.
+    if not args.force:
+        current_event = _json(event_path)
+        try:
+            dependency_state = _audit_dependency_state(
+                config=config,
+                live_root=live_root,
+            )
+            current_eligibility = require_exact_session_eligibility(
+                rule_data_dir=live_root,
+                parquet_root=live_root / "stocks",
+                trading_date=started.date(),
+            )
+            exact_eligibility = _same_session_accepted(
+                {
+                    "same_session_eligibility": {
+                        "trading_date": session_date,
+                        "venues": current_eligibility,
+                    }
+                },
+                trading_date=session_date,
+            )
+            runtime_link_matches = (
+                REPO_ROOT / "data_tw_public"
+            ).resolve(strict=True) == live_root
+        except (OSError, RuntimeError, ValueError):
+            dependency_state = {}
+            exact_eligibility = False
+            runtime_link_matches = False
+        reused = None
+        if exact_eligibility and runtime_link_matches:
+            reused = _reuse_accepted_session(
+                receipt_path=receipt_path,
+                started=started,
+                session_date=session_date,
+                expected_latest=expected_latest,
+                event_receipt=current_event,
+                dependency_sha256=str(dependency_state.get("sha256") or ""),
+            )
+        if reused is not None:
+            print(json.dumps(reused, ensure_ascii=False, sort_keys=True))
+            return 0
 
     publication = _json(publication_path)
     publication_failures = _publication_errors(
