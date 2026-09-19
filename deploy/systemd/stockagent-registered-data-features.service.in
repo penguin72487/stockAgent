@@ -1,0 +1,27 @@
+[Unit]
+Description=StockAgent crypto hot-tail historical feature refresh
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_registered_data_refresh.sh" features
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryAccounting=true
+MemoryHigh=24G
+MemoryMax=32G
+MemorySwapMax=4G
+OOMScoreAdjust=750
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

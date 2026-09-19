@@ -1,0 +1,30 @@
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
+
+# A new experimental feature ABI: source-level values enter the basis builder
+# without returns, ratios, log/log1p, or asinh transforms. The model still has
+# its learned projection and RMSNorm; this is not checkpoint-compatible with
+# the engineered-feature baseline.
+experiment_name: tw-day-trade-daily-multi-basis-raw-ohlcv-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_raw_ohlcv_v1
+  resume: false
+  post_train_infer: false
+
+data:
+  # 64 concurrent full-symbol decodes caused swap pressure on the 94 GiB
+  # penguin host; eight keeps the scan bounded while preserving parallel I/O.
+  panel_load_workers: 8
+  # This experiment is a completed-session decision: the 09:00 current-open
+  # quote is used only by execution, not as a model input. Including the old
+  # next_session_open_gap_logret would defeat the all-raw feature contract.
+  day_trade_open_feature: false
+  feature_include:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+  feature_exclude: []

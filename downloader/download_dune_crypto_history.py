@@ -100,6 +100,10 @@ class DuneCreditsExhausted(RuntimeError):
     pass
 
 
+class DuneSubscriptionBlocked(RuntimeError):
+    """The API key's subscription cannot start programmatic executions."""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -421,9 +425,19 @@ class DuneClient:
                 return decoded
             except HTTPError as exc:
                 last_error = exc
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
                 if exc.code == 402:
                     raise DuneCreditsExhausted(
                         "Dune returned HTTP 402; no additional executions will be started"
+                    ) from exc
+                if exc.code == 400 and (
+                    "performance tier is not available with your subscription"
+                    in detail.lower()
+                    or "upgrade your subscription" in detail.lower()
+                ):
+                    raise DuneSubscriptionBlocked(
+                        "Dune subscription does not permit the requested API execution tier; "
+                        "no additional partitions will be submitted"
                     ) from exc
                 if (
                     exc.code in {408, 429, 500, 502, 503, 504}
@@ -437,7 +451,6 @@ class DuneClient:
                         )
                     )
                     continue
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
                 raise RuntimeError(f"Dune HTTP {exc.code}: {detail}") from exc
             except (
                 URLError,
@@ -777,6 +790,15 @@ def main() -> int:
                 0,
                 message=str(exc),
             )
+        except DuneSubscriptionBlocked as exc:
+            stop.set()
+            result = PartitionResult(
+                partition.contract.query_id,
+                partition.partition_id,
+                "blocked_subscription",
+                0,
+                message=str(exc),
+            )
         except Exception as exc:  # each partition remains independently resumable
             result = PartitionResult(
                 partition.contract.query_id,
@@ -792,17 +814,47 @@ def main() -> int:
         )
         return result
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Probe one real due partition before opening the worker pool. Subscription
+    # tier failures are account-wide and permanent until the plan changes; the
+    # old fan-out repeated the same HTTP 400 for every partition.
+    remaining = list(due)
+    if remaining:
+        results.append(worker(remaining.pop(0)))
+    if stop.is_set():
+        for partition in remaining:
+            result = PartitionResult(
+                partition.contract.query_id,
+                partition.partition_id,
+                "not_started_subscription",
+                0,
+                message="not submitted after subscription capability gate",
+            )
+            results.append(result)
+            progress.update(
+                f"{partition.contract.query_id}:{partition.partition_id}",
+                result.status,
+            )
+    elif remaining:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(
-        max_workers=max(1, min(args.workers, len(contracts) or 1))
-    ) as executor:
-        futures = [executor.submit(worker, partition) for partition in due]
-        for future in as_completed(futures):
-            results.append(future.result())
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(args.workers, len(contracts) or 1))
+        ) as executor:
+            futures = [executor.submit(worker, partition) for partition in remaining]
+            for future in as_completed(futures):
+                results.append(future.result())
 
     hard_failed = any(item.status == "failed" for item in results)
-    blocked = any(item.status in {"blocked_credits", "not_started"} for item in results)
+    blocked = any(
+        item.status
+        in {
+            "blocked_credits",
+            "blocked_subscription",
+            "not_started",
+            "not_started_subscription",
+        }
+        for item in results
+    )
     state = "failed" if hard_failed else "blocked" if blocked else "complete"
     progress.finish(state=state)
     summary = {
@@ -816,6 +868,10 @@ def main() -> int:
         "failed_partitions": sum(item.status == "failed" for item in results),
         "blocked_credit_partitions": sum(
             item.status == "blocked_credits" for item in results
+        ),
+        "blocked_subscription_partitions": sum(
+            item.status in {"blocked_subscription", "not_started_subscription"}
+            for item in results
         ),
         "rows": sum(item.rows for item in results),
         "results": [

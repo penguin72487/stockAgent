@@ -1,0 +1,11 @@
+# Isolated OFAT candidate: disable cuDNN autotune without forcing every
+# operation into PyTorch's slower deterministic algorithm path.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_score_entmax_cash.yaml
+
+experiment_name: tw-day-trade-last-last-only-score-entmax-cash-v8-cudnn-fixed-profile
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_v8_cudnn_fixed_profile_candidate
+
+environment:
+  cudnn_benchmark: false

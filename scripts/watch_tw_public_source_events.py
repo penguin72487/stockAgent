@@ -101,6 +101,31 @@ FAST_TAGS = frozenset(
 )
 MEDIUM_TAGS = frozenset({"fundamental", "ownership", "dividend", "valuation"})
 CLOSE_EVENT_DATASETS = frozenset({"twse_daily_ohlcv", "tpex_daily_ohlcv"})
+
+# A source-version burst can make dozens of datasets pending at once (for
+# example after WSL was asleep). Running every selector in one downloader
+# process retains the union of their historical tables and can pin the event
+# daemon at memory.high for hours while it holds the canonical refresh lock.
+# Keep causal/opening inputs first, isolate the largest historical tables, and
+# let the persistent monitor drain the remaining queue over subsequent cycles.
+OPENING_REFRESH_PRIORITY = (
+    "twse_day_trade_eligibility",
+    "tpex_day_trade_eligibility",
+    "twse_daily_ohlcv",
+    "tpex_daily_ohlcv",
+    "twse_market_index",
+    "twse_daily_valuation",
+    "tpex_daily_valuation",
+    "twse_margin_balance",
+    "tpex_margin_balance",
+    "twse_institutional_trades",
+    "tpex_institutional_trades",
+)
+MEMORY_HEAVY_REFRESH_DATASETS = frozenset(
+    name
+    for name in OPENING_REFRESH_PRIORITY
+    if name not in {"twse_day_trade_eligibility", "tpex_day_trade_eligibility"}
+)
 CLOSE_EVENT_PHASE = "close_event"
 CLOSE_PROBE_WINDOW_START = datetime_time(13, 25)
 CLOSE_PROBE_WINDOW_END = datetime_time(14, 10)
@@ -147,6 +172,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--close-probe-interval-seconds", type=float, default=5.0)
     parser.add_argument("--medium-interval-seconds", type=float, default=300.0)
     parser.add_argument("--slow-interval-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--max-refresh-datasets-per-cycle",
+        type=int,
+        default=12,
+        help=(
+            "maximum light datasets applied by one downloader process; "
+            "memory-heavy Taiwan history datasets are always isolated"
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--probe-only", action="store_true")
     parser.add_argument(
@@ -936,6 +970,36 @@ def _download_retry_due(row: Mapping[str, Any], observed: datetime) -> bool:
     return retry_at is None or retry_at <= observed
 
 
+def _bounded_refresh_names(names: list[str], *, maximum: int) -> list[str]:
+    """Choose one bounded, deterministic source-event refresh batch.
+
+    Heavy canonical Parquet histories are deliberately run alone because the
+    downloader's peak working set is driven by the selected tables, not by the
+    number of HTTP requests. Successful names leave the pending set; failed
+    names receive retry backoff, so this ordering cannot starve later names.
+    """
+
+    if maximum <= 0:
+        raise ValueError("max refresh datasets per cycle must be positive")
+    priority = {name: index for index, name in enumerate(OPENING_REFRESH_PRIORITY)}
+    ordered = sorted(
+        set(names),
+        key=lambda name: (priority.get(name, len(priority)), name),
+    )
+    if not ordered:
+        return []
+    if ordered[0] in MEMORY_HEAVY_REFRESH_DATASETS:
+        return ordered[:1]
+    light: list[str] = []
+    for name in ordered:
+        if name in MEMORY_HEAVY_REFRESH_DATASETS:
+            break
+        light.append(name)
+        if len(light) >= maximum:
+            break
+    return light or ordered[:1]
+
+
 def _deferred_opening_refresh(
     names: list[str],
     *,
@@ -1578,7 +1642,7 @@ def _prioritize_unpublished_close_event(
     observed: datetime,
     close_probe_interval_seconds: float,
 ) -> list[DatasetSpec]:
-    """Keep the two close probes out of a slow 156-source batch until ready."""
+    """Keep the two close probes out of a slow full-source batch until ready."""
 
     if not _in_close_probe_window(observed):
         return due
@@ -1718,6 +1782,12 @@ def main() -> int:
                 if name in changed
                 or _download_retry_due(rows[name], datetime.now(TAIPEI))
             ]
+            refreshable_pending = _bounded_refresh_names(
+                refreshable_pending,
+                maximum=int(
+                    getattr(args, "max_refresh_datasets_per_cycle", 12)
+                ),
+            )
             if refreshable_pending and not args.probe_only:
                 refresh_observed = datetime.now(TAIPEI)
                 freeze = active_opening_revision_freeze(

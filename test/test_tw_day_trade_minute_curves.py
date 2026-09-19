@@ -13,6 +13,7 @@ import pytest
 from scripts.maintain_tw_day_trade_minute_curves import (
     _completed_scope,
     _inspect_strategy_price_provenance,
+    _tx_benchmark_source_state,
     _validate_benchmarks,
 )
 from scripts.rebuild_tw_day_trade_minute_curves import (
@@ -48,6 +49,33 @@ def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
     assert DEFAULT_LOCAL_MINUTE_ROOTS[0] == Path(
         "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
     )
+
+
+def test_tx_benchmark_preflight_rejects_missing_or_source_empty_receipt(
+    tmp_path: Path,
+) -> None:
+    state = _tx_benchmark_source_state(tmp_path / "TXFR1", "2026-09-15")
+    assert state["ready"] is False
+    assert state["status"] == "missing_or_invalid"
+
+    receipts = tmp_path / "TXFR1" / "receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "trading_date=2026-09-15.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "shioaji_txfr1_historical_ticks_v1",
+                "contract": "TXFR1",
+                "trading_date": "2026-09-15",
+                "status": "source_empty",
+                "session_finalized": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = _tx_benchmark_source_state(tmp_path / "TXFR1", "2026-09-15")
+    assert state["ready"] is False
+    assert state["status"] == "source_empty"
 
 
 def test_verified_minute_source_cannot_change_before_publication(tmp_path: Path) -> None:
@@ -115,6 +143,75 @@ def test_maintenance_waits_before_subprocess_or_minute_data_loading(
     payload = json.loads(status.read_text())
     assert payload["status"] == "waiting_accepted_endpoints"
     assert payload["missing_endpoints"][0]["missing_clocks"] == ["13:30"]
+    assert not (tmp_path / "output").exists()
+
+
+def test_maintenance_no_fetch_still_protects_live_publication(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from scripts import maintain_tw_day_trade_minute_curves as maintenance
+
+    day = "2026-09-03"
+    (tmp_path / "marks.jsonl").write_text(
+        "".join(
+            json.dumps({"session_date": day, "market": "test",
+                        "minute": f"{day}T{clock}+08:00"}) + "\n"
+            for clock in ("09:01", "13:30")
+        ),
+        encoding="utf-8",
+    )
+    status = tmp_path / "status.json"
+    status.write_text(json.dumps({"completed_session_dates": [day]}), encoding="utf-8")
+    monkeypatch.setattr(maintenance, "parse_args", lambda: SimpleNamespace(
+        state_dir=tmp_path, output_root=tmp_path / "output", status_path=status,
+        no_fetch=True,
+    ))
+    monkeypatch.setattr(maintenance, "_completed_scope", lambda _: ([day], {"test"}))
+    monkeypatch.setattr(maintenance, "_tx_benchmark_source_state", lambda *a: {"ready": True})
+    monkeypatch.setattr(maintenance, "_validate_current", lambda *a, **k: None)
+    monkeypatch.setattr(maintenance, "_inspect_strategy_price_provenance", lambda *a, **k: {
+        "unverified_opening_rows": 1,
+        "unverified_interior_rows": 268,
+    })
+    monkeypatch.setattr(maintenance, "_validate_benchmarks", lambda *a, **k: None)
+    monkeypatch.setattr(maintenance, "historical_query_is_protected", lambda _: True)
+    monkeypatch.setattr(maintenance.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("protected window must not start a rebuilder")
+    ))
+
+    maintenance.main()
+    assert json.loads(status.read_text())["status"] == "waiting_live_priority_window"
+    assert not (tmp_path / "output").exists()
+
+
+def test_waiting_source_retry_never_skips_tx_preflight(tmp_path: Path, monkeypatch) -> None:
+    from scripts import maintain_tw_day_trade_minute_curves as maintenance
+
+    day = "2026-09-17"
+    (tmp_path / "marks.jsonl").write_text(
+        "".join(
+            json.dumps({"session_date": day, "market": "test",
+                        "minute": f"{day}T{clock}+08:00"}) + "\n"
+            for clock in ("09:01", "13:30")
+        ),
+        encoding="utf-8",
+    )
+    status = tmp_path / "status.json"
+    status.write_text(
+        json.dumps({"status": "waiting_source", "completed_session_dates": [day]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(maintenance, "parse_args", lambda: SimpleNamespace(
+        state_dir=tmp_path, output_root=tmp_path / "output", status_path=status,
+        no_fetch=False, tx_history_root=tmp_path / "TXFR1",
+    ))
+    monkeypatch.setattr(maintenance, "_completed_scope", lambda _: ([day], {"test"}))
+    monkeypatch.setattr(maintenance.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("unverified TX must not start a rebuilder")
+    ))
+
+    maintenance.main()
+    assert json.loads(status.read_text())["status"] == "waiting_source"
     assert not (tmp_path / "output").exists()
 
 
@@ -1027,6 +1124,60 @@ def test_price_provenance_inspection_rejects_timestamp_only_minute(
     assert result["expected_interior_rows"] == 268
     assert result["audited_interior_rows"] == 267
     assert result["unverified_interior_rows"] == 1
+    assert result["expected_opening_rows"] == 1
+    assert result["audited_opening_rows"] == 1
+    assert result["unverified_opening_rows"] == 0
+
+
+def test_price_provenance_inspection_rejects_unsourced_opening(tmp_path: Path) -> None:
+    opening = {
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "minute": "2026-08-13T09:01+08:00",
+        "accepted_endpoint_accounting_verified": True,
+    }
+    (tmp_path / "marks.jsonl").write_text(json.dumps(opening) + "\n", encoding="utf-8")
+    result = _inspect_strategy_price_provenance(
+        tmp_path,
+        completed_session_dates=["2026-08-13"],
+        expected_markets={"tw_day_trade"},
+    )
+    assert result["unverified_opening_rows"] == 1
+    assert result["audited_opening_rows"] == 0
+
+
+def test_price_provenance_inspection_uses_latest_append_only_mark(tmp_path: Path) -> None:
+    opening = {
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "minute": "2026-08-13T09:01+08:00",
+    }
+    sourced = {
+        **opening,
+        "historical_minute_replay": True,
+        "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+        "valuation_source": "retained_1m_close_from_immutable_carried_fill_and_action_book",
+        "fresh_trade_notional_coverage_ratio": 1.0,
+        "fresh_trade_position_count": 1,
+        "last_trade_carried_position_count": 0,
+        "missing_price_position_count": 0,
+        "valuation_executable": False,
+    }
+    marks_path = tmp_path / "marks.jsonl"
+    marks_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in (opening, sourced)),
+        encoding="utf-8",
+    )
+    kwargs = {
+        "completed_session_dates": ["2026-08-13"],
+        "expected_markets": {"tw_day_trade"},
+    }
+    assert _inspect_strategy_price_provenance(tmp_path, **kwargs)["unverified_opening_rows"] == 0
+    marks_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in (sourced, opening)),
+        encoding="utf-8",
+    )
+    assert _inspect_strategy_price_provenance(tmp_path, **kwargs)["unverified_opening_rows"] == 1
 
 
 def test_stock_benchmark_minute_rebuild_preserves_tx_marks(tmp_path: Path) -> None:

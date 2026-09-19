@@ -652,6 +652,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="data_yahoo", help="Root directory containing one subfolder per asset class.")
     parser.add_argument("--output-dir", default=None, help="Optional explicit output directory. Only valid when --asset is not 'all'.")
     parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date in YYYY-MM-DD.")
+    parser.add_argument(
+        "--verify-us-history-head",
+        action="store_true",
+        help=(
+            "For US daily stocks, retry files whose recorded requested start is "
+            "later than --start-date (or absent). Preserve valid local history "
+            "if the provider no longer serves an older/delisted symbol."
+        ),
+    )
     parser.add_argument("--end-date", default=date.today().isoformat(), help="Inclusive end date in YYYY-MM-DD.")
     parser.add_argument(
         "--workers",
@@ -3941,6 +3950,30 @@ def _resolve_repair_plan(
                 )
                 continue
 
+            if (
+                asset_class == "us_stocks"
+                and bool(getattr(args, "verify_us_history_head", False))
+                and (checked_start_dt is None or checked_start_dt > requested_start_dt)
+            ):
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="historical_head_extension",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=args.start_date,
+                        checked_through_date=checked_through_date,
+                        merge_existing=True,
+                        message=(
+                            f"requested_start={args.start_date}, "
+                            f"checked_start={info.requested_start_date}; "
+                            "retain local rows if upstream history is unavailable"
+                        ),
+                    )
+                )
+                continue
+
             metadata_problems: list[str] = []
             if info.metadata_error:
                 metadata_problems.append(info.metadata_error)
@@ -4148,6 +4181,24 @@ def _transform_repair_result(
     ):
         result.status = "not_found"
         terminal_unavailable = True
+
+    if check.status == "historical_head_extension" and check.output_path.is_file():
+        # A 1900-start retry failing does not invalidate already captured
+        # 2000+ observations, particularly for delisted symbols.  Keep their
+        # rows in the persisted report and distinguish a missing *extension*
+        # from a missing local dataset.
+        result.output_path = str(check.output_path)
+        result.rows = _read_parquet_row_count(check.output_path)
+        result.first_date = check.first_date
+        result.last_date = check.last_date
+        result.checked_through_date = check.checked_through_date
+        if terminal_unavailable:
+            result.status = "history_extension_unavailable"
+        elif result.status == "empty":
+            result.status = "history_extension_no_new_rows"
+        elif result.status == "failed":
+            result.status = "history_extension_retry"
+        return result
 
     if terminal_unavailable and check.status in QUARANTINE_ELIGIBLE_PRECHECK_STATUSES:
         original_message = str(result.message or "Yahoo confirmed unavailable")

@@ -37,7 +37,7 @@ from stockagent.backtest.tw_futures_portfolio import (
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
 )
 from stockagent.config import ExperimentConfig
-from stockagent.data.panel import PanelData
+from stockagent.data.panel import PanelData, _TIFRS_MAX_CARRY_DAYS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
     TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION,
@@ -273,6 +273,8 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if config.data.overnight_decision_time == "13:25":
+        snapshot["data"].pop("overnight_decision_time", None)
     if config.data.overnight_1325_missing_price_policy == "reject":
         snapshot["data"].pop("overnight_1325_missing_price_policy", None)
     if not config.trading.tw_overnight_fixed_close_to_open:
@@ -947,18 +949,25 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         ),
     }
     if trading.tw_overnight_fixed_close_to_open:
+        from stockagent.data.tw_overnight import normalize_overnight_decision_time
+        decision_time, _ = normalize_overnight_decision_time(
+            config.data.overnight_decision_time
+        )
         contract["overnight_fixed_close_to_open"] = {
-            "version": 1, "decision": "13:25 Asia/Taipei",
+            "version": 1, "decision": f"{decision_time} Asia/Taipei",
             "entry": "same_session_closing_auction",
             "exit": "next_observed_session_opening_auction",
             "failed_open_exit": "absorbing_execution_failure",
             "source_root": config.data.overnight_1325_root,
-            "sizing": "auction_price_target_weight_research_approximation",
+            "sizing": "decision_price_fixed_board_lots_exact_integer_audit",
+            "training_surrogate": "close_auction_target_weight_continuous_ledger",
             "settlement": "t_plus_2_session_open_carrying_account",
         }
         if config.data.overnight_1325_missing_price_policy == "same_session_close":
+            missing_key = f"missing_{decision_time.replace(':', '')}_input"
             contract["overnight_fixed_close_to_open"].update(
-                version=2, missing_1325_input="same_session_close",
+                version=2 if decision_time == "13:25" else 3,
+                **{missing_key: "same_session_close"},
                 timing_assumption="user_authorized_same_close_lookahead_approximation",
             )
     if execution_mode == "crypto_perpetual":
@@ -1985,16 +1994,22 @@ def _checkpoint_manifest(
             "force_exit_mask": fingerprint("force_exit_mask", effective_force_exit),
         }
         if config.trading.tw_overnight_fixed_close_to_open:
-            panel_arrays["overnight_1325_available"] = fingerprint(
-                "overnight_1325_available", panel.overnight_1325_available
+            decision_tag = config.data.overnight_decision_time.replace(":", "")
+            panel_arrays[f"overnight_{decision_tag}_available"] = fingerprint(
+                f"overnight_{decision_tag}_available", panel.overnight_1325_available
+            )
+            panel_arrays[f"overnight_{decision_tag}_decision_prices"] = fingerprint(
+                f"overnight_{decision_tag}_decision_prices",
+                panel.overnight_decision_prices,
             )
             if config.data.overnight_1325_missing_price_policy == "same_session_close":
-                panel_arrays["overnight_1325_close_fallback_mask"] = fingerprint(
-                    "overnight_1325_close_fallback_mask", panel.overnight_1325_close_fallback_mask
+                panel_arrays[f"overnight_{decision_tag}_close_fallback_mask"] = fingerprint(
+                    f"overnight_{decision_tag}_close_fallback_mask",
+                    panel.overnight_1325_close_fallback_mask,
                 )
             # Provenance records the local path in the run manifest; content
             # compatibility must survive moving the same source to another node.
-            panel_arrays["overnight_1325_source"] = (
+            panel_arrays[f"overnight_{decision_tag}_source"] = (
                 None if panel.overnight_1325_source is None else
                 {key: value for key, value in panel.overnight_1325_source.items()
                  if key != "source_root"}
@@ -2315,9 +2330,24 @@ def _checkpoint_manifest(
         preprocessing_contract["feature_zero_fill"] = list(
             config.data.feature_zero_fill
         )
+    if config.data.feature_availability_indicators:
+        preprocessing_contract["feature_availability_indicators"] = list(
+            config.data.feature_availability_indicators
+        )
+    if config.data.day_trade_physical_public_feature_path is not None:
+        preprocessing_contract["day_trade_physical_public_feature_path"] = str(
+            config.data.day_trade_physical_public_feature_path
+        )
+    if any(name.startswith("twpub_xbrl_tifrs_") for name in panel.feature_names):
+        preprocessing_contract["tifrs_max_carry_days"] = _TIFRS_MAX_CARRY_DAYS
+        preprocessing_contract["tifrs_carry_contract_version"] = 2
     if config.data.feature_shift_next_session:
         preprocessing_contract["feature_shift_next_session"] = list(
             config.data.feature_shift_next_session
+        )
+    if config.data.tw_public_feature_cutoff != "regular_close":
+        preprocessing_contract["tw_public_feature_cutoff"] = (
+            config.data.tw_public_feature_cutoff
         )
     if config.data.allow_same_close_feature_approximation:
         preprocessing_contract["allow_same_close_feature_approximation"] = True
@@ -3114,6 +3144,7 @@ def _subset_panel_symbols(
         overnight_1325_available=aligned_2d(panel.overnight_1325_available, False),
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=aligned_2d(panel.overnight_1325_close_fallback_mask, False),
+        overnight_decision_prices=aligned_2d(panel.overnight_decision_prices, np.nan),
         can_buy_mask=aligned_2d(panel.can_buy_mask, False),
         can_sell_mask=aligned_2d(panel.can_sell_mask, False),
         can_short_open_mask=aligned_2d(panel.can_short_open_mask, False),

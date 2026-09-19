@@ -104,15 +104,25 @@ immutable manifests、heads、packs/blobs；每次通過 build/audit 並原子�
 保留多寫者，HLC 後寫者勝出。任何較新的 head 若尚未收齊 objects，接收端會 fail closed，
 不會退回舊版本假裝成功。
 
-目前 canonical 拓撲中，penguin、lab203 與 vastai1T 都加入
-`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。penguin 是
-full-replica durable node，設計上 lab203 也應如此；沒有 persistent volume 的 vastai1T 是
-index-only edge。每次操作仍必須重新驗收 lab203 的實際連線與完整度，不能只依賴角色名稱。
+目前 canonical 拓撲中，penguin 與 vastai1T 加入 `stockagent-packed`；
+lab203 已退役，不能重新配對或接受其後續 release。penguin 是 full-replica durable node；
+沒有 persistent volume 的 vastai1T 是 index-only edge。歷史 lab203 head、manifest、
+objects 留在 penguin 冷庫與獨立 D 備份，producer 名稱不能更改。
 Vast 只常駐 heads、manifests 與 inventories。Vast 的大量訓練 artifacts 不可把整個 node-local
 工作集直接加入 hot folder；edge mode 也禁止直接 cold publish。舊 `stockagent-desync`、
-`stockagent-artifacts-live` 與 Git working-tree folder 已退役；不要重新接受 invitation。
+`stockagent-artifacts-live`、`stockagent-artifacts-hot` 與 Git working-tree folder 已退役；
+不要重新接受 invitation。penguin 舊 hot transport 的磁碟內容保留待逐檔稽核，
+解除 Syncthing 配對不等於刪除這些檔案。
 
-作業系統的 service manager 不屬於資料契約：penguin/lab203 使用 systemd，Vast container
+舊 hot artifact transport 和 repository `artifacts` 在 penguin 以 hard link 共用實體內容，
+不是兩份可獨立刪除的備份。已完成的完整 run 才能經過 `manage_cold_artifacts.py
+retire` 的七日租期、C/D checksum、所有指定 peer、pin/程序引用及 hot mirror 核對，
+把兩個熱名稱共同轉成 cold-only；部分小檔 release 不得退役整個 run。需用時以
+`manage_cold_artifacts.py use DATASET` 借用既有 materialized-cache 的七日 lease、
+READY 與 GC。這個過渡流程不移動或刪除 packed 冷物件與 D 槽歷史備份；詳見
+`docs/live_artifact_sync.md` 與 README 的指令。
+
+作業系統的 service manager 不屬於資料契約：penguin 使用 systemd，Vast container
 使用平台 supervisor。兩種部署都必須達成同一組內容與連線驗收：永久 Device ID、永久
 packed node ID、相同 Folder ID、`needBytes=0`、`needTotalItems=0`、無 errors、object
 verify 通過，以及實際觀測到的 TLS/QUIC 連線。
@@ -163,6 +173,14 @@ run_fintech_python scripts/manage_packed_edge.py use tw-public \
 必須先切回 full-replica 或由 durable node 執行受稽核的 ingest；禁止讓 ignored object 配上
 已發布 head。
 
+若同一資料集即將反覆發布，可對明確指定的 release 使用 `use DATASET
+--snapshot-id ID --retain-payload`。這只在驗證、READY 與租約成功後保留該 release 的
+本機 packed payload 快取，最多到七日租約到期；下一版 hydration 暫時保留舊版與新版的
+exact objects，驗收新版後清理不再需要的舊物件。它不改變 index-only 節點的發布禁令、
+penguin 冷庫權威或 Syncthing 身分。未加選項仍維持原本驗證後立即 prune 的行為。
+若工作中斷，重新執行相同 dataset/snapshot 的 `use` 可接續同步中的 exact release，
+但 peer 連線、來源有效性與無錯誤閘門仍需通過。
+
 既有的五分鐘 `stockagent-data gc` 排程會在 edge 自動改走 `manage_packed_edge.py gc`。
 它只有在 durable peer 當下完整收斂時，才可用外部冷證明刪除到期 hot cache；pin、READY、
 manifest hash 與 `/proc` 使用偵測仍照常 fail closed。Edge TTL 最多七天，舊的長 TTL
@@ -174,7 +192,7 @@ stockagent-data gc
 stockagent-data evict DATASET --dry-run
 ```
 
-## Lab203 接收（預設 cold-only）
+## 接收端範例（已退役的 lab203 不得重新配對）
 
 等 Syncthing 顯示 `idle / Up to Date`、`needBytes=0` 後：
 
@@ -183,7 +201,7 @@ cd /root/stockAgent
 
 ./scripts/run_packed_snapshot.sh init \
   --sync-root /srv/stockagent-packed \
-  --node-id lab203
+  --node-id NEW_NODE_ID
 
 ./scripts/run_packed_snapshot.sh verify tw-public \
   --sync-root /srv/stockagent-packed
@@ -373,7 +391,7 @@ D 保留：所有已接收歷史；不接收 C 的 delete
 
 - authority node ID 與 C/D config、D mount marker、不同 filesystem 完全相符；
 - 每個 current head 可解析且 objects 完整，沒有 invalid manifest 或 Syncthing conflict；
-- lab203、vastai1T 當下 connected、completion 100%、need bytes/items/deletes 為 0、
+- 現役 vastai1T 當下 connected、completion 100%、need bytes/items/deletes 為 0、
   `remoteState=valid`；本機 folder idle 且 error/pull/watch/system error 都為 0；
 - 每個 C 候選在 D 有同 digest、未過期的 SHA-256 readback receipt，且來源／目標 signature
   都未變；
@@ -396,7 +414,7 @@ systemctl list-timers stockagent-packed-retention.timer --all
 journalctl -u stockagent-packed-retention.service -n 50 --no-pager
 ```
 
-timer 遇到 blocker 時回報 deferred，不會把「沒清到」誤當刪除成功。不要在 lab203／Vast
+timer 遇到 blocker 時回報 deferred，不會把「沒清到」誤當刪除成功。不要在已退役 lab203／Vast
 安裝此 timer，也不要手動 `find ... -delete` 或以 Syncthing ignore 偽裝 rolling retention。
 需要復原舊版本時，依 [D 槽備份文件](packed_cold_backup.md) 從獨立目錄驗證還原；若要把
 它重新放回 current，必須經 catalog 發布門檻建立新的有效 release，不能手改 head。

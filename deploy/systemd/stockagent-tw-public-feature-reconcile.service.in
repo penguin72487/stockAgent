@@ -1,0 +1,28 @@
+[Unit]
+Description=Reconcile Taiwan public training features against exact source bytes
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python scripts/reconcile_tw_public_training_features.py --defer-market-hours --research-output-path data_tw_public/features/tw_public_research_wide_2014_v1.parquet --research-taifex-output-path artifacts/research_features/tw_public_research_wide_2014_taifex_v2.parquet'
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryAccounting=true
+MemoryHigh=48G
+MemoryMax=64G
+MemorySwapMax=8G
+TimeoutStartSec=30min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__REPO_ROOT__/artifacts /srv/stockagent-live/data_tw_public /srv/stockagent-live/.locks
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures

@@ -67,6 +67,20 @@ test("every signal row has an explicit dated futures badge, including unknown", 
   assert.equal(presentation.futuresPresentation({status: "constructor"}).status, "unknown");
 });
 
+test("missed opening replay is not labelled as a live market-order fill", () => {
+  const {view} = components();
+  const html = view.signalRow({
+    symbol: "2330", market: "old_account_id", side: "long", target_weight: 0.1,
+    requested_shares: 17000, filled_shares: 1000,
+    counterfactual_0901_price_fill: true,
+    entry_fill_policy: "official_open_signal_0900_execute_0901_vwap",
+    minute_kbar_capacity_shares: 1000, execution_price: 100,
+  });
+  assert.match(html, /09:01 首分鐘價反事實模擬/);
+  assert.match(html, /容量限制未建立委託/);
+  assert.doesNotMatch(html, /市價成交/);
+});
+
 test("one paged-table shell preserves rows during errors and owns loading/count state", () => {
   const {view, byId} = components();
   view.pagedTable({id: "signal", rows: [1], total: 30, loading: true, hasMore: true, error: "<bad>",
@@ -76,6 +90,10 @@ test("one paged-table shell preserves rows during errors and owns loading/count 
   assert.match(byId("signal-body").html, /&lt;bad>/);
   assert.equal(byId("load-more-signals").disabled, true);
   assert.equal(byId("load-more-signals").classes.hidden, false);
+  view.pagedTable({id: "signal", rows: [], total: 0, loading: false, hasMore: false, error: "讀取失敗",
+    renderRow: () => "", emptyText: "目前沒有訊號"});
+  assert.match(byId("signal-body").html, /讀取失敗/);
+  assert.doesNotMatch(byId("signal-body").html, /目前沒有訊號/);
 });
 
 test("mode card keeps filtered returns separate from the shared Discord account DTO", () => {

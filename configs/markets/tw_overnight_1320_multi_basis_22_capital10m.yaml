@@ -1,0 +1,55 @@
+base_config: ../baselines/tw_day_trade_multi_basis_22_remote_v1.yaml
+
+experiment_name: tw-overnight-1320-close-fallback-next-open-multi-basis-22-projection-l1-capital10m-v1
+
+runner:
+  output_dir: artifacts/markets/tw_overnight_1320_close_fallback_next_open_multi_basis_22_projection_l1_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  day_trade_open_feature: false
+  overnight_1325_root: data_tw_minute/research_dataset
+  overnight_decision_time: "13:20"
+  # User-authorized research approximation: missing 13:20 uses final CLOSE.
+  overnight_1325_missing_price_policy: same_session_close
+  panel_cache_root: artifacts/cache/tw_overnight_1320_daily_panel
+  # The decision gap is appended after these 23 prior-completed features.
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - twpub_official_close_logret_1d
+    - twpub_official_trading_volume_log
+    - twpub_official_trading_value_log
+    - twpub_official_trades_log
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
+
+trading:
+  execution_mode: tw_overnight
+  tw_overnight_fixed_close_to_open: true
+  # Historical point-in-time borrow inventory is absent; fail closed to long-only.
+  long_only: true
+  tw_day_trade_unlimited_margin_conversion: false
+  tw_short_capacity_limit_enabled: true
+  tw_cash_lot_size: 1000
+
+training:
+  financial_transformer:
+    portfolio_mode: long_only
+    center_long_short_logits: false

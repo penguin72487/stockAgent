@@ -11,7 +11,7 @@ import json
 import pickle
 import os
 import time as time_module
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -109,6 +109,20 @@ BASE_PANEL_FEATURE_COLUMNS = [
     *LOG_RETURN_FEATURE_COLUMNS,
     DAY_TRADE_OPEN_GAP_FEATURE,
 ]
+# Opt-in source-level OHLCV columns. Keep these outside the default schema:
+# materializing five extra floats for every symbol/date is expensive, and
+# existing checkpoints must retain their original engineered-feature ABI.
+RAW_PANEL_FEATURE_COLUMNS = [
+    "open_raw", "high_raw", "low_raw", "close_raw", "trading_volume_raw",
+]
+
+
+def _requested_raw_panel_features(feature_include: tuple[str, ...]) -> bool:
+    return any(
+        fnmatch.fnmatchcase(name, pattern)
+        for pattern in feature_include
+        for name in RAW_PANEL_FEATURE_COLUMNS
+    )
 # Version 45 adds point-in-time TW margin-short eligibility/capacity arrays.
 # Version 44 carries raw-close valuation through ordinary symbol halts while
 # resetting the basis at lifecycle/corporate-action boundaries.  Version 43
@@ -390,6 +404,10 @@ class PanelData:
     overnight_1325_available: np.ndarray | None = None
     overnight_1325_source: dict[str, Any] | None = None
     overnight_1325_close_fallback_mask: np.ndarray | None = None
+    # Exact point-in-time prices used to convert a model weight into the board-
+    # lot order quantity before the closing auction. The legacy field prefix
+    # above remains for compatibility; this follows the configured clock.
+    overnight_decision_prices: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -444,6 +462,7 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         overnight_1325_available=sliced(panel.overnight_1325_available),
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=sliced(panel.overnight_1325_close_fallback_mask),
+        overnight_decision_prices=sliced(panel.overnight_decision_prices),
         returns_1d=panel.returns_1d[slc],
         tradable_mask=panel.tradable_mask[slc],
         can_buy_mask=sliced(panel.can_buy_mask),
@@ -626,7 +645,9 @@ def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
     text = str(path).strip()
     if not text:
         return None
-    return Path(text)
+    # Catalog-managed live/materialized aliases must have one cache identity.
+    # Resolving here also binds a materialized symlink to its exact release.
+    return Path(text).resolve()
 
 
 def _resolve_external_data_path(
@@ -1418,6 +1439,7 @@ def _overlay_external_values(
 _POINT_IN_TIME_STATE_FEATURE_PREFIXES = (
     "twpub_monthly_revenue_",
     "twpub_financial_",
+    "twpub_xbrl_",
     "twpub_company_",
     "twpub_tdcc_",
     "twpub_cbc_",
@@ -1425,9 +1447,11 @@ _POINT_IN_TIME_STATE_FEATURE_PREFIXES = (
     "twpub_mof_",
 )
 _POINT_IN_TIME_STATE_FEATURES = {
+    "twpub_usdtwd_raw",
     "twpub_insider_holdings_log",
     "twpub_insider_pledge_ratio",
 }
+_TIFRS_MAX_CARRY_DAYS = 400
 
 
 def _is_point_in_time_state_feature(name: str) -> bool:
@@ -1436,13 +1460,31 @@ def _is_point_in_time_state_feature(name: str) -> bool:
     )
 
 
+def _tifrs_carry_cache_contract(
+    external_feature_path: Path | None,
+    feature_include: tuple[str, ...],
+    feature_exclude: tuple[str, ...],
+) -> str:
+    if external_feature_path is None or pq is None:
+        return ""
+    for name in pq.read_schema(external_feature_path).names:
+        if not name.startswith("twpub_xbrl_tifrs_"):
+            continue
+        if feature_include and not any(fnmatch.fnmatchcase(name, pattern) for pattern in feature_include):
+            continue
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in feature_exclude):
+            continue
+        return f"tifrs_carry_v2_days={_TIFRS_MAX_CARRY_DAYS}|"
+    return ""
+
+
 def _seed_point_in_time_features_before_panel_start(
     target: np.ndarray,
     feature_names: list[str],
     panel_dates: np.ndarray,
     source_dates: np.ndarray,
     source_values: np.ndarray,
-) -> None:
+) -> dict[int, int]:
     """Restore the last known PIT state before an early-materialized horizon."""
 
     if (
@@ -1452,20 +1494,46 @@ def _seed_point_in_time_features_before_panel_start(
         or source_dates.size == 0
         or source_values.ndim != 2
     ):
-        return
+        return {}
     cutoff = int(np.searchsorted(source_dates, panel_dates[0], side="left"))
     if cutoff <= 0:
-        return
+        return {}
     prior = source_values[:cutoff]
+    has_tifrs = any(name.startswith("twpub_xbrl_tifrs_") for name in feature_names)
+    source_days = source_dates.astype("datetime64[D]").astype(np.int64) if has_tifrs else None
+    panel_first_day = (
+        int(panel_dates[0].astype("datetime64[D]").astype(np.int64))
+        if has_tifrs else None
+    )
+    seed_day_ordinals: dict[int, int] = {}
     for col_idx, name in enumerate(feature_names):
         if not _is_point_in_time_state_feature(name):
             continue
         valid = np.flatnonzero(np.isfinite(prior[:, col_idx]))
         if valid.size:
-            target[0, col_idx] = prior[int(valid[-1]), col_idx]
+            prior_idx = int(valid[-1])
+            if name.startswith("twpub_xbrl_tifrs_"):
+                assert source_days is not None and panel_first_day is not None
+                if panel_first_day - int(source_days[prior_idx]) > _TIFRS_MAX_CARRY_DAYS:
+                    continue
+                # A value actually released on the first panel date replaces
+                # the seed; its age starts at that date, not the prior filing.
+                first_is_observed = (
+                    cutoff < source_dates.size
+                    and source_dates[cutoff] == panel_dates[0]
+                    and np.isfinite(source_values[cutoff, col_idx])
+                )
+                if not first_is_observed:
+                    seed_day_ordinals[col_idx] = int(source_days[prior_idx])
+            target[0, col_idx] = prior[prior_idx, col_idx]
+    return seed_day_ordinals
 
 
-def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list[str]) -> None:
+def _forward_fill_point_in_time_features(
+    values: np.ndarray, feature_names: list[str],
+    panel_day_ordinals: np.ndarray | None = None,
+    seed_day_ordinals: dict[int, int] | None = None,
+) -> None:
     if values.ndim != 2 or values.shape[0] == 0:
         return
     for col_idx, name in enumerate(feature_names):
@@ -1477,6 +1545,17 @@ def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list
             continue
         last_seen = np.maximum.accumulate(np.where(np.isfinite(column), np.arange(column.size), -1))
         fill_rows = (last_seen >= 0) & ~np.isfinite(column)
+        if name.startswith("twpub_xbrl_tifrs_"):
+            if panel_day_ordinals is None or panel_day_ordinals.size != column.size:
+                raise ValueError("TIFRS state carry requires aligned panel day ordinals")
+            source_rows = np.maximum(last_seen, 0)
+            source_days = panel_day_ordinals[source_rows].copy()
+            if seed_day_ordinals and col_idx in seed_day_ordinals:
+                source_days[last_seen == 0] = seed_day_ordinals[col_idx]
+            fill_rows &= (
+                panel_day_ordinals - source_days
+                <= _TIFRS_MAX_CARRY_DAYS
+            )
         column[fill_rows] = column[last_seen[fill_rows]]
 
 
@@ -2285,6 +2364,7 @@ def _load_symbol_arrays_pyarrow(
     path: Path,
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
+    raw_input_features: bool = False,
 ) -> _SymbolPanelArrays:
     if pq is None:
         raise RuntimeError("PyArrow is not available")
@@ -2297,6 +2377,7 @@ def _load_symbol_arrays_pyarrow(
         path,
         tradable_mode=tradable_mode,
         trading_volume_policy=trading_volume_policy,
+        raw_input_features=raw_input_features,
     )
 
 
@@ -2329,6 +2410,7 @@ def _load_symbol_arrays_pyarrow_tail(
     tail_rows: int,
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
+    raw_input_features: bool = False,
 ) -> _SymbolPanelArrays:
     from downloader.ohlcv_hot_tail import read_logical_parquet
 
@@ -2338,6 +2420,7 @@ def _load_symbol_arrays_pyarrow_tail(
         path,
         tradable_mode=tradable_mode,
         trading_volume_policy=trading_volume_policy,
+        raw_input_features=raw_input_features,
     )
 
 
@@ -2347,6 +2430,7 @@ def _symbol_arrays_from_arrow_table(
     *,
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
+    raw_input_features: bool = False,
 ) -> _SymbolPanelArrays:
     _require_trading_volume_column(path, set(table.column_names), trading_volume_policy)
     rows = int(table.num_rows)
@@ -2356,7 +2440,7 @@ def _symbol_arrays_from_arrow_table(
         return _SymbolPanelArrays(
             symbol=_symbol_name_from_path(path),
             dates=np.empty((0,), dtype="datetime64[ns]"),
-            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS)), dtype=np.float32),
+            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS) + (len(RAW_PANEL_FEATURE_COLUMNS) if raw_input_features else 0)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
             open_prices=empty_1d,
@@ -2503,8 +2587,19 @@ def _symbol_arrays_from_arrow_table(
         "lower_shadow": lower_shadow,
         "shadow_imbalance": shadow_imbalance,
     }
+    if raw_input_features:
+        feature_map.update({
+            "open_raw": open_px,
+            "high_raw": high_px,
+            "low_raw": low_px,
+            "close_raw": close_px,
+            "trading_volume_raw": volume,
+        })
     features = np.column_stack(
-        [feature_map[name] for name in BASE_PANEL_FEATURE_COLUMNS]
+        [feature_map[name] for name in (
+            *BASE_PANEL_FEATURE_COLUMNS,
+            *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ()),
+        )]
     ).astype(np.float32, copy=False)
 
     close_notna = np.isfinite(execution_px) & (execution_px > 0.0)
@@ -2610,6 +2705,7 @@ def _load_symbol_arrays_polars_lazy(
     *,
     collect_engine: str = "auto",
     trading_volume_policy: str | bool | None = "auto",
+    raw_input_features: bool = False,
 ) -> _SymbolPanelArrays:
     if pl is None:
         raise RuntimeError("Polars is not available")
@@ -2781,6 +2877,14 @@ def _load_symbol_arrays_polars_lazy(
         execution_available_expr.alias("execution_available"),
         *[pl.col(name) for name in BASE_PANEL_FEATURE_COLUMNS],
     ]
+    if raw_input_features:
+        selected_columns.extend([
+            pl.col("_open").alias("open_raw"),
+            pl.col("_max").alias("high_raw"),
+            pl.col("_min").alias("low_raw"),
+            pl.col("_close").alias("close_raw"),
+            pl.col("_volume").alias("trading_volume_raw"),
+        ])
     if eligibility_column is not None:
         selected_columns.append(
             num(eligibility_column).alias("day_trade_eligible")
@@ -2799,7 +2903,7 @@ def _load_symbol_arrays_polars_lazy(
         return _SymbolPanelArrays(
             symbol=_symbol_name_from_path(path),
             dates=np.empty((0,), dtype="datetime64[ns]"),
-            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS)), dtype=np.float32),
+            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS) + (len(RAW_PANEL_FEATURE_COLUMNS) if raw_input_features else 0)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
             open_prices=empty_1d,
@@ -2839,7 +2943,10 @@ def _load_symbol_arrays_polars_lazy(
     features = np.column_stack(
         [
             out[name].to_numpy().astype(np.float64, copy=False)
-            for name in BASE_PANEL_FEATURE_COLUMNS
+            for name in (
+                *BASE_PANEL_FEATURE_COLUMNS,
+                *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ()),
+            )
         ]
     ).astype(np.float32, copy=False)
     close_notna = ~np.isnan(close_px)
@@ -2930,6 +3037,9 @@ def _build_panel_from_symbol_arrays(
     external_features: _ExternalFeatureArrays | None = None,
     feature_include: tuple[str, ...] = (),
     feature_exclude: tuple[str, ...] = (),
+    raw_input_features: bool = False,
+    feature_availability_indicators: tuple[str, ...] = (),
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> PanelData:
     if not symbol_arrays:
         raise RuntimeError("No valid parquet files could be loaded.")
@@ -2967,7 +3077,10 @@ def _build_panel_from_symbol_arrays(
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
     session_dates = all_dates
-    all_base_feature_names = list(BASE_PANEL_FEATURE_COLUMNS)
+    all_base_feature_names = [
+        *BASE_PANEL_FEATURE_COLUMNS,
+        *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ()),
+    ]
     all_external_feature_names = list(external_features.feature_names) if external_features is not None else []
     # The next-session open is legal only when the caller deliberately opts in
     # by exact name.  In particular, an empty include and broad wildcards retain
@@ -2991,6 +3104,19 @@ def _build_panel_from_symbol_arrays(
         feature_include=feature_include,
         feature_exclude=effective_feature_exclude,
     )
+    indicator_indices = (
+        _feature_pattern_indices(
+            feature_names,
+            feature_availability_indicators,
+            label="feature_availability_indicators",
+        )
+        if feature_availability_indicators else []
+    )
+    original_feature_count = len(feature_names)
+    feature_names = [
+        *feature_names,
+        *(f"{feature_names[index]}__available" for index in indicator_indices),
+    ]
     num_base_features = len(base_feature_indices)
     num_external_features = len(external_feature_indices)
     num_features = len(feature_names)
@@ -3000,6 +3126,11 @@ def _build_panel_from_symbol_arrays(
     external_dest_indexer = _contiguous_indexer(external_dest_indices)
     external_dest_is_slice = isinstance(external_dest_indexer, slice)
     selected_external_feature_names = [all_external_feature_names[idx] for idx in external_feature_indices]
+    panel_day_ordinals = (
+        all_dates.astype("datetime64[D]").astype(np.int64)
+        if any(name.startswith("twpub_xbrl_tifrs_") for name in selected_external_feature_names)
+        else None
+    )
     total_available_features = len(all_base_feature_names) + len(all_external_feature_names)
     if num_features != total_available_features:
         print(
@@ -3041,7 +3172,7 @@ def _build_panel_from_symbol_arrays(
             external_features.market_dates,
             market_values,
         )
-        _seed_point_in_time_features_before_panel_start(
+        market_seed_days = _seed_point_in_time_features_before_panel_start(
             market_external,
             selected_external_feature_names,
             all_dates,
@@ -3051,6 +3182,8 @@ def _build_panel_from_symbol_arrays(
         _forward_fill_point_in_time_features(
             market_external,
             selected_external_feature_names,
+            panel_day_ordinals,
+            market_seed_days,
         )
 
     for sym_idx, item in enumerate(symbol_arrays):
@@ -3086,7 +3219,7 @@ def _build_panel_from_symbol_arrays(
             if symbol_external is not None:
                 symbol_values = symbol_external[1][:, external_source_indexer]
                 target = symbol_features[:, external_dest_indexer]
-                _seed_point_in_time_features_before_panel_start(
+                symbol_seed_days = _seed_point_in_time_features_before_panel_start(
                     target,
                     selected_external_feature_names,
                     all_dates,
@@ -3094,7 +3227,10 @@ def _build_panel_from_symbol_arrays(
                     symbol_values,
                 )
                 _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
-                _forward_fill_point_in_time_features(target, selected_external_feature_names)
+                _forward_fill_point_in_time_features(
+                    target, selected_external_feature_names, panel_day_ordinals,
+                    symbol_seed_days,
+                )
                 if not external_dest_is_slice:
                     symbol_features[:, external_dest_indexer] = target
         # A one-day label must end on the next market session and on an
@@ -3152,6 +3288,8 @@ def _build_panel_from_symbol_arrays(
             )
         if (sym_idx + 1) % 500 == 0 or (sym_idx + 1) == num_symbols:
             print(f"[panel] materialized symbols {sym_idx + 1}/{num_symbols}")
+            if progress_callback is not None:
+                progress_callback("materialize", sym_idx + 1, num_symbols)
 
     if masked_non_session_returns:
         print(
@@ -3174,6 +3312,10 @@ def _build_panel_from_symbol_arrays(
         ).astype(np.float32, copy=False)
 
     print("[panel] sanitizing feature NaN/inf values")
+    for offset, source_index in enumerate(indicator_indices):
+        features[:, :, original_feature_count + offset] = np.isfinite(
+            features[:, :, source_index]
+        )
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     return PanelData(
         dates=np.asarray(all_dates, dtype="datetime64[ns]"),
@@ -3715,11 +3857,13 @@ def build_tail_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_availability_indicators: Any = None,
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> PanelData:
     """Build a panel from only the last rows of each symbol file for live inference."""
-    parquet_root = Path(parquet_root)
+    parquet_root = Path(parquet_root).resolve()
     external_feature_path = _resolve_external_data_path(
         external_feature_path,
         include_features=external_include_features,
@@ -3735,8 +3879,13 @@ def build_tail_panel(
     )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    raw_input_features = _requested_raw_panel_features(feature_include_patterns)
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
+    )
+    availability_patterns = _normalize_feature_patterns(
+        feature_availability_indicators,
+        label="feature_availability_indicators",
     )
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
@@ -3768,7 +3917,7 @@ def build_tail_panel(
             _external_destinations,
             resolved_feature_names,
         ) = _resolve_panel_feature_indices(
-            list(BASE_PANEL_FEATURE_COLUMNS),
+            [*BASE_PANEL_FEATURE_COLUMNS, *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ())],
             all_external_feature_names,
             feature_include=feature_include_patterns,
             feature_exclude=effective_feature_exclude,
@@ -3821,6 +3970,7 @@ def build_tail_panel(
                 tail_rows=read_rows,
                 tradable_mode=tradable_mode,
                 trading_volume_policy=trading_volume_policy,
+                raw_input_features=raw_input_features,
             )
             if int(arrays.dates.size) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
@@ -3828,11 +3978,27 @@ def build_tail_panel(
         except Exception as exc:
             return path, None, exc
 
+    def report(phase: str, done: int, total: int) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, done, total)
+            except Exception:
+                # Monitoring must never make a valid signal fail.
+                pass
+
     if panel_load_workers > 1 and len(parquet_paths) > 1:
         with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
-            loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
+            loaded_arrays = []
+            for count, loaded in enumerate(executor.map(_load_one_arrays, parquet_paths), 1):
+                loaded_arrays.append(loaded)
+                if count % 250 == 0 or count == len(parquet_paths):
+                    report("load", count, len(parquet_paths))
     else:
-        loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+        loaded_arrays = []
+        for count, path in enumerate(parquet_paths, 1):
+            loaded_arrays.append(_load_one_arrays(path))
+            if count % 250 == 0 or count == len(parquet_paths):
+                report("load", count, len(parquet_paths))
     symbol_load_seconds = time_module.perf_counter() - build_started
 
     valid_arrays: list[_SymbolPanelArrays] = []
@@ -3885,6 +4051,7 @@ def build_tail_panel(
         else None
     )
     external_load_seconds = time_module.perf_counter() - external_started
+    report("external", len(valid_arrays), len(valid_arrays))
     assemble_started = time_module.perf_counter()
     panel = _build_panel_from_symbol_arrays(
         valid_arrays,
@@ -3900,12 +4067,17 @@ def build_tail_panel(
             if selected_panel_feature_names is not None
             else feature_exclude_patterns
         ),
+        raw_input_features=raw_input_features,
+        feature_availability_indicators=availability_patterns,
+        progress_callback=report,
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
     panel = _shift_panel_features_to_next_session(
         panel,
-        feature_shift_next_session_patterns,
+        _shift_patterns_with_availability_indicators(
+            panel, feature_shift_next_session_patterns
+        ),
     )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
     panel = _apply_corporate_action_avoidance_transitions(
@@ -3948,11 +4120,12 @@ def load_cached_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_availability_indicators: Any = None,
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData | None:
     del panel_load_workers
-    parquet_root = Path(parquet_root)
+    parquet_root = Path(parquet_root).resolve()
     external_feature_path = _resolve_external_data_path(
         external_feature_path,
         include_features=external_include_features,
@@ -3968,6 +4141,10 @@ def load_cached_panel(
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
+    )
+    availability_patterns = _normalize_feature_patterns(
+        feature_availability_indicators,
+        label="feature_availability_indicators",
     )
     include_day_trade_open_gap = (
         DAY_TRADE_OPEN_GAP_FEATURE in feature_include_patterns
@@ -4028,6 +4205,9 @@ def load_cached_panel(
     tradable_mode = str(tradable_mode).strip().lower()
     trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
     external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    tifrs_carry_key = _tifrs_carry_cache_contract(
+        external_feature_path, base_feature_include_patterns, feature_exclude_patterns,
+    )
     corporate_action_key = (
         (
             f"{corporate_action_paths.parquet}:"
@@ -4044,12 +4224,14 @@ def load_cached_panel(
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
+        f"{tifrs_carry_key}"
         f"corporate_action_reference={corporate_action_key}|"
         f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
         f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
         f"feature_include={list(base_feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(base_feature_zero_fill_patterns)!r}|"
+        f"feature_availability_indicators={list(availability_patterns)!r}|"
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
@@ -5029,6 +5211,7 @@ def _filter_panel_features(
         overnight_1325_available=panel.overnight_1325_available,
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=panel.overnight_1325_close_fallback_mask,
+        overnight_decision_prices=panel.overnight_decision_prices,
         returns_1d=panel.returns_1d,
         tradable_mask=panel.tradable_mask,
         can_buy_mask=panel.can_buy_mask,
@@ -5182,6 +5365,24 @@ def _append_configured_day_trade_open_gap_feature(
             (DAY_TRADE_OPEN_GAP_FEATURE,),
         )
     return panel
+
+
+def _shift_patterns_with_availability_indicators(
+    panel: PanelData,
+    patterns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Move an observed-value flag on the same clock as its source value."""
+
+    if not patterns:
+        return patterns
+    shifted = list(patterns)
+    for name in panel.feature_names:
+        if not name.endswith("__available"):
+            continue
+        source_name = name.removesuffix("__available")
+        if any(fnmatch.fnmatchcase(source_name, pattern) for pattern in patterns):
+            shifted.append(name)
+    return tuple(shifted)
 
 
 def _shift_panel_features_to_next_session(
@@ -5372,21 +5573,27 @@ def build_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_availability_indicators: Any = None,
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
     overnight_1325_root: str | Path | None = None,
+    overnight_decision_time: str = "13:25",
     overnight_1325_missing_price_policy: str = "reject",
 ) -> PanelData:
     def append_overnight_context(panel: PanelData) -> PanelData:
         if overnight_1325_root is not None:
-            from stockagent.data.tw_overnight import attach_overnight_1325
-            return attach_overnight_1325(panel, overnight_1325_root,
-                                         missing_price_policy=overnight_1325_missing_price_policy)
+            from stockagent.data.tw_overnight import attach_overnight_decision
+            return attach_overnight_decision(
+                panel,
+                overnight_1325_root,
+                decision_time=overnight_decision_time,
+                missing_price_policy=overnight_1325_missing_price_policy,
+            )
         return panel
 
-    parquet_root = Path(parquet_root)
+    parquet_root = Path(parquet_root).resolve()
     cache_root = (
-        Path(panel_cache_root)
+        Path(panel_cache_root).resolve()
         if panel_cache_root is not None and str(panel_cache_root).strip()
         else parquet_root
     )
@@ -5405,8 +5612,13 @@ def build_panel(
     )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    raw_input_features = _requested_raw_panel_features(feature_include_patterns)
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
+    )
+    availability_patterns = _normalize_feature_patterns(
+        feature_availability_indicators,
+        label="feature_availability_indicators",
     )
     include_day_trade_open_gap = (
         DAY_TRADE_OPEN_GAP_FEATURE in feature_include_patterns
@@ -5499,6 +5711,9 @@ def build_panel(
         raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
     external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    tifrs_carry_key = _tifrs_carry_cache_contract(
+        external_feature_path, base_feature_include_patterns, feature_exclude_patterns,
+    )
     corporate_action_key = (
         (
             f"{corporate_action_paths.parquet}:"
@@ -5515,12 +5730,14 @@ def build_panel(
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
+        f"{tifrs_carry_key}"
         f"corporate_action_reference={corporate_action_key}|"
         f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
         f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
         f"feature_include={list(base_feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(base_feature_zero_fill_patterns)!r}|"
+        f"feature_availability_indicators={list(availability_patterns)!r}|"
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
@@ -5575,6 +5792,7 @@ def build_panel(
                     path,
                     tradable_mode=tradable_mode,
                     trading_volume_policy=trading_volume_policy,
+                    raw_input_features=raw_input_features,
                 )
             else:
                 arrays = _load_symbol_arrays_polars_lazy(
@@ -5582,6 +5800,7 @@ def build_panel(
                     tradable_mode=tradable_mode,
                     collect_engine=polars_collect_engine,
                     trading_volume_policy=trading_volume_policy,
+                    raw_input_features=raw_input_features,
                 )
             if int(arrays.dates.size) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
@@ -5613,12 +5832,35 @@ def build_panel(
             "[panel] pruned per-symbol rows before dense materialization "
             f"for panel_start_date={normalized_panel_start_date}"
         )
+    selected_external_feature_names: tuple[str, ...] | None = None
+    if (
+        external_feature_path is not None
+        and external_include_features
+        and base_feature_include_patterns
+        and not feature_exclude_patterns
+    ):
+        # Project only explicitly selected public feature columns before
+        # reading the multi-million-row table. Keep all rule columns: masks,
+        # eligibility, and action guards are independent of model inputs.
+        external_names = [
+            name for name in pq.read_schema(external_feature_path).names
+            if name not in {"date", "symbol"} and not name.startswith("_")
+        ]
+        _, _, selected_external_indices, _, _ = _resolve_panel_feature_indices(
+            [*BASE_PANEL_FEATURE_COLUMNS, *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ())],
+            external_names,
+            feature_include=base_feature_include_patterns,
+        )
+        selected_external_feature_names = tuple(
+            external_names[index] for index in selected_external_indices
+        )
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,
             market_symbol=external_market_symbol,
             include_features=external_include_features,
             include_rules=external_include_rules,
+            selected_feature_names=selected_external_feature_names,
         )
         if external_feature_path is not None
         else None
@@ -5629,12 +5871,16 @@ def build_panel(
         external_features=external_features,
         feature_include=base_feature_include_patterns,
         feature_exclude=feature_exclude_patterns,
+        raw_input_features=raw_input_features,
+        feature_availability_indicators=availability_patterns,
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, base_feature_zero_fill_patterns)
     panel = _shift_panel_features_to_next_session(
         panel,
-        base_feature_shift_next_session_patterns,
+        _shift_patterns_with_availability_indicators(
+            panel, base_feature_shift_next_session_patterns
+        ),
     )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
     panel = _apply_corporate_action_avoidance_transitions(

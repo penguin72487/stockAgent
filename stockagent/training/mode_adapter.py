@@ -124,10 +124,10 @@ _MODE_SPECS: Final[tuple[TrainingModeSpec, ...]] = (
         execution_mode="tw_overnight",
         product_family="taiwan_stock_etf",
         frequency="daily_next_session",
-        decision_clock="completed_prior_session_plus_observed_open",
-        execution_clock="open_and_close_auctions_across_one_session",
+        decision_clock="configured_completed_intraday_bar_plus_prior_completed_daily_features",
+        execution_clock="same_session_close_then_next_session_open_auctions",
         recurrent_state_scope="one_session_cohort_plus_t_plus_2_account",
-        terminal_policy="cohort_closed_by_next_close",
+        terminal_policy="mandatory_next_open_or_absorbing_execution_failure",
         split_ownership="year_expanding_walk_forward",
     ),
     TrainingModeSpec(

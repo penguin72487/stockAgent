@@ -145,6 +145,11 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             or summary.get("generated_at")
         )
 
+    def _signal_started_timestamp(self, summary: Mapping[str, Any]) -> datetime | None:
+        """Live execution must use the actual start clock for its causal gate."""
+
+        return _parse_timestamp(summary.get("signal_started_at"))
+
     def _match_auction_print(
         self, quote: Mapping[str, Any], *, symbol: str, **kwargs: Any,
     ) -> tuple[float, datetime | None] | None:
@@ -414,7 +419,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         signal_at = self._signal_timestamp(summary)
         if signal_at is None or signal_at.date() != observed.date():
             return self._block_signal(mode, signal_id, "signal_not_current_session", observed)
-        signal_started_at = _parse_timestamp(summary.get("signal_started_at"))
+        signal_started_at = self._signal_started_timestamp(summary)
         if signal_started_at is not None and signal_started_at.date() != observed.date():
             return self._block_signal(
                 mode,

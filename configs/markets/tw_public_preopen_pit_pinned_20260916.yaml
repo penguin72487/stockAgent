@@ -1,0 +1,14 @@
+# Reproducible 09:00-information experiment against one verified cold release.
+# The materialized tree is immutable; keep all panel-cache writes outside it.
+# Re-run `stockagent-data use tw-public --snapshot-id ...` before training to
+# renew/verify the local lease. Do not point the live downloader symlink here.
+base_config: tw_public_preopen_pit.yaml
+experiment_name: tw-public-preopen-pit-pinned-20260916
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_pit_pinned_20260916
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260916T171214687367304Z-l0-penguin-028dc00cc959f551/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260916T171214687367304Z-l0-penguin-028dc00cc959f551/features/tw_public_stock_daily.parquet
+  panel_cache_root: artifacts/cache/tw_public_preopen_pit_pinned_20260916

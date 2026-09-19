@@ -42,6 +42,22 @@ def test_build_tail_panel_reads_only_recent_rows(tmp_path) -> None:
     assert np.isfinite(panel.features[-1]).all()
 
 
+def test_live_tail_reports_progress_during_load_and_materialization(tmp_path) -> None:
+    for index in range(3):
+        _write_symbol(tmp_path / f"S{index}_features.parquet", 10.0 + index)
+    events: list[tuple[str, int, int]] = []
+
+    build_tail_panel(
+        tmp_path,
+        tail_rows=6,
+        panel_load_workers=2,
+        progress_callback=lambda phase, done, total: events.append((phase, done, total)),
+    )
+
+    assert ("load", 3, 3) in events
+    assert ("materialize", 3, 3) in events
+
+
 def test_build_tail_panel_includes_hot_tail_without_duplicate_timestamp(
     tmp_path,
 ) -> None:

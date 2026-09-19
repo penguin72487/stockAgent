@@ -1,0 +1,41 @@
+# Longer 2005+ raw-valued research horizon.  The 2013+ sibling includes
+# valuation and institutional fields whose official TWSE history starts later.
+# This is a distinct input ABI and cannot resume the 22-feature checkpoint.
+base_config: tw_public_preopen_raw_v1.yaml
+experiment_name: tw-public-preopen-raw-long-history-v1
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_raw_long_history_v1
+  resume: false
+  post_train_infer: false
+
+data:
+  panel_start_date: "2005-01-01"
+  feature_include:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_margin_balance_lots_raw
+    - twpub_short_balance_lots_raw
+    - twpub_margin_buy_lots_raw
+    - twpub_margin_sell_lots_raw
+    - twpub_short_sell_lots_raw
+    - twpub_short_buy_lots_raw
+    - twpub_twse_taiex_raw
+    - twpub_cbc_fx_reserves_usd_billion_raw
+  feature_shift_next_session:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_twse_taiex_raw
+
+walk_forward:
+  expected_first_year: 2005

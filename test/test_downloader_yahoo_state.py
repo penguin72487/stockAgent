@@ -832,6 +832,90 @@ def test_unverified_history_is_not_quarantined_on_transport_failure(tmp_path):
 
     assert transformed.status == "failed"
     assert output_path.exists()
+
+
+def test_us_history_head_extension_preserves_local_rows_if_upstream_is_gone(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "AAPL_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        pl.DataFrame(
+            {
+                "date": ["2000-01-03"],
+                "open": [1.0],
+                "max": [1.0],
+                "min": [1.0],
+                "close": [1.0],
+                "adjclose": [1.0],
+                "Trading_Volume": [1000.0],
+            }
+        ),
+        output_path,
+        asset_class="us_stocks",
+        requested_start_date="2000-01-01",
+        requested_end_date="2026-09-16",
+    )
+    record = yahoo.SymbolRecord("AAPL", "Apple", "us_stocks", "AAPL")
+    args = _base_args(
+        tmp_path,
+        mode="repair",
+        start_date="1900-01-01",
+        end_date="2026-09-16",
+        verify_us_history_head=True,
+    )
+    check = yahoo._resolve_repair_plan("us_stocks", args, [record], output_dir)[0]
+    assert (check.status, check.repair_start_date, check.merge_existing) == (
+        "historical_head_extension", "1900-01-01", True
+    )
+    result = yahoo.DownloadResult(
+        asset_class="us_stocks",
+        code="AAPL",
+        yahoo_symbol="AAPL",
+        market="us_stocks",
+        status="not_found",
+        rows=0,
+        output_path=None,
+        message="Yahoo no longer serves this symbol",
+    )
+    transformed = yahoo._transform_repair_result(result, check, output_dir=output_dir)
+    assert transformed.status == "history_extension_unavailable"
+    assert transformed.rows == 1
+    assert transformed.output_path == str(output_path)
+    assert output_path.exists()
+    assert not (output_dir / "quarantine").exists()
+
+
+def test_us_history_head_verification_is_opt_in(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "AAPL_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        pl.DataFrame(
+            {
+                "date": ["2026-09-16"],
+                "open": [1.0],
+                "max": [1.0],
+                "min": [1.0],
+                "close": [1.0],
+                "adjclose": [1.0],
+                "Trading_Volume": [1000.0],
+            }
+        ),
+        output_path,
+        asset_class="us_stocks",
+        requested_start_date="2000-01-01",
+        requested_end_date="2026-09-16",
+    )
+    record = yahoo.SymbolRecord("AAPL", "Apple", "us_stocks", "AAPL")
+    args = _base_args(
+        tmp_path,
+        mode="daily-update",
+        start_date="1900-01-01",
+        end_date="2026-09-16",
+        verify_us_history_head=False,
+    )
+    check = yahoo._resolve_repair_plan("us_stocks", args, [record], output_dir)[0]
+    assert check.status == "current"
     assert not (output_dir / "quarantine").exists()
 
 

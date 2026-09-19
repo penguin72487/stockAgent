@@ -7,6 +7,7 @@
   let resizeFrame = null;
   let renderedHistory = null;
   let renderedKey = "";
+  let renderedNote = "";
 
   function taipeiDayNumber(epochMinute) {
     return Math.floor((Number(epochMinute) + 8 * 60) / (24 * 60));
@@ -158,6 +159,7 @@
     if (!historyMatchesSelection) {
       renderedHistory = null;
       renderedKey = "";
+      renderedNote = "";
       legend.replaceChildren();
       destroy();
       host.classList.add("hidden");
@@ -179,7 +181,11 @@
       data.modes.map((row) => [row.market, strategyLabel(row)]),
       (data.benchmarks || []).map((row) => [row.benchmark_id, row.label]),
     ]);
-    if (renderedHistory === history && renderedKey === renderKey) return;
+    const staleNote = historyLoadError ? `；${historyLoadError}；保留上次成功資料（可能已過期）` : "";
+    if (renderedHistory === history && renderedKey === renderKey) {
+      note.textContent = renderedNote + staleNote;
+      return;
+    }
     const renderStarted = global.performance.now();
 
     const selectedModes = selectedMode === "all"
@@ -235,6 +241,7 @@
         note.textContent = allPointCount
           ? `${chartWindowLabel} · 目前 ${formatCount(series.length)} 條曲線皆已隱藏。`
           : `${chartWindowLabel}內沒有可繪製資料。`;
+        note.textContent += staleNote;
       }
       return;
     }
@@ -267,6 +274,7 @@
       plotData.push(values);
       stalePoints.push(stale);
     }
+    const staleObservationCount = stalePoints.reduce((total, points) => total + points.length, 0);
 
     const ticks = tickPlan(selectedMinutes);
     const size = dimensions(host);
@@ -333,9 +341,13 @@
     const coverageGaps = (history.range_summary || []).filter((row) => Number(row.minute_coverage_ratio) < .999999);
     const coverageQuality = coverageGaps.length
       ? `；${isOvernight ? "事件來源未齊" : "分鐘來源未齊"}：${coverageGaps.map((row) => `${labels.get(row.series_id) || row.series_id} ${formatCount(row.point_count)}/${formatCount(row.expected_minute_points)}`).join("、")}`
-      : `；${isOvernight ? "集合競價事件" : "分鐘"}覆蓋完整`;
+      : `；${isOvernight ? "集合競價事件" : "分鐘"}時間點齊全`;
+    const staleQuality = staleObservationCount
+      ? `；警告：${formatCount(staleObservationCount)} 個顯示點使用延用估值或缺價，非即時可成交報價（圖中以黃色標記）`
+      : "";
     host.setAttribute("aria-label", `${isOvernight ? "集合競價事件" : "分鐘"}報酬率曲線，${start}至${end}，顯示${formatCount(visiblePointCount)}點與${formatCount(visibleSeries.length)}條線`);
-    note.textContent = `${chartWindowLabel} · ${isOvernight ? "收盤／次日開盤事件曲線（歷史為反事實近似）" : "一分鐘曲線"} · 每條線第一個有效${isOvernight ? "事件" : "分鐘"}固定為 0%；期末權益與累積淨損益仍沿用原始帳本 · ${start} ～ ${end} · 顯示 ${formatCount(visiblePointCount)} 點、${formatCount(visibleSeries.length)}/${formatCount(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}${coverageQuality}`;
+    renderedNote = `${chartWindowLabel} · ${isOvernight ? "收盤／次日開盤事件曲線（歷史為反事實近似）" : "一分鐘曲線"} · 每條線第一個有效${isOvernight ? "事件" : "分鐘"}固定為 0%；期末權益與累積淨損益仍沿用原始帳本 · ${start} ～ ${end} · 顯示 ${formatCount(visiblePointCount)} 點、${formatCount(visibleSeries.length)}/${formatCount(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}${coverageQuality}${staleQuality}`;
+    note.textContent = renderedNote + staleNote;
     renderedHistory = history;
     renderedKey = renderKey;
     global.requestAnimationFrame(() => global.requestAnimationFrame(() => {

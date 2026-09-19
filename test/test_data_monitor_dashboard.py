@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,14 +10,147 @@ import pytest
 from stockagent.live import data_monitor_dashboard as dashboard
 from stockagent.live.data_monitor_dashboard import (
     build_data_monitor_public_status,
+    build_data_monitor_feature_inventory,
     build_tw_public_monitor_status,
 )
+
+
+def test_tw_feature_inventory_distinguishes_conditional_and_unverified_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(dashboard, "build_feature_inventory", lambda _root: {
+        "rows": [
+            {"dataset_id": "physical:tw-public:stock-features", "field": "fallback_reason", "non_null_count": 0},
+            {"dataset_id": "physical:tw-public:training-features", "field": "twpub_usdtwd_log", "non_null_count": 0},
+        ],
+        "datasets_with_schema": 2, "datasets_total": 2,
+        "files_with_schema": 2, "files_total": 2,
+        "state": "complete", "basis": "fixture",
+    })
+    result = build_data_monitor_feature_inventory(tmp_path, monitor_status={"sources": []})
+    by_field = {row["field"]: row for row in result["rows"]}
+    assert by_field["fallback_reason"]["field_role"] == "conditional"
+    assert "不代表日價缺漏" in by_field["fallback_reason"]["availability_note"]
+    assert "發布時間" in by_field["twpub_usdtwd_log"]["availability_note"]
 
 
 def test_date_only_coverage_is_measured_through_end_of_day() -> None:
     parsed = dashboard._parse_time("2026-08-17")
 
     assert parsed == datetime(2026, 8, 17, 23, 59, 59, tzinfo=UTC)
+
+
+def test_provisional_macro_fields_have_separate_non_pit_inventory(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "artifacts/data_quality/tw_public_provisional_macro/events.parquet"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"fixture")
+    output.with_suffix(".summary.json").write_text(json.dumps({
+        "output_sha256": hashlib.sha256(b"fixture").hexdigest(),
+        "total_rows": 2,
+        "feature_coverage": {
+            "twpub_cbc_m1b_log": {
+                "rows": 2, "raw_value_only_rows": 1,
+                "estimated_publication_date_rows": 1,
+                "first_subject_period": "2020-01", "last_subject_period": "2020-02",
+            },
+        },
+    }), encoding="utf-8")
+
+    rows = dashboard._tw_public_sources(tmp_path, now=datetime(2026, 9, 17, tzinfo=UTC))
+    field = next(row for row in rows if row["id"] == "tw-public:provisional-feature:twpub_cbc_m1b_log")
+    stats = dashboard._record_stats_for_row(field, {})
+
+    assert field["status"] == "degraded"
+    assert field["publishable"] is False
+    assert field["rows"] == 2
+    assert "推定發布日 1 筆" in field["status_label"]
+    assert stats["count"] == 2
+    assert stats["first"] == "2020-01"
+    assert stats["last"] == "2020-02"
+    assert "不是實際發布時刻" in stats["basis"]
+    aggregate_valid = next(row for row in rows if row["id"] == "tw-public:provisional_macro_feature_events")
+    assert "1/1 欄" in aggregate_valid["status_label"]
+
+    output.write_bytes(b"changed after receipt")
+    stale_rows = dashboard._tw_public_sources(tmp_path, now=datetime(2026, 9, 17, tzinfo=UTC))
+    assert not any(row["id"].startswith("tw-public:provisional-feature:") for row in stale_rows)
+    aggregate = next(row for row in stale_rows if row["id"] == "tw-public:provisional_macro_feature_events")
+    assert aggregate["rows"] is None
+    assert "雜湊不符" in aggregate["status_label"]
+
+
+def test_official_release_archives_require_their_own_active_timer() -> None:
+    row = {"id": "tw-public:cbc_money_release_vintages", "parent_id": "group:tw-public",
+           "status": "complete", "automation_eligible": True}
+    now = datetime(2026, 9, 17, 7, 0, tzinfo=UTC)
+    unrelated = {"tw_public_source_events": {"active": True},
+                 "tw_public_release_archives": {"timer_active": False, "active": False}}
+    pending = dashboard._automation_for_row(row, now=now, refresh_services=unrelated)
+    assert pending["automatic_update"] is False
+    assert pending["schedule_state"] == "not_configured"
+    assert pending["service_keys"] == ["tw_public_release_archives"]
+    scheduled = dashboard._automation_for_row(
+        row, now=now,
+        refresh_services={"tw_public_release_archives": {
+            "timer_active": True, "active": False,
+            "next_run_at_utc": "2026-09-17T08:30:00Z",
+        }},
+    )
+    assert scheduled["automatic_update"] is True
+    assert scheduled["schedule_state"] == "scheduled"
+
+
+def test_dune_subscription_gate_is_not_reported_as_scheduled_catch_up(
+    tmp_path: Path,
+) -> None:
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "dune_crypto_queries.json").write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {
+                        "id": "fixture_query",
+                        "enabled": True,
+                        "history_start": "2026-01-01",
+                        "chunk_months": 3,
+                        "description": "fixture",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "data_dune_crypto"
+    output.mkdir()
+    (output / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "state": "blocked",
+                "blocked_credit_partitions": 0,
+                "blocked_subscription_partitions": 4,
+                "results": [
+                    {
+                        "query_id": "fixture_query",
+                        "status": "not_started_subscription",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = dashboard._crypto_history_sources(
+        tmp_path,
+        now=datetime(2026, 9, 16, tzinfo=UTC),
+    )
+    row = next(item for item in rows if item["id"] == "dune-query:fixture_query")
+
+    assert row["status"] == "blocked"
+    assert row["status_label"] == "Dune 訂閱不支援 API SQL 執行"
+    assert row["eta"]["state"] == "external_input"
 
 
 def test_tw_public_monitor_builds_only_requested_official_source_scope(
@@ -462,9 +596,20 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "已延後／未啟用" in html
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
-    assert "styles.css?v=10" in html
-    assert "app.js?v=21" in html
-    assert "void refresh().finally(installDetailsActivation);" in javascript
+    assert "styles.css?v=15" in html
+    assert "app.js?v=32" in html
+    assert 'id="feature-rows"' in html
+    assert 'id="feature-search"' in html
+    assert 'fetchJson("api/features")' in javascript
+    assert 'id="category-filter"' in html
+    assert 'id="category-grid"' in html
+    assert 'id="inventory-filter"' in html
+    assert "實存最早／最新／總筆數" in html
+    assert "row.record_stats?.first" in javascript
+    assert "row.record_stats?.last" in javascript
+    assert "row.record_stats?.count" in javascript
+    assert "installDetailsActivation();" in javascript
+    assert "installFeatureActivation();" in javascript
     assert 'const target = $("source-list");' in javascript
     assert "IntersectionObserver" in javascript
     assert "state.detailsActivated" in javascript
@@ -698,6 +843,113 @@ def test_tw_public_source_rollup_accepts_only_verified_official_fallback(
         "data_gov_tdcc_shareholding_distribution"
     )
     assert any("原端點探測失敗" in warning for warning in direct["warnings"])
+
+
+def test_dgbas_release_archive_monitor_keeps_progress_and_completion_distinct(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data_tw_public"
+    state = data / "state"
+    state.mkdir(parents=True)
+    (data / "dataset_manifest.json").write_text("[]", encoding="utf-8")
+    (state / "dgbas_release_vintages.json").write_text(
+        json.dumps({
+            "status": "running", "phase": "downloading",
+            "started_at_utc": "2026-09-16T00:00:00+00:00",
+            "completed_releases": 30, "total_releases": 100,
+            "estimated_seconds_remaining": 70,
+        }), encoding="utf-8",
+    )
+    now = datetime(2026, 9, 16, 1, 0, tzinfo=UTC)
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:dgbas_release_vintages")
+    assert row["status"] == "updating"
+    assert row["coverage"]["ratio"] == 0.3
+    assert row["eta"]["remaining_seconds"] == 70
+    (state / "dgbas_release_vintages.json").write_text(
+        json.dumps({"status": "complete", "complete": True,
+                    "registered_releases": 100, "saved_releases": 100}),
+        encoding="utf-8",
+    )
+    # A completion flag without the durable parquet is not a completed source.
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:dgbas_release_vintages")
+    assert row["status"] == "degraded"
+    (state / "dgbas_release_vintages.json").write_text(
+        json.dumps({"status": "degraded", "complete": False,
+                    "source_access_blocked_reason": "Cloudflare HTTP 429 without Retry-After"}),
+        encoding="utf-8",
+    )
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:dgbas_release_vintages")
+    assert row["eta"]["state"] == "waiting_source_access"
+    assert "429" in " ".join(row["warnings"])
+
+
+def test_cbc_release_archive_monitor_requires_durable_receipt(tmp_path: Path) -> None:
+    data = tmp_path / "data_tw_public"
+    state = data / "state"
+    state.mkdir(parents=True)
+    (data / "dataset_manifest.json").write_text("[]", encoding="utf-8")
+    (state / "cbc_fx_reserve_release_vintages.json").write_text(
+        json.dumps({"status": "running", "completed_releases": 20,
+                    "total_releases": 40, "estimated_seconds_remaining": 80}),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 9, 16, 1, 0, tzinfo=UTC)
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:cbc_fx_reserve_release_vintages")
+    assert row["status"] == "updating"
+    assert row["coverage"]["ratio"] == 0.5
+    assert row["eta"]["remaining_seconds"] == 80
+    (state / "cbc_fx_reserve_release_vintages.json").write_text(
+        json.dumps({"status": "complete", "complete": True,
+                    "registered_releases": 40, "saved_releases": 40}), encoding="utf-8",
+    )
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:cbc_fx_reserve_release_vintages")
+    assert row["status"] == "degraded"
+    (state / "cbc_fx_reserve_release_vintages.json").write_text(
+        json.dumps({"status": "running", "phase": "discovering",
+                    "completed_pages": 20, "total_pages": 40,
+                    "estimated_seconds_remaining": 30}), encoding="utf-8",
+    )
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:cbc_fx_reserve_release_vintages")
+    assert row["coverage"]["ratio"] == 0.5
+    assert "20/40 頁" in row["status_label"]
+
+
+def test_cbc_money_release_archive_is_independent_monitor_row(tmp_path: Path) -> None:
+    data = tmp_path / "data_tw_public"
+    state = data / "state"
+    state.mkdir(parents=True)
+    (data / "dataset_manifest.json").write_text("[]", encoding="utf-8")
+    (state / "cbc_money_release_vintages.json").write_text(
+        json.dumps({"status": "running", "phase": "discovering",
+                    "completed_pages": 5, "total_pages": 20,
+                    "estimated_seconds_remaining": 30}), encoding="utf-8",
+    )
+    now = datetime(2026, 9, 16, 1, 0, tzinfo=UTC)
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:cbc_money_release_vintages")
+    assert row["status"] == "updating"
+    assert row["coverage"]["ratio"] == 0.25
+    assert row["eta"]["remaining_seconds"] == 30
+    assert row["publishable"] is False
+
+    (data / "cbc_money_release_vintages.parquet").write_bytes(b"saved archive")
+    (state / "cbc_money_release_vintages.json").write_text(
+        json.dumps({"status": "complete", "complete": True,
+                    "value_history_complete": False, "registered_releases": 12,
+                    "saved_releases": 12, "missing_periods": ["2000-06"]}),
+        encoding="utf-8",
+    )
+    row = next(item for item in dashboard._tw_public_sources(tmp_path, now=now)
+               if item["id"] == "tw-public:cbc_money_release_vintages")
+    assert row["status"] == "degraded"
+    assert row["publishable"] is False
+    assert "1 個月" in row["warnings"][-1]
 
 
 def test_streaming_requires_open_window_and_recent_endpoint_heartbeat() -> None:

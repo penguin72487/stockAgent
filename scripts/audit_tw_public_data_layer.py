@@ -45,6 +45,7 @@ from scripts.build_tw_official_symbol_parquets import (
     _official_symbol_source_paths,
     _validate_yahoo_fallback_archive,
 )
+from scripts.audit_tw_price_precision import audit_file as audit_tw_quote_grid_file
 from downloader.download_tw_public_data import (
     DEFAULT_DATASETS,
     HistoricalResponseError,
@@ -77,12 +78,26 @@ BASE_FEATURES = {
 # establish a position at that same regular close.
 PRE_CLOSE_FEATURE_COLUMNS = (
     "open_logret_1d",
+    "open_raw",
     # The day-trade panel constructs this dedicated final-row channel from the
     # observed session-t open and close[t-1].  It is intentionally separate
     # from session-t high/low/close/full-day aggregates.
     "next_session_open_gap_logret",
 )
 CLOSE_COMPLETION_FEATURE_COLUMNS = (
+    "high_raw",
+    "low_raw",
+    "close_raw",
+    "trading_volume_raw",
+    "twpub_official_trading_volume_raw",
+    "twpub_official_trading_value_raw",
+    "twpub_official_trades_raw",
+    "twpub_pe_raw",
+    "twpub_pb_raw",
+    "twpub_dividend_yield_pct_raw",
+    "twpub_dividend_per_share_raw",
+    "twpub_twse_taiex_raw",
+    "twpub_usdtwd_raw",
     "max_logret_1d",
     "min_logret_1d",
     "close_logret_1d",
@@ -149,12 +164,17 @@ HISTORICAL_SOURCES = (
     HistoricalSourceExpectation(
         "twse_daily_valuation",
         "2005-09-02",
-        ("twpub_pe_log", "twpub_pb_log", "twpub_dividend_yield"),
+        ("twpub_pe_*", "twpub_pb_*", "twpub_dividend_yield*", "twpub_dividend_per_share_*"),
     ),
     HistoricalSourceExpectation(
         "tpex_daily_valuation",
         "2003-08-01",
-        ("twpub_pe_log", "twpub_pb_log", "twpub_dividend_yield"),
+        ("twpub_pe_*", "twpub_pb_*", "twpub_dividend_yield*", "twpub_dividend_per_share_*"),
+    ),
+    HistoricalSourceExpectation(
+        "twse_taiex_ohlc",
+        "1999-01-05",
+        ("twpub_twse_taiex_*",),
     ),
     HistoricalSourceExpectation(
         "twse_margin_balance",
@@ -228,6 +248,29 @@ NON_VINTAGE_ARCHIVE_SOURCES: dict[str, tuple[str, ...]] = {
         "mof_tax_revenue.parquet",
     ),
 }
+
+# A CBC feature is eligible only through its matching original-release
+# archive. Source presence alone does not certify complete historical values.
+CBC_RELEASE_VINTAGE_FEATURE_ARCHIVES = {
+    "twpub_cbc_fx_reserves_usd_billion_raw": "cbc_fx_reserve_release_vintages",
+    "twpub_cbc_fx_reserves_log": "cbc_fx_reserve_release_vintages",
+    "twpub_cbc_fx_reserves_chg": "cbc_fx_reserve_release_vintages",
+    "twpub_cbc_m1b_yoy_pct_raw": "cbc_money_release_vintages",
+    "twpub_cbc_m2_yoy_pct_raw": "cbc_money_release_vintages",
+    "twpub_cbc_m1b_yoy": "cbc_money_release_vintages",
+    "twpub_cbc_m2_yoy": "cbc_money_release_vintages",
+}
+CBC_RELEASE_VINTAGE_FEATURES = frozenset(CBC_RELEASE_VINTAGE_FEATURE_ARCHIVES)
+DGBAS_RELEASE_VINTAGE_FEATURE_ARCHIVES = {
+    "twpub_dgbas_cpi_yoy_pct_raw": "dgbas_release_vintages",
+    "twpub_dgbas_unemployment_pct_raw": "dgbas_release_vintages",
+    "twpub_dgbas_gdp_yoy_pct_raw": "dgbas_release_vintages",
+}
+RELEASE_VINTAGE_FEATURE_ARCHIVES = {
+    **CBC_RELEASE_VINTAGE_FEATURE_ARCHIVES,
+    **DGBAS_RELEASE_VINTAGE_FEATURE_ARCHIVES,
+}
+RELEASE_VINTAGE_FEATURES = frozenset(RELEASE_VINTAGE_FEATURE_ARCHIVES)
 
 
 @dataclass
@@ -2444,7 +2487,11 @@ def audit_non_vintage_archive_contract(
     selected = _selected_features(config)
     findings: list[Finding] = []
     for feature_pattern, source_names in NON_VINTAGE_ARCHIVE_SOURCES.items():
-        matched = [feature for feature in selected if fnmatch.fnmatchcase(feature, feature_pattern)]
+        matched = [
+            feature for feature in selected
+            if fnmatch.fnmatchcase(feature, feature_pattern)
+            and feature not in DGBAS_RELEASE_VINTAGE_FEATURE_ARCHIVES
+        ]
         if not matched:
             continue
         source_paths = [public_dir / name for name in source_names]
@@ -2478,6 +2525,7 @@ def audit_feature_lineage_registry(config: ExperimentConfig) -> list[Finding]:
         *(pattern for source in HISTORICAL_SOURCES for pattern in source.feature_patterns),
         *SNAPSHOT_FEATURE_SOURCES,
         *NON_VINTAGE_ARCHIVE_SOURCES,
+        *RELEASE_VINTAGE_FEATURES,
     ]
     unregistered = [
         feature
@@ -2501,6 +2549,116 @@ def audit_feature_lineage_registry(config: ExperimentConfig) -> list[Finding]:
     ]
 
 
+def audit_release_vintage_contract(
+    public_dir: Path,
+    config: ExperimentConfig,
+) -> list[Finding]:
+    active = RELEASE_VINTAGE_FEATURES.intersection(
+        feature for feature in _selected_features(config)
+        if not _is_zero_filled(feature, config)
+    )
+    if not active:
+        return []
+    from scripts.audit_tw_official_release_archives import audit_one
+
+    findings: list[Finding] = []
+    archives = {RELEASE_VINTAGE_FEATURE_ARCHIVES[feature] for feature in active}
+    for archive_name in sorted(archives):
+        result = audit_one(public_dir, archive_name)
+        archive_features = sorted(
+            feature for feature in active
+            if RELEASE_VINTAGE_FEATURE_ARCHIVES[feature] == archive_name
+        )
+        horizon_value_history_complete = True
+        first_required = None
+        if archive_name == "cbc_money_release_vintages":
+            try:
+                state = json.loads((public_dir / "state" / f"{archive_name}.json").read_text(encoding="utf-8"))
+                # A missing 2000 vintage must not disqualify a 2014 experiment.
+                # Require one full year of original releases before the model
+                # start so its initial forward-filled observation is justified.
+                first_required = f"{int(str(config.data.panel_start_date)[:4]) - 1:04d}-01"
+                earliest = str(state.get("earliest_period") or "")
+                latest = str(state.get("latest_period") or "")
+                missing = state.get("missing_periods")
+                horizon_value_history_complete = (
+                    bool(earliest and latest and earliest <= first_required <= latest)
+                    and isinstance(missing, list)
+                    and not any(str(period) >= first_required for period in missing)
+                )
+            except (OSError, ValueError, TypeError):
+                horizon_value_history_complete = False
+        elif archive_name == "dgbas_release_vintages":
+            first_year = int(str(config.data.panel_start_date)[:4]) - 1
+            first_required = str(first_year)
+            try:
+                frame = pl.read_parquet(public_dir / f"{archive_name}.parquet")
+                if not {"source", "period", "metric", "value_pct", "value_evidence",
+                        "published_on", "html_sha256"} <= set(frame.columns):
+                    raise ValueError("DGBAS original-value schema is incomplete")
+                expected_metrics = {
+                    "cpi": ("cpi_yoy_pct", "twpub_dgbas_cpi_yoy_pct_raw"),
+                    "unemployment": ("unemployment_rate_pct", "twpub_dgbas_unemployment_pct_raw"),
+                    "gdp": ("gdp_yoy_pct", "twpub_dgbas_gdp_yoy_pct_raw"),
+                }
+                for source, (metric, feature) in expected_metrics.items():
+                    if feature not in archive_features:
+                        continue
+                    values = frame.filter(
+                        (pl.col("source") == source)
+                        & (pl.col("metric") == metric)
+                        & pl.col("value_pct").is_not_null()
+                        & pl.col("published_on").is_not_null()
+                        & pl.col("html_sha256").is_not_null()
+                        & pl.col("value_evidence").is_in([
+                            "official_release_headline", "original_attachment_cpi_text",
+                            "original_attachment_unemployment_text",
+                        ])
+                    )
+                    periods = {str(value) for value in values["period"].to_list()}
+                    if not periods:
+                        horizon_value_history_complete = False
+                        break
+                    last = max(periods)
+                    if source == "gdp":
+                        expected = {
+                            f"{year}-Q{quarter}"
+                            for year in range(first_year, int(last[:4]) + 1)
+                            for quarter in range(1, 5)
+                            if f"{year}-Q{quarter}" <= last
+                        }
+                    else:
+                        expected = {
+                            f"{year}-{month:02d}"
+                            for year in range(first_year, int(last[:4]) + 1)
+                            for month in range(1, 13)
+                            if f"{year}-{month:02d}" <= last
+                        }
+                    first_model_period = (
+                        f"{first_year + 1}-Q1" if source == "gdp"
+                        else f"{first_year + 1}-01"
+                    )
+                    if last < first_model_period or expected - periods:
+                        horizon_value_history_complete = False
+                        break
+            except (OSError, ValueError, TypeError, pl.exceptions.PolarsError):
+                horizon_value_history_complete = False
+        if result["integrity_ok"] and result["coverage_complete"] and horizon_value_history_complete:
+            continue
+        findings.append(Finding(
+            "critical", "incomplete_release_vintage", "feature_lineage", archive_name,
+            (f"active={archive_features}, saved={result.get('saved_releases')}, "
+             f"registered={result.get('registered_releases')}, "
+             f"first_required={first_required}, "
+             f"horizon_value_history_complete={horizon_value_history_complete}, "
+             f"global_value_history_complete={result.get('value_history_complete')}, "
+             f"errors={result.get('errors')}"),
+            "Active features lack a complete, hash-verified original-release value history for the model horizon.",
+            "Finish the matching original-release archive or exclude these feature slots.",
+        ))
+    return findings
+
+
 def audit_feature_availability_contract(
     config: ExperimentConfig,
 ) -> tuple[dict[str, Any], list[Finding]]:
@@ -2515,20 +2673,29 @@ def audit_feature_availability_contract(
     pre_close = active & set(PRE_CLOSE_FEATURE_COLUMNS)
     close_completion = active & set(CLOSE_COMPLETION_FEATURE_COLUMNS)
     post_close = active & set(POST_CLOSE_CHIP_FEATURE_COLUMNS)
-    classified = pre_close | close_completion | post_close
+    release_vintage = active & RELEASE_VINTAGE_FEATURES
+    classified = pre_close | close_completion | post_close | release_vintage
     unclassified = active - classified
     overlaps = sorted(
         (pre_close & close_completion)
         | (pre_close & post_close)
         | (close_completion & post_close)
+        | (release_vintage & (pre_close | close_completion | post_close))
     )
     configured_panel_shift = {
         feature
         for feature in selected
         if _matches(feature, config.data.feature_shift_next_session)
     }
+    feature_cutoff = config.data.tw_public_feature_cutoff
+    required_shift = (
+        pre_close | close_completion
+        if feature_cutoff == "preopen_0900"
+        else close_completion
+    )
+    missing_required_shift = required_shift - configured_panel_shift
     missing_close_shift = close_completion - configured_panel_shift
-    unexpected_panel_shift = configured_panel_shift - close_completion
+    unexpected_panel_shift = configured_panel_shift - required_shift
     execution_mode = str(config.trading.execution_mode).strip().lower()
     allow_same_close_approximation = bool(
         config.data.allow_same_close_feature_approximation
@@ -2536,7 +2703,7 @@ def audit_feature_availability_contract(
 
     summary = {
         "execution_mode": execution_mode,
-        "decision_time_contract": "regular_close",
+        "decision_time_contract": feature_cutoff,
         "allow_same_close_feature_approximation": (
             allow_same_close_approximation
         ),
@@ -2546,6 +2713,7 @@ def audit_feature_availability_contract(
         "pre_close_active_features": sorted(pre_close),
         "close_completion_active_features": sorted(close_completion),
         "post_close_active_features": sorted(post_close),
+        "release_vintage_active_features": sorted(release_vintage),
         "post_close_selected_features": sorted(
             selected_set & set(POST_CLOSE_CHIP_FEATURE_COLUMNS)
         ),
@@ -2553,6 +2721,7 @@ def audit_feature_availability_contract(
         "unclassified_active_features": sorted(unclassified),
         "classification_overlaps": overlaps,
         "missing_close_completion_shifts": sorted(missing_close_shift),
+        "missing_required_shifts": sorted(missing_required_shift),
         "unexpected_panel_shifts": sorted(unexpected_panel_shift),
     }
     findings: list[Finding] = []
@@ -2581,30 +2750,45 @@ def audit_feature_availability_contract(
             )
         )
     if execution_mode == "naive":
-        if missing_close_shift:
+        if feature_cutoff == "preopen_0900" and allow_same_close_approximation:
+            findings.append(Finding(
+                "high", "preopen_same_close_approximation_conflict",
+                "feature_availability", "preopen_0900",
+                "allow_same_close_feature_approximation=true",
+                "A strict preopen dataset cannot opt into same-close information leakage.",
+                "Disable the same-close research approximation.",
+            ))
+        if missing_required_shift:
+            if feature_cutoff == "preopen_0900":
+                severity = "high"
+                code = "preopen_feature_leakage"
+                impact = "Session-t opening or completed OHLCV is not known before the 09:00 opening cutoff."
+                remediation = "Shift every session-t open/completed aggregate to the next verified session."
+            elif allow_same_close_approximation:
+                severity = "medium"
+                code = "same_close_feature_approximation"
+                impact = (
+                    "Final session values are deliberately used with the same final close as an approximate "
+                    "execution price; the research backtest is not a realizable closing-auction timing simulation."
+                )
+                remediation = (
+                    "Replace the approximation with an explicit order cutoff and executable price model; "
+                    "until then keep the opt-in and caveat in every result."
+                )
+            else:
+                severity = "high"
+                code = "same_close_feature_leakage"
+                impact = "Final session values would be used to establish a position at that same regular close."
+                remediation = "Add every final-session aggregate to data.feature_shift_next_session and rebuild the panel."
             findings.append(
                 Finding(
-                    "medium" if allow_same_close_approximation else "high",
-                    (
-                        "same_close_feature_approximation"
-                        if allow_same_close_approximation
-                        else "same_close_feature_leakage"
-                    ),
+                    severity,
+                    code,
                     "feature_availability",
-                    "regular_close_inputs",
-                    f"missing_next_session_shift={sorted(missing_close_shift)}",
-                    (
-                        "Final session values are deliberately used with the same final close as an approximate execution price; "
-                        "the research backtest is not a realizable closing-auction timing simulation."
-                        if allow_same_close_approximation
-                        else "Final session values would be used to establish a position at that same regular close."
-                    ),
-                    (
-                        "Replace the approximation with an explicit order cutoff and executable price model; "
-                        "until then keep the opt-in and caveat in every result."
-                        if allow_same_close_approximation
-                        else "Add every final-session aggregate to data.feature_shift_next_session and rebuild the panel."
-                    ),
+                    f"{feature_cutoff}_inputs",
+                    f"missing_next_session_shift={sorted(missing_required_shift)}",
+                    impact,
+                    remediation,
                 )
             )
         if unexpected_panel_shift:
@@ -2619,7 +2803,7 @@ def audit_feature_availability_contract(
                     "Remove the shift or register the feature in the correct availability class.",
                 )
             )
-    elif configured_panel_shift or post_close or allow_same_close_approximation:
+    elif configured_panel_shift or post_close or allow_same_close_approximation or feature_cutoff != "regular_close":
         findings.append(
             Finding(
                 "high",
@@ -2629,7 +2813,7 @@ def audit_feature_availability_contract(
                 (
                     f"execution_mode={execution_mode}, panel_shifted={len(configured_panel_shift)}, "
                     f"source_shifted_post_close={len(post_close)}, "
-                    f"same_close_approximation={allow_same_close_approximation}"
+                    f"same_close_approximation={allow_same_close_approximation}, feature_cutoff={feature_cutoff}"
                 ),
                 "Taiwan execution modes already lag the model window by one completed session, so availability-shifted inputs would be delayed twice.",
                 "Use the regular-close naive contract or redesign the dataset to consume per-feature availability timestamps exactly once.",
@@ -2646,6 +2830,35 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _audit_input_signatures(
+    parquet_root: Path,
+    public_dir: Path,
+    public_feature_path: Path,
+) -> dict[str, tuple[int, int, int] | None]:
+    """Detect concurrent writes during a multi-minute live-source audit."""
+
+    paths = {
+        *public_dir.glob("*.parquet"),
+        *public_dir.glob("*.json"),
+        *parquet_root.glob("*_features.parquet"),
+        parquet_root / "official_symbol_build_summary.json",
+        parquet_root / "symbols.csv",
+        public_feature_path,
+        public_feature_path.with_suffix(".summary.json"),
+    }
+    signatures: dict[str, tuple[int, int, int] | None] = {}
+    for path in paths:
+        key = str(path.resolve())
+        try:
+            stat = path.stat()
+            signatures[key] = (
+                int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+            )
+        except FileNotFoundError:
+            signatures[key] = None
+    return signatures
 
 
 def _audit_tpex_daily_name_provenance(
@@ -3514,6 +3727,7 @@ def _panel_kwargs(config: ExperimentConfig, public_feature_path: Path) -> dict[s
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_availability_indicators": config.data.feature_availability_indicators,
         "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
@@ -3525,16 +3739,18 @@ def _load_or_build_panel(
     public_feature_path: Path,
     *,
     build_if_missing: bool,
+    panel_cache_root: Path | None = None,
 ):
     kwargs = _panel_kwargs(config, public_feature_path)
-    panel = load_cached_panel(parquet_root, **kwargs)
-    if panel is not None:
-        return panel, "cache"
+    if panel_cache_root is None:
+        panel = load_cached_panel(parquet_root, **kwargs)
+        if panel is not None:
+            return panel, "cache"
     if not build_if_missing:
         raise RuntimeError(
             "No valid panel cache exists for this exact data/config fingerprint; pass --build-panel."
         )
-    return build_panel(parquet_root, **kwargs), "built"
+    return build_panel(parquet_root, panel_cache_root=panel_cache_root, **kwargs), "built"
 
 
 def _empty_panel_accumulator(years: np.ndarray, feature_count: int) -> dict[str, np.ndarray]:
@@ -4060,6 +4276,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--public-dir", type=Path, default=None)
     parser.add_argument("--public-feature-path", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/data_quality/tw_public"))
+    parser.add_argument(
+        "--panel-cache-root", type=Path, default=None,
+        help="Writable panel cache outside an immutable --public-dir; requires --build-panel.",
+    )
     parser.add_argument("--build-panel", action="store_true")
     parser.add_argument("--strict", action="store_true")
     parser.add_argument(
@@ -4077,7 +4297,18 @@ def main() -> None:
     public_feature_path = args.public_feature_path or Path(config.data.tw_public_feature_path)
     public_dir = args.public_dir or public_feature_path.parent.parent
     output_dir: Path = args.output_dir
+    panel_cache_root = args.panel_cache_root
+    if panel_cache_root is not None:
+        if not args.build_panel:
+            raise ValueError("--panel-cache-root requires --build-panel")
+        resolved_cache = panel_cache_root.resolve()
+        if resolved_cache.is_relative_to(public_dir.resolve()):
+            raise ValueError("--panel-cache-root must be outside the audited public directory")
+        panel_cache_root = resolved_cache
     output_dir.mkdir(parents=True, exist_ok=True)
+    input_signatures = _audit_input_signatures(
+        parquet_root, public_dir, public_feature_path
+    )
 
     sessions = _benchmark_sessions(
         parquet_root,
@@ -4117,6 +4348,25 @@ def main() -> None:
         sessions,
         config,
     )
+    quote_grid_profiles = [
+        audit_tw_quote_grid_file(
+            name, public_dir.parent,
+            path_override=public_dir / f"{name}.parquet",
+        )
+        for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+    ]
+    quote_grid_findings = [
+        Finding(
+            "high", "official_quote_off_tick_grid_or_bad_date", "quote_grid",
+            item["dataset"],
+            f"status={item['status']}, off_grid={item.get('off_grid_values')}, "
+            f"invalid_dates={item.get('invalid_date_rows')}, "
+            f"examples={[(field, value['examples'][:2]) for field, value in item.get('fields', {}).items() if value['off_grid']]}",
+            "An official quote or trading date is invalid under its dated product rule.",
+            "Repair from receipt-backed official data, rebuild symbol/feature files, and rerun this audit.",
+        )
+        for item in quote_grid_profiles if item["status"] != "quote_grid_valid"
+    ]
     snapshot_findings = audit_snapshot_contract(public_dir, config)
     non_vintage_findings = audit_non_vintage_archive_contract(public_dir, config)
     availability_summary, availability_findings = (
@@ -4134,10 +4384,12 @@ def main() -> None:
         *return_price_findings,
         *universe_findings,
         *source_findings,
+        *quote_grid_findings,
     ]
     findings.extend(snapshot_findings)
     findings.extend(non_vintage_findings)
     findings.extend(audit_feature_lineage_registry(config))
+    findings.extend(audit_release_vintage_contract(public_dir, config))
     findings.extend(availability_findings)
 
     selected = _selected_features(config)
@@ -4153,6 +4405,7 @@ def main() -> None:
         parquet_root,
         public_feature_path,
         build_if_missing=bool(args.build_panel),
+        panel_cache_root=panel_cache_root,
     )
     missing_selected = [feature for feature in selected if feature not in panel.feature_names]
     extra_selected = [feature for feature in panel.feature_names if feature not in selected]
@@ -4178,9 +4431,25 @@ def main() -> None:
     panel_summary["source"] = panel_source
     panel_summary["parquet_root"] = str(parquet_root)
     panel_summary["public_feature_path"] = str(public_feature_path)
+    if panel_cache_root is not None:
+        panel_summary["panel_cache_root"] = str(panel_cache_root)
     findings.extend(contract_findings)
     walk_forward_summary, walk_forward_findings = audit_walk_forward_availability(panel, config)
     findings.extend(walk_forward_findings)
+    final_signatures = _audit_input_signatures(
+        parquet_root, public_dir, public_feature_path
+    )
+    if input_signatures != final_signatures:
+        changed_paths = sorted(
+            path for path in input_signatures.keys() | final_signatures.keys()
+            if input_signatures.get(path) != final_signatures.get(path)
+        )
+        findings.append(Finding(
+            "critical", "inputs_changed_during_audit", "source_receipt",
+            "live_training_inputs", f"changed_count={len(changed_paths)}, examples={changed_paths[:8]}",
+            "A producer modified the candidate dataset while its model-safety proof was being built.",
+            "Rerun the audit against a stable source or an immutable selected release.",
+        ))
 
     _write_csv(output_dir / "source_profiles.csv", [asdict(item) for item in source_profiles])
     _write_csv(output_dir / "quote_source_profiles.csv", quote_profiles)
@@ -4198,6 +4467,7 @@ def main() -> None:
         "source_receipts": receipt_summary,
         "feature_build_receipt": feature_receipt_summary,
         "quote_sources": quote_summary,
+        "quote_grid": quote_grid_profiles,
         "official_symbol_build": official_build_summary,
         "return_price_provenance": return_price_summary,
         "feature_availability": availability_summary,

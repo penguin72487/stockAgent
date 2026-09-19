@@ -13,11 +13,10 @@ aliases="${SHIOAJI_FUTURES_ALIAS_FILE:-data_tw_futures/shioaji_contracts/continu
 calendar="${SHIOAJI_FUTURES_HISTORY_CALENDAR_FILE:-data_tw_index_futures/day_session_contracts.parquet}"
 query_calendar="$run_root/receipt_verified_query_calendar.parquet"
 max_traffic_fraction="${SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90}"
-batch_queries="${SHIOAJI_FUTURES_HISTORY_BATCH_QUERIES:-5000}"
+batch_queries="${SHIOAJI_FUTURES_HISTORY_BATCH_QUERIES:-64}"
 recheck="${SHIOAJI_FUTURES_HISTORY_TARGET_RECHECK_SECONDS:-3600}"
-for value in "$batch_queries" "$recheck"; do
-  [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 60 && value <= 10000 )) || exit 2
-done
+[[ "$batch_queries" =~ ^[0-9]+$ ]] && (( batch_queries >= 1 && batch_queries <= 10000 )) || exit 2
+[[ "$recheck" =~ ^[0-9]+$ ]] && (( recheck >= 60 && recheck <= 10000 )) || exit 2
 mkdir -p "$run_root"
 exec 9>"$run_root/runner.lock"
 flock -n 9 || exit 3

@@ -86,6 +86,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _receipt(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return {"path": str(path), "size": path.stat().st_size, "sha256": _sha256(path)}
+
+
 def _validate_download_summary(root: Path, *, allow_incomplete: bool) -> dict[str, Any]:
     path = root / "download_summary.json"
     summary = _read_json(path)
@@ -468,6 +474,8 @@ def main() -> None:
             flush=True,
         )
         return
+    base_build_path = args.base_stock_root / "official_symbol_build_summary.json"
+    base_build_receipt = _receipt(base_build_path)
     download_summary = _validate_download_summary(
         args.shioaji_root, allow_incomplete=bool(args.allow_incomplete)
     )
@@ -578,6 +586,8 @@ def main() -> None:
             f"TW Shioaji dataset build failed for {len(failed)} symbols: "
             f"{[asdict(item) for item in failed[:10]]}"
         )
+    if base_build_receipt != _receipt(base_build_path):
+        raise RuntimeError("official symbol build changed during Shioaji hybrid materialization")
     shutil.copy2(symbols_path, args.output_dir / "symbols.csv")
     provenance = {
         "schema_version": 1,
@@ -642,6 +652,7 @@ def main() -> None:
             "size": int((args.shioaji_root / "download_summary.json").stat().st_size),
             "sha256": _sha256(args.shioaji_root / "download_summary.json"),
         },
+        "base_symbol_build_receipt": base_build_receipt,
         "download_end_date": download_summary.get("end_date"),
         "report_path": str(report_path),
         "written_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),

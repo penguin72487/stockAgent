@@ -1,0 +1,16 @@
+[Unit]
+Description=Poll authorized MOPS quarterly XBRL archives every four hours
+
+[Timer]
+OnCalendar=*-*-* 00:15:00 Asia/Taipei
+OnCalendar=*-*-* 04:15:00 Asia/Taipei
+OnCalendar=*-*-* 08:15:00 Asia/Taipei
+OnCalendar=*-*-* 12:15:00 Asia/Taipei
+OnCalendar=*-*-* 16:15:00 Asia/Taipei
+OnCalendar=*-*-* 20:15:00 Asia/Taipei
+Persistent=true
+AccuracySec=1min
+Unit=stockagent-tw-mops-xbrl.service
+
+[Install]
+WantedBy=timers.target

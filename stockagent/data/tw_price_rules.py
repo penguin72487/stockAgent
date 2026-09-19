@@ -1,9 +1,13 @@
-"""Versioned Taiwan regular-equity and ETF order-price rules.
+"""Versioned Taiwan cash-equity, ETF and single-stock-futures price grids.
 
-The model archive starts in 2000, so two historical rule boundaries matter:
+The model archive starts in 2000, so these historical boundaries matter:
 
 * 2005-03-01: the regular stock tick buckets changed.
 * 2015-06-01: the daily price fluctuation limit widened from 7% to 10%.
+* 2026-07-06: stock-futures 1-dollar ticks extend from below 1,000 to below
+  2,500. This change does not apply to the underlying cash stock.
+* 2020-03-23: emerging-stock quotes move from a flat 0.01 to the six
+  regular-stock price bands. An emerging listing is not a TPEx mainboard stock.
 
 Dates are execution-session dates.  Missing dates deliberately select the
 current rule so callers that only price a live order retain their historical
@@ -20,11 +24,30 @@ import numpy as np
 TW_PRICE_RULE_CONTRACT_VERSION = 3
 # Optional product-aware order pricing is independently versioned: the
 # unchanged regular-stock panel limit contract above must remain reproducible.
-TW_ORDER_PRICE_CONTRACT_VERSION = 1
+TW_ORDER_PRICE_CONTRACT_VERSION = 2
+TW_DERIVATIVE_PRICE_CONTRACT_VERSION = 2
 TW_TICK_RULE_2005_EFFECTIVE_DATE = np.datetime64("2005-03-01", "D")
+TW_REIT_TICK_2006_EFFECTIVE_DATE = np.datetime64("2006-03-06", "D")
+TW_STOCK_FUTURE_TICK_2026_EFFECTIVE_DATE = np.datetime64("2026-07-06", "D")
+TW_TEO_TICK_2025_EFFECTIVE_DATE = np.datetime64("2025-12-08", "D")
+TW_EMERGING_STOCK_TICK_2020_EFFECTIVE_DATE = np.datetime64("2020-03-23", "D")
+TW_STOCK_FUTURE_FIRST_DATE = np.datetime64("2010-01-25", "D")
+TW_ETF_FUTURE_FIRST_DATE = np.datetime64("2014-10-06", "D")
 TW_LIMIT_10_PERCENT_EFFECTIVE_DATE = np.datetime64("2015-06-01", "D")
 TW_TICK_RULE_2005_EFFECTIVE_ORDINAL = int(
     TW_TICK_RULE_2005_EFFECTIVE_DATE.astype(np.int64)
+)
+TW_REIT_TICK_2006_EFFECTIVE_ORDINAL = int(
+    TW_REIT_TICK_2006_EFFECTIVE_DATE.astype(np.int64)
+)
+TW_STOCK_FUTURE_TICK_2026_EFFECTIVE_ORDINAL = int(
+    TW_STOCK_FUTURE_TICK_2026_EFFECTIVE_DATE.astype(np.int64)
+)
+TW_TEO_TICK_2025_EFFECTIVE_ORDINAL = int(
+    TW_TEO_TICK_2025_EFFECTIVE_DATE.astype(np.int64)
+)
+TW_EMERGING_STOCK_TICK_2020_EFFECTIVE_ORDINAL = int(
+    TW_EMERGING_STOCK_TICK_2020_EFFECTIVE_DATE.astype(np.int64)
 )
 TW_LIMIT_10_PERCENT_EFFECTIVE_ORDINAL = int(
     TW_LIMIT_10_PERCENT_EFFECTIVE_DATE.astype(np.int64)
@@ -60,19 +83,43 @@ def trade_date_ordinals(values: Any | None, shape: tuple[int, ...]) -> np.ndarra
 
 def _security_types(values: Any, shape: tuple[int, ...]) -> np.ndarray:
     kinds = np.broadcast_to(np.asarray(values), shape)
-    if not np.all(np.isin(kinds, ["stock", "etf"])):
-        raise ValueError("TW order-price security_types must be stock or etf")
+    if not np.all(
+        np.isin(
+            kinds,
+            [
+                "stock",
+                "emerging_stock",
+                "etf",
+                "reit",
+                "etn",
+                "warrant",
+                "convertible_bond",
+                "stock_future",
+                "etf_future",
+            ],
+        )
+    ):
+        raise ValueError(
+            "unsupported TW outright quote-grid security type"
+        )
     return kinds
 
 
 def tick_size_numpy(
     price: np.ndarray, dates: Any | None = None, *, security_types: Any = "stock"
 ) -> np.ndarray:
-    """Dated stock buckets; ETFs use 0.01 below 50 and 0.05 at/above 50.
+    """Dated outright quote/order tick, in quote-currency units, for named products.
 
-    The ETF schedule is not a claim about its daily price-limit percentage.
-    Callers retain exchange-supplied limits (including leveraged/no-limit ETFs).
-    See https://www.twse.com.tw/zh/products/system/trading.html .
+    This is not a rule for VWAP, settlement, adjusted prices, dividends, spread
+    orders, block trades, other foreign-currency products or other products.
+    TWSE odd-lot quoted prices share the ordinary numerical grid, while their
+    auction/execution mechanics remain a separate contract.
+    ETFs use 0.01 below 50 and 0.05 at/above 50; their daily price limit must
+    still come from the exchange. This numerical grid also covers TWSE foreign-
+    currency ETF counters, but callers must resolve their actual quote currency
+    separately. Historical callers must supply execution dates.
+    Sources: https://accessibility.twse.com.tw/zh/products/system/trading.html
+    and TAIFEX notice 1150001529 (effective 2026-07-06).
     """
 
     values = np.asarray(price, dtype=np.float64)
@@ -102,9 +149,170 @@ def tick_size_numpy(
     out[current & (values < 50.0)] = 0.05
     out[current & (values < 10.0)] = 0.01
     if kinds is not None:
-        etf = valid & (kinds == "etf")
+        stock_future = valid & (kinds == "stock_future")
+        etf_future = valid & (kinds == "etf_future")
+        if dates is not None:
+            if np.any(stock_future & (ordinals < int(TW_STOCK_FUTURE_FIRST_DATE.astype(np.int64)))):
+                raise ValueError("stock futures were not listed before 2010-01-25")
+            if np.any(etf_future & (ordinals < int(TW_ETF_FUTURE_FIRST_DATE.astype(np.int64)))):
+                raise ValueError("ETF futures were not listed before 2014-10-06")
+            if np.any((stock_future | etf_future) & (ordinals == TW_CURRENT_RULE_ORDINAL)):
+                raise ValueError("historical futures price requires a trading date")
+        etf = valid & np.isin(kinds, ["etf", "etf_future", "etn"])
         out[etf] = np.where(values[etf] < 50.0, 0.01, 0.05)
+        # REITs initially used the regular post-2005 equity grid.  TWSE changed
+        # them to the ETF grid on 2006-03-06.
+        reit = valid & (kinds == "reit") & (
+            ordinals >= TW_REIT_TICK_2006_EFFECTIVE_ORDINAL
+        )
+        out[reit] = np.where(values[reit] < 50.0, 0.01, 0.05)
+        emerging = valid & (kinds == "emerging_stock")
+        if np.any(emerging & (ordinals == TW_CURRENT_RULE_ORDINAL)):
+            raise ValueError("historical emerging-stock price requires a trading date")
+        out[emerging & (ordinals < TW_EMERGING_STOCK_TICK_2020_EFFECTIVE_ORDINAL)] = 0.01
+        warrant = valid & (kinds == "warrant")
+        old_warrant = warrant & (ordinals < TW_TICK_RULE_2005_EFFECTIVE_ORDINAL)
+        current_warrant = warrant & ~old_warrant
+        out[old_warrant] = 5.0
+        out[old_warrant & (values < 1000.0)] = 1.0
+        out[old_warrant & (values < 150.0)] = 0.5
+        out[old_warrant & (values < 50.0)] = 0.1
+        out[old_warrant & (values < 15.0)] = 0.05
+        out[current_warrant] = 5.0
+        out[current_warrant & (values < 500.0)] = 1.0
+        out[current_warrant & (values < 100.0)] = 0.5
+        out[current_warrant & (values < 50.0)] = 0.1
+        out[current_warrant & (values < 10.0)] = 0.05
+        out[current_warrant & (values < 5.0)] = 0.01
+        convertible = valid & (kinds == "convertible_bond")
+        out[convertible] = 5.0
+        out[convertible & (values < 1000.0)] = 1.0
+        out[convertible & (values < 150.0)] = 0.05
+        revised = stock_future & (ordinals >= TW_STOCK_FUTURE_TICK_2026_EFFECTIVE_ORDINAL)
+        out[revised & (values < 2500.0) & (values >= 1000.0)] = 1.0
     return out
+
+
+def taifex_index_future_tick_size_numpy(
+    price: np.ndarray, *, product_codes: Any
+) -> np.ndarray:
+    """Return ordinary outright tick sizes for locally trained index futures.
+
+    Settlement/VWAP and calendar-spread prices are outside this contract.
+    TX, MTX and TMF all quote in one index-point increments.  Requiring the
+    product code prevents this small verified registry from silently blessing
+    a different TAIFEX future.
+    """
+
+    values = np.asarray(price, dtype=np.float64)
+    products = np.char.upper(
+        np.broadcast_to(np.asarray(product_codes).astype(str), values.shape)
+    )
+    supported = np.isin(products, ["TX", "MTX", "TMF"])
+    if np.any(np.isfinite(values) & (values > 0.0) & ~supported):
+        unknown = sorted(set(products[np.isfinite(values) & (values > 0.0) & ~supported]))
+        raise ValueError(f"unsupported TAIFEX index future products: {unknown[:8]}")
+    return np.where(np.isfinite(values) & (values > 0.0) & supported, 1.0, np.nan)
+
+
+def taifex_option_tick_size_numpy(
+    price: np.ndarray,
+    dates: Any | None = None,
+    *,
+    product_families: Any,
+    trading_method: str = "ordinary",
+) -> np.ndarray:
+    """Return TAIFEX option premium ticks, excluding strikes and settlement.
+
+    Product families are ``txo``, ``teo``, ``tfo`` and ``stock_option``.
+    The 2019 TXO block-trade rule is intentionally a distinct trading method;
+    it must never be applied to ordinary-market daily or tick files.
+    """
+
+    values = np.asarray(price, dtype=np.float64)
+    ordinals = trade_date_ordinals(dates, values.shape)
+    families = np.char.lower(
+        np.broadcast_to(np.asarray(product_families).astype(str), values.shape)
+    )
+    supported = np.isin(families, ["txo", "teo", "tfo", "stock_option"])
+    valid = np.isfinite(values) & (values > 0.0)
+    if np.any(valid & ~supported):
+        unknown = sorted(set(families[valid & ~supported]))
+        raise ValueError(f"unsupported TAIFEX option families: {unknown[:8]}")
+    if trading_method not in {"ordinary", "block"}:
+        raise ValueError("TAIFEX option trading_method must be ordinary or block")
+    if trading_method == "block":
+        if np.any(valid & (families != "txo")):
+            raise ValueError("only the verified TXO block-price rule is supported")
+        # The separate block-trade quotation unit has been 0.1 point since
+        # 2019-05-27.  Earlier block history is deliberately unsupported.
+        if dates is None or np.any(
+            valid & (ordinals < int(np.datetime64("2019-05-27", "D").astype(np.int64)))
+        ):
+            raise ValueError("verified TXO block tick starts on 2019-05-27")
+        return np.where(valid, 0.1, np.nan)
+
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    txo = valid & (families == "txo")
+    out[txo] = 10.0
+    out[txo & (values < 1000.0)] = 5.0
+    out[txo & (values < 500.0)] = 1.0
+    out[txo & (values < 50.0)] = 0.5
+    out[txo & (values < 10.0)] = 0.1
+
+    stock_option = valid & (families == "stock_option")
+    out[stock_option] = 5.0
+    out[stock_option & (values < 1000.0)] = 1.0
+    out[stock_option & (values < 150.0)] = 0.5
+    out[stock_option & (values < 50.0)] = 0.1
+    out[stock_option & (values < 15.0)] = 0.05
+    out[stock_option & (values < 5.0)] = 0.01
+
+    # TFO and post-change TEO share the current five bands.
+    modern_sector = valid & (
+        (families == "tfo")
+        | ((families == "teo") & (ordinals >= TW_TEO_TICK_2025_EFFECTIVE_ORDINAL))
+    )
+    out[modern_sector] = 2.0
+    out[modern_sector & (values < 200.0)] = 1.0
+    out[modern_sector & (values < 100.0)] = 0.2
+    out[modern_sector & (values < 10.0)] = 0.1
+    out[modern_sector & (values < 2.0)] = 0.02
+
+    old_teo = valid & (families == "teo") & (
+        ordinals < TW_TEO_TICK_2025_EFFECTIVE_ORDINAL
+    )
+    out[old_teo] = 0.5
+    out[old_teo & (values < 50.0)] = 0.25
+    out[old_teo & (values < 25.0)] = 0.05
+    out[old_teo & (values < 2.5)] = 0.025
+    out[old_teo & (values < 0.5)] = 0.005
+    return out
+
+
+def price_on_explicit_tick_grid_numpy(
+    price: np.ndarray, tick: np.ndarray
+) -> np.ndarray:
+    """Validate source values against a caller-resolved tick array."""
+
+    raw = np.asarray(price)
+    values = np.asarray(raw, dtype=np.float64)
+    ticks = np.asarray(tick, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nearest = np.rint(values / ticks) * ticks
+        tolerance = np.maximum(1e-9, np.abs(np.spacing(values)) * 4)
+        if raw.dtype.kind == "f" and raw.dtype.itemsize <= 4:
+            tolerance = np.maximum(
+                tolerance, np.abs(np.spacing(raw)).astype(np.float64) * 2
+            )
+        tolerance = np.minimum(tolerance, ticks * 0.001)
+        return (
+            np.isfinite(values)
+            & (values > 0.0)
+            & np.isfinite(ticks)
+            & (ticks > 0.0)
+            & (np.abs(values - nearest) <= tolerance)
+        )
 
 
 def price_on_tick_grid_numpy(

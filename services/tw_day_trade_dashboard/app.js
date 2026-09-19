@@ -51,6 +51,7 @@ let signalOpeningExecutionAudit = {};
 let signalTotal = 0;
 let signalHasMore = false;
 let signalDataRevision = null;
+let signalSelectionKey = null;
 let signalLoading = false;
 let signalLoadError = "";
 let signalLoadNotice = "";
@@ -72,6 +73,7 @@ let eventOrderTotal = 0;
 let eventFillTotal = 0;
 let eventHasMore = false;
 let eventRecordRevision = null;
+let eventSelectionKey = null;
 let eventLoading = false;
 let eventLoadError = "";
 let eventRequestSequence = 0;
@@ -85,6 +87,7 @@ let positionLoading = false;
 let positionLoadError = "";
 let positionRequestSequence = 0;
 let positionDataRevision = null;
+let positionSelectionKey = null;
 let positionRequestRevisionInFlight = "";
 let positionAbortController = null;
 let availableDetailDates = [];
@@ -156,6 +159,14 @@ function installProductCopy() {
     <li><time>隔夜</time><div><strong>逐分鐘依可清算 bid／ask 估值</strong><span>使用一般現股交易成本；多單以 bid、空單以 ask 評價，缺價時清楚標示估值延用。</span></div></li>
     <li><time>次日 08:30</time><div><strong>送開盤集合競價沖銷單</strong><span>多單掛當日跌停賣出、空單掛當日漲停回補；開盤前試撮只更新觀察，不記成交。</span></div></li>
     <li><time>次日 09:00</time><div><strong>只按實際開盤撮合價全數沖銷</strong><span>必須有非試撮、同一交易日且不早於 09:00 的實際 open；缺少證據就保留部位並顯示錯誤，不製造假成交。</span></div></li>`);
+
+  const timelineHead = document.querySelector(".timeline-panel .panel-head");
+  if (timelineHead) {
+    timelineHead.querySelector("h2").textContent = "隔日沖執行時鐘與資料契約";
+    timelineHead.querySelector("p").textContent = "收盤進場、次日開盤沖銷；模擬結果以帳本與實際撮合證據為準。";
+  }
+  const sourceTemplate = document.querySelector("#overnight-source-contract");
+  if (timeline && sourceTemplate) timeline.after(sourceTemplate.content.cloneNode(true));
 
   const sourceTerms = document.querySelectorAll(".source-list dt");
   ["訊號", "試撮界線", "收盤／開盤成交", "一般交易成本", "百分比比較", "隔夜放空資格", "集合競價假設", "跨日退出時程", "延遲邊界"].forEach((label, index) => {
@@ -498,15 +509,20 @@ function selectedDate() {
   return availableDetailDates.find((value) => value <= boundary) || boundary;
 }
 function detailRangeKey() { return `${selectedDetailStartDate()}|${selectedDetailEndDate()}`; }
-function detailDataRevision(kind) {
-  const service = snapshot?.service_sync || {};
-  const history = snapshot?.historical_replay || {};
+function detailSelectionKey(kind) {
   return JSON.stringify([
     kind,
     detailRangeKey(),
     selectedMode(),
     textFilter(),
     kind === "events" ? "all" : $("status-filter").value,
+  ]);
+}
+function detailDataRevision(kind) {
+  const service = snapshot?.service_sync || {};
+  const history = snapshot?.historical_replay || {};
+  return JSON.stringify([
+    detailSelectionKey(kind),
     service.content_revision ?? null,
     history.generated_at || null,
     history.end_date || null,
@@ -552,6 +568,28 @@ function beginSilentTableUpdate(bodyId, loadMoreId, append) {
   if (!loadMore) return;
   loadMore.disabled = true;
   loadMore.textContent = "載入中…";
+}
+
+function validateDetailPage(page, {kind, offset, limit, expectedTotal = null}) {
+  const count = page?.rows?.length;
+  if (!Array.isArray(page?.rows) || !Number.isSafeInteger(page.total)
+    || page.total < 0 || !Number.isSafeInteger(page.returned)
+    || page.returned !== count || count > limit
+    || page.total < offset + count || page.offset !== offset
+    || typeof page.has_more !== "boolean"
+    || page.has_more !== (offset + count < page.total)
+    || (page.has_more && count === 0)
+    || (expectedTotal !== null && page.total !== expectedTotal)
+    || page.start_date !== selectedDetailStartDate()
+    || page.end_date !== selectedDetailEndDate()) {
+    throw new Error(`${kind}分頁範圍或筆數不完整`);
+  }
+  if (kind === "事件" && (!Number.isSafeInteger(page.order_total)
+    || !Number.isSafeInteger(page.fill_total)
+    || page.order_total < 0 || page.fill_total < 0
+    || page.order_total + page.fill_total !== page.total)) {
+    throw new Error("事件分頁統計不完整");
+  }
 }
 
 function healthPresentation(value) {
@@ -748,6 +786,11 @@ function renderHeader(data) {
   const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
   const overnightHistory = data.historical_replay || {};
   const overnightHistoryDegraded = IS_OVERNIGHT && overnightHistory.status === "ready_with_stale_unresolved_position";
+  const localPaperExecution = !IS_OVERNIGHT
+    && data.execution_evidence !== "shioaji_simulation_stock_deal_v1";
+  const liveStaleModes = !IS_OVERNIGHT && selectedDetailEndDate() === data.session_date && data.session_progress?.phase === "active"
+    ? data.modes.filter((mode) => mode.valuation_stale && Number(mode.open_position_count || 0) > 0)
+    : [];
   const signalMissingEligibility = new Map();
   const currentMissingEligibility = new Map();
   for (const mode of data.modes) {
@@ -760,8 +803,10 @@ function renderHeader(data) {
       if (!coverage.covered && !currentMissingEligibility.has(venue)) currentMissingEligibility.set(venue, coverage);
     }
   }
-  if (operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+  if (localPaperExecution || operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || liveStaleModes.length || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
+      localPaperExecution ? "目前當沖成交來自本地紙上帳本，Shioaji 只提供行情；尚未接入 Shioaji 模擬委託與 StockDeal 成交回報，不可將紙上成交當作券商 API 成交。" : "",
+      liveStaleModes.length ? `盤中 ${number(liveStaleModes.length)} 個當沖模式的持倉估值正在延用舊價格；分鐘曲線仍記錄時間，但不是即時可成交行情，最新損益不可當成即時值。` : "",
       hasBenchmarkReplay ? "舊版市場基準歷史仍含開盤起算資料；新版會計契約尚未完成原子替換，該區段暫不視為 Buy & Hold 正式結果。" : "",
       overnightHistoryDegraded ? "隔日沖歷史含一個缺少後續官方開盤價的未解決持倉；該模式估值已標示延用，沒有補造退出。" : "",
       data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
@@ -837,6 +882,7 @@ function clearDateScopedViews() {
   signalTotal = eventTotal = eventOrderTotal = eventFillTotal = positionTotal = 0;
   signalHasMore = eventHasMore = positionHasMore = false;
   signalDataRevision = positionDataRevision = eventRecordRevision = lastRenderedRevision = null;
+  signalSelectionKey = positionSelectionKey = eventSelectionKey = null;
   signalRequestRevisionInFlight = positionRequestRevisionInFlight = eventRequestRevisionInFlight = "";
   featurePanelScopeText = featurePanelSignalKey = "";
   signalLoadError = signalLoadNotice = eventLoadError = positionLoadError = historyLoadError = "";
@@ -937,7 +983,7 @@ function renderModes(data) {
       <div class="mode-glance">
         <div><span>帳戶累積報酬（Discord 同口徑）</span><strong class="${pnlClass(accountReturnPct)}">${accountReturnPct == null ? "資料不可用" : `${accountReturnPct >= 0 ? "+" : ""}${displayPct(accountReturnPct)}`}</strong></div>
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
-        <div><span>實際成交結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
+        <div><span>紙上執行結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
         <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
@@ -952,7 +998,7 @@ function renderModes(data) {
         ${mode.counterfactual_open_replay
           ? `<div class="wide"><span>訊號／重建時間</span><strong>${esc(replayTimingText(mode))}</strong></div>`
           : `<div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>`}
-        <div><span>要求／成交／未成交</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
+        <div><span>模型目標／紙上成交／目標缺口</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
         <div><span>13:24 市價重試後殘餘</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div><span>13:30 帳務強平</span><strong>${number(mode.terminal_flatten_count || 0)}</strong></div>
         <div><span>強平價替代值</span><strong class="${Number(mode.terminal_flatten_degraded_count || 0) ? "negative" : ""}">${number(mode.terminal_flatten_degraded_count || 0)}</strong></div>
@@ -1436,6 +1482,9 @@ async function loadTwPublicMonitor() {
   const started = performance.now();
   try {
     const payload = await loadTwPublicMonitorWithFallback(controller);
+    if (!Array.isArray(payload.sources) && !Array.isArray(payload.rows)) {
+      throw new Error("官方資料來源清單缺漏");
+    }
     twPublicMonitorData = payload;
     twPublicMonitorLastFetchMs = performance.now() - started;
     twPublicMonitorLastUpdated = payload.generated_at_utc || null;
@@ -1443,9 +1492,18 @@ async function loadTwPublicMonitor() {
   } catch (error) {
     if (error?.name === "AbortError") return;
     const root = $("tw-public-monitor-list");
-    if (root) setHtml(root, `<div class="tw-public-empty">台股公開資料取得狀態讀取失敗：${esc(error)}</div>`);
     const summary = $("tw-public-monitor-summary");
-    if (summary) summary.textContent = "讀取失敗";
+    const fetchState = $("tw-public-monitor-fetch-state");
+    const failure = `台股公開資料狀態更新失敗：${error}`;
+    if (twPublicMonitorData) {
+      const lastSuccess = twPublicMonitorLastUpdated
+        ? shortDateTime(twPublicMonitorLastUpdated) : "時間不明";
+      if (fetchState) fetchState.textContent = `${failure}；保留 ${lastSuccess} 的最後成功資料（可能已過期）`;
+    } else {
+      if (root) setHtml(root, `<div class="tw-public-empty">${esc(failure)}</div>`);
+      if (summary) summary.textContent = "讀取失敗";
+      if (fetchState) fetchState.textContent = failure;
+    }
   } finally {
     if (twPublicMonitorAbortController === controller) twPublicMonitorAbortController = null;
     twPublicMonitorRefreshInFlight = false;
@@ -1473,6 +1531,28 @@ function renderChart(data) {
 
 function decodeChartHistory(payload) {
   return Chart.decodeHistory(payload);
+}
+
+function validateMinuteHistory(payload, {startDate, endDate, unbounded}) {
+  const series = payload?.minute_series;
+  if (payload?.history_encoding !== "minute_columns_v2"
+    || !Array.isArray(payload.minute_axis)
+    || !Array.isArray(payload.history)
+    || !Array.isArray(payload.range_summary)
+    || !Array.isArray(series)
+    || !Number.isSafeInteger(payload.returned_points)
+    || payload.returned_points < 0
+    || (!unbounded && (payload.start_date !== startDate || payload.end_date !== endDate))
+    || series.some((row) => !Array.isArray(row.minute_indexes)
+      || !Array.isArray(row.return_pct)
+      || !Array.isArray(row.cumulative_return_pct)
+      || !Array.isArray(row.quality_flags)
+      || row.minute_indexes.length !== row.return_pct.length
+      || row.minute_indexes.length !== row.cumulative_return_pct.length
+      || row.minute_indexes.length !== row.quality_flags.length)
+    || series.reduce((sum, row) => sum + row.minute_indexes.length, 0) !== payload.returned_points) {
+    throw new Error("分鐘曲線範圍或點數不完整");
+  }
 }
 
 function applyChartHistory(payload) {
@@ -1508,7 +1588,6 @@ async function loadChartHistory({preferCache = false} = {}) {
   const sequence = ++historyRequestSequence;
   historyInFlight = true;
   historyRequestKeyInFlight = requestedKey;
-  historyLoadError = "";
   if (snapshot && !chartHistoryMatchesSelection()) renderChart(snapshot);
   try {
     const params = new URLSearchParams({range: requestedRange, resolution: "1m", encoding: "v2"});
@@ -1525,6 +1604,7 @@ async function loadChartHistory({preferCache = false} = {}) {
     const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== historyRequestSequence) return;
     if (requestedKey !== chartRequestKey()) return;
+    validateMinuteHistory(payload, {startDate: requestedStart, endDate: requestedEnd, unbounded: coversAllAvailableDates});
     if (!chartHistoryCache.has(requestedKey) && chartHistoryCache.size >= HISTORY_CLIENT_CACHE_MAX_ENTRIES) {
       chartHistoryCache.delete(chartHistoryCache.keys().next().value);
     }
@@ -1552,24 +1632,34 @@ async function loadChartHistory({preferCache = false} = {}) {
 }
 
 function renderPositions() {
+  const acceptedSelection = positionSelectionKey === detailSelectionKey("positions");
   detailComponents.pagedTable({
-    id: "position", rows: positionRows, total: positionTotal, loading: positionLoading,
-    hasMore: positionHasMore, error: positionLoadError,
-    renderRow: detailComponents.positionRow, emptyText: "目前沒有符合篩選的持倉",
+    id: "position", rows: acceptedSelection ? positionRows : [],
+    total: acceptedSelection ? positionTotal : 0,
+    loading: positionLoading || !acceptedSelection,
+    hasMore: acceptedSelection && positionHasMore, error: positionLoadError,
+    renderRow: detailComponents.positionRow,
+    emptyText: acceptedSelection && positionDataRevision === detailDataRevision("positions")
+      ? "目前沒有符合篩選的持倉" : "正在讀取符合篩選的持倉…",
   });
 }
 
 function renderSignals() {
   syncFeaturePanelSelection();
-  const target = signalDirectionSummary.target || {};
-  const actual = signalDirectionSummary.actual || {};
-  const positionMap = new Map(positionRows.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}`, row]));
+  const acceptedSelection = signalSelectionKey === detailSelectionKey("signals");
+  const visibleRows = acceptedSelection ? signalRows : [];
+  const visibleSummary = acceptedSelection ? signalDirectionSummary : {};
+  const visibleAudit = acceptedSelection ? signalOpeningExecutionAudit : {};
+  const target = visibleSummary.target || {};
+  const actual = visibleSummary.actual || {};
+  const visiblePositions = positionSelectionKey === detailSelectionKey("positions") ? positionRows : [];
+  const positionMap = new Map(visiblePositions.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}`, row]));
   const modeMap = new Map((snapshot?.modes || []).map((mode) => [mode.market, mode]));
   const directionHtml = [
     ["區間訊號目標", target],
     [IS_OVERNIGHT ? "整張／隔夜放空守門後收盤成交" : "資格／整張／深度後實際成交", actual],
   ].map(([label, row]) => `<div><span>${esc(label)}</span><strong>${esc(directionPair(row))}</strong></div>`).join("");
-  const openingAuditHtml = Object.entries(signalOpeningExecutionAudit).map(([market, row]) => {
+  const openingAuditHtml = Object.entries(visibleAudit).map(([market, row]) => {
     const missing = Number(row.opening_price_missing_count || 0);
     const recorded = Number(row.model_signal_row_count || 0);
     const expected = Number(row.expected_model_signal_row_count || 0);
@@ -1584,9 +1674,12 @@ function renderSignals() {
   }).join("");
   setHtml("signal-direction-summary", directionHtml + openingAuditHtml);
   detailComponents.pagedTable({
-    id: "signal", rows: signalRows, total: signalTotal, loading: signalLoading,
-    hasMore: signalHasMore, error: signalLoadError, emptyText: "目前沒有符合篩選的訊號",
-    countDetail: signalLoadNotice ? ` · ${signalLoadNotice}` : "",
+    id: "signal", rows: visibleRows, total: acceptedSelection ? signalTotal : 0,
+    loading: signalLoading || !acceptedSelection,
+    hasMore: acceptedSelection && signalHasMore, error: signalLoadError,
+    emptyText: acceptedSelection && signalDataRevision === detailDataRevision("signals")
+      ? "目前沒有符合篩選的訊號" : "正在讀取符合篩選的訊號…",
+    countDetail: acceptedSelection && signalLoadNotice ? ` · ${signalLoadNotice}` : "",
     renderRow: (row) => detailComponents.signalRow(row, {
       position: positionMap.get(`${row.session_date}\u0000${row.market}\u0000${row.symbol}`),
       mode: modeMap.get(row.market), sessionDate: snapshot?.session_date,
@@ -1642,14 +1735,17 @@ function renderSignalFeaturePanel() {
 }
 
 function renderEvents() {
+  const acceptedSelection = eventSelectionKey === detailSelectionKey("events");
   detailComponents.pagedTable({
-    id: "event", rows: eventRows, total: eventTotal, loading: eventLoading,
-    hasMore: eventHasMore, error: eventLoadError,
-    countDetail: `（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）`,
+    id: "event", rows: acceptedSelection ? eventRows : [],
+    total: acceptedSelection ? eventTotal : 0,
+    loading: eventLoading || (eventViewActivated && !acceptedSelection),
+    hasMore: acceptedSelection && eventHasMore, error: eventLoadError,
+    countDetail: acceptedSelection ? `（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）` : "",
     renderRow: detailComponents.eventRow,
-    emptyText: eventViewActivated
-      ? "尚無委託／成交事件"
-      : "捲動到本區時載入完整委託與成交事件。",
+    emptyText: !eventViewActivated ? "捲動到本區時載入完整委託與成交事件。"
+      : acceptedSelection && eventRecordRevision === detailDataRevision("events")
+        ? "尚無委託／成交事件" : "正在讀取委託／成交事件…",
   });
 }
 
@@ -1676,6 +1772,7 @@ function renderAudit(data) {
     ...(data.benchmarks || []).map((row) => [`${row.label || row.benchmark_id}`, row.return_pct == null ? `等待可成交報價 · ${row.valuation_source || "尚未進場"}` : `${row.return_pct >= 0 ? "+" : ""}${sourceNumber(row.return_pct)}% · ${shortTime(row.entry_at)} 起 · 資金 ${money(row.initial_capital_twd)} · ${row.contract_code || row.symbol || ""}`]),
   ];
   setHtml("audit-grid", items.map(([label,value]) => `<div class="audit-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join(""));
+  if (!IS_OVERNIGHT) return;
   const contract = data.source_contract || {};
   $("source-signal").textContent = contract.signal || "—"; $("source-replay").textContent = contract.replay || "—"; $("source-fill").textContent = contract.entry_fill || "—";
   $("source-fees").textContent = contract.fees || "—";
@@ -1724,24 +1821,11 @@ function render({heavy = true} = {}) {
   renderSignalFeaturePanel();
 }
 
-function hydrateDefaultPositions(data) {
-  if (IS_OVERNIGHT) return false;
-  const isDefaultFilter = selectedMode() === "all"
-    && !textFilter()
-    && $("status-filter").value === "all";
-  const isSingleSnapshotDate = selectedDetailStartDate() === data.session_date
-    && selectedDetailEndDate() === data.session_date;
-  if (!isDefaultFilter || !isSingleSnapshotDate || !Array.isArray(data.positions)) return false;
-  positionRows = data.positions;
-  positionTotal = Number(data.payload_window?.positions ?? positionRows.length);
-  positionHasMore = positionRows.length < positionTotal;
-  positionLoadError = "";
-  return true;
-}
-
 async function loadSignals({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("signals");
+  const requestSelection = detailSelectionKey("signals");
+  if (append && (signalSelectionKey !== requestSelection || signalDataRevision !== requestRevision)) append = false;
   if (!append && !force && (
     signalDataRevision === requestRevision
     || (signalLoading && signalRequestRevisionInFlight === requestRevision)
@@ -1752,17 +1836,14 @@ async function loadSignals({append = false, force = false} = {}) {
   const sequence = ++signalRequestSequence;
   const requestRange = detailRangeKey();
   signalRequestRevisionInFlight = requestRevision;
-  if (force) {
-    signalLoadError = "";
-    signalLoadNotice = "";
-  }
+  const requestOffset = append ? signalRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
     status: $("status-filter").value,
-    offset: String(append ? signalRows.length : 0),
+    offset: String(requestOffset),
     limit: String(SIGNAL_PAGE_SIZE),
   });
   signalLoading = true;
@@ -1771,7 +1852,9 @@ async function loadSignals({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== signalRequestSequence) return;
-    if (requestRange !== detailRangeKey()) return;
+    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("signals")) return;
+    validateDetailPage(page, {kind: "訊號", offset: requestOffset, limit: SIGNAL_PAGE_SIZE,
+      expectedTotal: append ? signalTotal : null});
     featurePanelScopeText = page.feature_drivers_scope
       ? `訊號頁面欄位 ${String(page.feature_drivers_scope)}`
       : "訊號頁面欄位 all_feature_drivers_if_available_else_top_feature_drivers";
@@ -1779,11 +1862,12 @@ async function loadSignals({append = false, force = false} = {}) {
     signalLoadNotice = page.scan_limit_reached
       ? `已達 ${number(page.scan_limit)} 筆跨日掃描上限；縮小日期可查完整單日，事件曲線不受影響`
       : "";
-    signalRows = append ? signalRows.concat(page.rows || []) : (page.rows || []);
+    signalRows = append ? signalRows.concat(page.rows) : page.rows;
     signalRows.sort(compareByAbsoluteWeight);
-    signalTotal = Number(page.total || 0);
-    signalHasMore = Boolean(page.has_more);
+    signalTotal = page.total;
+    signalHasMore = page.has_more;
     signalDataRevision = requestRevision;
+    signalSelectionKey = requestSelection;
     signalDirectionSummary = page.direction_summary || {};
     signalOpeningExecutionAudit = page.opening_execution_audit || {};
     const incomingDrivers = page.feature_drivers_by_signal || {};
@@ -1791,7 +1875,7 @@ async function loadSignals({append = false, force = false} = {}) {
       ? {...signalFeatureDrivers, ...incomingDrivers}
       : incomingDrivers;
   } catch (error) {
-    if (sequence !== signalRequestSequence) return;
+    if (sequence !== signalRequestSequence || requestRevision !== detailDataRevision("signals")) return;
     if (error?.name === "AbortError") return;
     signalLoadError = `訊號明細暫時無法更新：${error}`;
     signalLoadNotice = "";
@@ -1811,6 +1895,8 @@ async function loadSignals({append = false, force = false} = {}) {
 async function loadPositions({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("positions");
+  const requestSelection = detailSelectionKey("positions");
+  if (append && (positionSelectionKey !== requestSelection || positionDataRevision !== requestRevision)) append = false;
   if (!append && !force && (
     positionDataRevision === requestRevision
     || (positionLoading && positionRequestRevisionInFlight === requestRevision)
@@ -1821,14 +1907,14 @@ async function loadPositions({append = false, force = false} = {}) {
   const sequence = ++positionRequestSequence;
   const requestRange = detailRangeKey();
   positionRequestRevisionInFlight = requestRevision;
-  if (!append || force) positionLoadError = "";
+  const requestOffset = append ? positionRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
     status: $("status-filter").value,
-    offset: String(append ? positionRows.length : 0),
+    offset: String(requestOffset),
     limit: String(POSITION_PAGE_SIZE),
   });
   positionLoading = true;
@@ -1837,14 +1923,17 @@ async function loadPositions({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/positions?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== positionRequestSequence) return;
-    if (requestRange !== detailRangeKey()) return;
+    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("positions")) return;
+    validateDetailPage(page, {kind: "持倉", offset: requestOffset, limit: POSITION_PAGE_SIZE,
+      expectedTotal: append ? positionTotal : null});
     positionLoadError = "";
-    positionRows = append ? positionRows.concat(page.rows || []) : (page.rows || []);
-    positionTotal = Number(page.total || 0);
-    positionHasMore = Boolean(page.has_more);
+    positionRows = append ? positionRows.concat(page.rows) : page.rows;
+    positionTotal = page.total;
+    positionHasMore = page.has_more;
     positionDataRevision = requestRevision;
+    positionSelectionKey = requestSelection;
   } catch (error) {
-    if (sequence !== positionRequestSequence) return;
+    if (sequence !== positionRequestSequence || requestRevision !== detailDataRevision("positions")) return;
     if (error?.name === "AbortError") return;
     positionLoadError = `持倉明細暫時無法更新：${error}`;
     positionDataRevision = null;
@@ -1863,6 +1952,8 @@ async function loadPositions({append = false, force = false} = {}) {
 async function loadEvents({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("events");
+  const requestSelection = detailSelectionKey("events");
+  if (append && (eventSelectionKey !== requestSelection || eventRecordRevision !== requestRevision)) append = false;
   if (!append && !force && (
     eventRecordRevision === requestRevision
     || (eventLoading && eventRequestRevisionInFlight === requestRevision)
@@ -1873,13 +1964,13 @@ async function loadEvents({append = false, force = false} = {}) {
   const sequence = ++eventRequestSequence;
   const requestRange = detailRangeKey();
   eventRequestRevisionInFlight = requestRevision;
-  if (!append || force) eventLoadError = "";
+  const requestOffset = append ? eventRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
-    offset: String(append ? eventRows.length : 0),
+    offset: String(requestOffset),
     limit: String(EVENT_PAGE_SIZE),
   });
   eventLoading = true;
@@ -1888,16 +1979,19 @@ async function loadEvents({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== eventRequestSequence) return;
-    if (requestRange !== detailRangeKey()) return;
+    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("events")) return;
+    validateDetailPage(page, {kind: "事件", offset: requestOffset, limit: EVENT_PAGE_SIZE,
+      expectedTotal: append ? eventTotal : null});
     eventLoadError = "";
-    eventRows = append ? eventRows.concat(page.rows || []) : (page.rows || []);
-    eventTotal = Number(page.total || 0);
-    eventOrderTotal = Number(page.order_total || 0);
-    eventFillTotal = Number(page.fill_total || 0);
-    eventHasMore = Boolean(page.has_more);
+    eventRows = append ? eventRows.concat(page.rows) : page.rows;
+    eventTotal = page.total;
+    eventOrderTotal = page.order_total;
+    eventFillTotal = page.fill_total;
+    eventHasMore = page.has_more;
     eventRecordRevision = requestRevision;
+    eventSelectionKey = requestSelection;
   } catch (error) {
-    if (sequence !== eventRequestSequence) return;
+    if (sequence !== eventRequestSequence || requestRevision !== detailDataRevision("events")) return;
     if (error?.name === "AbortError") return;
     eventLoadError = `事件明細暫時無法更新：${error}`;
     eventRecordRevision = null;
@@ -1938,10 +2032,6 @@ async function refresh({force = false} = {}) {
     const sourceHasChanged = sourceUpdatedAt && sourceUpdatedAt !== lastSourceUpdatedAt;
     if (sourceHasChanged || force) {
       lastSourceUpdatedAt = sourceUpdatedAt || `${String(Date.now())}`;
-      signalLoadError = "";
-      signalLoadNotice = "";
-      positionLoadError = "";
-      eventLoadError = "";
       if (force) {
         signalDataRevision = null;
         eventRecordRevision = null;
@@ -1951,8 +2041,6 @@ async function refresh({force = false} = {}) {
     syncFilters(snapshot);
     if (detailRangeKey() !== previousRange) clearDateScopedViews();
     scheduleSessionRollover(snapshot.service_sync);
-    const positionsHydrated = hydrateDefaultPositions(snapshot);
-    if (positionsHydrated) positionDataRevision = detailDataRevision("positions");
     const revision = revisionOf(snapshot);
     const heavy = revision !== lastRenderedRevision;
     lastRenderedRevision = revision;
@@ -1963,9 +2051,9 @@ async function refresh({force = false} = {}) {
     // dashboard blank.
     const shouldReloadSignals = force || signalDataRevision !== detailDataRevision("signals");
     const shouldReloadEvents = force || eventRecordRevision !== detailDataRevision("events");
-    const shouldReloadPositions = force || (
-      !positionsHydrated && positionDataRevision !== detailDataRevision("positions")
-    );
+    // The compact status intentionally omits position rows. Only the scoped
+    // positions API owns the complete open + closed lifecycle table.
+    const shouldReloadPositions = force || positionDataRevision !== detailDataRevision("positions");
     // Signals are the latency-critical view. A cold lossless minute history can
     // take seconds. Send signals first, then start the independent history;
     // neither a cold historical signal query nor a curve may gate the other.
@@ -2072,11 +2160,13 @@ function filtersChanged({debounceSignals = false, includeChart = false, reloadEv
   featurePanelSignalKey = "";
   featurePanelScopeText = "";
   signalFeatureDrivers = {};
+  signalLoadError = positionLoadError = "";
+  if (reloadEvents) eventLoadError = "";
   if (includeChart && snapshot) renderChart(snapshot);
   renderSignalFeaturePanel();
-  beginSilentTableUpdate("position-body", "load-more-positions", false);
-  beginSilentTableUpdate("signal-body", "load-more-signals", false);
-  if (reloadEvents) beginSilentTableUpdate("event-body", "load-more-events", false);
+  renderPositions();
+  renderSignals();
+  if (reloadEvents) renderEvents();
   window.clearTimeout(signalFilterTimer);
   if (debounceSignals) signalFilterTimer = window.setTimeout(() => {
     void loadPositions();

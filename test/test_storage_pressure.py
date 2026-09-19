@@ -6,10 +6,26 @@ from pathlib import Path
 import pytest
 
 from stockagent.data_sync.storage_pressure import (
+    _filesystem_usage,
     maintain_rebuildable_caches,
     protected_processes,
     validate_cache_roots,
 )
+
+
+def test_pressure_uses_writer_available_space_including_reserved_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "stockagent.data_sync.storage_pressure.shutil.disk_usage",
+        lambda _path: type("Usage", (), {"total": 1000, "used": 850, "free": 100})(),
+    )
+
+    usage = _filesystem_usage(tmp_path)
+
+    assert usage["raw_filesystem_used_percent"] == 85.0
+    assert usage["used_percent"] == 90.0
+    assert usage["unavailable_bytes"] == 900
 
 
 def _age(path: Path, *, now_ns: int, days: float) -> None:

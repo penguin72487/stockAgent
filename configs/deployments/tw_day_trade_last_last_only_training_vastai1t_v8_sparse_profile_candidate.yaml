@@ -1,0 +1,13 @@
+# Isolated OFAT performance candidate. Keep the formal v8 config unchanged.
+# The runtime configuration overwrites STOCKAGENT_DAY_TRADE_SPARSE_EVENTS,
+# so sparse training must be selected through this resolved config.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_cudnn_fixed_profile_candidate.yaml
+
+experiment_name: tw-day-trade-last-last-only-score-entmax-cash-v8-sparse-profile
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_v8_sparse_profile_candidate
+
+training:
+  day_trade_sparse_events: true
+  day_trade_sparse_event_slots: 262144

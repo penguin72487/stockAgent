@@ -1,0 +1,11 @@
+# Isolated reproducibility/performance candidate. Formal v8 remains unchanged.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_score_entmax_cash.yaml
+
+experiment_name: tw-day-trade-last-last-only-score-entmax-cash-v8-deterministic-profile
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_v8_deterministic_profile_candidate
+
+environment:
+  deterministic_algorithms: true
+  cudnn_benchmark: false

@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import date, timedelta
+import csv
+from datetime import date, datetime, time as datetime_time, timedelta
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
+import tempfile
 import time
 from typing import Final
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -46,6 +51,7 @@ _ANNUAL_RECEIPT_RE: Final[re.Pattern[str]] = re.compile(r"^(\d{4})_fut\.zip$")
 _RANGE_RECEIPT_RE: Final[re.Pattern[str]] = re.compile(
     r"^(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_all\.csv$"
 )
+TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 
 
 def _parse_date(value: str) -> date:
@@ -84,6 +90,118 @@ def _month_ranges(start: date, end: date):
 
 def _validate_receipt(path: Path) -> None:
     validate_taifex_receipt(path)
+
+
+def _needs_postclose_refresh(
+    path: Path,
+    end_date: date,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Never reuse today's pre-16:30 all-product file as a final close."""
+
+    local = (now or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    if not path.is_file() or end_date != local.date() or local.time() < datetime_time(16, 30):
+        return False
+    finalization = datetime.combine(end_date, datetime_time(16, 30), tzinfo=TAIPEI)
+    return path.stat().st_mtime < finalization.timestamp()
+
+
+def _range_receipt_coverage(path: Path) -> tuple[set[date], set[tuple[date, str]]]:
+    """Read dated rows and index day sessions before replacing a source."""
+
+    dates: set[date] = set()
+    index_days: set[tuple[date, str]] = set()
+    with path.open("r", encoding="cp950", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"交易日期", "契約", "交易時段"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(f"TAIFEX range file lacks required columns: {path}")
+        for line_number, row in enumerate(reader, start=2):
+            value = str(row.get("交易日期") or "").strip().replace("/", "-")
+            try:
+                trading_date = date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"TAIFEX range file has invalid trading date at line {line_number}: {path}"
+                ) from exc
+            dates.add(trading_date)
+            product = str(row.get("契約") or "").strip()
+            if product in TAIFEX_INDEX_FUTURES_PRODUCTS and str(row.get("交易時段") or "").strip() == "一般":
+                index_days.add((trading_date, product))
+    if not dates:
+        raise ValueError(f"TAIFEX range file contains no dated rows: {path}")
+    return dates, index_days
+
+
+def _refresh_postclose_range(
+    payload: dict[str, str],
+    target: Path,
+    *,
+    attempts: int,
+    request_interval: float,
+) -> Path:
+    """Stage a fresh official reply, preserving any differing early bytes."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent,
+        prefix=f".{target.stem}.postclose.",
+        suffix=".csv",
+        delete=False,
+    ) as handle:
+        staged = Path(handle.name)
+    try:
+        _download(
+            payload,
+            staged,
+            attempts=attempts,
+            request_interval=request_interval,
+        )
+        _validate_receipt(staged)
+        old_dates, old_index_days = _range_receipt_coverage(target)
+        fresh_dates, fresh_index_days = _range_receipt_coverage(staged)
+        if not old_dates.issubset(fresh_dates):
+            raise RuntimeError(
+                f"TAIFEX post-close reply loses previously observed trading dates: "
+                f"{sorted(old_dates - fresh_dates)}"
+            )
+        if not old_index_days.issubset(fresh_index_days):
+            raise RuntimeError(
+                "TAIFEX post-close reply loses previously observed index day "
+                f"sessions: {sorted(old_index_days - fresh_index_days)}"
+            )
+        old_hash = _sha256(target)
+        if _sha256(staged) != old_hash:
+            archive = target.parent.parent / "superseded" / f"{target.stem}.{old_hash}.raw"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            if archive.exists():
+                if _sha256(archive) != old_hash:
+                    raise RuntimeError(f"TAIFEX archive hash mismatch: {archive}")
+            else:
+                with tempfile.NamedTemporaryFile(
+                    dir=archive.parent,
+                    prefix=f".{archive.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    archive_temp = Path(handle.name)
+                try:
+                    with target.open("rb") as source, archive_temp.open("wb") as sink:
+                        shutil.copyfileobj(source, sink)
+                        sink.flush()
+                        os.fsync(sink.fileno())
+                    if _sha256(archive_temp) != old_hash:
+                        raise RuntimeError("TAIFEX source changed during post-close archive")
+                    os.replace(archive_temp, archive)
+                finally:
+                    archive_temp.unlink(missing_ok=True)
+        if _sha256(target) != old_hash:
+            raise RuntimeError("TAIFEX source changed before post-close promotion")
+        os.replace(staged, target)
+        return target
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _select_rebuild_receipts(raw_dir: Path) -> list[Path]:
@@ -236,17 +354,19 @@ def main() -> int:
                 f"{range_start.isoformat()}_{range_end.isoformat()}_all.csv"
             )
             was_cached = target.is_file() and target.stat().st_size > 0
+            payload = {
+                "down_type": "1",
+                "queryStartDate": range_start.strftime("%Y/%m/%d"),
+                "queryEndDate": range_end.strftime("%Y/%m/%d"),
+                "commodity_id": "all",
+                "commodity_id2": "",
+            }
             receipts.append(
-                _download(
-                    {
-                        "down_type": "1",
-                        "queryStartDate": range_start.strftime("%Y/%m/%d"),
-                        "queryEndDate": range_end.strftime("%Y/%m/%d"),
-                        "commodity_id": "all",
-                        "commodity_id2": "",
-                    },
-                    target,
-                    attempts=args.attempts,
+                _refresh_postclose_range(
+                    payload, target, attempts=args.attempts,
+                    request_interval=args.request_interval,
+                ) if _needs_postclose_refresh(target, range_end) else _download(
+                    payload, target, attempts=args.attempts,
                     request_interval=args.request_interval,
                 )
             )

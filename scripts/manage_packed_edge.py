@@ -33,9 +33,11 @@ from stockagent.data_sync.materialized_cache import (  # noqa: E402
 from stockagent.data_sync.packed_edge_cache import (  # noqa: E402
     EDGE_CACHE_SCHEMA_VERSION,
     EDGE_IGNORE_NAME,
+    ensure_edge_include,
     local_payload_inventory,
     prune_local_payloads,
     release_payload_relpaths,
+    render_edge_ignore,
     verify_payload_relpaths,
     write_edge_ignore,
     write_edge_receipt,
@@ -53,6 +55,7 @@ def _request_json(
     query: dict[str, str],
     *,
     method: str = "GET",
+    timeout_seconds: float = 30,
 ) -> Any:
     url = base_url.rstrip("/") + path
     if query:
@@ -63,7 +66,7 @@ def _request_json(
         headers={"X-API-Key": api_key},
         method=method,
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         payload = response.read()
     return json.loads(payload) if payload else None
 
@@ -137,7 +140,21 @@ def _scan(base_url: str, api_key: str, folder: str) -> None:
         "/rest/db/scan",
         {"folder": folder},
         method="POST",
+        timeout_seconds=180,
     )
+
+
+def _write_edge_ignore_if_changed(
+    sync_root: Path, allowed_relpaths: set[str]
+) -> bool:
+    """Avoid a full Syncthing scan when a resumed fetch has the same allowlist."""
+    ensure_edge_include(sync_root)
+    path = sync_root / EDGE_IGNORE_NAME
+    wanted = render_edge_ignore(allowed_relpaths)
+    if path.is_file() and path.read_bytes() == wanted:
+        return False
+    write_edge_ignore(sync_root, allowed_relpaths)
+    return True
 
 
 def _wait_for(
@@ -178,13 +195,54 @@ def _acquire_operation_lock(state_root: Path, *, nonblocking: bool):
     return handle
 
 
+def _retained_snapshots(
+    state: dict[str, Any], *, now_ns: int | None = None
+) -> dict[str, str]:
+    """Keep only unexpired, explicitly retained exact-release payload caches."""
+    current_ns = time.time_ns() if now_ns is None else now_ns
+    retained = state.get("retained_payloads", {})
+    if not isinstance(retained, dict):
+        raise SnapshotError("invalid retained edge payload state")
+    result: dict[str, str] = {}
+    for dataset, item in retained.items():
+        if not isinstance(dataset, str) or not isinstance(item, dict):
+            raise SnapshotError("invalid retained edge payload entry")
+        snapshot_id = item.get("snapshot_id")
+        expires_ns = item.get("expires_ns")
+        if not isinstance(snapshot_id, str) or not isinstance(expires_ns, int):
+            raise SnapshotError("invalid retained edge payload lease")
+        if expires_ns > current_ns:
+            result[dataset] = snapshot_id
+    return result
+
+
+def _can_resume_hydration(
+    peer: dict[str, Any], state: dict[str, Any], dataset: str, snapshot_id: str
+) -> bool:
+    """A persisted exact-release fetch may resume while its own folder is syncing."""
+    if dict(state.get("hydrating", {})).get(dataset) != snapshot_id:
+        return False
+    transient = {"folder_idle", "need_bytes_zero", "need_items_zero"}
+    return all(
+        passed for name, passed in peer["checks"].items() if name not in transient
+    )
+
+
 def _allowed_relpaths(sync_root: Path, state: dict[str, Any]) -> set[str]:
     result: set[str] = set()
-    for dataset, snapshot_id in sorted(dict(state.get("hydrating", {})).items()):
+    wanted = _retained_snapshots(state)
+    hydrating = dict(state.get("hydrating", {}))
+    for dataset, snapshot_id in sorted({**wanted, **hydrating}.items()):
         resolved = resolve_packed_snapshot_id(
             sync_root, dataset, snapshot_id, require_objects=False
         )
         result.update(release_payload_relpaths(resolved))
+    for dataset, snapshot_id in sorted(wanted.items()):
+        if dataset in hydrating and hydrating[dataset] != snapshot_id:
+            resolved = resolve_packed_snapshot_id(
+                sync_root, dataset, snapshot_id, require_objects=False
+            )
+            result.update(release_payload_relpaths(resolved))
     return result
 
 
@@ -224,6 +282,11 @@ def build_parser() -> argparse.ArgumentParser:
     hydrate.add_argument("--ttl-days", type=float, default=7.0)
     hydrate.add_argument("--link", type=Path, action="append", default=[])
     hydrate.add_argument("--timeout-seconds", type=float, default=21_600.0)
+    hydrate.add_argument(
+        "--retain-payload",
+        action="store_true",
+        help="retain this verified release's packed payload as a seven-day edge cache",
+    )
     return parser
 
 
@@ -364,8 +427,6 @@ def main() -> int:
             _print(payload | {"receipt": str(receipt)})
             return 0
         if args.command == "use":
-            if not peer["ok"]:
-                raise SnapshotError("durable Syncthing peer is not fully converged")
             if args.ttl_days > DEFAULT_CACHE_TTL_DAYS:
                 raise SnapshotError(
                     "edge cache TTL cannot exceed seven days; use a pin for "
@@ -384,13 +445,20 @@ def main() -> int:
                 )
             )
             snapshot_id = str(resolved.manifest["snapshot_id"])
+            if not peer["ok"] and not _can_resume_hydration(
+                peer, state, args.dataset, snapshot_id
+            ):
+                raise SnapshotError(
+                    "durable Syncthing peer is not fully converged and "
+                    "no safe exact-release hydration can resume"
+                )
             hydrating = dict(state.get("hydrating", {}))
             hydrating[args.dataset] = snapshot_id
             state["hydrating"] = hydrating
             allowed = _allowed_relpaths(sync_root, state)
             atomic_write_json(state_path, state)
-            write_edge_ignore(sync_root, allowed)
-            _scan(args.syncthing_url, api_key, args.folder)
+            if _write_edge_ignore_if_changed(sync_root, allowed):
+                _scan(args.syncthing_url, api_key, args.folder)
 
             required = release_payload_relpaths(resolved)
 
@@ -410,10 +478,19 @@ def main() -> int:
             )
             hydrating.pop(args.dataset, None)
             state["hydrating"] = hydrating
+            retained = dict(state.get("retained_payloads", {}))
+            if args.retain_payload:
+                retained[args.dataset] = {
+                    "snapshot_id": snapshot_id,
+                    "expires_ns": int(lease["expires_ns"]),
+                }
+            else:
+                retained.pop(args.dataset, None)
+            state["retained_payloads"] = retained
             atomic_write_json(state_path, state)
             remaining = _allowed_relpaths(sync_root, state)
-            write_edge_ignore(sync_root, remaining)
-            _scan(args.syncthing_url, api_key, args.folder)
+            if _write_edge_ignore_if_changed(sync_root, remaining):
+                _scan(args.syncthing_url, api_key, args.folder)
             prune = prune_local_payloads(
                 sync_root, allowed_relpaths=remaining, apply=True
             )
@@ -423,6 +500,7 @@ def main() -> int:
                 "snapshot_id": snapshot_id,
                 "object_proof": object_proof,
                 "lease": lease,
+                "retained_payload": bool(args.retain_payload),
                 "payload_prune": prune,
             }
             receipt = write_edge_receipt(receipt_root, payload)

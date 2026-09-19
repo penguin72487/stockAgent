@@ -281,6 +281,9 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     ).write_csv(base_root / "symbols.csv")
     _base_frame().write_parquet(base_root / "2330_features.parquet")
     _base_frame().write_parquet(base_root / "9999_features.parquet")
+    (base_root / "official_symbol_build_summary.json").write_text(
+        '{"build":"original"}', encoding="utf-8"
+    )
     daily_path = daily_root / "2330.parquet"
     _shioaji_frame().write_parquet(daily_path)
     daily_chunk_path = daily_chunk_root / "2020-03-02_2020-03-04.parquet"
@@ -392,6 +395,9 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     assert summary["hybrid_symbols"] == 1
     assert summary["public_only_contract_unavailable_symbols"] == 1
     assert summary["shioaji_rows"] == 3
+    assert summary["base_symbol_build_receipt"]["sha256"] == _file_sha256(
+        base_root / "official_symbol_build_summary.json"
+    )
     assert _file_sha256(output_root / "9999_features.parquet") == _file_sha256(
         base_root / "9999_features.parquet"
     )
@@ -409,4 +415,14 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     assert audit["public_only_contract_unavailable_symbols"] == 1
     assert audit["daily_chunk_receipts"] == 1
     assert audit["storage_frequency"] == "daily"
+    (base_root / "official_symbol_build_summary.json").write_text(
+        '{"build":"updated"}', encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="changed after Shioaji hybrid"):
+        __import__("scripts.audit_tw_shioaji_dataset", fromlist=["audit"]).audit(
+            base_stock_root=base_root,
+            shioaji_root=shioaji_root,
+            dataset_root=output_root,
+            verify_chunk_checksums=False,
+        )
     assert not (shioaji_root / "raw").exists()

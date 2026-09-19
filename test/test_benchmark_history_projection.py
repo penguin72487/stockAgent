@@ -178,7 +178,7 @@ def test_dashboard_session_projection_rebuilds_only_appended_day(
 
     assert incremental == full
     assert selected == [("2026-08-15",), ("2026-08-15",)]
-    root = next(cache.glob("history-session-projection-v2-*"))
+    root = next(cache.glob("history-session-projection-v3-*"))
     assert len((root / "delta.jsonl").read_text().splitlines()) == 3
     assert all((path.stat().st_mode & 0o777) == 0o600 for path in root.rglob("*") if path.is_file())
 

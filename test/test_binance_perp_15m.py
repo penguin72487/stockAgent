@@ -224,7 +224,7 @@ def test_binance_funding_asof_never_uses_a_future_settlement() -> None:
 def test_binance_historical_features_join_every_public_family_causally(
     tmp_path: Path,
 ) -> None:
-    start_ms = 1_780_000_000_000
+    start_ms = 1_780_000_000_000 - (1_780_000_000_000 % features.STATISTICS_INTERVAL_MS)
     raw_candles = [
         _raw_candle(start_ms + index * binance.CANDLE_INTERVAL_MS) for index in range(4)
     ]
@@ -329,21 +329,39 @@ def test_binance_historical_features_join_every_public_family_causally(
         0.0002,
     ]
     assert enriched["binance_open_interest_value_usd"].to_list() == [
-        None,
         1000.0,
         None,
         None,
+        None,
     ]
-    assert enriched["binance_taker_imbalance"].to_list()[1] == pytest.approx(0.2)
+    # A start-stamped 5m taker window cannot be used at its opening minute.
+    assert enriched["binance_taker_imbalance"].null_count() == 4
     assert enriched["binance_basis_annualized_rate"].null_count() == 4
     rolling_floor = (
         start_ms + 4 * features.CANDLE_INTERVAL_MS - features.SHORT_HISTORY_RETENTION_MS
     )
     assert all(
-        start >= rolling_floor
+        start >= rolling_floor - features.STATISTICS_INTERVAL_MS
         for path, start in request_starts
         if path.startswith("/futures/data/")
     )
+
+
+def test_binance_start_stamped_statistics_wait_until_period_close() -> None:
+    start_ms = 1_780_000_000_000 - (1_780_000_000_000 % features.STATISTICS_INTERVAL_MS)
+    rows = [{"timestamp": start_ms, "buyVol": "12"}]
+    frame = features._normalize_object_rows(
+        rows,
+        timestamp_field="timestamp",
+        field_map={"buyVol": "buy"},
+        start_ms=start_ms,
+        end_ms=start_ms + 4 * features.CANDLE_INTERVAL_MS,
+        timestamp_semantics="period_start",
+    )
+    assert frame["date"].to_list() == [
+        features._ms_to_date_string(start_ms + 4 * features.CANDLE_INTERVAL_MS)
+    ]
+    assert frame["buy"].to_list() == [12.0]
 
 
 def test_binance_pipeline_progress_persists_measured_eta(tmp_path: Path) -> None:

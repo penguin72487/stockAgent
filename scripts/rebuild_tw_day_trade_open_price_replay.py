@@ -55,6 +55,7 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     MARGIN_CARRY_CONTRACT,
     EXECUTION_REALISM_CONTRACT,
     TwDayTradeSimulationEngine,
@@ -93,6 +94,9 @@ DEFAULT_MINUTE_DATA_ROOTS = (
 MINUTE_VOLUME_PARTICIPATION = 0.50
 HISTORICAL_KBAR_FILL_CONTRACT = (
     "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
+)
+HISTORICAL_FULL_KBAR_FILL_CONTRACT = (
+    "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
 )
 HISTORICAL_OFFICIAL_CLOSE_FILL_CONTRACT = (
     "historical_official_close_auction_counterfactual_no_depth_claim"
@@ -1537,6 +1541,9 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
             or mode.get("entry_0901_vwap_fill_count")
             or 0
         ),
+        "entry_prior_paper_fill_reused_count": int(
+            mode.get("entry_prior_paper_fill_reused_count") or 0
+        ),
         "entry_requested_shares": int(mode.get("entry_requested_shares") or 0),
         "entry_filled_shares": int(mode.get("entry_filled_shares") or 0),
         "entry_unfilled_shares": int(mode.get("entry_unfilled_shares") or 0),
@@ -1704,8 +1711,10 @@ def _bar_quote(
     bid: float | None,
     ask: float | None,
     last: float | None = None,
+    full_target: bool = False,
 ) -> dict[str, Any]:
-    lots = max(0.0, float(bar.get("volume_shares") or 0.0) / 1_000.0)
+    observed_lots = max(0.0, float(bar.get("volume_shares") or 0.0) / 1_000.0)
+    lots = PAPER_LIQUIDITY_LOTS if full_target and observed_lots > 0 else observed_lots
     return {
         "symbol": str(position.get("symbol") or ""),
         "last": float(last if last is not None else bar["close"]),
@@ -1716,8 +1725,15 @@ def _bar_quote(
         "minute_volume_lots": lots,
         "quote_at": observed.isoformat(timespec="seconds"),
         "source": "retained_right_labelled_1m_ohlcv_counterfactual",
-        "fill_contract": HISTORICAL_KBAR_FILL_CONTRACT,
-        "depth_assumption": "50pct_observed_minute_volume_no_level_one_depth_claim",
+        "fill_contract": (
+            HISTORICAL_FULL_KBAR_FILL_CONTRACT if full_target
+            else HISTORICAL_KBAR_FILL_CONTRACT
+        ),
+        "depth_assumption": (
+            "full_target_if_positive_trade_bar_no_liquidity_or_exchange_fill_claim"
+            if full_target else "50pct_observed_minute_volume_no_level_one_depth_claim"
+        ),
+        "observed_minute_volume_lots": observed_lots,
         "historical_bar_open": float(bar["open"]),
         "historical_bar_high": float(bar["high"]),
         "historical_bar_low": float(bar["low"]),
@@ -1757,6 +1773,7 @@ def _apply_historical_kbar_brackets(
     """
 
     mode = engine.state["modes"][market]
+    full_target = mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
     valuation_quotes: dict[str, dict[str, Any]] = {}
     minute_key = observed.isoformat(timespec="minutes")
     for position in (mode.get("positions") or {}).values():
@@ -1778,7 +1795,11 @@ def _apply_historical_kbar_brackets(
         take_profit_hit = (
             side == "long" and float(bar["high"]) > take_profit
         ) or (side == "short" and float(bar["low"]) < take_profit)
-        capacity = _capacity_from_bar(position, bar)
+        capacity = (
+            abs(int(position.get("signed_shares") or 0))
+            if full_target and float(bar.get("volume_shares") or 0) > 0
+            else _capacity_from_bar(position, bar)
+        )
         if stop_hit:
             position["stop_order_status"] = "triggered_waiting_liquidity"
             if capacity > 0:
@@ -1790,6 +1811,7 @@ def _apply_historical_kbar_brackets(
                     bid=execution if side == "long" else None,
                     ask=execution if side == "short" else None,
                     last=stop,
+                    full_target=full_target,
                 )
                 engine._close_position(  # noqa: SLF001 - canonical ledger writer
                     position,
@@ -1815,6 +1837,7 @@ def _apply_historical_kbar_brackets(
                 observed=observed,
                 bid=execution if side == "long" else None,
                 ask=execution if side == "short" else None,
+                full_target=full_target,
             )
             engine._close_position(  # noqa: SLF001 - canonical ledger writer
                 position,
@@ -1837,6 +1860,7 @@ def _apply_historical_kbar_brackets(
                 observed=observed,
                 bid=close if side == "long" else None,
                 ask=close if side == "short" else None,
+                full_target=full_target,
             )
     engine._mark_mode(  # noqa: SLF001 - one exact minute mark per mode
         market,
@@ -1853,6 +1877,7 @@ def _eod_kbar_quotes(
     observed: datetime,
 ) -> dict[str, dict[str, Any]]:
     quotes: dict[str, dict[str, Any]] = {}
+    full_target = mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
     minute_key = observed.isoformat(timespec="minutes")
     for position in (mode.get("positions") or {}).values():
         if int(position.get("signed_shares") or 0) == 0:
@@ -1890,6 +1915,7 @@ def _eod_kbar_quotes(
             observed=observed,
             bid=bid,
             ask=ask,
+            full_target=full_target,
         )
     return quotes
 
@@ -1952,6 +1978,70 @@ def _replay_historical_intraday(
                 quotes=quotes,
                 now=observed, markets=[market], persist=False,
             )
+
+
+def _retained_prior_paper_fills(
+    source_ledger_dir: Path,
+    *,
+    pinned_signal_keys: set[tuple[str, str]],
+    end_date: date,
+) -> tuple[dict[tuple[str, str, str], dict[str, Any]], dict[str, Any]]:
+    """Read only previously recorded paper entry fills; never infer broker fills."""
+
+    path = source_ledger_dir / "fills.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.endswith("\n"):
+                break  # active writer's incomplete last line is not a record
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: malformed paper fill") from exc
+            session = str(row.get("session_date") or "")
+            market = str(row.get("market") or "")
+            symbol = str(row.get("symbol") or "")
+            if (session, market) not in pinned_signal_keys or not symbol:
+                continue
+            if row.get("purpose") != "entry" or row.get("simulation_only") is not True:
+                continue
+            fill_at = datetime.fromisoformat(str(row.get("fill_at")))
+            if (fill_at.utcoffset() != timedelta(hours=8)
+                    or fill_at.date().isoformat() != session or fill_at.date() > end_date
+                    or not time(9, 0) <= fill_at.timetz().replace(tzinfo=None) <= time(9, 1)):
+                raise ValueError(f"{path}:{line_number}: invalid prior paper fill clock")
+            price = _finite(row.get("price"))
+            quantity = int(row.get("quantity") or 0)
+            if price is None or price <= 0 or quantity <= 0:
+                raise ValueError(f"{path}:{line_number}: invalid prior paper fill price/quantity")
+            key = (session, market, symbol)
+            current = grouped.setdefault(key, {
+                "fill_at": fill_at.isoformat(timespec="seconds"),
+                "priced_shares": 0.0,
+                "original_paper_quantity": 0,
+                "entry_price_source": str(row.get("entry_price_source") or "retained_prior_paper_fill"),
+                "source_order_ids": [],
+                "source_record_sha256": [],
+            })
+            current["priced_shares"] += price * quantity
+            current["original_paper_quantity"] += quantity
+            current["source_order_ids"].append(str(row.get("order_id") or ""))
+            current["source_record_sha256"].append(hashlib.sha256(line.encode("utf-8")).hexdigest())
+            if fill_at.isoformat(timespec="seconds") < current["fill_at"]:
+                current["fill_at"] = fill_at.isoformat(timespec="seconds")
+    for current in grouped.values():
+        current["price"] = current.pop("priced_shares") / current["original_paper_quantity"]
+    return grouped, {
+        "source": str(path),
+        "source_size_bytes_at_read_end": path.stat().st_size,
+        "matched_symbol_sessions": len(grouped),
+        "prior_0900_symbol_sessions": sum(
+            str(row["fill_at"])[11:16] == "09:00" for row in grouped.values()
+        ),
+        "claim": "retained local paper fills only; no Shioaji broker-deal inference",
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2089,6 +2179,16 @@ def build_parser() -> argparse.ArgumentParser:
             "exchange-fill claim."
         ),
     )
+    entry_policy.add_argument(
+        "--historical-full-fill-0901",
+        action="store_true",
+        help=(
+            "Isolated retrospective scenario: preserve a retained paper fill's "
+            "time/price where one exists; otherwise fill the legal NAV-funded "
+            "target at a source-backed 09:01 minute price without a volume cap. "
+            "Never changes the live ledger or claims a Shioaji deal."
+        ),
+    )
     parser.add_argument(
         "--assume-margin-conversion", action="store_true",
         help="Assume every unfilled residual can convert to margin and rebalance inventory to the next daily target; costs use configured stress rates, not broker availability.",
@@ -2149,6 +2249,12 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
+    if args.historical_full_fill_0901 and (
+        args.include_current_open_session or end >= datetime.now(TAIPEI).date()
+    ):
+        raise ValueError("--historical-full-fill-0901 accepts completed past sessions only")
+    if args.historical_full_fill_0901 and not args.replay_intraday_kbars:
+        raise ValueError("--historical-full-fill-0901 requires --replay-intraday-kbars")
     state_dir = args.state_dir.resolve()
     if state_dir.exists() and any(state_dir.iterdir()):
         raise RuntimeError(f"refusing non-empty rebuild target: {state_dir}")
@@ -2202,6 +2308,7 @@ def main() -> None:
                 spec,
                 entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                 entry_price_offset_ticks=0,
+                historical_full_fill_at_0901=bool(args.historical_full_fill_0901),
             )
             for spec in specs
         ]
@@ -2306,6 +2413,24 @@ def main() -> None:
             "--allow-unpinned-market and --replace-signal-market require "
             "--source-ledger-dir"
         )
+    prior_paper_fills: dict[tuple[str, str, str], dict[str, Any]] = {}
+    prior_paper_fill_provenance: dict[str, Any] | None = None
+    if args.historical_full_fill_0901:
+        if args.source_ledger_dir is None:
+            raise ValueError("--historical-full-fill-0901 requires --source-ledger-dir")
+        prior_paper_fills, prior_paper_fill_provenance = _retained_prior_paper_fills(
+            args.source_ledger_dir.resolve(),
+            pinned_signal_keys=set(source_signal_ids),
+            end_date=end,
+        )
+        manifest_path = state_dir / "prior_paper_fills.json"
+        _atomic_json(
+            manifest_path,
+            {"schema_version": 1, "source": str(args.source_ledger_dir.resolve() / "fills.jsonl"),
+             "fills": {"|".join(key): value for key, value in sorted(prior_paper_fills.items())}},
+        )
+        prior_paper_fill_provenance["candidate_manifest"] = str(manifest_path)
+        prior_paper_fill_provenance["candidate_manifest_sha256"] = _sha256(manifest_path)
     benchmark_state_provenance: dict[str, Any] | None = None
     if args.benchmark_state_source is not None:
         benchmark_state_path = args.benchmark_state_source.resolve()
@@ -2349,7 +2474,9 @@ def main() -> None:
         for spec in specs
     )
     replay_entry_contract = (
-        REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+        (REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+         if args.historical_full_fill_0901
+         else REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE)
         if minute_price_at_0901
         else "retrospective_official_session_open_at_09_01_counterfactual"
         if official_open_at_0901
@@ -2364,12 +2491,20 @@ def main() -> None:
         "created_at": current.isoformat(timespec="seconds"),
         "simulation_only": True,
         "production_order_possible": False,
+        "prior_paper_fill_provenance": prior_paper_fill_provenance,
         "replay_contract": {
             "order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
             "entry": replay_entry_contract,
             "residual": MARGIN_CARRY_CONTRACT if all(s.residual_margin_conversion for s in specs) else "unresolved_delivery_obligation",
             "odd_lot_execution_policy": specs[0].odd_lot_execution_policy,
             "entry_price": (
+                "existing local paper entry fills retain their original price and "
+                "time, with the full legal NAV-funded target attributed to that "
+                "counterfactual; symbols without a prior paper fill use the "
+                "source-backed right-labelled 09:01 minute price; missing both "
+                "fails closed"
+                if args.historical_full_fill_0901
+                else
                 "the official 09:00 open is used only for inference/sizing and every "
                 "direction executes at the source-backed right-labelled 09:01 minute "
                 "price (VWAP, otherwise that bar's Close); a missing tick is not a "
@@ -2384,6 +2519,10 @@ def main() -> None:
                 "side uses official session open moved one adverse legal tick"
             ),
             "entry_liquidity": (
+                "full legal NAV-funded target at prior paper fill or 09:01 price; "
+                "no observed-liquidity, exchange-fill, or broker-deal claim"
+                if args.historical_full_fill_0901
+                else
                 "whole lots capped at 50pct observed 09:01 volume and session NAV "
                 "including entry charges; no exchange-fill or queue claim"
                 if minute_price_at_0901
@@ -2405,12 +2544,21 @@ def main() -> None:
                 "reduction only when the total exceeds NAV; no direction balancing"
             ),
             "completed_session_exit": (
+                "retained right-labelled one-minute OHLCV exit schedule; when a "
+                "trade bar exists, complete the paper target at its proxy price "
+                "without a liquidity or broker-fill claim; missing bars retain residuals"
+                if args.historical_full_fill_0901 and args.replay_intraday_kbars
+                else
                 "13:20 passive proxy; 13:24 market submission uses right-labelled 13:25 VWAP; "
                 "13:30 observed auction volume only; unfilled delivery obligations retained"
                 if args.replay_intraday_kbars
                 else "official daily close"
             ),
             "intraday_path": (
+                "retained right-labelled 1m OHLCV; stop-before-profit; full target "
+                "only on positive-trade bars; no executable Bid/Ask or liquidity claim"
+                if args.historical_full_fill_0901 and args.replay_intraday_kbars
+                else
                 "retained right-labelled 1m OHLCV; stop-before-profit for same-minute ambiguity; 50pct minute-volume capacity; no executable Bid/Ask claim"
                 if args.replay_intraday_kbars
                 else "not reconstructed; daily-limit bracket ordering is not inferred from OHLC"
@@ -2804,6 +2952,13 @@ def main() -> None:
                     "simulation_replay": True,
                     "historical_minute_valuation": bool(args.replay_intraday_kbars),
                     "replay_basis": (
+                        "retained_prior_paper_fill_else_source_backed_09_01_full_target_to_intraday_kbar_schedule"
+                        if args.historical_full_fill_0901 and should_close and args.replay_intraday_kbars
+                        else "retained_prior_paper_fill_else_source_backed_09_01_full_target_to_official_close"
+                        if args.historical_full_fill_0901 and should_close
+                        else "retained_prior_paper_fill_else_source_backed_09_01_full_target_to_live_quotes"
+                        if args.historical_full_fill_0901
+                        else
                         "official_09_00_open_inference_to_observed_09_01_minute_price_to_intraday_kbar_schedule"
                         if minute_price_at_0901 and should_close and args.replay_intraday_kbars
                         else "official_09_00_open_inference_to_observed_09_01_minute_price_to_official_close"
@@ -2819,6 +2974,9 @@ def main() -> None:
                         else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
                     "replay_source": (
+                        "pinned_signal_retained_local_paper_fill_else_source_backed_09_01_minute_price"
+                        if args.historical_full_fill_0901
+                        else
                         "immutable_live_signal_official_daily_session_open_and_source_backed_09_01_minute_price"
                         if minute_price_at_0901
                         else "immutable_live_signal_and_official_daily_session_open"
@@ -2827,6 +2985,9 @@ def main() -> None:
                     ),
                     "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
+                        "historical_prior_paper_fill_else_09_01_full_target_no_liquidity_or_broker_fill_claim"
+                        if args.historical_full_fill_0901
+                        else
                         "observed_09_01_minute_price_50pct_volume_capped_no_exchange_fill_claim"
                         if minute_price_at_0901
                         else "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
@@ -2867,6 +3028,13 @@ def main() -> None:
                 historical_books=historical_books,
                 official_no_trade_symbols=official_no_trade_symbols,
             )
+            if args.historical_full_fill_0901:
+                for symbol, quote in entry_quotes.items():
+                    prior_fill = prior_paper_fills.get(
+                        (day.isoformat(), spec.market, symbol)
+                    )
+                    if prior_fill is not None:
+                        quote["historical_prior_paper_fill"] = prior_fill
             replay_rows = _canonicalize_signal_rows_for_replay(
                 rows,
                 canonical_open_by_symbol,
@@ -2948,9 +3116,15 @@ def main() -> None:
                 )
             session_receipt["intraday_replay"] = {
                 **minute_coverage,
-                "contract": HISTORICAL_KBAR_FILL_CONTRACT,
+                "contract": (
+                    HISTORICAL_FULL_KBAR_FILL_CONTRACT
+                    if args.historical_full_fill_0901 else HISTORICAL_KBAR_FILL_CONTRACT
+                ),
                 "same_minute_bracket_order": "stop_before_take_profit",
-                "minute_volume_participation": MINUTE_VOLUME_PARTICIPATION,
+                "minute_volume_participation": (
+                    None if args.historical_full_fill_0901
+                    else MINUTE_VOLUME_PARTICIPATION
+                ),
                 "historical_best_bid_ask_claimed": False,
             }
             engine.begin_deferred_ledger_writes()
@@ -3006,6 +3180,11 @@ def main() -> None:
         day += timedelta(days=1)
 
     _atomic_json(state_dir / "rebuild_receipt.json", receipt)
+    if args.historical_full_fill_0901:
+        # Promotion exchanges whole directories. Preserve selected original
+        # paper records inside the isolated candidate before that can happen.
+        from scripts.stage_tw_day_trade_prior_paper_source import stage
+        stage(state_dir)
     print(
         json.dumps(
             {

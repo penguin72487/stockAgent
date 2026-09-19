@@ -11,6 +11,7 @@ WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_binance_public_archive.sh"
+SuccessExitStatus=75
 Nice=10
 CPUWeight=20
 IOWeight=20

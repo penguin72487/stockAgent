@@ -36,6 +36,23 @@ def test_drain_runs_after_validation_and_changed_benchmark_blocks_exchange(tmp_p
     assert stages == ["validated", "drained"]
 
 
+def test_validate_only_saves_proof_outside_ledgers_without_exchange(tmp_path, monkeypatch):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    receipt = tmp_path / "validation.json"
+    monkeypatch.setattr(promotion, "_validate_rebuild", lambda *args, **kwargs: {"proof": "ok"})
+    monkeypatch.setattr(promotion, "_exchange_directories", lambda *args: pytest.fail("exchanged"))
+    args = ["promote", "--live-dir", str(live), "--candidate-dir", str(candidate),
+            "--expected-market", "mode_a", "--validate-only", "--validation-receipt", str(receipt)]
+    monkeypatch.setattr(sys, "argv", args)
+    promotion.main()
+    assert json.loads(receipt.read_text()) == {"status": "validated", "acceptance": {"proof": "ok"}}
+    monkeypatch.setattr(sys, "argv", args[:-1] + [str(candidate / "bad.json")])
+    with pytest.raises(ValueError, match="outside both ledgers"):
+        promotion.main()
+
+
 def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:
     root = tmp_path / "candidate"
     root.mkdir()

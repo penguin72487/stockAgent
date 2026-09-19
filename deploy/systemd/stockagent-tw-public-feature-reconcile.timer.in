@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Taiwan feature source receipts before open and after close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:20:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 14:20:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 19:00:00 Asia/Taipei
+Persistent=true
+AccuracySec=1min
+Unit=stockagent-tw-public-feature-reconcile.service
+
+[Install]
+WantedBy=timers.target

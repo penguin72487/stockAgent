@@ -141,37 +141,21 @@ PY
 
 futures_priority_state() {
   run_fintech_python - <<'PY'
-import json
 from pathlib import Path
-import polars as pl
 
-calendar = Path("data_tw_index_futures/day_session_contracts.parquet")
-receipt_path = Path("artifacts/data_repair/shioaji_futures_history/latest_batch.json")
+from downloader.download_shioaji_tx_futures_ticks import _valid_receipt
+from stockagent.live.shioaji_schedule import latest_completed_tw_stock_session
+
+root = Path('data_tw_index_futures/shioaji_history/TXFR1')
 try:
-    latest = (
-        pl.scan_parquet(calendar)
-        .filter(pl.col("product") == "TX")
-        .select(pl.col("date").max())
-        .collect()
-        .item()
-    )
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError):
+    # Use the exact stock session that the minute-curve consumer will value.
+    # A lagging futures calendar must not make an older TX receipt look current.
+    target = latest_completed_tw_stock_session(parquet_root=Path('data_tw_public'))
+    receipt = _valid_receipt(root, target)
+except (OSError, ValueError, RuntimeError):
     print("60 futures_history_receipt_missing")
     raise SystemExit
-ready = (
-    latest is not None
-    and receipt.get("status") == "complete"
-    and receipt.get("target_end_date") == latest.isoformat()
-    and int(receipt.get("terminal_contracts", -1))
-        == int(receipt.get("total_contracts", -2))
-)
-if receipt.get('schema_version') == 2:
-    # Old source gaps do not monopolize the account after today's query sweep.
-    from downloader.shioaji_history_repair import latest_completed_futures_session
-    target = latest_completed_futures_session(calendar)
-    ready = (receipt.get('target_end_date') == target.isoformat()
-             and receipt.get('current_query_sweep_complete') is True)
+ready = receipt is not None and receipt.get('status') == 'complete'
 print("0 futures_history_current" if ready else "60 futures_history_priority")
 PY
 }

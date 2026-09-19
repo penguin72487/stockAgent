@@ -308,6 +308,9 @@ def deploy(source: Path, state_dir: Path) -> dict[str, Any]:
         "production_order_possible": False,
         "counterfactual": True,
         "model_scope": plan.get("model_scope"),
+        "history_lineage_fingerprint": (
+            plan.get("history_lineage") or {}
+        ).get("fingerprint_sha256"),
         "observation_contract": (
             "13:25 when source-backed; same-session close fallback when missing"
         ),
@@ -323,6 +326,9 @@ def deploy(source: Path, state_dir: Path) -> dict[str, Any]:
         "source": str(source),
         "source_result_sha256": _sha256(result_path),
         "source_plan_sha256": _sha256(plan_path),
+        "history_lineage_fingerprint": (
+            plan.get("history_lineage") or {}
+        ).get("fingerprint_sha256"),
         "end_date": result["end_date"],
         "history_sha256": _sha256(current_path),
         "signal_history_sha256": signal_digest,

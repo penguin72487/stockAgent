@@ -90,6 +90,60 @@ def test_panel_cache_can_live_outside_immutable_source_tree(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
+def test_raw_ohlcv_is_opt_in_and_untransformed(
+    tmp_path: Path, panel_backend: str,
+) -> None:
+    pl.DataFrame({
+        "date": ["2024-01-02", "2024-01-03"],
+        "open": [100.0, 101.0], "max": [105.0, 107.0],
+        "min": [98.0, 99.0], "close": [103.0, 106.0],
+        "adjclose": [103.0, 106.0],
+        "Trading_Volume": [1000.0, 1200.0],
+    }).write_parquet(tmp_path / "2330_features.parquet")
+
+    raw_names = ["open_raw", "high_raw", "low_raw", "close_raw", "trading_volume_raw"]
+    panel = build_panel(
+        tmp_path, benchmark_name="2330", panel_backend=panel_backend,
+        panel_load_workers=0, feature_include=raw_names,
+    )
+    assert panel.feature_names == raw_names
+    np.testing.assert_array_equal(panel.features[:, 0, :], np.asarray([
+        [100.0, 105.0, 98.0, 103.0, 1000.0],
+        [101.0, 107.0, 99.0, 106.0, 1200.0],
+    ], dtype=np.float32))
+    default = build_panel(
+        tmp_path, benchmark_name="2330", panel_backend=panel_backend,
+        panel_load_workers=0,
+    )
+    assert not set(raw_names).intersection(default.feature_names)
+
+
+def test_raw_input_projects_only_selected_public_values(tmp_path: Path) -> None:
+    _write_symbol(
+        tmp_path / "2330_features.parquet",
+        ["2024-01-02", "2024-01-03"], [100.0, 101.0], [10.0, 20.0],
+    )
+    external = tmp_path / "public.parquet"
+    pl.DataFrame({
+        "date": ["2024-01-02", "2024-01-03"],
+        "symbol": ["2330", "2330"],
+        "twpub_official_trading_value_raw": [12345.0, 67890.0],
+        "unselected_feature": [999.0, 999.0],
+    }).write_parquet(external)
+    panel = build_panel(
+        tmp_path, benchmark_name="2330", panel_backend="pyarrow",
+        panel_load_workers=0, external_feature_path=external,
+        external_include_rules=False,
+        feature_include=["close_raw", "twpub_official_trading_value_raw"],
+    )
+    assert panel.feature_names == ["close_raw", "twpub_official_trading_value_raw"]
+    np.testing.assert_array_equal(
+        panel.features[:, 0, :],
+        np.asarray([[100.0, 12345.0], [101.0, 67890.0]], dtype=np.float32),
+    )
+
+
+@pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
 def test_explicit_day_trade_open_gap_is_next_open_over_current_close(
     tmp_path: Path,
     panel_backend: str,

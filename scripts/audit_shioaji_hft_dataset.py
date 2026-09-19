@@ -5,10 +5,21 @@ from datetime import date, datetime, time
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from stockagent.data.tw_exchange_price_classification import (  # noqa: E402
+    classify_tw_exchange_security,
+)
+from stockagent.data.tw_price_rules import price_on_tick_grid_numpy  # noqa: E402
 
 NS_PER_SECOND = 1_000_000_000
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -106,12 +117,37 @@ def audit_frame(
         result = {key: int(value) for key, value in checked.items()}
         label_results[f"{horizon}s"] = result
         label_errors += result["mask_mismatch"] + result["invalid_rows_with_labels"]
+    symbols = frame["code"].cast(pl.String).to_numpy()
+    markets = frame["market"].cast(pl.String).to_numpy()
+    kind_map = {
+        key: classify_tw_exchange_security(key[0], key[1])
+        for key in set(zip(markets.tolist(), symbols.tolist()))
+    }
+    kinds = np.asarray(
+        [kind_map[(market, symbol)] or "unknown" for market, symbol in zip(markets, symbols)]
+    )
+    supported = kinds != "unknown"
+    dates = np.full(frame.height, np.datetime64(trade_date.isoformat(), "D"))
+    off_grid_price_values = 0
+    for field in tuple(
+        [f"bid_price_{level}" for level in range(1, 6)]
+        + [f"ask_price_{level}" for level in range(1, 6)]
+        + ["last_trade_price"]
+    ):
+        values = frame[field].cast(pl.Float64).to_numpy()[supported]
+        good = price_on_tick_grid_numpy(
+            values, dates[supported], security_types=kinds[supported]
+        )
+        observed = np.isfinite(values) & (values > 0.0)
+        off_grid_price_values += int(np.count_nonzero(observed & ~good))
     failures = {
         "duplicate_keys": int(duplicate_keys),
         "out_of_session_rows": int(out_of_session),
         "future_feature_rows": int(future_features),
         "unknown_universe_rows": int(frame["market_cap_rank"].null_count()),
         "label_errors": int(label_errors),
+        "unknown_price_security_rows": int(np.count_nonzero(~supported)),
+        "off_grid_price_values": off_grid_price_values,
     }
     if any(failures.values()):
         raise RuntimeError(f"HFT dataset audit failed: {failures}")

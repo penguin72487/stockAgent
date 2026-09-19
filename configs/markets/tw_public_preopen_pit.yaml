@@ -1,0 +1,79 @@
+# Point-in-time TW public *feature* contract at the 09:00 Asia/Taipei opening
+# boundary. This is a new experiment: the inherited naive close-price ledger
+# remains an execution approximation, not a claim of an executable 09:00 fill.
+base_config: tw_public.yaml
+experiment_name: tw-public-preopen-pit-close-proxy
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_pit
+  resume: false
+
+data:
+  tw_public_feature_cutoff: preopen_0900
+  allow_same_close_feature_approximation: false
+  # Only proven, active channels are retained; unavailable source families do
+  # not consume model capacity as permanently zero-filled fake features.
+  feature_zero_fill: []
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - twpub_official_close_logret_1d
+    - twpub_official_trading_volume_log
+    - twpub_official_trading_value_log
+    - twpub_official_trades_log
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
+    - twpub_margin_balance_log
+    - twpub_margin_balance_chg
+    - twpub_margin_buy_flow
+    - twpub_margin_sell_flow
+    - twpub_short_balance_log
+    - twpub_short_balance_chg
+    - twpub_short_buy_flow
+    - twpub_short_sell_flow
+    - twpub_investment_trust_net_buy_flow
+    - twpub_dealer_net_buy_flow
+    - twpub_cbc_fx_reserves_log
+    - twpub_cbc_fx_reserves_chg
+  # Every current-session OPEN or complete-day aggregate is unknown before
+  # 09:00. Post-close chip data is already mapped to the next exchange session
+  # by the source feature builder; CBC values use original release dates.
+  feature_shift_next_session:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - twpub_official_close_logret_1d
+    - twpub_official_trading_volume_log
+    - twpub_official_trading_value_log
+    - twpub_official_trades_log
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low

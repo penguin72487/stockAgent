@@ -25,7 +25,6 @@ $coreServices = @(
     "chrony.service",
     "syncthing@root.service",
     "stockagent-discord-bot.service",
-    "stockagent-hot-artifact-sync.service",
     "stockagent-public-dashboards.service",
     "stockagent-shioaji-taifex-bidask.service",
     "stockagent-shioaji-taifex-dashboard.service",

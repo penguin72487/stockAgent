@@ -17,8 +17,10 @@ from tqdm import tqdm
 
 try:
     from .artifact_io import atomic_write_parquet
+    from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
     from artifact_io import atomic_write_parquet
+    from ohlcv_hot_tail import hot_tail_path
 
 
 KLINE_BAR = "1m"
@@ -424,12 +426,23 @@ def _normalize_object_rows(
     field_map: dict[str, str],
     start_ms: int,
     end_ms: int,
+    timestamp_semantics: str = "period_end",
 ) -> pl.DataFrame:
+    if timestamp_semantics not in {"period_start", "period_end"}:
+        raise ValueError(f"unknown statistics timestamp semantics: {timestamp_semantics}")
     rows: list[dict[str, Any]] = []
     for raw in raw_rows:
         if not isinstance(raw, dict) or raw.get(timestamp_field) in {None, ""}:
             continue
-        ts = int(raw[timestamp_field])
+        source_ts = int(raw[timestamp_field])
+        # The 1m row is labelled by its open.  A start-stamped native 5m
+        # statistic is not known until that interval ends; attaching it to
+        # the source timestamp would leak four future minutes into training.
+        available_at = (
+            source_ts + STATISTICS_INTERVAL_MS
+            if timestamp_semantics == "period_start" else source_ts
+        )
+        ts = ((available_at + CANDLE_INTERVAL_MS - 1) // CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS - CANDLE_INTERVAL_MS
         if not (start_ms <= ts <= end_ms):
             continue
         item: dict[str, Any] = {"date": _ms_to_date_string(ts)}
@@ -799,7 +812,9 @@ def enrich_symbol_historical_features(
         )
         # Pull one day of context so the first selected bar receives the latest
         # settlement and the first in-window event can infer its interval.
-        event_start = max(dataset_start_ms, feature_start - 24 * 60 * 60 * 1000)
+        # A hot tail starts after the immutable base.  The latest settlement
+        # before its first bar still belongs in the causal as-of join.
+        event_start = max(start_ms, feature_start - 24 * 60 * 60 * 1000)
         rows = _fetch_forward(
             client,
             FUNDING_RATE_ENDPOINT,
@@ -837,9 +852,19 @@ def enrich_symbol_historical_features(
         path: str,
         field_map: dict[str, str],
         base_params: dict[str, Any],
+        *,
+        timestamp_semantics: str = "period_end",
     ) -> Callable[[], None]:
         def execute() -> None:
             nonlocal frame
+            if timestamp_semantics == "period_start":
+                # Previously these start-stamped observations were attached
+                # before their 5m window closed.  The upstream retains only
+                # 30 days, so unrecoverable older misaligned values must be
+                # masked, not silently left in the training table.
+                frame = frame.with_columns(
+                    [pl.lit(None, dtype=pl.Float64).alias(column) for column in field_map.values()]
+                )
             feature_start = max(
                 short_start_floor,
                 _latest_non_null_ms(
@@ -852,8 +877,16 @@ def enrich_symbol_historical_features(
                 client,
                 path,
                 {**base_params, "period": STATISTICS_PERIOD},
-                start_ms=feature_start,
-                end_ms=closed_end_ms,
+                start_ms=(
+                    feature_start - STATISTICS_INTERVAL_MS
+                    if timestamp_semantics == "period_start"
+                    else feature_start
+                ),
+                end_ms=(
+                    closed_end_ms + CANDLE_INTERVAL_MS
+                    if timestamp_semantics == "period_end"
+                    else closed_end_ms
+                ),
                 limit=SHORT_HISTORY_LIMIT,
                 timestamp_field="timestamp",
                 # The futures/data routes historically reported zero request
@@ -867,6 +900,7 @@ def enrich_symbol_historical_features(
                 field_map=field_map,
                 start_ms=feature_start,
                 end_ms=closed_end_ms,
+                timestamp_semantics=timestamp_semantics,
             )
             frame = _overlay_feature_frame(frame, fresh, tuple(field_map.values()))
 
@@ -965,6 +999,7 @@ def enrich_symbol_historical_features(
                 "buySellRatio": "binance_taker_buy_sell_ratio",
             },
             symbol_params,
+            timestamp_semantics="period_start",
         ),
     )
     run_stage(
@@ -980,6 +1015,7 @@ def enrich_symbol_historical_features(
                 "annualizedBasisRate": "binance_basis_annualized_rate",
             },
             {"pair": pair, "contractType": "PERPETUAL"},
+            timestamp_semantics="period_start",
         ),
     )
 
@@ -1053,6 +1089,7 @@ def run_historical_feature_downloads(
     start_ms: int,
     end_ms: int,
     workers: int,
+    tail_only: bool = False,
     observed_at_ms: int | None = None,
     stage_progress_callback: Callable[[str, str, str], None] | None = None,
 ) -> list[HistoricalFeatureResult]:
@@ -1067,10 +1104,12 @@ def run_historical_feature_downloads(
     results: list[HistoricalFeatureResult] = []
 
     def worker(record: Any) -> HistoricalFeatureResult:
+        base_path = output_dir / f"{record.code}_features.parquet"
+        tail_path = hot_tail_path(base_path)
         return enrich_symbol_historical_features(
             client,
             record,
-            output_dir / f"{record.code}_features.parquet",
+            tail_path if tail_only and tail_path.is_file() else base_path,
             start_ms=start_ms,
             end_ms=end_ms,
             observed_at_ms=observed_at_ms,
@@ -1095,7 +1134,9 @@ def run_historical_feature_downloads(
                             status="failed",
                             rows=0,
                             output_path=str(
-                                output_dir / f"{record.code}_features.parquet"
+                                hot_tail_path(output_dir / f"{record.code}_features.parquet")
+                                if tail_only and hot_tail_path(output_dir / f"{record.code}_features.parquet").is_file()
+                                else output_dir / f"{record.code}_features.parquet"
                             ),
                             changed=False,
                             stage_status_json="{}",

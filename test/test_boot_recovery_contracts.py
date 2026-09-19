@@ -88,14 +88,31 @@ def test_expensive_job_installers_remove_legacy_boot_symlinks() -> None:
         assert "enable --now" in installer
 
 
-def test_artifact_dedup_waits_for_the_current_hot_sync_service() -> None:
+def test_postclose_futures_refresh_targets_the_completed_same_day_session() -> None:
+    runner = _read("scripts/run_taifex_all_futures_daily.sh")
+
+    assert "TAIFEX_FUTURES_TARGET_SESSION" in runner
+    assert "TZ=Asia/Taipei date +%F" in runner
+    assert '--end-date "$target_session"' in runner
+
+
+def test_stock_minute_backfill_waits_for_the_exact_consumer_tx_session() -> None:
+    runner = _read("scripts/run_shioaji_minute_full_backfill.sh")
+
+    assert "latest_completed_tw_stock_session" in runner
+    assert "latest_completed_futures_session" not in runner
+    assert "_valid_receipt(root, target)" in runner
+
+
+def test_artifact_dedup_does_not_depend_on_retired_hot_sync_service() -> None:
     service = _read("deploy/systemd/stockagent-artifact-dedup.service.in")
-    assert "stockagent-hot-artifact-sync.service" in service
+    assert "stockagent-hot-artifact-sync.service" not in service
     assert "stockagent-live-artifact-sync.service" not in service
 
 
 def test_cold_boot_probe_requires_new_boot_and_all_public_surfaces() -> None:
     probe = _read("scripts/test_wsl_cold_boot_recovery.ps1")
+    assert '"stockagent-hot-artifact-sync.service"' not in probe
     assert "& $wsl --shutdown" in probe
     assert "DefaultDistribution" in probe
     assert "DistributionName" in probe

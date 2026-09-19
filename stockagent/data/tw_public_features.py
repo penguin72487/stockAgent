@@ -28,6 +28,23 @@ DAY_TRADE_SUSPENSION_COLUMN = "暫停現股賣出後現款買進當沖註記"
 TW_MARGIN_BOARD_LOT_SHARES = 1_000.0
 
 STOCK_FEATURE_COLUMNS = (
+    "twpub_official_trading_volume_raw",
+    "twpub_official_trading_value_raw",
+    "twpub_official_trades_raw",
+    "twpub_pe_raw",
+    "twpub_pb_raw",
+    "twpub_dividend_yield_pct_raw",
+    "twpub_dividend_per_share_raw",
+    "twpub_margin_balance_lots_raw",
+    "twpub_short_balance_lots_raw",
+    "twpub_margin_buy_lots_raw",
+    "twpub_margin_sell_lots_raw",
+    "twpub_short_sell_lots_raw",
+    "twpub_short_buy_lots_raw",
+    "twpub_foreign_net_buy_shares_raw",
+    "twpub_investment_trust_net_buy_shares_raw",
+    "twpub_dealer_net_buy_shares_raw",
+    "twpub_institutional_net_buy_shares_raw",
     "twpub_official_close_logret_1d",
     "twpub_official_trading_volume_log",
     "twpub_official_trading_value_log",
@@ -106,6 +123,16 @@ STOCK_FEATURE_COLUMNS = (
 )
 
 MARKET_FEATURE_COLUMNS = (
+    "twpub_twse_taiex_raw",
+    "twpub_usdtwd_raw",
+    "twpub_cbc_fx_reserves_usd_billion_raw",
+    "twpub_cbc_m1b_raw",
+    "twpub_cbc_m1b_yoy_pct_raw",
+    "twpub_cbc_m2_raw",
+    "twpub_cbc_m2_yoy_pct_raw",
+    "twpub_dgbas_cpi_yoy_pct_raw",
+    "twpub_dgbas_unemployment_pct_raw",
+    "twpub_dgbas_gdp_yoy_pct_raw",
     "twpub_twse_taiex_log",
     "twpub_twse_taiex_logret_1d",
     "twpub_twse_taiex_pct",
@@ -151,6 +178,16 @@ MARKET_FEATURE_COLUMNS = (
 
 FEATURE_COLUMNS = (*STOCK_FEATURE_COLUMNS, *MARKET_FEATURE_COLUMNS)
 POST_CLOSE_CHIP_FEATURE_COLUMNS = (
+    "twpub_margin_balance_lots_raw",
+    "twpub_short_balance_lots_raw",
+    "twpub_margin_buy_lots_raw",
+    "twpub_margin_sell_lots_raw",
+    "twpub_short_sell_lots_raw",
+    "twpub_short_buy_lots_raw",
+    "twpub_foreign_net_buy_shares_raw",
+    "twpub_investment_trust_net_buy_shares_raw",
+    "twpub_dealer_net_buy_shares_raw",
+    "twpub_institutional_net_buy_shares_raw",
     "twpub_margin_balance_log",
     "twpub_margin_balance_chg",
     "twpub_short_balance_log",
@@ -185,18 +222,20 @@ RULE_COLUMNS = (
 )
 OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
-TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION = 2
+TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION = 10
 AVAILABILITY_POLICY = {
     "historical_daily": "official session/trading date with source-specific publication timing",
     "post_close_chip_daily": (
         "official margin and institutional values for session t are published after "
-        "the close and mapped to the next receipt-verified TAIEX session before model use"
+        "the close and mapped to the next source-verified exchange session before model use"
     ),
-    "tdcc_shareholding": "TDCC data date plus 7 calendar days as a conservative availability date",
-    "monthly_macro": "period end plus 45 calendar days when no explicit release date is provided",
-    "quarterly_macro": "quarter end plus 90 calendar days when no explicit release date is provided",
-    "snapshot_openapi": "announcement/report date when present; otherwise downloader as-of date",
-    "future_event_snapshot": "downloader as-of date for known future-event snapshot rows",
+    "tdcc_shareholding": "first observed response time at the 09:00 Asia/Taipei session boundary unless a verified release receipt is available",
+    "monthly_macro": "period end is not publication; unverified historical release clocks require a separate vintage/calendar receipt",
+    "quarterly_macro": "period end is not publication; unverified historical release clocks require a separate vintage/calendar receipt",
+    "dgbas_official_release": "original document clocks take precedence; date-only 2012-05-07..2017-06-30 CPI, unemployment and GDP advance estimates use the official 08:30 schedule; other date-only releases enter the next verified session",
+    "cbc_official_fx_release": "dated original foreign-reserve press-release values enter the first verified exchange session after the date-only posting; current bulk values remain separately first-observed",
+    "snapshot_openapi": "announcement timestamp where supplied; otherwise response completion at the 09:00 Asia/Taipei session boundary",
+    "future_event_snapshot": "response completion clock and explicit future effective date",
     "delisting_short_rules": "explicit effective date not before publication; otherwise next calendar day after notice",
     "margin_short_capacity": (
         "official end-of-session margin-short balance and next-business-day "
@@ -221,6 +260,8 @@ class TwPublicFeatureBuildResult:
     source_receipts: list[dict[str, str | int]]
     output_receipt: dict[str, str | int]
     symbol_universe_receipt: dict[str, str | int | bool]
+    requested_end_date: str | None = None
+    allow_daily_publication_lag: bool = False
     build_mode: str = "full"
     incremental_start_date: str | None = None
     reused_rows: int = 0
@@ -235,6 +276,9 @@ class TwPublicFeatureBuildResult:
 _INCREMENTAL_READ_RANGE: ContextVar[tuple[date, date] | None] = ContextVar(
     "tw_public_incremental_read_range",
     default=None,
+)
+_BUILD_SESSION_DATES: ContextVar[tuple[Path, pl.DataFrame] | None] = ContextVar(
+    "tw_public_build_session_dates", default=None
 )
 _INCREMENTAL_DATE_DATASETS = frozenset(
     {
@@ -267,10 +311,76 @@ def _file_content_receipt(path: Path) -> dict[str, str | int]:
 
 
 def _source_content_receipts(input_dir: Path) -> list[dict[str, str | int]]:
-    return [
-        _file_content_receipt(path)
+    # These are raw-archive indexes, not inputs to the current feature ABI.
+    # Keep their bytes in the cold release without forcing a full 9.5M-row
+    # feature rebuild whenever an unrelated GCIS/FSC CSV is captured.
+    background_catalogs = {
+        "gcis_open_data_catalog.parquet",
+        "fsc_open_data_catalog.parquet",
+    }
+    receipts = [
+        _release_feature_content_receipt(path)
+        if path.name in {
+            "dgbas_release_vintages.parquet",
+            "cbc_fx_reserve_release_vintages.parquet",
+            "cbc_money_release_vintages.parquet",
+        }
+        else _file_content_receipt(path)
         for path in sorted(input_dir.glob("*.parquet"))
+        if path.name not in background_catalogs
     ]
+    supplemental = input_dir / "supplemental/cbc_overnight_official_pages.parquet"
+    if supplemental.is_file():
+        # The acceptance gate resolves receipt names relative to input_dir.
+        # Keeping only the basename made a valid supplemental source appear
+        # missing at input_dir/cbc_overnight_official_pages.parquet and caused
+        # a full feature rebuild on every 08:30 gate retry, including 09:00.
+        receipt = _file_content_receipt(supplemental)
+        receipt["name"] = supplemental.relative_to(input_dir).as_posix()
+        receipts.append(receipt)
+    return receipts
+
+
+def _release_feature_content_receipt(path: Path) -> dict[str, str | int]:
+    """Hash exact model inputs, not a release page's cosmetic HTML revision.
+
+    Raw page/attachment hashes remain in the archive and its independent
+    integrity audit. A PDF value, publication clock, source identity, or
+    evidence-eligibility change *must* still invalidate the feature table.
+    """
+
+    frame = pl.read_parquet(path)
+    if path.name == "dgbas_release_vintages.parquet":
+        columns = (
+            "source", "period", "published_on", "release_id", "release_kind",
+            "metric", "value_pct", "value_evidence", "published_time_precision",
+            "published_clock_taipei", "html_sha256",
+        )
+        ordering = ("source", "release_id")
+    elif path.name == "cbc_money_release_vintages.parquet":
+        columns = ("period", "published_on", "release_url", "metric",
+                   "value_pct", "value_evidence", "html_sha256")
+        ordering = ("period", "published_on", "release_url", "metric")
+    else:
+        columns = ("period", "published_on", "metric", "value", "value_evidence", "html_sha256")
+        ordering = ("period", "published_on", "metric", "value")
+    if not set(columns) <= set(frame.columns):
+        # Unknown historical schema: never accidentally ignore a revision.
+        return _file_content_receipt(path)
+    semantic = frame.select(
+        [pl.col(name) for name in columns if name != "html_sha256"]
+        + [pl.col("html_sha256").is_not_null().alias("has_original_html")]
+    ).sort(list(ordering))
+    payload = json.dumps(
+        semantic.to_dicts(), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "name": path.name,
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "basis": "feature_semantics_v1",
+    }
 
 
 def _symbol_universe_receipt(symbols_root: str | Path | None) -> dict[str, str | int | bool]:
@@ -304,8 +414,16 @@ def _incremental_base_is_compatible(
     summary_path: Path,
     *,
     market_symbol: str,
+    source_receipts: list[dict[str, str | int]],
+    symbol_universe_receipt: dict[str, str | int | bool],
+    allow_daily_publication_lag: bool = False,
 ) -> bool:
-    """Accept only a receipt-verified output with the current exact ABI."""
+    """Reuse a prefix only when its complete dependency bytes are unchanged.
+
+    A rewritten source parquet may correct an arbitrarily old observation or
+    effective-date rule. Without a source-partition receipt proving the changed
+    rows are confined to the tail, reusing any historical prefix is unsafe.
+    """
 
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -321,6 +439,12 @@ def _incremental_base_is_compatible(
     if summary.get("rule_columns") != list(RULE_COLUMNS):
         return False
     if summary.get("market_symbol") != market_symbol:
+        return False
+    if summary.get("source_receipts") != source_receipts:
+        return False
+    if summary.get("symbol_universe_receipt") != symbol_universe_receipt:
+        return False
+    if summary.get("allow_daily_publication_lag") is not allow_daily_publication_lag:
         return False
     if (
         int(summary.get("availability_contract_version") or -1)
@@ -364,20 +488,52 @@ def build_tw_public_training_features(
     ):
         raise ValueError("incremental_start_date must not be after end_date")
 
-    use_incremental = bool(
-        incremental_start_date is not None
-        and output_path.is_file()
+    source_receipts = _source_content_receipts(input_dir)
+    symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
+    base_compatible = bool(
+        output_path.is_file()
         and _incremental_base_is_compatible(
             output_path,
             resolved_summary_path,
             market_symbol=market_symbol,
+            source_receipts=source_receipts,
+            symbol_universe_receipt=symbol_universe_receipt,
+            allow_daily_publication_lag=allow_daily_publication_lag,
         )
     )
+    if base_compatible:
+        summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
+        if summary.get("requested_end_date") == (
+            end_date.isoformat() if end_date is not None else None
+        ):
+            if source_receipts != _source_content_receipts(input_dir):
+                raise RuntimeError("TW public source parquet changed while verifying unchanged features")
+            if symbol_universe_receipt != _symbol_universe_receipt(symbols_root):
+                raise RuntimeError("TW symbol universe changed while verifying unchanged features")
+            # Repeated 08:30 acceptance retries must not rewrite the 1+ GiB
+            # feature table when every input, semantic option and output hash
+            # already verifies. A needless replace invalidates the opening
+            # panel cache even though the model-visible values are identical.
+            return TwPublicFeatureBuildResult(
+                output_path=output_path,
+                rows=int(summary["rows"]),
+                feature_count=int(summary["feature_count"]),
+                stock_rows=int(summary["stock_rows"]),
+                market_rows=int(summary["market_rows"]),
+                market_symbol=market_symbol,
+                source_files=list(summary["source_files"]),
+                source_receipts=source_receipts,
+                output_receipt=dict(summary["output_receipt"]),
+                symbol_universe_receipt=symbol_universe_receipt,
+                requested_end_date=summary.get("requested_end_date"),
+                allow_daily_publication_lag=allow_daily_publication_lag,
+                build_mode="unchanged_verified",
+                reused_rows=int(summary["rows"]),
+            )
+    use_incremental = incremental_start_date is not None and base_compatible
     existing_identity = (
         _stable_file_identity(output_path) if use_incremental else None
     )
-    source_receipts = _source_content_receipts(input_dir)
-    symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
     symbols = _load_symbol_filter(symbols_root)
     read_token = None
     if use_incremental:
@@ -390,7 +546,10 @@ def build_tw_public_training_features(
                 end_date,
             )
         )
+    session_token = None
     try:
+        exchange_sessions = _exchange_session_dates(input_dir)
+        session_token = _BUILD_SESSION_DATES.set((input_dir.resolve(), exchange_sessions))
         stock_frames = [
             _build_official_ohlcv_features(input_dir),
             _build_delisted_company_rules(input_dir),
@@ -414,6 +573,14 @@ def build_tw_public_training_features(
                 allow_missing_latest_session=allow_daily_publication_lag,
             ),
         ]
+        # Every model-facing row must be keyed by an exchange session. This
+        # also carries weekend/holiday announcements to the first open session
+        # instead of silently discarding them during panel alignment.
+        if not exchange_sessions.is_empty():
+            stock_frames = [
+                _map_available_dates_to_sessions(frame, input_dir, sessions=exchange_sessions)
+                for frame in stock_frames
+            ]
         if use_incremental:
             assert incremental_start_date is not None
             assert end_date is not None
@@ -473,6 +640,11 @@ def build_tw_public_training_features(
                     market_symbol=market_symbol,
                 ),
             ]
+        if not exchange_sessions.is_empty():
+            market_frames = [
+                _map_available_dates_to_sessions(frame, input_dir, sessions=exchange_sessions)
+                for frame in market_frames
+            ]
         if use_incremental:
             assert incremental_start_date is not None
             assert end_date is not None
@@ -482,6 +654,8 @@ def build_tw_public_training_features(
             ]
         market_features = _merge_feature_frames(market_frames)
     finally:
+        if session_token is not None:
+            _BUILD_SESSION_DATES.reset(session_token)
         if read_token is not None:
             _INCREMENTAL_READ_RANGE.reset(read_token)
 
@@ -576,6 +750,8 @@ def build_tw_public_training_features(
         source_receipts=source_receipts,
         output_receipt=_file_content_receipt(output_path),
         symbol_universe_receipt=symbol_universe_receipt,
+        requested_end_date=end_date.isoformat() if end_date is not None else None,
+        allow_daily_publication_lag=allow_daily_publication_lag,
         build_mode="incremental_tail" if use_incremental else "full",
         incremental_start_date=(
             incremental_start_date.isoformat() if use_incremental else None
@@ -602,6 +778,8 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "feature_columns": list(FEATURE_COLUMNS),
         "rule_columns": list(RULE_COLUMNS),
         "market_symbol": result.market_symbol,
+        "requested_end_date": result.requested_end_date,
+        "allow_daily_publication_lag": result.allow_daily_publication_lag,
         "build_mode": result.build_mode,
         "incremental_start_date": result.incremental_start_date,
         "reused_rows": result.reused_rows,
@@ -659,19 +837,58 @@ def _read_optional(input_dir: Path, name: str) -> pl.DataFrame:
     return _read_date_bounded_parquet(path, dataset=name)
 
 
-def _next_exchange_session_lookup(input_dir: Path) -> pl.DataFrame:
-    """Map a completed exchange session to the next verified TAIEX session."""
-
+def _exchange_session_dates(input_dir: Path) -> pl.DataFrame:
+    """Historical index sessions plus a jointly published future rule session."""
+    cached = _BUILD_SESSION_DATES.get()
+    if cached is not None and cached[0] == input_dir.resolve():
+        return cached[1]
     calendar = _read_optional(input_dir, "twse_taiex_ohlc")
-    if calendar.is_empty() or "date" not in calendar.columns:
-        return pl.DataFrame(
-            schema={"_source_date": pl.Date, "_available_date": pl.Date}
+    if not calendar.is_empty() and "date" in calendar.columns:
+        sessions = calendar.select(_date_column_expr("date").alias("_session_date"))
+    else:
+        # Minimal/older official archives may have OHLCV before the separate
+        # index table was collected. A nonempty official daily trading table
+        # still proves that its exchange session occurred.
+        for name in (
+            "twse_daily_ohlcv", "tpex_daily_ohlcv",
+            "twse_daily_valuation", "tpex_daily_valuation",
+        ):
+            path = input_dir / f"{name}.parquet"
+            if path.exists():
+                sessions = pl.scan_parquet(path).select(
+                    _date_column_expr("date").alias("_session_date")
+                ).collect()
+                break
+        else:
+            return pl.DataFrame(schema={"_session_date": pl.Date})
+    sessions = sessions.drop_nulls("_session_date").unique("_session_date")
+    latest = sessions.get_column("_session_date").max()
+    future: list[pl.DataFrame] = []
+    for name in ("twse_day_trade_eligibility", "tpex_day_trade_eligibility"):
+        path = input_dir / f"{name}.parquet"
+        if not path.exists():
+            break
+        future.append(
+            pl.scan_parquet(path)
+            .select(_date_column_expr("date").alias("_session_date"))
+            .filter(pl.col("_session_date") > latest)
+            .drop_nulls("_session_date")
+            .unique("_session_date")
+            .collect()
         )
-    sessions = (
-        calendar.select(_date_column_expr("date").alias("_source_date"))
-        .drop_nulls("_source_date")
-        .unique("_source_date")
-        .sort("_source_date")
+    if len(future) == 2:
+        jointly_published = future[0].join(
+            future[1], on="_session_date", how="inner", validate="1:1"
+        )
+        sessions = pl.concat([sessions, jointly_published])
+    return sessions.unique("_session_date").sort("_session_date")
+
+
+def _next_exchange_session_lookup(input_dir: Path) -> pl.DataFrame:
+    """Map a completed session to the next source-verified exchange session."""
+
+    sessions = _exchange_session_dates(input_dir).rename(
+        {"_session_date": "_source_date"}
     )
     if sessions.height < 2:
         return pl.DataFrame(
@@ -683,6 +900,28 @@ def _next_exchange_session_lookup(input_dir: Path) -> pl.DataFrame:
         )
         .drop_nulls("_available_date")
         .select("_source_date", "_available_date")
+    )
+
+
+def _map_available_dates_to_sessions(
+    frame: pl.DataFrame, input_dir: Path, *, sessions: pl.DataFrame | None = None
+) -> pl.DataFrame:
+    """A Saturday or holiday release enters the first verified open session."""
+
+    if frame.is_empty() or "date" not in frame.columns:
+        return frame
+    if sessions is None:
+        sessions = _exchange_session_dates(input_dir)
+    if sessions.is_empty():
+        return frame.head(0)
+    return (
+        frame.drop_nulls("date").sort("date")
+        .join_asof(
+            sessions, left_on="date", right_on="_session_date", strategy="forward"
+        )
+        .filter(pl.col("_session_date").is_not_null())
+        .drop("date")
+        .rename({"_session_date": "date"})
     )
 
 
@@ -777,6 +1016,7 @@ def _metadata_columns() -> set[str]:
         "_dataset",
         "_source",
         "_downloaded_at_utc",
+        "_payload_sha256",
         "_url",
         "_resource",
         "_data_gov_id",
@@ -997,6 +1237,9 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                     _symbol_expr("證券代號").alias("symbol"),
                     pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
+                    volume.alias("twpub_official_trading_volume_raw"),
+                    value.alias("twpub_official_trading_value_raw"),
+                    trades.alias("twpub_official_trades_raw"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
                     _positive_log1p(trades).alias("twpub_official_trades_log"),
@@ -1022,6 +1265,9 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                     _symbol_expr("代號").alias("symbol"),
                     pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
+                    volume.alias("twpub_official_trading_volume_raw"),
+                    value.alias("twpub_official_trading_value_raw"),
+                    trades.alias("twpub_official_trades_raw"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
                     _positive_log1p(trades).alias("twpub_official_trades_log"),
@@ -1099,14 +1345,110 @@ def _build_delisted_company_rules(input_dir: Path) -> pl.DataFrame:
 
 
 def _snapshot_date_expr(columns: set[str]):
-    explicit = _first_existing(columns, ("出表日期", "Date", "日期"))
-    declared = _date_column_expr(explicit) if explicit else _date_column_expr("date")
-    if "_as_of_date" not in columns:
-        return declared
-    # Never project a current snapshot back to the provider's subject/report
-    # date if these exact bytes were only archived later. A future-declared
-    # report date remains future-dated through the horizontal maximum.
-    return pl.max_horizontal(declared, _date_column_expr("_as_of_date"))
+    explicit = _first_existing(columns, ("出表日期", "發言日期", "Date", "日期", "date"))
+    declared = _date_column_expr(explicit) if explicit else pl.lit(None, dtype=pl.Date)
+    observed = _observed_available_date_expr(columns)
+    if observed is not None:
+        # The report date describes the subject, not necessarily publication.
+        # An observation made at 09:00 or later belongs to the next session.
+        return (
+            pl.when(observed.is_not_null())
+            .then(pl.max_horizontal(declared, observed))
+            .otherwise(None)
+        )
+    return declared
+
+
+def _snapshot_not_before_expr(columns: set[str], event_date):
+    published = _snapshot_date_expr(columns)
+    return (
+        pl.when(published.is_not_null())
+        .then(pl.max_horizontal(event_date, published))
+        .otherwise(None)
+    )
+
+
+def _observed_available_date_expr(columns: set[str]):
+    if "_downloaded_at_utc" in columns:
+        local = (
+            pl.col("_downloaded_at_utc")
+            .cast(pl.Utf8, strict=False)
+            .str.to_datetime(time_zone="UTC", strict=False)
+            .dt.convert_time_zone("Asia/Taipei")
+        )
+        candidate = (
+            pl.when(local.dt.hour() < 9)
+            .then(local.dt.date())
+            .otherwise(local.dt.date().dt.offset_by("1d"))
+        )
+        if "_as_of_date" in columns:
+            # A legacy/partial row with an unparseable response clock cannot
+            # be promoted to the snapshot day before opening.
+            return pl.coalesce(
+                [candidate, _date_column_expr("_as_of_date").dt.offset_by("1d")]
+            )
+        return candidate
+    if "_as_of_date" in columns:
+        return _date_column_expr("_as_of_date").dt.offset_by("1d")
+    return None
+
+
+def _periodic_available_date_expr(columns: set[str], period_end):
+    """Never manufacture a historical release from a statistical period end.
+
+    Current-only open-data resources contain later revisions of old months.
+    Without a source-timestamped historical value vintage, the first archived
+    response is the earliest defensible time for those exact values.
+    """
+
+    observed = _observed_available_date_expr(columns)
+    if observed is None:
+        return pl.lit(None, dtype=pl.Date)
+    return (
+        pl.when(observed.is_not_null() & period_end.is_not_null())
+        .then(pl.max_horizontal(period_end.dt.offset_by("1d"), observed))
+        .otherwise(None)
+    )
+
+
+def _material_info_available_date_expr(columns: set[str]):
+    """Use MOPS's row-level speaking time, never the fact/event date."""
+
+    fallback = (
+        _snapshot_date_expr(columns)
+        if "_downloaded_at_utc" in columns or "_as_of_date" in columns
+        else pl.lit(None, dtype=pl.Date)
+    )
+    if "發言日期" not in columns or "發言時間" not in columns:
+        return fallback
+    announced = _date_column_expr("發言日期")
+    raw_clock = _text_expr("發言時間")
+    compact = raw_clock.str.zfill(6)
+    colon_clock = raw_clock.str.contains(r"^\d{1,2}:\d{2}(?::\d{2})?$")
+    compact_clock = raw_clock.str.contains(r"^\d{4,6}$")
+    hour = pl.coalesce(
+        [raw_clock.str.extract(r"^(\d{1,2}):", 1), compact.str.slice(0, 2)]
+    ).cast(pl.Int32, strict=False)
+    minute = pl.coalesce(
+        [raw_clock.str.extract(r"^\d{1,2}:(\d{2})", 1), compact.str.slice(2, 2)]
+    ).cast(pl.Int32, strict=False)
+    second = pl.coalesce(
+        [raw_clock.str.extract(r"^\d{1,2}:\d{2}:(\d{2})$", 1),
+         pl.when(colon_clock).then(pl.lit("0")).otherwise(compact.str.slice(4, 2))]
+    ).cast(pl.Int32, strict=False)
+    valid = (
+        announced.is_not_null()
+        & (colon_clock | compact_clock)
+        & hour.is_between(0, 23)
+        & minute.is_between(0, 59)
+        & second.is_between(0, 59)
+    )
+    release_date = (
+        pl.when(hour < 9)
+        .then(announced)
+        .otherwise(announced.dt.offset_by("1d"))
+    )
+    return pl.when(valid).then(release_date).otherwise(fallback)
 
 
 def _snapshot_symbol_expr(columns: set[str]):
@@ -1235,7 +1577,7 @@ def _build_model_useful_shorting_features(input_dir: Path) -> pl.DataFrame:
         for code, volume in (("TWSECode", "TWSEAvailableVolume"), ("GRETAICode", "GRETAIAvailableVolume")):
             frames.append(
                 twse.select(
-                    _date_column_expr("date").alias("date"),
+                    _snapshot_date_expr(set(twse.columns)).alias("date"),
                     _symbol_expr(code).alias("symbol"),
                     _positive_log1p(_num_expr(volume)).alias("twpub_borrow_available_log"),
                 )
@@ -2013,6 +2355,7 @@ def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) ->
             # from FX, macro, or futures features are not evidence that the
             # cash-equity market traded.
             pl.lit(1.0).alias("_twpub_official_traded"),
+            pl.col("_taiex").alias("twpub_twse_taiex_raw"),
             _positive_log(pl.col("_taiex")).alias("twpub_twse_taiex_log"),
             _safe_log(pl.col("_taiex") / pl.col("_previous_taiex")).alias(
                 "twpub_twse_taiex_logret_1d"
@@ -2023,6 +2366,7 @@ def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) ->
             "date",
             "symbol",
             "_twpub_official_traded",
+            "twpub_twse_taiex_raw",
             "twpub_twse_taiex_log",
             "twpub_twse_taiex_logret_1d",
             "twpub_twse_taiex_pct",
@@ -2042,16 +2386,20 @@ def _build_valuation_features(input_dir: Path) -> pl.DataFrame:
         columns = set(frame.columns)
         pe = _num_expr("本益比")
         pb = _num_expr("股價淨值比")
-        dividend_yield = _num_expr("殖利率(%)") / 100.0
+        dividend_yield_pct = _num_expr("殖利率(%)")
         dividend = _optional_num_expr(columns, dividend_col) if dividend_col else pl.lit(None, dtype=pl.Float64)
         frames.append(
             frame.select(
                 [
                     _date_column_expr("date").alias("date"),
                     _symbol_expr(code_col).alias("symbol"),
+                    pe.alias("twpub_pe_raw"),
+                    pb.alias("twpub_pb_raw"),
+                    dividend_yield_pct.alias("twpub_dividend_yield_pct_raw"),
+                    dividend.alias("twpub_dividend_per_share_raw"),
                     _positive_log1p(pe).alias("twpub_pe_log"),
                     _positive_log1p(pb).alias("twpub_pb_log"),
-                    dividend_yield.alias("twpub_dividend_yield"),
+                    (dividend_yield_pct / 100.0).alias("twpub_dividend_yield"),
                     _positive_log1p(dividend).alias("twpub_dividend_per_share_log"),
                 ]
             )
@@ -2102,6 +2450,12 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
             [
                 _date_column_expr("date").alias("date"),
                 _symbol_expr("代號").alias("symbol"),
+                margin_today.alias("twpub_margin_balance_lots_raw"),
+                short_today.alias("twpub_short_balance_lots_raw"),
+                _num_expr("買進").alias("twpub_margin_buy_lots_raw"),
+                _num_expr("賣出").alias("twpub_margin_sell_lots_raw"),
+                _num_expr("賣出_2").alias("twpub_short_sell_lots_raw"),
+                _num_expr("買進_2").alias("twpub_short_buy_lots_raw"),
                 _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
                 _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
                 _positive_log1p(short_today).alias("twpub_short_balance_log"),
@@ -2170,6 +2524,12 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
             [
                 _date_column_expr("date").alias("date"),
                 _symbol_expr("代號").alias("symbol"),
+                margin_today.alias("twpub_margin_balance_lots_raw"),
+                short_today.alias("twpub_short_balance_lots_raw"),
+                _num_expr("資買").alias("twpub_margin_buy_lots_raw"),
+                _num_expr("資賣").alias("twpub_margin_sell_lots_raw"),
+                _num_expr("券賣").alias("twpub_short_sell_lots_raw"),
+                _num_expr("券買").alias("twpub_short_buy_lots_raw"),
                 _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
                 _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
                 _positive_log1p(short_today).alias("twpub_short_balance_log"),
@@ -2206,13 +2566,30 @@ def _build_institutional_features(input_dir: Path) -> pl.DataFrame:
     session_lookup = _next_exchange_session_lookup(input_dir)
     twse = _read_optional(input_dir, "twse_institutional_trades")
     if not twse.is_empty():
+        # T86 changed its historical foreign-investor header.  Each source
+        # row has one of these columns, not both; selecting only the modern
+        # name silently erased most TWSE values before 2018.
+        foreign_net = pl.coalesce(
+            _optional_num_expr(set(twse.columns), "外陸資買賣超股數(不含外資自營商)"),
+            _optional_num_expr(set(twse.columns), "外資買賣超股數"),
+        )
         source = twse.select(
             [
                 _date_column_expr("date").alias("date"),
                 _symbol_expr("證券代號").alias("symbol"),
-                _signed_asinh(
-                    _num_expr("外陸資買賣超股數(不含外資自營商)")
-                ).alias("twpub_foreign_net_buy_flow"),
+                foreign_net.alias(
+                    "twpub_foreign_net_buy_shares_raw"
+                ),
+                _num_expr("投信買賣超股數").alias(
+                    "twpub_investment_trust_net_buy_shares_raw"
+                ),
+                _num_expr("自營商買賣超股數").alias(
+                    "twpub_dealer_net_buy_shares_raw"
+                ),
+                _num_expr("三大法人買賣超股數").alias(
+                    "twpub_institutional_net_buy_shares_raw"
+                ),
+                _signed_asinh(foreign_net).alias("twpub_foreign_net_buy_flow"),
                 _signed_asinh(_num_expr("投信買賣超股數")).alias(
                     "twpub_investment_trust_net_buy_flow"
                 ),
@@ -2240,6 +2617,18 @@ def _build_institutional_features(input_dir: Path) -> pl.DataFrame:
             [
                 _date_column_expr("date").alias("date"),
                 _symbol_expr("代號").alias("symbol"),
+                _num_expr("外資及陸資淨買股數").alias(
+                    "twpub_foreign_net_buy_shares_raw"
+                ),
+                _num_expr("投信淨買股數").alias(
+                    "twpub_investment_trust_net_buy_shares_raw"
+                ),
+                _num_expr("自營淨買股數").alias(
+                    "twpub_dealer_net_buy_shares_raw"
+                ),
+                _num_expr(total_col).alias(
+                    "twpub_institutional_net_buy_shares_raw"
+                ),
                 _signed_asinh(_num_expr("外資及陸資淨買股數")).alias(
                     "twpub_foreign_net_buy_flow"
                 ),
@@ -2286,12 +2675,7 @@ def _build_tdcc_features(input_dir: Path) -> pl.DataFrame:
         source_date = pl.coalesce(
             [_yyyymmdd_expr(candidate) for candidate in date_columns]
         )
-        availability_date = source_date.dt.offset_by("7d")
-        if "_as_of_date" in columns:
-            availability_date = pl.max_horizontal(
-                availability_date,
-                _date_column_expr("_as_of_date"),
-            )
+        availability_date = _periodic_available_date_expr(columns, source_date)
         normalized.append(
             frame.select(
                 [
@@ -2302,22 +2686,36 @@ def _build_tdcc_features(input_dir: Path) -> pl.DataFrame:
                     (_num_expr("占集保庫存數比例%") / 100.0).alias("_ratio"),
                     _num_expr("人數").alias("_holders"),
                     pl.lit(priority, dtype=pl.Int8).alias("_source_priority"),
+                    _text_expr("_downloaded_at_utc").alias("_observed_at")
+                    if "_downloaded_at_utc" in columns
+                    else pl.lit("").alias("_observed_at"),
                 ]
             )
         )
     if not normalized:
         return pl.DataFrame()
-    frame = pl.concat(normalized, how="vertical_relaxed")
+    frame = _map_available_dates_to_sessions(
+        pl.concat(normalized, how="vertical_relaxed"), input_dir
+    )
     if frame.is_empty():
         return pl.DataFrame()
     return (
         frame.drop_nulls(["_source_date", "date", "symbol", "_tier"])
-        .sort(["_source_date", "symbol", "_tier", "_source_priority"])
+        .sort(["date", "symbol", "_source_date", "_tier", "_observed_at", "_source_priority"])
         .unique(
-            subset=["_source_date", "symbol", "_tier"],
+            subset=["date", "_source_date", "symbol", "_tier"],
             keep="last",
             maintain_order=True,
         )
+        .join(
+            frame.group_by(["date", "symbol"]).agg(
+                pl.col("_source_date").max().alias("_latest_source_date")
+            ),
+            on=["date", "symbol"],
+            how="left",
+            validate="m:1",
+        )
+        .filter(pl.col("_source_date") == pl.col("_latest_source_date"))
         .group_by(["date", "symbol"])
         .agg(
             [
@@ -2448,13 +2846,16 @@ def _build_dividend_features(input_dir: Path) -> pl.DataFrame:
         frames.append(
             twse.select(
                 [
-                    pl.coalesce(
-                        [
-                            _date_column_expr("董事會（擬議）股利分派日"),
-                            _date_column_expr("股東會日期"),
-                            _date_column_expr("出表日期"),
-                            _date_column_expr("date"),
-                        ]
+                    _snapshot_not_before_expr(
+                        columns,
+                        pl.coalesce(
+                            [
+                                _date_column_expr("董事會（擬議）股利分派日"),
+                                _date_column_expr("股東會日期"),
+                                _date_column_expr("出表日期"),
+                                _date_column_expr("date"),
+                            ]
+                        ),
                     ).alias("date"),
                     _symbol_expr("公司代號").alias("symbol"),
                     cash_per_share.alias("twpub_dividend_cash_per_share"),
@@ -2491,13 +2892,16 @@ def _build_dividend_features(input_dir: Path) -> pl.DataFrame:
         frames.append(
             tpex.select(
                 [
-                    pl.coalesce(
-                        [
-                            _date_column_expr("董事會決議通過股利分派日"),
-                            _date_column_expr("股東會日期配盈餘/待彌補虧損(元)"),
-                            _date_column_expr("出表日期"),
-                            _date_column_expr("date"),
-                        ]
+                    _snapshot_not_before_expr(
+                        columns,
+                        pl.coalesce(
+                            [
+                                _date_column_expr("董事會決議通過股利分派日"),
+                                _date_column_expr("股東會日期配盈餘/待彌補虧損(元)"),
+                                _date_column_expr("出表日期"),
+                                _date_column_expr("date"),
+                            ]
+                        ),
                     ).alias("date"),
                     _symbol_expr("公司代號").alias("symbol"),
                     cash_per_share.alias("twpub_dividend_cash_per_share"),
@@ -2525,7 +2929,7 @@ def _build_ex_dividend_preview_features(input_dir: Path) -> pl.DataFrame:
     stock_dividend = _sum_num_expr(columns, ["StockDividendRatio", "SubscriptionRatio"])
     return frame.select(
         [
-            _date_column_expr("date").alias("date"),
+            _snapshot_date_expr(columns).alias("date"),
             _symbol_expr("Code").alias("symbol"),
             pl.lit(1.0).alias("twpub_exdiv_known"),
             _optional_num_expr(columns, "CashDividend").alias("twpub_exdiv_cash_dividend"),
@@ -2546,7 +2950,7 @@ def _build_material_info_features(input_dir: Path) -> pl.DataFrame:
     event_date = _date_column_expr("事實發生日") if "事實發生日" in columns else _date_column_expr("發言日期")
     base = frame.select(
         [
-            pl.coalesce([_date_column_expr("發言日期"), _date_column_expr("出表日期"), _date_column_expr("date")]).alias("date"),
+            _material_info_available_date_expr(columns).alias("date"),
             _symbol_expr("公司代號").alias("symbol"),
             _num_from_text_digits_expr("符合條款").alias("_clause")
             if "符合條款" in columns
@@ -2556,6 +2960,7 @@ def _build_material_info_features(input_dir: Path) -> pl.DataFrame:
     ).drop_nulls(["date", "symbol"])
     if base.is_empty():
         return base
+    base = _map_available_dates_to_sessions(base, input_dir)
     return base.group_by(["date", "symbol"]).agg(
         [
             (pl.len().cast(pl.Float64) + 1.0).log().alias("twpub_material_event_count_log"),
@@ -2583,7 +2988,7 @@ def _build_attention_disposal_features(input_dir: Path) -> pl.DataFrame:
         symbol = _symbol_expr(symbol_col)
         base = frame.select(
             [
-                pl.coalesce([_date_column_expr(date_col), _date_column_expr("date")]).alias("date"),
+                _snapshot_date_expr(columns).alias("date"),
                 symbol.alias("symbol"),
                 _optional_num_expr(columns, close_col).alias("_close"),
                 _optional_num_expr(columns, pe_col).alias("_pe"),
@@ -2620,7 +3025,9 @@ def _build_usdtwd_features(input_dir: Path, *, market_symbol: str) -> pl.DataFra
         return pl.DataFrame()
     rate = _num_expr("NTD/USD")
     return (
-        frame.select([_yyyymmdd_expr("日期").alias("date"), rate.alias("_rate")])
+        _macro_release_rows(
+            frame, input_dir, _yyyymmdd_expr("日期"), [rate.alias("_rate")]
+        )
         .drop_nulls(["date"])
         .group_by("date")
         .agg(pl.col("_rate").drop_nulls().last().alias("_rate"))
@@ -2628,119 +3035,418 @@ def _build_usdtwd_features(input_dir: Path, *, market_symbol: str) -> pl.DataFra
         .with_columns(
             [
                 pl.lit(market_symbol).alias("symbol"),
+                pl.col("_rate").alias("twpub_usdtwd_raw"),
                 _safe_log(pl.col("_rate")).alias("twpub_usdtwd_log"),
                 _safe_log(pl.col("_rate") / pl.col("_rate").shift(1)).alias("twpub_usdtwd_logret_1d"),
             ]
         )
-        .select(["date", "symbol", "twpub_usdtwd_log", "twpub_usdtwd_logret_1d"])
+        .select(["date", "symbol", "twpub_usdtwd_raw", "twpub_usdtwd_log", "twpub_usdtwd_logret_1d"])
     )
 
 
 def _build_cbc_overnight_rate_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
-    frame = _read_optional(input_dir, "cbc_overnight_rate")
-    if frame.is_empty() or "日期" not in frame.columns:
-        return pl.DataFrame()
-    rate_col = "利率[%]" if "利率[%]" in frame.columns else None
-    if rate_col is None:
-        return pl.DataFrame()
-    return (
-        frame.select([_date_column_expr("日期").alias("date"), (_num_expr(rate_col) / 100.0).alias("_rate")])
-        .drop_nulls(["date"])
-        .group_by("date")
-        .agg(pl.col("_rate").drop_nulls().last().alias("_rate"))
-        .sort("date")
-        .with_columns(
-            [
-                pl.lit(market_symbol).alias("symbol"),
+    sources: list[pl.DataFrame] = []
+    bulk = _read_optional(input_dir, "cbc_overnight_rate")
+    if not bulk.is_empty() and {"日期", "利率[%]"} <= set(bulk.columns):
+        sources.append(bulk)
+    pages_path = input_dir / "supplemental/cbc_overnight_official_pages.parquet"
+    if pages_path.is_file():
+        pages = pl.read_parquet(pages_path)
+        if {"subject_date", "rate_pct", "status", "observed_at_utc"} <= set(pages.columns):
+            pages = pages.filter(pl.col("status") == "ok").select(
+                pl.col("subject_date").alias("日期"),
+                pl.col("rate_pct").alias("利率[%]"),
+                pl.col("observed_at_utc").alias("_downloaded_at_utc"),
+            )
+            sources.append(pages)
+    events: list[pl.DataFrame] = []
+    for priority, frame in enumerate(sources):
+        values = (
+            _macro_release_rows(
+                frame, input_dir, _date_column_expr("日期"),
+                [(_num_expr("利率[%]") / 100.0).alias("_rate")],
+            )
+            .drop_nulls(["date", "_rate"])
+            .group_by("date")
+            .agg(pl.col("_rate").last())
+            .sort("date")
+            .with_columns(
                 pl.col("_rate").alias("twpub_cbc_overnight_rate"),
                 (pl.col("_rate") - pl.col("_rate").shift(1)).alias("twpub_cbc_overnight_rate_chg"),
-            ]
+                pl.lit(priority).alias("_priority"),
+            )
+            .drop("_rate")
         )
+        if not values.is_empty():
+            events.append(values)
+    if not events:
+        return pl.DataFrame()
+    return (
+        pl.concat(events)
+        .sort(["date", "_priority"])
+        .group_by("date")
+        .agg(
+            pl.col("twpub_cbc_overnight_rate").last(),
+            pl.col("twpub_cbc_overnight_rate_chg").last(),
+        )
+        .with_columns(pl.lit(market_symbol).alias("symbol"))
         .select(["date", "symbol", "twpub_cbc_overnight_rate", "twpub_cbc_overnight_rate_chg"])
+    )
+
+
+def _macro_release_rows(
+    frame: pl.DataFrame,
+    input_dir: Path,
+    period_end,
+    values: list[pl.Expr],
+) -> pl.DataFrame:
+    """Keep period ordering separate from release/session ordering."""
+
+    rows = frame.select(
+        [
+            period_end.alias("_period"),
+            _periodic_available_date_expr(set(frame.columns), period_end).alias("date"),
+            _text_expr("_downloaded_at_utc").alias("_observed_at")
+            if "_downloaded_at_utc" in frame.columns
+            else pl.lit("").alias("_observed_at"),
+            *values,
+        ]
+    ).drop_nulls(["_period", "date"])
+    if rows.is_empty():
+        return rows.drop("_period", "_observed_at")
+    return (
+        _map_available_dates_to_sessions(rows, input_dir)
+        .sort(["date", "_period", "_observed_at"])
+        .drop("_period", "_observed_at")
+    )
+
+
+def _dgbas_headline_release_rows(
+    archive: pl.DataFrame,
+    input_dir: Path,
+    *,
+    source: str,
+    metric: str,
+    value_column: str,
+    percent_as_fraction: bool = True,
+) -> pl.DataFrame:
+    """Use original release values, never a current table relabelled as old."""
+
+    required = {"source", "period", "published_on", "release_id", "release_kind",
+                "metric", "value_pct", "value_evidence", "html_sha256"}
+    if archive.is_empty() or not required <= set(archive.columns):
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    rows = archive.filter(
+        (pl.col("source") == source)
+        & (pl.col("metric") == metric)
+        & pl.col("value_evidence").is_in(
+            ["official_release_headline", "original_attachment_cpi_text",
+             "original_attachment_unemployment_text"]
+        )
+        & pl.col("value_pct").is_not_null()
+        & ((pl.col("release_kind") == "direct_attachment") | pl.col("html_sha256").is_not_null())
+    )
+    if rows.is_empty():
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    conflicting = (
+        rows.group_by(["period", "published_on"])
+        .agg(pl.col("value_pct").n_unique().alias("distinct_values"))
+        .filter(pl.col("distinct_values") > 1)
+    )
+    if not conflicting.is_empty():
+        raise ValueError(f"conflicting same-day DGBAS {source} release headlines")
+    # Original document clocks override the historical official schedule.
+    # DGBAS moved CPI, employment and GDP advance estimates to 08:30 on
+    # 2012-05-07, then moved all statistics to 16:00 on 2017-07-01.
+    # GDP preliminary releases were explicitly exempt from the 08:30 era.
+    # https://www.stat.gov.tw/News_Content.aspx?n=3703&s=23721
+    # https://www.stat.gov.tw/News_Content.aspx?n=2642&s=97506
+    published_day = pl.col("published_on").str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+    is_gdp_advance = (
+        pl.col("title").cast(pl.Utf8, strict=False).str.contains("概估")
+        if "title" in rows.columns else pl.lit(False)
+    )
+    scheduled_preopen = published_day.is_between(
+        date(2012, 5, 7), date(2017, 6, 30), closed="both"
+    ) & (
+        pl.lit(source in {"cpi", "unemployment"})
+        | (pl.lit(source == "gdp") & is_gdp_advance)
+    )
+    if {"published_time_precision", "published_clock_taipei"} <= set(rows.columns):
+        before_open = pl.when(
+            pl.col("published_time_precision") == "official_document_time"
+        ).then(
+            pl.col("published_clock_taipei") < "09:00:00"
+        ).otherwise(scheduled_preopen)
+    else:
+        before_open = scheduled_preopen
+    available_day = pl.when(before_open).then(published_day).otherwise(
+        published_day.dt.offset_by("1d")
+    )
+    release_rows = rows.select(
+        available_day.alias("date"),
+        pl.col("period").alias("_period"),
+        pl.col("release_id").alias("_release_id"),
+        (
+            pl.col("value_pct").cast(pl.Float64, strict=False)
+            / (100.0 if percent_as_fraction else 1.0)
+        ).alias(value_column),
+    ).drop_nulls(["date", value_column])
+    if release_rows.is_empty():
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    return (
+        _map_available_dates_to_sessions(release_rows, input_dir)
+        .sort(["date", "_period", "_release_id"])
+        .group_by("date")
+        .agg(pl.col(value_column).last())
+    )
+
+
+def _merge_bulk_and_official_release_values(
+    bulk: pl.DataFrame, official: pl.DataFrame, value_column: str
+) -> pl.DataFrame:
+    frames = []
+    for priority, frame in enumerate((bulk, official)):
+        if not frame.is_empty():
+            frames.append(frame.with_columns(pl.lit(priority).alias("_priority")))
+    if not frames:
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    return (
+        pl.concat(frames)
+        .sort(["date", "_priority"])
+        .group_by("date")
+        .agg(pl.col(value_column).drop_nulls().last())
+    )
+
+
+def _cbc_fx_release_rows(input_dir: Path) -> pl.DataFrame:
+    archive = _read_optional(input_dir, "cbc_fx_reserve_release_vintages")
+    value_column = "_fx_reserves"
+    required = {"period", "published_on", "metric", "value", "value_evidence", "html_sha256"}
+    if archive.is_empty() or not required <= set(archive.columns):
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    rows = archive.filter(
+        (pl.col("metric") == "fx_reserves_usd_100m")
+        & (pl.col("value_evidence") == "original_press_release_text")
+        & pl.col("value").is_not_null()
+        & pl.col("html_sha256").is_not_null()
+    )
+    if rows.is_empty():
+        return pl.DataFrame(schema={"date": pl.Date, value_column: pl.Float64})
+    conflicting = (
+        rows.group_by(["period", "published_on"])
+        .agg(pl.col("value").n_unique().alias("distinct_values"))
+        .filter(pl.col("distinct_values") > 1)
+    )
+    if not conflicting.is_empty():
+        raise ValueError("conflicting same-day CBC foreign-reserve release values")
+    # The release page states a date but not a proven intra-day timestamp.
+    # One 億 USD is 0.1 billion USD, the unit used by cbc_fx_reserves.
+    release_rows = rows.select(
+        pl.col("published_on").str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+        .dt.offset_by("1d").alias("date"),
+        pl.col("period").alias("_period"),
+        (pl.col("value").cast(pl.Float64, strict=False) / 10.0).alias(value_column),
+    ).drop_nulls(["date", value_column])
+    return (
+        _map_available_dates_to_sessions(release_rows, input_dir)
+        .sort(["date", "_period"])
+        .group_by("date")
+        .agg(pl.col(value_column).last())
+    )
+
+
+def _cbc_money_release_rows(input_dir: Path) -> pl.DataFrame:
+    """Use only M1B/M2 year-on-year values stated in dated original releases."""
+
+    schema = {"date": pl.Date, "_m1b_yoy": pl.Float64, "_m2_yoy": pl.Float64}
+    archive = _read_optional(input_dir, "cbc_money_release_vintages")
+    required = {"period", "published_on", "release_url", "metric", "value_pct",
+                "value_evidence", "html_sha256"}
+    if archive.is_empty() or not required <= set(archive.columns):
+        return pl.DataFrame(schema=schema)
+    rows = archive.filter(
+        pl.col("metric").is_in(["m1b_yoy_pct", "m2_yoy_pct"])
+        & (pl.col("value_evidence") == "original_press_release_text")
+        & pl.col("value_pct").is_not_null()
+        & pl.col("html_sha256").is_not_null()
+    )
+    if rows.is_empty():
+        return pl.DataFrame(schema=schema)
+    conflicting = (
+        rows.group_by(["period", "published_on", "metric"])
+        .agg(pl.col("value_pct").n_unique().alias("distinct_values"))
+        .filter(pl.col("distinct_values") > 1)
+    )
+    if not conflicting.is_empty():
+        raise ValueError("conflicting same-day CBC money-supply release values")
+    # The original article gives a posting date; its historical intra-day
+    # publication clock is not independently proven. The next verified market
+    # session is therefore the earliest model-safe session.
+    releases = rows.select(
+        pl.col("published_on").str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+        .dt.offset_by("1d").alias("date"),
+        pl.col("period").alias("_period"),
+        pl.col("release_url").alias("_release_url"),
+        pl.when(pl.col("metric") == "m1b_yoy_pct")
+        .then(pl.col("value_pct")).otherwise(None).alias("_m1b_yoy"),
+        pl.when(pl.col("metric") == "m2_yoy_pct")
+        .then(pl.col("value_pct")).otherwise(None).alias("_m2_yoy"),
+    ).drop_nulls(["date"])
+    return (
+        _map_available_dates_to_sessions(releases, input_dir)
+        .sort(["date", "_period", "_release_url"])
+        .group_by("date")
+        .agg(pl.col("_m1b_yoy").drop_nulls().last(),
+             pl.col("_m2_yoy").drop_nulls().last())
     )
 
 
 def _build_cbc_monthly_macro_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
+    official_fx = _cbc_fx_release_rows(input_dir)
     fx = _read_optional(input_dir, "cbc_fx_reserves")
+    bulk_fx = pl.DataFrame(schema={"date": pl.Date, "_fx_reserves": pl.Float64})
     if not fx.is_empty() and "日期" in fx.columns and "金額" in fx.columns:
-        frames.append(
-            fx.select(
-                [
-                    _month_period_available_expr("日期", lag_days=45).alias("date"),
-                    _num_expr("金額").alias("_fx_reserves"),
-                ]
+        bulk_fx = (
+            _macro_release_rows(
+                fx, input_dir, _month_period_available_expr("日期", lag_days=0),
+                [_num_expr("金額").alias("_fx_reserves")],
             )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("_fx_reserves").drop_nulls().last().alias("_fx_reserves"))
-            .sort("date")
+        )
+    reserves = _merge_bulk_and_official_release_values(bulk_fx, official_fx, "_fx_reserves")
+    if not reserves.is_empty():
+        frames.append(
+            reserves.sort("date")
             .with_columns(
                 [
                     pl.lit(market_symbol).alias("symbol"),
+                    pl.col("_fx_reserves").alias("twpub_cbc_fx_reserves_usd_billion_raw"),
                     _positive_log(pl.col("_fx_reserves")).alias("twpub_cbc_fx_reserves_log"),
                     _safe_log(pl.col("_fx_reserves") / pl.col("_fx_reserves").shift(1)).alias(
                         "twpub_cbc_fx_reserves_chg"
                     ),
                 ]
             )
-            .select(["date", "symbol", "twpub_cbc_fx_reserves_log", "twpub_cbc_fx_reserves_chg"])
+            .select(["date", "symbol", "twpub_cbc_fx_reserves_usd_billion_raw", "twpub_cbc_fx_reserves_log", "twpub_cbc_fx_reserves_chg"])
         )
     money = _read_optional(input_dir, "cbc_money_aggregates")
+    money_rows: list[pl.DataFrame] = []
     if not money.is_empty() and "期間" in money.columns:
         columns = set(money.columns)
-        frames.append(
-            money.select(
+        money_rows.append(
+            _macro_release_rows(
+                money, input_dir, _month_period_available_expr("期間", lag_days=0),
                 [
-                    _month_period_available_expr("期間", lag_days=45).alias("date"),
                     _first_num_expr(columns, ["貨幣總計數-Ｍ１Ｂ-原始值", "貨幣總計數 -Ｍ１Ｂ-原始值"]).alias("_m1b"),
                     _first_num_expr(columns, ["貨幣總計數-Ｍ１Ｂ-年增率", "貨幣總計數 -Ｍ１Ｂ-年增率"]).alias("_m1b_yoy"),
                     _first_num_expr(columns, ["貨幣總計數-Ｍ２-原始值", "貨幣總計數 -Ｍ２-原始值"]).alias("_m2"),
                     _first_num_expr(columns, ["貨幣總計數-Ｍ２-年增率", "貨幣總計數 -Ｍ２-年增率"]).alias("_m2_yoy"),
                 ]
             )
+            .with_columns(pl.lit(0).alias("_priority"))
+        )
+    official_money = _cbc_money_release_rows(input_dir)
+    if not official_money.is_empty():
+        money_rows.append(official_money.with_columns(pl.lit(1).alias("_priority")))
+    if money_rows:
+        money_columns = ("_m1b", "_m1b_yoy", "_m2", "_m2_yoy")
+        combined = pl.concat(money_rows, how="diagonal_relaxed")
+        combined = combined.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias(name)
+            for name in money_columns if name not in combined.columns
+        ])
+        combined_money = (
+            combined
             .drop_nulls(["date"])
+            .sort(["date", "_priority"])
             .group_by("date")
-            .agg(
-                [
-                    pl.col("_m1b").drop_nulls().last().alias("_m1b"),
-                    pl.col("_m1b_yoy").drop_nulls().last().alias("_m1b_yoy"),
-                    pl.col("_m2").drop_nulls().last().alias("_m2"),
-                    pl.col("_m2_yoy").drop_nulls().last().alias("_m2_yoy"),
-                ]
-            )
-            .with_columns(
+            .agg([pl.col(name).drop_nulls().last().alias(name)
+                  for name in money_columns])
+        )
+        frames.append(
+            combined_money.with_columns(
                 [
                     pl.lit(market_symbol).alias("symbol"),
+                    pl.col("_m1b").alias("twpub_cbc_m1b_raw"),
+                    pl.col("_m1b_yoy").alias("twpub_cbc_m1b_yoy_pct_raw"),
+                    pl.col("_m2").alias("twpub_cbc_m2_raw"),
+                    pl.col("_m2_yoy").alias("twpub_cbc_m2_yoy_pct_raw"),
                     _positive_log(pl.col("_m1b")).alias("twpub_cbc_m1b_log"),
                     (pl.col("_m1b_yoy") / 100.0).alias("twpub_cbc_m1b_yoy"),
                     _positive_log(pl.col("_m2")).alias("twpub_cbc_m2_log"),
                     (pl.col("_m2_yoy") / 100.0).alias("twpub_cbc_m2_yoy"),
                 ]
             )
-            .select(["date", "symbol", "twpub_cbc_m1b_log", "twpub_cbc_m1b_yoy", "twpub_cbc_m2_log", "twpub_cbc_m2_yoy"])
+            .select(["date", "symbol", "twpub_cbc_m1b_raw", "twpub_cbc_m1b_yoy_pct_raw", "twpub_cbc_m2_raw", "twpub_cbc_m2_yoy_pct_raw", "twpub_cbc_m1b_log", "twpub_cbc_m1b_yoy", "twpub_cbc_m2_log", "twpub_cbc_m2_yoy"])
         )
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
 
 def _build_dgbas_macro_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
+    release_archive = _read_optional(input_dir, "dgbas_release_vintages")
+    # Preserve the numbers printed in the original release. The older
+    # fraction-valued channels remain available for checkpoint compatibility.
+    for source, metric, raw_name in (
+        ("cpi", "cpi_yoy_pct", "twpub_dgbas_cpi_yoy_pct_raw"),
+        ("unemployment", "unemployment_rate_pct", "twpub_dgbas_unemployment_pct_raw"),
+        ("gdp", "gdp_yoy_pct", "twpub_dgbas_gdp_yoy_pct_raw"),
+    ):
+        original = _dgbas_headline_release_rows(
+            release_archive, input_dir, source=source, metric=metric,
+            value_column=raw_name, percent_as_fraction=False,
+        )
+        if not original.is_empty():
+            frames.append(
+                original.with_columns(pl.lit(market_symbol).alias("symbol"))
+                .select("date", "symbol", raw_name)
+            )
+    official_cpi_yoy = _dgbas_headline_release_rows(
+        release_archive, input_dir, source="cpi", metric="cpi_yoy_pct",
+        value_column="_cpi_yoy",
+    )
+    official_unemployment = _dgbas_headline_release_rows(
+        release_archive, input_dir, source="unemployment",
+        metric="unemployment_rate_pct",
+        value_column="twpub_dgbas_unemployment_rate",
+    )
+    official_gdp_yoy = _dgbas_headline_release_rows(
+        release_archive, input_dir, source="gdp", metric="gdp_yoy_pct",
+        value_column="_gdp_yoy",
+    )
     cpi = _read_optional(input_dir, "dgbas_cpi_basic")
     if not cpi.is_empty() and {"Item", "TIME_PERIOD", "TYPE", "Item_VALUE"} <= set(cpi.columns):
         base = cpi.filter(pl.col("Item").cast(pl.Utf8, strict=False).str.contains("總指數"))
         cpi_level = (
             base.filter(pl.col("TYPE").cast(pl.Utf8, strict=False).str.contains("原始值"))
-            .select([_month_period_available_expr("TIME_PERIOD", lag_days=45).alias("date"), _num_expr("Item_VALUE").alias("_cpi")])
+            .pipe(
+                _macro_release_rows, input_dir,
+                _month_period_available_expr("TIME_PERIOD", lag_days=0),
+                [_num_expr("Item_VALUE").alias("_cpi")],
+            )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("_cpi").drop_nulls().last().alias("_cpi"))
         )
         cpi_yoy = (
             base.filter(pl.col("TYPE").cast(pl.Utf8, strict=False).str.contains("年增率"))
-            .select([_month_period_available_expr("TIME_PERIOD", lag_days=45).alias("date"), (_num_expr("Item_VALUE") / 100.0).alias("_cpi_yoy")])
+            .pipe(
+                _macro_release_rows, input_dir,
+                _month_period_available_expr("TIME_PERIOD", lag_days=0),
+                [(_num_expr("Item_VALUE") / 100.0).alias("_cpi_yoy")],
+            )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("_cpi_yoy").drop_nulls().last().alias("_cpi_yoy"))
+        )
+        cpi_yoy = _merge_bulk_and_official_release_values(
+            cpi_yoy,
+            official_cpi_yoy,
+            "_cpi_yoy",
         )
         frames.append(
             cpi_level.join(cpi_yoy, on="date", how="full", coalesce=True)
@@ -2753,19 +3459,37 @@ def _build_dgbas_macro_features(input_dir: Path, *, market_symbol: str) -> pl.Da
             )
             .select(["date", "symbol", "twpub_dgbas_cpi_log", "twpub_dgbas_cpi_yoy"])
         )
+    elif not official_cpi_yoy.is_empty():
+        frames.append(
+            official_cpi_yoy.with_columns(
+                pl.lit(market_symbol).alias("symbol"),
+                pl.col("_cpi_yoy").alias("twpub_dgbas_cpi_yoy"),
+            ).select(["date", "symbol", "twpub_dgbas_cpi_yoy"])
+        )
     unemp = _read_optional(input_dir, "dgbas_unemployment_rate")
     if not unemp.is_empty() and "年月別_Year_and_month" in unemp.columns and "總計_Total_百分比" in unemp.columns:
-        frames.append(
-            unemp.select(
-                [
-                    _month_period_available_expr("年月別_Year_and_month", lag_days=45).alias("date"),
-                    (_num_expr("總計_Total_百分比") / 100.0).alias("twpub_dgbas_unemployment_rate"),
-                ]
+        bulk_unemployment = (
+            _macro_release_rows(
+                unemp, input_dir,
+                _month_period_available_expr("年月別_Year_and_month", lag_days=0),
+                [(_num_expr("總計_Total_百分比") / 100.0).alias("twpub_dgbas_unemployment_rate")],
             )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("twpub_dgbas_unemployment_rate").drop_nulls().last())
+        )
+        frames.append(
+            _merge_bulk_and_official_release_values(
+                bulk_unemployment,
+                official_unemployment,
+                "twpub_dgbas_unemployment_rate",
+            )
             .with_columns(pl.lit(market_symbol).alias("symbol"))
+            .select(["date", "symbol", "twpub_dgbas_unemployment_rate"])
+        )
+    elif not official_unemployment.is_empty():
+        frames.append(
+            official_unemployment.with_columns(pl.lit(market_symbol).alias("symbol"))
             .select(["date", "symbol", "twpub_dgbas_unemployment_rate"])
         )
     gdp = _read_optional(input_dir, "dgbas_gdp_expenditure_sa")
@@ -2773,17 +3497,28 @@ def _build_dgbas_macro_features(input_dir: Path, *, market_symbol: str) -> pl.Da
         base = gdp.filter(pl.col("Item").cast(pl.Utf8, strict=False).str.contains("國內生產毛額"))
         level = (
             base.filter(pl.col("TYPE").cast(pl.Utf8, strict=False).str.contains("原始值"))
-            .select([_quarter_period_available_expr("TIME_PERIOD", lag_days=90).alias("date"), _num_expr("Item_VALUE").alias("_gdp")])
+            .pipe(
+                _macro_release_rows, input_dir,
+                _quarter_period_available_expr("TIME_PERIOD", lag_days=0),
+                [_num_expr("Item_VALUE").alias("_gdp")],
+            )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("_gdp").drop_nulls().last().alias("_gdp"))
         )
         yoy = (
             base.filter(pl.col("TYPE").cast(pl.Utf8, strict=False).str.contains("年增率"))
-            .select([_quarter_period_available_expr("TIME_PERIOD", lag_days=90).alias("date"), (_num_expr("Item_VALUE") / 100.0).alias("_gdp_yoy")])
+            .pipe(
+                _macro_release_rows, input_dir,
+                _quarter_period_available_expr("TIME_PERIOD", lag_days=0),
+                [(_num_expr("Item_VALUE") / 100.0).alias("_gdp_yoy")],
+            )
             .drop_nulls(["date"])
             .group_by("date")
             .agg(pl.col("_gdp_yoy").drop_nulls().last().alias("_gdp_yoy"))
+        )
+        yoy = _merge_bulk_and_official_release_values(
+            yoy, official_gdp_yoy, "_gdp_yoy"
         )
         frames.append(
             level.join(yoy, on="date", how="full", coalesce=True)
@@ -2796,7 +3531,14 @@ def _build_dgbas_macro_features(input_dir: Path, *, market_symbol: str) -> pl.Da
             )
             .select(["date", "symbol", "twpub_dgbas_gdp_log", "twpub_dgbas_gdp_yoy"])
         )
-    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    elif not official_gdp_yoy.is_empty():
+        frames.append(
+            official_gdp_yoy.with_columns(
+                pl.lit(market_symbol).alias("symbol"),
+                pl.col("_gdp_yoy").alias("twpub_dgbas_gdp_yoy"),
+            ).select(["date", "symbol", "twpub_dgbas_gdp_yoy"])
+        )
+    return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
 
 
 def _build_mof_macro_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
@@ -2807,9 +3549,10 @@ def _build_mof_macro_features(input_dir: Path, *, market_symbol: str) -> pl.Data
         exports = _first_num_expr(columns, ["出口總值(新臺幣千元)", "出口(新臺幣千元)"])
         imports = _first_num_expr(columns, ["進口總值(新臺幣千元)", "進口(新臺幣千元)"])
         frames.append(
-            trade.select(
+            _macro_release_rows(
+                trade, input_dir,
+                _roc_year_month_available_expr("年度", "月份", lag_days=0),
                 [
-                    _roc_year_month_available_expr("年度", "月份", lag_days=45).alias("date"),
                     exports.alias("_exports"),
                     imports.alias("_imports"),
                     _optional_num_expr(columns, "出入超(新臺幣千元)").alias("_balance"),
@@ -2838,9 +3581,9 @@ def _build_mof_macro_features(input_dir: Path, *, market_symbol: str) -> pl.Data
     if not tax.is_empty() and "稅目別" in tax.columns:
         columns = set(tax.columns)
         frames.append(
-            tax.select(
+            _macro_release_rows(
+                tax, input_dir, _roc_tax_period_available_expr("稅目別", lag_days=0),
                 [
-                    _roc_tax_period_available_expr("稅目別", lag_days=45).alias("date"),
                     _optional_num_expr(columns, "總計").alias("_total"),
                     _optional_num_expr(columns, "證券交易稅").alias("_securities_tax"),
                     _optional_num_expr(columns, "期貨交易稅").alias("_futures_tax"),

@@ -27,6 +27,8 @@ units=(
   stockagent-registered-data-daily.timer
   stockagent-registered-data-intraday.service
   stockagent-registered-data-intraday.timer
+  stockagent-registered-data-features.service
+  stockagent-registered-data-features.timer
   stockagent-registered-data-backfill.service
   stockagent-registered-data-backfill.timer
   stockagent-binance-public-archive.service
@@ -36,6 +38,17 @@ units=(
   stockagent-taifex-public-history.service
   stockagent-taifex-public-history.timer
 )
+if [[ "${1:-}" == "features-only" ]]; then
+  # A targeted deployment must not reinstall unrelated dirty service templates
+  # or start the large daily/backfill jobs during a live market window.
+  units=(
+    stockagent-registered-data-features.service
+    stockagent-registered-data-features.timer
+  )
+elif [[ $# -gt 0 ]]; then
+  echo "usage: $0 [features-only]" >&2
+  exit 2
+fi
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 for unit in "${units[@]}"; do
@@ -49,10 +62,11 @@ for unit in "${units[@]}"; do
     "$template" > "$target"
 done
 
-systemd-analyze verify \
-  "$temporary_dir"/*.service \
-  "$temporary_dir"/*.timer \
-  "$temporary_dir"/*.slice
+verify_units=("$temporary_dir"/*.service "$temporary_dir"/*.timer)
+if [[ -f "$temporary_dir/stockagent-heavy-data.slice" ]]; then
+  verify_units+=("$temporary_dir/stockagent-heavy-data.slice")
+fi
+systemd-analyze verify "${verify_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
   "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
@@ -63,9 +77,15 @@ chmod 0755 \
   "$repo_root/scripts/run_taifex_auxiliary_daily.sh" \
   "$repo_root/scripts/run_taifex_public_history.sh"
 systemctl daemon-reload
+if [[ "${1:-}" == "features-only" ]]; then
+  systemctl enable --now stockagent-registered-data-features.timer
+  echo "[registered-data] crypto feature timer enabled; existing jobs left untouched"
+  exit 0
+fi
 systemctl enable --now \
   stockagent-registered-data-daily.timer \
   stockagent-registered-data-intraday.timer \
+  stockagent-registered-data-features.timer \
   stockagent-registered-data-backfill.timer \
   stockagent-binance-public-archive.timer \
   stockagent-taifex-auxiliary-daily.timer \

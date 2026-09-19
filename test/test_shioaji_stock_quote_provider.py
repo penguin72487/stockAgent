@@ -332,6 +332,84 @@ def test_shioaji_stock_snapshot_reconnects_once_after_session_failure(
     np.testing.assert_allclose(snapshot.bid_prices, [100.5])
 
 
+def test_silent_snapshot_timeout_probes_lost_session_before_reconnect(
+    monkeypatch, tmp_path
+):
+    contract = SimpleNamespace(code="2330", reference=100.0, limit_up=110.0, limit_down=90.0)
+
+    class DisconnectedApi(_FakeApi):
+        def snapshots(self, contracts, timeout=30000, cb=None):
+            assert timeout == 0 and cb is not None
+            return []  # Native API never invokes the callback after disconnect.
+
+        def usage(self):
+            raise RuntimeError("SessionNotEstablished")
+
+    class FreshApi(_FakeApi):
+        def __init__(self, *, simulation):
+            assert simulation is True
+            super().__init__({"2330": contract})
+
+        def login(self, **_kwargs):
+            return None
+
+    stale = DisconnectedApi({"2330": contract})
+    fresh: list[FreshApi] = []
+
+    def new_api(*, simulation):
+        api = FreshApi(simulation=simulation)
+        fresh.append(api)
+        return api
+
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_SNAPSHOT_TIMEOUT_MS", "250")
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", stale)
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=new_api))
+
+    result = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330"], np.asarray([99.0], dtype=np.float64)
+    )
+    assert stale.logged_out is True
+    assert len(fresh) == 1
+    assert result.available_count == 1
+
+
+def test_empty_snapshot_with_healthy_session_does_not_relogin(monkeypatch, tmp_path):
+    contract = SimpleNamespace(code="2330", reference=100.0, limit_up=110.0, limit_down=90.0)
+
+    class EmptyApi(_FakeApi):
+        def snapshots(self, contracts, timeout=30000, cb=None):
+            assert timeout == 0 and cb is not None
+            cb([])
+            return []
+
+        def usage(self):
+            return SimpleNamespace(bytes=100, limit_bytes=1000)
+
+    api = EmptyApi({"2330": contract})
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+
+    try:
+        quote_provider.fetch_shioaji_stock_snapshots(
+            ["2330"], np.asarray([99.0], dtype=np.float64)
+        )
+    except RuntimeError as exc:
+        assert "no usable stock snapshots" in str(exc)
+    else:
+        raise AssertionError("empty snapshot must fail closed")
+    assert api.logged_out is False
+    assert quote_provider._SHIOAJI_STOCK_API is api
+
+
 def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
     monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
@@ -605,6 +683,43 @@ def test_shioaji_futures_snapshot_resolves_target_and_fetches_old_roll_contract(
     assert payload["quotes"]["TXFH6"]["delivery_month"] == "202608"
     assert payload["quotes"]["TXFG6"]["delivery_month"] == "202607"
     assert payload["source"].endswith("contract_v2_target")
+
+
+def test_futures_snapshot_reconnects_once_after_session_not_established(monkeypatch):
+    logical = SimpleNamespace(code="TXFR1", target_code="TXFH6")
+    current = SimpleNamespace(code="TXFH6", delivery_month="202608")
+    contracts = {"TXFR1": logical, "TXFH6": current}
+
+    class DisconnectedApi(_FakeApi):
+        def snapshots(self, contracts, timeout=30000, cb=None):
+            raise RuntimeError("SessionNotEstablished")
+
+    class FreshApi(_FakeApi):
+        def __init__(self, *, simulation):
+            assert simulation is True
+            super().__init__(contracts)
+
+        def login(self, **_kwargs):
+            return None
+
+    stale = DisconnectedApi(contracts)
+    fresh: list[FreshApi] = []
+
+    def new_api(*, simulation):
+        api = FreshApi(simulation=simulation)
+        fresh.append(api)
+        return api
+
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", stale)
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=new_api))
+
+    result = quote_provider.fetch_shioaji_futures_snapshot("TXFR1")
+    assert stale.logged_out is True
+    assert len(fresh) == 1
+    assert result["current_contract_code"] == "TXFH6"
 
 
 def test_shioaji_stock_snapshots_restore_only_executable_locked_limit_side(
