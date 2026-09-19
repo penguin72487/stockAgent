@@ -96,16 +96,19 @@ def test_vast_candidate_pins_release_and_keeps_writes_outside_materialization():
     for key in ('parquet_root', 'tw_public_feature_path', 'day_trade_minute_execution_root'):
         value = remote['data'][key]
         assert value.startswith('/srv/stockagent-packed-materialized/')
-        assert '20260910T' in value and '/current/' not in value and '/latest/' not in value
+        assert '/current/' not in value and '/latest/' not in value
+    assert '248d0869d7d53be4' in remote['data']['parquet_root']
+    assert '248d0869d7d53be4' in remote['data']['tw_public_feature_path']
+    assert '09bedd96a2f68c39' in remote['data']['day_trade_minute_execution_root']
     for key in ('panel_cache_root', 'day_trade_minute_execution_cache_dir'):
-        assert remote['data'][key].startswith('/root/stockAgent-daytrade-parity-20260910/artifacts/')
+        assert remote['data'][key].startswith('/root/stockAgent/artifacts/')
     assert remote['environment']['cpu_threads'] <= 53
     assert remote['runner']['require_cuda'] is True
     resolved = load_config(path)
     assert resolved.runner.require_cuda is True
 
 
-def test_vast_integration_workspace_only_overrides_local_paths():
+def test_vast_integration_workspace_keeps_contract_and_measured_batch32_overrides():
     old = _load_raw_config(ROOT / 'configs/deployments/tw_day_trade_attention_parity_vastai1t_candidate.yaml')
     path = ROOT / 'configs/deployments/tw_day_trade_attention_training_vastai1t.yaml'
     new = _load_raw_config(path)
@@ -114,12 +117,25 @@ def test_vast_integration_workspace_only_overrides_local_paths():
     assert new['environment'] == old['environment']
     assert new['training']['pretrained_initialization_root'] == '/root/stockAgent/' + old['training']['pretrained_initialization_root']
     new['training']['pretrained_initialization_root'] = old['training']['pretrained_initialization_root']
+    assert new['training']['batch_size_train'] == 32
+    assert new['training']['batch_size_eval'] == 16
+    assert new['training']['day_trade_event_compression'] is True
+    assert new['training']['day_trade_sparse_events'] is False
+    assert new['training']['day_trade_sparse_event_slots'] == 262144
+    for key in ('batch_size_train', 'batch_size_eval'):
+        new['training'][key] = old['training'][key]
+    for key in (
+        'day_trade_event_compression',
+        'day_trade_sparse_events',
+        'day_trade_sparse_event_slots',
+    ):
+        new['training'].pop(key)
     assert new['training'] == old['training']
     for key in ('panel_cache_root', 'day_trade_minute_execution_cache_dir'):
-        assert new['data'][key].startswith('/root/stockAgent-daytrade-training-20260910/artifacts/')
+        assert new['data'][key].startswith('/root/stockAgent/artifacts/')
         new['data'][key] = old['data'][key]
     assert new['data'] == old['data']
-    assert new['runner']['output_dir'].startswith('/root/stockAgent-daytrade-training-20260910/artifacts/')
+    assert new['runner']['output_dir'].startswith('/root/stockAgent/artifacts/')
     resolved = load_config(path)
     assert resolved.training.pretrained_initialization_root.startswith('/root/stockAgent/')
 

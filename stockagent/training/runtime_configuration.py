@@ -224,6 +224,15 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS"] = str(
         max(0, int(training.backtest_checkpoint_chunk_rows))
     )
+    os.environ["STOCKAGENT_DAY_TRADE_EVENT_COMPRESSION"] = (
+        "1" if bool(training.day_trade_event_compression) else "0"
+    )
+    os.environ["STOCKAGENT_DAY_TRADE_SPARSE_EVENTS"] = (
+        "1" if bool(training.day_trade_sparse_events) else "0"
+    )
+    os.environ["STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS"] = str(
+        int(training.day_trade_sparse_event_slots)
+    )
 
 
 def configure_inference_runtime(config: ExperimentConfig) -> None:

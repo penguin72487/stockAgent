@@ -1,7 +1,7 @@
 # Exact-algorithm OFAT candidate for dual-RTX-5090 profiling.  Every market,
 # optimizer, model and physical-FIFO rule is inherited from the active v4
 # deployment; only immutable CPU batch preparation is memoized across epochs.
-base_config: tw_day_trade_last_last_only_training_vastai1t.yaml
+base_config: tw_day_trade_last_last_only_training_vastai1t_v4.yaml
 
 runner:
   output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v5_prepared_cache_candidate
@@ -12,4 +12,3 @@ training:
   day_trade_source_decode_workers: 4
   day_trade_prefetch_depth: 2
   day_trade_sparse_events: false
-

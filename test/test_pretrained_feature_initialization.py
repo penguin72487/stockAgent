@@ -9,9 +9,12 @@ from torch import nn
 from stockagent.config import load_config
 from stockagent.models.financial_transformer import CandleEncoder
 from stockagent.training.trainer import (
+    _PretrainedEpochZeroUnderperformsFlatCash,
     _PretrainedInitialization,
     _pretrained_temporal_basis_matches_target,
+    _reset_pretrained_exact_account_action_head_to_flat_,
     _reset_pretrained_futures_action_head_to_flat_,
+    _temporary_pretrained_exact_account_flat_checkpoint,
     _transfer_pretrained_feature_identity,
     _transfer_pretrained_transformer_feature_projection,
     _validate_pretrained_epoch_zero_account_segment,
@@ -70,12 +73,18 @@ def test_epoch_zero_guard_accepts_only_alive_exact_account() -> None:
 
 
 def test_epoch_zero_guard_rejects_solvent_policy_worse_than_flat_cash() -> None:
-    with pytest.raises(RuntimeError, match=r"does not improve on flat cash"):
+    with pytest.raises(
+        _PretrainedEpochZeroUnderperformsFlatCash,
+        match=r"does not improve on flat cash",
+    ) as rejected:
         _validate_pretrained_epoch_zero_improves_flat_cash(
             fold_id=2,
             validation_loss=0.14884938299655914,
             min_delta=1.0e-4,
         )
+    assert rejected.value.fold_id == 2
+    assert rejected.value.validation_loss == pytest.approx(0.14884938299655914)
+    assert rejected.value.required_loss_below == pytest.approx(-1.0e-4)
     with pytest.raises(RuntimeError, match=r"does not improve on flat cash"):
         _validate_pretrained_epoch_zero_improves_flat_cash(
             fold_id=2,
@@ -120,6 +129,89 @@ def test_rejected_pretrained_account_resets_only_trainable_action_head() -> None
     (output * target).sum().backward()
     assert model.futures_action_head.weight.grad is not None
     assert torch.count_nonzero(model.futures_action_head.weight.grad).item() > 0
+
+
+class _TinyProjectionL1StockPolicy(nn.Module):
+    portfolio_output_mode = "projection_l1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.score_head = nn.Sequential(
+            nn.Linear(3, 4),
+            nn.GELU(),
+            nn.Linear(4, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        scores = self.score_head(features).squeeze(-1)
+        return scores - scores.mean()
+
+
+def test_rejected_stock_policy_resets_only_final_scalar_score_layer() -> None:
+    torch.manual_seed(19)
+    model = _TinyProjectionL1StockPolicy()
+    stem_before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if not name.startswith("score_head.2.")
+    }
+
+    receipt = _reset_pretrained_exact_account_action_head_to_flat_(model)
+
+    assert receipt["method"] == "zero_score_head_final_linear_flat_projection_l1_v1"
+    assert receipt["reset_parameter_names"] == [
+        "score_head.2.weight",
+        "score_head.2.bias",
+    ]
+    assert torch.count_nonzero(model.score_head[-1].weight).item() == 0
+    assert torch.count_nonzero(model.score_head[-1].bias).item() == 0
+    for name, expected in stem_before.items():
+        assert torch.equal(model.state_dict()[name], expected), name
+
+    features = torch.randn(7, 3)
+    output = model(features)
+    assert torch.count_nonzero(output).item() == 0
+    target = torch.linspace(-1.0, 1.0, steps=7)
+    (output * target).sum().backward()
+    assert model.score_head[-1].weight.grad is not None
+    assert torch.count_nonzero(model.score_head[-1].weight.grad).item() > 0
+
+
+def test_learned_cash_stock_policy_has_an_exact_flat_checkpoint_floor() -> None:
+    model = _TinyProjectionL1StockPolicy()
+    model.portfolio_output_mode = "learned_cash"
+
+    receipt = _reset_pretrained_exact_account_action_head_to_flat_(model)
+
+    assert receipt["schema_version"] == 2
+    assert receipt["method"] == (
+        "zero_score_head_final_linear_flat_learned_cash_v2"
+    )
+    assert receipt["portfolio_output_mode"] == "learned_cash"
+    assert torch.count_nonzero(model.score_head[-1].weight).item() == 0
+    assert torch.count_nonzero(model.score_head[-1].bias).item() == 0
+
+
+def test_flat_stock_checkpoint_restores_transferred_training_initialization() -> None:
+    torch.manual_seed(23)
+    model = _TinyProjectionL1StockPolicy()
+    original_state = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    features = torch.randn(7, 3)
+    expected = model(features).detach().clone()
+    assert torch.count_nonzero(expected).item() > 0
+
+    with _temporary_pretrained_exact_account_flat_checkpoint(model) as receipt:
+        assert receipt["checkpoint_only"] is True
+        assert receipt["training_initialization_preserved"] is True
+        assert receipt["restore_scope"] == "complete_model_state_dict"
+        assert torch.count_nonzero(model(features)).item() == 0
+
+    assert torch.equal(model(features), expected)
+    for name, expected_value in original_state.items():
+        assert torch.equal(model.state_dict()[name], expected_value), name
 
 
 def test_feature_name_adapter_preserves_source_output_with_causal_rms() -> None:
@@ -239,6 +331,48 @@ def test_same_feature_abi_preserves_learned_bottleneck_checkpoint_exactly() -> N
         == name.startswith("candle_encoder.continuous_feature_bottleneck.")
         for name, parameter in target.named_parameters()
     )
+
+
+def test_non_strict_transfer_preserves_new_zero_initialized_cash_gate() -> None:
+    source = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target = _TinyFinancialStem(
+        num_features=4,
+        feature_bottleneck_dim=2,
+        causal_rms=False,
+    )
+    target.learned_cash_score_head = nn.Linear(4, 1)
+    nn.init.zeros_(target.learned_cash_score_head.weight)
+    nn.init.zeros_(target.learned_cash_score_head.bias)
+    feature_names = ["a", "b", "c", "d"]
+    initialization = _PretrainedInitialization(
+        checkpoint_path=Path("projection-source.pt"),
+        checkpoint={"model_state_dict": source.state_dict()},
+        source_feature_names=feature_names,
+        provenance={"source_checkpoint_sha256": "unit-test"},
+    )
+
+    report = _transfer_pretrained_feature_identity(
+        target,
+        initialization,
+        target_feature_names=feature_names,
+        require_exact_backbone=False,
+        trainable_parameter_prefixes=(),
+    )
+
+    assert torch.count_nonzero(target.learned_cash_score_head.weight).item() == 0
+    assert torch.count_nonzero(target.learned_cash_score_head.bias).item() == 0
+    assert target.learned_cash_score_head.weight.requires_grad
+    assert target.learned_cash_score_head.bias.requires_grad
+    assert "learned_cash_score_head.weight:missing" in report[
+        "incompatible_source_tensors"
+    ]
+    assert "learned_cash_score_head.bias:missing" in report[
+        "incompatible_source_tensors"
+    ]
 
 
 def test_financial_transfer_allows_explicit_position_free_symbol_superset() -> None:

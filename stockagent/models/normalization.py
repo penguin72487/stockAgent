@@ -146,6 +146,76 @@ def masked_cash_asset_l1_weights(
     return stock_weights, cash_weight.squeeze(1), positive_cash_score.squeeze(1)
 
 
+def masked_learned_cash_weights(
+    stock_logits: torch.Tensor,
+    cash_logit: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    long_only: bool = False,
+    activation: str | None = "identity",
+    eps: float = PORTFOLIO_L1_EPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate signed direction behind an independent learned cash gate.
+
+    The signed stock logits determine only relative portfolio direction.  One
+    contextual cash logit independently selects cash in ``[0,1]``; its
+    complement scales the unit-L1 stock direction.  Separating these two
+    degrees of freedom prevents either candidate count or arbitrary score
+    magnitude from forcing full investment.  Replicating an otherwise
+    identical candidate set splits its directional weights but leaves total
+    risky gross and cash unchanged.
+
+    If every active stock score is exactly zero, the requested portfolio is
+    exactly flat cash regardless of the gate.  Execution masks, lot rounding
+    and volume capacity are deliberately downstream and never manufacture the
+    model's cash allocation.
+
+    This is a distinct checkpoint/output contract from historical ``cash_l1``
+    and ``projection_l1``.  The legacy functions remain available only so old
+    artifacts can be replayed exactly.
+    """
+
+    if stock_logits.ndim != 2:
+        raise ValueError("learned-cash stock logits must have shape [B,S]")
+    if cash_logit.ndim == 1:
+        cash_logit = cash_logit.unsqueeze(1)
+    if tuple(cash_logit.shape) != (int(stock_logits.size(0)), 1):
+        raise ValueError("learned-cash cash logit must have shape [B] or [B,1]")
+
+    if mask is None:
+        mask_bool = torch.ones_like(stock_logits, dtype=torch.bool)
+    else:
+        mask_bool = mask.to(device=stock_logits.device, dtype=torch.bool)
+        if tuple(mask_bool.shape) != tuple(stock_logits.shape):
+            raise ValueError("learned-cash mask must match stock logits")
+
+    stock_scores = apply_portfolio_activation(stock_logits, activation).float()
+    if long_only:
+        stock_scores = stock_scores.clamp_min(0.0)
+    stock_scores = stock_scores.masked_fill(~mask_bool, 0.0)
+    clean_cash_logit = torch.nan_to_num(
+        cash_logit.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    cash_gate = torch.sigmoid(clean_cash_logit)
+    directional_gross = stock_scores.abs().sum(dim=1, keepdim=True)
+    unit_direction = torch.where(
+        directional_gross > float(eps),
+        stock_scores / directional_gross.clamp_min(float(eps)),
+        torch.zeros_like(stock_scores),
+    )
+    requested_risky_gross = 1.0 - cash_gate
+    stock_weights = unit_direction * requested_risky_gross
+    # The exact zero-score state owns no risky position. Derive final cash from
+    # the actual stock vector so the accounting identity remains exact there.
+    actual_risky_gross = stock_weights.abs().sum(dim=1, keepdim=True)
+    cash_weight = (1.0 - actual_risky_gross).clamp(0.0, 1.0)
+    return (
+        stock_weights,
+        cash_weight.squeeze(1),
+        requested_risky_gross.squeeze(1),
+    )
+
+
 def _masked_distribution(
     logits: torch.Tensor,
     mask: torch.Tensor,
