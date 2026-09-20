@@ -8,6 +8,8 @@ Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
+Environment="OMP_NUM_THREADS=1"
+Environment="KMP_AFFINITY=disabled"
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_data_refresh_status_snapshot.sh"
 UMask=0077
 NoNewPrivileges=true

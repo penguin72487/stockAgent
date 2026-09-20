@@ -161,6 +161,27 @@ def test_capacity_gate_fails_before_download(monkeypatch, tmp_path: Path) -> Non
     ]
 
 
+def test_capacity_preflight_rejects_before_remote_discovery_when_reserve_is_gone(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _: shutil._ntuple_diskusage(total=1_000, used=950, free=50),
+    )
+
+    receipt = _capacity_receipt(
+        tmp_path,
+        [],
+        reserve_gib=0,
+        max_download_bytes=0,
+    )
+
+    assert receipt["accepted"] is False
+    assert receipt["pending_objects"] == 0
+    assert receipt["reasons"] == ["filesystem_free_below_required_reserve"]
+
+
 @pytest.mark.parametrize("status", ["failed", "quarantined_repair_required"])
 @pytest.mark.parametrize("reason", ["3 invalid OHLCV rows", "conflicting duplicate open timestamp"])
 def test_invalid_monthly_object_is_quarantined_for_daily_rebuild(

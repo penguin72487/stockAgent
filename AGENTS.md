@@ -120,7 +120,7 @@ coordinated code, config, test, and documentation change.
 | Penguin historical archive | `D:\stockagent-backup\packed` | additive immutable history | no |
 | Replaceable local hot cache | `/srv/stockagent-packed-materialized` | only lifecycle metadata; materialized data is immutable | no |
 | In-progress training artifacts | node-local `artifacts` workspace | yes | no |
-| Optional operational artifact transport | `/srv/stockagent-artifacts-hot` | yes | separate, explicitly scoped folder only |
+| Retired operational artifact transport | `/srv/stockagent-artifacts-hot` | yes, pending local audit | no; Syncthing folder retired |
 
 - `configs/data_sync/packed_datasets.json` is the dataset publication catalog.
   Its `source`, `publish`, `excluded_subtrees`, writer-process, freshness, role,
@@ -131,7 +131,10 @@ coordinated code, config, test, and documentation change.
   that writes panel caches, metadata, checkpoints, logs, or temporary files must
   use a separate writable live/cache/artifact root.  In particular,
   `stocks/panel_cache_v2` is reproducible node-local state and is excluded from
-  the `tw-public` release.
+  the `tw-public` release.  `artifacts/cache` is also node-local derived state:
+  neither the hot artifact bridge nor its Syncthing folder may publish or
+  rehydrate it. Only exact byte-identical, stable cache files may share an
+  inode; a cache directory name is not proof that unique source data can go.
 - Runtime `data_*` paths may be local directories or atomic symlinks, but the
   target's role must remain explicit.  A writable service must target its
   catalog-resolved live workspace, not a packed materialization.  Never infer
@@ -149,10 +152,10 @@ coordinated code, config, test, and documentation change.
   objects for a selected release before use.  Repositories, mutable `data_*`
   trees, materialized caches, downloader shards, and active training directories
   do not belong in this folder.
-- `stockagent`, `stockagent-desync`, and `stockagent-artifacts-live` are retired
-  Folder IDs.  Never recreate or accept them.  `stockagent-artifacts-hot` is a
-  non-canonical low-latency channel for an explicitly bounded penguin/lab203
-  artifact set; vastai1T must not join it with its complete `artifacts` tree.
+- `stockagent`, `stockagent-desync`, `stockagent-artifacts-live`, and
+  `stockagent-artifacts-hot` are retired Folder IDs. Never recreate or accept
+  them. Preserve any unique data still present in the old local hot transport
+  until an exact content and process-reference audit proves it redundant.
 - The explicitly authorized `stockagent-artifact-ingress-vastai1t` folder is a
   separate, bounded **quarantine transport**, not another cold authority or hot
   artifact mirror. `configs/data_sync/artifact_ingress.json` pins its sole model
@@ -164,16 +167,18 @@ coordinated code, config, test, and documentation change.
   penguin may subsequently publish through the registered cold-artifact path.
   Do not change Vast's index-only role, sync raw artifacts, create release heads
   in the ingress folder, auto-activate models, or delete either source copy.
-- Each machine owns one permanent release node ID and one unique Syncthing
-  identity, currently named `penguin`, `lab203`, and `vastai1T`.  Never copy
-  Syncthing certificates, keys, device IDs, databases, or
+- Each enrolled machine owns one permanent release node ID and one unique
+  Syncthing identity, currently `penguin` and `vastai1T`. `lab203` is a retired
+  historical producer: retain its existing cold heads, manifests, and objects,
+  but do not pair it again, accept its invitations, or receive later releases.
+  Never copy Syncthing certificates, keys, device IDs, databases, or
   `.local-state/node-id` between machines.  `.local-state` remains ignored by
   Syncthing.
 - QUIC and multiple connections are preferred throughput mechanisms, not data
   correctness proofs.  Syncthing's authenticated encrypted transport remains
   mandatory; TCP is a valid fallback.  Report QUIC, relay, TLS suite, or channel
   count as active only when the current connection record actually observes it.
-- Platform supervision may differ: penguin/lab203 normally use systemd, while a
+- Platform supervision may differ: penguin uses systemd, while a
   Vast container may use a user supervisor and cron.  This does not change the
   storage contract.  Before calling a Vast cold store durable, verify that its
   path is on persistent storage that survives instance recreation.
@@ -260,6 +265,24 @@ coordinated code, config, test, and documentation change.
   an empty process-reference check, an unchanged source activity fingerprint,
   expired retention, and full intended-peer convergence.  Resolve peer identity
   from current Syncthing configuration rather than hard-coding a Device ID.
+- On penguin the retired hot bridge left hard links between the repository
+  artifact tree and `/srv/stockagent-artifacts-hot`. Source-only eviction is
+  forbidden: it frees no shared payload, and some transport paths may be unique.
+  The bridge must stay disabled and the retired folder must not be recreated. A complete
+  run may become cold-only only through an exact, D-backed retirement plan
+  that checks both hot names, a seven-day use lease, pins, process references,
+  and the local Syncthing health plus peers named by
+  `configs/data_sync/artifact_retirement.json`. The penguin-only D-backed hot
+  retirement policy currently names no remote peer: lab203 does not block
+  local hot eviction, while the independent C cold-object retention policy
+  requires convergence with enrolled vastai1T. Install a node-local directory tombstone
+  before unlinking either hot name. Partial cold releases cannot retire a
+  whole run. A failed/interrupted retirement remains in quarantine for audit.
+- On-demand artifact use must resolve one exact retired release through the
+  managed materialized cache, expose only an immutable symlink at its original
+  artifact path, and renew the same seven-day lease. A deployed or intermittently
+  read strategy requires a pin or an explicit `use` before a short job; an
+  open-file monitor alone cannot guarantee future availability.
 - Training, backtest, resume, and audit jobs must resolve and record one exact
   release ID before starting.  They may not re-resolve `latest` during a run or
   silently resume against a different release.
@@ -1305,6 +1328,20 @@ Rules:
   available solely for provenance, auditing, and future data-quality research;
   they must not influence training, validation, test, inference, or feature
   importance.
+- The 2026-09-18 broad-history request authorizes a **separate** research-only
+  table/config for obtainable current-revision macro values and historical
+  MOPS XBRL facts mapped by labelled theoretical release dates. It does not
+  repeal the snapshot-only denylist above: use new `twpub_xbrl_*` columns from
+  the quarter archives, not recent `twpub_financial_*` OpenAPI snapshots.
+  Keep the canonical strict/live feature table and checkpoint ABI unchanged.
+  The wide config removes log/asinh inputs, retains ratios, carries only
+  released state features, and adds per-feature availability channels before
+  NaN-to-zero. Retired TIFRS concepts expire after 400 calendar days without
+  a new observation; do not carry their last value across taxonomy eras.
+  Event flags such as attention/disposal must never forward-fill;
+  source coverage is a separate channel and pre-capture zeros are unknown.
+  Current revisions and estimated dates are research approximations, not
+  verified historical PIT values. See `docs/tw_public_wide_research_2014.md`.
 
 ### TW Phase-Aware Current-Open Feature Contract
 
@@ -1329,6 +1366,76 @@ Rules:
   Use a new artifact root and retrain for the 99-feature open-aware model.
 
 ## TW Public Execution-Rule Contract
+
+### Taiwan price precision and dated tick contract
+
+- A quoted trade, Bid/Ask, or limit order is constrained by the exchange's
+  **product + trading date + venue/currency + order type** tick schedule.
+  `stockagent/data/tw_price_rules.py` owns supported regular stock/ETF
+  outright grids in their quote currencies and the 2026-07-06 stock-futures
+  change (1 TWD ticks extend from below 1,000 to below 2,500). Never use the
+  cash-stock grid for stock futures on or after that date. Query dated Shioaji
+  `tick_rule`/`tick_bands()`
+  for live FOP contract metadata when available and reconcile it with official
+  notices; current metadata cannot rewrite historical quotes.
+- Market labels from the broker are not a point-in-time listing-status proof:
+  `tpex` minute KBars include emerging issues. The emerging-stock tick was
+  fixed at TWD 0.01 before 2020-03-23 and follows six regular-stock bands
+  thereafter. The TPEx officially lists 2743 on 2020-03-09 and 6716 on
+  2020-03-27; older minute observations for these two are emerging. Admit
+  other historical transitions only after checking their dated official
+  listing notices, not by guessing from first observed data or retroactively
+  relabeling current records. Changes to the price-rule contract and eligible
+  market universe are distinct; independently audit the strategy's admission
+  of emerging securities before declaring a historical execution realistic.
+  `scripts/audit_tw_emerging_stock_admission.py --strict` reports two 6716
+  pre-listing minute bars with both feature and label eligibility. Price
+  validity does not clear this model-safety gap; admission repair must bind a
+  new dataset/normalizer/checkpoint fingerprint and preserve the raw source.
+- Index-future outright prices, option *premiums*, calendar-spread prices,
+  block trades, and option strikes use different grids or semantics. In
+  particular TXO ordinary premium has five bands, while 2019-05-27 onward
+  TXO block trades use 0.1; TEO premiums change on 2025-12-08; stock futures
+  change on 2026-07-06. Do not apply a 2026 Shioaji Contract V2 snapshot to
+  past non-equity futures to assert that historical ticks were unchanged.
+- A tick is **not** the number of significant digits for every field. Source
+  OHLC/trade/Bid/Ask prices may be checked against their grid. VWAP, average
+  price, official daily/final settlement, adjusted price/index, corporate-action
+  cash and stock entitlements, FX rates, percentages, ratios, features, fees,
+  NAV, and contract-adjustment cash values retain source/calculation precision.
+  Never round those fields to a quote tick, two decimal places, or a generic
+  display format. Preserve original source bytes/strings and units; derive
+  order prices only with directional quantization, then validate the result.
+- Each new market-price source must declare field semantics and applicable
+  historical rule dates. A TWSE foreign-currency ETF counter (sixth symbol
+  character K/M/S/C) uses the ETF numerical tick in its own quote currency;
+  the suffix alone does not identify CNY versus USD. Other unsupported
+  foreign-currency quotes,
+  block auctions, spread orders, unknown effective dates, and contract
+  adjustments must be marked unverified and fail closed for executable-price
+  claims. Do not infer a rule from current product specifications or from a
+  source column named `price`. Run `scripts/audit_tw_price_precision.py` to
+  record source SHA, per-field eligible and off-grid counts; review exceptions
+  against dated exchange evidence before changing producer data or training
+  labels. See `docs/tw_price_precision_tick_contract.md`.
+- TWSE odd-lot quoted prices use the ordinary-market price tick according to
+  its published trading-system guide, so source odd-lot bid/ask/close may
+  share the stock price-grid audit. This does not make its auction clock,
+  volume unit, or available execution capacity identical to board lots.
+- `scripts/audit_tw_price_precision.py --full` audits registered cash OHLC,
+  stock/ETF futures, TX/MTX/TMF, TXO and selected minute/HFT/historical
+  broker prices. `scripts/audit_tw_capture_price_grid.py` audits raw capture
+  price columns against the worker-selected files without relying on the
+  mutable `top_200.csv`. Its receipt explicitly cannot prove the historical
+  universe SHA when that CSV is no longer available. Keep price-grid validity,
+  source provenance, capture completeness, PIT, and executable fills separate.
+- A malformed official daily date is a source defect even when reported date
+  coverage appears complete. TWSE `2014-12-;1 / 8070` was repaired only by a
+  verified 2014-12-31 official re-fetch plus exact-symbol replacement; the
+  dependent symbol parquet and public feature table were rebuilt. Daily mode
+  must stop on such rows, and repair mode must keep an unmatched malformed row
+  visible rather than guessing its date. An old feature or panel cache cannot
+  inherit the new source receipt merely because its file still exists.
 
 - Never put a data-dependent `torch._assert_async` in a compiled model,
   settlement, loss, or backtest CUDA hot path. A failed device assertion poisons
@@ -1507,16 +1614,13 @@ Rules:
   2004-10-19 onward 16-cell generation, preserving the real trailing blank
   note cell, plus its narrowly styled standalone ROC-date header. Do not accept
   a 15-cell row: preserving the blank `<td>` is what distinguishes an empty
-  note from a genuinely missing column. The v7 source-gap contract remains:
-  the official backend has a verified 331-open-session archive gap from
-  2007-06-01 through 2008-09-29
-  (data exists through 2007-05-31 and again from 2008-09-30). Never infer the
-  whole gap from its bounds: each session counts for coverage/resume only after
-  an HTTP 200 explicit-no-data body is saved immutably under
-  `raw_empty/tpex_margin_balance`, and its journal URL, byte counts, and body/raw
-  SHA-256 all verify. This receipt is mandatory even with `--skip-raw`; an empty
-  outside the declared range or any receipt mismatch remains a failure, while
-  nonempty official data inside the range remains data.
+  note from a genuinely missing column. The former v7 331-session
+  `2007-06-01`--`2008-09-29` source-gap annotation was disproved by direct
+  official re-query on 2026-09-16; those sessions were backfilled. Historical
+  `raw_empty` receipts remain investigation evidence, never a substitute for
+  current nonempty official data or proof of coverage. Re-audit the actual
+  official response and TAIEX calendar rather than reinstating a date-range
+  exception.
 - Keep `tpex_daily_valuation` at parser contract v7. The 2004--2006 archive
   declares its requested day as a labeled ROC date such as
   `交易日期:94年08月08日`; bind that exact date and still fail on missing or

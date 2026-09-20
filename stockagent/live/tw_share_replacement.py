@@ -71,4 +71,5 @@ def _load(name: str, signature: tuple) -> tuple[tuple[dict, ...], dict]:
 
 def halted_symbols(root: Path, day: date) -> set[str]:
     return {e["symbol"] for e in load_share_replacements(root)
-            if e["suspension_date"] <= day < e["resume_date"]}
+            if e.get("suspension_date") is not None
+            and e["suspension_date"] <= day < e["resume_date"]}

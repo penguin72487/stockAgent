@@ -299,6 +299,13 @@ def audit(
     dataset_summary = _read_json(dataset_root / "shioaji_dataset_summary.json")
     if dataset_summary.get("source") != HYBRID_SOURCE:
         raise RuntimeError("hybrid dataset summary source mismatch")
+    base_build_receipt = dataset_summary.get("base_symbol_build_receipt")
+    if base_build_receipt is not None and not _receipt_matches(
+        base_stock_root / "official_symbol_build_summary.json",
+        base_build_receipt,
+        checksum=True,
+    ):
+        raise RuntimeError("official symbol build changed after Shioaji hybrid materialization")
     build_report = _report_map(dataset_root / "shioaji_dataset_report.csv")
     if set(build_report) != base_symbols:
         raise RuntimeError("hybrid build report does not account for the full universe")

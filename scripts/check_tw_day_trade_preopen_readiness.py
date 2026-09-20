@@ -238,7 +238,9 @@ def evaluate_readiness(
             "heartbeat_age_seconds": age_seconds,
         }
         if not event_ready:
-            failures.append("156-dataset source-event monitor is not healthy")
+            failures.append(
+                f"{len(DEFAULT_DATASETS)}-dataset source-event monitor is not healthy"
+            )
 
     model_rows = model_receipt.get("markets")
     model_rows = dict(model_rows) if isinstance(model_rows, Mapping) else {}
@@ -477,20 +479,25 @@ def evaluate_readiness(
                 entry_commit_delay_ms is not None
                 and 0.0 <= entry_commit_delay_ms <= opening_commit_slo_seconds * 1000.0
             )
-            accepted = bool(
+            committed = bool(
                 row.get("session_date") == session_date
+                and row.get("signal_id")
                 and _same_session(row.get("signal_at"), session_date)
                 and _same_session(row.get("entry_completed_at"), session_date)
                 and row.get("checkpoint_ready") is True
-                and row.get("entry_fill_policy") == "causal_best_quote"
-                and int(row.get("entry_price_offset_ticks") or 0) == 0
-                and slo_met
                 and not str(row.get("engine_status") or "").startswith(
                     ("blocked", "critical", "waiting")
                 )
             )
+            accepted = bool(
+                committed
+                and row.get("entry_fill_policy") == "causal_best_quote"
+                and int(row.get("entry_price_offset_ticks") or 0) == 0
+                and slo_met
+            )
             mode_results[market] = {
                 "ready": accepted,
+                "same_session_commit_present": committed,
                 "session_date": row.get("session_date"),
                 "signal_id": row.get("signal_id"),
                 "signal_at": row.get("signal_at"),
@@ -508,6 +515,11 @@ def evaluate_readiness(
         )
         opening_execution = {
             "ready": opening_ready,
+            "operational_ready": bool(mode_results)
+            and all(
+                row["same_session_commit_present"]
+                for row in mode_results.values()
+            ),
             "checked_after": opening_check_after.isoformat(),
             "commit_slo_seconds": opening_commit_slo_seconds,
             "modes": mode_results,
@@ -526,6 +538,18 @@ def evaluate_readiness(
         service for service in required_services if service_states.get(service) != "active"
     ]
     failures.extend(f"required service is not active: {service}" for service in inactive)
+    operational_ready = bool(
+        public_ready
+        and (event_monitor is None or event_monitor.get("ready") is True)
+        and simulation_ready
+        and (engine_runtime is None or engine_runtime.get("ready") is True)
+        and (runtime_sync is None or runtime_sync.get("ready") is True)
+        and (
+            opening_execution is None
+            or opening_execution.get("operational_ready") is True
+        )
+        and not inactive
+    )
     strict = observed.astimezone(TAIPEI).timetz().replace(tzinfo=None) >= strict_after
     ready = not failures
     status = "ready" if ready else "failed" if strict else "warming"
@@ -533,6 +557,14 @@ def evaluate_readiness(
         "schema_version": 1,
         "status": status,
         "ready": ready,
+        # A missed opening deadline is immutable, while this field answers
+        # whether the services, sources, and ledgers are healthy right now.
+        "operational_ready": operational_ready,
+        "opening_slo_met": (
+            None
+            if opening_execution is None
+            else opening_execution.get("ready") is True
+        ),
         "strict": strict,
         "session_date": session_date,
         "observed_at_taipei": observed.astimezone(TAIPEI).isoformat(
@@ -680,7 +712,14 @@ def main() -> int:
     )
     _atomic_json(run_path, payload)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
-    return 0 if payload["ready"] or not payload["strict"] else 1
+    post_open = observed.astimezone(TAIPEI).timetz().replace(tzinfo=None) >= datetime_time(
+        9, 5
+    )
+    return 0 if (
+        payload["ready"]
+        or not payload["strict"]
+        or (post_open and payload.get("operational_ready") is True)
+    ) else 1
 
 
 if __name__ == "__main__":

@@ -17,10 +17,18 @@ from downloader.artifact_io import atomic_write_json, atomic_write_parquet
 DEFAULT_FUTURES_ACTIVITY = Path('data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet')
 
 
-def futures_date_is_closed(day: date, now: datetime | None = None) -> bool:
+def futures_date_is_closed(
+    day: date,
+    now: datetime | None = None,
+    *,
+    contract: str | None = None,
+) -> bool:
     local = (now or datetime.now(UTC)).astimezone(ZoneInfo('Asia/Taipei'))
-    # Gold/FX have a 16:15 day close; 14:31 only releases the API priority gate.
-    return day < local.date() or (day == local.date() and local.time() >= time(16, 30))
+    # TXFR1's trading-date day session ends before the 14:31 historical-query
+    # gate. Other futures include products with a 16:15 day close, so they
+    # retain the conservative 16:30 finalization clock.
+    close_clock = time(14, 31) if contract == 'TXFR1' else time(16, 30)
+    return day < local.date() or (day == local.date() and local.time() >= close_clock)
 
 
 def latest_completed_futures_session(calendar: Path, now: datetime | None = None) -> date:

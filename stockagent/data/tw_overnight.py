@@ -1,4 +1,4 @@
-"""Receipt-backed 13:25 information for the canonical overnight account."""
+"""Receipt-backed intraday decision information for the overnight account."""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,8 @@ from stockagent.data.tw_minute import _sha256
 OVERNIGHT_1325_FEATURE = "next_session_1325_gap_logret"
 OVERNIGHT_1325_CONTRACT_VERSION = 1
 OVERNIGHT_CLOSE_FALLBACK_CONTRACT_VERSION = 2
+OVERNIGHT_DECISION_CONTRACT_VERSION = 3
+OVERNIGHT_DEFAULT_DECISION_TIME = "13:25"
 OVERNIGHT_CLOSE_FALLBACK_CAVEAT = (
     "Missing 13:25 inputs use the same session's final close. "
     "These samples contain look-ahead relative to a 13:25 decision and "
@@ -20,9 +22,45 @@ OVERNIGHT_CLOSE_FALLBACK_CAVEAT = (
 )
 
 
-def _validate_missing_policy(policy: str) -> bool:
+def normalize_overnight_decision_time(value: str) -> tuple[str, int]:
+    """Return canonical exchange time and right-labelled minutes from 09:00."""
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise ValueError("overnight_decision_time must use HH:MM exchange time")
+    hour, minute = (int(part) for part in parts)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("overnight_decision_time must use HH:MM exchange time")
+    minutes_from_open = hour * 60 + minute - 9 * 60
+    if not 1 <= minutes_from_open < 270:
+        raise ValueError(
+            "overnight_decision_time must select a completed right-labelled bar "
+            "from 09:01 through 13:29"
+        )
+    return f"{hour:02d}:{minute:02d}", minutes_from_open
+
+
+def overnight_decision_feature(decision_time: str) -> str:
+    normalized, _ = normalize_overnight_decision_time(decision_time)
+    return f"next_session_{normalized.replace(':', '')}_gap_logret"
+
+
+def overnight_close_fallback_caveat(decision_time: str) -> str:
+    normalized, _ = normalize_overnight_decision_time(decision_time)
+    if normalized == OVERNIGHT_DEFAULT_DECISION_TIME:
+        return OVERNIGHT_CLOSE_FALLBACK_CAVEAT
+    return (
+        f"Missing {normalized} inputs use the same session's final close. "
+        f"These samples contain look-ahead relative to a {normalized} decision and "
+        f"are a user-selected research approximation, not executable {normalized} evidence."
+    )
+
+
+def _validate_missing_policy(policy: str, *, decision_time: str) -> bool:
     if policy not in {"reject", "same_session_close"}:
-        raise ValueError("13:25 missing_price_policy must be reject or same_session_close")
+        raise ValueError(
+            f"{decision_time} missing_price_policy must be reject or same_session_close"
+        )
     return policy == "same_session_close"
 
 
@@ -59,45 +97,71 @@ def require_overnight_dates(manifest: dict, dates: np.ndarray) -> None:
         )
 
 
-def read_overnight_1325_partition(
-    path: Path, day: str, expected_sha256: str,
+def read_overnight_decision_partition(
+    path: Path,
+    day: str,
+    expected_sha256: str,
+    *,
+    decision_time: str = OVERNIGHT_DEFAULT_DECISION_TIME,
 ) -> dict[str, float]:
     """Read one verified decision observation for training or historical inference."""
+    normalized_time, minutes_from_open = normalize_overnight_decision_time(decision_time)
+    hour, minute = (int(part) for part in normalized_time.split(":"))
     if not path.is_file() or not expected_sha256 or _sha256(path) != expected_sha256:
-        raise RuntimeError(f"13:25 partition SHA256 mismatch or missing: {path}")
+        raise RuntimeError(f"{normalized_time} partition SHA256 mismatch or missing: {path}")
     table = pq.read_table(
         path, columns=["ts", "symbol", "Close", "minutes_from_open"],
-        filters=[("minutes_from_open", "=", 265)],
+        filters=[("minutes_from_open", "=", minutes_from_open)],
     )
     seen: set[str] = set()
     prices: dict[str, float] = {}
     for row in table.to_pylist():
         ts = row["ts"]
         if (ts is None or str(ts.date()) != day
-                or (ts.hour, ts.minute, ts.second, ts.microsecond) != (13, 25, 0, 0)):
-            raise RuntimeError(f"13:25 timestamp disagrees with partition: {path}")
+                or (ts.hour, ts.minute, ts.second, ts.microsecond) != (hour, minute, 0, 0)):
+            raise RuntimeError(f"{normalized_time} timestamp disagrees with partition: {path}")
         if ts.tzinfo is not None and ts.utcoffset().total_seconds() != 8 * 3600:
-            raise RuntimeError("13:25 timestamps must use Asia/Taipei exchange time")
+            raise RuntimeError(
+                f"{normalized_time} timestamps must use Asia/Taipei exchange time"
+            )
         symbol = str(row["symbol"])
         if symbol in seen:
-            raise RuntimeError(f"duplicate 13:25 observation: {day}/{symbol}")
+            raise RuntimeError(f"duplicate {normalized_time} observation: {day}/{symbol}")
         seen.add(symbol)
         if row["Close"] is not None:
             value = float(row["Close"])
             if np.isfinite(value) and value > 0:
                 prices[symbol] = value
     if _sha256(path) != expected_sha256:
-        raise RuntimeError(f"13:25 source changed while reading: {path}")
+        raise RuntimeError(f"{normalized_time} source changed while reading: {path}")
     return prices
 
 
-def attach_overnight_1325(panel: PanelData, root: str | Path, *,
-                          missing_price_policy: str = "reject") -> PanelData:
-    allow_fallback = _validate_missing_policy(missing_price_policy)
+def read_overnight_1325_partition(
+    path: Path, day: str, expected_sha256: str,
+) -> dict[str, float]:
+    """Backward-compatible fixed 13:25 reader."""
+    return read_overnight_decision_partition(path, day, expected_sha256)
+
+
+def attach_overnight_decision(
+    panel: PanelData,
+    root: str | Path,
+    *,
+    decision_time: str = OVERNIGHT_DEFAULT_DECISION_TIME,
+    missing_price_policy: str = "reject",
+) -> PanelData:
+    normalized_time, minutes_from_open = normalize_overnight_decision_time(decision_time)
+    feature_name = overnight_decision_feature(normalized_time)
+    allow_fallback = _validate_missing_policy(
+        missing_price_policy, decision_time=normalized_time
+    )
     if DAY_TRADE_OPEN_GAP_FEATURE in panel.feature_names:
-        raise ValueError("13:25 must replace, not relabel, the opening-gap channel")
-    if OVERNIGHT_1325_FEATURE in panel.feature_names:
-        raise ValueError("13:25 context is already attached")
+        raise ValueError(
+            f"{normalized_time} must replace, not relabel, the opening-gap channel"
+        )
+    if feature_name in panel.feature_names:
+        raise ValueError(f"{normalized_time} context is already attached")
     root = Path(root).resolve()
     manifest_path = root / "manifest.json"
     manifest_sha256 = _sha256(manifest_path) if manifest_path.is_file() else None
@@ -106,7 +170,7 @@ def attach_overnight_1325(panel: PanelData, root: str | Path, *,
     manifest = (overnight_minute_manifest(root) if manifest_sha256 is not None or not allow_fallback
                 else {"dates": [], "partitions": []})
     if manifest_sha256 is not None and _sha256(manifest_path) != manifest_sha256:
-        raise RuntimeError("13:25 manifest changed while selecting source")
+        raise RuntimeError(f"{normalized_time} manifest changed while selecting source")
     if not allow_fallback:
         require_overnight_dates(manifest, panel.dates[1:])
     summaries = {p["trade_date"]: p for p in manifest["partitions"]}
@@ -123,32 +187,50 @@ def attach_overnight_1325(panel: PanelData, root: str | Path, *,
             missing_partitions.append(day)
             continue
         expected = summaries[day].get("output_sha256")
-        for symbol, value in read_overnight_1325_partition(path, day, expected).items():
+        for symbol, value in read_overnight_decision_partition(
+            path, day, expected, decision_time=normalized_time
+        ).items():
             if symbol in symbols:
                 prices[index, symbols[symbol]] = value
         verified_partitions += 1
         if verified_partitions == 1 or index % 100 == 0 or index == panel.num_dates - 1:
-            print(f"[overnight] verified 13:25 partitions={verified_partitions} "
+            print(f"[overnight] verified {normalized_time} partitions={verified_partitions} "
                   f"requested_session={index}/{panel.num_dates - 1} date={day}", flush=True)
     final_manifest_sha256 = _sha256(manifest_path) if manifest_path.is_file() else None
     if final_manifest_sha256 != manifest_sha256:
-        raise RuntimeError("13:25 manifest changed while preparing panel")
-    panel = attach_overnight_prices(panel, prices, missing_price_policy=missing_price_policy)
+        raise RuntimeError(f"{normalized_time} manifest changed while preparing panel")
+    panel = attach_overnight_prices(
+        panel,
+        prices,
+        decision_time=normalized_time,
+        missing_price_policy=missing_price_policy,
+    )
     panel.overnight_1325_source = {
         "source_root": str(root), "manifest_sha256": manifest_sha256,
         "first_source_date": manifest["dates"][0] if manifest["dates"] else None,
         "last_source_date": manifest["dates"][-1] if manifest["dates"] else None,
         "verified_session_partitions": verified_partitions,
     }
+    if normalized_time != OVERNIGHT_DEFAULT_DECISION_TIME:
+        panel.overnight_1325_source.update(
+            decision_contract_version=OVERNIGHT_DECISION_CONTRACT_VERSION,
+            decision_time=normalized_time,
+            minutes_from_open=minutes_from_open,
+            feature_name=feature_name,
+        )
     if allow_fallback:
         fallback = panel.overnight_1325_close_fallback_mask
         panel.overnight_1325_source.update(
-            contract_version=OVERNIGHT_CLOSE_FALLBACK_CONTRACT_VERSION,
+            contract_version=(
+                OVERNIGHT_CLOSE_FALLBACK_CONTRACT_VERSION
+                if normalized_time == OVERNIGHT_DEFAULT_DECISION_TIME
+                else OVERNIGHT_DECISION_CONTRACT_VERSION
+            ),
             missing_price_policy=missing_price_policy,
             missing_partition_dates=missing_partitions,
             close_fallback_symbol_sessions=int(np.count_nonzero(fallback)),
             close_fallback_sessions=int(np.count_nonzero(np.any(fallback, axis=1))),
-            caveat=OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
+            caveat=overnight_close_fallback_caveat(normalized_time),
         )
         print(f"[overnight] CLOSE FALLBACK research approximation: "
               f"missing_partitions={len(missing_partitions)} "
@@ -156,13 +238,33 @@ def attach_overnight_1325(panel: PanelData, root: str | Path, *,
     return panel
 
 
-def attach_overnight_prices(panel: PanelData, prices: np.ndarray, *,
-                            missing_price_policy: str = "reject") -> PanelData:
+def attach_overnight_1325(panel: PanelData, root: str | Path, *,
+                          missing_price_policy: str = "reject") -> PanelData:
+    """Backward-compatible fixed 13:25 panel attachment."""
+    return attach_overnight_decision(
+        panel,
+        root,
+        decision_time=OVERNIGHT_DEFAULT_DECISION_TIME,
+        missing_price_policy=missing_price_policy,
+    )
+
+
+def attach_overnight_prices(
+    panel: PanelData,
+    prices: np.ndarray,
+    *,
+    decision_time: str = OVERNIGHT_DEFAULT_DECISION_TIME,
+    missing_price_policy: str = "reject",
+) -> PanelData:
     """Align verified observations; kept separate for causal-boundary tests."""
-    allow_fallback = _validate_missing_policy(missing_price_policy)
+    normalized_time, _ = normalize_overnight_decision_time(decision_time)
+    feature_name = overnight_decision_feature(normalized_time)
+    allow_fallback = _validate_missing_policy(
+        missing_price_policy, decision_time=normalized_time
+    )
     prices = np.array(prices, dtype=np.float64, copy=True)
     if prices.shape != panel.close_prices.shape:
-        raise ValueError("13:25 prices must match the complete panel [T,S]")
+        raise ValueError(f"{normalized_time} prices must match the complete panel [T,S]")
     prior_close = np.full_like(prices, np.nan)
     prior_close[1:] = panel.close_prices[:-1]
     fallback = None
@@ -179,9 +281,21 @@ def attach_overnight_prices(panel: PanelData, prices: np.ndarray, *,
     context = np.zeros_like(gap)
     context[:-1] = gap[1:]
     panel.features = np.concatenate((panel.features, context[..., None]), axis=-1)
-    panel.feature_names = [*panel.feature_names, OVERNIGHT_1325_FEATURE]
+    panel.feature_names = [*panel.feature_names, feature_name]
     panel.overnight_1325_available = available
     panel.overnight_1325_close_fallback_mask = fallback
+    # Executor-only label for fixed pre-close board-lot sizing. The policy sees
+    # only the shifted log-gap feature above, never this same-row raw price.
+    panel.overnight_decision_prices = prices
+    if normalized_time != OVERNIGHT_DEFAULT_DECISION_TIME:
+        _, minutes_from_open = normalize_overnight_decision_time(normalized_time)
+        panel.overnight_1325_source = {
+            "decision_contract_version": OVERNIGHT_DECISION_CONTRACT_VERSION,
+            "decision_time": normalized_time,
+            "minutes_from_open": minutes_from_open,
+            "feature_name": feature_name,
+            "source_kind": "prealigned_decision_prices",
+        }
     # Recompute the logical array hashes after adding a new information source.
     panel.content_fingerprints = None
     return panel

@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep official Taiwan macro release originals current
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 07:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 16:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 19:30:00 Asia/Taipei
+OnCalendar=Sun *-*-* 03:00:00 Asia/Taipei
+Persistent=true
+AccuracySec=1min
+Unit=stockagent-tw-public-release-archives.service
+
+[Install]
+WantedBy=timers.target

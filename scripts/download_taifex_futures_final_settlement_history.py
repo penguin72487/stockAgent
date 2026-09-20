@@ -335,6 +335,10 @@ def main() -> int:
         ),
     )
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--refresh-current", action="store_true",
+        help="Refresh the requested end year's index page and current/prior stock-futures months; reuse older receipts.",
+    )
     parser.add_argument("--request-delay-seconds", type=float, default=0.05)
     args = parser.parse_args()
     if args.end_date < args.start_date:
@@ -367,7 +371,7 @@ def main() -> int:
         receipt = _download_html(
             url,
             raw_dir / "index" / f"{year:04d}.html",
-            refresh=bool(args.refresh),
+            refresh=bool(args.refresh or (args.refresh_current and year == args.end_date.year)),
             transport=transport,
         )
         digest = sha256_path(receipt)
@@ -424,7 +428,12 @@ def main() -> int:
         receipt = _download_html(
             url,
             raw_dir / "stock_etf" / f"{year:04d}-{month:02d}.html",
-            refresh=bool(args.refresh),
+            refresh=bool(
+                args.refresh or (
+                    args.refresh_current
+                    and (year * 12 + month) >= (args.end_date.year * 12 + args.end_date.month - 1)
+                )
+            ),
             transport=transport,
         )
         digest = sha256_path(receipt)

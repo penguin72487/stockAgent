@@ -12,7 +12,7 @@ import pytest
 from downloader import download_shioaji_historical_market_data as exact
 from downloader import download_shioaji_tx_futures_ticks as continuous
 from downloader.shioaji_history_repair import (
-    FuturesActivity, latest_completed_futures_session, load_futures_activity,
+    FuturesActivity, futures_date_is_closed, latest_completed_futures_session, load_futures_activity,
     publication_ready, retry_due, retry_metadata,
 )
 from scripts.export_shioaji_futures_products import export_inventory
@@ -54,6 +54,17 @@ def test_stock_close_does_not_finalize_later_closing_futures(tmp_path):
     pl.DataFrame({'product':['TX','TX'], 'date':[date(2026,9,4),date(2026,9,7)]}).write_parquet(path)
     assert latest_completed_futures_session(path, datetime(2026,9,7,6,31,tzinfo=UTC)) == date(2026,9,4)
     assert latest_completed_futures_session(path, datetime(2026,9,7,8,31,tzinfo=UTC)) == date(2026,9,7)
+
+
+def test_txfr1_day_session_finalizes_after_historical_query_gate_only():
+    day = date(2026, 9, 17)
+    before_gate = datetime(2026, 9, 17, 6, 30, tzinfo=UTC)
+    after_gate = datetime(2026, 9, 17, 6, 31, tzinfo=UTC)
+    all_futures_close = datetime(2026, 9, 17, 8, 30, tzinfo=UTC)
+    assert not futures_date_is_closed(day, before_gate, contract='TXFR1')
+    assert futures_date_is_closed(day, after_gate, contract='TXFR1')
+    assert not futures_date_is_closed(day, after_gate, contract='MXFR1')
+    assert futures_date_is_closed(day, all_futures_close, contract='MXFR1')
 
 
 def future_row():

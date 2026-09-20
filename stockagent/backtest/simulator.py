@@ -5400,6 +5400,7 @@ def run_backtest_integer_shares(
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: np.ndarray | float = 0.0,
     overnight_fixed_close_to_open: bool = False,
+    overnight_decision_prices: np.ndarray | None = None,
     open_prices: np.ndarray | None = None,
     can_short_open_open_mask: np.ndarray | None = None,
     day_trade_eligible_mask: np.ndarray | None = None,
@@ -6103,6 +6104,15 @@ def run_backtest_integer_shares(
         close_real = np.asarray(close_prices, dtype=np.float64)
         if close_real.shape != daily_shape:
             raise ValueError("close_prices must have shape [T,S]")
+        decision_real = (
+            None
+            if overnight_decision_prices is None
+            else np.asarray(overnight_decision_prices, dtype=np.float64)
+        )
+        if decision_real is not None and decision_real.shape != daily_shape:
+            raise ValueError(
+                "overnight_decision_prices must have shape [T,S]"
+            )
         if buy_fee_rates is None or sell_fee_rates is None:
             raise ValueError(
                 f"{mode} requires explicit per-symbol buy_fee_rates and sell_fee_rates"
@@ -6550,6 +6560,11 @@ def run_backtest_integer_shares(
                 phase_sell,
                 selected_buy_fees,
                 selected_sell_fees,
+                **(
+                    {"overnight_decision_prices": decision_real}
+                    if mode == "tw_overnight"
+                    else {}
+                ),
                 commission_rebate_rates=selected_commission_rebate_rates,
                 commission_rebate_timing=rebate_timing,
                 session_month_ids=rebate_month_ids,

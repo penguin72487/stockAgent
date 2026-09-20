@@ -18,7 +18,9 @@ import downloader.download_tw_public_data as twpub
 from scripts.audit_tw_public_data_layer import (
     _audit_tpex_daily_name_provenance,
     _benchmark_sessions,
+    _audit_input_signatures,
     audit_delisted_universe_coverage,
+    audit_cbc_release_vintage_contract,
     audit_feature_availability_contract,
     audit_feature_lineage_registry,
     audit_historical_sources,
@@ -52,11 +54,40 @@ from scripts.build_tw_official_symbol_parquets import (
     OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
     YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
     _receipt,
+    _receipt_matches,
     _write_official_quote_parquet,
 )
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData, _shift_panel_features_to_next_session
 from stockagent.data.tw_public_features import _file_content_receipt
+
+
+def test_content_receipt_accepts_live_path_alias_but_rejects_changed_bytes(tmp_path: Path) -> None:
+    live = tmp_path / "live"
+    live.mkdir()
+    source = live / "reference.parquet"
+    source.write_bytes(b"official bytes")
+    alias = tmp_path / "data_tw_public"
+    alias.symlink_to(live, target_is_directory=True)
+    expected = _receipt(source)
+    assert _receipt_matches(alias / source.name, expected)
+    source.write_bytes(b"changed bytes")
+    assert not _receipt_matches(alias / source.name, expected)
+
+
+def test_data_audit_detects_live_input_rewrite(tmp_path: Path) -> None:
+    public = tmp_path / "public"
+    stocks = public / "stocks"
+    features = public / "features"
+    stocks.mkdir(parents=True)
+    features.mkdir()
+    source = public / "twse_daily_ohlcv.parquet"
+    source.write_bytes(b"source v1")
+    feature = features / "tw_public_stock_daily.parquet"
+    feature.write_bytes(b"feature")
+    before = _audit_input_signatures(stocks, public, feature)
+    source.write_bytes(b"source v2")
+    assert _audit_input_signatures(stocks, public, feature) != before
 
 
 def test_daily_yahoo_refresh_symbols_extracts_only_actionable_gaps(tmp_path: Path) -> None:
@@ -388,6 +419,42 @@ def test_day_trade_features_fail_closed_without_double_availability_lag() -> Non
     assert summary["zero_filled_features"] == []
     assert summary["unclassified_active_features"] == []
     assert audit_feature_lineage_registry(config) == []
+
+
+def test_preopen_pit_config_has_no_current_session_inputs_or_dummy_slots() -> None:
+    config = load_config("configs/markets/tw_public_preopen_pit.yaml")
+    summary, findings = audit_feature_availability_contract(config)
+
+    assert findings == []
+    assert summary["decision_time_contract"] == "preopen_0900"
+    assert summary["selected_features"] == summary["active_features"] == 35
+    assert summary["zero_filled_features"] == []
+    assert len(summary["configured_panel_shift_features"]) == 23
+    assert summary["missing_required_shifts"] == []
+    assert summary["unclassified_active_features"] == []
+    assert summary["release_vintage_active_features"] == [
+        "twpub_cbc_fx_reserves_chg", "twpub_cbc_fx_reserves_log",
+    ]
+    assert audit_feature_lineage_registry(config) == []
+
+    config.data.feature_shift_next_session.remove("open_logret_1d")
+    _, findings = audit_feature_availability_contract(config)
+    assert any(item.code == "preopen_feature_leakage" for item in findings)
+
+
+def test_active_cbc_features_fail_closed_on_incomplete_release_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.audit_tw_official_release_archives as archive_audit
+
+    config = load_config("configs/markets/tw_public_preopen_pit.yaml")
+    monkeypatch.setattr(archive_audit, "audit_one", lambda *_: {
+        "integrity_ok": True, "coverage_complete": False,
+        "saved_releases": 1, "registered_releases": 2, "errors": [],
+    })
+    findings = audit_cbc_release_vintage_contract(tmp_path, config)
+    assert [item.code for item in findings] == ["incomplete_cbc_release_vintage"]
+    assert findings[0].severity == "critical"
 
 
 def test_availability_audit_rejects_missing_or_unjustified_panel_shift() -> None:
@@ -771,7 +838,7 @@ def test_tpex_legacy_json_name_damage_reconciles_exact_symbol_rows(
     assert any(item.code == "tpex_name_provenance_mismatch" for item in findings)
 
 
-def test_historical_source_audit_separates_observed_and_receipt_resolved_sessions(
+def test_historical_source_audit_rejects_stale_former_gap_receipts(
     tmp_path: Path,
 ) -> None:
     config = load_config("configs/markets/tw_public.yaml")
@@ -864,11 +931,11 @@ def test_historical_source_audit_separates_observed_and_receipt_resolved_session
     assert profile.session_coverage == pytest.approx(2 / 3)
     assert profile.observed_sessions == 2
     assert profile.observed_session_coverage == pytest.approx(2 / 3)
-    assert profile.source_unavailable_sessions == 1
-    assert profile.resolved_sessions == 3
-    assert profile.resolved_session_coverage == 1.0
-    assert profile.status == "complete"
-    assert not any(
+    assert profile.source_unavailable_sessions == 0
+    assert profile.resolved_sessions == 2
+    assert profile.resolved_session_coverage == pytest.approx(2 / 3)
+    assert profile.status == "incomplete"
+    assert any(
         item.code == "historical_session_coverage"
         and item.item == "tpex_margin_balance"
         for item in findings
@@ -904,8 +971,8 @@ def test_historical_source_audit_separates_observed_and_receipt_resolved_session
     ).write_csv(tmp_path / "download_report.csv")
     profiles, findings = audit_historical_sources(tmp_path, expected, config)
     profile = next(item for item in profiles if item.source == "tpex_margin_balance")
-    assert profile.source_unavailable_sessions == 1
-    assert profile.resolved_session_coverage == 1.0
+    assert profile.source_unavailable_sessions == 0
+    assert profile.resolved_session_coverage == pytest.approx(2 / 3)
 
     raw_path.write_bytes(raw_content + b" ")
     profiles, findings = audit_historical_sources(tmp_path, expected, config)

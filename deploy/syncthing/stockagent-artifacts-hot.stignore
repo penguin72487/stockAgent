@@ -5,6 +5,7 @@
 (?d).stversions/**
 (?d)data_locks
 (?d)data_locks/**
+(?d)/cache
 (?d)**/*.lock
 (?d)**/*.pid
 (?d)**/.syncthing.*

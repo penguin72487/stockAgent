@@ -62,12 +62,100 @@ def test_carried_revaluation_preserves_fills_basis_cash_interest_and_endpoints()
         assert actual["total_equity_twd"] == endpoint["total_equity_twd"]
 
 
+def test_new_paper_entry_does_not_reprice_older_cohort_without_a_minute_trade():
+    days = ["2026-08-13", "2026-08-14"]
+    base = dict(symbol="2330", side="long", buy_fee_rate=0., sell_fee_rate=0.,
+                cash_buy_fee_rate=0., cash_sell_fee_rate=0.,
+                margin_carry_contract=MARGIN_CARRY_CONTRACT)
+    old = {**base, "position_id": "old", "entry_price": 9.51,
+           "margin_converted_at": days[0] + "T13:30:00+08:00"}
+    new = {**base, "position_id": "new", "entry_price": 9.51,
+           "margin_converted_at": days[1] + "T13:30:00+08:00"}
+    fills = [dict(position_id="old", market="a", symbol="2330", purpose="entry",
+                  quantity=1000, fill_at=days[0]+"T09:01:00+08:00",
+                  recorded_at=days[0]+"T09:01:00+08:00", session_date=days[0],
+                  price=9.51, fee_and_tax_twd=0.),
+             dict(position_id="new", market="a", symbol="2330", purpose="entry",
+                  quantity=1000, fill_at=days[1]+"T09:01:00+08:00",
+                  recorded_at=days[1]+"T09:01:00+08:00", session_date=days[1],
+                  price=9.51, fee_and_tax_twd=0.)]
+    rows = [dict(market="a", minute=f"{day}T{clock}+08:00", session_date=day,
+                 initial_capital_twd=100000., cumulative_realized_net_pnl_twd=0.,
+                 open_net_liquidation_pnl_twd=net,
+                 total_equity_twd=100000. + net,
+                 cumulative_corporate_action_net_twd=0., cumulative_carry_cost_twd=0.,
+                 margin_carry_contract=MARGIN_CARRY_CONTRACT, open_position_count=count)
+            for day, count, opening, closing in ((days[0], 1, 40., 40.),
+                                                  (days[1], 2, 40., 100.))
+            for clock, net in (("09:01", opening), ("13:30", closing))]
+
+    class Store:
+        def prices(self, symbol, day):
+            first = datetime.fromisoformat(day + "T09:01:00+08:00")
+            return {(first + timedelta(minutes=i)).isoformat(timespec="minutes"):
+                    (9.55 if day == days[0] else 9.56)
+                    for i in range(270) if day == days[0] or i >= 44}
+
+    state = {"modes": {"a": dict(initial_capital_twd=100000.,
+                                 margin_carry_contract=MARGIN_CARRY_CONTRACT,
+                                 share_replacement_ledger=[], corporate_action_ledger=[],
+                                 carry_cost_ledger=[])}}
+    positions = {days[0]: {"a": [old]}, days[1]: {"a": [old, new]}}
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, Store(), state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14))
+    by_minute = {row["minute"]: row for row in rebuilt}
+    assert by_minute[days[1]+"T09:02+08:00"]["total_equity_twd"] == pytest.approx(100040.)
+    assert by_minute[days[1]+"T09:44+08:00"]["total_equity_twd"] == pytest.approx(100040.)
+    assert by_minute[days[1]+"T09:45+08:00"]["total_equity_twd"] == pytest.approx(100100.)
+    assert stats["differing_original_equity_points"] == 0
+
+
 def test_carried_revaluation_rejects_a_changed_endpoint_or_impossible_exit():
     rows, positions, store, state, fills = fixture()
     rows[-1]["cumulative_realized_net_pnl_twd"] = 99.
     with pytest.raises(RuntimeError, match="endpoint accounting"):
         rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
                                        start=date(2026, 8, 13), end=date(2026, 8, 14))
+
+
+def test_carried_opening_revaluation_requires_completed_bar_and_preserves_fills():
+    rows, positions, store, state, fills = fixture()
+    original_fills = deepcopy(fills)
+    original_prices = store.prices
+
+    class ShiftedStore:
+        def prices(self, symbol, day):
+            prices = original_prices(symbol, day)
+            if day == "2026-08-13":
+                prices["2026-08-13T09:01+08:00"] = 101.
+            return prices
+
+    rebuilt, _ = rebuild_carried_strategy_marks(
+        rows, positions, ShiftedStore(), state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+        revalue_opening_marks=True,
+    )
+    opening = next(row for row in rebuilt if row["minute"] == "2026-08-13T09:01+08:00")
+    closing = next(row for row in rebuilt if row["minute"] == "2026-08-13T13:30+08:00")
+    assert opening["opening_mark_revalued_from_completed_bar"] is True
+    assert opening["total_equity_twd"] == pytest.approx(100990.)
+    assert closing["total_equity_twd"] == rows[1]["total_equity_twd"]
+    assert fills == original_fills
+
+    class MissingOpeningStore:
+        def prices(self, symbol, day):
+            prices = original_prices(symbol, day)
+            if day == "2026-08-13":
+                prices.pop("2026-08-13T09:01+08:00")
+            return prices
+
+    with pytest.raises(RuntimeError, match="missing completed 09:01 valuation bar"):
+        rebuild_carried_strategy_marks(
+            rows, positions, MissingOpeningStore(), state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14),
+            revalue_opening_marks=True,
+        )
 
 
 def test_carried_prices_require_exact_source_receipt_and_positive_trade_volume(tmp_path):

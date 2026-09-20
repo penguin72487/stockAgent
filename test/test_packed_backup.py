@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +54,35 @@ def test_incremental_backup_and_existing_reader_restore(setup, tmp_path):
     assert not (cfg.destination / ".local-state/node-id").exists()
     assert not (cfg.destination / "current").exists()
     assert (cfg.destination.parent / "last-complete.json").exists()
+
+
+def test_backup_receipt_survives_remount_only_when_file_identity_is_stable(setup):
+    cfg, _work, _release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    item = inventory(cfg)[0][0]
+    relative = item["relative"]
+    with sqlite3.connect(cfg.state_dir / "verified.sqlite3") as connection:
+        source_json, target_json = connection.execute(
+            "SELECT source_sig,target_sig FROM verified WHERE path=?", (relative,)
+        ).fetchone()
+        source_sig = json.loads(source_json)
+        target_sig = json.loads(target_json)
+        source_sig[0] += 1
+        target_sig[0] += 1
+        connection.execute(
+            "UPDATE verified SET source_sig=?,target_sig=? WHERE path=?",
+            (json.dumps(source_sig), json.dumps(target_sig), relative),
+        )
+    assert backup.trusted(relative, item["sha256"], item["signature"])
+    assert backup.run_once()["copied_objects"] == 0
+
+    target_sig[2] += 1
+    with sqlite3.connect(cfg.state_dir / "verified.sqlite3") as connection:
+        connection.execute(
+            "UPDATE verified SET target_sig=? WHERE path=?",
+            (json.dumps(target_sig), relative),
+        )
+    assert not backup.trusted(relative, item["sha256"], item["signature"])
 
 
 def test_deletion_does_not_propagate_and_missing_current_is_degraded(setup):

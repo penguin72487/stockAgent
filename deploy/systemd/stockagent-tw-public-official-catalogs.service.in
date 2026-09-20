@@ -1,0 +1,30 @@
+[Unit]
+Description=Incrementally archive MOEA GCIS and FSC official open data
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash __REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_tw_public_official_catalogs.sh
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryAccounting=true
+MemoryHigh=24G
+MemoryMax=40G
+MemorySwapMax=4G
+TimeoutStartSec=4h
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__REPO_ROOT__/artifacts /srv/stockagent-live/data_tw_public /srv/stockagent-live/.locks /srv/stockagent-packed
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures

@@ -783,6 +783,26 @@ def build_taifex_index_futures_day_session(
             "source_sha256": [row.source_sha256 for row in rows],
         }
     )
+    from stockagent.data.tw_price_rules import (
+        price_on_explicit_tick_grid_numpy,
+        taifex_index_future_tick_size_numpy,
+    )
+
+    price_dates = np.asarray([row.date for row in rows], dtype="datetime64[D]")
+    price_products = np.asarray([row.product for row in rows])
+    for field in ("open", "high", "low", "close"):
+        values = np.asarray([getattr(row, field) for row in rows], dtype=np.float64)
+        ticks = taifex_index_future_tick_size_numpy(
+            values, product_codes=price_products
+        )
+        valid = price_on_explicit_tick_grid_numpy(values, ticks)
+        bad = np.flatnonzero(np.isfinite(values) & (values > 0.0) & ~valid)
+        if bad.size:
+            index = int(bad[0])
+            raise ValueError(
+                f"off-grid TAIFEX {price_products[index]} {field} at "
+                f"{price_dates[index]}: {values[index]!r}"
+            )
     metadata = dict(table.schema.metadata or {})
     metadata.update(
         {

@@ -1,0 +1,43 @@
+# Original-valued, release-audited features for the 2014+ preopen research panel.
+# The inherited same-close execution target remains a research approximation.
+base_config: tw_public_preopen_raw_v1.yaml
+experiment_name: tw-public-preopen-raw-2014-v1
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_raw_2014_v1
+  resume: false
+  post_train_infer: false
+
+data:
+  panel_start_date: "2014-01-01"
+  feature_include:
+    - open_raw
+    - high_raw
+    - low_raw
+    - close_raw
+    - trading_volume_raw
+    - twpub_official_trading_value_raw
+    - twpub_official_trades_raw
+    - twpub_pe_raw
+    - twpub_pb_raw
+    - twpub_dividend_yield_pct_raw
+    - twpub_margin_balance_lots_raw
+    - twpub_short_balance_lots_raw
+    - twpub_margin_buy_lots_raw
+    - twpub_margin_sell_lots_raw
+    - twpub_short_sell_lots_raw
+    - twpub_short_buy_lots_raw
+    - twpub_foreign_net_buy_shares_raw
+    - twpub_investment_trust_net_buy_shares_raw
+    - twpub_dealer_net_buy_shares_raw
+    - twpub_institutional_net_buy_shares_raw
+    - twpub_twse_taiex_raw
+    - twpub_cbc_fx_reserves_usd_billion_raw
+    - twpub_cbc_m1b_yoy_pct_raw
+    - twpub_cbc_m2_yoy_pct_raw
+    - twpub_dgbas_cpi_yoy_pct_raw
+    - twpub_dgbas_unemployment_pct_raw
+    - twpub_dgbas_gdp_yoy_pct_raw
+
+walk_forward:
+  expected_first_year: 2014

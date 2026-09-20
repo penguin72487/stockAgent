@@ -23,6 +23,7 @@ from typing import Any, Final
 import numpy as np
 
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_price_rules import price_on_tick_grid_numpy
 
 try:
     import polars as pl
@@ -1109,6 +1110,36 @@ def _write_parquet_with_metadata(frame: Any, path: Path, *, dataset: str) -> Non
     )
 
 
+def _validate_supported_outright_quotes(frame: Any) -> None:
+    """Reject off-grid observed stock/ETF futures quotes before publication.
+
+    Synthetic valuation rows and official settlements are not trade quotes.
+    Index products require their own dated product rules.
+    """
+
+    observed = frame.filter(
+        pl.col("source_row_observed")
+        & pl.col("asset_class").is_in(["stock_future", "etf_future"])
+    )
+    if observed.is_empty():
+        return
+    dates = np.asarray(observed["date"].to_list(), dtype="datetime64[D]")
+    kinds = observed["asset_class"].to_numpy()
+    for field in ("open", "high", "low", "close", "last_bid", "last_ask"):
+        values = observed[field].cast(pl.Float64, strict=False).to_numpy()
+        quoted = np.isfinite(values) & (values > 0)
+        valid = price_on_tick_grid_numpy(values, dates, security_types=kinds)
+        bad = np.flatnonzero((quoted & ~valid) | (np.isfinite(values) & (values < 0)))
+        if bad.size:
+            index = int(bad[0])
+            raise ValueError(
+                f"off-grid dated futures {field}: date={dates[index]} "
+                f"contract={observed['physical_contract'][index]} "
+                f"asset_class={kinds[index]} price={values[index]} "
+                f"invalid_rows={bad.size}"
+            )
+
+
 def build_dataset(
     *,
     source_path: str | Path = DEFAULT_SOURCE_PATH,
@@ -1145,6 +1176,7 @@ def build_dataset(
         stock_master_path,
         official_product_code_path,
     )
+    _validate_supported_outright_quotes(continuous)
     continuous_path = output_root / "continuous_daily.parquet"
     product_output_path = output_root / "product_master.parquet"
     feature_path = output_root / "model_features.parquet"

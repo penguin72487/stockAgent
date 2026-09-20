@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_json
 from scripts.deploy_tw_overnight_history import deploy
+from scripts.rebuild_tw_overnight_history import configured_history_lineage
 from scripts.switch_tw_day_trade_strategy import _latest_completed_session
 from stockagent.live.tw_day_trade_simulation import TAIPEI
 
@@ -29,7 +30,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _deployment_current(state_dir: Path, end_date: str) -> bool:
+def _deployment_current(
+    state_dir: Path,
+    end_date: str,
+    lineage_fingerprint: str,
+) -> bool:
     history_path = state_dir / "overnight_history.json"
     receipt_path = state_dir / "overnight_history_deployment.json"
     signal_path = state_dir / "overnight_signal_history.parquet"
@@ -48,12 +53,14 @@ def _deployment_current(state_dir: Path, end_date: str) -> bool:
         and receipt.get("history_sha256") == _sha256(history_path)
         and receipt.get("signal_history_sha256") == _sha256(signal_path)
         and receipt.get("event_history_sha256") == _sha256(event_path)
+        and receipt.get("history_lineage_fingerprint") == lineage_fingerprint
     )
 
 
 def maintain(args: argparse.Namespace) -> dict[str, object]:
     state_dir = args.state_dir.resolve()
     work_dir = args.work_dir.resolve()
+    markets_dir = args.markets_dir.resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = work_dir / ".maintenance.lock"
@@ -68,11 +75,19 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
             start_date=date.fromisoformat(args.start_date),
         )
         latest_text = latest.isoformat()
-        if _deployment_current(state_dir, latest_text) and not args.force:
+        lineage = configured_history_lineage(markets_dir, args.start_date)
+        lineage_fingerprint = str(lineage["fingerprint_sha256"])
+        lineage_dir = work_dir / "lineages" / lineage_fingerprint
+        lineage_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            _deployment_current(state_dir, latest_text, lineage_fingerprint)
+            and not args.force
+        ):
             return {
                 "status": "already_current",
                 "end_date": latest_text,
                 "session_count": len(sessions),
+                "history_lineage_fingerprint": lineage_fingerprint,
             }
 
         command = [
@@ -88,13 +103,15 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
             str(args.minute_root),
             "--price-limit-dir",
             str(args.price_limit_dir),
+            "--markets-dir",
+            str(markets_dir),
             "--output",
-            str(work_dir),
+            str(lineage_dir),
             "--stage",
             "all",
         ]
         subprocess.run(command, cwd=REPO_ROOT, check=True)
-        receipt = deploy(work_dir, state_dir)
+        receipt = deploy(lineage_dir, state_dir)
         maintenance = {
             "schema_version": 1,
             "status": "complete",
@@ -103,6 +120,8 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
             "end_date": latest_text,
             "session_count": len(sessions),
             "calendar_sha256": calendar_sha256,
+            "history_lineage_fingerprint": lineage_fingerprint,
+            "lineage_work_dir": str(lineage_dir),
             "deployment": receipt,
         }
         output = REPO_ROOT / "artifacts/operations/tw_overnight_history_maintenance/latest.json"
@@ -133,6 +152,11 @@ def main() -> None:
         "--state-dir",
         type=Path,
         default=Path("artifacts/live/tw_overnight_simulation"),
+    )
+    parser.add_argument(
+        "--markets-dir",
+        type=Path,
+        default=Path("services/discord_bot/markets"),
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()

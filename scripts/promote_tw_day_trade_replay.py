@@ -52,9 +52,26 @@ MINUTE_PRICE_0901_REPLAY_CONTRACT = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_"
     "minute_price_volume_capped_nav_counterfactual_v3"
 )
+PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT = (
+    "retrospective_prior_paper_fill_else_09_01_minute_price_"
+    "full_target_no_liquidity_claim_v1"
+)
+
+
+def _verified_prior_paper_manifest(
+    candidate: Path, receipt: dict[str, Any], failures: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Require an immutable source snapshot that survives atomic exchange."""
+    try:
+        from scripts.stage_tw_day_trade_prior_paper_source import verify
+        return verify(candidate, receipt)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        failures.append(f"prior paper-fill manifest invalid: {exc}")
+        return {}
 MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
     MINUTE_VWAP_0901_REPLAY_CONTRACT,
     MINUTE_PRICE_0901_REPLAY_CONTRACT,
+    PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT,
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_price_counterfactual_v2",
 }
 MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
@@ -591,12 +608,15 @@ def _validate_0901_minute_price_signal_ledger(
     failures: list[str],
     require_capacity: bool = False,
     allow_receipted_absence: bool = False,
+    expected_prior_fills: int = 0,
+    prior_manifest: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     path = candidate / "signals.jsonl"
     if not path.is_file():
         failures.append("09:01 minute-price replay has no signals.jsonl audit ledger")
         return {"minute_price_0901_fills": 0, "minute_vwap_0901_fills": 0}
     fill_count = 0
+    prior_count = 0
     absent_pairs: set[tuple[str, str]] = set()
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -606,6 +626,37 @@ def _validate_0901_minute_price_signal_ledger(
                 failures.append(f"signals.jsonl:{line_number}: invalid JSON")
                 continue
             if str(row.get("entry_fill_policy") or "") != MINUTE_VWAP_0901_ENTRY_POLICY:
+                continue
+            if row.get("prior_paper_fill_reused") is True:
+                prior_count += 1
+                prior = (prior_manifest or {}).get(
+                    "|".join((str(row.get("session_date") or ""),
+                              str(row.get("market") or ""),
+                              str(row.get("symbol") or "")))
+                )
+                try:
+                    prior_at = datetime.fromisoformat(str(row.get("prior_paper_fill_at")))
+                    price = float(row.get("execution_price"))
+                    valid_prior = (
+                        row.get("reason") in {
+                            "counterfactual_full_target_from_prior_paper_fill",
+                            "account_nav_budget_exhausted",
+                        }
+                        and row.get("entry_price_method") == "prior_paper_fill"
+                        and row.get("counterfactual_0901_price_fill") is False
+                        and row.get("simulation_replay") is True
+                        and prior_at.date().isoformat() == str(row.get("session_date"))
+                        and prior_at.hour == 9 and prior_at.minute in {0, 1}
+                        and math.isfinite(price) and price > 0
+                        and 0 < int(row.get("filled_shares") or 0) <= int(row.get("requested_shares") or 0)
+                        and isinstance(prior, dict)
+                        and math.isclose(price, float(prior["price"]), rel_tol=0.0, abs_tol=1e-8)
+                        and row.get("prior_paper_fill_at") == prior["fill_at"]
+                    )
+                except (TypeError, ValueError):
+                    valid_prior = False
+                if not valid_prior:
+                    failures.append(f"signals.jsonl:{line_number}: invalid prior paper-fill reuse")
                 continue
             if require_capacity and int(row.get("requested_shares") or 0) > 0 and row.get("reason") in {
                 "observed_09_01_minute_price_unavailable", "observed_09_01_minute_liquidity_unavailable",
@@ -668,6 +719,10 @@ def _validate_0901_minute_price_signal_ledger(
         failures.append(
             f"signals ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
         )
+    if prior_count != expected_prior_fills:
+        failures.append(
+            f"signals ledger prior-paper fills={prior_count} receipt={expected_prior_fills}"
+        )
     absence = None
     if absent_pairs:
         try:
@@ -677,6 +732,7 @@ def _validate_0901_minute_price_signal_ledger(
     return {
         "minute_price_0901_fills": fill_count,
         "minute_vwap_0901_fills": fill_count,
+        "prior_paper_fills": prior_count,
         "absent_execution_price_validation": absence,
     }
 
@@ -686,6 +742,8 @@ def _validate_0901_minute_price_fill_ledger(
     *,
     expected_fills: int,
     failures: list[str],
+    expected_prior_fills: int = 0,
+    prior_manifest: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     path = candidate / "fills.jsonl"
     if not path.is_file():
@@ -695,6 +753,7 @@ def _validate_0901_minute_price_fill_ledger(
             "fill_ledger_minute_vwap_0901_fills": 0,
         }
     fill_count = 0
+    prior_count = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -707,6 +766,34 @@ def _validate_0901_minute_price_fill_ledger(
                 or str(row.get("fill_contract") or "")
                 not in MINUTE_PRICE_0901_REPLAY_CONTRACTS
             ):
+                continue
+            if row.get("prior_paper_fill_reused") is True:
+                prior_count += 1
+                prior = (prior_manifest or {}).get(
+                    "|".join((str(row.get("session_date") or ""),
+                              str(row.get("market") or ""),
+                              str(row.get("symbol") or "")))
+                )
+                try:
+                    fill_at = datetime.fromisoformat(str(row.get("fill_at")))
+                    price = float(row.get("price"))
+                    valid_prior = (
+                        row.get("entry_price_method") == "prior_paper_fill"
+                        and row.get("counterfactual_0901_price_fill") is False
+                        and row.get("simulation_replay") is True
+                        and fill_at.isoformat(timespec="seconds") == row.get("prior_paper_fill_at")
+                        and fill_at.date().isoformat() == row.get("session_date")
+                        and fill_at.hour == 9 and fill_at.minute in {0, 1}
+                        and math.isfinite(price) and price > 0
+                        and int(row.get("quantity") or 0) > 0
+                        and isinstance(prior, dict)
+                        and math.isclose(price, float(prior["price"]), rel_tol=0.0, abs_tol=1e-8)
+                        and row.get("prior_paper_fill_at") == prior["fill_at"]
+                    )
+                except (TypeError, ValueError):
+                    valid_prior = False
+                if not valid_prior:
+                    failures.append(f"fills.jsonl:{line_number}: invalid prior paper-fill reuse")
                 continue
             fill_count += 1
             try:
@@ -739,9 +826,14 @@ def _validate_0901_minute_price_fill_ledger(
         failures.append(
             f"fills ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
         )
+    if prior_count != expected_prior_fills:
+        failures.append(
+            f"fills ledger prior-paper fills={prior_count} receipt={expected_prior_fills}"
+        )
     return {
         "fill_ledger_minute_price_0901_fills": fill_count,
         "fill_ledger_minute_vwap_0901_fills": fill_count,
+        "fill_ledger_prior_paper_fills": prior_count,
     }
 
 
@@ -802,6 +894,7 @@ def _validate_rebuild(
     official_open_fills = 0
     minute_vwap_0901_fills = 0
     minute_price_0901_fills = 0
+    prior_paper_fills = 0
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -810,6 +903,12 @@ def _validate_rebuild(
             continue
         session_date = str(session.get("session_date") or "")
         session_dates.append(session_date)
+        if receipt_entry_contract == PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT:
+            intraday = session.get("intraday_replay") or {}
+            if (intraday.get("contract")
+                    != "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
+                    or intraday.get("minute_volume_participation") is not None):
+                failures.append(f"{session_date}: full-target intraday receipt is inconsistent")
         close = session.get("close")
         close_status = close.get("status") if isinstance(close, dict) else None
         is_allowed_current_open = bool(
@@ -870,17 +969,19 @@ def _validate_rebuild(
                     or minute_vwap_0901_count
                     or 0
                 )
+                prior_paper_count = int(entry.get("entry_prior_paper_fill_reused_count") or 0)
                 best_quote_fills += exact_count
                 synthetic_fallback_fills += fallback_count
                 official_open_fills += official_open_count
                 minute_vwap_0901_fills += minute_vwap_0901_count
                 minute_price_0901_fills += minute_price_0901_count
+                prior_paper_fills += prior_paper_count
                 if policy == MINUTE_VWAP_0901_ENTRY_POLICY:
                     if receipt_entry_contract not in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
                         failures.append(
                             f"{session_date}/{market}: 09:01 minute-price replay contract is not explicit"
                         )
-                    if minute_price_0901_count != fill_count:
+                    if minute_price_0901_count + prior_paper_count != fill_count:
                         failures.append(
                             f"{session_date}/{market}: 09:01 minute-price fill counts do not reconcile"
                         )
@@ -1049,7 +1150,8 @@ def _validate_rebuild(
                         f"{market}/{symbol}: position is not counterfactual replay"
                     )
                 if mode_is_0901_vwap and (
-                    position.get("counterfactual_0901_price_fill") is not True
+                    (position.get("counterfactual_0901_price_fill") is not True
+                     and position.get("prior_paper_fill_reused") is not True)
                     or position.get("counterfactual_open_price_fill") is not False
                 ):
                     failures.append(
@@ -1092,6 +1194,11 @@ def _validate_rebuild(
             )
         )
     elif receipt_entry_contract in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
+        prior_manifest = (
+            _verified_prior_paper_manifest(candidate, receipt, failures)
+            if receipt_entry_contract == PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT
+            else {}
+        )
         expected_minute_price_fills = (
             minute_price_0901_fills
             if receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT
@@ -1103,12 +1210,16 @@ def _validate_rebuild(
             failures=failures,
             require_capacity=receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT,
             allow_receipted_absence=allow_margin_carry,
+            expected_prior_fills=prior_paper_fills,
+            prior_manifest=prior_manifest,
         )
         signal_ledger_validation.update(
             _validate_0901_minute_price_fill_ledger(
                 candidate,
                 expected_fills=expected_minute_price_fills,
                 failures=failures,
+                expected_prior_fills=prior_paper_fills,
+                prior_manifest=prior_manifest,
             )
         )
 
@@ -1145,6 +1256,7 @@ def _validate_rebuild(
         "official_open_fills": official_open_fills,
         "minute_vwap_0901_fills": minute_vwap_0901_fills,
         "minute_price_0901_fills": minute_price_0901_fills,
+        "prior_paper_fills": prior_paper_fills,
         "signal_ledger_validation": signal_ledger_validation,
         "minute_curve_validation": minute_curve_validation,
         "benchmark_minute_validation": benchmark_validation,
@@ -1219,6 +1331,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate the candidate and print acceptance without exchanging directories.",
     )
+    parser.add_argument(
+        "--validation-receipt", type=Path,
+        help="With --validate-only, atomically save the read-only acceptance proof outside both ledgers.",
+    )
     parser.add_argument("--allow-margin-carry", action="store_true",
                         help="Explicit user-approved carried-history contract; requires full source/accounting audit and a flat old live account.")
     return parser
@@ -1252,12 +1368,18 @@ def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> N
 
 def main(*, before_exchange: Callable[[], None] | None = None) -> None:
     args = build_parser().parse_args()
+    if args.validation_receipt is not None and not args.validate_only:
+        raise ValueError("--validation-receipt requires --validate-only")
     live = args.live_dir.resolve(strict=True)
     candidate = args.candidate_dir.resolve(strict=True)
     if live == candidate or live in candidate.parents or candidate in live.parents:
         raise ValueError("live and candidate directories must be separate siblings")
     if live.stat().st_dev != candidate.stat().st_dev:
         raise RuntimeError("atomic directory exchange requires the same filesystem")
+    if args.validation_receipt is not None:
+        output = args.validation_receipt.resolve()
+        if output.is_relative_to(live) or output.is_relative_to(candidate):
+            raise ValueError("validation receipt must be outside both ledgers")
     expected_markets = {str(value).strip() for value in args.expected_market}
     if not expected_markets or "" in expected_markets:
         raise ValueError("--expected-market values must be non-empty")
@@ -1268,9 +1390,12 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
         allow_margin_carry=bool(args.allow_margin_carry),
     )
     if args.validate_only:
+        result = {"status": "validated", "acceptance": acceptance}
+        if args.validation_receipt is not None:
+            _atomic_json(args.validation_receipt, result)
         print(
             json.dumps(
-                {"status": "validated", "acceptance": acceptance},
+                result,
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,

@@ -666,6 +666,8 @@ def _capacity_receipt(
     reserve = max(int(reserve_gib * 1024**3), int(usage.total * 0.10))
     usable = max(0, usage.free - reserve)
     reasons: list[str] = []
+    if usage.free < reserve:
+        reasons.append("filesystem_free_below_required_reserve")
     if estimated_peak > usable:
         reasons.append("estimated_peak_bytes_exceeds_free_space_after_reserve")
     if max_download_bytes > 0 and compressed > max_download_bytes:
@@ -905,6 +907,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reserve-gib", type=float, default=100.0)
     parser.add_argument("--max-download-bytes", type=int, default=0)
     parser.add_argument("--retries", type=int, default=5)
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Persist the O(1) local capacity gate without listing remote archives.",
+    )
     return parser.parse_args()
 
 
@@ -912,6 +919,23 @@ def main() -> int:
     args = parse_args()
     root = args.output_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    preflight = _capacity_receipt(
+        root,
+        [],
+        reserve_gib=args.reserve_gib,
+        max_download_bytes=args.max_download_bytes,
+    )
+    preflight["phase"] = "before_remote_discovery"
+    atomic_write_text(
+        root / "capacity_receipt.json",
+        json.dumps(preflight, ensure_ascii=False, indent=2) + "\n",
+    )
+    if args.preflight_only:
+        print(json.dumps(preflight, ensure_ascii=False, indent=2), flush=True)
+        return 0 if preflight["accepted"] else 75
+    if args.mode == "download" and not preflight["accepted"]:
+        print(json.dumps(preflight, ensure_ascii=False, indent=2), flush=True)
+        return 75
     state_path = root / "state/archive_objects.sqlite3"
     repair_months = _promote_monthly_repairs(state_path)
     completed = _completed_etags(state_path)
@@ -978,8 +1002,10 @@ def main() -> int:
     if args.mode == "plan":
         return 0
     if not capacity["accepted"]:
-        raise SystemExit(
-            "capacity gate rejected download: " + ", ".join(capacity["reasons"])
+        return (
+            75
+            if any("space" in reason or "reserve" in reason for reason in capacity["reasons"])
+            else 1
         )
     summary = execute_download(
         client,

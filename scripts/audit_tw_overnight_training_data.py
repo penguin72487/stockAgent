@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the canonical 13:25 research panel and persist its acceptance gate."""
+"""Prepare the configured overnight-decision panel and persist its acceptance gate."""
 from __future__ import annotations
 
 import argparse

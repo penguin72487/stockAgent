@@ -24,9 +24,14 @@ IOWeight=50
 # stateful event monitor when the host is under memory pressure.
 OOMScoreAdjust=-250
 MemoryAccounting=true
-MemoryHigh=6G
-MemoryMax=12G
-MemorySwapMax=2G
+# A canonical 9.6M-row TW feature rebuild measured ~41 GiB RSS.  The prior
+# 12/16 GiB cgroup ceiling throttled the completed-session finalizer while
+# it owned the source-update lock, delaying every dependent refresh. Keep the
+# opening engine in its separate service/cgroup; never silently lower this
+# bound below a measured full-history rebuild without a new benchmark.
+MemoryHigh=48G
+MemoryMax=64G
+MemorySwapMax=8G
 TasksMax=2048
 TimeoutStopSec=2min
 

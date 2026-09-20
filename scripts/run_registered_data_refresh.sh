@@ -74,14 +74,40 @@ case "$refresh_scope" in
       RUN_CRYPTO_ETF_HISTORY=0 \
       "$repo_root/downloader/run_daily_all_markets.sh"
     ;;
+  features)
+    exec env "${common_env[@]}" \
+      RUN_ID="registered-features-$(date -u +%Y%m%dT%H%M%SZ)" \
+      LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_features.lock" \
+      RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_features" \
+      RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_features_runs.tsv" \
+      RUN_YAHOO=0 \
+      YAHOO_ASSETS="" \
+      RUN_FRANKFURTER=0 \
+      RUN_PEPPERSTONE_GROUPS=0 \
+      RUN_CEX_PERP=1 \
+      CRYPTO_TAIL_ONLY=1 \
+      CRYPTO_HISTORICAL_FEATURES=1 \
+      OKX_SKIP_FUNDING_ARCHIVE=1 \
+      RUN_CRYPTO_DAILY_MATERIALIZE=0 \
+      RUN_CRYPTO_REFERENCE=0 \
+      RUN_FREE_PUBLIC_CONTEXT=0 \
+      RUN_COINMETRICS_COMMUNITY=0 \
+      RUN_DUNE_CRYPTO_HISTORY=0 \
+      RUN_CRYPTO_ETF_HISTORY=0 \
+      RUN_FRED_CRYPTO_MACRO=0 \
+      "$repo_root/downloader/run_daily_all_markets.sh"
+    ;;
   backfill)
     exec env "${common_env[@]}" \
       RUN_ID="registered-backfill-$(date -u +%Y%m%dT%H%M%SZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_backfill.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_backfill" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_backfill_runs.tsv" \
-      RUN_YAHOO=0 \
-      YAHOO_ASSETS="" \
+      RUN_YAHOO=1 \
+      YAHOO_ASSETS="us_stocks" \
+      YAHOO_VERIFY_US_HISTORY_HEAD=1 \
+      YAHOO_HISTORY_START_DATE=1900-01-01 \
+      DAILY_STALE_MAX_LAG_DAYS=0 \
       RUN_FRANKFURTER=0 \
       RUN_PEPPERSTONE_GROUPS=0 \
       RUN_CEX_PERP=1 \
@@ -95,7 +121,7 @@ case "$refresh_scope" in
       "$repo_root/downloader/run_daily_all_markets.sh"
     ;;
   *)
-    echo "usage: $0 {daily|intraday|backfill}" >&2
+    echo "usage: $0 {daily|intraday|features|backfill}" >&2
     exit 2
     ;;
 esac

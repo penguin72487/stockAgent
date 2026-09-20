@@ -43,6 +43,22 @@ def signature(path: Path) -> tuple[int, ...]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def same_file_signature(recorded: object, observed: tuple[int, ...]) -> bool:
+    """Compare a receipt across a WSL remount without trusting ``st_dev``.
+
+    DrvFs may assign the same enrolled D: volume a new Linux device number at
+    boot.  The volume guard checks the mount and enrollment separately; inode,
+    size, mtime and ctime must still match the checksum-readback receipt.
+    """
+    return (
+        isinstance(recorded, list)
+        and len(recorded) == 5
+        and all(type(value) is int for value in recorded)
+        and len(observed) == 5
+        and recorded[1:] == list(observed)[1:]
+    )
+
+
 def safe_path(root: Path, relative: str) -> Path:
     path = Path(relative)
     if path.is_absolute() or not path.parts or any(part in {".", ".."} for part in path.parts):
@@ -221,11 +237,13 @@ class PackedBackup:
         row = self.db.execute("SELECT digest,source_sig,target_sig,checked FROM verified WHERE path=?", (relative,)).fetchone()
         if row is None or row[0] != digest or time.time() - row[3] > self.config.checksum_recheck_days * 86400:
             return False
-        if source_sig is not None and row[1] != json.dumps(source_sig):
-            return False
         try:
-            return row[2] == json.dumps(signature(safe_path(self.config.destination, relative)))
-        except (OSError, SnapshotError):
+            if source_sig is not None and not same_file_signature(json.loads(row[1]), source_sig):
+                return False
+            return same_file_signature(
+                json.loads(row[2]), signature(safe_path(self.config.destination, relative))
+            )
+        except (OSError, ValueError, TypeError, SnapshotError):
             return False
 
     def remember(self, relative: str, digest: str, source_sig: tuple[int, ...]) -> None:

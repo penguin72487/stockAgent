@@ -2,7 +2,7 @@
 """Refresh official Taiwan public-data groups at their release boundaries.
 
 This is the low-latency, mutable download layer.  The 07:50 full sweep commits
-its metadata beside the live tree only after all 156 sources have zero failure,
+its metadata beside the live tree only after every registered source has zero failure,
 zero publication lag, and complete historical coverage.  The independent
 08:00 acceptance job then performs the strict model-safety audit and selects
 this same live root directly; it never packs or materializes data on the
@@ -74,7 +74,7 @@ PUBLICATION_PHASES: dict[str, PublicationPhase] = {
         name="preopen_all",
         anchor=datetime_time(7, 50),
         selectors=("all",),
-        official_basis="TWSE financial key-data preopen boundary; full 156-dataset sweep",
+        official_basis="TWSE financial key-data preopen boundary; full registered-source sweep",
     ),
     "close_initial": PublicationPhase(
         name="close_initial",
@@ -500,7 +500,7 @@ def _preopen_acceptance_errors(
 
 
 def _promote_preopen_metadata(metadata_dir: Path, live_root: Path) -> list[str]:
-    """Commit the accepted 156-dataset receipt beside the exact source tree."""
+    """Commit the accepted full-source receipt beside the exact source tree."""
 
     promoted: list[str] = []
     for name in ("dataset_manifest.json", "download_report.csv", "download_summary.json"):

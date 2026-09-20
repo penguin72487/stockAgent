@@ -33,6 +33,7 @@ from stockagent.live.shioaji_schedule import (  # noqa: E402
     historical_query_is_protected,
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+from downloader.download_shioaji_tx_futures_ticks import _valid_receipt  # noqa: E402
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -135,13 +136,35 @@ def _validate_current(
     return result
 
 
+def _tx_benchmark_source_state(
+    tx_history_root: Path,
+    completed_session: str,
+) -> dict[str, Any]:
+    """Validate the exact TXFR1 session consumed by the benchmark rebuild."""
+
+    trading_date = date.fromisoformat(completed_session)
+    receipt_path = (
+        tx_history_root
+        / "receipts"
+        / f"trading_date={completed_session}.json"
+    )
+    receipt = _valid_receipt(tx_history_root, trading_date)
+    ready = bool(receipt is not None and receipt.get("status") == "complete")
+    return {
+        "ready": ready,
+        "trading_date": completed_session,
+        "receipt_path": str(receipt_path),
+        "status": receipt.get("status") if receipt is not None else "missing_or_invalid",
+    }
+
+
 def _inspect_strategy_price_provenance(
     state_dir: Path,
     *,
     completed_session_dates: list[str],
     expected_markets: set[str],
 ) -> dict[str, Any]:
-    """Inspect every completed-session interior minute, not just timestamps."""
+    """Inspect completed-session opening and interior prices, not just timestamps."""
 
     expected_sessions = set(completed_session_dates)
     expected_keys = {
@@ -149,13 +172,14 @@ def _inspect_strategy_price_provenance(
         for session_date in completed_session_dates
         for market in expected_markets
         for minute in (
-            datetime.fromisoformat(f"{session_date}T09:02:00+08:00")
+            datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
             + timedelta(minutes=index)
-            for index in range(268)
+            for index in range(269)
         )
     }
-    audited: set[tuple[str, str, datetime]] = set()
-    unverified: set[tuple[str, str, datetime]] = set()
+    # The append-only ledger may contain multiple marks for one minute.  The
+    # latest row is what the dashboard projects, so audit that exact row.
+    source_by_key: dict[tuple[str, str, datetime], bool] = {}
     marks_path = state_dir / "marks.jsonl"
     with marks_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -173,16 +197,19 @@ def _inspect_strategy_price_provenance(
             key = (session_date, market, minute)
             if key not in expected_keys:
                 continue
-            if historical_minute_mark_has_source(row):
-                audited.add(key)
-            else:
-                unverified.add(key)
-    unverified.update(expected_keys - audited)
+            source_by_key[key] = historical_minute_mark_has_source(row)
+    audited = {key for key, has_source in source_by_key.items() if has_source}
+    unverified = expected_keys - audited
+    opening = {key for key in expected_keys if key[2].hour == 9 and key[2].minute == 1}
+    interior = expected_keys - opening
     return {
         "contract": "right_labelled_historical_last_trade_mark_v1",
-        "expected_interior_rows": len(expected_keys),
-        "audited_interior_rows": len(audited),
-        "unverified_interior_rows": len(unverified),
+        "expected_opening_rows": len(opening),
+        "audited_opening_rows": len(audited & opening),
+        "unverified_opening_rows": len(unverified & opening),
+        "expected_interior_rows": len(interior),
+        "audited_interior_rows": len(audited & interior),
+        "unverified_interior_rows": len(unverified & interior),
         "unverified_sample": [
             f"{session_date}:{market}:{minute.isoformat(timespec='minutes')}"
             for session_date, market, minute in sorted(unverified)[:20]
@@ -210,6 +237,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/operations/tw_day_trade_minute_curves/latest.json"),
     )
     parser.add_argument("--no-fetch", action="store_true")
+    parser.add_argument(
+        "--tx-history-root",
+        type=Path,
+        default=Path("data_tw_index_futures/shioaji_history/TXFR1"),
+    )
     return parser.parse_args()
 
 
@@ -264,6 +296,37 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
             return
 
+        # An attempted session is not a completed session: waiting_source also
+        # records completed_session_dates. Always check the exact receipt before
+        # starting the expensive benchmark rebuild, even on a retry.
+        source_state = _tx_benchmark_source_state(
+            getattr(
+                args,
+                "tx_history_root",
+                Path("data_tw_index_futures/shioaji_history/TXFR1"),
+            ).resolve(),
+            completed[-1],
+        )
+        if not source_state["ready"]:
+            payload = {
+                "schema_version": 1,
+                "status": "waiting_source",
+                "failed_stage": "benchmark_source_preflight",
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "completed_session_dates": completed,
+                "source": source_state,
+                "retry_contract": (
+                    "A verified TXFR1 receipt change triggers the minute-curve "
+                    "path unit; the post-close timer is a fallback. No benchmark "
+                    "subprocess was started"
+                ),
+                "simulation_only": True,
+                "production_order_possible": False,
+            }
+            _atomic_json(status_path, payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
         try:
             strategy_validation = _validate_current(
                 state_dir,
@@ -289,6 +352,7 @@ def main() -> None:
             benchmark_validation = None
         price_provenance_ready = bool(
             price_validation is not None
+            and int(price_validation.get("unverified_opening_rows") or 0) == 0
             and int(price_validation.get("unverified_interior_rows") or 0) == 0
         )
         if (
@@ -314,13 +378,19 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
             return
 
-        if historical_query_is_protected(observed) and not args.no_fetch:
+        # The worker always publishes rebuilt marks.  Skipping API fallback
+        # does not make that write safe during the protected live window.
+        if historical_query_is_protected(observed):
             payload = {
                 "schema_version": 1,
                 "status": "waiting_live_priority_window",
                 "observed_at": observed.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
-                "retry_contract": "weekly systemd calendar resumes after 14:31",
+                "strategy_price_provenance": price_validation,
+                "retry_contract": (
+                    "scheduled post-close attempts at 14:35, 15:30 and 18:00; "
+                    "do not compete with live quote traffic before 14:31"
+                ),
                 "simulation_only": True,
                 "production_order_possible": False,
             }
@@ -399,6 +469,8 @@ def main() -> None:
         ]
         if not args.no_fetch:
             command.append("--fetch-missing-kbars")
+        if price_validation is not None and int(price_validation.get("unverified_opening_rows") or 0) > 0:
+            command.append("--revalue-opening-marks")
         has_margin_carry = any(m.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
                               for m in _object(state_dir / "state.json").get("modes", {}).values())
         if price_provenance_ready and (strategy_validation is not None or has_margin_carry):
@@ -452,9 +524,10 @@ def main() -> None:
             completed_session_dates=completed,
             expected_markets=markets,
         )
-        if int(price_validation.get("unverified_interior_rows") or 0) != 0:
+        if (int(price_validation.get("unverified_opening_rows") or 0) != 0
+                or int(price_validation.get("unverified_interior_rows") or 0) != 0):
             raise RuntimeError(
-                "minute-curve rebuild left unverified interior strategy prices: "
+                "minute-curve rebuild left unverified opening/interior strategy prices: "
                 f"{price_validation['unverified_sample']}"
             )
         benchmark_validation = _validate_benchmarks(

@@ -484,7 +484,9 @@ def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None)
             prior_receipt = _valid_receipt(args.output_dir, trading_date)
             refresh_fields = retry_metadata(prior_receipt, empty=frame.is_empty(),
                                             positive_activity=trading_date in positive_dates)
-            refresh_fields['session_finalized'] = futures_date_is_closed(trading_date)
+            refresh_fields['session_finalized'] = futures_date_is_closed(
+                trading_date, contract=str(args.contract)
+            )
             if frame.is_empty():
                 current_usage = api.usage()
                 usage = int(current_usage.bytes), int(current_usage.limit_bytes)

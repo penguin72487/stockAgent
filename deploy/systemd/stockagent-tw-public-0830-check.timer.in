@@ -9,13 +9,14 @@ OnCalendar=Mon..Fri *-*-* 08:20:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:24:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:27:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:29:00 Asia/Taipei
-# Keep bounded weekday catch-up points after the deadline so a late official
-# source or reboot repairs the same session instead of waiting until Monday.
+# Keep bounded weekday catch-up points after the deadline. A full audit at
+# 09:00:05/09:05 cannot improve the already-open 09:00 causal decision and can
+# evict hot panel caches or contend with the signal/executor. Resume it only
+# after the protected opening window; new post-open data is for the next trade.
 OnCalendar=Mon..Fri *-*-* 08:35:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:45:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:55:00 Asia/Taipei
-OnCalendar=Mon..Fri *-*-* 09:00:05 Asia/Taipei
-OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 09:10:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 09:15:00 Asia/Taipei
 AccuracySec=1s
 RandomizedDelaySec=0

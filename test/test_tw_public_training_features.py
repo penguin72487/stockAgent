@@ -12,7 +12,14 @@ from polars.testing import assert_frame_equal
 import pytest
 
 import stockagent.data.panel as panel_module
-from scripts.audit_tw_public_data_layer import audit_feature_build_receipt
+from scripts.audit_tw_public_data_layer import (
+    audit_feature_availability_contract,
+    audit_feature_build_receipt,
+    audit_feature_lineage_registry,
+    audit_release_vintage_contract,
+)
+from scripts.build_tw_public_training_features import _writer_lock_path
+from stockagent.config import load_config
 from stockagent.data.panel import build_panel, build_tail_panel
 from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
@@ -22,15 +29,213 @@ from stockagent.data.tw_public_features import (
     _build_margin_features,
     _build_official_ohlcv_features,
     _build_tdcc_features,
+    _build_material_info_features,
+    _build_cbc_monthly_macro_features,
+    _build_cbc_overnight_rate_features,
+    _build_dgbas_macro_features,
+    _merge_feature_frames,
+    _next_exchange_session_lookup,
+    _material_info_available_date_expr,
     _build_twse_market_index_features,
     _snapshot_date_expr,
+    _snapshot_not_before_expr,
+    _source_content_receipts,
     build_tw_public_training_features,
 )
+
+
+def test_feature_writer_lock_uses_resolved_output_identity(tmp_path: Path) -> None:
+    live = tmp_path / "live"
+    live.mkdir()
+    alias = tmp_path / "data_tw_public"
+    alias.symlink_to(live, target_is_directory=True)
+    assert _writer_lock_path(alias / "features.parquet") == _writer_lock_path(
+        live / "features.parquet"
+    )
+
+
+def test_supplemental_cbc_receipt_keeps_relative_path(tmp_path: Path) -> None:
+    supplemental = tmp_path / "supplemental"
+    supplemental.mkdir()
+    pq.write_table(pa.table({"rate": [1.0]}), supplemental / "cbc_overnight_official_pages.parquet")
+
+    receipts = _source_content_receipts(tmp_path)
+
+    assert receipts[-1]["name"] == "supplemental/cbc_overnight_official_pages.parquet"
+    assert receipts[-1]["sha256"]
+
+
+def test_background_catalog_updates_do_not_invalidate_training_feature_sources(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "twse_daily_ohlcv.parquet"
+    gcis = tmp_path / "gcis_open_data_catalog.parquet"
+    fsc = tmp_path / "fsc_open_data_catalog.parquet"
+    source.write_bytes(b"official-day-one")
+    gcis.write_bytes(b"catalog-one")
+    fsc.write_bytes(b"catalog-one")
+    original = _source_content_receipts(tmp_path)
+    assert [item["name"] for item in original] == [source.name]
+
+    gcis.write_bytes(b"catalog-two")
+    fsc.write_bytes(b"catalog-two")
+    assert _source_content_receipts(tmp_path) == original
+
+    source.write_bytes(b"official-day-two")
+    assert _source_content_receipts(tmp_path) != original
+
+
+def test_raw_preopen_feature_selection_has_one_causal_availability_class() -> None:
+    config = load_config("configs/markets/tw_public_preopen_raw_v1.yaml")
+    summary, findings = audit_feature_availability_contract(config)
+    assert len(config.data.feature_include) == 22
+    assert summary["unclassified_active_features"] == []
+    assert summary["classification_overlaps"] == []
+    assert summary["missing_required_shifts"] == []
+    assert summary["unexpected_panel_shifts"] == []
+    assert findings == []
+    assert audit_feature_lineage_registry(config) == []
+
+
+def test_long_history_raw_preopen_excludes_later_starting_families() -> None:
+    config = load_config("configs/markets/tw_public_preopen_raw_long_history_v1.yaml")
+    summary, findings = audit_feature_availability_contract(config)
+    assert len(config.data.feature_include) == 15
+    assert config.walk_forward.expected_first_year == 2005
+    assert all(not name.startswith(("twpub_pe_", "twpub_pb_", "twpub_foreign_"))
+               for name in config.data.feature_include)
+    assert summary["missing_required_shifts"] == []
+    assert summary["unclassified_active_features"] == []
+    assert findings == []
+    assert audit_feature_lineage_registry(config) == []
+
+
+def test_2014_original_value_contract_accepts_full_horizon() -> None:
+    config = load_config("configs/markets/tw_public_preopen_raw_2014_v1.yaml")
+    summary, findings = audit_feature_availability_contract(config)
+    assert config.walk_forward.expected_first_year == 2014
+    assert len(config.data.feature_include) == 27
+    assert len(summary["release_vintage_active_features"]) == 6
+    assert not findings
+    assert not audit_feature_lineage_registry(config)
+
+
+def test_cbc_missing_2000_release_does_not_block_2014_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.audit_tw_official_release_archives as archive_audit
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "cbc_money_release_vintages.json").write_text(json.dumps({
+        "earliest_period": "1999-12", "latest_period": "2026-07",
+        "missing_periods": ["2000-06"], "value_history_complete": False,
+    }))
+    monkeypatch.setattr(archive_audit, "audit_one", lambda root, name: {
+        "integrity_ok": True, "coverage_complete": True,
+        "saved_releases": 321, "registered_releases": 321, "errors": [],
+    })
+    config = load_config("configs/markets/tw_public_preopen_raw_2014_v1.yaml")
+    config.data.feature_include = ["twpub_cbc_m1b_yoy_pct_raw"]
+    assert audit_release_vintage_contract(tmp_path, config) == []
+    (state / "cbc_money_release_vintages.json").write_text(json.dumps({
+        "earliest_period": "1999-12", "latest_period": "2026-07",
+        "missing_periods": ["2019-06"], "value_history_complete": False,
+    }))
+    assert any(f.item == "cbc_money_release_vintages"
+               for f in audit_release_vintage_contract(tmp_path, config))
+
+
+def test_dgbas_original_value_gap_blocks_2014_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.audit_tw_official_release_archives as archive_audit
+
+    monkeypatch.setattr(archive_audit, "audit_one", lambda root, name: {
+        "integrity_ok": True, "coverage_complete": True,
+        "saved_releases": 1, "registered_releases": 1, "errors": [],
+    })
+    pl.DataFrame({
+        "source": ["cpi"], "period": ["2013-01"],
+        "metric": ["cpi_yoy_pct"], "value_pct": [1.0],
+        "value_evidence": ["official_release_headline"],
+        "published_on": ["2013-02-06"], "html_sha256": ["original"],
+    }).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    config = load_config("configs/markets/tw_public_preopen_raw_2014_v1.yaml")
+    config.data.feature_include = ["twpub_dgbas_cpi_yoy_pct_raw"]
+    assert any(f.item == "dgbas_release_vintages"
+               for f in audit_release_vintage_contract(tmp_path, config))
+
+
+def test_release_feature_receipt_ignores_html_rewrap_but_tracks_value_and_clock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "dgbas_release_vintages.parquet"
+    row = {
+        "source": ["gdp"], "period": ["2013-Q1"], "published_on": ["2013-04-30"],
+        "release_id": ["1"], "release_kind": ["article"],
+        "metric": ["gdp_yoy_pct"], "value_pct": [1.54],
+        "value_evidence": ["official_release_headline"],
+        "published_time_precision": ["official_document_time"],
+        "published_clock_taipei": ["08:30:00"],
+        "html_sha256": ["first"], "observed_at_utc": ["2026-09-17T01:00:00Z"],
+    }
+    pl.DataFrame(row).write_parquet(path)
+    first = _source_content_receipts(tmp_path)
+    row["html_sha256"] = ["second"]
+    row["observed_at_utc"] = ["2026-09-17T02:00:00Z"]
+    pl.DataFrame(row).write_parquet(path)
+    assert _source_content_receipts(tmp_path) == first
+    row["value_pct"] = [1.55]
+    pl.DataFrame(row).write_parquet(path)
+    assert _source_content_receipts(tmp_path) != first
+    row["value_pct"] = [1.54]
+    row["published_clock_taipei"] = ["16:00:00"]
+    pl.DataFrame(row).write_parquet(path)
+    assert _source_content_receipts(tmp_path) != first
+
+
+def test_cbc_release_feature_receipt_ignores_html_rewrap_only(tmp_path: Path) -> None:
+    path = tmp_path / "cbc_fx_reserve_release_vintages.parquet"
+    row = {
+        "period": ["2024-08"], "published_on": ["2024-09-06"],
+        "metric": ["fx_reserves_usd_100m"], "value": [6019.04],
+        "value_evidence": ["original_press_release_text"],
+        "html_sha256": ["first"], "observed_at_utc": ["2026-09-17T01:00:00Z"],
+    }
+    pl.DataFrame(row).write_parquet(path)
+    first = _source_content_receipts(tmp_path)
+    row["html_sha256"] = ["second"]
+    pl.DataFrame(row).write_parquet(path)
+    assert _source_content_receipts(tmp_path) == first
+    row["value"] = [6019.05]
+    pl.DataFrame(row).write_parquet(path)
+    assert _source_content_receipts(tmp_path) != first
+
+
+def test_cbc_current_overnight_page_waits_until_first_observed_session(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-05-10", "2024-05-13", "2024-05-14"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    supplemental = tmp_path / "supplemental"
+    supplemental.mkdir()
+    pl.DataFrame([
+        {"subject_date": "2024-05-10", "rate_pct": 0.8, "status": "ok",
+         "observed_at_utc": "2024-05-13T00:00:00+00:00"},
+        {"subject_date": "2024-05-13", "rate_pct": 0.9, "status": "ok",
+         "observed_at_utc": "2024-05-13T08:00:00+00:00"},
+    ]).write_parquet(supplemental / "cbc_overnight_official_pages.parquet")
+    result = _build_cbc_overnight_rate_features(tmp_path, market_symbol="__MARKET__")
+    assert result.get_column("date").to_list() == [date(2024, 5, 13), date(2024, 5, 14)]
+    assert result.get_column("twpub_cbc_overnight_rate").to_list() == pytest.approx([0.008, 0.009])
 
 
 def test_tdcc_canonical_mirror_supersedes_overlap_and_direct_keeps_history(
     tmp_path: Path,
 ) -> None:
+    pl.DataFrame({"date": ["2024-01-05", "2024-01-08", "2024-01-12", "2024-01-15"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
     pl.DataFrame(
         {
             "\ufeff資料日期": ["20240101", "20240108"],
@@ -38,6 +243,7 @@ def test_tdcc_canonical_mirror_supersedes_overlap_and_direct_keeps_history(
             "持股分級": ["1", "1"],
             "人數": ["5", "10"],
             "占集保庫存數比例%": ["5.0", "10.0"],
+            "_downloaded_at_utc": ["2024-01-05T06:00:00+00:00", "2024-01-12T06:00:00+00:00"],
         }
     ).write_parquet(tmp_path / "tdcc_shareholding_distribution.parquet")
     pl.DataFrame(
@@ -47,6 +253,7 @@ def test_tdcc_canonical_mirror_supersedes_overlap_and_direct_keeps_history(
             "持股分級": ["1"],
             "人數": ["20"],
             "占集保庫存數比例%": ["20.0"],
+            "_downloaded_at_utc": ["2024-01-12T07:00:00+00:00"],
         }
     ).write_parquet(tmp_path / "data_gov_tdcc_shareholding_distribution.parquet")
 
@@ -163,7 +370,12 @@ def test_post_close_chip_history_moves_to_next_verified_exchange_session(
         0, named=True
     )
     assert margin_source["twpub_margin_balance_log"] is None
+    assert margin_source["twpub_margin_balance_lots_raw"] is None
     assert margin_source["_twpub_margin_short_evidence_next_session"] == 1.0
+    assert margin_available["twpub_margin_balance_lots_raw"] == 120.0
+    assert margin_available["twpub_short_balance_lots_raw"] == 12.0
+    assert margin_available["twpub_margin_buy_lots_raw"] == 30.0
+    assert margin_available["twpub_short_sell_lots_raw"] == 4.0
     assert margin_available["twpub_margin_balance_log"] == pytest.approx(
         np.log1p(120)
     )
@@ -172,6 +384,47 @@ def test_post_close_chip_history_moves_to_next_verified_exchange_session(
     assert institutional.row(0, named=True)[
         "twpub_investment_trust_net_buy_flow"
     ] == pytest.approx(np.arcsinh(200 / 1000.0))
+    assert institutional.row(0, named=True)["twpub_dealer_net_buy_shares_raw"] == -50.0
+    assert institutional.row(0, named=True)["twpub_foreign_net_buy_shares_raw"] == 1000.0
+
+
+def test_twse_legacy_foreign_header_is_preserved_in_raw_and_engineered_history(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame({"date": ["2017-12-28", "2017-12-29"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame(
+        {
+            "date": ["2017-12-28"],
+            "證券代號": ["2330"],
+            "外資買賣超股數": ["-1,250"],
+            "投信買賣超股數": ["0"],
+            "自營商買賣超股數": ["0"],
+            "三大法人買賣超股數": ["-1,250"],
+        }
+    ).write_parquet(tmp_path / "twse_institutional_trades.parquet")
+    row = _build_institutional_features(tmp_path).row(0, named=True)
+    assert row["date"] == date(2017, 12, 29)
+    assert row["twpub_foreign_net_buy_shares_raw"] == -1250.0
+    assert row["twpub_foreign_net_buy_flow"] == pytest.approx(
+        -np.arcsinh(1.25)
+    )
+
+
+def test_next_session_can_be_proved_before_its_index_close(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-01-05"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    for market in ("twse", "tpex"):
+        pl.DataFrame({"date": ["2024-01-08"], "證券代號": ["2330"]}).write_parquet(
+            tmp_path / f"{market}_day_trade_eligibility.parquet"
+        )
+    lookup = _next_exchange_session_lookup(tmp_path)
+    assert lookup.to_dicts() == [{
+        "_source_date": date(2024, 1, 5),
+        "_available_date": date(2024, 1, 8),
+    }]
 
 
 def test_margin_short_capacity_is_exactly_next_session_and_never_forward_filled(
@@ -323,6 +576,36 @@ def _write_symbol(path: Path, closes: list[float]) -> None:
     pq.write_table(table, path)
 
 
+def test_raw_preopen_panel_shifts_daily_values_once_but_not_pre_shifted_chip(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "symbol": ["2330", "2330"],
+            "twpub_pe_raw": [20.5, None],
+            # This is the source-day 01-02 chip value already relabelled 01-03.
+            "twpub_margin_balance_lots_raw": [None, 120.0],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["open_raw", "twpub_pe_raw", "twpub_margin_balance_lots_raw"],
+        feature_shift_next_session=["open_raw", "twpub_pe_raw"],
+    )
+    assert panel.feature_names == ["open_raw", "twpub_pe_raw", "twpub_margin_balance_lots_raw"]
+    np.testing.assert_allclose(panel.features[0, 0], [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(panel.features[1, 0], [99.0, 20.5, 120.0])
+
+
 def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path: Path) -> None:
     input_dir = tmp_path / "tw_public"
     input_dir.mkdir()
@@ -364,8 +647,12 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     ).write_parquet(input_dir / "tpex_margin_balance.parquet")
     pl.DataFrame(
         {
-            "日期": ["20240102", "20240103"],
+            "日期": ["20240101", "20240102"],
             "NTD/USD": ["31.0", "31.31"],
+            "_downloaded_at_utc": [
+                "2024-01-02T00:59:00+00:00",
+                "2024-01-03T00:59:00+00:00",
+            ],
         }
     ).write_parquet(input_dir / "cbc_usdtwd_closing_rate.parquet")
     pl.DataFrame(
@@ -394,11 +681,20 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     assert stock.filter(pl.col("date") == date(2024, 1, 2)).row(0, named=True)[
         "twpub_pe_log"
     ] is not None
+    first_stock = stock.filter(pl.col("date") == date(2024, 1, 2)).row(0, named=True)
+    assert first_stock["twpub_pe_raw"] == 20.5
+    assert first_stock["twpub_pb_raw"] == 5.2
+    assert first_stock["twpub_dividend_yield_pct_raw"] == 2.5
     assert stock.filter(pl.col("date") == date(2024, 1, 3)).row(0, named=True)[
         "twpub_margin_balance_log"
     ] is not None
+    assert stock.filter(pl.col("date") == date(2024, 1, 3)).row(0, named=True)[
+        "twpub_margin_balance_lots_raw"
+    ] == 1050.0
     market = out.filter(pl.col("symbol") == DEFAULT_MARKET_SYMBOL).sort("date")
     assert market.height == 2
+    assert market["twpub_twse_taiex_raw"].to_list() == [100.5, 101.5]
+    assert market["twpub_usdtwd_raw"][1] == 31.31
     assert market["twpub_usdtwd_logret_1d"][1] is not None
     summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
     assert summary["source_receipts"]
@@ -464,9 +760,11 @@ def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
         end_date=date(2024, 1, 4),
     )
 
-    assert incremental.build_mode == "incremental_tail"
-    assert incremental.incremental_start_date == "2024-01-03"
-    assert incremental.reused_rows == 1
+    # A changed source parquet could contain corrections before the tail.
+    # Without a per-partition proof, a full rebuild is required.
+    assert incremental.build_mode == "full"
+    assert incremental.incremental_start_date is None
+    assert incremental.reused_rows == 0
     assert incremental.rows == full.rows
     assert_frame_equal(
         pl.read_parquet(incremental_path),
@@ -474,6 +772,33 @@ def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
         check_row_order=True,
         check_column_order=True,
     )
+    prior_identity = incremental_path.stat()
+    prior_summary = incremental_path.with_suffix(".summary.json").stat()
+    unchanged = build_tw_public_training_features(
+        input_dir,
+        incremental_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 4),
+        incremental_start_date=date(2024, 1, 3),
+    )
+    assert unchanged.build_mode == "unchanged_verified"
+    assert unchanged.reused_rows == incremental.rows
+    assert incremental_path.stat().st_ino == prior_identity.st_ino
+    assert incremental_path.stat().st_mtime_ns == prior_identity.st_mtime_ns
+    assert incremental_path.with_suffix(".summary.json").stat().st_mtime_ns == prior_summary.st_mtime_ns
+
+    # The same bytes with a different causal-lag policy are not equivalent.
+    rebuilt = build_tw_public_training_features(
+        input_dir,
+        incremental_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 4),
+        allow_daily_publication_lag=True,
+    )
+    assert rebuilt.build_mode == "full"
+    assert json.loads(incremental_path.with_suffix(".summary.json").read_text())[
+        "allow_daily_publication_lag"
+    ] is True
 
 
 def test_tw_public_feature_builder_excludes_rows_after_completed_cutoff(
@@ -528,6 +853,9 @@ def test_legacy_tpex_quote_statistics_feed_public_features_without_fabricating_p
 
     first = output.row(0, named=True)
     assert first["_twpub_official_traded"] == 1.0
+    assert first["twpub_official_trading_volume_raw"] == 240
+    assert first["twpub_official_trading_value_raw"] == 6408
+    assert first["twpub_official_trades_raw"] == 1
     assert first["twpub_official_trading_volume_log"] == pytest.approx(np.log1p(240))
     assert first["twpub_official_trading_value_log"] == pytest.approx(np.log1p(6408))
     assert first["twpub_official_trades_log"] == pytest.approx(np.log1p(1))
@@ -571,6 +899,7 @@ def test_taiex_monthly_archive_is_complete_base_and_ind_has_same_day_priority(
     ]
     assert output.get_column("symbol").unique().to_list() == [DEFAULT_MARKET_SYMBOL]
     assert output.get_column("_twpub_official_traded").to_list() == [1.0, 1.0, 1.0]
+    assert output.get_column("twpub_twse_taiex_raw").to_list() == [100.0, 101.0, 102.0]
     assert output.get_column("twpub_twse_taiex_pct").to_list()[1:] == pytest.approx(
         [0.015, 0.0099]
     )
@@ -821,6 +1150,32 @@ def test_build_panel_zero_fill_keeps_feature_slots_and_zeros_matching_values(tmp
     )
     assert np.count_nonzero(zero_filled_again.features[:, :, 1:]) == 0
     assert len(list((cache_dir / "generations").iterdir())) == 2
+
+
+def test_panel_cache_reuses_canonical_source_behind_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(source, target_is_directory=True)
+    _write_symbol(source / "2330_features.parquet", [100.0, 101.0, 102.0])
+    pl.DataFrame({
+        "date": ["2024-01-02"],
+        "symbol": [DEFAULT_MARKET_SYMBOL],
+        "twpub_usdtwd_logret_1d": [0.01],
+    }).write_parquet(source / "external.parquet")
+    kwargs = {
+        "benchmark_name": "2330", "panel_backend": "pyarrow",
+        "panel_load_workers": 0,
+        "feature_include": ["close_logret_1d", "twpub_usdtwd_logret_1d"],
+    }
+    first = build_panel(
+        source, external_feature_path=source / "external.parquet", **kwargs
+    )
+    second = build_panel(
+        alias, external_feature_path=alias / "external.parquet", **kwargs
+    )
+    np.testing.assert_array_equal(first.features, second.features)
+    assert len(list((source / "panel_cache_v2" / "generations").iterdir())) == 1
 
 
 def test_market_point_in_time_state_is_forward_filled_after_release(tmp_path: Path) -> None:
@@ -1846,11 +2201,129 @@ def test_point_in_time_financial_features_forward_fill_only_after_publication(tm
     assert panel.features[2, symbol_idx, feature_idx] == np.float32(0.25)
 
 
+def test_sparse_xbrl_state_has_availability_channel_and_daily_missing_stays_missing(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame({
+        "date": ["2024-01-03"],
+        "symbol": ["2330"],
+        "twpub_xbrl_assets_twd_raw": [0.0],
+        "twpub_pe_raw": [0.0],
+    }).write_parquet(external_path)
+    kwargs = dict(
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["twpub_xbrl_assets_twd_raw", "twpub_pe_raw"],
+        feature_availability_indicators=["twpub_xbrl_*", "twpub_pe_raw"],
+        feature_shift_next_session=["twpub_pe_raw"],
+    )
+    panel = build_panel(tmp_path, **kwargs)
+    asset = panel.feature_names.index("twpub_xbrl_assets_twd_raw")
+    asset_available = panel.feature_names.index("twpub_xbrl_assets_twd_raw__available")
+    pe_available = panel.feature_names.index("twpub_pe_raw__available")
+    assert np.all(panel.features[:, 0, asset] == 0.0)
+    assert panel.features[:, 0, asset_available].tolist() == [0.0, 1.0, 1.0]
+    assert panel.features[:, 0, pe_available].tolist() == [0.0, 0.0, 1.0]
+    cached = build_panel(tmp_path, **kwargs)
+    assert cached.feature_names == panel.feature_names
+    assert np.array_equal(cached.features, panel.features)
+
+
+def test_retired_tifrs_state_expires_without_changing_m2_carry() -> None:
+    dates = np.array(["2018-01-01", "2018-06-01", "2019-03-01"], dtype="datetime64[D]")
+    values = np.array([
+        [100.0, 10.0], [np.nan, np.nan], [np.nan, np.nan],
+    ])
+    names = ["twpub_xbrl_tifrs_operating_revenue_twd_ytd_raw", "twpub_cbc_m2_raw"]
+    panel_module._forward_fill_point_in_time_features(
+        values, names, dates.astype(np.int64),
+    )
+    assert values[1].tolist() == [100.0, 10.0]
+    assert np.isnan(values[2, 0])
+    assert values[2, 1] == 10.0
+    seeded = np.full((2, 2), np.nan)
+    seed_panel_dates = np.array(["2019-01-01", "2020-03-01"], dtype="datetime64[D]")
+    seed_days = panel_module._seed_point_in_time_features_before_panel_start(
+        seeded, names,
+        seed_panel_dates,
+        np.array(["2018-12-31"], dtype="datetime64[D]"),
+        np.array([[100.0, 10.0]]),
+    )
+    assert seeded[0, 0] == 100.0
+    assert seeded[0, 1] == 10.0
+    assert seed_days[0] == np.datetime64("2018-12-31", "D").astype(np.int64)
+    panel_module._forward_fill_point_in_time_features(
+        seeded, names, seed_panel_dates.astype(np.int64), seed_days,
+    )
+    assert np.isnan(seeded[1, 0])
+    assert seeded[1, 1] == 10.0
+    stale_seed = np.full((2, 2), np.nan)
+    panel_module._seed_point_in_time_features_before_panel_start(
+        stale_seed, names,
+        np.array(["2019-03-01", "2019-03-04"], dtype="datetime64[D]"),
+        np.array(["2018-01-01"], dtype="datetime64[D]"),
+        np.array([[100.0, 10.0]]),
+    )
+    assert np.isnan(stale_seed[0, 0])
+    assert stale_seed[0, 1] == 10.0
+
+
+def test_tifrs_carry_version_only_changes_relevant_panel_cache(tmp_path: Path) -> None:
+    source = tmp_path / "research.parquet"
+    pl.DataFrame({
+        "twpub_xbrl_tifrs_operating_revenue_twd_ytd_raw": [1.0],
+        "twpub_cbc_m2_raw": [2.0],
+    }).write_parquet(source)
+    assert panel_module._tifrs_carry_cache_contract(
+        source, ("twpub_xbrl_tifrs_*",), (),
+    ) == "tifrs_carry_v2_days=400|"
+    assert panel_module._tifrs_carry_cache_contract(
+        source, ("twpub_cbc_m2_raw",), (),
+    ) == ""
+
+
+def test_tifrs_expiry_updates_model_availability_mask(tmp_path: Path) -> None:
+    dates = np.array(["2018-01-02", "2018-06-01", "2019-03-01"], dtype="datetime64[D]")
+    close = np.array([100.0, 101.0, 102.0])
+    pq.write_table(pa.table({
+        "date": pa.array(dates),
+        "open": pa.array(close), "max": pa.array(close),
+        "min": pa.array(close), "close": pa.array(close),
+        "adjclose": pa.array(close),
+        "Trading_Volume": pa.array(np.full(3, 1000.0)),
+    }), tmp_path / "2330_features.parquet")
+    external = tmp_path / "external.parquet"
+    old_name = "twpub_xbrl_tifrs_operating_revenue_twd_ytd_raw"
+    pl.DataFrame({
+        "date": [date(2017, 12, 31)], "symbol": ["2330"],
+        old_name: [100.0], "twpub_cbc_m2_raw": [10.0],
+    }).write_parquet(external)
+    panel = build_panel(
+        tmp_path, benchmark_name="universe_average_return",
+        tradable_mode="tradable", trading_volume_policy="required",
+        panel_backend="pyarrow", panel_load_workers=0,
+        external_feature_path=external,
+        feature_include=[old_name, "twpub_cbc_m2_raw"],
+        feature_availability_indicators=[old_name, "twpub_cbc_m2_raw"],
+    )
+    old_available = panel.feature_names.index(f"{old_name}__available")
+    m2_available = panel.feature_names.index("twpub_cbc_m2_raw__available")
+    assert panel.features[:, 0, old_available].tolist() == [1.0, 1.0, 0.0]
+    assert panel.features[:, 0, m2_available].tolist() == [1.0, 1.0, 1.0]
+
+
 def test_snapshot_date_never_precedes_archived_vintage() -> None:
     frame = pl.DataFrame(
         {
             "出表日期": ["2024-05-10", "2024-07-12"],
             "_as_of_date": ["2024-07-11", "2024-07-11"],
+            "_downloaded_at_utc": ["2024-07-11T00:59:59+00:00", "2024-07-11T00:59:59+00:00"],
         }
     )
 
@@ -1859,3 +2332,232 @@ def test_snapshot_date_never_precedes_archived_vintage() -> None:
     ).get_column("available_date")
 
     assert dates.to_list() == [date(2024, 7, 11), date(2024, 7, 12)]
+
+
+def test_snapshot_response_at_or_after_open_is_next_session() -> None:
+    frame = pl.DataFrame(
+        {
+            "出表日期": ["2024-01-05"] * 3,
+            "_as_of_date": ["2024-01-05"] * 3,
+            "_downloaded_at_utc": [
+                "2024-01-05T00:59:59+00:00",
+                "2024-01-05T01:00:00+00:00",
+                "2024-01-05T01:00:01+00:00",
+            ],
+        }
+    )
+    assert frame.select(_snapshot_date_expr(set(frame.columns)).alias("date"))["date"].to_list() == [
+        date(2024, 1, 5), date(2024, 1, 6), date(2024, 1, 6)
+    ]
+
+
+def test_event_effective_date_cannot_precede_observed_snapshot() -> None:
+    frame = pl.DataFrame({
+        "出表日期": ["2024-01-05"],
+        "_downloaded_at_utc": ["2024-01-05T01:05:00+00:00"],
+        "_as_of_date": ["2024-01-05"],
+    })
+    assert frame.select(
+        _snapshot_not_before_expr(
+            set(frame.columns), pl.lit(date(2024, 1, 4))
+        ).alias("date")
+    )["date"].to_list() == [date(2024, 1, 6)]
+
+
+def test_material_info_speaking_clock_and_weekend_session(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-01-05", "2024-01-08"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame(
+        {
+            "發言日期": ["1130105"] * 3,
+            "發言時間": ["085959", "090000", "170000"],
+            "事實發生日": ["1130104"] * 3,
+            "公司代號": ["2330"] * 3,
+            "符合條款": ["1"] * 3,
+        }
+    ).write_parquet(tmp_path / "twse_listed_material_info.parquet")
+    result = _build_material_info_features(tmp_path).sort("date")
+    assert result["date"].to_list() == [date(2024, 1, 5), date(2024, 1, 8)]
+    assert result["twpub_material_event_count_log"].to_list() == pytest.approx(
+        [np.log(2), np.log(3)]
+    )
+
+
+def test_material_info_colon_clock_and_invalid_clock_fail_closed() -> None:
+    frame = pl.DataFrame({
+        "發言日期": ["1130105"] * 3,
+        "發言時間": ["08:59:59", "09:00", "unknown"],
+    })
+    assert frame.select(
+        _material_info_available_date_expr(set(frame.columns)).alias("date")
+    )["date"].to_list() == [date(2024, 1, 5), date(2024, 1, 6), None]
+
+
+def test_monthly_period_is_not_a_release_receipt(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-02-07", "2024-02-08"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame(
+        {
+            "日期": ["2024.01"] * 3, "金額": ["100", "110", "120"],
+            "_downloaded_at_utc": [
+                "2024-02-07T00:00:00+00:00",
+                "2024-02-07T00:30:00+00:00",
+                "2024-02-07T01:05:00+00:00",
+            ],
+        }
+    ).write_parquet(tmp_path / "cbc_fx_reserves.parquet")
+    result = _build_cbc_monthly_macro_features(
+        tmp_path, market_symbol="__MARKET__"
+    ).sort("date")
+    assert result["date"].to_list() == [date(2024, 2, 7), date(2024, 2, 8)]
+    assert result["twpub_cbc_fx_reserves_log"].to_list() == pytest.approx(
+        [np.log(110), np.log(120)]
+    )
+
+
+def test_official_cbc_reserve_release_restores_original_value_next_session(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-09-06", "2024-09-09"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame({
+        "period": ["2024-08"], "published_on": ["2024-09-06"],
+        "metric": ["fx_reserves_usd_100m"], "value": [6019.04],
+        "value_evidence": ["original_press_release_text"], "html_sha256": ["abc"],
+    }).write_parquet(tmp_path / "cbc_fx_reserve_release_vintages.parquet")
+    result = _build_cbc_monthly_macro_features(tmp_path, market_symbol="__MARKET__")
+    assert result["date"].to_list() == [date(2024, 9, 9)]
+    assert result["twpub_cbc_fx_reserves_log"].to_list() == pytest.approx([np.log(601.904)])
+    assert result["twpub_cbc_fx_reserves_usd_billion_raw"].to_list() == pytest.approx([601.904])
+
+
+def test_conflicting_same_day_cbc_reserve_values_fail_closed(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-09-09"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame({
+        "period": ["2024-08", "2024-08"],
+        "published_on": ["2024-09-06", "2024-09-06"],
+        "metric": ["fx_reserves_usd_100m"] * 2,
+        "value": [6019.04, 6020.0],
+        "value_evidence": ["original_press_release_text"] * 2,
+        "html_sha256": ["abc", "def"],
+    }).write_parquet(tmp_path / "cbc_fx_reserve_release_vintages.parquet")
+    with pytest.raises(ValueError, match="conflicting same-day CBC"):
+        _build_cbc_monthly_macro_features(tmp_path, market_symbol="__MARKET__")
+
+
+def test_official_dgbas_release_headlines_recover_causal_history(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-09-06", "2024-09-09", "2024-09-10"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame(
+        {
+            "source": ["cpi", "unemployment", "gdp"],
+            "period": ["2024-08", "2024-08", "2024-Q2"],
+            "published_on": ["2024-09-06"] * 3,
+            "release_id": ["1", "2", "3"],
+            "release_kind": ["article"] * 3,
+            "metric": ["cpi_yoy_pct", "unemployment_rate_pct", "gdp_yoy_pct"],
+            "value_pct": [-1.25, 3.39, 7.12],
+            "value_evidence": ["official_release_headline"] * 3,
+            "html_sha256": ["abc"] * 3,
+        }
+    ).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    result = _merge_feature_frames([
+        _build_dgbas_macro_features(tmp_path, market_symbol="__MARKET__")
+    ])
+    assert result["date"].to_list() == [date(2024, 9, 9)]
+    assert result["twpub_dgbas_cpi_yoy"].to_list() == pytest.approx([-0.0125])
+    assert result["twpub_dgbas_unemployment_rate"].to_list() == pytest.approx([0.0339])
+    assert result["twpub_dgbas_gdp_yoy"].to_list() == pytest.approx([0.0712])
+    assert result["twpub_dgbas_cpi_yoy_pct_raw"].to_list() == pytest.approx([-1.25])
+    assert result["twpub_dgbas_unemployment_pct_raw"].to_list() == pytest.approx([3.39])
+    assert result["twpub_dgbas_gdp_yoy_pct_raw"].to_list() == pytest.approx([7.12])
+
+
+def test_dgbas_original_unemployment_pdf_value_enters_next_verified_session(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2005-02-25", "2005-03-01"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame({
+        "source": ["unemployment"], "period": ["2005-01"],
+        "published_on": ["2005-02-25"], "release_id": ["1"],
+        "release_kind": ["article"], "metric": ["unemployment_rate_pct"],
+        "value_pct": [4.06], "value_evidence": ["original_attachment_unemployment_text"],
+        "html_sha256": ["abc"],
+    }).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    result = _build_dgbas_macro_features(tmp_path, market_symbol="__MARKET__")
+    assert result["date"].to_list() == [date(2005, 3, 1)]
+    assert result["twpub_dgbas_unemployment_rate"].to_list() == pytest.approx([0.0406])
+
+
+def test_original_dgbas_pdf_clock_controls_exact_opening_boundary(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-09-06", "2024-09-09"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame({
+        "source": ["cpi", "cpi"], "period": ["2024-07", "2024-08"],
+        "published_on": ["2024-09-06"] * 2,
+        "release_id": ["1", "2"], "release_kind": ["article"] * 2,
+        "metric": ["cpi_yoy_pct"] * 2, "value_pct": [1.0, 2.0],
+        "value_evidence": ["original_attachment_cpi_text"] * 2,
+        "html_sha256": ["abc", "def"],
+        "published_time_precision": ["official_document_time"] * 2,
+        "published_clock_taipei": ["08:59:59", "09:00:00"],
+    }).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    result = _build_dgbas_macro_features(tmp_path, market_symbol="__MARKET__").sort("date")
+    assert result["date"].to_list() == [date(2024, 9, 6), date(2024, 9, 9)]
+    assert result["twpub_dgbas_cpi_yoy"].to_list() == pytest.approx([0.01, 0.02])
+
+
+def test_dgbas_official_0830_schedule_uses_same_session_until_2017(tmp_path: Path) -> None:
+    pl.DataFrame({"date": [
+        "2017-05-05", "2017-05-08", "2017-07-05", "2017-07-06",
+    ]}).write_parquet(tmp_path / "twse_taiex_ohlc.parquet")
+    pl.DataFrame({
+        "source": ["cpi", "unemployment", "gdp", "gdp", "cpi", "cpi"],
+        "period": ["2017-04", "2017-04", "2017-Q1", "2016-Q4", "2017-06", "2017-03"],
+        "published_on": ["2017-05-05"] * 4 + ["2017-07-05", "2017-05-05"],
+        "release_id": ["1", "2", "3", "4", "5", "6"],
+        "release_kind": ["article"] * 6,
+        "title": ["物價", "失業率", "GDP 概估統計", "GDP 初步統計", "物價", "物價"],
+        "metric": ["cpi_yoy_pct", "unemployment_rate_pct", "gdp_yoy_pct", "gdp_yoy_pct", "cpi_yoy_pct", "cpi_yoy_pct"],
+        "value_pct": [1.0, 3.5, 2.0, 1.9, 1.5, 1.2],
+        "value_evidence": ["official_release_headline"] * 6,
+        "html_sha256": ["abc"] * 6,
+        "published_time_precision": ["official_date_only"] * 5 + ["official_document_time"],
+        "published_clock_taipei": [None] * 5 + ["16:00:00"],
+    }).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    result = _merge_feature_frames([
+        _build_dgbas_macro_features(tmp_path, market_symbol="__MARKET__")
+    ]).sort("date")
+    assert result["date"].to_list() == [
+        date(2017, 5, 5), date(2017, 5, 8), date(2017, 7, 6)
+    ]
+    assert result["twpub_dgbas_cpi_yoy"].to_list()[0] == pytest.approx(0.01)
+    assert result["twpub_dgbas_cpi_yoy"].to_list()[1] == pytest.approx(0.012)
+    assert result["twpub_dgbas_unemployment_rate"].to_list()[0] == pytest.approx(0.035)
+    assert result["twpub_dgbas_gdp_yoy"].to_list()[:2] == pytest.approx([0.02, 0.019])
+
+
+def test_conflicting_same_day_dgbas_headlines_fail_closed(tmp_path: Path) -> None:
+    pl.DataFrame({"date": ["2024-09-09"]}).write_parquet(
+        tmp_path / "twse_taiex_ohlc.parquet"
+    )
+    pl.DataFrame(
+        {
+            "source": ["cpi", "cpi"],
+            "period": ["2024-08", "2024-08"],
+            "published_on": ["2024-09-06", "2024-09-06"],
+            "release_id": ["1", "2"],
+            "release_kind": ["article", "article"],
+            "metric": ["cpi_yoy_pct", "cpi_yoy_pct"],
+            "value_pct": [1.0, 2.0],
+            "value_evidence": ["official_release_headline"] * 2,
+            "html_sha256": ["abc", "def"],
+        }
+    ).write_parquet(tmp_path / "dgbas_release_vintages.parquet")
+    with pytest.raises(ValueError, match="conflicting same-day DGBAS"):
+        _build_dgbas_macro_features(tmp_path, market_symbol="__MARKET__")

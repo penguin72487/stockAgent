@@ -181,6 +181,27 @@ def test_all_continuous_features_flow_through_low_rank_basis_bottleneck() -> Non
     assert torch.all(feature_gradient > 0.0)
 
 
+def test_raw_ohlcv_magnitude_and_signed_value_are_finite_with_basis() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        num_features=7,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    raw = torch.tensor(
+        [100.0, 105.0, 98.0, 103.0, 1_000_000.0, 1_000_000_000.0, -5.0],
+        dtype=torch.float32, device=device,
+    ).expand(1, 8, 7, 7).contiguous()
+    mask = torch.ones(1, 7, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        weights = model(raw, mask)
+    assert torch.isfinite(weights).all()
+
+
 def test_financial_transformer_panel_paths_match_materialized_windows() -> None:
     device = _device()
     model = _make_model(return_aux=False, return_aux_details=False).eval()

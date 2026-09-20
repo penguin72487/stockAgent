@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
@@ -124,6 +124,10 @@ ENTRY_FILL_POLICY_0901_MINUTE_PRICE: Final[str] = (
 REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE: Final[str] = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_"
     "minute_price_volume_capped_nav_counterfactual_v3"
+)
+REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
+    "retrospective_prior_paper_fill_else_09_01_minute_price_"
+    "full_target_no_liquidity_claim_v1"
 )
 EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
 HISTORICAL_MINUTE_MARK_CONTRACT: Final[str] = "right_labelled_historical_last_trade_mark_v1"
@@ -469,6 +473,23 @@ def _prepare_entry_plan(
     minute_price_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
     )
+    prior_fill = (
+        quote_values.get("historical_prior_paper_fill")
+        if spec.historical_full_fill_at_0901
+        else None
+    )
+    prior_fill = prior_fill if isinstance(prior_fill, Mapping) else None
+    prior_fill_at = _parse_timestamp(prior_fill.get("fill_at")) if prior_fill else None
+    prior_fill_price = _finite(prior_fill.get("price")) if prior_fill else None
+    if prior_fill and not (
+        prior_fill_at is not None
+        and prior_fill_at.utcoffset() == timedelta(hours=8)
+        and prior_fill_at.date() == observation_at.date()
+        and time(9, 0) <= prior_fill_at.timetz().replace(tzinfo=None) <= time(9, 1)
+        and prior_fill_price is not None
+        and prior_fill_price > 0
+    ):
+        raise ValueError("invalid retained historical paper fill")
     synthetic_fallback_fill = bool(
         spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
         and quote_values.get("entry_price_is_synthetic_fallback") is True
@@ -477,7 +498,7 @@ def _prepare_entry_plan(
     entry_price = (
         sizing_price
         if official_open_at_0901
-        else _finite(quote_values.get("execution_price_0901"))
+        else (prior_fill_price or _finite(quote_values.get("execution_price_0901")))
         if minute_price_at_0901
         else _finite(quote_values.get("ask" if side == "long" else "bid"))
     )
@@ -581,12 +602,21 @@ def _prepare_entry_plan(
             # blocked and is never replaced by the open, a carried last price,
             # a best quote, or an adverse tick.
             minute_kbar_capacity_shares = _minute_kbar_capacity_shares(quote_values, lot_size=spec.lot_size)
-            filled_shares = min(requested_shares, minute_kbar_capacity_shares)
-            reason = "counterfactual_observed_09_01_minute_price_fill"
-            if filled_shares <= 0:
-                status, reason = "blocked", "observed_09_01_minute_liquidity_unavailable"
-            elif filled_shares < requested_shares:
-                status, reason = "partial_depth", "observed_09_01_minute_capacity_exhausted"
+            if spec.historical_full_fill_at_0901:
+                # Retrospective scenario only: the minute supplies a price,
+                # never evidence that the requested size could have traded.
+                filled_shares = requested_shares
+                reason = (
+                    "counterfactual_full_target_from_prior_paper_fill"
+                    if prior_fill else "counterfactual_09_01_full_target_no_liquidity_claim"
+                )
+            else:
+                filled_shares = min(requested_shares, minute_kbar_capacity_shares)
+                reason = "counterfactual_observed_09_01_minute_price_fill"
+                if filled_shares <= 0:
+                    status, reason = "blocked", "observed_09_01_minute_liquidity_unavailable"
+                elif filled_shares < requested_shares:
+                    status, reason = "partial_depth", "observed_09_01_minute_capacity_exhausted"
         elif official_open_at_0901:
             # User-selected paper convention: at 09:01 use the already observed
             # official session open for both directions.  This is deterministic
@@ -680,8 +710,10 @@ def _prepare_entry_plan(
         "minute_kbar_capacity_shares": minute_kbar_capacity_shares,
         "entry_fill_policy": spec.entry_fill_policy,
         "entry_price_offset_ticks": int(spec.entry_price_offset_ticks),
-        "entry_price_source": quote_values.get("entry_price_source")
-        or (
+        "entry_price_source": (
+            str(prior_fill.get("entry_price_source") or "retained_prior_paper_fill")
+            if prior_fill else quote_values.get("entry_price_source")
+        ) or (
             "observed_right_labelled_09_01_minute_price"
             if minute_price_at_0901
             else
@@ -693,9 +725,13 @@ def _prepare_entry_plan(
         "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
         "paper_market_fill": market_at_best_else_tick and filled_shares > 0,
         "counterfactual_0901_price_fill": (
-            minute_price_at_0901 and filled_shares > 0
+            minute_price_at_0901 and not prior_fill and filled_shares > 0
         ),
-        "entry_price_method": quote_values.get("execution_price_0901_method"),
+        "prior_paper_fill_reused": bool(prior_fill and filled_shares > 0),
+        "prior_paper_fill_at": prior_fill_at.isoformat(timespec="seconds") if prior_fill_at else None,
+        "entry_price_method": (
+            "prior_paper_fill" if prior_fill else quote_values.get("execution_price_0901_method")
+        ),
         "counterfactual_open_price_fill": (official_open_at_0901 and filled_shares > 0),
     }
 
@@ -808,6 +844,7 @@ class ModeSpec:
     entry_fill_policy: str = ENTRY_FILL_POLICY_CAUSAL_BOOK
     entry_price_offset_ticks: int = 0
     realistic_execution: bool = True
+    historical_full_fill_at_0901: bool = False
     residual_margin_conversion: bool = False
     strict_intraday: bool = False
     odd_lot_execution_policy: str = "reject"
@@ -824,6 +861,8 @@ class ModeSpec:
         }
 
     def __post_init__(self) -> None:
+        if self.historical_full_fill_at_0901 and self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE:
+            raise ValueError("historical 09:01 full fill requires the 09:01 minute-price policy")
         if self.strict_intraday and not self.uses_realistic_execution:
             raise ValueError("strict intraday requires source-backed realistic execution")
         if self.odd_lot_execution_policy not in {"reject", "assumed_odd_lot_at_regular_board_price_v1"}:
@@ -1981,6 +2020,8 @@ class TwDayTradeSimulationEngine:
                         "valuation_source",
                         "entry_at",
                         "entry_price",
+                        "origin_entry_at",
+                        "origin_entry_price",
                         "roll_count",
                         "previous_contract_code",
                         "last_roll_at",
@@ -3443,6 +3484,8 @@ class TwDayTradeSimulationEngine:
                 mode, signal_id, "signal_not_current_session", observed
             )
         wall_time = observed.timetz().replace(tzinfo=None)
+        if spec.historical_full_fill_at_0901 and not counterfactual_open_replay:
+            raise ValueError("historical full-fill scenario is forbidden for live signals")
         if counterfactual_open_replay:
             if not bool(summary.get("simulation_replay")):
                 raise ValueError(
@@ -3453,7 +3496,9 @@ class TwDayTradeSimulationEngine:
                 "retrospective_actual_session_open_price_counterfactual"
                 if spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
                 else (
-                    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+                    (REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+                     if spec.historical_full_fill_at_0901
+                     else REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE)
                     if spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
                     else
                     "retrospective_official_session_open_at_09_01_counterfactual"
@@ -3865,7 +3910,8 @@ class TwDayTradeSimulationEngine:
             # funding, not the now-superseded flat-account preview quantity.
             if not int(plan["filled_shares"]):
                 for key in ("synthetic_fill", "synthetic_fallback_fill", "paper_market_fill",
-                            "counterfactual_0901_price_fill", "counterfactual_open_price_fill"):
+                            "counterfactual_0901_price_fill", "counterfactual_open_price_fill",
+                            "prior_paper_fill_reused"):
                     plan[key] = False
             row = plan["row"]
             symbol = plan["symbol"]
@@ -3884,6 +3930,12 @@ class TwDayTradeSimulationEngine:
             top_book_capacity_shares = int(plan["top_book_capacity_shares"])
             minute_kbar_capacity_shares = int(plan["minute_kbar_capacity_shares"])
             entry_price_source = plan["entry_price_source"]
+            prior_paper_fill_at = plan.get("prior_paper_fill_at")
+            effective_entry_at = (
+                str(prior_paper_fill_at)
+                if plan.get("prior_paper_fill_reused")
+                else observed.isoformat(timespec="seconds")
+            )
             offset_ticks = int(spec.price_limit_offset_ticks)
             filled_weight = (
                 (1.0 if side == "long" else -1.0)
@@ -3961,6 +4013,8 @@ class TwDayTradeSimulationEngine:
                 "counterfactual_0901_price_fill": bool(
                     plan["counterfactual_0901_price_fill"]
                 ),
+                "prior_paper_fill_reused": bool(plan.get("prior_paper_fill_reused")),
+                "prior_paper_fill_at": prior_paper_fill_at,
                 "counterfactual_open_price_fill": bool(
                     plan["counterfactual_open_price_fill"]
                 ),
@@ -4040,8 +4094,8 @@ class TwDayTradeSimulationEngine:
                 "lot_size": int(spec.lot_size),
                 "odd_lot_execution_policy": spec.odd_lot_execution_policy,
                 "entry_order_id": entry_order_id,
-                "entry_at": observed.isoformat(timespec="seconds"),
-                "entry_quote_at": quote.get("quote_at"),
+                "entry_at": effective_entry_at,
+                "entry_quote_at": effective_entry_at if prior_paper_fill_at else quote.get("quote_at"),
                 "historical_entry_quote_at": quote.get("historical_source_quote_at"),
                 "entry_price": entry_price,
                 "sizing_open_price": sizing_price,
@@ -4094,6 +4148,8 @@ class TwDayTradeSimulationEngine:
                 "counterfactual_0901_price_fill": bool(
                     plan["counterfactual_0901_price_fill"]
                 ),
+                "prior_paper_fill_reused": bool(plan.get("prior_paper_fill_reused")),
+                "prior_paper_fill_at": prior_paper_fill_at,
                 "counterfactual_open_price_fill": bool(
                     plan["counterfactual_open_price_fill"]
                 ),
@@ -4114,7 +4170,7 @@ class TwDayTradeSimulationEngine:
                 + entry_rebate
             )
             order_base = {
-                "recorded_at": observed.isoformat(timespec="seconds"),
+                "recorded_at": effective_entry_at,
                 "session_date": observed.date().isoformat(),
                 "market": spec.market,
                 "signal_market": spec.signal_market or spec.market,
@@ -4135,7 +4191,9 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "side": "buy" if side == "long" else "sell_short",
                     "order_type": (
-                        "PAPER_0901_MINUTE_PRICE"
+                        "PAPER_PRIOR_FILL_FULL_TARGET"
+                        if bool(plan.get("prior_paper_fill_reused"))
+                        else "PAPER_0901_MINUTE_PRICE"
                         if bool(plan["counterfactual_0901_price_fill"])
                         else "PAPER_OPEN_PRICE_0901"
                         if bool(plan["counterfactual_open_price_fill"])
@@ -4156,6 +4214,8 @@ class TwDayTradeSimulationEngine:
                     "counterfactual_0901_price_fill": bool(
                         plan["counterfactual_0901_price_fill"]
                     ),
+                    "prior_paper_fill_reused": bool(plan.get("prior_paper_fill_reused")),
+                    "prior_paper_fill_at": prior_paper_fill_at,
                     "counterfactual_open_price_fill": bool(
                         plan["counterfactual_open_price_fill"]
                     ),
@@ -4171,8 +4231,8 @@ class TwDayTradeSimulationEngine:
                     **order_base,
                     "order_id": entry_order_id,
                     "purpose": "entry",
-                    "fill_at": observed.isoformat(timespec="seconds"),
-                    "quote_at": quote.get("quote_at"),
+                    "fill_at": effective_entry_at,
+                    "quote_at": effective_entry_at if prior_paper_fill_at else quote.get("quote_at"),
                     "historical_source_quote_at": quote.get(
                         "historical_source_quote_at"
                     ),
@@ -4191,6 +4251,8 @@ class TwDayTradeSimulationEngine:
                     "counterfactual_0901_price_fill": bool(
                         plan["counterfactual_0901_price_fill"]
                     ),
+                    "prior_paper_fill_reused": bool(plan.get("prior_paper_fill_reused")),
+                    "prior_paper_fill_at": prior_paper_fill_at,
                     "counterfactual_open_price_fill": bool(
                         plan["counterfactual_open_price_fill"]
                     ),
@@ -4251,6 +4313,7 @@ class TwDayTradeSimulationEngine:
             and not bool(plan.get("synthetic_fill"))
             and not bool(plan.get("counterfactual_0901_price_fill"))
             and not bool(plan.get("counterfactual_open_price_fill"))
+            and not bool(plan.get("prior_paper_fill_reused"))
             for plan in plans
         )
         entry_synthetic_fallback_fill_count = sum(
@@ -4278,6 +4341,9 @@ class TwDayTradeSimulationEngine:
         )
         entry_0901_minute_price_fill_count = sum(
             bool(plan.get("counterfactual_0901_price_fill")) for plan in plans
+        )
+        entry_prior_paper_fill_reused_count = sum(
+            bool(plan.get("prior_paper_fill_reused")) for plan in plans
         )
         entry_fill_outcome = (
             "filled"
@@ -4310,6 +4376,7 @@ class TwDayTradeSimulationEngine:
         mode["entry_0901_minute_price_fill_count"] = (
             entry_0901_minute_price_fill_count
         )
+        mode["entry_prior_paper_fill_reused_count"] = entry_prior_paper_fill_reused_count
         mode["entry_fill_has_synthetic_fallback"] = bool(
             entry_synthetic_fallback_fill_count
         )
@@ -5567,8 +5634,17 @@ class TwDayTradeSimulationEngine:
             reduce = max(0, abs(held) - abs(target)) if held * target > 0 else abs(held)
             reduction_filled = 0
             if reduce:
+                # An old inventory reduction is not today's new entry. The
+                # retained entry-only paper fill may have occurred at 09:00,
+                # so it cannot price a 09:01 target-delta exit. Keep only the
+                # independently sourced 09:01 price for this reduction.
+                reduction_quote = (
+                    {key: value for key, value in quote.items()
+                     if key != "historical_prior_paper_fill"}
+                    if spec.historical_full_fill_at_0901 else quote
+                )
                 reducing = _prepare_entry_plan({"symbol": symbol, "target_weight": -1.0 if held > 0 else 1.0},
-                    quote=quote, evidence=None, signal_at=signal_at, observation_at=observed,
+                    quote=reduction_quote, evidence=None, signal_at=signal_at, observation_at=observed,
                     spec=spec, sizing_nav_twd=nav, allow_quote_at_signal=allow_quote_at_signal,
                     requested_shares_override=reduce, reduce_only=True)
                 left = int(reducing["filled_shares"])
@@ -5576,8 +5652,17 @@ class TwDayTradeSimulationEngine:
                     take = min(left, abs(int(p["signed_shares"])))
                     if take:
                         before = abs(int(p["signed_shares"]))
+                        historical_full_quote = (
+                            {**reduction_quote,
+                             "minute_volume_lots": 1_000_000_000.0,
+                             "observed_minute_volume_lots": reduction_quote.get("minute_volume_lots"),
+                             "fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                             "depth_assumption": "historical_09_01_target_delta_full_no_liquidity_claim"}
+                            if spec.historical_full_fill_at_0901 else quote
+                        )
                         self._close_position(p, mode, price=float(reducing["entry_price"]),
-                            quote=({**quote, "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+                            quote=(historical_full_quote if spec.historical_full_fill_at_0901
+                                   else {**quote, "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
                                    if allow_quote_at_signal else quote),
                             now=observed, reason="next_signal_inventory_delta",
                             order_type="PAPER_0901_MINUTE_PRICE" if allow_quote_at_signal else "MKT",
@@ -5595,7 +5680,11 @@ class TwDayTradeSimulationEngine:
                 addition = 0
             plan.update(reduction_requested_shares=reduce, reduction_filled_shares=reduction_filled)
             plan["requested_shares"] = addition
-            capacity = int(plan["minute_kbar_capacity_shares"])
+            capacity = (
+                addition + reduction_filled
+                if spec.historical_full_fill_at_0901
+                else int(plan["minute_kbar_capacity_shares"])
+            )
             if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK:
                 capacity = int(plan["top_book_capacity_shares"]) if observed.time() < time(9, 1) else min(capacity, int(plan["top_book_capacity_shares"]))
             if plan["status"] not in {"ready", "partial_depth"}:
@@ -6456,6 +6545,7 @@ __all__ = [
     "CLOSING_AUCTION_TIME",
     "ENTRY_FILL_POLICY_0901_MINUTE_PRICE",
     "ENTRY_FILL_POLICY_0901_MINUTE_VWAP",
+    "REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
     "ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK",

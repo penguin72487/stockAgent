@@ -15,6 +15,10 @@ import numpy as np
 import polars as pl
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
+from stockagent.data.tw_price_rules import (
+    TW_DERIVATIVE_PRICE_CONTRACT_VERSION,
+    price_on_tick_grid_numpy,
+)
 from stockagent.data.tw_stock_futures_day_trade import select_causal_front_stock_futures_candidates
 from stockagent.data.tw_stock_futures_minute import EVENT_MINUTES
 from stockagent.data.tw_stock_futures_quarantine import (
@@ -52,6 +56,13 @@ def normalize_continuous_ticks(frame: pl.DataFrame, *, day: date, alias: str,
     if session.filter(~pl.col("close").is_finite() | (pl.col("close") <= 0)
                       | (pl.col("volume") <= 0)).height:
         raise ValueError("invalid day-session price/volume")
+    # A transaction is a grid-constrained outright price; the minute VWAP
+    # calculated below is not. Use the session date, never today's FOP rule.
+    if not price_on_tick_grid_numpy(
+        session["close"].to_numpy(), np.datetime64(day),
+        security_types="stock_future",
+    ).all():
+        raise ValueError("off-grid dated stock-futures transaction price")
     stats = dict(tick_open=float(session["close"][0]), tick_close=float(session["close"][-1]),
                  tick_high=float(session["close"].max()), tick_low=float(session["close"].min()),
                  tick_volume=int(session["volume"].sum()), tick_rows=session.height)
@@ -194,6 +205,7 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
             # corrected raw data even when a dated shard was previously complete.
             saved = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
             cached = (cache_bars.is_file() and cache_coverage.is_file()
+                    and saved.get("price_rule_contract_version") == TW_DERIVATIVE_PRICE_CONTRACT_VERSION
                     and saved.get("bars_sha256") == sha256_file(cache_bars)
                     and saved.get("coverage_sha256") == sha256_file(cache_coverage))
             prior_bars, prior_coverage = cache_bars, cache_coverage
@@ -201,6 +213,7 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
                 prior_bars, prior_coverage, old_receipt = (original_cache / f'{day}.{suffix}' for suffix in ('parquet','coverage.parquet','json'))
                 old = json.loads(old_receipt.read_text()) if old_receipt.is_file() else {}
                 cached = (prior_bars.is_file() and prior_coverage.is_file()
+                          and old.get("price_rule_contract_version") == TW_DERIVATIVE_PRICE_CONTRACT_VERSION
                           and sha256_file(prior_bars) == old.get('bars_sha256')
                           and sha256_file(prior_coverage) == old.get('coverage_sha256'))
             preserve_date = bool(refresh_dates) and str(day) not in refresh_dates
@@ -245,6 +258,7 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
                 atomic_write_parquet(cache_bars, bars)
                 atomic_write_parquet(cache_coverage, coverage)
                 atomic_write_json(receipt_path, {"complete": bool(rows) and coverage["status"].is_in(ACCEPTED).all(),
+                                               "price_rule_contract_version": TW_DERIVATIVE_PRICE_CONTRACT_VERSION,
                                                "bars_sha256": sha256_file(cache_bars), "coverage_sha256": sha256_file(cache_coverage)})
             frames.append(cache_bars)
             inventories.append(cache_coverage)
@@ -279,6 +293,7 @@ def build_continuous_history(args, source: pl.DataFrame, expected_dates: list[da
     if sha256_file(args.daily_data_path) != daily_digest:
         raise ValueError("daily source changed during build; outputs cannot be accepted")
     manifest = {"dataset": HISTORY_DATASET, "contract_version": HISTORY_VERSION, "source_kind": HISTORY_SOURCE,
+                "price_rule_contract_version": TW_DERIVATIVE_PRICE_CONTRACT_VERSION,
                 "status": ("partial" if training_gaps.height else "complete_with_quarantine" if quarantine or contract_days else "complete"), "source_daily_sha256": daily_digest,
                 "quarantined_dates": quarantine,
                 "daily_proxy_before": str(cutoff), "covered_dates": complete_dates,

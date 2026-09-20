@@ -302,7 +302,10 @@ def _validate_download_receipts(
         ):
             problems.append("corporate-action historical coverage is incomplete")
         output_path = input_dir / "tw_corporate_action_reference.parquet"
-        if corporate_summary.get("output_receipt") != _receipt(output_path):
+        # The producer may write through the catalog's resolved live path
+        # while this builder reads its managed data_tw_public symlink. File
+        # identity here is the exact bytes, not the spelling of the alias.
+        if not _receipt_matches(output_path, corporate_summary.get("output_receipt")):
             problems.append("corporate-action output receipt mismatch")
     except Exception as exc:
         problems.append(f"invalid corporate-action receipt: {type(exc).__name__}: {exc}")

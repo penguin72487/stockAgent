@@ -222,6 +222,10 @@ def _is_shioaji_session_failure(exc: BaseException) -> bool:
     )
 
 
+class _ShioajiSnapshotEmpty(RuntimeError):
+    """A submitted non-blocking Snapshot request produced no usable rows."""
+
+
 def _shioaji_stock_api() -> object:
     """Return one process-local, simulation-only Shioaji quote connection."""
 
@@ -1527,7 +1531,18 @@ def fetch_shioaji_stock_snapshots(
                 api=api,
             )
         except Exception as exc:
-            if attempt > 0 or not _is_shioaji_session_failure(exc):
+            session_failure = _is_shioaji_session_failure(exc)
+            if not session_failure and isinstance(exc, _ShioajiSnapshotEmpty):
+                # A disconnected non-blocking Snapshot request may only time
+                # out its callbacks and surface as an empty batch. Probe the
+                # existing session before deciding whether to reconnect; an
+                # empty market response or exhausted quota is not proof that
+                # another login is appropriate.
+                try:
+                    api.usage()
+                except Exception as probe_exc:
+                    session_failure = _is_shioaji_session_failure(probe_exc)
+            if attempt > 0 or not session_failure:
                 raise
             _reconnect_shioaji_stock_quote_client(api)
     raise AssertionError("unreachable Shioaji stock snapshot retry state")
@@ -2100,7 +2115,12 @@ def _fetch_shioaji_stock_snapshots_once(
 
     count = int(available.sum())
     if count <= 0:
-        raise RuntimeError("Shioaji returned no usable stock snapshots")
+        error = (
+            _ShioajiSnapshotEmpty
+            if snapshot_batches
+            else RuntimeError
+        )
+        raise error("Shioaji returned no usable stock snapshots")
     latest_received_ms = int(timestamps_ms.max(initial=0))
     timestamp = (
         datetime.fromtimestamp(latest_received_ms / 1000.0, tz=timezone.utc).isoformat()
@@ -2149,6 +2169,29 @@ def fetch_shioaji_futures_snapshot(
     *,
     additional_contract_codes: tuple[str, ...] = (),
 ) -> dict[str, object]:
+    """Retry one futures observation only after an evidenced lost session."""
+
+    for attempt in range(2):
+        api = _shioaji_stock_api()
+        try:
+            return _fetch_shioaji_futures_snapshot_once(
+                logical_code,
+                additional_contract_codes=additional_contract_codes,
+                api=api,
+            )
+        except Exception as exc:
+            if attempt > 0 or not _is_shioaji_session_failure(exc):
+                raise
+            _reconnect_shioaji_stock_quote_client(api)
+    raise AssertionError("unreachable Shioaji futures snapshot retry state")
+
+
+def _fetch_shioaji_futures_snapshot_once(
+    logical_code: str = "TXFR1",
+    *,
+    additional_contract_codes: tuple[str, ...] = (),
+    api: object,
+) -> dict[str, object]:
     """Fetch the current continuous future and optional old roll contract.
 
     This reuses the process-local simulation-only Shioaji quote connection used
@@ -2162,7 +2205,6 @@ def fetch_shioaji_futures_snapshot(
     normalized_logical = str(logical_code or "").strip().upper()
     if not normalized_logical:
         raise ValueError("logical futures code is required")
-    api = _shioaji_stock_api()
     with _SHIOAJI_STOCK_LOCK:
         logical = api.contracts.get(normalized_logical)
         if logical is None:

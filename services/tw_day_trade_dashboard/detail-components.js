@@ -48,6 +48,10 @@
       const executionPrice = row.execution_price ?? position?.entry_price;
       const hasTarget = Math.abs(Number(row.target_weight || 0)) > 0;
       const entryNotional = hasFill ? Math.abs(Number(row.filled_shares || 0)) * Number(executionPrice || 0) : null;
+      const minuteReplay = row.counterfactual_0901_price_fill === true
+        || String(row.entry_fill_policy || "").startsWith("official_open_signal_0900_execute_0901");
+      const fillLabel = minuteReplay ? "09:01 首分鐘價反事實模擬" : "因果報價紙上模擬";
+      const targetGap = Math.max(0, Number(row.requested_shares || 0) - Number(row.filled_shares || 0));
       const modeTotalEquity = row.session_date === sessionDate ? Number(mode?.total_equity_twd) : NaN;
       const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
         ? Number(positionPnl.total) / modeTotalEquity * 100
@@ -91,7 +95,7 @@
         <td><strong>${esc(strategyLabel(row))}</strong><small>${esc(signalTimingText(row))}</small></td>
         <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
         <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(reasonText)}</small></td>
-        <td>${hasTarget ? `<strong class="${openingPrice == null ? "negative" : ""}">開盤計價 ${money(openingPrice)}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `市價成交 ${money(executionPrice)} · 名目 ${money(entryNotional)}` : hasTarget ? `完整模型訊號已保留 · 0 股未成交` : "不需開盤計價"}</small><small>${hasTarget && !hasFill ? `${esc(reasonText)} · ` : ""}成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
+        <td>${hasTarget ? `<strong class="${openingPrice == null ? "negative" : ""}">開盤計價 ${money(openingPrice)}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `${fillLabel} ${money(executionPrice)} · 名目 ${money(entryNotional)}` : hasTarget ? `完整模型訊號已保留 · 0 股紙上成交` : "不需開盤計價"}</small><small>${hasTarget && !hasFill ? `${esc(reasonText)} · ` : ""}模型目標 ${number(row.requested_shares)}／紙上成交 ${number(row.filled_shares)}／${minuteReplay ? "容量限制未建立委託" : "尚未成交"} ${number(targetGap)} 股${minuteReplay ? ` · 09:01 容量 ${number(row.minute_kbar_capacity_shares)}` : ` · L1 ${number(row.top_book_capacity_shares)}`}</small></td>
         <td><strong>${currentLabel} ${hasPosition ? money(currentPrice) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
         <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : "未成交不納入"}</small></td>
       </tr>`;
@@ -104,14 +108,14 @@
 
     function pagedTable({id, rows, total, loading, hasMore, error, renderRow, emptyText, countDetail = ""}) {
       $(`${id}-body`).setAttribute("aria-busy", String(loading));
-      $(`${id}-count`).textContent = `${number(rows.length)} / ${number(total)} 筆${error ? " · 等待重試" : countDetail}`;
+      $(`${id}-count`).textContent = `${number(rows.length)} / ${number(total)} 筆${error ? " · 更新失敗" : countDetail}`;
       const button = $(`load-more-${id}s`);
       button.classList.toggle("hidden", !hasMore);
       button.disabled = loading;
       button.textContent = loading ? "載入中…" : "載入更多";
       const message = (text) => `<tr><td colspan="6">${esc(text)}</td></tr>`;
       const markup = rows.map(renderRow).join("");
-      setHtml(`${id}-body`, (error ? message(error) : "") + (markup || message(emptyText)));
+      setHtml(`${id}-body`, (error ? message(error) : "") + (markup || (error ? "" : message(emptyText))));
     }
 
     return Object.freeze({positionRow, signalRow, eventRow, futuresBadge, pagedTable});

@@ -1,0 +1,30 @@
+[Unit]
+Description=Authorized MOPS quarterly XBRL archive refresh
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/test -r /etc/stockagent/mops_xbrl_authorization.json
+ExecCondition=/usr/bin/bash __REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh
+ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python downloader/download_tw_mops_xbrl.py --mode download --authorization-file /etc/stockagent/mops_xbrl_authorization.json --output-dir /srv/stockagent-live/data_tw_public/mops_xbrl --max-archives 4 --recheck-recent-quarters 2 --request-interval 1.0'
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryAccounting=true
+MemoryHigh=16G
+MemoryMax=24G
+TimeoutStartSec=4h
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/stockagent-live/data_tw_public/mops_xbrl /srv/stockagent-live/.locks
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures

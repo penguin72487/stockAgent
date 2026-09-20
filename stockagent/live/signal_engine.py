@@ -562,6 +562,7 @@ def _build_panel(
     config: ExperimentConfig,
     *,
     live_tail: bool = False,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
@@ -584,6 +585,7 @@ def _build_panel(
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_availability_indicators": config.data.feature_availability_indicators,
         "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
@@ -653,10 +655,12 @@ def _build_panel(
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
+            feature_availability_indicators=config.data.feature_availability_indicators,
             feature_shift_next_session=config.data.feature_shift_next_session,
             # Persist the reusable unsliced tail. Apply each strategy's exact
             # boundary after memory/disk/build retrieval.
             panel_start_date=None,
+            progress_callback=progress_callback,
         )
         if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
             try:
@@ -2000,13 +2004,14 @@ def _opening_price_receipt_timing(
         tz=timezone.utc,
     )
     last = datetime.fromtimestamp(int(ordered[-1]) / 1000.0, tz=timezone.utc)
+    reused_snapshot = coverage < requested
 
     def milliseconds(later: datetime, earlier: datetime) -> float:
         return round((later - earlier).total_seconds() * 1000.0, 3)
 
     result.update(
         {
-            "quality": "observed",
+            "quality": "observed_reused_snapshot" if reused_snapshot else "observed",
             "first_receipt_at": first.astimezone(zone).isoformat(
                 timespec="milliseconds"
             ),
@@ -2019,8 +2024,11 @@ def _opening_price_receipt_timing(
             "first_receipt_from_open_ms": milliseconds(first, gate),
             "coverage_receipt_from_open_ms": milliseconds(coverage, gate),
             "last_receipt_from_open_ms": milliseconds(last, gate),
-            "quote_request_to_coverage_ms": milliseconds(coverage, requested),
-            "coverage_to_quote_response_ms": milliseconds(received, coverage),
+            # A later mode may reuse the first mode's opening snapshot. Its
+            # local receipt precedes this mode's quote request, so these two
+            # durations do not describe this request's transport latency.
+            "quote_request_to_coverage_ms": None if reused_snapshot else milliseconds(coverage, requested),
+            "coverage_to_quote_response_ms": None if reused_snapshot else milliseconds(received, coverage),
             "coverage_to_signal_ready_ms": milliseconds(ready, coverage),
         }
     )
@@ -3123,6 +3131,16 @@ def generate_live_signal(
         panel, panel_cache_hit, panel_cache_tier = _build_panel(
             config,
             live_tail=True,
+            progress_callback=(
+                (lambda phase, done, total: _emit_progress(
+                    progress_callback,
+                    label=progress_name,
+                    step=3,
+                    total=progress_total,
+                    message=f"panel {phase} {done}/{total}",
+                ))
+                if progress_callback is not None else None
+            ),
         )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel, alignment_cache_hit = _cached_aligned_panel(
