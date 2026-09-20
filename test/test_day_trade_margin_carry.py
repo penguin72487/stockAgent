@@ -9,7 +9,8 @@ import pytest
 
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE, ENTRY_FILL_POLICY_CAUSAL_BOOK, MARGIN_CARRY_CONTRACT,
-    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, TwDayTradeSimulationEngine,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    TwDayTradeSimulationEngine,
     position_net_liquidation_pnl,
 )
 from test_tw_day_trade_simulation import _spec, _row, _quote, _eligibility, _summary, _now
@@ -342,6 +343,77 @@ def test_reduction_reversal_and_shared_minute_capacity(tmp_path):
     mode = engine.state["modes"][spec.market]
     assert sum(p["signed_shares"] for p in mode["positions"].values()) == -1000
     assert sum(r["quantity"] for r in rows) == 3000
+
+
+def test_historical_full_reduction_uses_0901_price_not_prior_entry_and_has_no_volume_cap(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    spec = replace(spec, historical_full_fill_at_0901=True)
+    at = _now(9, 1) + timedelta(days=1)
+    prior_at = at.replace(hour=9, minute=0, second=13)
+    summary = _summary("full-reduction") | {
+        "generated_at": prior_at.isoformat(), "simulation_replay": True,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    }
+    quote = _quote(bid=1010, ask=1010, minute_volume_lots=2) | {
+        "open": 1000, "execution_price_0901": 1010,
+        "execution_price_0901_method": "minute_close", "quote_at": at.isoformat(),
+        "historical_prior_paper_fill": {"price": 1050, "fill_at": prior_at.isoformat(),
+                                         "entry_price_source": "old_entry_paper"},
+    }
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row(0)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={},
+        now=at, counterfactual_open_replay=True) == "registered"
+    reduction = fills(engine)[-1]
+    assert reduction["purpose"] == "next_signal_inventory_delta"
+    assert reduction["quantity"] == 2000
+    assert reduction["price"] == 1010
+    assert reduction["fill_contract"] == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+
+
+def test_historical_full_reversal_does_not_reapply_minute_capacity_to_addition(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    spec = replace(spec, historical_full_fill_at_0901=True)
+    at = _now(9, 1) + timedelta(days=1)
+    summary = _summary("full-reversal") | {
+        "generated_at": (at - timedelta(minutes=1)).isoformat(),
+        "simulation_replay": True,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    }
+    quote = _quote(bid=1000, ask=1000, minute_volume_lots=2) | {
+        "open": 1000, "execution_price_0901": 1000,
+        "execution_price_0901_method": "minute_close", "quote_at": at.isoformat(),
+    }
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row(-.4)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={},
+        now=at, counterfactual_open_replay=True) == "registered"
+    rows = fills(engine)[1:]
+    assert [(row["purpose"], row["quantity"]) for row in rows] == [
+        ("next_signal_inventory_delta", 2000), ("entry", 3000),
+    ]
+    assert sum(position["signed_shares"] for position in
+               engine.state["modes"][spec.market]["positions"].values()) == -3000
+
+
+def test_historical_prior_entry_does_not_fabricate_missing_0901_reduction_price(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    spec = replace(spec, historical_full_fill_at_0901=True)
+    at = _now(9, 1) + timedelta(days=1)
+    prior_at = at.replace(hour=9, minute=0, second=13)
+    summary = _summary("missing-reduction-price") | {
+        "generated_at": prior_at.isoformat(), "simulation_replay": True,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    }
+    quote = _quote(bid=1000, ask=1000, minute_volume_lots=0) | {
+        "open": 1000, "execution_price_0901": None,
+        "execution_price_0901_method": None, "quote_at": at.isoformat(),
+        "historical_prior_paper_fill": {"price": 1050, "fill_at": prior_at.isoformat()},
+    }
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row(0)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={},
+        now=at, counterfactual_open_replay=True) == "registered"
+    assert len(fills(engine)) == 1
+    assert sum(position["signed_shares"] for position in
+               engine.state["modes"][spec.market]["positions"].values()) == 2000
 
 
 def test_blocked_reversal_does_not_open_opposite_inventory(tmp_path):

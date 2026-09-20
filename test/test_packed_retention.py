@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
 import time
 
 import pytest
@@ -154,6 +155,36 @@ def test_missing_d_object_and_stale_peer_proof_fail_closed(retention_store):
 
     with pytest.raises(SnapshotError, match="peer convergence proof"):
         apply_plan(cfg, plan["plan_fingerprint"], peer_proof=_peer_proof(ok=False))
+
+
+def test_d_receipts_survive_device_number_change_but_not_file_change(retention_store):
+    cfg, _old, _current = retention_store
+    plan = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    object_path = next(item["path"] for item in plan["entries"] if item["kind"] == "object")
+    db_path = BackupConfig.load(cfg.backup_config).state_dir / "verified.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        source_json, target_json = connection.execute(
+            "SELECT source_sig,target_sig FROM verified WHERE path=?", (object_path,)
+        ).fetchone()
+        old_source = json.loads(source_json)
+        old_target = json.loads(target_json)
+        old_source[0] += 1
+        old_target[0] += 1
+        connection.execute(
+            "UPDATE verified SET source_sig=?,target_sig=? WHERE path=?",
+            (json.dumps(old_source), json.dumps(old_target), object_path),
+        )
+    remounted = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    assert not remounted["blockers"]
+
+    old_target[4] += 1
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE verified SET target_sig=? WHERE path=?",
+            (json.dumps(old_target), object_path),
+        )
+    changed = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    assert "D archive proof incomplete" in changed["blockers"]
 
 
 def test_conflict_file_blocks_retention(retention_store):

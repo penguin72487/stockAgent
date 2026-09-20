@@ -179,6 +179,7 @@ def maintain_completed_artifacts(
     max_publish: int = 1,
     apply: bool = False,
     peer_converged: Callable[[], Mapping[str, Any]] | None = None,
+    live_sync_root: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
     """Publish complete runs and safely evict expired local sources.
@@ -191,6 +192,7 @@ def maintain_completed_artifacts(
     artifact_root = artifact_root.resolve()
     sync_root = sync_root.resolve()
     state_root = state_root.resolve()
+    live_sync_root = live_sync_root.resolve() if live_sync_root is not None else None
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
     expiry_ns = int(retention_days * 86_400 * 1_000_000_000)
     state_dir = state_root / "automatic"
@@ -307,6 +309,13 @@ def maintain_completed_artifacts(
                 row.update(action="keep", reason="retention-active")
             elif published_this_call:
                 row["reason"] = "awaiting-independent-peer-check"
+            elif live_sync_root is not None and live_sync_root.is_dir():
+                # Penguin's bridge intentionally restores missing local files
+                # from its hot transport. Removing only this source would not
+                # reclaim the shared inode and may resurrect the run. A
+                # separate, exact cold-retirement transaction must remove
+                # both hot names after installing a local ignore tombstone.
+                row["reason"] = "hot-transport-retirement-required"
             elif peer_converged is None:
                 row["reason"] = "peer-check-unavailable"
             else:

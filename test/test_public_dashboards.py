@@ -766,6 +766,22 @@ def test_compact_tw_overview_fails_closed_on_unsafe_receipt(tmp_path: Path) -> N
         build_compact_tw_overview_status(state_dir)
 
 
+def test_day_trade_clock_ends_at_auction_without_overnight_contract_details() -> None:
+    root = Path(__file__).resolve().parents[1] / "services" / "tw_day_trade_dashboard"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    panel = html.split('<article class="panel timeline-panel">', 1)[1].split("</article>", 1)[0]
+    timeline = panel.split('<ol class="timeline">', 1)[1].split("</ol>", 1)[0]
+
+    assert re.findall(r"<time>([^<]+)</time>", timeline) == [
+        "09:00", "盤中", "13:20", "13:24", "13:25", "13:30",
+    ]
+    assert "沒有成交證據的部位仍顯示未平倉" in timeline
+    assert '<template id="overnight-source-contract"><dl class="source-list">' in panel
+    assert 'timeline.after(sourceTemplate.content.cloneNode(true))' in javascript
+    assert "if (!IS_OVERNIGHT) return;" in javascript
+
+
 def test_public_pages_share_visual_tokens() -> None:
     root = Path(__file__).resolve().parents[1] / "services"
     shared = (root / "public_dashboards" / "dashboard-core.css").read_text(
@@ -808,7 +824,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f'src="../time-axis.js?v={version}"' in html
     tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
-    assert 'src="chart-renderer.js?v=1"' in tw_html
+    assert 'src="chart-renderer.js?v=3"' in tw_html
     assert "https://" not in tw_html and "http://" not in tw_html
 
     shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
@@ -1062,7 +1078,10 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
                 "summary": {"registered_items": 390},
                 "endpoint_inventory": {"total": 390},
                 "provider_summaries": [{"provider": "fixture"}],
+                "market_categories": [{"id": "crypto", "items": 5}],
+                "record_inventory_progress": {"selected_files": 7, "inspected_files": 6},
                 "definitions": {"freshness": "fixture"},
+                "tw_public_acquisition": {"observation": {"registered": 159}},
                 "groups": [{"id": "large"}],
                 "sources": [{"endpoint_id": "private-heavy-row"}],
             },
@@ -1071,12 +1090,36 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         summary = json.loads(server.data_monitor_summary().body)
         assert summary["summary"]["registered_items"] == 390
         assert summary["groups"] == [{"id": "large"}]
+        assert summary["tw_public_acquisition"]["observation"]["registered"] == 159
+        assert summary["market_categories"] == [{"id": "crypto", "items": 5}]
+        assert summary["record_inventory_progress"]["selected_files"] == 7
         assert "sources" not in summary
         assert "private-heavy-row" not in json.dumps(summary)
         details = json.loads(server.data_monitor_details().body)
         assert details["sources"] == [{"endpoint_id": "private-heavy-row"}]
         assert "summary" not in details
         assert "groups" not in details
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_features_reads_separate_read_only_snapshot(tmp_path: Path) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        empty = json.loads(server.data_monitor_features().body)
+        assert empty["summary"]["state"] == "waiting_inventory"
+        snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_text(json.dumps({
+            "schema_version": 1,
+            "read_only": True,
+            "production_control_possible": False,
+            "summary": {"fields": 1},
+            "rows": [{"dataset_id": "tw-public:twse_daily_ohlcv", "field": "close"}],
+        }), encoding="utf-8")
+        payload = json.loads(server.data_monitor_features().body)
+        assert payload["rows"] == [{"dataset_id": "tw-public:twse_daily_ohlcv", "field": "close"}]
     finally:
         server.server_close()
 

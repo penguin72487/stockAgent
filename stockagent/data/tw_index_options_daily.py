@@ -1105,6 +1105,40 @@ def build_taifex_option_full_chain(
                         )
             if normalized_rows:
                 normalized_rows.sort(key=lambda item: (item["date"], item["option_slot"]))
+                from stockagent.data.tw_price_rules import (
+                    price_on_explicit_tick_grid_numpy,
+                    taifex_option_tick_size_numpy,
+                )
+
+                price_dates = np.asarray(
+                    [item["date"] for item in normalized_rows], dtype="datetime64[D]"
+                )
+                families = np.full(len(normalized_rows), "txo", dtype="U3")
+                for field in ("open", "close", "last_bid", "last_ask"):
+                    values = np.asarray(
+                        [
+                            float(item[field]) if item[field] is not None else np.nan
+                            for item in normalized_rows
+                        ],
+                        dtype=np.float64,
+                    )
+                    ticks = taifex_option_tick_size_numpy(
+                        values,
+                        price_dates,
+                        product_families=families,
+                        trading_method="ordinary",
+                    )
+                    valid = price_on_explicit_tick_grid_numpy(values, ticks)
+                    bad = np.flatnonzero(
+                        np.isfinite(values) & (values > 0.0) & ~valid
+                    )
+                    if bad.size:
+                        index = int(bad[0])
+                        raise ValueError(
+                            f"off-grid TXO {field} at {price_dates[index]} "
+                            f"series={normalized_rows[index]['option_series']}: "
+                            f"{values[index]!r}"
+                        )
                 writer.write_table(pa.Table.from_pylist(normalized_rows, schema=schema))
                 total_rows += len(normalized_rows)
     finally:

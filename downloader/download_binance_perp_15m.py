@@ -228,6 +228,14 @@ class _PipelineProgress:
                 self._last_telemetry_publish = observed
                 self._write("running", phase)
 
+    def revise_total(self, total: int, *, phase: str) -> None:
+        with self._lock:
+            new_total = int(total)
+            if new_total < self.current:
+                raise ValueError("progress total cannot be below completed units")
+            self.total = new_total
+            self._write("running", phase)
+
     def finish(self, *, failed: bool) -> None:
         with self._lock:
             incomplete = self.current != self.total
@@ -1175,13 +1183,31 @@ def main() -> None:
     observed_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     historical_feature_results = []
     if not args.skip_historical_features:
+        # Tail refreshes must enrich only symbols with newly written candles.
+        # Otherwise a quiet/delisted symbol with no hot tail would make the
+        # daily pass rewrite its entire multi-year base Parquet.
+        updated_codes = {result.code for result in results if result.status == "updated"}
+        feature_symbols = (
+            [record for record in symbols if record.code in updated_codes]
+            if args.tail_only
+            else symbols
+        )
+        feature_symbols = [
+            record for record in feature_symbols
+            if (output_dir / f"{record.code}_features.parquet").is_file()
+        ]
+        pipeline_progress.revise_total(
+            len(symbols) + len(feature_symbols) * len(FEATURE_STAGE_IDS),
+            phase="historical-features",
+        )
         historical_feature_results = run_historical_feature_downloads(
             client,
-            symbols,
+            feature_symbols,
             output_dir,
             start_ms=start_ms,
             end_ms=end_ms,
             workers=args.feature_workers or args.workers,
+            tail_only=args.tail_only,
             observed_at_ms=observed_at_ms,
             stage_progress_callback=lambda code, stage, status: (
                 pipeline_progress.update(stage, status, item=code)
@@ -1206,7 +1232,8 @@ def main() -> None:
             }
         )
     )
-    _write_csv_atomic(feature_report, historical_feature_report_path)
+    if not args.skip_historical_features or not historical_feature_report_path.is_file():
+        _write_csv_atomic(feature_report, historical_feature_report_path)
 
     historical_by_code = {result.code: result for result in historical_feature_results}
     result_rows = []
@@ -1254,6 +1281,7 @@ def main() -> None:
         "status_counts": status_counts,
         "row_count": sum(int(result.rows) for result in results),
         "historical_features_enabled": not args.skip_historical_features,
+        "historical_feature_report_is_current_run": not args.skip_historical_features,
         "tail_only": args.tail_only,
         "historical_feature_status_counts": historical_status_counts,
         "historical_feature_report": str(historical_feature_report_path),

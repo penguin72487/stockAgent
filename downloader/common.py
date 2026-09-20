@@ -180,6 +180,16 @@ class PersistentProgress:
             self.status_counts[key] = self.status_counts.get(key, 0) + increment
             self._write("running", phase)
 
+    def revise_total(self, total: int, *, phase: str) -> None:
+        """Set the stage denominator after eligible symbols are known."""
+
+        with self._lock:
+            new_total = int(total)
+            if new_total < self.current:
+                raise ValueError("progress total cannot be below completed units")
+            self.total = new_total
+            self._write("running", phase)
+
     def heartbeat(self, phase: str) -> None:
         """Refresh a long-running phase without falsely incrementing progress."""
 

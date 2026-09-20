@@ -1,5 +1,7 @@
 # penguin 冷庫 D 槽備份
 
+最近一次實際清理與未解問題見 [2026-09-17 儲存清理稽核](storage_cleanup_2026-09-17.md)。
+
 ## 責任與資料流
 
 penguin 是目前資料權威。收到的 immutable release 保留原 publisher 身分；本工具
@@ -29,7 +31,10 @@ manifest 與 head 保留原格式，因此不再封成一份巨型壓縮檔，�
   `packed/head-history/heads/<dataset>/<node>/<head-sha256>.json`；舊 manifest／物件不刪。
   正在接收的新 release 不會使前一份已完整的 D head 消失。
 - 定期比對檔案 signature 只用於重用**已有 checksum 證明**；不是首次去重或刪除證據。
-  signature 改變、校驗資料庫遺失、或 checksum 證明逾 30 日都重讀驗證。
+  WSL 重新掛載 D: 可能只改變 Linux `st_dev`；在掛載、volume marker 及磁碟隔離
+  驗證通過的前提下，沿用收據時仍須 inode、大小、mtime、ctime 四欄完全相同。
+  任何一欄改變、校驗資料庫遺失、或 checksum 證明逾 30 日都重讀驗證；
+  不能因這項規則推論先前未通過完整雜湊的 release 已可還原。
 - 只在 config 指定的 D 掛載點、來源磁碟不同、node ID 正確且 volume marker 符合時工作。
   `init` 另外核對 Windows volume UUID。掛載消失／替換即 fail closed，不能寫進空的
   `/mnt/d` 而把 C 槽塞滿。預留 D 槽 20 GiB；空間不足保留所有既有副本。

@@ -7,6 +7,7 @@ PREOPEN_TIMER="stockagent-tw-day-trade-preopen-gate.timer"
 TIME_SYNC_TIMER="stockagent-time-sync-check.timer"
 GUARDIAN_TIMER="stockagent-tw-day-trade-unattended-guardian.timer"
 MINUTE_CURVE_TIMER="stockagent-tw-day-trade-minute-curves.timer"
+MINUTE_CURVE_PATH="stockagent-tw-day-trade-minute-curves.path"
 MULTI_BASIS_22_HISTORY_TIMER="stockagent-tw-day-trade-multi-basis-22-history.timer"
 
 if (( EUID != 0 )); then
@@ -32,6 +33,7 @@ units=(
   "$GUARDIAN_TIMER"
   stockagent-tw-day-trade-minute-curves.service
   "$MINUTE_CURVE_TIMER"
+  "$MINUTE_CURVE_PATH"
   stockagent-tw-day-trade-multi-basis-22-history.service
   "$MULTI_BASIS_22_HISTORY_TIMER"
 )
@@ -44,7 +46,7 @@ for unit in "${units[@]}"; do
     "$REPO_ROOT/deploy/systemd/$unit.in" > "$temporary_dir/$unit"
 done
 
-systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
+systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer "$temporary_dir"/*.path
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
   "$REPO_ROOT/scripts/check_tw_day_trade_preopen_readiness.py" \
@@ -63,5 +65,6 @@ systemctl enable --now "$PREOPEN_TIMER"
 systemctl enable --now "$TIME_SYNC_TIMER"
 systemctl enable --now "$GUARDIAN_TIMER"
 systemctl enable --now "$MINUTE_CURVE_TIMER"
+systemctl enable --now "$MINUTE_CURVE_PATH"
 systemctl enable --now "$MULTI_BASIS_22_HISTORY_TIMER"
-echo "[tw-day-trade-service] service_active=$(systemctl is-active "$SERVICE_NAME") preopen_timer_active=$(systemctl is-active "$PREOPEN_TIMER") time_sync_timer_active=$(systemctl is-active "$TIME_SYNC_TIMER") guardian_timer_active=$(systemctl is-active "$GUARDIAN_TIMER") minute_curve_timer_active=$(systemctl is-active "$MINUTE_CURVE_TIMER") multi_basis_22_history_timer_active=$(systemctl is-active "$MULTI_BASIS_22_HISTORY_TIMER")"
+echo "[tw-day-trade-service] service_active=$(systemctl is-active "$SERVICE_NAME") preopen_timer_active=$(systemctl is-active "$PREOPEN_TIMER") time_sync_timer_active=$(systemctl is-active "$TIME_SYNC_TIMER") guardian_timer_active=$(systemctl is-active "$GUARDIAN_TIMER") minute_curve_timer_active=$(systemctl is-active "$MINUTE_CURVE_TIMER") minute_curve_path_active=$(systemctl is-active "$MINUTE_CURVE_PATH") multi_basis_22_history_timer_active=$(systemctl is-active "$MULTI_BASIS_22_HISTORY_TIMER")"

@@ -171,7 +171,7 @@ def parse_args() -> argparse.Namespace:
         help="incremental: reconcile missing head/tail coverage; daily-update: deprecated alias; full: reconcile requested coverage; --refresh forces rebuild.",
     )
     parser.add_argument(
-        "--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD"
+        "--start-date", default="2018-01-01", help="Inclusive start date YYYY-MM-DD; per-symbol launch time is the lower bound"
     )
     parser.add_argument(
         "--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'"

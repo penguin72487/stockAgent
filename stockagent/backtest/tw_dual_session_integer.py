@@ -1419,6 +1419,7 @@ def _run_dual_session_integer(
     initial_commission_rebate_current: object | None,
     initial_commission_rebate_due: object | None,
     initial_commission_rebate_month_id: object | None,
+    overnight_decision_prices: object | None,
 ) -> TaiwanDualSessionIntegerBacktestResult:
     action_values = _as_actions(actions, mode=mode)
     time, _, symbols = action_values.shape
@@ -1429,6 +1430,17 @@ def _run_dual_session_integer(
     if raw_opens.shape != daily_shape or raw_closes.shape != daily_shape:
         raise ValueError(
             "open_prices and close_prices must have shape [T,S] matching actions"
+        )
+    raw_decision_prices = (
+        None
+        if overnight_decision_prices is None
+        else _as_execution_price_matrix(
+            "overnight_decision_prices", overnight_decision_prices
+        )
+    )
+    if raw_decision_prices is not None and raw_decision_prices.shape != daily_shape:
+        raise ValueError(
+            "overnight_decision_prices must have shape [T,S] matching actions"
         )
 
     selection = _as_phase_bool(
@@ -2214,10 +2226,31 @@ def _run_dual_session_integer(
                 0.0,
                 close_entry_weights,
             )
+            sizing_prices = close_marks
+            if raw_decision_prices is not None:
+                active_entry = (
+                    selection[t, CLOSE]
+                    & ~close_mandatory_exit
+                    & (np.abs(close_entry_weights) > 0.0)
+                )
+                valid_decision = (
+                    np.isfinite(raw_decision_prices[t])
+                    & (raw_decision_prices[t] > 0.0)
+                )
+                if np.any(active_entry & ~valid_decision):
+                    raise RuntimeError(
+                        "tw_overnight active close entry lacks a finite positive "
+                        "decision-time sizing price"
+                    )
+                sizing_prices = np.where(
+                    valid_decision,
+                    raw_decision_prices[t],
+                    close_marks,
+                )
             close_entry_holdings = _target_holdings_from_weights(
                 close_entry_weights,
                 nav=nav_close,
-                prices=close_marks,
+                prices=sizing_prices,
                 long_lot_sizes=long_lots,
                 short_lot_sizes=short_lots,
             )
@@ -2637,6 +2670,7 @@ def run_tw_cash_dual_session_integer(
         initial_commission_rebate_month_id=(
             initial_commission_rebate_month_id
         ),
+        overnight_decision_prices=None,
     )
 
 
@@ -2650,6 +2684,7 @@ def run_tw_overnight_dual_session_integer(
     buy_fee_rates: object,
     sell_fee_rates: object,
     *,
+    overnight_decision_prices: object | None = None,
     commission_rebate_rates: object = 0.0,
     commission_rebate_timing: str = "daily_close",
     session_month_ids: object | None = None,
@@ -2733,4 +2768,5 @@ def run_tw_overnight_dual_session_integer(
         initial_commission_rebate_month_id=(
             initial_commission_rebate_month_id
         ),
+        overnight_decision_prices=overnight_decision_prices,
     )

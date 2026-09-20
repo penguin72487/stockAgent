@@ -18,6 +18,11 @@ import polars as pl
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+try:
+    from .ohlcv_hot_tail import hot_tail_path
+except ImportError:  # direct execution/import from downloader/
+    from ohlcv_hot_tail import hot_tail_path
+
 
 KLINE_BAR = "1m"
 RUBIK_PERIOD = "5m"
@@ -1372,6 +1377,7 @@ def run_historical_feature_downloads(
     end_ms: int,
     workers: int,
     include_funding_archive: bool,
+    tail_only: bool = False,
     stage_progress_callback: Callable[[str, str, str], None] | None = None,
 ) -> list[HistoricalFeatureResult]:
     eligible = [
@@ -1386,7 +1392,9 @@ def run_historical_feature_downloads(
     results: list[HistoricalFeatureResult] = []
 
     def worker(record: Any) -> HistoricalFeatureResult:
-        output_path = output_dir / f"{record.code}_features.parquet"
+        base_path = output_dir / f"{record.code}_features.parquet"
+        tail_path = hot_tail_path(base_path)
+        output_path = tail_path if tail_only and tail_path.is_file() else base_path
         return enrich_symbol_historical_features(
             client,
             record,
@@ -1415,7 +1423,9 @@ def run_historical_feature_downloads(
                             status="failed",
                             rows=0,
                             output_path=str(
-                                output_dir / f"{record.code}_features.parquet"
+                                hot_tail_path(output_dir / f"{record.code}_features.parquet")
+                                if tail_only and hot_tail_path(output_dir / f"{record.code}_features.parquet").is_file()
+                                else output_dir / f"{record.code}_features.parquet"
                             ),
                             changed=False,
                             stage_status_json="{}",

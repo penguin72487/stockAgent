@@ -124,17 +124,16 @@
         <p id="equity-range-note" class="time-range-note" aria-live="polite"></p>
       </article>
       <article class="panel timeline-panel">
-        <div class="panel-head"><div><h2>執行時鐘與資料契約</h2><p>畫面直接讀取同一份 append-only 模擬帳本</p></div></div>
+        <div class="panel-head"><div><h2>當沖執行時鐘</h2><p>依時間看模擬策略預計做什麼；實際成交與未平倉狀態請看下方明細。</p></div></div>
         <ol class="timeline">
-	          <li><time>09:00</time><div><strong>產生並鎖定當日即時訊號</strong><span>盤前已預熱模型、契約與資格；訊號原子發布後，買入／回補取第一筆較晚 best ask，賣出／放空取第一筆較晚 best bid。若錯過開盤，回補改以官方 09:00 開盤價推論與計算張數，並用右標記 09:01 首分鐘價執行（VWAP 優先，否則同根 K 棒 Close）。缺 tick 不阻擋成交；缺整根 K 棒才阻擋，不使用開盤價成交、last 或 +1 tick。</span></div></li>
-	          <li><time>進場</time><div><strong>可成交委託全數成交</strong><span>買入取 best ask、賣空取 best bid；送出的模擬市價量不超過新鮮一檔可見量，因此送單量全成，模型原始目標超出深度的部分另列為未送出，不捏造流動性。</span></div></li>
-          <li><time>盤中</time><div><strong>啟用模式 TP/SL 皆內縮一 Tick</strong><span>每個啟用策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
-          <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
-	          <li><time>13:24</time><div><strong>撤單後市價強平重試</strong><span>多單賣 bid、空單補 ask，持續到 13:25；缺價或一檔量不足時保留殘餘持倉，不假造成交。</span></div></li>
-	          <li><time>13:25</time><div><strong>收盤集合競價強平</strong><span>仍有多單就掛跌停賣出，仍有空單就掛漲停回補，直接參與 13:30 收盤撮合。</span></div></li>
-	          <li><time>13:30</time><div><strong>撮合與帳務終態</strong><span>模擬帳本才在收盤撮合後結算；若行情資料不足，會明確標示替代估值，不把未成交提前算成已平倉。</span></div></li>
+          <li><time>09:00</time><div><strong>發布訊號並嘗試進場</strong><span>開盤資料到齊後產生當日訊號，再依訊號後的最佳買賣價與可見量模擬進場；錯過開盤的回補另行標示，不冒充即時成交。</span></div></li>
+          <li><time>盤中</time><div><strong>監控持倉與停利停損</strong><span>價格觸及各模式設定的停利或停損時，依對應規則嘗試退出；未成交的持倉繼續監控。</span></div></li>
+          <li><time>13:20</time><div><strong>開始被動限價平倉</strong><span>多單掛最佳賣價、空單回補掛最佳買價；未成交委託隨新的一分鐘報價調整，已觸發的停損仍優先處理。</span></div></li>
+          <li><time>13:24</time><div><strong>改用市價方式嘗試平倉</strong><span>撤換尚未成交的限價委託，以可成交的一檔報價持續嘗試至 13:25；沒有足夠報價或量時保留剩餘持倉。</span></div></li>
+          <li><time>13:25</time><div><strong>送出收盤集合競價平倉單</strong><span>剩餘多單掛當日跌停賣出，剩餘空單掛當日漲停回補；試撮價格不算正式成交。</span></div></li>
+          <li><time>13:30</time><div><strong>核對撮合結果並更新帳本</strong><span>依正式收盤撮合證據記錄成交與損益；延緩收市可能至 13:33。沒有成交證據的部位仍顯示未平倉，不會自動清零。</span></div></li>
         </ol>
-        <dl class="source-list">
+        <template id="overnight-source-contract"><dl class="source-list">
           <div><dt>訊號</dt><dd id="source-signal">—</dd></div>
           <div><dt>開盤價重建</dt><dd id="source-replay">—</dd></div>
           <div><dt>成交</dt><dd id="source-fill">—</dd></div>
@@ -144,7 +143,7 @@
           <div><dt>深度限制</dt><dd id="source-depth">—</dd></div>
           <div><dt>退出時程</dt><dd id="source-exit">—</dd></div>
           <div><dt>延遲邊界</dt><dd id="source-latency">—</dd></div>
-        </dl>
+        </dl></template>
       </article>
     </section>
 
@@ -199,8 +198,8 @@
   <script src="../dashboard-core.js?v=8" defer></script>
   <script src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32" defer></script>
   <script src="presentation.js?v=2" defer></script>
-  <script src="detail-components.js?v=6" defer></script>
-  <script src="chart-renderer.js?v=1" defer></script>
-  <script src="app.js?v=84" defer></script>
+  <script src="detail-components.js?v=7" defer></script>
+  <script src="chart-renderer.js?v=3" defer></script>
+  <script src="app.js?v=88" defer></script>
 </body>
 </html>

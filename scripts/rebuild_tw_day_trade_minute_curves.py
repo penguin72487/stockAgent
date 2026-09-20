@@ -788,8 +788,9 @@ def historical_minute_mark_has_source(row: Mapping[str, Any]) -> bool:
     Cardinality alone is insufficient: a live writer can emit every wall-clock
     minute while repeatedly carrying an unproved snapshot.  Completed-session
     replay rows therefore need the retained one-minute contract and explicit
-    price-quality fields.  The accepted 09:01 entry and 13:30 endpoint are
-    checked separately and intentionally do not use this predicate.
+    price-quality fields.  Completed 09:01 revaluation uses this predicate
+    after separately checking its accepted accounting; the 13:30 execution
+    endpoint is checked under its own immutable-ledger contract.
     """
 
     try:
@@ -1116,13 +1117,15 @@ def _is_terminal_carry_cost(cost: Mapping[str, Any]) -> bool:
     )
 
 
-def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill_rows, start, end, preserve_sourced=True):
+def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill_rows, start, end,
+                                   preserve_sourced=True, revalue_opening_marks=False):
     """Revalue an immutable carried fill/action book, never re-execute trades.
 
     Unlike the flat-session path, inventory, cost basis, unallocated entry
     fees, cash claims and financing charges all survive the session boundary.
-    Accepted endpoint NAV is preserved and its accounting is independently
-    checked. Interior prices come only from retained completed-minute trades.
+    Accepted endpoint accounting is independently checked. The 13:30 NAV is
+    preserved; explicit opening repair revalues 09:01 from the completed bar.
+    Interior prices come only from retained completed-minute trades.
     """
     selected = {(r["market"], r["minute"]): r for r in source_rows
                 if _in_range(r["session_date"], start, end)}
@@ -1137,8 +1140,13 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                          *(a | {"clock": a["recorded_at"], "share_action": True}
                            for a in mode.get("share_replacement_ledger", []))], key=lambda e: e["clock"])
         book, prices, price_times, seen_entries = {}, {}, {}, set()
+        # A new paper entry is a price for that cohort, not a market-wide
+        # trade. Until a sourced minute print arrives, older carried cohorts
+        # retain their own last observed mark.
+        entry_fallbacks: dict[str, tuple[float, str]] = {}
         cursor, realized = 0, 0.
         for day in days:
+            new_entries_this_day = set()
             symbols = {p["symbol"] for p in positions.get(day, {}).get(market, [])}
             source = {symbol: store.prices(symbol, day) for symbol in symbols}
             claims = [c for c in mode.get("corporate_action_ledger", []) if c["ex_date"] <= day]
@@ -1165,21 +1173,25 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                         p["signed_shares"] = int(event["new_signed_shares"])
                         p["inventory_basis_price"] = float(event["new_entry_price"])
                         symbol = p["symbol"]
-                        if price_times.get(symbol, "") < day:
+                        if symbol in prices and price_times.get(symbol, "") < day:
                             prices[symbol] = (prices[symbol] - event["cash_per_old_share"]) / event["ratio"]
                             price_times[symbol] = event["clock"]
+                        if identity in entry_fallbacks:
+                            fallback, started = entry_fallbacks[identity]
+                            entry_fallbacks[identity] = (
+                                (fallback - event["cash_per_old_share"]) / event["ratio"], started
+                            )
                     elif event["purpose"] == "entry":
                         if identity in seen_entries or identity not in metadata:
                             raise RuntimeError("minute entry identity is duplicate or has no accepted position")
                         seen_entries.add(identity)
+                        new_entries_this_day.add(identity)
                         p = dict(metadata[identity])
                         sign = 1 if p["side"] == "long" else -1
                         p.update(signed_shares=sign * int(event["quantity"]), inventory_basis_price=float(event["price"]),
                                  remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
                         book[identity] = p
-                        symbol = p["symbol"]
-                        if price_times.get(symbol, "") < event["clock"]:
-                            prices[symbol], price_times[symbol] = float(event["price"]), event["clock"]
+                        entry_fallbacks[identity] = (float(event["price"]), event["clock"])
                     else:
                         p = book[identity]
                         quantity = int(event["quantity"])
@@ -1190,6 +1202,7 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                         realized += float(event["net_pnl_twd"])
                         if not p["signed_shares"]:
                             del book[identity]
+                            entry_fallbacks.pop(identity, None)
                     cursor += 1
                 fresh = set()
                 for symbol, values in source.items():
@@ -1201,14 +1214,19 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                     if not p["signed_shares"]:
                         continue
                     symbol = p["symbol"]
-                    if symbol not in prices:
+                    fallback = entry_fallbacks.get(p["position_id"])
+                    if fallback and price_times.get(symbol, "") < fallback[1]:
+                        mark_price = fallback[0]
+                    else:
+                        mark_price = prices.get(symbol)
+                    if mark_price is None:
                         raise RuntimeError("carried valuation has no prior observed price")
                     valuation = dict(p)
                     if str(p.get("margin_converted_at") or "9999") > clock:
                         valuation.pop("margin_carry_contract", None)
-                    net += position_net_liquidation_pnl(valuation, prices[symbol])
+                    net += position_net_liquidation_pnl(valuation, mark_price)
                     count += 1
-                    amount = abs(p["signed_shares"] * prices[symbol])
+                    amount = abs(p["signed_shares"] * mark_price)
                     notional += amount
                     if symbol in fresh:
                         fresh_count += 1
@@ -1237,8 +1255,19 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                     for field in ("cumulative_realized_net_pnl_twd", "open_position_count", "cumulative_carry_cost_twd", "cumulative_corporate_action_net_twd"):
                         if not math.isclose(float(existing.get(field) or 0), float(row[field]), rel_tol=1e-12, abs_tol=1e-6):
                             raise RuntimeError(f"carried endpoint accounting disagrees: {market}:{key}:{field}")
-                    row = dict(existing)
-                    row["accepted_endpoint_accounting_verified"] = True
+                    if (key[11:16] == "09:01" and revalue_opening_marks
+                            and not historical_minute_mark_has_source(existing)):
+                        missing_open = sorted({book[identity]["symbol"] for identity in new_entries_this_day
+                                               if identity in book and book[identity]["symbol"] not in fresh})
+                        if missing_open:
+                            raise RuntimeError(
+                                f"missing completed 09:01 valuation bar for {day}:{market}:{missing_open}"
+                            )
+                        row["opening_mark_revalued_from_completed_bar"] = True
+                        row["accepted_endpoint_accounting_verified"] = True
+                    else:
+                        row = dict(existing)
+                        row["accepted_endpoint_accounting_verified"] = True
                 elif preserve_sourced and existing and historical_minute_mark_has_source(existing):
                     row = dict(existing)
                 output.append(row)
@@ -1799,8 +1828,7 @@ def main() -> None:
     source_marks = _read_jsonl(args.state_dir / "marks.jsonl")
     has_margin_carry = any(row.get("margin_carry_contract") for row in source_marks)
     accounting_signature = _carried_accounting_signature(args.state_dir, end) if args.revalue_carried_marks else None
-    if args.revalue_carried_marks and (not has_margin_carry or args.validate_existing_strategy_marks
-                                      or args.revalue_opening_marks):
+    if args.revalue_carried_marks and (not has_margin_carry or args.validate_existing_strategy_marks):
         raise ValueError("carried revaluation requires its own explicit inventory contract")
     if has_margin_carry and (not (args.validate_existing_strategy_marks or args.revalue_carried_marks)
             or args.repair_terminal_only or args.repair_unverified_strategy_marks):
@@ -1961,7 +1989,8 @@ def main() -> None:
         rebuilt_marks, strategy_stats = rebuild_carried_strategy_marks(
             source_marks, positions, store, state=_read_json(args.state_dir / "state.json"),
             fill_rows=source_fills, start=start, end=end,
-            preserve_sourced=not args.recompute_existing_strategy_marks)
+            preserve_sourced=not args.recompute_existing_strategy_marks,
+            revalue_opening_marks=bool(args.revalue_opening_marks))
     elif args.validate_existing_strategy_marks:
         rebuilt_marks, strategy_stats = validate_existing_strategy_marks(
             source_marks, start=start, end=end

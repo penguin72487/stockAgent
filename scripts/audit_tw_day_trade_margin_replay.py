@@ -89,6 +89,14 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     names = ("state.json", "rebuild_receipt.json", "fills.jsonl", "marks.jsonl", "orders.jsonl")
     before = {name: _sha256(state_dir / name) for name in names}
     state, rebuild = _read_json(state_dir / "state.json"), _read_json(state_dir / "rebuild_receipt.json")
+    full_target_counterfactual = (
+        (rebuild.get("replay_contract") or {}).get("entry")
+        == "retrospective_prior_paper_fill_else_09_01_minute_price_full_target_no_liquidity_claim_v1"
+    )
+    prior_manifest: dict[str, dict] = {}
+    if full_target_counterfactual and verify_sources:
+        from scripts.stage_tw_day_trade_prior_paper_source import verify
+        prior_manifest = verify(state_dir, rebuild)
     sessions = rebuild["sessions"]
     incomplete = [i for i, row in enumerate(sessions)
                   if str((row.get("close") or {}).get("status", "")).startswith("blocked")]
@@ -297,14 +305,63 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             path = _entry_source_path(source)
             if (path.parent.name, session["session_date"]) in filled_symbol_days:
                 source_days[str(path)].add(date.fromisoformat(session["session_date"]))
-    if verify_sources and fills and not source_days:
+    if verify_sources and not full_target_counterfactual and any(
+        row.get("prior_paper_fill_reused") for row in fills
+    ):
+        errors.append("prior paper-fill reuse outside explicit full-target contract")
+    if verify_sources and full_target_counterfactual:
+        for fill in fills:
+            if not fill.get("prior_paper_fill_reused"):
+                continue
+            key_prior = "|".join((str(fill["session_date"]),
+                                  str(fill["market"]), str(fill["symbol"])))
+            prior = prior_manifest.get(key_prior)
+            if (not isinstance(prior, dict)
+                    or str(fill.get("fill_at")) != str(prior.get("fill_at"))
+                    or not math.isclose(float(fill["price"]), float(prior.get("price") or 0),
+                                        rel_tol=0.0, abs_tol=1e-8)):
+                errors.append(f"prior paper fill has no matching source: {key_prior}")
+    if verify_sources and any(not row.get("prior_paper_fill_reused") for row in fills) and not source_days:
         errors.append("filled replay has no retained minute source receipts")
     if verify_sources and fills:
-        needs = pl.DataFrame([{"symbol": row["symbol"], "minute_key": row["recorded_at"][:16]} for row in fills]).unique()
+        needs = pl.DataFrame(
+            [{"symbol": row["symbol"], "minute_key": row["recorded_at"][:16]}
+             for row in fills if not row.get("prior_paper_fill_reused")],
+            schema={"symbol": pl.Utf8, "minute_key": pl.Utf8},
+        ).unique()
         source_bars = []
         for name, days in source_days.items():
             path = Path(name)
             if "minute_chunks" not in path.parts:
+                if "research_dataset" in path.parts and path.name == "data.parquet":
+                    manifest_path = path.parent.parent / "manifest.json"
+                    try:
+                        for source in (path, manifest_path):
+                            stat = source.stat()
+                            signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                            if minute_source_signatures.setdefault(str(source), signature) != signature:
+                                raise RuntimeError(f"minute source changed during audit: {source}")
+                        manifest = _read_json(manifest_path)
+                        relative = str(path.relative_to(path.parent.parent))
+                        entry = next(row for row in manifest.get("partitions") or []
+                                     if row.get("output") == relative)
+                        if (entry.get("status") != "ok"
+                                or entry.get("trade_date") not in {d.isoformat() for d in days}
+                                or _sha256(path) != entry.get("output_sha256")):
+                            raise ValueError("research partition hash/date mismatch")
+                        schema = pl.read_parquet_schema(path)
+                        volume = (pl.col("volume_shares") if "volume_shares" in schema else
+                                  pl.col("Volume") * (pl.col("contract_unit") if "contract_unit" in schema else 1000))
+                        source_bars.append(pl.scan_parquet(path)
+                            .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
+                                    pl.col("High").cast(pl.Float64).alias("high"),
+                                    pl.col("Low").cast(pl.Float64).alias("low"),
+                                    volume.cast(pl.Float64).alias("volume_shares"))
+                            .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
+                        continue
+                    except (OSError, ValueError, StopIteration, KeyError) as exc:
+                        errors.append(f"invalid research minute source {name}: {exc}")
+                        continue
                 errors.append(f"minute source has no checked collector receipt: {name}")
                 continue
             start, end = map(date.fromisoformat, path.stem.split("_"))
@@ -334,6 +391,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             bars = {(row["symbol"], row["minute_key"]): row for row in frame.to_dicts()}
             usage = defaultdict(int)
             for fill in fills:
+                if fill.get("prior_paper_fill_reused"):
+                    continue
                 key = (fill["symbol"], fill["recorded_at"][:16])
                 bar = bars.get(key)
                 if bar is None:
@@ -345,7 +404,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 usage[(fill["market"], *key)] += int(fill["quantity"])
             for (market, symbol, minute), quantity in usage.items():
                 capacity = math.floor(bars[(symbol, minute)]["volume_shares"] * .5 / 1000) * 1000
-                if quantity > capacity:
+                if not full_target_counterfactual and quantity > capacity:
                     errors.append(f"shared minute capacity exceeded: {market}:{symbol}:{minute}: {quantity}>{capacity}")
     if before != {name: _sha256(state_dir / name) for name in names}:
         raise RuntimeError("replay changed during audit; rerun on completed candidate")

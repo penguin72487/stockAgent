@@ -60,6 +60,12 @@ class TwOvernightHistoricalReplayEngine(TwOvernightSimulationEngine):
             raise ValueError("Replay signal date differs from selected official source")
         return effective
 
+    def _signal_started_timestamp(self, summary: Mapping[str, Any]) -> datetime | None:
+        # A historical model run happens after its selected session. Its real
+        # signal_started_at stays in the summary/ledger for provenance; only
+        # the explicitly dated counterfactual clock may enter execution gates.
+        return self._signal_timestamp(summary)
+
     def _match_auction_print(
         self, quote: Mapping[str, Any], *, symbol: str, **kwargs: Any,
     ) -> tuple[float, None] | None:

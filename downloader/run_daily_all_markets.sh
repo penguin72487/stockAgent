@@ -44,6 +44,8 @@ YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
 YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS="${YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS:-0}"
 YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS:-0}"
 YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
+YAHOO_VERIFY_US_HISTORY_HEAD="${YAHOO_VERIFY_US_HISTORY_HEAD:-0}"
+YAHOO_HISTORY_START_DATE="${YAHOO_HISTORY_START_DATE:-1900-01-01}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_yahoo/forex}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
@@ -58,6 +60,7 @@ CRYPTO_HISTORICAL_FEATURES="${CRYPTO_HISTORICAL_FEATURES:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
 OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
+OKX_SKIP_FUNDING_ARCHIVE="${OKX_SKIP_FUNDING_ARCHIVE:-0}"
 # Bybit permits 600 public HTTP requests per five seconds.  Use enough
 # in-flight requests to finish before the slower official OKX 10 req/s bucket,
 # without retaining workers that cannot shorten the end-to-end CEX cycle.
@@ -443,9 +446,14 @@ run_yahoo_incremental() {
   for asset in "${assets[@]}"; do
     local yahoo_mode="daily-update"
     local step_suffix="daily_update"
+    local -a history_flags=()
     if [[ "$asset" == "crypto" ]]; then
       yahoo_mode="incremental"
       step_suffix="1m_update"
+    elif [[ "$asset" == "us_stocks" && "$YAHOO_VERIFY_US_HISTORY_HEAD" == "1" ]]; then
+      yahoo_mode="repair"
+      step_suffix="history_head_repair"
+      history_flags=(--verify-us-history-head --start-date "$YAHOO_HISTORY_START_DATE")
     fi
     base_cmd=(
       "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
@@ -460,6 +468,7 @@ run_yahoo_incremental() {
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
       --rate-limit-abort-after "$YAHOO_RATE_LIMIT_ABORT_AFTER"
+      "${history_flags[@]}"
       "${yahoo_flags[@]}"
     )
 
@@ -599,6 +608,9 @@ run_okx_perp_incremental() {
   fi
   if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
     cmd+=(--skip-historical-features)
+  fi
+  if [[ "$OKX_SKIP_FUNDING_ARCHIVE" == "1" ]]; then
+    cmd+=(--skip-funding-archive)
   fi
   run_step okx_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
@@ -1057,6 +1069,10 @@ validate_settings() {
     echo "[daily] CRYPTO_HISTORICAL_FEATURES must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$OKX_SKIP_FUNDING_ARCHIVE" != "0" && "$OKX_SKIP_FUNDING_ARCHIVE" != "1" ]]; then
+    echo "[daily] OKX_SKIP_FUNDING_ARCHIVE must be 0 or 1" >&2
+    exit 2
+  fi
   if [[ "$RUN_CRYPTO_TRADE_TICKS" != "0" || "$RUN_CRYPTO_ORDER_BOOK" != "0" || "$RUN_CRYPTO_LIQUIDATIONS" != "0" ]]; then
     echo "[daily] crypto event acquisition is deferred; trade ticks, order books and liquidations must remain disabled" >&2
     exit 2
@@ -1135,6 +1151,14 @@ validate_settings() {
   fi
   if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then
     echo "[daily] RUN_YAHOO must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$YAHOO_VERIFY_US_HISTORY_HEAD" != "0" && "$YAHOO_VERIFY_US_HISTORY_HEAD" != "1" ]]; then
+    echo "[daily] YAHOO_VERIFY_US_HISTORY_HEAD must be 0 or 1" >&2
+    exit 2
+  fi
+  if ! [[ "$YAHOO_HISTORY_START_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "[daily] YAHOO_HISTORY_START_DATE must be YYYY-MM-DD" >&2
     exit 2
   fi
   if [[ " $YAHOO_ASSETS " == *" tw_stocks "* ]]; then

@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import html
 import io
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 import polars as pl
 import pyarrow.parquet as pq
 import requests
+from bs4 import BeautifulSoup
 from tqdm import tqdm
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -57,6 +59,11 @@ except ImportError:  # pragma: no cover - direct script execution from downloade
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
+GCIS_CATALOG_URL = "https://data.gcis.nat.gov.tw/od/datacategory"
+GCIS_DETAIL_URL = "https://data.gcis.nat.gov.tw/od/detail?oid={oid}"
+GCIS_FILE_URL = "https://data.gcis.nat.gov.tw/od/file?oid={oid}"
+FSC_CATALOG_URL = "https://stat.fsc.gov.tw/api/v1/public/datasets"
+FSC_EXPORT_URL = FSC_CATALOG_URL + "/{identifier}/export"
 TWSE_DAY_TRADE_OPENAPI_URL = "https://openapi.twse.com.tw/v1/exchangeReport/TWTB4U"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -314,20 +321,12 @@ DAY_TRADE_ELIGIBILITY_DATASETS = frozenset(
 TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES: dict[
     str,
     tuple[tuple[date, date, str], ...],
-] = {
-    # Live checks against the official endpoint, using the receipt-verified
-    # TAIEX calendar, found data through 2007-05-31 and again from 2008-09-30.
-    # Every intervening open session returns the same explicit structured
-    # no-data response.  These dates are coverage only after their individual
-    # immutable response receipts have been journaled and verified.
-    "tpex_margin_balance": (
-        (
-            date(2007, 6, 1),
-            date(2008, 9, 29),
-            "official_endpoint_archive_gap",
-        ),
-    ),
-}
+] = {}
+# Do not turn a previously observed empty response into a permanent archive
+# gap.  The TPEx margin endpoint was verified again on 2026-09-16 and returned
+# 409 rows for 2007-06-01 and 412 rows for 2008-09-26, both inside the old
+# hard-coded 331-session "gap".  Old empty receipts remain for provenance but
+# are no longer allowed to satisfy coverage or suppress a repair request.
 TPEX_LEGACY_HTML_RESPONSE_KINDS = frozenset(
     {
         "tpex_margin_archive_html",
@@ -882,6 +881,30 @@ SNAPSHOT_OPEN_DATASETS: tuple[DatasetSpec, ...] = (
 
 DATA_GOV_DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
+        name="sitca_domestic_fund_monthly_report_index",
+        kind="data_gov",
+        source="data.gov.tw / SITCA",
+        description="Domestic fund ISIN, report URL, and manager directory; current open-data snapshot, not historical holdings.",
+        tags=("sitca", "fund", "directory", "monthly", "data_gov", "snapshot"),
+        data_gov_id="21404",
+    ),
+    DatasetSpec(
+        name="sitca_domestic_fund_basic",
+        kind="data_gov",
+        source="data.gov.tw / SITCA",
+        description="Domestic fund identity, scale, and investment-area metadata; current open-data snapshot.",
+        tags=("sitca", "fund", "directory", "monthly", "data_gov", "snapshot"),
+        data_gov_id="43476",
+    ),
+    DatasetSpec(
+        name="twse_etf_fund_basic",
+        kind="data_gov",
+        source="data.gov.tw / TWSE",
+        description="ETF identity, issuer, listing, and benchmark metadata; current open-data snapshot, not PCF or holdings.",
+        tags=("twse", "etf", "fund", "directory", "monthly", "data_gov", "snapshot"),
+        data_gov_id="157399",
+    ),
+    DatasetSpec(
         name="data_gov_tdcc_shareholding_distribution",
         kind="data_gov",
         source="data.gov.tw",
@@ -964,6 +987,26 @@ DATA_GOV_DATASETS: tuple[DatasetSpec, ...] = (
 )
 
 
+ADDITIONAL_OFFICIAL_CATALOGS: tuple[DatasetSpec, ...] = (
+    DatasetSpec(
+        name="gcis_open_data_catalog",
+        kind="gcis_catalog",
+        source="MOEA GCIS",
+        description="All discoverable commercial-registration CSV resources, preserved by source resource and payload version.",
+        tags=("gcis", "moea", "company", "business", "registration", "catalog"),
+        url=GCIS_CATALOG_URL,
+    ),
+    DatasetSpec(
+        name="fsc_open_data_catalog",
+        kind="fsc_catalog",
+        source="FSC public statistics API",
+        description="All public FSC API datasets, preserved as official CSV exports by dataset and payload version.",
+        tags=("fsc", "financial", "statistics", "catalog"),
+        url=FSC_CATALOG_URL,
+    ),
+)
+
+
 DEFAULT_DATASETS: dict[str, DatasetSpec] = {
     spec.name: spec
     for spec in (
@@ -975,10 +1018,18 @@ DEFAULT_DATASETS: dict[str, DatasetSpec] = {
     )
 }
 
+# The opening/source-event readiness contract counts DEFAULT_DATASETS. Keep
+# broad background catalogs separately selectable so a first 700+ source
+# catch-up cannot delay the TWSE/TPEx close and pre-open paths.
+EXTENDED_DATASETS: dict[str, DatasetSpec] = {
+    **DEFAULT_DATASETS,
+    **{spec.name: spec for spec in ADDITIONAL_OFFICIAL_CATALOGS},
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download Taiwan free public datasets from TWSE, TPEx, MOPS, TDCC, TAIFEX, CBC, DGBAS, and MOF."
+        description="Download Taiwan free public datasets from TWSE, TPEx, MOPS, TDCC, TAIFEX, CBC, DGBAS, MOF, MOEA GCIS, and FSC."
     )
     parser.add_argument(
         "--mode",
@@ -995,7 +1046,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        help="Dataset names or tags/sources, e.g. all twse tpex macro price.",
+        help="Dataset names or tags/sources, e.g. all twse tpex gcis fsc; all-extended includes the background catalogs.",
     )
     parser.add_argument(
         "--start-date", default="earliest", help="Historical start date or 'earliest'."
@@ -1110,7 +1161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--refresh",
         action="store_true",
-        help="Overwrite existing parquet instead of merging.",
+        help="Overwrite eligible merged parquet outputs; for GCIS/FSC, recheck existing resource bytes for silent corrections while preserving immutable prior versions.",
     )
     parser.add_argument(
         "--resume",
@@ -1167,7 +1218,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    # Two response completions can straddle the 09:00 boundary or correct the
+    # same payload within one second; a second-rounded receipt loses ordering.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _snapshot_as_of_date() -> str:
@@ -1810,6 +1863,38 @@ def _existing_date_counts(path: Path) -> tuple[dict[date, int], list[str]]:
             continue
         output[parsed] = output.get(parsed, 0) + int(count)
     return output, invalid
+
+
+def _malformed_twse_ohlcv_source_dates(path: Path) -> set[date]:
+    """Recover only official request dates for malformed canonical date cells.
+
+    A source URL schedules a re-fetch; it never by itself rewrites a row. The
+    newly fetched official row must contain the same symbol before merge may
+    retire the malformed copy.
+    """
+    if not path.is_file():
+        return set()
+    schema = set(pq.read_schema(path).names)
+    if not {DATE_COLUMN, "_url", "證券代號"} <= schema:
+        raise ValueError("malformed TWSE OHLCV date cannot be traced to its source URL")
+    invalid = (
+        pl.scan_parquet(path)
+        .select(DATE_COLUMN, "_url", "證券代號")
+        .filter(pl.col(DATE_COLUMN).str.strptime(pl.Date, "%Y-%m-%d", strict=False).is_null())
+        .collect()
+    )
+    days: set[date] = set()
+    for row in invalid.iter_rows(named=True):
+        parsed = urlparse(str(row["_url"] or ""))
+        query = dict(parse_qsl(parsed.query))
+        token = query.get("date", "")
+        if (parsed.scheme != "https" or parsed.netloc not in {"www.twse.com.tw", "wwwc.twse.com.tw"}
+                or parsed.path != "/rwd/zh/afterTrading/MI_INDEX"
+                or query.get("type") != "ALLBUT0999" or not re.fullmatch(r"\d{8}", token)
+                or not str(row["證券代號"] or "").strip()):
+            raise ValueError(f"malformed TWSE OHLCV date has unverified source: {row!r}")
+        days.add(datetime.strptime(token, "%Y%m%d").date())
+    return days
 
 
 def _suspicious_ohlcv_dates(
@@ -2509,6 +2594,19 @@ def _plan_historical_download(
     suspicious_dates &= all_weekdays
     if invalid_date_values:
         suspicious_issues.append(f"invalid_date_values={len(invalid_date_values)}")
+        if not replace_output and spec.name != "twse_daily_ohlcv":
+            raise RuntimeError(
+                f"{spec.name} has untraceable invalid date values; rebuild from official source"
+            )
+        elif not replace_output and mode == "daily":
+            raise RuntimeError(
+                "TWSE daily OHLCV has malformed source dates; run --mode repair first"
+            )
+        elif not replace_output:
+            traced_dates = _malformed_twse_ohlcv_source_dates(parquet_path)
+            if not traced_dates or not traced_dates <= all_weekdays:
+                raise RuntimeError("malformed TWSE OHLCV source dates fall outside verified sessions")
+            suspicious_dates |= traced_dates
 
     if replace_output:
         requested = sorted(all_weekdays)
@@ -4641,6 +4739,46 @@ def _merge_frames(
         return incoming
     if incoming.is_empty():
         return existing
+    # A snapshot's subject date is not its publication/vintage key.  Preserve
+    # every payload transition, including a correction that later reverts to
+    # previously seen bytes.  Unchanged consecutive bytes are a semantic
+    # no-op.  Older archives lacking the digest remain intact.
+    if "_payload_sha256" in incoming.columns:
+        if "_payload_sha256" in existing.columns:
+            if "_downloaded_at_utc" in existing.columns:
+                if "_resource" in incoming.columns and "_resource" in existing.columns:
+                    latest = (
+                        existing.select("_resource", "_payload_sha256", "_downloaded_at_utc")
+                        .with_columns(pl.col("_resource").fill_null("").alias("_dedupe_resource"))
+                        .sort("_downloaded_at_utc", maintain_order=True)
+                        .unique(subset=["_dedupe_resource"], keep="last")
+                        .select(
+                            "_dedupe_resource",
+                            pl.col("_payload_sha256").alias("_last_payload_sha256"),
+                        )
+                    )
+                    incoming = (
+                        incoming.with_columns(
+                            pl.col("_resource").fill_null("").alias("_dedupe_resource")
+                        )
+                        .join(latest, on="_dedupe_resource", how="left", validate="m:1")
+                        .filter(
+                            pl.col("_last_payload_sha256").is_null()
+                            | (pl.col("_payload_sha256") != pl.col("_last_payload_sha256"))
+                        )
+                        .drop("_dedupe_resource", "_last_payload_sha256")
+                    )
+                else:
+                    latest_digest = (
+                        existing.select("_payload_sha256", "_downloaded_at_utc")
+                        .sort("_downloaded_at_utc", maintain_order=True)
+                        .get_column("_payload_sha256")[-1]
+                    )
+                    if latest_digest is not None:
+                        incoming = incoming.filter(pl.col("_payload_sha256") != latest_digest)
+        if incoming.is_empty():
+            return existing
+        return pl.concat([existing, incoming], how="diagonal_relaxed")
     # Snapshot files are daily vintages. Re-running one day may replace that
     # day's parsed snapshot, but must never erase an older day's bytes merely
     # because the provider repeats the same report/data date.
@@ -4682,6 +4820,32 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
         return _read_existing_row_count(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_existing(path)
+    if (path.name == "twse_daily_ohlcv.parquet" and not existing.is_empty()
+            and {DATE_COLUMN, "_url", "證券代號"} <= set(existing.columns)
+            and {DATE_COLUMN, "證券代號"} <= set(frame.columns)):
+        # Remove a malformed-date copy only after the requested official day
+        # has produced a replacement for that exact security. No date is
+        # inferred from a typo, and unmatched old evidence stays visible.
+        replacements = set(frame.select(DATE_COLUMN, "證券代號").iter_rows())
+        rejected_indices: list[int] = []
+        malformed = existing.with_row_index("_repair_row_index").filter(
+            pl.col(DATE_COLUMN).str.strptime(pl.Date, "%Y-%m-%d", strict=False).is_null()
+        )
+        for row in malformed.select("_repair_row_index", "_url", "證券代號").iter_rows(named=True):
+            parsed = urlparse(str(row["_url"] or ""))
+            query = dict(parse_qsl(parsed.query))
+            token = query.get("date", "")
+            if (parsed.scheme == "https" and parsed.netloc in {"www.twse.com.tw", "wwwc.twse.com.tw"}
+                    and parsed.path == "/rwd/zh/afterTrading/MI_INDEX"
+                    and query.get("type") == "ALLBUT0999"
+                    and re.fullmatch(r"\d{8}", token)):
+                official_date = datetime.strptime(token, "%Y%m%d").date().isoformat()
+                if (official_date, row["證券代號"]) in replacements:
+                    rejected_indices.append(int(row["_repair_row_index"]))
+        if rejected_indices:
+            existing = existing.with_row_index("_repair_row_index").filter(
+                ~pl.col("_repair_row_index").is_in(rejected_indices)
+            ).drop("_repair_row_index")
     merged = _merge_frames(existing, frame, refresh=refresh)
     # Re-fetching an overlap updates the observation timestamp even when the
     # official payload is byte-for-byte equivalent.  Rewriting a multi-million
@@ -6044,7 +6208,6 @@ def _download_snapshot_url(
     spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
 ) -> DownloadResult:
     assert spec.url is not None
-    fetched_at = _now_utc()
     response = _http_get(
         spec.url,
         timeout=args.timeout,
@@ -6052,17 +6215,19 @@ def _download_snapshot_url(
         retries=int(args.retries),
         retry_backoff=float(args.retry_backoff),
     )
+    # The response completion, not request start, proves first observation.
+    fetched_at = _now_utc()
     as_of_date = _snapshot_as_of_date()
+    digest = hashlib.sha256(response.content).hexdigest()
     raw_path: Path | None = None
     if not args.skip_raw:
         suffix = _suffix_from_url(spec.url, response.headers.get("content-type", ""))
-        digest = hashlib.sha256(response.content).hexdigest()
         raw_path = _write_immutable_raw(
             response.content,
             output_dir / "raw" / spec.name,
             spec.name,
             suffix,
-            stem=f"{as_of_date}.{digest[:16]}",
+            stem=digest[:16],
         )
     frame = _parse_resource_bytes(response.content, url=spec.url)
     if frame.is_empty():
@@ -6075,12 +6240,12 @@ def _download_snapshot_url(
         fetched_at=fetched_at,
         url=spec.url,
         as_of_date=as_of_date,
-    )
+    ).with_columns(pl.lit(digest).alias("_payload_sha256"))
     parquet_path = output_dir / f"{spec.name}.parquet"
     rows = _write_parquet_merged(
         parquet_path,
         frame,
-        refresh=bool(args.refresh) or _canonical_mode(args.mode) == "rebuild",
+        refresh=False,
     )
     return DownloadResult(
         spec.name,
@@ -6286,7 +6451,6 @@ def _download_data_gov(
     spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
 ) -> DownloadResult:
     assert spec.data_gov_id is not None
-    fetched_at = _now_utc()
     metadata_url = DATA_GOV_DATASET_API.format(dataset_id=quote(str(spec.data_gov_id)))
     metadata_response = _http_get(
         metadata_url,
@@ -6329,15 +6493,17 @@ def _download_data_gov(
                 retries=int(args.retries),
                 retry_backoff=float(args.retry_backoff),
             )
+            fetched_at = _now_utc()
+            digest = hashlib.sha256(response.content).hexdigest()
             if not args.skip_raw:
-                raw_path = _write_raw(
+                raw_path = _write_immutable_raw(
                     response.content,
                     output_dir / "raw" / spec.name,
                     spec.name,
                     _suffix_from_url(
                         str(url), response.headers.get("content-type", "")
                     ),
-                    stem=f"{idx}_{resource_format or 'resource'}",
+                    stem=f"{idx}.{digest[:16]}",
                 )
             frame = _parse_resource_bytes(
                 response.content, url=str(url), resource_format=resource_format
@@ -6353,11 +6519,12 @@ def _download_data_gov(
                 spec,
                 fetched_at=fetched_at,
                 url=str(url),
-                as_of_date=date.today().isoformat(),
+                as_of_date=_snapshot_as_of_date(),
                 resource=resource_name or f"resource_{idx}",
             ).with_columns(
                 pl.lit(spec.data_gov_id).alias("_data_gov_id"),
                 pl.lit(str(metadata.get("title") or "")).alias("_data_gov_title"),
+                pl.lit(digest).alias("_payload_sha256"),
             )
         )
 
@@ -6387,7 +6554,7 @@ def _download_data_gov(
 
     incoming = pl.concat(frames, how="diagonal_relaxed")
     parquet_path = output_dir / f"{spec.name}.parquet"
-    rows = _write_parquet_merged(parquet_path, incoming, refresh=True)
+    rows = _write_parquet_merged(parquet_path, incoming, refresh=False)
     return DownloadResult(
         spec.name,
         "ok",
@@ -6395,6 +6562,328 @@ def _download_data_gov(
         str(parquet_path),
         message="; ".join(messages) if messages else None,
         raw_path=str(raw_path) if raw_path else None,
+    )
+
+
+def _catalog_get(url: str, args: argparse.Namespace) -> requests.Response:
+    return _http_get(
+        url,
+        timeout=int(args.timeout),
+        verify_ssl=bool(args.verify_ssl),
+        retries=int(args.retries),
+        retry_backoff=float(args.retry_backoff),
+    )
+
+
+def _load_catalog_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"schema_version": 1, "datasets": {}}
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("schema_version") != 1 or not isinstance(state.get("datasets"), dict):
+        raise ValueError(f"invalid catalog state: {path}")
+    return state
+
+
+def _catalog_recheck_due(item: dict[str, Any], update_marker: Any, args: argparse.Namespace) -> bool:
+    if bool(args.refresh) or args.mode == "rebuild":
+        return True
+    if not item.get("complete") or item.get("update_marker") != update_marker:
+        return True
+    # Daily runs only fetch missing or catalog-marked changed resources.
+    # A same-marker correction requires an explicit --refresh audit.
+    return False
+
+
+def _catalog_resource_refresh_due(
+    item: dict[str, Any], update_marker: Any, args: argparse.Namespace
+) -> bool:
+    """Keep already archived resources during a partially failed item retry."""
+    if bool(args.refresh) or args.mode == "rebuild":
+        return True
+    if item.get("update_marker") != update_marker:
+        return True
+    if not item.get("complete"):
+        return False
+    return _catalog_recheck_due(item, update_marker, args)
+
+
+def _catalog_existing_raw(
+    item: dict[str, Any], output_dir: Path, *, verify_digest: bool = False
+) -> bool:
+    relative = item.get("raw_path")
+    digest = item.get("sha256")
+    if not isinstance(relative, str) or not isinstance(digest, str):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return False
+    raw_root = (output_dir / "raw").resolve()
+    path = (output_dir / relative).resolve()
+    if not path.is_relative_to(raw_root) or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    return not verify_digest or _file_sha256(path) == digest
+
+
+def _catalog_save_raw(
+    raw: bytes,
+    output_dir: Path,
+    spec: DatasetSpec,
+    dataset_id: str,
+    resource_id: str,
+    *,
+    suffix: str,
+    label: str,
+    source_url: str,
+) -> dict[str, Any]:
+    if not raw:
+        raise ValueError(f"empty source resource: {source_url}")
+    digest = hashlib.sha256(raw).hexdigest()
+    raw_dir = output_dir / "raw" / spec.name / dataset_id
+    path = _write_immutable_raw(
+        raw,
+        raw_dir,
+        spec.name,
+        suffix,
+        stem=f"{resource_id}.{digest}",
+    )
+    return {
+        "resource_id": resource_id,
+        "label": label,
+        "source_url": source_url,
+        "raw_path": str(path.relative_to(output_dir)),
+        "sha256": digest,
+        "size_bytes": len(raw),
+        "first_observed_at_utc": _now_utc(),
+        "value_vintage_basis": "current_official_export_at_first_observation",
+        "publication_date_basis": "not_proven_by_export",
+    }
+
+
+def _write_catalog_inventory(
+    spec: DatasetSpec, state: dict[str, Any], output_dir: Path
+) -> Path:
+    rows: list[dict[str, Any]] = []
+    for dataset_id, item in sorted(state["datasets"].items()):
+        for resource_id, resource in sorted(item.get("resources", {}).items()):
+            rows.append({
+                "dataset_id": dataset_id,
+                "dataset_name": str(item.get("name") or ""),
+                "resource_id": resource_id,
+                "resource_label": str(resource.get("label") or ""),
+                "catalog_update_marker": str(item.get("update_marker") or ""),
+                "source_rows": item.get("row_count"),
+                "raw_path": str(resource.get("raw_path") or ""),
+                "sha256": str(resource.get("sha256") or ""),
+                "size_bytes": int(resource.get("size_bytes") or 0),
+                "first_observed_at_utc": str(resource.get("first_observed_at_utc") or ""),
+                "value_vintage_basis": str(resource.get("value_vintage_basis") or ""),
+                "publication_date_basis": str(resource.get("publication_date_basis") or ""),
+            })
+    path = output_dir / f"{spec.name}.parquet"
+    if rows:
+        temporary = path.with_suffix(".parquet.tmp")
+        pl.DataFrame(rows).write_parquet(temporary)
+        os.replace(temporary, path)
+    return path
+
+
+def _gcis_catalog_entries(raw: bytes) -> list[dict[str, str]]:
+    soup = BeautifulSoup(raw, "html.parser")
+    entries: dict[str, dict[str, str]] = {}
+    for li in soup.find_all("li"):
+        link = li.find("a", href=re.compile(r"/od/detail"))
+        if link is None:
+            continue
+        match = re.search(r"[?&]oid=([0-9A-F-]{36})", str(link.get("href", "")), re.I)
+        if match is None:
+            continue
+        updated = li.select_one("span.date")
+        oid = match.group(1).upper()
+        entries[oid] = {
+            "id": oid,
+            "name": link.get_text(" ", strip=True),
+            "updated": updated.get_text(" ", strip=True) if updated else "",
+        }
+    if len(entries) < 100:
+        raise ValueError(f"GCIS catalog is unexpectedly short: {len(entries)} entries")
+    return list(entries.values())
+
+
+def _gcis_detail_resources(raw: bytes) -> list[dict[str, str]]:
+    soup = BeautifulSoup(raw, "html.parser")
+    resources: dict[str, dict[str, str]] = {}
+    for link in soup.find_all("a", onclick=True):
+        match = re.search(r"/od/file\?oid=([0-9A-F-]{36})", str(link["onclick"]), re.I)
+        if match is None:
+            continue
+        oid = match.group(1).upper()
+        row = link.find_parent("tr")
+        label = row.get_text(" ", strip=True) if row is not None else oid
+        resources[oid] = {"id": oid, "label": label}
+    return list(resources.values())
+
+
+def _download_gcis_catalog(
+    spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
+) -> DownloadResult:
+    response = _catalog_get(GCIS_CATALOG_URL, args)
+    entries = _gcis_catalog_entries(response.content)
+    state_path = output_dir / "state" / f"{spec.name}.json"
+    state = _load_catalog_state(state_path)
+    if state.get("catalog_entry_count") != len(entries):
+        state["catalog_entry_count"] = len(entries)
+        _write_json(state_path, state)
+    downloaded = skipped = 0
+    errors: list[str] = []
+    for index, entry in enumerate(entries, 1):
+        dataset_id = entry["id"]
+        previous = state["datasets"].get(dataset_id, {})
+        if not _catalog_recheck_due(previous, entry["updated"], args) and all(
+            _catalog_existing_raw(resource, output_dir, verify_digest=args.mode == "repair")
+            for resource in previous.get("resources", {}).values()
+        ):
+            skipped += 1
+            continue
+        item = {**previous, "name": entry["name"], "resources": dict(previous.get("resources", {}))}
+        refresh_existing = _catalog_resource_refresh_due(previous, entry["updated"], args)
+        item["update_marker"] = entry["updated"]
+        try:
+            detail = _catalog_get(GCIS_DETAIL_URL.format(oid=dataset_id), args)
+            resources = _gcis_detail_resources(detail.content)
+            for resource in resources:
+                resource_id = resource["id"]
+                existing = item["resources"].get(resource_id)
+                if not refresh_existing and existing is not None and _catalog_existing_raw(
+                    existing, output_dir, verify_digest=args.mode == "repair"
+                ):
+                    continue
+                source_url = GCIS_FILE_URL.format(oid=resource_id)
+                payload = _catalog_get(source_url, args)
+                if payload.content.lstrip().lower().startswith((b"<html", b"<!doctype html")):
+                    raise ValueError(f"GCIS returned HTML instead of CSV: {source_url}")
+                receipt = _catalog_save_raw(
+                    payload.content, output_dir, spec, dataset_id, resource_id,
+                    suffix=".csv", label=resource["label"], source_url=source_url,
+                )
+                old = item["resources"].get(resource_id)
+                if old is None or old.get("sha256") != receipt["sha256"]:
+                    item["resources"][resource_id] = receipt
+                    _append_jsonl(output_dir / "metadata" / f"{spec.name}_versions.jsonl", {
+                        "dataset_id": dataset_id, "dataset_name": entry["name"], **receipt,
+                    })
+                    downloaded += 1
+                    state["datasets"][dataset_id] = item
+                    _write_json(state_path, state)
+            item.update({
+                "update_marker": entry["updated"], "checked_on": _snapshot_as_of_date(),
+                "complete": True,
+            })
+            item.pop("last_error", None)
+        except Exception as exc:
+            item["complete"] = False
+            item["last_error"] = f"{type(exc).__name__}:{exc}"
+            errors.append(f"{dataset_id}:{item['last_error']}")
+        state["datasets"][dataset_id] = item
+        _write_json(state_path, state)
+        if index % 25 == 0:
+            print(f"[tw-public:gcis] checked={index}/{len(entries)} new_versions={downloaded} errors={len(errors)}", flush=True)
+    if skipped != len(entries) or not state.get("last_catalog_check_utc"):
+        state["last_catalog_check_utc"] = _now_utc()
+        _write_json(state_path, state)
+    inventory = _write_catalog_inventory(spec, state, output_dir)
+    status = "incomplete" if errors else ("ok" if downloaded else "up_to_date")
+    return DownloadResult(
+        spec.name, status,
+        sum(len(item.get("resources", {})) for item in state["datasets"].values()),
+        str(inventory) if inventory.is_file() else None,
+        message=f"catalog_entries={len(entries)} new_versions={downloaded} skipped={skipped} errors={len(errors)}" +
+                ("; " + "; ".join(errors[:5]) if errors else ""),
+        fetched_dates=downloaded,
+        skipped_dates=skipped,
+        failed_dates=len(errors),
+    )
+
+
+def _download_fsc_catalog(
+    spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
+) -> DownloadResult:
+    response = _catalog_get(FSC_CATALOG_URL, args)
+    entries = response.json()
+    if not isinstance(entries, list) or len(entries) < 50:
+        raise ValueError("FSC dataset catalog is missing or unexpectedly short")
+    state_path = output_dir / "state" / f"{spec.name}.json"
+    state = _load_catalog_state(state_path)
+    if state.get("catalog_entry_count") != len(entries):
+        state["catalog_entry_count"] = len(entries)
+        _write_json(state_path, state)
+    downloaded = skipped = 0
+    errors: list[str] = []
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            errors.append(f"invalid FSC catalog entry at {index}")
+            continue
+        dataset_id = str(entry["id"])
+        if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", dataset_id):
+            errors.append(f"invalid FSC dataset id at {index}")
+            continue
+        previous = state["datasets"].get(dataset_id, {})
+        row_count = entry.get("row_count")
+        if not _catalog_recheck_due(previous, row_count, args) and all(
+            _catalog_existing_raw(resource, output_dir, verify_digest=args.mode == "repair")
+            for resource in previous.get("resources", {}).values()
+        ):
+            skipped += 1
+            continue
+        item = {**previous, "name": str(entry.get("name") or ""),
+                "identifier": entry.get("identifier"), "row_count": row_count,
+                "resources": dict(previous.get("resources", {}))}
+        try:
+            if row_count is not None and int(row_count) > 0:
+                identifier = str(entry.get("identifier") or dataset_id)
+                source_url = FSC_EXPORT_URL.format(identifier=quote(identifier, safe=""))
+                payload = _catalog_get(source_url, args)
+                decoded, _encoding = _decode_bytes(payload.content)
+                preview = list(islice(csv.reader(io.StringIO(decoded)), 2))
+                if len(preview) < 2 or not preview[0] or not preview[1]:
+                    raise ValueError(f"FSC export is not a nonempty CSV: {source_url}")
+                receipt = _catalog_save_raw(
+                    payload.content, output_dir, spec, dataset_id, dataset_id,
+                    suffix=".csv", label=item["name"], source_url=source_url,
+                )
+                old = item["resources"].get(dataset_id)
+                if old is None or old.get("sha256") != receipt["sha256"]:
+                    item["resources"][dataset_id] = receipt
+                    _append_jsonl(output_dir / "metadata" / f"{spec.name}_versions.jsonl", {
+                        "dataset_id": dataset_id, "dataset_name": item["name"],
+                        "source_rows": row_count, **receipt,
+                    })
+                    downloaded += 1
+            item.update({
+                "update_marker": row_count, "checked_on": _snapshot_as_of_date(),
+                "complete": True,
+            })
+            item.pop("last_error", None)
+        except Exception as exc:
+            item["complete"] = False
+            item["last_error"] = f"{type(exc).__name__}:{exc}"
+            errors.append(f"{dataset_id}:{item['last_error']}")
+        state["datasets"][dataset_id] = item
+        _write_json(state_path, state)
+        if index % 25 == 0:
+            print(f"[tw-public:fsc] checked={index}/{len(entries)} new_versions={downloaded} errors={len(errors)}", flush=True)
+    if skipped != len(entries) or not state.get("last_catalog_check_utc"):
+        state["last_catalog_check_utc"] = _now_utc()
+        _write_json(state_path, state)
+    inventory = _write_catalog_inventory(spec, state, output_dir)
+    status = "incomplete" if errors else ("ok" if downloaded else "up_to_date")
+    return DownloadResult(
+        spec.name, status,
+        len(state["datasets"]),
+        str(inventory) if inventory.is_file() else None,
+        message=f"catalog_entries={len(entries)} new_versions={downloaded} skipped={skipped} errors={len(errors)}" +
+                ("; " + "; ".join(errors[:5]) if errors else ""),
+        fetched_dates=downloaded,
+        skipped_dates=skipped,
+        failed_dates=len(errors),
     )
 
 
@@ -6410,6 +6899,10 @@ def download_dataset(
             return _download_snapshot_url(spec, args, output_dir)
         if spec.kind == "data_gov":
             return _download_data_gov(spec, args, output_dir)
+        if spec.kind == "gcis_catalog":
+            return _download_gcis_catalog(spec, args, output_dir)
+        if spec.kind == "fsc_catalog":
+            return _download_fsc_catalog(spec, args, output_dir)
         return DownloadResult(
             spec.name, "unsupported", 0, None, message=f"kind={spec.kind}"
         )
@@ -6424,11 +6917,13 @@ def _select_specs(tokens: list[str]) -> list[DatasetSpec]:
             value = part.strip().lower()
             if value:
                 normalized_tokens.add(value)
+    if "all-extended" in normalized_tokens:
+        return list(EXTENDED_DATASETS.values())
     if not normalized_tokens or "all" in normalized_tokens:
         return list(DEFAULT_DATASETS.values())
 
     selected: list[DatasetSpec] = []
-    for spec in DEFAULT_DATASETS.values():
+    for spec in EXTENDED_DATASETS.values():
         labels = {
             spec.name.lower(),
             spec.source.lower(),
@@ -6446,7 +6941,7 @@ def _select_specs(tokens: list[str]) -> list[DatasetSpec]:
                 spec.source.lower(),
                 *[tag.lower() for tag in spec.tags],
             }
-            for spec in DEFAULT_DATASETS.values()
+            for spec in EXTENDED_DATASETS.values()
         )
     )
     if unknown:

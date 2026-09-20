@@ -39,8 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-root", action="append", type=Path)
     parser.add_argument("--min-age-days", type=float, default=14.0)
-    parser.add_argument("--high-watermark-percent", type=float, default=95.0)
-    parser.add_argument("--target-percent", type=float, default=92.0)
+    parser.add_argument("--high-watermark-percent", type=float, default=89.0)
+    parser.add_argument("--target-percent", type=float, default=88.0)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument(

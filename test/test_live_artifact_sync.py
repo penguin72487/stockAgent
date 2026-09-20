@@ -89,6 +89,7 @@ def test_reconcile_never_propagates_deletion(tmp_path: Path) -> None:
     "relative",
     [
         "data_locks/job.lock",
+        "cache/panel_cache_v2/generations/features.npy",
         "markets/train.pid",
         ".stversions/old.json",
         ".stignore-cold-local",
@@ -132,6 +133,23 @@ def test_reconcile_does_not_publish_or_restore_atomic_temp_files(
     assert not (sync / "state.json.tmp.local").exists()
 
 
+def test_reconcile_keeps_derived_cache_node_local(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    sync = tmp_path / "sync"
+    (local / "cache").mkdir(parents=True)
+    (sync / "cache").mkdir(parents=True)
+    (local / "cache" / "local.npy").write_bytes(b"local")
+    (sync / "cache" / "remote.npy").write_bytes(b"remote")
+
+    result = reconcile_artifacts(local, sync)
+    direct = reconcile_artifacts(local, sync, relative="cache/remote.npy")
+
+    assert result.incoming_added == result.local_published == 0
+    assert direct.ignored == 1
+    assert not (local / "cache" / "remote.npy").exists()
+    assert not (sync / "cache" / "local.npy").exists()
+
+
 def test_reconcile_does_not_publish_activated_cold_paths(tmp_path: Path) -> None:
     local = tmp_path / "local"
     sync = tmp_path / "sync"
@@ -167,3 +185,23 @@ def test_reconcile_counts_exact_cold_event_as_ignored(tmp_path: Path) -> None:
     )
 
     assert result.ignored == 1
+
+
+def test_retired_directory_cannot_be_rehydrated_or_republished(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    sync = tmp_path / "sync"
+    (local / "markets" / "retired").mkdir(parents=True)
+    (sync / "markets" / "retired").mkdir(parents=True)
+    (local / "markets" / "retired" / "local.txt").write_text("local")
+    (sync / "markets" / "retired" / "remote.txt").write_text("remote")
+    (sync / ".stignore-cold-local").write_text(
+        "(?d)/markets/retired\n", encoding="utf-8"
+    )
+
+    result = reconcile_artifacts(local, sync)
+    direct = reconcile_artifacts(local, sync, relative="markets/retired/remote.txt")
+
+    assert result.incoming_added == result.local_published == 0
+    assert direct.ignored == 1
+    assert not (local / "markets" / "retired" / "remote.txt").exists()
+    assert not (sync / "markets" / "retired" / "local.txt").exists()

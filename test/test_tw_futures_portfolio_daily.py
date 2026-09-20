@@ -16,6 +16,7 @@ from stockagent.backtest.tw_futures_portfolio import (
 from stockagent.config import load_config
 from stockagent.data.tw_futures_portfolio_daily import (
     _fixed_portfolio_slot_map,
+    _validate_supported_outright_quotes,
     build_continuous_daily,
     build_product_master,
 )
@@ -64,6 +65,26 @@ def _source_row(
 
 def _write_official_codes(path: Path, rows: list[tuple[str, str]]) -> None:
     pl.DataFrame(rows, schema=["code", "product_name"], orient="row").write_csv(path)
+
+
+def test_portfolio_build_rejects_dated_stock_future_off_grid_quotes() -> None:
+    fields = ("open", "high", "low", "close", "last_bid", "last_ask")
+    frame = pl.DataFrame({
+        "date": [date(2026, 7, 3), date(2026, 7, 6), date(2026, 7, 3)],
+        "asset_class": ["stock_future"] * 3,
+        "physical_contract": ["CDF:202607"] * 3,
+        "source_row_observed": [True, True, False],
+        **{field: [1000.0, 1001.0, 1001.0] for field in fields},
+        "settlement": [1000.25, 1001.25, 1001.25],
+    })
+    _validate_supported_outright_quotes(frame)
+    with pytest.raises(ValueError, match="off-grid dated futures close"):
+        _validate_supported_outright_quotes(
+            frame.with_columns(
+                pl.when(pl.col("date") == date(2026, 7, 3))
+                .then(1001.0).otherwise(pl.col("close")).alias("close")
+            )
+        )
 
 
 def test_fixed_slots_reuse_only_after_inclusive_cooldown() -> None:

@@ -9,16 +9,30 @@
       "pack_buckets": 64,
       "loose_threshold_mib": 8,
       "excluded_subtrees": [
-        "stocks/panel_cache_v2"
+        "stocks/panel_cache_v2",
+        "mops_xbrl",
+        "features/tw_public_research_wide_2014_v1.parquet",
+        "features/tw_public_research_wide_2014_v1.research.json"
       ],
       "active_process_substrings": [
         "download_tw_public_data.py",
+        "download_tw_dgbas_release_archive.py",
+        "download_tw_cbc_fx_release_archive.py",
+        "download_tw_cbc_overnight_pages.py",
+        "download_tw_cbc_fx_annual_pages.py",
+        "download_tw_mof_macro_release_dates.py",
+        "download_tw_mof_trade_release_values.py",
+        "download_tw_mof_release_archive.py",
         "download_tw_corporate_action_entitlements.py",
         "download_tw_corporate_action_reference.py",
         "download_tw_share_replacement_reference.py",
+        "download_shioaji_tw_kbars",
         "refresh_tw_day_trade_margin_actions.py",
+        "build_tw_official_symbol_parquets.py",
+        "build_tw_shioaji_dataset",
         "rebuild_tw_public_data_layer.py",
-        "build_tw_public_training_features.py"
+        "build_tw_public_training_features.py",
+        "build_tw_public_research_features.py"
       ],
       "freshness": {
         "receipt": "download_summary.json",

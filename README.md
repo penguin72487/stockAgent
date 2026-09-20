@@ -64,7 +64,8 @@ canonical 可讀資料
   strict audit 成功、原子發布 release 後才進入同步，不同步下載中的半成品。
 - 接收節點預設只保留冷庫，沒有任何 timer、cron 或 service 自動執行 `fetch`、`use` 或
   materialize。解封只能是使用者明確要求的本機動作。
-- 冷庫 release 不可變。各節點使用永久名稱，例如 `penguin`、`lab203`、`vastai1T`。
+- 冷庫 release 不可變。現役節點使用永久名稱 `penguin`、`vastai1T`；
+  `lab203` 僅保留歷史 producer provenance，不再配對或接收新資料。
 - 儲存格式仍保留各產生者的 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
   不舊於現有 release，否則 fail closed。
 - penguin 已接收的冷庫是 D 槽備份唯一來源。D 槽保持冷儲存，不加入 Syncthing、
@@ -85,7 +86,7 @@ canonical 可讀資料
 | 下載／修復工作區 | `data_*` | 依 catalog | 否 |
 | immutable packed 冷庫 | `/srv/stockagent-packed` | 是 | 是，Folder ID `stockagent-packed` |
 | materialized 熱工作集 | `/srv/stockagent-packed-materialized` | 否 | 否 |
-| 可變 artifacts hot transport | `/srv/stockagent-artifacts-hot` | 視產物 | 是，獨立 folder |
+| 舊 artifacts hot transport | `/srv/stockagent-artifacts-hot` | 保留待稽核 | 否，folder 已退役 |
 
 ### Canonical 多機拓撲
 
@@ -94,12 +95,16 @@ canonical 可讀資料
 
 | Folder ID | penguin | lab203 | vastai1T | 用途 |
 |---|---|---|---|---|
-| `stockagent-packed` | active，`/srv/stockagent-packed` | active，同一路徑 | active，同一路徑 | 所有 canonical 資料與完成 artifacts 的 immutable 冷 release |
-| `stockagent-artifacts-hot` | active，transport root | active，工作 artifacts | 不加入 | penguin/lab 的低延遲 operational artifacts |
+| `stockagent-packed` | active，`/srv/stockagent-packed` | 已退役；歷史資料留在 penguin 冷庫 | active，同一路徑 | canonical 資料與完成 artifacts 的 immutable 冷 release |
+| `stockagent-artifacts-hot` | 已退役；磁碟內容保留待稽核 | 已退役 | 不加入 | 不再同步 |
 
-舊 `stockagent`、`stockagent-desync` 與 `stockagent-artifacts-live` Folder ID 已退役；
+舊 `stockagent`、`stockagent-desync`、`stockagent-artifacts-live` 與
+`stockagent-artifacts-hot` Folder ID 已退役；
 penguin 與 vastai1T 的舊 store/materialization 已在 packed release 完整驗證後刪除。
 不要重新接受或建立這些 Folder ID。程式一律使用 Git，不同步 working tree。
+lab203 退役時的 C 冷庫驗證、兩端配對變更與 D 備份未完成事項記錄於
+[退役紀錄](docs/lab203_retirement_2026-09-16.md)；不要把「已解除配對」誤當作
+「所有歷史資料都已備份」。
 
 Vast 的 `artifacts` 是大量訓練／ablation 輸出，不可直接加入
 `stockagent-artifacts-hot`：這會把各節點的完整訓練工作集做聯集，增加數百 GB 流量、
@@ -110,8 +115,8 @@ cold release；執行中的 run 保持 node-local。
 
 | 節點 | Syncthing 管理方式 | GUI | 備註 |
 |---|---|---|---|
-| penguin | `syncthing@root.service` | `127.0.0.1:8384` | systemd；hot artifact bridge 也由 systemd 管理 |
-| lab203 | `syncthing@root.service` | `127.0.0.1:8384` | WSL 網路另依 QUIC 驗收 |
+| penguin | `syncthing@root.service` | `127.0.0.1:8384` | systemd；舊 hot bridge 已停用 |
+| lab203 | 不再是 penguin 的 peer | — | 已退役；不從 penguin 重新配對 |
 | vastai1T | Vast supervisor 的 `syncthing` | `127.0.0.1:18384` | 無 systemd；使用平台配置的 self-mapped TCP/UDP port |
 
 所有節點必須保留自己的 Syncthing cert/Device ID 與 packed `.local-state/node-id`；只能同步
@@ -160,8 +165,8 @@ run_fintech_python train.py --help
 
 ### 新機器一次性部署
 
-先同步程式碼，再建立該機器自己的永久 node ID。以下以 `lab203` 為例；其他機器只能
-替換名稱，不可複製另一台機器的 `.local-state/node-id`。
+先同步程式碼，再建立該機器自己的永久 node ID。以下使用 `NEW_NODE_ID` 佔位；
+不得沿用已退役的 `lab203` 身分，也不可複製另一台機器的 `.local-state/node-id`。
 
 ```bash
 cd /path/to/stockAgent
@@ -172,7 +177,7 @@ sudo install -d -m 0755 /srv/stockagent-packed-materialized
 
 ./scripts/run_packed_snapshot.sh init \
   --sync-root /srv/stockagent-packed \
-  --node-id lab203
+  --node-id NEW_NODE_ID
 
 sudo ./scripts/install_data_cache_gc_service.sh
 ```
@@ -296,7 +301,7 @@ sudo systemctl start stockagent-packed-backup.service
 systemctl status stockagent-packed-retention.timer --no-pager
 ```
 
-`apply` 不是一般的 `rm`：只有 lab203、vastai1T 與本機全部收斂、D 槽存在且每個候選
+`apply` 不是一般的 `rm`：只有現役 vastai1T 與本機全部收斂、D 槽存在且每個候選
 都有未過期 SHA-256 receipt、沒有 conflict、pin、熱快取或程序引用時才會 unlink C 候選；
 先刪歷史 manifest，再刪其已無引用的 objects。D 不刪，current heads 不刪。清理期間會
 短暫停止本機 backup/Syncthing，完成後立即重啟並等待同步刪除收斂。人工執行方式：
@@ -637,6 +642,9 @@ scripts/manage_cold_artifacts.py [全域路徑參數] status [DATASET]
 scripts/manage_cold_artifacts.py [全域路徑參數] publish DATASET [--node-id NODE]
 scripts/manage_cold_artifacts.py [全域路徑參數] activate DATASET
   [--conflict-policy fail|local-wins|packed-wins]
+scripts/manage_cold_artifacts.py [全域路徑參數] retire DATASET
+  [--apply --plan-fingerprint SHA256]
+scripts/manage_cold_artifacts.py [全域路徑參數] use DATASET [--path-only] [--verify]
 scripts/manage_cold_artifacts.py [全域路徑參數] rebuild-ignore
 ```
 
@@ -651,6 +659,62 @@ run_fintech_python scripts/manage_cold_artifacts.py activate \
 run_fintech_python scripts/manage_cold_artifacts.py rebuild-ignore
 ```
 
+penguin 的 `artifacts` 與 hot transport 已以 hard link 共用大部分實體檔案；刪掉其中
+一個路徑不會回收那份內容。舊 bridge 已停用；完整 run 若要轉成冷儲存，
+必須使用下列兩階段流程；只接受 `maximum_file_bytes: null` 的完整 release，會驗證 C
+冷庫、D 備份、本機 Syncthing 健康、`artifact_retirement.json` 指定的 peer、
+兩個熱路徑、pin、程序引用和七日租期。penguin 的 hot 退役不要求已退役的 lab203；
+另一套 C 冷物件保留規則只要求現役 vastai1T 收斂。唯讀計畫
+提供穩定 fingerprint；未通過任何 gate 就不能套用。
+
+`artifacts/cache` 不是完成產物；panel、tape 與 dashboard cache 在各節點本地
+重建，不進 hot Syncthing。舊 hot transport 中的 `cache/` 必須先確認每個檔案
+都與工作樹同 inode 才能移除其第二個名稱；這不會直接回收 block。真正的本機
+快取重複內容，可在精確的 cache root 用 SHA-256 去重，保留全部 generation 路徑：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/prune_hot_cache_mirror.py
+# 確認沒有獨有檔、symlink 或 process reference 後，使用報告中的 fingerprint：
+sudo bash scripts/run_hot_cache_mirror_prune.sh PLAN_FINGERPRINT
+
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --root artifacts/cache/EXACT_DATASET/stocks/panel_cache_v2 \
+  --min-age-hours 24
+# 核對報告後才加 --apply；不可對整個 artifacts/cache 盲目執行。
+```
+
+完整 artifact run 的冷藏與七日退役則使用：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/manage_cold_artifacts.py retire ARTIFACT_DATASET
+# 首次計畫顯示 seven-day-use-lease-not-enrolled 時，複製 plan_fingerprint：
+run_fintech_python scripts/manage_cold_artifacts.py retire ARTIFACT_DATASET \
+  --apply --plan-fingerprint PLAN_FINGERPRINT
+# 這次只登錄七日租期，不刪檔；七日後重新產生計畫並取得新 fingerprint。
+```
+
+實際退役時使用包裝指令；舊 hot bridge 若已停用，指令不會啟動它：
+
+```bash
+run_fintech_python scripts/manage_cold_artifacts.py retire ARTIFACT_DATASET
+sudo bash scripts/run_cold_artifact_retirement.sh ARTIFACT_DATASET PLAN_FINGERPRINT
+```
+
+指令會把這一個 run 的工作路徑及傳輸路徑一起轉為 cold-only，不刪 packed
+release 或 D 備份。若驗證失敗或中斷，會保留 quarantine 並拒絕下一次退役，不可手動
+清空。解除 lab203 配對不會刪除其本機資料；penguin 不再依賴該機的 hot 副本。
+當前仍有服務使用的策略要保留 pin，不能只看七日到期。
+
+退役後按需還原並取得七日熱快取租期；既有每五分鐘的 `stockagent-data-cache-gc.timer`
+會在確定無引用、無 pin、冷庫完整後移除熱快取與受管理 symlink：
+
+```bash
+run_fintech_python scripts/manage_cold_artifacts.py use ARTIFACT_DATASET --path-only
+./scripts/run_data_cache.sh gc --dry-run
+```
+
 衝突策略：`fail` 最安全；`local-wins` 保留本機；`packed-wins` 以已驗證 release 覆蓋。
 跨機器首次啟用不可猜測衝突策略，必須依該機器的權威角色選擇。
 
@@ -662,11 +726,11 @@ run_fintech_python scripts/manage_cold_artifacts.py --help
 run_fintech_python scripts/manage_cold_artifacts.py activate --help
 ```
 
-安裝 hot bridge 與檢查：
+舊 hot bridge 已退役；只檢查它未被重新啟用：
 
 ```bash
-sudo ./scripts/install_hot_artifact_sync_service.sh
-systemctl status stockagent-hot-artifact-sync.service --no-pager
+systemctl is-active stockagent-hot-artifact-sync.service   # inactive
+systemctl is-enabled stockagent-hot-artifact-sync.service  # disabled
 ```
 
 穩定檔案內容去重先 audit，再套用 hard link；它節省 block，不減少 Syncthing 路徑數：
@@ -829,6 +893,66 @@ run_fintech_python scripts/build_tw_public_training_features.py \
 
 完整 rebuild、repair、rate limit 與 receipt 規則見
 [台灣公開資料續傳文件](docs/tw_public_download_resume_and_rate_limits.md)。
+逐商品、逐欄位的實際覆蓋與發布版本限制見
+[台灣資料歷史完整度與可用性](docs/tw_data_history_status.md)。可用
+`run_fintech_python scripts/audit_symbol_history_coverage.py` 重建清冊，
+並用 `run_fintech_python scripts/reconcile_tw_public_training_features.py --dry-run`
+檢查訓練特徵是否落後於官方來源；正式對帳省略 `--dry-run`。
+台股多基底的原始 OHLCV／官方成交原值輸入另見
+[獨立 raw-input 實驗](docs/tw_raw_feature_input.md)；既有模型與 checkpoint 不會自動切換。
+官方資料與 ToAlpha 的分工、新增基金/ETF 開放資料、單次 MCP 查詢及歷史版本驗收見
+[台灣公開資料取得計畫](docs/tw_public_toalpha_acquisition.md)。
+官方逐日歷史、原始新聞稿、可續傳回補與每日排程的分界見
+[臺灣官方歷史資料回補](docs/tw_official_history_backfill.md)。
+取得進度見[全資料監控頁](https://penguin72487.ddnsgeek.com/data-monitor/)的「臺灣公開資料擴充進度」。
+
+經濟部商工開放資料與金管會公開統計另以背景來源接入同一下載器，不增加開盤／收盤關鍵路徑的 159 項來源數。首次執行會盤點商工目錄中所有可見 CSV 與金管會 API 目錄；之後每日讀目錄，僅下載未存或官方目錄更新標記已變的資源，並僅保存尚未保存的原檔版本。`raw/gcis_open_data_catalog/`、`raw/fsc_open_data_catalog/` 保留原始 CSV，`state/*_catalog.json` 與 `metadata/*_versions.jsonl` 記錄每個資源的雜湊和首次觀測。背景批次的執行報告放在 `artifacts/data_refresh/tw_public/catalogs/latest/`，不覆寫核心 159 項來源的正式報告；有新原檔時會呼叫既有冷封存發布器，發布結果另見 `artifacts/data_refresh/tw_public/cold_publish/latest.json`。新來源先進入原始資料庫；未經逐欄日期映射，不會自動改動正式或寬覆蓋模型的特徵 ABI。
+
+```bash
+bash scripts/run_tw_public_official_catalogs.sh
+sudo bash scripts/install_tw_public_official_catalogs_service.sh
+systemctl list-timers 'stockagent-tw-public-official-catalogs.timer'
+```
+
+商工與金管會來源的值版本、官方公告日及推定公告日的接受次序見[原始特徵盤點](docs/tw_public_raw_feature_inventory_2026-09-18.md)。金管會匯出端點沒有增量日期參數；目錄筆數變化時需重新讀取該 CSV 比對 SHA-256，但相同內容不會另存。若官方在目錄日期或筆數都不變時悄悄修正內容，每日增量模式無法發現；需要時可執行 `bash scripts/run_tw_public_official_catalogs.sh --refresh` 校對全部現有資源。商工舊日期查詢和現行登記狀態不可當作舊時版本。
+固定版 33 欄研究訓練設定見 [tw_public_verified_features_20260917.yaml](configs/markets/tw_public_verified_features_20260917.yaml)；嚴格稽核結果見 `artifacts/data_quality/tw_public_verified_features_20260917/report.md`，仍須遵守同日收盤近似限制。
+
+目前台股日當沖、隔夜與公開資料主線配置的**所有逐欄訓練特徵**、來源首末日、有限值筆數、更新節奏、前處理及品質阻礙直接列在[台股訓練特徵現況](docs/tw_stock_training_feature_status_2026-09-18.md)，由 `scripts/summarize_tw_stock_training_features.py` 重建 Markdown 清單。[去重特徵與 2014 歷史缺口](docs/tw_stock_unique_feature_history_2014.md)每個名稱只列一次，並對應官方回補入口與限制；由 `scripts/summarize_tw_stock_unique_feature_history.py` 重建。[免費來源下載與訓練接入稽核](docs/tw_free_feature_download_training_audit_2026-09-19.md)另列已落地的免費來源、未補的舊期與官方付費選項。
+
+逐日價格歷史與「當年真正發布的總經版本」是不同資料。查詢完整來源與缺口：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_tw_public_source_catalog.py \
+  --root data_tw_public --format markdown
+run_fintech_python scripts/audit_tw_official_release_archives.py \
+  --root data_tw_public
+
+# 僅在 data_tw_public 指向 catalog 註冊的可寫 live source 時執行；
+# 不可寫入 packed/materialized 冷庫。
+run_fintech_python downloader/download_tw_dgbas_release_archive.py \
+  --output-dir data_tw_public --sources cpi unemployment gdp --attachments primary
+run_fintech_python downloader/download_tw_cbc_fx_release_archive.py \
+  --output-dir data_tw_public
+run_fintech_python downloader/download_tw_cbc_money_release_archive.py \
+  --output-dir data_tw_public
+run_fintech_python downloader/download_tw_mof_release_archive.py \
+  --output-dir data_tw_public
+
+# 註冊原始公告庫及 MOF 新聞稿的增量排程；DGBAS 與 CBC 平行，兩個 CBC 庫共用站點而依序跑。
+bash scripts/install_tw_public_release_archives_service.sh
+systemctl list-timers 'stockagent-tw-public-release-archives.timer'
+```
+
+三個公告封存器保留逐期原始頁／附件與校驗碼；有原稿時刻就用原稿，主計總處無逐篇時刻的舊公告則依當年官方 08:30／16:00 改制規則判定是否能在同日開盤前使用，其他無時刻公告才映射到其後首個已驗證交易日。不可把現在的整包統計值倒填到舊公告日。稽核輸出分開報告原檔完整性、公告覆蓋及原稿數值連續性；如需原檔與公告均完整才回傳成功，另加 `--require-complete`。央行 M1B/M2 年增率原稿目前仍缺 2000-06，故 `value_history_complete=false`，不能因公告封存完成就宣稱所有月份有值。下載器的 `state/*release_vintages.json` 記錄失敗、缺期與進度；`degraded` 不得解讀為完成。來源拒絕自動存取時遵守阻擋並稍後續跑，不要繞過官方限制。詳見[台股公開資料發布時鐘與歷史覆蓋](docs/tw_public_release_timing.md)。
+
+嚴格 09:00 前模型輸入請使用 `configs/markets/tw_public_preopen_pit.yaml`，先按上述文件執行 `--strict --require-live-selected-features --build-panel` 全量稽核及 `train.py --check-data-only`。它與原本 `tw_public.yaml` 的同日收盤研究近似使用不同實驗目錄；尚無原始歷史版本的欄位不會假裝已可訓練，且 `naive` 收盤成交代理仍不是可執行的開盤成交證明。
+
+偏好未經 log/asinh/比率轉換的來源數值，且主力訓練 2014–2026 時，使用 `configs/markets/tw_public_preopen_raw_2014_v1.yaml`（27 個原始輸入，含央行及主計總處逐期原稿）；先執行 `run_fintech_python train.py --config configs/markets/tw_public_preopen_raw_2014_v1.yaml --check-data-only`。舊版 2013 起 22 欄配置與 2005 起 15 欄配置仍保留，三者 checkpoint ABI 不可混用。[原始特徵與逐欄歷史盤點](docs/tw_public_raw_feature_inventory_2026-09-18.md)區分來源日期覆蓋、數值版本與實際可用日；`scripts/inventory_tw_public_feature_table.py --output-dir artifacts/data_quality/tw_public_raw_2014_v1` 會輸出全部特徵的非空筆數與首末日，`scripts/classify_tw_public_2014_features.py --inventory-dir artifacts/data_quality/tw_public_raw_2014_v1` 再列出每欄可用性與原因。它不把目前整包宏觀數值或快照產品倒填為舊訓練資料，也不宣稱 naive 收盤代理可實際成交。
+
+若研究目標改為「2014–2026 盡量多用可取得的歷史值」，允許已標記的目前修訂版與理論發布日，並保留比率但移除 log/asinh，改用 `configs/markets/tw_public_preopen_wide_research_2014_v1.yaml`。先執行 `run_fintech_python scripts/build_tw_public_research_features.py`，再跑該配置的 `train.py --check-data-only`。此配置納入 XBRL 逐季財報、M2 等週期總體值與缺值旗標；注意／處置事件不沿用，2026 前尚無完整歷史的快照也不假裝已補齊。數值版本、發布推估、來源覆蓋、冷庫界線與重跑方式見[2014 台股寬覆蓋研究特徵](docs/tw_public_wide_research_2014.md)。這是獨立研究實驗，不能拿既有嚴格 PIT checkpoint 續訓。
+
+期交所年度免費歷史在本機另有 2014 年 TX 日盤合約、TX 月契約最後結算價與臺指選擇權 Put/Call 比；`run_fintech_python scripts/build_tw_public_research_taifex.py` 會把 10 個原值依來源盤後、下一交易日可用的規則接到獨立本機 v2 表。使用 `configs/markets/tw_public_preopen_wide_research_taifex_2014_v2.yaml` 預檢或研究訓練，欄位與仍未補齊的付費／授權缺口見[免費來源稽核](docs/tw_free_feature_download_training_audit_2026-09-19.md)。
 
 ### Yahoo、外匯與加密市場
 
@@ -1058,6 +1182,11 @@ run_fintech_python services/discord_bot/bot.py
 `artifacts/discord_bot/postclose_fast_cache.json`；預設同日報價覆蓋門檻為 90%，
 未通過時 fail closed，不用前收價偽造結果。
 
+台股當沖歷史容量缺口的隔離全量紙上回放、逐筆來源與 270 點分鐘曲線驗證見
+[`docs/tw_day_trade_historical_full_fill.md`](docs/tw_day_trade_historical_full_fill.md)。
+這是反事實候選，不會修改正在執行的帳本；現行本地紙上成交不能當作 Shioaji
+模擬委託 API 的成交回報。
+
 systemd 服務一律用同一組操作方式；以下以 Shioaji top-200 為例：
 
 ```bash
@@ -1135,6 +1264,17 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 
 ## 文件分類
 
+台灣市場原始報價與歷史 tick 稽核：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_tw_price_precision.py --full --strict
+run_fintech_python scripts/audit_tw_capture_price_grid.py
+run_fintech_python scripts/audit_tw_emerging_stock_admission.py --strict
+```
+
+結果與已知未驗證範圍見 [價格精度契約](docs/tw_price_precision_tick_contract.md)；未查明的歷史商品規則、擷取來源歧義或興櫃訓練資格異常會各自回傳非零。報價格點、資料是否完整、當時是否可成交及特徵有效位數是不同檢查。
+
 | 類別 | 入口 | 用途 |
 |---|---|---|
 | 現行正確性契約 | [AGENTS.md](AGENTS.md) | point-in-time、backtest、checkpoint、reproducibility |
@@ -1146,6 +1286,7 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 | 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |
 | 台灣資料 | [tw_public_download_resume_and_rate_limits.md](docs/tw_public_download_resume_and_rate_limits.md) | rebuild、repair、daily、receipt |
+| 台股歷史可用性 | [tw_public_release_timing.md](docs/tw_public_release_timing.md) | 官方公告版本、交易日映射與未完成缺口 |
 | 執行模式 | [tw_execution_modes.md](docs/tw_execution_modes.md) | day/cash/overnight 與交易語意 |
 | 13:25 隔日沖研究 | [tw_overnight_1325_training.md](docs/tw_overnight_1325_training.md) | 遠端 22 基底、缺價用收盤替代、次日開盤退出與訓練驗收 |
 | 分鐘資料 | [tw_minute_kbar_research.md](docs/tw_minute_kbar_research.md) | causal minute dataset 與訓練 |
@@ -1162,4 +1303,5 @@ README 只保留可重現、跨機器成立的入口。套件全面升級、文�
 
 sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo snap refresh
 mamba activate fintech
-mamba update --all
+mamba update --all -y
+mamba clean --all -y

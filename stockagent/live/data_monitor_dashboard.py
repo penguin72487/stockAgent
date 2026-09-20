@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -20,12 +21,51 @@ from typing import Any, Final, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from stockagent.data.taifex_sessions import next_taifex_capture_window
+from stockagent.live.data_monitor_inventory import PHYSICAL_FAMILIES, build_feature_inventory, build_record_inventory
 from stockagent.live.openbb_archive_dashboard import build_openbb_public_status
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
+from stockagent.live.tw_public_acquisition_progress import (
+    ADDED_DATASETS,
+    build_tw_public_acquisition_progress,
+)
 
 
-DATA_MONITOR_SCHEMA_VERSION: Final[int] = 6
+DATA_MONITOR_SCHEMA_VERSION: Final[int] = 8
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
+_MARKET_CATEGORY_LABELS: Final[dict[str, str]] = {
+    "taiwan_equity": "台股",
+    "taiwan_derivatives": "臺灣期貨／選擇權",
+    "taiwan_public": "臺灣公開資料",
+    "global_equity": "海外股票／ETF",
+    "forex": "外匯",
+    "macro": "總體經濟／公開資訊",
+    "cross_market": "跨市場／其他",
+    "configuration": "設定／憑證",
+    "crypto": "加密貨幣",
+}
+_GROUP_MARKET_CATEGORY: Final[dict[str, str]] = {
+    **{name: "taiwan_equity" for name in (
+        "tw-minute-train", "tw-minute-source-cold", "tw-microstructure-train",
+        "tw-microstructure-captures-cold", "tw-shioaji-history",
+    )},
+    **{name: "taiwan_derivatives" for name in (
+        "tw-index-futures", "tw-index-derivatives-ticks", "tw-index-options-daily",
+        "taifex-public-history", "tw-futures",
+    )},
+    **{name: "crypto" for name in (
+        "okx", "bybit", "binance", "binance-public-archive", "crypto-reference",
+        "free-public-context", "coinmetrics-community", "dune-crypto",
+        "crypto-etf-history", "fred-crypto-macro", "crypto-historical-public",
+    )},
+    "tw-public": "taiwan_public",
+    "yahoo-market": "cross_market",
+    "openbb-compact": "cross_market",
+    "openbb-task-shards-local": "cross_market",
+    "forex-frankfurter": "forex",
+    "forex-pepperstone": "cross_market",
+    "cftc-legacy-pre2000": "macro",
+    "legacy-parquet": "cross_market",
+}
 OPENBB_L1_MAX_SOURCE_FILES_PER_RUN: Final[int] = 2_048
 OPENBB_L1_MIN_FILES_PER_SEGMENT: Final[int] = 32
 OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 20 * 60
@@ -301,6 +341,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-registered-data-backfill.service",
         "timer": "stockagent-registered-data-backfill.timer",
     },
+    "registered_features": {
+        "service": "stockagent-registered-data-features.service",
+        "timer": "stockagent-registered-data-features.timer",
+    },
     "taifex_futures": {
         "service": "stockagent-taifex-futures-daily.service",
         "timer": "stockagent-taifex-futures-daily.timer",
@@ -361,9 +405,21 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-tw-public-source-events.service",
         "timer": None,
     },
+    "tw_public_release_archives": {
+        "service": "stockagent-tw-public-release-archives.service",
+        "timer": "stockagent-tw-public-release-archives.timer",
+    },
+    "tw_mops_xbrl": {
+        "service": "stockagent-tw-mops-xbrl.service",
+        "timer": "stockagent-tw-mops-xbrl.timer",
+    },
     "tw_public_0830": {
         "service": "stockagent-tw-public-0830-check.service",
         "timer": "stockagent-tw-public-0830-check.timer",
+    },
+    "tw_public_feature_reconcile": {
+        "service": "stockagent-tw-public-feature-reconcile.service",
+        "timer": "stockagent-tw-public-feature-reconcile.timer",
     },
     "tw_public_cold_publish": {
         "service": "stockagent-tw-public-cold-publish.service",
@@ -386,11 +442,12 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
             "tw_public_source_events",
             "tw_public_publication",
             "tw_public_0830",
+            "tw_public_feature_reconcile",
             "tw_public_cold_publish",
             "tw_public_eligibility",
             "tw_day_trade_preopen_gate",
         ),
-        "schedule_label": "156 項來源版本事件持續監測、07:50 全量掃描、08:00/08:15/08:24 live root 驗收、08:59:30 最終守門；23:50 背景冷備份",
+        "schedule_label": "來源版本持續監測、07:50 全量掃描、08:20/14:20/19:00 特徵憑證對帳、08:59:30 最終守門；23:50 背景冷備份",
         "active_means_running": False,
     },
     "group:tw-minute-train": {
@@ -439,18 +496,19 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
     },
     "group:okx": {
         "mode": "interval_after_completion",
-        "service_keys": ("registered_intraday", "registered_backfill"),
+        "service_keys": ("registered_intraday", "registered_features", "registered_backfill"),
         "schedule_label": "尾端本輪完成後 1 分鐘；每週日 02:00 完整 head/backfill",
     },
     "group:bybit": {
         "mode": "interval_after_completion",
-        "service_keys": ("registered_intraday", "registered_backfill"),
+        "service_keys": ("registered_intraday", "registered_features", "registered_backfill"),
         "schedule_label": "尾端本輪完成後 1 分鐘；每週日 02:00 完整 head/backfill",
     },
     "group:binance": {
         "mode": "interval_after_completion",
         "service_keys": (
             "registered_intraday",
+            "registered_features",
             "registered_backfill",
             "binance_backfill",
         ),
@@ -1596,7 +1654,7 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     )
     publication_rows = _tw_public_publication_index(root)
     if not isinstance(manifest, list):
-        return []
+        manifest = []
     report: dict[str, dict[str, str]] = {}
     try:
         with (base / "download_report.csv").open(
@@ -1690,6 +1748,21 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 "waiting_schedule",
                 "目前沒有執行中吞吐率；下次更新會先掃描再補齊。",
             )
+        elif (
+            name in {dataset for dataset, _ in ADDED_DATASETS}
+            and event_applied
+            and (base / f"{name}.parquet").is_file()
+            and (base / "metadata" / f"{name}.json").is_file()
+            and (base / "raw" / name).is_dir()
+            and any(item.is_file() for item in (base / "raw" / name).iterdir())
+            and name not in report
+        ):
+            status = "waiting"
+            label = "live 已下載，待完整批次稽核"
+            eta = _unknown_eta(
+                "waiting_schedule",
+                "來源變更已套用；仍需下一次涵蓋此資料集的完整批次稽核。",
+            )
         else:
             status = "degraded"
             label = "缺少完整度證據"
@@ -1726,7 +1799,10 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 "latest_at_utc": _iso(
                     _parse_time(event_row.get("last_checked_at_taipei")) or generated
                 ),
-                "data_through": str(summary.get("end_date") or "") or None,
+                "data_through": (
+                    str(summary.get("end_date") or "") or None
+                    if name in report else None
+                ),
                 "freshness": dict(fresh),
                 "coverage": _coverage(
                     1 if complete else 0, 1, unit="資料集", label="缺口稽核"
@@ -1790,6 +1866,563 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 },
             }
         )
+    archive = _read_json(base / "state/dgbas_release_vintages.json", {})
+    archive = archive if isinstance(archive, Mapping) else {}
+    archive_path = base / "dgbas_release_vintages.parquet"
+    total = _integer(archive.get("total_releases")) or _integer(
+        archive.get("registered_releases")
+    )
+    completed = _integer(archive.get("completed_releases"))
+    if completed is None:
+        completed = _integer(archive.get("saved_releases")) or 0
+    running = archive.get("status") == "running"
+    complete_archive = bool(archive.get("complete")) and archive_path.is_file()
+    if running:
+        archive_status = "updating"
+        if archive.get("phase") == "discovering":
+            done_sources = _integer(archive.get("completed_sources")) or 0
+            total_sources = _integer(archive.get("total_sources"))
+            archive_label = (
+                f"已清點 {done_sources:,}/{total_sources:,} 類官方公告"
+                if total_sources else "正在清點官方公告"
+            )
+        else:
+            archive_label = f"已處理 {completed:,}/{total:,} 篇官方公告" if total else "正在清點官方公告"
+        remaining = _integer(archive.get("estimated_seconds_remaining"))
+        archive_eta = (
+            {
+                "state": "running_estimated",
+                "remaining_seconds": remaining,
+                "estimated_complete_at_utc": _iso(now + timedelta(seconds=remaining)),
+                "confidence": "low",
+                "basis": "依本次已處理公告的實測平均速度估計；附件及來源節流可能使時間變動。",
+            }
+            if remaining is not None else _unknown_eta(
+                "running_unmeasured", "正在清點來源或尚無足夠吞吐率樣本。"
+            )
+        )
+    elif complete_archive:
+        archive_status = "complete"
+        archive_label = "本次官方清單及附件抓取完成"
+        archive_eta = _complete_eta("已清點本次官方公告清單；不代表每篇都能解析為數值特徵。")
+    elif archive:
+        archive_status = "degraded"
+        if archive.get("source_access_blocked_reason"):
+            archive_label = "官方站點阻擋自動存取，歷史未完成"
+            archive_eta = _unknown_eta(
+                "waiting_source_access", "需等待官方站點允許正常取得；不能由已保存部分推算完成時間。"
+            )
+        else:
+            archive_label = "官方公告仍有失敗或缺期"
+            archive_eta = _unknown_eta("waiting_retry", "續跑下載器並檢查逐篇失敗與缺期收據。")
+    else:
+        archive_status = "waiting"
+        archive_label = "尚未建立官方歷史公告收據"
+        archive_eta = _unknown_eta("waiting_source", "啟動主計總處逐期公告封存下載器。")
+    generated_archive = _parse_time(archive.get("generated_at_utc")) or _parse_time(
+        archive.get("started_at_utc")
+    )
+    rows.append(
+        {
+            "id": "tw-public:dgbas_release_vintages",
+            "parent_id": "group:tw-public",
+            "scope": "logical_source",
+            "title": "dgbas_release_vintages",
+            "provider": "主計總處官方新聞稿",
+            "category": "CPI, 失業率, GDP, 歷史公告",
+            "status": archive_status,
+            "status_label": archive_label,
+            "cadence": "交易日 07:00／16:30／19:30；週日稽核",
+            "update_owner": "stockagent-tw-public-release-archives.timer",
+            "latest_at_utc": _iso(generated_archive),
+            "data_through": (
+                archive.get("latest_period", {}).get("cpi")
+                if isinstance(archive.get("latest_period"), Mapping)
+                else None
+            ),
+            "freshness": _freshness(generated_archive, now=now, window_seconds=45 * 86400),
+            "coverage": (
+                _coverage(_integer(archive.get("completed_sources")) or 0,
+                          _integer(archive.get("total_sources")), unit="類", label="來源清點進度")
+                if archive.get("phase") == "discovering" and running
+                else _coverage(completed, total, unit="公告", label="逐篇下載進度")
+            ),
+            "eta": archive_eta,
+            "rows": _integer(archive.get("saved_releases")),
+            "publishable": complete_archive,
+            "automation_eligible": True,
+            "detail": "官方逐期新聞稿與原始附件；CPI、失業率、GDP 值來自當期標題或原始 PDF，發布時刻優先用原稿、缺時刻才依當年官方規則推定。",
+            "warnings": [
+                "公告日期不等於統計期間；GDP headline 與季調 GDP 表定義未核對前不進模型。",
+                "缺少標題數值的早年公告保留原檔，不以現在的整包數值倒填。",
+                *([str(archive["source_access_blocked_reason"])]
+                  if archive.get("source_access_blocked_reason") else []),
+            ],
+            "detail_link": "https://www.stat.gov.tw/News.aspx?n=2668&sms=10980",
+        }
+    )
+    cbc_archive = _read_json(base / "state/cbc_fx_reserve_release_vintages.json", {})
+    cbc_archive = cbc_archive if isinstance(cbc_archive, Mapping) else {}
+    cbc_path = base / "cbc_fx_reserve_release_vintages.parquet"
+    cbc_total = _integer(cbc_archive.get("total_releases")) or _integer(
+        cbc_archive.get("registered_releases")
+    )
+    cbc_completed = _integer(cbc_archive.get("completed_releases"))
+    if cbc_completed is None:
+        cbc_completed = _integer(cbc_archive.get("saved_releases")) or 0
+    cbc_complete = bool(cbc_archive.get("complete")) and cbc_path.is_file()
+    if cbc_archive.get("status") == "running":
+        cbc_status = "updating"
+        if cbc_archive.get("phase") == "discovering":
+            done_pages = _integer(cbc_archive.get("completed_pages")) or 0
+            total_pages = _integer(cbc_archive.get("total_pages"))
+            cbc_label = (
+                f"已清點 {done_pages:,}/{total_pages:,} 頁央行索引"
+                if total_pages else "正在清點央行公告"
+            )
+        else:
+            cbc_label = (
+                f"已處理 {cbc_completed:,}/{cbc_total:,} 篇央行公告"
+                if cbc_total else "正在清點央行公告"
+            )
+        remaining = _integer(cbc_archive.get("estimated_seconds_remaining"))
+        cbc_eta = (
+            {
+                "state": "running_estimated",
+                "remaining_seconds": remaining,
+                "estimated_complete_at_utc": _iso(now + timedelta(seconds=remaining)),
+                "confidence": "low",
+                "basis": "依本次央行公告實測速度估計；來源節流可改變剩餘時間。",
+            }
+            if remaining is not None else _unknown_eta(
+                "running_unmeasured", "正在清點來源或尚無足夠吞吐率樣本。"
+            )
+        )
+    elif cbc_complete:
+        cbc_status = "complete"
+        cbc_label = "本次央行公告清單抓取完成"
+        cbc_eta = _complete_eta("公告已封存；不是所有公告都含可機讀數值。")
+    elif cbc_archive:
+        cbc_status = "degraded"
+        cbc_label = "央行公告仍有失敗或缺期"
+        cbc_eta = _unknown_eta("waiting_retry", "續跑下載器並檢查逐篇失敗與缺期收據。")
+    else:
+        cbc_status = "waiting"
+        cbc_label = "尚未建立央行歷史公告收據"
+        cbc_eta = _unknown_eta("waiting_source", "啟動央行外匯存底新聞稿封存下載器。")
+    cbc_generated = _parse_time(cbc_archive.get("generated_at_utc")) or _parse_time(
+        cbc_archive.get("started_at_utc")
+    )
+    rows.append(
+        {
+            "id": "tw-public:cbc_fx_reserve_release_vintages",
+            "parent_id": "group:tw-public",
+            "scope": "logical_source",
+            "title": "cbc_fx_reserve_release_vintages",
+            "provider": "中央銀行官方新聞稿",
+            "category": "外匯存底, 歷史公告",
+            "status": cbc_status,
+            "status_label": cbc_label,
+            "cadence": "交易日 07:00／16:30／19:30；週日稽核",
+            "update_owner": "stockagent-tw-public-release-archives.timer",
+            "latest_at_utc": _iso(cbc_generated),
+            "data_through": cbc_archive.get("latest_period"),
+            "freshness": _freshness(cbc_generated, now=now, window_seconds=45 * 86400),
+            "coverage": (
+                _coverage(_integer(cbc_archive.get("completed_pages")) or 0,
+                          _integer(cbc_archive.get("total_pages")), unit="頁", label="來源索引進度")
+                if cbc_archive.get("phase") == "discovering" and cbc_status == "updating"
+                else _coverage(cbc_completed, cbc_total, unit="公告", label="逐篇下載進度")
+            ),
+            "eta": cbc_eta,
+            "rows": _integer(cbc_archive.get("saved_releases")),
+            "publishable": cbc_complete,
+            "automation_eligible": True,
+            "detail": "央行原始外匯存底新聞稿與文內當期數值；不以今日整包統計回填歷史版本。",
+            "warnings": [
+                "公告只有日期、無可靠逐篇時鐘；保守映射到該日期後的首個已證實交易日。",
+                "找不到文內金額的公告保留原始頁，不產生模型數值。",
+            ],
+            "detail_link": "https://www.cbc.gov.tw/tw/lp-302-1-1-20.html",
+        }
+    )
+    money_archive = _read_json(base / "state/cbc_money_release_vintages.json", {})
+    money_archive = money_archive if isinstance(money_archive, Mapping) else {}
+    money_path = base / "cbc_money_release_vintages.parquet"
+    money_running = money_archive.get("status") == "running"
+    money_archive_complete = bool(money_archive.get("complete")) and money_path.is_file()
+    money_values_complete = money_archive.get("value_history_complete") is True
+    money_complete = money_archive_complete and money_values_complete
+    money_missing = money_archive.get("missing_periods")
+    money_missing_count = len(money_missing) if isinstance(money_missing, list) else None
+    money_total = _integer(money_archive.get("total_releases")) or _integer(
+        money_archive.get("registered_releases")
+    )
+    money_done = _integer(money_archive.get("completed_releases"))
+    if money_done is None:
+        money_done = _integer(money_archive.get("saved_releases")) or 0
+    money_remaining = _integer(money_archive.get("estimated_seconds_remaining"))
+    money_generated = _parse_time(money_archive.get("generated_at_utc")) or _parse_time(
+        money_archive.get("started_at_utc")
+    )
+    rows.append({
+        "id": "tw-public:cbc_money_release_vintages",
+        "parent_id": "group:tw-public",
+        "scope": "logical_source",
+        "title": "cbc_money_release_vintages",
+        "provider": "中央銀行官方新聞稿",
+        "category": "M1B, M2, 歷史公告",
+        "status": "updating" if money_running else "complete" if money_complete else "degraded" if money_archive else "waiting",
+        "status_label": (
+            "正在清點央行公告索引" if money_archive.get("phase") == "discovering" and money_running
+            else f"已處理 {money_done:,}/{money_total:,} 篇央行公告" if money_running and money_total
+            else "原稿已封存，仍有歷史月份缺值" if money_archive_complete and not money_values_complete
+            else "已核對原稿及連續月份當期數值" if money_complete
+            else "公告仍有失敗或未解析的數值" if money_archive
+            else "尚未建立央行貨幣新聞稿收據"
+        ),
+        "cadence": "交易日 07:00／16:30／19:30 增量；週日全索引",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(money_generated),
+        "data_through": money_archive.get("latest_period"),
+        "freshness": _freshness(money_generated, now=now, window_seconds=45 * 86400),
+        "coverage": (
+            _coverage(_integer(money_archive.get("completed_pages")) or 0,
+                      _integer(money_archive.get("total_pages")), unit="頁", label="來源索引進度")
+            if money_archive.get("phase") == "discovering" and money_running
+            else _coverage(money_done, money_total, unit="公告", label="逐篇下載進度")
+        ),
+        "eta": (
+            {"state": "running_estimated", "remaining_seconds": money_remaining,
+             "estimated_complete_at_utc": _iso(now + timedelta(seconds=money_remaining)),
+             "confidence": "low", "basis": "依已完成公告的實測速度推估。"}
+            if money_running and money_remaining is not None
+            else _unknown_eta("running_unmeasured", "清點來源中，尚無可靠速度樣本。")
+            if money_running else _complete_eta("本次原稿清點完成；缺期另外標示。")
+            if money_complete else _unknown_eta("waiting_retry", "尚有歷史缺期或來源失敗。")
+        ),
+        "rows": _integer(money_archive.get("saved_releases")),
+        "publishable": money_complete,
+        "automation_eligible": True,
+        "detail": "只取逐期新聞稿原文 M1B／M2 年增率；不把現行整包貨幣水準倒填為歷史值。",
+        "warnings": ["只記錄公告日期、非已證實逐篇時刻；映射到其後首個已驗證交易日。",
+                     "找不到當期數值的原稿保留原文，不製造特徵。",
+                     f"歷史數值缺期：{money_missing_count} 個月。" if money_missing_count is not None
+                     else "歷史數值缺期尚待清點。"],
+        "detail_link": "https://www.cbc.gov.tw/tw/lp-302-1-1-20.html",
+    })
+    overnight_state = _read_json(base / "state/cbc_overnight_official_pages.json", {})
+    overnight_state = overnight_state if isinstance(overnight_state, Mapping) else {}
+    overnight_path = base / "supplemental/cbc_overnight_official_pages.parquet"
+    overnight_done = _integer(overnight_state.get("full_index_pages")) if overnight_state.get("full_history_scanned") else _integer(overnight_state.get("pages_read")) or 0
+    overnight_total = _integer(overnight_state.get("full_index_pages"))
+    overnight_good = overnight_path.is_file() and overnight_state.get("full_history_scanned") is True and not overnight_state.get("ambiguous_dates")
+    overnight_observed = _parse_time(overnight_state.get("generated_at_utc"))
+    rows.append({
+        "id": "tw-public:cbc_overnight_official_pages",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "cbc_overnight_official_pages", "provider": "中央銀行官方日表",
+        "category": "隔夜拆款利率, 日資料, 歷史數值",
+        "status": "complete" if overnight_good else "degraded" if overnight_state else "waiting",
+        "status_label": (
+            f"官網日表已收齊至 {overnight_state.get('last_subject_date')}；首發版本另待驗證"
+            if overnight_good else "日表未收齊或含衝突日期" if overnight_state
+            else "尚未下載央行官方日表"
+        ),
+        "cadence": "交易日 07:00／16:30／19:30 增量；週日全索引",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(overnight_observed),
+        "data_through": overnight_state.get("last_subject_date"),
+        "freshness": _freshness(overnight_observed, now=now, window_seconds=3 * 86400),
+        "coverage": _coverage(overnight_done or 0, overnight_total, unit="頁", label="官方日表歷史索引"),
+        "eta": _complete_eta("日表已抓齊；此非首發數值版本驗證。") if overnight_good
+        else _unknown_eta("waiting_retry", "先完成官網日表，再比對發布版本。"),
+        "rows": _integer(overnight_state.get("distinct_dates")),
+        "publishable": overnight_good, "automation_eligible": True,
+        "detail": "央行官網每日歷史利率與原始 HTML；修補開放資料 CSV 的舊值衝突及近期延遲。",
+        "warnings": ["官網現值未證明當年首發數值或首次發布時刻；不得直接宣稱嚴格 PIT。"],
+        "detail_link": "https://www.cbc.gov.tw/tw/lp-641-1.html",
+    })
+    annual_state = _read_json(base / "state/cbc_usdtwd_annual_pages.json", {})
+    annual_state = annual_state if isinstance(annual_state, Mapping) else {}
+    annual_path = base / "supplemental/cbc_usdtwd_annual_pages.parquet"
+    annual_years = annual_state.get("years") if isinstance(annual_state.get("years"), list) else []
+    annual_good = annual_path.is_file() and annual_state.get("status") == "complete" and bool(annual_years)
+    annual_observed = _parse_time(annual_state.get("generated_at_utc"))
+    rows.append({
+        "id": "tw-public:cbc_usdtwd_annual_pages",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "cbc_usdtwd_annual_pages", "provider": "中央銀行官方年表",
+        "category": "美元／新臺幣, 日收盤, 歷史數值",
+        "status": "complete" if annual_good else "degraded" if annual_state else "waiting",
+        "status_label": (
+            f"已收集 {len(annual_years)} 年官方日表；首發版本另待驗證"
+            if annual_good else "官方年表尚未收齊" if annual_state else "尚未下載官方年表"
+        ),
+        "cadence": "首次擷取；週日重查年度索引",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(annual_observed),
+        "data_through": annual_state.get("last_subject_date"),
+        "freshness": _freshness(annual_observed, now=now, window_seconds=10 * 86400),
+        "coverage": _coverage(len(annual_years), len(annual_years) if annual_good else None,
+                              unit="年", label="已列出的官方年表"),
+        "eta": _complete_eta("已列出的年度日表已保存；首發值仍待驗證。") if annual_good
+        else _unknown_eta("waiting_retry", "需抓取官方年度索引與各年日表。"),
+        "rows": _integer(annual_state.get("distinct_dates")),
+        "publishable": annual_good, "automation_eligible": True,
+        "detail": "官網年度日表補足開放資料 CSV 之前的匯率數值；保存原始 HTML。",
+        "warnings": ["今日查得的年表不等於每個交易日當年的首發版本。"],
+        "detail_link": "https://www.cbc.gov.tw/tw/lp-2151-1.html",
+    })
+    mof_state = _read_json(base / "state/mof_macro_release_dates.json", {})
+    mof_state = mof_state if isinstance(mof_state, Mapping) else {}
+    mof_path = base / "supplemental/mof_macro_release_dates.parquet"
+    mof_done = mof_path.is_file() and mof_state.get("full_history_scanned") is True
+    mof_fallback = mof_state.get("tax_pdf_fallback") if isinstance(mof_state.get("tax_pdf_fallback"), Mapping) else {}
+    mof_unresolved = mof_fallback.get("not_found") if isinstance(mof_fallback.get("not_found"), list) else []
+    mof_fallback_failures = mof_fallback.get("failures") if isinstance(mof_fallback.get("failures"), list) else []
+    mof_dates_complete = mof_done and bool(mof_fallback) and not mof_unresolved and not mof_fallback_failures
+    mof_observed = _parse_time(mof_state.get("generated_at_utc"))
+    mof_categories = mof_state.get("categories") if isinstance(mof_state.get("categories"), Mapping) else {}
+    mof_pages_scanned_now = sum(_integer(item.get("pages_read")) or 0 for item in mof_categories.values()
+                                if isinstance(item, Mapping))
+    mof_total = sum(_integer(item.get("pages")) or 0 for item in mof_categories.values()
+                    if isinstance(item, Mapping))
+    mof_pages = mof_total if mof_done else mof_pages_scanned_now
+    rows.append({
+        "id": "tw-public:mof_macro_release_dates",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "mof_macro_release_dates", "provider": "財政部新聞稿索引",
+        "category": "進出口／賦稅, 月資料, 官方發布日",
+        "status": "complete" if mof_dates_complete else "degraded" if mof_state else "waiting",
+        "status_label": (
+            "官方新聞稿日期與缺漏 PDF 已掃完；原始數值版本仍待核對"
+            if mof_dates_complete else
+            f"索引已掃完；{len(mof_unresolved)} 個無原稿、{len(mof_fallback_failures)} 個擷取失敗"
+            if mof_done and mof_fallback else
+            "財政部索引已掃完，待補查舊 PDF" if mof_done else
+            "財政部索引尚未掃完" if mof_state else "尚未下載新聞稿日期索引"
+        ),
+        "cadence": "交易日 07:00／16:30／19:30 增量；週日全索引",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(mof_observed),
+        "data_through": mof_state.get("latest_published_on"),
+        "freshness": _freshness(mof_observed, now=now, window_seconds=3 * 86400),
+        "coverage": _coverage(mof_pages, mof_total or None, unit="頁", label="財政部新聞稿索引"),
+        "eta": _complete_eta("已掃完列出的新聞稿；歷史原始數值另驗證。") if mof_dates_complete
+        else _unknown_eta("waiting_retry", "需完成貿易及稅收新聞稿索引。"),
+        "rows": _integer(mof_state.get("distinct_release_periods")),
+        "publishable": mof_dates_complete, "automation_eligible": True,
+        "detail": "逐月保存官方新聞稿發布日與索引 HTML；若無公告才推測發布日。",
+        "warnings": ["發布日期不等於發布時刻；今日整包統計值不等於當年首發版本。"] + (
+            [f"仍無原始 PDF 的賦稅月份：{', '.join(mof_unresolved)}"] if mof_unresolved else []
+        ) + ([f"原稿擷取失敗：{len(mof_fallback_failures)} 個期別。"] if mof_fallback_failures else []),
+        "detail_link": "https://www.mof.gov.tw/multiplehtml/384fb3077bb349ea973e7fc6f13b6974?categoryCode=STAT",
+    })
+    trade_pdf_state = _read_json(base / "state/mof_trade_release_values.json", {})
+    trade_pdf_state = trade_pdf_state if isinstance(trade_pdf_state, Mapping) else {}
+    trade_pdf_path = base / "supplemental/mof_trade_release_values.parquet"
+    trade_pdf_missing = trade_pdf_state.get("missing_bulk_periods")
+    trade_pdf_missing = trade_pdf_missing if isinstance(trade_pdf_missing, list) else []
+    trade_pdf_unresolved = trade_pdf_state.get("unresolved_periods")
+    trade_pdf_unresolved = trade_pdf_unresolved if isinstance(trade_pdf_unresolved, list) else []
+    trade_pdf_done = trade_pdf_state.get("status") == "complete" and not trade_pdf_unresolved
+    trade_pdf_observed = _parse_time(trade_pdf_state.get("generated_at_utc"))
+    rows.append({
+        "id": "tw-public:mof_trade_release_values",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "mof_trade_release_values", "provider": "財政部初報 PDF",
+        "category": "進出口, 月資料, 補齊整包 CSV 尾端",
+        "status": "complete" if trade_pdf_done else "degraded" if trade_pdf_state else "waiting",
+        "status_label": (
+            "整包 CSV 缺月已由初報 PDF 補候選值；精度較低"
+            if trade_pdf_done else f"仍有 {len(trade_pdf_unresolved)} 個月份未解析"
+            if trade_pdf_state else "尚未檢查缺月的初報 PDF"
+        ),
+        "cadence": "交易日 07:00／16:30／19:30 缺月增量",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(trade_pdf_observed),
+        "data_through": max(trade_pdf_missing) if trade_pdf_missing else trade_pdf_state.get("bulk_latest_period"),
+        "freshness": _freshness(trade_pdf_observed, now=now, window_seconds=3 * 86400),
+        "coverage": _coverage(len(trade_pdf_missing) - len(trade_pdf_unresolved),
+                              len(trade_pdf_missing) or None, unit="月", label="整包 CSV 缺月 PDF"),
+        "eta": _complete_eta("可解析缺月已補；原 PDF 僅發布到億元。") if trade_pdf_done
+        else _unknown_eta("waiting_retry", "需取得並解析未解月份的官方初報 PDF。"),
+        "rows": _integer(trade_pdf_state.get("pdf_value_periods")),
+        "publishable": trade_pdf_done, "automation_eligible": True,
+        "detail": "取得原始新聞稿 PDF；臺幣數值以億元四捨五入，另存為候選，不偽裝成千元精度。",
+        "warnings": ["不得把四捨五入候選值當作海關 CSV 的精確千元值或嚴格訓練特徵。"],
+        "detail_link": "https://www.mof.gov.tw/multiplehtml/384fb3077bb349ea973e7fc6f13b6974?categoryCode=STAT_EXP",
+    })
+    mof_original = _read_json(base / "state/mof_original_release_archive.json", {})
+    mof_original = mof_original if isinstance(mof_original, Mapping) else {}
+    mof_original_path = base / "supplemental/mof_original_release_archive.parquet"
+    mof_indexed = _integer(mof_original.get("indexed_releases"))
+    mof_archived = _integer(mof_original.get("archived_releases")) or 0
+    mof_original_complete = (
+        mof_original_path.is_file() and mof_original.get("status") == "complete"
+        and mof_original.get("continuous_index_history") is True
+    )
+    mof_original_observed = _parse_time(mof_original.get("generated_at_utc"))
+    mof_original_latest = mof_original.get("latest_period_by_series")
+    mof_original_latest = mof_original_latest if isinstance(mof_original_latest, Mapping) else {}
+    mof_original_gaps = mof_original.get("index_period_gaps")
+    mof_original_gap_count = sum(len(gaps) for gaps in mof_original_gaps.values()
+                                 if isinstance(gaps, list)) if isinstance(mof_original_gaps, Mapping) else 0
+    mof_subject_unverified = mof_original.get("subject_unverified_releases")
+    mof_subject_unverified = mof_subject_unverified if isinstance(mof_subject_unverified, list) else []
+    mof_original_complete = mof_original_complete and not mof_subject_unverified
+    rows.append({
+        "id": "tw-public:mof_original_release_archive",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "mof_original_release_archive", "provider": "財政部初報原稿",
+        "category": "進出口／賦稅, 月資料, 原始 PDF 封存",
+        "status": "complete" if mof_original_complete else "degraded" if mof_original else "waiting",
+        "status_label": (
+            "已保存所列原稿；首發版本仍待核對" if mof_original_complete else
+            f"已存 {mof_archived}/{mof_indexed or '?'} 份；索引缺 {mof_original_gap_count} 個月、內文期別未驗 {len(mof_subject_unverified)} 份"
+            if mof_original else "尚未下載財政部逐期原稿"
+        ),
+        "cadence": "交易日近期原稿重驗；週日全量重驗",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": _iso(mof_original_observed),
+        "data_through": max((str(value) for value in mof_original_latest.values()), default=None),
+        "freshness": _freshness(mof_original_observed, now=now, window_seconds=3 * 86400),
+        "coverage": _coverage(mof_archived, mof_indexed, unit="份", label="索引列出的財政部原稿"),
+        "eta": _complete_eta("已保存索引原稿；首發版本未證明。") if mof_original_complete
+        else _unknown_eta("waiting_retry", "需補齊或核對原始新聞稿 PDF。"),
+        "rows": mof_archived, "publishable": mof_original_complete,
+        "automation_eligible": True,
+        "detail": "保留財政部貿易及稅收初報 PDF、原網址、位元組雜湊與逐期收據。",
+        "warnings": ["今日可下載的舊 PDF 不必然是歷史首次發布的位元組版本。"]
+        + ([f"原稿內文未能驗證期別：{', '.join(mof_subject_unverified)}"]
+           if mof_subject_unverified else []),
+        "detail_link": "https://www.mof.gov.tw/multiplehtml/384fb3077bb349ea973e7fc6f13b6974?categoryCode=STAT",
+    })
+    provisional_path = root / "artifacts/data_quality/tw_public_provisional_macro/events.parquet"
+    provisional_summary = _read_json(provisional_path.with_suffix(".summary.json"), {})
+    provisional_summary = provisional_summary if isinstance(provisional_summary, Mapping) else {}
+    provisional_receipt_valid = False
+    if provisional_path.is_file() and provisional_summary.get("output_sha256"):
+        try:
+            with provisional_path.open("rb") as handle:
+                provisional_receipt_valid = (
+                    hashlib.file_digest(handle, "sha256").hexdigest()
+                    == provisional_summary["output_sha256"]
+                )
+        except OSError:
+            pass
+    provisional_coverage = provisional_summary.get("feature_coverage") if provisional_receipt_valid else None
+    provisional_expected = len(provisional_coverage) if isinstance(provisional_coverage, Mapping) else None
+    provisional_count = sum(
+        _integer(item.get("rows")) not in (None, 0)
+        for item in provisional_coverage.values() if isinstance(item, Mapping)
+    ) if isinstance(provisional_coverage, Mapping) else 0
+    rows.append({
+        "id": "tw-public:provisional_macro_feature_events",
+        "parent_id": "group:tw-public", "scope": "logical_source",
+        "title": "provisional_macro_feature_events", "provider": "央行／主計總處／財政部",
+        "category": "總體特徵原值與衍生候選, 暫定發布時刻, 待 PIT 驗證",
+        "status": "degraded" if provisional_path.is_file() else "waiting",
+        "status_label": f"{provisional_count}/{provisional_expected} 欄已有候選歷史值；全部仍需原始數值版本驗證"
+        if provisional_receipt_valid else "候選歷史總帳收據缺失或雜湊不符",
+        "cadence": "官方公告封存完成後重建",
+        "update_owner": "stockagent-tw-public-release-archives.timer",
+        "latest_at_utc": None, "data_through": None,
+        "freshness": _freshness(None, now=now, window_seconds=86400),
+        "coverage": _coverage(provisional_count, provisional_expected, unit="欄", label="候選歷史值欄位"),
+        "eta": _unknown_eta("waiting_source", "原始數值版本與逐期發布時刻尚待補齊；不能估計嚴格 PIT 完成時間。"),
+        "rows": _integer(provisional_summary.get("total_rows")) if provisional_receipt_valid else None,
+        "publishable": False, "automation_eligible": True,
+        "detail": "與嚴格訓練表分離；每筆保留數值來源、日期證據等級和推定時刻，strict_pit_eligible 一律為 false。",
+        "warnings": ["現行整包歷史值可能含事後修訂；推定發布時刻不是精確發布證據。"]
+        if provisional_receipt_valid else ["候選表與摘要未通過位元組雜湊核對；不展示逐欄筆數。"],
+    })
+    # The aggregate ledger is not a substitute for field-level coverage.  Its
+    # build receipt already contains exact feature-period counts and bounds, so
+    # the monitor can expose every candidate without rescanning Parquet on each
+    # HTTP request or implying that any field is strict-PIT ready.
+    if provisional_receipt_valid and isinstance(provisional_coverage, Mapping):
+        for feature, stats in sorted(provisional_coverage.items()):
+            if not isinstance(stats, Mapping):
+                continue
+            count = _integer(stats.get("rows")) or 0
+            first = stats.get("first_subject_period")
+            last = stats.get("last_subject_period")
+            invalid = _integer(stats.get("raw_value_only_rows")) or 0
+            estimated_dates = _integer(stats.get("estimated_publication_date_rows")) or 0
+            rows.append({
+                "id": f"tw-public:provisional-feature:{feature}",
+                "parent_id": "group:tw-public", "scope": "logical_source",
+                "title": str(feature), "provider": "台股公開總體特徵",
+                "category": "候選歷史特徵, 非嚴格 PIT",
+                "status": "degraded" if count else "waiting",
+                "status_label": f"候選值 {count:,} 筆；推定發布日 {estimated_dates:,} 筆；僅可用原值 {invalid:,} 筆",
+                "cadence": "官方來源更新後重建",
+                "update_owner": "stockagent-tw-public-release-archives.timer",
+                "latest_at_utc": None, "data_through": last,
+                "freshness": _freshness(None, now=now, window_seconds=86400),
+                "coverage": _coverage(count, None, unit="筆", label="候選歷史值"),
+                "eta": _unknown_eta("waiting_source", "歷史首發數值與精確時刻未齊；不能估計嚴格 PIT 完成時間。"),
+                "rows": count, "publishable": False, "automation_eligible": True,
+                "detail": f"最早資料期 {first or '未知'}；最新資料期 {last or '未知'}。與總帳重複，不可加總。",
+                "warnings": ["推定發布時刻及目前可下載的舊數值，不等於歷史首發版本。"],
+                "_provisional_feature_stats": {"count": count, "first": first, "last": last},
+            })
+    xbrl = _read_json(base / "mops_xbrl/state.json", {})
+    xbrl = xbrl if isinstance(xbrl, Mapping) else {}
+    xbrl_total = _integer(xbrl.get("discovered_periods"))
+    xbrl_done = _integer(xbrl.get("completed_periods")) or 0
+    xbrl_local = _integer(xbrl.get("local_imported_periods"))
+    if xbrl_local is None:
+        xbrl_local = xbrl_done
+    xbrl_observed = _parse_time(xbrl.get("generated_at_utc"))
+    xbrl_covered = xbrl_total is not None and xbrl_done == xbrl_total
+    xbrl_local_covered = xbrl_total is not None and xbrl_local == xbrl_total
+    rows.append({
+        "id": "tw-public:mops_xbrl_quarterly",
+        "parent_id": "group:tw-public",
+        "scope": "logical_source",
+        "title": "mops_xbrl_quarterly",
+        "provider": "MOPS / 公開資訊觀測站",
+        "category": "台股, 季報, XBRL 原始事實",
+        "status": (
+            "updating" if xbrl.get("status") == "updating"
+            else "degraded" if xbrl.get("status") == "failed" or xbrl_covered
+            else "blocked" if not xbrl.get("automated_download_authorized") else "waiting"
+        ),
+        "status_label": (
+            f"正在匯入季度 ZIP：{xbrl_local:,}/{xbrl_total:,} 季" if xbrl.get("status") == "updating" and xbrl_total is not None
+            else "季度 ZIP 匯入失敗，等待診斷／重試" if xbrl.get("status") == "failed"
+            else "季度 ZIP 已涵蓋；申報發布時刻尚未驗證" if xbrl_covered
+            else f"本機已匯入 {xbrl_local:,}/{xbrl_total:,} 季；來源與申報時刻待驗證，自動更新待授權"
+            if xbrl_local_covered and not xbrl.get("automated_download_authorized")
+            else f"本機已匯入 {xbrl_local:,}/{xbrl_total:,} 季；缺自動下載授權"
+            if not xbrl.get("automated_download_authorized") and xbrl_total is not None
+            else "自動下載需證交所授權；尚無可驗證季度清單"
+            if not xbrl.get("automated_download_authorized")
+            else f"本機已匯入 {xbrl_local:,}/{xbrl_total:,} 季" if xbrl_total is not None
+            else "尚未清點官方季度清單"
+        ),
+        "cadence": "取得自動下載授權後，每次排程重掃官方季度清單",
+        "update_owner": "download_tw_mops_xbrl.py；timer 啟用狀態另見排程證據",
+        "latest_at_utc": _iso(xbrl_observed),
+        "data_through": xbrl.get("latest_period") if xbrl_covered else None,
+        "freshness": _freshness(xbrl_observed, now=now, window_seconds=7 * 86400),
+        "coverage": _coverage(xbrl_local, xbrl_total, unit="季", label="本機季度 ZIP 正規化匯入"),
+        "eta": _unknown_eta("waiting_authorization" if not xbrl.get("automated_download_authorized")
+                            else "waiting_schedule", "未有可據以估計完成時間的實測吞吐率與有效排程。"),
+        "rows": _integer(xbrl.get("local_fact_rows")) if xbrl.get("local_fact_rows") is not None
+                else _integer(xbrl.get("fact_rows")),
+        "publishable": False,
+        "automation_eligible": xbrl.get("automated_download_authorized") is True,
+        "authorization_expires_on": xbrl.get("authorization_expires_on"),
+        "detail": "本機匯入與官方來源驗證分開計數；按季原始 ZIP 保留版本與 SHA-256，正規化事實另存，季度結束日不能充當申報發布時刻。",
+        "warnings": ["本機 ZIP 匯入不證明來源真實性、逐公司首次申報時刻與後續修訂；不可直接作為歷史回測特徵。",
+                     "ToAlpha 依條款只供有限互動查詢，不做全市場自動缺口鏡像。"]
+                    + ([f"最近一次失敗：{str(xbrl.get('last_error'))[:240]}"] if xbrl.get("last_error") else []),
+        "detail_link": "https://mopsov.twse.com.tw/mops/web/t203sb02",
+    })
     return rows
 
 
@@ -3168,6 +3801,9 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
         str(dune_summary.get("state") or "") == "blocked"
         or (_integer(dune_summary.get("blocked_credit_partitions")) or 0) > 0
     )
+    dune_subscription_blocked = isinstance(dune_summary, Mapping) and (
+        (_integer(dune_summary.get("blocked_subscription_partitions")) or 0) > 0
+    )
     progress_updated = (
         _parse_time(dune_progress.get("updated_at_utc"))
         if isinstance(dune_progress, Mapping)
@@ -3204,18 +3840,39 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
         result_status = next(
             (
                 status
-                for status in ("blocked_credits", "failed", "not_started", "complete")
+                for status in (
+                    "blocked_subscription",
+                    "not_started_subscription",
+                    "blocked_credits",
+                    "failed",
+                    "not_started",
+                    "complete",
+                )
                 if status in query_statuses
             ),
             "",
         )
-        if dune_run_blocked and query_statuses & {"blocked_credits", "not_started"}:
+        if dune_subscription_blocked and query_statuses & {
+            "blocked_subscription",
+            "not_started_subscription",
+        }:
+            result_status = "blocked_subscription"
+        elif dune_run_blocked and query_statuses & {
+            "blocked_credits",
+            "not_started",
+        }:
             result_status = "blocked_credits"
         query_progress_live = progress_live and query_id in str(
             dune_progress.get("phase") or ""
         )
         fresh = _freshness(latest, now=now, window_seconds=72 * 3600)
-        if result_status == "blocked_credits":
+        if result_status == "blocked_subscription":
+            status, label = "blocked", "Dune 訂閱不支援 API SQL 執行"
+            eta = _unknown_eta(
+                "external_input",
+                "等待可執行 API SQL 的 Dune 訂閱；其餘分區未送出。",
+            )
+        elif result_status == "blocked_credits":
             status, label = "blocked", "Dune credits 不足，已停止新增執行"
             eta = _unknown_eta(
                 "waiting_quota", "HTTP 402 後 fail-closed；等待 credits 恢復。"
@@ -3946,6 +4603,30 @@ def _next_declared_calendar(
 
 def _profile_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
     row_id = str(row.get("id") or "")
+    if row_id == "tw-public:mops_xbrl_quarterly":
+        return {
+            "mode": "timer", "service_keys": ("tw_mops_xbrl",),
+            "schedule_label": "取得核准後每四小時檢查官方季度 ZIP",
+            "active_means_running": True, "requires_timer_active": True,
+        }
+    if row_id in {
+        "tw-public:dgbas_release_vintages",
+        "tw-public:cbc_fx_reserve_release_vintages",
+        "tw-public:cbc_money_release_vintages",
+        "tw-public:cbc_overnight_official_pages",
+        "tw-public:cbc_usdtwd_annual_pages",
+        "tw-public:mof_macro_release_dates",
+        "tw-public:mof_trade_release_values",
+        "tw-public:mof_original_release_archive",
+        "tw-public:provisional_macro_feature_events",
+    }:
+        return {
+            "mode": "timer",
+            "service_keys": ("tw_public_release_archives",),
+            "schedule_label": "交易日 07:00／16:30／19:30 增量；週日全索引稽核",
+            "active_means_running": True,
+            "requires_timer_active": True,
+        }
     shioaji_profiles: dict[str, dict[str, Any]] = {
         "shioaji:fop_stream": {
             **_AUTOMATION_PROFILES["group:tw-microstructure-captures-cold"],
@@ -4062,12 +4743,16 @@ def _automation_for_row(
     eligible = row.get("automation_eligible", True) is True
     mode = str(profile.get("mode") or "not_configured")
     automatic = eligible and mode not in {"frozen", "not_configured", "on_demand"}
+    if profile.get("requires_timer_active") is True:
+        automatic = automatic and any(state.get("timer_active") is True for state in states)
     schedule_label = str(
         profile.get("schedule_label") or row.get("cadence") or "未指定"
     )
     if not eligible and mode not in {"frozen", "on_demand"}:
         schedule_label = "未接入可執行自動更新；父群組排程不代表此端點"
     if not eligible and mode not in {"frozen", "on_demand"}:
+        schedule_state = "not_configured"
+    elif profile.get("requires_timer_active") is True and not automatic:
         schedule_state = "not_configured"
     elif mode == "stream":
         schedule_state = (
@@ -4541,6 +5226,18 @@ def _enrich_and_sort_rows(
     enriched: list[dict[str, Any]] = []
     for original in rows:
         row = dict(original)
+        if row.get("id") == "tw-public:mops_xbrl_quarterly":
+            timer_state = refresh_services.get("tw_mops_xbrl", {})
+            try:
+                expires_on = date.fromisoformat(str(row.get("authorization_expires_on")))
+            except (TypeError, ValueError):
+                expires_on = None
+            row["automation_eligible"] = bool(
+                row.get("automation_eligible") is True
+                and expires_on is not None and expires_on >= now.astimezone(TAIPEI).date()
+                and isinstance(timer_state, Mapping)
+                and timer_state.get("timer_active") is True
+            )
         publication_hint = row.pop("_publication_hint", None)
         automation = _automation_for_row(
             row, now=now, refresh_services=refresh_services
@@ -4680,6 +5377,244 @@ def _monitor_integrity_checks(
     }
 
 
+def _market_category(row: Mapping[str, Any]) -> str:
+    row_id = str(row.get("id") or "")
+    parent = str(row.get("parent_id") or "")
+    if row_id.startswith("inventory:pepperstone:"):
+        return {
+            "forex": "forex", "crypto": "crypto",
+            "commodities": "macro", "other": "cross_market",
+        }.get(row_id.rsplit(":", 1)[-1], "cross_market")
+    if row_id.startswith("inventory:yahoo:"):
+        return {
+            "tw_stocks": "taiwan_equity", "us_stocks": "global_equity",
+            "crypto": "crypto", "forex": "forex",
+        }.get(row_id.rsplit(":", 1)[-1], "cross_market")
+    if row_id.startswith("inventory:tw-public:"):
+        return "taiwan_equity"
+    if row_id == "inventory:legacy:stock-features":
+        return "taiwan_equity"
+    if row.get("scope") == "credential_gate":
+        return "configuration"
+    if row_id.startswith("tw-public:"):
+        source = row_id.partition(":")[2]
+        if source.startswith(("taifex_",)):
+            return "taiwan_derivatives"
+        if source.startswith(("cbc_", "dgbas_", "mof_")):
+            return "macro"
+        if source.startswith(("twse_", "tpex_", "mops_", "tdcc_", "sitca_", "tw_", "data_gov_tdcc_")):
+            return "taiwan_equity"
+        return "taiwan_public"
+    if row_id.startswith("product:"):
+        product = row_id.split(":", 2)[1]
+        if product.startswith("tw_index"):
+            return "taiwan_derivatives"
+        if product.startswith("tw_listed"):
+            return "taiwan_equity"
+        if product.startswith("yahoo_crypto") or product in {
+            "okx_perpetual_swaps", "bybit_perpetuals", "binance_usdm_perpetuals",
+            "coinbase_spot", "kraken_spot", "bitfinex_spot_derivatives",
+            "hyperliquid_perpetuals", "deribit_derivatives",
+        }:
+            return "crypto"
+        if product.startswith("yahoo_global") or product.startswith("alpaca_"):
+            return "global_equity"
+        if product.startswith(("fx_", "pepperstone_")):
+            return "forex"
+    group = row_id.removeprefix("group:") if row_id.startswith("group:") else parent.removeprefix("group:")
+    if group in _GROUP_MARKET_CATEGORY:
+        return _GROUP_MARKET_CATEGORY[group]
+    source_text = " ".join(str(row.get(key) or "") for key in ("id", "provider", "title")).lower()
+    if any(token in source_text for token in ("crypto", "binance", "bybit", "okx", "dune", "coingecko", "bitcoin", "ethereum", "defi")):
+        return "crypto"
+    if any(token in source_text for token in ("forex", "frankfurter", "pepperstone", "匯率")):
+        return "forex"
+    return "cross_market"
+
+
+def _record_stats_for_row(
+    row: Mapping[str, Any], inventory: Mapping[str, Any]
+) -> dict[str, Any]:
+    row_id = str(row.get("id") or "")
+    provisional_stats = row.get("_provisional_feature_stats")
+    if row_id.startswith("tw-public:provisional-feature:") and isinstance(provisional_stats, Mapping):
+        return {
+            "count": _integer(provisional_stats.get("count")),
+            "first": provisional_stats.get("first"),
+            "last": provisional_stats.get("last"),
+            "files_inspected": 1, "files_total": 1, "state": "verified",
+            "basis": "候選事件總帳的建置收據：首末為資料所屬期間，不是實際發布時刻；各欄與總帳重複，不可加總。",
+        }
+    if row.get("scope") == "credential_gate" or row.get("implementation") == "not_available":
+        return {
+            "count": None, "first": None, "last": None,
+            "files_inspected": 0, "files_total": None, "state": "not_applicable",
+            "basis": "此列是設定或來源能力契約，不是已儲存資料集。",
+        }
+    key = str(row.get("record_inventory_key") or row_id)
+    if row_id.startswith("product:") and row.get("granularity") == "1m":
+        product = row_id.split(":", 2)[1]
+        key = {
+            "okx_perpetual_swaps": "group:okx",
+            "bybit_perpetuals": "group:bybit",
+            "binance_usdm_perpetuals": "group:binance",
+        }.get(product, row_id)
+    elif row_id == "product:yahoo_crypto_spot:daily":
+        key = "yahoo:crypto"
+    elif row_id == "product:yahoo_global_equities:daily":
+        key = "yahoo:equities"
+    key = {
+        "product:tw_index_futures:daily": "group:tw-index-futures",
+        "product:tw_index_options:daily": "group:tw-index-options-daily",
+        "free-source:taifex_public_history": "group:taifex-public-history",
+        "dune-query:dune_cex_labeled_flows_daily_v1": "physical:dune:cex-flows",
+        "dune-query:dune_dex_asset_activity_daily_v1": "physical:dune:dex-activity",
+        "dune-query:dune_stablecoin_issuance_daily_v1": "physical:dune:stablecoin",
+    }.get(row_id, key)
+    stats = inventory.get(key)
+    if isinstance(stats, Mapping):
+        result = dict(stats)
+        result["basis"] = (
+            str(result.get("basis") or "")
+            + (f" 時間欄位：{result['time_column']}。" if result.get("time_column") else "")
+            + (" 此列沿用實體檔案統計，不可與母群組重複加總。" if key != row_id else "")
+        )
+        return result
+    return {
+        "count": None, "first": None, "last": None,
+        "files_inspected": 0, "files_total": None, "state": "unverified",
+        "basis": {
+            "group:tw-minute-source-cold": "原始 Shioaji 回補 chunks 存在重疊；未建立去重後清冊前不能加總。",
+            "group:tw-microstructure-captures-cold": "即時原始落盤與研究分區分屬不同層，尚未建立不重疊的 capture 主表清冊。",
+            "group:tw-shioaji-history": "契約原始查詢、補洞與衍生表可能重疊；尚未建立逐契約主表清冊。",
+            "group:tw-futures": "期貨原始 KBar／Tick、補洞和衍生視圖並存；尚未建立不重疊的主表清冊。",
+            "group:openbb-task-shards-local": "可續傳任務分片會被端點封存壓實；與 compact 重複，不加總原始分片。",
+            "group:crypto-reference": "同一來源有連續快照；快照列數不是唯一資產事實，尚未定義去重口徑。",
+            "group:legacy-parquet": "舊版封存可能與現行來源重疊；不將兩份副本相加。",
+        }.get(
+            row_id,
+            "尚無對應的實體檔案清冊；批次下載列數或要求日期不能冒充庫存總筆數與實際首末筆。",
+        ),
+    }
+
+
+def _yahoo_inventory_rows() -> list[dict[str, Any]]:
+    labels = {
+        "tw_stocks": "台股日資料", "us_stocks": "海外股票／ETF 日資料",
+        "crypto": "加密貨幣現貨日資料", "forex": "外匯日資料",
+    }
+    return [
+        {
+            "id": f"inventory:yahoo:{asset_class}",
+            "parent_id": "group:yahoo-market",
+            "scope": "inventory_partition",
+            "title": f"Yahoo · {label}",
+            "provider": "yfinance / Yahoo Finance",
+            "category": "physical_inventory",
+            "status": "legacy",
+            "status_label": "實存 Parquet 分類清冊；下載狀態請看母群組",
+            "cadence": "隨檔案清冊更新",
+            "update_owner": "Yahoo OHLCV 更新器",
+            "latest_at_utc": None,
+            "data_through": None,
+            "freshness": {"state": "unknown", "age_seconds": None},
+            "coverage": None,
+            "eta": _not_applicable_eta("reference", "此列僅按資產分類展示庫存，不另起下載任務。"),
+            "rows": None,
+            "publishable": False,
+            "automation_eligible": False,
+            "registry_alias": True,
+            "record_inventory_key": f"yahoo:{asset_class}",
+            "detail": "這是 Yahoo 物理檔案分類，不重複計入下載完成率。",
+            "warnings": [],
+            "detail_link": None,
+        }
+        for asset_class, label in labels.items()
+    ]
+
+
+def _physical_inventory_rows() -> list[dict[str, Any]]:
+    """Expose every selected physical table without adding a downloader task."""
+
+    return [
+        {
+            "id": f"inventory:{family}",
+            "parent_id": f"group:{group}",
+            "scope": "physical_inventory",
+            "title": label,
+            "provider": _GROUP_META.get(group, {}).get("provider", "公開資料"),
+            "category": "physical_inventory",
+            "status": "legacy",
+            "status_label": "實存表清冊；下載狀態請看母群組",
+            "cadence": "隨檔案清冊更新",
+            "update_owner": "實體 Parquet 清冊",
+            "latest_at_utc": None,
+            "data_through": None,
+            "freshness": {"state": "unknown", "age_seconds": None},
+            "coverage": None,
+            "eta": _not_applicable_eta("reference", "此列只展示實體表，不另起下載任務。"),
+            "rows": None,
+            "publishable": False,
+            "automation_eligible": False,
+            "registry_alias": True,
+            "record_inventory_key": f"physical:{family}",
+            "detail": (
+                "群組主表；納入群組實存列數，與衍生表分開顯示。"
+                if primary else "衍生或輔助視圖；不重複納入群組實存列數。"
+            ),
+            "warnings": [],
+            "detail_link": None,
+        }
+        for family, (group, label, _, primary) in PHYSICAL_FAMILIES.items()
+    ]
+
+
+def _apply_verified_storage_freshness(
+    rows: Iterable[dict[str, Any]],
+    inventory: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> None:
+    """Prevent a requested 1m end date from passing as observed storage."""
+
+    for row in rows:
+        row_id = str(row.get("id") or "")
+        group = row_id if row_id in {"group:okx", "group:bybit", "group:binance"} else {
+            "product:okx_perpetual_swaps:1m": "group:okx",
+            "product:bybit_perpetuals:1m": "group:bybit",
+            "product:binance_usdm_perpetuals:1m": "group:binance",
+        }.get(row_id)
+        if group is None:
+            continue
+        stats = inventory.get(group)
+        if not isinstance(stats, Mapping) or stats.get("state") != "verified":
+            continue
+        actual = str(stats.get("last") or "")
+        actual_time = _parse_time(actual)
+        target = str(row.get("data_through") or "")
+        target_time = _parse_time(target)
+        if actual_time is None or target_time is None:
+            continue
+        row["requested_data_through"] = target
+        row["data_through"] = actual
+        row["freshness"] = _freshness(actual_time, now=now, window_seconds=6 * 3600)
+        behind_target = actual_time.date() < target_time.date()
+        behind_clock = row["freshness"]["state"] == "stale"
+        if not behind_target and not behind_clock:
+            continue
+        warning = (
+            f"下載摘要截止日 {target} 不等於實存最新 1 分 K {actual}；"
+            "尚未到最新，不能以摘要日期宣告完成。"
+        )
+        row["warnings"] = [*row.get("warnings", []), warning]
+        if row.get("status") in {"current", "complete"}:
+            row["status"] = "stale"
+            row["status_label"] = "實存 1 分 K 落後於摘要／時鐘"
+            row["eta"] = _unknown_eta(
+                "waiting_schedule", "等待原更新器續抓；實存尾端沒有可量測吞吐率。"
+            )
+
+
 def build_data_monitor_public_status(
     repo_root: Path,
     *,
@@ -4687,11 +5622,19 @@ def build_data_monitor_public_status(
     refresh_services: Mapping[str, Mapping[str, Any]] | None = None,
     shioaji_status: Mapping[str, Any] | None = None,
     openbb_status: Mapping[str, Any] | None = None,
+    refresh_inventory: bool = False,
+    inventory_max_refresh_files: int = 4_096,
 ) -> dict[str, Any]:
     """Build the complete public registry and current monitor projection."""
 
     root = Path(repo_root)
     observed = (now or datetime.now(UTC)).astimezone(UTC)
+    record_inventory = build_record_inventory(
+        root,
+        refresh=refresh_inventory,
+        max_refresh_files=inventory_max_refresh_files,
+    )
+    inventory_datasets = record_inventory["datasets"]
     registry = _read_json(root / "configs/data_sync/packed_datasets.json", {})
     configs = registry.get("datasets", []) if isinstance(registry, Mapping) else []
     groups = [
@@ -4738,7 +5681,11 @@ def build_data_monitor_public_status(
         + _product_granularity_sources(root, now=observed)
         + _crypto_acquisition_sources(root, now=observed)
         + _free_public_registry_sources(root, now=observed)
+        + _yahoo_inventory_rows()
         + history_logical
+    )
+    _apply_verified_storage_freshness(
+        groups + logical, inventory_datasets, now=observed
     )
     logical_for_rollup = _enrich_and_sort_rows(
         logical,
@@ -4747,10 +5694,15 @@ def build_data_monitor_public_status(
     )
     _rollup_storage_groups(groups, logical_for_rollup)
     rows = _enrich_and_sort_rows(
-        groups + logical,
+        groups + logical + _physical_inventory_rows(),
         now=observed,
         refresh_services=service_states,
     )
+    for row in rows:
+        category = _market_category(row)
+        row["market_category"] = category
+        row["market_category_label"] = _MARKET_CATEGORY_LABELS[category]
+        row["record_stats"] = _record_stats_for_row(row, inventory_datasets)
     groups = [row for row in rows if row.get("scope") == "storage_group"]
     logical = [row for row in rows if row.get("scope") != "storage_group"]
     status_counts: dict[str, int] = {}
@@ -4839,6 +5791,17 @@ def build_data_monitor_public_status(
         rows,
         active_data_endpoints=active_scope_count,
     )
+    physical_stats = [
+        stats for key, stats in inventory_datasets.items()
+        if (
+            (key.startswith(("tw-public:", "yahoo:", "physical:")) and key != "yahoo:equities")
+            or key in {
+                "group:tw-minute-train", "group:tw-microstructure-train",
+                "group:okx", "group:bybit", "group:binance",
+                "group:forex-frankfurter", "group:coinmetrics-community",
+            }
+        )
+    ]
     return {
         "schema_version": DATA_MONITOR_SCHEMA_VERSION,
         "generated_at_utc": _iso(observed),
@@ -4874,6 +5837,25 @@ def build_data_monitor_public_status(
             "group_rollups": len(groups),
             "unable": data_operation_counts["unable"],
             "known_group_rows": known_rows,
+            "verified_inventory_items": sum(
+                row["record_stats"]["state"] == "verified" for row in rows
+            ),
+            "inventory_applicable_items": sum(
+                row["record_stats"]["state"] != "not_applicable" for row in rows
+            ),
+            "physical_inventory_items": len(physical_stats),
+            "physical_inventory_verified_items": sum(
+                stats.get("state") == "verified" for stats in physical_stats
+            ),
+            "physical_inventory_time_bounded_items": sum(
+                stats.get("state") == "verified"
+                and stats.get("first") is not None
+                and stats.get("last") is not None
+                for stats in physical_stats
+            ),
+            "physical_inventory_invalid_items": sum(
+                stats.get("state") == "invalid" for stats in physical_stats
+            ),
             "status_counts": status_counts,
             "operation_state_counts": operation_counts,
             "data_endpoint_state_counts": data_operation_counts,
@@ -4916,11 +5898,52 @@ def build_data_monitor_public_status(
                 "operation_rank, execution_state, measured_eta, next_run, "
                 "provider, title, endpoint_id"
             ),
+            "display_sort_contract": (
+                "market_category (Taiwan first, crypto last), provider, "
+                "operation_rank, execution_state, measured_eta, next_run"
+            ),
         },
         "provider_summaries": _provider_summaries(rows),
+        "market_categories": [
+            {
+                "id": category,
+                "label": label,
+                "items": sum(row["market_category"] == category for row in rows),
+                "verified_items": sum(
+                    row["market_category"] == category
+                    and row["record_stats"]["state"] == "verified"
+                    for row in rows
+                ),
+                "unverified_items": sum(
+                    row["market_category"] == category
+                    and row["record_stats"]["state"] in {"unverified", "scanning", "empty"}
+                    for row in rows
+                ),
+                "invalid_items": sum(
+                    row["market_category"] == category
+                    and row["record_stats"]["state"] == "invalid"
+                    for row in rows
+                ),
+            }
+            for category, label in _MARKET_CATEGORY_LABELS.items()
+        ],
+        "record_inventory_progress": {
+            "cached_files": record_inventory["cached_files"],
+            "refreshed_files": record_inventory["refreshed_files"],
+            "inspected_files": sum(int(stats.get("files_inspected") or 0) for stats in physical_stats),
+            "selected_files": sum(int(stats.get("files_total") or 0) for stats in physical_stats),
+            "invalid_files": sum(int(stats.get("invalid_files") or 0) for stats in physical_stats),
+        },
         "integrity_checks": integrity_checks,
         "refresh_services": service_states,
         "active_progress": runtime_progress,
+        "tw_public_acquisition": build_tw_public_acquisition_progress(
+            root,
+            now=observed,
+            next_full_scan_at_utc=(
+                service_states.get("tw_public_0830", {}).get("next_run_at_utc")
+            ),
+        ),
         "groups": groups,
         "sources": rows,
         "definitions": {
@@ -4951,6 +5974,7 @@ def build_data_monitor_public_status(
                 "這是端點狀態比例，不是資料列數完成率。"
             ),
             "realtime_boundary": "即時 Tick／BidAsk 是連續流，沒有總完工日；歷史 Tick 不能重建未曾擷取的五檔委託簿。",
+            "record_stats": "最早／最新來自實際 Parquet 時間欄位的 footer 統計；有時區值轉為 UTC，無時區欄位保留來源時間，跨欄位群組只比較日期。總筆數為儲存列數，不等於唯一事件數或發布後可用時間；缺時間統計時僅時間界限未知。",
             "tw_public_boundary": "臺灣官方資料只透過完整稽核後的不可變快照切換，不直接修改已發佈版本。",
         },
     }
@@ -5049,8 +6073,98 @@ def build_tw_public_monitor_status(
     }
 
 
+def build_data_monitor_feature_inventory(
+    repo_root: Path, *, monitor_status: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Public, field-level projection of the cached physical Parquet inventory."""
+
+    inventory = build_feature_inventory(repo_root)
+    status = monitor_status or build_data_monitor_public_status(repo_root)
+    source_rows = {
+        str(row.get("record_inventory_key") or row.get("id")): row
+        for row in status.get("sources", ())
+        if isinstance(row, Mapping)
+    }
+    category_order = {category: index for index, category in enumerate(_MARKET_CATEGORY_LABELS)}
+    rows: list[dict[str, Any]] = []
+    for field in inventory["rows"]:
+        dataset = field["dataset_id"]
+        source = source_rows.get(dataset)
+        if source is None:
+            if dataset.startswith("physical:"):
+                family = dataset.removeprefix("physical:")
+                group, label, _, _ = PHYSICAL_FAMILIES[family]
+                source = {"id": f"inventory:{family}", "parent_id": f"group:{group}",
+                          "title": label, "provider": _GROUP_META.get(group, {}).get("provider", "公開資料")}
+            else:
+                source = {"id": dataset, "title": dataset, "provider": "公開資料"}
+        category = str(source.get("market_category") or _market_category(source))
+        field_name = str(field["field"])
+        conditional_tw_evidence = (
+            dataset == "physical:tw-public:stock-features"
+            and field_name in {
+                "fallback_reason", "raw_ohlc_scale_factor",
+                "raw_ohlc_scale_reference_date", "adjustment_reference_date",
+                "adjustment_reference_price", "adjustment_reference_kind",
+                "ohlc_normalization", "return_quarantine_reason",
+                "official_listing_evidence",
+            }
+        )
+        unverified_tw_feature = (
+            dataset == "physical:tw-public:training-features"
+            and field_name.startswith("twpub_")
+            and field.get("non_null_count") == 0
+        )
+        availability_note = (
+            "事件／異常才有值的證據欄；空值不代表日價缺漏。"
+            if conditional_tw_evidence else
+            "目前建置無可驗證的非空訓練值；需查原始歷史版本與發布時間，不能回填未驗證值。"
+            if unverified_tw_feature else None
+        )
+        rows.append({
+            **field,
+            "source_title": source.get("title") or dataset,
+            "provider": source.get("provider") or "公開資料",
+            "market_category": category,
+            "market_category_label": _MARKET_CATEGORY_LABELS.get(category, "跨市場／其他"),
+            "field_role": "conditional" if conditional_tw_evidence else "key" if field["field"] in {
+                "date", "trade_date", "trading_date", "ts", "timestamp", "time",
+                "event_ts", "event_ts_utc", "snapshot_ts_ns", "symbol", "asset",
+                "instrument", "contract", "exchange", "source", "data_source",
+            } else "value",
+            "availability_note": availability_note,
+        })
+    rows.sort(key=lambda row: (
+        category_order.get(row["market_category"], 99),
+        str(row["provider"]), str(row["source_title"]),
+        str(row["dataset_id"]), str(row["field"]),
+    ))
+    return {
+        "schema_version": 1,
+        "generated_at_utc": status.get("generated_at_utc"),
+        "read_only": True,
+        "production_control_possible": False,
+        "summary": {
+            "fields": len(rows),
+            "datasets_with_schema": inventory["datasets_with_schema"],
+            "datasets_total": inventory["datasets_total"],
+            "files_with_schema": inventory["files_with_schema"],
+            "files_total": inventory["files_total"],
+            "state": inventory["state"],
+        },
+        "basis": inventory["basis"],
+        "definitions": {
+            "non_null_count": "僅當所有含此欄位檔案的 row-group null_count 完整且資料集所有檔案已核實，才顯示精確非空值筆數；否則只顯示已核實下界。",
+            "dataset_bounds": "首末時間是資料集時間欄位界限，不是此 feature 第一／最後一個非空值，也不是發布或訓練可用時間。",
+            "duplicate_scope": "每個實體資料集 × 欄位各列一次；原始表、衍生特徵及來源替代檔互不加總。",
+        },
+        "rows": rows,
+    }
+
+
 __all__ = [
     "DATA_MONITOR_SCHEMA_VERSION",
+    "build_data_monitor_feature_inventory",
     "build_data_monitor_public_status",
     "build_tw_public_monitor_status",
 ]

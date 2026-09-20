@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", type=Path, default=REPO_ROOT / "artifacts")
     parser.add_argument("--sync-root", type=Path, default=Path("/srv/stockagent-packed"))
     parser.add_argument(
+        "--live-sync-root",
+        type=Path,
+        default=Path("/srv/stockagent-artifacts-hot"),
+    )
+    parser.add_argument(
         "--state-root", type=Path, default=Path("/var/lib/stockagent-cold-artifacts")
     )
     parser.add_argument("--scope", default="ablations")
@@ -143,6 +148,7 @@ def main() -> int:
             max_publish=args.max_publish,
             apply=args.apply,
             peer_converged=peer_check,
+            live_sync_root=args.live_sync_root,
         )
     except (OSError, SnapshotError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

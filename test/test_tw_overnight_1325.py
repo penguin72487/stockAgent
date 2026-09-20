@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +17,12 @@ from stockagent.backtest.simulator import run_backtest_integer_shares, run_backt
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
 from stockagent.data.tw_overnight import (
-    OVERNIGHT_1325_FEATURE, attach_overnight_1325, attach_overnight_prices,
+    OVERNIGHT_1325_FEATURE,
+    attach_overnight_1325,
+    attach_overnight_decision,
+    attach_overnight_prices,
+    normalize_overnight_decision_time,
+    overnight_decision_feature,
 )
 from stockagent.models.factory import build_model
 from stockagent.models.temporal_basis_fit import fit_training_only_pca_klt
@@ -26,6 +32,7 @@ from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import _build_execution_runtime
 
 CONFIG = "configs/markets/tw_overnight_1325_multi_basis_22_capital10m.yaml"
+CONFIG_1320 = "configs/markets/tw_overnight_1320_multi_basis_22_capital10m.yaml"
 
 
 def panel_fixture(dates=None, symbols=2, features=23):
@@ -143,6 +150,39 @@ def test_integer_and_tensor_auctions_agree_and_do_not_use_intraday_profit():
     assert result.shares_history[1, 0] == 0
 
 
+def test_integer_close_order_keeps_decision_time_board_lot_quantity():
+    actions = np.array([[[1.0], [0.0], [0.5]], [[1.0], [0.0], [0.0]]])
+    side = np.ones((2, 1), dtype=bool)
+    result, _ = run_backtest_integer_shares(
+        actions,
+        np.zeros((2, 1)),
+        side,
+        np.zeros(2),
+        can_buy_mask=side,
+        can_sell_mask=side,
+        close_prices=np.array([[105.0], [105.0]]),
+        overnight_decision_prices=np.array([[100.0], [100.0]]),
+        open_prices=np.array([[105.0], [105.0]]),
+        symbols=["2330"],
+        day_trade_can_buy_open_mask=side,
+        day_trade_can_sell_open_mask=side,
+        unresolved_corporate_action_mask=~side,
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.array([1000]),
+        initial_capital=1_000_000,
+        collect_holdings=False,
+        execution_mode="tw_overnight",
+        overnight_fixed_close_to_open=True,
+        portfolio_activation="pre_normalized",
+        long_only=True,
+    )
+    # 0.5 * 1,000,000 / 100 = 5,000 shares. Re-sizing at the 105 close
+    # would incorrectly produce only 4,000 shares.
+    assert result.shares_history[0, 0] == 5000
+    assert result.shares_history[1, 0] == 0
+
+
 def test_runtime_uses_stock_tax_and_refuses_unprepared_panel():
     c = load_config(CONFIG)
     p = panel_fixture()
@@ -192,6 +232,33 @@ def source_fixture(tmp_path, *, minute=25):
     }))
 
 
+def source_fixture_with_1320_and_1325(tmp_path):
+    dates = ["2024-01-05", "2024-01-08", "2024-01-09"]
+    parts = []
+    for day in dates:
+        path = tmp_path / f"trade_date={day}" / "data.parquet"
+        path.parent.mkdir()
+        pq.write_table(pa.Table.from_pylist([
+            {
+                "ts": datetime.fromisoformat(day + "T13:20:00"),
+                "symbol": "2330", "Close": 103., "minutes_from_open": 260,
+            },
+            {
+                "ts": datetime.fromisoformat(day + "T13:25:00"),
+                "symbol": "2330", "Close": 109., "minutes_from_open": 265,
+            },
+        ]), path)
+        parts.append({
+            "trade_date": day,
+            "output_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "schema_version": 4, "source": "shioaji_kbars_1m", "research_ready": True,
+        "status": "research_ready", "decision_clock": "completed_right_labelled_1m_bar",
+        "dates": dates, "partitions": parts,
+    }))
+
+
 def test_source_hash_and_clock_are_required(tmp_path):
     source_fixture(tmp_path)
     p = attach_overnight_1325(panel_fixture(), tmp_path)
@@ -203,6 +270,83 @@ def test_source_hash_and_clock_are_required(tmp_path):
     path.write_bytes(path.read_bytes() + b"tamper")
     with pytest.raises(RuntimeError, match="SHA256"):
         attach_overnight_1325(panel_fixture(), tmp_path)
+
+
+def test_1320_selects_exact_completed_bar_and_binds_semantic_identity(tmp_path):
+    source_fixture_with_1320_and_1325(tmp_path)
+    panel = attach_overnight_decision(
+        panel_fixture(), tmp_path, decision_time="13:20",
+        missing_price_policy="same_session_close",
+    )
+    assert panel.feature_names[-1] == "next_session_1320_gap_logret"
+    assert panel.features[0, 0, -1] == pytest.approx(np.log(1.03))
+    assert panel.overnight_1325_source["decision_time"] == "13:20"
+    assert panel.overnight_1325_source["minutes_from_open"] == 260
+    assert panel.overnight_1325_source["contract_version"] == 3
+    assert "13:20" in panel.overnight_1325_source["caveat"]
+
+
+def test_1320_config_inherits_remote_training_assumptions_and_new_clock():
+    config = load_config(CONFIG_1320)
+    assert config.data.overnight_decision_time == "13:20"
+    assert overnight_decision_feature(config.data.overnight_decision_time) == (
+        "next_session_1320_gap_logret"
+    )
+    assert normalize_overnight_decision_time("13:20") == ("13:20", 260)
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.lookback == 32
+    assert config.training.epochs == 1000
+    assert config.training.multi_gpu_strategy == "distributed_data_parallel"
+    assert config.environment.amp_dtype == "bf16"
+    assert len(config.training.financial_transformer.temporal_basis_families) == 22
+    assert config.training.financial_transformer.portfolio_output_mode == "projection_l1"
+    assert config.trading.volume_participation_equity == 10_000_000
+    assert config.trading.tw_commission_discount == pytest.approx(0.2)
+    assert config.trading.tw_settlement_lag_sessions == 2
+    assert config.trading.long_only
+
+
+def test_1320_only_changes_declared_product_and_clock_contracts():
+    baseline = asdict(load_config(
+        "configs/baselines/tw_day_trade_multi_basis_22_remote_v1.yaml"
+    ))
+    overnight = asdict(load_config(CONFIG_1320))
+
+    def changed_paths(left, right, prefix=""):
+        if isinstance(left, dict) and isinstance(right, dict):
+            changed = set()
+            for key in set(left) | set(right):
+                path = f"{prefix}.{key}" if prefix else key
+                changed.update(changed_paths(left.get(key), right.get(key), path))
+            return changed
+        return {prefix} if left != right else set()
+
+    assert changed_paths(baseline, overnight) == {
+        "data.day_trade_open_feature",
+        "data.feature_include",
+        "data.overnight_1325_missing_price_policy",
+        "data.overnight_1325_root",
+        "data.overnight_decision_time",
+        "data.panel_cache_root",
+        "experiment_name",
+        "runner.output_dir",
+        "trading.execution_mode",
+        "trading.long_only",
+        "trading.tw_cash_lot_size",
+        "trading.tw_day_trade_unlimited_margin_conversion",
+        "trading.tw_overnight_fixed_close_to_open",
+        "trading.tw_short_capacity_limit_enabled",
+        "training.executable_portfolio_transformer.center_long_short_logits",
+        "training.executable_portfolio_transformer.portfolio_mode",
+        "training.financial_transformer.center_long_short_logits",
+        "training.financial_transformer.portfolio_mode",
+    }
+
+
+@pytest.mark.parametrize("decision_time", ["13:30", "09:00", "bad"])
+def test_overnight_decision_time_must_precede_close(decision_time):
+    with pytest.raises(ValueError, match="overnight_decision_time"):
+        normalize_overnight_decision_time(decision_time)
 
 
 def test_source_identity_is_bound_to_prepared_panel_not_later_live_manifest(tmp_path):

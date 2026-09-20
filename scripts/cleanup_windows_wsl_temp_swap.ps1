@@ -56,9 +56,17 @@ foreach ($directory in Get-ChildItem -LiteralPath $resolvedTempRoot -Directory -
     if (-not [Guid]::TryParse($directory.Name, [ref]$parsedGuid)) {
         continue
     }
+    if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        $skipped.Add([pscustomobject]@{
+            directory = $directory.FullName
+            reason = "directory-is-a-reparse-point"
+        })
+        continue
+    }
     $children = @(Get-ChildItem -LiteralPath $directory.FullName -Force)
     if ($children.Count -ne 1 -or $children[0].PSIsContainer -or
-        $children[0].Name -ne "swap.vhdx") {
+        $children[0].Name -ne "swap.vhdx" -or
+        ($children[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         $skipped.Add([pscustomobject]@{
             directory = $directory.FullName
             reason = "directory-is-not-a-single-swap-vhdx"
@@ -122,11 +130,24 @@ foreach ($directory in Get-ChildItem -LiteralPath $resolvedTempRoot -Directory -
     }
     try {
         # Recheck the exact shape and exclusive lock immediately before removal.
+        $activeNow = @(Get-CimInstance Win32_Process -Filter "Name='wslhost.exe'" |
+            Where-Object {
+                [regex]::IsMatch(
+                    [string]$_.CommandLine,
+                    '--vm-id\s+\{' + [regex]::Escape($parsedGuid.ToString()) + '\}',
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+            })
+        if ($activeNow.Count -ne 0) {
+            throw "candidate became an active WSL VM"
+        }
         $latestChildren = @(Get-ChildItem -LiteralPath $directory.FullName -Force)
         if ($latestChildren.Count -ne 1 -or $latestChildren[0].PSIsContainer -or
             $latestChildren[0].Name -ne "swap.vhdx" -or
+            ($latestChildren[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
             [long]$latestChildren[0].Length -ne [long]$swap.Length -or
-            $latestChildren[0].LastWriteTimeUtc -ne $swap.LastWriteTimeUtc) {
+            $latestChildren[0].LastWriteTimeUtc -ne $swap.LastWriteTimeUtc -or
+            ((Get-Date) - $latestChildren[0].LastWriteTime).TotalHours -lt $MinimumAgeHours) {
             throw "candidate changed after audit"
         }
         $recheck = [System.IO.File]::Open(

@@ -20,6 +20,56 @@ from downloader.shioaji_capture_parts import (
     select_capture_part_paths,
     shared_capture_id,
 )
+from stockagent.data.tw_exchange_price_classification import (
+    classify_tw_exchange_security,
+)
+
+
+def _current_tick_expr(field: str) -> pl.Expr:
+    price = pl.col(field).cast(pl.Float64)
+    stock = (
+        pl.when(price < 10.0).then(0.01)
+        .when(price < 50.0).then(0.05)
+        .when(price < 100.0).then(0.1)
+        .when(price < 500.0).then(0.5)
+        .when(price < 1000.0).then(1.0)
+        .otherwise(5.0)
+    )
+    etf_like = pl.when(price < 50.0).then(0.01).otherwise(0.05)
+    warrant = (
+        pl.when(price < 5.0).then(0.01)
+        .when(price < 10.0).then(0.05)
+        .when(price < 50.0).then(0.1)
+        .when(price < 100.0).then(0.5)
+        .when(price < 500.0).then(1.0)
+        .otherwise(5.0)
+    )
+    convertible = (
+        pl.when(price < 150.0).then(0.05)
+        .when(price < 1000.0).then(1.0)
+        .otherwise(5.0)
+    )
+    return (
+        pl.when(pl.col("_kind").is_in(["etf", "reit", "etn"]))
+        .then(etf_like)
+        .when(pl.col("_kind") == "warrant")
+        .then(warrant)
+        .when(pl.col("_kind") == "convertible_bond")
+        .then(convertible)
+        .otherwise(stock)
+    )
+
+
+def _price_grid_counts(frame: pl.LazyFrame, fields: tuple[str, ...]) -> dict[str, int]:
+    expressions = []
+    for field in fields:
+        price = pl.col(field).cast(pl.Float64)
+        tick = _current_tick_expr(field)
+        observed = price.is_finite() & (price > 0.0)
+        off_grid = observed & (((price / tick).round(0) * tick - price).abs() > 1e-8)
+        expressions.append(off_grid.sum().alias(field))
+    row = frame.select(expressions).collect().row(0, named=True)
+    return {key: int(value or 0) for key, value in row.items()}
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +106,13 @@ def audit(
         infer_schema_length=0,
     )
     expected_symbols = set(universe["symbol"])
+    security_rows = []
+    for row in universe.select("symbol", "market").iter_rows(named=True):
+        kind = classify_tw_exchange_security(row["market"], row["symbol"])
+        if kind is None:
+            raise RuntimeError(f"unknown exchange price rule for capture symbol: {row}")
+        security_rows.append({"code": str(row["symbol"]), "_kind": kind})
+    security_map = pl.DataFrame(security_rows).lazy()
     universe_sha256 = hashlib.sha256(universe_path.read_bytes()).hexdigest()
     manifests = read_capture_manifests(capture_root, trade_date.isoformat())
     if len(manifests) != 2:
@@ -111,6 +168,35 @@ def audit(
     ticks = _scan(tick_paths, kind="tick")
     books = _scan(book_paths, kind="book event")
     snapshots = _scan(snapshot_paths, kind="one-second book")
+    ticks_with_kind = ticks.join(security_map, on="code", how="left")
+    books_with_kind = books.join(security_map, on="code", how="left")
+    snapshots_with_kind = snapshots.join(security_map, on="code", how="left")
+    tick_price_grid = _price_grid_counts(
+        ticks_with_kind,
+        (
+            "open",
+            "high",
+            "low",
+            "close",
+            "closing_oddlot_close",
+            "closing_oddlot_bid_price",
+            "closing_oddlot_ask_price",
+        ),
+    )
+    book_fields = tuple(
+        [f"bid_price_{level}" for level in range(1, 6)]
+        + [f"ask_price_{level}" for level in range(1, 6)]
+    )
+    book_price_grid = _price_grid_counts(books_with_kind, book_fields)
+    snapshot_price_grid = _price_grid_counts(snapshots_with_kind, book_fields)
+    off_grid_price_values = sum(tick_price_grid.values()) + sum(
+        book_price_grid.values()
+    ) + sum(snapshot_price_grid.values())
+    if off_grid_price_values:
+        raise RuntimeError(
+            "capture contains off-grid exchange prices: "
+            f"ticks={tick_price_grid} books={book_price_grid} snapshots={snapshot_price_grid}"
+        )
     tick_counts = {
         int(row["worker_index"]): int(row["len"])
         for row in ticks.group_by("worker_index").len().collect().iter_rows(named=True)
@@ -190,6 +276,13 @@ def audit(
         "book_age_ms_mean": float(age["mean"]),
         "book_age_ms_p99": float(age["p99"]),
         "stale_book_1s_rows": int(age["stale"]),
+        "off_grid_price_values": off_grid_price_values,
+        "price_grid_fields": {
+            "ticks": tick_price_grid,
+            "book_events": book_price_grid,
+            "book_1s": snapshot_price_grid,
+        },
+        "price_grid_contract": "dated TWSE/TPEx quote grid; calculated average/midpoint/amount fields excluded",
         "missed_snapshot_seconds": sum(
             int(manifest.get("missed_snapshot_seconds", 0)) for manifest in manifests
         ),

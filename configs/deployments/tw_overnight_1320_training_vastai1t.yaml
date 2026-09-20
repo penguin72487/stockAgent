@@ -1,0 +1,11 @@
+base_config: ../markets/tw_overnight_1320_multi_basis_22_capital10m.yaml
+
+# Measured 2026-09-15 vastai1T CPU budget; DDP divides it across both ranks.
+environment:
+  cpu_threads: 53
+  torch_compile_threads: 16
+
+runner:
+  output_dir: artifacts/markets/tw_overnight_1320_close_fallback_next_open_multi_basis_22_projection_l1_capital10m_v1
+  resume: true
+  post_train_infer: false

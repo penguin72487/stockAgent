@@ -40,7 +40,7 @@ services/public_dashboards/dashboard-core.js
 | `/tw-overnight/` | `/tw-overnight/api/*` | 隔日沖獨立帳本；共用畫面但保留集合競價事件時間粒度 |
 | `/shioaji/` | `/shioaji/api/status` | 永豐資料流程、配額、流量與儲存量 |
 | `/openbb/` | `/openbb/api/status`, `/openbb/api/history` | OpenBB 封存與歷史進度 |
-| `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋與 freshness |
+| `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`, `/data-monitor/api/features`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋、freshness 與實存 Parquet 逐欄位清冊 |
 | `/traffic/` | `/traffic/api/status`, `/traffic/api/history` | 匿名請求延遲、分階段耗時、吞吐、錯誤率、快取容量及 90 天趨勢 |
 
 新增欄位時，應先在資料建置層定義語意，再加入公開 allowlist，最後才渲染。前端不得從名稱猜測單位、時區、成交狀態或資料完整性。
@@ -49,6 +49,8 @@ services/public_dashboards/dashboard-core.js
 
 - 缺資料必須顯示為缺口、等待、過期或部分完成；不得插值或用其他價格冒充。
 - 當沖歷史回放與即時模擬是不同資料域。回放必須保留反事實標籤，不能宣稱是券商成交。
+- 當沖 `/api/status` 為低成本摘要，`position_rows_included=false` 時其中的 `positions: []` 代表未載入，不代表當日沒有持倉。完整「持倉與生命週期」僅以受日期／模式／狀態篩選的 `/api/positions` 分頁為準；刷新摘要不得覆蓋已顯示的明細或將未載入標示成零筆。
+- 當沖與隔日沖共用的訊號、持倉、事件分頁，只有日期範圍、offset／returned／total／has_more 和請求版本驗證通過後才可取代畫面資料；同篩選的更新失敗保留上一份並標示失敗，切換篩選時不得把舊範圍偽裝成新結果。分鐘曲線與台股官方來源監控遵守同一「保留最後成功資料並揭露更新失敗」原則。
 - 每分鐘曲線的絕對權益持續從初始資金累積；使用者選定期間只把顯示報酬率的第一個可見點設為 0%，不重置絕對資金。
 - 0050、2330 與 TXFR1 是 Buy-and-Hold 基準；跨日報酬以同一實體部位相對前一收盤計算。TXFR1 換月價差只調整外部現金，不製造投資報酬或槓桿。
 - API 時間一律附時區或明確標示 UTC；瀏覽器顯示轉為 `Asia/Taipei`。
@@ -128,11 +130,18 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
   變動時才計算 digest；讀取前後核對 descriptor 與 pathname，避免原子替換競態。
   這是本機 Linux 檔案變動偵測，不是冷庫完整性證明，也不承諾任意遠端檔案系統語意。
 - 完整分鐘曲線在同一份投影內共用時間轉換，沿用已排序順序；不刪分鐘、不改報酬或品質旗標。
+- 當沖完成交易日的 09:01 與 09:02–13:29 必須逐模式驗證最新 append-only mark 的
+  分鐘價格來源；270 個時間戳齊全不代表估值有效。盤中 Shioaji 斷線留下的 stale mark
+  保持明示，不得標成即時可成交報價。盤後由分鐘曲線 timer 使用本地已驗證 K 線優先、
+  缺口才查歷史來源；僅在來源完整、原始 fills 雜湊不變且 13:30 已接受端點保留時，
+  將 09:01 改為完成分鐘 Close 的反事實估值。當日新建部位若缺少 09:01 bar，
+  維持 waiting/failed；跨日舊部位可沿用先前已觀測成交價，但必須標為 stale。
+  不以開盤價、未來價格或插值冒充。
 - `benchmark_history.json` 保留 canonical 相容來源；其重建器同步發布
   `benchmark_history_projection/v1/{head.json,delta.jsonl,shards/...}`。日分片不可變且以內容 hash
   定址，head 原子切換，delta 只追加實際改變的 session。dashboard 必須逐 shard 驗證 schema、日期、
   筆數、路徑與 SHA-256；companion 缺漏或不符時回退 canonical JSON，不得把快取當真值。
-- all-history final projection 失效時，`history-session-projection-v2` 以策略/live ledger session span
+- all-history final projection 失效時，`history-session-projection-v3` 以策略/live ledger session span
   digest、benchmark session digest、origin、product 與 schema 組合 fingerprint。未變日直接合併；少量
   變更只重建該日，超過安全界線則完整重建。任何快路徑輸出都須和 full-source control 點數及 hash
   相同。
@@ -143,8 +152,40 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
   這是記憶體去重，不是刪除分鐘，點數與品質旗標必須保持一致。
 - 全資料監控首屏只取得摘要及實體群組；逐來源明細在來源清冊接近 viewport
   時才讀取。摘要／明細仍來自同一份公開 snapshot，延後傳輸不能省略資料或改變完整度判定。
-- 全資料明細第一次只建立筆電 25 列／手機 10 列，其餘 421 筆仍可用「載入更多」取得；穩定排序鍵只在新
-  details revision 計算一次，篩選不重排全部資料。details 回應不含 `groups` 時不得清掉已由
+- `features` 是另一份由同一輪背景 snapshot 產生的唯讀欄位清冊，接近欄位區塊才載入，
+  依市場、供應商、實體資料集分組，臺灣資料在前、加密貨幣最後；瀏覽器只逐頁建立欄位 DOM。
+  每個實體資料集 × 欄位獨立列出名稱、型別、含欄位檔案數與實際非空值筆數。
+  `non_null_count` 只在該資料集所有檔案已核實，且每個含欄位檔案的 Parquet row-group
+  `null_count` 皆完整時顯示；否則只顯示已驗證下界。多型別顯示 schema drift。
+  此處的 `dataset_first`／`dataset_last` 是整表時間界限，不是欄位首末有效值，
+  更不是 point-in-time 發布或訓練可用時間。非 Parquet 原始格式仍由來源清冊顯示未核實，
+  不可冒稱逐欄位已清點。台股公開資料訓練特徵、TWSE／TPEx 個股特徵、永豐個股補充
+  特徵、期貨 v4 模型特徵與 Binance／OKX／Bybit 日資料特徵為獨立衍生家族，
+  不加進原始群組筆數；舊版根目錄行情特徵獨立標示，避免冒稱與 1 分 K 去重。
+  背景清冊在來源 footer 與分類定義未變時重用欄位快照，不每 30 秒重算所有欄位。
+- 資料監控的 `record_stats` 是另一個證據域：最早／最新取實體 Parquet 時間欄位的
+  row-group footer min/max，總筆數取所有選定實體檔案的 footer `num_rows`；不得把
+  `start_date` 下載目標、`end_date` 回執日期或本次 `rows_this_run` 冒充實存首末筆／總筆數。
+  30 秒背景 snapshot 每次最多重新讀取 4096 個新增或變動 footer，依檔案大小與 mtime
+  快取未變檔；HTTP 只讀已完成的本機清冊。掃描未完成或 Parquet 損毀時總筆數保持
+  未知；若列數可核實但檔案缺時間欄位／footer 統計，僅時間界限未知，不抹掉已核實列數。
+  面板列出選定檔案、核實檔案及異常數；憑證閘門與來源根本不提供的粒度標不適用。
+  台股官方資料逐資料集、台股研究分鐘資料按
+  `trade_date` 唯一檔、台股微結構按交易日、三家交易所 1 分 K 與 Coin Metrics 按標的檔、
+  Frankfurter 外匯按幣對檔、Yahoo 按台股／海外股票／加密／外匯分類。Shioaji 原始重疊
+  回補 chunks 不加總。TAIFEX 日資料、期權全鏈、逐筆、OpenBB 端點封存、Dune、SEC／ETF、
+  FRED、CFTC、Pepperstone 與免費公開觀測主表另有明確實體家族；衍生視圖各自顯示但不加進母群組。
+  未涵蓋的原始分片、非 Parquet 及其他未建立無重疊主表契約的來源，必須顯示未核實，
+  不能由批次回執列數填補。來源列與母群組是同一份實體資料，不能重複相加。
+  有明確時區的實存時間轉為 UTC 比較；無時區欄位保留來源牆上時間（可能為臺灣本地時間），
+  `snapshot_ts_ns` 明確以 Unix 奈秒解為 UTC。跨不同時間欄位的群組只比較日界限。
+  實存時間不等於官方發布時刻或模型可用時間；不能把未附時區的欄位強制轉成瀏覽器時區。
+  Binance／OKX／Bybit 的 1 分 K 若實存最新列落後於摘要的要求截止日或六小時新鮮度窗，
+  群組與 1 分 K 產品列不可宣告已到最新；`requested_data_through` 保留原摘要供比對，
+  `data_through` 改呈實存尾端，不覆蓋更強的 blocked／degraded 狀態。
+- 全資料明細第一次只建立筆電 25 列／手機 10 列，其餘列仍可用「載入更多」取得；穩定排序鍵只在新
+  details revision 計算一次，先依市場（臺灣優先、加密最後）與供應商，分類內依作業狀態排序；
+  篩選不重排全部資料。欄位清冊第一次建立桌面 80 列／手機 25 列，其餘逐頁載入。details 回應不含 `groups` 時不得清掉已由
   summary 顯示的群組。
 - TAIFEX 歷史服務將七個合法 range 的完整 display projection 原子保存於本機 cache；程序
   冷啟動可先回傳最後一份已通過 schema、range、mark-limit 及欄位白名單的快照，再以背景

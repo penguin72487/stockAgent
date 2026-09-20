@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,12 @@ from scripts.build_shioaji_tw_minute_dataset import (  # noqa: E402
     SCHEMA_VERSION,
     VOLUME_NOTIONAL_TOLERANCE,
 )
+from stockagent.data.tw_exchange_price_classification import (  # noqa: E402
+    VERIFIED_EMERGING_TO_TPEX_LISTINGS,
+    classify_tw_broker_security_on_date,
+    classify_tw_exchange_security,
+)
+from stockagent.data.tw_price_rules import price_on_tick_grid_numpy  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,6 +170,38 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
             > 1e-8
         )
     ).height
+    symbol_values = frame["symbol"].cast(pl.String).to_numpy()
+    market_values = frame["market"].cast(pl.String).to_numpy()
+    kind_map = {
+        key: classify_tw_exchange_security(key[0], key[1])
+        for key in set(zip(market_values.tolist(), symbol_values.tolist()))
+    }
+    security_types = np.asarray(
+        [
+            kind_map[(market, symbol)] or "unknown"
+            for market, symbol in zip(market_values, symbol_values)
+        ],
+        dtype="U16",
+    )
+    for code in VERIFIED_EMERGING_TO_TPEX_LISTINGS:
+        candidates = np.flatnonzero((market_values == "tpex") & (symbol_values == code))
+        for index in candidates:
+            security_types[index] = classify_tw_broker_security_on_date(
+                "tpex", code, trade_date
+            ) or "unknown"
+    supported_price_rows = security_types != "unknown"
+    unknown_price_security_rows = int(np.count_nonzero(~supported_price_rows))
+    date_values = np.full(frame.height, np.datetime64(trade_date.isoformat(), "D"))
+    off_grid_price_values = 0
+    for field in ("Open", "High", "Low", "Close"):
+        values = frame[field].cast(pl.Float64).to_numpy()[supported_price_rows]
+        good = price_on_tick_grid_numpy(
+            values,
+            date_values[supported_price_rows],
+            security_types=security_types[supported_price_rows],
+        )
+        observed = np.isfinite(values) & (values > 0.0)
+        off_grid_price_values += int(np.count_nonzero(observed & ~good))
     invalid_rows_with_labels = frame.filter(
         ~pl.col("label_valid_1m")
         & pl.any_horizontal(
@@ -219,6 +258,8 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
         "invalid_volume_unit_rows": int(invalid_volume_unit),
         "invalid_volume_notional_rows": int(invalid_volume_notional),
         "invalid_volume_shares_rows": int(invalid_volume_shares),
+        "unknown_price_security_rows": unknown_price_security_rows,
+        "off_grid_price_values": off_grid_price_values,
         "invalid_rows_with_labels": int(invalid_rows_with_labels),
         "invalid_session_rows_with_labels": int(invalid_session_rows_with_labels),
         "bad_label_alignment_rows": int(bad_label_alignment),

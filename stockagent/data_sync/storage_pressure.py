@@ -206,11 +206,18 @@ def _scan_cache_files(
 
 def _filesystem_usage(path: Path) -> dict[str, float | int]:
     usage = shutil.disk_usage(path)
+    # ``shutil.disk_usage().used`` excludes blocks reserved by the filesystem,
+    # while ``free`` is the space actually available to normal writers. Capacity
+    # gates use ``free``; pressure maintenance must use the same denominator or
+    # it can remain idle while downloads are already blocked by their reserve.
+    unavailable = usage.total - usage.free
     return {
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
-        "used_percent": usage.used * 100.0 / usage.total,
+        "unavailable_bytes": unavailable,
+        "used_percent": unavailable * 100.0 / usage.total,
+        "raw_filesystem_used_percent": usage.used * 100.0 / usage.total,
     }
 
 
@@ -276,7 +283,7 @@ def maintain_rebuildable_caches(
         candidates, per_root = [], {}
     required_bytes = max(
         0,
-        int(before["used_bytes"])
+        int(before["unavailable_bytes"])
         - int(int(before["total_bytes"]) * target_percent / 100.0),
     )
     if force:

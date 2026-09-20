@@ -407,6 +407,10 @@ class PanelData:
     overnight_1325_available: np.ndarray | None = None
     overnight_1325_source: dict[str, Any] | None = None
     overnight_1325_close_fallback_mask: np.ndarray | None = None
+    # Exact point-in-time prices used to convert a model weight into the board-
+    # lot order quantity before the closing auction. The legacy field prefix
+    # above remains for compatibility; this follows the configured clock.
+    overnight_decision_prices: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -461,6 +465,7 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         overnight_1325_available=sliced(panel.overnight_1325_available),
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=sliced(panel.overnight_1325_close_fallback_mask),
+        overnight_decision_prices=sliced(panel.overnight_decision_prices),
         returns_1d=panel.returns_1d[slc],
         tradable_mask=panel.tradable_mask[slc],
         can_buy_mask=sliced(panel.can_buy_mask),
@@ -5344,6 +5349,7 @@ def _filter_panel_features(
         overnight_1325_available=panel.overnight_1325_available,
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=panel.overnight_1325_close_fallback_mask,
+        overnight_decision_prices=panel.overnight_decision_prices,
         returns_1d=panel.returns_1d,
         tradable_mask=panel.tradable_mask,
         can_buy_mask=panel.can_buy_mask,
@@ -5709,13 +5715,18 @@ def build_panel(
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
     overnight_1325_root: str | Path | None = None,
+    overnight_decision_time: str = "13:25",
     overnight_1325_missing_price_policy: str = "reject",
 ) -> PanelData:
     def append_overnight_context(panel: PanelData) -> PanelData:
         if overnight_1325_root is not None:
-            from stockagent.data.tw_overnight import attach_overnight_1325
-            return attach_overnight_1325(panel, overnight_1325_root,
-                                         missing_price_policy=overnight_1325_missing_price_policy)
+            from stockagent.data.tw_overnight import attach_overnight_decision
+            return attach_overnight_decision(
+                panel,
+                overnight_1325_root,
+                decision_time=overnight_decision_time,
+                missing_price_policy=overnight_1325_missing_price_policy,
+            )
         return panel
 
     parquet_root = Path(parquet_root).resolve()
