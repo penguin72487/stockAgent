@@ -1,5 +1,15 @@
 # StockAgent 服務完整清單（2026-09-23 起逐次更新）
 
+## 2026-09-26 00:57～01:00 OpenBB 等待上游狀態與公開頁驗收
+
+OpenBB 正式下載器與 supervisor 均仍存活、invocation `c003edcbc0434efc98df60fb30f09a1b` 未變；但最新 `provider_scheduler.json` 為 `phase=waiting`、`wait_reason=provider_cooldown`，下一次**最早**可重試時間約 **09-26 04:05 台北時間**，本輪新嘗試仍為 0。原公開投影只因 PID 與活動心跳新鮮就標 `health=active`，頁面顯示「下載中」，且在兩份階段檔都新鮮時固定偏向 downloader 舊 `download`，可蓋過較新的 scheduler `waiting`。這會把供應商配額等待冒充成有效下載進度；進程活著與任務有產出必須分開。
+
+`stockagent/live/openbb_archive_dashboard.py` 現依兩份可信階段檔的**實際更新時間**選最新、忽略超過既有 10 分鐘新鮮度界線的舊狀態；只有 supervisor 與 downloader 都活著、活動證據新鮮且最新階段確為 `waiting` 時才顯示新 `health=waiting`。只投影已消毒的等待原因與可解析的最早重試時間，不公開上游原始錯誤／憑證。`services/openbb_archive_dashboard/app.js` 將此狀態標為「等待上游」、使用警示色、顯示供應商配額冷卻與「最早重試」，不誤報成程序停止。**沒有**縮短配額冷卻、改任務規劃、提高請求速率或改變下載內容。
+
+相鄰公開 gateway／OpenBB supervisor／dashboard **119 tests passed**，Ruff、Node 語法、`git diff --check` 通過。僅重啟唯讀 `stockagent-public-dashboards.service`，00:57:56 起 `active/running`；實際 localhost `/openbb/api/status` 回 `waiting/provider_cooldown`、兩程序仍活著。公開 IPv4 HTTPS 頁回 200，並透過 Chrome 檢查 **1366×768** 與 **390×844**：狀態文案正確、無主頁水平溢出與 JS console error，1h 曲線按鈕 API 成功；可重測收據與截圖分別在 `artifacts/benchmarks/openbb-browser-20260926-{desktop,mobile}/`。兩次按鈕至畫面量測約 **41.4／42.8 ms**，只是當次 browser path，不是對照組或全路徑性能提升證據。桌面稽核仍報 16 個低於 40 px 的觸控目標，手機本次為 0；資料完整稽核快照仍逾時，封存右界仍停在 **2026-07-18**，不得把狀態標示修正當成 8.9M 待辦已下載。
+
+部署後全服務唯讀收據 `artifacts/benchmarks/service-coverage-20260926T0100-openbb-waiting.json` 對當時可發現的 **57 service／42 timer／2 path** 顯示 `timer_schedule_findings=[]`，OpenBB 產品探測已為 HTTP 200／`waiting`，全資料監控仍 `critical`。與 00:39 基線相比多出的三個 FinMind service、兩個 timer 是同一工作樹的其它並行維護產物，**不是**這次 OpenBB 修改造成的服務增加；測試與截圖只驗了 OpenBB 頁，不能概括成全部 57 項服務無故障。
+
 ## 2026-09-26 00:33～00:39 TAIFEX 正式輪恢復與新版本驗收
 
 前一輪 TAIFEX 官方歷史資料發布在 D: head 更新後遇到 Syncthing 明確掃描逾時，留下 `failed` 的 systemd 結果；先前的掃描收據補償與舊版本本機校驗，不能代替下一次正式輪成功。離開交易時段後，執行原有 `stockagent-taifex-public-history.service` 一次；官方來源抓取、驗收、冷發布與掃描均走正式入口，**00:36:20 退出 0／Result=success**，systemd 記錄 wall **3 分 16.465 秒**、CPU **19.250 秒**、峰值記憶體 **207.1 MB**。沒有僅用 `reset-failed` 消除錯誤，也沒有重啟行情／交易服務。
