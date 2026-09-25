@@ -1,0 +1,2 @@
+# Optional, local-only licensed-source connector; not part of base runtime.
+finlab==2.1.1

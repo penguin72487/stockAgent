@@ -107,6 +107,21 @@ def test_before_close_and_changed_quantity_are_rejected(tmp_path):
         reconcile_candidate(engine.state_dir,plan,recorded_at=_now(18,0))
 
 
+def test_completed_session_can_be_recorded_after_midnight_without_backdating(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    day = _now(13, 30).date()
+    recorded_at = _now(0, 10) + timedelta(days=1)
+    plan = make_plan(engine.state_dir, reports(tmp_path), day)
+
+    result = reconcile_candidate(engine.state_dir, plan, recorded_at=recorded_at)
+
+    assert result["remaining_count"] == 0
+    fill = json.loads(engine.fills_path.read_text().splitlines()[-1])
+    assert fill["fill_at"] == _now(13, 30).isoformat()
+    assert fill["recorded_at"] == recorded_at.isoformat()
+    assert fill["counterfactual_settlement"]["broker_fill"] is False
+
+
 def test_older_carry_costs_and_basis_survive_settlement(tmp_path):
     engine,spec=setup_account(tmp_path,weight=-.2)
     mode=engine.state["modes"][spec.market]

@@ -14,9 +14,12 @@ from datetime import UTC, date, datetime, time as datetime_time, timedelta
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
+import time as clock
 from typing import Any, Final, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -28,9 +31,44 @@ from stockagent.live.tw_public_acquisition_progress import (
     ADDED_DATASETS,
     build_tw_public_acquisition_progress,
 )
+from scripts.download_finlab_history import (
+    AUTOMATICALLY_DEFERRED_REASONS,
+    attempt_retry_at,
+)
+from downloader.download_finmind_complement import (
+    ALL_DATASETS as FINMIND_COMPLEMENT_DATASETS,
+    SNAPSHOTS as FINMIND_COMPLEMENT_SNAPSHOTS,
+    WIDE_INSTITUTIONAL as FINMIND_DERIVED_WIDE,
+)
+from downloader.download_finmind_sponsor import SOURCES as FINMIND_SPONSOR_SOURCES
 
 
 DATA_MONITOR_SCHEMA_VERSION: Final[int] = 8
+DATA_MONITOR_SUMMARY_KEYS: Final[tuple[str, ...]] = (
+    "schema_version",
+    "generated_at_utc",
+    "health",
+    "read_only",
+    "production_control_possible",
+    "summary",
+    "endpoint_inventory",
+    "provider_summaries",
+    "market_categories",
+    "record_inventory_progress",
+    "integrity_checks",
+    "definitions",
+    "tw_public_acquisition",
+    "finlab_acquisition",
+    "groups",
+)
+
+
+def project_data_monitor_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the first-paint projection identical across producer and gateway."""
+
+    return {key: payload[key] for key in DATA_MONITOR_SUMMARY_KEYS if key in payload}
+
+
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 _MARKET_CATEGORY_LABELS: Final[dict[str, str]] = {
     "taiwan_equity": "台股",
@@ -58,6 +96,8 @@ _GROUP_MARKET_CATEGORY: Final[dict[str, str]] = {
         "crypto-etf-history", "fred-crypto-macro", "crypto-historical-public",
     )},
     "tw-public": "taiwan_public",
+    "finlab-research": "taiwan_public",
+    "finmind-free": "taiwan_public",
     "yahoo-market": "cross_market",
     "openbb-compact": "cross_market",
     "openbb-task-shards-local": "cross_market",
@@ -71,6 +111,20 @@ OPENBB_L1_MIN_FILES_PER_SEGMENT: Final[int] = 32
 OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 20 * 60
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
+    "finmind-free": {
+        "title": "FinMind Free／Sponsor 歷史",
+        "provider": "FinMind（Free／Sponsor 帳號）",
+        "cadence": "來源配額共享；全市場與逐檔歷史持續回補",
+        "owner": "FinMind Free／Sponsor 資料下載器",
+        "window": 48 * 3600,
+    },
+    "finlab-research": {
+        "title": "FinLab 帳號歷史研究資料",
+        "provider": "FinLab（本機授權來源）",
+        "cadence": "每日 16:10（Asia/Taipei）增量下載；依帳號配額",
+        "owner": "FinLab 歷史下載器",
+        "window": 48 * 3600,
+    },
     "tw-public": {
         "title": "臺灣官方公開資料",
         "provider": "TWSE / TPEx / MOPS / CBC / TDCC",
@@ -263,6 +317,7 @@ _GROUP_META: Final[dict[str, dict[str, Any]]] = {
 }
 
 _SUMMARY_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
+    "finmind-free": ("status.json",),
     "tw-public": ("download_summary.json",),
     "yahoo-market": (
         "download_summary.json",
@@ -329,6 +384,22 @@ _STATUS_PRIORITY: Final[dict[str, int]] = {
 }
 
 _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
+    "finmind_free": {
+        "service": "stockagent-finmind-free.service",
+        "timer": None,
+    },
+    "finmind_complement": {
+        "service": "stockagent-finmind-complement.service",
+        "timer": None,
+    },
+    "finmind_sponsor": {
+        "service": "stockagent-finmind-sponsor.service",
+        "timer": None,
+    },
+    "finlab_local": {
+        "service": "stockagent-finlab-local-refresh.service",
+        "timer": "stockagent-finlab-local-refresh.timer",
+    },
     "registered_daily": {
         "service": "stockagent-registered-data-daily.service",
         "timer": "stockagent-registered-data-daily.timer",
@@ -436,6 +507,17 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
 }
 
 _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
+    "group:finmind-free": {
+        "mode": "continuous_backfill",
+        "service_keys": ("finmind_free", "finmind_complement", "finmind_sponsor"),
+        "schedule_label": "常駐服務依官方每小時配額追新並續補歷史；交易日 08:20–09:10 暫停",
+    },
+    "group:finlab-research": {
+        "mode": "quota_backfill",
+        "service_keys": ("finlab_local",),
+        "schedule_label": "每日 16:10（Asia/Taipei）；帳號配額不足則次日續抓",
+        "requires_timer_active": True,
+    },
     "group:tw-public": {
         "mode": "preopen_gate",
         "service_keys": (
@@ -674,6 +756,23 @@ def _systemd_time(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=TAIPEI).astimezone(UTC)
 
 
+def _systemd_monotonic_time(value: Any) -> datetime | None:
+    """Map systemd's absolute CLOCK_MONOTONIC deadline onto the UTC clock."""
+
+    raw = str(value or "").strip()
+    if not raw or raw in {"n/a", "infinity"}:
+        return None
+    units = {"d": 86400, "h": 3600, "min": 60, "s": 1, "ms": .001, "us": .000001}
+    matches = list(re.finditer(r"(\d+(?:\.\d+)?)\s*(min|ms|us|d|h|s)", raw))
+    if not matches or "".join(match.group(0) for match in matches).replace(" ", "") != raw.replace(" ", ""):
+        return None
+    deadline = sum(float(match.group(1)) * units[match.group(2)] for match in matches)
+    remaining = deadline - clock.monotonic()
+    if not 0 <= remaining <= 366 * 86400:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=remaining)
+
+
 def _systemd_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
     """Read allowlisted properties from one fixed unit."""
 
@@ -816,12 +915,17 @@ def _service_state(
                 "ActiveState",
                 "SubState",
                 "NextElapseUSecRealtime",
+                "NextElapseUSecMonotonic",
                 "LastTriggerUSec",
             ),
         )
         if timer
         else {}
     )
+    next_options = [candidate for candidate in (
+        _systemd_time(timer_fields.get("NextElapseUSecRealtime")),
+        _systemd_monotonic_time(timer_fields.get("NextElapseUSecMonotonic")),
+    ) if candidate is not None]
     output = {
         "active": active,
         "state": fields.get("SubState") or fields.get("ActiveState") or "unknown",
@@ -833,9 +937,7 @@ def _service_state(
         "timer_state": timer_fields.get("SubState")
         or timer_fields.get("ActiveState")
         or ("not_applicable" if not timer else "unknown"),
-        "next_run_at_utc": _iso(
-            _systemd_time(timer_fields.get("NextElapseUSecRealtime"))
-        ),
+        "next_run_at_utc": _iso(min(next_options)) if next_options else None,
         "last_trigger_at_utc": _iso(_systemd_time(timer_fields.get("LastTriggerUSec"))),
     }
     return output
@@ -869,6 +971,7 @@ def _refresh_service_states(
             "ExecMainStartTimestamp",
             "ExecMainExitTimestamp",
             "NextElapseUSecRealtime",
+            "NextElapseUSecMonotonic",
             "LastTriggerUSec",
         ),
     )
@@ -922,14 +1025,20 @@ def _runtime_progress(repo_root: Path) -> list[dict[str, Any]]:
     paths: list[Path] = []
     for directory in roots:
         try:
-            candidates = sorted(
-                directory.glob("*.log"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
+            # A busy intraday collector leaves thousands of historical logs.
+            # Only the newest by *mtime* is relevant: filenames are not a
+            # safe proxy because a resumed older run may still be appending.
+            # DirEntry avoids allocating/sorting one Path per old log.
+            with os.scandir(directory) as entries:
+                latest = max(
+                    (entry for entry in entries if entry.name.endswith(".log")),
+                    key=lambda entry: entry.stat().st_mtime,
+                    default=None,
+                )
         except OSError:
-            candidates = []
-        paths.extend(candidates[:1])
+            latest = None
+        if latest is not None:
+            paths.append(directory / latest.name)
     output: list[dict[str, Any]] = []
     for path in paths:
         text = _ANSI_RE.sub("", _tail_text(path).replace("\r", "\n"))
@@ -3593,6 +3702,681 @@ def _crypto_acquisition_sources(root: Path, *, now: datetime) -> list[dict[str, 
     return output
 
 
+def _finlab_receipt_file_exists(finlab_root: Path, data_path: str) -> bool:
+    """Check the ordinary flat dataset grain without repeated path resolution.
+
+    The directory and leaf must both reject symlinks on the fast path. Older
+    nested paths or links within the enrolled root retain the existing resolved
+    containment check; a link outside that root is never accepted.
+    """
+
+    relative = Path(data_path)
+    if relative.is_absolute() or relative.parts[:1] != ("datasets",):
+        return False
+    if (
+        len(relative.parts) == 2
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    ):
+        try:
+            directory_fd = os.open(
+                finlab_root / "datasets",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError:
+            pass
+        else:
+            try:
+                try:
+                    mode = os.stat(
+                        relative.parts[1], dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    ).st_mode
+                except FileNotFoundError:
+                    return False
+                opened_directory = os.fstat(directory_fd)
+                current_directory = os.stat(
+                    finlab_root / "datasets", follow_symlinks=False,
+                )
+                if (
+                    opened_directory.st_dev == current_directory.st_dev
+                    and opened_directory.st_ino == current_directory.st_ino
+                ):
+                    if stat.S_ISREG(mode):
+                        return True
+                    if not stat.S_ISLNK(mode):
+                        return False
+            except (OSError, ValueError):
+                pass
+            finally:
+                os.close(directory_fd)
+    resolved = (finlab_root / relative).resolve()
+    return resolved.is_relative_to(finlab_root) and resolved.is_file()
+
+
+def _finlab_candidate_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
+    """Expose every discovered key without treating catalog membership as data."""
+
+    catalog = _read_json(root / "configs/finlab_history_candidates.json", {})
+    candidates = catalog.get("datasets", []) if isinstance(catalog, Mapping) else []
+    discovered = _read_json(root / "data_finlab/catalog/discovery.json", {})
+    discovered_keys = discovered.get("keys", []) if isinstance(discovered, Mapping) else []
+    receipts_root = root / "data_finlab/receipts"
+    attempts_root = root / "data_finlab/attempts"
+    intraday_status = _read_json(root / "data_finlab/intraday/status.json", {})
+    intraday_by_key = intraday_status.get("by_key", {}) if isinstance(intraday_status, Mapping) else {}
+    if not isinstance(intraday_by_key, Mapping):
+        intraday_by_key = {}
+    by_key: dict[str, Mapping[str, Any]] = {}
+    attempts_by_key: dict[str, Mapping[str, Any]] = {}
+    if receipts_root.is_dir():
+        for path in receipts_root.glob("*.json"):
+            receipt = _read_json(path, {})
+            if isinstance(receipt, Mapping) and receipt.get("dataset"):
+                by_key[str(receipt["dataset"])] = receipt
+    if attempts_root.is_dir():
+        for path in attempts_root.glob("*.json"):
+            attempt = _read_json(path, {})
+            if isinstance(attempt, Mapping) and attempt.get("dataset"):
+                attempts_by_key[str(attempt["dataset"])] = attempt
+    finlab_root = (root / "data_finlab").resolve()
+    local_timer_enabled = (
+        (root / "deploy/systemd/stockagent-finlab-local-refresh.timer.in").is_file()
+        and Path("/etc/systemd/system/timers.target.wants/stockagent-finlab-local-refresh.timer").exists()
+    )
+    listed = [item for item in candidates if isinstance(item, Mapping)] if isinstance(candidates, list) else []
+    listed_keys = {str(item.get("key")) for item in listed if item.get("key")}
+    # Discovery is a key inventory, not proof of entitlement or download.
+    all_keys = set(by_key) | set(attempts_by_key)
+    if isinstance(discovered_keys, list):
+        all_keys.update(str(key) for key in discovered_keys if isinstance(key, str) and key)
+    for key in sorted(all_keys - listed_keys):
+        listed.append({"key": key, "group": key.split(":", 1)[0],
+                       "gap": "FinLab SDK 目錄發現項；需另行核對本機語義重複與歷史發布時點"})
+    output: list[dict[str, Any]] = []
+    for item in listed:
+        if not isinstance(item, Mapping) or not item.get("key"):
+            continue
+        key = str(item["key"])
+        receipt = by_key.get(key, {})
+        attempt = attempts_by_key.get(key, {})
+        data_path = receipt.get("parquet_path") if isinstance(receipt, Mapping) else None
+        stored = (
+            isinstance(data_path, str)
+            and receipt.get("dataset") == key
+            and receipt.get("status") == "downloaded_unverified_for_pit"
+            and _finlab_receipt_file_exists(finlab_root, data_path)
+        )
+        count = _integer(receipt.get("rows_with_values")) if stored else None
+        first = (receipt.get("first_event_at") or receipt.get("first_non_null_source_index")) if stored else None
+        last = (receipt.get("last_event_at") or receipt.get("last_non_null_source_index")) if stored else None
+        bounds_basis = (
+            f"來源欄 {receipt.get('event_time_column')} 的事件時刻"
+            if stored and receipt.get("first_event_at") else "來源索引"
+        )
+        attempt_status = str(attempt.get("status") or "") if attempt.get("dataset") == key else ""
+        configured_deferred_reason = AUTOMATICALLY_DEFERRED_REASONS.get(key)
+        deferred_reason = configured_deferred_reason if not stored else None
+        deferred = deferred_reason is not None
+        partition = intraday_by_key.get(key, {}) if deferred_reason == "requires_date_window" else {}
+        if not isinstance(partition, Mapping):
+            partition = {}
+        partition_count = _integer(partition.get("receipted_partitions")) or 0
+        partition_total = _integer(partition.get("requested_weekday_partitions")) or 0
+        partition_rows = _integer(partition.get("rows")) or 0
+        vip_only = not stored and not deferred and attempt_status == "vip_only"
+        failed = not stored and not deferred and attempt_status in {
+            "provider_error", "provider_empty", "timed_out",
+            "authentication_failed", "quota_exhausted",
+        }
+        failure_state = {
+            "provider_empty": "provider_empty",
+            "timed_out": "resource_timeout",
+            "authentication_failed": "authentication_failed",
+            "quota_exhausted": "quota_wait",
+        }.get(attempt_status, "provider_error")
+        acquisition_state = (
+            "downloaded" if stored else
+            "partial_windowed" if deferred_reason == "requires_date_window" and partition_count else
+            "deferred_windowed" if deferred_reason == "requires_date_window" else
+            "deferred_resource" if deferred else failure_state if failed else
+            "vip_only" if vip_only else "pending"
+        )
+        retry_at = (
+            attempt_retry_at(dict(attempt), downloaded=stored)
+            if attempt_status and not deferred else None
+        )
+        status_labels = {
+            "oversized_metadata": "來源標籤寬表超出單鍵記憶體預算；待有界擷取方案",
+            "oversized_wide_refresh": "來源寬表強制追新超出單鍵記憶體預算；舊版仍保留",
+            "oversized_table": "券商整表超出單鍵記憶體與額度預算；待供應商分區介面",
+            "requires_date_window": "此鍵必須指定起訖日期；一般整表下載器不適用",
+            "resource_timeout": "最近一次 SDK 查詢達單鍵逾時上限；保留冷卻時間",
+            "provider_error": "最近一次 SDK 查詢失敗；僅保留錯誤類別，根因未證實",
+            "provider_empty": "SDK 有回傳資料框，但沒有任何非空來源值",
+            "authentication_failed": "最近一次登入驗證失敗；需檢查本機 session",
+            "quota_wait": "最近一次帳號額度不足；重置後再試",
+            "vip_only": "此鍵的 SDK 回覆要求 VIP；需核對實際帳號與此鍵授權",
+        }
+        status_label = (
+            status_labels[configured_deferred_reason]
+            if stored and configured_deferred_reason else
+            "已下載；歷史 PIT 與跨主機使用權限仍待查證" if stored else
+            f"已收 {partition_count:,}/{partition_total:,} 個工作日分區；所列期間之前的歷史仍未知"
+            if partition_count else
+            status_labels.get(deferred_reason or acquisition_state, "尚未下載；列入帳號配額排程")
+        )
+        output.append({
+            "id": f"finlab:{key}",
+            "parent_id": "group:finlab-research",
+            "scope": "source_registry",
+            "title": key,
+            "provider": "FinLab",
+            "category": str(item.get("group") or "historical_research"),
+            "status": (
+                "stale" if stored and configured_deferred_reason else
+                "legacy" if stored else "partial" if partition_count else "deferred" if deferred
+                else "degraded" if failed else "blocked" if vip_only else "waiting"
+            ),
+            "status_label": status_label,
+            "cadence": "每日 08:00 台北時間配額重置後（含休市日）；交易日 08:20–09:10 保護開盤資源",
+            "update_owner": "FinLab 歷史下載器",
+            "latest_at_utc": receipt.get("fetched_at_utc") if stored else None,
+            "data_through": None,
+            "freshness": {"state": "unknown", "age_seconds": None},
+            "coverage": _coverage(partition_count, partition_total, unit="日分區",
+                                  label="已存／所列期間工作日；不代表 FinLab 最早歷史")
+                        if partition_count and partition_total else None,
+            "eta": _not_applicable_eta("reference", "逐鍵下載狀態由 FinLab 群組計算；沒有逐鍵可信 ETA。"),
+            "rows": count if stored else partition_rows if partition_count else None,
+            "publishable": False,
+            "automation_eligible": True,
+            "acquisition_enabled": local_timer_enabled,
+            "registry_alias": True,
+            "finlab_acquisition_state": acquisition_state,
+            "finlab_deferred_reason": configured_deferred_reason,
+            "finlab_attempt_status": attempt_status or None,
+            "finlab_provider_rows": _integer(attempt.get("provider_rows")) if attempt_status == "provider_empty" else None,
+            "finlab_provider_fields": _integer(attempt.get("provider_fields")) if attempt_status == "provider_empty" else None,
+            "finlab_intraday_partitions": dict(partition) if partition_count else None,
+            "finlab_last_attempt_at_utc": attempt.get("attempted_at_utc") if attempt_status else None,
+            "finlab_next_retry_at_utc": _iso(retry_at),
+            "detail": str(item.get("gap") or "FinLab 歷史候選資料集"),
+            "warnings": [
+                "FinLab 目錄與 FAQ 不等於帳號授權；舊 Free 快取曾只到 2018 年底，升級後以逐項雲端刷新回執為準。",
+                "收據索引是來源期別或時間，不等於盤前可用日；原始值與修訂版本尚未完成 PIT 驗證。",
+                *(["最近一次官方 SDK 回覆 VIP only；目錄鍵名不代表目前可下載。"] if vip_only else []),
+                *(["舊版仍在；高記憶體強制追新已暫緩，不能視為目前最新。"] if stored and configured_deferred_reason else []),
+                *(["FinLab 官方 intraday 歷史仍在陸續上架；日期分區完成不等於全史完整。"] if partition_count else []),
+            ],
+            "detail_link": item.get("url"),
+            "record_stats": {
+                "count": count if stored else partition_rows if partition_count else None,
+                "first": first if stored else partition.get("first_data_date"),
+                "last": last if stored else partition.get("last_data_date"),
+                "files_inspected": 1 if stored else partition_count,
+                "files_total": 1 if stored else partition_total if partition_count else 0,
+                "state": "receipt_only_not_hash_reverified" if stored else
+                         "partition_receipts_not_full_history" if partition_count else
+                         "vip_only" if vip_only else "not_downloaded",
+                "basis": (
+                    "FinLab 日期分區收據：僅所列期間與已上架日；不是全部歷史或 PIT 驗證。"
+                    if partition_count else
+                    f"FinLab 下載收據：{bounds_basis}首末與非空列數；不是交易可用日或當前檔案雜湊重驗。"
+                ),
+            },
+        })
+    market_status = _read_json(root / "data_finlab/intraday/market_status.json", {})
+    market_kinds = market_status.get("by_kind", {}) if isinstance(market_status, Mapping) else {}
+    if isinstance(market_kinds, Mapping):
+        for kind in ("tw_minute", "tw_tick"):
+            facts = market_kinds.get(kind)
+            if not isinstance(facts, Mapping):
+                continue
+            total = _integer(facts.get("target_partitions")) or 0
+            received = _integer(facts.get("receipted_partitions")) or 0
+            output.append({
+                "id": f"finlab-market:{kind}",
+                "parent_id": "group:finlab-research",
+                "scope": "source_registry",
+                "title": ("FinLab 全市場 Tick 合成分鐘" if kind == "tw_minute"
+                          else "FinLab 全市場原始 Tick"),
+                "provider": "FinLab",
+                "category": "tw_stock_intraday_market",
+                "status": "partial" if received else "waiting",
+                "status_label": f"已收 {received:,}/{total:,} 個歷史候選股日分區；來源可供性未證實",
+                "cadence": "帳號額度重置後持續補；交易日開盤保護窗暫停",
+                "update_owner": "FinLab 全市場逐檔下載器",
+                "latest_at_utc": market_status.get("observed_at_utc"),
+                "data_through": facts.get("last_data_date"),
+                "freshness": {"state": "unknown", "age_seconds": None},
+                "coverage": _coverage(received, total, unit="股日分區",
+                                      label="歷史候選分區；不代表 FinLab 已上架") if total else None,
+                "eta": _not_applicable_eta("reference", "FinLab 上架範圍與帳號流量成本未知，無可信全市場 ETA。"),
+                "rows": _integer(facts.get("rows")),
+                "publishable": False,
+                "automation_eligible": True,
+                "acquisition_enabled": local_timer_enabled,
+                "registry_alias": True,
+                "detail": ("只從已存 FinLab Tick 在本機合成，不另呼叫分鐘 API；逐檔表見 FinLab 面板。"
+                           if kind == "tw_minute" else
+                           "官方現有＋歷史下市股票名單，依觀測交易日與個股生命週期列候選；逐檔表見 FinLab 面板。"),
+                "warnings": [
+                    "清冊分母是待查詢候選，不是來源已提供的完整歷史。",
+                    "下市前資料、未上架分區和 2004 年以前交易日仍需個別驗證。",
+                ],
+                "detail_link": "/finlab/#market-title",
+                "record_stats": {
+                    "count": _integer(facts.get("rows")),
+                    "first": facts.get("first_data_date"),
+                    "last": facts.get("last_data_date"),
+                    "files_inspected": received,
+                    "files_total": total,
+                    "state": "partition_receipts_not_full_history",
+                    "basis": "FinLab 個股交易日收據索引；尚非全面檔案雜湊重驗或訓練可用性證明。",
+                },
+            })
+    daily = market_status.get("daily_price_coverage", {}) if isinstance(market_status, Mapping) else {}
+    if isinstance(daily, Mapping) and daily.get("state") == "parquet_footer_nonnull_counts":
+        total = _integer(market_status.get("universe_symbols")) or 0
+        received = _integer(daily.get("symbols_with_values")) or 0
+        output.append({
+            "id": "finlab-market:daily-close-symbols",
+            "parent_id": "group:finlab-research",
+            "scope": "source_registry",
+            "title": "FinLab 日收盤價逐股覆蓋",
+            "provider": "FinLab",
+            "category": "tw_stock_daily_market",
+            "status": "partial" if received < total else "legacy",
+            "status_label": f"非空股票欄 {received:,}/{total:,}；缺 {max(0, total - received):,} 檔",
+            "cadence": "FinLab 日價表依帳號額度重置後追新；逐股欄位由本機收據核對",
+            "update_owner": "FinLab 歷史下載器",
+            "latest_at_utc": market_status.get("observed_at_utc"),
+            "data_through": daily.get("source_last_index"),
+            "freshness": {"state": "unknown", "age_seconds": None},
+            "coverage": _coverage(received, total, unit="股票代號",
+                                  label="已下載價表的非空股票欄，不代表全史") if total else None,
+            "eta": _not_applicable_eta("reference", "FinLab 缺的歷史下市股不保證來源有資料。"),
+            "rows": None,
+            "publishable": False,
+            "automation_eligible": True,
+            "acquisition_enabled": local_timer_enabled,
+            "registry_alias": True,
+            "detail": "FinLab 寬表按 Parquet 頁尾非空列數逐股核對；另有本機官方日線的缺項不算 FinLab 已取得。",
+            "warnings": [
+                f"FinLab 缺的 {daily.get('symbols_missing')} 檔中，本機另有日線 {daily.get('missing_but_local_daily')} 檔；兩邊都缺 {daily.get('missing_both_sources')} 檔。",
+                "欄位有值不代表每個交易日完整、發布時點正確或適合歷史 PIT 訓練。",
+            ],
+            "detail_link": "/finlab/#market-title",
+            "record_stats": {
+                "count": received,
+                "first": daily.get("source_first_index"),
+                "last": daily.get("source_last_index"),
+                "files_inspected": 1,
+                "files_total": 1,
+                "state": "parquet_footer_nonnull_symbol_count_not_full_history",
+                "basis": "FinLab price:收盤價當前 Parquet 逐股非空列數，不是完整交易日審計。",
+            },
+        })
+    return output
+
+
+def _finlab_acquisition_status(
+    root: Path,
+    sources: list[Mapping[str, Any]],
+    *,
+    service: Mapping[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Measure catalog acquisition, not historical/PIT completeness."""
+
+    discovery = _read_json(root / "data_finlab/catalog/discovery.json", {})
+    keys = discovery.get("keys") if isinstance(discovery, Mapping) else None
+    catalog_keys = (
+        {key for key in keys if isinstance(key, str) and key}
+        if isinstance(keys, list) else None
+    )
+    selected = [
+        row for row in sources
+        if catalog_keys is None or str(row.get("id") or "").removeprefix("finlab:") in catalog_keys
+    ]
+    downloaded = sum(row.get("finlab_acquisition_state") == "downloaded" for row in selected)
+    states = (
+        "pending", "deferred_resource", "deferred_windowed", "partial_windowed",
+        "provider_error", "provider_empty",
+        "resource_timeout", "vip_only", "authentication_failed", "quota_wait",
+    )
+    reason_counts = {
+        state: sum(row.get("finlab_acquisition_state") == state for row in selected)
+        for state in states
+    }
+    deferred = reason_counts["deferred_resource"]
+    failed = sum(reason_counts[state] for state in (
+        "provider_error", "provider_empty", "resource_timeout", "vip_only",
+        "authentication_failed", "quota_wait",
+    ))
+    total = len(catalog_keys) if catalog_keys is not None else None
+    observed_receipts = [
+        parsed for row in selected
+        if row.get("finlab_acquisition_state") == "downloaded"
+        if (parsed := _parse_time(row.get("latest_at_utc"))) is not None
+    ]
+    last_receipt = max(observed_receipts) if observed_receipts else None
+    recent_downloads = sum(
+        timestamp >= now - timedelta(minutes=15) for timestamp in observed_receipts
+    )
+    run = _read_json(root / "data_finlab/runs/latest.json", {})
+    run_finished = _parse_time(run.get("finished_at_utc")) if isinstance(run, Mapping) else None
+    quota_fresh = (
+        run_finished is not None
+        and run_finished.astimezone(TAIPEI).date() == now.astimezone(TAIPEI).date()
+    )
+    quota_remaining = _number(run.get("quota_remaining_mb")) if quota_fresh else None
+    quota_limit = _number(run.get("quota_limit_mb")) if quota_fresh else None
+    recorded_margin = _number(run.get("quota_reserve_mb"))
+    quota_margin = recorded_margin if recorded_margin is not None and recorded_margin >= 0 else 50.0
+    packed_catalog = _read_json(root / "configs/data_sync/packed_datasets.json", {})
+    packed_datasets = packed_catalog.get("datasets", []) if isinstance(packed_catalog, Mapping) else []
+    finlab_pack = next(
+        (entry for entry in packed_datasets
+         if isinstance(entry, Mapping) and entry.get("dataset") == "finlab-research"),
+        {},
+    )
+    cold_publish_configured = finlab_pack.get("publish") is True
+    running = service.get("active") is True
+    timer_active = service.get("timer_active") is True
+    if total is None:
+        state = "catalog_unknown"
+    elif total > 0 and downloaded >= total:
+        state = "catalog_downloaded_not_pit_validated"
+    elif running:
+        state = "running"
+    elif quota_remaining is not None and quota_remaining <= quota_margin:
+        state = "waiting_quota"
+    elif service.get("result") not in {None, "success"}:
+        state = "service_failed"
+    elif timer_active:
+        state = "scheduled"
+    else:
+        state = "timer_disabled"
+    return {
+        "state": state,
+        "catalog_observed_at_utc": discovery.get("observed_at_utc") if isinstance(discovery, Mapping) else None,
+        "catalog_total": total,
+        "downloaded": downloaded,
+        "not_downloaded": max(0, total - downloaded) if total is not None else None,
+        "deferred_resource": deferred,
+        "not_downloaded_by_reason": reason_counts,
+        "failed_or_entitlement": failed,
+        "recent_downloaded_15m": recent_downloads,
+        "last_receipt_at_utc": _iso(last_receipt),
+        "last_receipt_age_seconds": max(0, int((now - last_receipt).total_seconds())) if last_receipt else None,
+        "run_finished_at_utc": _iso(run_finished),
+        "quota_observed_at_utc": _iso(run_finished) if quota_fresh else None,
+        "quota_remaining_mb": quota_remaining,
+        "quota_limit_mb": quota_limit,
+        "quota_reserve_mb": quota_margin,
+        "cold_publish_configured": cold_publish_configured,
+        "service_active": running,
+        "timer_active": timer_active,
+        "next_run_at_utc": service.get("next_run_at_utc"),
+        "ratio": downloaded / total if total else None,
+        "eta": _unknown_eta(
+            "waiting_quota" if state == "waiting_quota" else "running_unmeasured" if running else "waiting_schedule",
+            "目錄各鍵大小差異很大且共享每日帳號配額；目前沒有可驗證的全目錄完工 ETA。",
+        ),
+        "basis": "FinLab SDK 目錄為分母；檔案存在且有下載收據才算已取得。不是歷史完整度、PIT 或冷庫同步率。",
+    }
+
+
+def _finmind_free_sources(
+    root: Path, *, now: datetime, service: Mapping[str, Any],
+    complement_service: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Project receipt-backed FinMind tasks without scanning daily Parquet."""
+
+    storage = root / "data_finmind"
+    summary = _read_json(storage / "status.json", {})
+    series = summary.get("series") if isinstance(summary.get("series"), Mapping) else {}
+    active = service.get("active") is True
+    state = str(summary.get("state") or "not_started")
+    rows: list[dict[str, Any]] = []
+    labels = {
+        "TaiwanStockStatisticsOfOrderBookAndTrade": "全市場委託／成交統計（實測 1 分或 5 秒）",
+        "TaiwanVariousIndicators5Seconds": "盤中加權指數（實測 1 分或 5 秒）",
+    }
+    for dataset, title in labels.items():
+        item = series.get(dataset) if isinstance(series.get(dataset), Mapping) else {}
+        total = _integer(item.get("total")) or 0
+        complete = _integer(item.get("complete")) or 0
+        latest = str(item.get("last_complete_date") or "") or None
+        date_freshness = _freshness(_parse_time(latest), now=now, window_seconds=72 * 3600)
+        if not summary:
+            row_state = "waiting"
+        elif state.startswith("calendar_") or state == "not_entitled":
+            row_state = "degraded"
+        elif complete >= total and total:
+            row_state = "current" if date_freshness["state"] == "current" else "stale"
+        elif active and state in {"running", "backfilling"}:
+            row_state = "updating"
+        else:
+            row_state = "waiting"
+        record_count = _integer(item.get("rows"))
+        rows.append({
+            "id": f"finmind:{dataset}",
+            "parent_id": "group:finmind-free",
+            "scope": "source_registry",
+            "title": title,
+            "provider": "FinMind",
+            "category": "taiwan_market_intraday",
+            "status": row_state,
+            "status_label": f"已驗證 {complete:,}/{total:,} 個交易日分區；{state}",
+            "cadence": "交易日 14:00 後嘗試追新；歷史按官方速率續補",
+            "update_owner": "FinMind 免費資料下載器",
+            "latest_at_utc": None,
+            "data_through": latest,
+            "freshness": date_freshness,
+            "coverage": _coverage(complete, total, unit="交易日分區", label="逐日完整格點") if total else None,
+            "eta": _unknown_eta(
+                "running_unmeasured" if row_state == "updating" else "waiting_schedule",
+                "總網路時間至少受 FinMind 每小時配額限制；重試及來源缺口使精確完工時間未知。",
+            ),
+            "rows": record_count,
+            "publishable": False,
+            "automation_eligible": active,
+            "registry_alias": False,
+            "detail": "只有交易所盤中全市場彙總，不是逐檔 L2 或逐筆；原始來源尚非 PIT 訓練特徵。",
+            "warnings": ["早期來源實測為 1 分鐘；逐日收據記錄實際格點，不將 1 分鐘偽標為 5 秒。"],
+            "record_stats": {
+                "count": record_count,
+                "first": item.get("first_complete_date"),
+                "last": latest,
+                "files_inspected": 0,
+                "files_total": complete,
+                "state": "source_receipts_not_hash_reverified" if complete else "not_downloaded",
+                "basis": "逐日下載收據和檔案大小檢查；完整 SHA-256 與 PIT 可用性須另行稽核。",
+            },
+        })
+    calendar = _read_json(storage / "calendar.json", {})
+    calendar_dates = calendar.get("dates") if isinstance(calendar.get("dates"), list) else []
+    rows.append({
+        "id": "finmind:TaiwanStockTradingDate",
+        "parent_id": "group:finmind-free", "scope": "source_registry",
+        "title": "FinMind 台股交易日曆（含未來預排日）",
+        "provider": "FinMind", "category": "calendar",
+        "status": "current" if calendar_dates else "waiting",
+        "status_label": f"已存 {len(calendar_dates):,} 個日曆日期" if calendar_dates else "等待首次查詢",
+        "cadence": "約每 20 小時重新查詢", "update_owner": "FinMind 免費資料下載器",
+        "latest_at_utc": calendar.get("observed_at_utc"), "data_through": None,
+        "freshness": _freshness(_parse_time(calendar.get("observed_at_utc")), now=now, window_seconds=48 * 3600),
+        "coverage": None, "eta": _not_applicable_eta("reference", "日曆不是逐交易日歷史回補工作。"),
+        "rows": len(calendar_dates) if calendar_dates else None,
+        "publishable": False, "automation_eligible": active, "registry_alias": False,
+        "detail": "可能包含未來預排開市日；不是已發生的市場觀測。",
+        "warnings": [],
+        "record_stats": {
+            "count": len(calendar_dates) if calendar_dates else None,
+            "first": calendar_dates[0] if calendar_dates else None,
+            "last": calendar_dates[-1] if calendar_dates else None,
+            "files_inspected": 1 if calendar_dates else 0, "files_total": 1,
+            "state": "calendar_with_future_dates" if calendar_dates else "not_downloaded",
+            "basis": "FinMind 交易日曆來源；末日可能尚未發生，不代表行情資料最新日。",
+        },
+    })
+    today = now.astimezone(TAIPEI).date()
+    master_root = storage / "receipts" / "TaiwanStockInfoWithWarrant"
+    try:
+        receipt_paths = sorted(master_root.glob("*.json"))
+    except OSError:
+        receipt_paths = []
+    latest_master = _read_json(receipt_paths[-1], {}) if receipt_paths else {}
+    master_count = _integer(latest_master.get("rows")) if latest_master.get("status") == "complete" else None
+    rows.append({
+        "id": "finmind:TaiwanStockInfoWithWarrant",
+        "parent_id": "group:finmind-free", "scope": "source_registry",
+        "title": "台股及權證主檔每日觀測快照",
+        "provider": "FinMind", "category": "security_master",
+        "status": "current" if latest_master.get("snapshot_date_taipei") == today.isoformat() and master_count else "stale" if master_count else "waiting",
+        "status_label": "已取得最近快照；非歷史上市狀態" if master_count else "等待首次快照",
+        "cadence": "每日 14:00 後", "update_owner": "FinMind 免費資料下載器",
+        "latest_at_utc": latest_master.get("fetched_at_utc"),
+        "data_through": latest_master.get("snapshot_date_taipei"),
+        "freshness": _freshness(_parse_time(latest_master.get("fetched_at_utc")), now=now, window_seconds=48 * 3600),
+        "coverage": None, "eta": _not_applicable_eta("reference", "主檔每日觀測快照，不是完整歷史日分區。"),
+        "rows": master_count, "publishable": False, "automation_eligible": active,
+        "registry_alias": False,
+        "detail": "當日查詢得到的主檔快照；不得回填成歷史當時已知名單。",
+        "warnings": [],
+        "record_stats": {
+            "count": master_count, "first": latest_master.get("source_first_date"),
+            "last": latest_master.get("source_last_date"),
+            "files_inspected": 0, "files_total": len(receipt_paths),
+            "state": "snapshot_receipt_not_hash_reverified" if master_count else "not_downloaded",
+            "basis": "最新每日主檔收據；非歷史 PIT 主檔。",
+        },
+    })
+    return (rows + _finmind_complement_sources(storage, now=now, service=complement_service or {})
+            + _finmind_sponsor_sources(storage, now=now))
+
+
+def _finmind_complement_sources(storage: Path, *, now: datetime,
+                                service: Mapping[str, Any]) -> list[dict[str, Any]]:
+    complement = _read_json(storage / "complement" / "status.json", {})
+    companion_series = complement.get("series") if isinstance(complement.get("series"), Mapping) else {}
+    companion_state = str(complement.get("state") or "not_started")
+    delegated = set(complement.get("delegated_to_sponsor", [])) if isinstance(complement.get("delegated_to_sponsor"), list) else set()
+    companion_time = _parse_time(complement.get("observed_at_utc"))
+    companion_fresh = companion_time is not None and (now - companion_time).total_seconds() < 180
+    active = service.get("active") is True
+    rows: list[dict[str, Any]] = []
+    for dataset in FINMIND_COMPLEMENT_DATASETS:
+        item = companion_series.get(dataset) if isinstance(companion_series.get(dataset), Mapping) else {}
+        total = _integer(item.get("target")) or 0
+        complete = _integer(item.get("complete")) or 0
+        empty = _integer(item.get("observed_empty")) or 0
+        checked = complete + empty
+        failed = _integer(item.get("failed")) or 0
+        blocked = _integer(item.get("not_entitled")) or 0
+        invalid = _integer(item.get("invalid_request")) or 0
+        latest = item.get("last_data_date")
+        if dataset in delegated:
+            row_state = "deferred"
+        elif blocked + invalid == total and total:
+            row_state = "unavailable"
+        elif checked == total and total:
+            if dataset in FINMIND_COMPLEMENT_SNAPSHOTS:
+                snapshot_time = _parse_time(item.get("last_attempt_at_utc"))
+                row_state = "current" if snapshot_time and (now - snapshot_time).total_seconds() < 36 * 3600 else "stale"
+            else:
+                row_state = "complete"
+        elif active and companion_fresh and companion_state == "running":
+            row_state = "updating"
+        elif failed or invalid or companion_state in {"rate_limited", "not_entitled", "disk_guard", "ip_banned", "invalid_token"}:
+            row_state = "degraded"
+        else:
+            row_state = "waiting"
+        record_count = _integer(item.get("rows"))
+        rows.append({
+            "id": f"finmind:{dataset}", "parent_id": "group:finmind-free",
+            "scope": "source_registry", "title": dataset,
+            "provider": "FinMind", "category": "cross_market_source",
+            "status": row_state,
+            "status_label": ("已讓渡給 Sponsor 全市場批量管線；保留既有收據" if dataset in delegated else
+                             f"已查驗 {checked:,}/{total:,} 分區（非空 {complete:,}、來源空回 {empty:,}）；失敗 {failed:,}；權限 {blocked:,}；無效請求 {invalid:,}"),
+            "cadence": ("本機由法人長表衍生，不呼叫 FinMind API" if dataset == FINMIND_DERIVED_WIDE
+                        else "共用每小時額度；依標的／年份分區增量"),
+            "update_owner": "FinMind 補充資料下載器",
+            "latest_at_utc": item.get("last_attempt_at_utc"),
+            "data_through": latest,
+            "freshness": _freshness(_parse_time(item.get("last_attempt_at_utc")), now=now, window_seconds=30 * 86400),
+            "coverage": _coverage(checked, total, unit="來源分區", label="已查驗來源分區；空回不代表有數值") if total else None,
+            "eta": _unknown_eta("running_unmeasured" if row_state == "updating" else "waiting_schedule",
+                                "與 FinMind 盤中工作共用額度；空回與來源修訂使完工時間不可精確預測。"),
+            "rows": record_count, "publishable": False,
+            "automation_eligible": active and dataset not in delegated, "registry_alias": False,
+            "detail": ("從 FinMind 法人長表於本機轉成寬表，缺席的歷史類別填 0；非獨立 API 來源，不代表歷史 PIT 或訓練可用。"
+                       if dataset == FINMIND_DERIVED_WIDE else
+                       "FinMind 原始研究資料；與 FinLab／官方來源分開，不代表歷史 PIT 或訓練可用。"),
+            "warnings": (["空回分區未算取得；需逐資料集驗證最早可用日及完整性。"] if empty else [])
+                        + (["指定代碼仍遭權限拒絕；已停止自動重試，需核對帳號後手動重排。"] if blocked else [])
+                        + (["請求參數遭來源拒絕；已停止自動重試以避免 IP 封鎖。"] if invalid else []),
+            "record_stats": {
+                "count": record_count, "first": item.get("first_data_date"),
+                "last": latest, "files_inspected": 0, "files_total": complete,
+                "state": "source_receipts_not_hash_reverified" if complete else "not_downloaded",
+                "basis": ("法人長表衍生 Parquet 與收據；公開面板未重算全部檔案雜湊。"
+                          if dataset == FINMIND_DERIVED_WIDE else
+                          "逐請求 Parquet 與收據；公開面板未重算全部檔案雜湊。"),
+            },
+        })
+    return rows
+
+
+def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, Any]]:
+    sponsor = _read_json(storage / "sponsor" / "status.json", {})
+    series = sponsor.get("series") if isinstance(sponsor.get("series"), Mapping) else {}
+    fresh = _parse_time(sponsor.get("observed_at_utc"))
+    running = sponsor.get("state") == "running" and fresh is not None and (now - fresh).total_seconds() < 180
+    rows: list[dict[str, Any]] = []
+    for spec in FINMIND_SPONSOR_SOURCES:
+        item = series.get(spec.dataset) if isinstance(series.get(spec.dataset), Mapping) else {}
+        total = _integer(item.get("target")) or 0
+        complete = _integer(item.get("complete")) or 0
+        empty = _integer(item.get("observed_empty")) or 0
+        failed = _integer(item.get("failed")) or 0
+        blocked = _integer(item.get("blocked")) or 0
+        checked = complete + empty
+        latest = item.get("last_data_date")
+        state = ("unavailable" if total and blocked == total else
+                 "complete" if total and checked == total else
+                 "updating" if running else
+                 "degraded" if blocked or failed else "waiting")
+        count = _integer(item.get("rows"))
+        rows.append({
+            "id": f"finmind:sponsor:{spec.dataset}", "parent_id": "group:finmind-free",
+            "scope": "source_registry", "title": f"{spec.dataset}（Sponsor 全市場）",
+            "provider": "FinMind", "category": "taiwan_market_sponsor",
+            "status": state,
+            "status_label": f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}",
+            "cadence": "按官方實際帳號額度共用節流；全市場日期分區增量",
+            "update_owner": "FinMind Sponsor 資料下載器",
+            "latest_at_utc": item.get("last_attempt_at_utc"), "data_through": latest,
+            "freshness": _freshness(_parse_time(item.get("last_attempt_at_utc")), now=now, window_seconds=30 * 86400),
+            "coverage": _coverage(checked, total, unit="來源分區", label="已查驗；空回非資料") if total else None,
+            "eta": _unknown_eta("running_unmeasured" if running else "waiting_schedule",
+                                "官方額度只是請求下界，回應大小、服務時間及缺口未知。"),
+            "rows": count, "publishable": False, "automation_eligible": running,
+            "registry_alias": False,
+            "detail": "獨立原始收據；與 Free 逐檔任務重疊時先由 Sponsor 批量查詢。尚未驗證 PIT 或可訓練性。",
+            "warnings": ["來源空回不算有數值的歷史。"] if empty else [],
+            "record_stats": {"count": count, "first": item.get("first_data_date"), "last": latest,
+                             "files_inspected": 0, "files_total": complete,
+                             "state": "source_receipts_not_hash_reverified" if complete else "not_downloaded",
+                             "basis": "不可變 Parquet 與原子收據；公開頁未重算 SHA-256。"},
+        })
+    return rows
+
+
 def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     registry = _read_json(root / "configs/free_public_data_sources.json", {})
     sources = registry.get("sources", []) if isinstance(registry, Mapping) else []
@@ -4681,6 +5465,15 @@ def _automation_for_row(
         for key in keys
         if isinstance(refresh_services.get(key), Mapping)
     ]
+    unarmed_service_keys = [
+        key
+        for key in keys
+        if isinstance(state := refresh_services.get(key), Mapping)
+        and state.get("timer_active") is True
+        and state.get("timer_state") == "elapsed"
+        and state.get("active") is not True
+        and not state.get("next_run_at_utc")
+    ]
     next_runs = [
         parsed
         for state in states
@@ -4745,6 +5538,8 @@ def _automation_for_row(
     automatic = eligible and mode not in {"frozen", "not_configured", "on_demand"}
     if profile.get("requires_timer_active") is True:
         automatic = automatic and any(state.get("timer_active") is True for state in states)
+    if unarmed_service_keys:
+        automatic = False
     schedule_label = str(
         profile.get("schedule_label") or row.get("cadence") or "未指定"
     )
@@ -4754,6 +5549,8 @@ def _automation_for_row(
         schedule_state = "not_configured"
     elif profile.get("requires_timer_active") is True and not automatic:
         schedule_state = "not_configured"
+    elif unarmed_service_keys:
+        schedule_state = "timer_unarmed"
     elif mode == "stream":
         schedule_state = (
             "stream_window_open"
@@ -4793,6 +5590,7 @@ def _automation_for_row(
         "schedule_state": schedule_state,
         "schedule_label": schedule_label,
         "service_keys": list(keys),
+        "unarmed_service_keys": unarmed_service_keys,
         "service_active": active,
         "job_running": job_running,
         "next_run_at_utc": _iso(min(next_runs)) if next_runs else None,
@@ -4897,6 +5695,8 @@ def _operation_state(
         if eta_state == "waiting_quota"
         else "waiting"
     )
+    if schedule_state == "timer_unarmed" and not actively_working:
+        return "unable", "failed", "自動 timer 已啟用，但沒有下一次觸發"
     if raw_status in {"blocked", "unavailable"}:
         return "unable", "blocked", str(row.get("status_label") or "來源不可用")
     if raw_status == "degraded":
@@ -5435,6 +6235,8 @@ def _market_category(row: Mapping[str, Any]) -> str:
 def _record_stats_for_row(
     row: Mapping[str, Any], inventory: Mapping[str, Any]
 ) -> dict[str, Any]:
+    if str(row.get("id") or "").startswith("finlab:") and isinstance(row.get("record_stats"), Mapping):
+        return dict(row["record_stats"])
     row_id = str(row.get("id") or "")
     provisional_stats = row.get("_provisional_feature_stats")
     if row_id.startswith("tw-public:provisional-feature:") and isinstance(provisional_stats, Mapping):
@@ -5624,16 +6426,30 @@ def build_data_monitor_public_status(
     openbb_status: Mapping[str, Any] | None = None,
     refresh_inventory: bool = False,
     inventory_max_refresh_files: int = 4_096,
+    record_inventory: Mapping[str, Any] | None = None,
+    timing_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the complete public registry and current monitor projection."""
 
+    stage_started = clock.perf_counter()
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        if timing_ms is not None:
+            completed = clock.perf_counter()
+            timing_ms[name] = round((completed - stage_started) * 1_000, 3)
+            stage_started = completed
+
     root = Path(repo_root)
     observed = (now or datetime.now(UTC)).astimezone(UTC)
-    record_inventory = build_record_inventory(
-        root,
-        refresh=refresh_inventory,
-        max_refresh_files=inventory_max_refresh_files,
-    )
+    if record_inventory is not None and refresh_inventory:
+        raise ValueError("cannot refresh an already observed record inventory")
+    if record_inventory is None:
+        record_inventory = build_record_inventory(
+            root,
+            refresh=refresh_inventory,
+            max_refresh_files=inventory_max_refresh_files,
+        )
     inventory_datasets = record_inventory["datasets"]
     registry = _read_json(root / "configs/data_sync/packed_datasets.json", {})
     configs = registry.get("datasets", []) if isinstance(registry, Mapping) else []
@@ -5642,16 +6458,24 @@ def build_data_monitor_public_status(
         for config in configs
         if isinstance(config, Mapping)
     ]
+    mark_stage("inventory_and_groups")
+    shioaji_timing_ms: dict[str, float] = {}
     shioaji = (
         dict(shioaji_status)
         if isinstance(shioaji_status, Mapping)
-        else build_shioaji_public_status(root)
+        else build_shioaji_public_status(
+            root, timing_ms=shioaji_timing_ms if timing_ms is not None else None
+        )
     )
+    mark_stage("shioaji_status")
+    if timing_ms is not None:
+        timing_ms.update({f"shioaji.{key}": value for key, value in shioaji_timing_ms.items()})
     openbb = (
         dict(openbb_status)
         if isinstance(openbb_status, Mapping)
         else build_openbb_public_status(root)
     )
+    mark_stage("openbb_status")
     service_states = (
         _refresh_service_states(
             snapshot_path=(root / "artifacts/live/data_monitor/refresh_services.json"),
@@ -5662,6 +6486,7 @@ def build_data_monitor_public_status(
         else {str(key): dict(value) for key, value in refresh_services.items()}
     )
     runtime_progress = _runtime_progress(root)
+    mark_stage("service_state_and_runtime_progress")
     _specialize_groups(
         groups,
         shioaji=shioaji,
@@ -5670,6 +6495,131 @@ def build_data_monitor_public_status(
         now=observed,
         refresh_services=service_states,
         runtime_progress=runtime_progress,
+    )
+    mark_stage("specialize_groups")
+    finmind_summary = _read_json(root / "data_finmind/status.json", {})
+    finmind_complement = _read_json(root / "data_finmind/complement/status.json", {})
+    finmind_sponsor = _read_json(root / "data_finmind/sponsor/status.json", {})
+    finmind_service = service_states.get("finmind_free", {})
+    finmind_complement_service = service_states.get("finmind_complement", {})
+    finmind_sponsor_service = service_states.get("finmind_sponsor", {})
+    for group in groups:
+        if group.get("id") != "group:finmind-free":
+            continue
+        complete = _integer(finmind_summary.get("complete_session_day_tasks")) or 0
+        total = _integer(finmind_summary.get("total_session_day_tasks")) or 0
+        extra = finmind_complement.get("series") if isinstance(finmind_complement.get("series"), Mapping) else {}
+        delegated = set(finmind_complement.get("delegated_to_sponsor", [])) if isinstance(finmind_complement.get("delegated_to_sponsor"), list) else set()
+        primary_extra = {name: item for name, item in extra.items() if name not in delegated and isinstance(item, Mapping)}
+        extra_complete = sum(_integer(item.get("complete")) or 0 for item in primary_extra.values())
+        extra_empty = sum(_integer(item.get("observed_empty")) or 0 for item in primary_extra.values())
+        extra_total = sum(_integer(item.get("target")) or 0 for item in primary_extra.values())
+        extra_blocked = sum((_integer(item.get("not_entitled")) or 0) +
+                            (_integer(item.get("invalid_request")) or 0)
+                            for item in primary_extra.values())
+        paid = finmind_sponsor.get("series") if isinstance(finmind_sponsor.get("series"), Mapping) else {}
+        paid_complete = sum(_integer(item.get("complete")) or 0 for item in paid.values() if isinstance(item, Mapping))
+        paid_empty = sum(_integer(item.get("observed_empty")) or 0 for item in paid.values() if isinstance(item, Mapping))
+        paid_total = sum(_integer(item.get("target")) or 0 for item in paid.values() if isinstance(item, Mapping))
+        paid_blocked = sum(_integer(item.get("blocked")) or 0 for item in paid.values() if isinstance(item, Mapping))
+        state = str(finmind_summary.get("state") or "not_started")
+        active = finmind_service.get("active") is True
+        extra_active = finmind_complement_service.get("active") is True
+        paid_active = finmind_sponsor_service.get("active") is True
+        group["coverage"] = _coverage(
+            complete + extra_complete + extra_empty + paid_complete + paid_empty,
+            total + extra_total + paid_total,
+            unit="已建立任務", label="Free 與 Sponsor 已查驗分區（含空回）"
+        ) if total + extra_total + paid_total else None
+        group["status"] = (
+            "degraded" if state.startswith("calendar_") or state in {"not_entitled", "invalid_token", "invalid_request", "ip_banned"} or extra_blocked or paid_blocked
+            else "updating" if (active and state in {"running", "backfilling"}) or
+                               (extra_active and finmind_complement.get("state") == "running") or
+                               (paid_active and finmind_sponsor.get("state") == "running")
+            else "current" if state == "current"
+            else "waiting" if active or extra_active or paid_active else "deferred"
+        )
+        group["status_label"] = (
+            f"盤中 {complete:,}/{total:,} 日；Free {extra_complete + extra_empty:,}/{extra_total:,}；Sponsor {paid_complete + paid_empty:,}/{paid_total:,}；受阻 {extra_blocked + paid_blocked:,}"
+            if total or extra_total or paid_total else "尚未取得來源日曆與清冊"
+        )
+        group["latest_at_utc"] = finmind_summary.get("observed_at_utc")
+        group["rows"] = sum(
+            _integer(item.get("rows")) or 0
+            for item in (finmind_summary.get("series") or {}).values()
+            if isinstance(item, Mapping)
+        ) + sum(_integer(item.get("rows")) or 0 for item in extra.values() if isinstance(item, Mapping)) + sum(_integer(item.get("rows")) or 0 for item in paid.values() if isinstance(item, Mapping)) if isinstance(finmind_summary.get("series"), Mapping) else None
+        group["automation_eligible"] = active or extra_active or paid_active
+        group["acquisition_enabled"] = active or extra_active or paid_active
+        group["eta"] = _unknown_eta(
+            "running_unmeasured" if group["status"] == "updating" else "waiting_schedule",
+            "FinMind 三支 worker 共用官方帳號額度；回應大小、權限與空回使全範圍完工時間未知。",
+        )
+        group["warnings"] = [
+            *group.get("warnings", []),
+            "FinMind 新聞依使用者要求不下載；原始歷史尚未驗證 PIT 可訓練性。",
+        ]
+    finmind_sources = _finmind_free_sources(
+        root, now=observed, service=finmind_service,
+        complement_service=finmind_complement_service,
+    )
+    finlab_sources = _finlab_candidate_sources(root, now=observed)
+    finlab_acquisition = _finlab_acquisition_status(
+        root, finlab_sources,
+        service=service_states.get("finlab_local", {}), now=observed,
+    )
+    for group in groups:
+        if group.get("id") != "group:finlab-research":
+            continue
+        total = finlab_acquisition["catalog_total"]
+        downloaded = finlab_acquisition["downloaded"]
+        group["coverage"] = _coverage(
+            downloaded, total, unit="目錄鍵", label="FinLab 帳號下載覆蓋率"
+        )
+        group["status"] = {
+            "catalog_downloaded_not_pit_validated": "current",
+            "running": "updating",
+            "scheduled": "waiting",
+            "waiting_quota": "waiting",
+            "service_failed": "degraded",
+            "timer_disabled": "deferred",
+            "catalog_unknown": "degraded",
+        }[finlab_acquisition["state"]]
+        group["status_label"] = (
+            f"已下載 {downloaded:,}/{total:,} 個目錄鍵；歷史 PIT 尚未驗證"
+            if total is not None else "SDK 目錄未核實；下載總進度未知"
+        )
+        group["latest_at_utc"] = finlab_acquisition["last_receipt_at_utc"]
+        group["freshness"] = _freshness(
+            _parse_time(finlab_acquisition["last_receipt_at_utc"]),
+            now=observed, window_seconds=48 * 3600,
+        )
+        group["automation_eligible"] = finlab_acquisition["timer_active"]
+        group["acquisition_enabled"] = finlab_acquisition["timer_active"]
+        group["eta"] = finlab_acquisition["eta"]
+        group["detail"] = finlab_acquisition["basis"]
+        group["warnings"] = [
+            *group.get("warnings", []),
+            "原始值仍僅供本機研究；目錄下載率不代表歷史完整、當時可用或可跨主機複製。",
+        ]
+    mark_stage("finlab_sources_and_acquisition")
+    finlab_group = next((row for row in groups if row.get("id") == "group:finlab-research"), None)
+    finlab_catalog_endpoint = (
+        {
+            **finlab_group,
+            "id": "finlab:catalog-acquisition",
+            "parent_id": "group:finlab-research",
+            "scope": "source_registry",
+            "title": "FinLab SDK 目錄逐鍵下載",
+            "registry_alias": False,
+            "record_stats": {
+                "count": None, "first": None, "last": None,
+                "files_inspected": 0, "files_total": None,
+                "state": "not_applicable",
+                "basis": "此端點的分子／分母是已下載資料鍵／SDK 目錄鍵；原始表列數不可跨鍵加總。",
+            },
+        }
+        if finlab_group is not None else None
     )
     history_logical = _crypto_history_sources(root, now=observed)
     logical = (
@@ -5681,9 +6631,13 @@ def build_data_monitor_public_status(
         + _product_granularity_sources(root, now=observed)
         + _crypto_acquisition_sources(root, now=observed)
         + _free_public_registry_sources(root, now=observed)
+        + finmind_sources
+        + ([finlab_catalog_endpoint] if finlab_catalog_endpoint is not None else [])
+        + finlab_sources
         + _yahoo_inventory_rows()
         + history_logical
     )
+    mark_stage("logical_sources")
     _apply_verified_storage_freshness(
         groups + logical, inventory_datasets, now=observed
     )
@@ -5693,11 +6647,20 @@ def build_data_monitor_public_status(
         refresh_services=service_states,
     )
     _rollup_storage_groups(groups, logical_for_rollup)
+    # Child operation/publication state was already computed for the group
+    # roll-up above. Reuse that same immutable-in-this-build observation;
+    # enriching logical rows again repeats registry/timer work and can even
+    # observe a different source state in one published snapshot.
     rows = _enrich_and_sort_rows(
-        groups + logical + _physical_inventory_rows(),
+        groups + _physical_inventory_rows(),
         now=observed,
         refresh_services=service_states,
     )
+    mark_stage("enrich_and_rollup")
+    rows.extend(logical_for_rollup)
+    rows.sort(key=_row_sort_key)
+    for index, row in enumerate(rows, start=1):
+        row["sort_index"] = index
     for row in rows:
         category = _market_category(row)
         row["market_category"] = category
@@ -5791,6 +6754,7 @@ def build_data_monitor_public_status(
         rows,
         active_data_endpoints=active_scope_count,
     )
+    mark_stage("row_stats_and_integrity")
     physical_stats = [
         stats for key, stats in inventory_datasets.items()
         if (
@@ -5930,6 +6894,8 @@ def build_data_monitor_public_status(
         "record_inventory_progress": {
             "cached_files": record_inventory["cached_files"],
             "refreshed_files": record_inventory["refreshed_files"],
+            "identity_rechecked_files": record_inventory.get("identity_rechecked_files", 0),
+            "identity_unbound_files": record_inventory.get("identity_unbound_files", 0),
             "inspected_files": sum(int(stats.get("files_inspected") or 0) for stats in physical_stats),
             "selected_files": sum(int(stats.get("files_total") or 0) for stats in physical_stats),
             "invalid_files": sum(int(stats.get("invalid_files") or 0) for stats in physical_stats),
@@ -5944,6 +6910,7 @@ def build_data_monitor_public_status(
                 service_states.get("tw_public_0830", {}).get("next_run_at_utc")
             ),
         ),
+        "finlab_acquisition": finlab_acquisition,
         "groups": groups,
         "sources": rows,
         "definitions": {
@@ -6074,11 +7041,13 @@ def build_tw_public_monitor_status(
 
 
 def build_data_monitor_feature_inventory(
-    repo_root: Path, *, monitor_status: Mapping[str, Any] | None = None
+    repo_root: Path, *, monitor_status: Mapping[str, Any] | None = None,
+    inventory: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Public, field-level projection of the cached physical Parquet inventory."""
 
-    inventory = build_feature_inventory(repo_root)
+    if inventory is None:
+        inventory = build_feature_inventory(repo_root)
     status = monitor_status or build_data_monitor_public_status(repo_root)
     source_rows = {
         str(row.get("record_inventory_key") or row.get("id")): row
@@ -6087,18 +7056,29 @@ def build_data_monitor_feature_inventory(
     }
     category_order = {category: index for index, category in enumerate(_MARKET_CATEGORY_LABELS)}
     rows: list[dict[str, Any]] = []
+    source_meta: dict[str, tuple[Any, Any, str, str]] = {}
     for field in inventory["rows"]:
         dataset = field["dataset_id"]
-        source = source_rows.get(dataset)
-        if source is None:
-            if dataset.startswith("physical:"):
-                family = dataset.removeprefix("physical:")
-                group, label, _, _ = PHYSICAL_FAMILIES[family]
-                source = {"id": f"inventory:{family}", "parent_id": f"group:{group}",
-                          "title": label, "provider": _GROUP_META.get(group, {}).get("provider", "公開資料")}
-            else:
-                source = {"id": dataset, "title": dataset, "provider": "公開資料"}
-        category = str(source.get("market_category") or _market_category(source))
+        meta = source_meta.get(dataset)
+        if meta is None:
+            source = source_rows.get(dataset)
+            if source is None:
+                if dataset.startswith("physical:"):
+                    family = dataset.removeprefix("physical:")
+                    group, label, _, _ = PHYSICAL_FAMILIES[family]
+                    source = {"id": f"inventory:{family}", "parent_id": f"group:{group}",
+                              "title": label, "provider": _GROUP_META.get(group, {}).get("provider", "公開資料")}
+                else:
+                    source = {"id": dataset, "title": dataset, "provider": "公開資料"}
+            category = str(source.get("market_category") or _market_category(source))
+            meta = (
+                source.get("title") or dataset,
+                source.get("provider") or "公開資料",
+                category,
+                _MARKET_CATEGORY_LABELS.get(category, "跨市場／其他"),
+            )
+            source_meta[dataset] = meta
+        source_title, provider, category, category_label = meta
         field_name = str(field["field"])
         conditional_tw_evidence = (
             dataset == "physical:tw-public:stock-features"
@@ -6123,10 +7103,10 @@ def build_data_monitor_feature_inventory(
         )
         rows.append({
             **field,
-            "source_title": source.get("title") or dataset,
-            "provider": source.get("provider") or "公開資料",
+            "source_title": source_title,
+            "provider": provider,
             "market_category": category,
-            "market_category_label": _MARKET_CATEGORY_LABELS.get(category, "跨市場／其他"),
+            "market_category_label": category_label,
             "field_role": "conditional" if conditional_tw_evidence else "key" if field["field"] in {
                 "date", "trade_date", "trading_date", "ts", "timestamp", "time",
                 "event_ts", "event_ts_utc", "snapshot_ts_ns", "symbol", "asset",

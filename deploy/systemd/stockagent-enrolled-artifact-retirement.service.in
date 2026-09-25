@@ -1,0 +1,14 @@
+[Unit]
+Description=Retire enrolled D-backed cold artifacts after seven-day lease
+After=network-online.target stockagent-packed-backup.service syncthing@root.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash -c 'source "__REPO_ROOT__/scripts/runtime_env.sh" && run_fintech_python "__REPO_ROOT__/scripts/retire_enrolled_artifacts.py" --apply'
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+

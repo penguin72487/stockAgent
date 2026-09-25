@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import importlib.util
 import io
+import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
+import zipfile
 
 import pytest
 
@@ -39,6 +42,91 @@ def test_extracts_latest_common_taifex_dates() -> None:
         date(2026, 8, 5),
         date(2026, 8, 6),
     ]
+
+
+def test_recent_listing_cutoff_rejects_unfinished_and_future_dates() -> None:
+    taipei = ZoneInfo("Asia/Taipei")
+    assert MODULE._latest_completed_listing_date(
+        datetime(2026, 9, 25, 5, 24, tzinfo=taipei)
+    ) == date(2026, 9, 24)
+    assert MODULE._latest_completed_listing_date(
+        datetime(2026, 9, 25, 17, 0, tzinfo=taipei)
+    ) == date(2026, 9, 25)
+
+
+def test_recent_rolling_gap_reuses_only_hash_verified_prior_window(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    days = [date(2026, 9, 23), date(2026, 9, 24)]
+    raw_downloads: list[dict[str, object]] = []
+    partitions: list[dict[str, object]] = []
+    listing_pages: dict[str, dict[str, object]] = {}
+    for kind in ("futures", "options"):
+        page_path = root / "raw" / "listing_pages" / f"{kind}.html"
+        page_path.parent.mkdir(parents=True, exist_ok=True)
+        page_path.write_bytes(b"official prior listing")
+        listing_pages[kind] = {
+            "path": str(page_path),
+            "bytes": page_path.stat().st_size,
+            "sha256": MODULE._sha256_path(page_path),
+        }
+        for day in days:
+            compact = day.strftime("%Y_%m_%d")
+            stem = f"Daily_{compact}" if kind == "futures" else f"OptionsDaily_{compact}"
+            raw_path = root / "raw" / kind / f"{stem}.zip"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(raw_path, "w") as archive:
+                archive.writestr(f"{stem}.csv", b"column_a,column_b\n" + b"1,2\n" * 30)
+            raw_sha = MODULE._sha256_path(raw_path)
+            raw_downloads.append({
+                "kind": kind,
+                "trading_date": day.isoformat(),
+                "path": str(raw_path),
+                "bytes": raw_path.stat().st_size,
+                "sha256": raw_sha,
+            })
+            parquet_path, receipt_path = MODULE._partition_paths(root, kind, day)
+            parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            parquet_path.write_bytes(b"verified partition bytes")
+            receipt = {
+                "parser_contract_version": MODULE.PARSER_CONTRACT_VERSION,
+                "kind": kind,
+                "product": "TX" if kind == "futures" else "TXO",
+                "trading_date": day.isoformat(),
+                "source_path": str(raw_path),
+                "source_sha256": raw_sha,
+                "output_path": str(parquet_path),
+                "output_bytes": parquet_path.stat().st_size,
+                "output_sha256": MODULE._sha256_path(parquet_path),
+            }
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            partitions.append({**receipt, "reused": False})
+    manifest = {
+        "status": "complete",
+        "parser_contract_version": MODULE.PARSER_CONTRACT_VERSION,
+        "requested_days": 2,
+        "date_start": days[0].isoformat(),
+        "date_end": days[-1].isoformat(),
+        "trading_dates": [day.isoformat() for day in days],
+        "raw_downloads": raw_downloads,
+        "partitions": partitions,
+        "listing_pages": listing_pages,
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    ready, reason, digest = MODULE._reuse_previous_complete_window(
+        root, common_dates=days[1:], requested_days=2
+    )
+    assert ready and reason == "verified_previous_30_day_window" and digest
+    assert MODULE._reuse_previous_complete_window(
+        root, common_dates=days, requested_days=2
+    )[0] is False
+    raw_path = Path(str(raw_downloads[0]["path"]))
+    raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+    assert MODULE._reuse_previous_complete_window(
+        root, common_dates=days[1:], requested_days=2
+    )[:2] == (False, "prior_raw_hash_mismatch")
 
 
 def test_options_preserve_side_rows_and_pair_matched_quantity() -> None:

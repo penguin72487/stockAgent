@@ -245,73 +245,39 @@ stockagent-data \
   status --human
 ```
 
-## penguin 冷庫 D 槽備份
+## penguin D 槽單份冷庫
 
-權威冷庫 `/srv/stockagent-packed` 位於 C 槽 WSL 磁碟；獨立副本存放於
-`D:\stockagent-backup\packed`（WSL：`/mnt/d/stockagent-backup/packed`）。
-備份服務監看新物件並自動增量複製，30 秒週期補查漏掉的事件；不解壓、不連動刪除。
-完整操作、還原與驗收見 [冷庫備份 Runbook](docs/packed_cold_backup.md)。
+penguin 的 `/srv/stockagent-packed` 是 `D:\stockagent-cold-primary\packed` 的受保護掛載，
+不是 C 槽副本。這是使用者同意的**單一實體磁碟**設計：Syncthing 的 vastai1T
+副本不能替代獨立異地備份；D 槽故障可能導致資料遺失。release／manifest 只描述
+原子版本，物件按內容雜湊增量去重，不是每版複製一整份資料。
+C 舊冷庫已刪除並在 WSL ext4 內釋出約 419.76 GB；這不保證 Windows C:
+立即增加同量可用空間。現場 `fstrim` 後 Windows C: 仍未觀察到 VHDX 縮減；
+若要縮小 VHDX，需另排可停止 WSL 與其中交易／資料服務的維護窗口，
+不可在服務運行時直接關閉 WSL。詳見遷移驗收文件。
 
 ```bash
-# 日常：查看實際驗證進度；active 不等於首次備份完成
+# 掛載與身分：D 未掛載時必須失敗，禁止退回 C 槽寫入
+sudo systemctl status stockagent-d-cold-mount.service --no-pager
+./scripts/mount_packed_d_cold.sh --check
+findmnt /srv/stockagent-packed /srv/stockagent-d-volume
+
+# 檢查 Syncthing 和實際資料集狀態
+sudo systemctl status syncthing@root.service --no-pager
+stockagent-data status --human
+./scripts/run_packed_snapshot.sh status tw-public --sync-root /srv/stockagent-packed
+
+# 舊 C→D 備份和 C rolling-retention 已退役，勿重新安裝或執行 apply
 ./scripts/run_packed_backup.sh status
-systemctl status stockagent-packed-backup.service --no-pager
-journalctl -u stockagent-packed-backup.service -n 10 --no-pager
-
-# 唯讀盤點，不複製或刪除
-./scripts/run_packed_backup.sh plan
-
-# 首次部署：核對 config、D 槽 UUID／容量後才執行
-./scripts/run_packed_backup.sh init
-./scripts/run_packed_backup.sh install-service
-
-# 暫停／繼續；不會移除已備份資料
-sudo systemctl stop stockagent-packed-backup.service
-sudo systemctl start stockagent-packed-backup.service
-
-# 手動補齊或全量 checksum 複查：先停服務，避免重複工作
-sudo systemctl stop stockagent-packed-backup.service
-./scripts/run_packed_backup.sh once
-# 下列指令重讀 C 現存物件及其 D 副本，可能耗時數小時
-./scripts/run_packed_backup.sh once --verify-existing
-sudo systemctl start stockagent-packed-backup.service
+systemctl is-enabled stockagent-packed-backup.service stockagent-packed-retention.timer
 ```
 
-`state=up_to_date`、`remaining_bytes=0`、`pending_objects=0`、`pending_heads=0`、
-`pending_releases=0`、`error_count=0` 才表示該次盤點全部完成。
-`last_complete_at` 是上次完整完成時間，不代表目前沒有新的待備份資料。
-只有一台主機內兩顆磁碟，仍不能防整機損壞、失竊或勒索軟體；不是離線／異地備份。
-
-### C 槽 rolling-current：避免歷史版本長期重複佔位
-
-「release／manifest」是原子一致性描述，不是每版複製一份資料；實際內容以 SHA-256
-物件去重，來源未變時也不會產生新 release。penguin 的 C 槽只需保存目前 heads、pin／
-使用中的版本及 24 小時安全窗；更舊且不再引用的物件只保留在 D 槽 additive archive。
-這樣新資料仍是即時增量發布與 Syncthing 同步，不把 mutable 來源直接拿去互相覆蓋。
-
-```bash
-# 唯讀：列出精確候選、D checksum 證明、peer 狀態與可回收配置量
-./scripts/run_packed_retention.sh plan
-
-# 查看最近計畫與最近一次實際清理 receipt
-./scripts/run_packed_retention.sh status
-
-# penguin 一次性安裝每日 reconcile timer
-./scripts/run_packed_retention.sh install-service
-systemctl status stockagent-packed-retention.timer --no-pager
-```
-
-`apply` 不是一般的 `rm`：只有現役 vastai1T 與本機全部收斂、D 槽存在且每個候選
-都有未過期 SHA-256 receipt、沒有 conflict、pin、熱快取或程序引用時才會 unlink C 候選；
-先刪歷史 manifest，再刪其已無引用的 objects。D 不刪，current heads 不刪。清理期間會
-短暫停止本機 backup/Syncthing，完成後立即重啟並等待同步刪除收斂。人工執行方式：
-
-```bash
-./scripts/run_packed_retention.sh apply
-```
-
-目前任何 blocker 都會 fail closed；timer 使用 `--defer-if-blocked`，只留下計畫而不刪檔。
-完整架構、恢復與安全門檻見 [packed 冷庫 Runbook](docs/packed_dataset_storage.md)。
+DrvFs 沒有可靠的 inotify。每次通過稽核的原子發布會要求 Syncthing 先掃物件、
+再掃 manifest/head；另有 300 秒週期全量掃描兜底。`active` 或掃描請求成功
+不等於兩端已收斂；仍須查 `needBytes=0`、各類 need 件數為零、錯誤為零、
+vastai1T 100% 與 `remoteState=valid`，再驗證指定 release 的完整物件。
+已退役的備份操作僅供歷史稽核，詳見 [D 槽遷移與驗收](docs/d_cold_store_migration_2026-09-25.md)
+及 [packed 冷庫 Runbook](docs/packed_dataset_storage.md)。
 
 ## 資料冷庫完整指令
 
@@ -580,9 +546,9 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 penguin 的官方 TW 驗收 service 使用同一原則：主工作成功後才由 `ExecStartPost` 發布
 `tw-public`。若 receipt 的 `end_date` 比冷庫現有版本舊，即使本機 HLC 較新仍拒絕發布。
 
-不要手動刪 cold objects。penguin 已有 D-backed rolling retention；它只會處理 D 已驗證、
-不被 current／pin／lease／安全窗引用且全 fleet 已收斂的候選。其他節點及 D archive
-仍不得自行做 cold GC。熱快取 GC 與這個冷庫 retention 是兩套不同生命週期。
+不要手動刪 cold objects。舊 C rolling retention 已退役；目前沒有核准的 D
+冷庫自動 GC。需要 D 孤兒／歷史保留政策時，須先做引用圖、完整性與 peer
+稽核，不能直接套用舊的 C→D 刪除計畫。熱快取 GC 是另一套生命週期。
 
 ## Syncthing 驗收
 
@@ -596,6 +562,13 @@ errors             = 0
 pullErrors         = 0
 remoteState        = valid
 ```
+
+這些值不能只在 penguin 查：peer 自己的 folder `errors`、`pullErrors`、
+`watchError`、system errors 也必須為零。vastai1T 是 index-only edge，
+100% 指 metadata 已收斂，不代表它有本機 pack/blob payload；需要使用資料時
+仍須按指定 release hydrate/verify。2026-09-25 遷移時曾因其 supervisor 使用者
+無法對 root-owned metadata `chmod` 產生 482 筆 pull errors，已將該 folder
+設為 `ignorePerms=true`；詳見 [D 槽遷移稽核](docs/d_cold_store_migration_2026-09-25.md)。
 
 連線層另看實際 transport，而不是只看設定：
 
@@ -661,10 +634,10 @@ run_fintech_python scripts/manage_cold_artifacts.py rebuild-ignore
 
 penguin 的 `artifacts` 與 hot transport 已以 hard link 共用大部分實體檔案；刪掉其中
 一個路徑不會回收那份內容。舊 bridge 已停用；完整 run 若要轉成冷儲存，
-必須使用下列兩階段流程；只接受 `maximum_file_bytes: null` 的完整 release，會驗證 C
-冷庫、D 備份、本機 Syncthing 健康、`artifact_retirement.json` 指定的 peer、
+必須使用下列兩階段流程；只接受 `maximum_file_bytes: null` 的完整 release，會驗證 D
+主冷庫、本機 Syncthing 健康、`artifact_retirement.json` 指定的 peer、
 兩個熱路徑、pin、程序引用和七日租期。penguin 的 hot 退役不要求已退役的 lab203；
-另一套 C 冷物件保留規則只要求現役 vastai1T 收斂。唯讀計畫
+已退役的 C 冷物件保留規則不可再執行。唯讀計畫
 提供穩定 fingerprint；未通過任何 gate 就不能套用。
 
 `artifacts/cache` 不是完成產物；panel、tape 與 dashboard cache 在各節點本地
@@ -695,6 +668,40 @@ run_fintech_python scripts/manage_cold_artifacts.py retire ARTIFACT_DATASET \
 # 這次只登錄七日租期，不刪檔；七日後重新產生計畫並取得新 fingerprint。
 ```
 
+不符合完整訓練生命週期的舊 `artifacts/markets` 資料，不能偽裝成可部署
+checkpoint。唯一例外是登錄於 `configs/data_sync/legacy_artifact_archives.json`
+的「僅保全位元組」封存：大型 CSV 逐檔壓縮、其餘逐檔保留，原始與編碼後
+SHA-256 均記錄。它同步的是 D 主冷庫的不可變 release；不再有 C→D 獨立
+備份服務。D 槽的 `stockagent-legacy-archive-stage` 是可續跑的工作暫存，
+在熱資料退役前不可清除，因為退役還要逐檔比對原始與壓縮內容。
+查詢與恢復指令如下；`restore` 只寫新的目標路徑，不覆蓋服務目錄：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/manage_legacy_artifact_archives.py plan legacy-artifact-markets-crypto
+run_fintech_python scripts/manage_legacy_artifact_archives.py prepare legacy-artifact-markets-crypto
+run_fintech_python scripts/manage_legacy_artifact_archives.py publish legacy-artifact-markets-crypto
+run_fintech_python scripts/manage_legacy_artifact_archives.py verify legacy-artifact-markets-crypto
+run_fintech_python scripts/manage_legacy_artifact_archives.py restore legacy-artifact-markets-crypto \
+  --destination /srv/stockagent-legacy-restore/crypto
+run_fintech_python scripts/manage_legacy_artifact_archives.py retire-plan legacy-artifact-markets-crypto
+# 僅在完整檢查後，使用 retire-plan 回傳的 plan_fingerprint：
+run_fintech_python scripts/manage_legacy_artifact_archives.py retire-apply legacy-artifact-markets-crypto \
+  --plan-fingerprint PLAN_FINGERPRINT
+# 執行時間短於定期程序掃描的人工工作，先明確延長七日使用租期：
+run_fintech_python scripts/manage_legacy_artifact_archives.py renew legacy-artifact-markets-crypto
+```
+
+第一次 `retire-apply` 只開始七日租期，不刪資料。到期後仍須重新取得計畫
+並確認無服務／程序引用、D 主冷庫完整、Syncthing 及現役 peer 收斂，才會一起
+退役 repository 與舊 hot bridge 的兩個名稱。`legacy-artifact-markets-us` 的
+Discord 市場目前已停用，但仍不得跳過完整封存、空間預算及七日退役門檻。
+舊封存始終標示
+`deployable=false`，恢復的檔案也不能直接當已驗證訓練結果部署。penguin 的
+`stockagent-enrolled-artifact-retirement.timer` 僅對
+`artifact_retirement.json` 內已登錄的 legacy dataset 定期重查；不會自行開始
+租期，任何檢查未通過都不會刪除。
+
 實際退役時使用包裝指令；舊 hot bridge 若已停用，指令不會啟動它：
 
 ```bash
@@ -703,9 +710,21 @@ sudo bash scripts/run_cold_artifact_retirement.sh ARTIFACT_DATASET PLAN_FINGERPR
 ```
 
 指令會把這一個 run 的工作路徑及傳輸路徑一起轉為 cold-only，不刪 packed
-release 或 D 備份。若驗證失敗或中斷，會保留 quarantine 並拒絕下一次退役，不可手動
+release 或 D 主冷庫。若驗證失敗或中斷，會保留 quarantine 並拒絕下一次退役，不可手動
 清空。解除 lab203 配對不會刪除其本機資料；penguin 不再依賴該機的 hot 副本。
 當前仍有服務使用的策略要保留 pin，不能只看七日到期。
+
+penguin 上已登錄、且列在 `configs/data_sync/artifact_retirement.json` 的
+`scheduled_datasets` 的完整 run，可由每日排程到期後再次執行相同的 D 主庫雜湊、
+來源/舊 hot mirror、程序引用、pin、Syncthing 與計畫指紋檢查。排程不會自動登錄新 run，
+也不會把未通過的訓練輸出誤認為冷庫完成資料：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/retire_enrolled_artifacts.py  # 唯讀計畫
+sudo bash scripts/install_enrolled_artifact_retirement.sh
+systemctl list-timers stockagent-enrolled-artifact-retirement.timer
+```
 
 退役後按需還原並取得七日熱快取租期；既有每五分鐘的 `stockagent-data-cache-gc.timer`
 會在確定無引用、無 pin、冷庫完整後移除熱快取與受管理 symlink：
@@ -814,6 +833,14 @@ Edge hot cache 的 TTL 上限為七天；仍在使用會自動續租，刻意長
 
 ## Windows 與 WSL 暫存清理
 
+若 Windows 顯示 `vmmemWSL` 佔用高，先看
+`/usr/bin/python3 scripts/reclaim_wsl_backfill_memory.py` 的唯讀報告與
+`free -h` 的 `available`；不要把 Linux 檔案快取全算成不可回收記憶體。
+註冊的歷史回補若留下大量 `LazyFree`，
+`stockagent-wsl-backfill-memory-reclaim.timer` 會在 Windows 可用 RAM
+低於 32 GiB 時，只對該回補 cgroup 定量回收。詳細量測與保護界線見
+`docs/shared_host_resource_optimization_2026-09-20.md`。
+
 `%LOCALAPPDATA%\Temp` 是 Windows 每位使用者的暫存區，可能同時包含安裝程式、瀏覽器、
 VS Code、診斷工具與 WSL VM 正在使用的檔案，禁止整個目錄遞迴刪除。WSL 異常重啟有時會
 留下 `<GUID>\swap.vhdx`；只有已不屬於任何 `wslhost.exe --vm-id`、超過最短保留時間、
@@ -898,6 +925,12 @@ run_fintech_python scripts/build_tw_public_training_features.py \
 `run_fintech_python scripts/audit_symbol_history_coverage.py` 重建清冊，
 並用 `run_fintech_python scripts/reconcile_tw_public_training_features.py --dry-run`
 檢查訓練特徵是否落後於官方來源；正式對帳省略 `--dry-run`。
+[FinLab 歷史補充來源設定與免費範圍盤點](docs/finlab_history_setup_2026-09-23.md)
+整理官方台股主表之外的候選舊史；原始帳號資料仍只留本機，私人非商業研究的合併特徵須待全目錄最近 24 小時強制來源查詢及 SHA-256 驗證完成才打包新版，不能當成嚴格 PIT 或正式模型。沿用永豐資訊架構的[FinLab 面板](https://penguin72487.ddnsgeek.com/finlab/)顯示帳號額度、逐鍵實測估時、全目錄守門、儲存及分發驗證；樣本不足或受共用配額影響時不虛構完工倒數。
+
+[FinMind 免費歷史下載與排程](docs/finmind_free_history.md)涵蓋 52 類官方 Free／Free(w/ data_id) 非新聞資料集：原本 4 類盤中／日曆／主檔，加上 48 類台股、期選、總經、海外股票來源。新聞依目前要求停用；原始資料與 FinLab 分開留本機，不自動當成 PIT 訓練特徵。逐檔尚未清點的代號及空回不冒充完整歷史。
+
+FinMind 獨立追蹤頁：`/finmind/`。顯示逐資料集進度、最早／最新資料、筆數、容量、官方每小時上限與本站兩支下載器的滾動請求用量；用量不代表帳號其他程式的請求。
 台股多基底的原始 OHLCV／官方成交原值輸入另見
 [獨立 raw-input 實驗](docs/tw_raw_feature_input.md)；既有模型與 checkpoint 不會自動切換。
 官方資料與 ToAlpha 的分工、新增基金/ETF 開放資料、單次 MCP 查詢及歷史版本驗收見
@@ -954,6 +987,8 @@ systemctl list-timers 'stockagent-tw-public-release-archives.timer'
 
 期交所年度免費歷史在本機另有 2014 年 TX 日盤合約、TX 月契約最後結算價與臺指選擇權 Put/Call 比；`run_fintech_python scripts/build_tw_public_research_taifex.py` 會把 10 個原值依來源盤後、下一交易日可用的規則接到獨立本機 v2 表。使用 `configs/markets/tw_public_preopen_wide_research_taifex_2014_v2.yaml` 預檢或研究訓練，欄位與仍未補齊的付費／授權缺口見[免費來源稽核](docs/tw_free_feature_download_training_audit_2026-09-19.md)。
 
+若研究要把**所有本機已觀測的去重特徵**納入同一個台股日資料 ABI，先依序更新正式表、寬研究表與期交所 v2 表，再執行 `run_fintech_python scripts/build_tw_public_research_all_features.py`。v3 以研究表為主，從原值重算 15 個早期衍生欄，並補入正式表獨有欄及同鍵研究空值；輸入未變則重用雜湊驗證的成品。`run_fintech_python scripts/report_tw_public_research_all_features.py` 會更新[全部去重特徵與 2014 覆蓋](docs/tw_stock_all_observed_training_features_2014_v3.md)，訓練前以 `run_fintech_python train.py --config configs/markets/tw_public_preopen_all_observed_research_2014_v3.yaml --check-data-only` 預檢。每日來源 reconcile 已接入 v3 重建；此表只供接受現修值、推估公告日與晚起始欄的研究實驗，不代表嚴格歷史 PIT 或可執行成交。
+
 ### Yahoo、外匯與加密市場
 
 ```bash
@@ -978,6 +1013,16 @@ Bybit 日頻策略固定每日 00:00 UTC 決策／零延遲研究執行，可跨
 `artifacts/markets/bybit_perpetual_daily_0000_trajectory_v1`。
 帳本修正、績效診斷與使用者自行執行的命令見
 [Bybit 日頻策略](docs/bybit_perpetual_daily_strategy.md#績效診斷與待驗證修正)。
+
+另有獨立的 00:05 UTC **Bybit 單交易所**歷史訓練研究配置
+`configs/markets/bybit_perpetual_daily_0005_historical_pit_v1.yaml`；
+OKX、Binance 各有獨立 1m 價量研究配置
+`configs/markets/okx_1m_venue_only_v1.yaml`、
+`configs/markets/binance_1m_venue_only_v1.yaml`。新配置不會讀取其他交易所或
+共用公開特徵；逐交易所 feature、來源首末日、缺口與訓練限制見
+[加密貨幣訓練資料盤點](docs/crypto_training_dataset_2026-09-20.md)。
+原始 1m、funding、可訓練日表及公開特徵有不同完成狀態，勿以 1m
+下載摘要的日期代替日表完成日期。
 
 ### 一分鐘與衍生品資料
 
@@ -1282,6 +1327,7 @@ run_fintech_python scripts/audit_tw_emerging_stock_admission.py --strict
 | 訓練架構 | [training_spec.md](docs/training_spec.md) | 訓練、評估、artifact 驗收 |
 | 公開面板 | [public_dashboards_architecture.md](docs/public_dashboards_architecture.md) | 唯讀資料流、快取、前端競態、安全與上線驗收 |
 | 網站 review／重測速 | [WEB_PROJECT_REVIEW_2026-09-12.md](docs/WEB_PROJECT_REVIEW_2026-09-12.md) | 八頁驗收、HTTP／瀏覽器／SSE 測速、原始樣本與未解限制 |
+| 跨服務延遲／持續測速 | [services_latency_2026-09-23.md](docs/services_latency_2026-09-23.md) | 清冊共用、監控 I/O 並行、systemd 資源與分階段 journal、固定輸入 A/B |
 | packed 冷庫 | [packed_dataset_storage.md](docs/packed_dataset_storage.md) | pack/blob、manifest、lease 與 smoke 證據 |
 | 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
 | artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |

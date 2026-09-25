@@ -48,6 +48,7 @@ from stockagent.data.tw_day_trade_execution import (
     DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
     DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION,
 )
+from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.models.factory import _feature_indices_from_patterns
@@ -220,6 +221,12 @@ def _project_temporal_basis_model_config(
         projected.pop("causal_feature_rms_normalization", None)
         projected.pop("causal_feature_min_active_dates", None)
         projected.pop("causal_feature_scale_epsilon", None)
+    if str(projected.get("causal_feature_compression", "none")) == "none":
+        # A disabled compression is the exact historical feature path.
+        projected.pop("causal_feature_compression", None)
+        projected.pop("causal_feature_compression_patterns", None)
+    if not bool(projected.get("causal_feature_window_rms_normalization", False)):
+        projected.pop("causal_feature_window_rms_normalization", None)
     for field_name in (
         "futures_denomination_aware_output",
         "futures_current_open_feature",
@@ -1638,6 +1645,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         if (
             execution_mode == "tw_day_trade"
             and config.data.day_trade_minute_execution_root is not None
+        ):
+            contract["taiwan_execution"]["regular_market_admission"] = (
+                regular_market_admission_contract()
+            )
+        if (
+            execution_mode == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
             and config.data.day_trade_minute_execution_policy
             == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
         ):
@@ -2326,6 +2340,11 @@ def _checkpoint_manifest(
         "feature_include": list(config.data.feature_include),
         "feature_exclude": list(config.data.feature_exclude),
     }
+    if config.data.crypto_exchange_scope:
+        # Opt-in only: pin venue identity without changing legacy fingerprints.
+        preprocessing_contract["crypto_exchange_scope"] = str(
+            config.data.crypto_exchange_scope
+        )
     if not bool(config.data.day_trade_minute_execution_allow_daily_proxy):
         # True is the historical hybrid-loader behavior and remains omitted for
         # checkpoint compatibility.  Strict no-proxy mode changes the label

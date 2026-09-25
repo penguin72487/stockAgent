@@ -1,0 +1,13 @@
+# Keep the v3 data, architecture, exact FIFO execution, and power-of-two
+# compute shapes. The 428-channel train panel occupies 14.72 GiB per GPU when
+# cached in FP32, leaving too little room for variable FIFO cohort workspaces
+# and compiled graph specializations on 32 GiB cards.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_pow2_v3.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-v4
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_v4
+
+training:
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
@@ -105,15 +107,36 @@ _LATEST_SESSION_BLOCK_CACHE: dict[
 ] = {}
 _LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
-    tuple[int, int, int, int], list[dict[str, Any]]
+    tuple[int, int, int, int, int], list[dict[str, Any]]
 ] = {}
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
+_SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ENTRIES: Final[int] = 256
+_SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ITEM_BYTES: Final[int] = 256 * 1024
 _AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = {}
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
 _OBJECT_CACHE: dict[Path, tuple[tuple[int, ...], bytes, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
-_SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+@dataclass(slots=True)
+class _SignalPageCacheEntry:
+    payload: dict[str, Any]
+    source_rows: tuple[dict[str, Any], ...]
+    overlay_signature: str
+    feature_checked_at: float
+
+
+_SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], _SignalPageCacheEntry] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
+_SIGNAL_RANGE_SUMMARY_CACHE: dict[
+    tuple[Any, ...],
+    tuple[dict[str, dict[str, float | int]], dict[str, dict[str, Any]]],
+] = {}
+_SIGNAL_RANGE_SUMMARY_CACHE_LOCK = threading.Lock()
+_SIGNAL_RANGE_SUMMARY_CACHE_MAX_ENTRIES: Final[int] = 16
+_SIGNAL_FEATURE_PAGE_CHECK_INTERVAL_SECONDS: Final[float] = 1.0
+_SIGNAL_LEDGER_FRAME_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+_SIGNAL_LEDGER_FRAME_CACHE_LOCK = threading.Lock()
+_EVENT_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_EVENT_PAGE_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
@@ -126,6 +149,8 @@ _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
 _COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
 _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
 _COLUMNAR_LEDGER_WRITE_BUFFER_BYTES: Final[int] = 8 * 1024 * 1024
+_DETAIL_SESSION_PROJECTION_VERSION: Final[int] = 1
+_DETAIL_SESSION_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024 * 1024
 _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "action": "string",
     "ask": "float",
@@ -155,6 +180,7 @@ _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "side": "string",
     "signal_at": "string",
     "signal_id": "string",
+    "signal_source_path": "string",
     "simtrade": "bool",
     "simulation_replay": "bool",
     "sizing_capital_twd": "float",
@@ -165,6 +191,7 @@ _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "status": "string",
     "symbol": "string",
     "target_weight": "float",
+    "target_unsubmitted_shares": "int",
     "temporary_day_trade_model_adapter": "bool",
     "top_book_capacity_shares": "int",
     "upper_limit": "float",
@@ -412,11 +439,12 @@ class _PositionHistoryIndex:
     source_signature: tuple[tuple[str, int, int, int, int], ...]
     sources: tuple[Path, ...]
     entries: tuple[_PositionHistoryEntry, ...]
+    per_source_entries: tuple[tuple[_PositionHistoryEntry, ...], ...]
 
 
 _POSITION_HISTORY_INDEX_CACHE: dict[Path, _PositionHistoryIndex] = {}
 _POSITION_HISTORY_INDEX_LOCK = threading.Lock()
-_POSITION_HISTORY_INDEX_SCHEMA_VERSION: Final[int] = 1
+_POSITION_HISTORY_INDEX_SCHEMA_VERSION: Final[int] = 2
 
 
 @lru_cache(maxsize=32)
@@ -532,7 +560,8 @@ def build_dashboard_revision(
     bot_markets = sorted(
         str(item) for item in (bot or {}).get(discord_markets_field) or ()
     )
-    engine_age = age_seconds(engine.get("published_at"), now=observed)
+    engine_liveness_at = engine.get("heartbeat_at") or engine.get("published_at")
+    engine_age = age_seconds(engine_liveness_at, now=observed)
     bot_age = age_seconds((bot or {}).get("updated_at"), now=observed)
     bot_fresh = bot_age is not None and bot_age <= 5.0
     bot_connected = bool((bot or {}).get("discord_connected", False))
@@ -586,6 +615,7 @@ def build_dashboard_revision(
         "state_revision": engine_revision,
         "content_revision": content_revision,
         "engine_published_at": engine.get("published_at"),
+        "engine_heartbeat_at": engine_liveness_at,
         "engine_age_seconds": (
             round(engine_age, 3) if engine_age is not None else None
         ),
@@ -721,12 +751,16 @@ def _as_path(path: Path, value: Any) -> Path | None:
 
 
 def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
-    signature = summary_path.stat()
+    try:
+        signature = summary_path.stat()
+    except OSError:
+        return []
     cache_key = (
         signature.st_dev,
         signature.st_ino,
         signature.st_size,
         signature.st_mtime_ns,
+        signature.st_ctime_ns,
     )
     with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
         cached = _SIGNAL_FEATURE_SUMMARY_CACHE.get(cache_key)
@@ -772,8 +806,19 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
             # Keep legacy fallback behavior for compatibility with older summaries.
             driver["weighted_abs_value"] = 0.0
         drivers.append(driver)
+    cacheable = (
+        signature.st_size < 64 * 1024 * 1024
+        and len(json.dumps(drivers, separators=(",", ":")).encode("utf-8"))
+        <= _SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ITEM_BYTES
+    )
     with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
-        if signature.st_size < 64 * 1024 * 1024:
+        if cacheable:
+            if len(_SIGNAL_FEATURE_SUMMARY_CACHE) >= (
+                _SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ENTRIES
+            ):
+                _SIGNAL_FEATURE_SUMMARY_CACHE.pop(
+                    next(iter(_SIGNAL_FEATURE_SUMMARY_CACHE))
+                )
             _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = list(drivers)
     return drivers
 
@@ -856,6 +901,95 @@ def _lookup_signal_feature_drivers(
                     output.setdefault(row_key, record)
                 break
     return output
+
+
+def _signal_position_overlays(
+    state: Mapping[str, Any],
+) -> tuple[dict[tuple[str, str, str, str], Mapping[str, Any]], str]:
+    """Fingerprint only position fields used to amend a cached signal page."""
+
+    overlays: dict[tuple[str, str, str, str], Mapping[str, Any]] = {}
+    for raw_mode in (state.get("modes") or {}).values():
+        if not isinstance(raw_mode, Mapping):
+            continue
+        for position in (raw_mode.get("positions") or {}).values():
+            if not isinstance(position, Mapping):
+                continue
+            identity = (
+                str(position.get("session_date") or "")[:10],
+                str(position.get("market") or raw_mode.get("market") or ""),
+                str(position.get("symbol") or ""),
+                str(position.get("signal_id") or ""),
+            )
+            overlays[identity] = position
+    if not overlays:
+        return overlays, ""
+    material = []
+    for identity, position in sorted(overlays.items()):
+        completion = position.get("manual_entry_completion")
+        if not isinstance(completion, Mapping):
+            completion = {}
+        material.append((
+            identity,
+            str(position.get("filled_shares")),
+            str(position.get("requested_shares")),
+            str(position.get("entry_price")),
+            str(completion.get("contract")),
+            str(completion.get("recorded_at")),
+            str(completion.get("broker_fill")),
+        ))
+    encoded = json.dumps(material, separators=(",", ":")).encode("utf-8")
+    return overlays, hashlib.sha256(encoded).hexdigest()
+
+
+def _overlay_signal_page_rows(
+    source_rows: list[Mapping[str, Any]],
+    overlays: Mapping[tuple[str, str, str, str], Mapping[str, Any]],
+    futures_catalog: Any,
+) -> list[dict[str, Any]]:
+    page: list[dict[str, Any]] = []
+    for source_row in source_rows:
+        row = dict(source_row)
+        overlay = overlays.get((
+            str(row.get("session_date") or "")[:10],
+            str(row.get("market") or ""),
+            str(row.get("symbol") or ""),
+            str(row.get("signal_id") or ""),
+        ))
+        if isinstance(overlay, Mapping):
+            current_filled = int(overlay.get("filled_shares") or 0)
+            ledger_filled = int(row.get("filled_shares") or 0)
+            if current_filled > ledger_filled:
+                row["initial_filled_shares"] = ledger_filled
+                row["filled_shares"] = current_filled
+                row["requested_shares"] = int(
+                    overlay.get("requested_shares") or row.get("requested_shares") or 0
+                )
+                row["target_unsubmitted_shares"] = max(
+                    0, int(row["requested_shares"]) - current_filled
+                )
+                row["execution_price"] = overlay.get("entry_price")
+                row["status"] = (
+                    "ready" if int(row["target_unsubmitted_shares"]) == 0
+                    else "partial_depth"
+                )
+                row["reason"] = "paper_entry_completed_after_initial_execution"
+                completion = overlay.get("manual_entry_completion")
+                if isinstance(completion, Mapping):
+                    row["entry_completion_contract"] = completion.get("contract")
+                    row["entry_completion_recorded_at"] = completion.get("recorded_at")
+                    row["entry_completion_broker_fill"] = bool(
+                        completion.get("broker_fill")
+                    )
+        row["stock_futures"] = futures_catalog.membership(
+            str(row.get("symbol") or "")
+        )
+        if bool(row.get("counterfactual_open_replay")):
+            row["open_reconstructed_at"] = row.get("open_reconstructed_at") or row.get(
+                "signal_at"
+            )
+        page.append(row)
+    return page
 
 
 def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
@@ -1276,6 +1410,7 @@ def _columnar_ledger_frame(
     selected_spans: list[tuple[int, int, str]],
     maximum_rows: int | None,
     projected_schema: Mapping[str, str] | None = None,
+    minimum_bytes: int | None = None,
 ) -> tuple[Any, Any] | None:
     """Decode sufficiently large indexed NDJSON spans into a columnar frame.
 
@@ -1290,7 +1425,9 @@ def _columnar_ledger_frame(
     """
 
     total_bytes = sum(end - start for start, end, _ in selected_spans)
-    if total_bytes < _COLUMNAR_LEDGER_MIN_BYTES:
+    if total_bytes < (
+        _COLUMNAR_LEDGER_MIN_BYTES if minimum_bytes is None else minimum_bytes
+    ):
         return None
     needs_bounded_tail = total_bytes > _COLUMNAR_LEDGER_MAX_BYTES
     if needs_bounded_tail and maximum_rows is None:
@@ -1381,6 +1518,125 @@ def _columnar_ledger_frame(
     if maximum_rows is not None and frame.height > maximum_rows:
         frame = frame.tail(maximum_rows)
     return pl, frame
+
+
+def _detail_session_projection_root(
+    source: Path, projected_schema: Mapping[str, str]
+) -> Path | None:
+    cache_name = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    if not cache_name or not Path(cache_name).is_dir():
+        return None
+    contract = json.dumps(
+        [str(source.resolve()), sorted(projected_schema.items())],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(contract).hexdigest()
+    return Path(cache_name) / f"detail-session-projection-v1-{digest}"
+
+
+def _projected_ledger_session_frame(
+    source: Path,
+    *,
+    index: _LedgerSessionIndex,
+    session_date: str,
+    projected_schema: Mapping[str, str],
+) -> Any | None:
+    """Load one exact ledger session, rebuilding only that derived projection.
+
+    The append-only ledger and its validated byte-span index remain authority.
+    A same-size rewrite invalidates the cache; later appends to other sessions
+    do not. Cached Parquet is private, atomic, and checked before every read.
+    """
+
+    spans = index.spans.get(session_date)
+    if not spans:
+        return None
+    root = _detail_session_projection_root(source, projected_schema)
+    if root is None:
+        return None
+    try:
+        stat = source.stat()
+    except OSError:
+        return None
+    if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != (
+        index.device, index.inode, index.observed_size, index.modified_ns
+    ):
+        return None
+    try:
+        import polars as pl
+    except ImportError:
+        return None
+    receipt_path = root / f"{session_date}.json"
+    parquet_path = root / f"{session_date}.parquet"
+    selected_spans = [list(span) for span in spans]
+    try:
+        receipt = json.loads(receipt_path.read_bytes())
+        if (
+            isinstance(receipt, Mapping)
+            and receipt.get("schema_version") == _DETAIL_SESSION_PROJECTION_VERSION
+            and receipt.get("source") == str(source.resolve())
+            and receipt.get("source_identity") == [index.device, index.inode]
+            and receipt.get("spans") == selected_spans
+            and isinstance(receipt.get("source_observed_size"), int)
+            and (
+                stat.st_size > receipt["source_observed_size"]
+                or (
+                    stat.st_size == receipt["source_observed_size"]
+                    and stat.st_mtime_ns == receipt.get("source_modified_ns")
+                )
+            )
+            and 0 < parquet_path.stat().st_size <= _DETAIL_SESSION_PROJECTION_MAX_BYTES
+        ):
+            encoded = parquet_path.read_bytes()
+            if hashlib.sha256(encoded).hexdigest() == receipt.get("parquet_sha256"):
+                frame = pl.read_parquet(io.BytesIO(encoded))
+                if frame.height == receipt.get("rows"):
+                    return frame
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, pl.exceptions.PolarsError):
+        pass
+    columnar = _columnar_ledger_frame(
+        source,
+        selected_spans=[(start, end, session_date) for start, end in spans],
+        maximum_rows=None,
+        projected_schema=projected_schema,
+        minimum_bytes=0,
+    )
+    if columnar is None:
+        return None
+    frame = columnar[1]
+    try:
+        updated = _ledger_session_index(source, recorded_at_fallback=False)
+        if (
+            updated is None
+            or (updated.device, updated.inode) != (index.device, index.inode)
+            or updated.spans.get(session_date) != spans
+        ):
+            return None
+        buffer = io.BytesIO()
+        frame.write_parquet(buffer, compression="zstd")
+        encoded = buffer.getvalue()
+        if not 0 < len(encoded) <= _DETAIL_SESSION_PROJECTION_MAX_BYTES:
+            return frame
+        _atomic_private_bytes(parquet_path, encoded)
+        receipt = {
+            "schema_version": _DETAIL_SESSION_PROJECTION_VERSION,
+            "source": str(source.resolve()),
+            "source_identity": [index.device, index.inode],
+            "source_observed_size": index.observed_size,
+            "source_modified_ns": index.modified_ns,
+            "spans": selected_spans,
+            "parquet_sha256": hashlib.sha256(encoded).hexdigest(),
+            "rows": frame.height,
+        }
+        _atomic_private_bytes(
+            receipt_path,
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+    except (OSError, TypeError, ValueError):
+        # Cache publication failure cannot invalidate a successfully decoded
+        # authoritative ledger session.
+        pass
+    return frame
 
 
 @contextmanager
@@ -3736,6 +3992,10 @@ def _attach_execution_records(
     outcome_counts: dict[str, int] = {}
     for mode in modes:
         market = str(mode.get("market") or "")
+        current_live_mode = bool(
+            selected_date == local.date().isoformat()
+            and str(mode.get("session_date") or "") == selected_date
+        )
         event = latest_by_market.get(market)
         if (
             str((event or {}).get("event") or "") == "signal_blocked"
@@ -3745,6 +4005,15 @@ def _attach_execution_records(
         ):
             event = latest_registered_by_market[market]
         event_name = str((event or {}).get("event") or "")
+        live_registered_mode = bool(
+            current_live_mode
+            and event_name == "signal_registered"
+            and str(mode.get("signal_id") or "")
+            == str((event or {}).get("signal_id") or "")
+            and _is_taipei_session_date(
+                mode.get("entry_completed_at"), selected_date
+            )
+        )
         reason = (event or {}).get("reason")
         recorded_at = (event or {}).get("recorded_at")
         if event_name == "signal_registered":
@@ -3777,7 +4046,9 @@ def _attach_execution_records(
         event_counts = (event or {}).get("counts")
         event_counts = dict(event_counts) if isinstance(event_counts, Mapping) else {}
         fill_count = int(
-            (event or {}).get("entry_fill_count")
+            mode.get("entry_fill_count")
+            if live_registered_mode and mode.get("entry_fill_count") is not None
+            else (event or {}).get("entry_fill_count")
             or mode.get("entry_fill_count")
             or sum(
                 int(event_counts.get(key) or 0)
@@ -3788,19 +4059,30 @@ def _attach_execution_records(
                 )
             )
         )
-        event_requested = (event or {}).get("entry_requested_shares")
+        event_requested = (
+            None
+            if live_registered_mode
+            else (event or {}).get("entry_requested_shares")
+        )
         requested = int(
             mode.get("entry_requested_shares") or 0
             if event_requested is None
             else event_requested
         )
-        event_unfilled = (event or {}).get("entry_unfilled_shares")
+        event_unfilled = (
+            None if live_registered_mode else (event or {}).get("entry_unfilled_shares")
+        )
         unfilled = int(
             mode.get("entry_unfilled_shares") or 0
             if event_unfilled is None
             else event_unfilled
         )
-        outcome = str((event or {}).get("entry_fill_outcome") or "")
+        outcome_source = (
+            mode.get("entry_fill_outcome")
+            if live_registered_mode
+            else (event or {}).get("entry_fill_outcome")
+        )
+        outcome = str(outcome_source or "")
         if outcome == "no_fill" and requested == 0 and fill_count == 0:
             outcome = "no_order"
         if not outcome:
@@ -3830,6 +4112,12 @@ def _attach_execution_records(
                 "entry_fill_is_synthetic",
                 "reason_counts",
             ):
+                if live_registered_mode and key != "reason_counts":
+                    # The immutable registration event is the initial opening
+                    # snapshot. Retry fills and terminal rejections evolve in
+                    # state; replacing them here made the web page show zero
+                    # fills even after durable orders/fills had committed.
+                    continue
                 if event.get(key) is not None:
                     target = "signal_reason_counts" if key == "reason_counts" else key
                     mode[target] = event.get(key)
@@ -6001,12 +6289,14 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "side",
         "target_weight",
         "requested_shares",
+        "target_unsubmitted_shares",
         "filled_shares",
         "signed_shares",
         "lot_size",
         "entry_at",
         "entry_quote_at",
         "entry_price",
+        "entry_price_source",
         "inventory_basis_price",
         "odd_lot_execution_policy",
         "share_replacement_contract",
@@ -6058,6 +6348,7 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "margin_converted_at",
         "margin_exception_evidence",
         "manual_close_settlement",
+        "manual_entry_completion",
         "mandatory_exit_pending",
         "stop_triggered_at",
         "exit_quote_status",
@@ -6067,6 +6358,11 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "inventory_session_date",
     )
     row = {key: position.get(key) for key in allowed if key in position}
+    completion = position.get("manual_entry_completion")
+    if isinstance(completion, Mapping):
+        row["entry_completion_contract"] = completion.get("contract")
+        row["entry_completion_recorded_at"] = completion.get("recorded_at")
+        row["entry_completion_broker_fill"] = bool(completion.get("broker_fill"))
     if bool(position.get("counterfactual_open_replay")):
         row["open_reconstructed_at"] = (
             position.get("open_reconstructed_at")
@@ -6133,6 +6429,7 @@ def _persistent_position_history_index_path(root: Path) -> Path | None:
 def _position_history_source_signature(
     root: Path,
 ) -> tuple[tuple[Path, tuple[str, int, int, int, int]], ...]:
+    prefix = str(root) + os.sep
     sources = sorted(
         path
         for directory in ("position_history", OVERNIGHT_POSITION_HISTORY_DIRNAME)
@@ -6140,12 +6437,15 @@ def _position_history_source_signature(
     )
     output: list[tuple[Path, tuple[str, int, int, int, int]]] = []
     for path in sources:
+        absolute = str(path)
+        if not absolute.startswith(prefix):
+            raise OSError(f"position history source escaped root: {path}")
         stat = path.stat()
         output.append(
             (
                 path,
                 (
-                    str(path.relative_to(root)),
+                    absolute[len(prefix):],
                     stat.st_dev,
                     stat.st_ino,
                     stat.st_size,
@@ -6174,24 +6474,34 @@ def _position_history_index(root: Path) -> _PositionHistoryIndex:
             return cached
 
         cache_path = _persistent_position_history_index_path(resolved_root)
-        if cache_path is not None and cache_path.is_file():
+        reusable: _PositionHistoryIndex | None = cached
+        if reusable is None and cache_path is not None and cache_path.is_file():
             try:
                 payload = json.loads(gzip.decompress(cache_path.read_bytes()))
                 if (
-                    isinstance(payload, Mapping)
-                    and int(payload.get("schema_version") or 0)
-                    == _POSITION_HISTORY_INDEX_SCHEMA_VERSION
-                    and str(payload.get("root") or "") == str(resolved_root)
-                    and tuple(tuple(item) for item in payload.get("source_signature") or ())
-                    == signature
+                    not isinstance(payload, Mapping)
+                    or int(payload.get("schema_version") or 0)
+                    != _POSITION_HISTORY_INDEX_SCHEMA_VERSION
+                    or str(payload.get("root") or "") != str(resolved_root)
                 ):
-                    expected_sources = tuple(item[0] for item in inventory)
-                    if tuple(payload.get("sources") or ()) != tuple(
-                        str(path.relative_to(resolved_root)) for path in expected_sources
-                    ):
-                        raise ValueError("position history source list mismatch")
-                    sources = expected_sources
-                    entries = tuple(
+                    raise ValueError("position history index contract mismatch")
+                prior_signature = tuple(
+                    tuple(item) for item in (payload.get("source_signature") or ())
+                )
+                prior_sources = tuple(payload.get("sources") or ())
+                prior_groups = payload.get("per_source_entries") or ()
+                if (
+                    len(prior_signature) != len(prior_sources)
+                    or len(prior_sources) != len(prior_groups)
+                    or any(
+                        str(prior_signature[index][0]) != prior_sources[index]
+                        for index in range(len(prior_sources))
+                    )
+                ):
+                    raise ValueError("position history source list mismatch")
+                per_source_entries: list[tuple[_PositionHistoryEntry, ...]] = []
+                for source_index, values_group in enumerate(prior_groups):
+                    group = tuple(
                         _PositionHistoryEntry(
                             identity=str(values[0]),
                             source_index=int(values[1]),
@@ -6203,56 +6513,104 @@ def _position_history_index(root: Path) -> _PositionHistoryIndex:
                             signed_shares=int(values[7]),
                             target_weight=float(values[8]),
                         )
-                        for values in (payload.get("entries") or ())
+                        for values in values_group
                     )
                     if any(
-                        entry.source_index < 0
-                        or entry.source_index >= len(sources)
-                        or entry.row_index < 0
-                        for entry in entries
+                        entry.source_index != source_index or entry.row_index < 0
+                        for entry in group
                     ):
                         raise ValueError("position history locator is outside source")
-                    result = _PositionHistoryIndex(signature, sources, entries)
-                    _POSITION_HISTORY_INDEX_CACHE[resolved_root] = result
-                    return result
+                    per_source_entries.append(group)
+                deduplicated = {
+                    entry.identity: entry
+                    for group in per_source_entries
+                    for entry in group
+                }
+                reusable = _PositionHistoryIndex(
+                    prior_signature,
+                    tuple(resolved_root / name for name in prior_sources),
+                    tuple(deduplicated.values()),
+                    tuple(per_source_entries),
+                )
+                if prior_signature == signature:
+                    _POSITION_HISTORY_INDEX_CACHE[resolved_root] = reusable
+                    return reusable
             except (
                 EOFError,
                 OSError,
                 TypeError,
                 ValueError,
-                json.JSONDecodeError,
+                KeyError,
+                IndexError,
                 gzip.BadGzipFile,
             ):
-                pass
+                reusable = None
+
+        reusable_by_path = {}
+        if reusable is not None:
+            reusable_by_path = {
+                old_signature[0]: (old_signature, reusable.per_source_entries[index])
+                for index, old_signature in enumerate(reusable.source_signature)
+            }
 
         sources = tuple(item[0] for item in inventory)
+        per_source_entries = []
         deduplicated: dict[str, _PositionHistoryEntry] = {}
         for source_index, path in enumerate(sources):
-            session_date = path.parent.name
-            payload = _object(path, use_cache=False)
-            if str(payload.get("session_date") or "") != session_date:
-                continue
-            for row_index, position in enumerate(payload.get("positions") or ()):
-                if not isinstance(position, Mapping):
-                    continue
-                market = str(position.get("market") or "")
-                symbol = str(position.get("symbol") or "")
-                identity = str(
-                    position.get("position_id")
-                    or f"{session_date}:{market}:{symbol}"
+            old = reusable_by_path.get(signature[source_index][0])
+            if old is not None and old[0] == signature[source_index]:
+                previous_group = old[1]
+                group = tuple(
+                    entry
+                    if entry.source_index == source_index
+                    else _PositionHistoryEntry(
+                        identity=entry.identity,
+                        source_index=source_index,
+                        row_index=entry.row_index,
+                        session_date=entry.session_date,
+                        market=entry.market,
+                        symbol=entry.symbol,
+                        name=entry.name,
+                        signed_shares=entry.signed_shares,
+                        target_weight=entry.target_weight,
+                    )
+                    for entry in previous_group
                 )
-                deduplicated[identity] = _PositionHistoryEntry(
-                    identity=identity,
-                    source_index=source_index,
-                    row_index=row_index,
-                    session_date=sys.intern(session_date),
-                    market=sys.intern(market),
-                    symbol=sys.intern(symbol),
-                    name=str(position.get("name") or ""),
-                    signed_shares=int(position.get("signed_shares") or 0),
-                    target_weight=_finite_float(position.get("target_weight")) or 0.0,
-                )
-        result = _PositionHistoryIndex(signature, sources, tuple(deduplicated.values()))
+            else:
+                session_date = path.parent.name
+                payload = _object(path, use_cache=False)
+                group_rows: list[_PositionHistoryEntry] = []
+                if str(payload.get("session_date") or "") == session_date:
+                    for row_index, position in enumerate(payload.get("positions") or ()):
+                        if not isinstance(position, Mapping):
+                            continue
+                        market = str(position.get("market") or "")
+                        symbol = str(position.get("symbol") or "")
+                        identity = str(
+                            position.get("position_id")
+                            or f"{session_date}:{market}:{symbol}"
+                        )
+                        group_rows.append(_PositionHistoryEntry(
+                            identity=identity,
+                            source_index=source_index,
+                            row_index=row_index,
+                            session_date=sys.intern(session_date),
+                            market=sys.intern(market),
+                            symbol=sys.intern(symbol),
+                            name=str(position.get("name") or ""),
+                            signed_shares=int(position.get("signed_shares") or 0),
+                            target_weight=_finite_float(position.get("target_weight")) or 0.0,
+                        ))
+                group = tuple(group_rows)
+            per_source_entries.append(group)
+            for entry in group:
+                deduplicated[entry.identity] = entry
+        result = _PositionHistoryIndex(
+            signature,
+            sources,
+            tuple(deduplicated.values()),
+            tuple(per_source_entries),
+        )
         _POSITION_HISTORY_INDEX_CACHE[resolved_root] = result
 
         if cache_path is not None:
@@ -6266,19 +6624,22 @@ def _position_history_index(root: Path) -> _PositionHistoryIndex:
                         "root": str(resolved_root),
                         "source_signature": signature,
                         "sources": [str(path.relative_to(resolved_root)) for path in sources],
-                        "entries": [
+                        "per_source_entries": [
                             [
-                                entry.identity,
-                                entry.source_index,
-                                entry.row_index,
-                                entry.session_date,
-                                entry.market,
-                                entry.symbol,
-                                entry.name,
-                                entry.signed_shares,
-                                entry.target_weight,
+                                [
+                                    entry.identity,
+                                    entry.source_index,
+                                    entry.row_index,
+                                    entry.session_date,
+                                    entry.market,
+                                    entry.symbol,
+                                    entry.name,
+                                    entry.signed_shares,
+                                    entry.target_weight,
+                                ]
+                                for entry in group
                             ]
-                            for entry in result.entries
+                            for group in result.per_source_entries
                         ],
                     },
                     ensure_ascii=False,
@@ -6486,10 +6847,38 @@ def build_dashboard_snapshot(
             tzinfo=TAIPEI,
         )
     )
-    source_updated = _timestamp(status.get("updated_at"))
-    source_age = max(0.0, (observed - source_updated).total_seconds())
+    commit_updated_at = status.get("updated_at")
+    commit_updated = _timestamp(commit_updated_at)
+    commit_age = max(0.0, (observed - commit_updated).total_seconds())
+    state_revision = int(state.get("state_revision") or 0)
+    status_revision = int(status.get("state_revision") or 0)
+    engine_receipt = load_service_sync(root)
+    sync_revision = int((engine_receipt or {}).get("state_revision") or 0)
+    state_run_id = str(state.get("engine_run_id") or "")
+    status_run_id = str(status.get("engine_run_id") or "")
+    sync_run_id = str((engine_receipt or {}).get("engine_run_id") or "")
+    committed_identity_present = bool(
+        state_revision or status_revision or state_run_id or status_run_id
+    )
+    heartbeat_matches_commit = bool(
+        state_revision > 0
+        and state_revision == status_revision == sync_revision
+        and state_run_id
+        and state_run_id == status_run_id == sync_run_id
+    )
+    heartbeat_at = (engine_receipt or {}).get("heartbeat_at") or (
+        engine_receipt or {}
+    ).get("published_at")
+    heartbeat_age = (
+        age_seconds(heartbeat_at, now=observed) if heartbeat_matches_commit else None
+    )
+    source_updated_at = heartbeat_at if heartbeat_age is not None else commit_updated_at
+    source_age = heartbeat_age if heartbeat_age is not None else commit_age
     health = str(status.get("health") or "unknown")
-    if source_age > float(max_source_age_seconds):
+    if (
+        source_age > float(max_source_age_seconds)
+        or (committed_identity_present and not heartbeat_matches_commit)
+    ):
         health = "stale"
     benchmark_history = (
         _benchmark_history_index(root)
@@ -6566,7 +6955,10 @@ def build_dashboard_snapshot(
                 # show both facts instead of making a legacy replay look like
                 # the active policy (or rewriting it as though it had used the
                 # active policy).
-                "configured_entry_fill_policy": mode.get("entry_fill_policy"),
+                "configured_entry_fill_policy": (
+                    mode.get("configured_entry_fill_policy")
+                    or mode.get("entry_fill_policy")
+                ),
                 "configured_entry_price_offset_ticks": mode.get(
                     "entry_price_offset_ticks", 0
                 ),
@@ -6637,6 +7029,9 @@ def build_dashboard_snapshot(
                     "configured_intraday_contract"
                 ),
                 "pending_entry_shares": mode.get("pending_entry_shares", 0),
+                "pending_entry_reason_counts": mode.get(
+                    "pending_entry_reason_counts"
+                ) or {},
                 "manual_close_settlement": mode.get("manual_close_settlement"),
                 "closing_auction_pending_count": mode.get(
                     "closing_auction_pending_count", 0
@@ -7268,8 +7663,10 @@ def build_dashboard_snapshot(
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "generated_at_utc": observed.isoformat(timespec="seconds"),
         "health": health,
-        "source_updated_at": status.get("updated_at"),
+        "source_updated_at": source_updated_at,
         "source_age_seconds": round(source_age, 3),
+        "source_commit_updated_at": commit_updated_at,
+        "source_commit_age_seconds": round(commit_age, 3),
         "service_sync": service_sync,
         "unattended_guardian": unattended_guardian,
         "ledger_integrity": status.get("ledger_integrity") or {},
@@ -7342,6 +7739,181 @@ def build_dashboard_snapshot(
     }
 
 
+def _summarize_columnar_signals(
+    signal_frame: Any,
+    filtered_frame: Any,
+    capitals: Mapping[str, float | None],
+) -> tuple[dict[str, dict[str, float | int]], dict[str, dict[str, Any]]]:
+    """Aggregate complete signal history without decoding every row to Python."""
+
+    import polars as pl
+
+    signal_keys = signal_frame.select(
+        "session_date", "market", "signal_id"
+    ).with_columns(
+        pl.col("session_date").fill_null("").str.slice(0, 10).alias("__session_day"),
+        pl.col("market").fill_null("").alias("__market_key"),
+    )
+    current_ids = (
+        signal_keys.filter(
+            (pl.col("signal_id").fill_null("") != "")
+            & (pl.col("__session_day") != "")
+            & (pl.col("__market_key") != "")
+        )
+        .group_by("__session_day", "__market_key", maintain_order=True)
+        .agg(pl.col("signal_id").last().alias("__current_signal_id"))
+    )
+    summary_fields = (
+        "session_date", "market", "signal_id", "symbol", "target_weight",
+        "filled_weight", "filled_shares", "inventory_weight_after",
+        "sizing_capital_twd", "ask", "bid", "sizing_open_price",
+        "execution_price", "requested_shares", "reason", "status",
+        "__resolved_weight", "__absolute_weight",
+    )
+    rows = filtered_frame.select(
+        name for name in summary_fields if name in filtered_frame.columns
+    ).with_columns(
+        pl.col("session_date").fill_null("").str.slice(0, 10).alias("__session_day"),
+        pl.col("market").fill_null("").alias("__market_key"),
+    ).join(
+        current_ids, on=["__session_day", "__market_key"], how="left"
+    ).filter(
+        pl.col("__current_signal_id").is_null()
+        | (pl.col("signal_id").fill_null("") == pl.col("__current_signal_id"))
+    )
+
+    def finite(name: str) -> Any:
+        if name not in rows.columns:
+            return pl.lit(None, dtype=pl.Float64)
+        value = pl.col(name).cast(pl.Float64, strict=False)
+        return pl.when(value.is_finite()).then(value).otherwise(None)
+
+    target = finite("target_weight").fill_null(0.0)
+    capital_fallback = (
+        pl.col("market").replace_strict(
+            {market: value for market, value in capitals.items() if value is not None},
+            default=None,
+            return_dtype=pl.Float64,
+        )
+        if any(value is not None for value in capitals.values())
+        else pl.lit(None, dtype=pl.Float64)
+    )
+    rows = rows.with_columns(
+        target.alias("__target"),
+        finite("sizing_capital_twd").fill_null(capital_fallback).alias("__capital"),
+        finite("ask").alias("__ask"),
+        finite("bid").alias("__bid"),
+        finite("filled_weight").alias("__filled_weight"),
+        finite("inventory_weight_after").alias("__inventory_weight"),
+        finite("sizing_open_price").alias("__sizing_open"),
+        finite("execution_price").alias("__execution_price"),
+    )
+    entry_price = pl.when(pl.col("__target") > 0).then(
+        pl.col("__ask")
+    ).otherwise(pl.col("__bid"))
+    computed_actual = (
+        pl.when(
+            (pl.col("__capital").is_not_null())
+            & (pl.col("__capital") != 0)
+            & entry_price.is_not_null()
+            & (entry_price != 0)
+            & (pl.col("__target") != 0)
+        )
+        .then(
+            pl.col("filled_shares").fill_null(0).cast(pl.Float64)
+            * entry_price / pl.col("__capital")
+            * pl.col("__target").sign()
+        )
+        .otherwise(0.0)
+    )
+    rows = rows.with_columns(
+        pl.when(
+            pl.col("inventory_weight_after").is_not_null()
+            if "inventory_weight_after" in rows.columns else pl.lit(False)
+        )
+        .then(pl.col("__inventory_weight"))
+        .when(pl.col("__filled_weight").is_not_null())
+        .then(pl.col("__filled_weight"))
+        .otherwise(computed_actual)
+        .alias("__actual"),
+    )
+    direction_summary: dict[str, dict[str, float | int]] = {}
+    for stage, value_name in (("target", "__target"), ("actual", "__actual")):
+        value = pl.col(value_name)
+        totals = rows.select(
+            (value > 0).sum().alias("long_count"),
+            (value < 0).sum().alias("short_count"),
+            pl.when(value > 0).then(value).otherwise(0.0).sum().alias("long_gross"),
+            pl.when(value < 0).then(-value).otherwise(0.0).sum().alias("short_gross"),
+        ).row(0, named=True)
+        direction_summary[stage] = {
+            "long_count": int(totals["long_count"] or 0),
+            "short_count": int(totals["short_count"] or 0),
+            "long_gross": float(totals["long_gross"] or 0.0),
+            "short_gross": float(totals["short_gross"] or 0.0),
+        }
+
+    nonzero = pl.col("__target") != 0
+    covered_open = (pl.col("__sizing_open").is_not_null()) & (
+        pl.col("__sizing_open") > 0
+    )
+    covered_execution = (pl.col("__execution_price").is_not_null()) & (
+        pl.col("__execution_price") > 0
+    )
+    requested = pl.col("requested_shares").fill_null(0) > 0
+    filled = pl.col("filled_shares").fill_null(0) > 0
+    counts = rows.group_by("market").agg(
+        pl.len().alias("model_signal_row_count"),
+        (~nonzero).sum().alias("zero_target_row_count"),
+        nonzero.sum().alias("nonzero_signal_count"),
+        (nonzero & covered_open).sum().alias("opening_price_covered_count"),
+        (nonzero & ~covered_open).sum().alias("opening_price_missing_count"),
+        (nonzero & covered_execution).sum().alias("execution_price_covered_count"),
+        (nonzero & requested).sum().alias("requested_signal_count"),
+        (nonzero & filled).sum().alias("filled_signal_count"),
+        (nonzero & ~filled).sum().alias("unfilled_signal_count"),
+        (
+            nonzero & ~filled & (pl.col("reason").fill_null("") == "below_one_board_lot")
+        ).sum().alias("below_one_board_lot_count"),
+    )
+    audit: dict[str, dict[str, Any]] = {
+        str(item["market"] or "unknown"): {
+            **{key: int(value or 0) for key, value in item.items() if key != "market"},
+            "missing_open_symbols": [],
+            "unfilled_reason_counts": {},
+        }
+        for item in counts.to_dicts()
+    }
+    missing = (
+        rows.filter(nonzero & ~covered_open)
+        .sort(
+            ["__absolute_weight", "session_date", "__resolved_weight", "market", "symbol"],
+            descending=[True, True, True, False, False],
+            nulls_last=True,
+        )
+        .group_by("market", maintain_order=True)
+        .agg(pl.col("symbol").fill_null("").head(50).alias("symbols"))
+    )
+    for market, symbols in missing.iter_rows():
+        audit[str(market or "unknown")]["missing_open_symbols"] = symbols
+    failures = (
+        rows.filter(nonzero & ~filled)
+        .with_columns(
+            pl.when(pl.col("reason").fill_null("") != "")
+            .then(pl.col("reason"))
+            .when(pl.col("status").fill_null("") != "")
+            .then(pl.col("status"))
+            .otherwise(pl.lit("unknown"))
+            .alias("__failure_reason")
+        )
+        .group_by("market", "__failure_reason")
+        .agg(pl.len().alias("count"))
+    )
+    for market, reason, count in failures.iter_rows():
+        audit[str(market or "unknown")]["unfilled_reason_counts"][reason] = int(count)
+    return direction_summary, audit
+
+
 def build_dashboard_signal_page(
     *,
     state_dir: Path,
@@ -7396,6 +7968,15 @@ def build_dashboard_signal_page(
         and requested_single_date == latest_state_date
     )
     observed = datetime.now(timezone.utc)
+    requested_end = str(end_date or session_date or start_date or "").strip()
+    try:
+        requested_end_day = (
+            datetime_date.fromisoformat(requested_end) if requested_end else None
+        )
+    except ValueError:
+        # The range validator below owns the public error. Keep the usual
+        # calendar path here rather than giving malformed input new behavior.
+        requested_end_day = None
     available_session_dates = _available_session_dates(
         root=root,
         state=state,
@@ -7404,7 +7985,11 @@ def build_dashboard_signal_page(
         # Signal/position archives already enumerate execution sessions. The
         # benchmark curve must not be decoded just to populate a detail filter.
         include_benchmark_history_dates=False,
-        include_preopen_session=bool(start_date or end_date or session_date),
+        include_preopen_session=bool(start_date or end_date or session_date)
+        and (
+            requested_end_day is None
+            or requested_end_day >= observed.astimezone(TAIPEI).date()
+        ),
         ledger_filenames=("signals.jsonl",),
     )
     selected_start_date, selected_end_date, selected_session_dates = (
@@ -7438,6 +8023,7 @@ def build_dashboard_signal_page(
         if overnight_history.get("product") == "tw_overnight":
             formal_signal_record_count = int(overnight_history.get("signal_count") or 0)
     futures_catalog = load_stock_futures_catalog()
+    current_position_overlays, overlay_signature = _signal_position_overlays(state)
     cache_key = (
         root.resolve(),
         signal_stat.st_dev,
@@ -7453,13 +8039,55 @@ def build_dashboard_signal_page(
         int(limit),
         int(maximum_scan_rows),
         state_signal_signature,
+        int(state.get("dashboard_content_revision") or 0),
         futures_catalog.revision,
     )
+    observed_monotonic = time.monotonic()
     with _SIGNAL_PAGE_CACHE_LOCK:
-        cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
-        if cached_page is not None:
-            return dict(cached_page)
+        cached_entry = _SIGNAL_PAGE_CACHE.get(cache_key)
+    if cached_entry is not None:
+        overlays_changed = overlay_signature != cached_entry.overlay_signature
+        rows = (
+            _overlay_signal_page_rows(
+                cached_entry.source_rows, current_position_overlays, futures_catalog
+            )
+            if overlays_changed else cached_entry.payload["rows"]
+        )
+        # An independent completion can change positions without appending a
+        # signal or incrementing the content revision. Reapply only the saved
+        # page rows, never rescan the full canonical history for this update.
+        check_features = bool(rows) and (
+            overlays_changed
+            or observed_monotonic - cached_entry.feature_checked_at
+            >= _SIGNAL_FEATURE_PAGE_CHECK_INTERVAL_SECONDS
+        )
+        if not overlays_changed and not check_features:
+            return dict(cached_entry.payload)
+        refreshed_drivers = (
+            _lookup_signal_feature_drivers(state_dir=root, state=state, rows=rows)
+            if check_features else cached_entry.payload["feature_drivers_by_signal"]
+        )
+        updated_page = {
+            **cached_entry.payload,
+            "rows": rows,
+            "feature_drivers_by_signal": refreshed_drivers,
+        }
+        updated_entry = _SignalPageCacheEntry(
+            payload=updated_page,
+            source_rows=cached_entry.source_rows,
+            overlay_signature=overlay_signature,
+            feature_checked_at=(
+                observed_monotonic if check_features
+                else cached_entry.feature_checked_at
+            ),
+        )
+        with _SIGNAL_PAGE_CACHE_LOCK:
+            if _SIGNAL_PAGE_CACHE.get(cache_key) is cached_entry:
+                _SIGNAL_PAGE_CACHE[cache_key] = updated_entry
+        return dict(updated_page)
     signal_frame: Any | None = None
+    signal_projection_complete = False
+    signal_source_paths: dict[str, Any] = {}
     polars_module: Any | None = None
     if use_latest_session_fast_path and selected_session_dates == [
         requested_single_date
@@ -7487,12 +8115,81 @@ def build_dashboard_signal_page(
             if signal_index is not None
             else []
         )
-        columnar = _columnar_ledger_frame(
-            signal_path,
-            selected_spans=selected_spans,
-            maximum_rows=maximum_scan_rows,
-            projected_schema=_SIGNAL_PAGE_COLUMN_TYPES,
+        # The recent-row cap is not a history contract. Exact per-session
+        # projections let range queries include every canonical signal while
+        # an append to one day invalidates only that day's derived shard.
+        if signal_index is not None and not formal_signal_path.is_file():
+            projected_frames: list[tuple[int, Any]] = []
+            for selected_date in selected_session_dates:
+                spans = signal_index.spans.get(selected_date, ())
+                if not spans:
+                    continue
+                if len(spans) != 1:
+                    break
+                frame = _projected_ledger_session_frame(
+                    signal_path,
+                    index=signal_index,
+                    session_date=selected_date,
+                    projected_schema=_SIGNAL_PAGE_COLUMN_TYPES,
+                )
+                if frame is None:
+                    break
+                if "signal_source_path" in frame.columns:
+                    signal_source_paths[selected_date] = frame.get_column("signal_source_path")
+                    frame = frame.drop("signal_source_path")
+                projected_frames.append(
+                    (spans[0][0], frame.with_row_index("__projection_row"))
+                )
+            else:
+                if projected_frames:
+                    import polars as pl
+
+                    polars_module = pl
+                    signal_frame = pl.concat(
+                        [frame for _, frame in sorted(projected_frames)],
+                        how="diagonal_relaxed",
+                        rechunk=False,
+                    )
+                    signal_projection_complete = True
+        frame_cache_key = (
+            signal_path.resolve(),
+            (
+                signal_index.device,
+                signal_index.inode,
+                signal_index.observed_size,
+                signal_index.modified_ns,
+            )
+            if signal_index is not None
+            else None,
+            tuple(selected_session_dates),
+            int(maximum_scan_rows),
         )
+        with _SIGNAL_LEDGER_FRAME_CACHE_LOCK:
+            columnar = (
+                _SIGNAL_LEDGER_FRAME_CACHE.get(frame_cache_key)
+                if signal_frame is None else None
+            )
+        if columnar is None and signal_frame is None:
+            columnar = _columnar_ledger_frame(
+                signal_path,
+                selected_spans=selected_spans,
+                maximum_rows=maximum_scan_rows,
+                projected_schema=_SIGNAL_PAGE_COLUMN_TYPES,
+            )
+            if columnar is not None and columnar[1].estimated_size() <= 64 << 20:
+                final_signal_stat = signal_path.stat()
+                if signal_index is not None and (
+                    final_signal_stat.st_dev,
+                    final_signal_stat.st_ino,
+                    final_signal_stat.st_size,
+                    final_signal_stat.st_mtime_ns,
+                ) == frame_cache_key[1]:
+                    with _SIGNAL_LEDGER_FRAME_CACHE_LOCK:
+                        if len(_SIGNAL_LEDGER_FRAME_CACHE) >= 2:
+                            _SIGNAL_LEDGER_FRAME_CACHE.pop(
+                                next(iter(_SIGNAL_LEDGER_FRAME_CACHE))
+                            )
+                        _SIGNAL_LEDGER_FRAME_CACHE[frame_cache_key] = columnar
         if columnar is not None:
             polars_module, candidate_frame = columnar
             required_columns = {
@@ -7513,6 +8210,16 @@ def build_dashboard_signal_page(
             }
             if required_columns.issubset(candidate_frame.columns):
                 signal_frame = candidate_frame
+        if signal_frame is not None:
+            required_columns = {
+                "ask", "bid", "execution_price", "filled_shares",
+                "filled_weight", "market", "reason", "requested_shares",
+                "session_date", "signal_id", "sizing_open_price", "status",
+                "symbol", "target_weight",
+            }
+            if not required_columns.issubset(signal_frame.columns):
+                signal_frame = None
+                signal_projection_complete = False
         if signal_frame is None:
             rows_by_session = _rows_for_sessions(
                 signal_path,
@@ -7599,59 +8306,42 @@ def build_dashboard_signal_page(
         if normalized_mode and normalized_mode != "all":
             predicate &= pl.col("market").fill_null("") == normalized_mode
         if normalized_symbol:
-            # Keep Python's Unicode casefold semantics for textual searches.
-            # Decode the already bounded frame once; date-only filtering takes
-            # the native columnar path below without Python row materialization.
-            decoded_rows_by_session: dict[str, list[dict[str, Any]]] = {}
-            for row in signal_frame.to_dicts():
-                decoded_rows_by_session.setdefault(
-                    str(row.get("session_date") or "")[:10], []
-                ).append(row)
-            signal_frame = None
-            current_rows = [
-                row
-                for selected_date in selected_session_dates
-                for row in decoded_rows_by_session.get(selected_date, ())
-            ]
-            filtered = [row for row in current_rows if included(row)]
-            filtered.sort(key=sort_key)
-            source_rows_scanned = len(current_rows)
-            filtered_total = len(filtered)
-        else:
-            if normalized_status == "blocked":
-                predicate &= ~pl.col("status").fill_null("").is_in(
-                    ["ready", "partial_depth", "hold"]
-                )
-            resolved_weight = (
-                pl.col("target_weight").cast(pl.Float64, strict=False).fill_null(0.0)
+            # Python casefold is the existing exact search contract (including
+            # Unicode names). Apply it to just the two string columns instead
+            # of decoding millions of wide signal dictionaries.
+            name = (
+                pl.col("name") if "name" in signal_frame.columns
+                else pl.lit(None).alias("name")
             )
-            filtered_frame = (
-                signal_frame.filter(predicate)
-                .with_columns(
-                    resolved_weight.alias("__resolved_weight"),
-                    resolved_weight.abs().alias("__absolute_weight"),
-                )
-                .sort(
-                    [
-                        "__absolute_weight",
-                        "session_date",
-                        "__resolved_weight",
-                        "market",
-                        "symbol",
-                    ],
-                    descending=[True, True, True, False, False],
-                    nulls_last=True,
-                )
+            predicate &= pl.struct(pl.col("symbol"), name).map_elements(
+                lambda row: normalized_symbol in (
+                    f"{row['symbol'] or ''} {row['name'] or ''}".casefold()
+                ),
+                return_dtype=pl.Boolean,
             )
-            source_rows_scanned = signal_frame.height
-            filtered_total = filtered_frame.height
+        if normalized_status == "blocked":
+            predicate &= ~pl.col("status").fill_null("").is_in(
+                ["ready", "partial_depth", "hold"]
+            )
+        resolved_weight = (
+            pl.col("target_weight").cast(pl.Float64, strict=False).fill_null(0.0)
+        )
+        filtered_frame = (
+            signal_frame.filter(predicate)
+            .with_columns(
+                resolved_weight.alias("__resolved_weight"),
+                resolved_weight.abs().alias("__absolute_weight"),
+            )
+        )
+        source_rows_scanned = signal_frame.height
+        filtered_total = filtered_frame.height
     capitals = {
         str(market): _finite_float(raw_mode.get("initial_capital_twd"))
         for market, raw_mode in (state.get("modes") or {}).items()
         if isinstance(raw_mode, Mapping)
     }
     current_signal_ids: dict[tuple[str, str], str] = {}
-    if signal_frame is not None:
+    if signal_frame is not None and filtered_frame is None:
         for row_date, market, signal_id in signal_frame.select(
             "session_date", "market", "signal_id"
         ).iter_rows():
@@ -7660,7 +8350,7 @@ def build_dashboard_signal_page(
             signal_id = str(signal_id or "")
             if row_date and market and signal_id:
                 current_signal_ids[(row_date, market)] = signal_id
-    else:
+    elif signal_frame is None:
         for row in current_rows:
             row_date = str(row.get("session_date") or "")[:10]
             market = str(row.get("market") or "")
@@ -7699,6 +8389,8 @@ def build_dashboard_signal_page(
         summary_columns.append("inventory_weight_after")
 
     def summary_rows():
+        if filtered_frame is not None:
+            return
         candidates = (
             filtered_frame.select(summary_columns).iter_rows(named=True)
             if filtered_frame is not None
@@ -7717,6 +8409,39 @@ def build_dashboard_signal_page(
                 yield row
 
     opening_execution_audit: dict[str, dict[str, Any]] = {}
+    if filtered_frame is not None and signal_frame is not None:
+        # Only the selected range, filters, source revision, and fallback
+        # capitals affect this complete-history aggregate. Page position and
+        # limit affect neither it nor the current-signal-id selection.
+        summary_key = (
+            root.resolve(),
+            signal_stat.st_dev,
+            signal_stat.st_ino,
+            signal_stat.st_size,
+            signal_stat.st_mtime_ns,
+            signal_stat.st_ctime_ns,
+            formal_signal_signature,
+            tuple(selected_session_dates),
+            normalized_mode,
+            normalized_symbol,
+            normalized_status,
+            int(maximum_scan_rows),
+            tuple(sorted(capitals.items())),
+        )
+        with _SIGNAL_RANGE_SUMMARY_CACHE_LOCK:
+            cached_summary = _SIGNAL_RANGE_SUMMARY_CACHE.get(summary_key)
+        if cached_summary is None:
+            computed_summary = _summarize_columnar_signals(
+                signal_frame, filtered_frame, capitals
+            )
+            with _SIGNAL_RANGE_SUMMARY_CACHE_LOCK:
+                if len(_SIGNAL_RANGE_SUMMARY_CACHE) >= _SIGNAL_RANGE_SUMMARY_CACHE_MAX_ENTRIES:
+                    _SIGNAL_RANGE_SUMMARY_CACHE.pop(next(iter(_SIGNAL_RANGE_SUMMARY_CACHE)))
+                _SIGNAL_RANGE_SUMMARY_CACHE[summary_key] = computed_summary
+            cached_summary = computed_summary
+        # The per-request audit below adds state-derived expected row counts;
+        # never mutate the reusable source aggregate in place.
+        direction_summary, opening_execution_audit = deepcopy(cached_summary)
     for row in summary_rows():
         target = _finite_float(row.get("target_weight")) or 0.0
         market = str(row.get("market") or "unknown")
@@ -7818,21 +8543,44 @@ def build_dashboard_signal_page(
         )
 
     source_page = (
-        filtered_frame.slice(offset, limit)
+        filtered_frame.top_k(
+            min(offset + limit, filtered_total),
+            by=[
+                "__absolute_weight", "session_date", "__resolved_weight",
+                "market", "symbol",
+            ],
+            reverse=[False, False, False, True, True],
+        )
+        .sort(
+            [
+                "__absolute_weight", "session_date", "__resolved_weight",
+                "market", "symbol",
+            ],
+            descending=[True, True, True, False, False],
+            nulls_last=True,
+        )
+        .slice(offset, limit)
         .drop("__resolved_weight", "__absolute_weight")
         .to_dicts()
         if filtered_frame is not None
         else filtered[offset : offset + limit]
     )
-    page: list[dict[str, Any]] = []
+    base_rows: list[dict[str, Any]] = []
     for source_row in source_page:
         row = dict(source_row)
-        row["stock_futures"] = futures_catalog.membership(str(row.get("symbol") or ""))
-        if bool(row.get("counterfactual_open_replay")):
-            row["open_reconstructed_at"] = row.get("open_reconstructed_at") or row.get(
-                "signal_at"
+        projection_row = row.pop("__projection_row", None)
+        if projection_row is not None:
+            source_paths = signal_source_paths.get(
+                str(row.get("session_date") or "")[:10]
             )
-        page.append(row)
+            if source_paths is not None and 0 <= int(projection_row) < len(source_paths):
+                source_path = source_paths[int(projection_row)]
+                if source_path is not None:
+                    row["signal_source_path"] = source_path
+        base_rows.append(row)
+    page = _overlay_signal_page_rows(
+        base_rows, current_position_overlays, futures_catalog
+    )
     feature_drivers_by_signal = _lookup_signal_feature_drivers(
         state_dir=root,
         state=state,
@@ -7855,7 +8603,7 @@ def build_dashboard_signal_page(
         "source_rows_scanned": source_rows_scanned,
         "scan_limit": maximum_scan_rows,
         "scan_limit_reached": (
-            source_rows_scanned >= maximum_scan_rows
+            source_rows_scanned >= maximum_scan_rows and not signal_projection_complete
             or formal_signal_total > len(formal_rows)
         ),
         "record_count": (
@@ -7865,7 +8613,7 @@ def build_dashboard_signal_page(
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,
         "opening_execution_audit_scope": "bounded_recent_signal_rows_per_mode"
-        if source_rows_scanned >= maximum_scan_rows
+        if source_rows_scanned >= maximum_scan_rows and not signal_projection_complete
         else "complete_current_signal_rows_per_mode",
         "opening_execution_audit": opening_execution_audit,
         "feature_drivers_scope": "all_feature_drivers_if_available_else_top_feature_drivers",
@@ -7874,8 +8622,14 @@ def build_dashboard_signal_page(
     }
     with _SIGNAL_PAGE_CACHE_LOCK:
         if len(_SIGNAL_PAGE_CACHE) >= 128:
-            _SIGNAL_PAGE_CACHE.pop(next(iter(_SIGNAL_PAGE_CACHE)))
-        _SIGNAL_PAGE_CACHE[cache_key] = payload
+            oldest_key = next(iter(_SIGNAL_PAGE_CACHE))
+            _SIGNAL_PAGE_CACHE.pop(oldest_key)
+        _SIGNAL_PAGE_CACHE[cache_key] = _SignalPageCacheEntry(
+            payload=payload,
+            source_rows=tuple(base_rows),
+            overlay_signature=overlay_signature,
+            feature_checked_at=time.monotonic(),
+        )
     return dict(payload)
 
 
@@ -8042,6 +8796,31 @@ def build_dashboard_event_page(
     normalized_mode = str(mode or "").strip()
     normalized_symbol = str(symbol or "").strip().casefold()
 
+    def source_signature(filename: str) -> tuple[int, int, int, int] | None:
+        try:
+            stat = (root / filename).stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    cache_key = (
+        root.resolve(),
+        tuple(available_session_dates),
+        tuple(selected_session_dates),
+        normalized_mode,
+        normalized_symbol,
+        int(offset),
+        int(limit),
+        int(maximum_scan_rows),
+        source_signature("orders.jsonl"),
+        source_signature("fills.jsonl"),
+        source_signature(OVERNIGHT_EVENT_HISTORY_FILENAME),
+    )
+    with _EVENT_PAGE_CACHE_LOCK:
+        cached_page = _EVENT_PAGE_CACHE.get(cache_key)
+        if cached_page is not None:
+            return dict(cached_page)
+
     allowed_fields = (
         "recorded_at",
         "fill_at",
@@ -8098,6 +8877,8 @@ def build_dashboard_event_page(
     total_rows = 0
     order_total = 0
     fill_total = 0
+    source_rows_scanned = {"orders": 0, "fills": 0}
+    source_projection_complete = {"orders": False, "fills": False}
 
     def consider(event: dict[str, Any], event_kind: str) -> None:
         nonlocal sequence, total_rows, order_total, fill_total
@@ -8155,18 +8936,32 @@ def build_dashboard_event_page(
             "price",
         )
         for batch in batches:
+            source_rows_scanned["fills" if event_kind == "fill" else "orders"] += (
+                batch.num_rows
+            )
             available = set(batch.schema.names)
-            identity_columns = {
-                name: (
+            # Convert each Arrow column once, then walk rows in its fixed
+            # identity order; repeated per-row name lookups dominate a broad
+            # 200k-event page without contributing to the dedup contract.
+            identity_columns = [
+                (
                     batch.column(batch.schema.get_field_index(name)).to_pylist()
                     if name in available
                     else [None] * batch.num_rows
                 )
                 for name in identity_names
-            }
-            for row_index in range(batch.num_rows):
-                market_value = identity_columns["market"][row_index]
-                symbol_value = identity_columns["symbol"][row_index]
+            ]
+            for row_index, values in enumerate(zip(*identity_columns)):
+                (
+                    recorded_at_value,
+                    fill_at_value,
+                    market_value,
+                    symbol_value,
+                    purpose_value,
+                    status_value,
+                    quantity_value,
+                    price_value,
+                ) = values
                 if normalized_mode and normalized_mode != "all":
                     if str(market_value or "") != normalized_mode:
                         continue
@@ -8177,18 +8972,18 @@ def build_dashboard_event_page(
                 status_value = (
                     "filled"
                     if event_kind == "fill"
-                    else identity_columns["status"][row_index]
+                    else status_value
                 )
                 identity = (
                     event_kind,
-                    str(identity_columns["recorded_at"][row_index] or ""),
-                    str(identity_columns["fill_at"][row_index] or ""),
+                    str(recorded_at_value or ""),
+                    str(fill_at_value or ""),
                     str(market_value or ""),
                     str(symbol_value or ""),
-                    str(identity_columns["purpose"][row_index] or ""),
+                    str(purpose_value or ""),
                     str(status_value or ""),
-                    str(identity_columns["quantity"][row_index] or ""),
-                    str(identity_columns["price"][row_index] or ""),
+                    str(quantity_value or ""),
+                    str(price_value or ""),
                 )
                 if identity in seen:
                     continue
@@ -8200,8 +8995,8 @@ def build_dashboard_event_page(
                     order_total += 1
                 sort_key = (
                     str(
-                        identity_columns["fill_at"][row_index]
-                        or identity_columns["recorded_at"][row_index]
+                        fill_at_value
+                        or recorded_at_value
                         or ""
                     ),
                     event_kind,
@@ -8225,9 +9020,153 @@ def build_dashboard_event_page(
                         heapq.heapreplace(retained, item)
                 sequence += 1
 
+    def consume_projected_frames(frames: list[Any], event_kind: str) -> Any:
+        """Count and select exact events in native columns, materializing one page.
+
+        This path is used only without a formal overlay or Unicode substring
+        search. Those retain the existing row-wise dedup/order contract.
+        """
+
+        nonlocal sequence, total_rows, order_total, fill_total
+        import polars as pl
+
+        source_key = "fills" if event_kind == "fill" else "orders"
+        source_rows_scanned[source_key] += sum(frame.height for frame in frames)
+        if not frames:
+            return None
+        frame = pl.concat(frames, how="diagonal_relaxed", rechunk=False).reverse()
+        frame = frame.with_columns(
+            pl.lit(None).cast(pl.String).alias(name)
+            for name in ("market", "symbol") if name not in frame.columns
+        )
+        if event_kind == "fill":
+            frame = frame.with_columns(pl.lit("filled").alias("status"))
+        if normalized_mode and normalized_mode != "all":
+            frame = frame.filter(pl.col("market").fill_null("") == normalized_mode)
+        if frame.is_empty():
+            return None
+        identity_names = (
+            "recorded_at", "fill_at", "market", "symbol", "purpose",
+            "status", "quantity", "price",
+        )
+        identity_columns = []
+        for name in identity_names:
+            if name not in frame.columns:
+                value = pl.lit("")
+            elif name in {"quantity", "price"}:
+                source = pl.col(name)
+                value = pl.when(source.is_null() | (source == 0)).then(
+                    pl.lit("")
+                ).otherwise(source.cast(pl.String))
+            else:
+                value = pl.col(name).cast(pl.String).fill_null("")
+            identity_columns.append(value.alias(f"__identity_{name}"))
+        frame = frame.with_columns(identity_columns).unique(
+            subset=[f"__identity_{name}" for name in identity_names],
+            keep="first", maintain_order=True,
+        ).with_row_index("__source_sequence")
+        row_count = frame.height
+        total_rows += row_count
+        if event_kind == "fill":
+            fill_total += row_count
+        else:
+            order_total += row_count
+        first_sequence = sequence
+        sequence += row_count
+        event_time = (
+            pl.when(pl.col("fill_at").fill_null("") != "")
+            .then(pl.col("fill_at"))
+            .otherwise(pl.col("recorded_at"))
+            if "fill_at" in frame.columns and "recorded_at" in frame.columns
+            else pl.col("fill_at") if "fill_at" in frame.columns
+            else pl.col("recorded_at") if "recorded_at" in frame.columns
+            else pl.lit("")
+        )
+        return frame.with_columns(
+            event_time.fill_null("").alias("__event_time"),
+            pl.lit(event_kind).alias("__event_kind"),
+            pl.col("market").fill_null("").alias("__event_market"),
+            pl.col("symbol").fill_null("").alias("__event_symbol"),
+            (pl.col("__source_sequence") + first_sequence).alias("__global_sequence"),
+        )
+
+    # Only use columnar paging when *both* canonical sources are complete.
+    # Mixing a vectorized source with the bounded heap can silently lose rows.
+    fast_projection: dict[str, list[Any]] | None = None
+    if not normalized_symbol and not (root / OVERNIGHT_EVENT_HISTORY_FILENAME).is_file():
+        projected_sources: dict[str, list[Any]] = {}
+        for filename, event_kind in (("orders.jsonl", "order"), ("fills.jsonl", "fill")):
+            path = root / filename
+            index = _ledger_session_index(path, recorded_at_fallback=False)
+            if index is None:
+                break
+            projected_frames: list[tuple[int, Any]] = []
+            for selected_date in selected_session_dates:
+                spans = index.spans.get(selected_date, ())
+                if not spans:
+                    continue
+                if len(spans) != 1:
+                    break
+                frame = _projected_ledger_session_frame(
+                    path,
+                    index=index,
+                    session_date=selected_date,
+                    projected_schema=_EVENT_PAGE_COLUMN_TYPES,
+                )
+                if frame is None:
+                    break
+                projected_frames.append((spans[0][0], frame))
+            else:
+                projected_sources[event_kind] = [
+                    frame for _, frame in sorted(projected_frames, key=lambda item: item[0])
+                ]
+                continue
+            break
+        else:
+            fast_projection = projected_sources
+    vectorized_parts: list[Any] = []
+
     for filename, event_kind in (("orders.jsonl", "order"), ("fills.jsonl", "fill")):
+        if fast_projection is not None:
+            projected = consume_projected_frames(fast_projection[event_kind], event_kind)
+            if projected is not None:
+                vectorized_parts.append(projected)
+            source_projection_complete["fills" if event_kind == "fill" else "orders"] = True
+            continue
         path = root / filename
         index = _ledger_session_index(path, recorded_at_fallback=False)
+        source_key = "fills" if event_kind == "fill" else "orders"
+        if index is not None:
+            projected_frames: list[tuple[int, Any]] = []
+            for selected_date in selected_session_dates:
+                if selected_date not in index.spans:
+                    continue
+                # A date can have several disjoint byte spans when old replay
+                # rows were appended late. Preserve source order via the
+                # existing bounded reader until the shard stores per-row
+                # offsets, rather than silently reordering equal timestamps.
+                if len(index.spans[selected_date]) != 1:
+                    break
+                frame = _projected_ledger_session_frame(
+                    path,
+                    index=index,
+                    session_date=selected_date,
+                    projected_schema=_EVENT_PAGE_COLUMN_TYPES,
+                )
+                if frame is None:
+                    break
+                projected_frames.append((index.spans[selected_date][0][0], frame))
+            else:
+                ordered_frames = [
+                    frame for _, frame in sorted(projected_frames, key=lambda item: item[0])
+                ]
+                for frame in reversed(ordered_frames):
+                    consume_batches(
+                        frame.reverse().to_arrow().to_batches(max_chunksize=8_192),
+                        event_kind,
+                    )
+                source_projection_complete[source_key] = True
+                continue
         selected_spans = (
             sorted(
                 (start, end, session_date)
@@ -8252,6 +9191,9 @@ def build_dashboard_event_page(
             maximum_scan_rows,
             projected_schema=_EVENT_PAGE_COLUMN_TYPES,
         )
+        source_rows_scanned["fills" if event_kind == "fill" else "orders"] += sum(
+            len(rows) for rows in rows_by_session.values()
+        )
         consume(
             (
                 row
@@ -8266,9 +9208,34 @@ def build_dashboard_event_page(
         maximum_rows=maximum_scan_rows,
     )
     consume(reversed(formal_rows))
-    retained.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    page = [item[2] for item in retained[offset : offset + limit]]
-    return {
+    if fast_projection is not None:
+        if vectorized_parts:
+            import polars as pl
+
+            selected_events = (
+                pl.concat(vectorized_parts, how="diagonal_relaxed", rechunk=False)
+                .sort(
+                    [
+                        "__event_time", "__event_kind", "__event_market",
+                        "__event_symbol", "__global_sequence",
+                    ],
+                    descending=True,
+                )
+                .slice(offset, limit)
+            )
+            page = [
+                safe_event(
+                    {key: value for key, value in row.items() if value is not None},
+                    str(row["__event_kind"]),
+                )
+                for row in selected_events.to_dicts()
+            ]
+        else:
+            page = []
+    else:
+        retained.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        page = [item[2] for item in retained[offset : offset + limit]]
+    payload = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
@@ -8284,6 +9251,17 @@ def build_dashboard_event_page(
         "order_total": order_total,
         "fill_total": fill_total,
         "has_more": offset + len(page) < total_rows,
+        "source_rows_scanned": source_rows_scanned,
+        "source_projection_complete": source_projection_complete,
+        "scan_limit": maximum_scan_rows,
+        "scan_limit_reached": (
+            any(
+                count >= maximum_scan_rows
+                and not source_projection_complete[source]
+                for source, count in source_rows_scanned.items()
+            )
+            or formal_event_total > len(formal_rows)
+        ),
         "record_counts": {
             "orders": _line_count(root / "orders.jsonl")
             + sum(row.get("event_kind") == "order" for row in formal_rows),
@@ -8293,6 +9271,11 @@ def build_dashboard_event_page(
         },
         "rows": page,
     }
+    with _EVENT_PAGE_CACHE_LOCK:
+        if len(_EVENT_PAGE_CACHE) >= 32:
+            _EVENT_PAGE_CACHE.pop(next(iter(_EVENT_PAGE_CACHE)))
+        _EVENT_PAGE_CACHE[cache_key] = payload
+    return dict(payload)
 
 
 def build_dashboard_summary(
@@ -8324,6 +9307,8 @@ def build_dashboard_summary(
         "health",
         "source_updated_at",
         "source_age_seconds",
+        "source_commit_updated_at",
+        "source_commit_age_seconds",
         "service_sync",
         "unattended_guardian",
         "session_date",

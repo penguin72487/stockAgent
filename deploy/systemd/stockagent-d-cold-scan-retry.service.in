@@ -1,0 +1,24 @@
+[Unit]
+Description=Retry one pending D-primary Syncthing cold-store scan
+Requires=stockagent-d-cold-mount.service
+Wants=network-online.target syncthing@root.service
+After=stockagent-d-cold-mount.service network-online.target syncthing@root.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+ExecStart=/usr/bin/bash -c 'source "__REPO_ROOT__/scripts/runtime_env.sh" && run_fintech_python "__REPO_ROOT__/scripts/retry_packed_syncthing_scans.py"'
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=no
+

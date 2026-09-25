@@ -1,4 +1,5 @@
 import json
+from datetime import time as datetime_time
 from pathlib import Path
 
 from scripts import check_outside_tw_opening_resource_window as opening_window
@@ -176,6 +177,35 @@ def test_guardian_distinguishes_missing_signal_from_nonlive_recovery() -> None:
     assert recovered == ["tw_day_trade_100m"]
 
 
+def test_guardian_accepts_both_causal_best_quote_paper_contracts() -> None:
+    session_date = "2026-09-24"
+    modes = {
+        market: {
+            "session_date": session_date,
+            "signal_id": f"{market}-signal",
+            "entry_completed_at": f"{session_date}T09:00:05+08:00",
+            "entry_fill_policy": "causal_market_full_target_at_best_quote",
+            "entry_price_offset_ticks": 0,
+        }
+        for market in guardian.EXPECTED_MARKETS
+    }
+    modes["tw_day_trade_100m"]["entry_fill_policy"] = "causal_best_quote"
+
+    assert guardian._classify_session_signals(modes, session_date=session_date) == (
+        [],
+        [],
+    )
+
+    modes["tw_day_trade_multi_basis"]["entry_fill_policy"] = (
+        "official_open_signal_0900_execute_0901_vwap"
+    )
+    modes["tw_day_trade_multi_basis_22"]["entry_price_offset_ticks"] = 1
+    assert guardian._classify_session_signals(modes, session_date=session_date) == (
+        [],
+        ["tw_day_trade_multi_basis", "tw_day_trade_multi_basis_22"],
+    )
+
+
 def test_guardian_rearms_failed_unit_without_restart(monkeypatch) -> None:
     commands: list[tuple[str, ...]] = []
 
@@ -270,9 +300,42 @@ def test_guardian_pauses_and_resumes_bulk_jobs_around_open(monkeypatch) -> None:
     assert all(command[:2] == ("start", "--no-block") for command in commands)
 
 
+def test_guardian_does_not_pause_bulk_jobs_on_verified_closed_weekday(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        guardian,
+        "_systemctl_show",
+        lambda _unit: {"ActiveState": "active", "SubState": "running"},
+    )
+    monkeypatch.setattr(
+        guardian,
+        "_run_systemctl",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("closed session must not pause maintenance")
+        ),
+    )
+    guard, actions, failures = guardian._protect_opening_resources(
+        observed=time_sync.datetime(2026, 9, 25, 8, 30, tzinfo=guardian.TAIPEI),
+        repair=True,
+        action_state={},
+        session_open=False,
+    )
+    assert guard["protected"] is False
+    assert actions == []
+    assert failures == []
+
+
 def test_opening_resource_guard_never_manages_critical_services() -> None:
     managed = set(guardian.BEST_EFFORT_MAINTENANCE_UNITS)
 
+    assert "stockagent-openbb-archive.service" in managed
+    assert (
+        guardian.BEST_EFFORT_MAINTENANCE_UNITS[
+            "stockagent-openbb-archive.service"
+        ]
+        == "stockagent-openbb-archive.timer"
+    )
     assert managed.isdisjoint(guardian.REQUIRED_SERVICES)
     assert "stockagent-discord-bot.service" not in managed
     assert "stockagent-tw-day-trade-simulation.service" not in managed
@@ -435,6 +498,30 @@ def test_bulk_services_fail_safe_before_guardian_can_stop_them() -> None:
     ):
         result = opening_window.evaluate(time_sync.datetime.fromisoformat(timestamp))
         assert result["allowed"] is allowed
+
+
+def test_openbb_compaction_reserves_full_runway_before_opening() -> None:
+    template = _read("deploy/systemd/stockagent-openbb-l1-compaction.service.in")
+    assert "run_outside_tw_opening_resource_window.sh" in template
+    assert "--minimum-runway-minutes 45" in template
+    assert "--protected-until 13:35" in template
+    for timestamp, allowed in (
+        ("2026-09-14T07:34:59+08:00", True),
+        ("2026-09-14T07:35:00+08:00", False),
+        ("2026-09-14T08:18:00+08:00", False),
+        ("2026-09-14T09:09:59+08:00", False),
+        ("2026-09-14T09:10:00+08:00", False),
+        ("2026-09-14T13:34:59+08:00", False),
+        ("2026-09-14T13:35:00+08:00", True),
+        ("2026-09-13T08:30:00+08:00", True),
+    ):
+        result = opening_window.evaluate(
+            time_sync.datetime.fromisoformat(timestamp),
+            minimum_runway_minutes=45,
+            protected_until=datetime_time(13, 35),
+        )
+        assert result["allowed"] is allowed
+        assert result["protected_start"] == "07:35:00"
 
 
 def test_disk_guard_warns_before_it_reaches_the_fail_closed_floor(

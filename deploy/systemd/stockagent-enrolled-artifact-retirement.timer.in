@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily verified retirement of explicitly enrolled cold artifacts
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+RandomizedDelaySec=5m
+Persistent=true
+Unit=stockagent-enrolled-artifact-retirement.service
+
+[Install]
+WantedBy=timers.target

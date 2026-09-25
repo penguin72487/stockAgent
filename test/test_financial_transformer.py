@@ -266,6 +266,55 @@ def test_causal_feature_rms_normalizes_once_across_multi_basis_paths(
     )
 
 
+@pytest.mark.parametrize("method", ["signed_log1p", "asinh"])
+def test_causal_feature_compression_precedes_multi_basis_once(method: str) -> None:
+    device = _device()
+    options = {
+        "lookback": 8,
+        "temporal_pooling": "last",
+        "temporal_query_mode": "last_only",
+        "temporal_basis_families": ("haar", "dct"),
+        "temporal_basis_components": 2,
+        "temporal_basis_input": "input_features",
+        "causal_feature_rms_normalization": True,
+    }
+    transformed = _make_model(
+        **options,
+        causal_feature_compression=method,
+        causal_feature_compression_indices=(0, 3),
+    ).eval()
+    reference = _make_model(**options).eval()
+    scale = torch.linspace(2.0, 11.0, 10, device=device)
+    active = torch.ones(10, dtype=torch.bool, device=device)
+    active[7] = False
+    transformed.set_causal_feature_rms_normalizer(scale, active)
+    reference.set_causal_feature_rms_normalizer(scale, active)
+    raw = torch.randn(2, 8, 7, 10, device=device) * 100.0
+    raw[0, 0, 0, 0] = 0.0
+    expected_normalized = raw / scale
+    selected = expected_normalized[..., [0, 3]]
+    compressed = (
+        selected.sign() * selected.abs().log1p()
+        if method == "signed_log1p"
+        else selected.asinh()
+    )
+    expected_normalized[..., [0, 3]] = compressed
+    expected_normalized[..., 7] = 0.0
+    actual_normalized = transformed.candle_encoder._normalize_raw_features(raw)
+    torch.testing.assert_close(actual_normalized, expected_normalized)
+    assert actual_normalized[0, 0, 0, 0].item() == 0.0
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        actual = transformed(raw, mask)
+        expected = reference(expected_normalized * scale, mask)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    gradient_input = raw.detach().clone().requires_grad_(True)
+    transformed.candle_encoder._normalize_raw_features(gradient_input).square().sum().backward()
+    assert gradient_input.grad is not None
+    assert bool(torch.isfinite(gradient_input.grad).all())
+    assert bool((gradient_input.grad[..., [0, 3]].abs() > 0).any())
+
+
 def test_causal_feature_rms_fit_uses_only_training_window_rows(tmp_path) -> None:
     config = load_config(Path("configs/experiment_baseline.yaml"))
     config.training.model_name = "financial_transformer"
@@ -312,6 +361,128 @@ def test_causal_feature_rms_fit_uses_only_training_window_rows(tmp_path) -> None
     assert metadata["feature_row_start"] == 1
     assert metadata["feature_row_end_inclusive"] == 4
     assert metadata["active_feature_count"] == 2
+
+
+def test_window_rms_uses_only_observed_values_and_keeps_flags_binary() -> None:
+    model = _make_model(
+        lookback=4,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        causal_feature_rms_normalization=True,
+        causal_feature_window_rms_normalization=True,
+        window_rms_observation_pairs=((0, 8),),
+        window_rms_passthrough_indices=(8, 9),
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu().eval()
+    x = torch.zeros(1, 4, 2, 10)
+    x[0, :, 0, 0] = torch.tensor([2.0, 100.0, 4.0, 100.0])
+    x[0, :, 0, 8] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    x[0, :, 0, 1] = torch.tensor([3.0, 4.0, 0.0, 0.0])
+    x[0, :, 0, 9] = torch.tensor([0.0, 1.0, 1.0, 0.0])
+    normalized = model.candle_encoder._window_scaled_features(x)
+    expected_value_scale = (10.0) ** 0.5
+    torch.testing.assert_close(
+        normalized[0, :, 0, 0],
+        torch.tensor([2.0 / expected_value_scale, 0.0, 4.0 / expected_value_scale, 0.0]),
+    )
+    torch.testing.assert_close(
+        normalized[0, :, 0, 1], torch.tensor([1.2, 1.6, 0.0, 0.0])
+    )
+    torch.testing.assert_close(normalized[..., 8:], x[..., 8:])
+    assert bool(torch.isfinite(normalized).all())
+    with pytest.raises(ValueError, match="global scales"):
+        model.set_causal_feature_rms_normalizer(
+            torch.full((10,), 2.0), torch.ones(10, dtype=torch.bool)
+        )
+
+
+def test_window_rms_panel_paths_are_causal_and_match_materialized_windows() -> None:
+    model = _make_model(
+        lookback=4,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        causal_feature_rms_normalization=True,
+        causal_feature_window_rms_normalization=True,
+        window_rms_observation_pairs=((0, 8),),
+        window_rms_passthrough_indices=(8,),
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu().eval()
+    panel = torch.randn(8, 7, 10)
+    panel[..., 8] = 1.0
+    panel[2, :, 8] = 0.0
+    panel[2, :, 0] = 0.0
+    endpoints = torch.arange(3, 8)
+    windows = panel.unfold(0, 4, 1).permute(0, 3, 1, 2).contiguous()
+    mask = torch.ones(5, 7, dtype=torch.bool)
+    with torch.no_grad():
+        expected = model(windows, mask)
+        direct = model.forward_from_panel(panel, endpoints, mask)
+        slab = model.forward_from_panel_slab(panel, mask)
+        second_panel = panel.clone()
+        second_panel[..., :8] *= 0.5
+        second_windows = second_panel.unfold(0, 4, 1).permute(0, 3, 1, 2).contiguous()
+        batched_expected = model(
+            torch.cat((windows, second_windows), dim=0),
+            torch.cat((mask, mask), dim=0),
+        )
+        batched = model.forward_from_batched_panel_slabs(
+            torch.stack((panel, second_panel)), torch.stack((mask, mask))
+        )
+        changed_future = panel.clone()
+        changed_future[4:] = 1.0e5
+        first_after_future_change = model.forward_from_panel(
+            changed_future, endpoints[:1], mask[:1]
+        )
+    torch.testing.assert_close(direct, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(slab, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(batched, batched_expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(first_after_future_change, expected[:1], rtol=1e-5, atol=1e-6)
+
+
+def test_window_rms_fit_ignores_future_rows_and_stores_only_active_mask(tmp_path) -> None:
+    config = load_config(Path("configs/experiment_baseline.yaml"))
+    config.training.model_name = "financial_transformer"
+    config.training.financial_transformer.causal_feature_rms_normalization = True
+    config.training.financial_transformer.causal_feature_window_rms_normalization = True
+    config.training.financial_transformer.causal_feature_min_active_dates = 2
+    config.training.financial_transformer.categorical_feature_names = []
+    values = np.zeros((8, 2, 2), dtype=np.float32)
+    values[1:5, :, 0] = 2.0
+    values[5:, :, 1] = 1.0e6
+    panel = SimpleNamespace(
+        features=values,
+        alive_mask=np.ones((8, 2), dtype=np.bool_),
+        feature_names=("observed", "future_only"),
+        dates=np.arange("2014-01-01", "2014-01-09", dtype="datetime64[D]"),
+    )
+    train_ds = SimpleNamespace(
+        valid_indices=np.asarray([4, 5], dtype=np.int64),
+        lookback=3,
+        execution_mode="tw_day_trade",
+    )
+    fitted = _fit_group_causal_feature_rms(
+        config=config, panel=panel, train_ds=train_ds, train_years=[2014],
+        group_folds=[], output_path=tmp_path,
+    )
+    assert fitted is not None
+    scale, active, metadata = fitted
+    torch.testing.assert_close(scale, torch.ones(2))
+    assert active.tolist() == [True, False]
+    assert metadata["normalization"] == "training_only_active_mask_plus_observed_window_rms"
+
+
+def test_window_rms_config_does_not_enable_executable_model_implicitly() -> None:
+    config = load_config(Path(
+        "configs/markets/tw_public_preopen_all_observed_multibasis_window_rms_2014_v1.yaml"
+    ))
+    assert config.training.lookback == 32
+    assert config.training.batch_size_train == 4
+    assert config.training.financial_transformer.causal_feature_window_rms_normalization
+    assert not config.training.executable_portfolio_transformer.causal_feature_window_rms_normalization
 
 
 def test_causal_feature_units_do_not_change_cash_actions_or_parameter_gradients() -> None:

@@ -4,6 +4,17 @@ import numpy as np
 import pytest
 
 from stockagent.backtest.tw_commission_rebate import commission_rebate_calendar
+from stockagent.backtest.tw_commission_rebate_policy import (
+    commission_rebate_calendar as policy_calendar,
+    normalize_commission_rebate_timing as policy_timing,
+)
+
+
+def test_lightweight_policy_preserves_original_public_abi() -> None:
+    from stockagent.backtest.tw_commission_rebate import normalize_commission_rebate_timing
+
+    assert commission_rebate_calendar is policy_calendar
+    assert normalize_commission_rebate_timing is policy_timing
 
 
 def test_commission_rebate_calendar_tracks_months_across_year_boundary() -> None:

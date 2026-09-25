@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 
@@ -77,18 +78,41 @@ def _command(name: str, root: Path, *, money_recent_pages: int) -> list[str]:
 
 
 @contextmanager
-def _source_update_lock(root: Path):
+def _source_update_lock(root: Path, *, wait_seconds: float = 120.0):
     # Share the canonical TW-public producer lock with the completed-session
     # finalizer and publication sweep. An overlapping build must never take a
     # source receipt while originals are being promoted underneath it.
     path = root.parent / ".locks" / "tw-public-refresh.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
+        started = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() - started >= wait_seconds:
+                    raise RuntimeError(
+                        "Taiwan public source update remained busy after "
+                        f"{wait_seconds:g} seconds; retry later"
+                    ) from exc
+                remaining = wait_seconds - (time.monotonic() - started)
+                time.sleep(min(0.1, max(0.0, remaining)))
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("Taiwan public source update is already active; retry later") from exc
-        try:
+            print(
+                "[tw-public-release-archives] "
+                f"source_lock_wait_seconds={time.monotonic() - started:.3f}",
+                flush=True,
+            )
+            # A producer may have held the lock across the protected opening
+            # boundary. Recheck after acquisition, not only at systemd start.
+            subprocess.run(
+                ["/usr/bin/bash", str(REPO_ROOT / "scripts" /
+                 "run_outside_tw_opening_resource_window.sh"),
+                 "--minimum-runway-minutes", "45"],
+                cwd=REPO_ROOT,
+                check=True,
+            )
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -185,6 +209,12 @@ def _refresh(root: Path, commands: dict[str, list[str]]) -> None:
         [sys.executable, str(REPO_ROOT / "scripts" /
          "build_tw_public_research_taifex.py"),
          "--base-path", str(root / "features" / "tw_public_research_wide_2014_v1.parquet")],
+        cwd=REPO_ROOT, check=True,
+    )
+    subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" /
+         "build_tw_public_research_all_features.py"),
+         "--official-path", str(root / "features" / "tw_public_stock_daily.parquet")],
         cwd=REPO_ROOT, check=True,
     )
 

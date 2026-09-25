@@ -590,6 +590,24 @@ def build_model(
             if executable_policy
             else {}
         )
+        window_observation_pairs: list[tuple[int, int]] = []
+        window_passthrough_indices: list[int] = []
+        if fin_cfg.causal_feature_window_rms_normalization:
+            if not feature_names or len(feature_names) != num_features:
+                raise ValueError("window RMS requires the exact ordered feature names")
+            ordered_names = [str(name) for name in feature_names]
+            name_to_index = {name: index for index, name in enumerate(ordered_names)}
+            if len(name_to_index) != len(ordered_names):
+                raise ValueError("window RMS requires unique feature names")
+            window_passthrough_indices = [
+                index for index, name in enumerate(ordered_names)
+                if name.endswith("__available")
+            ]
+            window_observation_pairs = [
+                (index, name_to_index[f"{name}__available"])
+                for index, name in enumerate(ordered_names)
+                if f"{name}__available" in name_to_index
+            ]
         return model_type(
             lookback=lookback,
             num_features=num_features,
@@ -667,6 +685,19 @@ def build_model(
             candle_dropout=fin_cfg.candle_dropout,
             causal_feature_rms_normalization=(
                 fin_cfg.causal_feature_rms_normalization
+            ),
+            causal_feature_window_rms_normalization=(
+                fin_cfg.causal_feature_window_rms_normalization
+            ),
+            window_rms_observation_pairs=window_observation_pairs,
+            window_rms_passthrough_indices=window_passthrough_indices,
+            window_rms_epsilon=fin_cfg.causal_feature_scale_epsilon,
+            causal_feature_compression=fin_cfg.causal_feature_compression,
+            causal_feature_compression_indices=(
+                _feature_indices_from_patterns(
+                    feature_names,
+                    fin_cfg.causal_feature_compression_patterns,
+                )
             ),
             feature_bottleneck_dim=fin_cfg.feature_bottleneck_dim,
             temporal_basis_algebraic_contraction=(

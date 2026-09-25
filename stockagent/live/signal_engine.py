@@ -4,12 +4,13 @@ from collections import OrderedDict
 from concurrent.futures import Future
 import hashlib
 import json
+import math
 import os
 import threading
 import time
 import uuid
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -88,6 +89,32 @@ class LiveSignalResult:
     decision_rows: list[dict[str, Any]]
     message: str
     output_dir: str | None = None
+    _complete_artifacts: Callable[[], None] | None = field(default=None, repr=False)
+
+
+def finalize_live_signal_artifacts(result: LiveSignalResult) -> None:
+    """Finish a published signal once; failures remain incomplete and retryable.
+
+    The scheduler owns the result until completion. This does not run inference
+    or emit another execution pointer/signal, and needs no model-runtime lock.
+    """
+    complete = result._complete_artifacts
+    if complete is not None:
+        complete()
+        result._complete_artifacts = None
+
+
+def _complete_latest_signal_pointer(path: Path, pointer: dict[str, Any]) -> bool:
+    """Do not resurrect an unpublished signal or roll back a newer publication."""
+    with _LIVE_PUBLICATION_LOCK:
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        if current.get("signal_id") != pointer["signal_id"]:
+            return False
+        _atomic_write_json(path, {**pointer, "artifact_complete": True})
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +131,7 @@ class PrefetchedLiveQuote:
 
 _LIVE_QUOTE_INFLIGHT: dict[str, Future[PrefetchedLiveQuote]] = {}
 _LIVE_QUOTE_INFLIGHT_LOCK = threading.Lock()
+_LIVE_PUBLICATION_LOCK = threading.Lock()
 
 
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
@@ -179,6 +207,27 @@ def clear_live_inference_memory_cache() -> None:
         _LIVE_CHECKPOINT_CACHE.clear()
     with _LIVE_MODEL_CACHE_LOCK:
         _LIVE_MODEL_CACHE.clear()
+
+
+def release_idle_live_cuda_cache() -> bool:
+    """Release retained inference models after the caller has excluded live work.
+
+    Clearing a model reference alone leaves PyTorch's allocator reservation in
+    VRAM.  This is intentionally separate from normal cache invalidation: the
+    caller must gate it to off-hours and serialize against model inference.
+    """
+
+    with _LIVE_MODEL_CACHE_LOCK:
+        has_models = bool(_LIVE_MODEL_CACHE)
+    if not has_models:
+        return False
+    clear_live_inference_memory_cache()
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+    return True
 
 
 def _checkpoint_cache_key(path: Path) -> str:
@@ -1540,6 +1589,7 @@ def _price_snapshot(
 
         fallback_errors: list[str] = []
         shared_opening: PriceSnapshot | None = None
+        opening_cache_hit = False
         if require_official_tw_session_open:
             # The paper engine authenticates and resolves Contract V2 at 08:55.
             # Use that already-hot session as the opening source instead of
@@ -1559,6 +1609,7 @@ def _price_snapshot(
             )
             if cached_coverage >= _tw_opening_minimum_coverage():
                 snapshot = cached_opening
+                opening_cache_hit = True
             else:
                 missing_cached = np.flatnonzero(~cached_available)
                 try:
@@ -1718,7 +1769,7 @@ def _price_snapshot(
                 available_count=0,
                 available_mask=np.zeros((len(symbols),), dtype=bool),
             )
-        if require_official_tw_session_open:
+        if require_official_tw_session_open and not opening_cache_hit:
             seed_tw_opening_snapshot_cache(
                 requested_symbols,
                 snapshot,
@@ -2294,7 +2345,7 @@ def _finite_float_or_none(value: Any) -> float | None:
         number = float(value)
     except Exception:
         return None
-    if not np.isfinite(number):
+    if not math.isfinite(number):
         return None
     return number
 
@@ -3049,6 +3100,7 @@ def generate_live_signal(
     daily_bar_time: str | None = None,
     write: bool = True,
     publish_latest: bool = True,
+    defer_rich_artifacts: bool = False,
     ensure_previous_signal: bool = True,
     previous_signal_backfill_limit: int = 8,
     progress_callback: ProgressCallback | None = None,
@@ -3814,18 +3866,13 @@ def generate_live_signal(
         symbol_names=symbol_names,
         top_n=min(8, max(1, int(top_n))),
     )
-    feature_drivers = _feature_driver_summary(
-        panel.feature_names,
-        x_np[-1],
-        target_weights,
-        top_n=min(8, max(1, int(top_n))),
-    )
     all_feature_drivers = _feature_driver_summary(
         panel.feature_names,
         x_np[-1],
         target_weights,
         top_n=max(1, int(len(panel.feature_names))),
     )
+    feature_drivers = all_feature_drivers[: min(8, max(1, int(top_n)))]
     confidence_proxy = None
     if score_values is not None:
         valid_scores = np.asarray(score_values, dtype=np.float64)[mask_np]
@@ -4238,35 +4285,49 @@ def generate_live_signal(
             ),
         }
         if publish_latest:
-            _atomic_write_json(
-                output_root / "latest_signal.json",
-                pointer_payload,
+            with _LIVE_PUBLICATION_LOCK:
+                _atomic_write_json(
+                    output_root / "latest_signal.json",
+                    pointer_payload,
+                )
+            result.summary["execution_pointer_written_at"] = datetime.now(display_tz).isoformat(timespec="microseconds")
+            result.summary["live_latency"]["input_to_execution_pointer_ms"] = round(
+                (time.perf_counter() - signal_started) * 1000.0, 3
             )
         # The execution contract is now visible to the separate simulation
         # process. Rich Parquet/Markdown/Discord artifacts are completed after
         # that causal handoff and may not delay the order-simulation ledger.
-        result.output_dir = _write_outputs_to_dir(result, result_path)
-        live_weights_path = (
-            None
-            if execution_preview_only
-            else write_live_weights_history(
-                checkpoint.parent,
-                result.summary,
-                result.weights_rows,
+        def complete_artifacts() -> None:
+            completion_started = time.perf_counter()
+            result.output_dir = _write_outputs_to_dir(result, result_path)
+            live_weights_path = (
+                None
+                if execution_preview_only
+                else write_live_weights_history(
+                    checkpoint.parent,
+                    result.summary,
+                    result.weights_rows,
+                )
             )
-        )
-        if live_weights_path:
-            result.summary["live_weights_path"] = live_weights_path
-        completed_at = datetime.now(display_tz).isoformat(timespec="microseconds")
-        result.summary["artifact_completed_at"] = completed_at
-        result.summary["live_latency"]["rich_artifact_complete_ms"] = round(
-            float((time.perf_counter() - signal_ready) * 1000.0), 3
-        )
-        _atomic_write_json(summary_path, result.summary)
-        if publish_latest:
-            _atomic_write_json(
-                output_root / "latest_signal.json",
-                {**pointer_payload, "artifact_complete": True},
+            if live_weights_path:
+                result.summary["live_weights_path"] = live_weights_path
+            completed_at = datetime.now(display_tz).isoformat(timespec="microseconds")
+            result.summary["artifact_completed_at"] = completed_at
+            result.summary["live_latency"]["rich_artifact_write_ms"] = round(
+                (time.perf_counter() - completion_started) * 1000.0, 3
             )
+            result.summary["live_latency"]["rich_artifact_complete_ms"] = round(
+                float((time.perf_counter() - signal_ready) * 1000.0), 3
+            )
+            _atomic_write_json(summary_path, result.summary)
+            if publish_latest:
+                # Delayed reporting must never roll back a newer signal.
+                _complete_latest_signal_pointer(
+                    output_root / "latest_signal.json", pointer_payload,
+                )
+
+        result._complete_artifacts = complete_artifacts
+        if not defer_rich_artifacts:
+            finalize_live_signal_artifacts(result)
     _emit_progress(progress_callback, label=progress_name, step=17, total=progress_total, message="done")
     return result

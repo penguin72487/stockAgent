@@ -20,6 +20,21 @@ from downloader.tw_public_contract import (
 )
 
 
+def test_daily_publication_lag_requires_explicit_official_no_data() -> None:
+    assert twpub._confirmed_daily_publication_lag(
+        "2026-09-22=official TPEx report returned no rows on a validated open session"
+    )
+    assert twpub._confirmed_daily_publication_lag(
+        "2026-09-22=official response status is not OK: 很抱歉，沒有符合條件的資料!"
+    )
+    assert not twpub._confirmed_daily_publication_lag(
+        "2026-09-22=official response is not valid JSON: Expecting value"
+    )
+    assert not twpub._confirmed_daily_publication_lag(
+        "2026-09-22=HTTP 429 Too Many Requests"
+    )
+
+
 def _historical_args(
     mode: str,
     *,
@@ -2112,6 +2127,52 @@ def test_historical_transport_failure_reports_all_internal_attempts(
     assert result.response_attempts == 3
 
 
+def test_http_get_sends_only_requested_conditional_validator(monkeypatch) -> None:
+    class FakeLimiter:
+        def wait(self):
+            return None
+
+    class FakeResponse:
+        status_code = 304
+        headers = {}
+        content = b""
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        def __init__(self):
+            self.sent_headers = []
+
+        def get(self, *_args, **kwargs):
+            self.sent_headers.append(kwargs["headers"])
+            return FakeResponse()
+
+    session = FakeSession()
+    monkeypatch.setattr(twpub, "_global_tw_public_rate_limiter", lambda: FakeLimiter())
+    monkeypatch.setattr(twpub, "_http_session", lambda: session)
+    assert twpub._http_get(
+        "https://example.test",
+        timeout=1,
+        verify_ssl=True,
+        conditional_etag='W/"known"',
+        conditional_modified_since="Wed, 23 Sep 2026 21:22:03 GMT",
+        retries=0,
+    ).status_code == 304
+    assert session.sent_headers[0]["If-None-Match"] == 'W/"known"'
+    assert "If-Modified-Since" not in session.sent_headers[0]
+    assert twpub._http_get(
+        "https://example.test",
+        timeout=1,
+        verify_ssl=True,
+        conditional_modified_since="Wed, 23 Sep 2026 21:22:03 GMT",
+        retries=0,
+    ).status_code == 304
+    assert session.sent_headers[1]["If-Modified-Since"] == (
+        "Wed, 23 Sep 2026 21:22:03 GMT"
+    )
+
+
 def test_http_security_block_applies_long_provider_global_cooldown(monkeypatch):
     class FakeLimiter:
         def __init__(self):
@@ -2601,6 +2662,198 @@ def test_merged_writer_does_not_rewrite_for_fetch_timestamp_only(
     assert after.st_ino == before.st_ino
     assert after.st_mtime_ns == before.st_mtime_ns
     assert pl.read_parquet(path)["_downloaded_at_utc"].to_list() == ["old", "old"]
+
+
+def test_merged_writer_unchanged_overlap_avoids_full_archive_read(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-06-03", "2024-06-04"],
+            "value": ["same", "keep"],
+            "_downloaded_at_utc": ["old", "old"],
+        }
+    ).write_parquet(path)
+    before = path.stat()
+
+    def forbid_full_read(_path: Path) -> pl.DataFrame:
+        raise AssertionError("unchanged overlap must not decode the archive")
+
+    monkeypatch.setattr(twpub, "_read_existing", forbid_full_read)
+    rows = twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-03"],
+            "value": ["same"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert rows == 2
+    assert path.stat().st_ino == before.st_ino
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+def test_merged_writer_unchanged_overlap_allows_legacy_null_columns(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame({
+        "date": ["2024-06-03", "2024-06-04"],
+        "legacy_value": ["old", None],
+        "value": ["keep", "same"],
+        "_downloaded_at_utc": ["old", "old"],
+    }).write_parquet(path)
+    before = path.stat()
+
+    def forbid_full_read(_path: Path) -> pl.DataFrame:
+        raise AssertionError("null legacy columns must not force a full read")
+
+    monkeypatch.setattr(twpub, "_read_existing", forbid_full_read)
+    rows = twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-04"],
+            "value": ["same"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert rows == 2
+    assert path.stat().st_ino == before.st_ino
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+def test_merged_writer_legacy_nonnull_value_still_gets_replaced(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame({
+        "date": ["2024-06-03"],
+        "legacy_value": ["old"],
+        "value": ["same"],
+        "_downloaded_at_utc": ["old"],
+    }).write_parquet(path)
+
+    twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-03"],
+            "value": ["same"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert pl.read_parquet(path)["legacy_value"].to_list() == [None]
+
+
+def test_merged_writer_changed_provenance_uses_full_merge(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame({
+        "date": ["2024-06-03"],
+        "value": ["same"],
+        "_url": ["https://old.example/report"],
+        "_downloaded_at_utc": ["old"],
+    }).write_parquet(path)
+    original_read = twpub._read_existing
+    full_reads: list[Path] = []
+
+    def observed_full_read(read_path: Path) -> pl.DataFrame:
+        full_reads.append(read_path)
+        return original_read(read_path)
+
+    monkeypatch.setattr(twpub, "_read_existing", observed_full_read)
+    twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-03"],
+            "value": ["same"],
+            "_url": ["https://new.example/report"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert full_reads == [path]
+    assert pl.read_parquet(path)["_url"].to_list() == ["https://new.example/report"]
+
+
+def test_merged_writer_new_date_is_not_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame({
+        "date": ["2024-06-03"],
+        "value": ["old"],
+        "_downloaded_at_utc": ["old"],
+    }).write_parquet(path)
+
+    rows = twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-04"],
+            "value": ["new"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert rows == 2
+    assert pl.read_parquet(path)["value"].to_list() == ["old", "new"]
+
+
+def test_merged_writer_unsorted_archive_still_canonicalizes_dates(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "historical.parquet"
+    pl.DataFrame({
+        "date": ["2024-06-04", "2024-06-03"],
+        "value": ["keep", "same"],
+        "_downloaded_at_utc": ["old", "old"],
+    }).write_parquet(path)
+
+    twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-03"],
+            "value": ["same"],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert pl.read_parquet(path)["date"].to_list() == ["2024-06-03", "2024-06-04"]
+
+
+def test_merged_writer_twse_ohlcv_still_repairs_malformed_date(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "twse_daily_ohlcv.parquet"
+    url = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=20240603&type=ALLBUT0999"
+    pl.DataFrame({
+        "date": ["2024-13-03", "2024-06-03"],
+        "證券代號": ["2330", "2330"],
+        "_url": [url, url],
+        "_downloaded_at_utc": ["old", "old"],
+    }).write_parquet(path)
+
+    rows = twpub._write_parquet_merged(
+        path,
+        pl.DataFrame({
+            "date": ["2024-06-03"],
+            "證券代號": ["2330"],
+            "_url": [url],
+            "_downloaded_at_utc": ["new"],
+        }),
+        refresh=False,
+    )
+
+    assert rows == 1
+    assert pl.read_parquet(path)["date"].to_list() == ["2024-06-03"]
 
 
 def test_merged_writer_rewrites_real_value_change(tmp_path: Path) -> None:

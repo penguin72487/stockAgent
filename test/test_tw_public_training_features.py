@@ -34,6 +34,8 @@ from stockagent.data.tw_public_features import (
     _build_cbc_overnight_rate_features,
     _build_dgbas_macro_features,
     _merge_feature_frames,
+    _finalize_feature_frame,
+    _map_available_dates_to_sessions,
     _next_exchange_session_lookup,
     _material_info_available_date_expr,
     _build_twse_market_index_features,
@@ -42,6 +44,142 @@ from stockagent.data.tw_public_features import (
     _source_content_receipts,
     build_tw_public_training_features,
 )
+
+
+def test_large_session_aligned_frame_skips_asof_without_skipping_holiday_mapping(
+    tmp_path: Path,
+) -> None:
+    sessions = pl.DataFrame({
+        "_session_date": [date(2024, 1, 2), date(2024, 1, 3)],
+    })
+    aligned = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * 100_000,
+        "symbol": ["2330"] * 100_000,
+        "value": list(range(100_000)),
+    })
+    assert _map_available_dates_to_sessions(aligned, tmp_path, sessions=sessions) is aligned
+
+    with_holiday = pl.concat([
+        aligned,
+        pl.DataFrame({
+            "date": [date(2024, 1, 1)], "symbol": ["0050"], "value": [100_000],
+        }),
+    ])
+    mapped = _map_available_dates_to_sessions(with_holiday, tmp_path, sessions=sessions)
+    assert mapped.height == with_holiday.height
+    assert mapped.filter(pl.col("value") == 100_000).select("date").item() == date(2024, 1, 2)
+
+
+def test_unique_key_merge_matches_redundant_final_group_by() -> None:
+    frames = [
+        pl.DataFrame({
+            "date": [date(2024, 1, 2), date(2024, 1, 2), date(2024, 1, 3)],
+            "symbol": ["2330", "2330", "0050"],
+            "twpub_official_trading_volume_raw": [1.0, 2.0, None],
+        }),
+        pl.DataFrame({
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "symbol": ["2330", "0050"],
+            "twpub_pe_raw": [20.0, 10.0],
+            "twpub_official_trading_volume_raw": [99.0, 88.0],
+        }),
+        pl.DataFrame({
+            "date": [date(2024, 1, 3)], "symbol": ["2330"],
+            "twpub_pb_raw": [5.0],
+        }),
+    ]
+    cleaned = [_finalize_feature_frame(frame) for frame in frames]
+    old = cleaned[0]
+    for frame in cleaned[1:]:
+        old = old.join(frame, on=["date", "symbol"], how="full", coalesce=True)
+    old = _finalize_feature_frame(old)
+    new = _merge_feature_frames(frames)
+    assert_frame_equal(
+        new.sort(["date", "symbol"]), old.sort(["date", "symbol"]),
+        check_row_order=True, check_column_order=True,
+    )
+
+
+def test_large_feature_frame_skips_groupby_only_when_keys_are_unique() -> None:
+    unique = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * 100_000,
+        "symbol": [f"{index:06d}" for index in range(100_000)],
+        "twpub_pe_raw": [float(index) for index in range(100_000)],
+    })
+    normalized = _finalize_feature_frame(unique)
+    assert normalized.height == unique.height
+    assert_frame_equal(normalized, unique, check_row_order=True)
+
+    duplicated = pl.concat([
+        unique,
+        pl.DataFrame({
+            "date": [date(2024, 1, 2)], "symbol": ["000000"],
+            "twpub_pe_raw": [999.0],
+        }),
+    ])
+    result = _finalize_feature_frame(duplicated)
+    assert result.height == unique.height
+    assert result.filter(pl.col("symbol") == "000000")["twpub_pe_raw"].item() == 999.0
+
+
+def test_sparse_duplicate_feature_keys_keep_last_non_null_per_column() -> None:
+    frame = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * 100_003,
+        "symbol": [f"{index:06d}" for index in range(100_000)]
+        + ["000000", "000000", "000001"],
+        "twpub_pe_raw": [float(index) for index in range(100_000)]
+        + [None, 321.0, None],
+        "twpub_pb_raw": [float(index) for index in range(100_000)]
+        + [123.0, None, None],
+    })
+    expected = frame.group_by(["date", "symbol"]).agg([
+        pl.col(name).drop_nulls().last().alias(name)
+        for name in ("twpub_pe_raw", "twpub_pb_raw")
+    ])
+    assert_frame_equal(
+        _finalize_feature_frame(frame).sort(["date", "symbol"]),
+        expected.sort(["date", "symbol"]),
+        check_row_order=True,
+        check_column_order=True,
+    )
+
+
+def test_large_feature_join_preserves_extra_keys_and_first_column_wins() -> None:
+    frames = [
+        pl.DataFrame({
+            "date": [date(2024, 1, 2)] * 100_000,
+            "symbol": [f"{index:06d}" for index in range(100_000)],
+            "twpub_pe_raw": [float(index) for index in range(100_000)],
+        }),
+        pl.DataFrame({
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "symbol": ["000000", "999999"],
+            "twpub_pe_raw": [999.0, 3.0],
+            "twpub_pb_raw": [1.0, 2.0],
+        }),
+        pl.DataFrame({
+            "date": [date(2024, 1, 4)],
+            "symbol": ["888888"],
+            "twpub_dividend_yield": [0.04],
+        }),
+    ]
+    expected = _finalize_feature_frame(frames[0])
+    for frame in frames[1:]:
+        expected = expected.join(
+            _finalize_feature_frame(frame),
+            on=["date", "symbol"], how="full", coalesce=True,
+        )
+    expected = expected.select(
+        ["date", "symbol", *[name for name in expected.columns if name in ("twpub_pe_raw", "twpub_pb_raw", "twpub_dividend_yield")]]
+    )
+    stages: dict[str, float] = {}
+    result = _merge_feature_frames(frames, stage_seconds=stages)
+    assert "join_keys" in stages
+    assert_frame_equal(
+        result.sort(["date", "symbol"]),
+        expected.sort(["date", "symbol"]),
+        check_row_order=True, check_column_order=True,
+    )
 
 
 def test_feature_writer_lock_uses_resolved_output_identity(tmp_path: Path) -> None:
@@ -764,6 +902,23 @@ def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
     assert incremental.build_mode == "full"
     assert incremental.incremental_start_date is None
     assert incremental.reused_rows == 0
+    assert incremental.incremental_fallback_reason == "base_contract_not_verified"
+    assert incremental.stage_elapsed_seconds["total_before_summary"] >= 0
+    assert {
+        "source_proof",
+        "stock_build",
+        "market_build",
+        "output_assembly",
+        "parquet_write_and_proof",
+        "total_before_summary",
+        "stock_official_ohlcv",
+        "stock_day_trade_rule",
+        "market_twse_index",
+        "market_taifex_settlement",
+    } <= set(incremental.stage_elapsed_seconds)
+    summary = json.loads(incremental_path.with_suffix(".summary.json").read_text())
+    assert summary["incremental_fallback_reason"] == "base_contract_not_verified"
+    assert summary["stage_elapsed_seconds"] == incremental.stage_elapsed_seconds
     assert incremental.rows == full.rows
     assert_frame_equal(
         pl.read_parquet(incremental_path),
@@ -782,6 +937,7 @@ def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
     )
     assert unchanged.build_mode == "unchanged_verified"
     assert unchanged.reused_rows == incremental.rows
+    assert unchanged.stage_elapsed_seconds["total_before_summary"] >= 0
     assert incremental_path.stat().st_ino == prior_identity.st_ino
     assert incremental_path.stat().st_mtime_ns == prior_identity.st_mtime_ns
     assert incremental_path.with_suffix(".summary.json").stat().st_mtime_ns == prior_summary.st_mtime_ns
@@ -798,6 +954,94 @@ def test_incremental_feature_tail_matches_full_rebuild(tmp_path: Path) -> None:
     assert json.loads(incremental_path.with_suffix(".summary.json").read_text())[
         "allow_daily_publication_lag"
     ] is True
+
+
+def test_taifex_futures_only_change_reuses_verified_stock_rows(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "tw_public"
+    input_dir.mkdir()
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 11.0])
+    stock_path = input_dir / "twse_daily_ohlcv.parquet"
+    stock = pl.DataFrame({
+        "證券代號": ["2330", "2330"],
+        "收盤價": ["100", "101"], "最高價": ["101", "102"],
+        "最低價": ["99", "100"], "成交股數": ["1000", "1100"],
+        "成交金額": ["100000", "111100"], "成交筆數": ["10", "11"],
+        "date": ["2024-01-02", "2024-01-03"],
+    })
+    stock.write_parquet(stock_path)
+    futures_path = input_dir / "taifex_daily_futures.parquet"
+
+    def write_futures(last_settlement: str) -> None:
+        pl.DataFrame({
+            "Date": ["2024/01/02", "2024/01/03"],
+            "Contract": ["TX", "TX"],
+            "TradingSession": ["一般", "一般"],
+            "ContractMonth(Week)": ["202401", "202401"],
+            "Volume": ["100", "110"],
+            "OpenInterest": ["500", "510"],
+            "SettlementPrice": ["18000", last_settlement],
+        }).write_parquet(futures_path)
+
+    write_futures("18010")
+    settlement_path = input_dir / "taifex_final_settlement_price.parquet"
+
+    def write_settlement(last_price: str) -> None:
+        pl.DataFrame({
+            "商品代號": ["TX", "TX"],
+            "最後結算日": ["2024-01-02", "2024-01-03"],
+            "最後結算價": ["18000", last_price],
+        }).write_parquet(settlement_path)
+
+    write_settlement("18010")
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(
+        input_dir, output_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+    write_futures("18020")
+    reused = build_tw_public_training_features(
+        input_dir, output_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+        incremental_start_date=date(2024, 1, 3),
+    )
+    assert reused.build_mode == "market_only_rebuild"
+    assert reused.reused_rows == reused.stock_rows == 2
+    assert "stock_official_ohlcv" not in reused.stage_elapsed_seconds
+    full_path = tmp_path / "full.parquet"
+    build_tw_public_training_features(
+        input_dir, full_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+    assert_frame_equal(
+        pl.read_parquet(output_path), pl.read_parquet(full_path),
+        check_row_order=True, check_column_order=True,
+    )
+
+    write_settlement("18030")
+    settlement_only = build_tw_public_training_features(
+        input_dir, output_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+    assert settlement_only.build_mode == "market_only_rebuild"
+    build_tw_public_training_features(
+        input_dir, full_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+    assert_frame_equal(
+        pl.read_parquet(output_path), pl.read_parquet(full_path),
+        check_row_order=True, check_column_order=True,
+    )
+
+    stock.with_columns(pl.lit("102").alias("收盤價")).write_parquet(stock_path)
+    revised_stock = build_tw_public_training_features(
+        input_dir, output_path, symbols_root=symbols_root,
+        end_date=date(2024, 1, 3),
+    )
+    assert revised_stock.build_mode == "full"
 
 
 def test_tw_public_feature_builder_excludes_rows_after_completed_cutoff(

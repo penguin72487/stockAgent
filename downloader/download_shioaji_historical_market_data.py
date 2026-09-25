@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 import fcntl
 import hashlib
 import heapq
@@ -600,7 +601,20 @@ def _read_receipt(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _valid_receipt(path: Path, data_path: Path, *, method: str, code: str) -> dict[str, Any] | None:
+def _file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+@lru_cache(maxsize=131_072)
+def _valid_receipt_at_signature(
+    path: Path, data_path: Path, method: str, code: str,
+    receipt_signature: tuple[int, int, int, int, int] | None,
+    data_signature: tuple[int, int, int, int, int] | None,
+) -> dict[str, Any] | None:
     payload = _read_receipt(path)
     if not payload or not (
         payload.get("schema_version") == RECEIPT_SCHEMA_VERSION
@@ -615,11 +629,25 @@ def _valid_receipt(path: Path, data_path: Path, *, method: str, code: str) -> di
                  else f"trading_date={payload.get('trading_date')}")
     if data_path.parent.name != partition:
         return None
-    if payload.get("status") == "source_empty":
-        return payload
-    if not data_path.is_file() or verified_sha(data_path) != payload.get("sha256"):
+    if payload.get("status") != "source_empty" and (
+        data_signature is None or verified_sha(data_path) != payload.get("sha256")
+    ):
+        return None
+    # An atomic replacement between stat/read/hash is not a reusable proof.
+    if _file_signature(path) != receipt_signature or _file_signature(data_path) != data_signature:
         return None
     return payload
+
+
+def _valid_receipt(path: Path, data_path: Path, *, method: str, code: str) -> dict[str, Any] | None:
+    receipt_signature = _file_signature(path)
+    if receipt_signature is None:
+        return None
+    data_signature = _file_signature(data_path)
+    payload = _valid_receipt_at_signature(
+        path, data_path, method, code, receipt_signature, data_signature
+    )
+    return dict(payload) if payload is not None else None
 
 
 def _naive_wall_clock(ts_ns: int) -> datetime:
@@ -705,9 +733,15 @@ def build_tasks(
         if refresh_empty and unavailable and unavailable.get('status') in {'contract_unavailable', 'query_failed'} and not retry_due(unavailable):
             continue
         official_dates = (activity or FuturesActivity()).exact_dates(row)
+        observed_dates: set[date] = set()
         for start, end in iter_date_chunks(row.begin_date, row.end_date, chunk_days):
             data_path, receipt_path = _kbar_paths(root, row, start, end)
             receipt = _valid_receipt(receipt_path, data_path, method='kbars', code=row.code)
+            if receipt is not None and not kbars_only:
+                for value in receipt.get('observed_trading_dates') or ():
+                    parsed = _date_value(value)
+                    if parsed is not None:
+                        observed_dates.add(parsed)
             positive = any(start <= day <= end for day in official_dates)
             repair_partial = bool(receipt and receipt['status'] == 'complete'
                                   and missing_kbar_activity(receipt, start, end, official_dates)
@@ -729,7 +763,7 @@ def build_tasks(
             )
         if kbars_only:
             continue
-        dates = set(observed_tick_dates(root, row, chunk_days=chunk_days)) | official_dates
+        dates = observed_dates | official_dates
         for trading_date in sorted(dates):
             data_path, receipt_path = _tick_paths(root, row, trading_date)
             receipt = _valid_receipt(receipt_path, data_path, method='ticks', code=row.code)
@@ -899,6 +933,18 @@ def _write_summary(
     if persist:
         _atomic_write_json(root / ("summary_kbars.json" if kbars_only else "summary.json"), payload)
     return payload
+
+
+def _needs_intermediate_summary(
+    completed_queries: int, *, max_queries: int, pending_tasks: bool
+) -> bool:
+    """Bound full-tree audits; per-query progress remains available meanwhile."""
+
+    return (
+        pending_tasks
+        and (not max_queries or completed_queries < max_queries)
+        and (completed_queries == 1 or completed_queries % 250 == 0)
+    )
 
 
 def _query_with_retries(
@@ -1355,9 +1401,12 @@ def main() -> int:
             )
             # The full receipt audit is O(total targets).  Progress JSON is
             # already refreshed per query, so audit the canonical summary at a
-            # bounded cadence instead of turning every ten API responses into
-            # a 31k+ filesystem scan.
-            if completed_queries == 1 or completed_queries % 100 == 0:
+            # bounded cadence instead of turning every few API responses into
+            # a 100k+ filesystem scan.
+            if _needs_intermediate_summary(
+                completed_queries, max_queries=args.max_queries, pending_tasks=bool(heap)
+            ):
+                summary_started = time.perf_counter()
                 _write_summary(
                     args.output_dir,
                     rows,
@@ -1368,6 +1417,11 @@ def main() -> int:
                     kbars_only=args.kbars_only,
                     refresh_empty=args.refresh_empty, activity=activity,
                 )
+                print(
+                    f"[shioaji-history] summary_audit query={completed_queries} "
+                    f"kind=intermediate elapsed_seconds={time.perf_counter() - summary_started:.3f}",
+                    flush=True,
+                )
             print(
                 f"[shioaji-history] query={completed_queries} "
                 f"collection={task.contract.collection} contract={task.code} "
@@ -1376,6 +1430,7 @@ def main() -> int:
                 f"traffic={usage[0]:,}/{usage[1]:,}",
                 flush=True,
             )
+        summary_started = time.perf_counter()
         summary = _write_summary(
             args.output_dir,
             rows,
@@ -1385,6 +1440,11 @@ def main() -> int:
             progress_path=progress_path,
             kbars_only=args.kbars_only,
             refresh_empty=args.refresh_empty, activity=activity,
+        )
+        print(
+            f"[shioaji-history] summary_audit query={completed_queries} "
+            f"kind=final elapsed_seconds={time.perf_counter() - summary_started:.3f}",
+            flush=True,
         )
         final_state = str(summary["state"])
         progress.finish(

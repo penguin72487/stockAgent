@@ -1,0 +1,24 @@
+[Unit]
+Description=Snapshot FinLab account data quota for the read-only dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python "@REPO_ROOT@/scripts/snapshot_finlab_quota.py"'
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryAccounting=true
+MemoryMax=512M
+MemorySwapMax=0
+TimeoutStartSec=30s
+
+[Install]
+WantedBy=multi-user.target

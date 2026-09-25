@@ -39,6 +39,8 @@ from common import (
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from artifact_io import archive_run_reports
+from candle_frame_buffer import CandleFrameBuffer
 from ohlcv_hot_tail import (
     hot_tail_path,
     read_logical_parquet,
@@ -219,6 +221,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.6,
         help="Base seconds for exponential backoff",
+    )
+    parser.add_argument(
+        "--archive-report-dir",
+        default=None,
+        help="Optional per-run report archive before later jobs replace latest reports.",
     )
     return parser.parse_args()
 
@@ -734,6 +741,7 @@ def _download_symbol_1m(
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
     effective_start_ms = start_ms
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
     if record.launch_time:
         effective_start_ms = max(
             effective_start_ms,
@@ -792,11 +800,12 @@ def _download_symbol_1m(
     elif tail_only:
         effective_start_ms = max(
             effective_start_ms,
-            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+            closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    all_rows: list[list[str]] = []
-    for window_start, window_end in _iter_windows(effective_start_ms, end_ms):
+    candles = CandleFrameBuffer(_normalize_candles)
+    received_rows = False
+    for window_start, window_end in _iter_windows(effective_start_ms, closed_end_ms):
         payload = client.get(
             KLINE_ENDPOINT,
             {
@@ -812,9 +821,14 @@ def _download_symbol_1m(
             page_progress_callback(record.code)
         chunk = payload.get("result", {}).get("list", [])
         if chunk:
-            all_rows.extend(chunk)
+            received_rows = True
+            candles.extend(
+                row
+                for row in chunk
+                if effective_start_ms <= int(row[0]) <= closed_end_ms
+            )
 
-    if not all_rows:
+    if not received_rows:
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
@@ -836,11 +850,7 @@ def _download_symbol_1m(
             message="No candles returned by Bybit.",
         )
 
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    filtered_rows = [
-        row for row in all_rows if effective_start_ms <= int(row[0]) <= closed_end_ms
-    ]
-    df = _normalize_candles(filtered_rows)
+    df = candles.finish()
     if df.is_empty():
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
@@ -1121,15 +1131,31 @@ def main() -> None:
         summary_path,
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
+    if args.archive_report_dir:
+        archive_run_reports(
+            args.archive_report_dir,
+            (symbols_path, report_path, summary_path),
+        )
+    source_incomplete = sum(
+        result.status in {"failed", "repair_required"} for result in results
+    )
     pipeline_progress.finish(
-        failed=any(result.status in {"failed", "repair_required"} for result in results),
+        failed=bool(source_incomplete),
         require_exact=True,
     )
 
     print(f"[bybit] symbols.csv -> {symbols_path}")
     print(f"[bybit] download_report.csv -> {report_path}")
     print(f"[bybit] download_summary.json -> {summary_path}")
-    print(f"[bybit] done: {json.dumps(summary, ensure_ascii=False)}")
+    print(f"[bybit] report: {json.dumps(summary, ensure_ascii=False)}")
+    lock_handle.close()
+    if source_incomplete or pipeline_progress.current != pipeline_progress.total:
+        raise RuntimeError(
+            "Bybit download incomplete: "
+            f"{source_incomplete} source symbols, "
+            f"progress {pipeline_progress.current}/{pipeline_progress.total}"
+        )
+    print("[bybit] complete")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data.tw_price_rules import move_price_ticks_numpy
+from stockagent.live.benchmark_history_projection import load_benchmark_projection
 from scripts.rebuild_tw_day_trade_minute_curves import (
     historical_minute_mark_has_source,
 )
@@ -49,8 +50,8 @@ MINUTE_VWAP_0901_REPLAY_CONTRACT = (
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
 )
 MINUTE_PRICE_0901_REPLAY_CONTRACT = (
-    "retrospective_official_open_signal_at_09_00_observed_09_01_"
-    "minute_price_volume_capped_nav_counterfactual_v3"
+    "retrospective_official_open_signal_at_09_00_observed_minute_price_"
+    "50pct_volume_sweep_until_exit_window_nav_counterfactual_v4"
 )
 PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT = (
     "retrospective_prior_paper_fill_else_09_01_minute_price_"
@@ -72,6 +73,8 @@ MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
     MINUTE_VWAP_0901_REPLAY_CONTRACT,
     MINUTE_PRICE_0901_REPLAY_CONTRACT,
     PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT,
+    "retrospective_official_open_signal_at_09_00_observed_09_01_"
+    "minute_price_volume_capped_nav_counterfactual_v3",
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_price_counterfactual_v2",
 }
 MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
@@ -286,22 +289,40 @@ def _validate_benchmarks(
     state_dir: Path, *, completed_session_dates: list[str],
 ) -> dict[str, Any]:
     """Shared maintenance/promotion gate: date coverage is not an envelope claim."""
-    marks = _load_object(state_dir / "benchmark_history.json").get("marks")
-    if not isinstance(marks, list):
-        raise RuntimeError("benchmark history has no marks")
+    source_path = state_dir / "benchmark_history.json"
+    source_sha256 = _sha256(source_path)
+    projection = load_benchmark_projection(
+        state_dir=state_dir,
+        source_path=source_path,
+        selected_sessions=completed_session_dates,
+    )
+    if projection is not None and projection.source_sha256 == source_sha256:
+        marks = projection.marks
+    else:
+        marks = _load_object(source_path).get("marks")
+        if not isinstance(marks, list):
+            raise RuntimeError("benchmark history has no marks")
     expected_sessions = set(completed_session_dates)
     contracts = {
         "benchmark_0050": ("09:00", "13:30", 271),
         "benchmark_2330": ("09:00", "13:30", 271),
         "benchmark_tx_continuous": ("08:45", "13:44", 300),
     }
+    by_benchmark: dict[str, dict[str, list[str]]] = {
+        benchmark_id: {} for benchmark_id in contracts
+    }
+    for row in marks:
+        if not isinstance(row, dict):
+            continue
+        benchmark_id = str(row.get("benchmark_id") or "")
+        session_date = str(row.get("session_date") or "")
+        if benchmark_id in by_benchmark and session_date in expected_sessions:
+            by_benchmark[benchmark_id].setdefault(session_date, []).append(
+                str(row.get("minute") or "")
+            )
     counts = {}
     for benchmark_id, (first_clock, last_clock, expected_points) in contracts.items():
-        by_session: dict[str, list[str]] = {}
-        for row in marks:
-            if (isinstance(row, dict) and row.get("benchmark_id") == benchmark_id
-                    and str(row.get("session_date") or "") in expected_sessions):
-                by_session.setdefault(str(row["session_date"]), []).append(str(row.get("minute") or ""))
+        by_session = by_benchmark[benchmark_id]
         if set(by_session) != expected_sessions:
             raise RuntimeError(f"{benchmark_id} missing completed sessions: {sorted(expected_sessions - set(by_session))[:20]}")
         for session_date, minutes in by_session.items():
@@ -743,6 +764,7 @@ def _validate_0901_minute_price_fill_ledger(
     expected_fills: int,
     failures: list[str],
     expected_prior_fills: int = 0,
+    expected_post_0901_sweep_fills: int = 0,
     prior_manifest: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     path = candidate / "fills.jsonl"
@@ -754,6 +776,11 @@ def _validate_0901_minute_price_fill_ledger(
         }
     fill_count = 0
     prior_count = 0
+    post_0901_sweep_count = 0
+    reduction_sweep_fill_rows = 0
+    sweep_usage: dict[tuple[str, str, str, str], tuple[int, int]] = {}
+    reduction_sweep_buckets: set[tuple[str, str, str, str]] = set()
+    opened_positions: set[tuple[str, str, str]] = set()
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -761,10 +788,15 @@ def _validate_0901_minute_price_fill_ledger(
             except json.JSONDecodeError:
                 failures.append(f"fills.jsonl:{line_number}: invalid JSON")
                 continue
-            if (
-                str(row.get("purpose") or "") != "entry"
-                or str(row.get("fill_contract") or "")
-                not in MINUTE_PRICE_0901_REPLAY_CONTRACTS
+            purpose = str(row.get("purpose") or "")
+            fill_contract = str(row.get("fill_contract") or "")
+            is_sweep = (
+                row.get("counterfactual_minute_sweep_fill") is True
+                and fill_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT
+            )
+            if not is_sweep and (
+                purpose != "entry"
+                or fill_contract not in MINUTE_PRICE_0901_REPLAY_CONTRACTS
             ):
                 continue
             if row.get("prior_paper_fill_reused") is True:
@@ -794,6 +826,72 @@ def _validate_0901_minute_price_fill_ledger(
                     valid_prior = False
                 if not valid_prior:
                     failures.append(f"fills.jsonl:{line_number}: invalid prior paper-fill reuse")
+                else:
+                    opened_positions.add((
+                        str(row.get("session_date") or ""),
+                        str(row.get("market") or ""),
+                        str(row.get("position_id") or ""),
+                    ))
+                continue
+            if is_sweep:
+                post_0901_sweep_count += 1
+                if purpose == "next_signal_inventory_delta_minute_sweep":
+                    reduction_sweep_fill_rows += 1
+                try:
+                    price = float(row.get("price"))
+                    fill_at = datetime.fromisoformat(str(row.get("fill_at")))
+                    volume = float(row.get("observed_minute_volume_lots"))
+                    quantity = int(row.get("quantity") or 0)
+                    capacity = int(math.floor(volume * 0.5)) * 1000
+                    position_key = (
+                        str(row.get("session_date") or ""),
+                        str(row.get("market") or ""),
+                        str(row.get("position_id") or ""),
+                    )
+                    valid_sweep = (
+                        str(row.get("entry_fill_policy") or "")
+                        == MINUTE_VWAP_0901_ENTRY_POLICY
+                        and str(row.get("entry_price_method") or "")
+                        == "minute_vwap"
+                        and row.get("simulation_replay") is True
+                        and math.isfinite(price)
+                        and price > 0.0
+                        and math.isfinite(volume)
+                        and volume > 0.0
+                        and 0 < quantity <= capacity
+                        and (
+                            purpose == "entry"
+                            or (
+                                purpose == "entry_completion"
+                                and position_key in opened_positions
+                            )
+                            or purpose
+                            == "next_signal_inventory_delta_minute_sweep"
+                        )
+                        and fill_at.date().isoformat()
+                        == str(row.get("session_date") or "")
+                        and (fill_at.hour, fill_at.minute) >= (9, 2)
+                        and (fill_at.hour, fill_at.minute) < (13, 20)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    valid_sweep = False
+                if not valid_sweep:
+                    failures.append(
+                        f"fills.jsonl:{line_number}: invalid post-09:01 minute sweep"
+                    )
+                else:
+                    key = (
+                        str(row.get("session_date") or ""),
+                        str(row.get("market") or ""),
+                        str(row.get("symbol") or ""),
+                        fill_at.isoformat(timespec="minutes"),
+                    )
+                    used, recorded_capacity = sweep_usage.get(key, (0, capacity))
+                    sweep_usage[key] = (used + quantity, min(recorded_capacity, capacity))
+                    if purpose == "entry":
+                        opened_positions.add(position_key)
+                    elif purpose == "next_signal_inventory_delta_minute_sweep":
+                        reduction_sweep_buckets.add(key)
                 continue
             fill_count += 1
             try:
@@ -822,6 +920,18 @@ def _validate_0901_minute_price_fill_ledger(
                 failures.append(
                     f"fills.jsonl:{line_number}: 09:01 minute-price contract mismatch"
                 )
+            else:
+                opened_positions.add((
+                    str(row.get("session_date") or ""),
+                    str(row.get("market") or ""),
+                    str(row.get("position_id") or ""),
+                ))
+    for key, (used, capacity) in sweep_usage.items():
+        if used > capacity:
+            failures.append(
+                "fills ledger post-09:01 shared minute capacity exceeded: "
+                f"{key} used={used} capacity={capacity}"
+            )
     if fill_count != expected_fills:
         failures.append(
             f"fills ledger 09:01 minute-price fills={fill_count} receipt={expected_fills}"
@@ -830,10 +940,23 @@ def _validate_0901_minute_price_fill_ledger(
         failures.append(
             f"fills ledger prior-paper fills={prior_count} receipt={expected_prior_fills}"
         )
+    # Reduction counters in the replay receipt count one symbol/minute order
+    # attempt, while one attempt can close multiple carried position IDs and
+    # therefore append multiple fill rows.  Entry counters are per fill row.
+    entry_sweep_fill_count = post_0901_sweep_count - reduction_sweep_fill_rows
+    receipt_counter_units = entry_sweep_fill_count + len(reduction_sweep_buckets)
+    if receipt_counter_units != expected_post_0901_sweep_fills:
+        failures.append(
+            "fills ledger post-09:01 receipt counter units="
+            f"{receipt_counter_units} receipt={expected_post_0901_sweep_fills} "
+            f"fill_rows={post_0901_sweep_count}"
+        )
     return {
         "fill_ledger_minute_price_0901_fills": fill_count,
         "fill_ledger_minute_vwap_0901_fills": fill_count,
         "fill_ledger_prior_paper_fills": prior_count,
+        "fill_ledger_post_0901_minute_sweep_fills": post_0901_sweep_count,
+        "fill_ledger_post_0901_receipt_counter_units": receipt_counter_units,
     }
 
 
@@ -895,6 +1018,8 @@ def _validate_rebuild(
     minute_vwap_0901_fills = 0
     minute_price_0901_fills = 0
     prior_paper_fills = 0
+    post_0901_sweep_fills = 0
+    post_0901_cumulative_by_market: dict[str, tuple[int, int]] = {}
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -1050,9 +1175,31 @@ def _validate_rebuild(
                 if receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT and isinstance(after_close, dict):
                     if int(after_close.get("terminal_flatten_count") or 0):
                         failures.append(f"{session_date}/{market}: v3 uses synthetic terminal flatten")
+            terminal_entry = (
+                row.get("current_open") if is_allowed_current_open else row.get("after_close")
+            )
+            if not isinstance(terminal_entry, dict):
+                terminal_entry = entry if isinstance(entry, dict) else {}
+            current_sweep_counts = (
+                int(terminal_entry.get("entry_post_0901_minute_price_fill_count") or 0),
+                int(terminal_entry.get("rebalance_reduction_post_0901_fill_count") or 0),
+            )
+            prior_sweep_counts = post_0901_cumulative_by_market.get(str(market))
+            if prior_sweep_counts and any(
+                current < prior
+                for current, prior in zip(current_sweep_counts, prior_sweep_counts)
+            ):
+                failures.append(
+                    f"{session_date}/{market}: cumulative minute-sweep counters regressed"
+                )
+            post_0901_cumulative_by_market[str(market)] = current_sweep_counts
 
     if session_dates != sorted(set(session_dates)):
         failures.append("session dates are duplicated or not strictly increasing")
+    post_0901_sweep_fills = sum(
+        entry_count + reduction_count
+        for entry_count, reduction_count in post_0901_cumulative_by_market.values()
+    )
 
     final_open_positions: dict[str, int] = {}
     ending_equity: dict[str, float] = {}
@@ -1151,11 +1298,12 @@ def _validate_rebuild(
                     )
                 if mode_is_0901_vwap and (
                     (position.get("counterfactual_0901_price_fill") is not True
+                     and position.get("counterfactual_minute_sweep_fill") is not True
                      and position.get("prior_paper_fill_reused") is not True)
                     or position.get("counterfactual_open_price_fill") is not False
                 ):
                     failures.append(
-                        f"{market}/{symbol}: position is not an observed 09:01 minute-price fill"
+                        f"{market}/{symbol}: position is not an observed minute-price fill"
                     )
                 if (
                     position.get("entry_fill_is_synthetic") is not False
@@ -1219,6 +1367,7 @@ def _validate_rebuild(
                 expected_fills=expected_minute_price_fills,
                 failures=failures,
                 expected_prior_fills=prior_paper_fills,
+                expected_post_0901_sweep_fills=post_0901_sweep_fills,
                 prior_manifest=prior_manifest,
             )
         )
@@ -1283,6 +1432,48 @@ def _acquire_engine_lock(directory: Path):
             f"paper ledger still has a live writer: {directory}"
         ) from None
     return handle
+
+
+def _cutover_blockers(
+    live: Path, candidate: Path, expected_markets: set[str]
+) -> list[str]:
+    """Check the mutable live boundary separately from candidate validity.
+
+    A replay can be internally valid but still be unsafe to publish when the
+    paper engine has since advanced to a later session.  This check is run
+    both before draining the writer and again under its lock.
+    """
+
+    live_path = live / "state.json"
+    if not live_path.is_file():
+        return [f"live paper state is missing: {live_path}"]
+    live_modes = _load_object(live_path).get("modes") or {}
+    candidate_modes = _load_object(candidate / "state.json").get("modes") or {}
+    blockers: list[str] = []
+    if set(live_modes) != expected_markets:
+        blockers.append(
+            f"live mode set differs from expected: {sorted(live_modes)}"
+        )
+    for market in sorted(expected_markets & set(live_modes)):
+        live_mode = live_modes[market]
+        candidate_mode = candidate_modes.get(market) or {}
+        if int(live_mode.get("open_position_count") or 0) != 0 or any(
+            int(position.get("signed_shares") or 0) != 0
+            for position in (live_mode.get("positions") or {}).values()
+            if isinstance(position, dict)
+        ):
+            blockers.append(f"{market}: live paper inventory remains open")
+        live_date = str(live_mode.get("session_date") or "")
+        candidate_date = str(candidate_mode.get("session_date") or "")
+        if live_date and (
+            not candidate_date
+            or date.fromisoformat(candidate_date) < date.fromisoformat(live_date)
+        ):
+            blockers.append(
+                f"{market}: candidate session {candidate_date or 'missing'} "
+                f"precedes live session {live_date}"
+            )
+    return blockers
 
 
 def _exchange_directories(left: Path, right: Path) -> None:
@@ -1389,8 +1580,13 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
         allow_current_open_session=bool(args.allow_current_open_session),
         allow_margin_carry=bool(args.allow_margin_carry),
     )
+    cutover_blockers = _cutover_blockers(live, candidate, expected_markets)
     if args.validate_only:
-        result = {"status": "validated", "acceptance": acceptance}
+        result = {
+            "status": "validated" if not cutover_blockers else "validated_not_promotable",
+            "acceptance": acceptance,
+            "cutover": {"ready": not cutover_blockers, "blockers": cutover_blockers},
+        }
         if args.validation_receipt is not None:
             _atomic_json(args.validation_receipt, result)
         print(
@@ -1402,6 +1598,9 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
             )
         )
         return
+
+    if cutover_blockers:
+        raise RuntimeError("replay cutover blocked: " + "; ".join(cutover_blockers))
 
     # The service coordinator can drain writers only AFTER expensive source
     # validation, avoiding minutes of needless Gateway downtime. The callback
@@ -1416,10 +1615,12 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
         # must never erase a still-open pre-existing live account.
         if acceptance["promotion_input_hashes"] != _promotion_input_hashes(candidate):
             raise RuntimeError("candidate history changed after validation")
-        old_state = _load_object(live / "state.json")
-        if any(int(p.get("signed_shares") or 0) for m in old_state.get("modes", {}).values()
-               for p in m.get("positions", {}).values()):
-            raise RuntimeError("refusing promotion over open live paper inventory")
+        locked_blockers = _cutover_blockers(live, candidate, expected_markets)
+        if locked_blockers:
+            raise RuntimeError(
+                "replay cutover changed while draining: "
+                + "; ".join(locked_blockers)
+            )
         if _sha256(candidate / "state.json") != acceptance["state_sha256"] or _sha256(candidate / "rebuild_receipt.json") != acceptance["rebuild_receipt_sha256"]:
             raise RuntimeError("candidate changed after validation")
         if args.allow_margin_carry:

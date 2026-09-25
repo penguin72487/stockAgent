@@ -2,6 +2,33 @@
   "schema_version": 1,
   "artifacts": [
     {
+      "dataset": "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9b7356396ce1b5cd",
+      "relative_root": "markets/bybit_perpetual_daily_multi_basis_projection_l1_endogenous_policy_1w_v1",
+      "maximum_file_bytes": null,
+      "loose_file_threshold_bytes": 8388608,
+      "pack_buckets": 32,
+      "min_stable_hours": 24,
+      "completion_contract": "training-lifecycle-v1"
+    },
+    {
+      "dataset": "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9a43064c449d8429",
+      "relative_root": "markets/bybit_perpetual_daily_multi_basis_projection_l1_endogenous_policy_v1",
+      "maximum_file_bytes": null,
+      "loose_file_threshold_bytes": 8388608,
+      "pack_buckets": 32,
+      "min_stable_hours": 24,
+      "completion_contract": "training-lifecycle-v1"
+    },
+    {
+      "dataset": "artifact-auto-bybit-perpetual-daily-multi-basis-projec-682eec353e0237e9",
+      "relative_root": "markets/bybit_perpetual_daily_multi_basis_projection_l1_public_web_v1",
+      "maximum_file_bytes": null,
+      "loose_file_threshold_bytes": 8388608,
+      "pack_buckets": 32,
+      "min_stable_hours": 24,
+      "completion_contract": "training-lifecycle-v1"
+    },
+    {
       "dataset": "artifact-auto-tw-day-trade-hybrid-minute-v12-attention-e3a38655a6a5cad6",
       "relative_root": "markets/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_commission20_capital10m_all_features_v1",
       "maximum_file_bytes": null,

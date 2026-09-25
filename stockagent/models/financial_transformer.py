@@ -37,6 +37,12 @@ class CandleEncoder(nn.Module):
         categorical_embedding_cardinality: int = 512,
         extra_continuous_features: int = 0,
         causal_feature_rms_normalization: bool = False,
+        causal_feature_window_rms_normalization: bool = False,
+        window_rms_observation_pairs: Sequence[tuple[int, int]] | None = None,
+        window_rms_passthrough_indices: Sequence[int] | None = None,
+        window_rms_epsilon: float = 1.0e-6,
+        causal_feature_compression: str = "none",
+        causal_feature_compression_indices: Sequence[int] | None = None,
         feature_bottleneck_dim: int = 0,
     ) -> None:
         super().__init__()
@@ -63,6 +69,66 @@ class CandleEncoder(nn.Module):
         self.feature_bottleneck_dim = requested_bottleneck
         self.causal_feature_rms_normalization = bool(
             causal_feature_rms_normalization
+        )
+        self.causal_feature_window_rms_normalization = bool(
+            causal_feature_window_rms_normalization
+        )
+        self.window_rms_epsilon = float(window_rms_epsilon)
+        if not (0.0 < self.window_rms_epsilon < float("inf")):
+            raise ValueError("window RMS epsilon must be finite and positive")
+        if self.causal_feature_window_rms_normalization and not self.causal_feature_rms_normalization:
+            raise ValueError("window RMS requires the train-only active-feature mask")
+        observation_pairs = tuple(window_rms_observation_pairs or ())
+        value_indices = tuple(int(value) for value, _ in observation_pairs)
+        flag_indices = tuple(int(flag) for _, flag in observation_pairs)
+        passthrough_indices = tuple(sorted(set(
+            int(index) for index in (window_rms_passthrough_indices or ())
+        ).union(categorical_index_set)))
+        if not self.causal_feature_window_rms_normalization and (
+            observation_pairs or window_rms_passthrough_indices
+        ):
+            raise ValueError("window RMS mappings require window RMS mode")
+        if any(index < 0 or index >= self.num_features for index in (
+            *value_indices, *flag_indices, *passthrough_indices
+        )):
+            raise ValueError("window RMS feature index is out of range")
+        if len(set(value_indices)) != len(value_indices):
+            raise ValueError("window RMS observation values must be unique")
+        self.register_buffer(
+            "window_rms_value_indices",
+            torch.tensor(value_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "window_rms_flag_indices",
+            torch.tensor(flag_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "window_rms_passthrough_indices",
+            torch.tensor(passthrough_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.causal_feature_compression = str(causal_feature_compression)
+        compression_indices = tuple(
+            int(index) for index in (causal_feature_compression_indices or ())
+        )
+        if self.causal_feature_compression not in {"none", "signed_log1p", "asinh"}:
+            raise ValueError("unsupported causal feature compression")
+        if self.causal_feature_compression != "none" and (
+            not self.causal_feature_rms_normalization or not compression_indices
+        ):
+            raise ValueError("causal feature compression needs train-only RMS and indices")
+        if self.causal_feature_compression == "none" and compression_indices:
+            raise ValueError("causal feature compression indices require an enabled method")
+        if any(index < 0 or index >= self.num_features for index in compression_indices):
+            raise ValueError("causal feature compression index is out of range")
+        if set(compression_indices).intersection(categorical_index_set):
+            raise ValueError("categorical feature IDs cannot be compressed")
+        self.register_buffer(
+            "causal_feature_compression_index_tensor",
+            torch.tensor(compression_indices, dtype=torch.long),
+            persistent=False,
         )
         self.register_buffer(
             "categorical_feature_index_tensor",
@@ -169,6 +235,10 @@ class CandleEncoder(nn.Module):
             normalized_active = normalized_active.clone()
             normalized_scale.index_fill_(0, categorical, 1.0)
             normalized_active.index_fill_(0, categorical, True)
+        if self.causal_feature_window_rms_normalization and not bool(
+            (normalized_scale == 1.0).all().item()
+        ):
+            raise ValueError("window RMS uses only the train-fitted active mask, not global scales")
         self.causal_feature_rms_scale.copy_(normalized_scale)
         self.causal_feature_active_mask.copy_(normalized_active)
 
@@ -183,7 +253,60 @@ class CandleEncoder(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
-        return (x / scale) * active
+        normalized = (x / scale) * active
+        if self.causal_feature_compression == "none":
+            return normalized
+        indices = self.causal_feature_compression_index_tensor
+        selected = normalized.index_select(-1, indices)
+        if self.causal_feature_compression == "signed_log1p":
+            compressed = torch.sign(selected) * torch.log1p(torch.abs(selected))
+        else:
+            compressed = torch.asinh(selected)
+        return normalized.index_copy(-1, indices, compressed)
+
+    def _window_scaled_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale each decision window from its own visible rows only.
+
+        Paired availability flags determine the denominator for sparse public
+        values. The flags and categorical IDs themselves retain their units.
+        This runs before the train-only active mask and optional compression.
+        """
+
+        if not self.causal_feature_window_rms_normalization:
+            return x
+        if x.ndim != 4 or int(x.size(-1)) != self.num_features:
+            raise ValueError("window RMS requires [batch, lookback, symbols, features]")
+        clean = x.float()
+        if self.sanitize_inputs:
+            clean = torch.nan_to_num(clean, nan=0.0, posinf=0.0, neginf=0.0)
+        squared_sum = clean.square().sum(dim=1)
+        counts = torch.full_like(squared_sum, float(x.size(1)))
+        value_indices = self.window_rms_value_indices
+        if int(value_indices.numel()):
+            flags = clean.index_select(-1, self.window_rms_flag_indices) > 0.0
+            observed_values = clean.index_select(-1, value_indices)
+            observed_squared = torch.where(
+                flags, observed_values.square(), 0.0
+            ).sum(dim=1)
+            squared_sum = squared_sum.index_copy(-1, value_indices, observed_squared)
+            counts = counts.index_copy(-1, value_indices, flags.sum(dim=1).float())
+        scale = torch.sqrt(squared_sum / counts.clamp_min(1.0))
+        scale = torch.where(
+            (counts > 0.0) & (scale > self.window_rms_epsilon),
+            scale,
+            torch.ones_like(scale),
+        )
+        passthrough = self.window_rms_passthrough_indices
+        if int(passthrough.numel()):
+            scale = scale.index_fill(-1, passthrough, 1.0)
+        result = clean / scale.unsqueeze(1)
+        if int(value_indices.numel()):
+            result = result.index_copy(
+                -1,
+                value_indices,
+                torch.where(flags, result.index_select(-1, value_indices), 0.0),
+            )
+        return result
 
     def _base_joint_features(
         self,
@@ -804,6 +927,12 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         *args,
         candle_dropout: float = 0.0,
         causal_feature_rms_normalization: bool = False,
+        causal_feature_window_rms_normalization: bool = False,
+        window_rms_observation_pairs: Sequence[tuple[int, int]] | None = None,
+        window_rms_passthrough_indices: Sequence[int] | None = None,
+        window_rms_epsilon: float = 1.0e-6,
+        causal_feature_compression: str = "none",
+        causal_feature_compression_indices: Sequence[int] | None = None,
         feature_bottleneck_dim: int = 0,
         temporal_basis_algebraic_contraction: bool = False,
         daily_context_num_features: int = 0,
@@ -838,6 +967,13 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             )
             else None
         )
+        if causal_feature_window_rms_normalization and (
+            self.temporal_basis_input_feature_builder is None
+            or int(daily_context_num_features) > 0
+        ):
+            raise ValueError(
+                "window RMS requires input_features temporal basis without daily context"
+            )
         basis_input_width = (
             0
             if self.temporal_basis_input_feature_builder is None
@@ -857,6 +993,14 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             causal_feature_rms_normalization=(
                 causal_feature_rms_normalization
             ),
+            causal_feature_window_rms_normalization=(
+                causal_feature_window_rms_normalization
+            ),
+            window_rms_observation_pairs=window_rms_observation_pairs,
+            window_rms_passthrough_indices=window_rms_passthrough_indices,
+            window_rms_epsilon=window_rms_epsilon,
+            causal_feature_compression=causal_feature_compression,
+            causal_feature_compression_indices=causal_feature_compression_indices,
             feature_bottleneck_dim=feature_bottleneck_dim,
         )
         if basis_input_width > 0 and not isinstance(
@@ -1119,8 +1263,9 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         builder = self.temporal_basis_input_feature_builder
         if builder is None:
             raise RuntimeError("input temporal basis builder is unexpectedly missing")
-        ordinary_projected, _ = self.candle_encoder(x, return_aux=False)
-        decomposition = builder.explainability_decomposition(x, self.candle_encoder)
+        prepared = self.candle_encoder._window_scaled_features(x)
+        ordinary_projected, _ = self.candle_encoder(prepared, return_aux=False)
+        decomposition = builder.explainability_decomposition(prepared, self.candle_encoder)
         decomposition["ordinary_projected"] = ordinary_projected
         decomposition["symbol_indices"] = symbol_indices
         return decomposition
@@ -1133,7 +1278,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Encode a window with its causal coefficients as endpoint columns."""
 
-        h, _ = self.candle_encoder(x, return_aux=False)
+        prepared = self.candle_encoder._window_scaled_features(x)
+        h, _ = self.candle_encoder(prepared, return_aux=False)
         basis_encoder = self.temporal_basis_input_feature_builder
         if basis_encoder is None:
             if not return_token_aux:
@@ -1145,7 +1291,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             }
 
         endpoint, basis_aux = basis_encoder(
-            x,
+            prepared,
             self.candle_encoder,
             collect_aux=return_token_aux,
         )
@@ -1183,6 +1329,16 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         feature_slab: torch.Tensor,
         symbol_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.candle_encoder.causal_feature_window_rms_normalization:
+            raw_windows = feature_slab.unfold(0, self.lookback, 1).permute(
+                0, 3, 1, 2
+            )
+            h, _ = self._candle_project_window_features(
+                raw_windows, return_token_aux=False
+            )
+            return self._add_window_positions(
+                h, int(feature_slab.size(1)), symbol_indices
+            )
         if not self._input_basis_enabled():
             return super()._embed_windowed_from_panel_slab(
                 feature_slab,
@@ -1215,6 +1371,20 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         feature_slabs: torch.Tensor,
         symbol_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.candle_encoder.causal_feature_window_rms_normalization:
+            raw_windows = feature_slabs.unfold(1, self.lookback, 1).permute(
+                0, 1, 4, 2, 3
+            )
+            days, decision_rows, lookback, symbols, features = raw_windows.shape
+            windows = raw_windows.reshape(
+                days * decision_rows, lookback, symbols, features
+            )
+            h, _ = self._candle_project_window_features(
+                windows, return_token_aux=False
+            )
+            return self._add_window_positions(
+                h, int(feature_slabs.size(2)), symbol_indices
+            )
         if not self._input_basis_enabled():
             return super()._embed_windowed_from_batched_panel_slabs(
                 feature_slabs,

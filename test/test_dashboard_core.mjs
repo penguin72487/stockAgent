@@ -74,15 +74,15 @@ function loadCore({current = "tw-day-trade", fetchImpl, localStorage} = {}) {
 
 test("shared navigation renders one canonical route list and current page", () => {
   const {core, nav} = loadCore({current: "tw-day-trade"});
-  assert.equal(core.NAV_ITEMS.length, 8);
-  assert.equal(nav.children.length, 8);
+  assert.equal(core.NAV_ITEMS.length, 9);
+  assert.equal(nav.children.length, 9);
   assert.deepEqual(nav.children.map((link) => link.textContent), [
-    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "OpenBB", "全資料", "流量",
+    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "FinLab", "OpenBB", "全資料", "流量",
   ]);
   assert.equal(nav.children[0].href, "../");
   assert.equal(nav.children[2].href, "./");
   assert.equal(nav.children[2].attributes["aria-current"], "page");
-  assert.equal(nav.children[6].href, "../data-monitor/");
+  assert.equal(nav.children[7].href, "../data-monitor/");
   assert.equal(nav.dataset.dashboardNavMounted, "true");
   assert.ok(Object.isFrozen(core));
   assert.ok(Object.isFrozen(core.NAV_ITEMS));
@@ -141,6 +141,19 @@ test("shared JSON reader rejects invalid roots and preserves API errors", async 
     core.readJsonResponse({ok: false, status: 503, json: async () => ({error: "source waiting"})}, {expectedRoot: "object"}),
     /source waiting/,
   );
+});
+
+test("conditional refresh consumes 304 without parsing or recording an error", async () => {
+  const {core} = loadCore({fetchImpl: async () => ({
+    ok: false, status: 304, headers: {get: () => null},
+    text: async () => "", json: async () => assert.fail("304 has no JSON body"),
+  })});
+  const response = await core.fetchWithTimeout("/data-monitor/api/features", {
+    cache: "no-store", headers: {"If-None-Match": '"known"'},
+  });
+  assert.equal(response.status, 304);
+  assert.equal(await core.readTextResponse(response), "");
+  assert.equal(core.performanceSnapshot().at(-1).outcome, "ok");
 });
 
 test("latest-request guard cancels and invalidates superseded work", () => {

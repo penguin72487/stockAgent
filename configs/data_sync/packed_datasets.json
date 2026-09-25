@@ -70,6 +70,55 @@
       "note": "Private derived 143-channel research feature table, receipt, and exact formal corporate-action companions; no raw XBRL redistribution or live/PIT claim."
     },
     {
+      "dataset": "tw-public-research-all-observed-2014-v3",
+      "source": "/srv/stockagent-live/data_tw_public_research_all_observed_2014_v3",
+      "role": "private-research-training-not-live-or-strict-pit",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "stage_tw_public_all_observed_release.py"
+      ],
+      "freshness": {
+        "receipt": "release_receipt.json",
+        "field": "end_date",
+        "format": "iso-date",
+        "required_values": {
+          "status": "complete",
+          "research_only": true,
+          "model_channels": 428
+        }
+      },
+      "note": "Private derived all-observed v3 research table, exact upstream receipts, and formal corporate-action companions; accepts current revisions, inferred publication dates, and late-starting observations."
+    },
+    {
+      "dataset": "tw-public-research-finlab-2014-v4",
+      "source": "/srv/stockagent-live/data_tw_public_research_finlab_2014_v4",
+      "role": "private-owner-research-training-not-live-or-strict-pit",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "stage_tw_public_finlab_research_release.py"
+      ],
+      "freshness": {
+        "receipt": "release_receipt.json",
+        "field": "end_date",
+        "format": "iso-date",
+        "timestamp_field": "catalog_checked_at_utc",
+        "max_receipt_age_hours": 24,
+        "required_values": {
+          "status": "complete",
+          "research_only": true,
+          "private_personal_research": true,
+          "model_channels": 636,
+          "catalog_latest_verified": true,
+          "source_hashes_verified": true
+        }
+      },
+      "note": "Owner-only noncommercial derived research feature table and formal action companions; no raw FinLab catalog/cache, no public serving, no PIT/live claim."
+    },
+    {
       "dataset": "tw-minute-train",
       "source": "data_tw_minute/research_dataset",
       "role": "training",
@@ -165,11 +214,18 @@
       "publish": true,
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "perpetual_daily/panel_cache_v2"
+      ],
       "active_process_substrings": [
         "download_bybit_perp_1m.py",
-        "download_bybit_perp_daily.py"
+        "download_bybit_perp_daily.py",
+        "download_bybit_funding_history.py",
+        "materialize_bybit_perpetual_daily.py",
+        "build_bybit_crypto_public_daily_features.py",
+        "build_bybit_venue_daily_features.py"
       ],
-      "note": "Bybit public perpetual market data."
+      "note": "Bybit public perpetual market data; reproducible panel_cache_v2 remains node-local."
     },
     {
       "dataset": "binance",
@@ -206,6 +262,35 @@
         "download_crypto_keyed_context.py"
       ],
       "note": "Non-duplicated keyed crypto reference facts, entitlement receipts and canonical/fallback source allocation. Kept local because free-plan access does not imply redistribution rights."
+    },
+    {
+      "dataset": "finmind-free",
+      "source": "data_finmind",
+      "role": "local-public-raw-research-not-pit-validated",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_finmind_free.py",
+        "downloader.download_finmind_free",
+        "download_finmind_complement.py",
+        "downloader.download_finmind_complement",
+        "download_finmind_sponsor.py",
+        "downloader.download_finmind_sponsor"
+      ],
+      "note": "FinMind Free and Sponsor research sources share one limiter. Sponsor whole-market receipts are separate from Free per-symbol receipts. Provider entitlement is verified at runtime; receipts do not prove complete historical or PIT coverage. Keep local until source rights and release audits are verified."
+    },
+    {
+      "dataset": "finlab-research",
+      "source": "data_finlab",
+      "role": "local-licensed-research-not-pit-validated",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_finlab_history.py"
+      ],
+      "note": "FinLab account-scoped source data and receipts. Private cross-host copying scope remains unconfirmed; cold publication stays disabled. Local research use and publication-time safety require per-field verification."
     },
     {
       "dataset": "free-public-context",

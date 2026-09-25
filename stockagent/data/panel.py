@@ -5921,6 +5921,7 @@ def build_panel(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
     )
+    build_started = time_module.perf_counter()
     polars_collect_engine = "streaming" if selected_backend == "polars_streaming" else "auto"
 
     def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
@@ -5951,6 +5952,7 @@ def build_panel(
             loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
     else:
         loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+    symbol_load_seconds = time_module.perf_counter() - build_started
 
     valid_arrays: list[_SymbolPanelArrays] = []
     for path, arrays, exc in loaded_arrays:
@@ -5992,6 +5994,7 @@ def build_panel(
         selected_external_feature_names = tuple(
             external_names[index] for index in selected_external_indices
         )
+    external_started = time_module.perf_counter()
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,
@@ -6003,6 +6006,8 @@ def build_panel(
         if external_feature_path is not None
         else None
     )
+    external_load_seconds = time_module.perf_counter() - external_started
+    assemble_started = time_module.perf_counter()
     panel = _build_panel_from_symbol_arrays(
         valid_arrays,
         benchmark_name=benchmark_name,
@@ -6028,7 +6033,19 @@ def build_panel(
     )
     if panel.unresolved_corporate_action_mask is not None:
         panel = _attach_raw_close_forward_returns(panel)
+    assemble_seconds = time_module.perf_counter() - assemble_started
+    cache_started = time_module.perf_counter()
     _save_panel_cache(cache_root, panel, source_hash, backend_key)
+    cache_save_seconds = time_module.perf_counter() - cache_started
+    print(
+        "[panel] cold build stages "
+        f"symbols={symbol_load_seconds:.3f}s "
+        f"external={external_load_seconds:.3f}s "
+        f"assemble_rules={assemble_seconds:.3f}s "
+        f"cache_save={cache_save_seconds:.3f}s "
+        f"total={time_module.perf_counter() - build_started:.3f}s",
+        flush=True,
+    )
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(cache_root)}")
     if include_day_trade_open_gap:
         panel = _append_configured_day_trade_open_gap_feature(

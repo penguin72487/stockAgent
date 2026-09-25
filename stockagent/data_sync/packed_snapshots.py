@@ -506,6 +506,11 @@ def initialize_packed_layout(
     replace_node_id: bool = False,
 ) -> str:
     sync_root = sync_root.resolve()
+    if (sync_root / ".stockagent-d-mount-required").exists():
+        raise SnapshotError(
+            f"D-backed cold volume is not mounted at {sync_root}; "
+            "refusing to recreate the packed store on the fallback filesystem"
+        )
     if git_root := _contains_git_metadata(sync_root):
         raise SnapshotError(
             f"sync root {sync_root} is inside Git worktree {git_root}; "
@@ -787,6 +792,31 @@ def _observed_stamps(
     return [HLC.from_mapping(item.manifest["hlc"]) for item in candidates]
 
 
+def _archive_d_primary_head(sync_root: Path, head_path: Path) -> str | None:
+    """Preserve the replaced head bytes when D is the only cold history."""
+
+    if not (sync_root / ".stockagent-d-primary").exists() or not head_path.exists():
+        return None
+    if head_path.is_symlink():
+        raise SnapshotError("D primary head is redirected")
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+
+    _check_d_primary_mount(sync_root)
+    previous = head_path.read_bytes()
+    digest = hashlib.sha256(previous).hexdigest()
+    relative = Path("head-history") / head_path.relative_to(sync_root).with_suffix("") / f"{digest}.json"
+    archived = sync_root / relative
+    _ensure_shared_packed_directory(sync_root, archived.parent)
+    if archived.is_symlink():
+        raise SnapshotError("D primary head history is redirected")
+    if archived.exists():
+        if archived.read_bytes() != previous:
+            raise SnapshotError("D primary head history checksum collision")
+    else:
+        atomic_write_bytes(archived, previous)
+    return relative.as_posix()
+
+
 def publish_packed_snapshot(
     sync_root: Path,
     dataset: str,
@@ -1009,6 +1039,9 @@ def publish_packed_snapshot(
         ):
             if recover_missing_base_objects:
                 verify_packed_snapshot(sync_root, previous)
+            from stockagent.data_sync.syncthing_scan import scan_after_publish
+
+            scan_after_publish(sync_root, dataset, retry_full=True)
             return previous
 
         wall_time_ns = time.time_ns()
@@ -1150,13 +1183,24 @@ def publish_packed_snapshot(
         }
         head_path = sync_root / "heads" / dataset / f"{publisher_node}.json"
         _ensure_shared_packed_directory(sync_root, head_path.parent)
+        archived_head = _archive_d_primary_head(sync_root, head_path)
         atomic_write_json(head_path, head)
-        return ResolvedSnapshot(
+        published = ResolvedSnapshot(
             manifest=manifest,
             manifest_path=manifest_path,
             manifest_sha256=manifest_sha,
             head_path=head_path,
         )
+        scan_paths = tuple(
+            str(created_objects[digest]["relpath"])
+            for digest in sorted(newly_installed_hashes)
+        ) + (() if inventory_already_present else (inventory_relpath.as_posix(),))
+        if archived_head is not None:
+            scan_paths += (archived_head,)
+    from stockagent.data_sync.syncthing_scan import scan_after_publish
+
+    scan_after_publish(sync_root, dataset, new_object_paths=scan_paths)
+    return published
 
 
 def _load_inventory(

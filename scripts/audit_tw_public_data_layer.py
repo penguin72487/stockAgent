@@ -7,7 +7,9 @@ import fnmatch
 import hashlib
 import json
 import math
+import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -4291,6 +4293,39 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    audit_started = time.perf_counter()
+    stage_started = audit_started
+    stage_metrics: dict[str, dict[str, int | float | None]] = {}
+
+    def checkpoint(name: str) -> None:
+        nonlocal stage_started
+        observed = time.perf_counter()
+        try:
+            resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            resident_bytes: int | None = resident_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            resident_bytes = None
+        try:
+            peak_kib = next(
+                int(line.split()[1])
+                for line in Path("/proc/self/status").read_text().splitlines()
+                if line.startswith("VmHWM:")
+            )
+            peak_bytes: int | None = peak_kib * 1024
+        except (OSError, ValueError, IndexError, StopIteration):
+            peak_bytes = None
+        stage_metrics[name] = {
+            "elapsed_ms": round((observed - stage_started) * 1000.0, 3),
+            "rss_bytes": resident_bytes,
+            "rss_peak_bytes": peak_bytes,
+        }
+        print(
+            "[tw-public-audit-stage] "
+            + json.dumps({"stage": name, **stage_metrics[name]}, sort_keys=True),
+            flush=True,
+        )
+        stage_started = observed
+
     args = parse_args()
     config = load_config(args.config)
     parquet_root = args.parquet_root or Path(config.data.parquet_root)
@@ -4309,6 +4344,7 @@ def main() -> None:
     input_signatures = _audit_input_signatures(
         parquet_root, public_dir, public_feature_path
     )
+    checkpoint("input_signatures")
 
     sessions = _benchmark_sessions(
         parquet_root,
@@ -4322,6 +4358,7 @@ def main() -> None:
     source_sessions = np.asarray(
         source_calendar["date"].to_numpy(), dtype="datetime64[D]"
     )
+    checkpoint("session_calendars")
     quote_profiles, quote_summary, quote_findings = audit_quote_source_files(
         parquet_root,
         sessions,
@@ -4329,25 +4366,30 @@ def main() -> None:
         require_official=True,
         source_sessions=source_sessions,
     )
+    checkpoint("quote_source_files")
     official_build_summary, official_build_findings = audit_official_symbol_build(
         parquet_root,
         public_dir,
     )
     return_price_summary, return_price_findings = audit_return_price_provenance(parquet_root)
+    checkpoint("symbol_and_price_provenance")
     universe_profiles, missing_delisted_rows, universe_findings = (
         audit_delisted_universe_coverage(parquet_root, public_dir, sessions)
     )
+    checkpoint("delisted_universe")
     receipt_summary, receipt_findings = audit_source_receipts(public_dir, config)
     feature_receipt_summary, feature_receipt_findings = audit_feature_build_receipt(
         public_feature_path,
         public_dir,
         parquet_root,
     )
+    checkpoint("source_and_feature_receipts")
     source_profiles, source_findings = audit_historical_sources(
         public_dir,
         sessions,
         config,
     )
+    checkpoint("historical_sources")
     quote_grid_profiles = [
         audit_tw_quote_grid_file(
             name, public_dir.parent,
@@ -4355,6 +4397,7 @@ def main() -> None:
         )
         for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
     ]
+    checkpoint("official_quote_grid")
     quote_grid_findings = [
         Finding(
             "high", "official_quote_off_tick_grid_or_bad_date", "quote_grid",
@@ -4391,6 +4434,7 @@ def main() -> None:
     findings.extend(audit_feature_lineage_registry(config))
     findings.extend(audit_release_vintage_contract(public_dir, config))
     findings.extend(availability_findings)
+    checkpoint("source_contracts")
 
     selected = _selected_features(config)
     raw_stats, raw_annual_rows, table_findings = audit_public_feature_table(
@@ -4399,6 +4443,7 @@ def main() -> None:
         config.data.tw_public_market_symbol,
     )
     findings.extend(table_findings)
+    checkpoint("public_feature_table")
 
     panel, panel_source = _load_or_build_panel(
         config,
@@ -4407,6 +4452,7 @@ def main() -> None:
         build_if_missing=bool(args.build_panel),
         panel_cache_root=panel_cache_root,
     )
+    checkpoint("panel_load_or_build")
     missing_selected = [feature for feature in selected if feature not in panel.feature_names]
     extra_selected = [feature for feature in panel.feature_names if feature not in selected]
     if missing_selected or extra_selected:
@@ -4427,6 +4473,7 @@ def main() -> None:
         config,
     )
     findings.extend(panel_findings)
+    checkpoint("panel_feature_profiles")
     panel_summary, contract_findings = audit_panel_contract(panel, sessions)
     panel_summary["source"] = panel_source
     panel_summary["parquet_root"] = str(parquet_root)
@@ -4436,6 +4483,7 @@ def main() -> None:
     findings.extend(contract_findings)
     walk_forward_summary, walk_forward_findings = audit_walk_forward_availability(panel, config)
     findings.extend(walk_forward_findings)
+    checkpoint("panel_contract_and_walk_forward")
     final_signatures = _audit_input_signatures(
         parquet_root, public_dir, public_feature_path
     )
@@ -4450,6 +4498,7 @@ def main() -> None:
             "A producer modified the candidate dataset while its model-safety proof was being built.",
             "Rerun the audit against a stable source or an immutable selected release.",
         ))
+    checkpoint("final_input_stability")
 
     _write_csv(output_dir / "source_profiles.csv", [asdict(item) for item in source_profiles])
     _write_csv(output_dir / "quote_source_profiles.csv", quote_profiles)
@@ -4459,6 +4508,7 @@ def main() -> None:
     _write_csv(output_dir / "raw_annual_feature_profiles.csv", raw_annual_rows)
     _write_csv(output_dir / "panel_annual_feature_profiles.csv", panel_annual_rows)
     _write_csv(output_dir / "findings.csv", [asdict(item) for item in findings])
+    checkpoint("profile_artifacts")
     summary = {
         "generated_on": date.today().isoformat(),
         "config": str(args.config),
@@ -4479,6 +4529,10 @@ def main() -> None:
         "model_safe": not any(item.severity in {"critical", "high"} for item in findings),
         "feature_count": len(feature_profiles),
         "source_count": len(source_profiles),
+        "stage_metrics": stage_metrics,
+        "elapsed_before_summary_ms": round(
+            (time.perf_counter() - audit_started) * 1000.0, 3
+        ),
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=True) + "\n",

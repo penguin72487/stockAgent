@@ -196,6 +196,35 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 )
                 continue
 
+            # A multi-market pass can run for hours. Recheck the independent
+            # priority gates between expensive inferences, not only once at
+            # worker startup; a close refresh or an interactive request may
+            # begin while the previous market is still running.
+            if discord_bot._opening_critical_work_pending():
+                deferred += 1
+                _emit(
+                    status="deferred",
+                    reason="opening_critical_work_pending",
+                    market=market,
+                )
+                continue
+            if discord_bot._interactive_signal_work_pending():
+                deferred += 1
+                _emit(
+                    status="deferred",
+                    reason="interactive_signal_work_pending",
+                    market=market,
+                )
+                continue
+            if not _wait_for_tw_public_refresh():
+                deferred += 1
+                _emit(
+                    status="deferred",
+                    reason="tw_public_refresh_wait_timeout",
+                    market=market,
+                )
+                continue
+
             attempted += 1
             discord_bot._begin_artifact_backfill(key, market)
             try:

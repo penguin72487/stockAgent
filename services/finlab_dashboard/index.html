@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071019">
+  <title>FinLab API 資料監控｜StockAgent</title>
+  <link rel="stylesheet" href="../shioaji/styles.css?v=6">
+  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav data-dashboard-nav="finlab" aria-label="公開面板導覽"></nav>
+  </header>
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">FINLAB · READ-ONLY DATA MONITOR</p>
+        <h1 id="page-title">FinLab API<br>資料管線</h1>
+        <p class="lead">一頁看懂 FinLab 目錄、歷史回補、帳號流量、儲存容量與私有研究訓練交付。只讀既有證據，不會因為開啟面板再呼叫 API。</p>
+      </div>
+      <div class="health-panel">
+        <span>管線狀態</span>
+        <strong id="finlab-health" class="status loading" role="status" aria-live="polite"><i aria-hidden="true"></i>讀取中</strong>
+        <p id="finlab-freshness">正在取得最新觀測…</p>
+        <small>公開唯讀 · 金鑰、帳號與原始資料永不傳到瀏覽器</small>
+      </div>
+    </section>
+
+    <nav class="jump-nav" aria-label="頁內導覽">
+      <a href="#pipelines">全部管線</a>
+      <a href="#traffic">流量與費用</a>
+      <a href="#storage">儲存容量</a>
+      <a href="#backfill">歷史明細</a>
+      <a href="#capture">執行摘要</a>
+      <a href="#method">口徑</a>
+    </nav>
+
+    <section id="pipeline-alert" class="alert" hidden aria-live="polite"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+
+    <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
+      <header class="section-heading pipeline-heading"><span>01</span><div><h2 id="pipelines-title">所有資料管線</h2><p>先看是否可用，再看是否執行；服務運行不等於全目錄或逐檔歷史完整。</p></div></header>
+      <div class="kpi-grid overview-kpis">
+        <article class="kpi featured"><span>管線總數</span><strong id="pipeline-total">—</strong><p>目錄、歷史、研究表、冷庫與遠端訓練</p></article>
+        <article class="kpi"><span>目前運行</span><strong id="pipeline-active">—</strong><p>SDK 下載 worker</p></article>
+        <article class="kpi"><span>資料就緒</span><strong id="pipeline-ready">—</strong><p>依各層收據區分</p></article>
+        <article class="kpi"><span>需要注意</span><strong id="pipeline-attention">—</strong><p>未追新、阻塞或未核驗</p></article>
+      </div>
+      <div class="pipeline-toolbar" role="group" aria-label="篩選 FinLab 管線">
+        <button type="button" class="filter active" data-pipeline-filter="all" aria-pressed="true">全部</button>
+        <button type="button" class="filter" data-pipeline-filter="historical" aria-pressed="false">歷史下載</button>
+        <button type="button" class="filter" data-pipeline-filter="derived" aria-pressed="false">衍生資料</button>
+        <button type="button" class="filter" data-pipeline-filter="reference" aria-pressed="false">目錄與帳號</button>
+      </div>
+      <div id="pipeline-grid" class="pipeline-grid" aria-live="polite"><article class="pipeline-card skeleton" aria-hidden="true"></article><article class="pipeline-card skeleton" aria-hidden="true"></article></div>
+      <p id="pipeline-empty" class="empty pipeline-empty" hidden>這個分類目前沒有資料管線。</p>
+    </section>
+
+    <section id="traffic" class="section-block" aria-labelledby="quota-title">
+      <header class="section-heading"><span>02</span><div><h2 id="quota-title">流量、費用與資料歸因</h2><p>沿用永豐帳號流量的呈現方式；FinLab 的配額單位是 MB，沒有可證明的逐鍵流量歸因。</p></div></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>已使用</span><strong id="quota-used">—</strong><p id="quota-percent">尚無觀測</p></article>
+        <article class="kpi"><span>FinLab 原始剩餘</span><strong id="quota-remaining">—</strong><p>帳號上限扣除已使用量</p></article>
+        <article class="kpi"><span>保留額度後可用</span><strong id="quota-safe-remaining">—</strong><p id="quota-reserve-basis">依下載器預設保留 50 MB</p></article>
+        <article class="kpi"><span>重置規則</span><strong id="quota-reset">—</strong><p id="quota-reset-basis">官方 08:00 台北時間；日期依規則推算</p></article>
+      </div>
+      <div class="quota-track"><div class="quota-track-header"><span>帳號已用比例</span><strong id="quota-ratio">—</strong></div><progress id="quota-progress" max="1" aria-label="FinLab 帳號每日資料流量使用比例"></progress><small id="quota-observed">尚未取得獨立帳號觀測</small></div>
+      <figure class="chart-card finlab-chart"><figcaption><div><strong>歷史用量軌跡</strong><span>現在起每分鐘取樣；近 24 小時逐筆顯示，較早資料以 20 分鐘桶呈現；缺觀測不補零</span></div></figcaption><div id="quota-time-range" class="time-range-control" role="group" aria-label="流量曲線時間範圍"><span>時間範圍</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="all">全部</button></div><svg id="quota-chart" viewBox="0 0 960 270" role="img" aria-labelledby="quota-chart-title quota-chart-desc"><title id="quota-chart-title">FinLab 歷史帳號下載流量</title><desc id="quota-chart-desc">FinLab 帳號已用每日額度比例，缺觀測的時段保留缺口。</desc></svg><p id="quota-chart-empty" class="empty" hidden>累積兩筆帳號觀測後顯示趨勢。</p></figure>
+      <div class="kpi-grid traffic-kpis finlab-traffic-details">
+        <article class="kpi featured"><span>費用證據</span><strong id="quota-price">帳號方案</strong><p>本頁不推定方案價格或使用授權</p></article>
+        <article class="kpi"><span>每日額度</span><strong id="quota-limit">—</strong><p>直接採 SDK 帳號回覆</p></article>
+        <article class="kpi"><span>逐鍵可歸因</span><strong>未量測</strong><p>帳號餘額可能含其他程式使用</p></article>
+        <article class="kpi"><span>請求速率上限</span><strong id="request-limit">官方未公布</strong><p>不虛構 10 req/s</p></article>
+      </div>
+      <details class="audit-details"><summary>查看最近帳號用量觀測</summary><div class="table-wrap" tabindex="0" role="region" aria-label="FinLab 用量觀測"><table><thead><tr><th>時間</th><th>已用</th><th>剩餘</th><th>使用率</th></tr></thead><tbody id="quota-history-body"><tr><td colspan="4">讀取中</td></tr></tbody></table></div></details>
+    </section>
+
+    <section id="storage" class="section-block" aria-labelledby="storage-title">
+      <header class="section-heading"><span>03</span><div><h2 id="storage-title">儲存容量與研究資料</h2><p>依目前收據指向的檔案核算；原始資料、衍生研究表、冷庫與遠端 READY 分開。</p></div></header>
+      <div class="kpi-grid capacity-kpis">
+        <article class="kpi featured"><span>目前來源檔</span><strong id="storage-source">—</strong><p id="storage-files">—</p></article>
+        <article class="kpi"><span>本機研究表</span><strong id="storage-derived">—</strong><p>不與原始來源容量相加</p></article>
+        <article class="kpi"><span>來源磁碟可用</span><strong id="storage-free">—</strong><p>僅本機 FinLab 工作區檔案系統</p></article>
+        <article class="kpi"><span>日均淨成長</span><strong id="storage-growth">—</strong><p>尚無連續容量快照，不以 mtime 偽裝</p></article>
+        <article class="kpi"><span>私有分發狀態</span><strong id="training-cold">—</strong><p>舊版與新包守門分別呈現</p></article>
+        <article class="kpi"><span>遠端可訓練</span><strong id="training-remote">—</strong><p>須另驗 exact release 與 READY</p></article>
+      </div>
+      <div class="storage-layout">
+        <section class="storage-bars-card" aria-labelledby="storage-bars-title"><header><strong id="storage-bars-title">容量占比</strong><span>目前來源檔與研究表</span></header><div id="storage-bars" class="storage-bars"><p class="empty">讀取中</p></div></section>
+        <section class="storage-bars-card" aria-labelledby="research-summary-title"><header><strong id="research-summary-title">研究訓練表</strong><span>非 PIT 嚴格版</span></header><dl class="finlab-research-stats"><div><dt>列數</dt><dd id="training-rows">—</dd></div><div><dt>FinLab 特徵欄</dt><dd id="training-columns">—</dd></div><div><dt>已映射來源鍵</dt><dd id="training-sources">—</dd></div></dl></section>
+      </div>
+      <p id="storage-basis" class="data-note">—</p>
+      <p id="training-basis" class="data-note">FinLab 當前修訂資料與估計發布日屬研究近似，不能聲稱歷史逐時點真值或實盤績效。</p>
+    </section>
+
+    <section id="backfill" class="section-block" aria-labelledby="downloads-title">
+      <header class="section-heading"><span>04</span><div><h2 id="downloads-title">全部歷史資料鍵</h2><p>SDK 目錄是分母；只有本機檔案與完成收據同時存在才列為已取得。</p></div></header>
+      <div class="progress-card"><div class="progress-copy"><div><span>全目錄鍵數進度</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>全部完成預計還要</span><strong id="download-global-eta">無可信倒數</strong><p>帳號共用額度與暫緩鍵使排隊完成時間無法可靠推算。</p></div></div><progress id="download-progress" class="progress-track" max="1" aria-label="FinLab 歷史鍵下載覆蓋率"></progress><div class="finlab-volume"><div class="finlab-volume-heading"><span>壓縮後來源檔容量進度 · 粗估</span><strong id="volume-progress-label">—</strong></div><progress id="volume-progress" class="progress-track" max="1" aria-label="FinLab 本機 Parquet 容量估計進度"></progress><div class="finlab-volume-values"><span>已抓 <strong id="volume-downloaded">—</strong></span><span>估計剩餘 <strong id="volume-remaining">—</strong></span><span>估計總量 <strong id="volume-total">—</strong></span></div><p id="volume-basis" class="fleet-progress-detail">正在核對本機檔案與目錄樣本…</p></div><p id="release-gate" class="fleet-progress-detail">正在核對全目錄最新查詢與打包條件…</p></div>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>已取得／目錄鍵</span><strong id="download-count">—</strong><p id="download-percent">—</p></article>
+        <article class="kpi"><span>未下載</span><strong id="download-pending">—</strong><p>包含資源限制暫緩的鍵</p></article>
+        <article class="kpi"><span>近 15 分鐘新增</span><strong id="download-recent">—</strong><p id="download-last">—</p></article>
+        <article class="kpi"><span>下次排程</span><strong id="download-next">—</strong><p id="download-state">—</p></article>
+      </div>
+      <p id="download-breakdown" class="data-note">—</p>
+      <div class="finlab-toolbar"><label>搜尋資料鍵<input id="dataset-search" type="search" autocomplete="off" placeholder="鍵名或類別"></label><label>狀態<select id="dataset-filter"><option value="all">全部（未取得優先）</option><option value="not_downloaded">未取得（全部）</option><option value="downloaded">已取得</option><option value="pending">尚未嘗試</option><option value="attention">失敗／權限／暫緩</option></select></label><span id="dataset-result-count">—</span></div>
+      <div class="finlab-table-scroll" role="region" aria-label="FinLab 資料鍵明細" tabindex="0"><table><thead><tr><th>資料鍵</th><th>狀態</th><th>原因／下一步</th><th>最早</th><th>最新</th><th>非空列／事件列</th><th>本機容量</th><th>單鍵估計耗時</th><th>預計完成</th><th>最後嘗試</th><th>最後來源查詢</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="11">讀取中…</td></tr></tbody></table></div>
+      <button type="button" id="dataset-more" class="finlab-more" hidden>載入更多</button>
+      <section class="finlab-market" aria-labelledby="market-title">
+        <h3 id="market-title">全市場原始 Tick 與本機合成分鐘</h3>
+        <p id="market-basis" class="data-note">正在核對官方現有／下市名單與逐檔分區收據…</p>
+        <p class="data-note">Tick 是同帳號最低優先級：先補／追新一般歷史資料及處理可發版研究資料，當輪可執行待辦清空且仍有保留額度之外的餘量才抓 Tick。分鐘棒在本機依逐筆成交合成；舊版直接下載的分鐘檔保留但不算合成進度。此區以「代號 × 交易日 × 粒度」計算，尚未通過逐時點訓練或冷庫發版守門。</p>
+        <div class="kpi-grid">
+          <article class="kpi"><span>股票名單</span><strong id="market-symbols">—</strong><p id="market-former">—</p></article>
+          <article class="kpi"><span>Tick 合成分鐘分區</span><strong id="market-minute">—</strong><progress id="market-minute-progress" class="progress-track" max="1" aria-label="全市場合成分鐘分區覆蓋率"></progress></article>
+          <article class="kpi"><span>逐筆分區</span><strong id="market-tick">—</strong><progress id="market-tick-progress" class="progress-track" max="1" aria-label="全市場逐筆分區覆蓋率"></progress></article>
+          <article class="kpi"><span>FinLab 日收盤價代號</span><strong id="market-daily">—</strong><p id="market-daily-gap">—</p></article>
+          <article class="kpi"><span>完成時間</span><strong id="market-eta">未知</strong><p id="market-state">—</p></article>
+        </div>
+        <div class="finlab-toolbar"><label>搜尋股票代號<input id="market-search" type="search" autocomplete="off" placeholder="例如 2330、2867、tw_tick"></label><span id="market-result-count">—</span></div>
+        <div class="finlab-table-scroll" role="region" aria-label="全市場逐檔分鐘與 Tick 進度" tabindex="0"><table><thead><tr><th>動態資料鍵</th><th>分類</th><th>FinLab 日收盤價</th><th>目標日分區</th><th>已收</th><th>未上架／其他失敗</th><th>資料最早</th><th>資料最新</th><th>筆數</th><th>本機容量</th></tr></thead><tbody id="market-rows"><tr><td colspan="10">正在讀取…</td></tr></tbody></table></div>
+        <button type="button" id="market-more" class="finlab-more" hidden>載入更多</button>
+      </section>
+    </section>
+
+    <section id="capture" class="section-block" aria-labelledby="capture-title">
+      <header class="section-heading"><span>05</span><div><h2 id="capture-title">下載執行摘要</h2><p>FinLab 此處是定時 SDK 查詢，沒有永豐 Tick / BidAsk 訂閱；空檔不會假裝串流中。</p></div></header>
+      <div class="capture-card"><div class="capture-primary"><span id="capture-dot" class="pulse" aria-hidden="true"></span><div><span>下載器狀態</span><strong id="capture-state">—</strong><p id="capture-freshness">—</p></div></div><dl><div><dt>目前資料鍵</dt><dd id="capture-key">—</dd></div><div><dt>上次完成收據</dt><dd id="capture-last">—</dd></div><div><dt>下一次排程</dt><dd id="capture-next">—</dd></div><div><dt>全目錄追新</dt><dd id="capture-gate">—</dd></div><div><dt>配額觀測</dt><dd id="capture-quota">—</dd></div></dl></div>
+    </section>
+
+    <section id="method" class="section-block method" aria-labelledby="method-title">
+      <header class="section-heading"><span>06</span><div><h2 id="method-title">你看到的數字怎麼來</h2><p>公開面板只呈現必要的聚合證據。</p></div></header>
+      <p class="limitation">容量進度的已抓量是目前收據指向的本機 Parquet 位元組，與 FinLab 帳號流量 MB 不同；未下載鍵以同類檔案大小中位數估算，無同類樣本才使用全域中位數。較大情境是樣本第 90 百分位，不是上限；Tick、分鐘與券商資料等未取得時可能遠超推估總量。只有鍵數與收據／檔案守門可判定取得狀態，容量比例不能證明完整。單鍵估時只取本機完整 SDK 抓取的實測秒數：同鍵上次實測，或至少 3 個同類鍵的中位數至較慢樣本；沒有足夠樣本就顯示未知。排隊、共用額度和單鍵未知大小不納入耗時，所以未開始的鍵不虛構完成日；正在抓的鍵只在實測範圍內顯示預計完成。每日 5 GB 等額度以帳號實測為準，可能包括其他程式。新私有包須所有目錄鍵在 24 小時內強制來源查詢且本地 SHA-256 通過；舊包可保留但不得宣稱最新。鍵數與日期尾端不驗證逐股完整或歷史 PIT。遠端研究限定私人、非商業用途。</p>
+    </section>
+  </main>
+  <script src="../dashboard-core.js?v=10" defer></script>
+  <script src="app.js?v=10" defer></script>
+</body>
+</html>

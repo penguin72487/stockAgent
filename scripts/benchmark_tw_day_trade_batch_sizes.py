@@ -60,6 +60,11 @@ _FALLBACK_KEYS = (
     "bt_prep_compile_nonhit",
     "bt_compile_nonhit",
 )
+_GENERIC_FAILURE_KEYS = (
+    "bt_compile_failures",
+    "bt_prep_compile_failures",
+    "bt_runtime_fallback_calls",
+)
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -207,6 +212,7 @@ def _score_curve(
     memory: dict[str, Any],
     max_peak_fraction: float,
     min_headroom_gib: float,
+    strict_compiled_backtest: bool = True,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -230,7 +236,8 @@ def _score_curve(
             reasons.append(f"epoch {epoch} has non-positive/non-finite gradient norm")
         if int(row.get("dynamo_unique_graphs_epoch_delta", 0) or 0) != 0:
             reasons.append(f"epoch {epoch} compiled a new Dynamo graph after warmup")
-        for key in _FALLBACK_KEYS:
+        failure_keys = _FALLBACK_KEYS if strict_compiled_backtest else _GENERIC_FAILURE_KEYS
+        for key in failure_keys:
             if int(row.get(key, 0) or 0) != 0:
                 reasons.append(f"epoch {epoch} has {key}={row.get(key)!r}")
 
@@ -405,6 +412,7 @@ def _write_candidate_config(
     path: Path,
     output_dir: Path,
     batch_size: int,
+    batch_size_eval: int,
     epochs: int,
     start_fold: int,
 ) -> None:
@@ -423,6 +431,12 @@ def _write_candidate_config(
     training.update(
         {
             "batch_size_train": batch_size,
+            # Keep the model-forward evaluation chunk inside the measured
+            # evaluation batch boundary. A larger inherited manual chunk can
+            # OOM after an otherwise valid training epoch and misclassify the
+            # training batch frontier.
+            "batch_size_eval": batch_size_eval,
+            "eval_model_chunk_rows": batch_size_eval,
             "auto_batch_size": False,
             "epochs": epochs,
             # The short measurement must not stop before enough steady epochs
@@ -445,7 +459,9 @@ def _plain_config_value(value: Any) -> Any:
     return value
 
 
-def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
+def _validate_source_contract(
+    config: dict[str, Any], *, expected_execution_mode: str = "tw_day_trade"
+) -> dict[str, Any]:
     training = config.get("training")
     trading = config.get("trading")
     data = config.get("data")
@@ -458,7 +474,7 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
             "source config must contain data, training, and trading mappings"
         )
     expected = {
-        "trading.execution_mode": "tw_day_trade",
+        "trading.execution_mode": expected_execution_mode,
         "trading.frequency": "daily",
         "training.loss_type": "log_utility",
     }
@@ -484,6 +500,22 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
             f"executable_portfolio_transformer, got {model_name!r}"
         )
     actual["training.model_name"] = model_name
+    if expected_execution_mode == "naive":
+        if model_name != "financial_transformer":
+            raise ValueError(
+                "naive batch benchmark requires financial_transformer, "
+                f"got {model_name!r}"
+            )
+        financial = training.get("financial_transformer")
+        if not isinstance(financial, dict):
+            raise ValueError("naive batch benchmark requires financial_transformer settings")
+        output_mode = str(financial.get("portfolio_output_mode", ""))
+        if output_mode != "projection_l1":
+            raise ValueError(
+                "naive batch benchmark requires the requested projection_l1 ABI, "
+                f"got {output_mode!r}"
+            )
+        actual["training.portfolio_output_mode"] = output_mode
     if model_name == "executable_portfolio_transformer":
         minute_execution = bool(data.get("day_trade_minute_execution_root"))
         actual["objective"] = (
@@ -554,6 +586,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         path=config_path,
         output_dir=run_dir,
         batch_size=batch_size,
+        batch_size_eval=args.batch_size_eval,
         epochs=args.epochs,
         start_fold=args.start_fold,
     )
@@ -665,6 +698,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 memory=memory,
                 max_peak_fraction=args.max_peak_vram_fraction,
                 min_headroom_gib=args.min_vram_headroom_gib,
+                strict_compiled_backtest=(
+                    args.expected_execution_mode == "tw_day_trade"
+                ),
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)
@@ -723,6 +759,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--batch-size-eval", type=int, default=128)
+    parser.add_argument(
+        "--expected-execution-mode",
+        choices=("tw_day_trade", "naive"),
+        default="tw_day_trade",
+        help="fail closed unless the resolved config has this execution mode",
+    )
     parser.add_argument("--start-fold", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--skip-epochs", type=int, default=2)
@@ -797,7 +839,9 @@ def main() -> None:
         base = _plain_config_value(asdict(load_config(args.config)))
         if not isinstance(base, dict):
             raise ValueError(f"resolved config root must be a mapping: {args.config}")
-        source_contract = _validate_source_contract(base)
+        source_contract = _validate_source_contract(
+            base, expected_execution_mode=args.expected_execution_mode
+        )
         _run_environment_preflight(
             args.python,
             output_path=args.output_root / "environment_preflight.log",
@@ -809,6 +853,7 @@ def main() -> None:
         "schema_version": 1,
         "source_config": str(args.config),
         "source_contract": source_contract,
+        "expected_execution_mode": args.expected_execution_mode,
         "output_root": str(args.output_root),
         "batch_sizes": batch_sizes,
         "world_size": args.world_size,

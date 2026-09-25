@@ -1,14 +1,56 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import zipfile
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from downloader import okx_historical_features as features
+
+
+def test_enrichment_records_each_stage_time_even_when_source_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = pl.DataFrame(
+        {
+            "date": ["2026-01-01 00:01:00"],
+            "close": [100.0],
+            "Trading_Volume": [1.0],
+        }
+    )
+    monkeypatch.setattr(features, "_read_parquet", lambda _path: base)
+    monkeypatch.setattr(features, "_add_derived_features", lambda frame: frame)
+    monkeypatch.setattr(features, "_coverage_summary", lambda _frame: {})
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("offline")
+
+    for name in ("_fetch_array_history", "_fetch_object_history", "_fetch_rubik_history"):
+        monkeypatch.setattr(features, name, unavailable)
+    result = features.enrich_symbol_historical_features(
+        object(),
+        SimpleNamespace(code="BTC", okx_symbol="BTC-USDT-SWAP", inst_family="BTC-USDT"),
+        tmp_path / "BTC_features.parquet",
+        start_ms=1767225600000,
+        end_ms=1767225660000,
+        include_funding_archive=False,
+    )
+
+    elapsed = json.loads(result.stage_elapsed_seconds_json)
+    assert set(features.FEATURE_STAGE_IDS) <= elapsed.keys()
+    assert {"read_existing", "derive", "compare", "coverage"} <= elapsed.keys()
+    assert all(value >= 0 for value in elapsed.values())
+    assert result.total_elapsed_seconds >= 0
+    assert result.status == "failed"
+    assert set(json.loads(result.stage_status_json).values()) == {"failed"}
+    summary = features.stage_latency_summary([result])
+    assert summary["mark_price"]["samples"] == 1
+    assert summary["mark_price"]["p95_seconds"] >= 0
 
 
 def test_catalog_never_includes_snapshot_only_source() -> None:

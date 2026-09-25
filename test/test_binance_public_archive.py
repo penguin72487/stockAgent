@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from http.client import IncompleteRead
 from io import BytesIO
+import json
 from pathlib import Path
 import shutil
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -10,8 +12,10 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import polars as pl
 import pytest
 
+import downloader.download_binance_public_archive as archive
 from downloader.download_binance_public_archive import (
     ArchiveObject,
+    BinanceArchiveClient,
     _canonical_merge,
     _capacity_receipt,
     _download_states,
@@ -76,6 +80,81 @@ def test_parse_s3_listing_with_namespace_and_pagination() -> None:
     ]
     assert prefixes == ["data/BTCUSDT/"]
     assert token == "next"
+
+
+def test_s3_listing_retries_truncated_chunked_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return b"<ListBucketResult/>"
+
+    calls = 0
+
+    def fake_urlopen(_request, *, timeout: int):
+        nonlocal calls
+        assert timeout == 120
+        calls += 1
+        if calls == 1:
+            raise IncompleteRead(b"truncated", 10)
+        return Response()
+
+    monkeypatch.setattr(archive, "urlopen", fake_urlopen)
+    monkeypatch.setattr(archive.time, "sleep", lambda _seconds: None)
+    client = BinanceArchiveClient(retries=1, retry_base=0.1)
+    monkeypatch.setattr(client.limiters["listing"], "wait", lambda: None)
+
+    assert client.list_objects("data/spot/monthly/klines/") == ([], [])
+    assert calls == 2
+
+
+def test_s3_listing_exhausted_truncated_body_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_urlopen(_request, *, timeout: int):
+        nonlocal calls
+        assert timeout == 120
+        calls += 1
+        raise IncompleteRead(b"truncated", 10)
+
+    monkeypatch.setattr(archive, "urlopen", fake_urlopen)
+    monkeypatch.setattr(archive.time, "sleep", lambda _seconds: None)
+    client = BinanceArchiveClient(retries=1, retry_base=0.1)
+    monkeypatch.setattr(client.limiters["listing"], "wait", lambda: None)
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        client.list_objects("data/spot/monthly/klines/")
+    assert calls == 2
+
+
+def test_discovery_failure_marks_progress_failed(tmp_path: Path) -> None:
+    class FailingClient:
+        def list_objects(self, _prefix: str, *, delimiter=None, start_after=None):
+            if delimiter:
+                return [], ["data/spot/monthly/klines/BTCUSDT/"]
+            raise RuntimeError("S3 list failed")
+
+    progress_path = tmp_path / "progress.json"
+    with pytest.raises(RuntimeError, match="S3 list failed"):
+        archive.discover_plan(
+            FailingClient(),
+            markets=("spot",),
+            selected_symbols=None,
+            workers=1,
+            tail_months=2,
+            correction_dates=(),
+            progress_path=progress_path,
+        )
+    receipt = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed"
+    assert receipt["current"] == 0
+    assert receipt["total"] == 1
 
 
 def test_spot_microsecond_archive_is_normalized_to_milliseconds() -> None:

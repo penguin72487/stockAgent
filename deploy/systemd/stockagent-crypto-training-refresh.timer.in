@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry causal crypto training materialization after raw ingestion
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Taipei
+OnCalendar=*-*-* 16:30:00 Asia/Taipei
+OnCalendar=*-*-* 22:30:00 Asia/Taipei
+Persistent=false
+Unit=stockagent-crypto-training-refresh.service
+
+[Install]
+WantedBy=timers.target

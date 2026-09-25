@@ -114,6 +114,8 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_day_trade_execution import DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION
+from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_ACTION_COUNT,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
@@ -3146,6 +3148,8 @@ def _mode_artifact_contract_for_config(
                     if physical_fifo
                     else "exact_board_lot_minute_event_tape_v1"
                 ),
+                "minute_execution_contract_version": DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
+                "regular_market_admission": regular_market_admission_contract(),
                 "daily_policy_decisions_per_session": 1,
                 "daily_proxy_allowed": bool(
                     config.data.day_trade_minute_execution_allow_daily_proxy
@@ -5786,6 +5790,7 @@ def _fit_group_causal_feature_rms(
 
     epsilon = float(model_config.causal_feature_scale_epsilon)
     minimum_dates = int(model_config.causal_feature_min_active_dates)
+    window_rms = bool(model_config.causal_feature_window_rms_normalization)
     valid_indices = np.asarray(train_ds.valid_indices, dtype=np.int64).reshape(-1)
     if valid_indices.size == 0:
         raise ValueError("causal feature RMS normalization requires training rows")
@@ -5804,7 +5809,8 @@ def _fit_group_causal_feature_rms(
         panel=panel,
         train_ds=train_ds,
         contract={
-            "schema_version": 1,
+            "schema_version": 2 if window_rms else 1,
+            **({"window_rms": True} if window_rms else {}),
             "feature_row_start": int(row_start),
             "feature_row_end_inclusive": int(row_end),
             "feature_lag": int(feature_lag),
@@ -5833,7 +5839,9 @@ def _fit_group_causal_feature_rms(
             cache_status = "hit"
             return
         started = time.perf_counter()
-        squared_sum = np.zeros(feature_count, dtype=np.float64)
+        squared_sum = (
+            None if window_rms else np.zeros(feature_count, dtype=np.float64)
+        )
         active_date_count = np.zeros(feature_count, dtype=np.int64)
         alive_cell_count = 0
         chunk_rows = 32
@@ -5847,14 +5855,15 @@ def _fit_group_causal_feature_rms(
             )
             alive = np.asarray(panel.alive_mask[start:end], dtype=np.bool_)
             alive_cell_count += int(alive.sum(dtype=np.int64))
-            squared_sum += np.einsum(
-                "tsf,tsf,ts->f",
-                values,
-                values,
-                alive,
-                dtype=np.float64,
-                optimize=True,
-            )
+            if squared_sum is not None:
+                squared_sum += np.einsum(
+                    "tsf,tsf,ts->f",
+                    values,
+                    values,
+                    alive,
+                    dtype=np.float64,
+                    optimize=True,
+                )
             observed = (np.abs(values) > epsilon) & alive[..., None]
             active_date_count += np.any(observed, axis=1).sum(
                 axis=0,
@@ -5864,13 +5873,17 @@ def _fit_group_causal_feature_rms(
             raise ValueError(
                 "causal feature RMS normalization found no alive training cells"
             )
-        rms = np.sqrt(squared_sum / float(alive_cell_count))
-        active = (
-            np.isfinite(rms)
-            & (rms >= epsilon)
-            & (active_date_count >= minimum_dates)
-        )
-        scale = np.where(active, rms, 1.0).astype(np.float32)
+        if squared_sum is None:
+            active = active_date_count >= minimum_dates
+            scale = np.ones(feature_count, dtype=np.float32)
+        else:
+            rms = np.sqrt(squared_sum / float(alive_cell_count))
+            active = (
+                np.isfinite(rms)
+                & (rms >= epsilon)
+                & (active_date_count >= minimum_dates)
+            )
+            scale = np.where(active, rms, 1.0).astype(np.float32)
         categorical_names = {
             str(name) for name in model_config.categorical_feature_names
         }
@@ -5893,8 +5906,11 @@ def _fit_group_causal_feature_rms(
             scale[categorical_indices] = 1.0
             active[categorical_indices] = True
         metadata = {
-            "schema_version": 1,
-            "normalization": "training_only_zero_preserving_rms",
+            "schema_version": 2 if window_rms else 1,
+            "normalization": (
+                "training_only_active_mask_plus_observed_window_rms"
+                if window_rms else "training_only_zero_preserving_rms"
+            ),
             "train_years": [int(year) for year in train_years],
             "fold_ids": [int(fold.fold_id) for fold in group_folds],
             "feature_row_start": int(row_start),

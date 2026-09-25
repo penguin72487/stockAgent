@@ -1,0 +1,13 @@
+# Private owner-only research. Activate exact cold releases with stockagent-data
+# before training; current FinLab revisions are not historical PIT vintages.
+base_config: ../markets/tw_public_preopen_finlab_research_2014_v4.yaml
+experiment_name: tw-public-finlab-research-2014-v4-remote
+
+runner:
+  output_dir: artifacts/markets/tw_public_finlab_research_2014_v4_remote
+  resume: false
+  post_train_infer: false
+
+data:
+  parquet_root: data_tw_public/stocks
+  tw_public_feature_path: data_finlab_training/features/tw_public_research_finlab_2014_v4.parquet

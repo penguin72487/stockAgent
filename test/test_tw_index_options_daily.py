@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import csv
 from datetime import date
+import math
 from pathlib import Path
 import zipfile
+
+import pyarrow.parquet as pq
+
+from scripts.download_taifex_option_daily_history import (
+    _builder_fingerprint,
+    _futures_contract_open_by_date,
+    _futures_open_by_date,
+    _merge_full_chain_shards,
+    _prepare_atm_source_projections,
+    _prepare_full_chain_shards,
+)
+from scripts.taifex_daily_download_common import sha256_path
 
 from scripts.backtest_taifex_classic_opening_straddle_daily import (
     _assert_accounting,
@@ -13,12 +26,257 @@ from stockagent.data.tw_index_futures import (
     build_taifex_index_futures_day_session,
 )
 from stockagent.data.tw_index_options_daily import (
+    _read_txo_rows,
+    build_taifex_opening_atm_straddles,
     build_taifex_monthly_atm_straddles,
+    build_taifex_option_full_chain,
     build_taifex_weekly_atm_straddles,
     iter_taifex_option_daily_rows,
     load_taifex_monthly_atm_straddles,
     load_taifex_weekly_atm_straddles,
 )
+
+
+def test_atm_source_cache_matches_direct_and_invalidates_affected_futures(tmp_path: Path) -> None:
+    futures = _futures(tmp_path)
+    sources = []
+    for suffix, day, strike in (
+        ("02", "2025/01/02", 20200),
+        ("03", "2025/01/03", 20300),
+    ):
+        source = tmp_path / f"option_{suffix}.csv"
+        _write(source, _OPTION_HEADER, [
+            _option_row(day, "202501", strike, "買權", 100, 110),
+            _option_row(day, "202501", strike, "賣權", 90, 80),
+        ])
+        sources.append(source)
+    manifest = [
+        {"path": str(source), "sha256": sha256_path(source)}
+        for source in sources
+    ]
+    kwargs = {
+        "scope": "monthly",
+        "tx_by_date": _futures_contract_open_by_date(futures),
+        "builder_fingerprint": _builder_fingerprint(),
+    }
+    cache = tmp_path / "atm_cache"
+    projections, rebuilt = _prepare_atm_source_projections(manifest, cache, **kwargs)
+    assert rebuilt == 2
+    direct = build_taifex_opening_atm_straddles(
+        sources, futures, tmp_path / "direct.parquet", series_scope="monthly"
+    )
+    cached = build_taifex_opening_atm_straddles(
+        sources, futures, tmp_path / "cached.parquet", series_scope="monthly",
+        source_projections=projections,
+    )
+    assert sha256_path(cached) == sha256_path(direct)
+    assert pq.read_table(cached).num_rows == 2
+
+    reused, rebuilt = _prepare_atm_source_projections(manifest, cache, **kwargs)
+    assert rebuilt == 0
+    assert reused == projections
+    cache_file = next((cache / "monthly").glob("*.json"))
+    cache_file.write_text("{corrupt", encoding="utf-8")
+    _repaired, rebuilt = _prepare_atm_source_projections(manifest, cache, **kwargs)
+    assert rebuilt == 1
+
+    changed_source = tmp_path / "changed_futures.csv"
+    _write(changed_source, _FUTURES_HEADER, [
+        _future_row("2025/01/02", "202501", 20120),
+        _future_row("2025/01/03", "202501", 20420),
+        _future_row("2025/01/06", "202501", 30320),
+    ])
+    changed_futures = build_taifex_index_futures_day_session(
+        [changed_source], tmp_path / "changed_futures.parquet", products=("TX",)
+    )
+    changed_kwargs = {
+        **kwargs,
+        "tx_by_date": _futures_contract_open_by_date(changed_futures),
+    }
+    changed, rebuilt = _prepare_atm_source_projections(
+        manifest, cache, **changed_kwargs
+    )
+    assert rebuilt == 1  # Only Jan 3 changed; Jan 6 has no option receipt.
+    changed_cached = build_taifex_opening_atm_straddles(
+        sources, changed_futures, tmp_path / "changed_cached.parquet",
+        series_scope="monthly", source_projections=changed,
+    )
+    changed_direct = build_taifex_opening_atm_straddles(
+        sources, changed_futures, tmp_path / "changed_direct.parquet",
+        series_scope="monthly",
+    )
+    assert sha256_path(changed_cached) == sha256_path(changed_direct)
+
+    _write(sources[0], _OPTION_HEADER, [
+        _option_row("2025/01/02", "202501", 20200, "買權", 110, 120),
+        _option_row("2025/01/02", "202501", 20200, "賣權", 90, 80),
+    ])
+    changed_manifest = [
+        {"path": str(source), "sha256": sha256_path(source)}
+        for source in sources
+    ]
+    changed, rebuilt = _prepare_atm_source_projections(
+        changed_manifest, cache, **changed_kwargs
+    )
+    assert rebuilt == 1
+    changed_cached = build_taifex_opening_atm_straddles(
+        sources, changed_futures, tmp_path / "source_changed_cached.parquet",
+        series_scope="monthly", source_projections=changed,
+    )
+    changed_direct = build_taifex_opening_atm_straddles(
+        sources, changed_futures, tmp_path / "source_changed_direct.parquet",
+        series_scope="monthly",
+    )
+    assert sha256_path(changed_cached) == sha256_path(changed_direct)
+
+
+def test_weekly_atm_cache_preserves_monthly_only_gap_reason(tmp_path: Path) -> None:
+    futures = _futures(tmp_path)
+    sources = []
+    for suffix, day, series in (
+        ("02", "2025/01/02", "202501W1"),
+        ("03", "2025/01/03", "202501"),
+        ("06", "2025/01/06", "202501W2"),
+    ):
+        source = tmp_path / f"weekly_{suffix}.csv"
+        _write(source, _OPTION_HEADER, [
+            _option_row(day, series, 20200, "買權", 100, 110),
+            _option_row(day, series, 20200, "賣權", 90, 80),
+        ])
+        sources.append(source)
+    manifest = [
+        {"path": str(source), "sha256": sha256_path(source)}
+        for source in sources
+    ]
+    projected, rebuilt = _prepare_atm_source_projections(
+        manifest, tmp_path / "cache", scope="weekly",
+        tx_by_date=_futures_contract_open_by_date(futures),
+        builder_fingerprint=_builder_fingerprint(),
+    )
+    assert rebuilt == 3
+    direct = build_taifex_opening_atm_straddles(
+        sources, futures, tmp_path / "weekly_direct.parquet", series_scope="weekly"
+    )
+    cached = build_taifex_opening_atm_straddles(
+        sources, futures, tmp_path / "weekly_cached.parquet", series_scope="weekly",
+        source_projections=projected,
+    )
+    assert sha256_path(cached) == sha256_path(direct)
+    frame = pq.read_table(cached).to_pandas()
+    gap = frame.loc[frame["date"].astype(str) == "2025-01-03"].iloc[0]
+    assert gap["exclusion_reason"] == "no_weekly_txo_listing"
+
+
+def test_full_chain_shards_match_direct_build_and_rebuild_only_changed_futures_dates(
+    tmp_path: Path,
+) -> None:
+    futures = _futures(tmp_path)
+    sources = []
+    for day, strike in (("2025/01/02", 20200), ("2025/01/03", 20300)):
+        source = tmp_path / f"{day[-2:]}.csv"
+        _write(source, _OPTION_HEADER, [
+            _option_row(day, "202501", strike, "買權", 100, 110),
+            _option_row(day, "202501", strike, "賣權", 90, 80),
+        ])
+        sources.append(source)
+    receipt_manifest = [
+        {"path": str(source), "sha256": sha256_path(source)}
+        for source in sources
+    ]
+    fingerprint = _builder_fingerprint()
+    output_root = tmp_path / "normalized"
+    cache_root = tmp_path / "node_cache"
+    opens = _futures_open_by_date(futures)
+    shards, rebuilt = _prepare_full_chain_shards(
+        receipt_manifest, futures, cache_root,
+        scope="monthly", tx_open_by_date=opens,
+        builder_fingerprint=fingerprint,
+    )
+    assert rebuilt == 2
+    merged = _merge_full_chain_shards(
+        shards, output_root / "monthly_full_chain.parquet", scope="monthly"
+    )
+    direct = build_taifex_option_full_chain(
+        sources, futures, tmp_path / "direct.parquet", series_scope="monthly"
+    )
+    assert pq.read_table(merged).equals(pq.read_table(direct), check_metadata=True)
+    reused, rebuilt = _prepare_full_chain_shards(
+        receipt_manifest, futures, cache_root,
+        scope="monthly", tx_open_by_date=opens,
+        builder_fingerprint=fingerprint,
+    )
+    assert rebuilt == 0
+    assert reused == shards
+
+    Path(str(reused[0]["shard_path"])).write_bytes(b"corrupt")
+    repaired, rebuilt = _prepare_full_chain_shards(
+        receipt_manifest, futures, cache_root,
+        scope="monthly", tx_open_by_date=opens,
+        builder_fingerprint=fingerprint,
+    )
+    assert rebuilt == 1
+    assert pq.read_table(_merge_full_chain_shards(
+        repaired, output_root / "repaired.parquet", scope="monthly"
+    )).equals(pq.read_table(direct), check_metadata=True)
+
+    changed_source = tmp_path / "changed_futures.csv"
+    _write(changed_source, _FUTURES_HEADER, [
+        _future_row("2025/01/02", "202501", 20120),
+        _future_row("2025/01/03", "202501", 20420),
+        _future_row("2025/01/06", "202501", 30320),
+    ])
+    changed_futures = build_taifex_index_futures_day_session(
+        [changed_source], tmp_path / "changed_futures.parquet", products=("TX",)
+    )
+    changed_shards, rebuilt = _prepare_full_chain_shards(
+        receipt_manifest, changed_futures, cache_root,
+        scope="monthly", tx_open_by_date=_futures_open_by_date(changed_futures),
+        builder_fingerprint=fingerprint,
+    )
+    assert rebuilt == 1  # Jan 6 is outside both receipts; only Jan 3 changed.
+    changed_merged = _merge_full_chain_shards(
+        changed_shards, output_root / "changed.parquet", scope="monthly"
+    )
+    changed_direct = build_taifex_option_full_chain(
+        sources, changed_futures, tmp_path / "changed_direct.parquet",
+        series_scope="monthly",
+    )
+    assert pq.read_table(changed_merged).equals(
+        pq.read_table(changed_direct), check_metadata=True
+    )
+
+
+def test_full_chain_shard_empty_scope_and_overlap_fail_closed(tmp_path: Path) -> None:
+    futures = _futures(tmp_path)
+    sources = []
+    for name in ("first", "second"):
+        source = tmp_path / f"{name}.csv"
+        _write(source, _OPTION_HEADER, [
+            _option_row("2025/01/02", "202501", 20200, "買權", 100, 110),
+        ])
+        sources.append(source)
+    manifest = [
+        {"path": str(source), "sha256": sha256_path(source)}
+        for source in sources
+    ]
+    kwargs = {
+        "tx_open_by_date": _futures_open_by_date(futures),
+        "builder_fingerprint": _builder_fingerprint(),
+    }
+    monthly, rebuilt = _prepare_full_chain_shards(
+        manifest, futures, tmp_path / "node_cache", scope="monthly", **kwargs
+    )
+    assert rebuilt == 2
+    import pytest
+
+    with pytest.raises(ValueError, match="overlapping full-chain receipts"):
+        _merge_full_chain_shards(monthly, tmp_path / "overlap.parquet", scope="monthly")
+    weekly, rebuilt = _prepare_full_chain_shards(
+        manifest, futures, tmp_path / "node_cache", scope="weekly", **kwargs
+    )
+    assert rebuilt == 2
+    with pytest.raises(ValueError, match="no normalized TXO weekly"):
+        _merge_full_chain_shards(weekly[:1], tmp_path / "empty.parquet", scope="weekly")
 
 
 _FUTURES_HEADER = [
@@ -147,6 +405,35 @@ def _futures(tmp_path: Path) -> Path:
         tmp_path / "futures.parquet",
         products=("TX",),
     )
+
+
+def test_option_csv_reader_preserves_duplicate_header_and_short_row(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "options.csv"
+    header = [
+        "交易日期", "契約", "到期月份(週別)", "履約價", "買賣權",
+        "開盤價", "收盤價", "結算價", "成交量",
+        "最後最佳買價", "最後最佳買價", "最後最佳賣價",
+    ]
+    _write(
+        source,
+        header,
+        [
+            ["2025/01/02", "TXO", "202501", 20000, "買權", 100, 110,
+             105, 3, 1, 2, 3, "ignored extra field"],
+            [],
+            ["2025/01/03", "TXO", "202501", 20000, "賣權", 90, 80,
+             85, 2],
+        ],
+    )
+    by_date, all_dates = _read_txo_rows(source, series_scope="monthly")
+
+    assert all_dates == {date(2025, 1, 2), date(2025, 1, 3)}
+    assert by_date[date(2025, 1, 2)][("202501", 20000.0, "C")].last_bid == 2.0
+    short = by_date[date(2025, 1, 3)][("202501", 20000.0, "P")]
+    assert math.isnan(short.last_bid)
+    assert math.isnan(short.last_ask)
 
 
 def test_monthly_atm_uses_tx_open_and_never_falls_back_for_liquidity(

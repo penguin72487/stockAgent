@@ -16,7 +16,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json
-from stockagent.data_sync.packed_backup import BackupConfig, PackedBackup, VolumeGuard, inventory, now_iso
+from stockagent.data_sync.cold_primary import D_PRIMARY_MARKER
+from stockagent.data_sync.packed_backup import (
+    BackupConfig, PackedBackup, VolumeGuard, current_inventory, inventory, now_iso,
+)
 from scripts.run_live_artifact_sync import RecursiveInotify
 
 
@@ -28,6 +31,13 @@ def windows_volume_id() -> str:
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; (Get-Volume -DriveLetter D).UniqueId",
     ], check=True, capture_output=True, text=True, timeout=30)
     return result.stdout.strip().lower()
+
+
+def watch_timeout(cfg: BackupConfig, result: dict, *, has_watcher: bool) -> float:
+    """Drain a progressing backlog, but avoid full scans while inotify is quiet."""
+    if result["pending_objects"] > 0 and result["completed_objects"] > 0:
+        return 0
+    return cfg.idle_reconcile_seconds if has_watcher else cfg.poll_seconds
 
 
 def watch(cfg: BackupConfig) -> None:
@@ -51,8 +61,7 @@ def watch(cfg: BackupConfig) -> None:
             priority.clear()
             # Keep draining a healthy initial backlog. A bad object must not
             # cause a busy retry loop. Polling also repairs missed/overflow events.
-            progressing_backlog = result["pending_objects"] > 0 and result["completed_objects"] > 0
-            timeout = 0 if progressing_backlog else cfg.poll_seconds
+            timeout = watch_timeout(cfg, result, has_watcher=watcher is not None)
             if watcher is not None:
                 changes, _overflow = watcher.wait(timeout)
                 priority.update(f"objects/{path}" for path in changes["objects"])
@@ -75,25 +84,46 @@ def watch(cfg: BackupConfig) -> None:
             time.sleep(cfg.poll_seconds)
 
 
+def backup_status(cfg: BackupConfig) -> dict:
+    """Never present an old C-to-D receipt as a current D-primary backup."""
+    if (cfg.source / ".stockagent-d-mount-required").exists():
+        return {
+            "state": "unavailable",
+            "reason": "D cold primary is not mounted",
+            "backup_verified": False,
+        }
+    if (cfg.source / D_PRIMARY_MARKER).exists():
+        return {
+            "state": "retired_single_d_primary",
+            "reason": "C-to-D independent backup is retired; D is the sole cold volume",
+            "backup_verified": False,
+        }
+    status_path = cfg.state_dir / "status.json"
+    return json.loads(status_path.read_text()) if status_path.exists() else {"state": "not_started"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "init", "install-service", "once", "watch", "status"))
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs/data_sync/packed_backup.json")
-    parser.add_argument("--verify-existing", action="store_true", help="once only: re-read all source/backup object checksums")
+    parser.add_argument("--verify-existing", action="store_true", help="once only: re-read checksums in the configured backup scope")
     args = parser.parse_args()
     cfg = BackupConfig.load(args.config)
     if args.verify_existing and args.command != "once":
         parser.error("--verify-existing requires once")
     if args.command == "status":
-        status_path = cfg.state_dir / "status.json"
-        result = json.loads(status_path.read_text()) if status_path.exists() else {"state": "not_started"}
+        result = backup_status(cfg)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     guard = VolumeGuard(cfg)
     if args.command == "plan":
         guard.check(require_marker=guard.marker_path.exists())
-        objects, errors = inventory(cfg)
+        if cfg.backup_scope == "current_heads":
+            objects, errors, _, _ = current_inventory(cfg)
+        else:
+            objects, errors = inventory(cfg)
         result = {"dry_run": True, "source": str(cfg.source), "destination": str(cfg.destination),
+                  "backup_scope": cfg.backup_scope,
                   "mount": guard.mount_identity, "objects": len(objects), "object_bytes": sum(item["bytes"] for item in objects),
                   "destination_free_bytes": shutil.disk_usage(cfg.mount_point).free, "reserve_bytes": cfg.reserve_bytes,
                   "errors": errors, "checksums_verified": False, "deletes": [], "materialization": False}

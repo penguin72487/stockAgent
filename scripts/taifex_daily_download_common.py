@@ -46,6 +46,7 @@ def download_taifex_attachment(
     attempts: int,
     request_interval: float,
     user_agent: str,
+    cooldown_after_download: bool = False,
 ) -> Path:
     """Download one immutable TAIFEX attachment with atomic promotion."""
 
@@ -81,6 +82,8 @@ def download_taifex_attachment(
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.replace(target)
+            if cooldown_after_download and request_interval > 0:
+                time.sleep(request_interval)
             return target
         except Exception as exc:
             last_error = exc

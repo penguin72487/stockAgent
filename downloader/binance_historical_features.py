@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -17,9 +18,11 @@ from tqdm import tqdm
 
 try:
     from .artifact_io import atomic_write_parquet
+    from .feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
     from artifact_io import atomic_write_parquet
+    from feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from ohlcv_hot_tail import hot_tail_path
 
 
@@ -256,6 +259,8 @@ class HistoricalFeatureResult:
     stage_status_json: str
     coverage_json: str
     errors_json: str
+    stage_elapsed_seconds_json: str = "{}"
+    total_elapsed_seconds: float = 0.0
 
 
 def feature_catalog_payload() -> dict[str, Any]:
@@ -334,6 +339,8 @@ def _fetch_forward(
     limit: int,
     timestamp_field: str | int,
     weight: float,
+    page_span_ms: int | None = None,
+    request_end_offset_ms: int = 0,
 ) -> list[Any]:
     if start_ms > end_ms:
         return []
@@ -341,32 +348,57 @@ def _fetch_forward(
     cursor = start_ms
     seen: set[int] = set()
     while cursor <= end_ms:
+        # Futures statistics endpoints may return the *latest* `limit` rows
+        # before endTime even when startTime is supplied.  A single endTime
+        # covering weeks can therefore skip the head, then repeat its tail.
+        # Bound time as well as row count for fixed-frequency observations.
+        page_end = min(end_ms, cursor + page_span_ms) if page_span_ms else end_ms
         payload = client.get(
             path,
             {
                 **base_params,
                 "startTime": str(cursor),
-                "endTime": str(end_ms),
+                "endTime": str(page_end + request_end_offset_ms),
                 "limit": str(limit),
             },
             weight=weight,
         )
-        if not isinstance(payload, list) or not payload:
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Binance returned non-list pagination for {path}")
+        if not payload:
+            if page_span_ms:
+                cursor = page_end + 1
+                continue
             break
-        timestamps = [
-            timestamp
+        if page_span_ms and any(
+            (timestamp := _timestamp_from_row(row, timestamp_field)) is not None
+            and timestamp > page_end + request_end_offset_ms
             for row in payload
+        ):
+            raise RuntimeError(f"Binance returned pagination beyond requested window for {path}")
+        if page_span_ms:
+            # Taker/basis endTime is a period-end bound while its timestamp is
+            # the period start. Binance may also return one preceding period.
+            payload = [row for row in payload if (
+                (timestamp := _timestamp_from_row(row, timestamp_field)) is not None
+                and cursor <= timestamp <= page_end
+            )]
+        timestamps = [
+            timestamp for row in payload
             if (timestamp := _timestamp_from_row(row, timestamp_field)) is not None
         ]
         if not timestamps:
-            break
+            if page_span_ms:
+                cursor = page_end + 1
+                continue
+            raise RuntimeError(f"Binance returned timestamps missing for {path}")
         rows.extend(payload)
         latest = max(timestamps)
         if latest in seen or latest < cursor:
             raise RuntimeError(f"Binance pagination made no progress for {path}")
         seen.add(latest)
-        cursor = latest + 1
-        if len(payload) < limit:
+        cursor = page_end + 1 if page_span_ms else latest + 1
+        if not page_span_ms and len(payload) < limit:
             break
     return rows
 
@@ -738,10 +770,14 @@ def enrich_symbol_historical_features(
     observed_at_ms: int | None = None,
     stage_callback: Callable[[str, str], None] | None = None,
 ) -> HistoricalFeatureResult:
+    started = time.perf_counter()
     original = _read_parquet(output_path)
     frame = original
     stage_status: dict[str, str] = {}
     errors: dict[str, str] = {}
+    stage_elapsed_seconds: dict[str, float] = {
+        "read_existing": round(time.perf_counter() - started, 6)
+    }
 
     base_start = original.select(_datetime_ms_expr("date").min()).item()
     base_end = original.select(_datetime_ms_expr("date").max()).item()
@@ -755,12 +791,14 @@ def enrich_symbol_historical_features(
     short_start_floor = observation_ms - SHORT_HISTORY_RETENTION_MS
 
     def run_stage(stage: str, fn: Callable[[], None]) -> None:
+        stage_started = time.perf_counter()
         status = "ok"
         try:
             fn()
         except Exception as exc:
             status = "failed"
             errors[stage] = f"{type(exc).__name__}: {exc}"
+        stage_elapsed_seconds[stage] = round(time.perf_counter() - stage_started, 6)
         stage_status[stage] = status
         if stage_callback is not None:
             stage_callback(stage, status)
@@ -785,6 +823,7 @@ def enrich_symbol_historical_features(
                 limit=KLINE_LIMIT,
                 timestamp_field=0,
                 weight=KLINE_REQUEST_WEIGHT,
+                page_span_ms=(KLINE_LIMIT - 1) * CANDLE_INTERVAL_MS,
             )
             fresh = _normalize_price_klines(
                 rows,
@@ -893,6 +932,10 @@ def enrich_symbol_historical_features(
                 # weight, but the shared limiter requires a positive cost and
                 # a conservative unit also protects against documentation drift.
                 weight=1.0,
+                page_span_ms=(SHORT_HISTORY_LIMIT - 1) * STATISTICS_INTERVAL_MS,
+                request_end_offset_ms=(
+                    STATISTICS_INTERVAL_MS if timestamp_semantics == "period_start" else 0
+                ),
             )
             fresh = _normalize_object_rows(
                 rows,
@@ -1019,11 +1062,19 @@ def enrich_symbol_historical_features(
         ),
     )
 
+    stage_started = time.perf_counter()
     frame = _add_derived_features(frame)
+    stage_elapsed_seconds["derive"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     changed = not original.equals(frame)
+    stage_elapsed_seconds["compare"] = round(time.perf_counter() - stage_started, 6)
     if changed:
+        stage_started = time.perf_counter()
         _write_parquet_atomic(frame, output_path)
+        stage_elapsed_seconds["write"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     coverage = _coverage_summary(frame)
+    stage_elapsed_seconds["coverage"] = round(time.perf_counter() - stage_started, 6)
     failed = len(errors)
     status = "partial" if failed else "updated" if changed else "unchanged"
     if failed == len(FEATURE_STAGE_IDS):
@@ -1038,6 +1089,8 @@ def enrich_symbol_historical_features(
         stage_status_json=json.dumps(stage_status, ensure_ascii=False, sort_keys=True),
         coverage_json=json.dumps(coverage, ensure_ascii=False, sort_keys=True),
         errors_json=json.dumps(errors, ensure_ascii=False, sort_keys=True),
+        stage_elapsed_seconds_json=json.dumps(stage_elapsed_seconds, sort_keys=True),
+        total_elapsed_seconds=round(time.perf_counter() - started, 6),
     )
 
 

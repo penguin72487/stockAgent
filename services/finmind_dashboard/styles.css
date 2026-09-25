@@ -1,0 +1,14 @@
+main{width:min(1180px,calc(100% - 36px))}
+.finlab-chart{margin-top:18px}
+.finlab-chart svg{margin-top:12px}
+.finlab-chart .axis{stroke:#385166;stroke-width:1}
+.finlab-chart .ceiling{stroke:#f5bd4f;stroke-width:1;stroke-dasharray:5 5}
+.finlab-chart .series{fill:none;stroke:#71d9a1;stroke-width:2.4}
+.finlab-chart .point{fill:#71d9a1}
+.finlab-chart .tick{fill:#8da4b6;font:12px system-ui,sans-serif}
+.finlab-chart .time-range-control{margin-top:16px}
+.storage-layout{grid-template-columns:1fr}
+.storage-layout .storage-bars-card{margin-top:14px}
+.finlab-table-scroll table{min-width:1100px}
+.finlab-table-scroll td:first-child{max-width:270px}
+.data-note a{color:var(--cyan)}

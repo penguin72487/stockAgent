@@ -4713,6 +4713,16 @@ class Manifest:
             ON tasks(active, plan_token, status, endpoint)
             """
             )
+            # L1 compaction selects the earliest unassigned successful task
+            # per endpoint. Keep that order in a partial covering index so a
+            # bounded batch does not sort the entire multi-million-task plan.
+            self.connection.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_l1_tasks_compaction_order
+            ON tasks(plan_token, endpoint, task_id, rows)
+            WHERE active=1 AND status='success'
+            """
+            )
             self.connection.execute(
                 """
             CREATE INDEX IF NOT EXISTS idx_tasks_retry_not_before

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import date, datetime
+from datetime import date, datetime, time as clock_time, timedelta
 import fcntl
 import html
 import io
@@ -191,6 +191,119 @@ def _selected_common_dates(
             f"only {len(common)} common TAIFEX trading dates are available; need {count}"
         )
     return common[-count:]
+
+
+def _latest_completed_listing_date(observed_at: datetime) -> date:
+    """The current TAIFEX trading day is not a complete daily file before 17:00."""
+
+    local = observed_at.astimezone(TAIPEI)
+    return local.date() if local.time() >= clock_time(17) else local.date() - timedelta(days=1)
+
+
+def _reuse_previous_complete_window(
+    root: Path,
+    *,
+    common_dates: list[date],
+    requested_days: int,
+) -> tuple[bool, str, str | None]:
+    """Retain a verified 30-day window while the rolling pages expose 29.
+
+    The source may remove its oldest link before publishing the next completed
+    trading date. Reuse is legal only for that exact one-date rollover shape;
+    every retained raw ZIP and normalized partition is checked by content hash.
+    """
+
+    if len(common_dates) != requested_days - 1 or not common_dates:
+        return False, "not_one_date_rollover", None
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_symlink():
+        return False, "manifest_symlink", None
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        previous_dates = [date.fromisoformat(str(value)) for value in manifest["trading_dates"]]
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("status") != "complete"
+            or manifest.get("parser_contract_version") != PARSER_CONTRACT_VERSION
+            or manifest.get("requested_days") != requested_days
+            or len(previous_dates) != requested_days
+            or previous_dates != sorted(set(previous_dates))
+            or previous_dates[1:] != common_dates
+            or manifest.get("date_start") != previous_dates[0].isoformat()
+            or manifest.get("date_end") != previous_dates[-1].isoformat()
+        ):
+            return False, "prior_manifest_contract_mismatch", None
+        expected_keys = {
+            (kind, day.isoformat())
+            for kind in ("futures", "options")
+            for day in previous_dates
+        }
+        raw_entries = manifest["raw_downloads"]
+        partition_entries = manifest["partitions"]
+        raw_by_key = {
+            (entry["kind"], entry["trading_date"]): entry
+            for entry in raw_entries
+        }
+        partition_by_key = {
+            (entry["kind"], entry["trading_date"]): entry
+            for entry in partition_entries
+        }
+        if (
+            len(raw_entries) != len(expected_keys)
+            or len(partition_entries) != len(expected_keys)
+            or set(raw_by_key) != expected_keys
+            or set(partition_by_key) != expected_keys
+        ):
+            return False, "prior_manifest_member_mismatch", None
+        for kind in ("futures", "options"):
+            page = manifest["listing_pages"][kind]
+            page_path = Path(str(page["path"]))
+            if (
+                page_path.is_symlink()
+                or page_path.parent != root / "raw" / "listing_pages"
+                or page_path.stat().st_size != page["bytes"]
+                or _sha256_path(page_path) != page["sha256"]
+            ):
+                return False, "prior_listing_page_hash_mismatch", None
+        for kind, day_text in sorted(expected_keys):
+            day = date.fromisoformat(day_text)
+            compact = day.strftime("%Y_%m_%d")
+            name = f"Daily_{compact}" if kind == "futures" else f"OptionsDaily_{compact}"
+            raw_path = root / "raw" / kind / f"{name}.zip"
+            raw = raw_by_key[kind, day_text]
+            if raw_path.is_symlink() or raw.get("path") != str(raw_path):
+                return False, "prior_raw_path_mismatch", None
+            payload = raw_path.read_bytes()
+            if len(payload) != raw.get("bytes") or _sha256_bytes(payload) != raw.get("sha256"):
+                return False, "prior_raw_hash_mismatch", None
+            _validate_zip_payload(payload, expected_member=f"{name}.csv")
+            parquet_path, receipt_path = _partition_paths(root, kind, day)
+            if parquet_path.is_symlink() or receipt_path.is_symlink():
+                return False, "prior_partition_symlink", None
+            receipt = _load_reusable_partition(
+                parquet_path,
+                receipt_path,
+                source_sha256=str(raw["sha256"]),
+                kind=kind,
+            )
+            if (
+                receipt is None
+                or receipt.get("trading_date") != day_text
+                or receipt.get("source_path") != str(raw_path)
+                or receipt.get("output_path") != str(parquet_path)
+                or receipt.get("output_bytes") != parquet_path.stat().st_size
+                or receipt.get("product") != ("TX" if kind == "futures" else "TXO")
+            ):
+                return False, "prior_partition_contract_mismatch", None
+            if {
+                key: value for key, value in partition_by_key[kind, day_text].items()
+                if key != "reused"
+            } != receipt:
+                return False, "prior_partition_hash_mismatch", None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, zipfile.BadZipFile):
+        return False, "prior_manifest_unverifiable", None
+    return True, "verified_previous_30_day_window", _sha256_bytes(manifest_bytes)
 
 
 def _validate_zip_payload(payload: bytes, *, expected_member: str) -> None:
@@ -767,10 +880,19 @@ def main() -> int:
         )
         futures_urls = _extract_downloads(futures_page, pattern=FUTURES_URL_RE)
         options_urls = _extract_downloads(options_page, pattern=OPTIONS_URL_RE)
-        selected_dates = _selected_common_dates(
-            futures_urls, options_urls, count=args.days
+        observed_at = datetime.now(TAIPEI)
+        completed_cutoff = _latest_completed_listing_date(observed_at)
+        completed_futures = {
+            day: url for day, url in futures_urls.items() if day <= completed_cutoff
+        }
+        completed_options = {
+            day: url for day, url in options_urls.items() if day <= completed_cutoff
+        }
+        common_dates = sorted(set(completed_futures) & set(completed_options))
+        withheld_dates = sorted(
+            (set(futures_urls) | set(options_urls))
+            - (set(completed_futures) | set(completed_options))
         )
-
         page_receipts = {
             "futures": {
                 "url": FUTURES_LISTING_URL,
@@ -783,6 +905,61 @@ def main() -> int:
                 **_save_listing_page(root, "options", options_page),
             },
         }
+        listing_status: dict[str, object] = {
+            "observed_at": observed_at.isoformat(),
+            "requested_days": args.days,
+            "completed_cutoff": completed_cutoff.isoformat(),
+            "futures_listed": len(futures_urls),
+            "options_listed": len(options_urls),
+            "common_completed_days": len(common_dates),
+            "latest_completed_listed": (
+                common_dates[-1].isoformat() if common_dates else None
+            ),
+            "withheld_after_cutoff": [day.isoformat() for day in withheld_dates],
+            "listing_page_sha256": {
+                kind: details["sha256"] for kind, details in page_receipts.items()
+            },
+        }
+        listing_status_path = root / "state" / "recent_listing_status.json"
+        if len(common_dates) < args.days:
+            reusable, reason, manifest_sha256 = _reuse_previous_complete_window(
+                root, common_dates=common_dates, requested_days=args.days
+            )
+            listing_status.update(
+                {
+                    "status": (
+                        "waiting_next_publication"
+                        if reusable else "blocked_incomplete_listing"
+                    ),
+                    "prior_manifest_check": reason,
+                    "reused_manifest_sha256": manifest_sha256,
+                }
+            )
+            _atomic_write_text(
+                listing_status_path,
+                json.dumps(listing_status, ensure_ascii=False, indent=2) + "\n",
+            )
+            if reusable:
+                print(
+                    "[taifex-recent-ticks] waiting_next_publication "
+                    f"common_completed_days={len(common_dates)} "
+                    f"retained_verified_days={args.days} "
+                    f"date_end={common_dates[-1].isoformat()}",
+                    flush=True,
+                )
+                return 0
+            raise ValueError(
+                f"only {len(common_dates)} completed common TAIFEX trading dates "
+                f"are available; need {args.days}; prior_manifest={reason}"
+            )
+        selected_dates = _selected_common_dates(
+            completed_futures, completed_options, count=args.days
+        )
+        listing_status["status"] = "listing_ready"
+        _atomic_write_text(
+            listing_status_path,
+            json.dumps(listing_status, ensure_ascii=False, indent=2) + "\n",
+        )
 
         downloads: list[dict[str, object]] = []
         partitions: list[dict[str, object]] = []
@@ -908,6 +1085,10 @@ def main() -> int:
             "listing_page_dates": {
                 "futures": sorted(value.isoformat() for value in futures_urls),
                 "options": sorted(value.isoformat() for value in options_urls),
+                "completed_cutoff": completed_cutoff.isoformat(),
+                "withheld_after_cutoff": [
+                    day.isoformat() for day in withheld_dates
+                ],
                 "futures_only": sorted(
                     value.isoformat() for value in set(futures_urls) - set(options_urls)
                 ),
@@ -950,6 +1131,18 @@ def main() -> int:
         _atomic_write_text(
             root / "manifest.json",
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+        listing_status.update(
+            {
+                "status": "complete",
+                "built_date_start": manifest["date_start"],
+                "built_date_end": manifest["date_end"],
+                "built_manifest_sha256": _sha256_path(root / "manifest.json"),
+            }
+        )
+        _atomic_write_text(
+            listing_status_path,
+            json.dumps(listing_status, ensure_ascii=False, indent=2) + "\n",
         )
         print(
             json.dumps(

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 import json
 import os
 import shlex
@@ -134,6 +134,15 @@ def _source_freshness(entry: Mapping[str, Any]) -> dict[str, Any] | None:
         raise SnapshotError(
             f"freshness receipt completion gate failed: {mismatches}"
         )
+    if "max_receipt_age_hours" in config:
+        try:
+            max_hours = float(config["max_receipt_age_hours"])
+            checked = datetime.fromisoformat(str(payload[config["timestamp_field"]]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SnapshotError("freshness receipt timestamp is missing or invalid") from exc
+        if (not 0 < max_hours <= 8760 or checked.tzinfo is None
+                or not timedelta(0) <= datetime.now(UTC) - checked.astimezone(UTC) <= timedelta(hours=max_hours)):
+            raise SnapshotError("freshness receipt is outside its configured age window")
     return {
         "field": field,
         "format": "iso-date",

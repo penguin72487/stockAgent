@@ -43,6 +43,25 @@ def test_update_hub_recovers_directory_created_after_subscription(tmp_path: Path
         hub.close()
 
 
+def test_large_append_only_source_uses_metadata_invalidation_without_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "marks.jsonl"
+    path.write_text("first\n", encoding="utf-8")
+    hub = DashboardUpdateHub(
+        {"tw": (path,)}, metadata_only_paths={path},
+    )
+    monkeypatch.setattr(
+        "stockagent.live.dashboard_updates.file_signature",
+        lambda _path: pytest.fail("large append-only file must not be hashed"),
+    )
+    before = hub.signature(path)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("second\n")
+    assert hub.signature(path) != before
+    hub.close()
+
+
 def test_sse_flushes_initial_and_committed_view_without_polling():
     server = _test_server()
     server.tw_revision = lambda: server.cached_local_json(
@@ -131,7 +150,8 @@ def test_signals_are_requested_before_lossless_history_and_client_keys_include_r
     key = source[source.index("function detailDataRevision"):source.index("function chartHistoryMatchesSelection")]
     assert "service.content_revision" in key
     assert "history.generated_at" in key
-    assert 'return detailDataRevision("history")' in key
+    assert "service.history_revision || service.revision_token" in key
+    assert "detailRangeKey()" in key
     assert "signalLoading && signalRequestRevisionInFlight === requestRevision" in source
     assert "positionLoading && positionRequestRevisionInFlight === requestRevision" in source
     assert "eventLoading && eventRequestRevisionInFlight === requestRevision" in source

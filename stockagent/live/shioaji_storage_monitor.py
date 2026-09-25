@@ -8,12 +8,14 @@ read-only.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time as daytime, timedelta
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import time
 from typing import Any, Final, Iterable
@@ -152,7 +154,7 @@ def _iter_files(root: Path) -> Iterable[os.stat_result]:
     except OSError:
         return
 
-    pending = [root]
+    pending = [os.fspath(root)]
     while pending:
         current = pending.pop()
         try:
@@ -162,13 +164,70 @@ def _iter_files(root: Path) -> Iterable[os.stat_result]:
                         if entry.is_symlink():
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            pending.append(Path(entry.path))
+                            pending.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             yield entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
         except OSError:
             continue
+
+
+def _iter_file_metadata(root: Path) -> Iterable[tuple[int, float]]:
+    """Stream file metadata without materializing paths or following symlinks.
+
+    GNU find performs the directory walk in native code.  The Python walker is
+    retained for hosts without it; a failed native scan is *not* treated as a
+    successful partial inventory.
+    """
+
+    try:
+        if root.is_symlink() or not (root.is_file() or root.is_dir()):
+            return
+    except OSError:
+        return
+    # The timer runs as root; never resolve an executable from a writable
+    # environment PATH supplied by a shell or Conda activation.
+    find_binary = shutil.which("find", path="/usr/bin:/bin")
+    if find_binary is None:
+        for stat_result in _iter_files(root):
+            yield int(stat_result.st_size), float(stat_result.st_mtime)
+        return
+
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as errors:
+        process = subprocess.Popen(
+            [
+                find_binary,
+                os.fspath(root.absolute()),
+                "-ignore_readdir_race",
+                "-type",
+                "f",
+                "-printf",
+                "%s %T@\n",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            text=True,
+            encoding="ascii",
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                try:
+                    size_text, mtime_text = line.split()
+                    yield int(size_text), float(mtime_text)
+                except ValueError as exc:
+                    raise RuntimeError("Invalid storage scan metadata") from exc
+            if process.wait() != 0:
+                errors.seek(0)
+                detail = errors.read(512).strip()
+                raise RuntimeError(f"Storage scan failed: {detail or process.returncode}")
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def _scan_dataset(
@@ -179,28 +238,29 @@ def _scan_dataset(
     local_now = now.astimezone(TAIPEI)
     today = local_now.date()
     first_day = today - timedelta(days=GROWTH_WINDOW_DAYS)
-    daily = {
-        (first_day + timedelta(days=offset)).isoformat(): 0
-        for offset in range(GROWTH_WINDOW_DAYS)
-    }
+    days = [first_day + timedelta(days=offset) for offset in range(GROWTH_WINDOW_DAYS)]
+    # Compare numeric mtimes against exact local-midnight boundaries. This
+    # preserves the prior timezone/day semantics without creating millions of
+    # datetime/date objects for files outside (or inside) the 30-day window.
+    bounds = [
+        datetime.combine(day, daytime.min, tzinfo=TAIPEI).timestamp()
+        for day in (*days, today)
+    ]
+    daily_bytes = [0] * GROWTH_WINDOW_DAYS
     total_bytes = 0
     file_count = 0
     latest_mtime = 0.0
     for root in spec.roots:
-        for stat_result in _iter_files(root):
-            size = max(0, int(stat_result.st_size))
+        for file_size, file_mtime in _iter_file_metadata(root):
+            size = max(0, file_size)
             total_bytes += size
             file_count += 1
-            latest_mtime = max(latest_mtime, float(stat_result.st_mtime))
-            changed_date = (
-                datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
-                .astimezone(TAIPEI)
-                .date()
-            )
-            if first_day <= changed_date < today:
-                daily[changed_date.isoformat()] += size
-    recent_bytes = sum(daily.values())
-    active_days = sum(value > 0 for value in daily.values())
+            mtime = file_mtime
+            latest_mtime = max(latest_mtime, mtime)
+            if bounds[0] <= mtime < bounds[-1]:
+                daily_bytes[bisect_right(bounds, mtime) - 1] += size
+    recent_bytes = sum(daily_bytes)
+    active_days = sum(value > 0 for value in daily_bytes)
     return {
         "id": spec.dataset_id,
         "title": spec.title,
@@ -225,7 +285,8 @@ def _scan_dataset(
         "active_growth_days": active_days,
         "growth_source": "file_mtime_estimate",
         "daily_growth": [
-            {"date": date, "bytes": value} for date, value in daily.items()
+            {"date": day.isoformat(), "bytes": value}
+            for day, value in zip(days, daily_bytes)
         ],
     }
 
@@ -259,10 +320,12 @@ def build_shioaji_storage_snapshot(
         observed = observed.replace(tzinfo=UTC)
     observed = observed.astimezone(UTC)
     started = time.monotonic()
-    datasets = [
-        _scan_dataset(spec, now=observed)
-        for spec in (specs or default_storage_datasets(Path(repo_root)))
-    ]
+    datasets = []
+    for spec in specs or default_storage_datasets(Path(repo_root)):
+        dataset_started = time.monotonic()
+        row = _scan_dataset(spec, now=observed)
+        row["scan_seconds"] = round(time.monotonic() - dataset_started, 3)
+        datasets.append(row)
     total_bytes = sum(int(item["bytes"]) for item in datasets)
     recent_daily: dict[str, int] = {}
     for item in datasets:

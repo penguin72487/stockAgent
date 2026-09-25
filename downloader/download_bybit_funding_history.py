@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Any
 
 import polars as pl
@@ -21,6 +22,7 @@ from artifact_io import (  # noqa: E402
     atomic_write_parquet,
     sha256_file,
 )
+from feature_stage_timing import stage_latency_summary  # noqa: E402
 from download_bybit_perp_daily import (  # noqa: E402
     BybitClient,
     SymbolRecord,
@@ -52,6 +54,7 @@ class FundingResult:
     output_path: str | None
     sha256: str | None
     message: str | None = None
+    stage_elapsed_seconds_json: str = "{}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +180,7 @@ def _download_symbol(
     output_dir: Path,
     refresh: bool,
 ) -> FundingResult:
+    work_started = time.perf_counter()
     path = output_dir / f"{record.code}_funding.parquet"
     effective_start_ms = max(
         requested_start_ms,
@@ -187,6 +191,7 @@ def _download_symbol(
     requested_text = _ms_to_date_string(requested_start_ms)
     coverage_start_text = _ms_to_date_string(effective_start_ms)
     snapshot_text = _ms_to_date_string(snapshot_ms)
+    existing: pl.DataFrame | None = None
     if path.is_file() and not refresh:
         frame = pl.read_parquet(path)
         current_schema = {
@@ -208,6 +213,8 @@ def _download_symbol(
         ):
             latest_snapshot = str(frame["download_snapshot_utc"].max())
             if latest_snapshot[:10] == snapshot_text[:10]:
+                output_sha256 = _sha256(path)
+                proof_elapsed = round(time.perf_counter() - work_started, 6)
                 return FundingResult(
                     symbol=record.code,
                     status="skipped_current_snapshot",
@@ -226,14 +233,29 @@ def _download_symbol(
                         frame["funding_prefix_quarantined_events"].max()
                     ),
                     output_path=str(path),
-                    sha256=_sha256(path),
+                    sha256=output_sha256,
+                    stage_elapsed_seconds_json=json.dumps(
+                        {"same_day_proof": proof_elapsed, "total": proof_elapsed},
+                        sort_keys=True,
+                    ),
                 )
+            existing = frame
 
     end_ms = snapshot_ms
+    # Revisit the last seven days so revisions and changed funding intervals
+    # are reconciled, but do not refetch years of old events on every run.
+    previous_last_ms = (
+        int(existing["funding_timestamp_ms"].max()) if existing is not None else None
+    )
+    history_boundary_ms = (
+        max(effective_start_ms, previous_last_ms - 7 * 24 * HOUR_MS)
+        if previous_last_ms is not None
+        else effective_start_ms
+    )
     rows: list[dict[str, Any]] = []
     head_complete = False
     seen_oldest: int | None = None
-    while end_ms >= effective_start_ms:
+    while end_ms >= history_boundary_ms:
         payload = client.get(
             FUNDING_ENDPOINT,
             {
@@ -251,7 +273,7 @@ def _download_symbol(
         for item in items:
             timestamp = int(item["fundingRateTimestamp"])
             page_times.append(timestamp)
-            if timestamp < effective_start_ms or timestamp > snapshot_ms:
+            if timestamp < history_boundary_ms or timestamp > snapshot_ms:
                 continue
             rows.append(
                 {
@@ -264,7 +286,7 @@ def _download_symbol(
                 }
             )
         oldest = min(page_times)
-        if oldest <= effective_start_ms:
+        if oldest <= history_boundary_ms:
             head_complete = True
             break
         if seen_oldest is not None and oldest >= seen_oldest:
@@ -274,16 +296,26 @@ def _download_symbol(
 
     if not head_complete:
         raise RuntimeError(
-            "funding history did not reach the requested/launch boundary"
+            "funding history did not reach the requested/overlap boundary"
         )
+    if previous_last_ms is not None and previous_last_ms not in {
+        int(row["funding_timestamp_ms"]) for row in rows
+    }:
+        raise RuntimeError("incremental funding page did not overlap prior last event")
     event_times = sorted({int(row["funding_timestamp_ms"]) for row in rows})
     mark_by_time = _funding_mark_prices(client, record, event_times)
+    fetch_done = time.perf_counter()
     rows, prefix_end_ms, quarantined_prefix_events = _quarantine_unmarked_launch_prefix(
         rows, mark_by_time
     )
     if prefix_end_ms is not None:
         effective_start_ms = max(effective_start_ms, prefix_end_ms)
         coverage_start_text = _ms_to_date_string(effective_start_ms)
+    if existing is not None:
+        coverage_start_text = str(existing["funding_coverage_start_utc"].min())
+        quarantined_prefix_events += int(
+            existing["funding_prefix_quarantined_events"].max()
+        )
     for row in rows:
         row["funding_mark_price"] = mark_by_time[int(row["funding_timestamp_ms"])]
         row["funding_mark_price_source"] = "bybit_hourly_mark_kline_open"
@@ -291,10 +323,15 @@ def _download_symbol(
         row["funding_prefix_quarantined_events"] = quarantined_prefix_events
         row["funding_coverage_start_utc"] = coverage_start_text
     frame = (
-        pl.DataFrame(rows)
+        pl.concat([existing, pl.DataFrame(rows)], how="vertical")
+        if existing is not None
+        else pl.DataFrame(rows)
+    ) if rows else existing
+    frame = (
+        frame
         .unique(subset=["funding_timestamp_ms"], keep="last")
         .sort("funding_timestamp_ms")
-        if rows
+        if frame is not None
         else pl.DataFrame(
             schema={
                 "funding_time_utc": pl.String,
@@ -312,6 +349,8 @@ def _download_symbol(
         )
     )
     _write_parquet_atomic(frame, path)
+    output_sha256 = _sha256(path)
+    work_done = time.perf_counter()
     return FundingResult(
         symbol=record.code,
         status="updated",
@@ -328,12 +367,21 @@ def _download_symbol(
         head_complete=True,
         quarantined_prefix_events=quarantined_prefix_events,
         output_path=str(path),
-        sha256=_sha256(path),
+        sha256=output_sha256,
+        stage_elapsed_seconds_json=json.dumps(
+            {
+                "fetch_and_mark": round(fetch_done - work_started, 6),
+                "merge_write_proof": round(work_done - fetch_done, 6),
+                "total": round(work_done - work_started, 6),
+            },
+            sort_keys=True,
+        ),
     )
 
 
 def main() -> None:
     args = parse_args()
+    run_started = time.perf_counter()
     started = datetime.now(timezone.utc)
     snapshot_ms = int(started.timestamp() * 1000)
     requested_start_ms = _date_to_ms(args.start_date, end_of_day=False)
@@ -341,6 +389,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     client = BybitClient(args.request_interval, args.max_retries, args.retry_base)
     all_instruments = _fetch_perp_symbols(client, categories=["linear"])
+    instrument_discovery_seconds = round(time.perf_counter() - run_started, 6)
     atomic_write_text(
         output_dir / "instruments.csv",
         pl.DataFrame([asdict(item) for item in all_instruments]).write_csv(),
@@ -429,6 +478,9 @@ def main() -> None:
         ),
         "requested_start_date": args.start_date,
         "snapshot_utc": started.isoformat(),
+        "instrument_discovery_seconds": instrument_discovery_seconds,
+        "stage_latency": stage_latency_summary(ordered),
+        "elapsed_seconds_before_summary": round(time.perf_counter() - run_started, 6),
     }
     atomic_write_text(
         output_dir / "funding_summary.json",

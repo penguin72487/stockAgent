@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
@@ -7,11 +8,14 @@ import pytest
 
 from stockagent.data_sync import packed_backup as module
 from stockagent.data_sync.desync_snapshots import SnapshotError, scan_tree
-from stockagent.data_sync.packed_backup import BackupConfig, PackedBackup, VolumeGuard, inventory, safe_path
+from stockagent.data_sync.packed_backup import (
+    BackupConfig, PackedBackup, PinnedObjectSignatures, VolumeGuard, inventory, safe_path,
+)
 from stockagent.data_sync.packed_snapshots import (
     initialize_packed_layout, publish_packed_snapshot, resolve_latest_packed,
     fetch_packed_snapshot, verify_packed_snapshot,
 )
+from scripts.packed_backup import watch_timeout
 
 
 class TestGuard:
@@ -45,6 +49,17 @@ def test_incremental_backup_and_existing_reader_restore(setup, tmp_path):
     assert result["state"] == "up_to_date"
     assert result["verified_releases"] == 1
     assert result["remaining_bytes"] == 0
+    timings = result["stage_timings_ms"]
+    assert set(timings) == {
+        "volume_guard", "source_inventory", "destination_trust", "initial_status",
+        "object_processing", "metadata", "metadata_manifests", "metadata_heads",
+        "head_recheck", "pre_final_status_total",
+    }
+    assert all(value >= 0 for value in timings.values())
+    assert timings["metadata_manifests"] + timings["metadata_heads"] <= timings["metadata"] + 0.02
+    assert timings["pre_final_status_total"] >= max(
+        timings["source_inventory"], timings["destination_trust"], timings["metadata"]
+    )
     selected = resolve_latest_packed(cfg.destination, "prices")
     assert selected.manifest_sha256 == release.manifest_sha256
     verify_packed_snapshot(cfg.destination, selected)
@@ -54,6 +69,202 @@ def test_incremental_backup_and_existing_reader_restore(setup, tmp_path):
     assert not (cfg.destination / ".local-state/node-id").exists()
     assert not (cfg.destination / "current").exists()
     assert (cfg.destination.parent / "last-complete.json").exists()
+
+
+def test_watch_reconciles_on_events_and_bounds_quiet_full_scans(setup):
+    cfg, _work, _release, _backup = setup
+    assert watch_timeout(cfg, {"pending_objects": 0, "completed_objects": 0}, has_watcher=True) == 300
+    assert watch_timeout(cfg, {"pending_objects": 0, "completed_objects": 0}, has_watcher=False) == 30
+    assert watch_timeout(cfg, {"pending_objects": 2, "completed_objects": 1}, has_watcher=True) == 0
+    assert watch_timeout(cfg, {"pending_objects": 2, "completed_objects": 0}, has_watcher=True) == 300
+
+
+def test_backup_config_rejects_idle_reconcile_shorter_than_fallback_poll(tmp_path):
+    raw = json.loads((Path(__file__).resolve().parents[1] / "configs/data_sync/packed_backup.json").read_text())
+    raw["idle_reconcile_seconds"] = raw["poll_seconds"] - 1
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(SnapshotError, match="invalid backup limits"):
+        BackupConfig.load(path)
+
+
+def test_backup_config_rejects_unknown_scope(tmp_path):
+    raw = json.loads((Path(__file__).resolve().parents[1] / "configs/data_sync/packed_backup.json").read_text())
+    raw["backup_scope"] = "latest_guess"
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(SnapshotError, match="invalid backup limits"):
+        BackupConfig.load(path)
+
+
+def test_backup_guard_refuses_d_primary_source(setup):
+    cfg, _work, _release, _backup = setup
+    (cfg.source / ".stockagent-d-primary").write_text("D is primary\n")
+    with pytest.raises(SnapshotError, match="same D volume"):
+        VolumeGuard(cfg).check()
+
+
+def test_unchanged_backup_checks_each_target_once_per_pass(setup, monkeypatch):
+    cfg, _work, _release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    original = backup.trusted
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(backup, "trusted", record)
+    assert backup.run_once()["state"] == "up_to_date"
+    assert len(calls) == len(inventory(cfg)[0])
+
+
+def test_backup_marks_old_success_as_checking_before_destination_scan(setup, monkeypatch):
+    cfg, _work, _release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    original = backup.trusted
+    seen = []
+
+    def inspect_status(*args, **kwargs):
+        if not seen:
+            seen.append(json.loads((cfg.state_dir / "status.json").read_text()))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(backup, "trusted", inspect_status)
+    assert backup.run_once()["state"] == "up_to_date"
+    assert seen[0]["state"] == "checking"
+    assert seen[0]["phase"] == "destination_trust"
+    assert seen[0]["current_heads_complete"] is False
+    assert seen[0]["destination_trust_scanned"] == 0
+
+
+def test_unchanged_metadata_skips_repeated_guard_but_write_still_requires_it(setup):
+    cfg, _work, release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    relative = release.manifest_path.relative_to(cfg.source).as_posix()
+    target = cfg.destination / relative
+    original = target.read_bytes()
+
+    class FailingGuard:
+        def check(self, **kwargs):
+            raise SnapshotError("volume unavailable")
+
+    backup.guard = FailingGuard()
+    backup.copy_metadata(relative, original)
+    with pytest.raises(SnapshotError, match="volume unavailable"):
+        backup.copy_metadata(relative, b"changed", mutable=True)
+    assert target.read_bytes() == original
+
+
+def test_unchanged_metadata_fastpath_does_not_resolve_destination_paths(
+    setup, monkeypatch,
+):
+    cfg, _work, release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    relative = release.manifest_path.relative_to(cfg.source).as_posix()
+    original = (cfg.destination / relative).read_bytes()
+    safe_path_original = module.safe_path
+
+    def source_only_safe_path(root, selected):
+        if root == cfg.destination:
+            raise AssertionError("unchanged D: metadata should use no-follow read")
+        return safe_path_original(root, selected)
+
+    monkeypatch.setattr(module, "safe_path", source_only_safe_path)
+    backup.copy_metadata(relative, original)
+
+
+def test_existing_metadata_fastpath_rejects_symlink_leaf(setup):
+    cfg, _work, release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    relative = release.manifest_path.relative_to(cfg.source).as_posix()
+    source = cfg.destination / relative
+    alias = source.with_name("alias.json")
+    alias.symlink_to(source.name)
+    with pytest.raises((OSError, SnapshotError)):
+        backup.copy_metadata(alias.relative_to(cfg.destination).as_posix(), source.read_bytes())
+
+
+def test_unchanged_head_probe_does_not_use_following_path_read(setup, monkeypatch):
+    cfg, _work, _release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    target_head = cfg.destination / "heads/prices/penguin.json"
+    original = Path.read_bytes
+
+    def forbid_following_head_read(path):
+        if path == target_head:
+            raise AssertionError("backup head probe must not follow a path")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_following_head_read)
+    assert backup.run_once()["state"] == "up_to_date"
+
+
+def test_replaced_backup_head_symlink_fails_closed(setup, tmp_path):
+    cfg, _work, _release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    target_head = cfg.destination / "heads/prices/penguin.json"
+    outside = tmp_path / "outside-head.json"
+    original = target_head.read_bytes()
+    outside.write_bytes(original)
+    target_head.unlink()
+    target_head.symlink_to(outside)
+
+    result = backup.run_once()
+    assert result["state"] == "degraded"
+    assert result["current_heads_complete"] is False
+    assert result["pending_heads"] == 1
+    assert outside.read_bytes() == original
+
+
+def test_new_head_rechecks_target_after_pass_cache(setup, monkeypatch):
+    cfg, work, old, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    old_head = (cfg.destination / "heads/prices/penguin.json").read_bytes()
+    old_refs = {ref["relpath"] for ref in old.manifest["archive"]["objects"]}
+    (work / "large.bin").write_bytes(b"newblob" * 2048)
+    new = publish_packed_snapshot(cfg.source, "prices", work, loose_file_threshold_bytes=1024, pack_buckets=2)
+    new_ref = next(ref for ref in new.manifest["archive"]["objects"] if ref["relpath"] not in old_refs)
+    new_manifest = new.manifest_path.relative_to(cfg.source).as_posix()
+    original = backup.copy_metadata
+    changed = False
+
+    def corrupt_before_promotion(relative, expected, **kwargs):
+        nonlocal changed
+        if relative == new_manifest and not changed:
+            target = cfg.destination / new_ref["relpath"]
+            target.write_bytes(b"x" * target.stat().st_size)
+            changed = True
+        return original(relative, expected, **kwargs)
+
+    monkeypatch.setattr(backup, "copy_metadata", corrupt_before_promotion)
+    result = backup.run_once()
+    assert changed
+    assert result["pending_heads"] == 1
+    assert result["state"] == "copying"
+    assert (cfg.destination / "heads/prices/penguin.json").read_bytes() == old_head
+
+
+def test_pass_cache_rejects_changed_source_signature(setup, monkeypatch):
+    cfg, _work, release, backup = setup
+    assert backup.run_once()["state"] == "up_to_date"
+    ref = release.manifest["archive"]["objects"][0]
+    original = backup.copy_metadata
+    changed = False
+
+    def change_source_during_metadata(relative, expected, **kwargs):
+        nonlocal changed
+        if relative == release.manifest_path.relative_to(cfg.source).as_posix() and not changed:
+            source = cfg.source / ref["relpath"]
+            source.write_bytes(b"x" * source.stat().st_size)
+            changed = True
+        return original(relative, expected, **kwargs)
+
+    monkeypatch.setattr(backup, "copy_metadata", change_source_during_metadata)
+    result = backup.run_once()
+    assert changed
+    assert result["pending_releases"] == 1
+    assert result["pending_heads"] == 1
 
 
 def test_backup_receipt_survives_remount_only_when_file_identity_is_stable(setup):
@@ -210,11 +421,98 @@ def test_historical_release_missing_objects_blocks_full_completion(setup):
     assert result["pending_releases"] == 1
 
 
+def test_current_scope_ignores_missing_old_release_without_deleting_history(setup, tmp_path):
+    cfg, work, old, _backup = setup
+    assert _backup.run_once()["state"] == "up_to_date"
+    old_ref = next(ref for ref in old.manifest["archive"]["objects"] if ref["kind"] == "blob")
+    old_backup_bytes = (cfg.destination / old_ref["relpath"]).read_bytes()
+    (work / "large.bin").write_bytes(b"newblob" * 2048)
+    current_release = publish_packed_snapshot(
+        cfg.source, "prices", work, loose_file_threshold_bytes=1024, pack_buckets=2,
+    )
+    (cfg.source / old_ref["relpath"]).unlink()
+    current_cfg = replace(cfg, backup_scope="current_heads", state_dir=tmp_path / "current-state")
+    current = PackedBackup(current_cfg, guard=TestGuard())
+    try:
+        result = current.run_once()
+        assert result["state"] == "up_to_date"
+        assert result["current_heads_complete"] is True
+        assert result["backup_scope"] == "current_heads"
+        assert result["historical_completeness"] == "not_checked"
+        assert result["verified_releases"] == 1
+        assert result["pending_releases"] == 0
+        assert (cfg.destination / old_ref["relpath"]).read_bytes() == old_backup_bytes
+        assert (cfg.destination.parent / "last-current-complete.json").exists()
+        selected = resolve_latest_packed(cfg.destination, "prices")
+        assert selected.manifest_sha256 == current_release.manifest_sha256
+        verify_packed_snapshot(cfg.destination, selected)
+    finally:
+        current.close()
+
+
+def test_current_scope_fails_closed_when_latest_object_is_missing(setup, tmp_path):
+    cfg, work, _old, _backup = setup
+    (work / "large.bin").write_bytes(b"newblob" * 2048)
+    current_release = publish_packed_snapshot(
+        cfg.source, "prices", work, loose_file_threshold_bytes=1024, pack_buckets=2,
+    )
+    current_ref = next(ref for ref in current_release.manifest["archive"]["objects"] if ref["kind"] == "blob")
+    (cfg.source / current_ref["relpath"]).unlink()
+    current_cfg = replace(cfg, backup_scope="current_heads", state_dir=tmp_path / "current-state")
+    current = PackedBackup(current_cfg, guard=TestGuard())
+    try:
+        result = current.run_once()
+        assert result["state"] == "degraded"
+        assert result["current_heads_complete"] is False
+        assert result["pending_heads"] == 1
+        assert not (cfg.destination / "heads/prices/penguin.json").exists()
+    finally:
+        current.close()
+
+
+def test_current_scope_does_not_complete_if_head_changes_during_pass(setup, tmp_path, monkeypatch):
+    cfg, _work, _old, _backup = setup
+    current_cfg = replace(cfg, backup_scope="current_heads", state_dir=tmp_path / "current-state")
+    current = PackedBackup(current_cfg, guard=TestGuard())
+    original = current.metadata
+
+    def remove_head_after_metadata(*args, **kwargs):
+        result = original(*args, **kwargs)
+        (cfg.source / "heads/prices/penguin.json").unlink()
+        return result
+
+    monkeypatch.setattr(current, "metadata", remove_head_after_metadata)
+    try:
+        result = current.run_once()
+        assert result["state"] == "copying"
+        assert result["pending_heads"] == 1
+        assert result["current_heads_complete"] is False
+        assert not (cfg.destination.parent / "last-current-complete.json").exists()
+    finally:
+        current.close()
+
+
 def test_safe_paths_reject_escape_and_symlinks(tmp_path):
     (tmp_path / "redirect").symlink_to(tmp_path / "outside")
     for relative in ("../escape", "/escape", "redirect/file", ""):
         with pytest.raises(SnapshotError):
             safe_path(tmp_path, relative)
+
+
+def test_pinned_object_signatures_reject_changed_directory(tmp_path):
+    root = tmp_path / "packed"
+    shard = root / "objects/blobs/aa"
+    shard.mkdir(parents=True)
+    relative = "objects/blobs/aa/" + "a" * 64 + ".blob"
+    target = root / relative
+    target.write_bytes(b"object")
+    with PinnedObjectSignatures(root) as reader:
+        assert reader.signature(relative) == module.signature(safe_path(root, relative))
+        moved = tmp_path / "moved"
+        shard.rename(moved)
+        shard.symlink_to(moved, target_is_directory=True)
+        with pytest.raises(SnapshotError, match="directory changed"):
+            reader.recheck()
 
 
 def test_volume_guard_missing_wrong_or_source_disk(setup, monkeypatch):

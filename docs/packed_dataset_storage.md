@@ -3,9 +3,9 @@
 ## 結論
 
 目前部署以 penguin 為唯一資料權威；檔案格式中的多產生者 head 是來源與版本資訊，
-不代表多個權威庫。penguin 的 C 槽 cold store 另有單向、只增不刪的 D 槽備份，
-不影響下列 Syncthing／按需解封契約。日常操作見
-[冷庫 D 槽備份](packed_cold_backup.md)。
+不代表多個權威庫。penguin 的冷庫已移至 D 槽單份儲存，
+`/srv/stockagent-packed` 是 D 主庫的受保護 bind mount，C 不再保留冷副本。
+這犧牲了本機獨立備份；日常操作見 [D 槽遷移與驗收](d_cold_store_migration_2026-09-25.md)。
 
 不要讓 Syncthing 直接索引下載器的工作碎片，也不要把所有資料硬塞進一個
 不可增量更新的巨型檔案。資料分成四層：
@@ -18,7 +18,7 @@
         │ packed publish
         ▼
 Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
-        │ watcher 即時增量同步 + cold verify
+        │ 原子發布後通知掃描（penguin D:）／watcher（其他節點）+ cold verify
         ▼
 各節點預設 COLD_ONLY（不自動 fetch/use/materialize）
         │ 僅人工按需 use
@@ -107,7 +107,7 @@ immutable manifests、heads、packs/blobs；每次通過 build/audit 並原子�
 目前 canonical 拓撲中，penguin 與 vastai1T 加入 `stockagent-packed`；
 lab203 已退役，不能重新配對或接受其後續 release。penguin 是 full-replica durable node；
 沒有 persistent volume 的 vastai1T 是 index-only edge。歷史 lab203 head、manifest、
-objects 留在 penguin 冷庫與獨立 D 備份，producer 名稱不能更改。
+objects 留在 penguin D 主冷庫，producer 名稱不能更改。
 Vast 只常駐 heads、manifests 與 inventories。Vast 的大量訓練 artifacts 不可把整個 node-local
 工作集直接加入 hot folder；edge mode 也禁止直接 cold publish。舊 `stockagent-desync`、
 `stockagent-artifacts-live`、`stockagent-artifacts-hot` 與 Git working-tree folder 已退役；
@@ -359,65 +359,30 @@ blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
 冷庫 manifest、objects、heads 不受工作集 GC 影響；GC 不會刪
 `/srv/stockagent-packed` 內任何資料。
 
-## Penguin C 槽 rolling-current retention
+## Penguin D 槽主冷庫與保留政策
 
-### 保留集合
+`D:\stockagent-cold-primary\packed` 是唯一的 penguin 實體冷庫；受保護掛載維持
+`/srv/stockagent-packed` 這個應用程式路徑。原子發布直接寫入 D 主庫，通過稽核後
+呼叫 Syncthing REST scan（先 objects，後 manifest/head）；DrvFs 不依賴 inotify，
+另有每 300 秒全量掃描。Syncthing 及發布流程在 D 缺席時必須 fail closed，絕不能
+在 C 的空掛載點重新建立冷庫。
 
-penguin 的 Syncthing 冷庫是 fleet 的快速 current replica，不再同時扮演完整歷史 archive。
-保留集合由引用圖決定，不看檔名相似度、mtime 或目錄大小：
-
-1. 所有有效 per-node current heads；
-2. penguin 本機 pin、有效 materialized READY／hot lease 與 materialize quarantine；
-3. 發布未滿 24 小時的 release 安全窗；
-4. 上述 release 引用的 inventory、pack 與 blob。
-
-其餘歷史 manifest 及只被這些歷史 manifest 引用的 objects 才是候選。manifest 本身很小，
-保留它卻代表必須同時保留完整 object graph；所以 C 槽歷史釋放與 D 槽完整 archive 必須
-視為同一個有證明的狀態轉換。
-
-```text
-mutable source -> audited atomic release -> C current CAS -> Syncthing peers
-                                         \
-                                          -> D additive historical CAS
-
-C 保留：current + pin/use + 24h grace
-D 保留：所有已接收歷史；不接收 C 的 delete
-```
-
-### 刪除門檻
-
-`configs/data_sync/packed_retention.json` 只適用於 penguin。每次 apply 都重新建立引用圖，
-並且必須同時通過：
-
-- authority node ID 與 C/D config、D mount marker、不同 filesystem 完全相符；
-- 每個 current head 可解析且 objects 完整，沒有 invalid manifest 或 Syncthing conflict；
-- 現役 vastai1T 當下 connected、completion 100%、need bytes/items/deletes 為 0、
-  `remoteState=valid`；本機 folder idle 且 error/pull/watch/system error 都為 0；
-- 每個 C 候選在 D 有同 digest、未過期的 SHA-256 readback receipt，且來源／目標 signature
-  都未變；
-- 停止本機 backup 與 Syncthing 後，沒有任何程序以 fd、mmap、cwd、root 或 executable
-  引用 packed root；
-- 持有全域 publish-retention lock 後重建的 plan fingerprint 與 dry-run 完全一致。
-
-任一條不成立就不刪任何檔。apply 先刪歷史 manifest，再 unlink 無引用物件，保留 intent／
-result receipt，重啟服務後等待 peer 再次收斂。D 的 manifests、head-history 及 objects 不會
-被這個工具修改，因此每份被移出 C 的資料仍可用標準 `verify`／`fetch` 從 D 還原。
+舊的 `run_packed_backup.sh` C→D 備份服務與 `run_packed_retention.sh apply`
+C rolling-retention 已退役。不要重新安裝 timer 或對 D bind mount 執行舊 apply。
+D 的舊歷史 manifest、物件與 head-history 繼續保留；目前沒有核准的自動 D
+孤兒物件刪除政策。若未來需要 D GC，必須先證明完整 current、pin、租約、
+歷史復原範圍和 peer 狀態，再設計獨立工具。current-head 完整不代表每個舊歷史
+release 都完整；遷移稽核已記錄歷史缺件。
 
 ```bash
-./scripts/run_packed_retention.sh plan
-./scripts/run_packed_retention.sh status
-./scripts/run_packed_retention.sh apply
-
-# penguin 安裝每日 04:20（另有 0-10 分鐘 jitter）的 fail-closed reconcile
-./scripts/run_packed_retention.sh install-service
-systemctl list-timers stockagent-packed-retention.timer --all
-journalctl -u stockagent-packed-retention.service -n 50 --no-pager
+./scripts/mount_packed_d_cold.sh --check
+systemctl status stockagent-d-cold-mount.service syncthing@root.service --no-pager
+./scripts/run_packed_backup.sh status  # 應回報 retired_single_d_primary
+stockagent-data status --human
 ```
 
-timer 遇到 blocker 時回報 deferred，不會把「沒清到」誤當刪除成功。不要在已退役 lab203／Vast
-安裝此 timer，也不要手動 `find ... -delete` 或以 Syncthing ignore 偽裝 rolling retention。
-需要復原舊版本時，依 [D 槽備份文件](packed_cold_backup.md) 從獨立目錄驗證還原；若要把
-它重新放回 current，必須經 catalog 發布門檻建立新的有效 release，不能手改 head。
+這是使用者選擇的單一 D 實體磁碟，沒有本機獨立備份；硬碟損壞、勒索軟體或
+整機事故仍可能造成遺失。詳見 [遷移稽核](d_cold_store_migration_2026-09-25.md)。
 
 ## 歷史 smoke 證據（2026-08-11）
 

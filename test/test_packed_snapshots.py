@@ -32,6 +32,19 @@ def _source_tree(root: Path) -> Path:
     return source
 
 
+def test_unmounted_d_cold_fallback_refuses_layout_and_publication(tmp_path: Path) -> None:
+    sync_root = tmp_path / "cold"
+    sync_root.mkdir()
+    (sync_root / ".stockagent-d-mount-required").write_text("mount required\n")
+    source = _source_tree(tmp_path)
+
+    with pytest.raises(SnapshotError, match="not mounted"):
+        initialize_packed_layout(sync_root, node_id="node-a")
+    with pytest.raises(SnapshotError, match="not mounted"):
+        publish_packed_snapshot(sync_root, "prices", source, node_id="node-a")
+    assert not (sync_root / "objects").exists()
+
+
 def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"

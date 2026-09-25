@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import json
 import math
 from pathlib import Path
 import sys
@@ -34,9 +35,16 @@ if str(DOWNLOADER_DIR) not in sys.path:
     sys.path.insert(0, str(DOWNLOADER_DIR))
 
 from materialize_bybit_perpetual_daily import (  # noqa: E402
+    MaterializeResult,
     _attach_funding_total_return,
     _daily_bars,
+    _file_identity,
+    _incremental_daily_bars,
+    _run_symbol_jobs,
+    _sha256,
+    _write_parquet_atomic,
 )
+from ohlcv_hot_tail import hot_tail_path  # noqa: E402
 from download_bybit_funding_history import (  # noqa: E402
     _quarantine_unmarked_launch_prefix,
 )
@@ -72,6 +80,73 @@ from stockagent.data.crypto_public_web import (  # noqa: E402
     fred_macro_rows,
     sec_etf_filing_rows,
 )
+
+
+def test_daily_materialization_retries_only_changed_source_once() -> None:
+    class Progress:
+        def __init__(self) -> None:
+            self.updates: list[str] = []
+            self.phases: list[str] = []
+
+        def update(self, phase: str, status: str) -> None:
+            assert phase == "materialize"
+            self.updates.append(status)
+
+        def heartbeat(self, phase: str) -> None:
+            self.phases.append(phase)
+
+    attempts: dict[str, int] = {}
+
+    def work(record: dict[str, object]) -> MaterializeResult:
+        symbol = str(record["code"])
+        attempts[symbol] = attempts.get(symbol, 0) + 1
+        if symbol == "RACE" and attempts[symbol] == 1:
+            raise RuntimeError("Bybit source changed during daily materialization")
+        if symbol == "BAD":
+            raise ValueError("bad funding source")
+        return MaterializeResult(symbol, "updated", 1, 1, 0, 0, 0, None, None)
+
+    progress = Progress()
+    results = _run_symbol_jobs(
+        [{"code": symbol} for symbol in ("RACE", "BAD", "GOOD")],
+        work,
+        workers=2,
+        progress=progress,
+    )
+    assert [(row.symbol, row.status) for row in results] == [
+        ("BAD", "failed"), ("GOOD", "updated"), ("RACE", "updated")
+    ]
+    assert attempts == {"RACE": 2, "BAD": 1, "GOOD": 1}
+    assert sorted(progress.updates) == ["failed", "updated", "updated"]
+    assert progress.phases == ["retry_source_changed"]
+
+
+def test_daily_materialization_persistent_source_race_stays_failed() -> None:
+    class Progress:
+        def __init__(self) -> None:
+            self.updates: list[str] = []
+
+        def update(self, phase: str, status: str) -> None:
+            self.updates.append(status)
+
+        def heartbeat(self, phase: str) -> None:
+            assert phase == "retry_source_changed"
+
+    attempts = 0
+
+    def work(record: dict[str, object]) -> MaterializeResult:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("Bybit source changed during daily materialization")
+
+    progress = Progress()
+    result = _run_symbol_jobs(
+        [{"code": "RACE"}], work, workers=1, progress=progress
+    )
+    assert attempts == 2
+    assert [(row.symbol, row.status) for row in result] == [("RACE", "failed")]
+    assert "source changed" in str(result[0].message)
+    assert progress.updates == ["failed"]
 
 
 def _ledger(
@@ -680,6 +755,148 @@ def test_daily_features_stop_five_minutes_before_execution_open(tmp_path: Path) 
     assert daily[0, "last_minute_utc"] == datetime(
         2024, 1, 1, 23, 59, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize("execution_minutes_utc,contract_version", [(5, 6), (0, 7)])
+def test_bounded_bybit_minute_read_matches_full_after_policy_lookback(
+    tmp_path: Path, execution_minutes_utc: int, contract_version: int,
+) -> None:
+    timestamps = pl.datetime_range(
+        datetime(2024, 1, 1),
+        datetime(2024, 2, 12, 0, 5),
+        interval="1m",
+        eager=True,
+    )
+    prices = np.arange(len(timestamps), dtype=np.float64) * 0.01 + 100.0
+    source = tmp_path / "BTCUSDT_features.parquet"
+    pl.DataFrame(
+        {
+            "date": timestamps.dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": prices,
+            "max": prices + 1.0,
+            "min": prices - 1.0,
+            "close": prices + 0.5,
+            "Trading_Volume": np.ones(len(timestamps)),
+        }
+    ).write_parquet(source)
+
+    full, _, _ = _daily_bars(source, execution_minutes_utc=execution_minutes_utc)
+    bounded, _, _ = _daily_bars(
+        source,
+        execution_minutes_utc=execution_minutes_utc,
+        read_from_utc=datetime(2024, 1, 5, tzinfo=timezone.utc),
+    )
+    comparable_date = date(2024, 2, 8)
+    assert full.filter(pl.col("__session_end_date") >= comparable_date).equals(
+        bounded.filter(pl.col("__session_end_date") >= comparable_date)
+    )
+    with pytest.raises(ValueError, match="timezone-aware UTC"):
+        _daily_bars(
+            source,
+            execution_minutes_utc=execution_minutes_utc,
+            read_from_utc=datetime(2024, 1, 5),
+        )
+
+    funding_path = tmp_path / "funding.parquet"
+    pl.DataFrame(
+        {
+            "funding_time_utc": ["2024-01-10 08:00:00"],
+            "funding_rate": [0.001],
+            "funding_mark_price": [101.0],
+            "bybit_funding_contract_version": [3],
+        }
+    ).write_parquet(funding_path)
+    coverage = {
+        "head_complete": True,
+        "coverage_start_utc": "2024-01-01 00:00:00",
+        "coverage_end_utc": "2024-02-13 00:05:00",
+    }
+    initial_audit: dict[str, object] = {}
+    initial_daily, _, _ = _daily_bars(
+        source, execution_minutes_utc=execution_minutes_utc, audit=initial_audit
+    )
+    initial_output, _, _ = _attach_funding_total_return(
+        initial_daily, funding_path, coverage,
+        execution_minutes_utc=execution_minutes_utc,
+    )
+    target = tmp_path / "daily.parquet"
+    initial_output.write_parquet(target)
+    sidecar = tmp_path / "daily.materialize.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "execution_contract_version": contract_version,
+                "canonical_string_dates": True,
+                "base_identity": _file_identity(source),
+                "tail_start_date": None,
+                "execution_excluded_dates": initial_audit["execution_excluded_dates"],
+                "output_sha256": _sha256(target),
+            }
+        )
+    )
+    tail = hot_tail_path(source)
+    tail.parent.mkdir()
+    pl.read_parquet(source).tail(1440).with_columns(
+        pl.when(pl.col("date") == "2024-02-11 23:59:00")
+        .then(pl.col("close") + 0.1)
+        .otherwise(pl.col("close"))
+        .alias("close")
+    ).write_parquet(tail)
+
+    incremental = _incremental_daily_bars(
+        source, target, sidecar, execution_minutes_utc=execution_minutes_utc
+    )
+    assert incremental is not None
+    daily_incremental, incomplete_incremental, excluded_incremental, _ = incremental
+    new_full_audit: dict[str, object] = {}
+    daily_full, incomplete_full, excluded_full = _daily_bars(
+        source, execution_minutes_utc=execution_minutes_utc, audit=new_full_audit
+    )
+    assert daily_incremental.select(daily_full.columns).equals(daily_full)
+    assert (incomplete_incremental, excluded_incremental) == (
+        incomplete_full,
+        excluded_full,
+    )
+    output_incremental, _, _ = _attach_funding_total_return(
+        daily_incremental, funding_path, coverage,
+        execution_minutes_utc=execution_minutes_utc,
+    )
+    output_full, _, _ = _attach_funding_total_return(
+        daily_full, funding_path, coverage,
+        execution_minutes_utc=execution_minutes_utc,
+    )
+    assert not output_full.equals(initial_output)
+    assert output_incremental.equals(output_full)
+    proof = json.loads(sidecar.read_text())
+    sidecar.write_text(json.dumps({**proof, "output_sha256": "wrong"}))
+    assert _incremental_daily_bars(
+        source, target, sidecar, execution_minutes_utc=execution_minutes_utc
+    ) is None
+    sidecar.write_text(json.dumps(proof))
+    source.touch()
+    assert _incremental_daily_bars(
+        source, target, sidecar, execution_minutes_utc=execution_minutes_utc
+    ) is None
+
+
+def test_bybit_daily_precommit_source_guard_keeps_previous_output(tmp_path: Path) -> None:
+    target = tmp_path / "daily.parquet"
+    prior = pl.DataFrame({"date": ["2024-01-01"], "value": [1]})
+    prior.write_parquet(target)
+    original_sha = _sha256(target)
+
+    def reject_changed_source() -> None:
+        raise RuntimeError("source changed")
+
+    with pytest.raises(RuntimeError, match="source changed"):
+        _write_parquet_atomic(
+            pl.DataFrame({"date": ["2024-01-02"], "value": [2]}),
+            target,
+            before_replace=reject_changed_source,
+        )
+    assert _sha256(target) == original_sha
+    assert set(tmp_path.iterdir()) == {target}
 
 
 def test_daily_features_can_execute_at_midnight_without_using_current_bar(

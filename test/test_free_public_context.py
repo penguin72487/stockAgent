@@ -167,6 +167,37 @@ def test_append_observations_is_idempotent_for_same_observation_vintage(
     assert stored.columns == list(public.OBSERVATION_COLUMNS)
 
 
+def test_append_observations_streams_newer_vintage_without_losing_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "observations.parquet"
+    older = public._observation(
+        _spec("defillama_chains"),
+        "2026-08-16T05:00:00+00:00",
+        "a" * 64,
+        entity="Ethereum",
+        metric="tvl_usd",
+        value=100.0,
+    )
+    newer = public._observation(
+        _spec("defillama_chains"),
+        "2026-08-17T05:00:00+00:00",
+        "b" * 64,
+        entity="Ethereum",
+        metric="tvl_usd",
+        value=101.0,
+    )
+    assert older is not None and newer is not None
+    assert public._append_observations(path, [older]) == (1, 1)
+    assert public._append_observations(path, [newer, newer]) == (1, 2)
+    stored = pl.read_parquet(path)
+    assert stored["value_float"].to_list() == [100.0, 101.0]
+    assert stored["observed_at_utc"].to_list() == [
+        older["observed_at_utc"],
+        newer["observed_at_utc"],
+    ]
+
+
 def test_append_observations_keeps_distinct_events_in_one_retrieval(
     tmp_path: Path,
 ) -> None:

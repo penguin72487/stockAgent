@@ -522,6 +522,14 @@ def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
 
 
 def _build_panel_kwargs(config) -> dict:
+    if config.data.crypto_exchange_scope:
+        from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
+
+        validate_crypto_exchange_scope(
+            config.data,
+            repo_root=Path(__file__).resolve().parent,
+            check_schema=True,
+        )
     return {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,

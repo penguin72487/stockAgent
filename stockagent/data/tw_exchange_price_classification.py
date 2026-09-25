@@ -12,6 +12,7 @@ from datetime import date
 import re
 
 from stockagent.data.tw_security import classify_tw_stock_or_etf
+from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 
 
 _REIT = re.compile(r"^01[0-9A-Z]*T$")
@@ -25,17 +26,6 @@ _TPEX_WARRANT = re.compile(r"^7[0-9A-Z]{4,5}$")
 # These pre-ETF beneficiary certificates occur in the local TWSE history.
 # Their exchange quote grid followed the regular equity grid.
 _LEGACY_CLOSED_END_FUNDS = frozenset({"0001", "0015", "0029"})
-
-# Broker KBar ``market=tpex`` includes emerging listings before their first
-# mainboard session. Only independently verified transitions may use the older
-# emerging grid; first observed KBar dates are not listing-date evidence.
-# https://www.tpex.org.tw/storage/eb_data/10903/10900013051.html
-# https://www.tpex.org.tw/storage/eb_data/10903/10900018451.html
-VERIFIED_EMERGING_TO_TPEX_LISTINGS = {
-    "2743": date(2020, 3, 9),
-    "6716": date(2020, 3, 27),
-}
-
 
 def classify_tw_broker_security_on_date(
     venue: str, symbol: object, trading_date: date

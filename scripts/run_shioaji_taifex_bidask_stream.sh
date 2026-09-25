@@ -108,6 +108,7 @@ while true; do
     echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window session=$capture_session trade_date=$trade_date stop_at=$stop_at"
     sleep "$delay"
   fi
+  strategy_bootstrap_ready="$EXECUTE_STRATEGIES"
   if [[ "$EXECUTE_STRATEGIES" == true ]]; then
     if [[ "$capture_session" == night ]]; then
       # The day-session TXO/TX expiry has finished before night pre-open.  Pull
@@ -146,23 +147,24 @@ while true; do
       --strategy-option-risk-margin-c-twd "$STRATEGY_OPTION_RISK_MARGIN_C_TWD" \
       --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE" \
       --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"; then
-      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date retry_seconds=30" >&2
-      sleep 30
-      continue
+      # Strategy settlement must fail closed, but quotes are an independent
+      # data stream.  Run data-only capture without a strategy state mutation.
+      strategy_bootstrap_ready=false
+      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date strategy=blocked capture=data_only" >&2
     fi
   fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   required_option_codes=""
-  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+  if [[ "$strategy_bootstrap_ready" == true ]]; then
     required_option_codes="$(run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.live.taifex_strategy_state import load_required_option_codes; print(",".join(load_required_option_codes(Path(sys.argv[1]))))' "$STRATEGY_STATE_DIR")"
   fi
-  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at"
+  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at strategy_bootstrap_ready=$strategy_bootstrap_ready"
   worker_pids=()
   worker_rcs=()
   set +e
   for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
     strategy_args=()
-    if [[ "$EXECUTE_STRATEGIES" == true && "$worker_index" -eq 0 ]]; then
+    if [[ "$strategy_bootstrap_ready" == true && "$worker_index" -eq 0 ]]; then
       strategy_args+=(
         --execute-strategies
         --final-settlement-path "$FINAL_SETTLEMENT_PATH"

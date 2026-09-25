@@ -25,6 +25,10 @@ import numpy as np
 
 from stockagent.data.tw_price_rules import move_price_ticks_numpy, price_on_tick_grid_numpy
 from stockagent.data.tw_security import classify_tw_stock_or_etf
+from stockagent.data.tw_listing_admission import (
+    regular_market_admission_contract,
+    regular_market_admission_mask,
+)
 
 try:
     import pyarrow.compute as pc
@@ -34,7 +38,7 @@ except Exception:  # pragma: no cover - validated by the public loader
     pq = None
 
 
-DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION = 6
+DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION = 7
 # A regular session is represented by minute labels 0..270 in the canonical
 # archive.  Without historical minute bars, allocating the full daily volume
 # to one synthetic bar would violate the user's 50%-of-minute-K capacity rule
@@ -66,18 +70,23 @@ def daily_proxy_price_arrays(
     dates = np.asarray(dates, dtype="datetime64[D]")
     if dates.ndim != 1 or opens.shape != (len(dates), len(symbols)) or closes.shape != opens.shape:
         raise ValueError("daily proxy prices must align with exact dates and symbols")
+    admission = np.stack(
+        [regular_market_admission_mask(symbols, day) for day in dates]
+    )
     day_grid = np.broadcast_to(dates[:, None], opens.shape)
     if price_policy == DAILY_PROXY_PRICE_OFFICIAL:
         kinds = np.asarray([classify_tw_stock_or_etf(s) for s in symbols])[None, :]
         for values in (raw_opens, raw_closes):
-            observed = np.isfinite(values) & (values > 0)
+            observed = admission & np.isfinite(values) & (values > 0)
             if not np.all(~observed | price_on_tick_grid_numpy(values, day_grid, security_types=kinds)):
                 raise ValueError("official daily proxy single price is off the dated product tick grid")
-        return opens.copy(), opens.copy(), closes.copy(), closes.copy()
-    # Preserve legacy prices/checkpoints exactly; the new official policy is
-    # explicit rather than rewriting a completed artifact's historical labels.
-    return (move_price_ticks_numpy(opens, 1, day_grid), move_price_ticks_numpy(opens, -1, day_grid),
-            move_price_ticks_numpy(closes, -1, day_grid), move_price_ticks_numpy(closes, 1, day_grid))
+        return tuple(np.where(admission, values, np.nan) for values in (opens, opens, closes, closes))
+    # Preserve legacy adverse-tick direction for admitted rows. The admission
+    # contract versions caches/checkpoints without rewriting source quotes.
+    safe_opens = np.where(admission, opens, np.nan)
+    safe_closes = np.where(admission, closes, np.nan)
+    return (move_price_ticks_numpy(safe_opens, 1, day_grid), move_price_ticks_numpy(safe_opens, -1, day_grid),
+            move_price_ticks_numpy(safe_closes, -1, day_grid), move_price_ticks_numpy(safe_closes, 1, day_grid))
 
 
 DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION = 4
@@ -397,6 +406,7 @@ def load_tw_day_trade_execution_tape(
             f"policy={normalized_policy}\0"
             f"allow_daily_proxy={bool(allow_daily_proxy)}\0".encode("utf-8")
         )
+        digest.update(json.dumps(regular_market_admission_contract(), sort_keys=True).encode("utf-8"))
         if proxy_price_policy != DAILY_PROXY_PRICE_LEGACY:
             digest.update(f"daily_proxy_price_policy={proxy_price_policy}\0".encode("utf-8"))
         digest.update(str(root_path.resolve()).encode("utf-8"))
@@ -462,6 +472,15 @@ def load_tw_day_trade_execution_tape(
     tape[:, :, DayTradeExecutionField.DAILY_PROXY_FLAG] = 0.0
     tape[:, :, DayTradeExecutionField.OFFICIAL_OPEN] = opens.astype(np.float32)
     tape[:, :, DayTradeExecutionField.OFFICIAL_CLOSE] = closes.astype(np.float32)
+    admission = np.stack(
+        [regular_market_admission_mask(panel_symbols, day) for day in dates]
+    )
+    tape[:, :, DayTradeExecutionField.OFFICIAL_OPEN] = np.where(
+        admission, tape[:, :, DayTradeExecutionField.OFFICIAL_OPEN], np.nan
+    )
+    tape[:, :, DayTradeExecutionField.OFFICIAL_CLOSE] = np.where(
+        admission, tape[:, :, DayTradeExecutionField.OFFICIAL_CLOSE], np.nan
+    )
 
     # This is a labelled research proxy, not fabricated minute data.  It is
     # allowed only before the first canonical minute partition.  The dated
@@ -481,7 +500,8 @@ def load_tw_day_trade_execution_tape(
         proxy_closes = closes[proxy_rows]
         proxy_volumes = daily_volumes[proxy_rows]
         valid_proxy_prices = (
-            np.isfinite(proxy_opens)
+            admission[proxy_rows]
+            & np.isfinite(proxy_opens)
             & (proxy_opens > 0.0)
             & np.isfinite(proxy_closes)
             & (proxy_closes > 0.0)
@@ -529,7 +549,7 @@ def load_tw_day_trade_execution_tape(
         payload = table.to_pydict()
         for row in range(table.num_rows):
             sym_idx = symbol_index.get(str(payload["symbol"][row]))
-            if sym_idx is None:
+            if sym_idx is None or not admission[date_idx, sym_idx]:
                 continue
             minute = int(payload["minutes_from_open"][row])
             high = float(payload["High"][row])
@@ -625,6 +645,12 @@ def _load_full_session_volume_tape(
         tape[:] = np.nan
     tape[:, :, :, FULL_SESSION_VOLUME_SHARES] = 0.0
     tape[:, :, 0, FULL_SESSION_PRICE] = opens.astype(np.float32)
+    admission = np.stack(
+        [regular_market_admission_mask(panel_symbols, day) for day in dates]
+    )
+    tape[:, :, 0, FULL_SESSION_PRICE] = np.where(
+        admission, tape[:, :, 0, FULL_SESSION_PRICE], np.nan
+    )
 
     symbol_index = {str(symbol): idx for idx, symbol in enumerate(panel_symbols)}
     root_path = Path(root)
@@ -657,6 +683,7 @@ def _load_full_session_volume_tape(
             & (row_minutes >= 1)
             & (row_minutes < DAY_TRADE_FULL_SESSION_MINUTES)
         )
+        selected &= admission[date_idx, np.clip(row_symbol_indices, 0, len(panel_symbols) - 1)]
         if not bool(selected.any()):
             continue
         selected_indices = np.flatnonzero(selected)

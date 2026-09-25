@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 _COPY_CHUNK_BYTES = 1 << 20
@@ -101,6 +101,15 @@ def atomic_write_json(
     )
 
 
+def archive_run_reports(archive_dir: str | Path, paths: tuple[Path, ...]) -> None:
+    """Keep a durable per-run copy before mutable latest reports are replaced."""
+
+    destination = Path(archive_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        atomic_write_bytes(destination / path.name, path.read_bytes(), durable=True)
+
+
 def atomic_write_parquet(
     path: str | Path,
     frame: Any,
@@ -108,6 +117,7 @@ def atomic_write_parquet(
     compression: str = "zstd",
     write_statistics: bool = True,
     durable: bool = False,
+    before_replace: Callable[[], None] | None = None,
     **writer_options: Any,
 ) -> None:
     """Atomically publish a Polars DataFrame or PyArrow Table as Parquet."""
@@ -137,6 +147,8 @@ def atomic_write_parquet(
         if durable:
             with temporary.open("rb") as handle:
                 os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, target)
         if durable:
             _sync_parent(target)

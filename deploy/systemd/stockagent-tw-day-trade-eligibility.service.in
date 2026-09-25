@@ -2,7 +2,10 @@
 Description=Fetch exact-session TWSE and TPEx day-trade eligibility on publication
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
-StartLimitIntervalSec=0
+# A pending official release already waits up to 90 minutes inside one run.
+# Bound immediate crash loops separately from publication-time retries.
+StartLimitIntervalSec=10min
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -17,7 +20,7 @@ CPUWeight=50
 IOWeight=50
 TimeoutStartSec=2h
 Restart=on-failure
-RestartSec=5min
+RestartSec=30s
 
 [Install]
 WantedBy=multi-user.target

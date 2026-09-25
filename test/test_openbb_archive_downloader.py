@@ -12426,6 +12426,7 @@ def test_manifest_keeps_only_nonredundant_scheduler_indexes(tmp_path: Path) -> N
 
         assert "idx_tasks_schedule_age_v2" in indexes
         assert "idx_tasks_active_plan" in indexes
+        assert "idx_l1_tasks_compaction_order" in indexes
         assert not indexes.intersection(
             {
                 "idx_tasks_status",

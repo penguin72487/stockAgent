@@ -14,11 +14,116 @@ from scripts import promote_tw_day_trade_replay as promotion
 MARKETS = {"mode_a", "mode_b", "mode_c"}
 
 
+def test_minute_sweep_validator_shares_capacity_across_reduction_and_entry(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate-sweep"
+    candidate.mkdir()
+    base = {
+        "session_date": "2026-08-13",
+        "market": "mode_a",
+        "symbol": "2330",
+        "position_id": "mode_a:2026-08-13:2330",
+        "fill_at": "2026-08-13T09:02:00+08:00",
+        "price": 1_000.0,
+        "quantity": 1_000,
+        "observed_minute_volume_lots": 6.0,
+        "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "entry_price_method": "minute_vwap",
+        "simulation_replay": True,
+        "counterfactual_minute_sweep_fill": True,
+        "fill_contract": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT,
+    }
+    rows = [
+        {**base, "purpose": "next_signal_inventory_delta_minute_sweep"},
+        {**base, "purpose": "entry"},
+        {**base, "purpose": "entry_completion"},
+    ]
+    (candidate / "fills.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    failures: list[str] = []
+    promotion._validate_0901_minute_price_fill_ledger(
+        candidate,
+        expected_fills=0,
+        expected_post_0901_sweep_fills=3,
+        failures=failures,
+    )
+    assert failures == []
+
+    with (candidate / "fills.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({**base, "purpose": "entry"}) + "\n")
+    failures = []
+    promotion._validate_0901_minute_price_fill_ledger(
+        candidate,
+        expected_fills=0,
+        expected_post_0901_sweep_fills=4,
+        failures=failures,
+    )
+    assert any("shared minute capacity exceeded" in failure for failure in failures)
+
+    (candidate / "fills.jsonl").write_text(
+        json.dumps({**base, "purpose": "entry_completion"}) + "\n",
+        encoding="utf-8",
+    )
+    failures = []
+    promotion._validate_0901_minute_price_fill_ledger(
+        candidate,
+        expected_fills=0,
+        expected_post_0901_sweep_fills=1,
+        failures=failures,
+    )
+    assert any("invalid post-09:01 minute sweep" in failure for failure in failures)
+
+
+def test_reduction_receipt_counter_is_per_symbol_minute_order(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate-multi-position-reduction"
+    candidate.mkdir()
+    base = {
+        "session_date": "2026-08-13",
+        "market": "mode_a",
+        "symbol": "2330",
+        "fill_at": "2026-08-13T09:02:00+08:00",
+        "price": 1_000.0,
+        "quantity": 1_000,
+        "observed_minute_volume_lots": 4.0,
+        "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "entry_price_method": "minute_vwap",
+        "simulation_replay": True,
+        "counterfactual_minute_sweep_fill": True,
+        "fill_contract": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT,
+        "purpose": "next_signal_inventory_delta_minute_sweep",
+    }
+    rows = [
+        {**base, "position_id": "old-position-a"},
+        {**base, "position_id": "old-position-b"},
+    ]
+    (candidate / "fills.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    failures: list[str] = []
+    result = promotion._validate_0901_minute_price_fill_ledger(
+        candidate,
+        expected_fills=0,
+        expected_post_0901_sweep_fills=1,
+        failures=failures,
+    )
+    assert failures == []
+    assert result["fill_ledger_post_0901_minute_sweep_fills"] == 2
+    assert result["fill_ledger_post_0901_receipt_counter_units"] == 1
+
+
 def test_drain_runs_after_validation_and_changed_benchmark_blocks_exchange(tmp_path, monkeypatch):
     candidate = _candidate(tmp_path)
     live = tmp_path / "live"
     live.mkdir()
-    (live / "state.json").write_text('{"modes": {}}')
+    (live / "state.json").write_text(
+        json.dumps({"modes": {"mode_a": {"session_date": "2026-08-13", "positions": {}}}})
+    )
+    state = json.loads((candidate / "state.json").read_text())
+    state["modes"]["mode_a"]["session_date"] = "2026-08-13"
+    (candidate / "state.json").write_text(json.dumps(state))
     stages = []
     def validate(*args, **kwargs):
         stages.append("validated")
@@ -40,6 +145,12 @@ def test_validate_only_saves_proof_outside_ledgers_without_exchange(tmp_path, mo
     candidate = _candidate(tmp_path)
     live = tmp_path / "live"
     live.mkdir()
+    (live / "state.json").write_text(
+        json.dumps({"modes": {"mode_a": {"session_date": "2026-08-13", "positions": {}}}})
+    )
+    state = json.loads((candidate / "state.json").read_text())
+    state["modes"]["mode_a"]["session_date"] = "2026-08-13"
+    (candidate / "state.json").write_text(json.dumps(state))
     receipt = tmp_path / "validation.json"
     monkeypatch.setattr(promotion, "_validate_rebuild", lambda *args, **kwargs: {"proof": "ok"})
     monkeypatch.setattr(promotion, "_exchange_directories", lambda *args: pytest.fail("exchanged"))
@@ -47,10 +158,57 @@ def test_validate_only_saves_proof_outside_ledgers_without_exchange(tmp_path, mo
             "--expected-market", "mode_a", "--validate-only", "--validation-receipt", str(receipt)]
     monkeypatch.setattr(sys, "argv", args)
     promotion.main()
-    assert json.loads(receipt.read_text()) == {"status": "validated", "acceptance": {"proof": "ok"}}
+    assert json.loads(receipt.read_text()) == {
+        "status": "validated",
+        "acceptance": {"proof": "ok"},
+        "cutover": {"ready": True, "blockers": []},
+    }
     monkeypatch.setattr(sys, "argv", args[:-1] + [str(candidate / "bad.json")])
     with pytest.raises(ValueError, match="outside both ledgers"):
         promotion.main()
+
+
+def test_cutover_rejects_an_older_candidate_even_when_live_is_flat(tmp_path):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "state.json").write_text(json.dumps({
+        "modes": {
+            market: {"session_date": "2026-09-22", "positions": {}}
+            for market in MARKETS
+        }
+    }))
+    state = json.loads((candidate / "state.json").read_text())
+    for mode in state["modes"].values():
+        mode["session_date"] = "2026-09-21"
+    (candidate / "state.json").write_text(json.dumps(state))
+
+    blockers = promotion._cutover_blockers(live, candidate, MARKETS)
+    assert len(blockers) == len(MARKETS)
+    assert all("precedes live session 2026-09-22" in item for item in blockers)
+
+
+def test_cutover_rejects_live_inventory_after_dates_match(tmp_path):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "state.json").write_text(json.dumps({
+        "modes": {
+            market: {
+                "session_date": "2026-08-13",
+                "positions": {"carry": {"signed_shares": 1000}} if market == "mode_a" else {},
+            }
+            for market in MARKETS
+        }
+    }))
+    state = json.loads((candidate / "state.json").read_text())
+    for mode in state["modes"].values():
+        mode["session_date"] = "2026-08-13"
+    (candidate / "state.json").write_text(json.dumps(state))
+
+    assert promotion._cutover_blockers(live, candidate, MARKETS) == [
+        "mode_a: live paper inventory remains open"
+    ]
 
 
 def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:

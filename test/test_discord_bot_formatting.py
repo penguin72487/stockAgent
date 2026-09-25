@@ -593,9 +593,7 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: True,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
-        "2026-07-06:tw_day_trade:preopen"
-    )
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) is None
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_ready_for_session",
         lambda cfg, session_date: False,
@@ -684,6 +682,19 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
         },
     )
     assert _preopen_market_final_armed_for_session(armed_cfg, today) is True
+    _write_preopen_readiness(
+        armed_cfg,
+        status="running",
+        started_at=f"{today}T08:56:00+08:00",
+        elapsed_seconds=0.1,
+        step=1,
+        total=23,
+        message="retry race",
+    )
+    preserved = json.loads(path.read_text(encoding="utf-8"))["markets"][
+        "tw_day_trade"
+    ]
+    assert preserved["final_arm"]["status"] == "ready"
 
 
 def test_day_trade_schedule_catches_up_after_service_restart(

@@ -23,6 +23,15 @@ escape_replacement() {
 
 units=(
   stockagent-heavy-data.slice
+  stockagent-finmind-free.service
+  stockagent-finmind-complement.service
+  stockagent-finmind-sponsor.service
+  stockagent-finmind-quota-snapshot.service
+  stockagent-finmind-quota-snapshot.timer
+  stockagent-finmind-source-audit.service
+  stockagent-finmind-source-audit.timer
+  stockagent-crypto-training-refresh.service
+  stockagent-crypto-training-refresh.timer
   stockagent-registered-data-daily.service
   stockagent-registered-data-daily.timer
   stockagent-registered-data-intraday.service
@@ -31,6 +40,8 @@ units=(
   stockagent-registered-data-features.timer
   stockagent-registered-data-backfill.service
   stockagent-registered-data-backfill.timer
+  stockagent-wsl-backfill-memory-reclaim.service
+  stockagent-wsl-backfill-memory-reclaim.timer
   stockagent-binance-public-archive.service
   stockagent-binance-public-archive.timer
   stockagent-taifex-auxiliary-daily.service
@@ -45,8 +56,29 @@ if [[ "${1:-}" == "features-only" ]]; then
     stockagent-registered-data-features.service
     stockagent-registered-data-features.timer
   )
+elif [[ "${1:-}" == "crypto-training-only" ]]; then
+  units=(
+    stockagent-crypto-training-refresh.service
+    stockagent-crypto-training-refresh.timer
+  )
+elif [[ "${1:-}" == "intraday-timer-only" ]]; then
+  # Repair the recurring trigger without replacing a running downloader or
+  # reinstalling unrelated, possibly dirty service templates.
+  units=(stockagent-registered-data-intraday.timer)
+elif [[ "${1:-}" == "finlab-only" ]]; then
+  # The quota observer is independent of the slow account download worker.
+  units=(
+    stockagent-finlab-local-refresh.service
+    stockagent-finlab-local-refresh.timer
+    stockagent-finlab-quota-snapshot.service
+    stockagent-finlab-quota-snapshot.timer
+  )
+elif [[ "${1:-}" == "finmind-only" ]]; then
+  units=(stockagent-finmind-free.service stockagent-finmind-complement.service stockagent-finmind-sponsor.service
+         stockagent-finmind-quota-snapshot.service stockagent-finmind-quota-snapshot.timer
+         stockagent-finmind-source-audit.service stockagent-finmind-source-audit.timer)
 elif [[ $# -gt 0 ]]; then
-  echo "usage: $0 [features-only]" >&2
+  echo "usage: $0 [features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only]" >&2
   exit 2
 fi
 temporary_dir="$(mktemp -d)"
@@ -62,31 +94,77 @@ for unit in "${units[@]}"; do
     "$template" > "$target"
 done
 
-verify_units=("$temporary_dir"/*.service "$temporary_dir"/*.timer)
-if [[ -f "$temporary_dir/stockagent-heavy-data.slice" ]]; then
-  verify_units+=("$temporary_dir/stockagent-heavy-data.slice")
+verify_units=("$temporary_dir"/*)
+if [[ "${1:-}" == "finlab-only" || $# -eq 0 ]]; then
+  # Bash parses loops incrementally during execution. Catch a syntax error
+  # before installing the timer or starting a multi-hour account download.
+  bash -n "$repo_root/scripts/run_finlab_refresh.sh"
+  bash -n "$repo_root/scripts/run_finlab_refresh_frozen.sh"
+fi
+if [[ "${1:-}" == "finmind-only" || $# -eq 0 ]]; then
+  bash -n "$repo_root/scripts/run_finmind_free.sh"
+  bash -n "$repo_root/scripts/run_finmind_complement.sh"
+  bash -n "$repo_root/scripts/run_finmind_sponsor.sh"
 fi
 systemd-analyze verify "${verify_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
-chmod 0755 \
-  "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
-  "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
-  "$repo_root/scripts/run_registered_data_refresh.sh" \
-  "$repo_root/scripts/run_downloader_with_release.sh" \
-  "$repo_root/scripts/run_binance_public_archive.sh" \
-  "$repo_root/scripts/run_taifex_auxiliary_daily.sh" \
-  "$repo_root/scripts/run_taifex_public_history.sh"
+if [[ "${1:-}" != "intraday-timer-only" ]]; then
+  chmod 0755 \
+    "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
+    "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
+    "$repo_root/scripts/run_registered_data_refresh.sh" \
+    "$repo_root/scripts/run_finlab_refresh.sh" \
+    "$repo_root/scripts/run_finlab_refresh_frozen.sh" \
+    "$repo_root/scripts/run_downloader_with_release.sh" \
+    "$repo_root/scripts/run_binance_public_archive.sh" \
+    "$repo_root/scripts/run_taifex_auxiliary_daily.sh" \
+    "$repo_root/scripts/run_taifex_public_history.sh"
+fi
 systemctl daemon-reload
 if [[ "${1:-}" == "features-only" ]]; then
   systemctl enable --now stockagent-registered-data-features.timer
   echo "[registered-data] crypto feature timer enabled; existing jobs left untouched"
   exit 0
 fi
+if [[ "${1:-}" == "crypto-training-only" ]]; then
+  systemctl enable --now stockagent-crypto-training-refresh.timer
+  echo "[registered-data] crypto training refresh timer enabled; current writers left untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "intraday-timer-only" ]]; then
+  systemctl enable stockagent-registered-data-intraday.timer
+  # enable --now leaves an already-active but elapsed timer unchanged.
+  systemctl restart stockagent-registered-data-intraday.timer
+  timer_substate="$(systemctl show stockagent-registered-data-intraday.timer -p SubState --value)"
+  if [[ "$timer_substate" == "elapsed" ]]; then
+    echo "[registered-data] intraday timer remains elapsed after restart" >&2
+    exit 1
+  fi
+  echo "[registered-data] intraday timer rearmed; other units and running jobs left untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "finlab-only" ]]; then
+  systemctl enable --now stockagent-finlab-local-refresh.timer stockagent-finlab-quota-snapshot.timer
+  echo "[registered-data] FinLab download and quota-observation timers enabled"
+  exit 0
+fi
+if [[ "${1:-}" == "finmind-only" ]]; then
+  systemctl enable --now stockagent-finmind-free.service stockagent-finmind-complement.service stockagent-finmind-sponsor.service stockagent-finmind-quota-snapshot.timer stockagent-finmind-source-audit.timer
+  echo "[registered-data] FinMind Free and Sponsor history services enabled"
+  exit 0
+fi
 systemctl enable --now \
+  stockagent-finmind-free.service \
+  stockagent-finmind-complement.service \
+  stockagent-finmind-sponsor.service \
+  stockagent-finmind-quota-snapshot.timer \
+  stockagent-finmind-source-audit.timer \
+  stockagent-crypto-training-refresh.timer \
   stockagent-registered-data-daily.timer \
   stockagent-registered-data-intraday.timer \
   stockagent-registered-data-features.timer \
   stockagent-registered-data-backfill.timer \
+  stockagent-wsl-backfill-memory-reclaim.timer \
   stockagent-binance-public-archive.timer \
   stockagent-taifex-auxiliary-daily.timer \
   stockagent-taifex-public-history.timer

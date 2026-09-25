@@ -1,0 +1,12 @@
+# Same source, model, basis and fold contract as the train-only RMS control.
+# Per-decision scaling uses only each visible 32-session window.
+base_config: tw_public_preopen_all_observed_multibasis_rms_batch4_2014_v1.yaml
+experiment_name: tw-public-all-observed-multibasis-window-rms-2014-v1
+
+runner:
+  output_dir: artifacts/ablations/tw_public_preopen_all_observed_multibasis_2014_v1/window_rms
+  resume: false
+
+training:
+  financial_transformer:
+    causal_feature_window_rms_normalization: true

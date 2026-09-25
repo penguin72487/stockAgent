@@ -124,3 +124,61 @@ test("mode card keeps filtered returns separate from the shared Discord account 
   assert.match(output, /資料不可用/);
   assert.doesNotMatch(output, />\+25\.00%</);
 });
+
+test("both TW charts key large history by date and source revision only", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function chartRequestKey()"), app.indexOf("function chartHistoryMatchesSelection()"));
+  const context = vm.createContext({
+    snapshot: {service_sync: {content_revision: 7, history_revision: "history-a"}},
+    detailRangeKey: () => "2026-09-01|2026-09-22",
+  });
+  vm.runInContext(source, context);
+  const first = context.chartRequestKey();
+  assert.equal(first, context.chartRequestKey());
+  assert.doesNotMatch(source, /selectedMode|textFilter|status-filter/);
+  context.snapshot.service_sync.content_revision = 8;
+  context.snapshot.service_sync.revision_token = "status-only-change";
+  context.snapshot.historical_replay = {generated_at: "status-only-change"};
+  assert.equal(context.chartRequestKey(), first);
+  context.snapshot.service_sync.history_revision = "history-b";
+  assert.notEqual(context.chartRequestKey(), first);
+  context.snapshot.service_sync.history_revision = "history-a";
+  context.detailRangeKey = () => "2026-09-03|2026-09-22";
+  assert.notEqual(context.chartRequestKey(), first);
+});
+
+test("a previous curve stays visible but cannot supply current-period accounting", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function chartHistoryMatchesSelection()"), app.indexOf("function compareByAbsoluteWeight("));
+  const context = vm.createContext({
+    chartHistory: {
+      history: [], start_date: "2026-09-01", end_date: "2026-09-22",
+      range_summary: [{series_id: "strategy", cumulative_net_pnl_twd: 100}],
+    },
+    chartHistoryKey: "old-source",
+    chartRequestKey: () => "new-source",
+    selectedDetailStartDate: () => "2026-09-01",
+    selectedDetailEndDate: () => "2026-09-22",
+  });
+  vm.runInContext(source, context);
+  assert.equal(context.chartHistoryMatchesSelection(), true);
+  assert.equal(context.rangeSummaryFor("strategy"), null);
+  context.chartHistoryKey = "new-source";
+  assert.equal(context.rangeSummaryFor("strategy").cumulative_net_pnl_twd, 100);
+  const renderer = readFileSync(new URL("../services/tw_day_trade_dashboard/chart-renderer.js", import.meta.url), "utf8");
+  assert.match(renderer, /資料更新中，暫顯示上一份已驗證曲線/);
+});
+
+test("overnight missing history cannot become a zero PnL", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function totalModeNetPnl("), app.indexOf("function resolvedPositionPnl("));
+  const context = vm.createContext({
+    IS_OVERNIGHT: true,
+    chartHistory: {range_summary: [{series_id: "one"}]},
+    rangeSummaryFor: () => null,
+  });
+  vm.runInContext(source, context);
+  assert.equal(context.totalModeNetPnl({modes: [{market: "one"}]}), null);
+  context.rangeSummaryFor = () => ({cumulative_net_pnl_twd: 125});
+  assert.equal(context.totalModeNetPnl({modes: [{market: "one"}]}), 125);
+});

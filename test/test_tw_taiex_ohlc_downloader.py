@@ -554,6 +554,9 @@ def test_daily_refreshes_every_month_intersecting_recent_calendar_overlap(
         lambda url, _args: _Response(responses[month_from_url(url)]),
     )
     assert taiex._run(_args(output_dir)) == 0
+    canonical_path = taiex._canonical_path(output_dir)
+    accepted_bytes = canonical_path.read_bytes()
+    accepted_summary = taiex._summary_path(output_dir).read_bytes()
 
     calls: list[str] = []
 
@@ -567,6 +570,23 @@ def test_daily_refreshes_every_month_intersecting_recent_calendar_overlap(
     daily_args.daily_overlap_days = 7  # 1999-01-30 through 1999-02-05
     assert taiex._run(daily_args) == 0
     assert sorted(calls) == ["1999-01", "1999-02"]
+    assert canonical_path.read_bytes() == accepted_bytes
+    assert taiex._summary_path(output_dir).read_bytes() == accepted_summary
+    attempt = json.loads(taiex._latest_attempt_summary_path(output_dir).read_text())
+    assert attempt["semantic_noop"] is True
+    assert attempt["replacement_promoted"] is False
+    assert attempt["preserved_previous_canonical_summary"] is True
+
+    responses["1999-02"] = _payload(
+        "1999-02", [("1999-02-01", 10.5, 11.5, 10.0, 11.25)]
+    )
+    assert taiex._run(daily_args) == 0
+    assert canonical_path.read_bytes() != accepted_bytes
+    assert taiex._summary_path(output_dir).read_bytes() != accepted_summary
+    assert pl.read_parquet(canonical_path).get_column("closing_index")[-1] == 11.25
+    attempt = json.loads(taiex._latest_attempt_summary_path(output_dir).read_text())
+    assert attempt["semantic_noop"] is False
+    assert attempt["replacement_promoted"] is True
 
 
 def test_jsonl_loader_tolerates_only_torn_final_record(tmp_path: Path) -> None:

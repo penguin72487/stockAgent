@@ -276,6 +276,11 @@ run_step() {
   local end_ts
   local elapsed
   local rc
+  local -a source_summary_args=()
+
+  if [[ -n "${STEP_SOURCE_SUMMARY_PATH:-}" ]]; then
+    source_summary_args=(--source-summary "$STEP_SOURCE_SUMMARY_PATH")
+  fi
 
   start_ts="$(date +%s)"
   log "step=${name} start"
@@ -305,7 +310,8 @@ run_step() {
       --started-epoch "$start_ts" \
       --elapsed-seconds "$elapsed" \
       --exit-code 0 \
-      --runner-pid "$$"; then
+      --runner-pid "$$" \
+      "${source_summary_args[@]}"; then
       log "step=${name} receipt_failed state=complete"
       record_failure "${name}_receipt"
       return 1
@@ -328,7 +334,8 @@ run_step() {
     --started-epoch "$start_ts" \
     --elapsed-seconds "$elapsed" \
     --exit-code "$rc" \
-    --runner-pid "$$"; then
+    --runner-pid "$$" \
+    "${source_summary_args[@]}"; then
     log "step=${name} receipt_failed state=failed"
     record_failure "${name}_receipt"
   fi
@@ -446,13 +453,16 @@ run_yahoo_incremental() {
   for asset in "${assets[@]}"; do
     local yahoo_mode="daily-update"
     local step_suffix="daily_update"
+    local summary_name="daily_update_summary"
     local -a history_flags=()
     if [[ "$asset" == "crypto" ]]; then
       yahoo_mode="incremental"
       step_suffix="1m_update"
+      summary_name="incremental_update_summary"
     elif [[ "$asset" == "us_stocks" && "$YAHOO_VERIFY_US_HISTORY_HEAD" == "1" ]]; then
       yahoo_mode="repair"
       step_suffix="history_head_repair"
+      summary_name="repair_summary"
       history_flags=(--verify-us-history-head --start-date "$YAHOO_HISTORY_START_DATE")
     fi
     base_cmd=(
@@ -468,6 +478,7 @@ run_yahoo_incremental() {
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
       --rate-limit-abort-after "$YAHOO_RATE_LIMIT_ABORT_AFTER"
+      --run-id "$RUN_ID"
       "${history_flags[@]}"
       "${yahoo_flags[@]}"
     )
@@ -481,7 +492,8 @@ run_yahoo_incremental() {
       fi
     fi
 
-    if ! run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}"; then
+    if ! STEP_SOURCE_SUMMARY_PATH="$ROOT_DIR/data_yahoo/${summary_name}.${asset}.json" \
+      run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}"; then
       rc=1
       continue
     fi
@@ -605,6 +617,8 @@ run_okx_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
+  else
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/okx_source")
   fi
   if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
     cmd+=(--skip-historical-features)
@@ -654,6 +668,8 @@ run_bybit_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
+  else
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/bybit_source")
   fi
   run_step bybit_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
@@ -695,6 +711,9 @@ run_binance_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
+  else
+    # Save the full-history symbol report before a later intraday job replaces it.
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/binance_source")
   fi
   if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
     cmd+=(--skip-historical-features)

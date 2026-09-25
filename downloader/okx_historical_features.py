@@ -5,6 +5,7 @@ import io
 import json
 import os
 import threading
+import time
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,8 +20,10 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 try:
+    from .feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
+    from feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from ohlcv_hot_tail import hot_tail_path
 
 
@@ -424,6 +427,8 @@ class HistoricalFeatureResult:
     stage_status_json: str
     coverage_json: str
     errors_json: str
+    stage_elapsed_seconds_json: str = "{}"
+    total_elapsed_seconds: float = 0.0
 
 
 def feature_catalog_payload() -> dict[str, Any]:
@@ -1063,18 +1068,24 @@ def enrich_symbol_historical_features(
     include_funding_archive: bool,
     stage_callback: Callable[[str, str], None] | None = None,
 ) -> HistoricalFeatureResult:
+    started = time.perf_counter()
     original = _read_parquet(output_path)
     frame = original
     stage_status: dict[str, str] = {}
     errors: dict[str, str] = {}
+    stage_elapsed_seconds: dict[str, float] = {
+        "read_existing": round(time.perf_counter() - started, 6)
+    }
 
     def run_stage(stage: str, fn: Callable[[], None]) -> None:
+        stage_started = time.perf_counter()
         status = "ok"
         try:
             fn()
         except Exception as exc:
             status = "failed"
             errors[stage] = f"{type(exc).__name__}: {exc}"
+        stage_elapsed_seconds[stage] = round(time.perf_counter() - stage_started, 6)
         stage_status[stage] = status
         if stage_callback is not None:
             stage_callback(stage, status)
@@ -1304,12 +1315,20 @@ def enrich_symbol_historical_features(
         ),
     )
 
+    stage_started = time.perf_counter()
     frame = _add_derived_features(frame)
+    stage_elapsed_seconds["derive"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     changed = not _frames_equal(original, frame)
+    stage_elapsed_seconds["compare"] = round(time.perf_counter() - stage_started, 6)
     if changed:
+        stage_started = time.perf_counter()
         _write_parquet(frame, output_path)
+        stage_elapsed_seconds["write"] = round(time.perf_counter() - stage_started, 6)
 
+    stage_started = time.perf_counter()
     coverage = _coverage_summary(frame)
+    stage_elapsed_seconds["coverage"] = round(time.perf_counter() - stage_started, 6)
     failed = len(errors)
     status = "partial" if failed else "updated" if changed else "unchanged"
     if failed == len(FEATURE_STAGE_IDS):
@@ -1324,6 +1343,8 @@ def enrich_symbol_historical_features(
         stage_status_json=json.dumps(stage_status, ensure_ascii=False, sort_keys=True),
         coverage_json=json.dumps(coverage, ensure_ascii=False, sort_keys=True),
         errors_json=json.dumps(errors, ensure_ascii=False, sort_keys=True),
+        stage_elapsed_seconds_json=json.dumps(stage_elapsed_seconds, sort_keys=True),
+        total_elapsed_seconds=round(time.perf_counter() - started, 6),
     )
 
 
