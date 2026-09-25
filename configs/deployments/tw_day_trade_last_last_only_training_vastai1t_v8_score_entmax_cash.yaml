@@ -1,0 +1,39 @@
+# Fold-matched successor to the v7 learned-cash experiment.  Keep v7 and its
+# active artifacts intact; changing the output rule changes the checkpoint ABI.
+#
+# One signed stock score now owns direction, relative allocation and conviction.
+# Sparse entmax chooses relative names, and score/(1+abs(score)) determines
+# their risky fraction.  The unused gross stays in cash.  There is no cash
+# token, independent cash logit, sigmoid exposure gate, or forced gross=1.
+# The score_entmax_cash ABI preserves FP32 output weights under BF16 AMP; the
+# historical cash_entmax15 ABI continues to return its input dtype.
+# The physical FIFO loss, 13:30 terminal rule, fees, dates, features, optimizer
+# cadence, 0.1 early-stop ratio and source checkpoint otherwise inherit v7.
+base_config: tw_day_trade_last_last_only_training_vastai1t.yaml
+
+experiment_name: tw-day-trade-last-last-only-score-entmax-cash-v8
+
+runner:
+  # Fresh output ABI: source release differs from the failed pre-epoch v8 run.
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_terminal_unlimited_capital10m_batch32_score_entmax_cash_22_effective_rank_v8_twpublic_7e9a08bb7548fd88
+  resume: true
+
+data:
+  # Pin the immutable Syncthing release; never train against a moving link.
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260917T022610857716059Z-l0-penguin-7e9a08bb7548fd88/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260917T022610857716059Z-l0-penguin-7e9a08bb7548fd88/features/tw_public_stock_daily.parquet
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_paper_parity_7e9a08bb7548fd88_share_replacement_v8/stocks
+
+# One paired warm-cache two-GPU fold-11 A/B on this release found exact
+# model/test/deployment parity and a 4.9% lower median epoch-3/4 maximum-rank
+# wall time versus 112 threads. Other runs had substantial timing variance;
+# this is a measured operating point, not a guaranteed speedup.
+environment:
+  cpu_threads: 48
+
+training:
+  early_stopping_no_improve_ratio: 0.1
+  transformer_base_portfolio:
+    portfolio_output_mode: score_entmax_cash
+  financial_transformer:
+    portfolio_output_mode: score_entmax_cash

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -7,7 +8,10 @@ import numpy as np
 import torch
 
 from stockagent.config import load_config
-from stockagent.training.checkpoint_contract import _training_checkpoint_contract
+from stockagent.training.checkpoint_contract import (
+    _trading_checkpoint_contract,
+    _training_checkpoint_contract,
+)
 from stockagent.training.checkpoint_contract import (
     _active_model_config as _checkpoint_active_model_config,
     _checkpoint_model_values,
@@ -23,6 +27,14 @@ FIXED_CONFIG = (
 TRAJECTORY_V5_CONFIG = (
     "configs/deployments/"
     "tw_day_trade_last_last_only_training_vastai1t_v5.yaml"
+)
+LEARNED_CASH_V6_CONFIG = (
+    "configs/deployments/"
+    "tw_day_trade_last_last_only_training_vastai1t_v6.yaml"
+)
+SCORE_ENTMAX_V8_CONFIG = (
+    "configs/deployments/"
+    "tw_day_trade_last_last_only_training_vastai1t_v8_score_entmax_cash.yaml"
 )
 HISTORICAL_CONFIG = (
     "configs/deployments/"
@@ -141,6 +153,37 @@ def test_fixed_day_trade_recipe_keeps_user_assumptions_and_old_basis_rank_map() 
     assert sum(fixed_model.temporal_basis_components_by_family.values()) == 524
 
 
+def test_active_v7_changes_only_terminal_capacity_and_owns_a_fresh_contract() -> None:
+    fixed = load_config(FIXED_CONFIG)
+    learned_cash_v6 = load_config(LEARNED_CASH_V6_CONFIG)
+
+    assert (
+        fixed.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+        is True
+    )
+    assert (
+        learned_cash_v6.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+        is False
+    )
+    assert fixed.runner.output_dir != learned_cash_v6.runner.output_dir
+    assert "terminal_unlimited" in str(fixed.runner.output_dir)
+    assert asdict(fixed.training.financial_transformer) == asdict(
+        learned_cash_v6.training.financial_transformer
+    )
+    assert fixed.training.early_stopping_no_improve_ratio == 0.1
+    assert learned_cash_v6.training.early_stopping_no_improve_ratio == 0.1
+    fixed_contract = _trading_checkpoint_contract(fixed)
+    v6_contract = _trading_checkpoint_contract(learned_cash_v6)
+    assert fixed_contract != v6_contract
+    assert fixed_contract["taiwan_execution"][
+        "day_trade_terminal_liquidation_unlimited_capacity"
+    ] is True
+    assert (
+        "day_trade_terminal_liquidation_unlimited_capacity"
+        not in v6_contract["taiwan_execution"]
+    )
+
+
 def test_learned_cash_output_owns_a_fresh_checkpoint_and_artifact_contract() -> None:
     fixed = load_config(FIXED_CONFIG)
     trajectory = load_config(TRAJECTORY_V5_CONFIG)
@@ -165,6 +208,110 @@ def test_learned_cash_output_owns_a_fresh_checkpoint_and_artifact_contract() -> 
         "contextual_cash_gate_signed_direction_v1"
     )
     assert trajectory_model_contract["portfolio_output_mode"] == "projection_l1"
+
+
+def test_score_entmax_v8_removes_the_independent_cash_gate() -> None:
+    from stockagent.models.factory import build_model
+    from stockagent.models.normalization import masked_cash_entmax15_weights
+
+    v7 = load_config(FIXED_CONFIG)
+    v8 = load_config(SCORE_ENTMAX_V8_CONFIG)
+    assert v8.runner.output_dir != v7.runner.output_dir
+    assert v8.training.financial_transformer.portfolio_output_mode == "score_entmax_cash"
+    assert v8.training.transformer_base_portfolio.portfolio_output_mode == "score_entmax_cash"
+    assert v8.training.early_stopping_no_improve_ratio == 0.1
+    assert _trading_checkpoint_contract(v8) == _trading_checkpoint_contract(v7)
+    assert v8.training.pretrained_initialization_root == v7.training.pretrained_initialization_root
+    assert v8.training.loss_portfolio_activation == "pre_normalized"
+    assert v8.trading.portfolio_activation == "pre_normalized"
+    assert v8.data.feature_include == v7.data.feature_include
+    v7_model = asdict(v7.training.financial_transformer)
+    v8_model = asdict(v8.training.financial_transformer)
+    assert v7_model.pop("portfolio_output_mode") == "learned_cash"
+    assert v8_model.pop("portfolio_output_mode") == "score_entmax_cash"
+    assert v8_model == v7_model
+
+    old_contract = _checkpoint_model_values(
+        v7, _checkpoint_active_model_config(v7), v7.data.feature_include
+    )
+    new_contract = _checkpoint_model_values(
+        v8, _checkpoint_active_model_config(v8), v8.data.feature_include
+    )
+    assert new_contract != old_contract
+    assert "portfolio_output_contract" not in new_contract
+
+    # Model construction needs a training-fold PCA/KLT override.  Omit basis
+    # families only in this local head-ABI probe; the loaded recipe above is
+    # unchanged and formal training still fits the full 22-family map.
+    head_probe = deepcopy(v8)
+    head_probe.training.financial_transformer.temporal_basis_families = []
+    head_probe.training.financial_transformer.temporal_basis_components_by_family = {}
+    model = build_model(
+        config=head_probe,
+        lookback=v8.training.lookback,
+        num_features=len(v8.data.feature_include),
+        num_symbols=16,
+        feature_names=v8.data.feature_include,
+    )
+    assert model.cash_asset_token is None
+    assert model.cash_asset_norm is None
+    assert model.learned_cash_score_head is None
+    assert not any("cash_asset" in name or "learned_cash_score_head" in name
+                   for name in model.state_dict())
+    model.eval()
+    with torch.no_grad():
+        actual_weights, _, actual_aux = model(
+            torch.randn(2, v8.training.lookback, 16, len(v8.data.feature_include)),
+            torch.ones(2, 16, dtype=torch.bool),
+            return_aux=True,
+        )
+    assert actual_weights.shape == (2, 16)
+    assert bool((actual_weights.abs().sum(dim=1) < 1.0).all())
+    assert "cash_gate_risky_gross" not in actual_aux
+    assert "cash_entmax_cash_fraction" in actual_aux
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        amp_weights, _, _ = model(
+            torch.randn(1, v8.training.lookback, 16, len(v8.data.feature_include)),
+            torch.ones(1, 16, dtype=torch.bool),
+            return_aux=True,
+        )
+    assert amp_weights.dtype == torch.float32
+
+    scores = torch.tensor([[4.0, -2.0, 0.0, 0.0]], requires_grad=True)
+    weights, parts = masked_cash_entmax15_weights(
+        scores, torch.ones_like(scores, dtype=torch.bool), return_parts=True
+    )
+    gross = weights.abs().sum(dim=1)
+    assert 0.0 < float(gross[0].detach()) < 1.0
+    torch.testing.assert_close(parts["implicit_cash_weight"], 1.0 - gross)
+    gross.sum().backward()
+    assert scores.grad is not None
+    assert bool(torch.isfinite(scores.grad).all())
+    assert float(scores.grad.detach().abs().sum()) > 0.0
+    flat = masked_cash_entmax15_weights(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool)
+    )
+    strong = masked_cash_entmax15_weights(
+        torch.tensor([[100.0, 0.0, 0.0, 0.0]]),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
+    assert float(flat.abs().sum()) == 0.0
+    assert float(strong.abs().sum()) > 0.98
+    long_short = masked_cash_entmax15_weights(
+        torch.tensor([[2.0, -2.0]]), torch.ones(1, 2, dtype=torch.bool)
+    )
+    assert float(long_short[0, 0]) > 0.0
+    assert float(long_short[0, 1]) < 0.0
+    assert float(long_short.abs().sum()) < 1.0
+
+    bf16_scores = torch.tensor([[3.0, -1.0]], dtype=torch.bfloat16)
+    bf16_mask = torch.ones_like(bf16_scores, dtype=torch.bool)
+    legacy = masked_cash_entmax15_weights(bf16_scores, bf16_mask)
+    exact = masked_cash_entmax15_weights(
+        bf16_scores, bf16_mask, preserve_fp32_output=True
+    )
+    assert legacy.dtype == torch.bfloat16
+    assert exact.dtype == torch.float32
 
 
 def test_exact_loss_preserves_model_chosen_subunit_gross() -> None:

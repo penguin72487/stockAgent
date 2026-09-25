@@ -47,7 +47,106 @@ from stockagent.training.day_trade_carry_bridge import (
 )
 
 
-PHYSICAL_SOURCE_CACHE_ABI = "tw_day_trade_physical_source_cache_v11_share_replacement_session"
+def compact_packed_day_trade_carry_session(
+    packed: PackedDayTradeCarrySession,
+) -> DayTradeCarrySession:
+    """Compact the verified sparse source without materializing 270 x 2 exits.
+
+    This is the same source-only statistic as compacting a densified session.
+    The model-dependent long/short choice still happens inside the executor.
+    """
+    packed.validate()
+    symbols = int(packed.official_open.numel())
+    if packed.exit_flat.numel() and not bool(
+        (packed.exit_flat[1:] > packed.exit_flat[:-1]).all()
+    ):
+        raise ValueError("packed exit identities must be strictly ordered")
+    retained = (
+        torch.isfinite(packed.exit_price)
+        | (packed.exit_capacity != 0)
+        | ~torch.isfinite(packed.exit_capacity)
+    )
+    flat = packed.exit_flat[retained]
+    prices = packed.exit_price[retained]
+    capacity = packed.exit_capacity[retained]
+    event_symbols = torch.div(flat, 270 * 2, rounding_mode="floor")
+    event_sides = flat.remainder(2)
+    symbol_axis = torch.arange(symbols, dtype=torch.int64)
+    starts = torch.searchsorted(event_symbols, symbol_axis, right=False)
+    ends = torch.searchsorted(event_symbols, symbol_axis, right=True)
+
+    price_ok = torch.isfinite(prices) & (prices > 0)
+    side_slot = event_symbols * 2 + event_sides
+    minimum = prices.new_full((symbols * 2,), float("inf"))
+    maximum = prices.new_full((symbols * 2,), float("-inf"))
+    minimum.scatter_reduce_(
+        0, side_slot, torch.where(price_ok, prices, float("inf")), reduce="amin"
+    )
+    maximum.scatter_reduce_(
+        0, side_slot, torch.where(price_ok, prices, float("-inf")), reduce="amax"
+    )
+    has_exit = torch.isfinite(minimum)
+    minimum = torch.where(has_exit, minimum, 0).reshape(symbols, 2)
+    maximum = torch.where(has_exit, maximum, 0).reshape(symbols, 2)
+    mark_ok = torch.isfinite(packed.marks) & (packed.marks > 0)
+    mark_path_valid = mark_ok.all(dim=1)
+    minimum_marks = torch.where(
+        mark_path_valid,
+        torch.where(mark_ok, packed.marks, float("inf")).amin(dim=1),
+        0,
+    )
+    maximum_marks = torch.where(
+        mark_path_valid,
+        torch.where(mark_ok, packed.marks, float("-inf")).amax(dim=1),
+        0,
+    )
+
+    # The no-event slot is inert, but the fixed sparse ABI requires one entry.
+    if flat.numel() == 0:
+        prices = packed.exit_price.new_full((1,), float("nan"))
+        capacity = packed.exit_capacity.new_zeros((1,))
+        event_symbols = packed.exit_flat.new_full((1,), symbols - 1)
+        event_sides = packed.exit_flat.new_zeros((1,))
+
+    return DayTradeCarrySession(
+        day=packed.day,
+        official_open=packed.official_open,
+        opening_marks=packed.opening_marks,
+        entry_price=packed.entry_price,
+        entry_volume=packed.entry_volume,
+        lower_limit=packed.lower_limit,
+        upper_limit=packed.upper_limit,
+        halted=packed.halted,
+        exit_prices=prices,
+        exit_capacity=capacity,
+        marks=packed.marks[:, -1:],
+        action_mask=packed.action_mask,
+        share_ratio=packed.share_ratio,
+        cash_per_old_share=packed.cash_per_old_share,
+        payment_day=packed.payment_day,
+        stock_delivery_day=packed.stock_delivery_day,
+        source_gap_mask=packed.source_gap_mask,
+        unresolved_action_gap_mask=packed.unresolved_action_gap_mask,
+        daily_proxy_mask=packed.daily_proxy_mask,
+        exit_symbol_indices=event_symbols,
+        exit_sides=event_sides,
+        symbol_event_starts=starts,
+        symbol_event_ends=ends,
+        minimum_marks=minimum_marks,
+        maximum_marks=maximum_marks,
+        mark_path_valid=mark_path_valid.to(torch.float64),
+        minimum_exit_prices=minimum,
+        maximum_exit_prices=maximum,
+        terminal_liquidation_price=packed.terminal_liquidation_price,
+    )
+
+
+PHYSICAL_SOURCE_CACHE_ABI = (
+    "tw_day_trade_physical_source_cache_v12_subscription_right_reference_value"
+)
+_PREDECESSOR_PHYSICAL_SOURCE_CACHE_ABI = (
+    "tw_day_trade_physical_source_cache_v11_share_replacement_session"
+)
 PHYSICAL_PRICE_LIMIT_CACHE_ABI = "tw_day_trade_physical_price_limits_v1"
 PHYSICAL_SOURCE_RUN_RECEIPT_SCHEMA = 1
 PHYSICAL_SOURCE_RUN_RECEIPT_ENV = (
@@ -111,6 +210,93 @@ def _atomic_npy(path: Path, value: np.ndarray) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _load_canonical_sparse_exact_inventory_cache(
+    path: Path,
+    *,
+    exact_action_mask: np.ndarray,
+    exact_share_ratio: np.ndarray,
+    exact_cash: np.ndarray,
+    exact_payment_day: np.ndarray,
+    exact_stock_delivery_day: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load a sparse action cache only when it equals the accepted source.
+
+    A complete subscription right may have zero economic value when its
+    official reference price does not exceed the subscription price. Such an
+    event is intentionally retained as a resolved no-op action, so the old
+    blanket ``ratio == 1 and cash == 0`` rejection was not a valid cache
+    invariant. The stronger invariant is exact equality with the canonical
+    arrays already derived from the receipt-verified source for this run.
+    """
+    with np.load(path, allow_pickle=False) as packed_actions:
+        expected_fields = {
+            "action_flat",
+            "total_share_ratio",
+            "cash_per_old_share",
+            "payment_day",
+            "stock_delivery_day",
+        }
+        if set(packed_actions.files) != expected_fields:
+            raise RuntimeError(
+                "invalid physical exact-inventory cache fields: "
+                f"expected={sorted(expected_fields)} "
+                f"actual={sorted(packed_actions.files)}"
+            )
+        actual = {
+            name: np.array(packed_actions[name], copy=True)
+            for name in expected_fields
+        }
+
+    action_flat = np.flatnonzero(exact_action_mask.reshape(-1)).astype(
+        np.int64, copy=False
+    )
+    expected = {
+        "action_flat": action_flat,
+        "total_share_ratio": exact_share_ratio.reshape(-1)[action_flat].astype(
+            np.float64, copy=False
+        ),
+        "cash_per_old_share": exact_cash.reshape(-1)[action_flat].astype(
+            np.float64, copy=False
+        ),
+        "payment_day": exact_payment_day.reshape(-1)[action_flat].astype(
+            np.int64, copy=False
+        ),
+        "stock_delivery_day": exact_stock_delivery_day.reshape(-1)[
+            action_flat
+        ].astype(np.int64, copy=False),
+    }
+    for name, expected_value in expected.items():
+        actual_value = actual[name]
+        if (
+            actual_value.dtype != expected_value.dtype
+            or actual_value.shape != expected_value.shape
+        ):
+            raise RuntimeError(
+                "invalid physical sparse exact-inventory cache layout: "
+                f"field={name} expected_dtype={expected_value.dtype} "
+                f"actual_dtype={actual_value.dtype} "
+                f"expected_shape={expected_value.shape} "
+                f"actual_shape={actual_value.shape}"
+            )
+        if not np.array_equal(actual_value, expected_value):
+            mismatch = np.flatnonzero(actual_value != expected_value)
+            sparse_row = int(mismatch[0]) if mismatch.size else -1
+            raise RuntimeError(
+                "physical sparse exact-inventory cache differs from the "
+                "receipt-derived canonical action: "
+                f"field={name} sparse_row={sparse_row} "
+                f"cached={actual_value[sparse_row]!r} "
+                f"expected={expected_value[sparse_row]!r}"
+            )
+    return (
+        actual["action_flat"],
+        actual["total_share_ratio"],
+        actual["cash_per_old_share"],
+        actual["payment_day"],
+        actual["stock_delivery_day"],
+    )
 
 
 def _atomic_npz(path: Path, **payload: np.ndarray) -> None:
@@ -397,8 +583,42 @@ def _source_identity(
         name: {"path": str(path), "bytes": path.stat().st_size, "sha256": _sha256(path)}
         for name, path in source_paths.items()
     }
+    digest = _source_content_digest(
+        source_cache_abi=PHYSICAL_SOURCE_CACHE_ABI,
+        receipts=receipts,
+        symbols=symbols,
+        dates=dates,
+        opens=opens,
+        closes=closes,
+        volumes=volumes,
+        action_mask=action_mask,
+        unresolved_action_mask=unresolved_action_mask,
+        force_exit=force_exit,
+        exact_action_mask=exact_action_mask,
+        exact_share_ratio=exact_share_ratio,
+        exact_cash=exact_cash,
+        exact_payment_day=exact_payment_day,
+        exact_stock_delivery_day=exact_stock_delivery_day,
+        no_regular_execution=no_regular_execution,
+        unresolved_replacement_block=unresolved_replacement_block,
+    )
+    return digest, receipts, partitions, partition_scope
+
+
+def _source_content_digest(
+    *, source_cache_abi: str, receipts: dict[str, dict[str, Any]],
+    symbols: tuple[str, ...], dates: np.ndarray, opens: np.ndarray,
+    closes: np.ndarray, volumes: np.ndarray, action_mask: np.ndarray,
+    unresolved_action_mask: np.ndarray, force_exit: np.ndarray,
+    exact_action_mask: np.ndarray, exact_share_ratio: np.ndarray,
+    exact_cash: np.ndarray, exact_payment_day: np.ndarray,
+    exact_stock_delivery_day: np.ndarray, no_regular_execution: np.ndarray,
+    unresolved_replacement_block: np.ndarray,
+) -> str:
+    """Hash already-verified source inputs under one explicit executor ABI."""
+
     digest = hashlib.sha256()
-    digest.update(PHYSICAL_SOURCE_CACHE_ABI.encode("ascii") + b"\0")
+    digest.update(source_cache_abi.encode("ascii") + b"\0")
     digest.update(PAPER_MINUTE_SCHEDULE_ABI.encode("ascii") + b"\0")
     for name in sorted(receipts):
         digest.update(name.encode("utf-8") + b"\0")
@@ -419,7 +639,7 @@ def _source_identity(
         ("force_exit", force_exit),
     ):
         _hash_array(digest, name, np.asarray(value))
-    return digest.hexdigest(), receipts, partitions, partition_scope
+    return digest.hexdigest()
 
 
 def _exact_inventory_action_arrays(
@@ -432,13 +652,18 @@ def _exact_inventory_action_arrays(
     np.ndarray,
     dict[str, Any],
 ]:
-    """Map receipt-verified cash and pending-stock actions to sessions.
+    """Map receipt-verified cash, stock, and subscription rights to sessions.
 
     Avoid mode still asks the policy to flatten before every corporate action.
     This executor-only ledger is the physical fallback for a residual that 50%
     participation could not liquidate.  Stock rights enter economic holdings on
     the ex-date but remain non-executable until their official delivery/listing
-    date.  It is not a model feature and never relaxes unresolved terms.
+    date.  A pure cash-capital-increase subscription right is settled at its
+    official ex-right reference value ``ratio * max(reference - exercise, 0)``.
+    This symmetric signed claim prevents either long or short residuals from
+    receiving a free mechanical ex-right price move without fabricating an
+    exercise, payment date, or stock-delivery date.  It is not a model feature
+    and never relaxes incomplete or mixed terms.
     """
     paths = _resolve_corporate_action_reference_paths(
         public_feature_path, include_rules=True
@@ -481,11 +706,15 @@ def _exact_inventory_action_arrays(
         "date",
         "symbol",
         "handling",
+        "handling_reason",
+        "reference_price",
         "cash_dividend_per_share",
         "cash_payment_date",
         "stock_dividend_ratio",
         "stock_delivery_date",
+        "stock_terms_complete",
         "subscription_ratio",
+        "subscription_price",
     }
     missing = required - available
     if missing:
@@ -495,11 +724,26 @@ def _exact_inventory_action_arrays(
         )
     actions = (
         pl.read_parquet(parquet_path, columns=sorted(required))
-        .filter(pl.col("handling").is_in(["exact_cash", "exact_inventory"]))
+        .filter(
+            pl.col("handling").is_in(["exact_cash", "exact_inventory"])
+            | (
+                pl.col("handling").eq("avoid")
+                & pl.col("handling_reason").eq("stock_or_subscription_action")
+                & pl.col("stock_terms_complete").fill_null(False)
+                & (pl.col("cash_dividend_per_share") == 0.0)
+                & (pl.col("stock_dividend_ratio") == 0.0)
+                & (pl.col("subscription_ratio") > 0.0)
+                & (pl.col("subscription_price") > 0.0)
+                & (pl.col("reference_price") > 0.0)
+            )
+        )
         .sort(["date", "symbol"])
     )
     exact_cash_events = 0
     exact_stock_events = 0
+    subscription_right_events = 0
+    zero_value_subscription_right_events = 0
+    subscription_right_flat_indices: list[int] = []
     for item in actions.iter_rows(named=True):
         symbol = str(item["symbol"] or "").strip().upper()
         column = symbol_index.get(symbol)
@@ -520,6 +764,28 @@ def _exact_inventory_action_arrays(
         amount = float(item["cash_dividend_per_share"] or 0.0)
         stock_increment = float(item["stock_dividend_ratio"] or 0.0)
         subscription = float(item["subscription_ratio"] or 0.0)
+        subscription_price = float(item["subscription_price"] or 0.0)
+        reference_price = float(item["reference_price"] or 0.0)
+        is_subscription_right = item["handling"] == "avoid"
+        if is_subscription_right:
+            subscription_valid = (
+                item["handling_reason"] == "stock_or_subscription_action"
+                and item["stock_terms_complete"] is True
+                and amount == 0.0
+                and stock_increment == 0.0
+                and np.isfinite(subscription)
+                and subscription > 0.0
+                and np.isfinite(subscription_price)
+                and subscription_price > 0.0
+                and np.isfinite(reference_price)
+                and reference_price > 0.0
+            )
+            if not subscription_valid:
+                raise ValueError(
+                    "invalid subscription-right terms after session mapping: "
+                    f"event={event_date} effective={effective_day} symbol={symbol}"
+                )
+            amount = subscription * max(reference_price - subscription_price, 0.0)
         payment_date = (
             np.datetime64("NaT", "D")
             if item["cash_payment_date"] is None
@@ -530,6 +796,10 @@ def _exact_inventory_action_arrays(
             if item["stock_delivery_date"] is None
             else np.datetime64(item["stock_delivery_date"], "D")
         )
+        if is_subscription_right and amount > 0.0:
+            # This is an explicit ex-date cash-equivalent settlement of the
+            # official reference value, not a fabricated issuer payment date.
+            payment_date = effective_day
         cash_valid = (
             np.isfinite(amount)
             and amount >= 0.0
@@ -552,9 +822,14 @@ def _exact_inventory_action_arrays(
         if (
             not cash_valid
             or not stock_valid
-            or not np.isfinite(subscription)
-            or subscription != 0.0
-            or (amount == 0.0 and stock_increment == 0.0)
+            or (
+                not is_subscription_right
+                and (
+                    not np.isfinite(subscription)
+                    or subscription != 0.0
+                    or (amount == 0.0 and stock_increment == 0.0)
+                )
+            )
             or (
                 item["handling"] == "exact_cash"
                 and stock_increment != 0.0
@@ -572,19 +847,31 @@ def _exact_inventory_action_arrays(
         share_ratio[row, column] = 1.0 + stock_increment
         cash[row, column] = amount
         payment_day[row, column] = (
-            0 if amount == 0.0 else _ordinal(payment_date)
+            0
+            if amount == 0.0
+            else _ordinal(effective_day if is_subscription_right else payment_date)
         )
         stock_delivery_day[row, column] = (
             0 if stock_increment == 0.0 else _ordinal(delivery_date)
         )
         exact_cash_events += int(amount > 0.0)
         exact_stock_events += int(stock_increment > 0.0)
+        subscription_right_events += int(is_subscription_right)
+        zero_value_subscription_right_events += int(
+            is_subscription_right and amount == 0.0
+        )
+        if is_subscription_right:
+            subscription_right_flat_indices.append(row * len(symbols) + column)
         mapped += 1
         mapped_after_closed_date += int(effective_day != event_date)
     return event_mask, share_ratio, cash, payment_day, stock_delivery_day, {
         "mapped_events": mapped,
         "mapped_cash_events": exact_cash_events,
         "mapped_pending_stock_events": exact_stock_events,
+        "mapped_subscription_right_events": subscription_right_events,
+        "mapped_zero_value_subscription_right_events": (
+            zero_value_subscription_right_events
+        ),
         "mapped_after_closed_date": mapped_after_closed_date,
         "outside_universe_events": outside_universe,
         "outside_horizon_events": outside_horizon,
@@ -592,8 +879,17 @@ def _exact_inventory_action_arrays(
         "coverage_end": str(coverage_end),
         "policy": (
             "exact_inventory_on_first_exchange_session_on_or_after_ex_date_"
-            "with_stock_locked_until_official_delivery"
+            "with_stock_locked_until_official_delivery_and_pure_subscription_"
+            "rights_settled_at_official_reference_value"
         ),
+        "subscription_right_value_policy": (
+            "subscription_ratio_times_max_official_ex_right_reference_minus_"
+            "subscription_price_zero_as_symmetric_signed_claim"
+        ),
+        # Private build metadata. It is removed before the public manifest is
+        # written and is used only to reconstruct the exact v11 predecessor
+        # fingerprint for a guarded optimizer-checkpoint resume.
+        "_subscription_right_flat_indices": subscription_right_flat_indices,
     }
 
 
@@ -1218,6 +1514,8 @@ def build_prepared_day_trade_carry_source(
     *, panel: Any, minute_root: str | Path, public_feature_path: str | Path,
     cache_dir: str | Path, allow_daily_proxy: bool,
     daily_proxy_price_policy: str, corporate_action_mode: str,
+    terminal_liquidation_unlimited_capacity: bool = False,
+    sparse_event_slots: int | None = None,
 ) -> PreparedDayTradeCarrySource:
     if corporate_action_mode != "avoid":
         raise ValueError(
@@ -1264,6 +1562,10 @@ def build_prepared_day_trade_carry_source(
             dates=dates,
             symbols=symbols,
         )
+    )
+    subscription_right_flat = np.asarray(
+        exact_action_counts.pop("_subscription_right_flat_indices", ()),
+        dtype=np.int64,
     )
     no_regular_execution, no_execution_counts = (
         _official_no_regular_execution_mask(
@@ -1326,6 +1628,45 @@ def build_prepared_day_trade_carry_source(
         no_regular_execution=no_regular_execution,
         unresolved_replacement_block=unresolved_replacement_block,
     )
+    resume_compatible_release_ids: list[str] = []
+    if subscription_right_flat.size:
+        # V12 extends the physical objective only where v11 deterministically
+        # failed on a held, source-verified pure subscription right. Recreate
+        # the exact old content identity so a checkpoint from a trajectory
+        # which had not entered that formerly undefined branch can resume. No
+        # other data, feature, execution, fee, or model fingerprint is relaxed.
+        predecessor_action = exact_action.copy()
+        predecessor_ratio = exact_share_ratio.copy()
+        predecessor_cash = exact_cash.copy()
+        predecessor_payment = exact_payment_day.copy()
+        predecessor_delivery = exact_stock_delivery_day.copy()
+        predecessor_action.reshape(-1)[subscription_right_flat] = False
+        predecessor_ratio.reshape(-1)[subscription_right_flat] = 1.0
+        predecessor_cash.reshape(-1)[subscription_right_flat] = 0.0
+        predecessor_payment.reshape(-1)[subscription_right_flat] = 0
+        predecessor_delivery.reshape(-1)[subscription_right_flat] = 0
+        predecessor_digest = _source_content_digest(
+            source_cache_abi=_PREDECESSOR_PHYSICAL_SOURCE_CACHE_ABI,
+            receipts=receipts,
+            symbols=symbols,
+            dates=dates,
+            opens=opens,
+            closes=closes,
+            volumes=volumes,
+            action_mask=action,
+            unresolved_action_mask=unresolved_action,
+            force_exit=force_exit,
+            exact_action_mask=predecessor_action,
+            exact_share_ratio=predecessor_ratio,
+            exact_cash=predecessor_cash,
+            exact_payment_day=predecessor_payment,
+            exact_stock_delivery_day=predecessor_delivery,
+            no_regular_execution=no_regular_execution,
+            unresolved_replacement_block=unresolved_replacement_block,
+        )
+        resume_compatible_release_ids.append(
+            f"tw-day-trade-carry:{predecessor_digest}"
+        )
     cache_root = Path(cache_dir).resolve() / f"physical-{digest}"
     manifest_path = cache_root / "manifest.json"
     ready_path = cache_root / "READY.json"
@@ -1451,8 +1792,9 @@ def build_prepared_day_trade_carry_source(
             valuation_known = np.zeros(shape, dtype=np.bool_)
             # If an unresolved/terminal interval ends without liquidation, the
             # next session is an exact account-source failure for that held
-            # symbol. A receipt-verified exact cash event is instead applied to
-            # the residual FIFO cohorts below; it must never be called missing.
+            # symbol. A receipt-verified exact cash/stock action or a complete
+            # pure subscription-right valuation is instead applied to the
+            # residual FIFO cohorts below; it must never be called missing.
             if dates.size > 1:
                 action_ends = action[:-1] & ~action[1:]
                 unresolved_gaps[1:] |= action_ends & ~exact_action[1:]
@@ -1707,6 +2049,7 @@ def build_prepared_day_trade_carry_source(
                 "schedule_abi": PAPER_MINUTE_SCHEDULE_ABI,
                 "source_digest": digest,
                 "release_id": f"tw-day-trade-carry:{digest}",
+                "resume_compatible_release_ids": resume_compatible_release_ids,
                 "rows": int(dates.size), "symbols": len(symbols),
                 "date_start": str(dates[0]), "date_end": str(dates[-1]),
                 "first_minute_date": str(first_minute),
@@ -1725,6 +2068,10 @@ def build_prepared_day_trade_carry_source(
                     "policy_target": "avoid_all_announced_actions_before_event",
                     "residual_cash_entitlement": "receipt_verified_exact_amount_and_payment_date",
                     "residual_stock_entitlement": "economic_on_ex_date_and_nonexecutable_until_official_delivery",
+                    "residual_subscription_right": (
+                        "source_complete_pure_right_settled_on_ex_date_at_"
+                        "official_reference_value_symmetrically_for_long_and_short"
+                    ),
                     "unresolved_residual": "fail_closed_per_symbol_on_first_post_event_session",
                     **exact_action_counts,
                 },
@@ -1792,56 +2139,76 @@ def build_prepared_day_trade_carry_source(
         )
         if unresolved_gaps.shape != shape or unresolved_gaps.dtype != np.dtype(bool):
             raise RuntimeError("invalid unresolved corporate-action gap cache")
-        with np.load(action_path, allow_pickle=False) as packed_actions:
-            if set(packed_actions.files) != {
-                "action_flat",
-                "total_share_ratio",
-                "cash_per_old_share",
-                "payment_day",
-                "stock_delivery_day",
-            }:
-                raise RuntimeError("invalid physical exact-inventory cache fields")
-            action_flat = np.array(packed_actions["action_flat"], copy=True)
-            action_ratio = np.array(packed_actions["total_share_ratio"], copy=True)
-            action_cash = np.array(packed_actions["cash_per_old_share"], copy=True)
-            action_payment = np.array(packed_actions["payment_day"], copy=True)
-            action_delivery = np.array(
-                packed_actions["stock_delivery_day"], copy=True
+        sparse_capacity_audit = None
+        if sparse_event_slots is not None:
+            if (
+                sparse_event_slots <= 0
+                or sparse_event_slots & (sparse_event_slots - 1)
+            ):
+                raise ValueError("sparse_event_slots must be a positive power of two")
+            proxy_rows = dates < first_minute
+            proxy_executable = (
+                np.isfinite(opens[proxy_rows])
+                & (opens[proxy_rows] > 0)
+                & np.isfinite(closes[proxy_rows])
+                & (closes[proxy_rows] > 0)
+                & ~np.asarray(gaps[proxy_rows])
             )
-        action_size = dates.size * len(symbols)
-        if (
-            action_flat.dtype != np.int64
-            or action_ratio.dtype != np.float64
-            or action_cash.dtype != np.float64
-            or action_payment.dtype != np.int64
-            or action_delivery.dtype != np.int64
-            or action_flat.ndim != 1
-            or action_ratio.shape != action_flat.shape
-            or action_cash.shape != action_flat.shape
-            or action_payment.shape != action_flat.shape
-            or action_delivery.shape != action_flat.shape
-            or (
-                action_flat.size
-                and (
-                    action_flat[0] < 0
-                    or action_flat[-1] >= action_size
-                    or np.any(action_flat[1:] <= action_flat[:-1])
-                    or not np.isfinite(action_ratio).all()
-                    or np.any(action_ratio <= 0.0)
-                    or not np.isfinite(action_cash).all()
-                    or np.any(action_cash < 0.0)
-                    or np.any((action_cash > 0.0) != (action_payment > 0))
-                    or np.any(action_delivery < 0)
-                    or np.any(
-                        (action_delivery > 0) & (action_ratio <= 1.0)
-                    )
-                    or np.any(
-                        (action_cash == 0.0) & (action_ratio == 1.0)
-                    )
+            proxy_max = (
+                2 * int(proxy_executable.sum(axis=1).max())
+                if proxy_executable.shape[0]
+                else 0
+            )
+            minute_max = 0
+            minute_max_file = None
+            session_files = sorted(
+                name for name in manifest["files"]
+                if name.startswith("session-") and name.endswith(".npz")
+            )
+            for name in session_files:
+                with np.load(cache_root / name, allow_pickle=False) as packed:
+                    flat = packed["exit_flat"]
+                if flat.ndim != 1:
+                    raise RuntimeError(f"invalid sparse event shape: {name}")
+                if flat.size > minute_max:
+                    minute_max = int(flat.size)
+                    minute_max_file = name
+            required_slots = max(1, proxy_max, minute_max)
+            if required_slots > sparse_event_slots:
+                raise ValueError(
+                    "sparse event session exceeds the fixed compiled ABI before "
+                    f"training: required={required_slots} configured={sparse_event_slots} "
+                    f"max_minute_file={minute_max_file}; increase "
+                    "training.day_trade_sparse_event_slots to the next power of two"
                 )
+            sparse_capacity_audit = {
+                "configured_slots": int(sparse_event_slots),
+                "required_slots": required_slots,
+                "daily_proxy_max_events": proxy_max,
+                "minute_max_events": minute_max,
+                "minute_max_file": minute_max_file,
+                "session_files_checked": len(session_files),
+            }
+            print(
+                "[physical source] sparse event capacity accepted "
+                f"required={required_slots} configured={sparse_event_slots} "
+                f"minute_files={len(session_files)} max_file={minute_max_file}",
+                flush=True,
             )
-        ):
-            raise RuntimeError("invalid physical sparse exact-inventory cache")
+        (
+            action_flat,
+            action_ratio,
+            action_cash,
+            action_payment,
+            action_delivery,
+        ) = _load_canonical_sparse_exact_inventory_cache(
+            action_path,
+            exact_action_mask=exact_action,
+            exact_share_ratio=exact_share_ratio,
+            exact_cash=exact_cash,
+            exact_payment_day=exact_payment_day,
+            exact_stock_delivery_day=exact_stock_delivery_day,
+        )
         print(
             "[physical source] accepted cache "
             f"manifest_sha256={_sha256(manifest_path)} "
@@ -1939,19 +2306,15 @@ def build_prepared_day_trade_carry_source(
             ]
         if day < first_minute:
             marks = np.full((len(symbols), 270), np.nan, dtype=np.float64)
-            exit_prices = np.full((len(symbols), 270, 2), np.nan, dtype=np.float64)
-            exit_capacity = np.zeros_like(exit_prices)
             executable = (
                 np.isfinite(opens[row]) & (opens[row] > 0)
                 & np.isfinite(closes[row]) & (closes[row] > 0)
                 & (gap == 0)
             )
-            exit_prices[executable, -1, :] = closes[row, executable, None]
             capacity = (
                 np.floor(np.maximum(volumes[row], 0) / 271.0 * 0.5 / BOARD_LOT_SHARES)
                 * BOARD_LOT_SHARES
             )
-            exit_capacity[executable, -1, :] = capacity[executable, None]
             marks[executable] = opening_marks[row, executable, None]
             marks[executable, -1] = closes[row, executable]
             carried_mark = (
@@ -1964,12 +2327,14 @@ def build_prepared_day_trade_carry_source(
             entry_price = np.where(executable, opens[row], np.nan)
             entry_volume = np.where(executable, np.maximum(volumes[row], 0) / 271.0, 0)
             daily_proxy_mask = executable.astype(np.float64, copy=False)
-            exit_view = exit_prices.reshape(-1)
-            exit_flat = np.flatnonzero(np.isfinite(exit_view)).astype(
-                np.int64, copy=False
-            )
-            exit_value = exit_view[exit_flat]
-            exit_cap = exit_capacity.reshape(-1)[exit_flat]
+            # The proxy owns only the two final-minute exit sides. Construct
+            # their sorted flat identities directly; the dense tape would be
+            # allocated solely to discover these exact same cells.
+            executable_symbols = np.flatnonzero(executable).astype(np.int64)
+            exit_flat = np.repeat(executable_symbols * 540 + 538, 2)
+            exit_flat[1::2] += 1
+            exit_value = np.repeat(closes[row, executable], 2)
+            exit_cap = np.repeat(capacity[executable], 2)
         else:
             with np.load(
                 cache_root / f"session-{day_text}.npz", allow_pickle=False
@@ -2018,6 +2383,17 @@ def build_prepared_day_trade_carry_source(
             entry_price, entry_volume = entry[:, 0], entry[:, 1]
             daily_proxy_mask = entry[:, 2]
         tensor = lambda value: torch.from_numpy(np.asarray(value, dtype=np.float64))
+        terminal_liquidation_price = None
+        if terminal_liquidation_unlimited_capacity:
+            terminal_price_valid = (
+                np.isfinite(closes[row])
+                & (closes[row] > 0)
+                & (gap == 0)
+                & ~no_regular_execution[row]
+            )
+            terminal_liquidation_price = tensor(
+                np.where(terminal_price_valid, closes[row], np.nan)
+            )
         packed_session = PackedDayTradeCarrySession(
             day=_ordinal(day), official_open=tensor(opens[row]),
             opening_marks=tensor(opening_marks[row]), entry_price=tensor(entry_price),
@@ -2037,6 +2413,7 @@ def build_prepared_day_trade_carry_source(
             source_gap_mask=tensor(gap),
             unresolved_action_gap_mask=tensor(unresolved_gap),
             daily_proxy_mask=tensor(daily_proxy_mask),
+            terminal_liquidation_price=terminal_liquidation_price,
         )
         packed_session.validate()
         return packed_session
@@ -2071,6 +2448,7 @@ def build_prepared_day_trade_carry_source(
             source_gap_mask=packed.source_gap_mask,
             unresolved_action_gap_mask=packed.unresolved_action_gap_mask,
             daily_proxy_mask=packed.daily_proxy_mask,
+            terminal_liquidation_price=packed.terminal_liquidation_price,
         )
 
     def _load_session_uncached(row: int) -> DayTradeCarrySession:
@@ -2106,10 +2484,11 @@ def build_prepared_day_trade_carry_source(
             cached = compact_session_cache.get(index)
         if cached is not None:
             return cached
-        # Bypass the optional 86+ GiB dense cache.  The immutable sparse event
-        # sufficient statistic is reused for all later epochs, while formal
-        # artifact replay can still request the authoritative dense loader.
-        compact = compact_day_trade_carry_session(_load_session_uncached(index))
+        # Preserve the immutable packed source instead of constructing a
+        # [symbol,270,2] NaN/zero tape merely to remove it immediately.
+        compact = compact_packed_day_trade_carry_session(
+            _load_packed_session_uncached(index)
+        )
         with session_cache_lock:
             compact = compact_session_cache.setdefault(index, compact)
         return compact
@@ -2127,6 +2506,9 @@ def build_prepared_day_trade_carry_source(
             "ready_receipt_sha256": _sha256(ready_path),
             "run_verification_receipt": str(run_verification_receipt),
             "run_verification_mode": verification_mode,
+            "resume_compatible_release_ids": list(
+                manifest.get("resume_compatible_release_ids", ())
+            ),
             "source_gap_symbol_days": int(manifest["source_gap_symbol_days"]),
             "unresolved_action_gap_symbol_days": int(
                 manifest["unresolved_action_gap_symbol_days"]
@@ -2144,6 +2526,16 @@ def build_prepared_day_trade_carry_source(
             ],
             "minute_partition_scope": manifest["minute_partition_scope"],
             "limit_counts": manifest["limit_counts"],
+            **(
+                {"sparse_event_capacity": sparse_capacity_audit}
+                if sparse_capacity_audit is not None
+                else {}
+            ),
+            "terminal_liquidation_policy": (
+                "official_close_unlimited_capacity_reduction_only"
+                if terminal_liquidation_unlimited_capacity
+                else "source_minute_capacity_then_physical_margin_carry"
+            ),
         },
     )
 

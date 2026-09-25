@@ -27,6 +27,7 @@ from stockagent.training.loss import (
 )
 from stockagent.training.trainer import (
     _auto_backtest_chunk_rows,
+    _physical_eval_chunk_rows,
     _batched_loss_from_backtest_segments,
     _CompiledLossFallback,
     _dataset_to_tensors,
@@ -1379,6 +1380,28 @@ def test_auto_backtest_chunk_rows_uses_stable_power_of_two_bucket(
         model_chunk_rows=64,
         configured_cap=512,
     ) == expected
+
+
+def test_physical_eval_chunk_rows_accounts_for_dense_float64_staging() -> None:
+    gib = 1024**3
+    # 2,754 symbols require about 28.4 MiB/day for marks plus the two-sided
+    # exit price/capacity planes.  After the 1.5 GiB safety reserve, 5.4 GiB of
+    # usable VRAM fits about 140 days, so the stable execution bucket is 128.
+    assert _physical_eval_chunk_rows(
+        requested_rows=256,
+        num_symbols=2754,
+        available_bytes=int(5.4 * gib),
+    ) == 128
+    assert _physical_eval_chunk_rows(
+        requested_rows=512,
+        num_symbols=2754,
+        available_bytes=int(3.0 * gib),
+    ) == 32
+    assert _physical_eval_chunk_rows(
+        requested_rows=256,
+        num_symbols=2754,
+        available_bytes=int(16.0 * gib),
+    ) == 256
 
 
 def test_backtest_compile_gate_skips_toolchain_lookup_while_dynamo_compiling(monkeypatch) -> None:
@@ -4169,6 +4192,30 @@ def test_final_fold_validation_is_recomputed_after_each_best_checkpoint_load() -
     assert load_index < val_index < test_index
     assert "val_backtest.weights_history[start:end]" not in artifact_source
     assert "checkpoint_path=artifact_checkpoint_path" in artifact_source
+
+
+def test_rank0_releases_training_only_cuda_state_before_formal_artifacts() -> None:
+    source = inspect.getsource(trainer_module._run_training_impl)
+    artifact_source = source.split(
+        "if ddp_enabled and not _distributed_should_write():",
+        maxsplit=1,
+    )[1]
+    release_index = artifact_source.index("rank0_allocated_before_release")
+    load_index = artifact_source.index(
+        '_load_state_dict(model, checkpoint["model_state_dict"])'
+    )
+    assert release_index < load_index
+    rank0_release_source = artifact_source[release_index:load_index]
+    for dead_reference in (
+        "compiled_train_model = None",
+        "panel_slab_model = None",
+        "optimizer = None",
+        "combined_val_windowed = None",
+        "combined_test_windowed = None",
+        "val_backtest_epoch = None",
+        "test_backtest_epoch = None",
+    ):
+        assert dead_reference in rank0_release_source
 
 
 def test_eval_padding_rows_copy_last_valid_mask_for_no_fallback_attention() -> None:

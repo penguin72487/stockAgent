@@ -1516,15 +1516,14 @@ class DataConfig:
     tw_public_feature_path: str = (
         "data_tw_public/features/tw_public_stock_daily.parquet"
     )
-    # Physical FIFO may need the canonical public archive even when model
-    # inputs come from a separate, research-only feature table.
+    # Physical FIFO may need the canonical public archive when model inputs
+    # come from a separate research-only feature table.
     day_trade_physical_public_feature_path: str | None = None
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
     feature_zero_fill: list[str] = field(default_factory=list)
-    # Opt-in availability channels preserve the distinction between a real
-    # zero and a value that was never observed for this symbol/session.
+    # Opt-in availability flags distinguish observed zero from missing values.
     feature_availability_indicators: list[str] = field(default_factory=list)
     # Explicitly append the open[t]/close[t-1] execution-context feature.  It
     # is valid only for tw_day_trade and is never part of the default schema.
@@ -1714,6 +1713,13 @@ class TradingConfig:
     # positions remain flat, while only the resulting net cash difference
     # enters the T+2-close claim ledger; no settlement default is modeled.
     tw_day_trade_unlimited_margin_conversion: bool = False
+    # Research execution assumption for the physical FIFO minute account.
+    # The ordinary 09:01/13:20/13:24 path keeps its source-derived 50%
+    # capacity.  At the final 13:30 liquidation only, every remaining
+    # deliverable share is filled at the official close without a capacity
+    # ceiling.  This is an explicit semantic/checkpoint boundary, not an
+    # observed auction-liquidity claim.
+    tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
     tw_day_trade_margin_financing_ratio: float = 0.60
     tw_day_trade_margin_financing_annual_rate: float = 0.16
     tw_day_trade_margin_short_handling_fee_rate: float = 0.001
@@ -4528,6 +4534,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
+        if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires the exact "
+                "physical FIFO minute account"
+            )
+        if data["day_trade_minute_execution_root"] is None:
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires explicit "
+                "minute/daily-proxy physical sessions"
+            )
+        if data["day_trade_minute_execution_policy"] != (
+            DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+        ):
+            raise ValueError(
+                "unlimited terminal day-trade liquidation requires the "
+                "scheduled 50%-minute execution policy"
+            )
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(

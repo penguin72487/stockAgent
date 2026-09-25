@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.tw_day_trade_carry import _compact_detached_carry_state
 from stockagent.training.day_trade_carry_artifact import DayTradeCarryArtifactContext
 from stockagent.training.trainer import (
     _atomic_numpy_archive_save, _load_backtest_artifact, _save_backtest_artifact,
@@ -53,7 +54,12 @@ def test_canonical_roundtrip_retains_claims_fifo_and_exact_continuation(tmp_path
     for field in ("minute_nav", "strategy_returns", "weights_history", "shares_history"):
         np.testing.assert_array_equal(np.concatenate([getattr(loaded, field), getattr(tail, field)]),
             getattr(full, field))
-    assert_state(full.day_trade_carry_state, tail.day_trade_carry_state)
+    # A chunk boundary may discard already consumed FIFO rows.  The canonical
+    # active inventory and every cash claim must still match exactly.
+    assert_state(
+        _compact_detached_carry_state(full.day_trade_carry_state),
+        _compact_detached_carry_state(tail.day_trade_carry_state),
+    )
     context = replace(CONTEXT, initial_nav=loaded.day_trade_carry_state.last_nav.item())
     _save_backtest_artifact(tmp_path / "tail.npz", tail, dates(sessions[2:]), day_trade_carry_context=context)
     restored, _ = _load_backtest_artifact(tmp_path / "tail.npz", day_trade_carry_context=context)

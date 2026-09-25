@@ -151,6 +151,31 @@ def test_score_reallocation_preserves_learned_cash_contract() -> None:
         cross_asset_module._portfolio_weights_from_scores(model, scores, mask)
 
 
+def test_score_reallocation_preserves_fp32_score_entmax_cash_contract() -> None:
+    model = SimpleNamespace(
+        default_temperature=1.0,
+        portfolio_activation="pre_normalized",
+        portfolio_mode="long_short",
+        portfolio_output_mode="score_entmax_cash",
+        center_long_short_logits=False,
+        projection_l1_scale_by_active_count=False,
+    )
+    scores = torch.tensor([[3.0, -1.0, 2.0]], dtype=torch.bfloat16)
+    mask = torch.tensor([[True, True, False]])
+
+    actual = cross_asset_module._portfolio_weights_from_scores(model, scores, mask)
+    expected = cross_asset_module.masked_cash_entmax15_weights(
+        scores.masked_fill(~mask, 0.0),
+        mask,
+        short_mask=mask,
+        preserve_fp32_output=True,
+    )
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
+    assert float(actual.abs().sum()) < 1.0
+
+
 def _matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray]:
     frame = pl.read_csv(path)
     source_symbols = frame["source_symbol"].cast(pl.String).to_list()

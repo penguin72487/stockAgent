@@ -1,0 +1,111 @@
+# One-factor-at-a-time research suite for the original unsuffixed v8 run.
+# Train only fold 11 first; later rerun the same spec for folds 1-11 so the
+# canonical trainer validates and skips compatible completed fold-11 markers.
+# All variants keep the exact minute/FIFO ledger, 50% ordinary participation,
+# unbounded reduction-only 13:30 exit, TWD 10M, fees, source release, 99 PIT
+# inputs, loss, global batch 32, 1,000 epochs and 0.1 early-stop ratio.
+base_config: configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full.yaml
+output_root: artifacts/ablations/tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat
+expected_fold_count: 11
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  dimensions:
+    - name: cross_asset_bottleneck
+      enabled: true
+      variants:
+        - name: no_market_tokens
+          experiment_name: no_market_tokens
+          description: Keep latent factors and remove market tokens.
+          overrides:
+            training:
+              financial_transformer:
+                use_market_tokens: false
+        - name: no_latent_factors
+          experiment_name: no_latent_factors
+          description: Keep market tokens and remove latent factors.
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+        - name: no_cross_asset_bottleneck
+          experiment_name: no_cross_asset_bottleneck
+          description: Remove the complete cross-asset bottleneck as one subsystem.
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: false
+
+    - name: temporal_basis
+      enabled: true
+      path: training.financial_transformer.temporal_basis_families
+      values:
+        - name: disabled
+          experiment_name: no_temporal_basis
+          description: Remove the 22-family multi-basis decomposition.
+          value: []
+
+    - name: time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      values:
+        - name: disabled
+          experiment_name: no_time_position
+          value: false
+
+    - name: temporal_rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      values:
+        - name: disabled
+          experiment_name: no_temporal_rope
+          value: false
+
+    - name: qk_normalization
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      values:
+        - name: disabled
+          experiment_name: no_qk_norm
+          value: false
+
+    - name: feed_forward
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      values:
+        - name: gelu
+          experiment_name: gelu_ffn
+          value: gelu
+
+    - name: score_centering
+      enabled: true
+      path: training.financial_transformer.center_long_short_logits
+      values:
+        - name: enabled
+          experiment_name: center_long_short_scores
+          value: true
+
+    - name: output_rule
+      enabled: true
+      path: training.financial_transformer.portfolio_output_mode
+      values:
+        - name: learned_cash
+          experiment_name: learned_cash_output
+          description: Restore the contextual learned-cash output rule only.
+          value: learned_cash
+
+    - name: pretrained_initialization
+      enabled: true
+      path: training.pretrained_initialization_root
+      values:
+        - name: disabled
+          experiment_name: no_pretrained_initialization
+          description: Learn from random initialization under the same account and loss.
+          value: null

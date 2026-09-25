@@ -171,6 +171,7 @@ class PackedDayTradeCarrySession:
     source_gap_mask: torch.Tensor
     unresolved_action_gap_mask: torch.Tensor
     daily_proxy_mask: torch.Tensor
+    terminal_liquidation_price: torch.Tensor | None = None
 
     def validate(self) -> None:
         symbols = int(self.official_open.numel())
@@ -214,6 +215,11 @@ class PackedDayTradeCarrySession:
             )
         ):
             raise ValueError("invalid lossless packed day-trade transport")
+        if self.terminal_liquidation_price is not None and (
+            self.terminal_liquidation_price.shape != (symbols,)
+            or self.terminal_liquidation_price.dtype != torch.float64
+        ):
+            raise ValueError("invalid terminal liquidation price transport")
 
 
 @dataclass(frozen=True)
@@ -354,6 +360,19 @@ class PreparedDayTradeCarryBatch:
             packed[name] = torch.stack(
                 tuple(getattr(session, name) for session in sessions)
             )
+        terminal_prices = tuple(
+            session.terminal_liquidation_price for session in sessions
+        )
+        if any(value is None for value in terminal_prices) and not all(
+            value is None for value in terminal_prices
+        ):
+            raise ValueError(
+                "packed physical batch cannot mix terminal liquidation policies"
+            )
+        if all(isinstance(value, torch.Tensor) for value in terminal_prices):
+            packed["terminal_liquidation_price"] = torch.stack(
+                terminal_prices  # type: ignore[arg-type]
+            )
         for name, fill in (
             ("exit_flat", exit_size),
             ("exit_price", float("nan")),
@@ -395,9 +414,14 @@ class PreparedDayTradeCarryBatch:
                 device=device,
                 dtype=torch.float64,
             )
-            dense_capacity = torch.zeros_like(dense_prices)
             dense_prices.scatter_(1, flat, exit_values)
+            # The packed values are dead after their scatter.  Drop them
+            # before allocating the second dense FP64 plane so CUDA can reuse
+            # their blocks at the exact peak-allocation boundary.
+            del exit_values
+            dense_capacity = torch.zeros_like(dense_prices)
             dense_capacity.scatter_(1, flat, capacity_values)
+            del flat, capacity_values
             moved["exit_prices"] = dense_prices[:, :exit_size].reshape(
                 rows, symbols, 270, 2
             )

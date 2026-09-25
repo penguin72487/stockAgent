@@ -97,7 +97,10 @@ from stockagent.backtest.tw_day_trade_minute import (
 )
 from stockagent.backtest.tw_day_trade_carry import DayTradeCarryState
 from stockagent.training.day_trade_carry_bridge import (
-    PreparedDayTradeCarrySource, bind_physical_carry_loss, bind_physical_carry_backtest,
+    PreparedDayTradeCarrySource,
+    bind_physical_carry_backtest,
+    bind_physical_carry_loss,
+    prefetch_physical_carry_batches,
 )
 from stockagent.training.day_trade_carry_artifact import (
     DayTradeCarryArtifactContext,
@@ -1129,7 +1132,10 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
     output_mode = normalize_portfolio_output_mode(
         str(getattr(raw_model, "portfolio_output_mode", ""))
     )
-    if output_mode not in {"projection_l1", "learned_cash"}:
+    # score_entmax_cash multiplies its relative allocation by
+    # abs(score) / (1 + abs(score)); a zero final score is therefore exactly
+    # flat even when entmax assigns nonzero relative allocation.
+    if output_mode not in {"projection_l1", "learned_cash", "score_entmax_cash"}:
         raise RuntimeError(
             "pretrained exact-account stock fallback requires a proven "
             "zero-score output mode"
@@ -1161,15 +1167,20 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
         raise RuntimeError(
             "flat score-head fallback would be frozen and unable to learn"
         )
-    legacy_projection = output_mode == "projection_l1"
+    fallback_versions = {
+        "projection_l1": (1, "zero_score_head_final_linear_flat_projection_l1_v1"),
+        "learned_cash": (2, "zero_score_head_final_linear_flat_learned_cash_v2"),
+        "score_entmax_cash": (3, "zero_score_head_final_linear_flat_score_entmax_cash_v3"),
+    }
+    schema_version, method = fallback_versions[output_mode]
     return {
-        "schema_version": 1 if legacy_projection else 2,
-        "method": (
-            "zero_score_head_final_linear_flat_projection_l1_v1"
-            if legacy_projection
-            else "zero_score_head_final_linear_flat_learned_cash_v2"
+        "schema_version": schema_version,
+        "method": method,
+        **(
+            {}
+            if output_mode == "projection_l1"
+            else {"portfolio_output_mode": output_mode}
         ),
-        **({} if legacy_projection else {"portfolio_output_mode": output_mode}),
         "reset_parameter_names": reset_names,
         "reset_parameter_count": reset_parameter_count,
         "trainable_parameter_count": trainable_parameter_count,
@@ -1206,7 +1217,7 @@ def _temporary_pretrained_exact_account_flat_checkpoint(
                 "training_initialization_preserved": True,
                 "restore_scope": "complete_model_state_dict",
                 "reason": (
-                    "exact whole-share projection has a zero-action "
+                    "exact whole-share execution has a zero-action "
                     "zero-gradient dead zone"
                 ),
             }
@@ -3121,6 +3132,9 @@ def _mode_artifact_contract_for_config(
     if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
         return payload
     physical_fifo = bool(config.trading.tw_day_trade_unlimited_margin_conversion)
+    terminal_unlimited = bool(
+        config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+    )
     payload.update(
         {
             "frequency": "daily_policy_exact_minute_execution",
@@ -3135,7 +3149,9 @@ def _mode_artifact_contract_for_config(
                 else "cross_session_t_plus_2_net_claim_account"
             ),
             "terminal_policy": (
-                "marked_physical_margin_inventory_after_1330_or_absorbing_default"
+                "official_close_unlimited_capacity_liquidation_at_1330"
+                if terminal_unlimited
+                else "marked_physical_margin_inventory_after_1330_or_absorbing_default"
                 if physical_fifo
                 else "flat_after_1330_margin_conversion_with_t_plus_2_net_claim"
             ),
@@ -3156,7 +3172,16 @@ def _mode_artifact_contract_for_config(
                 ),
                 **(
                     {
-                        "residual_position_policy": "margin_inventory_fifo_carry",
+                        "residual_position_policy": (
+                            "terminal_official_close_full_liquidation"
+                            if terminal_unlimited
+                            else "margin_inventory_fifo_carry"
+                        ),
+                        "terminal_capacity_policy": (
+                            "unbounded_reduction_only"
+                            if terminal_unlimited
+                            else "source_minute_capacity"
+                        ),
                         "cash_claim_policy": "exact_dated_corporate_action_claims",
                         "legacy_tplus_cash_queue": "not_applicable",
                     }
@@ -12519,6 +12544,46 @@ def _auto_backtest_chunk_rows(
     return min(configured_cap, max(model_chunk_rows, bucket))
 
 
+_PHYSICAL_CARRY_MINUTE_SLOTS = 270
+_PHYSICAL_EVAL_VRAM_RESERVE_BYTES = 1536 * 1024**2
+
+
+def _physical_eval_chunk_rows(
+    *,
+    requested_rows: int,
+    num_symbols: int,
+    available_bytes: int,
+    reserve_bytes: int = _PHYSICAL_EVAL_VRAM_RESERVE_BYTES,
+) -> int:
+    """Cap dense physical replay to the largest affordable power of two.
+
+    Packed physical sessions reconstruct five float64 minute planes on CUDA:
+    one mark plane plus buy/sell price and capacity planes.  This is a strict
+    lower bound for the transient source staging allocation and is independent
+    of the model batch.  ``available_bytes`` includes CUDA free memory plus the
+    allocator's reusable inactive reservation; the fixed reserve protects the
+    executor state and allocations whose size is not described by those five
+    planes.
+    """
+
+    requested_rows = max(1, int(requested_rows))
+    num_symbols = max(1, int(num_symbols))
+    available_bytes = max(0, int(available_bytes))
+    reserve_bytes = max(0, int(reserve_bytes))
+    dense_bytes_per_row = (
+        num_symbols
+        * _PHYSICAL_CARRY_MINUTE_SLOTS
+        * 8
+        * 5
+    )
+    affordable_rows = max(
+        1,
+        (available_bytes - reserve_bytes) // max(1, dense_bytes_per_row),
+    )
+    logical_rows = max(1, min(requested_rows, int(affordable_rows)))
+    return 1 << (logical_rows.bit_length() - 1)
+
+
 def _split_valid_indices(
     panel: PanelData,
     date_indices: np.ndarray,
@@ -14917,8 +14982,6 @@ def _run_eval_backtest_from_weight_buffers(
         # buy/sell price/capacity planes.  Bound its peak independently of the
         # much lighter repeated-epoch two-mark evaluation.
         backtest_chunk_rows = min(backtest_chunk_rows, 128)
-    backtest_ranges = _eval_ranges_by_reset(total_rows, backtest_chunk_rows, reset_at_rows)
-    total_backtest_chunks = max(1, len(backtest_ranges))
     output_dtype = (torch.float64 if physical_source is not None
                     else torch.float32 if execution_mode != "naive" else weights_all.dtype)
     strategy_returns_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
@@ -14960,8 +15023,26 @@ def _run_eval_backtest_from_weight_buffers(
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
     commission_rebate_due_history_out: torch.Tensor | None = None
-    physical_minute_nav = (torch.empty((total_rows, 270), device=device, dtype=torch.float64)
-                           if physical_source is not None else None)
+    # Repeated epoch validation/test consumes daily return, turnover, default
+    # and terminal carry state; it never writes the formal 270-minute audit.
+    # Event compression still executes the identical dense first pass and uses
+    # an exact batch solvency certificate, retaining [minimum NAV, close NAV].
+    # Any inconclusive batch automatically replays the full authoritative path.
+    # Artifact callers request weights history and therefore keep all 270 marks.
+    compact_physical_eval = bool(
+        physical_source is not None
+        and not return_weights_history
+        and _env_truthy("STOCKAGENT_DAY_TRADE_EVENT_COMPRESSION", "1")
+    )
+    physical_minute_nav = (
+        torch.empty(
+            (total_rows, 2 if compact_physical_eval else 270),
+            device=device,
+            dtype=torch.float64,
+        )
+        if physical_source is not None
+        else None
+    )
     physical_shares = (torch.empty((total_rows, num_symbols), device=device, dtype=torch.float64)
                        if physical_source is not None else None)
     equity_scaled_execution = bool(
@@ -15069,6 +15150,49 @@ def _run_eval_backtest_from_weight_buffers(
                         device=device,
                         dtype=output_dtype,
                     )
+
+    if physical_source is not None and device.type == "cuda":
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            allocator_reusable_bytes = max(
+                0,
+                int(torch.cuda.memory_reserved(device))
+                - int(torch.cuda.memory_allocated(device)),
+            )
+            available_bytes = int(free_bytes) + allocator_reusable_bytes
+            requested_backtest_chunk_rows = backtest_chunk_rows
+            backtest_chunk_rows = _physical_eval_chunk_rows(
+                requested_rows=requested_backtest_chunk_rows,
+                num_symbols=num_symbols,
+                available_bytes=available_bytes,
+            )
+            if backtest_chunk_rows < requested_backtest_chunk_rows:
+                dense_bytes_per_row = (
+                    num_symbols
+                    * _PHYSICAL_CARRY_MINUTE_SLOTS
+                    * 8
+                    * 5
+                )
+                print(
+                    "[physical eval] VRAM-aware dense replay chunk "
+                    f"rows={backtest_chunk_rows} requested="
+                    f"{requested_backtest_chunk_rows} symbols={num_symbols} "
+                    f"available={available_bytes / 1024**3:.2f}GiB "
+                    f"minimum_staging="
+                    f"{backtest_chunk_rows * dense_bytes_per_row / 1024**3:.2f}GiB "
+                    f"reserve={_PHYSICAL_EVAL_VRAM_RESERVE_BYTES / 1024**3:.2f}GiB"
+                )
+        except (RuntimeError, TypeError, ValueError):
+            # Memory telemetry is an optimization hint.  Preserve the
+            # configured exact replay if the runtime cannot report it.
+            pass
+
+    backtest_ranges = _eval_ranges_by_reset(
+        total_rows,
+        backtest_chunk_rows,
+        reset_at_rows,
+    )
+    total_backtest_chunks = max(1, len(backtest_ranges))
 
     prev_weights: torch.Tensor | None = None
     prev_alive: torch.Tensor | None = None
@@ -15409,7 +15533,8 @@ def _run_eval_backtest_from_weight_buffers(
                 backtest_runner = (run_backtest_torch if physical_source is None
                     else bind_physical_carry_backtest(run_backtest_torch,
                         source=physical_source, split=physical_split, start=start, end=end,
-                        device=device, previous=physical_previous))
+                        device=device, previous=physical_previous,
+                        event_compression=compact_physical_eval))
                 backtest_chunk = backtest_runner(
                     weights_chunk,
                     returns_chunk,
@@ -19889,14 +20014,37 @@ def _train_epoch_windowed_tensor(
             f"batch_size={batch_size} batches={num_batches} objective={objective}"
         )
 
+    physical_prefetch = (
+        None
+        if physical_source is None
+        else iter(
+            prefetch_physical_carry_batches(
+                physical_source,
+                split,
+                batch_order,
+                batch_size,
+            )
+        )
+    )
+
     for step_idx, batch_idx in enumerate(batch_order, start=1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
+        prepared_physical_batch = None
+        if physical_prefetch is not None:
+            prefetched_batch_idx, prepared_physical_batch = next(
+                physical_prefetch
+            )
+            if int(prefetched_batch_idx) != int(batch_idx):
+                raise RuntimeError(
+                    "physical prefetch changed chronological batch order"
+                )
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=start, end=end,
-            device=device, previous=physical_previous))
+            device=device, previous=physical_previous,
+            prepared_batch=prepared_physical_batch))
         if progress_label:
             _progress(f"{progress_label}: batch {step_idx}/{num_batches} gather rows=[{start},{end})")
         _maybe_sync_cuda(device, profile_timing)
@@ -20252,10 +20400,22 @@ def _train_epoch_windowed_tensor(
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = physical_source is not None or optimizer_step_per_trajectory or _should_check_finite(
-            step_idx,
-            finite_check_interval_steps,
-            final_step=step_idx >= num_batches,
+        # The physical adapter already validates every batch loss and account
+        # state before backward.  With one optimizer step per trajectory there
+        # is no parameter mutation between truncated-BPTT batches, so rescanning
+        # every accumulated parameter gradient cannot change control flow.  The
+        # trajectory finalizer still performs the authoritative gradient scan,
+        # clip and parameter scan immediately before/after the only update.
+        should_check_finite = (
+            False
+            if physical_source is not None and optimizer_step_per_trajectory
+            else physical_source is not None
+            or optimizer_step_per_trajectory
+            or _should_check_finite(
+                step_idx,
+                finite_check_interval_steps,
+                final_step=step_idx >= num_batches,
+            )
         )
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -20760,15 +20920,38 @@ def _train_epoch_windowed_tensor_ddp(
         )
 
     prepare_device = _windowed_prepare_device(split, device)
+    physical_prefetch = (
+        None
+        if physical_source is None
+        else iter(
+            prefetch_physical_carry_batches(
+                physical_source,
+                split,
+                list(range(num_batches)),
+                int(batch_size),
+            )
+        )
+    )
     for step_idx in range(1, num_batches + 1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         global_start = (step_idx - 1) * int(batch_size)
         local_start = global_start + rank * local_batch_size
         local_end = local_start + local_batch_size
+        prepared_physical_batch = None
+        if physical_prefetch is not None:
+            prefetched_batch_idx, prepared_physical_batch = next(
+                physical_prefetch
+            )
+            if int(prefetched_batch_idx) != step_idx - 1:
+                raise RuntimeError(
+                    "physical DDP prefetch changed chronological batch order"
+                )
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=global_start,
-            end=global_start + int(batch_size), device=device, previous=physical_previous))
+            end=global_start + int(batch_size), device=device,
+            previous=physical_previous,
+            prepared_batch=prepared_physical_batch))
         if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} "
@@ -21085,10 +21268,16 @@ def _train_epoch_windowed_tensor_ddp(
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = physical_source is not None or optimizer_step_per_trajectory or _should_check_finite(
-            step_idx,
-            finite_check_interval_steps,
-            final_step=step_idx >= num_batches,
+        should_check_finite = (
+            False
+            if physical_source is not None and optimizer_step_per_trajectory
+            else physical_source is not None
+            or optimizer_step_per_trajectory
+            or _should_check_finite(
+                step_idx,
+                finite_check_interval_steps,
+                final_step=step_idx >= num_batches,
+            )
         )
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -27010,6 +27199,13 @@ def _run_training_impl(
                 )
             return fold_result
 
+        # Keep the last sampled evaluation handles explicit so their CUDA
+        # outputs can be released before the one-shot formal artifact replay.
+        val_backtest_epoch: BacktestResultTensor | None = None
+        test_backtest_epoch: BacktestResultTensor | None = None
+        deferred_val_loss_tensors: torch.Tensor | None = None
+        deferred_test_loss_tensors: torch.Tensor | None = None
+        train_loss_t: torch.Tensor | None = None
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             epoch_compile_before = _dynamo_compile_counter_snapshot()
@@ -27920,11 +28116,54 @@ def _run_training_impl(
             optimizer = None
             scaler = None
             scheduler = None
+            compiled_loss_fn = None
+            val_backtest_epoch = None
+            test_backtest_epoch = None
+            deferred_val_loss_tensors = None
+            deferred_test_loss_tensors = None
+            train_loss_t = None
             if device.type == "cuda":
                 _release_cuda_memory(device)
             final_artifact_sync.finish(None)
             final_postprocess_sync.finish(None)
             continue
+
+        # The checkpoint is durable and every remaining artifact calculation
+        # is inference-only.  Release rank-0 training state before allocating
+        # the dense [days, symbols, 270, side] physical replay tensors.  Keep
+        # ``model``/eval wrappers and ``train_windowed`` because the artifact
+        # loop still reloads best weights and reuses the shared panel base.
+        rank0_allocated_before_release = (
+            int(torch.cuda.memory_allocated(device))
+            if device.type == "cuda"
+            else 0
+        )
+        compiled_train_model = None
+        panel_slab_model = None
+        optimizer = None
+        scaler = None
+        scheduler = None
+        compiled_loss_fn = None
+        combined_val_windowed = None
+        combined_test_windowed = None
+        val_returns_device = None
+        val_masks_device = None
+        val_backtest_epoch = None
+        test_backtest_epoch = None
+        deferred_val_loss_tensors = None
+        deferred_test_loss_tensors = None
+        train_loss_t = None
+        if device.type == "cuda":
+            _release_cuda_memory(device)
+            rank0_allocated_after_release = int(
+                torch.cuda.memory_allocated(device)
+            )
+            print(
+                f"[Train {train_years}] released inference-dead rank0 CUDA "
+                f"state before formal artifacts: "
+                f"{max(0, rank0_allocated_before_release - rank0_allocated_after_release) / 1024**3:.2f}GiB; "
+                f"live={rank0_allocated_after_release / 1024**3:.2f}GiB"
+            )
 
         final_artifact_error: BaseException | None = None
         try:

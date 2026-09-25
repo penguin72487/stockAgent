@@ -1,0 +1,24 @@
+# Immutable reproduction config for the learned-cash v6 experiment.
+#
+# This preserves the historical capacity-limited 13:30 path: any residual is
+# converted into the physical margin/borrow FIFO account.  The active v7
+# config is a distinct terminal-liquidity assumption and must not resume this
+# optimizer trajectory.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v5.yaml
+
+experiment_name: tw-day-trade-last-last-only-layernorm-learned-cash-v6
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_learned_cash_22_effective_rank_v6
+  resume: true
+
+training:
+  early_stopping_no_improve_ratio: 0.1
+  transformer_base_portfolio:
+    portfolio_output_mode: learned_cash
+    center_long_short_logits: false
+  financial_transformer:
+    portfolio_output_mode: learned_cash
+    center_long_short_logits: false
+    temporal_pooling: last
+    temporal_query_mode: last_only
