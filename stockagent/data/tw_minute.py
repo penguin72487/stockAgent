@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -9,6 +9,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
+
+from stockagent.data.tw_listing_admission import regular_market_admission_mask
 
 
 MINUTE_SESSION_BARS = 270
@@ -685,10 +687,52 @@ class MinuteDatasetIndex:
     daily_feature_context: MinuteDailyFeatureContext | None = None
     daily_context_lookback: int = 1
     excluded_unusable_dates: tuple[str, ...] = ()
+    admission_normalizer_corrections: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=dict)
 
     @property
     def num_symbols(self) -> int:
         return len(self.symbols)
+
+    def _admission_normalizer_correction(
+        self, key: str, summary: dict[str, Any]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cached = self.admission_normalizer_corrections.get(key)
+        if cached is not None:
+            return cached
+        admitted = regular_market_admission_mask(self.symbols, key)
+        excluded = [
+            symbol
+            for symbol, allowed in zip(self.symbols, admitted, strict=True)
+            if not allowed
+        ]
+        zeros = np.zeros(len(MINUTE_FEATURE_COLUMNS), dtype=np.float64)
+        if not excluded:
+            correction = (zeros, zeros.copy(), zeros.copy())
+        else:
+            rows = (
+                pl.scan_parquet(_partition_path(self.root, summary))
+                .filter(
+                    pl.col("symbol").cast(pl.String).is_in(excluded)
+                    & pl.col("feature_valid").fill_null(False)
+                )
+                .select(MINUTE_FEATURE_COLUMNS)
+                .collect()
+            )
+            if rows.is_empty():
+                correction = (zeros, zeros.copy(), zeros.copy())
+            else:
+                values = rows.to_numpy().astype(np.float64)
+                if not np.isfinite(values).all():
+                    raise RuntimeError(
+                        f"excluded minute normalization rows are not finite: {key}"
+                    )
+                correction = (
+                    np.full(len(MINUTE_FEATURE_COLUMNS), values.shape[0], dtype=np.float64),
+                    values.sum(axis=0, dtype=np.float64),
+                    np.square(values).sum(axis=0, dtype=np.float64),
+                )
+        self.admission_normalizer_corrections[key] = correction
+        return correction
 
     def fit_normalizer(
         self, indices: Sequence[int] | np.ndarray
@@ -708,6 +752,14 @@ class MinuteDatasetIndex:
                 sum_squares[feature_index] += float(
                     summary["feature_sum_squares"][name]
                 )
+            # Schema-5 receipts summarize immutable source rows. Exclude only
+            # verified pre-listing moments, cached across walk-forward folds.
+            excluded_counts, excluded_sums, excluded_squares = (
+                self._admission_normalizer_correction(key, summary)
+            )
+            counts -= excluded_counts
+            sums -= excluded_sums
+            sum_squares -= excluded_squares
         if np.any(counts <= 1.0):
             missing = [
                 MINUTE_FEATURE_COLUMNS[index] for index in np.flatnonzero(counts <= 1.0)
@@ -807,6 +859,8 @@ class MinuteDatasetIndex:
         session_exit_mask = np.zeros(self.num_symbols, dtype=bool)
 
         valid_features = frame["feature_valid"].fill_null(False).to_numpy()
+        admitted_rows = regular_market_admission_mask(symbol_values, self.dates[int(index)])
+        valid_features &= admitted_rows
         raw_features = (
             frame.select(MINUTE_FEATURE_COLUMNS)
             .fill_null(0.0)
@@ -815,6 +869,7 @@ class MinuteDatasetIndex:
         )
         normalized = (raw_features - normalizer.mean) / normalizer.scale
         normalized[~np.isfinite(normalized)] = 0.0
+        normalized[~admitted_rows] = 0.0
         features[minute_indices, symbol_indices] = normalized
         feature_mask[minute_indices, symbol_indices] = valid_features
 
@@ -831,6 +886,7 @@ class MinuteDatasetIndex:
         )
         valid_execution = (
             raw_execution_mask
+            & admitted_rows
             & np.isfinite(opens)
             & np.isfinite(closes)
             & np.isfinite(volumes)
@@ -866,6 +922,30 @@ class MinuteDatasetIndex:
         session_close[session_indices] = session_values.astype(np.float32, copy=False)
         session_exit_mask[session_indices] = exit_values
         session_exit_mask &= np.isfinite(session_close) & (session_close > 0.0)
+        admitted_symbols = regular_market_admission_mask(self.symbols, self.dates[int(index)])
+        session_close[~admitted_symbols] = 0.0
+        session_exit_mask &= admitted_symbols
+        daily_context = (
+            None
+            if self.daily_feature_context is None
+            else self.daily_feature_context.for_minute_day(
+                int(index), lookback=int(self.daily_context_lookback)
+            )
+        )
+        if daily_context is not None and not bool(admitted_symbols.all()):
+            daily_context = daily_context.copy()
+            if daily_context.ndim == 2:
+                daily_context[~admitted_symbols] = 0.0
+            else:
+                daily_context[:, ~admitted_symbols] = 0.0
+        guidance_weights = (
+            None
+            if self.daily_feature_context is None
+            or self.daily_feature_context.daily_guidance is None
+            else self.daily_feature_context.daily_guidance.weights[int(index)]
+        )
+        if guidance_weights is not None and not bool(admitted_symbols.all()):
+            guidance_weights = np.where(admitted_symbols, guidance_weights, 0.0)
         return MinuteDayPanel(
             trade_date=self.dates[int(index)],
             features=features,
@@ -879,26 +959,15 @@ class MinuteDatasetIndex:
             short_open_mask=(
                 None
                 if self.short_open_mask is None
-                else self.short_open_mask[int(index)]
+                else self.short_open_mask[int(index)] & admitted_symbols
             ),
             short_capacity_shares=(
                 None
                 if self.short_capacity_shares is None
-                else self.short_capacity_shares[int(index)]
+                else np.where(admitted_symbols, self.short_capacity_shares[int(index)], 0.0)
             ),
-            daily_context_features=(
-                None
-                if self.daily_feature_context is None
-                else self.daily_feature_context.for_minute_day(
-                    int(index), lookback=int(self.daily_context_lookback)
-                )
-            ),
-            daily_guidance_weights=(
-                None
-                if self.daily_feature_context is None
-                or self.daily_feature_context.daily_guidance is None
-                else self.daily_feature_context.daily_guidance.weights[int(index)]
-            ),
+            daily_context_features=daily_context,
+            daily_guidance_weights=guidance_weights,
             benchmark_log_return=(
                 float("nan")
                 if self.daily_feature_context is None

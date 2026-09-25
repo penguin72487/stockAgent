@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import stockagent.data_sync.artifact_retirement as retirement
+import stockagent.data_sync.cold_primary as cold_primary
 from stockagent.data_sync.cold_artifacts import ColdArtifactSpec
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.live_artifacts import reconcile_artifacts
@@ -56,11 +57,11 @@ def _fixture(tmp_path: Path, monkeypatch):
     backup = tmp_path / "backup"
     shutil.copytree(sync_root, backup)
     monkeypatch.setattr(
-        retirement.BackupConfig,
+        cold_primary.BackupConfig,
         "load",
         lambda path: SimpleNamespace(source=sync_root, destination=backup),
     )
-    monkeypatch.setattr(retirement.VolumeGuard, "check", lambda self: None)
+    monkeypatch.setattr(cold_primary.VolumeGuard, "check", lambda self: None)
     monkeypatch.setattr(retirement, "artifact_process_references", lambda *args: [])
     monkeypatch.setattr(retirement, "process_references", lambda *args: [])
     options = {
@@ -98,6 +99,26 @@ def test_retirement_enrolls_before_seven_day_deletion(tmp_path: Path, monkeypatc
         spec, **{**options, "now_ns": start + 6 * 86_400 * 1_000_000_000}
     )
     assert "seven-day-use-lease-active" in later["blockers"]
+
+
+def test_retirement_accepts_verified_single_d_primary_without_backup_claim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spec, _resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    cold_primary_marker = options["sync_root"] / cold_primary.D_PRIMARY_MARKER
+    cold_primary_marker.write_text(json.dumps({
+        "schema_version": 1,
+        "volume_id": cold_primary.D_PRIMARY_VOLUME_ID,
+        "backing": cold_primary.D_PRIMARY_BACKING,
+        "authority_node_id": "penguin",
+        "resilience": "single_d_volume",
+    }))
+    monkeypatch.setattr(cold_primary, "_check_d_primary_mount", lambda root: None)
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    assert plan["cold_primary_verified"] is True
+    assert plan["backup_verified"] is False
+    assert plan["resilience"] == "single_d_volume"
+    assert source.exists() and hot_tree.exists()
 
 
 def test_retirement_removes_both_hot_names_and_rehydrates_on_use(

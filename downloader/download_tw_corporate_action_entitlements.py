@@ -939,7 +939,10 @@ def parse_mops_bulk_dividends(
 
     if _mops_throttle_response(content):
         raise ValueError(f"MOPS bulk dividend response was throttled for {key}")
-    soup = BeautifulSoup(content, "html.parser")
+    # MOPS returns UTF-8 here without a reliable charset. Passing bytes to
+    # BeautifulSoup can misidentify large TPEX tables and corrupt Chinese
+    # headers. Decode strictly: malformed responses must still fail closed.
+    soup = BeautifulSoup(content.decode("utf-8", errors="strict"), "html.parser")
     selected_table = None
     for table in soup.select("table"):
         header = " ".join(table.get_text(" ", strip=True).split())
@@ -1599,13 +1602,31 @@ def _fetch_stock_delivery_detail(
     return parse_mops_stock_delivery_detail(content, key=key)
 
 
+def _print_stock_delivery_progress(
+    stage: str,
+    completed: int,
+    total: int,
+    failures: int,
+    elapsed_seconds: float,
+) -> None:
+    rate = completed / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    remaining_seconds = (total - completed) / rate if rate > 0 else None
+    eta = f"{remaining_seconds:.1f}s" if remaining_seconds is not None else "unknown"
+    print(
+        f"[corporate-action] stock delivery {stage} {completed}/{total} "
+        f"failures={failures} elapsed={elapsed_seconds:.1f}s "
+        f"rate={rate:.2f}/s eta={eta}",
+        flush=True,
+    )
+
+
 def _attach_exact_stock_delivery_dates(
     rows: list[dict[str, Any]],
     *,
     raw_root: Path,
     args: argparse.Namespace,
     workers: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, int], bool]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, int | float], bool]:
     """Bind bulk stock ratios to an independent issuer delivery disclosure."""
     candidates = [
         row
@@ -1625,6 +1646,8 @@ def _attach_exact_stock_delivery_dates(
             "parsed_stock_delivery_details": 0,
             "resolved_stock_delivery_events": 0,
             "unresolved_stock_delivery_events": 0,
+            "stock_delivery_listing_elapsed_seconds": 0.0,
+            "stock_delivery_detail_elapsed_seconds": 0.0,
         }, False
 
     listing_keys = sorted(
@@ -1644,6 +1667,9 @@ def _attach_exact_stock_delivery_dates(
         listing_keys = listing_keys[: int(args.max_list_requests)]
     failures: list[dict[str, str]] = []
     detail_keys: list[StockDeliveryDetailKey] = []
+    listing_failures = 0
+    listing_started = time.monotonic()
+    print(f"[corporate-action] stock delivery listings 0/{len(listing_keys)}", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
@@ -1654,11 +1680,12 @@ def _attach_exact_stock_delivery_dates(
             ): key
             for key in listing_keys
         }
-        for future in as_completed(futures):
+        for index, future in enumerate(as_completed(futures), start=1):
             key = futures[future]
             try:
                 detail_keys.extend(future.result())
             except Exception as exc:
+                listing_failures += 1
                 failures.append(
                     {
                         "stage": "stock_delivery_listing",
@@ -1666,6 +1693,13 @@ def _attach_exact_stock_delivery_dates(
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
+            if index == 1 or index % 500 == 0 or index == len(futures):
+                _print_stock_delivery_progress(
+                    "listings", index, len(futures),
+                    listing_failures,
+                    time.monotonic() - listing_started,
+                )
+    listing_elapsed = time.monotonic() - listing_started
     detail_keys = sorted(
         set(detail_keys),
         key=lambda value: (
@@ -1682,6 +1716,9 @@ def _attach_exact_stock_delivery_dates(
         else detail_keys
     )
     detail_rows: list[dict[str, Any]] = []
+    detail_failures = 0
+    detail_started = time.monotonic()
+    print(f"[corporate-action] stock delivery details 0/{len(selected_detail_keys)}", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
@@ -1689,11 +1726,12 @@ def _attach_exact_stock_delivery_dates(
             ): key
             for key in selected_detail_keys
         }
-        for future in as_completed(futures):
+        for index, future in enumerate(as_completed(futures), start=1):
             key = futures[future]
             try:
                 detail_rows.append(future.result())
             except Exception as exc:
+                detail_failures += 1
                 failures.append(
                     {
                         "stage": "stock_delivery_detail",
@@ -1701,6 +1739,13 @@ def _attach_exact_stock_delivery_dates(
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
+            if index == 1 or index % 500 == 0 or index == len(futures):
+                _print_stock_delivery_progress(
+                    "details", index, len(futures),
+                    detail_failures,
+                    time.monotonic() - detail_started,
+                )
+    detail_elapsed = time.monotonic() - detail_started
 
     by_symbol: dict[str, list[dict[str, Any]]] = {}
     for detail in detail_rows:
@@ -1737,6 +1782,8 @@ def _attach_exact_stock_delivery_dates(
         "parsed_stock_delivery_details": len(detail_rows),
         "resolved_stock_delivery_events": resolved,
         "unresolved_stock_delivery_events": len(candidates) - resolved,
+        "stock_delivery_listing_elapsed_seconds": round(listing_elapsed, 3),
+        "stock_delivery_detail_elapsed_seconds": round(detail_elapsed, 3),
     }, bool(detail_limited or listing_limited)
 
 

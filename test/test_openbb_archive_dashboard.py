@@ -184,6 +184,8 @@ def test_openbb_page_uses_actionable_backlog_without_double_counting_unavailable
     assert 'let range = "1d"' in javascript
     assert 'data-range="1d" class="active" aria-pressed="true"' in html
     assert "archive.repair_queue_tasks" in javascript
+    assert 'waiting: "等待上游"' in javascript
+    assert '"waiting", "starting"' in javascript
 
 
 def test_public_status_fails_closed_when_incomplete_processes_are_dead(
@@ -196,6 +198,71 @@ def test_public_status_fails_closed_when_incomplete_processes_are_dead(
     public = dashboard.build_openbb_public_status(tmp_path, now=now)
     assert public["health"] == "stopped"
     assert public["snapshot_state"] == "current"
+
+
+def test_public_status_prefers_newest_phase_and_exposes_live_cooldown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 15, 4, 0, tzinfo=UTC)
+    state = tmp_path / "data_openBB" / "_state"
+    _write_json(state / "monitor_latest.json", _snapshot(now))
+    _write_json(
+        state / "downloader_phase.json",
+        {"updated_at": (now - timedelta(seconds=20)).isoformat(), "phase": "download"},
+    )
+    wait_until = now + timedelta(hours=3)
+    _write_json(
+        state / "provider_scheduler.json",
+        {
+            "updated_at": (now - timedelta(seconds=5)).isoformat(),
+            "phase": "waiting",
+            "wait_reason": "provider_cooldown",
+            "wait_until": wait_until.isoformat(),
+        },
+    )
+    monkeypatch.setattr(dashboard, "_pid_alive", lambda *_args: True)
+
+    waiting = dashboard.build_openbb_public_status(tmp_path, now=now)
+    assert waiting["health"] == "waiting"
+    assert waiting["process"]["phase"] == "waiting"
+    assert waiting["process"]["wait_reason"] == "provider_cooldown"
+    assert waiting["process"]["wait_until"] == wait_until.isoformat()
+
+    _write_json(
+        state / "downloader_phase.json",
+        {"updated_at": (now - timedelta(seconds=1)).isoformat(), "phase": "download"},
+    )
+    resumed = dashboard.build_openbb_public_status(tmp_path, now=now)
+    assert resumed["health"] == "active"
+    assert resumed["process"]["phase"] == "download"
+    assert resumed["process"]["wait_reason"] is None
+    assert resumed["process"]["wait_until"] is None
+
+
+def test_public_status_ignores_stale_scheduler_cooldown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 15, 4, 0, tzinfo=UTC)
+    state = tmp_path / "data_openBB" / "_state"
+    _write_json(state / "monitor_latest.json", _snapshot(now))
+    _write_json(
+        state / "provider_scheduler.json",
+        {
+            "updated_at": (now - timedelta(minutes=11)).isoformat(),
+            "phase": "waiting",
+            "wait_reason": "provider_cooldown",
+        },
+    )
+    _write_json(
+        state / "downloader_phase.json",
+        {"updated_at": (now - timedelta(minutes=2)).isoformat(), "phase": "download"},
+    )
+    monkeypatch.setattr(dashboard, "_pid_alive", lambda *_args: True)
+
+    public = dashboard.build_openbb_public_status(tmp_path, now=now)
+    assert public["health"] == "active"
+    assert public["process"]["phase"] == "download"
+    assert public["process"]["wait_reason"] is None
 
 
 def test_compact_history_projection_and_range_filter(tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ from stockagent.data_sync.cold_artifacts import (
     ColdArtifactSpec,
     rebuild_cold_ignore,
 )
+from stockagent.data_sync.cold_primary import verify_cold_resilience
 from stockagent.data_sync.desync_snapshots import (
     SnapshotError,
     _exclusive_lock,
@@ -34,7 +35,6 @@ from stockagent.data_sync.desync_snapshots import (
     sha256_file,
 )
 from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
-from stockagent.data_sync.packed_backup import BackupConfig, VolumeGuard
 from stockagent.data_sync.packed_snapshots import (
     _load_inventory,
     resolve_latest_packed,
@@ -198,16 +198,7 @@ def plan_artifact_retirement(
     inventory = _load_inventory(sync_root, resolved.manifest)
     mirror = _hot_mirror(source, hot_tree, inventory)
 
-    cfg = BackupConfig.load(backup_config)
-    if cfg.source.resolve() != sync_root.resolve():
-        raise SnapshotError("backup configuration source differs from the packed root")
-    VolumeGuard(cfg).check()
-    backup = resolve_packed_snapshot_id(
-        cfg.destination, spec.dataset, str(resolved.manifest["snapshot_id"])
-    )
-    if backup.manifest_sha256 != resolved.manifest_sha256:
-        raise SnapshotError("independent backup manifest differs from current cold release")
-    verify_packed_snapshot(cfg.destination, backup)
+    cold_proof = verify_cold_resilience(sync_root, resolved, backup_config)
 
     state = _read_state(_state_path(state_root, spec.dataset))
     if state is not None and (
@@ -280,7 +271,7 @@ def plan_artifact_retirement(
         "hot_mirror": mirror,
         "lease_expires_at": _utc_iso_from_ns(expiry_ns),
         "process_references": references,
-        "backup_verified": True,
+        **cold_proof,
         "peer_proof": dict(peer_proof),
         "blockers": blockers,
         "apply_ready": not blockers,

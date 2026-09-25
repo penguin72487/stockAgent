@@ -61,6 +61,42 @@ def test_live_panel_workers_are_bounded_by_host_capacity(
     assert _live_panel_load_workers(0) == 0
 
 
+def test_idle_live_cuda_cache_release_is_noop_when_no_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleared: list[bool] = []
+    monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", {})
+    monkeypatch.setattr(
+        signal_engine,
+        "clear_live_inference_memory_cache",
+        lambda: cleared.append(True),
+    )
+    assert signal_engine.release_idle_live_cuda_cache() is False
+    assert cleared == []
+
+
+def test_idle_live_cuda_cache_release_returns_allocator_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = {"model": object()}
+    events: list[str] = []
+    monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", models)
+
+    def clear() -> None:
+        models.clear()
+        events.append("clear")
+
+    monkeypatch.setattr(signal_engine, "clear_live_inference_memory_cache", clear)
+    monkeypatch.setattr(signal_engine.torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        signal_engine.torch.cuda,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    assert signal_engine.release_idle_live_cuda_cache() is True
+    assert events == ["clear", "empty_cache"]
+
+
 def test_live_panel_worker_override_is_a_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

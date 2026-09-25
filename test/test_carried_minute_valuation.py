@@ -6,7 +6,10 @@ import json
 import pytest
 import polars as pl
 
-from scripts.rebuild_tw_day_trade_minute_curves import rebuild_carried_strategy_marks
+from scripts.rebuild_tw_day_trade_minute_curves import (
+    _replay_opening_valuation_prices,
+    rebuild_carried_strategy_marks,
+)
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
 
 
@@ -62,6 +65,48 @@ def test_carried_revaluation_preserves_fills_basis_cash_interest_and_endpoints()
         assert actual["total_equity_twd"] == endpoint["total_equity_twd"]
 
 
+def test_carried_revaluation_counts_disclosed_entry_completion_as_inventory():
+    day = "2026-08-13"
+    position = dict(position_id="p", symbol="2330", side="long", entry_price=100.,
+                    buy_fee_rate=0., sell_fee_rate=0., cash_buy_fee_rate=0.,
+                    cash_sell_fee_rate=0., margin_carry_contract=MARGIN_CARRY_CONTRACT)
+    fills = [
+        dict(position_id="p", market="a", symbol="2330", purpose=purpose,
+             quantity=1000, fill_at=day + "T09:01:00+08:00",
+             recorded_at=recorded_at, session_date=day, price=100., fee_and_tax_twd=0.)
+        for purpose, recorded_at in (
+            ("entry", day + "T09:01:00+08:00"),
+            ("entry_completion", day + "T11:30:00+08:00"),
+        )
+    ]
+    rows = [dict(market="a", minute=f"{day}T{clock}+08:00", session_date=day,
+                 initial_capital_twd=100000., cumulative_realized_net_pnl_twd=0.,
+                 open_net_liquidation_pnl_twd=0., total_equity_twd=100000.,
+                 cumulative_corporate_action_net_twd=0., cumulative_carry_cost_twd=0.,
+                 margin_carry_contract=MARGIN_CARRY_CONTRACT, open_position_count=1)
+            for clock in ("09:01", "13:30")]
+
+    class Store:
+        def prices(self, symbol, session_date):
+            assert (symbol, session_date) == ("2330", day)
+            start = datetime.fromisoformat(day + "T09:01:00+08:00")
+            return {(start + timedelta(minutes=i)).isoformat(timespec="minutes"): 100.
+                    for i in range(270)}
+
+    state = {"modes": {"a": dict(initial_capital_twd=100000.,
+                                  margin_carry_contract=MARGIN_CARRY_CONTRACT,
+                                  share_replacement_ledger=[], corporate_action_ledger=[],
+                                  carry_cost_ledger=[])}}
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, {day: {"a": [position]}}, Store(), state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 13),
+    )
+    assert len(rebuilt) == 270
+    assert all(row["total_equity_twd"] == pytest.approx(100000.) for row in rebuilt)
+    assert all(row["open_position_count"] == 1 for row in rebuilt)
+    assert stats["differing_original_equity_points"] == 0
+
+
 def test_new_paper_entry_does_not_reprice_older_cohort_without_a_minute_trade():
     days = ["2026-08-13", "2026-08-14"]
     base = dict(symbol="2330", side="long", buy_fee_rate=0., sell_fee_rate=0.,
@@ -109,6 +154,220 @@ def test_new_paper_entry_does_not_reprice_older_cohort_without_a_minute_trade():
     assert by_minute[days[1]+"T09:44+08:00"]["total_equity_twd"] == pytest.approx(100040.)
     assert by_minute[days[1]+"T09:45+08:00"]["total_equity_twd"] == pytest.approx(100100.)
     assert stats["differing_original_equity_points"] == 0
+
+
+def test_registered_0901_fill_is_carried_until_the_next_positive_volume_minute():
+    day = "2026-09-24"
+    position = dict(
+        position_id="p",
+        symbol="2330",
+        side="long",
+        entry_price=100.0,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        cash_buy_fee_rate=0.0,
+        cash_sell_fee_rate=0.0,
+        margin_carry_contract=MARGIN_CARRY_CONTRACT,
+    )
+    fills = [
+        dict(
+            position_id="p",
+            market="a",
+            symbol="2330",
+            purpose="entry",
+            quantity=1_000,
+            fill_at=day + "T09:01:00+08:00",
+            recorded_at=day + "T09:01:00+08:00",
+            session_date=day,
+            price=100.0,
+            fee_and_tax_twd=0.0,
+        )
+    ]
+    common = dict(
+        market="a",
+        session_date=day,
+        initial_capital_twd=100_000.0,
+        cumulative_realized_net_pnl_twd=0.0,
+        cumulative_corporate_action_net_twd=0.0,
+        cumulative_carry_cost_twd=0.0,
+        margin_carry_contract=MARGIN_CARRY_CONTRACT,
+        open_position_count=1,
+    )
+    rows = [
+        {
+            **common,
+            "minute": f"{day}T{clock}+08:00",
+            "open_net_liquidation_pnl_twd": pnl,
+            "total_equity_twd": 100_000.0 + pnl,
+        }
+        for clock, pnl in (
+            ("09:01", 0.0),
+            ("09:02", 0.0),
+            ("09:03", 20_000.0),
+            ("13:30", 20_000.0),
+        )
+    ]
+
+    class Store:
+        def prices(self, symbol, session_date):
+            assert (symbol, session_date) == ("2330", day)
+            # 09:01 Close differs from the registered VWAP fill. With no 09:02
+            # trade, the engine carries 100 until the 09:03 print arrives.
+            return {
+                day + "T09:01+08:00": 110.0,
+                day + "T09:03+08:00": 120.0,
+            }
+
+    state = {
+        "modes": {
+            "a": dict(
+                initial_capital_twd=100_000.0,
+                margin_carry_contract=MARGIN_CARRY_CONTRACT,
+                share_replacement_ledger=[],
+                corporate_action_ledger=[],
+                carry_cost_ledger=[],
+            )
+        }
+    }
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows,
+        {day: {"a": [position]}},
+        Store(),
+        state=state,
+        fill_rows=fills,
+        start=date(2026, 9, 24),
+        end=date(2026, 9, 24),
+    )
+    by_minute = {row["minute"]: row for row in rebuilt}
+    assert by_minute[day + "T09:02+08:00"]["total_equity_twd"] == 100_000.0
+    assert by_minute[day + "T09:03+08:00"]["total_equity_twd"] == 120_000.0
+    assert stats["differing_original_equity_points"] == 0
+
+
+def test_retained_0901_valuation_reprices_inventory_before_later_print():
+    day = "2026-09-24"
+    position = dict(
+        position_id="p",
+        symbol="2330",
+        side="long",
+        entry_price=100.0,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        cash_buy_fee_rate=0.0,
+        cash_sell_fee_rate=0.0,
+        margin_carry_contract=MARGIN_CARRY_CONTRACT,
+    )
+    fills = [
+        dict(
+            position_id="p",
+            market="a",
+            symbol="2330",
+            purpose="entry",
+            quantity=1_000,
+            fill_at=day + "T09:01:00+08:00",
+            recorded_at=day + "T09:01:00+08:00",
+            session_date=day,
+            price=100.0,
+            fee_and_tax_twd=0.0,
+        )
+    ]
+    rows = [
+        dict(
+            market="a",
+            minute=f"{day}T{clock}+08:00",
+            session_date=day,
+            initial_capital_twd=100_000.0,
+            cumulative_realized_net_pnl_twd=0.0,
+            open_net_liquidation_pnl_twd=pnl,
+            total_equity_twd=100_000.0 + pnl,
+            cumulative_corporate_action_net_twd=0.0,
+            cumulative_carry_cost_twd=0.0,
+            margin_carry_contract=MARGIN_CARRY_CONTRACT,
+            open_position_count=1,
+        )
+        for clock, pnl in (
+            ("09:01", 10_000.0),
+            ("09:02", 10_000.0),
+            ("09:03", 20_000.0),
+            ("13:30", 20_000.0),
+        )
+    ]
+
+    class Store:
+        def prices(self, symbol, session_date):
+            assert (symbol, session_date) == ("2330", day)
+            return {
+                day + "T09:01+08:00": 999.0,
+                day + "T09:03+08:00": 120.0,
+            }
+
+    state = {
+        "modes": {
+            "a": dict(
+                initial_capital_twd=100_000.0,
+                margin_carry_contract=MARGIN_CARRY_CONTRACT,
+                share_replacement_ledger=[],
+                corporate_action_ledger=[],
+                carry_cost_ledger=[],
+            )
+        }
+    }
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows,
+        {day: {"a": [position]}},
+        Store(),
+        state=state,
+        fill_rows=fills,
+        start=date(2026, 9, 24),
+        end=date(2026, 9, 24),
+        opening_valuation_prices={day: {"2330": 110.0}},
+    )
+    by_minute = {row["minute"]: row for row in rebuilt}
+    assert by_minute[day + "T09:02+08:00"]["total_equity_twd"] == 110_000.0
+    assert by_minute[day + "T09:03+08:00"]["total_equity_twd"] == 120_000.0
+    assert stats["differing_original_equity_points"] == 0
+
+
+def test_opening_valuation_prices_require_exact_replay_entry_book(tmp_path):
+    day = "2026-09-24"
+    book = tmp_path / "replay_entry_books" / f"{day}.parquet"
+    book.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330", "2317"],
+            "valuation_price_0901": [101.0, None],
+        }
+    ).write_parquet(book)
+    digest = hashlib.sha256(book.read_bytes()).hexdigest()
+    (tmp_path / "rebuild_receipt.json").write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "session_date": day,
+                        "historical_entry_books": {
+                            "path": str(book.resolve()),
+                            "sha256": digest,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    assert _replay_opening_valuation_prices(
+        tmp_path,
+        start=date(2026, 9, 24),
+        end=date(2026, 9, 24),
+    ) == {day: {"2330": 101.0}}
+
+    book.write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="entry book changed"):
+        _replay_opening_valuation_prices(
+            tmp_path,
+            start=date(2026, 9, 24),
+            end=date(2026, 9, 24),
+        )
 
 
 def test_carried_revaluation_rejects_a_changed_endpoint_or_impossible_exit():

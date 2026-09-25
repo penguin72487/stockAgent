@@ -50,6 +50,29 @@ def test_benchmark_history_timestamp_only_rebuild_is_a_noop(tmp_path: Path) -> N
     assert destination.stat().st_mtime_ns == before.st_mtime_ns
 
 
+def test_benchmark_history_ignores_unrelated_live_state_hash_only(tmp_path: Path) -> None:
+    destination = tmp_path / "benchmark_history.json"
+    original = {
+        "created_at": "first",
+        "provenance": {"state_sha256": "old-state", "stock_files": {"0050": "source"}},
+        "marks": [{"last_mark_price": 61.2}],
+    }
+    assert benchmark_replay._write_json_if_semantically_changed(destination, original)
+    before = destination.read_bytes()
+    unchanged = {
+        **original,
+        "created_at": "second",
+        "provenance": {**original["provenance"], "state_sha256": "new-state"},
+    }
+    assert not benchmark_replay._write_json_if_semantically_changed(destination, unchanged)
+    assert destination.read_bytes() == before
+    changed_input = {
+        **unchanged,
+        "provenance": {**unchanged["provenance"], "stock_files": {"0050": "new-source"}},
+    }
+    assert benchmark_replay._write_json_if_semantically_changed(destination, changed_input)
+
+
 def test_benchmark_history_real_change_is_published(tmp_path: Path) -> None:
     destination = tmp_path / "benchmark_history.json"
     first = {"created_at": "first", "marks": [{"last_mark_price": 61.2}]}
@@ -69,6 +92,63 @@ def test_replay_checks_receipt_backed_repair_kbars_before_bulk_minute_data() -> 
         "artifacts/data_repair/tw_day_trade_minute_curve/kbars"
     )
     assert roots.index(Path("data_tw_minute/shioaji_1m")) > 1
+
+
+def test_known_delisting_forces_zero_only_from_causal_official_notice(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "tw_delisting_short_sale_announcements.parquet"
+    pl.DataFrame(
+        {
+            "announcement_date": ["2026-03-30", "2026-05-08", "2026-03-30"],
+            "symbols": ["00883B", "00999B", "00777B"],
+            "delisting_date": ["2026-05-07", "2026-05-07", "2026-05-07"],
+            "delisting_cancelled": [False, False, True],
+            "technical_share_replacement": [False, False, False],
+            "emerging_to_listed_transition": [False, False, False],
+            "short_cover_deadline": ["2026-04-22", None, None],
+            "market": ["tpex", "tpex", "tpex"],
+            "document_number": ["official-1", "late", "cancelled"],
+            "source_url": ["https://example.test/1", None, None],
+        }
+    ).write_parquet(source)
+    action_dir = tmp_path / "execution_actions"
+    action_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": [date(2026, 5, 7)],
+            "symbol": ["7584"],
+            "market": ["tpex"],
+            "announcement_date": [date(2026, 5, 5)],
+            "handling": ["avoid"],
+            "handling_reason": ["stock_or_subscription_action"],
+            "mops_source_url": ["https://example.test/action"],
+            "source_url": [None],
+        }
+    ).write_parquet(action_dir / "tw_corporate_action_entitlements.parquet")
+    sessions = {date(2026, 5, 5), date(2026, 5, 6), date(2026, 5, 7)}
+
+    lifecycle, provenance = replay._known_delisting_last_session_liquidations(
+        tmp_path,
+        official_sessions=sessions,
+    )
+    assert set(lifecycle[date(2026, 5, 6)]) == {"00883B", "7584"}
+    assert set(lifecycle[date(2026, 5, 5)]) == {"7584"}
+    assert lifecycle[date(2026, 5, 5)]["7584"]["source_kind"] == (
+        "official_noncash_corporate_action"
+    )
+    assert provenance["avoided_noncash_entitlements"] == 1
+    assert provenance["sha256"]
+
+    rows, applied = replay._apply_lifecycle_zero_targets(
+        [{"symbol": "00883B", "target_weight": 0.2},
+         {"symbol": "2330", "target_weight": -0.1}],
+        lifecycle[date(2026, 5, 6)],
+    )
+    assert rows[0]["target_weight"] == 0.0
+    assert rows[1]["target_weight"] == -0.1
+    assert applied[0]["model_target_weight"] == 0.2
+    assert applied[0]["announcement_date"] == "2026-03-30"
 
 
 def _complete_0901_query_receipt(*, resolved: int, requested: int) -> dict:
@@ -296,6 +376,23 @@ def test_executor_runtime_status_reports_registered_entries_not_waiting() -> Non
     assert "open positions=1" in status
     assert "waiting" not in status
 
+    closed = live_runner._executor_runtime_status(
+        Engine(),
+        specs,
+        datetime(2026, 9, 25, 9, 10, tzinfo=TAIPEI),
+        session_errors={"mode_a": "official TWSE schedule as-of 2026-09-16: 中秋節"},
+    )
+    assert "verified closed session" in closed
+    assert "carried paper positions=1" in closed
+    assert "today entries registered" not in closed
+    unknown = live_runner._executor_runtime_status(
+        Engine(),
+        specs,
+        datetime(2026, 9, 25, 9, 10, tzinfo=TAIPEI),
+        session_errors={"mode_a": "official TWSE holiday schedule is missing"},
+    )
+    assert "session gate not verified" in unknown
+
 
 def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:
     source = tmp_path / "source" / "benchmark_history.json"
@@ -337,6 +434,137 @@ def test_missing_retained_book_is_explicit_only_when_fallback_is_authorized(
     assert receipt["source_missing"] is True
     assert receipt["fallback_authorized"] is True
     assert receipt["additional_shioaji_requests"] == 0
+
+
+def test_new_completed_session_can_rebuild_a_missing_retained_book_locally() -> None:
+    assert replay._may_rebuild_missing_retained_book_locally(
+        minute_price_at_0901=True,
+        allow_adverse_tick_fallback=False,
+        paper_market_at_best=False,
+    )
+    assert not replay._may_rebuild_missing_retained_book_locally(
+        minute_price_at_0901=False,
+        allow_adverse_tick_fallback=False,
+        paper_market_at_best=False,
+    )
+
+
+def test_retained_missed_opening_price_receipt_replays_without_broker_query(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 9, 22)
+    (tmp_path / f"{day.isoformat()}.json").write_text(
+        json.dumps({
+            "schema_version": 2,
+            "session_date": day.isoformat(),
+            "simulation_only": True,
+            "production_order_possible": False,
+            "execution_price_contract": (
+                "source_backed_right_labelled_09_01_minute_price_vwap_else_kbar_close"
+            ),
+            "query_receipt": {
+                "attempted_symbols": ["2330", "0050", "2317"],
+                "unqueried_symbols": 0,
+                "error_counts": {},
+                "stopped_for_traffic": False,
+            },
+            "prices": {
+                "2330": {
+                    "symbol": "2330",
+                    "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                    "execution_price_0901": 100.0,
+                    "tick_volume_units_0901": 4.0,
+                },
+                "0050": {
+                    "symbol": "0050",
+                    "source": "shioaji:historical_kbar_0901_minute_close",
+                    "execution_price_0901": 70.0,
+                    "execution_price_0901_method": "minute_close",
+                    "tick_volume_units_0901": 0.0,
+                    "observed_volume_unit_0901": "shares",
+                    "session_open_price_0900": None,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    books, receipt = replay._load_retained_historical_entry_books(
+        historical_book_root=tmp_path, trading_date=day
+    )
+
+    assert replay.observed_0901_minute_volume_lots(books["2330"]) == 4.0
+    assert receipt["source"] == "retained_missed_opening_0901_price_receipt"
+    assert receipt["additional_shioaji_requests"] == 0
+
+    source_ledger = tmp_path / "source_ledger"
+    source_root = source_ledger / "missed_opening_0901_prices"
+    source_root.mkdir(parents=True)
+    (source_root / f"{day.isoformat()}.json").write_text(
+        (tmp_path / f"{day.isoformat()}.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    retained, retained_receipt = replay._retained_missed_opening_0901_rows(
+        source_ledger_dir=source_ledger,
+        symbols=["2330", "0050", "2317"],
+        trading_date=day,
+    )
+    assert set(retained) == {"2330", "0050"}
+    assert retained_receipt["resolved_symbols"] == 2
+    assert retained_receipt["additional_shioaji_requests"] == 0
+    assert retained_receipt["verified_no_trade_through_0901_symbols"] == [
+        "0050",
+        "2317",
+    ]
+    missing, missing_receipt = replay._retained_missed_opening_0901_rows(
+        source_ledger_dir=source_ledger,
+        symbols=["2330"],
+        trading_date=date(2026, 9, 21),
+    )
+    assert missing == {}
+    assert missing_receipt["resolved_symbols"] == 0
+
+
+def test_legacy_retained_tick_receipt_requires_exact_session_and_lot_unit(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 9, 2)
+    path = tmp_path / f"{day.isoformat()}.json"
+    payload = {
+        "schema_version": 1,
+        "session_date": day.isoformat(),
+        "simulation_only": True,
+        "production_order_possible": False,
+        "execution_price_contract": (
+            "right_labelled_09_01_minute_vwap_from_09_00_00_to_09_00_59_ticks"
+        ),
+        "prices": {
+            "2330": {
+                "symbol": "2330",
+                "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                "execution_price_0901": 100.5,
+                "tick_volume_units_0901": 4.0,
+                "tick_count_0901": 2,
+                "quote_at": "2026-09-02T09:01:00+08:00",
+                "source_window_start": "2026-09-02T09:00:01+08:00",
+                "source_window_end": "2026-09-02T09:00:59+08:00",
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    books, receipt = replay._load_retained_historical_entry_books(
+        historical_book_root=tmp_path, trading_date=day
+    )
+    assert replay.observed_0901_minute_volume_lots(books["2330"]) == 4.0
+    assert receipt["source"] == "retained_legacy_tick_0901_price_receipt"
+
+    payload["prices"]["2330"]["quote_at"] = "2026-09-03T09:01:00+08:00"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid legacy 09:01 tick receipt row"):
+        replay._load_retained_historical_entry_books(
+            historical_book_root=tmp_path, trading_date=day
+        )
 
 
 def test_open_only_replay_cannot_fabricate_best_bid_ask() -> None:
@@ -489,6 +717,7 @@ def test_0901_vwap_entry_quotes_keep_open_and_execution_prices_separate() -> Non
         historical_books={
             "2330": {
                 "execution_price_0901": 1_006.25,
+                "tick_volume_units_0901": 4.0,
                 "source_window_end": "2026-08-13T09:00:59.500000+08:00",
                 "source": (
                     "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
@@ -499,11 +728,104 @@ def test_0901_vwap_entry_quotes_keep_open_and_execution_prices_separate() -> Non
 
     assert quotes["2330"]["open"] == 1_000.0
     assert quotes["2330"]["execution_price_0901"] == 1_006.25
+    assert quotes["2330"]["minute_volume_lots"] == 4.0
     assert quotes["2330"]["last"] == 1_006.25
     assert quotes["2330"]["bid"] is None
     assert quotes["2330"]["ask"] is None
     assert quality["observed_0901_vwap_symbols"] == ["2330"]
     assert quality["missing_0901_vwap_symbols"] == []
+
+
+def test_0901_entry_quotes_carry_verified_no_trade_without_fabricated_fill() -> None:
+    spec = type(
+        "Spec",
+        (),
+        {
+            "market": "tw_day_trade",
+            "entry_fill_policy": ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+            "initial_capital_twd": 10_000_000.0,
+            "lot_size": 1_000,
+        },
+    )()
+    quotes, quality = replay._entry_quotes(
+        [{"symbol": "2330", "target_weight": 0.0, "open_price": None}],
+        {
+            "2330": {
+                "upper_limit_price": 1_100.0,
+                "lower_limit_price": 900.0,
+                "reference_price": 1_000.0,
+            }
+        },
+        quote_at=datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI),
+        spec=spec,
+        canonical_open_by_symbol={},
+        canonical_open_source="official_daily_session_open",
+        historical_books={},
+        observed_no_trade_through_0901_symbols={"2330"},
+    )
+
+    assert quotes["2330"]["open"] is None
+    assert quotes["2330"]["execution_price_0901"] is None
+    assert quotes["2330"]["opening_no_trade_print_through_0901"] is True
+    assert quality["observed_no_trade_through_0901_symbols"] == ["2330"]
+
+
+def test_zero_volume_0901_kbar_is_no_trade_evidence_not_liquidity() -> None:
+    books = {
+        "4562": {
+            "source": "shioaji:historical_kbar_0901_minute_close",
+            "execution_price_0901": 30.45,
+            "execution_price_0901_method": "minute_close",
+            "observed_volume_unit_0901": "shares",
+            "tick_volume_units_0901": 0.0,
+            "session_open_price_0900": None,
+        }
+    }
+    verified = replay._verified_no_trade_through_0901(
+        requested_symbols={"4562", "6212"},
+        books=books,
+        query_receipt={
+            "attempted_symbols": ["4562", "6212"],
+            "unqueried_symbols": 0,
+            "error_counts": {},
+            "stopped_for_traffic": False,
+        },
+    )
+
+    assert verified == {"4562", "6212"}
+    assert replay.observed_0901_minute_volume_lots(books["4562"]) == 0.0
+
+
+def test_first_minute_open_overlay_uses_only_positive_0901_bar(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "trade_date=2026-08-13"
+    partition.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330", "2317", "2317"],
+            "ts": [
+                datetime(2026, 8, 13, 9, 1),
+                datetime(2026, 8, 13, 9, 1),
+                datetime(2026, 8, 13, 9, 2),
+            ],
+            "Open": [100.0, 50.0, 51.0],
+            "High": [101.0, 50.0, 52.0],
+            "Low": [99.0, 50.0, 50.5],
+            "Close": [100.5, 50.0, 51.5],
+            "volume_shares": [2_000.0, 0.0, 3_000.0],
+            "Amount": [201_000.0, 0.0, 154_500.0],
+        }
+    ).write_parquet(partition / "data.parquet")
+
+    opens, receipt = replay._local_first_minute_session_opens(
+        (tmp_path,),
+        trading_date=date(2026, 8, 13),
+        symbols={"2330", "2317"},
+    )
+
+    assert opens == {"2330": 100.0}
+    assert receipt["resolved_first_minute_open_symbols"] == 1
 
 
 def test_local_0901_vwap_loader_uses_amount_over_normalized_shares(
@@ -573,6 +895,94 @@ def test_local_0901_price_loader_uses_source_kbar_close_without_tick_or_vwap(
     assert receipt["price_method_counts"] == {"minute_close": 1}
 
 
+@pytest.mark.parametrize("unit_valid", [False, None])
+def test_local_0901_loader_rejects_invalid_normalized_volume_for_capacity(
+    tmp_path: Path, unit_valid: bool | None,
+) -> None:
+    partition = tmp_path / "minute" / "trade_date=2026-08-13"
+    partition.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["2330"],
+        "date": [date(2026, 8, 13)],
+        "ts": [datetime(2026, 8, 13, 9, 1)],
+        "minutes_from_open": [1],
+        "Close": [101.0],
+        "Low": [100.0],
+        "High": [102.0],
+        "Amount": [100_500.0],
+        "volume_shares": [1_000.0],
+        "source_volume_unit_valid": [unit_valid],
+    }).write_parquet(partition / "data.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 101.0
+    assert rows["2330"]["execution_price_0901_method"] == "minute_close"
+    assert rows["2330"]["tick_volume_units_0901"] == 0.0
+    assert rows["2330"]["valuation_price_0901"] is None
+    assert receipt["invalid_volume_unit_rows"] == 1
+
+
+def test_local_0901_loader_does_not_use_wrong_date_from_minute_chunk(
+    tmp_path: Path,
+) -> None:
+    chunk_dir = tmp_path / "minute" / "minute_chunks" / "2330"
+    chunk_dir.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["2330", "2330"],
+        "ts": [
+            datetime(2026, 8, 12, 9, 1),
+            datetime(2026, 8, 13, 9, 2),
+        ],
+        "Close": [100.0, 200.0],
+        "Amount": [100_000.0, 200_000.0],
+        "Volume": [1.0, 1.0],
+        "contract_unit": [1_000.0, 1_000.0],
+    }).write_parquet(chunk_dir / "2026-08-12_2026-08-13.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows == {}
+    assert receipt["unresolved_symbols"] == 1
+
+
+def test_local_raw_minute_chunk_converts_source_lots_to_shares(
+    tmp_path: Path,
+) -> None:
+    chunk_dir = tmp_path / "minute" / "minute_chunks" / "2330"
+    chunk_dir.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["2330"],
+        "date": [date(2026, 8, 13)],
+        "ts": [datetime(2026, 8, 13, 9, 1)],
+        "Close": [101.0],
+        "Low": [100.0],
+        "High": [101.0],
+        "Amount": [201_000.0],
+        "Volume": [2.0],
+        "contract_unit": [1_000.0],
+    }).write_parquet(chunk_dir / "2026-08-12_2026-08-13.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 100.5
+    assert rows["2330"]["tick_volume_units_0901"] == 2_000.0
+    assert replay.observed_0901_minute_volume_lots(rows["2330"]) == 2.0
+    assert receipt["resolved_symbols"] == 1
+
+
 def test_previous_official_session_ignores_malformed_legacy_date(
     tmp_path: Path,
 ) -> None:
@@ -619,6 +1029,16 @@ def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
     assert row["low"] == 99.0
     assert receipt["resolved_symbols"] == 1
     assert receipt["missing_symbols"] == []
+    assert receipt["source_files"] == [
+        {
+            "path": str((partition / "data.parquet").resolve()),
+            "size_bytes": (partition / "data.parquet").stat().st_size,
+            "mtime_ns": (partition / "data.parquet").stat().st_mtime_ns,
+            "sha256": replay._sha256(partition / "data.parquet"),
+            "symbols": ["2330"],
+            "symbol_count": 1,
+        }
+    ]
 
 
 def test_intraday_zero_volume_padding_cannot_refresh_price_or_trigger_orders(tmp_path):
@@ -1254,6 +1674,48 @@ def test_tx_front_contract_comes_from_each_sessions_capture_manifest(
     }
     assert len(receipts) == 1
     assert len(receipts[0]["sha256"]) == 64
+
+
+def test_tx_future_expiry_uses_matching_retained_capture_only(tmp_path: Path) -> None:
+    manifest_root = tmp_path / "manifests" / "trade_date=2026-09-18"
+    manifest_root.mkdir(parents=True)
+    (manifest_root / "worker=00.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "contract_metadata": [
+                    {
+                        "logical_code": "TXFR1",
+                        "code": "TXFJ6",
+                        "delivery_month": "202610",
+                        "last_trading_date": "2026-10-21",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metadata, receipts = benchmark_replay._tx_retained_contract_metadata(
+        capture_root=tmp_path,
+        trading_date=date(2026, 9, 21),
+        resolved_target_code="TXFJ6",
+    )
+    assert metadata["last_trading_date"] == "2026-10-21"
+    assert len(receipts) == 1
+
+    with pytest.raises(RuntimeError, match="disagrees"):
+        benchmark_replay._tx_retained_contract_metadata(
+            capture_root=tmp_path,
+            trading_date=date(2026, 9, 21),
+            resolved_target_code="TXFI6",
+        )
+    with pytest.raises(RuntimeError, match="target code missing"):
+        benchmark_replay._tx_retained_contract_metadata(
+            capture_root=tmp_path,
+            trading_date=date(2026, 9, 21),
+            resolved_target_code="",
+        )
 
 
 def test_tx_history_minute_grid_is_complete_without_interpolation() -> None:

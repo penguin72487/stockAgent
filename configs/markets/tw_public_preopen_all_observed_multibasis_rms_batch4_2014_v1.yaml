@@ -1,0 +1,11 @@
+# Matched batch-size control for the window RMS study on 16 GiB GPUs.
+base_config: tw_public_preopen_all_observed_multibasis_rms_2014_v1.yaml
+experiment_name: tw-public-all-observed-multibasis-rms-batch4-2014-v1
+
+runner:
+  output_dir: artifacts/ablations/tw_public_preopen_all_observed_multibasis_2014_v1/rms_batch4
+  resume: false
+
+training:
+  batch_size_train: 4
+  batch_size_eval: 4

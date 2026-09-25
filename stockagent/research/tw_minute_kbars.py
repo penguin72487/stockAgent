@@ -12,6 +12,7 @@ from stockagent.backtest.tw_execution import (
     TaiwanFeeSchedule,
     effective_fee_rate_vectors,
 )
+from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 
 
 STRATEGY_SCORE_COLUMNS = (
@@ -21,6 +22,23 @@ STRATEGY_SCORE_COLUMNS = (
     "score_volume_breakout",
     "score_blend",
 )
+
+
+def _regular_market_rows(frame: pl.DataFrame) -> pl.DataFrame:
+    """Remove verified pre-listing bars before ranking or simulating fills."""
+
+    day = (
+        pl.col("date").cast(pl.Date)
+        if "date" in frame.columns
+        else pl.col("ts").dt.date()
+    )
+    admission = pl.lit(True)
+    for symbol, listing in VERIFIED_EMERGING_TO_TPEX_LISTINGS.items():
+        admission &= ~(
+            (pl.col("symbol").cast(pl.String) == symbol)
+            & (day < pl.lit(listing))
+        )
+    return frame.filter(admission)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +133,7 @@ def add_minute_strategy_scores(frame: pl.DataFrame) -> pl.DataFrame:
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"minute score inputs are missing: {sorted(missing)}")
+    frame = _regular_market_rows(frame)
     momentum = _rank_unit(pl.col("log_close_return_1m"))
     reversal = _rank_unit(-pl.col("log_close_return_1m"))
     candle_pressure = _rank_unit(
@@ -219,6 +238,7 @@ def run_minute_round_trip_backtest(
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"minute backtest inputs are missing: {sorted(missing)}")
+    frame = _regular_market_rows(frame)
     duplicates = frame.group_by("ts", "symbol").len().filter(pl.col("len") > 1).height
     if duplicates:
         raise ValueError("minute backtest requires unique timestamp/symbol rows")
@@ -725,6 +745,7 @@ class MinuteRebalanceBacktester:
         missing = required - set(frame.columns)
         if missing:
             raise ValueError(f"minute rebalance inputs are missing: {sorted(missing)}")
+        frame = _regular_market_rows(frame)
         if validate_keys:
             duplicates = (
                 frame.group_by("ts", "symbol").len().filter(pl.col("len") > 1).height

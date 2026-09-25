@@ -47,6 +47,10 @@
       current: (m, n) => `紙上市價買進／回補取最佳 Ask、賣出／放空取最佳 Bid，完整模擬委託；缺報價才用開盤價不利 ${n(m.configured_entry_price_offset_ticks || 1)} Tick`,
       recorded: (m, n) => `紙上市價完整成交 ${n(m.entry_paper_market_fill_count || m.entry_fill_count || 0)} 筆；不宣稱交易所深度或排隊成交`,
     },
+    causal_market_full_target_at_best_quote: {
+      current: () => "09:00 訊號發布後，以永豐第一筆較晚正式最佳 Ask／Bid 作為紙上價格，完整建立模型目標量；不宣稱券商成交、交易所深度或排隊位置",
+      recorded: (m, n) => `因果最佳 Bid／Ask 紙上完整目標 ${n(m.entry_paper_market_fill_count || m.entry_fill_count || 0)} 筆；非券商成交證明`,
+    },
     causal_best_quote_else_adverse_open_tick: {
       current: (m, n) => `因果最佳 Bid／Ask；缺報價才用開盤價不利 ${n(m.configured_entry_price_offset_ticks || 1)} Tick`,
       recorded: (m, n) => `歷史最佳 Bid／Ask ${n(m.entry_best_quote_fill_count || 0)} 筆；缺報價才用開盤價不利 ${n(m.entry_price_offset_ticks || 1)} Tick ${n(m.entry_synthetic_fallback_fill_count || 0)} 筆`,
@@ -85,6 +89,8 @@ const SIGNAL_REASON_LABELS = {
   quote_after_local_observation: "報價時間超前本機觀測",
   marketable_depth_unavailable: "可成交深度不足",
   marketable_depth_exhausted: "可成交深度僅部分足夠",
+  paper_full_target_at_causal_best_quote_no_exchange_fill_claim: "永豐因果報價完成紙上目標量（非券商成交）",
+  paper_entry_completed_after_initial_execution: "初始成交證據保留；紙上目標量已補齊（非券商成交）",
   decision_sizing_price_missing: "決策時計價不可用",
   signal_before_13_20_decision_gate: "訊號早於 13:20 決策閘門",
   outside_13_20_close_order_window: "未在 13:20 至 13:30 間完成模擬委託",

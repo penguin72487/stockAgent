@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=15">
+  <link rel="stylesheet" href="styles.css?v=16">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
@@ -44,6 +44,30 @@
       <article class="deferred"><span>已延後／未啟用</span><strong id="deferred-items">—</strong><small>保留登錄，但不冒充已完成</small></article>
       <article class="control"><span>設定／憑證閘門</span><strong id="control-items">—</strong><small id="control-detail">不進入資料完成率</small></article>
       <article><span>實體資料集筆數核實</span><strong id="verified-inventory">—</strong><small id="inventory-detail">檢查實存 Parquet；衍生視圖不重複計入群組總筆數</small></article>
+    </section>
+
+    <section class="section-block finlab-monitor" aria-labelledby="finlab-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">FINLAB ACCOUNT HISTORY</p>
+          <h2 id="finlab-title">FinLab 歷史資料下載</h2>
+        </div>
+        <p>進度以 SDK 目錄鍵與本機下載收據計算；不等於歷史完整度或可用於正式訓練。</p>
+      </div>
+      <div class="finlab-monitor-body">
+        <div class="finlab-monitor-head"><strong id="finlab-count">讀取中</strong><span id="finlab-state">—</span></div>
+        <progress id="finlab-progress" max="1" aria-label="FinLab 目錄鍵下載覆蓋率"></progress>
+        <p id="finlab-breakdown" class="finlab-monitor-copy">等待目錄與收據。</p>
+        <div class="finlab-monitor-metrics">
+          <div><span>最近回執剩餘額度（非即時）</span><strong id="finlab-quota">—</strong></div>
+          <div><span>最近 15 分鐘新增</span><strong id="finlab-recent">—</strong></div>
+          <div><span>上次成功下載</span><strong id="finlab-last">—</strong></div>
+          <div><span>下次排程</span><strong id="finlab-next">—</strong></div>
+          <div><span>全目錄 ETA</span><strong id="finlab-eta">—</strong></div>
+          <div><span>跨主機冷庫</span><strong id="finlab-cold">—</strong></div>
+        </div>
+        <p id="finlab-basis" class="finlab-monitor-copy"></p>
+      </div>
     </section>
 
     <section class="section-block" aria-labelledby="category-title">
@@ -206,7 +230,7 @@
   </main>
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
-  <script src="../dashboard-core.js?v=8" defer></script>
-  <script src="app.js?v=32" defer></script>
+  <script src="../dashboard-core.js?v=10" defer></script>
+  <script src="app.js?v=40" defer></script>
 </body>
 </html>

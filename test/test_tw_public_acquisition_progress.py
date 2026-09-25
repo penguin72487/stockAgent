@@ -10,6 +10,8 @@ import pytest
 
 from stockagent.live.tw_public_acquisition_progress import (
     ADDED_DATASETS,
+    _cached_inventory_membership,
+    _verified_inventory_membership,
     build_tw_public_acquisition_progress,
 )
 from stockagent.live.data_monitor_dashboard import _tw_public_sources
@@ -18,6 +20,35 @@ from stockagent.live.data_monitor_dashboard import _tw_public_sources
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_cold_inventory_disk_cache_reuses_only_the_same_verified_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "inventory.jsonl.gz"
+    compressed = gzip.compress(b'{"kind":"file","path":"raw/gcis_open_data_catalog/a.csv"}\n')
+    path.write_bytes(compressed)
+    cache_path = tmp_path / "status/cache.json"
+    monkeypatch.setenv("STOCKAGENT_COLD_INVENTORY_CACHE_PATH", str(cache_path))
+
+    def identity() -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    expected_sha = hashlib.sha256(compressed).hexdigest()
+    _verified_inventory_membership.cache_clear()
+    first = _cached_inventory_membership(path, expected_sha, identity(), 123)
+    assert dict(first[1])["gcis_open_data_catalog"] == 1
+    assert cache_path.is_file()
+    assert _verified_inventory_membership.cache_info().misses == 1
+    _verified_inventory_membership.cache_clear()
+    assert _cached_inventory_membership(path, expected_sha, identity(), 123) == first
+    assert _verified_inventory_membership.cache_info().misses == 0
+    assert _cached_inventory_membership(path, expected_sha, identity(), 124) == first
+    assert _verified_inventory_membership.cache_info().misses == 1
+    path.write_bytes(compressed + b"corrupt")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _cached_inventory_membership(path, expected_sha, identity(), 124)
 
 
 def test_acquisition_progress_keeps_four_evidence_gates_separate(
@@ -135,9 +166,13 @@ def test_acquisition_progress_keeps_four_evidence_gates_separate(
     materialized_root = tmp_path / "materialized"
     monkeypatch.setenv("STOCKAGENT_MATERIALIZED_ROOT", str(materialized_root))
 
+    _verified_inventory_membership.cache_clear()
     progress = build_tw_public_acquisition_progress(
         tmp_path, now=datetime(2026, 9, 16, 16, 8, 30, tzinfo=UTC)
     )
+    assert _verified_inventory_membership.cache_info().misses == 1
+    assert build_tw_public_acquisition_progress(tmp_path)["cold_release"]["state"] == "inventory_verified"
+    assert _verified_inventory_membership.cache_info().hits == 1
     assert progress["observation"]["observed"] == 159
     assert progress["observation"]["fresh"] is True
     assert progress["full_batch"]["coverage_complete"] is False
@@ -226,6 +261,7 @@ def test_acquisition_progress_keeps_four_evidence_gates_separate(
     )
     assert progress["observation"]["fresh"] is False
     assert progress["cold_release"]["state"] == "unverified"
+    assert _verified_inventory_membership.cache_info().misses >= 2
     assert all(not row["in_cold_inventory"] for row in progress["datasets"])
 
 

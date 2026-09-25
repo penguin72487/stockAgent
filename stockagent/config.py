@@ -16,11 +16,13 @@ from stockagent.backtest.tw_execution import (
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
 )
-from stockagent.backtest.tw_commission_rebate import (
+from stockagent.backtest.tw_commission_rebate_policy import (
     normalize_commission_rebate_timing,
 )
-from stockagent.backtest.tw_index_futures import FuturesCostSchedule
-from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
+from stockagent.backtest.tw_derivatives_cost_policy import (
+    FuturesCostSchedule,
+    OptionDayCostSchedule,
+)
 from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
@@ -33,6 +35,7 @@ from stockagent.data.tw_day_trade_execution import (
     normalize_day_trade_daily_proxy_price_policy,
 )
 from stockagent.data.walkforward import normalize_lookback_context
+from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     normalize_portfolio_activation,
@@ -1164,7 +1167,7 @@ def _validate_tw_index_derivatives_tick_mode_contract(
         )
 
 
-class _UniqueKeySafeLoader(yaml.SafeLoader):
+class _UniqueKeySafeLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
     """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
 
 
@@ -1398,6 +1401,33 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     return items
 
 
+def _normalize_causal_feature_compression(
+    model_config: dict[str, Any], *, section: str
+) -> None:
+    method = str(model_config["causal_feature_compression"]).strip().lower()
+    if method not in {"none", "signed_log1p", "asinh"}:
+        raise ValueError(
+            f"{section}.causal_feature_compression must be "
+            "none, signed_log1p, or asinh"
+        )
+    patterns = _normalize_string_list(
+        model_config["causal_feature_compression_patterns"],
+        field_name=f"{section}.causal_feature_compression_patterns",
+    )
+    if method != "none" and (
+        not model_config["causal_feature_rms_normalization"] or not patterns
+    ):
+        raise ValueError(
+            f"{section} feature compression requires train-only RMS and feature patterns"
+        )
+    if method == "none" and patterns:
+        raise ValueError(
+            f"{section} feature compression patterns require an enabled method"
+        )
+    model_config["causal_feature_compression"] = method
+    model_config["causal_feature_compression_patterns"] = patterns
+
+
 def _normalize_temporal_basis_component_map(
     value: Any,
     *,
@@ -1460,6 +1490,8 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
+    # Opt-in, checkpoint-affecting strict single-exchange source boundary.
+    crypto_exchange_scope: str = ""
     # Inclusive lower bound for the model panel.  Source archives may retain
     # older rows for provenance even when that interval cannot support an
     # unbiased training universe.
@@ -2127,6 +2159,14 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     causal_feature_rms_normalization: bool = False
     causal_feature_min_active_dates: int = 1
     causal_feature_scale_epsilon: float = 1e-6
+    # Opt-in exact per-decision trailing-window RMS. The training group still
+    # supplies an active-feature mask; its fitted global scale is not used.
+    causal_feature_window_rms_normalization: bool = False
+    # Optional zero-preserving compression after train-only RMS scaling and
+    # before temporal-basis decomposition. Patterns select source features;
+    # availability flags and categorical IDs should remain untouched.
+    causal_feature_compression: str = "none"
+    causal_feature_compression_patterns: list[str] = field(default_factory=list)
     # Disabled by default so historical checkpoints retain their original AMP
     # operation order. New experiments may opt into the algebraically
     # equivalent rank-lookback contraction explicitly.
@@ -3291,6 +3331,20 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["causal_feature_rms_normalization"] = bool(
         financial_transformer["causal_feature_rms_normalization"]
     )
+    financial_transformer["causal_feature_window_rms_normalization"] = bool(
+        financial_transformer["causal_feature_window_rms_normalization"]
+    )
+    if financial_transformer["causal_feature_window_rms_normalization"] and (
+        not financial_transformer["causal_feature_rms_normalization"]
+        or financial_transformer["temporal_basis_input"] != "input_features"
+        or not financial_transformer["temporal_basis_families"]
+        or int(financial_transformer["daily_context_layers"]) > 0
+    ):
+        raise ValueError(
+            "training.financial_transformer.causal_feature_window_rms_normalization "
+            "requires train-only active mask, input_features temporal basis, "
+            "and no daily context encoder"
+        )
     financial_transformer["causal_feature_min_active_dates"] = max(
         1, int(financial_transformer["causal_feature_min_active_dates"])
     )
@@ -3307,6 +3361,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     financial_transformer["causal_feature_scale_epsilon"] = (
         causal_feature_scale_epsilon
+    )
+    _normalize_causal_feature_compression(
+        financial_transformer, section="training.financial_transformer"
     )
     financial_transformer["feature_bottleneck_dim"] = max(
         0, int(financial_transformer["feature_bottleneck_dim"])
@@ -3344,6 +3401,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         deepcopy(financial_transformer),
         executable_portfolio_transformer_overrides,
     )
+    # The executable model has a distinct forward path. Do not inherit the
+    # Financial Transformer-only window transform implicitly.
+    if "causal_feature_window_rms_normalization" not in executable_portfolio_transformer_overrides:
+        executable_portfolio_transformer["causal_feature_window_rms_normalization"] = False
     training["executable_portfolio_transformer"] = (
         executable_portfolio_transformer
     )
@@ -3435,6 +3496,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     executable_portfolio_transformer["causal_feature_rms_normalization"] = bool(
         executable_portfolio_transformer["causal_feature_rms_normalization"]
     )
+    executable_portfolio_transformer["causal_feature_window_rms_normalization"] = bool(
+        executable_portfolio_transformer["causal_feature_window_rms_normalization"]
+    )
+    if executable_portfolio_transformer["causal_feature_window_rms_normalization"]:
+        raise ValueError(
+            "training.executable_portfolio_transformer does not support "
+            "per-window RMS for its execution-context path"
+        )
     executable_portfolio_transformer["causal_feature_min_active_dates"] = max(
         1,
         int(
@@ -3456,6 +3525,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     executable_portfolio_transformer["causal_feature_scale_epsilon"] = (
         executable_causal_epsilon
+    )
+    _normalize_causal_feature_compression(
+        executable_portfolio_transformer,
+        section="training.executable_portfolio_transformer",
     )
     executable_portfolio_transformer["feature_bottleneck_dim"] = max(
         0, int(executable_portfolio_transformer["feature_bottleneck_dim"])
@@ -3827,6 +3900,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["feature_shift_next_session"] = _normalize_string_list(
         data["feature_shift_next_session"],
         field_name="data.feature_shift_next_session",
+    )
+    data["crypto_exchange_scope"] = str(
+        data["crypto_exchange_scope"] or ""
+    ).strip().lower()
+    validate_crypto_exchange_scope(
+        data, repo_root=Path(__file__).resolve().parents[1]
     )
     data["tw_public_feature_cutoff"] = str(
         data["tw_public_feature_cutoff"]

@@ -14,6 +14,11 @@ from downloader.download_shioaji_tw_kbars import (
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
     historical_query_is_protected,
+    historical_login_pause_seconds,
+    minute_connection_plan,
+    minute_pre_night_deadline,
+    next_postreset_historical_window,
+    reserved_fop_connection_slots,
     historical_query_pause_seconds,
     latest_completed_tw_stock_session,
     previous_tw_stock_session,
@@ -42,6 +47,75 @@ def test_history_queries_resume_only_after_close_and_weekends_remain_available()
     assert historical_query_is_protected(_local(14, 30))
     assert not historical_query_is_protected(_local(14, 31))
     assert not historical_query_is_protected(_local(8, 2, day=16))
+
+
+def test_history_login_reserves_night_capture_and_uses_one_shared_slot() -> None:
+    assert reserved_fop_connection_slots(_local(14, 30)) == 0
+    assert reserved_fop_connection_slots(_local(14, 31)) == 3
+    assert reserved_fop_connection_slots(_local(4, 59, day=18)) == 3
+    assert reserved_fop_connection_slots(_local(5, 1, day=18)) == 0
+    assert reserved_fop_connection_slots(_local(5, 1, day=18), active_workers=2) == 2
+    assert historical_login_pause_seconds(_local(14, 31)) > 14 * 3600
+    assert historical_login_pause_seconds(_local(4, 59, day=18)) > 0
+    assert historical_login_pause_seconds(_local(5, 1, day=18)) == 0
+    assert historical_login_pause_seconds(_local(5, 1, day=18), fop_workers=3) == 60
+    assert historical_login_pause_seconds(_local(5, 1, day=18), fop_workers=2) == 0
+    assert historical_login_pause_seconds(_local(5, 1, day=16)) == 0
+
+
+def test_minute_frontier_uses_only_the_bounded_postclose_window() -> None:
+    deadline = datetime(2026, 8, 17, 14, 45, tzinfo=TAIPEI)
+    assert minute_pre_night_deadline(_local(14, 30)) is None
+    assert minute_pre_night_deadline(_local(14, 31)) == deadline
+    assert minute_pre_night_deadline(_local(14, 44)) == deadline
+    assert minute_pre_night_deadline(_local(14, 45)) is None
+    assert minute_connection_plan(
+        _local(14, 31), active_fop_workers=0, active_history_workers=0,
+        reserved_stock_quotes=2, configured_workers=4,
+    ) == (3, 0, 0, deadline)
+    # A still-running historical request keeps its real login slot.
+    assert minute_connection_plan(
+        _local(14, 31), active_fop_workers=0, active_history_workers=1,
+        reserved_stock_quotes=2, configured_workers=4,
+    ) == (2, 0, 1, deadline)
+    # Before the 14:50 FOP pre-open, all three future slots return to capture.
+    assert minute_connection_plan(
+        _local(14, 45), active_fop_workers=0, active_history_workers=0,
+        reserved_stock_quotes=2, configured_workers=4,
+    ) == (0, 3, 0, None)
+    assert minute_connection_plan(
+        _local(16, 0), active_fop_workers=3, active_history_workers=0,
+        reserved_stock_quotes=2, configured_workers=4,
+    ) == (0, 3, 0, None)
+    assert minute_connection_plan(
+        _local(5, 1, day=18), active_fop_workers=0, active_history_workers=0,
+        reserved_stock_quotes=2, configured_workers=4,
+    ) == (2, 0, 1, None)
+
+
+def test_traffic_ceiling_waits_for_next_reset_and_historical_window() -> None:
+    assert next_postreset_historical_window(_local(6, 0)) == _local(14, 31)
+    assert next_postreset_historical_window(_local(22, 0)) == _local(14, 31, day=18)
+    assert next_postreset_historical_window(_local(22, 0, day=21)) == _local(14, 31, day=24)
+
+
+def test_history_runners_share_one_logged_in_batch_lock() -> None:
+    root = Path(__file__).resolve().parents[1]
+    common = (root / "scripts/shioaji_history_runner_common.sh").read_text()
+    for name in ("run_shioaji_historical_market_data.sh", "run_shioaji_tx_history_backfill.sh"):
+        runner = (root / "scripts" / name).read_text()
+        assert "history_connection_delay" in runner
+        assert "flock -n 8" in runner
+        assert "flock -u 8" in runner
+    assert 'exec 8>"$history_login_lock_root/login.lock"' in common
+    general_runner = (root / "scripts/run_shioaji_historical_market_data.sh").read_text()
+    assert "history_recent_login_waiter" in general_runner
+    assert "yield_to_waiting_tx_history" in general_runner
+    assert "history_recent_login_waiter" in common
+    assert "incomplete_catalog_sweep" in common
+    futures_runner = (root / "scripts/run_shioaji_tx_history_backfill.sh").read_text()
+    assert "history_recent_login_waiter" in futures_runner
+    assert "yield_to_waiting_exact_history" in futures_runner
 
 
 def test_previous_tw_stock_session_skips_weekend_targets() -> None:
@@ -109,7 +183,9 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
     assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
     assert "rc == 79" in futures_runner
     assert "connection_capacity" in futures_runner
-    assert "--refresh-inventory --refresh-empty" in futures_runner
+    assert 'inventory_args+=(--refresh-inventory)' in futures_runner
+    assert '"${inventory_args[@]}" --refresh-empty' in futures_runner
+    assert "next_bounded_batch" in futures_runner
     assert "--contracts-file" in futures_runner
     assert "batch_is_current" not in futures_runner
 
@@ -121,12 +197,26 @@ def test_market_schedule_import_does_not_load_training_config() -> None:
     assert "from stockagent.config import load_config" not in prefix
 
 
-def test_minute_runner_reserves_one_account_connection_for_futures_history() -> None:
+def test_minute_runner_reserves_live_connections_and_does_not_gate_on_futures_calendar() -> None:
     root = Path(__file__).resolve().parents[1]
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
     assert "SHIOAJI_MINUTE_WORKERS:-4" in minute_runner
     assert "SHIOAJI_MINUTE_WORKERS:-5" not in minute_runner
-    assert "available=$((5 - fop_workers - history_workers))" in minute_runner
+    assert "minute_connection_plan(" in minute_runner
+    assert 'sleep "$market_delay"\n    # The target may advance while sleeping across the close.' in minute_runner
+    assert "futures_history=independent_downstream_gate" in minute_runner
+    assert "futures_priority_state" not in minute_runner
+    assert "--stop-at \"$minute_deadline\"" in minute_runner
+    assert "stop_at=$minute_deadline" in minute_runner
+    assert "taifex_session_kind(now, include_preopen=True)" in minute_runner
+    assert "time(5, 0, 10)" in minute_runner
+    assert 'grep -Fq "target=$BACKFILL_END_DATE" "$SOURCE_GAP_RETRY_MARKER"' in minute_runner
+    quota_function = minute_runner.split("seconds_until_next_quota_window() {", 1)[1].split("\n}\n", 1)[0]
+    assert "next_postreset_historical_window" in quota_function
+    assert "time(5, 0, 10)" not in quota_function
+    assert "latest_run_stop_reason" in minute_runner
+    timer = (root / "deploy/systemd/stockagent-shioaji-minute-backfill.timer.in").read_text()
+    assert "14:31:00 Asia/Taipei" in timer
 
 
 def test_top200_terminal_connection_skip_unblocks_postclose_minute_backfill() -> None:
@@ -138,6 +228,21 @@ def test_top200_terminal_connection_skip_unblocks_postclose_minute_backfill() ->
     assert 'payload.get("status") == "skipped"' in minute_runner
     assert 'payload.get("reason") == "connection_budget"' in minute_runner
     assert 'print("0 top200_terminal_skip")' in minute_runner
+    assert 'print("0 top200_audit_missing")' in minute_runner
+    assert top200_runner.index('if (( required_connections > MAX_CONNECTIONS )); then') < top200_runner.index('if ! wait_for_taifex_priority; then')
+    assert '"taifex_priority_window_expired"' in top200_runner
+
+
+def test_taifex_strategy_bootstrap_failure_preserves_data_only_capture() -> None:
+    runner = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/run_shioaji_taifex_bidask_stream.sh"
+    ).read_text()
+    assert "strategy_bootstrap_ready=false" in runner
+    assert 'capture=data_only' in runner
+    assert 'if [[ "$strategy_bootstrap_ready" == true && "$worker_index" -eq 0 ]]; then' in runner
+    assert 'if [[ "$strategy_bootstrap_ready" == true ]]; then' in runner
+    assert 'settlement_bootstrap_failed trade_date=$trade_date retry_seconds=30' not in runner
 
 
 def test_minute_backfill_service_has_bounded_memory() -> None:
@@ -160,7 +265,11 @@ def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
     assert "run_reported == run_selected" in minute_runner
     assert 'not bool(run_payload.get("stopped_for_traffic"))' in minute_runner
     assert "run_payload = payload" in minute_runner
-    assert "latest_run_summary.json" not in minute_runner
+    # Partial-run receipts may determine retry timing, never publish readiness.
+    assert 'path.name == "download_summary.json"' in minute_runner
+    assert 'path.stat().st_mtime_ns >= started_ns' in minute_runner
+    assert 'path = Path("data_tw_minute/shioaji_1m/latest_run_summary.json")' in minute_runner
+    assert "shioaji_minute_backfill_state reuse" in minute_runner
     assert "run_fintech_python -m scripts.build_shioaji_tw_minute_dataset" in minute_runner
     assert "run_fintech_python scripts/build_shioaji_tw_minute_dataset.py" not in minute_runner
     assert "run_fintech_python -m scripts.audit_shioaji_tw_minute_dataset" in minute_runner

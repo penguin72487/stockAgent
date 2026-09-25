@@ -20,7 +20,7 @@
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">七個面板，<br>一個可信的即時視角</h1>
+      <h1 id="page-title">九個面板，<br>一個可信的即時視角</h1>
       <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
       <div class="trust-row" aria-label="面板資料原則">
         <span>只讀模擬</span>
@@ -94,6 +94,38 @@
         <span class="card-action">開啟 API 面板 <b aria-hidden="true">→</b></span>
       </a>
 
+      <a class="dashboard-card finlab" href="finlab/">
+        <div class="card-topline">
+          <span class="market">FINLAB API</span>
+          <span id="finlab-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>FinLab 歷史資料監控</strong>
+          <p>帳號資料流量額度、逐鍵下載進度與研究訓練資料狀態。</p>
+        </div>
+        <dl class="card-stats" aria-label="FinLab 即時摘要">
+          <div><dt>已下載／每日上限</dt><dd id="finlab-quota">—</dd></div>
+          <div><dt>資料鍵進度</dt><dd id="finlab-progress">—</dd></div>
+        </dl>
+        <span class="card-action">開啟 FinLab 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
+      <a class="dashboard-card finmind" href="finmind/">
+        <div class="card-topline">
+          <span class="market">FINMIND API</span>
+          <span id="finmind-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>FinMind 免費資料監控</strong>
+          <p>全市場歷史回補、每小時請求額度、逐資料集進度與容量；新聞未排程。</p>
+        </div>
+        <dl class="card-stats" aria-label="FinMind 即時摘要">
+          <div><dt>本站／官方每小時請求</dt><dd id="finmind-quota">—</dd></div>
+          <div><dt>歷史日分區進度</dt><dd id="finmind-progress">—</dd></div>
+        </dl>
+        <span class="card-action">開啟 FinMind 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
       <a class="dashboard-card openbb" href="openbb/">
         <div class="card-topline">
           <span class="market">OPENBB ARCHIVE</span>
@@ -152,7 +184,7 @@
     </aside>
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
-  <script src="dashboard-core.js?v=8" defer></script>
-  <script src="public.js?v=10" defer></script>
+  <script src="dashboard-core.js?v=10" defer></script>
+  <script src="public.js?v=12" defer></script>
 </body>
 </html>

@@ -134,6 +134,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._history_cache: OrderedDict[
             str, tuple[float, dict[str, object]]
         ] = OrderedDict()
+        self._history_source_signatures: dict[str, tuple[object, ...]] = {}
         self._history_disk_checked: set[str] = set()
         self._history_state_lock = threading.Lock()
         self._history_build_lock = threading.Lock()
@@ -143,6 +144,23 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         if self.history_cache_dir is None or range_key not in HISTORY_RANGE_KEYS:
             return None
         return self.history_cache_dir / f"history-{range_key}.json"
+
+    def _history_source_signature(self) -> tuple[object, ...]:
+        """Cheap invalidation for the multi-GB ledger; never hash it per poll."""
+        paths = [
+            self.state_dir / name for name in ("state.json", "status.json", "marks.jsonl")
+        ]
+        for receipt in sorted((self.state_dir / "backfills").glob("*/receipt.json")):
+            paths.extend((receipt, receipt.parent / "marks.jsonl"))
+        signature: list[object] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                observation = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            except FileNotFoundError:
+                observation = None
+            signature.append((str(path), observation))
+        return tuple(signature)
 
     def _read_persisted_history(
         self, *, range_key: str
@@ -212,11 +230,17 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         range_key: str,
         snapshot: dict[str, object],
         observed_at: float,
+        source_signature: tuple[object, ...] | None = None,
     ) -> None:
         self._history_cache[range_key] = (observed_at, snapshot)
+        if source_signature is None:
+            self._history_source_signatures.pop(range_key, None)
+        else:
+            self._history_source_signatures[range_key] = source_signature
         self._history_cache.move_to_end(range_key)
         while len(self._history_cache) > HISTORY_MEMORY_CACHE_ENTRIES:
-            self._history_cache.popitem(last=False)
+            evicted, _ = self._history_cache.popitem(last=False)
+            self._history_source_signatures.pop(evicted, None)
 
     def snapshot(self) -> dict[str, object]:
         now_monotonic = time.monotonic()
@@ -242,6 +266,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def history_snapshot(self, *, range_key: str) -> dict[str, object]:
         now_monotonic = time.monotonic()
+        source_signature = self._history_source_signature()
         with self._history_state_lock:
             if range_key not in self._history_disk_checked:
                 self._history_disk_checked.add(range_key)
@@ -255,7 +280,11 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                         observed_at=now_monotonic - 56.0,
                     )
             cached = self._history_cache.get(range_key)
-            if cached is not None and now_monotonic - cached[0] < 55.0:
+            recorded_signature = self._history_source_signatures.get(range_key)
+            if cached is not None and (
+                recorded_signature == source_signature
+                or (recorded_signature is None and now_monotonic - cached[0] < 55.0)
+            ):
                 self._history_cache.move_to_end(range_key)
                 return cached[1]
             if cached is not None:
@@ -280,9 +309,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def _build_history_snapshot(self, *, range_key: str) -> dict[str, object]:
         with self._history_build_lock:
             now_monotonic = time.monotonic()
+            source_signature = self._history_source_signature()
             with self._history_state_lock:
                 cached = self._history_cache.get(range_key)
-                if cached is not None and now_monotonic - cached[0] < 55.0:
+                recorded_signature = self._history_source_signatures.get(range_key)
+                if cached is not None and (
+                    recorded_signature == source_signature
+                    or (recorded_signature is None and now_monotonic - cached[0] < 55.0)
+                ):
                     self._history_refreshing.discard(range_key)
                     return cached[1]
             full = build_dashboard_history_snapshot(
@@ -304,11 +338,17 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 "history": [_display_history_row(row) for row in full["history"]],
                 "record_counts": full["record_counts"],
             }
+            stable_signature = (
+                source_signature
+                if source_signature == self._history_source_signature()
+                else ()  # Force the next reader to refresh after a racing write.
+            )
             with self._history_state_lock:
                 self._remember_history(
                     range_key=range_key,
                     snapshot=snapshot,
                     observed_at=time.monotonic(),
+                    source_signature=stable_signature,
                 )
                 self._history_refreshing.discard(range_key)
             self._persist_history(range_key=range_key, snapshot=snapshot)

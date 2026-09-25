@@ -1,4 +1,10 @@
-# penguin 冷庫 D 槽備份
+# penguin 冷庫 D 槽備份（已退役的歷史操作）
+
+> 2026-09-25 起 penguin 已改為 D 槽單份主冷庫：
+> `D:\stockagent-cold-primary\packed` 由 `/srv/stockagent-packed` 受保護掛載使用。
+> 下文的 C→D 備份指令只描述舊架構，不可重新啟用、初始化或把舊
+> `stockagent-backup` 路徑當成第二份實體備份。請改看
+> [D 槽遷移與驗收](d_cold_store_migration_2026-09-25.md)。
 
 最近一次實際清理與未解問題見 [2026-09-17 儲存清理稽核](storage_cleanup_2026-09-17.md)。
 
@@ -11,15 +17,18 @@ penguin 是目前資料權威。收到的 immutable release 保留原 publisher 
 經過 audit 的發布／Syncthing 接收
     ↓ 原子 rename，半成品不進備份
 C: WSL /srv/stockagent-packed          權威冷庫
-    ↓ inotify + 30 秒補查；SHA-256 copy + D 回讀
+    ↓ inotify + 閒置 300 秒補查；SHA-256 copy + D 回讀
 D: /stockagent-backup/packed           獨立、可用既有工具還原的冷副本
     └─ objects → inventories/manifests → 完整驗證後的 heads
 ```
 
 不備份 mutable downloader workspace、Git、熱快取、未發布 artifacts、憑證或
-`.local-state`。這不是整個 C 槽備份。所有 canonical `objects/blobs`、`objects/packs`、
-`objects/inventories` 都納入，包含歷史物件與目前未引用的物件；不只 latest release。
-manifest 與 head 保留原格式，因此不再封成一份巨型壓縮檔，內容相同的物件只存一份。
+`.local-state`。這不是整個 C 槽備份。2026-09-21 起，正式設定的
+`backup_scope=current_heads` 只維護來源目前各 head 直接指向的 manifest 及其
+inventory／pack／blob；每個當前 head 都必須完整，不能退回舊版冒充成功。
+D 上既有舊版 manifest、物件及 head-history 不刪除、不覆寫；但舊版及目前未引用物件
+不再列入日常備份完成條件，也不保證新發現的舊版會被補入 D。歷史還原能力須另外
+執行指定版本驗證，不能從最新版本的綠燈推論。
 
 ## 安全與一致性
 
@@ -29,24 +38,34 @@ manifest 與 head 保留原格式，因此不再封成一份巨型壓縮檔，�
 - 中斷保留 `.partial`；重啟會逐位元組驗證保留前綴後續傳，不盲信長度或 mtime。
 - D 的 current head 只有在相依 inventory／pack／blob 全部驗證後才更新。舊 head 存於
   `packed/head-history/heads/<dataset>/<node>/<head-sha256>.json`；舊 manifest／物件不刪。
-  正在接收的新 release 不會使前一份已完整的 D head 消失。
+  正在接收的新 release 不會使前一份已完整的 D head 消失。每輪結束還會重查來源
+  head 集合與內容；掃描期間若有發布變動，本輪不能標為已完成。
 - 定期比對檔案 signature 只用於重用**已有 checksum 證明**；不是首次去重或刪除證據。
   WSL 重新掛載 D: 可能只改變 Linux `st_dev`；在掛載、volume marker 及磁碟隔離
   驗證通過的前提下，沿用收據時仍須 inode、大小、mtime、ctime 四欄完全相同。
   任何一欄改變、校驗資料庫遺失、或 checksum 證明逾 30 日都重讀驗證；
   不能因這項規則推論先前未通過完整雜湊的 release 已可還原。
+- 大量已驗證物件的 D 槽身分檢查以本輪 `O_NOFOLLOW` 目錄描述符重用，逐檔仍以
+  `follow_symlinks=False` 查 regular-file 身分，結尾核對已固定的每層目錄未換位；
+  新物件複製及 checksum 回讀仍使用原本的安全路徑檢查。這只減少 DrvFs 目錄查詢，
+  不延長 checksum 證明有效期，也不把未驗證物件算作已完成。
+- 未變動的 manifest/head 已逐位元組讀回且相同時，不再逐檔重複核對掛載；每輪開始、
+  最終完成之前與任何 metadata 寫入前仍強制核對掛載、磁碟身分與 volume marker。
 - 只在 config 指定的 D 掛載點、來源磁碟不同、node ID 正確且 volume marker 符合時工作。
   `init` 另外核對 Windows volume UUID。掛載消失／替換即 fail closed，不能寫進空的
   `/mnt/d` 而把 C 槽塞滿。預留 D 槽 20 GiB；空間不足保留所有既有副本。
 - 備份服務以低 CPU／I/O 優先序執行，來源強制唯讀。初次複製期間會在小批次之間處理
-  新到事件；單一大物件的複製／回讀仍不可瞬間完成。30 秒是補查週期，不是完成 SLA。
-- 所有歷史 manifest 的相依物件都要可驗證，才能標記整庫 `up_to_date`。完整性問題
-  不會因最新 head 可讀而被忽略。這是備份完整性，不是交易資料品質／訓練有效性重審。
+  新到事件；單一大物件的複製／回讀仍不可瞬間完成。閒置 300 秒補查是兜底，
+  inotify 事件可提早喚醒；都不是完成 SLA。
+- `up_to_date` 現在只代表設定範圍內的目前各 head 及其相依物件完成；
+  `historical_completeness=not_checked` 是明確的未驗收，不代表舊版完整。
+  舊版缺件報告與既有 D 檔繼續保留，不以當前版成功沖銷歷史缺口。
 
 ## 安裝與日常操作
 
 從 repository root 執行；Python 由 `scripts/runtime_env.sh` 自動解析。
 設定入口：`configs/data_sync/packed_backup.json`，不可把這台的 D UUID 複製到別台盲用。
+監看器有 inotify 時，新物件／head 事件仍立即喚醒；無變更時每 300 秒對帳一次。inotify 無法使用時每 30 秒輪詢；有進度的積壓批次會連續處理。新設定不略過當前 head 缺件；舊版缺件另由歷史稽核揭露。
 
 ```bash
 ./scripts/run_packed_backup.sh --help
@@ -65,13 +84,14 @@ WSL／systemd 啟動後常駐；Windows 關機或 WSL 被終止時無法接收�
 ```bash
 sudo systemctl stop stockagent-packed-backup.service
 ./scripts/run_packed_backup.sh once            # 補齊當下盤點，結束回傳狀態
-./scripts/run_packed_backup.sh once --verify-existing # 強制重讀 C 現存物件及其 D 副本 checksum
+./scripts/run_packed_backup.sh once --verify-existing # 強制重讀設定範圍內 C/D 物件 checksum
 sudo systemctl start stockagent-packed-backup.service
 ```
 
 上述兩個手動命令可擇一使用；服務運作時以 flock 拒絕第二個備份程序。
 全量複查可能讀取上 TB，請選非繁忙時段。服務對仍在來源的物件，每 30 日按到期重驗。
-來源已刪、僅保留於 D 的歷史物件不在上述來源盤點內；要獨立稽核整個 D 庫可執行
+來源已刪、僅保留於 D 的歷史物件不在上述來源盤點內；目前未引用的物件也不在
+`current_heads` 盤點內。要獨立稽核整個 D 庫可執行
 下列唯讀全庫檢查（缺失歷史物件會報錯，不會刪除或自動修補）：
 
 ```bash
@@ -81,20 +101,25 @@ sudo systemctl start stockagent-packed-backup.service
 ```
 
 狀態位於 C：`/var/lib/stockagent-packed-backup/status.json`；D 上每批次也留
-`D:\stockagent-backup\status.json`，完整通過時另留 `last-complete.json`。
+`D:\stockagent-backup\status.json`，目前版本完整通過時另留
+`last-current-complete.json`。舊的 `last-complete.json` 若存在，是先前全歷史模式的
+歷史收據，不代表目前或最新完成狀態。
 C 的 `verified.sqlite3` 是可重建的校驗快取，不是還原資料的必要相依項目。
 
 | 欄位 | 判讀 |
 |---|---|
-| `state` | copying／up_to_date／degraded／blocked |
+| `state`, `backup_scope` | copying／up_to_date／degraded／blocked；先看驗收範圍，目前正式設定為 current_heads |
 | `total_bytes`, `verified_bytes`, `remaining_bytes` | 當次來源物件盤點、已驗證、尚待驗證的 bytes |
 | `current_object`, `phase`, `current_object_bytes` | 單一物件 copy／resume_prefix／readback 的進度 |
-| `pending_objects`, `pending_heads`, `pending_releases` | 整庫完成時必須全為 0 |
+| `pending_objects`, `pending_heads`, `pending_releases` | 設定範圍完成時必須全為 0 |
 | `error_count`, `errors` | 必須為 0／空；不可只看 systemd active |
 | `current_heads_complete` | 現行各 head 的相依物件是否已驗證；不能替代歷史完整性 |
+| `historical_completeness` | current_heads 模式為 not_checked；不是 verified |
 | `present_objects_complete` | 這次 C 槽實存物件是否全部完成；不涵蓋來源本來就遺失的物件 |
 | `integrity_state`, `previous_pass_errors` | 當前盤點中的檢查狀態與上一輪錯誤；copying 不等於完整性正常 |
-| `last_complete_at`, `updated_at` | 上次完整備份與當前狀態更新時間；要同時看 |
+| `last_current_complete_at`, `updated_at` | 上次目前版本完成與當前狀態更新時間；要同時看 |
+| `stage_timings_ms` | 每輪來源清單、D 槽既有物件信任檢查、實際物件處理、metadata、head 重查等毫秒耗時；`pre_final_status_total` 不含最後狀態／D 收據寫入，不能當作完整端到端備份時間 |
+| `phase`, `destination_trust_scanned` | 每輪開始即改為 `checking`，慢速 D 槽逐物件驗證期間約每五秒回報掃描筆數；先前 `last_current_complete_at` 只是前次通過時間，不能當作這輪完成 |
 
 `total_bytes` 是 cold object 邏輯大小，不含少量 manifests／head history／receipt；
 不等於 NTFS 實際配置量。最新資料到達可能讓剩餘 bytes 增加，這不是退步或刪檔。
@@ -163,3 +188,29 @@ D 為另一顆 SATA 磁碟，初始可用約 3.35 TB。首次完整複製已啟�
 `/var/lib/stockagent-packed-backup/source-missing-objects.json`。
 這些舊資料不能靠備份憑空補回；服務繼續保護現存資料，但歷史完整性保持 degraded，
 直到原物件被另外救回。沒有刪除舊 manifest、改寫 hash 或以新內容冒充缺失版本。
+
+### 2026-09-20 閒置掃描成本複測
+
+目前來源有 11,724 個現存物件；只盤點 C: 來源需約 1.9 秒，完整一輪還須逐一核對
+D: 的驗證憑證、歷史 manifest 與 head。重新載入服務後首輪於 23:45:33–23:54:24
+完成，消耗約 61.4 CPU 秒；後續 45 秒安靜期 CPU 計數不再增加，程序在 inotify 等待。
+此前每輪完成後只等 30 秒即再掃；現在無事件時等 300 秒，新發布仍由 inotify
+喚醒。這證明安靜期沒有忙輪詢，不是完整長期吞吐測試，也沒有消除上述 113 個
+歷史缺件或宣稱 D 歷史已完整。
+
+同日第二輪找出同一個 11,724 物件的 D: 驗證憑證，原先在物件清點和 manifest
+核對各讀一次。現在同一輪共用已驗證結果，但 manifest 仍複查 C: 來源身分；新或
+改變的 head 在提交 D: 前另做一次完整目標驗證。重載後實機首輪於
+00:02:51–00:07:07 完成，約 4 分 16 秒、30.2 CPU 秒，對比上輪的 8 分 51 秒、
+61.4 CPU 秒。這是同一主機的兩次完整冷備份對帳，不是所有工作負載的平均加速；
+結果仍是 `degraded`，current heads 完整、歷史缺件仍可見。
+
+### 2026-09-21 最新版本維護範圍
+
+依使用者要求，正式設定改為 `backup_scope=current_heads`。01:25:04 重啟備份服務後，
+01:29:18 的第一輪 C/D 收據均顯示 `up_to_date`、119 個 head、119 個當前 release、
+11,606 個相依物件、459,087,389,625 bytes 已驗證，`pending_*` 與 `error_count` 都是 0。
+D 上 `cftc-legacy-pre2000` 的當前 release 另以獨立 verifier 驗證 8 個物件、
+63,149,628 bytes。這是依有效校驗收據與檔案身分核對的當前範圍完成；
+不等於當次重新雜湊 459 GB，也不等於全歷史完整。先前 113 個歷史缺件報告仍保留，
+`historical_completeness=not_checked`；D 上既有舊資料未刪除。

@@ -467,6 +467,9 @@ def test_builder_summary_is_accepted_by_auditor_and_tampering_fails_closed(
     assert findings == []
     assert len(original["source_receipts"]) == 8
     assert len(original["lifecycle_source_receipts"]) == 5
+    timings = original["stage_elapsed_seconds"]
+    assert all(value >= 0 for value in timings.values())
+    assert timings["total_before_receipt"] >= timings["symbol_build"]
 
     quarantine_count_tamper = dict(original)
     quarantine_count_tamper["return_quarantined_rows"] = (

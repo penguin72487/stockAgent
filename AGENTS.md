@@ -32,10 +32,24 @@ changes, and follow the user's latest explicit experiment settings.
   complete fold lifecycle. Single-GPU runs may diagnose correctness only. Treat
   epoch 1 as compiler warm-up; compare steady epoch 3+ maximum-rank wall time,
   and require exact artifact/metric parity before promoting an optimization.
+- The 428-feature all-observed fold11 dataset with exact physical FIFO exceeded
+  a 32 GiB card's workspace when its 14.72 GiB FP32 panel was kept on each
+  GPU. The measured v4 experiment keeps train/eval panels in host memory;
+  six consecutive two-GPU epochs used at most 18.8 GiB on GPU 0 and added no
+  new Dynamo graphs after epoch 1, with identical v3 train/val/test scalars
+  through epoch 5. This is a dataset/hardware observation, not a universal
+  cache policy. See `docs/tw_public_all_observed_v8_ofat_fold11_data_contract.md`.
 - Use `rg` / `rg --files` for search.
 - Use `apply_patch` for manual file edits.
 - Do not revert user changes or unrelated dirty files.
 - Do not use destructive git commands such as `git reset --hard` or `git checkout --` unless the user explicitly asks.
+- For the Windows public Caddy supervisor, verify the actual `wsl.exe` child
+  exit code as well as gateway health.  On this host, a quoted distribution
+  name inside `ProcessStartInfo.Arguments` returned `WSL_E_DISTRO_NOT_FOUND`
+  even though the already-running gateway stayed healthy; use the validated
+  unquoted safe-name path.  Measure child `StartTime` to `ExitTime` separately
+  from the supervisor's polling/observation lag.  A warm WSL child success is
+  not a Windows cold-boot recovery proof.
 
 ## Discord Service Reliability Contract
 
@@ -116,8 +130,8 @@ coordinated code, config, test, and documentation change.
 |---|---|---:|---:|
 | Code, configs, contracts | Git working tree | yes, through Git | no data folder |
 | Canonical producer workspace | catalog-resolved `source`, including `/srv/stockagent-live/data_tw_public` for `tw-public` | yes | no |
-| Fleet current cold store | `/srv/stockagent-packed` | immutable current/protected releases | yes, Folder ID `stockagent-packed` |
-| Penguin historical archive | `D:\stockagent-backup\packed` | additive immutable history | no |
+| Fleet current cold store | `/srv/stockagent-packed`; on penguin this is a guarded bind mount of `D:\stockagent-cold-primary\packed` | immutable release objects and metadata | yes, Folder ID `stockagent-packed` |
+| Penguin C cold store | retired after exact C-to-D audit; never a fallback writer | no | no |
 | Replaceable local hot cache | `/srv/stockagent-packed-materialized` | only lifecycle metadata; materialized data is immutable | no |
 | In-progress training artifacts | node-local `artifacts` workspace | yes | no |
 | Retired operational artifact transport | `/srv/stockagent-artifacts-hot` | yes, pending local audit | no; Syncthing folder retired |
@@ -143,8 +157,11 @@ coordinated code, config, test, and documentation change.
 ### Syncthing topology and identity
 
 - The canonical data namespace is `stockagent-packed` at
-  `/srv/stockagent-packed`, configured Send & Receive, filesystem watcher on,
-  and not paused.  Full-replica nodes retain the rolling current/protected
+  `/srv/stockagent-packed`, configured Send & Receive and not paused. On
+  penguin the D: DrvFs mount has no reliable inotify: an atomic publication
+  requests an explicit Syncthing scan (objects before manifest/head), with a
+  300-second periodic rescan as fallback. Never infer delivery solely from a
+  successful scan request. Full-replica nodes retain the rolling current/protected
   manifests, per-node heads, inventories, packs, blobs, and their proofs.  An
   explicitly enrolled ephemeral compute node
   may use index-only edge mode: it still synchronizes heads/manifests/inventories
@@ -198,44 +215,37 @@ coordinated code, config, test, and documentation change.
   leases are capped at seven days; live references renew that seven-day window,
   while intentional longer retention must use a pin.
 
-### Penguin authority and independent cold backup
+### Penguin D: primary and single-volume risk
 
-- Current deployment authority is **penguin**. Its accepted cold store at
-  `/srv/stockagent-packed` is the sole source for the local disaster-recovery
-  backup. A producer node ID in an immutable manifest is provenance, not a
-  competing data authority. Retain existing per-node heads for compatibility;
-  never rename historical publishers or copy their identity files.
-- `configs/data_sync/packed_backup.json` enrolls penguin's independent Windows
-  D: volume. `stockagent-packed-backup.service` copies cold objects, inventories,
-  manifests, and validated heads one-way to `D:\stockagent-backup\packed`.
-  This destination is not a Syncthing folder, producer workspace, materialized
-  cache, or publication target. Do not copy `.local-state` or node credentials.
-- Backup is additive: preserve historical manifests, unreferenced immutable
-  objects, and replaced head history. Source deletion must not propagate to D:.
-  Any backup pruning needs a separately approved retention/reachability policy.
-- `configs/data_sync/packed_retention.json` defines the approved penguin-only
-  rolling-current policy for C:. Preserve all valid current heads, local pins,
-  active READY/leases/quarantine, their complete object graphs, and a 24-hour
-  release grace window. Historical manifests and objects not reachable from
-  that set may leave C only after every candidate has a fresh D checksum receipt,
-  every configured fleet peer is fully converged, there are no conflict files or
-  process references, and a global publish-retention lock plus unchanged plan
-  fingerprint are held. Stop local Syncthing and backup only around the final
-  recheck/unlink, then restart and require post-delete convergence. This policy
-  never deletes D, heads, producer sources, materialized data, or active artifacts.
-  A `snapshot_id` is a backward-compatible atomic release identifier, not a full
-  copied tree; do not remove manifests from the publication protocol.
-- Require the enrolled D: mount and volume marker, separate source filesystem,
-  SHA-256 streaming copy plus destination readback, stable source signatures,
-  and atomic finalization. Commit a head only after all its referenced objects
-  verify. Interrupted partial copies may resume only after prefix verification;
-  mismatches remain visible and must never overwrite an existing backup.
-- Watch atomic cold-store arrivals and reconcile periodically; never run
-  materialization from the backup service. Missing disks, disk pressure,
-  conflicts, corruption, or incomplete historical releases are degraded/blocked,
-  not a complete backup. Report actual verified bytes and remaining backlog.
-  WSL must be running for this service to operate. See
-  `docs/packed_cold_backup.md` for commands, restore, and acceptance.
+- Current deployment authority is **penguin**. Its only local physical cold
+  copy is `D:\stockagent-cold-primary\packed`, exposed at the stable
+  `/srv/stockagent-packed` path. A producer node ID in an immutable manifest is
+  provenance, not a competing authority. Retain existing per-node heads and
+  never copy another node's identity. The user explicitly accepted losing the
+  old independent C/D local backup; do not call Syncthing or a second path on
+  the same D: volume an independent disaster-recovery backup.
+- `stockagent-d-cold-mount.service` must validate the enrolled D: volume marker,
+  guarded canonical bind mount, primary marker and node identity before
+  Syncthing or a local publisher accesses the cold store. A missing D: mount
+  exposes only the C-side fail-closed marker; it must never become a new cold
+  store. The Syncthing unit depends on the mount service. Check the mount with
+  `scripts/mount_packed_d_cold.sh --check` before cold publication or cleanup.
+- The old `stockagent-packed-backup.service` and C-only
+  `stockagent-packed-retention.timer` are retired/disabled. Their historical
+  config and receipts may remain for audit, but must not be restarted or used
+  as proof of an independent copy. `packed_backup.py status` reports
+  `retired_single_d_primary` when the D primary is active. Do not run the old
+  retention `apply` against the D bind mount. A future D-specific retention
+  policy needs separate reachability, historical-recovery and peer proofs.
+- Preserve existing D historical manifests, objects and immutable head history.
+  A `snapshot_id` is an atomic release identifier, not a full copied tree.
+  Preserve all referenced objects, pins, leases, current heads, and receipts;
+  do not prune history merely from mtime or apparent duplication. Current-head
+  verification never asserts that every old historical release is reconstructible.
+  Missing D, disk pressure, conflict files, checksum mismatch or incomplete
+  current release is degraded/blocked. WSL must be running for publication and
+  synchronization; Windows cold-boot recovery remains a separate acceptance.
+  See `docs/d_cold_store_migration_2026-09-25.md` for migration receipts.
 
 ### Multi-writer publication and conflict resolution
 
@@ -259,6 +269,18 @@ coordinated code, config, test, and documentation change.
   caches, and incomplete training runs remain node-local.  Completed artifacts
   may enter cold storage only after their lifecycle/completion contract and
   final hashes pass; an active service or named file is not completion evidence.
+- A separately allowlisted `legacy-quarantine-archive` is a byte-preservation
+  exception, **not** a completed-artifact release. Only penguin may archive
+  stable, inactive legacy `artifacts/markets` roots listed in
+  `configs/data_sync/legacy_artifact_archives.json`. Record every original path,
+  size, signature and SHA-256, verify the encoded payload and exact decode, and
+  mark `deployable=false` / `completion_claim=not_checked`. Never use such an
+  archive as a model selection, promotion, or service-readiness proof. Hot-source
+  retirement still requires an exact source and old hard-link mirror audit,
+  direct D-primary cold verification, current fleet convergence, no active
+  service or process references, and an observed seven-day lease. Enabled US
+  Discord service output is protected; do not retire that root merely because
+  its bytes have been archived. Recovery is an explicit restore into a new path.
 - Automatic completed-artifact maintenance must keep discovery, publication,
   peer convergence, and source eviction as separate gates.  Publish at most one
   new wave at a time; deletion requires a later exact cold/source verification,
@@ -269,13 +291,13 @@ coordinated code, config, test, and documentation change.
   artifact tree and `/srv/stockagent-artifacts-hot`. Source-only eviction is
   forbidden: it frees no shared payload, and some transport paths may be unique.
   The bridge must stay disabled and the retired folder must not be recreated. A complete
-  run may become cold-only only through an exact, D-backed retirement plan
+  run may become cold-only only through an exact, D-primary-backed retirement plan
   that checks both hot names, a seven-day use lease, pins, process references,
   and the local Syncthing health plus peers named by
-  `configs/data_sync/artifact_retirement.json`. The penguin-only D-backed hot
+  `configs/data_sync/artifact_retirement.json`. The penguin-only hot
   retirement policy currently names no remote peer: lab203 does not block
-  local hot eviction, while the independent C cold-object retention policy
-  requires convergence with enrolled vastai1T. Install a node-local directory tombstone
+  local hot eviction; the retired C cold-object retention policy must not run.
+  Install a node-local directory tombstone
   before unlinking either hot name. Partial cold releases cannot retire a
   whole run. A failed/interrupted retirement remains in quarantine for audit.
 - On-demand artifact use must resolve one exact retired release through the
@@ -307,10 +329,10 @@ coordinated code, config, test, and documentation change.
   lease age only; it may not bypass those safety proofs.
 - Cache GC may delete only managed materialized versions.  It must never delete
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
-  an unmanaged directory.  It must never act as cold-object GC. The only approved
-  C cold deletion path is `scripts/run_packed_retention.sh`: it applies the exact
-  D-backed rolling-current and fleet-wide proof above. Other nodes and the D
-  archive remain report-only unless the user separately changes their policy.
+  an unmanaged directory. It must never act as cold-object GC. Former C cold
+  deletion was a one-time, separately audited migration; there is no approved
+  automatic D cold-object GC. Other nodes and D remain report-only until the
+  user separately approves a new retention policy.
 - Compiler caches are a separate rebuildable layer.  Under disk pressure, use
   `scripts/maintain_storage_pressure.py`: it may prune only allowlisted old
   TorchInductor/Triton/CUDA cache files after fd/mmap and signature rechecks.  It
@@ -1307,6 +1329,12 @@ Rules:
   five-minute OI/ratio series) must retain their native grain and may be
   causally carried/aligned to a one-minute decision grid; never fabricate
   one-minute observations.
+- For a newly listed crypto contract in tail-only mode, anchor the lookback to
+  the latest **completed** candle at or before the requested end, not the
+  requested date's possibly future UTC 23:59. Preserve the official listing
+  lower bound and do not mark an empty or not-yet-listed source complete. A
+  Taiwan early-morning run exposed this failure simultaneously in OKX, Bybit,
+  and Binance; bound forward request windows by the same completed-candle end.
 - Keep stock and FX Yahoo downloads on daily bars unless the user explicitly changes those markets too.
 
 ## Feature Engineering Guardrails
@@ -1319,20 +1347,28 @@ Rules:
 - Prefer log returns, relative price ratios, rolling normalization, and engineered K-line/volume features.
 - If changing feature schema, update cache/versioning so stale panel caches are not reused.
 - Keep `return_1d`, tradable masks, TW limit guards, and benchmark construction aligned with the canonical backtest.
-- TW public snapshot-only families are permanently forbidden model inputs. Never
-  add them to `data.feature_include`, model categorical-feature lists,
-  explainability selection, or a replacement model schema: `twpub_monthly_revenue_*`,
+- TW public snapshot-only families remain forbidden in strict/live model inputs. Never
+  add them to a strict/live `data.feature_include`, model categorical-feature list,
+  explainability selection, or replacement model schema: `twpub_monthly_revenue_*`,
   `twpub_cumulative_revenue_yoy`, `twpub_financial_*`, `twpub_insider_*`,
   `twpub_borrow_*`, `twpub_sbl_*`, `twpub_short_sale_available_*`,
   `twpub_tdcc_*`, and `twpub_company_*`. Their raw/source columns may remain
   available solely for provenance, auditing, and future data-quality research;
-  they must not influence training, validation, test, inference, or feature
-  importance.
+  they must not influence strict/live training, validation, test, inference, or
+  feature importance. The user's 2026-09-19 all-features request explicitly
+  permits these observed-date values only in the separate
+  `tw_public_preopen_all_observed_research_2014_v3.yaml` research ABI. There,
+  keep capture dates and missingness channels, never backdate a current snapshot
+  to an earlier year, shift unproven capture-session snapshots to the next
+  exchange session at a 09:00 decision, and never claim historical PIT or
+  executable performance.
 - The 2026-09-18 broad-history request authorizes a **separate** research-only
   table/config for obtainable current-revision macro values and historical
-  MOPS XBRL facts mapped by labelled theoretical release dates. It does not
-  repeal the snapshot-only denylist above: use new `twpub_xbrl_*` columns from
-  the quarter archives, not recent `twpub_financial_*` OpenAPI snapshots.
+  MOPS XBRL facts mapped by labelled theoretical release dates. That earlier
+  request did not repeal the snapshot-only denylist; the later v3 exception
+  above is limited to its separate research ABI. In that v1 wide ABI, use
+  `twpub_xbrl_*` columns from quarter archives, not recent
+  `twpub_financial_*` OpenAPI snapshots.
   Keep the canonical strict/live feature table and checkpoint ABI unchanged.
   The wide config removes log/asinh inputs, retains ratios, carries only
   released state features, and adds per-feature availability channels before
@@ -1389,9 +1425,15 @@ Rules:
   market universe are distinct; independently audit the strategy's admission
   of emerging securities before declaring a historical execution realistic.
   `scripts/audit_tw_emerging_stock_admission.py --strict` reports two 6716
-  pre-listing minute bars with both feature and label eligibility. Price
-  validity does not clear this model-safety gap; admission repair must bind a
-  new dataset/normalizer/checkpoint fingerprint and preserve the raw source.
+  pre-listing source minute bars with both feature and label eligibility, but
+  zero effective training rows after the dated admission mask. The schema-5
+  minute loader must remove excluded rows from model masks, session state and
+  fitted normalization moments; the schema-4 day-trade minute tape must block
+  those symbols before any executable price/volume is assigned. Keep
+  `stockagent/data/tw_listing_admission.py`, both loader paths, research
+  backtests, cache keys, dataset fingerprints, checkpoint and artifact contracts
+  aligned. A new listing date needs official evidence and a new contract
+  version; never rewrite raw source or silently resume old checkpoints.
 - Index-future outright prices, option *premiums*, calendar-spread prices,
   block trades, and option strikes use different grids or semantics. In
   particular TXO ordinary premium has five bands, while 2019-05-27 onward

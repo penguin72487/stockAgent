@@ -35,6 +35,7 @@ DEFAULT_EXCLUDED_TOP = frozenset(
     }
 )
 DEFAULT_EXCLUDED_SUFFIXES = frozenset({".jsonl", ".lock", ".log", ".pid"})
+SAMPLE_BYTES = 64 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +198,38 @@ def _hash_file(root: Path, item: ArtifactFile) -> str | None:
     return digest.hexdigest()
 
 
+def _sample_file(root: Path, item: ArtifactFile) -> str | None:
+    """Cheap rejection filter only; a matching sample never proves equality."""
+
+    path = root / item.relative
+    try:
+        before = path.stat(follow_symlinks=False)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != item.signature():
+            return None
+        digest = hashlib.blake2b(digest_size=16)
+        with path.open("rb", buffering=0) as stream:
+            digest.update(stream.read(SAMPLE_BYTES))
+            if item.size > SAMPLE_BYTES:
+                stream.seek(max(0, item.size - SAMPLE_BYTES))
+                digest.update(stream.read(SAMPLE_BYTES))
+        after = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) != item.signature():
+        return None
+    return digest.hexdigest()
+
+
 def find_duplicate_groups(
     root: Path,
     *,
@@ -227,6 +260,7 @@ def find_duplicate_groups(
     for item in files:
         by_size[item.size].append(item)
 
+    sampled_inodes = 0
     hashed_inodes = 0
     changed_while_hashing = 0
     exact: dict[
@@ -239,23 +273,45 @@ def find_duplicate_groups(
             distinct.setdefault((item.device, item.inode), item)
         if len(distinct) < 2:
             continue
+        by_metadata: dict[
+            tuple[int, int, int, int, tuple[tuple[str, bytes], ...]],
+            list[ArtifactFile],
+        ] = defaultdict(list)
         for item in distinct.values():
-            digest = _hash_file(root, item)
-            if digest is None:
-                changed_while_hashing += 1
-                continue
-            hashed_inodes += 1
-            exact[
-                (
-                    item.device,
-                    size,
-                    digest,
-                    item.mode,
-                    item.uid,
-                    item.gid,
-                    item.xattrs,
-                )
+            by_metadata[
+                (item.device, item.mode, item.uid, item.gid, item.xattrs)
             ].append(item)
+        for matching_metadata in by_metadata.values():
+            if len(matching_metadata) < 2:
+                continue
+            by_sample: dict[str, list[ArtifactFile]] = defaultdict(list)
+            for item in matching_metadata:
+                sample = _sample_file(root, item)
+                if sample is None:
+                    changed_while_hashing += 1
+                    continue
+                sampled_inodes += 1
+                by_sample[sample].append(item)
+            for matching_sample in by_sample.values():
+                if len(matching_sample) < 2:
+                    continue
+                for item in matching_sample:
+                    digest = _hash_file(root, item)
+                    if digest is None:
+                        changed_while_hashing += 1
+                        continue
+                    hashed_inodes += 1
+                    exact[
+                        (
+                            item.device,
+                            size,
+                            digest,
+                            item.mode,
+                            item.uid,
+                            item.gid,
+                            item.xattrs,
+                        )
+                    ].append(item)
 
     groups: list[DuplicateGroup] = []
     for (
@@ -286,6 +342,7 @@ def find_duplicate_groups(
         "eligible_files": len(files),
         "eligible_bytes": sum(item.size for item in files),
         "same_size_groups": sum(1 for value in by_size.values() if len(value) > 1),
+        "sampled_distinct_inodes": sampled_inodes,
         "hashed_distinct_inodes": hashed_inodes,
         "changed_while_hashing": changed_while_hashing,
         "exact_duplicate_groups": len(groups),

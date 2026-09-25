@@ -4,20 +4,23 @@ import argparse
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
-import threading
+import time
+from typing import Callable
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from common import PersistentProgress, atomic_write_text
 from artifact_io import atomic_write_parquet, sha256_file
-from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet
+from feature_stage_timing import stage_latency_summary
+from ohlcv_hot_tail import hot_tail_path, logical_mtime_ns, read_logical_parquet
 
 
 LEGACY_CONTRACT_VERSION = 6
@@ -28,6 +31,7 @@ DEFAULT_EXECUTION_MINUTES_UTC = 5
 EXPECTED_MINUTE_ROWS = 1440
 MODEL_LOOKBACK_DAYS = 32
 MODEL_RAW_SESSION_WINDOW_DAYS = MODEL_LOOKBACK_DAYS + 1
+CANONICAL_MINUTE_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
 
 
 @dataclass(slots=True)
@@ -42,6 +46,57 @@ class MaterializeResult:
     output_path: str | None
     output_sha256: str | None
     message: str | None = None
+    build_mode: str = "unknown"
+    stage_elapsed_seconds_json: str = "{}"
+
+
+def _run_symbol_jobs(
+    records: list[dict[str, object]],
+    work: Callable[[dict[str, object]], MaterializeResult],
+    *,
+    workers: int,
+    progress: PersistentProgress,
+) -> list[MaterializeResult]:
+    """Retry only a source-version race, once, after the first wave drains.
+
+    A raw-minute writer can atomically replace a source while one symbol is
+    being read.  Re-running that symbol with a fresh identity is safe; treating
+    an incomplete or changed read as success is not.  Draining the first wave
+    before retry gives the writer time to finish without delaying healthy
+    symbols or counting a failed attempt as completed progress.
+    """
+
+    completed: list[MaterializeResult] = []
+    pending = records
+    for attempt in range(2):
+        retry: list[dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            futures = {executor.submit(work, record): record for record in pending}
+            for future in as_completed(futures):
+                record = futures[future]
+                symbol = str(record["code"])
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    if (
+                        attempt == 0
+                        and type(exc) is RuntimeError
+                        and str(exc)
+                        == "Bybit source changed during daily materialization"
+                    ):
+                        retry.append(record)
+                        continue
+                    result = MaterializeResult(
+                        symbol, "failed", 0, 0, 0, 0, 0, None, None,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                completed.append(result)
+                progress.update("materialize", result.status)
+        if not retry:
+            break
+        progress.heartbeat("retry_source_changed")
+        pending = retry
+    return sorted(completed, key=lambda item: item.symbol)
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,8 +146,19 @@ def _sha256(path: Path) -> str:
     return sha256_file(path)
 
 
-def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
+def _write_parquet_atomic(
+    frame: pl.DataFrame,
+    path: Path,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
+    atomic_write_parquet(
+        path,
+        frame,
+        compression="snappy",
+        write_statistics=True,
+        before_replace=before_replace,
+    )
 
 
 def _parse_utc(column: str, schema: pl.Schema) -> pl.Expr:
@@ -145,6 +211,8 @@ def _daily_bars(
     source_path: Path,
     *,
     execution_minutes_utc: int = DEFAULT_EXECUTION_MINUTES_UTC,
+    read_from_utc: datetime | None = None,
+    audit: dict[str, object] | None = None,
 ) -> tuple[pl.DataFrame, int, int]:
     _contract_version(execution_minutes_utc)
     schema = pq.read_schema(source_path)
@@ -165,7 +233,27 @@ def _daily_bars(
         )
         if name in schema.names
     ]
-    raw = read_logical_parquet(source_path, columns=columns)
+    filters = None
+    if read_from_utc is not None:
+        if read_from_utc.tzinfo is None or read_from_utc.utcoffset() != timedelta(0):
+            raise ValueError("read_from_utc must be timezone-aware UTC")
+        date_type = schema.field("date").type
+        if not (pa.types.is_string(date_type) or pa.types.is_large_string(date_type)):
+            raise ValueError("bounded Bybit read requires canonical string timestamps")
+        filters = [
+            ("date", ">=", read_from_utc.strftime("%Y-%m-%d %H:%M:%S"))
+        ]
+    raw = read_logical_parquet(source_path, columns=columns, filters=filters)
+    if audit is not None:
+        audit["canonical_string_dates"] = bool(
+            raw.schema.get("date") == pl.String
+            and raw.select(
+                pl.col("date")
+                .str.contains(CANONICAL_MINUTE_DATE_PATTERN)
+                .fill_null(False)
+                .all()
+            ).item()
+        )
     timestamp = _parse_utc("date", raw.schema)
     normalized = (
         raw.with_columns(timestamp.alias("__ts"))
@@ -287,6 +375,13 @@ def _daily_bars(
     execution_excluded = int(
         grouped.select((~pl.col("execution_available")).sum()).item()
     )
+    if audit is not None:
+        audit["execution_excluded_dates"] = (
+            grouped.filter(~pl.col("execution_available"))
+            .get_column("__session_end_date")
+            .cast(pl.String)
+            .to_list()
+        )
     # A missing feature minute must never erase a real execution mark. Retain
     # every execution-valued row for recurrent valuation and funding accounting;
     # policy_tradable remains false until a complete causal 32-day feature
@@ -295,6 +390,151 @@ def _daily_bars(
         "__boundary_utc"
     )
     return executable_marks, incomplete_retained, execution_excluded
+
+
+def _file_identity(path: Path) -> dict[str, int] | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"materialization source is not a regular file: {path}")
+    info = path.stat(follow_symlinks=False)
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def _tail_start_date(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    parquet = pq.ParquetFile(path)
+    try:
+        index = parquet.schema.names.index("date")
+    except ValueError as exc:
+        raise ValueError("hot tail has no date column") from exc
+    date_values = pl.from_arrow(parquet.read(columns=["date"]))
+    if date_values.schema.get("date") != pl.String or not date_values.select(
+        pl.col("date")
+        .str.contains(CANONICAL_MINUTE_DATE_PATTERN)
+        .fill_null(False)
+        .all()
+    ).item():
+        raise ValueError("hot tail has noncanonical minute timestamps")
+    starts: list[date] = []
+    for group_index in range(parquet.metadata.num_row_groups):
+        stats = parquet.metadata.row_group(group_index).column(index).statistics
+        if stats is None or not stats.has_min_max:
+            raise ValueError("hot tail has no complete date statistics")
+        starts.append(date.fromisoformat(str(stats.min)[:10]))
+    if not starts:
+        raise ValueError("hot tail has no row groups")
+    return min(starts).isoformat()
+
+
+def _daily_from_verified_output(path: Path, *, contract_version: int) -> pl.DataFrame:
+    prior = pl.read_parquet(path)
+    required = {
+        "date", "execution_price", "source_minute_rows", "unique_minute_rows",
+        "minute_grid_complete", "policy_tradable", "execution_available",
+        "first_minute_utc", "last_minute_utc", "bybit_perpetual_contract_version",
+    }
+    if required - set(prior.columns):
+        raise ValueError("prior daily output lacks incremental input columns")
+    versions = prior.get_column("bybit_perpetual_contract_version")
+    if prior.is_empty() or versions.null_count() or versions.n_unique() != 1 or int(versions[0]) != contract_version:
+        raise ValueError("prior daily output uses a different execution contract")
+    dates = prior.get_column("date")
+    if dates.null_count() or dates.n_unique() != prior.height or not dates.is_sorted():
+        raise ValueError("prior daily dates are not unique and ordered")
+    return (
+        prior.with_columns(pl.col("date").str.to_date(strict=True).alias("__session_end_date"))
+        .with_columns(
+            pl.col("__session_end_date")
+            .cast(pl.Datetime("us"))
+            .dt.replace_time_zone("UTC")
+            .alias("__decision_cutoff_utc")
+        )
+        .with_columns(
+            (
+                pl.col("__decision_cutoff_utc")
+                + pl.duration(minutes=DEFAULT_EXECUTION_MINUTES_UTC if contract_version == LEGACY_CONTRACT_VERSION else 0)
+            ).alias("__boundary_utc")
+        )
+    )
+
+
+def _incremental_daily_bars(
+    source: Path,
+    target: Path,
+    sidecar: Path,
+    *,
+    execution_minutes_utc: int,
+) -> tuple[pl.DataFrame, int, int, list[str]] | None:
+    if not sidecar.is_file() or not target.is_file():
+        return None
+    try:
+        proof = json.loads(sidecar.read_text(encoding="utf-8"))
+        if (
+            proof.get("schema_version") != 1
+            or proof.get("execution_contract_version") != _contract_version(execution_minutes_utc)
+            or proof.get("canonical_string_dates") is not True
+            or proof.get("base_identity") != _file_identity(source)
+            or proof.get("output_sha256") != _sha256(target)
+        ):
+            return None
+        prior = _daily_from_verified_output(
+            target, contract_version=_contract_version(execution_minutes_utc)
+        )
+        old_tail_start = proof.get("tail_start_date")
+        new_tail_start = _tail_start_date(hot_tail_path(source))
+        earliest = min(
+            (date.fromisoformat(value) for value in (old_tail_start, new_tail_start) if value),
+            default=None,
+        )
+        excluded_before = proof["execution_excluded_dates"]
+        if not isinstance(excluded_before, list) or not all(isinstance(value, str) for value in excluded_before):
+            return None
+        if earliest is None:
+            daily = prior
+            excluded_dates = excluded_before
+        else:
+            read_from = datetime.combine(
+                earliest - timedelta(days=MODEL_RAW_SESSION_WINDOW_DAYS),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            tail_audit: dict[str, object] = {}
+            suffix, _, _ = _daily_bars(
+                source,
+                execution_minutes_utc=execution_minutes_utc,
+                read_from_utc=read_from,
+                audit=tail_audit,
+            )
+            if tail_audit.get("canonical_string_dates") is not True:
+                return None
+            daily = pl.concat(
+                [
+                    prior.filter(pl.col("__session_end_date") < earliest),
+                    suffix.filter(pl.col("__session_end_date") >= earliest),
+                ],
+                how="diagonal_relaxed",
+            ).sort("__decision_cutoff_utc")
+            excluded_dates = [value for value in excluded_before if value < earliest.isoformat()]
+            excluded_dates.extend(
+                value
+                for value in tail_audit["execution_excluded_dates"]
+                if value >= earliest.isoformat()
+            )
+        incomplete = int(
+            daily.select(
+                ((~pl.col("minute_grid_complete")) & pl.col("execution_available")).sum()
+            ).item()
+        )
+        return daily, incomplete, len(excluded_dates), excluded_dates
+    except (KeyError, OSError, TypeError, ValueError, pl.exceptions.PolarsError):
+        return None
 
 
 def _attach_funding_total_return(
@@ -541,7 +781,12 @@ def main() -> None:
     contract_version = _contract_version(execution_minutes_utc)
     execution_clock = _clock_hhmm(execution_minutes_utc)
     output_dir.mkdir(parents=True, exist_ok=True)
-    instruments = _standard_instruments(funding_dir / "instruments.csv")
+    instruments_path = funding_dir / "instruments.csv"
+    coverage_path = funding_dir / "funding_coverage.csv"
+    receipt_identity_before = (
+        _file_identity(instruments_path), _file_identity(coverage_path)
+    )
+    instruments = _standard_instruments(instruments_path)
     requested = {
         str(value).strip().upper()
         for value in (args.symbols or [])
@@ -558,13 +803,16 @@ def main() -> None:
             )
     if args.limit is not None:
         instruments = instruments.head(max(0, int(args.limit)))
-    coverage_path = funding_dir / "funding_coverage.csv"
     if not coverage_path.is_file():
         raise FileNotFoundError(f"missing funding coverage receipt: {coverage_path}")
     coverage = {
         str(row["symbol"]): row
         for row in pl.read_csv(coverage_path, infer_schema_length=10_000).to_dicts()
     }
+    if receipt_identity_before != (
+        _file_identity(instruments_path), _file_identity(coverage_path)
+    ):
+        raise RuntimeError("Bybit funding receipt changed while loading symbol coverage")
     records = instruments.to_dicts()
     progress = PersistentProgress(
         output_dir / "progress.json",
@@ -574,14 +822,13 @@ def main() -> None:
         basis="completed local 1m plus official funding materializations",
         started_at=started,
     )
-    results: list[MaterializeResult] = []
-    lock = threading.Lock()
-
     def work(record: dict[str, object]) -> MaterializeResult:
+        work_started = time.perf_counter()
         symbol = str(record["code"])
         source = input_dir / f"{symbol}_features.parquet"
         funding_path = funding_dir / f"{symbol}_funding.parquet"
         target = output_dir / f"{symbol}_features.parquet"
+        sidecar = output_dir / f"{symbol}_features.materialize.json"
         if not source.is_file():
             raise FileNotFoundError(f"missing one-minute source: {source}")
         if not funding_path.is_file() or symbol not in coverage:
@@ -603,6 +850,8 @@ def main() -> None:
             == contract_version
         ):
             frame = pl.read_parquet(target)
+            target_sha256 = _sha256(target)
+            elapsed = round(time.perf_counter() - work_started, 6)
             return MaterializeResult(
                 symbol,
                 "skipped_up_to_date",
@@ -612,19 +861,92 @@ def main() -> None:
                 0,
                 int(frame["funding_event_count_to_next"].sum()),
                 str(target),
-                _sha256(target),
+                target_sha256,
+                build_mode="skipped_up_to_date",
+                stage_elapsed_seconds_json=json.dumps(
+                    {"up_to_date_proof": elapsed, "total": elapsed},
+                    sort_keys=True,
+                ),
             )
-        daily, incomplete_retained, execution_excluded = _daily_bars(
-            source,
-            execution_minutes_utc=execution_minutes_utc,
+        source_identity = (
+            _file_identity(source),
+            _file_identity(hot_tail_path(source)),
+            _file_identity(funding_path),
+            _file_identity(instruments_path),
+            _file_identity(coverage_path),
         )
+        incremental = (
+            _incremental_daily_bars(
+                source,
+                target,
+                sidecar,
+                execution_minutes_utc=execution_minutes_utc,
+            )
+            if not args.refresh
+            else None
+        )
+        if incremental is None:
+            daily_audit: dict[str, object] = {}
+            daily, incomplete_retained, execution_excluded = _daily_bars(
+                source,
+                execution_minutes_utc=execution_minutes_utc,
+                audit=daily_audit,
+            )
+            excluded_dates = daily_audit["execution_excluded_dates"]
+            canonical_string_dates = daily_audit["canonical_string_dates"]
+            build_mode = "full"
+        else:
+            daily, incomplete_retained, execution_excluded, excluded_dates = incremental
+            canonical_string_dates = True
+            build_mode = "incremental"
+        daily_done = time.perf_counter()
         output, executable, events = _attach_funding_total_return(
             daily,
             funding_path,
             coverage[symbol],
             execution_minutes_utc=execution_minutes_utc,
         )
-        _write_parquet_atomic(output, target)
+        funding_done = time.perf_counter()
+        def assert_sources_unchanged() -> None:
+            if source_identity != (
+                _file_identity(source),
+                _file_identity(hot_tail_path(source)),
+                _file_identity(funding_path),
+                _file_identity(instruments_path),
+                _file_identity(coverage_path),
+            ):
+                raise RuntimeError("Bybit source changed during daily materialization")
+
+        _write_parquet_atomic(output, target, before_replace=assert_sources_unchanged)
+        output_sha256 = _sha256(target)
+        assert_sources_unchanged()
+        try:
+            tail_start_date = _tail_start_date(hot_tail_path(source))
+        except ValueError:
+            # A source without row-group statistics still has a valid full
+            # materialization, but cannot certify a bounded future rebuild.
+            tail_start_date = None
+            incremental_proof_available = False
+        else:
+            incremental_proof_available = True
+        if incremental_proof_available and canonical_string_dates:
+            atomic_write_text(
+                sidecar,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "execution_contract_version": contract_version,
+                        "canonical_string_dates": True,
+                        "base_identity": source_identity[0],
+                        "tail_start_date": tail_start_date,
+                        "execution_excluded_dates": excluded_dates,
+                        "output_sha256": output_sha256,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ) + "\n",
+            )
+        work_done = time.perf_counter()
         return MaterializeResult(
             symbol,
             "updated",
@@ -634,33 +956,22 @@ def main() -> None:
             execution_excluded,
             events,
             str(target),
-            _sha256(target),
+            output_sha256,
+            build_mode=build_mode,
+            stage_elapsed_seconds_json=json.dumps(
+                {
+                    "daily_bars": round(daily_done - work_started, 6),
+                    "funding_join": round(funding_done - daily_done, 6),
+                    "write_and_proof": round(work_done - funding_done, 6),
+                    "total": round(work_done - work_started, 6),
+                },
+                sort_keys=True,
+            ),
         )
 
-    with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
-        futures = {executor.submit(work, record): record for record in records}
-        for future in as_completed(futures):
-            record = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = MaterializeResult(
-                    str(record["code"]),
-                    "failed",
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    f"{type(exc).__name__}: {exc}",
-                )
-            with lock:
-                results.append(result)
-            progress.update("materialize", result.status)
-
-    ordered = sorted(results, key=lambda item: item.symbol)
+    ordered = _run_symbol_jobs(
+        records, work, workers=args.workers, progress=progress
+    )
     atomic_write_text(
         output_dir / "materialize_report.csv",
         pl.DataFrame(
@@ -688,6 +999,11 @@ def main() -> None:
         "symbols": len(records),
         "completed_symbols": len(records) - len(failed),
         "failed_symbols": len(failed),
+        "build_mode_counts": {
+            mode: sum(item.build_mode == mode for item in ordered)
+            for mode in ("full", "incremental", "skipped_up_to_date", "unknown")
+        },
+        "stage_latency": stage_latency_summary(ordered),
         "rows": sum(item.rows for item in ordered),
         "executable_return_rows": sum(item.executable_return_rows for item in ordered),
         "incomplete_feature_sessions_retained": sum(

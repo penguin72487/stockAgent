@@ -32,12 +32,19 @@ from common import (  # noqa: E402
     retry_delay_seconds,
     run_parallel_tasks,
 )
-from artifact_io import atomic_write_parquet, atomic_write_text  # noqa: E402
+from artifact_io import (  # noqa: E402
+    archive_run_reports as _archive_run_reports,
+    atomic_write_parquet,
+    atomic_write_text,
+)
+from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
 from binance_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
+    feature_run_summary_path,
     feature_catalog_payload,
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
+    stage_latency_summary,
 )
 from ohlcv_hot_tail import (  # noqa: E402
     hot_tail_path,
@@ -305,6 +312,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Parallel feature workers; defaults to --workers.",
+    )
+    parser.add_argument(
+        "--archive-report-dir",
+        default=None,
+        help="Optional per-run source report archive before a later job overwrites it.",
     )
     return parser.parse_args()
 
@@ -655,6 +667,18 @@ class BinanceClient:
             name="binance_usdm_request_weight",
         )
 
+    def endpoint_limiter_activity(self) -> dict[str, dict[str, float | int | str]]:
+        """Report local grants; shared IP quota may include other processes."""
+
+        return {
+            key: {
+                **limiter.grant_activity(),
+                "interval_seconds": limiter.interval_seconds,
+                "sharing_scope": "per_ip_local_process",
+            }
+            for key, limiter in self._endpoint_limiters.items()
+        }
+
     def configure_exchange_limits(self, payload: dict[str, Any]) -> None:
         candidates: list[float] = []
         interval_seconds = {
@@ -831,6 +855,38 @@ def _fetch_symbols(
     return records, payload
 
 
+def _first_available_candle_ms(
+    client: BinanceClient,
+    symbol: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> int | None:
+    """Check the provider's first actual bar, not exchangeInfo's listing date."""
+    payload = client.get(
+        KLINE_ENDPOINT,
+        {
+            "symbol": symbol,
+            "interval": KLINE_INTERVAL,
+            "startTime": str(start_ms),
+            "endTime": str(end_ms + CANDLE_INTERVAL_MS - 1),
+            "limit": "1",
+        },
+        weight=1.0,
+    )
+    if not isinstance(payload, list) or len(payload) > 1:
+        raise RuntimeError("Binance first-candle probe returned an invalid payload")
+    if not payload:
+        return None  # No proof that the existing historical head is complete.
+    row = payload[0]
+    if not isinstance(row, list) or len(row) < 11:
+        raise RuntimeError("Binance first-candle probe returned an invalid candle")
+    first_ms = int(row[0])
+    if first_ms < start_ms or first_ms > end_ms:
+        raise RuntimeError("Binance first-candle probe returned an out-of-range candle")
+    return first_ms
+
+
 def _download_symbol(
     client: BinanceClient,
     record: SymbolRecord,
@@ -846,6 +902,7 @@ def _download_symbol(
     output_path = output_dir / f"{record.code}_features.parquet"
     existing: ExistingCandleInfo | None = None
     effective_start = start_ms
+    closed_end = min(end_ms, _latest_closed_candle_start_ms())
     if record.onboard_time:
         effective_start = max(
             effective_start,
@@ -881,20 +938,40 @@ def _download_symbol(
             )
             existing = None
         elif existing.rows and existing.latest_ms is not None:
-            effective_start, _ = resolve_incremental_reconcile_start_ms(
+            effective_start, missing_head = resolve_incremental_reconcile_start_ms(
                 expected_first_ms=effective_start,
                 earliest_existing_ms=existing.earliest_ms,
                 latest_existing_ms=existing.latest_ms,
                 overlap_ms=CANDLE_INTERVAL_MS,
                 repair_missing_head=not tail_only,
             )
+            if missing_head and not tail_only and effective_start <= closed_end:
+                # exchangeInfo.onboardDate can precede the first published
+                # candle by days or more. Probe the actual source head before
+                # repeatedly downloading years of already-present history.
+                first_available = _first_available_candle_ms(
+                    client,
+                    record.binance_symbol,
+                    start_ms=effective_start,
+                    end_ms=closed_end,
+                )
+                if first_available is not None and existing.earliest_ms is not None:
+                    if first_available >= existing.earliest_ms:
+                        effective_start, _ = resolve_incremental_reconcile_start_ms(
+                            expected_first_ms=effective_start,
+                            earliest_existing_ms=existing.earliest_ms,
+                            latest_existing_ms=existing.latest_ms,
+                            overlap_ms=CANDLE_INTERVAL_MS,
+                            repair_missing_head=False,
+                        )
+                    else:
+                        effective_start = first_available
     elif tail_only:
         effective_start = max(
             effective_start,
-            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+            closed_end - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    closed_end = min(end_ms, _latest_closed_candle_start_ms())
     if effective_start > closed_end:
         if existing is not None and existing.rows:
             return DownloadResult(
@@ -917,8 +994,9 @@ def _download_symbol(
             message="Requested range ends before listing or before a completed candle.",
         )
 
-    rows: list[list[Any]] = []
+    candles = CandleFrameBuffer(_normalize_candles)
     cursor = effective_start
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     while cursor <= closed_end:
         payload = client.get(
             KLINE_ENDPOINT,
@@ -938,7 +1016,12 @@ def _download_symbol(
         chunk = [row for row in payload if isinstance(row, list) and len(row) >= 11]
         if not chunk:
             break
-        rows.extend(chunk)
+        candles.extend(
+            row
+            for row in chunk
+            if effective_start <= int(row[0]) <= closed_end
+            and int(row[6]) < now_ms
+        )
         last_open = max(int(row[0]) for row in chunk)
         next_cursor = last_open + CANDLE_INTERVAL_MS
         if next_cursor <= cursor:
@@ -947,13 +1030,7 @@ def _download_symbol(
         if len(chunk) < KLINE_LIMIT:
             break
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    filtered = [
-        row
-        for row in rows
-        if effective_start <= int(row[0]) <= closed_end and int(row[6]) < now_ms
-    ]
-    fresh = _normalize_candles(filtered)
+    fresh = candles.finish()
     if fresh.is_empty():
         if existing is not None and existing.rows:
             return DownloadResult(
@@ -1229,6 +1306,8 @@ def main() -> None:
                 "stage_status_json": pl.String,
                 "coverage_json": pl.String,
                 "errors_json": pl.String,
+                "stage_elapsed_seconds_json": pl.String,
+                "total_elapsed_seconds": pl.Float64,
             }
         )
     )
@@ -1284,6 +1363,7 @@ def main() -> None:
         "historical_feature_report_is_current_run": not args.skip_historical_features,
         "tail_only": args.tail_only,
         "historical_feature_status_counts": historical_status_counts,
+        "historical_feature_stage_latency": stage_latency_summary(historical_feature_results),
         "historical_feature_report": str(historical_feature_report_path),
         "historical_feature_catalog": str(feature_catalog_path),
         "start_date": start_date,
@@ -1296,11 +1376,16 @@ def main() -> None:
         "kline_limit": KLINE_LIMIT,
         "kline_request_weight": KLINE_REQUEST_WEIGHT,
         "limiter_activity": limiter_activity,
+        "endpoint_limiter_activity": client.endpoint_limiter_activity(),
     }
+    summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     _write_text_atomic(
-        summary_path,
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        feature_run_summary_path(
+            output_dir, features_enabled=not args.skip_historical_features
+        ),
+        summary_text,
     )
+    _write_text_atomic(summary_path, summary_text)
     receipt = {
         "contract_version": 1,
         "source": {
@@ -1331,6 +1416,18 @@ def main() -> None:
         receipt_path,
         json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
     )
+    if args.archive_report_dir:
+        _archive_run_reports(
+            Path(args.archive_report_dir),
+            (
+                symbols_path,
+                report_path,
+                summary_path,
+                receipt_path,
+                historical_feature_report_path,
+                feature_catalog_path,
+            ),
+        )
     failed = status_counts.get("failed", 0) + status_counts.get("repair_required", 0)
     feature_incomplete = historical_status_counts.get(
         "failed", 0
@@ -1343,7 +1440,8 @@ def main() -> None:
     print(f"[binance] receipt -> {receipt_path}")
     print(f"[binance] feature report -> {historical_feature_report_path}")
     print(f"[binance] feature catalog -> {feature_catalog_path}")
-    print(f"[binance] done: {json.dumps(summary, ensure_ascii=False)}")
+    print(f"[binance] report: {json.dumps(summary, ensure_ascii=False)}")
+    lock_handle.close()
     if failed:
         raise RuntimeError(f"Binance download incomplete: {failed} symbols failed")
     if feature_incomplete:
@@ -1351,6 +1449,7 @@ def main() -> None:
             "Binance historical features incomplete: "
             f"{feature_incomplete} symbols were partial or failed"
         )
+    print("[binance] complete")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ const state = {
   detailsActivated: false,
   detailsQueued: false,
   featureRows: [],
+  featureSearchIndex: [],
+  featureETag: null,
   featureVisible: FEATURE_PAGE_SIZE,
   featureActivated: false,
   featureInFlight: false,
@@ -198,6 +200,10 @@ function scheduleLines(row) {
     };
   }
   const next = timeLabel(automation.next_run_at_utc);
+  if (automation.schedule_state === "timer_unarmed") {
+    const affected = (automation.unarmed_service_keys || []).join("、");
+    return {primary: "自動排程中斷", secondary: affected ? `${affected}：已啟用但沒有下次觸發` : "已啟用但沒有下次觸發"};
+  }
   if (automation.job_running) {
     return {primary: "自動更新執行中", secondary: `${automation.schedule_label || row.cadence} · ${basisLabel}`};
   }
@@ -313,7 +319,11 @@ function renderSummary(data) {
   $("control-detail").textContent = `${formatInteger(summary.credential_ready)} 憑證就緒 · ${formatInteger(summary.credential_attention)} 待處理`;
   $("verified-inventory").textContent = `${formatInteger(summary.physical_inventory_verified_items)}/${formatInteger(summary.physical_inventory_items)}`;
   const inventory = data.record_inventory_progress || {};
-  $("inventory-detail").textContent = `${recordFiles({files_inspected: inventory.inspected_files, files_total: inventory.selected_files, invalid_files: inventory.invalid_files})}；${formatInteger(summary.physical_inventory_time_bounded_items)} 個資料集有首末時間，${formatInteger(summary.physical_inventory_invalid_items)} 個有異常。`;
+  const unbound = number(inventory.identity_unbound_files);
+  const identityProgress = unbound === null
+    ? "檔案身分重驗尚無收據"
+    : `檔案身分與 footer 重驗剩餘 ${formatInteger(unbound)}/${formatInteger(inventory.cached_files)} 檔`;
+  $("inventory-detail").textContent = `${recordFiles({files_inspected: inventory.inspected_files, files_total: inventory.selected_files, invalid_files: inventory.invalid_files})}；${formatInteger(summary.physical_inventory_time_bounded_items)} 個資料集有首末時間，${formatInteger(summary.physical_inventory_invalid_items)} 個有異常；${identityProgress}（非歷史完整度）。`;
   const categoryRevision = JSON.stringify(data.market_categories || []);
   if (categoryRevision !== state.categoryRevision) {
     state.categoryRevision = categoryRevision;
@@ -321,6 +331,51 @@ function renderSummary(data) {
   }
   if (data.definitions?.realtime_boundary) $("boundary-copy").textContent = data.definitions.realtime_boundary;
   renderAcquisition(data.tw_public_acquisition);
+  renderFinlabAcquisition(data.finlab_acquisition);
+}
+
+function renderFinlabAcquisition(acquisition) {
+  const info = acquisition || {};
+  const downloaded = number(info.downloaded);
+  const total = number(info.catalog_total);
+  const ratio = total > 0 ? number(info.ratio) : null;
+  const bar = $("finlab-progress");
+  if (ratio === null) bar.removeAttribute("value");
+  else bar.value = Math.min(1, Math.max(0, ratio));
+  $("finlab-count").textContent = total === null
+    ? `${formatInteger(downloaded)} 個已下載；目錄分母未核實`
+    : total === 0
+      ? "目錄已核實但沒有資料鍵；完成率不適用"
+      : `${formatInteger(downloaded)}/${formatInteger(total)} 個目錄鍵已下載 · ${ratio === null ? "—" : `${(ratio * 100).toFixed(1)}%`}`;
+  const stateLabels = {
+    running: "正在下載", scheduled: "等待排程", waiting_quota: "等待配額恢復",
+    service_failed: "下載服務失敗", timer_disabled: "排程未啟用",
+    catalog_unknown: "目錄未核實",
+    catalog_downloaded_not_pit_validated: "目錄已下載；歷史可用性未驗證",
+  };
+  $("finlab-state").textContent = stateLabels[info.state] || "狀態待驗證";
+  const reasons = info.not_downloaded_by_reason || {};
+  $("finlab-breakdown").textContent = total === null
+    ? "目錄分母未知；不顯示完成率。"
+    : Object.keys(reasons).length
+      ? `未取得 ${formatInteger(info.not_downloaded)} 鍵：尚未嘗試 ${formatInteger(reasons.pending)}、SDK 錯誤 ${formatInteger(reasons.provider_error)}、來源全空 ${formatInteger(reasons.provider_empty)}、逾時 ${formatInteger(reasons.resource_timeout)}、資源暫緩 ${formatInteger(reasons.deferred_resource)}、需分日期 ${formatInteger(reasons.deferred_windowed)}、分日期回補中 ${formatInteger(reasons.partial_windowed)}、權限待核 ${formatInteger(reasons.vip_only)}、登入失敗 ${formatInteger(reasons.authentication_failed)}、額度不足 ${formatInteger(reasons.quota_wait)}。`
+      : `未取得 ${formatInteger(info.not_downloaded)} 鍵；細項待下一次監控快照。`;
+  const quota = number(info.quota_remaining_mb);
+  const limit = number(info.quota_limit_mb);
+  $("finlab-quota").textContent = quota === null
+    ? "尚無今日額度回執"
+    : `${quota.toFixed(0)}${limit === null ? "" : ` / ${limit.toFixed(0)}`} MB · ${timeLabel(info.quota_observed_at_utc) || "時間未核實"}`;
+  $("finlab-recent").textContent = `${formatInteger(info.recent_downloaded_15m)} 鍵`;
+  const lastAge = number(info.last_receipt_age_seconds);
+  $("finlab-last").textContent = info.last_receipt_at_utc
+    ? `${timeLabel(info.last_receipt_at_utc)}${lastAge !== null && lastAge >= 600 ? ` · ${Math.floor(lastAge / 60)} 分鐘無新收據` : ""}`
+    : "尚無成功收據";
+  $("finlab-next").textContent = timeLabel(info.next_run_at_utc) || "未提供";
+  $("finlab-eta").textContent = "配額限制，無可信倒數";
+  $("finlab-cold").textContent = info.cold_publish_configured
+    ? "已設定發布；同步完成需另行核驗"
+    : "未啟用；原始資料留本機";
+  $("finlab-basis").textContent = info.basis || "";
 }
 
 function renderMarketCategories(categories) {
@@ -656,14 +711,20 @@ function populateFeatureFilters(rows) {
 }
 
 function filteredFeatures() {
-  const query = $("feature-search").value.trim().toLocaleLowerCase("zh-Hant");
+  // Search the immutable inventory's normalized strings.  Rebuilding these on
+  // every keystroke allocates hundreds of thousands of short-lived strings.
+  const query = $("feature-search").value.trim().toLowerCase();
   const category = $("feature-category").value;
   const source = $("feature-source").value;
-  return state.featureRows.filter((row) => {
+  return state.featureRows.filter((row, index) => {
     if (category !== "all" && row.market_category !== category) return false;
     if (source !== "all" && row.dataset_id !== source) return false;
-    return !query || [row.field, row.dataset_id, row.source_title, row.provider, row.market_category_label]
-      .some((value) => String(value || "").toLocaleLowerCase("zh-Hant").includes(query));
+    if (!query) return true;
+    // A NUL-delimited index cannot give exact field-local results for a query
+    // containing the delimiter. Preserve the original per-field semantics.
+    if (query.includes("\0")) return [row.field, row.dataset_id, row.source_title, row.provider, row.market_category_label]
+      .some((value) => String(value || "").toLowerCase().includes(query));
+    return state.featureSearchIndex[index].includes(query);
   });
 }
 
@@ -734,10 +795,24 @@ async function refreshFeatures() {
   if (!state.featureActivated || state.featureInFlight || document.hidden) return;
   state.featureInFlight = true;
   try {
-    const data = await fetchJson("api/features");
+    const response = await Dashboard.fetchWithTimeout("api/features", {
+      timeoutMs: 15000,
+      cache: "no-store",
+      headers: state.featureETag ? {"If-None-Match": state.featureETag} : {},
+    });
+    if (response.status === 304 && state.featureETag) {
+      await Dashboard.readTextResponse(response);
+      return;
+    }
+    const data = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (!Array.isArray(data.rows)) throw new Error("Invalid feature inventory");
+    const searchIndex = data.rows.map((row) =>
+      [row.field, row.dataset_id, row.source_title, row.provider, row.market_category_label]
+        .map((value) => String(value || "").toLowerCase()).join("\0"));
     state.featureRows = data.rows;
+    state.featureSearchIndex = searchIndex;
     state.featureSummary = data.summary || {};
+    state.featureETag = response.headers.get("ETag") || null;
     populateFeatureFilters(state.featureRows);
     renderFeatures({reset: true});
   } catch (_error) {
@@ -755,7 +830,7 @@ function activateFeatures() {
 
 function filteredRows() {
   const rows = state.sortedSources;
-  const query = $("search").value.trim().toLocaleLowerCase("zh-Hant");
+  const query = $("search").value.trim().toLowerCase();
   const provider = $("provider-filter").value;
   const category = $("category-filter").value;
   const status = $("status-filter").value;
@@ -779,7 +854,7 @@ function filteredRows() {
     if (granularity !== "all" && row.granularity !== granularity) return false;
     if (!query) return true;
     return [row.title, row.provider, row.update_owner, row.category, row.market_category_label, row.granularity, row.availability, row.detail]
-      .some((value) => String(value || "").toLocaleLowerCase("zh-Hant").includes(query));
+      .some((value) => String(value || "").toLowerCase().includes(query));
   });
 }
 

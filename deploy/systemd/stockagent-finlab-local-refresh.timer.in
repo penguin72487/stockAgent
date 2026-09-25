@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh licensed FinLab research cache after quota reset and TW opening
+
+[Timer]
+OnCalendar=*-*-* 08:00:05 Asia/Taipei
+OnCalendar=*-*-* 08:03:00 Asia/Taipei
+OnCalendar=*-*-* 09:10:05 Asia/Taipei
+OnCalendar=*-*-* 16:10:00 Asia/Taipei
+# Once a bounded pass exits, retry eligible failures and newly due source
+# checks during the same day. The service lock and opening-window gate remain.
+OnUnitInactiveSec=15min
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-finlab-local-refresh.service
+
+[Install]
+WantedBy=timers.target

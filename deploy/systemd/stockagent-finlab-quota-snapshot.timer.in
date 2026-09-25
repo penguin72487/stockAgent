@@ -1,0 +1,11 @@
+[Unit]
+Description=Observe FinLab account data quota every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00 Asia/Taipei
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-finlab-quota-snapshot.service
+
+[Install]
+WantedBy=timers.target

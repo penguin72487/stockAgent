@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from queue import Empty
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -25,6 +26,7 @@ except ModuleNotFoundError:  # direct script execution
 from stockagent.live.shioaji_traffic_ledger import shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
+    TAIPEI,
 )
 
 from downloader.download_shioaji_tw_kbars import (  # noqa: E402
@@ -54,7 +56,7 @@ DEFAULT_CHUNK_DAYS = 29
 MINUTE_SESSION_START = 9 * 60 + 1
 MINUTE_SESSION_END = 13 * 60 + 30
 SHIOAJI_QUOTE_LIMIT_REQUESTS = 50
-SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS = 5.0
+SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS = 10.0
 SHIOAJI_MAX_CONNECTIONS = 5
 DEFAULT_WORKERS = SHIOAJI_MAX_CONNECTIONS
 DEFAULT_REQUESTS_PER_SECOND = (
@@ -76,7 +78,7 @@ class SharedRequestRateLimiter:
     The documented Shioaji quote-query guard is account-wide, so every worker,
     retry, and single-day fallback must acquire from this one limiter. Pacing
     avoids a 50-request burst while the ring buffer also guarantees that no
-    sliding five-second window contains more than 50 request starts.
+    sliding ten-second window contains more than 50 request starts.
     """
 
     def __init__(
@@ -409,6 +411,11 @@ def query_minute_chunk(
             if missing_dates:
                 fallback_frames: list[pl.DataFrame] = []
                 for missing_date in missing_dates:
+                    # A one-day retry has already made this exact request.
+                    # Repeating the same empty query burns quota without
+                    # adding any evidence about the missing session.
+                    if start == end == missing_date:
+                        continue
                     if request_started is not None:
                         request_started()
                     with shioaji_query(
@@ -434,18 +441,50 @@ def query_minute_chunk(
                         stats[key] += value
                     if fallback.height:
                         fallback_frames.append(fallback)
-                stats["single_day_fallback_queries"] = len(missing_dates)
+                stats["single_day_fallback_queries"] = (
+                    0 if start == end else len(missing_dates)
+                )
                 if fallback_frames:
                     frame = pl.concat(
                         [frame, *fallback_frames], how="vertical_relaxed"
                     ).sort("ts")
                     returned_dates = set(frame["date"].to_list())
             unresolved_dates = sorted(expected_dates - returned_dates)
+            if unresolved_dates and tick_fallback_root is not None:
+                recovered, tick_audit = query_tick_minute_fallback(
+                    api, contract, row, contract_unit=contract_unit,
+                    days=unresolved_dates, timeout_ms=timeout_ms,
+                    request_started=request_started,
+                    output_root=tick_fallback_root,
+                    max_traffic_fraction=max_traffic_fraction,
+                )
+                for key in (
+                    "zero_placeholder_rows_dropped",
+                    "negative_correction_rows_dropped",
+                    "out_of_session_rows_dropped",
+                    "outside_reference_date_rows_dropped",
+                ):
+                    stats[key] += int(tick_audit.get(key, 0))
+                stats["tick_fallback_queries"] = int(tick_audit["tick_fallback_queries"])
+                stats["raw_tick_sources"] = tick_audit["raw_tick_sources"]
+                if recovered.height:
+                    provider_rows = frame.height
+                    frame = (
+                        pl.concat([frame, recovered.select(frame.columns)], how="vertical_relaxed")
+                        if provider_rows else recovered
+                    ).sort("ts")
+                    returned_dates = set(frame["date"].to_list())
+                    stats["underlying_data_method"] = (
+                        "mixed_provider_kbars_and_observed_ticks"
+                        if provider_rows
+                        else "observed_ticks_aggregated_to_right_labelled_1m"
+                    )
+                unresolved_dates = sorted(expected_dates - returned_dates)
             stats["source_gap_dates"] = [
                 value.isoformat() for value in unresolved_dates
             ]
             return frame, stats
-        except DownloadStopRequested:
+        except (DownloadStopRequested, TrafficBudgetReached, MarketHoursReached):
             raise
         except Exception as exc:
             last_error = exc
@@ -461,6 +500,76 @@ def query_minute_chunk(
             time.sleep(float(retry_backoff) * (2**attempt))
     assert last_error is not None
     raise last_error
+
+
+def query_source_gap_dates(
+    api: Any,
+    contract: Any,
+    row: UniverseRow,
+    *,
+    contract_unit: float,
+    missing_dates: set[date],
+    timeout_ms: int,
+    retries: int,
+    retry_backoff: float,
+    request_started: Callable[[], None] | None,
+    tick_fallback_root: Path | None,
+    max_traffic_fraction: float,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Retry only absent symbol-days; archived bars stay untouched by queries."""
+
+    frames: list[pl.DataFrame] = []
+    audit: dict[str, Any] = {
+        "zero_placeholder_rows_dropped": 0,
+        "negative_correction_rows_dropped": 0,
+        "out_of_session_rows_dropped": 0,
+        "outside_reference_date_rows_dropped": 0,
+        "single_day_fallback_queries": 0,
+        "tick_fallback_queries": 0,
+        "raw_tick_sources": [],
+    }
+    tick_recovered = False
+    provider_recovered = False
+    for day in sorted(missing_dates):
+        frame, day_audit = query_minute_chunk(
+            api, contract, row, contract_unit=contract_unit,
+            start=day, end=day, timeout_ms=timeout_ms, retries=retries,
+            retry_backoff=retry_backoff, expected_dates={day},
+            request_started=request_started,
+            tick_fallback_root=tick_fallback_root,
+            max_traffic_fraction=max_traffic_fraction,
+        )
+        for key in (
+            "zero_placeholder_rows_dropped",
+            "negative_correction_rows_dropped",
+            "out_of_session_rows_dropped",
+            "outside_reference_date_rows_dropped",
+            "single_day_fallback_queries",
+            "tick_fallback_queries",
+        ):
+            audit[key] += int(day_audit.get(key, 0))
+        audit["raw_tick_sources"].extend(day_audit.get("raw_tick_sources", []))
+        if frame.height:
+            frames.append(frame)
+            method = day_audit.get("underlying_data_method", "provider_kbars")
+            if method == "mixed_provider_kbars_and_observed_ticks":
+                tick_recovered = True
+                provider_recovered = True
+            elif method == "observed_ticks_aggregated_to_right_labelled_1m":
+                tick_recovered = True
+            else:
+                provider_recovered = True
+    result = pl.concat(frames, how="vertical_relaxed").sort("ts") if frames else pl.DataFrame()
+    returned = set(result["date"].to_list()) if result.height else set()
+    audit["source_gap_dates"] = [
+        day.isoformat() for day in sorted(missing_dates - returned)
+    ]
+    audit["underlying_data_method"] = (
+        "mixed_provider_kbars_and_observed_ticks" if tick_recovered and provider_recovered
+        else "observed_ticks_aggregated_to_right_labelled_1m" if tick_recovered
+        else "provider_kbars"
+    )
+    return result, audit
 
 
 def ticks_to_minute_kbars(ticks: Any, *, symbol: str, market: str,
@@ -494,6 +603,24 @@ def ticks_to_minute_kbars(ticks: Any, *, symbol: str, market: str,
     return normalize_kbars(payload, symbol=symbol, market=market, contract_unit=contract_unit)
 
 
+def _write_immutable_raw_ticks(
+    frame: pl.DataFrame, root: Path, *, symbol: str, day: date,
+) -> dict[str, Any]:
+    """Retain every observed tick version without overwriting an older receipt."""
+
+    directory = root / symbol
+    staging = directory / f".{day}.{os.getpid()}.{time.time_ns()}.parquet"
+    written = _write_minute_parquet(frame, staging)
+    destination = directory / f"{day}.{written['sha256']}.parquet"
+    if destination.exists():
+        if _sha256(destination) != written["sha256"]:
+            raise RuntimeError(f"raw tick evidence digest collision: {destination}")
+        staging.unlink()
+    else:
+        os.replace(staging, destination)
+    return {"path": str(destination), "size": written["size"], "sha256": written["sha256"]}
+
+
 def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
                               contract_unit: float, days: list[date], timeout_ms: int,
                               request_started: Callable[[], None] | None,
@@ -507,12 +634,19 @@ def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
         if request_started:
             request_started()
         _check_traffic_budget(api, max_fraction=max_traffic_fraction)
-        with shioaji_query(api, consumer="stock_minute_tick_recovery", method="ticks",
-                          asset_class="stock", details={"contract": row.symbol, "date": str(day)}) as record:
-            ticks = api.ticks(contract=contract, date=str(day), timeout=timeout_ms)
-            record(ticks)
+        try:
+            with shioaji_query(api, consumer="stock_minute_tick_recovery", method="ticks",
+                              asset_class="stock", details={"contract": row.symbol, "date": str(day)}) as record:
+                ticks = api.ticks(contract=contract, date=str(day), timeout=timeout_ms)
+                record(ticks)
+        except Exception as exc:
+            if "Data not found" in str(exc):
+                continue
+            raise
         raw = pl.DataFrame(_payload_dict(ticks))
-        source = _write_minute_parquet(raw, output_root / row.symbol / f"{day}.parquet")
+        source = _write_immutable_raw_ticks(
+            raw, output_root, symbol=row.symbol, day=day,
+        )
         sources.append({**source, "session_date": str(day), "symbol": row.symbol})
         bars = ticks_to_minute_kbars(ticks, symbol=row.symbol, market=row.market,
                                     session_date=str(day), contract_unit=contract_unit)
@@ -612,6 +746,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--end-date", default=(date.today() - timedelta(days=1)).isoformat()
     )
+    parser.add_argument(
+        "--stop-at",
+        default=None,
+        help="Aware ISO-8601 deadline; finish in-flight work, then persist resumable progress.",
+    )
     parser.add_argument("--chunk-days", type=int, default=DEFAULT_CHUNK_DAYS)
     parser.add_argument(
         "--symbols",
@@ -639,7 +778,7 @@ def parse_args() -> argparse.Namespace:
         "--requests-per-second",
         type=float,
         default=DEFAULT_REQUESTS_PER_SECOND,
-        help="Account-wide KBar request starts per second (maximum 10).",
+        help="Account-wide KBar request starts per second (maximum 5).",
     )
     parser.add_argument(
         "--request-interval",
@@ -667,6 +806,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--fallback-missing-kbars-to-ticks", action="store_true",
                         help="Recover explicit Data-not-found KBars from observed ticks; retain raw source hashes.")
+    parser.add_argument(
+        "--retry-source-gaps", action="store_true",
+        help=("Requery receipt-backed positive-volume source-gap dates after market close. "
+              "Requires --all-symbols so the terminal full-market catalog remains intact."),
+    )
     parser.add_argument(
         "--historical-stock-unit", action="append", default=[], metavar="SYMBOL=SHARES",
         help=("Read-only historical identity fallback for an explicitly selected stock/ETF "
@@ -743,6 +887,26 @@ def validate_minute_kbars(
     wrong_date_rows = frame.filter(
         (pl.col("date") < pl.lit(start)) | (pl.col("date") > pl.lit(end))
     ).height
+    inconsistent_date_rows = frame.filter(
+        pl.col("ts").dt.date() != pl.col("date")
+    ).height
+    price_columns = ("Open", "High", "Low", "Close")
+    invalid_value_rows = frame.filter(
+        pl.any_horizontal(*[
+            pl.col(name).is_null() | ~pl.col(name).is_finite()
+            | (pl.col(name) <= 0.0)
+            for name in (*price_columns, "contract_unit")
+        ])
+        | pl.any_horizontal(*[
+            pl.col(name).is_null() | ~pl.col(name).is_finite()
+            | (pl.col(name) < 0.0)
+            for name in ("Volume", "Amount")
+        ])
+        | (pl.col("High") < pl.max_horizontal(*price_columns))
+        | (pl.col("Low") > pl.min_horizontal(*price_columns))
+        | ((pl.col("Volume") == 0.0) & (pl.col("Amount") != 0.0))
+        | ((pl.col("Volume") > 0.0) & (pl.col("Amount") <= 0.0))
+    ).height
     too_many_bars = frame.group_by("date").len().filter(pl.col("len") > 270).height
     failures = {
         "duplicate_timestamps": duplicate_timestamps,
@@ -750,6 +914,8 @@ def validate_minute_kbars(
         "non_minute_rows": non_minute_rows,
         "wrong_symbol_rows": wrong_symbol_rows,
         "wrong_date_rows": wrong_date_rows,
+        "inconsistent_date_rows": inconsistent_date_rows,
+        "invalid_value_rows": invalid_value_rows,
         "sessions_over_270_bars": too_many_bars,
     }
     if any(failures.values()):
@@ -761,6 +927,57 @@ def validate_minute_kbars(
         "last_ts": str(frame["ts"].max()),
         **failures,
     }
+
+
+def merge_retried_source_gap_chunk(
+    retained: pl.DataFrame, refreshed: pl.DataFrame,
+) -> pl.DataFrame:
+    """Add newly verified bars without losing or silently revising archived bars."""
+
+    if retained.is_empty():
+        return refreshed
+    if refreshed.is_empty():
+        return retained
+    if set(retained.columns) != set(refreshed.columns):
+        raise RuntimeError("source-gap retry schema changed")
+    keys = ["symbol", "ts"]
+    overlap = retained.join(refreshed, on=keys, how="inner", suffix="_new")
+    changed = overlap.filter(pl.any_horizontal(*[
+        ~pl.col(name).eq_missing(pl.col(f"{name}_new"))
+        for name in retained.columns if name not in keys
+    ])).height
+    if changed:
+        raise RuntimeError(
+            f"source-gap retry conflicts with {changed} retained minute bars"
+        )
+    return (
+        pl.concat([retained, refreshed.select(retained.columns)])
+        .unique(subset=keys, keep="first")
+        .sort(["date", "ts"])
+    )
+
+
+def unresolved_source_gap_dates_after_retry(
+    *,
+    current_expected_dates: set[date],
+    retained_gap_dates: set[date],
+    returned_dates: set[date],
+) -> list[str]:
+    """Retain old unresolved queries even if the public daily reference changed.
+
+    A broker bar is positive evidence of a session; a missing current public
+    daily row is not evidence that an older broker source-gap receipt was wrong.
+    """
+
+    return [
+        day.isoformat()
+        for day in sorted((current_expected_dates | retained_gap_dates) - returned_dates)
+    ]
+
+
+def _retryable_source_gap_receipt(path: Path) -> bool:
+    payload = _read_json(path) or {}
+    return bool(payload.get("status") == "source_gap" and payload.get("source_gap_dates"))
 
 
 def minute_receipt_valid(
@@ -799,9 +1016,14 @@ def minute_receipt_valid(
         return int(payload.get("rows", -1)) == 0
     if payload["status"] == "source_gap" and not payload.get("source_gap_dates"):
         return False
-    if payload.get("underlying_data_method") == "observed_ticks_aggregated_to_right_labelled_1m":
-        sources = payload.get("raw_tick_sources")
-        if not isinstance(sources, list) or not sources:
+    sources = payload.get("raw_tick_sources", [])
+    if payload.get("underlying_data_method") in {
+        "observed_ticks_aggregated_to_right_labelled_1m",
+        "mixed_provider_kbars_and_observed_ticks",
+    } and not sources:
+        return False
+    if sources:
+        if not isinstance(sources, list):
             return False
         for source in sources:
             if not isinstance(source, dict):
@@ -1365,6 +1587,7 @@ def _write_run_summary(
     counters: dict[str, int],
     rate: dict[str, float | int],
     fatal_error: str,
+    stopped_for_schedule: bool = False,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     strict_complete = len(results) == len(selected) and all(
@@ -1432,6 +1655,8 @@ def _write_run_summary(
             "published_terminal_catalog": collection_complete,
             "stopped_for_traffic": stopped_for_traffic,
             "stopped_for_market_hours": stopped_for_market_hours,
+            "stopped_for_schedule": bool(stopped_for_schedule and not collection_complete),
+            "scheduled_stop_at": getattr(args, "stop_at", None),
             "fatal_error": fatal_error or None,
             "traffic_used_bytes": traffic[0] if traffic else None,
             "traffic_limit_bytes": traffic[1] if traffic else None,
@@ -1444,14 +1669,18 @@ def _write_run_summary(
     return summary_path
 
 
-def _write_market_hours_stop(
+def _write_preflight_stop(
     output_dir: Path,
     *,
     args: argparse.Namespace,
     selected: list[UniverseRow],
     message: str,
+    state: str,
 ) -> Path:
     """Persist a truthful zero-request receipt for a preflight schedule stop."""
+
+    if state not in {"stopped_for_market_hours", "stopped_for_schedule"}:
+        raise ValueError(f"unsupported preflight stop state: {state}")
 
     counters = {
         "processed_chunks": 0,
@@ -1466,7 +1695,8 @@ def _write_market_hours_stop(
         results=[],
         traffic=None,
         stopped_for_traffic=False,
-        stopped_for_market_hours=True,
+        stopped_for_market_hours=state == "stopped_for_market_hours",
+        stopped_for_schedule=state == "stopped_for_schedule",
         counters=counters,
         rate=rate,
         fatal_error="",
@@ -1475,7 +1705,7 @@ def _write_market_hours_stop(
         output_dir / "progress.json",
         {
             "schema_version": 2,
-            "state": "stopped_for_market_hours",
+            "state": state,
             "parallel_workers": int(args.workers),
             "requests_per_second_limit": float(args.requests_per_second),
             "selected_symbols": len(selected),
@@ -1497,6 +1727,22 @@ def _write_market_hours_stop(
         },
     )
     return summary_path
+
+
+def _write_market_hours_stop(
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    selected: list[UniverseRow],
+    message: str,
+) -> Path:
+    return _write_preflight_stop(
+        output_dir,
+        args=args,
+        selected=selected,
+        message=message,
+        state="stopped_for_market_hours",
+    )
 
 
 def _partial_symbol_result(
@@ -1563,7 +1809,10 @@ def _download_symbol(
             simulation=bool(args.simulation),
             expected_dates=expected_all,
         )
-        if sealed_result is not None:
+        retry_source_gaps = bool(getattr(args, "retry_source_gaps", False))
+        if (sealed_result is not None and not (
+            retry_source_gaps and sealed_result.status == "complete_with_source_gaps"
+        )):
             return sealed_result
         completed = sum(
             minute_receipt_valid(
@@ -1573,6 +1822,11 @@ def _download_symbol(
                 end=b,
                 simulation=bool(args.simulation),
                 required_dates={value for value in expected_all if a <= value <= b},
+            ) and not (
+                retry_source_gaps
+                and _retryable_source_gap_receipt(
+                    minute_chunk_paths(args.output_dir, row.symbol, a, b)[1]
+                )
             )
             for a, b in chunks
         )
@@ -1597,6 +1851,12 @@ def _download_symbol(
             if contract_message == "stock_contract_not_found" and historical_unit is not None:
                 contract, unit, contract_message = historical_stock_identity(row, historical_unit)
         if query_candidate_dates and contract is None:
+            if retry_source_gaps and sealed_result is not None:
+                _emit_worker_log(
+                    f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+                    "status=source_gap_retry_skipped_contract_unavailable"
+                )
+                return sealed_result
             restored = restore_extended_tail_from_archived_manifest(
                 args.output_dir,
                 row,
@@ -1642,6 +1902,8 @@ def _download_symbol(
         def acquire_request_slot() -> None:
             limiter.acquire(stop_event)
             host_rate_limiter.wait()
+            if stop_event.is_set():
+                raise DownloadStopRequested("scheduled or global stop requested")
 
         for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
             data_path, receipt_path = minute_chunk_paths(
@@ -1653,14 +1915,25 @@ def _download_symbol(
             provisional_dates = {
                 value for value in provisional_all if chunk_start <= value <= chunk_end
             }
-            if minute_receipt_valid(
+            existing_valid = minute_receipt_valid(
                 receipt_path,
                 symbol=row.symbol,
                 start=chunk_start,
                 end=chunk_end,
                 simulation=bool(args.simulation),
                 required_dates=expected_dates,
-            ):
+            )
+            old_receipt = _read_json(receipt_path) if existing_valid else None
+            retry_gap_chunk = bool(
+                retry_source_gaps and old_receipt
+                and old_receipt.get("source_gap_dates")
+            )
+            retained_gap_dates = (
+                {date.fromisoformat(str(value)) for value in old_receipt["source_gap_dates"]}
+                if retry_gap_chunk and old_receipt else set()
+            )
+            retry_days = retained_gap_dates
+            if existing_valid and not retry_days:
                 continue
             if stop_event.is_set():
                 raise DownloadStopRequested("another worker requested a global stop")
@@ -1669,33 +1942,79 @@ def _download_symbol(
                     "Taiwan market-hours safety window reached; "
                     "resume after 14:30 Asia/Taipei"
                 )
-            query_performed = bool(expected_dates or provisional_dates)
+            query_performed = bool(retry_days if retry_gap_chunk else expected_dates or provisional_dates)
             if query_performed:
                 traffic_guard.check(api)
                 assert contract is not None
-                frame, query_audit = query_minute_chunk(
-                    api,
-                    contract,
-                    row,
-                    contract_unit=unit,
-                    start=chunk_start,
-                    end=chunk_end,
-                    timeout_ms=int(args.timeout_ms),
-                    retries=int(args.retries),
-                    retry_backoff=float(args.retry_backoff),
-                    expected_dates=expected_dates,
-                    provisional_dates=provisional_dates,
-                    request_started=acquire_request_slot,
-                    tick_fallback_root=(args.output_dir / "raw_tick_recovery"
-                                        if getattr(args, "fallback_missing_kbars_to_ticks", False) else None),
-                    max_traffic_fraction=float(args.max_traffic_fraction),
-                )
+                query_options = {
+                    "contract_unit": unit,
+                    "timeout_ms": int(args.timeout_ms),
+                    "retries": int(args.retries),
+                    "retry_backoff": float(args.retry_backoff),
+                    "request_started": acquire_request_slot,
+                    "tick_fallback_root": (
+                        args.output_dir / "raw_tick_recovery"
+                        if getattr(args, "fallback_missing_kbars_to_ticks", False) else None
+                    ),
+                    "max_traffic_fraction": float(args.max_traffic_fraction),
+                }
+                if retry_gap_chunk:
+                    frame, query_audit = query_source_gap_dates(
+                        api, contract, row, missing_dates=retry_days,
+                        **query_options,
+                    )
+                else:
+                    frame, query_audit = query_minute_chunk(
+                        api, contract, row, start=chunk_start, end=chunk_end,
+                        expected_dates=expected_dates,
+                        provisional_dates=provisional_dates,
+                        **query_options,
+                    )
                 if contract_message == "explicit_public_historical_identity_read_only_v1":
                     validate_historical_unit_amount(frame, unit)
+                if retry_gap_chunk and old_receipt is not None:
+                    old_frame = (
+                        pl.read_parquet(data_path) if int(old_receipt.get("rows", 0)) else frame.head(0)
+                    )
+                    new_frame = frame
+                    frame = merge_retried_source_gap_chunk(old_frame, frame)
+                    old_method = old_receipt.get("underlying_data_method", "provider_kbars")
+                    new_method = query_audit.get("underlying_data_method", "provider_kbars")
+                    tick_methods = {
+                        "observed_ticks_aggregated_to_right_labelled_1m",
+                        "mixed_provider_kbars_and_observed_ticks",
+                    }
+                    provider_methods = {
+                        "provider_kbars", "mixed_provider_kbars_and_observed_ticks",
+                    }
+                    has_tick = (
+                        (old_frame.height > 0 and old_method in tick_methods)
+                        or (new_frame.height > 0 and new_method in tick_methods)
+                    )
+                    has_provider = (
+                        (old_frame.height > 0 and old_method in provider_methods)
+                        or (new_frame.height > 0 and new_method in provider_methods)
+                    )
+                    query_audit["underlying_data_method"] = (
+                        "mixed_provider_kbars_and_observed_ticks" if has_tick and has_provider
+                        else "observed_ticks_aggregated_to_right_labelled_1m" if has_tick
+                        else "provider_kbars"
+                    )
+                    sources = list(old_receipt.get("raw_tick_sources", []))
+                    sources.extend(query_audit.get("raw_tick_sources", []))
+                    query_audit["raw_tick_sources"] = list({
+                        str(source["path"]): source for source in sources
+                    }.values())
+                    returned_after_merge = set(frame["date"].to_list()) if frame.height else set()
+                    query_audit["source_gap_dates"] = unresolved_source_gap_dates_after_retry(
+                        current_expected_dates=expected_dates,
+                        retained_gap_dates=retained_gap_dates,
+                        returned_dates=returned_after_merge,
+                    )
             else:
-                # The public point-in-time panel is the universe and coverage
-                # reference. With no positive-volume session, this chunk cannot
-                # contribute a tradable minute bar.
+                # The current public daily panel is a query-planning reference,
+                # not proof that the broker has no bar. Older broker gaps are
+                # retried above even if the reference later loses those days.
                 frame = pl.DataFrame()
                 query_audit = {
                     "zero_placeholder_rows_dropped": 0,
@@ -1752,6 +2071,19 @@ def _download_symbol(
                     "first_ts": audit["first_ts"],
                     "last_ts": audit["last_ts"],
                     "expected_positive_volume_sessions": len(expected_dates),
+                    "public_positive_volume_reference": (
+                        {
+                            "path": str(row.base_path),
+                            "sha256": _sha256(row.base_path),
+                            "expected_dates": [
+                                day.isoformat() for day in sorted(expected_dates)
+                            ],
+                            "retained_broker_gap_dates": [
+                                day.isoformat() for day in sorted(retained_gap_dates)
+                            ],
+                        }
+                        if source_gap_dates else None
+                    ),
                     "provisional_publication_tail_dates": [
                         value.isoformat() for value in sorted(provisional_dates)
                     ],
@@ -1890,18 +2222,19 @@ def _parallel_download_worker(
     )
     init_error = ""
     try:
-        import shioaji as sj
+        if not stop_event.is_set():
+            import shioaji as sj
 
-        api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
-        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
-        api = sj.Shioaji(simulation=bool(args.simulation))
-        api.set_event_callback(lambda _code, _event_code, _info, _event: None)
-        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
-        contracts_by_code = stock_contract_map(api)
-        _emit_worker_log(
-            f"[shioaji-minute] worker={worker_index} login=ok "
-            f"stock_contracts={len(contracts_by_code)}"
-        )
+            api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+            api = sj.Shioaji(simulation=bool(args.simulation))
+            api.set_event_callback(lambda _code, _event_code, _info, _event: None)
+            api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+            contracts_by_code = stock_contract_map(api)
+            _emit_worker_log(
+                f"[shioaji-minute] worker={worker_index} login=ok "
+                f"stock_contracts={len(contracts_by_code)}"
+            )
     except Exception as exc:
         init_error = f"worker={worker_index} {type(exc).__name__}: {exc}"
         with init_failures.get_lock():
@@ -1953,6 +2286,9 @@ def _parallel_download_worker(
 
 def main() -> None:
     args = parse_args()
+    stop_at = datetime.fromisoformat(args.stop_at) if args.stop_at else None
+    if stop_at is not None and stop_at.tzinfo is None:
+        raise ValueError("--stop-at must contain a timezone offset")
     start = date.fromisoformat(str(args.start_date))
     end = date.fromisoformat(str(args.end_date))
     if start < SHIOAJI_STOCK_HISTORY_START:
@@ -1970,6 +2306,8 @@ def main() -> None:
             "--requests-per-second must be positive and no greater than "
             f"{DEFAULT_REQUESTS_PER_SECOND:g}"
         )
+    if args.retry_source_gaps and not args.all_symbols:
+        raise ValueError("--retry-source-gaps requires --all-symbols")
     if float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be nonnegative")
     if float(args.traffic_check_interval) <= 0.0:
@@ -2039,6 +2377,20 @@ def main() -> None:
             flush=True,
         )
         raise RuntimeError(message)
+    if stop_at is not None and datetime.now(TAIPEI) >= stop_at:
+        summary_path = _write_preflight_stop(
+            args.output_dir,
+            args=args,
+            selected=selected,
+            message=f"scheduled deadline reached: {stop_at.isoformat()}",
+            state="stopped_for_schedule",
+        )
+        print(
+            f"[shioaji-minute] status=stopped_for_schedule "
+            f"api_requests=0 summary={summary_path}",
+            flush=True,
+        )
+        return
     api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
     if not api_key or not secret_key:
@@ -2060,6 +2412,19 @@ def main() -> None:
     ready_barrier = context.Barrier(workers + 1)
     start_event = context.Event()
     stop_event = context.Event()
+    deadline_reached = threading.Event()
+    deadline_timer: threading.Timer | None = None
+    if stop_at is not None:
+        def request_deadline_stop() -> None:
+            deadline_reached.set()
+            stop_event.set()
+
+        deadline_timer = threading.Timer(
+            max(0.0, (stop_at - datetime.now(TAIPEI)).total_seconds()),
+            request_deadline_stop,
+        )
+        deadline_timer.daemon = True
+        deadline_timer.start()
     init_failures = context.Value("i", 0)
     runtime_failures = context.Value("i", 0)
     stopped_for_traffic = context.Value("b", 0)
@@ -2163,6 +2528,8 @@ def main() -> None:
             detail = "; ".join(message for _, message in error_items)
             fatal_error = f"{fatal_error}; {detail}".strip("; ")
     finally:
+        if deadline_timer is not None:
+            deadline_timer.cancel()
         stop_event.set()
         start_event.set()
         for process in processes:
@@ -2184,6 +2551,10 @@ def main() -> None:
 
     deduplicated = {int(symbol_index): result for symbol_index, result in result_items}
     results = [deduplicated[index] for index in sorted(deduplicated)]
+    incomplete_results = len(results) != len(selected) or any(
+        item.status not in {"complete", "complete_with_source_gaps", "contract_unavailable"}
+        for item in results
+    )
     failed_symbols = [row.symbol for row in results if row.status == "failed"]
     if failed_symbols and not fatal_error:
         fatal_error = f"symbol downloads failed: count={len(failed_symbols)} sample={failed_symbols[:10]}"
@@ -2199,6 +2570,7 @@ def main() -> None:
         traffic=traffic,
         stopped_for_traffic=bool(stopped_for_traffic.value),
         stopped_for_market_hours=bool(stopped_for_market_hours.value),
+        stopped_for_schedule=deadline_reached.is_set() and incomplete_results,
         counters=counter_snapshot,
         rate=rate_snapshot,
         fatal_error=fatal_error,
@@ -2212,7 +2584,11 @@ def main() -> None:
             else (
                 "stopped_for_market_hours"
                 if stopped_for_market_hours.value
-                else "finished"
+                else (
+                    "stopped_for_schedule"
+                    if deadline_reached.is_set() and incomplete_results
+                    else "finished"
+                )
             )
         )
     )

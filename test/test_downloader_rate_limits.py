@@ -37,7 +37,7 @@ def test_documented_provider_defaults_use_exact_average_limit() -> None:
     assert binance.requests_per_second == 2400 / 60
     assert binance_funding.requests_per_second == 500 / 300
     assert binance_statistics.requests_per_second == 1000 / 300
-    assert shioaji.requests_per_second == 10
+    assert shioaji.requests_per_second == 5
     assert hyperliquid.requests_per_second == 1
     assert coinmetrics.requests_per_second == 10 / 6
     assert resolve_request_interval("okx_history_candles", None) == okx.interval_seconds

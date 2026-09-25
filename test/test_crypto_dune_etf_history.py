@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from io import BytesIO
+from http.client import RemoteDisconnected
 import json
 from pathlib import Path
 from urllib.error import HTTPError
@@ -171,6 +172,48 @@ def test_dune_subscription_tier_error_is_a_non_retryable_global_gate(
     with pytest.raises(dune.DuneSubscriptionBlocked, match="subscription"):
         client.execute("select 1", "small")
     assert calls == 1
+
+
+def test_crypto_etf_retries_remote_disconnect_without_dropping_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class Response:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{}'
+
+    def flaky_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RemoteDisconnected("remote closed")
+        return Response()
+
+    class Limiter:
+        def wait(self):
+            return None
+
+        def defer(self, _seconds):
+            return None
+
+    monkeypatch.setattr(etf, "urlopen", flaky_urlopen)
+    client = etf.HttpClient(max_retries=1, retry_base=0.1)
+    monkeypatch.setattr(client, "_limiter", lambda _profile: Limiter())
+    body, headers = client.get(
+        "https://www.sec.gov/test", profile_name="sec_edgar", user_agent="unit-test"
+    )
+    assert body == b'{}'
+    assert headers == {"content-type": "application/json"}
+    assert calls == 2
 
 
 def test_generic_public_context_cannot_reenable_non_selected_exchanges() -> None:

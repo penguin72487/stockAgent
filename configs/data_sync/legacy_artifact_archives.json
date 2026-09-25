@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "archives": [
+    {
+      "dataset": "legacy-artifact-markets-crypto",
+      "relative_root": "markets/crypto",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/mnt/d/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-artifact-markets-us",
+      "relative_root": "markets/us",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/mnt/d/stockagent-legacy-archive-stage"
+    }
+  ]
+}

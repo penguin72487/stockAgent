@@ -17,7 +17,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,7 +105,9 @@ from stockagent.live.signal_engine import (
     LiveSignalResult,
     clear_live_panel_memory_cache,
     generate_live_signal,
+    finalize_live_signal_artifacts,
     prefetch_live_signal_prices,
+    release_idle_live_cuda_cache,
     write_live_weights_history,
 )
 from stockagent.live.service_notify import notify_systemd
@@ -217,7 +219,7 @@ def _opening_signal_latency_record(
         receipt = {}
     signal_started_at = summary.get("signal_started_at")
     signal_ready_at = summary.get("signal_ready_at")
-    artifact_published_at = summary.get("artifact_published_at")
+    artifact_published_at = summary.get("execution_pointer_written_at") or summary.get("artifact_published_at")
     artifact_completed_at = summary.get("artifact_completed_at")
     source_ready_from_open_ms = receipt.get("coverage_receipt_from_open_ms")
     source_ready_to_signal_ms = receipt.get("coverage_to_signal_ready_ms")
@@ -241,8 +243,10 @@ def _opening_signal_latency_record(
     )
     stages = {
         "scheduler_wake_ms": timing.get("scheduler_wake_ms"),
+        "mode_dispatch_queue_ms": timing.get("mode_dispatch_queue_ms"),
         "preopen_catch_up_ms": timing.get("preopen_catch_up_ms"),
         "realtime_prepare_ms": timing.get("realtime_prepare_ms"),
+        "realtime_prepare_wait_ms": timing.get("realtime_prepare_wait_ms"),
         "model_lock_queue_ms": timing.get("model_lock_queue_ms"),
         "signal_pre_quote_prepare_ms": live_latency.get("pre_quote_prepare_ms"),
         "signal_quote_fetch_ms": live_latency.get("quote_fetch_ms"),
@@ -1098,6 +1102,26 @@ def _scheduled_calendar_root(
     return _resolve_repo_path(experiment.data.parquet_root)
 
 
+@lru_cache(maxsize=256)
+def _cached_tw_session_day(
+    session_date: date,
+    holidays: tuple[str, ...],
+    calendar_root: Path | None,
+    monotonic_second: int,
+) -> tuple[bool, str]:
+    """Share one off-hours calendar proof across 10 Hz scheduler callbacks.
+
+    The time bucket bounds stale results to one second.  The protected opening
+    path bypasses this cache entirely so newly accepted official evidence is
+    visible immediately.
+    """
+
+    del monotonic_second
+    return verified_tw_stock_session_day(
+        session_date, holidays, parquet_root=calendar_root
+    )
+
+
 def _scheduled_market_session_day(
     cfg: LiveMarketConfig,
     now: datetime,
@@ -1124,10 +1148,19 @@ def _scheduled_market_session_day(
             str(getattr(cfg, "day_trade_rule_data_dir", "") or ""),
             str(getattr(cfg, "config_path", "") or ""),
         )
-        return verified_tw_stock_session_day(
-            now.date(),
-            holidays,
-            parquet_root=calendar_root,
+        wall_time = now.timetz().replace(tzinfo=None)
+        if datetime_time(8, 10) <= wall_time < datetime_time(9, 10):
+            return verified_tw_stock_session_day(
+                now.date(), holidays, parquet_root=calendar_root
+            )
+        try:
+            hash(holidays)
+        except TypeError:
+            return verified_tw_stock_session_day(
+                now.date(), holidays, parquet_root=calendar_root
+            )
+        return _cached_tw_session_day(
+            now.date(), holidays, calendar_root, int(time.monotonic())
         )
     is_open = is_trading_day(kind, now.date(), holidays)
     return (
@@ -1394,12 +1427,14 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
                 _env_int("STOCKAGENT_PREOPEN_FINAL_ARM_LEAD_MINUTES", 15) or 15,
             ),
         )
-        if (
-            now_minutes >= decision_minutes - final_arm_lead
-            and _preopen_market_ready_for_session(cfg, session_date)
-            and not _preopen_market_final_armed_for_session(cfg, session_date)
-        ):
-            return f"{session_date}:{cfg.market}:preopen-final-arm"
+        base_ready = _preopen_market_ready_for_session(cfg, session_date)
+        final_armed = _preopen_market_final_armed_for_session(cfg, session_date)
+        if now_minutes >= decision_minutes - final_arm_lead and base_ready:
+            if not final_armed:
+                return f"{session_date}:{cfg.market}:preopen-final-arm"
+            # Both phases are complete. Re-running the base phase would replace
+            # the market receipt and could erase its final-arm proof.
+            return None
         return f"{session_date}:{cfg.market}:preopen"
     exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
     if (
@@ -3118,6 +3153,7 @@ class StockAgentBot(discord.Client):
                 flush=True,
             )
         startup_inference_warmup.start()
+        offhours_gpu_cache_release.start()
         signal_now_job_resumer.start()
         preopen_prepare.start()
         daily_summary.start()
@@ -3240,6 +3276,7 @@ class _ConsoleProgress:
 
 def _run_market_signal_sync(**kwargs):
     timing_sink = kwargs.pop("_timing_sink", None)
+    defer_reports = bool(kwargs.pop("_defer_rich_artifacts", False))
     prefetch_prices = bool(kwargs.pop("_prefetch_prices", False))
     worker_started = time.perf_counter()
     if _env_bool("STOCKAGENT_BOT_PROGRESS", True) and kwargs.get("progress_callback") is None:
@@ -3248,6 +3285,8 @@ def _run_market_signal_sync(**kwargs):
         kwargs["progress_callback"] = _ConsoleProgress(prefix=label)
         kwargs["progress_label"] = label
     resolved_kwargs = _signal_kwargs(**kwargs)
+    if defer_reports:
+        resolved_kwargs["defer_rich_artifacts"] = True
     if prefetch_prices:
         resolved_kwargs["_prefetched_quote"] = prefetch_live_signal_prices(**resolved_kwargs)
     if isinstance(timing_sink, dict):
@@ -3335,7 +3374,9 @@ def _write_preopen_readiness(
             if terminal
             else None
         )
-        markets[cfg.market] = {
+        existing_row = markets.get(cfg.market)
+        existing_row = dict(existing_row) if isinstance(existing_row, dict) else {}
+        row = {
             "status": str(status),
             "started_at": started_at,
             "completed_at": completed_at,
@@ -3361,6 +3402,15 @@ def _write_preopen_readiness(
             ),
             "error": error,
         }
+        existing_final_arm = existing_row.get("final_arm")
+        if (
+            isinstance(existing_final_arm, dict)
+            and existing_final_arm.get("run_id") == _BOT_RUN_ID
+        ):
+            # A retry/race of the slower base preparation must never destroy a
+            # completed current-process final-arm receipt.
+            row["final_arm"] = existing_final_arm
+        markets[cfg.market] = row
         payload = {
             "schema_version": 2,
             "run_id": _BOT_RUN_ID,
@@ -3639,8 +3689,9 @@ def _write_postclose_fast_cache_status_best_effort(
 
 
 def _startup_inference_warmup_must_defer() -> bool:
-    """Yield the GPU lock while the canonical opening pipeline owns priority."""
+    """Only prewarm before a verified trading session's 08:15 preparation."""
 
+    warm_window_open = False
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
@@ -3658,12 +3709,45 @@ def _startup_inference_warmup_must_defer() -> bool:
         if prepare_minutes is None or open_minutes is None:
             continue
         now_minutes = now.hour * 60 + now.minute
+        if prepare_minutes - 75 <= now_minutes < prepare_minutes:
+            warm_window_open = True
         if (
             prepare_minutes <= now_minutes <= open_minutes + 5
             and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
         ):
             return True
-    return False
+    return not warm_window_open
+
+
+def _offhours_gpu_cache_release_allowed() -> bool:
+    """Protect 07:00–17:00 on actual trading sessions, including prewarm."""
+
+    for market in _scheduled_markets():
+        cfg = _resolve_market(market)
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+        session_open, reason = _scheduled_market_session_day(cfg, now)
+        calendar_uncertain = any(
+            marker in reason for marker in ("missing", "unverified", "conflicting")
+        )
+        if (
+            (session_open or calendar_uncertain)
+            and 7 * 60 <= now.hour * 60 + now.minute < 17 * 60
+        ):
+            return False
+    return True
+
+
+def _release_offhours_gpu_cache_sync() -> bool:
+    if not _offhours_gpu_cache_release_allowed():
+        return False
+    if not _MODEL_INFERENCE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        return release_idle_live_cuda_cache()
+    finally:
+        _MODEL_INFERENCE_LOCK.release()
 
 
 def _startup_warmup_failure_is_retryable(exc: BaseException) -> bool:
@@ -10922,6 +11006,19 @@ async def startup_inference_warmup() -> None:
             )
 
 
+@tasks.loop(minutes=5)
+async def offhours_gpu_cache_release() -> None:
+    """Return model VRAM to the shared Windows GPU when markets are closed."""
+
+    try:
+        released = await asyncio.to_thread(_release_offhours_gpu_cache_sync)
+    except Exception as exc:
+        _log_exception("offhours_gpu_cache_release", exc)
+        return
+    if released:
+        print("[gpu-cache] offhours inference models released", flush=True)
+
+
 @tasks.loop(seconds=1)
 async def service_heartbeat() -> None:
     """Keep a compact, source-backed Discord/engine synchronization receipt."""
@@ -11019,6 +11116,23 @@ async def preopen_prepare() -> None:
             )
 
 
+async def _prepare_scheduled_signal(cfg: LiveMarketConfig) -> tuple[Any, Exception | None, float]:
+    """Overlap independent freshness checks, without inference or quote I/O.
+
+    Return failures as values so one failed preparation cannot cancel another
+    due market. Each market's existing retry path owns its preparation error.
+    """
+    started = time.perf_counter()
+    try:
+        result = await asyncio.to_thread(
+            _prepare_realtime_signal_sync, cfg,
+            requested_price_source="auto", force_refresh=False,
+        )
+        return result, None, (time.perf_counter() - started) * 1000.0
+    except Exception as exc:
+        return None, exc, (time.perf_counter() - started) * 1000.0
+
+
 @tasks.loop(seconds=0.1)
 async def scheduled_signal() -> None:
     # Compute and publish every due strategy before doing any Discord network
@@ -11026,6 +11140,7 @@ async def scheduled_signal() -> None:
     # observer and must never serialize the three 09:00 models.
     deliveries: list[tuple[LiveMarketConfig, LiveSignalResult, str]] = []
     error_messages: list[str] = []
+    due: list[tuple[LiveMarketConfig, datetime, str, bool]] = []
     scheduled_markets = list(_scheduled_markets())
     scheduled_markets.sort(
         key=lambda market: (
@@ -11092,6 +11207,18 @@ async def scheduled_signal() -> None:
             continue
         if not _scheduled_retry_allowed(bot._scheduled_retry_after, key):
             continue
+        due.append((cfg, now, key, _scheduled_signal_requires_preopen_catch_up(cfg, now)))
+
+    preparations = {
+        cfg.market: asyncio.create_task(_prepare_scheduled_signal(cfg))
+        for cfg, _now, _key, catch_up in due
+        if not catch_up
+        and bool(cfg.day_trade_simulation_enabled or cfg.overnight_simulation_enabled)
+    }
+    for cfg, now, key, catch_up in due:
+        market = cfg.market
+        day_trade_simulation = bool(cfg.day_trade_simulation_enabled)
+        latency_critical_simulation = bool(day_trade_simulation or cfg.overnight_simulation_enabled)
         attempt_timing: dict[str, Any] = {}
         result: LiveSignalResult | None = None
         attempt_error: BaseException | None = None
@@ -11111,6 +11238,10 @@ async def scheduled_signal() -> None:
                         3,
                     ),
                     "preopen_catch_up_ms": 0.0,
+                    "mode_dispatch_queue_ms": round(
+                        (datetime.now(ZoneInfo(cfg.timezone or bot.tz.key)) - now).total_seconds() * 1000.0,
+                        3,
+                    ),
                 }
             )
             bot._opening_attempt_started_monotonic = attempt_started
@@ -11122,7 +11253,7 @@ async def scheduled_signal() -> None:
             )
             notify_systemd(f"STATUS=09:00 opening signal in progress: {market}")
         try:
-            if _scheduled_signal_requires_preopen_catch_up(cfg, now):
+            if catch_up:
                 # A restart may have missed both the pre-open preparation and
                 # the exact scheduled signal minute.  Reuse the complete
                 # pre-open contract so same-session eligibility and price
@@ -11136,18 +11267,17 @@ async def scheduled_signal() -> None:
                         3,
                     )
             prepare_started = time.perf_counter()
-            try:
-                resolved_price_source, prepared_status, _ = await asyncio.to_thread(
-                    _prepare_realtime_signal_sync,
-                    cfg,
-                    requested_price_source="auto",
-                    force_refresh=False,
-                )
-            finally:
-                attempt_timing["realtime_prepare_ms"] = round(
-                    (time.perf_counter() - prepare_started) * 1000.0,
-                    3,
-                )
+            prepared, prepare_error, prepare_ms = await (
+                preparations[market] if market in preparations
+                else _prepare_scheduled_signal(cfg)
+            )
+            attempt_timing["realtime_prepare_ms"] = round(prepare_ms, 3)
+            attempt_timing["realtime_prepare_wait_ms"] = round(
+                (time.perf_counter() - prepare_started) * 1000.0, 3
+            )
+            if prepare_error is not None:
+                raise prepare_error
+            resolved_price_source, prepared_status, _ = prepared
             result = await _run_market_signal(
                 market=market,
                 scheduled=True,
@@ -11155,6 +11285,7 @@ async def scheduled_signal() -> None:
                 prepared_status=prepared_status,
                 progress_label=f"scheduled:{market}",
                 _timing_sink=attempt_timing,
+                _defer_rich_artifacts=latency_critical_simulation,
             )
         except BotUserError as exc:
             attempt_error = exc
@@ -11236,6 +11367,13 @@ async def scheduled_signal() -> None:
 
     if not deliveries and not error_messages:
         return
+    # All due execution contracts are already atomically visible. Do not make
+    # model N+1 wait for model N's Parquet/Markdown/explanation report writes.
+    for cfg, result, _key in deliveries:
+        try:
+            await asyncio.to_thread(finalize_live_signal_artifacts, result)
+        except Exception as exc:
+            _log_exception(f"scheduled_signal:artifact_completion:{cfg.market}", exc)
     channel = await _scheduled_broadcast_channel()
     if channel is not None:
         for message in error_messages:

@@ -4,7 +4,9 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
+import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1446,9 +1448,48 @@ def _append_observations(path: Path, rows: list[dict[str, Any]]) -> tuple[int, i
         if rows
         else _empty_observations()
     )
-    existing = pl.read_parquet(path) if path.is_file() else _empty_observations()
     if fresh.is_empty():
-        return 0, existing.height
+        return (
+            0,
+            int(pq.ParquetFile(path).metadata.num_rows) if path.is_file() else 0,
+        )
+    # Capture timestamps are assigned once per source response.  In the normal
+    # append-only case every new vintage is later than the current maximum, so
+    # sorting and deduplicating the entire multi-year observation table wastes
+    # CPU and can force the host into swap.  Stream old row groups through a
+    # sibling temporary file instead; readers still see one atomic Parquet.
+    if path.is_file():
+        latest_existing = (
+            pl.scan_parquet(path)
+            .select(pl.col("observed_at_utc").max())
+            .collect()
+            .item()
+        )
+        if latest_existing is not None and fresh["observed_at_utc"].min() > latest_existing:
+            key = ["dataset", "entity", "metric", "event_ts_utc", "observed_at_utc"]
+            fresh = fresh.unique(subset=key, keep="last").sort(
+                ["observed_at_utc", "dataset", "entity", "metric"]
+            )
+            old = pq.ParquetFile(path)
+            old_rows = int(old.metadata.num_rows)
+            temporary_name: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+                ) as temporary:
+                    temporary_name = temporary.name
+                with pq.ParquetWriter(
+                    temporary_name, old.schema_arrow, compression="zstd"
+                ) as writer:
+                    for batch in old.iter_batches(batch_size=65_536):
+                        writer.write_batch(batch)
+                    writer.write_table(fresh.to_arrow().cast(old.schema_arrow))
+                os.replace(temporary_name, path)
+            finally:
+                if temporary_name is not None:
+                    Path(temporary_name).unlink(missing_ok=True)
+            return fresh.height, old_rows + fresh.height
+    existing = pl.read_parquet(path) if path.is_file() else _empty_observations()
     combined = (
         pl.concat([existing, fresh], how="diagonal_relaxed")
         .unique(

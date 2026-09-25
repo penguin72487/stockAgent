@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry pending D-primary cold-store scans without source rebuild
+
+[Timer]
+OnBootSec=3min
+OnActiveSec=5min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=stockagent-d-cold-scan-retry.service
+
+[Install]
+WantedBy=timers.target

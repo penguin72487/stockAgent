@@ -4,23 +4,35 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as wall_time, timedelta
 import fcntl
+from http.client import HTTPConnection, HTTPException
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, Mapping
 import uuid
+
+import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.promote_tw_day_trade_replay import (  # noqa: E402
+    MINUTE_CURVE_CONTRACT,
+    MINUTE_CURVE_SESSION_POINTS,
     _validate_benchmarks,
     _validate_minute_curve_coverage,
+)
+from scripts.rebuild_tw_day_trade_benchmark_history import (  # noqa: E402
+    _tx_complete_minute_books,
+    _tx_day_books,
+    _tx_front_contract_metadata,
+    _tx_historical_day_books,
 )
 from scripts.rebuild_tw_day_trade_minute_curves import (  # noqa: E402
     _iter_jsonl,
@@ -34,6 +46,9 @@ from stockagent.live.shioaji_schedule import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
 from downloader.download_shioaji_tx_futures_ticks import _valid_receipt  # noqa: E402
+from downloader.download_tw_public_data import (  # noqa: E402
+    _validated_taiex_session_dates,
+)
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -60,6 +75,50 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _prewarm_public_history() -> dict[str, Any]:
+    """Move the post-close all-minute projection cost off the first visitor.
+
+    This is a best-effort read of the local sanitized gateway, not another
+    source acceptance gate. The gateway's revision-keyed cache remains the
+    authority for whether the response can be reused by a later visitor.
+    """
+    try:
+        port = int(os.environ.get("STOCKAGENT_PUBLIC_DASHBOARD_PORT", "8770"))
+        if not 1 <= port <= 65_535:
+            raise ValueError("invalid local public-dashboard port")
+    except ValueError:
+        return {"status": "not_warmed", "reason": "invalid_local_port"}
+    started = time.monotonic()
+    connection = HTTPConnection("127.0.0.1", port, timeout=20)
+    try:
+        connection.request(
+            "GET", "/tw-day-trade/api/history?range=all&resolution=1m&encoding=v2"
+        )
+        response = connection.getresponse()
+        # Drain a bounded response so the gateway can finish writing cleanly.
+        # The complete 2026-02-25 onward history is currently about 15 MiB.
+        body = response.read(64 * 1024 * 1024 + 1)
+        status = "warmed" if (
+            response.status == 200
+            and "application/json" in str(response.getheader("Content-Type") or "")
+            and 0 < len(body) <= 64 * 1024 * 1024
+        ) else "not_warmed"
+        return {
+            "status": status,
+            "http_status": response.status,
+            "response_bytes": len(body),
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+        }
+    except (OSError, TimeoutError, HTTPException) as error:
+        return {
+            "status": "not_warmed",
+            "reason": type(error).__name__,
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+        }
+    finally:
+        connection.close()
 
 
 def _completed_scope(
@@ -118,6 +177,54 @@ def _completed_scope(
     return sorted(value for value in completed if value), markets
 
 
+def _endpoint_source_signature(path: Path) -> list[int]:
+    """Identify the exact append-only marks snapshot used by a prior preflight."""
+
+    info = path.stat()
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _missing_endpoints_with_cache(
+    marks_path: Path,
+    *,
+    completed: list[str],
+    markets: set[str],
+    previous_status: Mapping[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reuse only a successful preflight of the same immutable ledger view."""
+
+    before = _endpoint_source_signature(marks_path)
+    cached = (previous_status or {}).get("accepted_endpoint_preflight")
+    if (
+        isinstance(cached, dict)
+        and cached.get("contract_version") == 1
+        and cached.get("source_signature") == before
+        and cached.get("completed_session_dates") == completed
+        and cached.get("markets") == sorted(markets)
+        and cached.get("missing_endpoint_pairs") == 0
+        and _endpoint_source_signature(marks_path) == before
+    ):
+        return [], {**cached, "reused": True}
+    missing = missing_accepted_endpoints(
+        _iter_jsonl(marks_path),
+        start=date.fromisoformat(completed[0]),
+        end=date.fromisoformat(completed[-1]),
+        expected_sessions=completed,
+        expected_markets=markets,
+    )
+    after = _endpoint_source_signature(marks_path)
+    if before != after:
+        raise RuntimeError("marks ledger changed during accepted endpoint preflight")
+    return missing, {
+        "contract_version": 1,
+        "source_signature": after,
+        "completed_session_dates": completed,
+        "markets": sorted(markets),
+        "missing_endpoint_pairs": len(missing),
+        "reused": False,
+    }
+
+
 def _validate_current(
     state_dir: Path,
     *,
@@ -139,10 +246,63 @@ def _validate_current(
 def _tx_benchmark_source_state(
     tx_history_root: Path,
     completed_session: str,
+    capture_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate the exact TXFR1 session consumed by the benchmark rebuild."""
+    """Validate the same retained-capture-first source used by the rebuild."""
 
     trading_date = date.fromisoformat(completed_session)
+    capture_error: str | None = None
+    if capture_root is not None:
+        manifest_root = capture_root / "manifests" / f"trade_date={completed_session}"
+        if any(manifest_root.glob("worker=*.json")):
+            try:
+                metadata, manifests = _tx_front_contract_metadata(
+                    capture_root=capture_root, trading_date=trading_date
+                )
+                books = _tx_day_books(
+                    capture_root=capture_root,
+                    trading_date=trading_date,
+                    contract_code=str(metadata["code"]),
+                    end_at=datetime.combine(
+                        trading_date, wall_time(13, 45), tzinfo=TAIPEI
+                    ),
+                )
+            except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as exc:
+                return {
+                    "ready": False,
+                    "trading_date": completed_session,
+                    "status": "invalid_capture",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            try:
+                minutes = _tx_complete_minute_books(
+                    books,
+                    trading_date=trading_date,
+                    timestamp_column="snapshot_ts_ns",
+                    epoch_utc=True,
+                )
+            except RuntimeError as exc:
+                # Match the rebuild's fallback for incomplete minute coverage.
+                capture_error = str(exc)
+            except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as exc:
+                return {
+                    "ready": False,
+                    "trading_date": completed_session,
+                    "status": "invalid_capture",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            else:
+                return {
+                    "ready": True,
+                    "trading_date": completed_session,
+                    "status": "complete",
+                    "source": "retained_shioaji_fop_book_1s",
+                    "contract_code": metadata["code"],
+                    "minutes": len(minutes),
+                    "fresh_minutes": sum(fresh for _, _, fresh in minutes),
+                    "manifest_receipts": manifests,
+                }
+
     receipt_path = (
         tx_history_root
         / "receipts"
@@ -150,11 +310,73 @@ def _tx_benchmark_source_state(
     )
     receipt = _valid_receipt(tx_history_root, trading_date)
     ready = bool(receipt is not None and receipt.get("status") == "complete")
+    if ready:
+        try:
+            books, history_receipt = _tx_historical_day_books(
+                history_root=tx_history_root, trading_date=trading_date
+            )
+            minutes = _tx_complete_minute_books(
+                books,
+                trading_date=trading_date,
+                timestamp_column="event_ts",
+                epoch_utc=False,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {
+                "ready": False,
+                "trading_date": completed_session,
+                "status": "invalid_history",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "receipt_path": str(receipt_path),
+            }
+        return {
+            "ready": True,
+            "trading_date": completed_session,
+            "status": "complete",
+            "source": "receipt_backed_shioaji_txfr1_historical_tick_l1",
+            "minutes": len(minutes),
+            "fresh_minutes": sum(fresh for _, _, fresh in minutes),
+            "receipt": history_receipt,
+            "capture_open_error": capture_error,
+        }
     return {
         "ready": ready,
         "trading_date": completed_session,
         "receipt_path": str(receipt_path),
         "status": receipt.get("status") if receipt is not None else "missing_or_invalid",
+        "capture_open_error": capture_error,
+    }
+
+
+def _stock_calendar_source_state(
+    calendar_root: Path,
+    completed_session: str,
+) -> dict[str, Any]:
+    """Require the same verified session calendar as the minute collector."""
+
+    trading_date = date.fromisoformat(completed_session)
+    try:
+        sessions, digest = _validated_taiex_session_dates(
+            calendar_root, trading_date, trading_date
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "ready": False,
+            "trading_date": completed_session,
+            "status": "missing_or_invalid",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "summary_path": str(
+                (calendar_root / "twse_taiex_ohlc.summary.json").resolve()
+            ),
+        }
+    return {
+        "ready": trading_date in sessions,
+        "trading_date": completed_session,
+        "status": "complete" if trading_date in sessions else "not_a_verified_session",
+        "sha256": digest,
+        "summary_path": str(
+            (calendar_root / "twse_taiex_ohlc.summary.json").resolve()
+        ),
     }
 
 
@@ -167,19 +389,13 @@ def _inspect_strategy_price_provenance(
     """Inspect completed-session opening and interior prices, not just timestamps."""
 
     expected_sessions = set(completed_session_dates)
-    expected_keys = {
-        (session_date, market, minute)
+    opening_by_session = {
+        session_date: datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
         for session_date in completed_session_dates
-        for market in expected_markets
-        for minute in (
-            datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
-            + timedelta(minutes=index)
-            for index in range(269)
-        )
     }
     # The append-only ledger may contain multiple marks for one minute.  The
     # latest row is what the dashboard projects, so audit that exact row.
-    source_by_key: dict[tuple[str, str, datetime], bool] = {}
+    source_by_key: dict[tuple[str, str, int], bool] = {}
     marks_path = state_dir / "marks.jsonl"
     with marks_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -194,26 +410,84 @@ def _inspect_strategy_price_provenance(
                 minute = datetime.fromisoformat(str(row.get("minute") or ""))
             except ValueError:
                 raise RuntimeError(f"marks.jsonl:{line_number}: invalid minute")
-            key = (session_date, market, minute)
-            if key not in expected_keys:
+            try:
+                opening = opening_by_session[session_date]
+                offset = int((minute - opening).total_seconds() // 60)
+            except TypeError:
+                # A naive timestamp is not one of the +08:00 contract keys.
                 continue
-            source_by_key[key] = historical_minute_mark_has_source(row)
-    audited = {key for key, has_source in source_by_key.items() if has_source}
-    unverified = expected_keys - audited
-    opening = {key for key in expected_keys if key[2].hour == 9 and key[2].minute == 1}
-    interior = expected_keys - opening
+            if not (0 <= offset < 269 and minute == opening + timedelta(minutes=offset)):
+                continue
+            source_by_key[(session_date, market, offset)] = historical_minute_mark_has_source(row)
+    audited_opening = sum(bool(source) for (_, _, offset), source in source_by_key.items() if offset == 0)
+    audited_interior = sum(bool(source) for (_, _, offset), source in source_by_key.items() if offset > 0)
+    expected_opening = len(completed_session_dates) * len(expected_markets)
+    expected_interior = expected_opening * 268
+    unverified_opening = expected_opening - audited_opening
+    unverified_interior = expected_interior - audited_interior
+    unverified_sample: list[str] = []
+    if unverified_opening or unverified_interior:
+        for session_date in sorted(completed_session_dates):
+            for market in sorted(expected_markets):
+                for offset in range(269):
+                    if source_by_key.get((session_date, market, offset)):
+                        continue
+                    minute = opening_by_session[session_date] + timedelta(minutes=offset)
+                    unverified_sample.append(
+                        f"{session_date}:{market}:{minute.isoformat(timespec='minutes')}"
+                    )
+                    if len(unverified_sample) == 20:
+                        break
+                if len(unverified_sample) == 20:
+                    break
+            if len(unverified_sample) == 20:
+                break
     return {
         "contract": "right_labelled_historical_last_trade_mark_v1",
-        "expected_opening_rows": len(opening),
-        "audited_opening_rows": len(audited & opening),
-        "unverified_opening_rows": len(unverified & opening),
-        "expected_interior_rows": len(interior),
-        "audited_interior_rows": len(audited & interior),
-        "unverified_interior_rows": len(unverified & interior),
-        "unverified_sample": [
-            f"{session_date}:{market}:{minute.isoformat(timespec='minutes')}"
-            for session_date, market, minute in sorted(unverified)[:20]
-        ],
+        "expected_opening_rows": expected_opening,
+        "audited_opening_rows": audited_opening,
+        "unverified_opening_rows": unverified_opening,
+        "expected_interior_rows": expected_interior,
+        "audited_interior_rows": audited_interior,
+        "unverified_interior_rows": unverified_interior,
+        "unverified_sample": unverified_sample,
+    }
+
+
+def _proven_price_state_from_curve_validation(
+    validation: Mapping[str, Any] | None,
+    *,
+    completed_session_dates: list[str],
+    expected_markets: set[str],
+) -> dict[str, Any] | None:
+    """Reuse the stronger, hash-checked mark scan only when it covers 09:01."""
+
+    expected_sessions = len(completed_session_dates)
+    mode_count = len(expected_markets)
+    if not (
+        isinstance(validation, Mapping)
+        and validation.get("required") is True
+        and validation.get("contract") == MINUTE_CURVE_CONTRACT
+        and validation.get("opening_marks_revalued_at_completed_minute") is True
+        and validation.get("completed_session_dates") == completed_session_dates
+        and validation.get("points_per_session_mode") == MINUTE_CURVE_SESSION_POINTS
+        and validation.get("validated_rows")
+        == expected_sessions * mode_count * MINUTE_CURVE_SESSION_POINTS
+        and validation.get("unverified_historical_interior_rows") == 0
+    ):
+        return None
+    opening = expected_sessions * mode_count
+    interior = opening * (MINUTE_CURVE_SESSION_POINTS - 2)
+    return {
+        "contract": MINUTE_CURVE_CONTRACT,
+        "basis": "hash_checked_complete_minute_curve_validation",
+        "expected_opening_rows": opening,
+        "audited_opening_rows": opening,
+        "unverified_opening_rows": 0,
+        "expected_interior_rows": interior,
+        "audited_interior_rows": interior,
+        "unverified_interior_rows": 0,
+        "unverified_sample": [],
     }
 
 
@@ -242,6 +516,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data_tw_index_futures/shioaji_history/TXFR1"),
     )
+    parser.add_argument(
+        "--fop-capture-root",
+        type=Path,
+        default=Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
+    )
+    parser.add_argument(
+        "--calendar-root",
+        type=Path,
+        default=Path("data_tw_public"),
+    )
     return parser.parse_args()
 
 
@@ -260,7 +544,10 @@ def main() -> None:
             return
 
         observed = datetime.now(TAIPEI)
+        preflight_seconds: dict[str, float] = {}
+        stage_started = time.monotonic()
         completed, markets = _completed_scope(state_dir)
+        preflight_seconds["completed_scope"] = round(time.monotonic() - stage_started, 6)
         if not completed:
             payload = {
                 "schema_version": 1,
@@ -273,13 +560,18 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
             return
 
-        missing_endpoints = missing_accepted_endpoints(
-            _iter_jsonl(state_dir / "marks.jsonl"),
-            start=date.fromisoformat(completed[0]),
-            end=date.fromisoformat(completed[-1]),
-            expected_sessions=completed,
-            expected_markets=markets,
+        try:
+            previous_status = _object(status_path)
+        except (OSError, ValueError):
+            previous_status = None
+        stage_started = time.monotonic()
+        missing_endpoints, endpoint_preflight = _missing_endpoints_with_cache(
+            state_dir / "marks.jsonl",
+            completed=completed,
+            markets=markets,
+            previous_status=previous_status,
         )
+        preflight_seconds["accepted_endpoints"] = round(time.monotonic() - stage_started, 6)
         if missing_endpoints:
             payload = {
                 "schema_version": 1,
@@ -288,6 +580,8 @@ def main() -> None:
                 "completed_session_dates": completed,
                 "missing_endpoint_pairs": len(missing_endpoints),
                 "missing_endpoints": missing_endpoints[:50],
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "preflight_seconds": preflight_seconds,
                 "reason": "Accepted entry/close ledger marks require canonical history repair; minute prices cannot reconstruct missed executions.",
                 "simulation_only": True,
                 "production_order_possible": False,
@@ -299,6 +593,7 @@ def main() -> None:
         # An attempted session is not a completed session: waiting_source also
         # records completed_session_dates. Always check the exact receipt before
         # starting the expensive benchmark rebuild, even on a retry.
+        stage_started = time.monotonic()
         source_state = _tx_benchmark_source_state(
             getattr(
                 args,
@@ -306,7 +601,13 @@ def main() -> None:
                 Path("data_tw_index_futures/shioaji_history/TXFR1"),
             ).resolve(),
             completed[-1],
+            getattr(
+                args,
+                "fop_capture_root",
+                Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
+            ).resolve(),
         )
+        preflight_seconds["benchmark_source"] = round(time.monotonic() - stage_started, 6)
         if not source_state["ready"]:
             payload = {
                 "schema_version": 1,
@@ -315,10 +616,12 @@ def main() -> None:
                 "observed_at": observed.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
                 "source": source_state,
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "preflight_seconds": preflight_seconds,
                 "retry_contract": (
-                    "A verified TXFR1 receipt change triggers the minute-curve "
-                    "path unit; the post-close timer is a fallback. No benchmark "
-                    "subprocess was started"
+                    "A complete retained FOP capture or verified TXFR1 receipt "
+                    "can supply the benchmark; retry on source change or the "
+                    "post-close timer. No benchmark subprocess was started"
                 ),
                 "simulation_only": True,
                 "production_order_possible": False,
@@ -327,6 +630,36 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
             return
 
+        stage_started = time.monotonic()
+        calendar_state = _stock_calendar_source_state(
+            getattr(args, "calendar_root", Path("data_tw_public")).resolve(),
+            completed[-1],
+        )
+        preflight_seconds["stock_calendar"] = round(time.monotonic() - stage_started, 6)
+        if not calendar_state["ready"]:
+            payload = {
+                "schema_version": 1,
+                "status": "waiting_source",
+                "failed_stage": "stock_session_calendar_preflight",
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "completed_session_dates": completed,
+                "source": calendar_state,
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "preflight_seconds": preflight_seconds,
+                "retry_contract": (
+                    "Retry on verified TAIEX calendar publication or the next "
+                    "post-close timer; do not start price queries or a "
+                    "benchmark rebuild without this source"
+                ),
+                "simulation_only": True,
+                "production_order_possible": False,
+            }
+            _atomic_json(status_path, payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
+        validation_clock = time.monotonic()
+        check_clock = validation_clock
         try:
             strategy_validation = _validate_current(
                 state_dir,
@@ -335,14 +668,24 @@ def main() -> None:
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             strategy_validation = None
-        try:
-            price_validation = _inspect_strategy_price_provenance(
-                state_dir,
-                completed_session_dates=completed,
-                expected_markets=markets,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
-            price_validation = None
+        preflight_seconds["strategy_validation"] = round(time.monotonic() - check_clock, 6)
+        check_clock = time.monotonic()
+        price_validation = _proven_price_state_from_curve_validation(
+            strategy_validation,
+            completed_session_dates=completed,
+            expected_markets=markets,
+        )
+        if price_validation is None:
+            try:
+                price_validation = _inspect_strategy_price_provenance(
+                    state_dir,
+                    completed_session_dates=completed,
+                    expected_markets=markets,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+                price_validation = None
+        preflight_seconds["strategy_price_provenance"] = round(time.monotonic() - check_clock, 6)
+        check_clock = time.monotonic()
         try:
             benchmark_validation = _validate_benchmarks(
                 state_dir,
@@ -350,6 +693,8 @@ def main() -> None:
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             benchmark_validation = None
+        preflight_seconds["benchmark_validation"] = round(time.monotonic() - check_clock, 6)
+        preflight_seconds["existing_validation"] = round(time.monotonic() - validation_clock, 6)
         price_provenance_ready = bool(
             price_validation is not None
             and int(price_validation.get("unverified_opening_rows") or 0) == 0
@@ -366,6 +711,8 @@ def main() -> None:
                 "action": "no_op_already_complete",
                 "observed_at": observed.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "stage_seconds": preflight_seconds,
                 "validation": {
                     "strategy": strategy_validation,
                     "strategy_price_provenance": price_validation,
@@ -412,8 +759,21 @@ def main() -> None:
             completed[0],
             "--end-date",
             completed[-1],
+            "--fop-capture-root",
+            str(getattr(
+                args,
+                "fop_capture_root",
+                Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
+            ).resolve()),
+            "--tx-history-root",
+            str(getattr(
+                args,
+                "tx_history_root",
+                Path("data_tw_index_futures/shioaji_history/TXFR1"),
+            ).resolve()),
         ]
         benchmark_started = datetime.now(TAIPEI)
+        benchmark_clock = time.monotonic()
         benchmark_process = subprocess.run(
             benchmark_command,
             cwd=REPO_ROOT,
@@ -421,6 +781,7 @@ def main() -> None:
             capture_output=True,
             text=True,
         )
+        preflight_seconds["benchmark_rebuild"] = round(time.monotonic() - benchmark_clock, 6)
         if benchmark_process.returncode != 0:
             stderr_tail = benchmark_process.stderr.strip()[-4000:]
             stdout_tail = benchmark_process.stdout.strip()[-4000:]
@@ -432,6 +793,7 @@ def main() -> None:
                 "started_at": benchmark_started.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
                 "returncode": benchmark_process.returncode,
+                "stage_seconds": preflight_seconds,
                 "stderr_tail": stderr_tail,
                 "stdout_tail": stdout_tail,
                 "simulation_only": True,
@@ -480,6 +842,7 @@ def main() -> None:
         elif price_validation is not None and not price_provenance_ready:
             command.append("--repair-unverified-strategy-marks")
         started = datetime.now(TAIPEI)
+        minute_clock = time.monotonic()
         completed_process = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -487,6 +850,7 @@ def main() -> None:
             capture_output=True,
             text=True,
         )
+        preflight_seconds["minute_curve_rebuild"] = round(time.monotonic() - minute_clock, 6)
         if completed_process.returncode != 0:
             stderr_tail = completed_process.stderr.strip()[-4000:]
             stdout_tail = completed_process.stdout.strip()[-4000:]
@@ -497,6 +861,7 @@ def main() -> None:
                 "started_at": started.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
                 "returncode": completed_process.returncode,
+                "stage_seconds": preflight_seconds,
                 "stderr_tail": stderr_tail,
                 "stdout_tail": stdout_tail,
                 "simulation_only": True,
@@ -514,16 +879,23 @@ def main() -> None:
             print(completed_process.stdout.strip(), flush=True)
         if completed_process.stderr.strip():
             print(completed_process.stderr.strip(), file=sys.stderr, flush=True)
+        validation_clock = time.monotonic()
         strategy_validation = _validate_current(
             state_dir,
             completed_session_dates=completed,
             expected_markets=markets,
         )
-        price_validation = _inspect_strategy_price_provenance(
-            state_dir,
+        price_validation = _proven_price_state_from_curve_validation(
+            strategy_validation,
             completed_session_dates=completed,
             expected_markets=markets,
         )
+        if price_validation is None:
+            price_validation = _inspect_strategy_price_provenance(
+                state_dir,
+                completed_session_dates=completed,
+                expected_markets=markets,
+            )
         if (int(price_validation.get("unverified_opening_rows") or 0) != 0
                 or int(price_validation.get("unverified_interior_rows") or 0) != 0):
             raise RuntimeError(
@@ -534,6 +906,11 @@ def main() -> None:
             state_dir,
             completed_session_dates=completed,
         )
+        preflight_seconds["post_validation"] = round(time.monotonic() - validation_clock, 6)
+        public_history_prewarm = _prewarm_public_history()
+        preflight_seconds["public_history_prewarm"] = public_history_prewarm.get(
+            "elapsed_seconds", 0.0
+        )
         payload = {
             "schema_version": 1,
             "status": "ready",
@@ -541,6 +918,9 @@ def main() -> None:
             "observed_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
             "started_at": started.isoformat(timespec="seconds"),
             "completed_session_dates": completed,
+            "accepted_endpoint_preflight": endpoint_preflight,
+            "stage_seconds": preflight_seconds,
+            "public_history_prewarm": public_history_prewarm,
             "validation": {
                 "strategy": strategy_validation,
                 "strategy_price_provenance": price_validation,

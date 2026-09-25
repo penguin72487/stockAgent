@@ -1,0 +1,28 @@
+[Unit]
+Description=StockAgent FinLab account-scoped local research history refresh
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh" --official-calendar-root "@REPO_ROOT@/data_tw_public"
+ExecStartPre=/usr/bin/bash -n "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryAccounting=true
+MemoryHigh=6G
+MemoryMax=10G
+MemorySwapMax=0
+OOMScoreAdjust=700
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target

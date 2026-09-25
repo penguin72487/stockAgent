@@ -13,9 +13,111 @@ from downloader import download_shioaji_historical_market_data as exact
 from downloader import download_shioaji_tx_futures_ticks as continuous
 from downloader.shioaji_history_repair import (
     FuturesActivity, futures_date_is_closed, latest_completed_futures_session, load_futures_activity,
-    publication_ready, retry_due, retry_metadata,
+    publication_ready, recent_login_waiter, retry_due, retry_metadata,
 )
 from scripts.export_shioaji_futures_products import export_inventory
+
+
+def test_recent_login_waiter_only_accepts_a_fresh_lock_wait_receipt(tmp_path):
+    path = tmp_path / 'scheduler.json'
+    now = datetime(2026, 9, 24, 0, 0, tzinfo=UTC)
+    assert not recent_login_waiter(path, now=now)
+    payload = {'state': 'waiting', 'reason': 'history_login_slot_busy',
+               'observed_at_utc': (now - timedelta(seconds=60)).isoformat()}
+    path.write_text(json.dumps(payload))
+    assert recent_login_waiter(path, now=now)
+    assert not recent_login_waiter(path, now=now + timedelta(seconds=121))
+    path.write_text(json.dumps({**payload, 'reason': 'live_connection_reservation'}))
+    assert not recent_login_waiter(path, now=now)
+    path.write_text(json.dumps({**payload, 'state': 'running'}))
+    assert not recent_login_waiter(path, now=now)
+    path.write_text('{broken')
+    assert not recent_login_waiter(path, now=now)
+
+
+def test_bounded_history_batch_does_not_duplicate_its_final_receipt_audit():
+    check = exact._needs_intermediate_summary
+    assert check(1, max_queries=500, pending_tasks=True)
+    assert check(250, max_queries=500, pending_tasks=True)
+    assert not check(100, max_queries=500, pending_tasks=True)
+    assert not check(400, max_queries=500, pending_tasks=True)
+    assert not check(500, max_queries=500, pending_tasks=True)
+    assert not check(250, max_queries=0, pending_tasks=False)
+    assert check(250, max_queries=0, pending_tasks=True)
+    assert not check(101, max_queries=500, pending_tasks=True)
+
+
+def test_task_planning_reuses_verified_kbar_dates_without_second_scan(
+    tmp_path, monkeypatch,
+):
+    row = SimpleNamespace(
+        collection='exact_futures', priority=2, asset_class='futures', code='TXFJ6',
+        begin_date=date(2026, 9, 1), end_date=date(2026, 9, 2),
+    )
+    calls = []
+
+    def receipt(_path, _data_path, *, method, code):
+        calls.append((method, code))
+        if method == 'kbars':
+            return {
+                'status': 'complete',
+                'observed_trading_dates': ['2026-09-01', '2026-09-02'],
+            }
+        return None
+
+    monkeypatch.setattr(exact, '_valid_receipt', receipt)
+    monkeypatch.setattr(
+        exact, 'observed_tick_dates',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('second KBar scan')),
+    )
+    tasks = exact.build_tasks(
+        tmp_path, [row], chunk_days=29,
+        activity=SimpleNamespace(exact_dates=lambda _row: set()),
+    )
+    assert [(task.method, task.start) for task in tasks] == [
+        ('ticks', date(2026, 9, 2)), ('ticks', date(2026, 9, 1)),
+    ]
+    assert calls.count(('kbars', 'TXFJ6')) == 1
+
+
+def test_receipt_validation_cache_reuses_only_unchanged_file_identities(tmp_path, monkeypatch):
+    partition = tmp_path / 'start=2026-09-01_end=2026-09-02'
+    partition.mkdir()
+    receipt = partition / 'receipt.json'
+    data = partition / 'data.parquet'
+    data.write_bytes(b'old')
+    payload = {
+        'schema_version': exact.RECEIPT_SCHEMA_VERSION,
+        'source': exact.SOURCE,
+        'method': 'kbars',
+        'contract': 'TXFJ6',
+        'status': 'complete',
+        'start': '2026-09-01',
+        'end': '2026-09-02',
+        'sha256': 'verified',
+    }
+    receipt.write_text(json.dumps(payload))
+    calls = []
+    monkeypatch.setattr(exact, 'verified_sha', lambda path: calls.append(path) or 'verified')
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') == payload
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') == payload
+    assert len(calls) == 1
+    copy = exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6')
+    copy['status'] = 'tampered'
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6')['status'] == 'complete'
+    data.write_bytes(b'changed-size')
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') == payload
+    assert len(calls) == 2
+    receipt.write_text(json.dumps({**payload, 'contract': 'OTHER'}))
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') is None
+    receipt.unlink()
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') is None
+    receipt.write_text(json.dumps(payload))
+    def replace_during_validation(path):
+        path.write_bytes(b'replaced-during-hash')
+        return 'verified'
+    monkeypatch.setattr(exact, 'verified_sha', replace_during_validation)
+    assert exact._valid_receipt(receipt, data, method='kbars', code='TXFJ6') is None
 
 
 def test_empty_replies_expire_and_official_evidence_accelerates_retry():
@@ -206,13 +308,29 @@ def test_catalog_refresh_retains_removed_aliases_and_adds_new_ones(tmp_path):
     assert (tmp_path/'continuous_contracts.csv').read_bytes() == before
 
 
+def test_empty_futures_alias_catalog_cannot_publish_a_vacuous_complete_sweep(tmp_path, monkeypatch):
+    aliases = tmp_path / 'aliases.csv'
+    pl.DataFrame(schema={'priority': pl.Int64, 'contract': pl.String}).write_csv(aliases)
+    day = date(2026, 9, 4)
+    args = SimpleNamespace(
+        dry_run=True, start_date=str(day), end_date=str(day),
+        dates_per_contract=1, empty_probes_per_contract=0, max_dates=1,
+        calendar_path=tmp_path / 'calendar.parquet', refresh_empty=False,
+        refresh_inventory=False,
+        contracts_file=aliases, batch_receipt=tmp_path / 'batch.json',
+    )
+    monkeypatch.setattr(continuous, '_calendar', lambda *a: [day])
+    with pytest.raises(RuntimeError, match='empty futures alias catalog'):
+        continuous._run_batch(args)
+
+
 def test_continuous_batch_uses_one_login_and_then_reuses_verified_data(tmp_path,monkeypatch):
     day=date(2026,9,4)
     aliases=tmp_path/'aliases.csv'
     pl.DataFrame({'priority':[1,2], 'contract':['CAFR1','CDFR1']}).write_csv(aliases)
     monkeypatch.setattr(sys,'argv',['collector','--contracts-file',str(aliases),'--history-root',str(tmp_path/'history'),
         '--calendar-path',str(tmp_path/'calendar'),'--start-date',str(day),'--end-date',str(day),
-        '--batch-receipt',str(tmp_path/'batch.json')])
+        '--batch-receipt',str(tmp_path/'batch.json'),'--max-dates','1'])
     monkeypatch.setattr(continuous,'_calendar',lambda *a:[day])
     monkeypatch.setattr(continuous,'_taiwan_market_hours_now',lambda:False)
     monkeypatch.setattr(continuous,'shioaji_query',lambda *a,**kw:nullcontext(lambda _:None))
@@ -232,8 +350,20 @@ def test_continuous_batch_uses_one_login_and_then_reuses_verified_data(tmp_path,
     monkeypatch.setenv('SHIOAJI_API_KEY','test-key')
     monkeypatch.setenv('SHIOAJI_SECRET_KEY','test-secret')
     assert continuous.main() == 0
-    assert calls.count('login') == 1 and calls.count('logout') == 1 and calls.count('ticks') == 2
+    assert calls.count('login') == 1 and calls.count('logout') == 1 and calls.count('ticks') == 1
     payload=json.loads((tmp_path/'batch.json').read_text())
+    assert payload['status'] == 'batch_partial'
+    assert payload['scanned_contracts'] == 1 and payload['total_contracts'] == 2
+    assert payload['coverage_scope'] == 'scanned_contracts_only'
+    assert payload['query_budget_reached'] is True
+    assert payload['current_query_sweep_complete'] is False
+    assert not publication_ready(payload,continuous=True)
+    calls.clear()
+    assert continuous.main() == 0
+    assert calls.count('login') == 1 and calls.count('logout') == 1 and calls.count('ticks') == 1
+    payload=json.loads((tmp_path/'batch.json').read_text())
+    assert payload['status'] == 'batch_finished'
+    assert payload['coverage_scope'] == 'full_catalog'
     assert payload['current_query_sweep_complete'] is True
     assert publication_ready(payload,continuous=True)
     calls.clear()

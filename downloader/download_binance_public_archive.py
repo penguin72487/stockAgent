@@ -7,6 +7,7 @@ import csv
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from http.client import HTTPException
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -163,7 +164,11 @@ class BinanceArchiveClient:
                     retry_after=exc.headers.get("Retry-After"),
                 )
                 self.limiters[bucket].defer(delay)
-            except (TimeoutError, URLError, OSError) as exc:
+            # urllib may finish the status/header read and still lose a
+            # chunked S3 body.  HTTPException (notably IncompleteRead) is not
+            # an OSError, but a GET can safely retry before parsing or storing
+            # any bytes from that incomplete response.
+            except (TimeoutError, URLError, OSError, HTTPException) as exc:
                 last_error = exc
                 delay = retry_delay_seconds(attempt, base=self.retry_base, cap=60)
             if attempt < self.retries:
@@ -385,15 +390,27 @@ def discover_plan(
             "point_in_time_state": "retrieval_vintage; lifecycle inferred from archive coverage",
         }
 
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-        futures = {pool.submit(one_symbol, task): task for task in tasks}
-        for future in as_completed(futures):
-            objects, row = future.result()
-            with lock:
-                discovered.extend(objects)
-                lifecycle.append(row)
-            if progress is not None:
-                progress.update("discover", "planned")
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            futures = {pool.submit(one_symbol, task): task for task in tasks}
+            try:
+                for future in as_completed(futures):
+                    objects, row = future.result()
+                    with lock:
+                        discovered.extend(objects)
+                        lifecycle.append(row)
+                    if progress is not None:
+                        progress.update("discover", "planned")
+            except Exception:
+                # A terminal source error must not keep starting thousands of
+                # queued listings while the context waits for active workers.
+                for future in futures:
+                    future.cancel()
+                raise
+    except Exception:
+        if progress is not None:
+            progress.finish(failed=True)
+        raise
     if progress is not None:
         progress.finish()
     return sorted(discovered, key=lambda item: item.key), sorted(

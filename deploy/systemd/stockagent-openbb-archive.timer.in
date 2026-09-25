@@ -3,7 +3,12 @@ Description=Start the resumable OpenBB archive after interactive services recove
 
 [Timer]
 OnBootSec=5min
+OnCalendar=Mon..Fri *-*-* 09:12:00 Asia/Taipei
+# A disk-floor stop intentionally suppresses Restart=; recheck after the
+# Taiwan cash session so recovered capacity does not wait until next morning.
+OnCalendar=*-*-* 15:15:00 Asia/Taipei
 AccuracySec=10s
+Persistent=false
 Unit=stockagent-openbb-archive.service
 
 [Install]

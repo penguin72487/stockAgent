@@ -268,6 +268,22 @@ NO_DATA_STATUS_MARKERS = (
     "無資料",
     "no data",
 )
+
+
+def _confirmed_daily_publication_lag(message: str) -> bool:
+    """Only an explicit official no-data response may be called publication lag.
+
+    A timeout, malformed JSON, access challenge, or parser failure may occur
+    after publication and must remain a blocking source error until verified.
+    """
+
+    text = str(message).lower()
+    if "not valid json" in text or "did not explicitly report no data" in text:
+        return False
+    return "returned no rows on a validated open session" in text or (
+        "returned no rows on a verified open session" in text
+        or any(marker.lower() in text for marker in NO_DATA_STATUS_MARKERS)
+    )
 OHLCV_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "twse_daily_ohlcv": (
         "證券代號",
@@ -2430,20 +2446,53 @@ def _validated_tpex_session_dates(
     return selected
 
 
-def _calendar_end_before_same_session(same_session_day: date) -> date:
-    """Return the last possible weekday before a same-session rule request.
+def _calendar_end_before_same_session(
+    same_session_day: date, *, schedule_root: Path | None = None
+) -> date:
+    """Return the last verified open session before a same-session rule request.
 
-    The official session archive cannot contain Saturday or Sunday rows. A
-    Monday pre-open request must therefore validate history through Friday,
-    not require the archive to claim coverage through Sunday. Weekday holidays
-    are deliberately not skipped here because doing so without an official
-    calendar receipt would weaken the fail-closed contract.
+    Weekends need no external evidence. A forward weekday closure must be
+    proved by the provenance-checked TWSE holiday schedule; an absent or
+    conflicting schedule cannot silently turn a missing report into a holiday.
+    The no-root form preserves the weekday-only helper for callers that are
+    not preparing a canonical same-session download.
     """
 
     candidate = same_session_day - timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)
-    return candidate
+    if schedule_root is None:
+        return candidate
+    # This downloader is also launched as a file path by systemd, where Python
+    # puts downloader/ (not the repository root) on sys.path.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from stockagent.live.market_status import (
+        TW_HOLIDAY_SCHEDULE_NAME,
+        verified_tw_stock_session_day,
+    )
+
+    if not (schedule_root / TW_HOLIDAY_SCHEDULE_NAME).is_file():
+        raise RuntimeError(
+            "cannot prove the pre-session closure: canonical TWSE holiday "
+            "schedule is missing from the requested output root"
+        )
+
+    while True:
+        is_open, reason = verified_tw_stock_session_day(
+            candidate, parquet_root=schedule_root
+        )
+        if is_open:
+            return candidate
+        if not reason.startswith("official TWSE schedule as-of "):
+            raise RuntimeError(
+                "cannot prove the pre-session closure from official TWSE "
+                f"schedule: {candidate.isoformat()}: {reason}"
+            )
+        candidate -= timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate -= timedelta(days=1)
 
 
 def _plan_historical_download(
@@ -2464,11 +2513,17 @@ def _plan_historical_download(
             raise ValueError(
                 "--same-session-rule-date must be inside the requested range"
             )
+    prior_open_session = (
+        _calendar_end_before_same_session(
+            same_session_day, schedule_root=output_dir
+        )
+        if same_session_day is not None else None
+    )
     taiex_calendar_receipt: str | None = None
     if spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
         calendar_end = (
-            min(end, _calendar_end_before_same_session(same_session_day))
-            if same_session_day is not None
+            min(end, prior_open_session)
+            if prior_open_session is not None
             else end
         )
         expected_taiex_sessions: set[date] | None = None
@@ -2498,8 +2553,8 @@ def _plan_historical_download(
             all_weekdays.add(same_session_day)
     elif _uses_taiex_session_calendar(spec, args):
         calendar_end = (
-            min(end, _calendar_end_before_same_session(same_session_day))
-            if same_session_day is not None
+            min(end, prior_open_session)
+            if prior_open_session is not None
             else end
         )
         if calendar_end >= start:
@@ -2520,9 +2575,26 @@ def _plan_historical_download(
                 include_weekends=bool(args.include_weekends),
             )
         )
+        if prior_open_session is not None:
+            # The verified schedule proved every intervening weekday closed.
+            # Keep all older historical obligations and the exact target rule.
+            all_weekdays = {
+                day for day in all_weekdays
+                if day <= prior_open_session or day >= same_session_day
+            }
     parquet_path = output_dir / f"{spec.name}.parquet"
     state_path = _coverage_state_path(output_dir, spec)
     state = _load_coverage_state(state_path, spec)
+    if prior_open_session is not None:
+        state["same_session_rule_date"] = same_session_day.isoformat()
+        state["same_session_official_closed_bridge"] = [
+            day.isoformat()
+            for day in _iter_dates(
+                prior_open_session + timedelta(days=1),
+                same_session_day - timedelta(days=1),
+                include_weekends=False,
+            )
+        ]
     if _uses_taiex_session_calendar(spec, args):
         state["coverage_calendar_source"] = TAIEX_SESSION_CALENDAR_DATASET
         state["coverage_calendar_kind"] = "receipt_verified_official_open_sessions"
@@ -2890,6 +2962,8 @@ def _http_get(
     timeout: int,
     verify_ssl: bool,
     params: dict[str, str] | None = None,
+    conditional_etag: str | None = None,
+    conditional_modified_since: str | None = None,
     retries: int = 3,
     retry_backoff: float = 1.0,
     retry_security_blocks: bool = True,
@@ -2901,6 +2975,10 @@ def _http_get(
         "Referer": "https://wwwc.twse.com.tw/",
         "X-Requested-With": "XMLHttpRequest",
     }
+    if conditional_etag:
+        headers["If-None-Match"] = conditional_etag
+    elif conditional_modified_since:
+        headers["If-Modified-Since"] = conditional_modified_since
     retry_count = max(0, int(retries))
     # TWSE's edge can return a location-less 307 when its rate guard trips.
     # It is a retryable throttle response, not a successful redirect.
@@ -4815,11 +4893,76 @@ def _merge_frames(
     return incoming
 
 
+def _unchanged_historical_overlap(
+    path: Path, frame: pl.DataFrame, *, refresh: bool
+) -> bool:
+    """Prove a no-op from the affected dates without decoding the full archive."""
+
+    # Daily historical refreshes normally replace only one or two session
+    # dates.  Prove an unchanged overlap against those dates before decoding
+    # the complete multi-year parquet archive.  Do not use this shortcut for
+    # snapshot vintages, append-only payload histories, full refreshes, or the
+    # TWSE OHLCV malformed-date repair below.
+    if (
+        not frame.is_empty()
+        and path.is_file()
+        and not refresh
+        and path.name != "twse_daily_ohlcv.parquet"
+        and DATE_COLUMN in frame.columns
+        and "_as_of_date" not in frame.columns
+        and "_payload_sha256" not in frame.columns
+    ):
+        existing_schema = pl.read_parquet_schema(path)
+        # Official table columns have changed over the archive lifetime. The
+        # current day's frame can omit old columns that are already null for
+        # that day; diagonal_relaxed merge would restore those null columns.
+        # Any genuinely new column or changed common dtype must take the full
+        # merge path instead of being interpreted as an unchanged overlap.
+        if (
+            set(frame.columns) <= set(existing_schema)
+            and all(
+                existing_schema[name] == dtype
+                for name, dtype in frame.schema.items()
+            )
+        ):
+            missing_columns = [
+                name for name in existing_schema if name not in frame.columns
+            ]
+            comparable = frame.with_columns([
+                pl.lit(None).cast(existing_schema[name]).alias(name)
+                for name in missing_columns
+            ])
+            overlap_dates = frame.get_column(DATE_COLUMN).unique().to_list()
+            stable_columns = [
+                name for name in existing_schema if name != "_downloaded_at_utc"
+            ]
+            overlap = (
+                pl.scan_parquet(path)
+                .filter(pl.col(DATE_COLUMN).is_in(overlap_dates))
+                .select(stable_columns)
+                .collect()
+            )
+            if overlap.equals(comparable.select(stable_columns), null_equal=True):
+                # The full merge sorts by date.  Do not preserve a legacy
+                # archive whose physical order or date validity still needs
+                # that canonicalization.
+                date_column = pl.col(DATE_COLUMN)
+                order_check = pl.scan_parquet(path).select(
+                    date_column.is_null().any().alias("has_null_date"),
+                    (date_column < date_column.shift(1)).any().alias("out_of_order"),
+                ).collect().row(0, named=True)
+                return not order_check["has_null_date"] and not order_check["out_of_order"]
+    return False
+
+
 def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> int:
     if frame.is_empty():
         return _read_existing_row_count(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _unchanged_historical_overlap(path, frame, refresh=refresh):
+        return _read_existing_row_count(path)
     existing = _read_existing(path)
+    repaired_malformed_dates = False
     if (path.name == "twse_daily_ohlcv.parquet" and not existing.is_empty()
             and {DATE_COLUMN, "_url", "證券代號"} <= set(existing.columns)
             and {DATE_COLUMN, "證券代號"} <= set(frame.columns)):
@@ -4846,6 +4989,7 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
             existing = existing.with_row_index("_repair_row_index").filter(
                 ~pl.col("_repair_row_index").is_in(rejected_indices)
             ).drop("_repair_row_index")
+            repaired_malformed_dates = True
     merged = _merge_frames(existing, frame, refresh=refresh)
     # Re-fetching an overlap updates the observation timestamp even when the
     # official payload is byte-for-byte equivalent.  Rewriting a multi-million
@@ -4859,6 +5003,7 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
     ]
     if (
         not refresh
+        and not repaired_malformed_dates
         and not existing.is_empty()
         and existing.columns == merged.columns
         and existing.height == merged.height
@@ -7202,6 +7347,7 @@ def main() -> None:
             and int(row.failed_dates) == 1
             and int(row.missing_dates_after) == 1
             and resolved_end_date in str(row.message)
+            and _confirmed_daily_publication_lag(row.message)
         )
     ]
     publication_lag_names = {row.dataset for row in publication_lag_results}

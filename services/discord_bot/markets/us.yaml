@@ -1,6 +1,6 @@
 market: us
 label: 美股
-enabled: true
+enabled: false
 market_type: us
 timezone: America/New_York
 open_time: "09:30"

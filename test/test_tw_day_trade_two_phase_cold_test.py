@@ -45,7 +45,7 @@ def test_two_phase_cold_start_repairs_then_executes_all_modes(
     assert report["simulation_only"] is True
     assert report["production_order_possible"] is False
     assert report["active_markets"] == list(EXPECTED_MARKETS)
-    assert report["registered_public_dataset_count"] == 156
+    assert report["registered_public_dataset_count"] == len(cold_test.DEFAULT_DATASETS)
     assert report["phases"]["preopen_missing"]["ready"] is False
     assert report["phases"]["preopen_repaired"]["ready"] is True
     assert report["phases"]["opening_missing"] == {

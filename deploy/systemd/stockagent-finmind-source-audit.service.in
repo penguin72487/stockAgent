@@ -1,0 +1,18 @@
+[Unit]
+Description=Compare stored FinMind Sponsor prices with official Taiwan daily prices
+After=network-online.target
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.audit_finmind_sponsor_overlap'
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryAccounting=true
+MemoryHigh=1G
+MemoryMax=2G

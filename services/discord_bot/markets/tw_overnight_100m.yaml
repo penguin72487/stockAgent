@@ -1,6 +1,6 @@
 market: tw_overnight_100m
 label: 台股・隔日沖（初始 1 億）
-enabled: true
+enabled: false
 market_type: tw
 timezone: Asia/Taipei
 # These are source-availability hours for the signal engine.  The separate

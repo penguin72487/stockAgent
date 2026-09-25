@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import threading
 from urllib.error import HTTPError
 
 import polars as pl
@@ -10,6 +11,123 @@ import pyarrow.parquet as pq
 import pytest
 
 from downloader import download_yahoo_ohlcv as yahoo
+
+
+def test_daily_asset_summary_survives_separate_asset_invocations(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = argparse.Namespace(
+        request_interval=0.1,
+        asset="us_stocks",
+        asset_workers=1,
+        mode="daily-update",
+        output_root=str(tmp_path),
+        end_date="2026-09-23",
+        fail_on_any_error=False,
+        run_id="registered-daily-20260923T223000123456789Z",
+    )
+    monkeypatch.setattr(yahoo, "parse_args", lambda: args)
+    monkeypatch.setattr(yahoo, "resolve_request_interval", lambda *_: 0.1)
+    monkeypatch.setattr(yahoo, "_run_one_asset", lambda asset, _args: (asset, {"repaired": 1}, 12.3456))
+
+    yahoo.main()
+    args.asset = "forex"
+    yahoo.main()
+
+    us = json.loads((tmp_path / "daily_update_summary.us_stocks.json").read_text())
+    forex = json.loads((tmp_path / "daily_update_summary.forex.json").read_text())
+    legacy = json.loads((tmp_path / "daily_update_summary.json").read_text())
+    assert us["asset_class"] == "us_stocks"
+    assert us["elapsed_seconds"] == 12.346
+    assert us["end_date"] == "2026-09-23"
+    assert us["run_id"] == args.run_id
+    assert forex["asset_class"] == "forex"
+    assert forex["run_id"] == args.run_id
+    assert legacy == {"forex": {"repaired": 1}}
+
+
+def test_symbol_repair_budget_blocks_late_parquet_commit_and_retries(tmp_path, monkeypatch):
+    import time
+
+    calls = []
+
+    def slow_fetch(_fn, *, timeout):
+        calls.append(timeout)
+        time.sleep(0.06)
+        return pl.DataFrame()
+
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", slow_fetch)
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    result = yahoo._download_symbol(
+        "tw_stocks", record, tmp_path, "2000-01-01", "2026-09-23",
+        retries=3, refresh=True, symbol_timeout_seconds=0.05,
+    )
+
+    assert result.status == "failed"
+    assert "timed out" in str(result.message)
+    assert len(calls) == 1
+    assert 0 < calls[0] <= 0.05
+    assert not (tmp_path / "2330_features.parquet").exists()
+
+
+def test_hard_fetch_timeout_uses_daemon_and_caps_orphan_threads(monkeypatch):
+    gate = threading.Event()
+    entered = threading.Event()
+    called = []
+    limit = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(yahoo, "_YAHOO_FETCH_INFLIGHT", limit)
+
+    def blocked():
+        called.append(threading.current_thread().daemon)
+        entered.set()
+        gate.wait(1)
+
+    try:
+        with pytest.raises(TimeoutError):
+            yahoo._fetch_with_hard_timeout(blocked, timeout=0.02)
+        assert entered.is_set()
+        assert called == [True]
+        with pytest.raises(TimeoutError):
+            yahoo._fetch_with_hard_timeout(
+                lambda: called.append(False), timeout=0.02
+            )
+        assert called == [True]
+    finally:
+        gate.set()
+    assert limit.acquire(timeout=1)
+    limit.release()
+
+
+def test_parallel_repair_passes_budget_to_started_symbol_worker(tmp_path, monkeypatch):
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    seen = []
+
+    def fake_download(*args):
+        seen.append(args[-1])
+        return yahoo.DownloadResult(
+            asset_class="tw_stocks", code=record.code,
+            yahoo_symbol=record.yahoo_symbol, market=record.market,
+            status="failed", rows=0, output_path=None,
+            message="repair timed out after 7s",
+        )
+
+    monkeypatch.setattr(yahoo, "_download_symbol", fake_download)
+    monkeypatch.setattr(yahoo, "_build_yfinance_rate_limited_session", lambda *_: None)
+    monkeypatch.setattr(yahoo, "_warm_yfinance_session", lambda *_: None)
+    args = argparse.Namespace(
+        request_interval=0, workers=1, end_date="2026-09-23",
+        retries=0, rate_limit_abort_after=0,
+    )
+    results = yahoo._run_parallel_symbol_downloads(
+        "tw_stocks", args, tmp_path,
+        [(record, "2000-01-01", True, False, None)], "repair:test",
+        set(), tmp_path / "blacklist.txt", threading.Lock(),
+        set(), tmp_path / "whitelist.txt", threading.Lock(),
+        symbol_timeout_seconds=7,
+    )
+
+    assert seen == [7]
+    assert results[0].status == "failed"
 
 
 def _write_parquet(frame: pl.DataFrame, path) -> None:

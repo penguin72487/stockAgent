@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from stockagent.backtest.tw_day_trade_minute import (
 )
 from stockagent.data.tw_day_trade_execution import (
     DAILY_PROXY_SESSION_MINUTE_BARS,
+    DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
     DAY_TRADE_FULL_SESSION_FIELDS,
     DAY_TRADE_FULL_SESSION_MINUTES,
     DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
@@ -30,6 +32,7 @@ from stockagent.data.tw_day_trade_execution import (
     FULL_SESSION_VOLUME_SHARES,
     load_tw_day_trade_execution_tape,
 )
+from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import _mode_artifact_contract_for_config
 
@@ -594,6 +597,67 @@ def test_full_session_loader_preserves_every_right_labelled_minute(
     assert tape[0, 0, 3, FULL_SESSION_VOLUME_SHARES] == 0.0
 
 
+def test_full_session_tape_blocks_verified_prelisting_symbol_without_rewriting_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "minute"
+    dates = ["2020-03-13", "2020-03-27"]
+    for day in dates:
+        partition = root / f"trade_date={day}" / "data.parquet"
+        partition.parent.mkdir(parents=True)
+        pl.DataFrame({
+            "symbol": ["2330", "6716"],
+            "minutes_from_open": [1, 1],
+            "Close": [10.0, 100.01],
+            "Amount": [100_000.0, 1_000_100.0],
+            "volume_shares": [10_000.0, 10_000.0],
+        }).write_parquet(partition)
+    (root / "manifest.json").write_text(
+        json.dumps({
+            "schema_version": 4,
+            "source": "shioaji_kbars_1m",
+            "research_ready": True,
+            "status": "research_ready",
+            "dates": dates,
+            "partitions": [{"trade_date": day} for day in dates],
+        }),
+        encoding="utf-8",
+    )
+    tape = load_tw_day_trade_execution_tape(
+        root,
+        panel_dates=np.asarray(dates, dtype="datetime64[D]"),
+        panel_symbols=["2330", "6716"],
+        official_open_prices=np.full((2, 2), 100.0),
+        policy=DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    )
+    assert np.isnan(tape[0, 1, 0, FULL_SESSION_PRICE])
+    assert np.isnan(tape[0, 1, 1, FULL_SESSION_PRICE])
+    assert tape[0, 1, 1, FULL_SESSION_VOLUME_SHARES] == 0.0
+    assert tape[1, 1, 1, FULL_SESSION_PRICE] == pytest.approx(100.01)
+    assert tape[1, 1, 1, FULL_SESSION_VOLUME_SHARES] == 10_000.0
+
+
+def test_daily_proxy_excludes_prelisting_quote_before_tick_validation(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "minute" / "trade_date=2020-03-27"
+    partition.mkdir(parents=True)
+    (partition / "data.parquet").touch()
+    tape = load_tw_day_trade_execution_tape(
+        tmp_path / "minute",
+        panel_dates=np.asarray(["2020-03-13"], dtype="datetime64[D]"),
+        panel_symbols=["2330", "6716"],
+        official_open_prices=np.asarray([[100.0, 100.01]], dtype=np.float64),
+        official_close_prices=np.asarray([[101.0, 100.02]], dtype=np.float64),
+        daily_volume_shares=np.full((1, 2), 1_000_000.0),
+        daily_proxy_price_policy="official_open_close",
+    )
+    assert tape[0, 0, F.DAILY_PROXY_FLAG] == 1.0
+    assert tape[0, 1, F.DAILY_PROXY_FLAG] == 0.0
+    assert np.isnan(tape[0, 1, F.DAILY_PROXY_LONG_ENTRY_PRICE])
+    assert tape[0, 1, F.DAILY_PROXY_VOLUME] == 0.0
+
+
 def test_multi_basis_full_volume_config_is_an_independent_contract() -> None:
     config = load_config(
         "configs/markets/"
@@ -1103,6 +1167,8 @@ def test_pretrained_22_basis_config_keeps_target_execution_loss_contract() -> No
     assert contract["sample_order_contract"] == "strict_chronological_sessions"
     assert contract["mode_details"] == {
         "execution_variant": "exact_board_lot_minute_event_tape_v1",
+        "minute_execution_contract_version": DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
+        "regular_market_admission": regular_market_admission_contract(),
         "daily_policy_decisions_per_session": 1,
         "daily_proxy_allowed": True,
     }

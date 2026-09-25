@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,7 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     with (output / ".refresh.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        refresh_started = time.monotonic()
         receipt = {"session_date": str(day), "source_start_year": args.start_year,
                    "simulation_only": True, "production_order_possible": False,
                    "feature_panel_end_date_unchanged": True, "steps": [], "status": "running"}
@@ -69,11 +71,26 @@ def main() -> None:
         atomic_write_json(target, receipt)
         try:
             for command in commands(root, output, args.start_year, day):
-                result = subprocess.run(command, cwd=ROOT, timeout=900, check=False)
-                receipt["steps"].append({"script": Path(command[1]).name, "returncode": result.returncode})
+                step_started = time.monotonic()
+                try:
+                    result = subprocess.run(command, cwd=ROOT, timeout=900, check=False)
+                except Exception as exc:
+                    receipt["steps"].append({
+                        "script": Path(command[1]).name,
+                        "elapsed_seconds": round(time.monotonic() - step_started, 3),
+                        "error_class": type(exc).__name__,
+                    })
+                    atomic_write_json(target, receipt)
+                    raise
+                receipt["steps"].append({
+                    "script": Path(command[1]).name,
+                    "returncode": result.returncode,
+                    "elapsed_seconds": round(time.monotonic() - step_started, 3),
+                })
                 atomic_write_json(target, receipt)
                 if result.returncode:
                     raise RuntimeError(f"execution action collector failed: {command[1]}")
+            validation_started = time.monotonic()
             ref = output / "tw_corporate_action_reference.parquet"
             ent = output / "tw_corporate_action_entitlements.parquet"
             verified = _load_corporate_action_reference(_CorporateActionReferencePaths(
@@ -85,10 +102,15 @@ def main() -> None:
             receipt.update(status="source_ready", share_replacement_events=len(events),
                 exact_terms_are_position_gated=True,
                 sources={p.name: sha256_file(p) for p in output.glob("*.parquet")},
+                validation_elapsed_seconds=round(time.monotonic() - validation_started, 3),
+                total_elapsed_seconds=round(time.monotonic() - refresh_started, 3),
                 completed_at=datetime.now(ZoneInfo("Asia/Taipei")).isoformat())
             atomic_write_json(target, receipt)
         except Exception as exc:
-            receipt.update(status="blocked", error=f"{type(exc).__name__}: {exc}")
+            receipt.update(
+                status="blocked", error=f"{type(exc).__name__}: {exc}",
+                total_elapsed_seconds=round(time.monotonic() - refresh_started, 3),
+            )
             atomic_write_json(target, receipt)
             raise
 

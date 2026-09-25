@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ import stockagent.training.trainer as trainer_module
 from stockagent.backtest.simulator import CANONICAL_BACKTEST_CONTRACT_VERSION
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import load_model_from_checkpoint
 from stockagent.training.checkpoint_contract import checkpoint_manifest_symbols
@@ -275,6 +277,16 @@ def test_strict_minute_tape_content_owns_resume_fingerprint() -> None:
         ["day_trade_minute_execution_allow_daily_proxy"]
         is False
     )
+
+
+def test_minute_listing_date_change_invalidates_day_trade_checkpoint(monkeypatch) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_strict_exact_2020.yaml")
+    panel = _day_trade_minute_panel()
+    original = _checkpoint_manifest(panel, config)
+    assert original["contracts"]["trading"]["taiwan_execution"]["regular_market_admission"]
+    monkeypatch.setitem(VERIFIED_EMERGING_TO_TPEX_LISTINGS, "6716", date(2020, 3, 26))
+    revised = _checkpoint_manifest(panel, config)
+    assert original["fingerprints"]["trading"] != revised["fingerprints"]["trading"]
 
 
 def test_official_daily_proxy_price_contract_cannot_resume_adverse_tick_checkpoint(tmp_path) -> None:
@@ -1831,6 +1843,37 @@ def test_schema_v4_inactive_causal_feature_normalizer_spelling_is_compatible(
             checkpoint_path=tmp_path / "enabled_causal_normalizer.pt",
             scope="model",
         )
+
+
+def test_causal_feature_compression_changes_model_checkpoint_contract() -> None:
+    panel = _panel()
+    baseline = _config()
+    baseline.training.model_name = "financial_transformer"
+    baseline.training.financial_transformer.causal_feature_rms_normalization = True
+    original = _checkpoint_manifest(panel, baseline)
+    assert "causal_feature_compression" not in original["contracts"]["model"]["model"]
+
+    compressed = copy.deepcopy(baseline)
+    compressed.training.financial_transformer.causal_feature_compression = "asinh"
+    compressed.training.financial_transformer.causal_feature_compression_patterns = ["close_raw"]
+    transformed = _checkpoint_manifest(panel, compressed)
+    assert original["fingerprints"]["model"] != transformed["fingerprints"]["model"]
+    assert transformed["contracts"]["model"]["model"]["causal_feature_compression"] == "asinh"
+
+
+def test_window_rms_changes_model_checkpoint_contract() -> None:
+    panel = _panel()
+    baseline = _config()
+    baseline.training.model_name = "financial_transformer"
+    baseline.training.financial_transformer.causal_feature_rms_normalization = True
+    original = _checkpoint_manifest(panel, baseline)
+    assert "causal_feature_window_rms_normalization" not in original["contracts"]["model"]["model"]
+
+    windowed = copy.deepcopy(baseline)
+    windowed.training.financial_transformer.causal_feature_window_rms_normalization = True
+    transformed = _checkpoint_manifest(panel, windowed)
+    assert original["fingerprints"]["model"] != transformed["fingerprints"]["model"]
+    assert transformed["contracts"]["model"]["model"]["causal_feature_window_rms_normalization"] is True
 
 
 def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path: Path) -> None:

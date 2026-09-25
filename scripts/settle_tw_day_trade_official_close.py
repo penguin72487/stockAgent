@@ -167,7 +167,10 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
 def reconcile_candidate(root: Path, plan, *, recorded_at: datetime):
     """Mutate only an isolated candidate. All original ledger prefixes survive."""
     day = date.fromisoformat(plan["session_date"])
-    if recorded_at.astimezone(TAIPEI).date() != day or recorded_at.astimezone(TAIPEI).time() < time(13, 35):
+    # The effective paper close remains on the selected completed session.
+    # An audited reconciliation may be recorded after midnight; rejecting it
+    # would force callers to backdate the actual recording time.
+    if recorded_at.astimezone(TAIPEI) < datetime.combine(day, time(13, 35), TAIPEI):
         raise ValueError("offline reconciliation must run after today's closing auction")
     engine = TwDayTradeSimulationEngine(root)
     if book_fingerprint(engine.state) != plan["book_fingerprint"]:

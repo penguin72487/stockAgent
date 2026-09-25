@@ -21,7 +21,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
+import time
 from typing import Iterator, Mapping, Sequence
 
 import duckdb
@@ -42,6 +44,7 @@ SCHEMA_VERSION = 1
 SEGMENT_TABLE = "l1_compaction_segments"
 MEMBER_TABLE = "l1_compaction_members"
 FAILURE_TABLE = "l1_compaction_failures"
+TASK_COMPACTION_INDEX = "idx_l1_tasks_compaction_order"
 MAX_QUERY_VIEW_SCHEMA_VARIANTS = 4_096
 
 
@@ -161,6 +164,67 @@ def _read_json_object(path: Path) -> dict[str, object]:
     except (OSError, ValueError, TypeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _stage_resources() -> dict[str, int | None]:
+    """Observe process/cgroup memory and stall counters without altering work."""
+
+    snapshot: dict[str, int | None] = {
+        "process_rss_bytes": None,
+        "process_swap_bytes": None,
+        "process_read_bytes": None,
+        "process_write_bytes": None,
+        "cgroup_memory_bytes": None,
+        "cgroup_swap_bytes": None,
+        "cgroup_memory_high_events": None,
+        "cgroup_memory_full_stall_us": None,
+        "cgroup_io_full_stall_us": None,
+    }
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition(":")
+            if not separator or key not in {"VmRSS", "VmSwap"}:
+                continue
+            amount = int(value.strip().split()[0]) * 1024
+            snapshot["process_rss_bytes" if key == "VmRSS" else "process_swap_bytes"] = amount
+        for line in Path("/proc/self/io").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key in {"read_bytes", "write_bytes"}:
+                snapshot[f"process_{key}"] = int(value.strip())
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if not line.startswith("0::"):
+                continue
+            relative = line.removeprefix("0::").lstrip("/")
+            group = Path("/sys/fs/cgroup") / relative
+            for field, filename in (
+                ("cgroup_memory_bytes", "memory.current"),
+                ("cgroup_swap_bytes", "memory.swap.current"),
+            ):
+                path = group / filename
+                if path.is_file():
+                    snapshot[field] = int(path.read_text(encoding="utf-8").strip())
+            events = group / "memory.events"
+            if events.is_file():
+                for event in events.read_text(encoding="utf-8").splitlines():
+                    name, _, value = event.partition(" ")
+                    if name == "high":
+                        snapshot["cgroup_memory_high_events"] = int(value)
+            for field, filename in (
+                ("cgroup_memory_full_stall_us", "memory.pressure"),
+                ("cgroup_io_full_stall_us", "io.pressure"),
+            ):
+                path = group / filename
+                if path.is_file():
+                    for pressure in path.read_text(encoding="utf-8").splitlines():
+                        if pressure.startswith("full "):
+                            snapshot[field] = int(
+                                dict(item.split("=", 1) for item in pressure.split()[1:])["total"]
+                            )
+                            break
+            break
+    except (OSError, ValueError, IndexError):
+        pass
+    return snapshot
 
 
 def _lexical_absolute_path(value: object) -> str:
@@ -374,10 +438,58 @@ def _quarantine_path(output_dir: Path, segment_id: str, path: Path) -> Path:
     return output_dir / "compact_l1" / "_stale" / segment_id / f"{stamp}-{path.name}"
 
 
+def _stale_source_contract_sql(
+    filter_clause: str, *, member_first: bool = False
+) -> str:
+    source_join = (
+        f"FROM {MEMBER_TABLE} AS m "
+        f"CROSS JOIN {SEGMENT_TABLE} AS s ON s.segment_id=m.segment_id"
+        if member_first
+        else f"FROM {SEGMENT_TABLE} AS s "
+             f"JOIN {MEMBER_TABLE} AS m ON m.segment_id=s.segment_id"
+    )
+    return f"""
+        SELECT DISTINCT s.segment_id, s.endpoint, s.output_path,
+            CASE
+                WHEN t.task_id IS NULL THEN 'source task missing from manifest'
+                WHEN t.active!=1 THEN 'source task retired from active plan'
+                WHEN t.status!='success' THEN 'source task is no longer successful'
+                WHEN t.endpoint!=m.endpoint OR t.endpoint!=s.endpoint
+                    THEN 'source endpoint changed'
+                WHEN (? || t.output_path)!=m.source_path
+                    AND stockagent_resolve_path(t.output_path)!=m.source_path
+                    THEN 'source path changed'
+                WHEN t.rows!=m.source_rows THEN 'source row contract changed'
+                WHEN t.updated_at!=m.task_updated_at THEN 'source task was refreshed'
+                ELSE NULL
+            END AS stale_reason
+        {source_join}
+        LEFT JOIN tasks AS t ON t.task_id=m.task_id
+        WHERE s.status='success'{filter_clause}
+          AND (
+              t.task_id IS NULL OR t.active!=1 OR t.status!='success'
+              OR t.endpoint!=m.endpoint OR t.endpoint!=s.endpoint
+              OR ((? || t.output_path)!=m.source_path
+                  AND stockagent_resolve_path(t.output_path)!=m.source_path)
+              OR t.rows!=m.source_rows
+              OR t.updated_at!=m.task_updated_at
+          )
+        ORDER BY s.segment_id
+        """
+
+
 def _mark_stale_segments(
     connection: sqlite3.Connection,
     filters: Sequence[str],
+    *,
+    timing: dict[str, float] | None = None,
 ) -> tuple[set[str], int]:
+    stage_started = time.monotonic()
+    # Source members store absolute paths while the archive normally records
+    # cwd-relative paths.  Compare that common, exact spelling inside SQLite
+    # before calling the Python normalizer millions of times.  The fallback is
+    # required for absolute, dotted and otherwise noncanonical source paths.
+    source_prefix = os.path.abspath(os.curdir) + os.sep
     filter_clause, filter_parameters = _filter_sql(filters, alias="s")
     stale_endpoints = {
         str(row["endpoint"])
@@ -389,38 +501,25 @@ def _mark_stale_segments(
             filter_parameters,
         )
     }
+    if timing is not None:
+        timing["stale_existing_status_query"] = round(
+            time.monotonic() - stage_started, 3
+        )
+    source_query_started = time.monotonic()
     rows = connection.execute(
-        f"""
-        SELECT DISTINCT s.segment_id, s.endpoint, s.output_path,
-            CASE
-                WHEN t.task_id IS NULL THEN 'source task missing from manifest'
-                WHEN t.active!=1 THEN 'source task retired from active plan'
-                WHEN t.status!='success' THEN 'source task is no longer successful'
-                WHEN t.endpoint!=m.endpoint OR t.endpoint!=s.endpoint
-                    THEN 'source endpoint changed'
-                WHEN stockagent_resolve_path(t.output_path)!=m.source_path
-                    THEN 'source path changed'
-                WHEN t.rows!=m.source_rows THEN 'source row contract changed'
-                WHEN t.updated_at!=m.task_updated_at THEN 'source task was refreshed'
-                ELSE NULL
-            END AS stale_reason
-        FROM {SEGMENT_TABLE} AS s
-        JOIN {MEMBER_TABLE} AS m ON m.segment_id=s.segment_id
-        LEFT JOIN tasks AS t ON t.task_id=m.task_id
-        WHERE s.status='success'{filter_clause}
-          AND (
-              t.task_id IS NULL OR t.active!=1 OR t.status!='success'
-              OR t.endpoint!=m.endpoint OR t.endpoint!=s.endpoint
-              OR stockagent_resolve_path(t.output_path)!=m.source_path
-              OR t.rows!=m.source_rows
-              OR t.updated_at!=m.task_updated_at
-          )
-        ORDER BY s.segment_id
-        """,
-        filter_parameters,
+        _stale_source_contract_sql(filter_clause),
+        (source_prefix, *filter_parameters, source_prefix),
     ).fetchall()
+    if timing is not None:
+        timing["stale_source_join_query"] = round(
+            time.monotonic() - source_query_started, 3
+        )
+        timing["stale_source_contract_query"] = round(
+            time.monotonic() - stage_started, 3
+        )
     # Missing derivatives are stale even when the source task contract did not
     # change. Checking one path per segment is bounded by the segment count.
+    stage_started = time.monotonic()
     known = {str(row["segment_id"]): row for row in rows}
     for row in connection.execute(
         f"""
@@ -435,14 +534,27 @@ def _mark_stale_segments(
         path = Path(str(row["output_path"]))
         derivative_error: str | None = None
         try:
-            if not path.is_file():
-                derivative_error = "L1 output file is missing"
-            elif int(pq.ParquetFile(path).metadata.num_rows) != int(row["output_rows"]):
+            # Opening the Parquet metadata already checks path existence. Avoid
+            # an extra stat for every healthy segment; classify absent or
+            # non-file paths only on the exceptional path below.
+            parquet_file = pq.ParquetFile(str(path))
+            if int(parquet_file.metadata.num_rows) != int(row["output_rows"]):
                 derivative_error = "L1 output row count changed"
-            elif parquet_schema_fingerprint(path) != row["schema_fingerprint"]:
+            elif (
+                hashlib.sha256(
+                    parquet_file.schema_arrow.remove_metadata()
+                    .serialize()
+                    .to_pybytes()
+                ).hexdigest()
+                != row["schema_fingerprint"]
+            ):
                 derivative_error = "L1 output schema fingerprint changed"
         except Exception as exc:
-            derivative_error = f"L1 output is unreadable: {type(exc).__name__}: {exc}"
+            derivative_error = (
+                "L1 output file is missing"
+                if not path.is_file()
+                else f"L1 output is unreadable: {type(exc).__name__}: {exc}"
+            )
         if derivative_error is not None:
             known[str(row["segment_id"])] = {
                 "segment_id": row["segment_id"],
@@ -451,6 +563,12 @@ def _mark_stale_segments(
                 "stale_reason": derivative_error,
             }
 
+    if timing is not None:
+        timing["stale_derivative_metadata_scan"] = round(
+            time.monotonic() - stage_started, 3
+        )
+
+    stage_started = time.monotonic()
     for row in known.values():
         segment_id = str(row["segment_id"])
         stale_endpoints.add(str(row["endpoint"]))
@@ -466,6 +584,8 @@ def _mark_stale_segments(
             connection.execute(
                 f"DELETE FROM {MEMBER_TABLE} WHERE segment_id=?", (segment_id,)
             )
+    if timing is not None:
+        timing["stale_state_apply"] = round(time.monotonic() - stage_started, 3)
     return stale_endpoints, len(known)
 
 
@@ -511,6 +631,7 @@ def _load_unassigned_shards(
     *,
     limit: int,
     show_progress: bool,
+    timing: dict[str, float] | None = None,
 ) -> list[TaskShard]:
     plan_token = _active_plan_token(connection)
     token_clause = "" if plan_token is None else " AND t.plan_token=?"
@@ -518,8 +639,8 @@ def _load_unassigned_shards(
     filter_clause, filter_parameters = _filter_sql(filters, alias="t")
     parameters.extend(filter_parameters)
     parameters.append(int(limit))
-    cursor = connection.execute(
-        f"""
+    query_started = time.monotonic()
+    global_sql = f"""
         SELECT t.task_id, t.endpoint, t.output_path, t.rows, t.updated_at
         FROM tasks AS t
         LEFT JOIN {MEMBER_TABLE} AS m ON m.task_id=t.task_id
@@ -527,12 +648,111 @@ def _load_unassigned_shards(
           {token_clause}{filter_clause}
         ORDER BY t.endpoint, t.task_id
         LIMIT ?
-        """,
-        parameters,
-    )
+        """
+    rows: list[sqlite3.Row] | None = None
+    # The active-plan index yields endpoints in order, but not task IDs.  When
+    # the first unassigned endpoint fills this batch, sorting just that
+    # endpoint is identical to the global ORDER BY and avoids sorting every
+    # other endpoint's successful task.  Keep the original query for a short
+    # first endpoint, explicit endpoint filters, or manifests without the
+    # downloader's active-plan index.
+    task_indexes = {
+        str(row[1]) for row in connection.execute("PRAGMA index_list(tasks)")
+    }
+    active_plan_index = "idx_tasks_active_plan" in task_indexes
+    if (
+        plan_token is not None
+        and not filters
+        and 0 < limit <= 8192
+        and TASK_COMPACTION_INDEX in task_indexes
+    ):
+        # The partial covering index preserves the original global
+        # endpoint/task-id order without sorting millions of unassigned
+        # successes. Only the selected batch needs table-row lookups.
+        rows = connection.execute(
+            f"""
+            SELECT t.task_id, t.endpoint, t.output_path, t.rows, t.updated_at
+            FROM tasks AS t INDEXED BY {TASK_COMPACTION_INDEX}
+            LEFT JOIN {MEMBER_TABLE} AS m ON m.task_id=t.task_id
+            WHERE t.active=1 AND t.plan_token=? AND t.status='success'
+              AND m.task_id IS NULL
+            ORDER BY t.endpoint, t.task_id LIMIT ?
+            """,
+            (plan_token, int(limit)),
+        ).fetchall()
+        if timing is not None:
+            timing["unassigned_source_index_order"] = round(
+                time.monotonic() - query_started, 3
+            )
+    elif plan_token is not None and not filters and 0 < limit <= 8192 and active_plan_index:
+        connection.execute("SAVEPOINT l1_unassigned_read")
+        try:
+            endpoint_started = time.monotonic()
+            first = connection.execute(
+                f"""
+                SELECT t.endpoint
+                FROM tasks AS t INDEXED BY idx_tasks_active_plan
+                WHERE t.active=1 AND t.plan_token=? AND t.status='success'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {MEMBER_TABLE} AS m WHERE m.task_id=t.task_id
+                  )
+                ORDER BY t.endpoint LIMIT 1
+                """,
+                (plan_token,),
+            ).fetchone()
+            if timing is not None:
+                timing["unassigned_source_first_endpoint"] = round(
+                    time.monotonic() - endpoint_started, 3
+                )
+            if first is None:
+                rows = []
+            else:
+                endpoint_started = time.monotonic()
+                candidate = connection.execute(
+                    f"""
+                    SELECT t.task_id, t.endpoint, t.output_path, t.rows,
+                           t.updated_at
+                    FROM tasks AS t INDEXED BY idx_tasks_active_plan
+                    LEFT JOIN {MEMBER_TABLE} AS m ON m.task_id=t.task_id
+                    WHERE t.active=1 AND t.plan_token=? AND t.status='success'
+                      AND t.endpoint=? AND m.task_id IS NULL
+                    ORDER BY t.task_id LIMIT ?
+                    """,
+                    (plan_token, str(first[0]), int(limit)),
+                ).fetchall()
+                if timing is not None:
+                    timing["unassigned_source_endpoint_sort"] = round(
+                        time.monotonic() - endpoint_started, 3
+                    )
+                if len(candidate) == limit:
+                    rows = candidate
+            if rows is None:
+                fallback_started = time.monotonic()
+                rows = connection.execute(global_sql, parameters).fetchall()
+                if timing is not None:
+                    timing["unassigned_source_global_fallback"] = round(
+                        time.monotonic() - fallback_started, 3
+                    )
+        except BaseException:
+            connection.execute("ROLLBACK TO l1_unassigned_read")
+            raise
+        finally:
+            connection.execute("RELEASE l1_unassigned_read")
+    else:
+        fallback_started = time.monotonic()
+        rows = connection.execute(global_sql, parameters).fetchall()
+        if timing is not None:
+            timing["unassigned_source_global_fallback"] = round(
+                time.monotonic() - fallback_started, 3
+            )
+    if timing is not None:
+        timing["unassigned_source_query"] = round(
+            time.monotonic() - query_started, 3
+        )
+    metadata_started = time.monotonic()
     output: list[TaskShard] = []
     progress = tqdm(
-        cursor,
+        rows,
         desc="openbb:l1 source contracts",
         unit="file",
         disable=not show_progress,
@@ -568,6 +788,10 @@ def _load_unassigned_shards(
                 mtime_ns=int(stat.st_mtime_ns),
                 schema_fingerprint=schema_fingerprint,
             )
+        )
+    if timing is not None:
+        timing["unassigned_source_metadata"] = round(
+            time.monotonic() - metadata_started, 3
         )
     return output
 
@@ -851,9 +1075,85 @@ def _active_segment_paths(
     return dict(grouped)
 
 
+def _view_input_signature(paths: Sequence[Path]) -> str:
+    """Fingerprint the exact ordered path list embedded in one DuckDB view."""
+
+    digest = hashlib.sha256()
+    for path in paths:
+        encoded = os.fspath(path).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _reusable_view_catalog(
+    path: Path,
+) -> dict[str, tuple[str, str, str | None, str | None]] | None:
+    """Trust an old catalog only when its signature and view set are complete."""
+
+    if not path.is_file():
+        return None
+    try:
+        database = duckdb.connect(str(path), read_only=True)
+    except duckdb.Error:
+        return None
+    try:
+        columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info('l1_catalog')").fetchall()
+        }
+        if not {"view_input_signature", "view_sql_signature"} <= columns:
+            return None
+        catalog: dict[str, tuple[str, str, str | None, str | None]] = {}
+        expected_views: set[str] = set()
+        for endpoint, view_name, state, signature, sql_signature in database.execute(
+            "SELECT endpoint, view_name, query_state, view_input_signature, "
+            "view_sql_signature "
+            "FROM l1_catalog"
+        ).fetchall():
+            endpoint = str(endpoint)
+            if endpoint in catalog or state not in {"published", "deferred"}:
+                return None
+            if state == "published":
+                if (
+                    view_name != _view_name(endpoint)
+                    or not isinstance(signature, str)
+                    or len(signature) != 64
+                    or not isinstance(sql_signature, str)
+                    or len(sql_signature) != 64
+                ):
+                    return None
+                expected_views.add(view_name)
+            elif view_name is not None or signature is not None or sql_signature is not None:
+                return None
+            catalog[endpoint] = (
+                str(state), str(view_name) if view_name else "",
+                signature, sql_signature,
+            )
+        actual_views = {
+            str(name): str(sql)
+            for name, sql in database.execute(
+                "SELECT view_name, sql FROM duckdb_views() "
+                "WHERE schema_name='main' AND view_name LIKE 'openbb_l1_%'"
+            ).fetchall()
+        }
+        if set(actual_views) != expected_views:
+            return None
+        for state, view_name, _, sql_signature in catalog.values():
+            if state == "published" and hashlib.sha256(
+                actual_views[view_name].encode("utf-8")
+            ).hexdigest() != sql_signature:
+                return None
+        return catalog
+    except (duckdb.Error, RuntimeError, ValueError):
+        return None
+    finally:
+        database.close()
+
+
 def _publish_views(
     connection: sqlite3.Connection, database_path: Path
-) -> tuple[int, dict[str, str]]:
+) -> tuple[int, dict[str, str], dict[str, float], dict[str, str]]:
     endpoint_statistics = {
         str(row["endpoint"]): row
         for row in connection.execute(
@@ -889,52 +1189,97 @@ def _publish_views(
     database_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = database_path.with_name(f".{database_path.name}.{os.getpid()}.tmp")
     temporary.unlink(missing_ok=True)
-    database = duckdb.connect(str(temporary))
+    previous = _reusable_view_catalog(database_path)
+    endpoint_seconds: dict[str, float] = {}
+    endpoint_actions: dict[str, str] = {}
     try:
-        database.execute(
-            "CREATE TABLE l1_catalog ("
-            "endpoint VARCHAR, view_name VARCHAR, query_state VARCHAR, "
-            "query_reason VARCHAR, schema_variants BIGINT, segment_count BIGINT, "
-            "source_files BIGINT, rows BIGINT, input_bytes BIGINT, "
-            "output_bytes BIGINT, updated_at_utc VARCHAR)"
-        )
-        for endpoint, totals in endpoint_statistics.items():
-            paths = grouped.get(endpoint, [])
-            reason = deferred.get(endpoint)
-            view_name: str | None = None
-            if reason is None:
-                missing = [str(path) for path in paths if not path.is_file()]
-                if missing:
-                    raise FileNotFoundError(
-                        f"active L1 segment files are missing: {missing[:5]}"
-                    )
-                path_sql = "[" + ",".join(_sql_string(path) for path in paths) + "]"
-                view_name = _view_name(endpoint)
+        if previous is not None:
+            shutil.copy2(database_path, temporary)
+        database = duckdb.connect(str(temporary))
+        try:
+            if previous is None:
                 database.execute(
-                    f"CREATE VIEW {view_name} AS "
-                    f"SELECT * FROM read_parquet({path_sql}, union_by_name=true)"
+                    "CREATE TABLE l1_catalog ("
+                    "endpoint VARCHAR, view_name VARCHAR, query_state VARCHAR, "
+                    "query_reason VARCHAR, schema_variants BIGINT, segment_count BIGINT, "
+                    "source_files BIGINT, rows BIGINT, input_bytes BIGINT, "
+                    "output_bytes BIGINT, updated_at_utc VARCHAR, "
+                    "view_input_signature VARCHAR, view_sql_signature VARCHAR)"
                 )
-            database.execute(
-                "INSERT INTO l1_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    endpoint,
-                    view_name,
-                    "deferred" if reason is not None else "published",
-                    reason,
-                    int(totals["schema_variants"] or 0),
-                    int(totals["segment_count"] or 0),
-                    int(totals["source_files"] or 0),
-                    int(totals["rows"] or 0),
-                    int(totals["input_bytes"] or 0),
-                    int(totals["output_bytes"] or 0),
-                    str(totals["updated_at"] or ""),
-                ),
-            )
-        database.execute("CHECKPOINT")
+            else:
+                database.execute("DELETE FROM l1_catalog")
+                for old_endpoint, (old_state, old_name, _, _) in previous.items():
+                    if old_state == "published" and (
+                        old_endpoint not in endpoint_statistics
+                        or old_endpoint in deferred
+                    ):
+                        database.execute(f"DROP VIEW {old_name}")
+            for endpoint, totals in endpoint_statistics.items():
+                endpoint_started = time.monotonic()
+                paths = grouped.get(endpoint, [])
+                reason = deferred.get(endpoint)
+                view_name: str | None = None
+                view_signature: str | None = None
+                view_sql_signature: str | None = None
+                if reason is None:
+                    missing = [str(path) for path in paths if not path.is_file()]
+                    if missing:
+                        raise FileNotFoundError(
+                            f"active L1 segment files are missing: {missing[:5]}"
+                        )
+                    view_name = _view_name(endpoint)
+                    view_signature = _view_input_signature(paths)
+                    if previous is not None and previous.get(endpoint, ())[:3] == (
+                        "published", view_name, view_signature
+                    ):
+                        endpoint_actions[endpoint] = "reused_verified_paths"
+                        view_sql_signature = previous[endpoint][3]
+                    else:
+                        path_sql = "[" + ",".join(_sql_string(path) for path in paths) + "]"
+                        database.execute(
+                            f"CREATE OR REPLACE VIEW {view_name} AS "
+                            f"SELECT * FROM read_parquet({path_sql}, union_by_name=true)"
+                        )
+                        endpoint_actions[endpoint] = "rebuilt"
+                        view_sql = database.execute(
+                            "SELECT sql FROM duckdb_views() WHERE schema_name='main' "
+                            "AND view_name=?", (view_name,)
+                        ).fetchone()
+                        if view_sql is None or not isinstance(view_sql[0], str):
+                            raise RuntimeError(f"published L1 view is missing: {view_name}")
+                        view_sql_signature = hashlib.sha256(
+                            view_sql[0].encode("utf-8")
+                        ).hexdigest()
+                else:
+                    endpoint_actions[endpoint] = "deferred"
+                database.execute(
+                    "INSERT INTO l1_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        endpoint,
+                        view_name,
+                        "deferred" if reason is not None else "published",
+                        reason,
+                        int(totals["schema_variants"] or 0),
+                        int(totals["segment_count"] or 0),
+                        int(totals["source_files"] or 0),
+                        int(totals["rows"] or 0),
+                        int(totals["input_bytes"] or 0),
+                        int(totals["output_bytes"] or 0),
+                        str(totals["updated_at"] or ""),
+                        view_signature,
+                        view_sql_signature,
+                    ),
+                )
+                endpoint_seconds[endpoint] = round(
+                    time.monotonic() - endpoint_started, 3
+                )
+            database.execute("CHECKPOINT")
+        finally:
+            database.close()
+        os.replace(temporary, database_path)
     finally:
-        database.close()
-    os.replace(temporary, database_path)
-    return len(grouped), deferred
+        temporary.unlink(missing_ok=True)
+    return len(grouped), deferred, endpoint_seconds, endpoint_actions
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -975,25 +1320,43 @@ def _write_status(
     stale_segments: int,
     new_segments: int,
     deferred_query_views: Mapping[str, str],
+    stage_seconds: Mapping[str, float] | None = None,
+    view_endpoint_seconds: Mapping[str, float] | None = None,
+    view_endpoint_actions: Mapping[str, str] | None = None,
+    stage_resources: Mapping[str, Mapping[str, int | None]] | None = None,
 ) -> dict[str, object]:
+    timings = dict(stage_seconds or {})
+    status_started = time.monotonic()
     plan_token = _active_plan_token(connection)
     token_clause = "" if plan_token is None else " AND t.plan_token=?"
     filter_clause, filter_parameters = _filter_sql(filters, alias="t")
     task_parameters: list[object] = [] if plan_token is None else [plan_token]
     task_parameters.extend(filter_parameters)
+    task_index_hint = (
+        f" INDEXED BY {TASK_COMPACTION_INDEX}"
+        if plan_token is not None
+        and not filters
+        and any(
+            str(row[1]) == TASK_COMPACTION_INDEX
+            for row in connection.execute("PRAGMA index_list(tasks)")
+        )
+        else ""
+    )
     tasks = {
         str(row["endpoint"]): row
         for row in connection.execute(
             f"""
             SELECT t.endpoint, COUNT(*) AS success_files,
                    SUM(t.rows) AS success_rows
-            FROM tasks AS t
+            FROM tasks AS t{task_index_hint}
             WHERE t.active=1 AND t.status='success'{token_clause}{filter_clause}
             GROUP BY t.endpoint
             """,
             task_parameters,
         )
     }
+    timings["status_task_count"] = round(time.monotonic() - status_started, 3)
+    status_started = time.monotonic()
     compacted = _grouped_counts(
         connection,
         f"""
@@ -1007,6 +1370,8 @@ def _write_status(
         filters,
         alias="m",
     )
+    timings["status_member_count"] = round(time.monotonic() - status_started, 3)
+    status_started = time.monotonic()
     segments = _grouped_counts(
         connection,
         f"""
@@ -1021,6 +1386,8 @@ def _write_status(
         filters,
         alias="s",
     )
+    timings["status_segment_count"] = round(time.monotonic() - status_started, 3)
+    status_started = time.monotonic()
     endpoint_rows: list[dict[str, object]] = []
     for endpoint in sorted(set(tasks) | set(compacted) | set(segments)):
         task = tasks.get(endpoint)
@@ -1107,6 +1474,7 @@ def _write_status(
         os.replace(temporary, status_path)
     finally:
         temporary.unlink(missing_ok=True)
+    timings["status_projection_write"] = round(time.monotonic() - status_started, 3)
     payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": generated_at,
@@ -1125,6 +1493,10 @@ def _write_status(
         "new_segments": int(new_segments),
         "stale_segments": int(stale_segments),
         "deferred_query_views": dict(sorted(deferred_query_views.items())),
+        "stage_seconds": timings,
+        "view_endpoint_seconds": dict(sorted((view_endpoint_seconds or {}).items())),
+        "view_endpoint_actions": dict(sorted((view_endpoint_actions or {}).items())),
+        "stage_resources": dict(stage_resources or {}),
         "l0_deleted": False,
         "query_database": str((output_dir / "openbb_l1.duckdb").resolve()),
         "status_parquet": str(status_path.resolve()),
@@ -1396,6 +1768,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     with _exclusive_lock(lock_path):
         cleaned_temp_files = _clean_duckdb_temp_files(state_dir / "duckdb_l1_tmp")
         manifest = _open_manifest(state_path)
+        stage_seconds: dict[str, float] = {}
+        stage_resources: dict[str, dict[str, int | None]] = {}
         try:
             if args.audit_only:
                 audits = _audit_segments(
@@ -1414,15 +1788,24 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
                 return 0 if failed == 0 else 2
 
+            stage_resources["before_stale_contract_audit"] = _stage_resources()
+            stage_started = time.monotonic()
             stale_endpoints, stale_segments = _mark_stale_segments(
-                manifest, args.endpoint
+                manifest, args.endpoint, timing=stage_seconds
             )
+            stage_seconds["stale_contract_audit"] = round(time.monotonic() - stage_started, 3)
+            stage_resources["after_stale_contract_audit"] = _stage_resources()
+            stage_started = time.monotonic()
             shards = _load_unassigned_shards(
                 manifest,
                 args.endpoint,
                 limit=args.max_source_files,
                 show_progress=not args.no_progress,
+                timing=stage_seconds,
             )
+            stage_seconds["unassigned_source_load"] = round(time.monotonic() - stage_started, 3)
+            stage_resources["after_unassigned_source_load"] = _stage_resources()
+            stage_started = time.monotonic()
             batches = list(
                 _segment_batches(
                     shards,
@@ -1435,6 +1818,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     flush_endpoints=stale_endpoints,
                 )
             )
+            stage_seconds["batch_planning"] = round(time.monotonic() - stage_started, 3)
             progress = tqdm(
                 batches,
                 desc="openbb:l1 compact",
@@ -1445,6 +1829,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             failed_segments = 0
             deferred_failed_segments = 0
             stopped_for_archive = False
+            stage_started = time.monotonic()
             for batch in progress:
                 if args.archive_idle_only:
                     allowed, reason = _archive_compaction_allowed(state_dir)
@@ -1527,6 +1912,8 @@ def run(argv: Sequence[str] | None = None) -> int:
                     rows=receipt.output_rows,
                     refresh=False,
                 )
+            stage_seconds["segment_build"] = round(time.monotonic() - stage_started, 3)
+            stage_resources["after_segment_build"] = _stage_resources()
 
             if stopped_for_archive:
                 print(
@@ -1537,12 +1924,20 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
                 return 0
 
-            view_count, deferred_query_views = _publish_views(
-                manifest, output_dir / "openbb_l1.duckdb"
-            )
+            stage_started = time.monotonic()
+            (
+                view_count,
+                deferred_query_views,
+                view_endpoint_seconds,
+                view_endpoint_actions,
+            ) = _publish_views(manifest, output_dir / "openbb_l1.duckdb")
+            stage_seconds["query_view_publish"] = round(time.monotonic() - stage_started, 3)
+            stage_resources["after_query_view_publish"] = _stage_resources()
+            stage_started = time.monotonic()
             quarantined_segments = _quarantine_stale_outputs(
                 manifest, output_dir, args.endpoint
             )
+            stage_seconds["stale_output_quarantine"] = round(time.monotonic() - stage_started, 3)
             status = _write_status(
                 manifest,
                 output_dir,
@@ -1550,6 +1945,10 @@ def run(argv: Sequence[str] | None = None) -> int:
                 stale_segments=stale_segments,
                 new_segments=new_segments,
                 deferred_query_views=deferred_query_views,
+                stage_seconds=stage_seconds,
+                view_endpoint_seconds=view_endpoint_seconds,
+                view_endpoint_actions=view_endpoint_actions,
+                stage_resources=stage_resources,
             )
             print(
                 "[openbb-l1] "

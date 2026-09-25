@@ -212,6 +212,9 @@ data_bybit/*
 /data_free_public/
 /data_coinmetrics_community/
 /data_crypto_reference/
+/data_finlab/
+/data_finmind/
+/data_finlab_training
 /data_dune_crypto/
 /data_crypto_etf/
 data_yahoo_tw_ohlcv/*

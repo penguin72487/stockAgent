@@ -21,8 +21,10 @@ IOWeight=100
 # Preserve the stateful paper execution engine ahead of reproducible bulk
 # refresh/audit workers when the kernel must select an OOM victim.
 OOMScoreAdjust=-500
-# Measured peak was below 1 GiB.  Keep wide headroom for model/config growth,
-# but contain a leak inside this restartable cgroup instead of the whole host.
+# The 2026-09-25 full-history signal request raised this cgroup's observed
+# peak above 5.7 GiB; most private-dashboard anonymous pages were LazyFree and
+# reclaimable, with zero memory.high / OOM events. Re-measure cold concurrent
+# requests before changing the 8G / 16G boundaries or assuming a sub-1G peak.
 MemoryAccounting=true
 MemoryHigh=8G
 MemoryMax=16G

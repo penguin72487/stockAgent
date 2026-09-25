@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 from datetime import date, datetime
 import fcntl
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -23,6 +25,24 @@ from stockagent.live import tw_public_opening_revision as opening_revision
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_publication_receipt_separates_command_success_from_data_completeness() -> None:
+    assert publication._download_data_status(None) == "unknown"
+    assert publication._download_data_status(
+        {"coverage_complete": True, "failed_count": 0}
+    ) == "complete"
+    assert publication._download_data_status(
+        {
+            "coverage_complete": False,
+            "failed_count": 2,
+            "publication_lag_count": 2,
+            "blocking_failed_count": 0,
+        }
+    ) == "waiting_publication"
+    assert publication._download_data_status(
+        {"coverage_complete": False, "failed_count": 2, "publication_lag_count": 1}
+    ) == "incomplete"
 
 
 def test_preopen_sweep_covers_every_registered_official_dataset() -> None:
@@ -61,6 +81,72 @@ def test_close_command_requires_verified_publication(tmp_path: Path) -> None:
     assert "--require-daily-close-publication" in command
     assert "--run-metadata-dir" in command
     assert "--no-write-run-metadata" not in command
+
+
+@pytest.mark.parametrize(
+    ("opened", "reason", "expected"),
+    [
+        (False, "official TWSE schedule as-of 2026-09-16: 中秋節", True),
+        (True, "official TWSE schedule as-of 2026-09-16: ordinary weekday session", False),
+        (False, "official TWSE holiday schedule is missing", False),
+        (False, "official TWSE holiday schedule has conflicting open/closed events", False),
+    ],
+)
+def test_close_sweep_skips_only_verified_non_sessions(
+    tmp_path: Path, monkeypatch, opened: bool, reason: str, expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        publication, "verified_tw_stock_session_day", lambda *_args, **_kwargs: (opened, reason)
+    )
+    evidence = publication._confirmed_closed_stock_session(
+        tmp_path, datetime(2026, 9, 25, 14, 0, tzinfo=TAIPEI)
+    )
+    assert (evidence is not None) is expected
+
+
+def test_verified_holiday_close_sweep_does_not_download_or_finalize(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    receipt_root = tmp_path / "receipts"
+    monkeypatch.setattr(
+        publication,
+        "parse_args",
+        lambda: SimpleNamespace(
+            phase="close_initial",
+            live_root=live_root,
+            receipt_root=receipt_root,
+            workers=8,
+            date_workers=4,
+            timeout=20,
+            retries=2,
+            auto_window_minutes=20.0,
+        ),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_confirmed_closed_stock_session",
+        lambda *_args: "official TWSE schedule as-of 2026-09-16: 中秋節",
+    )
+    monkeypatch.setattr(
+        publication,
+        "_file_hashes",
+        lambda *_args: pytest.fail("verified holiday must not scan daily prices"),
+    )
+    monkeypatch.setattr(
+        publication.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("verified holiday must not download"),
+    )
+
+    assert publication.main() == 0
+    receipt = json.loads((receipt_root / "close_initial/latest.json").read_text())
+    assert receipt["status"] == "skipped_verified_non_session"
+    assert receipt["data_status"] == "not_applicable"
+    assert receipt["commands"] == []
+    assert receipt["completed_session_finalize"] == "not_applicable"
+    assert json.loads(capsys.readouterr().out)["status"] == receipt["status"]
 
 
 def test_completed_session_gate_accepts_official_close_without_next_opening(
@@ -356,6 +442,63 @@ def test_0830_command_refreshes_the_live_preopen_source_not_legacy_snapshot(
     assert "--auto-window-minutes" in forced
 
 
+@pytest.mark.parametrize(
+    ("session_state", "expected_status", "expected_exit"),
+    [
+        ("closed", "skipped", 0),
+        ("unknown", "failed", 1),
+        ("error", "failed", 1),
+    ],
+)
+def test_0830_session_gate_precedes_expensive_opening_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_state: str,
+    expected_status: str,
+    expected_exit: int,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.touch()
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    receipt = tmp_path / "latest.json"
+    monkeypatch.setattr(
+        run_tw_public_0830_check,
+        "parse_args",
+        lambda: argparse.Namespace(
+            config=config,
+            live_root=live_root,
+            receipt=receipt,
+            publication_receipt=tmp_path / "publication.json",
+            eligibility_receipt=tmp_path / "eligibility.json",
+            event_receipt=tmp_path / "event.json",
+            audit_root=tmp_path / "audit",
+            event_settle_seconds=0,
+            force=False,
+        ),
+    )
+    def session_contract(_observed: datetime) -> tuple[str, str, tuple[str, ...]]:
+        if session_state == "error":
+            raise OSError("official calendar unavailable")
+        return session_state, "verified schedule reason", ("market",)
+
+    monkeypatch.setattr(run_tw_public_0830_check, "_session_contract", session_contract)
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("expensive opening work must not run")
+
+    monkeypatch.setattr(
+        run_tw_public_0830_check, "_latest_completed_taiex_session", unexpected
+    )
+    assert run_tw_public_0830_check.main() == expected_exit
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["status"] == expected_status
+    assert payload["acceptance"]["same_session_eligibility"] is False
+    assert payload["acceptance"]["strict_model_safety_audit"] is False
+    assert payload["steps"] == []
+    assert len(list((tmp_path / "runs").glob("*.json"))) == 1
+
+
 def test_0830_opening_gate_never_publishes_or_materializes_packed_data() -> None:
     source = Path("scripts/run_tw_public_0830_check.py").read_text(encoding="utf-8")
     assert "run_data_cache.sh" not in source
@@ -457,6 +600,45 @@ def test_0830_reuses_only_exact_dependency_audit_receipt(tmp_path: Path) -> None
         )
         is None
     )
+
+
+def test_0830_audit_cache_invalidates_on_direct_short_rule_receipt_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    live = tmp_path / "live"
+    config = repo / "config.yaml"
+    monkeypatch.setattr(run_tw_public_0830_check, "REPO_ROOT", repo)
+    relative_files = (
+        "scripts/audit_tw_public_data_layer.py",
+        "scripts/build_tw_official_symbol_parquets.py",
+        "scripts/build_tw_public_training_features.py",
+        "stockagent/data/tw_public_features.py",
+    )
+    live_files = (
+        "download_summary.json",
+        "tw_short_sale_download_report.json",
+        "twse_taiex_ohlc.summary.json",
+        "tw_corporate_action_reference.summary.json",
+        "tw_corporate_action_entitlements.summary.json",
+        "stocks/official_symbol_build_summary.json",
+        "stocks/official_symbol_build_report.csv",
+        "features/tw_public_stock_daily.summary.json",
+    )
+    for path in (config, *(repo / item for item in relative_files), *(live / item for item in live_files)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("unchanged", encoding="utf-8")
+
+    before = run_tw_public_0830_check._audit_dependency_state(
+        config=config, live_root=live
+    )["sha256"]
+    (live / "tw_short_sale_download_report.json").write_text(
+        "new official receipt", encoding="utf-8"
+    )
+    after = run_tw_public_0830_check._audit_dependency_state(
+        config=config, live_root=live
+    )["sha256"]
+    assert before != after
 
 
 def test_0830_reuses_completed_session_only_for_exact_source_revision() -> None:
@@ -803,6 +985,7 @@ def test_systemd_timers_have_no_random_delay() -> None:
     )
     assert "refresh_tw_day_trade_margin_actions.py" in margin_runner
     assert "publish_tw_public_cold_release.py" in margin_runner
+    assert "--defer-stale-derived-receipts" in margin_runner
     assert "run_downloader_with_release.sh" not in margin_runner
 
 
@@ -888,6 +1071,71 @@ def test_cold_publish_rejects_stale_training_receipt(
     monkeypatch.setattr(public_audit, "audit_feature_build_receipt", lambda *a: ({}, [finding]))
     with pytest.raises(RuntimeError, match="stale_feature_build_receipt"):
         cold_publication._check_training_receipts(tmp_path)
+
+
+@pytest.mark.parametrize("defer,expected_status", [(False, "failed"), (True, "deferred")])
+def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defer: bool, expected_status: str,
+) -> None:
+    receipt_path = tmp_path / "latest.json"
+    args = type("Args", (), {
+        "receipt": receipt_path,
+        "timeout_seconds": 30.0,
+        "defer_stale_derived_receipts": defer,
+    })()
+    monkeypatch.setattr(cold_publication, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        cold_publication.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout='{"datasets":[{"active_blockers":[]}]}', stderr=""
+        ),
+    )
+
+    def stale(*args: object) -> None:
+        raise cold_publication.StaleDerivedReceipts(
+            ["stale_feature_build_receipt", "stale_official_symbol_build_receipt"]
+        )
+
+    monkeypatch.setattr(cold_publication, "_publish_while_source_stable", stale)
+    assert cold_publication.main() == (0 if defer else 1)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == expected_status
+    assert receipt["release"] is None
+    if defer:
+        assert receipt["reason"] == "stale_derived_receipts"
+        assert receipt["blocking_findings"] == [
+            "stale_feature_build_receipt", "stale_official_symbol_build_receipt"
+        ]
+        assert receipt["error"] is None
+    else:
+        assert "stale_feature_build_receipt" in receipt["error"]
+
+
+def test_source_only_cold_defer_does_not_suppress_other_publish_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt_path = tmp_path / "latest.json"
+    args = type("Args", (), {
+        "receipt": receipt_path,
+        "timeout_seconds": 30.0,
+        "defer_stale_derived_receipts": True,
+    })()
+    monkeypatch.setattr(cold_publication, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        cold_publication.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout='{"datasets":[{"active_blockers":[]}]}', stderr=""
+        ),
+    )
+
+    def fail(*args: object) -> None:
+        raise RuntimeError("unrelated publish failure")
+
+    monkeypatch.setattr(cold_publication, "_publish_while_source_stable", fail)
+    assert cold_publication.main() == 1
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["error"] == "unrelated publish failure"
 
 
 def test_source_event_registry_covers_all_official_datasets() -> None:
@@ -1532,6 +1780,26 @@ def test_0830_derived_warmup_does_not_wait_for_same_session_eligibility() -> Non
     ) == ["publication:preopen publication is not current"]
 
 
+def test_0830_bulk_writes_and_audit_defer_through_opening_window() -> None:
+    check = run_tw_public_0830_check._defer_opening_bulk_step
+    for step in (
+        "refresh_corporate_action_reference",
+        "build_official_symbol_panel",
+        "build_public_feature_panel",
+        "strict_model_safety_audit",
+    ):
+        assert not check(step, datetime(2026, 9, 22, 8, 39, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 8, 40, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 8, 45, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 8, 50, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 9, 4, tzinfo=TAIPEI))
+        assert not check(step, datetime(2026, 9, 22, 9, 5, tzinfo=TAIPEI))
+    assert not check(
+        "refresh_corporate_action_entitlements",
+        datetime(2026, 9, 22, 9, 0, tzinfo=TAIPEI),
+    )
+
+
 def test_eligibility_timer_has_weekday_boot_and_opening_catchups() -> None:
     timer = Path(
         "deploy/systemd/stockagent-tw-day-trade-eligibility.timer.in"
@@ -1826,8 +2094,12 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
                 "entry_completed_at": "2026-08-17T09:00:02+08:00",
                 "engine_status": "active",
                 "checkpoint_ready": True,
-                "entry_fill_policy": "causal_best_quote",
+                "entry_fill_policy": "causal_market_full_target_at_best_quote",
                 "entry_price_offset_ticks": 0,
+                "entry_requested_shares": 1_000,
+                "entry_filled_shares": 1_000,
+                "entry_unfilled_shares": 0,
+                "pending_entry_shares": 0,
             }
         }
     }
@@ -1857,7 +2129,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
     )
     assert failed["opening_execution"]["ready"] is False
     assert (
-        "09:00 live signals were not durably committed with causal best-quote execution for every paper mode by 09:00:15"
+        "09:00 live signals and causal paper execution were not durably complete for every mode by 09:00:15"
         in failed["failures"]
     )
 
@@ -1931,8 +2203,9 @@ def test_eligibility_watcher_retries_delayed_official_publication() -> None:
         .read_text(encoding="utf-8")
     )
     assert "Restart=on-failure" in service
-    assert "RestartSec=5min" in service
-    assert "StartLimitIntervalSec=0" in service
+    assert "RestartSec=30s" in service
+    assert "StartLimitIntervalSec=10min" in service
+    assert "StartLimitBurst=3" in service
 
 
 def test_service_wrappers_exec_resolved_python_not_shell_function() -> None:

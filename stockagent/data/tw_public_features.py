@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextvars import ContextVar
 from datetime import date, timedelta
 import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Iterable
+import time
+from typing import Callable, Iterable
 
 import polars as pl
 
@@ -265,6 +266,8 @@ class TwPublicFeatureBuildResult:
     build_mode: str = "full"
     incremental_start_date: str | None = None
     reused_rows: int = 0
+    incremental_fallback_reason: str | None = None
+    stage_elapsed_seconds: dict[str, float] = field(default_factory=dict)
 
 
 # Completed-session publication only changes a short daily tail, but the raw
@@ -296,6 +299,18 @@ _INCREMENTAL_DATE_DATASETS = frozenset(
         "tpex_day_trade_eligibility",
     }
 )
+
+# These five exact source files are read only by the market-row TAIFEX
+# builders below. They neither define stock features nor the verified equity
+# session calendar. Other market-looking sources may be shared with stock
+# builders or availability rules and remain on the full-rebuild path.
+_MARKET_ONLY_SOURCE_NAMES = frozenset({
+    "taifex_daily_futures.parquet",
+    "taifex_daily_options.parquet",
+    "taifex_institutional_total.parquet",
+    "taifex_large_trader_futures_oi.parquet",
+    "taifex_final_settlement_price.parquet",
+})
 
 
 def _file_content_receipt(path: Path) -> dict[str, str | int]:
@@ -417,12 +432,16 @@ def _incremental_base_is_compatible(
     source_receipts: list[dict[str, str | int]],
     symbol_universe_receipt: dict[str, str | int | bool],
     allow_daily_publication_lag: bool = False,
+    allowed_changed_source_names: frozenset[str] = frozenset(),
 ) -> bool:
     """Reuse a prefix only when its complete dependency bytes are unchanged.
 
     A rewritten source parquet may correct an arbitrarily old observation or
     effective-date rule. Without a source-partition receipt proving the changed
     rows are confined to the tail, reusing any historical prefix is unsafe.
+    A caller may separately allow a precisely named market-only dependency
+    change while reusing stock rows, but every other source and the entire old
+    output receipt must still match exactly.
     """
 
     try:
@@ -440,7 +459,27 @@ def _incremental_base_is_compatible(
         return False
     if summary.get("market_symbol") != market_symbol:
         return False
-    if summary.get("source_receipts") != source_receipts:
+    previous_receipts = summary.get("source_receipts")
+    if allowed_changed_source_names:
+        if not isinstance(previous_receipts, list):
+            return False
+        previous_by_name = {
+            item.get("name"): item for item in previous_receipts
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        current_by_name = {item["name"]: item for item in source_receipts}
+        if (
+            len(previous_by_name) != len(previous_receipts)
+            or previous_by_name.keys() != current_by_name.keys()
+        ):
+            return False
+        changed = {
+            name for name in current_by_name
+            if current_by_name[name] != previous_by_name[name]
+        }
+        if not changed or not changed <= allowed_changed_source_names:
+            return False
+    elif previous_receipts != source_receipts:
         return False
     if summary.get("symbol_universe_receipt") != symbol_universe_receipt:
         return False
@@ -488,6 +527,7 @@ def build_tw_public_training_features(
     ):
         raise ValueError("incremental_start_date must not be after end_date")
 
+    build_started = time.perf_counter()
     source_receipts = _source_content_receipts(input_dir)
     symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
     base_compatible = bool(
@@ -501,6 +541,26 @@ def build_tw_public_training_features(
             allow_daily_publication_lag=allow_daily_publication_lag,
         )
     )
+    market_only_summary: dict[str, object] = {}
+    if (
+        not base_compatible
+        and output_path.is_file()
+        and end_date is not None
+        and _incremental_base_is_compatible(
+            output_path,
+            resolved_summary_path,
+            market_symbol=market_symbol,
+            source_receipts=source_receipts,
+            symbol_universe_receipt=symbol_universe_receipt,
+            allow_daily_publication_lag=allow_daily_publication_lag,
+            allowed_changed_source_names=_MARKET_ONLY_SOURCE_NAMES,
+        )
+    ):
+        market_only_summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
+        if market_only_summary.get("requested_end_date") != end_date.isoformat():
+            market_only_summary = {}
+    use_market_only = bool(market_only_summary)
+    source_proof_done = time.perf_counter()
     if base_compatible:
         summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
         if summary.get("requested_end_date") == (
@@ -529,12 +589,32 @@ def build_tw_public_training_features(
                 allow_daily_publication_lag=allow_daily_publication_lag,
                 build_mode="unchanged_verified",
                 reused_rows=int(summary["rows"]),
+                stage_elapsed_seconds={
+                    "source_proof": round(source_proof_done - build_started, 3),
+                    "total_before_summary": round(time.perf_counter() - build_started, 3),
+                },
             )
     use_incremental = incremental_start_date is not None and base_compatible
+    incremental_fallback_reason = (
+        "base_contract_not_verified"
+        if incremental_start_date is not None and not base_compatible and not use_market_only
+        else None
+    )
     existing_identity = (
-        _stable_file_identity(output_path) if use_incremental else None
+        _stable_file_identity(output_path)
+        if use_incremental or use_market_only else None
     )
     symbols = _load_symbol_filter(symbols_root)
+    feature_stage_seconds: dict[str, float] = {}
+
+    def timed_frame(
+        name: str, builder: Callable[..., pl.DataFrame], *args: object, **kwargs: object
+    ) -> pl.DataFrame:
+        started = time.perf_counter()
+        frame = builder(*args, **kwargs)
+        feature_stage_seconds[name] = round(time.perf_counter() - started, 3)
+        return frame
+
     read_token = None
     if use_incremental:
         assert incremental_start_date is not None
@@ -550,101 +630,120 @@ def build_tw_public_training_features(
     try:
         exchange_sessions = _exchange_session_dates(input_dir)
         session_token = _BUILD_SESSION_DATES.set((input_dir.resolve(), exchange_sessions))
-        stock_frames = [
-            _build_official_ohlcv_features(input_dir),
-            _build_delisted_company_rules(input_dir),
-            _build_valuation_features(input_dir),
-            _build_margin_features(input_dir),
-            _build_institutional_features(input_dir),
-            _build_tdcc_features(input_dir),
-            _build_company_basic_features(input_dir),
-            _build_dividend_features(input_dir),
-            _build_ex_dividend_preview_features(input_dir),
-            _build_material_info_features(input_dir),
-            _build_attention_disposal_features(input_dir),
-            _build_model_useful_financial_features(input_dir),
-            _build_model_useful_ownership_features(input_dir),
-            _build_model_useful_shorting_features(input_dir),
-            _build_model_useful_rule_features(input_dir),
-            _build_day_trade_rule_features(
-                input_dir,
-                symbols=symbols,
-                end_date=end_date,
-                allow_missing_latest_session=allow_daily_publication_lag,
-            ),
-        ]
-        # Every model-facing row must be keyed by an exchange session. This
-        # also carries weekend/holiday announcements to the first open session
-        # instead of silently discarding them during panel alignment.
-        if not exchange_sessions.is_empty():
+        if use_market_only:
+            # These TAIFEX sources cannot affect stock rows: each is consumed
+            # exclusively by its corresponding market-row builder below.
+            # The old table and every other source were hash-verified above.
+            stock_features = pl.DataFrame()
+        else:
             stock_frames = [
-                _map_available_dates_to_sessions(frame, input_dir, sessions=exchange_sessions)
-                for frame in stock_frames
+                timed_frame("stock_official_ohlcv", _build_official_ohlcv_features, input_dir),
+                timed_frame("stock_delisted_rules", _build_delisted_company_rules, input_dir),
+                timed_frame("stock_valuation", _build_valuation_features, input_dir),
+                timed_frame("stock_margin", _build_margin_features, input_dir),
+                timed_frame("stock_institutional", _build_institutional_features, input_dir),
+                timed_frame("stock_tdcc", _build_tdcc_features, input_dir),
+                timed_frame("stock_company_basic", _build_company_basic_features, input_dir),
+                timed_frame("stock_dividend", _build_dividend_features, input_dir),
+                timed_frame("stock_ex_dividend_preview", _build_ex_dividend_preview_features, input_dir),
+                timed_frame("stock_material_info", _build_material_info_features, input_dir),
+                timed_frame("stock_attention_disposal", _build_attention_disposal_features, input_dir),
+                timed_frame("stock_financial", _build_model_useful_financial_features, input_dir),
+                timed_frame("stock_ownership", _build_model_useful_ownership_features, input_dir),
+                timed_frame("stock_shorting", _build_model_useful_shorting_features, input_dir),
+                timed_frame("stock_rule", _build_model_useful_rule_features, input_dir),
+                timed_frame("stock_day_trade_rule", _build_day_trade_rule_features,
+                    input_dir,
+                    symbols=symbols,
+                    end_date=end_date,
+                    allow_missing_latest_session=allow_daily_publication_lag,
+                ),
             ]
-        if use_incremental:
-            assert incremental_start_date is not None
-            assert end_date is not None
-            stock_frames = [
-                _slice_feature_frame(frame, incremental_start_date, end_date)
-                for frame in stock_frames
-            ]
-        stock_features = _merge_feature_frames(stock_frames)
-        if symbols is not None and not stock_features.is_empty():
-            stock_features = stock_features.filter(
-                pl.col("symbol").is_in(sorted(symbols))
+            # Every model-facing row must be keyed by an exchange session.
+            stock_mapping_started = time.perf_counter()
+            if not exchange_sessions.is_empty():
+                stock_frames = [
+                    _map_available_dates_to_sessions(frame, input_dir, sessions=exchange_sessions)
+                    for frame in stock_frames
+                ]
+            feature_stage_seconds["stock_session_mapping"] = round(
+                time.perf_counter() - stock_mapping_started, 3
             )
+            if use_incremental:
+                assert incremental_start_date is not None
+                assert end_date is not None
+                stock_frames = [
+                    _slice_feature_frame(frame, incremental_start_date, end_date)
+                    for frame in stock_frames
+                ]
+            stock_merge_started = time.perf_counter()
+            stock_features = _merge_feature_frames(
+                stock_frames, stage_seconds=feature_stage_seconds, stage_prefix="stock_join"
+            )
+            feature_stage_seconds["stock_merge"] = round(
+                time.perf_counter() - stock_merge_started, 3
+            )
+            if symbols is not None and not stock_features.is_empty():
+                stock_features = stock_features.filter(
+                    pl.col("symbol").is_in(sorted(symbols))
+                )
+        stock_build_done = time.perf_counter()
 
         market_frames = [
-                _build_twse_market_index_features(
+                timed_frame("market_twse_index", _build_twse_market_index_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_usdtwd_features(
+                timed_frame("market_usdtwd", _build_usdtwd_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_cbc_overnight_rate_features(
+                timed_frame("market_cbc_overnight", _build_cbc_overnight_rate_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_cbc_monthly_macro_features(
+                timed_frame("market_cbc_monthly", _build_cbc_monthly_macro_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_dgbas_macro_features(
+                timed_frame("market_dgbas", _build_dgbas_macro_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_mof_macro_features(
+                timed_frame("market_mof", _build_mof_macro_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_taifex_tx_features(
+                timed_frame("market_taifex_tx", _build_taifex_tx_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_taifex_options_features(
+                timed_frame("market_taifex_options", _build_taifex_options_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_taifex_institutional_features(
+                timed_frame("market_taifex_institutional", _build_taifex_institutional_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_taifex_large_trader_features(
+                timed_frame("market_taifex_large_trader", _build_taifex_large_trader_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
-                _build_taifex_final_settlement_features(
+                timed_frame("market_taifex_settlement", _build_taifex_final_settlement_features,
                     input_dir,
                     market_symbol=market_symbol,
                 ),
             ]
+        market_mapping_started = time.perf_counter()
         if not exchange_sessions.is_empty():
             market_frames = [
                 _map_available_dates_to_sessions(frame, input_dir, sessions=exchange_sessions)
                 for frame in market_frames
             ]
+        feature_stage_seconds["market_session_mapping"] = round(
+            time.perf_counter() - market_mapping_started, 3
+        )
         if use_incremental:
             assert incremental_start_date is not None
             assert end_date is not None
@@ -652,7 +751,14 @@ def build_tw_public_training_features(
                 _slice_feature_frame(frame, incremental_start_date, end_date)
                 for frame in market_frames
             ]
-        market_features = _merge_feature_frames(market_frames)
+        market_merge_started = time.perf_counter()
+        market_features = _merge_feature_frames(
+            market_frames, stage_seconds=feature_stage_seconds, stage_prefix="market_join"
+        )
+        feature_stage_seconds["market_merge"] = round(
+            time.perf_counter() - market_merge_started, 3
+        )
+        market_build_done = time.perf_counter()
     finally:
         if session_token is not None:
             _BUILD_SESSION_DATES.reset(session_token)
@@ -678,11 +784,35 @@ def build_tw_public_training_features(
                 **{name: pl.Series([], dtype=pl.Float64) for name in OUTPUT_COLUMNS},
             }
         )
+    assembly_done = time.perf_counter()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output_path.with_suffix(output_path.suffix + ".tmp")
     reused_rows = 0
-    if use_incremental:
+    if use_market_only:
+        if not output.is_empty() and output.filter(pl.col("symbol") != market_symbol).height:
+            raise RuntimeError("market-only feature rebuild produced stock rows")
+        stock_base = pl.scan_parquet(output_path).filter(
+            pl.col("symbol") != market_symbol
+        )
+        stock_rows = int(stock_base.select(pl.len()).collect(engine="streaming").item())
+        if stock_rows != int(market_only_summary["stock_rows"]):
+            raise RuntimeError("market-only feature base stock row count changed")
+        combined = pl.concat([stock_base, output.lazy()], how="vertical").sort(
+            ["date", "symbol"]
+        )
+        combined.sink_parquet(
+            temporary_output,
+            compression="snappy",
+            statistics=True,
+            row_group_size=64_000,
+            maintain_order=True,
+            engine="streaming",
+        )
+        reused_rows = stock_rows
+        market_rows = int(output.height)
+        rows = stock_rows + market_rows
+    elif use_incremental:
         assert incremental_start_date is not None
         prefix = pl.scan_parquet(output_path).filter(
             pl.col("date") < pl.lit(incremental_start_date)
@@ -733,12 +863,14 @@ def build_tw_public_training_features(
     if symbol_universe_receipt != _symbol_universe_receipt(symbols_root):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW symbol universe changed while public features were being built")
-    if use_incremental and existing_identity != _stable_file_identity(output_path):
+    if (use_incremental or use_market_only) and existing_identity != _stable_file_identity(output_path):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW public feature base changed during incremental build")
     os.replace(temporary_output, output_path)
 
     source_files = sorted(str(path) for path in input_dir.glob("*.parquet"))
+    output_receipt = _file_content_receipt(output_path)
+    committed_done = time.perf_counter()
     result = TwPublicFeatureBuildResult(
         output_path=output_path,
         rows=rows,
@@ -748,15 +880,28 @@ def build_tw_public_training_features(
         market_symbol=market_symbol,
         source_files=source_files,
         source_receipts=source_receipts,
-        output_receipt=_file_content_receipt(output_path),
+        output_receipt=output_receipt,
         symbol_universe_receipt=symbol_universe_receipt,
         requested_end_date=end_date.isoformat() if end_date is not None else None,
         allow_daily_publication_lag=allow_daily_publication_lag,
-        build_mode="incremental_tail" if use_incremental else "full",
+        build_mode=(
+            "market_only_rebuild" if use_market_only
+            else "incremental_tail" if use_incremental else "full"
+        ),
         incremental_start_date=(
             incremental_start_date.isoformat() if use_incremental else None
         ),
         reused_rows=reused_rows,
+        incremental_fallback_reason=incremental_fallback_reason,
+        stage_elapsed_seconds={
+            "source_proof": round(source_proof_done - build_started, 3),
+            "stock_build": round(stock_build_done - source_proof_done, 3),
+            "market_build": round(market_build_done - stock_build_done, 3),
+            **feature_stage_seconds,
+            "output_assembly": round(assembly_done - market_build_done, 3),
+            "parquet_write_and_proof": round(committed_done - assembly_done, 3),
+            "total_before_summary": round(committed_done - build_started, 3),
+        },
     )
     _write_summary(resolved_summary_path, result)
     return result
@@ -783,6 +928,8 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "build_mode": result.build_mode,
         "incremental_start_date": result.incremental_start_date,
         "reused_rows": result.reused_rows,
+        "incremental_fallback_reason": result.incremental_fallback_reason,
+        "stage_elapsed_seconds": result.stage_elapsed_seconds,
         "availability_contract_version": TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION,
         "availability_policy": AVAILABILITY_POLICY,
     }
@@ -914,6 +1061,20 @@ def _map_available_dates_to_sessions(
         sessions = _exchange_session_dates(input_dir)
     if sessions.is_empty():
         return frame.head(0)
+    if frame.schema["date"] == pl.Date and frame.height >= 100_000:
+        # Official daily panels already use verified session dates. Checking
+        # their date column is linear; sorting and as-of joining every wide
+        # stock row again is substantially more expensive. A holiday or null
+        # date takes the original mapping path, so this never changes which
+        # session owns an announcement.
+        already_aligned = frame.select(
+            pl.col("date")
+            .is_in(sessions.get_column("_session_date"))
+            .fill_null(False)
+            .all()
+        ).item()
+        if already_aligned:
+            return frame
     return (
         frame.drop_nulls("date").sort("date")
         .join_asof(
@@ -967,15 +1128,62 @@ def _slice_feature_frame(
     )
 
 
-def _merge_feature_frames(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
-    cleaned = [_finalize_feature_frame(frame) for frame in frames if frame is not None and not frame.is_empty()]
-    cleaned = [frame for frame in cleaned if not frame.is_empty()]
+def _merge_feature_frames(
+    frames: Iterable[pl.DataFrame], *,
+    stage_seconds: dict[str, float] | None = None,
+    stage_prefix: str = "join",
+) -> pl.DataFrame:
+    cleaned: list[pl.DataFrame] = []
+    for index, frame in enumerate(frames):
+        if frame is None or frame.is_empty():
+            continue
+        prepared_at = time.perf_counter()
+        prepared = _finalize_feature_frame(frame)
+        if stage_seconds is not None:
+            stage_seconds[f"{stage_prefix}_prepare_{index}"] = round(
+                time.perf_counter() - prepared_at, 3
+            )
+        if not prepared.is_empty():
+            cleaned.append(prepared)
     if not cleaned:
         return pl.DataFrame()
-    merged = cleaned[0]
-    for frame in cleaned[1:]:
-        merged = merged.join(frame, on=list(KEY_COLUMNS), how="full", coalesce=True)
-    return _finalize_feature_frame(merged)
+    if cleaned[0].height >= 100_000 and len(cleaned) >= 3:
+        # A sequence of wide full joins rebuilds and coalesces the growing
+        # key relation at every step. Form its union once, then attach each
+        # unique-key feature relation with a cheaper left join. Both plans
+        # retain every key and the first frame's value for repeated columns.
+        keys_at = time.perf_counter()
+        merged = pl.concat(
+            [frame.select(list(KEY_COLUMNS)) for frame in cleaned],
+            how="vertical",
+        ).unique(subset=list(KEY_COLUMNS))
+        if stage_seconds is not None:
+            stage_seconds[f"{stage_prefix}_keys"] = round(
+                time.perf_counter() - keys_at, 3
+            )
+        join_frames = enumerate(cleaned)
+        join_how = "left"
+    else:
+        merged = cleaned[0]
+        join_frames = enumerate(cleaned[1:], start=1)
+        join_how = "full"
+    for index, frame in join_frames:
+        joined_at = time.perf_counter()
+        merged = merged.join(
+            frame, on=list(KEY_COLUMNS), how=join_how,
+            coalesce=True,
+        )
+        if stage_seconds is not None:
+            stage_seconds[f"{stage_prefix}_{index}"] = round(
+                time.perf_counter() - joined_at, 3
+            )
+    # _finalize_feature_frame has already made every input unique by key and
+    # normalized key/value dtypes. Either join plan remains unique by key,
+    # so regrouping all 9M+ wide rows here is redundant. Keep
+    # the same first-frame-wins handling of suffixed duplicate feature names.
+    return merged.select(
+        [*KEY_COLUMNS, *[name for name in merged.columns if name in OUTPUT_COLUMNS]]
+    )
 
 
 def _finalize_feature_frame(frame: pl.DataFrame) -> pl.DataFrame:
@@ -984,18 +1192,34 @@ def _finalize_feature_frame(frame: pl.DataFrame) -> pl.DataFrame:
     output_cols = [col for col in frame.columns if col not in KEY_COLUMNS and col in OUTPUT_COLUMNS]
     if not output_cols:
         return pl.DataFrame()
+    date_expr = (
+        pl.col("date") if frame.schema["date"] == pl.Date
+        else _date_column_expr("date")
+    )
     frame = (
         frame.select(
             [
-                _date_column_expr("date").alias("date"),
+                date_expr.alias("date"),
                 _symbol_expr("symbol").alias("symbol"),
-                *[pl.col(col).cast(pl.Float64, strict=False).alias(col) for col in output_cols],
+                *[
+                    (pl.col(col) if frame.schema[col] == pl.Float64 else
+                     pl.col(col).cast(pl.Float64, strict=False)).alias(col)
+                    for col in output_cols
+                ],
             ]
         )
         .drop_nulls(["date", "symbol"])
         .filter(pl.col("symbol") != "")
     )
     if frame.is_empty():
+        return frame
+    if frame.height >= 100_000 and not frame.select(
+        pl.struct(list(KEY_COLUMNS)).is_duplicated().any()
+    ).item():
+        # The group-by below exists to collapse duplicate source keys. If a
+        # large frame has none, the same normalized rows are already final.
+        # On the real official OHLCV frame this checks 9.7M keys in ~0.6s;
+        # grouping every feature column is orders of magnitude costlier.
         return frame
     return frame.group_by(["date", "symbol"]).agg([pl.col(col).drop_nulls().last().alias(col) for col in output_cols])
 

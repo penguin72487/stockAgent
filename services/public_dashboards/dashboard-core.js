@@ -18,6 +18,8 @@
     Object.freeze({id: "tw-day-trade", label: "台股當沖", slug: "tw-day-trade"}),
     Object.freeze({id: "tw-overnight", label: "隔日沖", slug: "tw-overnight"}),
     Object.freeze({id: "shioaji", label: "永豐 API", slug: "shioaji"}),
+    Object.freeze({id: "finlab", label: "FinLab", slug: "finlab"}),
+    Object.freeze({id: "finmind", label: "FinMind", slug: "finmind"}),
     Object.freeze({id: "openbb", label: "OpenBB", slug: "openbb"}),
     Object.freeze({id: "data-monitor", label: "全資料", slug: "data-monitor"}),
     Object.freeze({id: "traffic", label: "流量", slug: "traffic"}),
@@ -550,7 +552,9 @@
     try {
       const text = await response.text();
       lifetime?.bodyRead();
-      lifetime?.finish(response.ok ? "ok" : "http_error");
+      // A conditional GET has no JSON body to parse; its retained local
+      // representation is a successful refresh, not an HTTP failure.
+      lifetime?.finish(response.ok || response.status === 304 ? "ok" : "http_error");
       return text;
     } catch (error) {
       lifetime?.finish(error?.name || "error");

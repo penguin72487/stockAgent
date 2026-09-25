@@ -1,0 +1,104 @@
+# Preserve the completed OFAT v8 baseline's model, execution, optimizer,
+# objective, basis and fold settings. Only the observed research data ABI,
+# its 09:00 availability timing, derived cache and output destination change.
+# Baseline snapshot SHA-256: 07d009d8c9dddb2b6d28f52e2c1193009d1fd112b3141eb898a30981dcdf534e
+base_config: tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat_baseline_snapshot.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_v1
+
+data:
+  # Latest already materialized stock release whose share-replacement archive
+  # covers the full price-panel horizon (through 2026-09-17).
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260918T013010528444073Z-l0-penguin-ac1e4027dfa26b98/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public-research-all-observed-2014-v3/tw-public-research-all-observed-2014-v3-20260921T041303541818804Z-l0-penguin-af32bae76010f47e/features/tw_public_research_all_2014_v3.parquet
+  # The model sees v3 research features; physical day-trade rules consume the
+  # separate official table from the same pinned stock release.
+  day_trade_physical_public_feature_path: /srv/stockagent-packed-materialized/tw-public/tw-public-20260918T013010528444073Z-l0-penguin-ac1e4027dfa26b98/features/tw_public_stock_daily.parquet
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_all_observed_v8_ofat_fold11_data_v1
+  day_trade_open_feature: false
+  tw_public_feature_cutoff: preopen_0900
+  feature_include:
+    - body_ratio
+    - close_logret_1d
+    - close_raw
+    - clv
+    - clv_centered
+    - delta_body_ratio
+    - delta_clv
+    - high_raw
+    - low_raw
+    - lower_shadow
+    - max_logret_1d
+    - min_logret_1d
+    - open_logret_1d
+    - open_raw
+    - shadow_imbalance
+    - signed_body_ratio
+    - signed_vol
+    - trading_volume_logret_1d
+    - trading_volume_raw
+    - upper_shadow
+    - twpub_*
+  feature_availability_indicators:
+    - twpub_*
+  feature_shift_next_session:
+    - body_ratio
+    - close_logret_1d
+    - close_raw
+    - clv
+    - clv_centered
+    - delta_body_ratio
+    - delta_clv
+    - high_raw
+    - low_raw
+    - lower_shadow
+    - max_logret_1d
+    - min_logret_1d
+    - open_logret_1d
+    - open_raw
+    - shadow_imbalance
+    - signed_body_ratio
+    - signed_vol
+    - trading_volume_logret_1d
+    - trading_volume_raw
+    - upper_shadow
+    - twpub_official_*
+    - twpub_twse_taiex_*
+    - twpub_pe_*
+    - twpub_pb_*
+    - twpub_dividend_yield*
+    - twpub_dividend_per_share_*
+    - twpub_attention_*
+    - twpub_disposal_*
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_short_sale_available_*
+    - twpub_tdcc_*
+    - twpub_company_*
+    - twpub_material_*
+    - twpub_dividend_board_approved
+    - twpub_dividend_cash_per_share
+    - twpub_dividend_confirmed
+    - twpub_dividend_stock_per_share
+    - twpub_dividend_total_*
+    - twpub_exdiv_*
+    - twpub_taifex_dealer_*
+    - twpub_taifex_foreign_*
+    - twpub_taifex_trust_*
+    - twpub_taifex_tx_final_settlement_logret
+    - twpub_taifex_tx_large_oi_log
+    - twpub_taifex_tx_open_interest_log
+    - twpub_taifex_tx_settlement_logret_1d
+    - twpub_taifex_tx_volume_log
+    - twpub_taifex_tx_top5_long_ratio
+    - twpub_taifex_tx_top10_long_ratio
+    - twpub_taifex_txo_call_*
+    - twpub_taifex_txo_put_oi_log
+    - twpub_taifex_txo_put_volume_log
+    - twpub_taifex_txo_put_call_*

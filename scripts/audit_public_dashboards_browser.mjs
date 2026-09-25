@@ -17,6 +17,8 @@ const allPages = [
   ["tw-day-trade", "/tw-day-trade/"],
   ["tw-overnight", "/tw-overnight/"],
   ["shioaji", "/shioaji/"],
+  ["finlab", "/finlab/"],
+  ["finmind", "/finmind/"],
   ["openbb", "/openbb/"],
   ["data-monitor", "/data-monitor/"],
   ["traffic", "/traffic/"],
@@ -28,6 +30,8 @@ const pages = requestedPages.size
 const representativeControls = {
   taifex: {selector: "button[data-range='1h']", apiPath: "/taifex/api/history"},
   shioaji: {selector: "button[data-filter='historical']"},
+  finlab: {selector: "button[data-pipeline-filter='historical']"},
+  finmind: {selector: "button[data-pipeline-filter='session_history']"},
   openbb: {selector: "button[data-range='1h']", apiPath: "/openbb/api/history"},
   "data-monitor": {selector: "#status-filter", value: "complete"},
   traffic: {selector: "#browser-kind-filter", value: "interaction"},

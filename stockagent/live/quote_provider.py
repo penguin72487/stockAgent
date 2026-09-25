@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 import uuid
 from zoneinfo import ZoneInfo
@@ -44,6 +44,15 @@ _SHIOAJI_STREAM_LOCK = threading.RLock()
 _SHIOAJI_STREAM_API: object | None = None
 _SHIOAJI_STREAM_SUBSCRIPTIONS: set[tuple[str, str]] = set()
 _SHIOAJI_STREAM_ROWS: dict[str, dict[str, dict[str, Any]]] = {}
+_SHIOAJI_STREAM_ROTATION_AT = 0.0
+_SHIOAJI_STREAM_CURSOR = 0
+_SHIOAJI_STREAM_TARGET: tuple[str, ...] = ()
+_SHIOAJI_STREAM_TARGET_READY = False
+# Shioaji permits at most 200 subscriptions. QuoteSTKv1 carries both best
+# levels and the non-trial flag, so one subscription per stock is sufficient.
+_SHIOAJI_STOCK_STREAM_LIMIT = 200
+_SHIOAJI_STOCK_STREAM_DWELL_SECONDS = 5.0
+_SHIOAJI_STOCK_STREAM_BATCH_LIMIT = 25
 _TW_LIMIT_CACHE_LOCK = threading.Lock()
 _TW_LIMIT_PREPARE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
@@ -680,6 +689,36 @@ def resolve_observed_minute_execution_price(
     return None, None, parsed_shares
 
 
+def observed_0901_minute_volume_lots(
+    price_row: Mapping[str, Any], *, lot_size: int = 1_000
+) -> float:
+    """Convert a 09:01 price receipt's *observed* volume to board lots.
+
+    Historical Shioaji stock ticks report regular-board volume in lots, while
+    local minute bars and the Shioaji KBar fallback are normalized to shares.
+    Older receipts lack an explicit unit, so their source identifies the unit.
+    Unknown provenance fails closed rather than inventing liquidity.
+    """
+
+    if lot_size <= 0:
+        raise ValueError("lot_size must be positive")
+    volume = _float_or_none(price_row.get("tick_volume_units_0901"))
+    if volume is None or volume <= 0.0:
+        return 0.0
+    unit = price_row.get("observed_volume_unit_0901")
+    if unit is None:
+        source = str(price_row.get("source") or "")
+        if source == "shioaji:historical_ticks_0900_090059_vwap_right_label_0901":
+            unit = "board_lots"
+        elif source.startswith(("shioaji:historical_kbar_0901_", "local_minute_parquet_0901_")):
+            unit = "shares"
+    if unit == "board_lots":
+        return float(volume)
+    if unit == "shares":
+        return float(volume) / lot_size
+    return 0.0
+
+
 def load_local_stock_0901_vwaps(
     minute_roots: tuple[Path, ...],
     symbols: list[str],
@@ -701,8 +740,10 @@ def load_local_stock_0901_vwaps(
     source_counts: dict[str, int] = {}
     price_method_counts: dict[str, int] = {}
     error_counts: dict[str, int] = {}
+    invalid_volume_unit_rows = 0
 
     def accept(frame: Any, source: Path) -> None:
+        nonlocal invalid_volume_unit_rows
         if not frame.height:
             return
         names = set(frame.columns)
@@ -714,14 +755,22 @@ def load_local_stock_0901_vwaps(
             )
         if "date" in frame.columns:
             frame = frame.filter(pl.col("date").cast(pl.Date) == trading_date)
+        elif "ts" in frame.columns:
+            frame = frame.filter(pl.col("ts").dt.date() == trading_date)
         for row in frame.iter_rows(named=True):
             symbol = str(row.get("symbol") or "")
             if symbol not in requested or symbol in resolved:
                 continue
+            volume_unit_valid = (
+                "source_volume_unit_valid" not in row
+                or row["source_volume_unit_valid"] is True
+            )
+            if not volume_unit_valid:
+                invalid_volume_unit_rows += 1
             price, price_method, volume_shares = resolve_observed_minute_execution_price(
-                amount=row.get("Amount"),
-                volume_shares=row.get("volume_shares"),
-                raw_volume=row.get("Volume"),
+                amount=row.get("Amount") if volume_unit_valid else None,
+                volume_shares=row.get("volume_shares") if volume_unit_valid else None,
+                raw_volume=row.get("Volume") if volume_unit_valid else None,
                 contract_unit=row.get("contract_unit"),
                 low=row.get("Low"),
                 high=row.get("High"),
@@ -734,10 +783,13 @@ def load_local_stock_0901_vwaps(
                 f"local_minute_parquet_0901_{price_method}:{row_source.resolve()}"
             )
             close = _float_or_none(row.get("Close"))
-            observed_volume = _float_or_none(
-                row.get("volume_shares")
-                if row.get("volume_shares") is not None
-                else row.get("Volume")
+            observed_volume = (
+                _float_or_none(
+                    row.get("volume_shares")
+                    if row.get("volume_shares") is not None
+                    else row.get("Volume")
+                )
+                if volume_unit_valid else None
             )
             resolved[symbol] = {
                 "symbol": symbol,
@@ -747,6 +799,7 @@ def load_local_stock_0901_vwaps(
                 ),
                 "execution_price_0901_method": price_method,
                 "tick_volume_units_0901": float(volume_shares or 0.0),
+                "observed_volume_unit_0901": "shares",
                 "tick_count_0901": 0,
                 "source_window_start": datetime.combine(
                     trading_date,
@@ -793,6 +846,11 @@ def load_local_stock_0901_vwaps(
                 error_counts[key] = error_counts.get(key, 0) + 1
         for schema_tuple, paths in schema_groups.items():
             schema = set(schema_tuple)
+            if "symbol" not in schema or "ts" not in schema:
+                error_counts["missing_symbol_or_timestamp"] = (
+                    error_counts.get("missing_symbol_or_timestamp", 0) + len(paths)
+                )
+                continue
             columns = [
                 name
                 for name in (
@@ -805,6 +863,12 @@ def load_local_stock_0901_vwaps(
                 lazy = pl.scan_parquet(sorted(paths), include_file_paths="_source_path")
                 if "date" in schema:
                     lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
+                else:
+                    lazy = lazy.filter(pl.col("ts").dt.date() == trading_date)
+                lazy = lazy.filter(
+                    (pl.col("ts").dt.hour() == 9)
+                    & (pl.col("ts").dt.minute() == 1)
+                )
                 accept(
                     lazy.select(*columns, "_source_path").collect(engine="streaming"),
                     root,
@@ -822,17 +886,21 @@ def load_local_stock_0901_vwaps(
                     for name in (
                         "symbol", "date", "ts", "minutes_from_open", "Amount",
                         "Volume", "volume_shares", "contract_unit", "Low", "High",
-                        "Close",
+                        "Close", "source_volume_unit_valid",
                     )
                     if name in schema
                 ]
-                accept(
-                    pl.scan_parquet(partition)
-                    .filter(pl.col("symbol").is_in(sorted(unresolved)))
-                    .select(columns)
-                    .collect(),
-                    partition,
+                lazy = pl.scan_parquet(partition).filter(
+                    pl.col("symbol").is_in(sorted(unresolved))
                 )
+                if "minutes_from_open" in schema:
+                    lazy = lazy.filter(pl.col("minutes_from_open") == 1)
+                elif "ts" in schema:
+                    lazy = lazy.filter(
+                        (pl.col("ts").dt.hour() == 9)
+                        & (pl.col("ts").dt.minute() == 1)
+                    )
+                accept(lazy.select(columns).collect(), partition)
             except Exception as exc:
                 key = type(exc).__name__
                 error_counts[key] = error_counts.get(key, 0) + 1
@@ -844,6 +912,7 @@ def load_local_stock_0901_vwaps(
         "source_counts": source_counts,
         "price_method_counts": price_method_counts,
         "error_counts": error_counts,
+        "invalid_volume_unit_rows": invalid_volume_unit_rows,
         "additional_shioaji_requests": 0,
     }
 
@@ -868,6 +937,10 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     unresolved only when neither source publishes a valid 09:01 minute price;
     callers must not replace that gap with the official open, a carried last
     price, best quote, or an adverse tick.
+
+    The legacy ``tick_volume_units_0901`` field retains source-native units:
+    regular-board historical ticks are lots, normalized minute bars are
+    shares. Consumers must use ``observed_0901_minute_volume_lots``.
     """
 
     if not 0.0 < float(max_traffic_fraction) <= 1.0:
@@ -902,6 +975,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     price_method_counts: dict[str, int] = {}
     contract_missing = 0
     stopped_for_traffic = False
+    queried_symbol_codes: list[str] = []
     request_times: deque[float] = deque()
     window_start = datetime.combine(
         trading_date,
@@ -964,6 +1038,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 )
                 set_ledger_result(ticks)
             queried += 1
+            queried_symbol_codes.append(symbol)
             timestamps = list(getattr(ticks, "ts", ()))
             closes = list(getattr(ticks, "close", ()))
             volumes = list(getattr(ticks, "volume", ()))
@@ -977,6 +1052,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
             total_volume = 0.0
             accepted = 0
             first_at: datetime | None = None
+            first_price: float | None = None
             last_at: datetime | None = None
             for position in sorted(
                 range(len(timestamps)),
@@ -997,7 +1073,9 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 notional += price * volume
                 total_volume += volume
                 accepted += 1
-                first_at = first_at or wall_clock
+                if first_at is None:
+                    first_at = wall_clock
+                    first_price = price
                 last_at = wall_clock
             vwap = notional / total_volume if total_volume > 0.0 else float("nan")
             if not np.isfinite(vwap) or vwap <= 0.0 or accepted <= 0:
@@ -1038,7 +1116,9 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 kbar_fallback_queries += 1
                 kbar_fields = {
                     name: list(getattr(kbars, name, ()))
-                    for name in ("ts", "Close", "Low", "High", "Volume", "Amount")
+                    for name in (
+                        "ts", "Open", "Close", "Low", "High", "Volume", "Amount"
+                    )
                 }
                 lengths = {len(values) for values in kbar_fields.values()}
                 if len(lengths) != 1:
@@ -1085,6 +1165,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                         "execution_price_0901": float(price),
                         "execution_price_0901_method": method,
                         "tick_volume_units_0901": float(normalized_shares or 0.0),
+                        "observed_volume_unit_0901": "shares",
                         "tick_count_0901": 0,
                         "source_window_start": window_start.isoformat(
                             timespec="seconds"
@@ -1092,6 +1173,20 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                         "source_window_end": window_end.isoformat(timespec="seconds"),
                         "quote_at": window_end.isoformat(timespec="seconds"),
                         "source": f"shioaji:historical_kbar_0901_{method}",
+                        "session_open_price_0900": (
+                            float(minute_row["Open"])
+                            if normalized_shares is not None
+                            and normalized_shares > 0.0
+                            and _float_or_none(minute_row.get("Open")) is not None
+                            else None
+                        ),
+                        "session_open_price_source": (
+                            "shioaji:historical_kbar_0901_open_first_trade"
+                            if normalized_shares is not None
+                            and normalized_shares > 0.0
+                            and _float_or_none(minute_row.get("Open")) is not None
+                            else None
+                        ),
                     }
             else:
                 price_method_counts["minute_vwap"] = (
@@ -1102,11 +1197,16 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                     "execution_price_0901": float(vwap),
                     "execution_price_0901_method": "minute_vwap",
                     "tick_volume_units_0901": float(total_volume),
+                    "observed_volume_unit_0901": "board_lots",
                     "tick_count_0901": int(accepted),
                     "source_window_start": first_at.isoformat(timespec="microseconds"),
                     "source_window_end": last_at.isoformat(timespec="microseconds"),
                     "quote_at": window_end.isoformat(timespec="seconds"),
                     "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                    "session_open_price_0900": float(first_price),
+                    "session_open_price_source": (
+                        "shioaji:historical_first_trade_session_open"
+                    ),
                 }
         except Exception as exc:
             key = type(exc).__name__
@@ -1131,6 +1231,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         "price_contract": "sum(close*volume)/sum(volume)",
         "requested_symbols": len(requested),
         "queried_symbols": queried,
+        "attempted_symbols": queried_symbol_codes,
         "resolved_symbols": len(resolved),
         "source_empty_symbols": source_empty,
         "kbar_fallback_queries": kbar_fallback_queries,
@@ -1143,6 +1244,212 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         "max_traffic_fraction": float(max_traffic_fraction),
         "usage_before": usage_before,
         "usage_after": usage(),
+    }
+
+
+def fetch_shioaji_current_stock_minute_bars(
+    symbols: list[str],
+    *,
+    trading_date: date,
+    completed_through: datetime,
+    max_traffic_fraction: float = 0.90,
+    timeout_ms: int = 30_000,
+    progress_every: int = 50,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read current-session completed stock KBars for an isolated replay.
+
+    This is a quote-only Shioaji query and never submits orders. Returned bars
+    retain the source's right-labelled timestamps and normalized share volume;
+    zero-volume placeholders are omitted and counted rather than treated as
+    executable liquidity.
+    """
+
+    if completed_through.tzinfo is None:
+        raise ValueError("completed_through must be timezone-aware")
+    cutoff = completed_through.astimezone(ZoneInfo("Asia/Taipei"))
+    if cutoff.date() != trading_date:
+        raise ValueError("completed_through must belong to trading_date")
+    if not 0.0 < float(max_traffic_fraction) <= 1.0:
+        raise ValueError("max_traffic_fraction must be in (0, 1]")
+    requested = [
+        symbol
+        for symbol in dict.fromkeys(str(value).strip() for value in symbols)
+        if symbol
+    ]
+    api = _shioaji_stock_api()
+
+    def usage() -> dict[str, int | float] | None:
+        try:
+            current = api.usage()
+            used = int(current.bytes)
+            limit = int(current.limit_bytes)
+        except Exception:
+            return None
+        if used < 0 or limit <= 0:
+            return None
+        return {"used_bytes": used, "limit_bytes": limit, "fraction": used / limit}
+
+    rows: list[dict[str, Any]] = []
+    attempted: list[str] = []
+    error_counts: dict[str, int] = {}
+    source_empty = 0
+    zero_volume_rows = 0
+    contract_missing = 0
+    stopped_for_traffic = False
+    request_times: deque[float] = deque()
+    usage_before = usage()
+    for index, symbol in enumerate(requested, start=1):
+        current_usage = usage()
+        if current_usage is not None and float(current_usage["fraction"]) >= float(
+            max_traffic_fraction
+        ):
+            stopped_for_traffic = True
+            break
+        with _SHIOAJI_STOCK_LOCK:
+            if symbol not in _SHIOAJI_STOCK_CONTRACTS:
+                _SHIOAJI_STOCK_CONTRACTS[symbol] = api.contracts.get(symbol)
+            contract = _SHIOAJI_STOCK_CONTRACTS[symbol]
+        if contract is None:
+            contract_missing += 1
+            continue
+        now_monotonic = time.monotonic()
+        while request_times and now_monotonic - request_times[0] >= 1.0:
+            request_times.popleft()
+        if len(request_times) >= 5:
+            time.sleep(max(0.0, 1.01 - (now_monotonic - request_times[0])))
+            now_monotonic = time.monotonic()
+            while request_times and now_monotonic - request_times[0] >= 1.0:
+                request_times.popleft()
+        request_times.append(time.monotonic())
+        try:
+            with shioaji_query(
+                api,
+                consumer="tw_day_trade_current_minute_replay",
+                method="kbars",
+                asset_class="stock",
+                details={
+                    "contract": symbol,
+                    "start": trading_date.isoformat(),
+                    "end": trading_date.isoformat(),
+                    "completed_through": cutoff.isoformat(timespec="minutes"),
+                },
+            ) as set_ledger_result:
+                payload = api.kbars(
+                    contract=contract,
+                    start=trading_date.isoformat(),
+                    end=trading_date.isoformat(),
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(payload)
+            attempted.append(symbol)
+            fields = {
+                name: list(getattr(payload, name, ()))
+                for name in (
+                    "ts",
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume",
+                    "Amount",
+                )
+            }
+            lengths = {len(values) for values in fields.values()}
+            if len(lengths) != 1:
+                raise ValueError(
+                    "inconsistent historical KBar fields: "
+                    + ", ".join(
+                        f"{name}={len(values)}" for name, values in fields.items()
+                    )
+                )
+            accepted = 0
+            for position in range(len(fields["ts"])):
+                stamp = (
+                    np.datetime64(int(fields["ts"][position]), "ns")
+                    .astype("datetime64[us]")
+                    .astype(datetime)
+                    .replace(tzinfo=ZoneInfo("Asia/Taipei"))
+                )
+                if (
+                    stamp.date() != trading_date
+                    or stamp.time() < datetime_time(9, 1)
+                    or stamp > cutoff
+                ):
+                    continue
+                raw_volume = _float_or_none(fields["Volume"][position])
+                if raw_volume is None or raw_volume <= 0.0:
+                    zero_volume_rows += 1
+                    continue
+                open_price = _float_or_none(fields["Open"][position])
+                high = _float_or_none(fields["High"][position])
+                low = _float_or_none(fields["Low"][position])
+                close = _float_or_none(fields["Close"][position])
+                if any(value is None for value in (open_price, high, low, close)):
+                    continue
+                _price, _method, volume_shares = (
+                    resolve_observed_minute_execution_price(
+                        amount=fields["Amount"][position],
+                        raw_volume=raw_volume,
+                        low=low,
+                        high=high,
+                        close=close,
+                    )
+                )
+                if volume_shares is None or volume_shares <= 0.0:
+                    zero_volume_rows += 1
+                    continue
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": trading_date,
+                        "ts": stamp.replace(tzinfo=None),
+                        "Open": float(open_price),
+                        "High": float(high),
+                        "Low": float(low),
+                        "Close": float(close),
+                        "volume_shares": float(volume_shares),
+                        "Amount": _float_or_none(fields["Amount"][position]),
+                        "contract_unit": 1.0,
+                        "source": "shioaji:current_session_stock_kbar",
+                    }
+                )
+                accepted += 1
+            if not accepted:
+                source_empty += 1
+        except Exception as exc:
+            key = type(exc).__name__
+            error_counts[key] = error_counts.get(key, 0) + 1
+        if progress_every > 0 and (
+            index % progress_every == 0 or index == len(requested)
+        ):
+            print(
+                "[tw-day-trade-current-minute] "
+                f"date={trading_date.isoformat()} progress={index}/{len(requested)} "
+                f"attempted={len(attempted)} rows={len(rows)}",
+                flush=True,
+            )
+
+    return rows, {
+        "source": "shioaji:current_session_stock_kbar",
+        "trading_date": trading_date.isoformat(),
+        "completed_through": cutoff.isoformat(timespec="minutes"),
+        "requested_symbols": len(requested),
+        "attempted_symbols": attempted,
+        "resolved_symbols": len({str(row["symbol"]) for row in rows}),
+        "rows": len(rows),
+        "source_empty_symbols": source_empty,
+        "zero_volume_rows_ignored": zero_volume_rows,
+        "contract_missing_symbols": contract_missing,
+        "unqueried_symbols": max(
+            0, len(requested) - len(attempted) - contract_missing
+        ),
+        "error_counts": error_counts,
+        "stopped_for_traffic": stopped_for_traffic,
+        "max_traffic_fraction": float(max_traffic_fraction),
+        "usage_before": usage_before,
+        "usage_after": usage(),
+        "simulation_only": True,
+        "production_order_possible": False,
     }
 
 
@@ -1175,19 +1482,25 @@ def _record_stock_stream_event(kind: str, event: object, *, received: datetime |
             return result if np.isfinite(result) and result >= 0 else None
         except (ValueError, TypeError):
             return None
-    if kind == "tick":
+    if kind in {"tick", "quote"}:
         for field in ("open", "close", "high", "low", "volume", "total_volume"):
             row[field] = number(getattr(event, field, None))
-    else:
+    if kind in {"book", "quote"}:
         for target, field in (("bid", "bid_price"), ("ask", "ask_price"),
                               ("bid_volume", "bid_volume"), ("ask_volume", "ask_volume")):
             values = getattr(event, field, None)
             row[target] = number(values[0]) if values is not None and len(values) else None
+    row["suspend"] = getattr(event, "suspend", None)
     with _SHIOAJI_STREAM_LOCK:
         previous = _SHIOAJI_STREAM_ROWS.get(code, {}).get(kind, {})
         if previous.get("exchange_at", "") > row["exchange_at"]:
             return
-        _SHIOAJI_STREAM_ROWS.setdefault(code, {})[kind] = row
+        rows = _SHIOAJI_STREAM_ROWS.setdefault(code, {})
+        rows[kind] = row
+        if (kind == "quote" and row.get("simtrade") is False
+                and row.get("volume") is not None and row["volume"] > 0
+                and datetime_time(13, 30) <= exchange_at.time() < datetime_time(13, 34)):
+            rows["auction"] = row
 
 
 def fetch_shioaji_stock_live_quotes(symbols: list[str], *, trading_date: date) -> dict[str, dict[str, Any]]:
@@ -1199,62 +1512,114 @@ def fetch_shioaji_stock_live_quotes(symbols: list[str], *, trading_date: date) -
     against the current execution universe so completed symbols release quota.
     """
     import shioaji as sj
-    global _SHIOAJI_STREAM_API
+    global _SHIOAJI_STREAM_API, _SHIOAJI_STREAM_ROTATION_AT, _SHIOAJI_STREAM_CURSOR
+    global _SHIOAJI_STREAM_TARGET, _SHIOAJI_STREAM_TARGET_READY
     api = _shioaji_stock_api()
     with _SHIOAJI_STREAM_LOCK:
         if _SHIOAJI_STREAM_API is not api:
             _SHIOAJI_STREAM_SUBSCRIPTIONS.clear()
             _SHIOAJI_STREAM_ROWS.clear()
-            api.set_on_tick_stk_v1_callback(lambda *args: _record_stock_stream_event("tick", args[-1]))
-            api.set_on_bidask_stk_v1_callback(lambda *args: _record_stock_stream_event("book", args[-1]))
+            _SHIOAJI_STREAM_CURSOR = 0
+            _SHIOAJI_STREAM_ROTATION_AT = 0.0
+            _SHIOAJI_STREAM_TARGET = ()
+            _SHIOAJI_STREAM_TARGET_READY = False
+            api.set_on_quote_stk_v1_callback(lambda *args: _record_stock_stream_event("quote", args[-1]))
             _SHIOAJI_STREAM_API = api
-    desired = {(str(s), kind) for s in symbols for kind in ("tick", "book")}
-    kinds = {"tick": sj.QuoteType.Tick, "book": sj.QuoteType.BidAsk}
+    requested = sorted(set(map(str, symbols)))
+    if len(requested) <= _SHIOAJI_STOCK_STREAM_LIMIT:
+        selected = requested
+        _SHIOAJI_STREAM_CURSOR = 0
+    else:
+        now = time.monotonic()
+        if (_SHIOAJI_STREAM_TARGET
+                and set(_SHIOAJI_STREAM_TARGET) <= set(requested)
+                and (not _SHIOAJI_STREAM_TARGET_READY or now < _SHIOAJI_STREAM_ROTATION_AT)):
+            selected = list(_SHIOAJI_STREAM_TARGET)
+        else:
+            start = _SHIOAJI_STREAM_CURSOR % len(requested)
+            selected = [requested[(start + idx) % len(requested)] for idx in range(_SHIOAJI_STOCK_STREAM_LIMIT)]
+            _SHIOAJI_STREAM_CURSOR = (start + _SHIOAJI_STOCK_STREAM_LIMIT) % len(requested)
+    if tuple(selected) != _SHIOAJI_STREAM_TARGET:
+        _SHIOAJI_STREAM_TARGET = tuple(selected)
+        _SHIOAJI_STREAM_TARGET_READY = False
+    desired = {(code, "quote") for code in selected}
+    kinds = {"tick": sj.QuoteType.Tick, "book": sj.QuoteType.BidAsk,
+             "quote": sj.QuoteType.Quote}
     # API calls stay outside the callback lock (a native subscribe may deliver
     # the first event synchronously). Only this engine thread owns subscriptions.
-    for code, kind in sorted(_SHIOAJI_STREAM_SUBSCRIPTIONS - desired):
+    for code, kind in sorted(_SHIOAJI_STREAM_SUBSCRIPTIONS - desired)[:_SHIOAJI_STOCK_STREAM_BATCH_LIMIT]:
         contract = api.contracts.get(code)
         if contract is not None:
             api.unsubscribe(contract, quote_type=kinds[kind])
         _SHIOAJI_STREAM_SUBSCRIPTIONS.discard((code, kind))
-        with _SHIOAJI_STREAM_LOCK:
-            _SHIOAJI_STREAM_ROWS.pop(code, None)
-    for code, kind in sorted(desired - _SHIOAJI_STREAM_SUBSCRIPTIONS):
+    free_slots = max(0, _SHIOAJI_STOCK_STREAM_LIMIT - len(_SHIOAJI_STREAM_SUBSCRIPTIONS))
+    for code, kind in sorted(desired - _SHIOAJI_STREAM_SUBSCRIPTIONS)[:min(_SHIOAJI_STOCK_STREAM_BATCH_LIMIT, free_slots)]:
         contract = api.contracts.get(code)
         if contract is None:
             continue
-        api.subscribe(contract, quote_type=kinds[kind])
+        api.subscribe(contract, quote_type=sj.QuoteType.Quote)
         _SHIOAJI_STREAM_SUBSCRIPTIONS.add((code, kind))
+    if not _SHIOAJI_STREAM_TARGET_READY:
+        unresolved_contracts = {
+            (code, "quote") for code in selected if api.contracts.get(code) is None
+        }
+        if desired - unresolved_contracts <= _SHIOAJI_STREAM_SUBSCRIPTIONS:
+            _SHIOAJI_STREAM_TARGET_READY = True
+            _SHIOAJI_STREAM_ROTATION_AT = time.monotonic() + _SHIOAJI_STOCK_STREAM_DWELL_SECONDS
     limits, _ = _load_prepared_tw_price_limits(trading_date.isoformat())
     quotes = {}
-    for code in symbols:
+    selected_set = set(selected)
+    requested_set = set(requested)
+    with _SHIOAJI_STREAM_LOCK:
+        for code in list(_SHIOAJI_STREAM_ROWS):
+            if code not in requested_set:
+                _SHIOAJI_STREAM_ROWS.pop(code, None)
+    observed = datetime.now(ZoneInfo("Asia/Taipei"))
+    for code in requested:
         with _SHIOAJI_STREAM_LOCK:
-            rows = {kind: dict(row) for kind, row in _SHIOAJI_STREAM_ROWS.get(code, {}).items()}
-        tick, book = rows.get("tick", {}), rows.get("book", {})
-        if not tick.get("exchange_at", "").startswith(trading_date.isoformat()):
-            tick = {}
-        if not book.get("exchange_at", "").startswith(trading_date.isoformat()):
-            book = {}
+            stored = _SHIOAJI_STREAM_ROWS.get(code, {})
+            row = dict(stored.get("quote", {}))
+            auction = dict(stored.get("auction", {}))
+        received = row.get("received_at")
+        try:
+            age_seconds = (observed - datetime.fromisoformat(received)).total_seconds()
+        except (TypeError, ValueError):
+            age_seconds = float("inf")
+        if (not row.get("exchange_at", "").startswith(trading_date.isoformat())
+                or row.get("suspend") is True or not 0 <= age_seconds <= 10):
+            row = {}
+        auction_received = auction.get("received_at")
+        try:
+            auction_age = (observed - datetime.fromisoformat(auction_received)).total_seconds()
+        except (TypeError, ValueError):
+            auction_age = float("inf")
+        if (not auction.get("exchange_at", "").startswith(trading_date.isoformat())
+                or not 0 <= auction_age <= 10):
+            auction = {}
         contract = api.contracts.get(code)
         reference, upper, lower = limits.get(code, (None, None, None))
         upper = upper or _contract_positive(contract, "limit_up")
         lower = lower or _contract_positive(contract, "limit_down")
         reference = reference or _contract_positive(contract, "reference")
-        q = {"symbol": code, "source": "shioaji_stock_stream", "available": bool(tick or book),
-             "last": tick.get("close"), "open": tick.get("open"),
-             "high": tick.get("high"), "low": tick.get("low"),
-             "bid": book.get("bid"), "ask": book.get("ask"),
-             "bid_volume": book.get("bid_volume"), "ask_volume": book.get("ask_volume"),
+        q = {"symbol": code, "source": "shioaji_stock_quote_stream", "available": bool(row),
+             "stream_subscribed": code in selected_set and (code, "quote") in _SHIOAJI_STREAM_SUBSCRIPTIONS,
+             "stream_capacity_limited": code not in selected_set,
+             "last": row.get("close"), "open": row.get("open"),
+             "high": row.get("high"), "low": row.get("low"),
+             "bid": row.get("bid"), "ask": row.get("ask"),
+             "bid_volume": row.get("bid_volume"), "ask_volume": row.get("ask_volume"),
              "upper_limit": upper, "lower_limit": lower, "reference_price": reference,
-             "cumulative_volume_lots": tick.get("total_volume") if tick.get("simtrade") is False else None,
-             "quote_at": book.get("received_at"), "book_exchange_at": book.get("exchange_at"),
-             "exchange_quote_at": tick.get("exchange_at"), "simtrade": book.get("simtrade"),
-             "trade_simtrade": tick.get("simtrade"), "trade_quote_at": tick.get("received_at")}
-        if tick.get("exchange_at") and tick.get("simtrade") is False:
-            exchange_time = datetime.fromisoformat(tick["exchange_at"]).time()
-            if datetime_time(13, 30) <= exchange_time < datetime_time(13, 34):
-                q["auction_volume_lots"] = tick.get("volume")
-                q["auction_volume_source"] = "exchange_non_trial_tick"
+             "cumulative_volume_lots": row.get("total_volume") if row.get("simtrade") is False else None,
+             "quote_at": row.get("received_at"), "book_exchange_at": row.get("exchange_at"),
+             "exchange_quote_at": row.get("exchange_at"), "simtrade": row.get("simtrade"),
+             "trade_simtrade": row.get("simtrade"), "trade_quote_at": row.get("received_at")}
+        if auction:
+            q["auction_volume_lots"] = auction.get("volume")
+            q["auction_volume_source"] = "exchange_non_trial_quote_trade"
+            q["last"] = auction.get("close")
+            q["trade_simtrade"] = auction.get("simtrade")
+            q["trade_quote_at"] = auction.get("received_at")
+            q["exchange_quote_at"] = auction.get("exchange_at")
         quotes[code] = q
     return quotes
 

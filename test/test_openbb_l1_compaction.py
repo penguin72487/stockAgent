@@ -12,13 +12,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.download_openbb_archive import DownloadTask, Manifest, TaskResult
+from scripts.benchmark_openbb_l1_stale_scan import _run_variant
 from scripts.compact_openbb_l1 import (
     MAX_QUERY_VIEW_SCHEMA_VARIANTS,
+    TASK_COMPACTION_INDEX,
     TaskShard,
     _archive_compaction_allowed,
     _lexical_absolute_path,
+    _load_unassigned_shards,
+    _mark_stale_segments,
+    _open_manifest,
     _query_view_deferred_reason,
     _segment_batches,
+    _stale_source_contract_sql,
     run,
 )
 
@@ -43,6 +49,94 @@ def test_manifest_path_normalization_is_lexical_and_absolute(
     monkeypatch.chdir(tmp_path)
 
     assert _lexical_absolute_path("link/source.parquet") == str(link / "source.parquet")
+
+
+def test_member_first_stale_scan_preserves_each_source_contract_reason(
+    tmp_path: Path,
+) -> None:
+    _publish_tasks(tmp_path, ["aa", "bb", "cc"])
+    args = _args(tmp_path)
+    args[args.index("--max-files-per-segment") + 1] = "1"
+    assert run(args) == 0
+    connection = _open_manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE tasks SET rows=rows+1 WHERE task_id='aa'"
+        )
+        connection.execute(
+            "UPDATE tasks SET active=0 WHERE task_id='bb'"
+        )
+        connection.execute(
+            "UPDATE tasks SET output_path='changed-path' WHERE task_id='cc'"
+        )
+        connection.commit()
+        prefix = os.path.abspath(os.curdir) + os.sep
+        parameters = (prefix, prefix)
+        baseline = [
+            tuple(row) for row in connection.execute(
+                _stale_source_contract_sql(""), parameters
+            )
+        ]
+        candidate = [
+            tuple(row) for row in connection.execute(
+                _stale_source_contract_sql("", member_first=True), parameters
+            )
+        ]
+        assert candidate == baseline
+        assert {row[3] for row in candidate} == {
+            "source row contract changed",
+            "source task retired from active plan",
+            "source path changed",
+        }
+    finally:
+        connection.close()
+
+
+def test_stale_scan_benchmark_hashes_multiple_reasons_per_segment(
+    tmp_path: Path,
+) -> None:
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    connection = _open_manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    try:
+        connection.execute("UPDATE tasks SET rows=rows+1 WHERE task_id='aa'")
+        connection.execute("UPDATE tasks SET active=0 WHERE task_id='bb'")
+        connection.commit()
+        prefix = os.path.abspath(os.curdir) + os.sep
+        baseline = _run_variant(connection, member_first=False, prefix=prefix)
+        candidate = _run_variant(connection, member_first=True, prefix=prefix)
+        assert baseline["stale_rows"] == candidate["stale_rows"] == 2
+        assert baseline["stale_rows_sha256"] == candidate["stale_rows_sha256"]
+    finally:
+        connection.close()
+
+
+def test_l1_source_path_fast_comparison_keeps_noncanonical_fallback(
+    tmp_path: Path,
+) -> None:
+    tasks = _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    manifest_path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    connection = _open_manifest(manifest_path)
+    try:
+        relative = os.path.relpath(tasks[0].output_path)
+        for spelling in (relative, f"./{relative}", tasks[0].output_path):
+            connection.execute(
+                "UPDATE tasks SET output_path=? WHERE task_id='aa'", (spelling,)
+            )
+            assert _mark_stale_segments(connection, ()) == (set(), 0)
+
+        connection.execute(
+            "UPDATE tasks SET output_path=? WHERE task_id='aa'",
+            (str(tmp_path / "different.parquet"),),
+        )
+        assert _mark_stale_segments(connection, ()) == ({ENDPOINT}, 1)
+        reason = connection.execute(
+            "SELECT stale_reason FROM l1_compaction_segments WHERE status='stale'"
+        ).fetchone()[0]
+        assert reason == "source path changed"
+    finally:
+        connection.close()
 
 
 def test_segment_batches_enforce_rows_and_uncompressed_bytes_before_file_minimum() -> (
@@ -149,10 +243,10 @@ def test_archive_idle_guard_prioritizes_downloader_work(tmp_path: Path) -> None:
     )
 
 
-def _task(root: Path, task_id: str) -> DownloadTask:
+def _task(root: Path, task_id: str, *, endpoint: str = ENDPOINT) -> DownloadTask:
     return DownloadTask(
         task_id=task_id,
-        endpoint=ENDPOINT,
+        endpoint=endpoint,
         category="equity",
         scope_key=task_id,
         kwargs={"symbol": task_id},
@@ -161,9 +255,11 @@ def _task(root: Path, task_id: str) -> DownloadTask:
     )
 
 
-def _publish_tasks(root: Path, task_ids: list[str]) -> list[DownloadTask]:
+def _publish_tasks(
+    root: Path, task_ids: list[str], *, endpoint: str = ENDPOINT
+) -> list[DownloadTask]:
     manifest = Manifest(root / "_state" / "openbb_archive.sqlite3")
-    tasks = [_task(root, task_id) for task_id in task_ids]
+    tasks = [_task(root, task_id, endpoint=endpoint) for task_id in task_ids]
     try:
         manifest.upsert_tasks(tasks, plan_token="test-plan")
         manifest.set_meta_value("active_plan_token", "test-plan")
@@ -219,6 +315,94 @@ def _segment_counts(root: Path) -> tuple[int, int]:
         )
 
 
+def test_unassigned_source_fast_path_preserves_global_task_order(
+    tmp_path: Path,
+) -> None:
+    _publish_tasks(tmp_path, ["cc", "bb", "aa"])
+    state_path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET endpoint='zeta.example' WHERE task_id='cc'"
+        )
+        connection.execute(f"DROP INDEX {TASK_COMPACTION_INDEX}")
+    connection = _open_manifest(state_path)
+    try:
+        fast_timing: dict[str, float] = {}
+        fast = _load_unassigned_shards(
+            connection, (), limit=2, show_progress=False, timing=fast_timing
+        )
+        assert [row.task_id for row in fast] == ["aa", "bb"]
+        assert "unassigned_source_endpoint_sort" in fast_timing
+        assert "unassigned_source_global_fallback" not in fast_timing
+
+        short_timing: dict[str, float] = {}
+        short = _load_unassigned_shards(
+            connection, (), limit=3, show_progress=False, timing=short_timing
+        )
+        assert [row.task_id for row in short] == ["aa", "bb", "cc"]
+        assert "unassigned_source_global_fallback" in short_timing
+
+        connection.execute("DROP INDEX idx_tasks_active_plan")
+        missing_index_timing: dict[str, float] = {}
+        missing_index = _load_unassigned_shards(
+            connection, (), limit=2, show_progress=False,
+            timing=missing_index_timing,
+        )
+        assert [row.task_id for row in missing_index] == ["aa", "bb"]
+        assert "unassigned_source_global_fallback" in missing_index_timing
+    finally:
+        connection.close()
+
+
+def test_covering_compaction_task_index_preserves_global_order(
+    tmp_path: Path,
+) -> None:
+    _publish_tasks(tmp_path, ["cc", "bb", "aa"])
+    state_path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET endpoint='zeta.example' WHERE task_id='cc'"
+        )
+        connection.execute(f"DROP INDEX {TASK_COMPACTION_INDEX}")
+    connection = _open_manifest(state_path)
+    try:
+        baseline = _load_unassigned_shards(
+            connection, (), limit=2, show_progress=False
+        )
+        connection.execute(
+            f"CREATE INDEX {TASK_COMPACTION_INDEX} "
+            "ON tasks(plan_token, endpoint, task_id, rows) "
+            "WHERE active=1 AND status='success'"
+        )
+        timing: dict[str, float] = {}
+        indexed = _load_unassigned_shards(
+            connection, (), limit=2, show_progress=False, timing=timing
+        )
+        assert [row.task_id for row in indexed] == [row.task_id for row in baseline]
+        assert [row.task_id for row in indexed] == ["aa", "bb"]
+        assert "unassigned_source_index_order" in timing
+        assert "unassigned_source_endpoint_sort" not in timing
+        selection_plan = connection.execute(
+            f"EXPLAIN QUERY PLAN SELECT t.task_id FROM tasks AS t "
+            f"INDEXED BY {TASK_COMPACTION_INDEX} "
+            "LEFT JOIN l1_compaction_members AS m ON m.task_id=t.task_id "
+            "WHERE t.active=1 AND t.plan_token=? AND t.status='success' "
+            "AND m.task_id IS NULL ORDER BY t.endpoint, t.task_id LIMIT ?",
+            ("test-plan", 2),
+        ).fetchall()
+        assert not any("TEMP B-TREE" in str(row[3]) for row in selection_plan)
+        count_plan = connection.execute(
+            f"EXPLAIN QUERY PLAN SELECT endpoint, COUNT(*), SUM(rows) "
+            f"FROM tasks INDEXED BY {TASK_COMPACTION_INDEX} "
+            "WHERE active=1 AND status='success' AND plan_token=? "
+            "GROUP BY endpoint",
+            ("test-plan",),
+        ).fetchall()
+        assert any("COVERING INDEX" in str(row[3]) for row in count_plan)
+    finally:
+        connection.close()
+
+
 def test_l1_compaction_is_incremental_queryable_and_self_healing(
     tmp_path: Path,
 ) -> None:
@@ -241,14 +425,42 @@ def test_l1_compaction_is_incremental_queryable_and_self_healing(
     assert status["success_files"].to_list() == [5]
     assert status["compacted_files"].to_list() == [5]
     assert status["pending_files"].to_list() == [0]
+    status_receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert all(
+        status_receipt["stage_seconds"][name] >= 0
+        for name in (
+            "stale_contract_audit", "stale_source_contract_query",
+            "stale_existing_status_query", "stale_source_join_query",
+            "stale_derivative_metadata_scan", "stale_state_apply",
+            "unassigned_source_load", "batch_planning",
+            "unassigned_source_query", "unassigned_source_metadata",
+            "segment_build", "query_view_publish", "stale_output_quarantine",
+            "status_task_count", "status_member_count", "status_projection_write",
+        )
+    )
+    assert status_receipt["view_endpoint_seconds"][ENDPOINT] >= 0
+    assert status_receipt["view_endpoint_actions"][ENDPOINT] == "rebuilt"
+    assert set(status_receipt["stage_resources"]) == {
+        "before_stale_contract_audit", "after_stale_contract_audit",
+        "after_unassigned_source_load",
+        "after_segment_build", "after_query_view_publish",
+    }
+    before = status_receipt["stage_resources"]["before_stale_contract_audit"]
+    after = status_receipt["stage_resources"]["after_stale_contract_audit"]
+    if before["process_read_bytes"] is not None:
+        assert after["process_read_bytes"] >= before["process_read_bytes"]
 
     # Idempotent reruns publish the same views without duplicating source rows.
     assert run(_args(tmp_path)) == 0
     assert _segment_counts(tmp_path) == (3, 0)
+    status_receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert status_receipt["view_endpoint_actions"][ENDPOINT] == "reused_verified_paths"
 
     _publish_tasks(tmp_path, ["ff"])
     assert run(_args(tmp_path)) == 0
     assert _segment_counts(tmp_path) == (4, 0)
+    status_receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert status_receipt["view_endpoint_actions"][ENDPOINT] == "rebuilt"
     with duckdb.connect(
         str(tmp_path / "openbb_l1.duckdb"), read_only=True
     ) as connection:
@@ -315,6 +527,144 @@ def test_l1_compaction_is_incremental_queryable_and_self_healing(
     assert run([*_args(tmp_path), "--audit-only"]) == 2
     assert run(_args(tmp_path)) == 0
     assert run([*_args(tmp_path), "--audit-only"]) == 0
+
+    # A derivative with unchanged row count but a different schema must also
+    # become stale; the single-open metadata path checks both contracts.
+    with sqlite3.connect(tmp_path / "_state" / "openbb_archive.sqlite3") as connection:
+        segment_path_value, segment_rows = connection.execute(
+            "SELECT output_path, output_rows FROM l1_compaction_segments "
+            "WHERE status='success' ORDER BY segment_id LIMIT 1"
+        ).fetchone()
+        segment_path = Path(segment_path_value)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"date": f"bad-{index}", "close": 0.0, "unexpected": 1}
+                for index in range(int(segment_rows))
+            ]
+        ),
+        segment_path,
+    )
+    assert run([*_args(tmp_path), "--audit-only"]) == 2
+    assert run(_args(tmp_path)) == 0
+    assert run([*_args(tmp_path), "--audit-only"]) == 0
+
+
+def test_l1_view_catalog_without_signatures_rebuilds_before_reuse(
+    tmp_path: Path,
+) -> None:
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    database_path = tmp_path / "openbb_l1.duckdb"
+    with duckdb.connect(str(database_path)) as database:
+        database.execute("ALTER TABLE l1_catalog DROP COLUMN view_input_signature")
+    assert run(_args(tmp_path)) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"][ENDPOINT] == "rebuilt"
+    with duckdb.connect(str(database_path), read_only=True) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_price_historical"
+        ).fetchone()[0] == 2
+        columns = {row[1] for row in database.execute(
+            "PRAGMA table_info('l1_catalog')"
+        ).fetchall()}
+        assert "view_input_signature" in columns
+    assert run(_args(tmp_path)) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"][ENDPOINT] == "reused_verified_paths"
+
+
+def test_l1_view_sql_drift_rebuilds_from_verified_segments(tmp_path: Path) -> None:
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    database_path = tmp_path / "openbb_l1.duckdb"
+    with duckdb.connect(str(database_path)) as database:
+        database.execute(
+            "CREATE OR REPLACE VIEW openbb_l1_equity_price_historical "
+            "AS SELECT -1 AS close"
+        )
+    assert run(_args(tmp_path)) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"][ENDPOINT] == "rebuilt"
+    with duckdb.connect(str(database_path), read_only=True) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_price_historical"
+        ).fetchone()[0] == 2
+
+
+def test_l1_only_rebuilds_endpoint_with_changed_segment_paths(tmp_path: Path) -> None:
+    other_endpoint = "equity.test.alternative"
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    _publish_tasks(tmp_path, ["cc", "dd"], endpoint=other_endpoint)
+    args = _args(tmp_path)
+    del args[args.index("--endpoint"):args.index("--endpoint") + 2]
+    assert run(args) == 0
+    _publish_tasks(tmp_path, ["ee"])
+    assert run(args) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"] == {
+        ENDPOINT: "rebuilt", other_endpoint: "reused_verified_paths"
+    }
+    with duckdb.connect(str(tmp_path / "openbb_l1.duckdb"), read_only=True) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_price_historical"
+        ).fetchone()[0] == 3
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_test_alternative"
+        ).fetchone()[0] == 2
+
+
+def test_l1_deferred_endpoint_removes_old_view_until_queryable_again(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts import compact_openbb_l1 as compactor
+
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    database_path = tmp_path / "openbb_l1.duckdb"
+    monkeypatch.setattr(compactor, "MAX_QUERY_VIEW_SCHEMA_VARIANTS", 0)
+    assert run(_args(tmp_path)) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"][ENDPOINT] == "deferred"
+    with duckdb.connect(str(database_path), read_only=True) as database:
+        assert database.execute(
+            "SELECT view_name FROM duckdb_views() "
+            "WHERE view_name='openbb_l1_equity_price_historical'"
+        ).fetchone() is None
+    monkeypatch.setattr(
+        compactor, "MAX_QUERY_VIEW_SCHEMA_VARIANTS",
+        MAX_QUERY_VIEW_SCHEMA_VARIANTS,
+    )
+    assert run(_args(tmp_path)) == 0
+    receipt = json.loads((tmp_path / "_state/l1_compaction_latest.json").read_text())
+    assert receipt["view_endpoint_actions"][ENDPOINT] == "rebuilt"
+    with duckdb.connect(str(database_path), read_only=True) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_price_historical"
+        ).fetchone()[0] == 2
+
+
+def test_missing_l1_derivative_is_detected_and_rebuilt(tmp_path: Path) -> None:
+    _publish_tasks(tmp_path, ["aa", "bb"])
+    assert run(_args(tmp_path)) == 0
+    manifest_path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    with sqlite3.connect(manifest_path) as connection:
+        missing = Path(connection.execute(
+            "SELECT output_path FROM l1_compaction_segments "
+            "WHERE status='success' ORDER BY segment_id LIMIT 1"
+        ).fetchone()[0])
+    missing.unlink()
+    assert run([*_args(tmp_path), "--audit-only"]) == 2
+    assert run(_args(tmp_path)) == 0
+    with duckdb.connect(str(tmp_path / "openbb_l1.duckdb"), read_only=True) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM openbb_l1_equity_price_historical"
+        ).fetchone()[0] == 2
+    with sqlite3.connect(manifest_path) as connection:
+        assert connection.execute(
+            "SELECT stale_reason FROM l1_compaction_segments "
+            "WHERE status='quarantined' ORDER BY segment_id LIMIT 1"
+        ).fetchone()[0] == "L1 output file is missing"
 
 
 def test_l1_tail_is_left_pending_until_threshold_or_explicit_flush(

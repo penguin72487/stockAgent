@@ -304,6 +304,8 @@ def deploy(source: Path, state_dir: Path) -> dict[str, Any]:
         "missing_1325_count": int(counts.get("missing") or 0),
         "close_fallback_count": int(counts.get("same_session_close") or 0),
         "valuation_stale_market_count": stale_markets,
+        "unresolved_prior_position_count": len(result.get("unresolved_positions") or ()),
+        "blocked_close_signal_count": int(result.get("blocked_close_signal_count") or 0),
         "simulation_only": True,
         "production_order_possible": False,
         "counterfactual": True,

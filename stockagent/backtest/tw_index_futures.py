@@ -26,6 +26,10 @@ from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
     TaiwanIndexFuturesDaySession,
 )
+from stockagent.backtest.tw_derivatives_cost_policy import (
+    FuturesCostSchedule,
+    TW_INDEX_FUTURES_TRANSACTION_TAX_RATE,
+)
 
 
 # v7 is the direct 18-action, exact whole-contract recurrent-equity contract.
@@ -37,7 +41,6 @@ TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 7
 # Forward whole-contract counts, costs, returns, and equity are unchanged, but
 # optimizer trajectories from v1 must not resume silently under this gradient.
 TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION: Final[int] = 2
-TW_INDEX_FUTURES_TRANSACTION_TAX_RATE: Final[float] = 0.00002
 # Compatibility exports for downstream imports.  Both names now denote the
 # per-transaction rate, not a one-sided round-trip rate.
 TW_INDEX_FUTURES_SELL_TAX_RATE: Final[float] = (
@@ -67,58 +70,6 @@ def get_tw_index_futures_compile_stats() -> dict[str, int]:
     """Return process-local fixed-block usage counters."""
 
     return dict(_ALL_TENOR_COMPILE_STATS)
-
-
-@dataclass(frozen=True, slots=True)
-class FuturesCostSchedule:
-    # Tax, fixed fees, and slippage apply to both transactions in a daily-flat
-    # round trip. ``tax_rate`` is the statutory per-transaction rate.
-    tax_rate: float = TW_INDEX_FUTURES_TRANSACTION_TAX_RATE
-    exchange_and_clearing_fee_per_side_twd: tuple[float, ...] = (20.0, 12.5, 8.0)
-    broker_fee_per_side_twd: tuple[float, ...] = (0.0, 0.0, 0.0)
-    slippage_points_per_side: tuple[float, ...] = (0.0, 0.0, 0.0)
-    basket_fee_penalty: float = 1.0
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.tax_rate, Real)
-            or isinstance(self.tax_rate, bool)
-            or not math.isfinite(float(self.tax_rate))
-            or float(self.tax_rate) < 0.0
-        ):
-            raise ValueError("tax_rate must be a finite non-negative real")
-        for name in (
-            "exchange_and_clearing_fee_per_side_twd",
-            "broker_fee_per_side_twd",
-            "slippage_points_per_side",
-        ):
-            values = tuple(getattr(self, name))
-            if len(values) != len(TAIFEX_INDEX_FUTURES_PRODUCTS):
-                raise ValueError(f"{name} must contain TX, MTX, and TMF values")
-            if any(
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-                for value in values
-            ):
-                raise ValueError(f"{name} must contain finite non-negative values")
-        if (
-            not isinstance(self.basket_fee_penalty, Real)
-            or isinstance(self.basket_fee_penalty, bool)
-            or not math.isfinite(float(self.basket_fee_penalty))
-            or float(self.basket_fee_penalty) < 0.0
-        ):
-            raise ValueError(
-                "basket_fee_penalty must be a finite non-negative real"
-            )
-
-    @property
-    def fixed_fee_per_side_twd(self) -> np.ndarray:
-        return np.asarray(
-            self.exchange_and_clearing_fee_per_side_twd,
-            dtype=np.float64,
-        ) + np.asarray(self.broker_fee_per_side_twd, dtype=np.float64)
 
 
 @dataclass(frozen=True, slots=True)

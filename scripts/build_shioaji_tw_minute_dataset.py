@@ -13,6 +13,8 @@ from typing import Any
 
 import polars as pl
 
+from scripts.shioaji_minute_backfill_state import source_fingerprint
+
 
 NS_PER_MINUTE = 60_000_000_000
 SCHEMA_VERSION = 4
@@ -165,6 +167,20 @@ def _quarantine_stale_partitions(
         os.replace(source, destination)
         moved.append({"source": str(source), "quarantine": str(destination)})
     return moved
+
+
+def _reject_subset_overwrite(output_root: Path, requested: set[str]) -> None:
+    """A subset build cannot replace full-market date partitions or manifest."""
+
+    if not requested:
+        return
+    if (output_root / "manifest.json").exists() or any(
+        output_root.glob("trade_date=*/data.parquet")
+    ):
+        raise RuntimeError(
+            "subset minute build requires a fresh isolated --output-root; "
+            "use scripts.reconcile_tw_stock_minute_day for canonical day repair"
+        )
 
 
 def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
@@ -600,6 +616,7 @@ def main() -> None:
     requested = {
         item.strip().upper() for item in str(args.symbols).split(",") if item.strip()
     }
+    _reject_subset_overwrite(args.output_root, requested)
     download_summary_path = (
         args.download_summary
         if args.download_summary is not None
@@ -721,6 +738,9 @@ def main() -> None:
             ),
             "quarantined_stale_output_partitions": quarantined_output_partitions,
             "download_summary": str(download_summary_path),
+            "source_fingerprint_sha256": (
+                source_fingerprint(args.input_root) if not requested else None
+            ),
             "download_start_date": collection.get("start_date"),
             "download_end_date": collection.get("end_date"),
             "full_market_selected_symbols": int(collection.get("selected_symbols", 0)),

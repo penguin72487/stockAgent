@@ -15,7 +15,7 @@ from pathlib import Path
 import select
 import sys
 import time as time_module
-from typing import Any
+from typing import Any, Mapping
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -41,6 +41,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_stock_snapshots,
     fetch_shioaji_stock_live_quotes,
     load_local_stock_0901_vwaps,
+    observed_0901_minute_volume_lots,
     prepare_tw_price_limit_snapshot,
     serve_shared_day_trade_quote_requests,
     warm_shioaji_stock_quote_client,
@@ -48,13 +49,15 @@ from stockagent.live.quote_provider import (  # noqa: E402
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
-    ENTRY_FILL_POLICY_CAUSAL_BOOK,
-    LIVE_ENTRY_GATE,
+    ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
     CLOSING_AUCTION_TIME,
+    EXIT_LIMIT_TIME,
     FORCE_EXIT_TIME,
+    LIVE_ENTRY_GATE,
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     STOCK_BENCHMARKS,
+    STRICT_INTRADAY_CONTRACT,
     TX_CONTINUOUS_LOGICAL_CODE,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
@@ -138,7 +141,11 @@ def _executor_runtime_status(
     engine: TwDayTradeSimulationEngine,
     specs: list[ModeSpec],
     observed: datetime,
+    *,
+    session_errors: Mapping[str, str] | None = None,
 ) -> str:
+    if not specs:
+        return "TW day-trade executor idle; no enabled paper modes"
     session_date = observed.date().isoformat()
     modes = engine.state.get("modes", {})
     completed = 0
@@ -153,6 +160,16 @@ def _executor_runtime_status(
         open_positions += sum(
             bool(int(row.get("signed_shares") or 0))
             for row in mode.get("positions", {}).values()
+        )
+    if session_errors:
+        gate = (
+            "verified closed session"
+            if _confirmed_closed_stock_session(session_errors)
+            else "session gate not verified"
+        )
+        return (
+            f"TW day-trade executor running; {gate}; "
+            f"carried paper positions={open_positions}"
         )
     if completed:
         return (
@@ -494,12 +511,13 @@ def _mode_specs(
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
                     price_limit_offset_ticks=1,
-                    # Live execution is causal: after the 09:00 signal is
+                    # Live paper execution is causal: after the 09:00 signal is
                     # atomically published, buy/cover uses the first later best
-                    # Ask and sell/short uses the first later best Bid. Replay
-                    # tools explicitly replace this with the 09:01 official-open
-                    # counterfactual policy.
-                    entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK,
+                    # Ask and sell/short uses the first later best Bid. The full
+                    # model target is booked at that observed price without an
+                    # exchange-depth or broker-fill claim. Replay tools replace
+                    # this with the explicit 09:01 counterfactual policy.
+                    entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
                     entry_price_offset_ticks=0,
                     residual_margin_conversion=live.day_trade_residual_margin_conversion,
                     strict_intraday=live.day_trade_strict_intraday,
@@ -1224,7 +1242,65 @@ def _loop_sleep_seconds(
     )
     if has_pending_signal or opening_hot_path or exit_hot_path or force_exit_hot_path:
         return max(0.01, float(fast_seconds))
+    if wall_time < datetime_time(8, 10) or wall_time >= datetime_time(14, 0):
+        # Inotify still wakes immediately for a newly published signal.  Idle
+        # overnight polling need not re-run calendar/readiness work each second.
+        return max(5.0, float(fast_seconds))
     return max(1.0, float(fast_seconds))
+
+
+def _closed_session_sleep_seconds(observed: datetime, *, poll_seconds: float) -> float:
+    wall_time = observed.timetz().replace(tzinfo=None)
+    if datetime_time(8, 10) <= wall_time < datetime_time(9, 10):
+        # A session may become verified shortly before 09:00; do not delay
+        # preopen readiness or the opening signal while that gate is closed.
+        return max(1.0, float(poll_seconds))
+    return max(5.0, float(poll_seconds))
+
+
+def _confirmed_closed_stock_session(errors: Mapping[str, str]) -> bool:
+    """Only a proven holiday/weekend may use the quiet-session cadence.
+
+    Missing or contradictory source evidence stays on the fast readiness path
+    so a newly accepted opening session is noticed without extra delay.
+    """
+
+    return bool(errors) and all(
+        str(reason).endswith(" is a weekend")
+        or str(reason).endswith(" is a configured market holiday")
+        or str(reason).startswith("official TWSE schedule as-of ")
+        for reason in errors.values()
+    )
+
+
+def _readiness_refresh_interval_seconds(
+    observed: datetime, *, session_errors: Mapping[str, str] | None = None,
+    has_enabled_modes: bool = True,
+) -> float:
+    if not has_enabled_modes:
+        return 60.0
+    wall_time = observed.timetz().replace(tzinfo=None)
+    if wall_time < datetime_time(8, 10) or wall_time >= datetime_time(14, 0):
+        return 60.0
+    # Keep the preopen and opening transition fast even on a holiday: an
+    # official schedule may be corrected shortly before 09:00.
+    if (
+        _confirmed_closed_stock_session(session_errors or {})
+        and not datetime_time(8, 30) <= wall_time < datetime_time(9, 10)
+    ):
+        return 60.0
+    return 10.0
+
+
+def _spec_reload_interval_seconds(observed: datetime) -> float:
+    wall_time = observed.timetz().replace(tzinfo=None)
+    return 60.0 if wall_time < datetime_time(8, 10) or wall_time >= datetime_time(14, 0) else 30.0
+
+
+def _spec_reload_due(monotonic_now: float, last_reload: float, interval: float) -> bool:
+    """An empty enabled-mode list is still a loaded configuration."""
+
+    return last_reload <= 0.0 or monotonic_now - last_reload >= interval
 
 
 class _SignalPointerWatcher:
@@ -1516,7 +1592,13 @@ def main(argv: list[str] | None = None) -> int:
     live_configs: dict[str, LiveMarketConfig] = {}
     last_reload = 0.0
     last_readiness = 0.0
+    last_liveness = 0.0
     last_quote_minute: str | None = None
+    last_causal_pending_quote_at = 0.0
+    last_stream_rotation_at = 0.0
+    last_stream_coverage_minute: str | None = None
+    last_pending_entry_shares: int | None = None
+    entry_fast_until = 0.0
     last_benchmark_minute: str | None = None
     last_ledger_mark_minute: str | None = None
     pending_retry_after: dict[str, float] = {}
@@ -1527,15 +1609,23 @@ def main(argv: list[str] | None = None) -> int:
     last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
     non_session_invalidation_attempts: set[tuple[str, str]] = set()
     ready_notified = False
+    previous_loop_work_ms = 0.0
     print(
         f"[tw-day-trade-sim] state_dir={engine.state_dir} simulation_only=true",
         flush=True,
     )
     while True:
+        loop_started = time_module.perf_counter()
+        reload_elapsed_ms = 0.0
+        session_gate_elapsed_ms = 0.0
+        readiness_elapsed_ms = 0.0
         notify_systemd("WATCHDOG=1")
         monotonic_now = time_module.monotonic()
         observed = datetime.now(TAIPEI)
-        if monotonic_now - last_reload >= 30.0 or not specs:
+        if _spec_reload_due(
+            monotonic_now, last_reload, _spec_reload_interval_seconds(observed)
+        ):
+            reload_started = time_module.perf_counter()
             specs, live_configs, errors = _mode_specs(markets_dir)
             signal_watcher.configure(
                 [spec.live_output_dir for spec in specs]
@@ -1629,18 +1719,24 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 current_eligibility_coverage=current_coverage,
             )
+            reload_elapsed_ms = (time_module.perf_counter() - reload_started) * 1000.0
             last_reload = monotonic_now
             last_readiness = monotonic_now
+            last_liveness = monotonic_now
             if not ready_notified:
                 notify_systemd(
-                    f"READY=1\nSTATUS={_executor_runtime_status(engine, specs, observed)}"
+                    f"READY=1\nSTATUS={_executor_runtime_status(engine, specs, observed, session_errors=session_errors)}"
                 )
                 ready_notified = True
+        session_gate_started = time_module.perf_counter()
         session_open, session_errors = _verified_stock_session(
             specs,
             live_configs,
             observed=observed,
         )
+        session_gate_elapsed_ms = (
+            time_module.perf_counter() - session_gate_started
+        ) * 1000.0
         if not session_open:
             for market, reason in session_errors.items():
                 invalidation_key = (observed.date().isoformat(), market)
@@ -1666,7 +1762,11 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                 non_session_invalidation_attempts.add(invalidation_key)
-            if monotonic_now - last_readiness >= 10.0:
+            readiness_interval = _readiness_refresh_interval_seconds(
+                observed, session_errors=session_errors,
+                has_enabled_modes=bool(specs),
+            )
+            if monotonic_now - last_readiness >= readiness_interval:
                 engine.update_readiness(
                     specs,
                     now=observed,
@@ -1676,11 +1776,18 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 )
                 last_readiness = monotonic_now
+                last_liveness = monotonic_now
+            elif readiness_interval > 10.0 and monotonic_now - last_liveness >= 10.0:
+                engine.publish_liveness(observed)
+                last_liveness = monotonic_now
             gate_key = (
                 observed.date().isoformat(),
                 tuple(sorted(session_errors.items())),
             )
             if gate_key != last_session_gate_log:
+                notify_systemd(
+                    f"STATUS={_executor_runtime_status(engine, specs, observed, session_errors=session_errors)}"
+                )
                 print(
                     "[tw-day-trade-sim] market_session=blocked "
                     f"date={observed.date().isoformat()} reasons={session_errors}",
@@ -1689,15 +1796,25 @@ def main(argv: list[str] | None = None) -> int:
                 last_session_gate_log = gate_key
             if args.once:
                 return 0
-            time_module.sleep(max(1.0, float(args.poll_seconds)))
+            time_module.sleep(
+                _closed_session_sleep_seconds(
+                    observed, poll_seconds=float(args.poll_seconds)
+                )
+            )
             continue
         last_session_gate_log = None
-        if monotonic_now - last_readiness >= 10.0:
+        readiness_interval = _readiness_refresh_interval_seconds(observed)
+        if monotonic_now - last_readiness >= readiness_interval:
+            readiness_started = time_module.perf_counter()
             engine.update_readiness(specs, now=observed)
             notify_systemd(
                 f"STATUS={_executor_runtime_status(engine, specs, observed)}"
             )
+            readiness_elapsed_ms = (
+                time_module.perf_counter() - readiness_started
+            ) * 1000.0
             last_readiness = monotonic_now
+            last_liveness = monotonic_now
 
         broker_wall_time = observed.timetz().replace(tzinfo=None)
         broker_protected_open = (
@@ -1709,6 +1826,8 @@ def main(argv: list[str] | None = None) -> int:
         # observation. This reuses the already-authenticated 08:55 session and
         # cannot be displaced by an interactive/full-history request. Outside
         # the window the broker retains its ordinary bounded FIFO behavior.
+        broker_started = time_module.perf_counter()
+        broker_prelude_ms = (broker_started - loop_started) * 1000.0
         broker_results = serve_shared_day_trade_quote_requests(
             state_dir=engine.state_dir,
             max_requests=1,
@@ -1724,6 +1843,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"purpose={broker_result.get('purpose')} "
                 f"available={broker_result.get('available_count', 0)}/"
                 f"{broker_result.get('requested_count', 0)} "
+                f"previous_loop_work_ms={previous_loop_work_ms:.3f} "
+                f"loop_prelude_ms={broker_prelude_ms:.3f} "
+                f"reload_ms={reload_elapsed_ms:.3f} "
+                f"session_gate_ms={session_gate_elapsed_ms:.3f} "
+                f"readiness_ms={readiness_elapsed_ms:.3f} "
                 f"error={broker_result.get('error')}",
                 flush=True,
             )
@@ -1945,19 +2069,59 @@ def main(argv: list[str] | None = None) -> int:
             pending_fallback.update(candidate_fallback)
 
         active_symbols, active_fallback = _active_symbols(engine)
+        use_execution_stream = any(
+            spec.strict_intraday
+            or spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+            for spec in specs
+        )
         wall_time = observed.timetz().replace(tzinfo=None)
-        urgent_execution = any(
-            (mode.get("configured_intraday_contract") and (
-                any(p.get("signed_shares") for p in (mode.get("positions") or {}).values())
-                or
-                any(o.get("status") == "working" for o in (mode.get("pending_entry_orders") or {}).values())
-                or any(p.get("stop_triggered_at") and p.get("signed_shares") for p in (mode.get("positions") or {}).values())
-                or datetime_time(13, 30) <= wall_time < datetime_time(13, 35)
-            )) for mode in engine.state.get("modes", {}).values()
+        strict_urgent_execution = any(
+            (
+                mode.get("configured_intraday_contract") == STRICT_INTRADAY_CONTRACT and (
+                    any(p.get("signed_shares") for p in (mode.get("positions") or {}).values())
+                    or any(o.get("status") == "working" for o in (mode.get("pending_entry_orders") or {}).values())
+                    or datetime_time(13, 30) <= wall_time < datetime_time(13, 35)
+                )
+            ) for mode in engine.state.get("modes", {}).values()
         ) and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)
+        causal_pending_entry = any(
+            str(
+                mode.get("configured_entry_fill_policy")
+                or mode.get("entry_fill_policy")
+                or ""
+            ) == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+            and any(
+                order.get("status") == "working"
+                and int(order.get("remaining_shares") or 0) > 0
+                for order in (mode.get("pending_entry_orders") or {}).values()
+            )
+            for mode in engine.state.get("modes", {}).values()
+        )
+        pending_entry_shares = sum(
+            int(order.get("remaining_shares") or 0)
+            for mode in engine.state.get("modes", {}).values()
+            for order in (mode.get("pending_entry_orders") or {}).values()
+            if order.get("status") == "working"
+        )
+        if pending_entry_shares and pending_entry_shares != last_pending_entry_shares:
+            entry_fast_until = monotonic_now + 20.0
+        last_pending_entry_shares = pending_entry_shares
+        # A fresh signal/fill briefly checks the pushed Quote feed each second.
+        # Unchanged intents back off to 30 seconds: they may be illiquid or
+        # unfunded, and must not rewrite the full paper ledger indefinitely.
+        causal_pending_interval = 1.0 if monotonic_now < entry_fast_until else 30.0
+        causal_pending_quote_due = bool(
+            causal_pending_entry
+            and datetime_time(9, 0) <= wall_time < EXIT_LIMIT_TIME
+            and monotonic_now - last_causal_pending_quote_at >= causal_pending_interval
+        )
         same_minute_force_exit_retry = (
             bool(active_symbols)
-            and (urgent_execution or FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME)
+            and (
+                strict_urgent_execution
+                or causal_pending_quote_due
+                or FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+            )
             and last_quote_minute == minute_key
         )
         # Keep observing only while a paper position remains.  In particular,
@@ -1968,7 +2132,7 @@ def main(argv: list[str] | None = None) -> int:
             active_symbols,
             observed=observed,
             last_quote_minute=last_quote_minute,
-            urgent=urgent_execution,
+            urgent=(strict_urgent_execution or causal_pending_quote_due),
         )
         benchmark_due = (
             observed.weekday() < 5
@@ -1999,6 +2163,8 @@ def main(argv: list[str] | None = None) -> int:
                 # quote request fails.  A failed observation is processed as
                 # missing evidence rather than retried every two seconds.
                 last_quote_minute = minute_key
+                if causal_pending_quote_due:
+                    last_causal_pending_quote_at = monotonic_now
             try:
                 quote_started = time_module.perf_counter()
                 quotes = _fetch_quotes(
@@ -2006,8 +2172,10 @@ def main(argv: list[str] | None = None) -> int:
                     fallback_by_symbol=fallback,
                     parquet_root=specs[0].parquet_root,
                     trading_date=observed,
-                    use_stream=any(spec.strict_intraday for spec in specs),
+                    use_stream=use_execution_stream,
                 )
+                if use_execution_stream:
+                    last_stream_rotation_at = monotonic_now
                 if benchmark_due:
                     _attach_benchmark_previous_close_context(
                         quotes,
@@ -2017,11 +2185,42 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 quotes = engine.prepare_minute_quotes(quotes, now=observed)
                 quote_fetch_ms = (time_module.perf_counter() - quote_started) * 1000.0
+                if (use_execution_stream and quote_due
+                        and last_stream_coverage_minute != minute_key):
+                    last_stream_coverage_minute = minute_key
+                    active_quotes = [quotes.get(symbol) or {} for symbol in active_symbols]
+                    print(
+                        "[tw-day-trade-sim] stock_stream_coverage "
+                        f"minute={minute_key} requested={len(active_quotes)} "
+                        f"subscribed={sum(q.get('stream_subscribed') is True for q in active_quotes)} "
+                        f"available={sum(q.get('available') is True for q in active_quotes)} "
+                        f"capacity_limited={sum(q.get('stream_capacity_limited') is True for q in active_quotes)} "
+                        f"quote_fetch_ms={quote_fetch_ms:.3f}",
+                        flush=True,
+                    )
             except Exception as exc:
                 print(
                     f"[tw-day-trade-sim] quote_error={type(exc).__name__}: {exc}",
                     flush=True,
                 )
+
+        if (use_execution_stream and active_symbols and not quote_due
+                and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)
+                and monotonic_now - last_stream_rotation_at >= 1.0):
+            # Subscription rotation is not a ledger valuation. Keep the
+            # >200-symbol universe subscribed over time without re-marking or
+            # fsyncing the 9 MB paper state every second.
+            last_stream_rotation_at = monotonic_now
+            try:
+                fetch_shioaji_stock_live_quotes(
+                    active_symbols, trading_date=observed.date()
+                )
+            except Exception as exc:
+                print(
+                    f"[tw-day-trade-sim] stock_stream_rotation_error="
+                    f"{type(exc).__name__}: {exc}", flush=True,
+                )
+                last_stream_rotation_at = monotonic_now + 4.0
 
         recovery_prices: dict[str, dict[str, Any]] = {}
         recovery_price_receipt: dict[str, Any] = {}
@@ -2223,7 +2422,9 @@ def main(argv: list[str] | None = None) -> int:
                             "bid": None,
                             "ask": None,
                             "execution_price_0901": valid_price,
-                            "minute_volume_lots": float(price_row.get("tick_volume_units_0901") or 0.0) / 1000.0,
+                            "minute_volume_lots": observed_0901_minute_volume_lots(
+                                price_row, lot_size=spec.lot_size
+                            ),
                             "execution_price_0901_method": price_row.get(
                                 "execution_price_0901_method"
                             ),
@@ -2331,13 +2532,19 @@ def main(argv: list[str] | None = None) -> int:
                 now=datetime.now(TAIPEI),
             )
 
+        if readiness_interval > 10.0 and monotonic_now - last_liveness >= 10.0:
+            engine.publish_liveness(datetime.now(TAIPEI))
+            last_liveness = monotonic_now
         if args.once:
             return 0
+        previous_loop_work_ms = (time_module.perf_counter() - loop_started) * 1000.0
         signal_watcher.wait(
             _loop_sleep_seconds(
                 datetime.now(TAIPEI),
                 fast_seconds=float(args.poll_seconds),
-                has_pending_signal=bool(pending),
+                has_pending_signal=bool(pending) or (
+                    causal_pending_entry and time_module.monotonic() < entry_fast_until
+                ),
                 has_open_position=bool(active_symbols),
             )
         )

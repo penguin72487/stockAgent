@@ -1,0 +1,23 @@
+# Fresh power-of-two compute-shape experiment after v2 OOM on GPU 0 during
+# epoch 3's first compiled physical-FIFO batch. v2 has a real epoch-2
+# checkpoint; changing the batch and feature bottleneck must not resume it.
+# Data, decision clock, execution, fees, objective and temporal bases are
+# inherited unchanged. Dataset width (428), symbol count (2755), and fold ID
+# are measured facts, not hyperparameters to pad or discard for this rule.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_fresh_v2.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-pow2-v3
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_pow2_v3
+
+environment:
+  cpu_threads: 64
+
+training:
+  # Global batch: two DDP ranks receive eight sessions each. Preserve the
+  # existing full-trajectory optimizer-step contract.
+  batch_size_train: 16
+  batch_size_eval: 8
+  epochs: 1024
+  financial_transformer:
+    feature_bottleneck_dim: 32

@@ -10,6 +10,7 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 35 --protected-until 14:31
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_historical_market_data.sh"
 Nice=10
 CPUWeight=25
@@ -18,4 +19,3 @@ Restart=on-failure
 RestartSec=120s
 TimeoutStopSec=90s
 KillMode=control-group
-

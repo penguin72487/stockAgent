@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from functools import lru_cache
 import csv
 import math
 from pathlib import Path
@@ -527,66 +528,89 @@ def _read_txo_rows(
 ]:
     by_date: dict[date, dict[tuple[str, float, str], _OptionDailyRow]] = {}
     all_txo_dates: set[date] = set()
+
+    @lru_cache(maxsize=512)
+    def trading_date(raw: str | None) -> date | None:
+        parsed = parse_taifex_trading_date(raw)
+        return date.fromisoformat(str(parsed)) if parsed is not None else None
+
     for stream, source_name, source_sha256 in iter_taifex_daily_csv_streams(
         source_path
     ):
-        reader = csv.DictReader(stream)
-        if reader.fieldnames is None:
+        reader = csv.reader(stream)
+        header = next(reader, None)
+        if header is None:
             raise ValueError(f"{source_name} has no CSV header")
-        reader.fieldnames = [
-            str(name or "").lstrip("\ufeff").strip() for name in reader.fieldnames
-        ]
-        missing = sorted(_REQUIRED_SOURCE_COLUMNS - set(reader.fieldnames))
+        fieldnames = [str(name or "").lstrip("\ufeff").strip() for name in header]
+        missing = sorted(_REQUIRED_SOURCE_COLUMNS - set(fieldnames))
         if missing:
             raise ValueError(f"{source_name} is missing TAIFEX columns: {missing}")
-        has_session = "交易時段" in reader.fieldnames
+        # DictReader allocates one mapping for every official contract row.
+        # Keep its last-duplicate-header and short-row semantics while reading
+        # only the columns this normalizer consumes.
+        positions = {name: index for index, name in enumerate(fieldnames)}
+        contract_index = positions["契約"]
+        session_index = positions.get("交易時段")
+        date_index = positions["交易日期"]
+        series_index = positions["到期月份(週別)"]
+        right_index = positions["買賣權"]
+        strike_index = positions["履約價"]
+        open_index = positions["開盤價"]
+        close_index = positions["收盤價"]
+        settlement_index = positions["結算價"]
+        volume_index = positions["成交量"]
+        bid_index = positions.get("最後最佳買價")
+        ask_index = positions.get("最後最佳賣價")
         for raw in reader:
-            if str(raw.get("契約") or "").strip().upper() != TAIFEX_TXO_PRODUCT:
+            if not raw:
                 continue
-            if has_session:
-                session = str(raw.get("交易時段") or "").strip().casefold()
+            if len(raw) < len(fieldnames):
+                raw.extend([None] * (len(fieldnames) - len(raw)))
+            if str(raw[contract_index] or "").strip().upper() != TAIFEX_TXO_PRODUCT:
+                continue
+            if session_index is not None:
+                session = str(raw[session_index] or "").strip().casefold()
                 if session not in TAIFEX_DAY_SESSION_ALIASES:
                     continue
-            parsed_date = parse_taifex_trading_date(raw.get("交易日期"))
+            parsed_date = trading_date(raw[date_index])
             if parsed_date is None:
                 continue
-            trading_date = date.fromisoformat(str(parsed_date))
-            all_txo_dates.add(trading_date)
-            series = str(raw.get("到期月份(週別)") or "").strip()
+            all_txo_dates.add(parsed_date)
+            series = str(raw[series_index] or "").strip()
             actual_scope = _series_scope(series)
             if actual_scope is None or (
                 series_scope is not None and actual_scope != series_scope
             ):
                 continue
-            right = _parse_right(raw.get("買賣權"))
+            right = _parse_right(raw[right_index])
             if right is None:
                 continue
-            strike = parse_taifex_daily_price(raw.get("履約價"))
+            strike = parse_taifex_daily_price(raw[strike_index])
             if not _finite_positive(strike):
                 continue
             row = _OptionDailyRow(
-                trading_date=trading_date,
+                trading_date=parsed_date,
                 series=series,
                 strike=strike,
                 right=right,
-                open=parse_taifex_daily_price(raw.get("開盤價")),
-                close=parse_taifex_daily_price(raw.get("收盤價")),
-                settlement=parse_taifex_daily_price(raw.get("結算價")),
-                volume=parse_taifex_daily_volume(raw.get("成交量")),
-                last_bid=parse_taifex_daily_price(raw.get("最後最佳買價")),
-                last_ask=parse_taifex_daily_price(raw.get("最後最佳賣價")),
+                open=parse_taifex_daily_price(raw[open_index]),
+                close=parse_taifex_daily_price(raw[close_index]),
+                settlement=parse_taifex_daily_price(raw[settlement_index]),
+                volume=parse_taifex_daily_volume(raw[volume_index]),
+                last_bid=parse_taifex_daily_price(raw[bid_index] if bid_index is not None else None),
+                last_ask=parse_taifex_daily_price(raw[ask_index] if ask_index is not None else None),
                 source_file=source_name,
                 source_sha256=source_sha256,
             )
             key = (series, strike, right)
-            previous = by_date.setdefault(trading_date, {}).get(key)
+            previous = by_date.setdefault(parsed_date, {}).get(key)
             if previous is not None and not _same_option_row(previous, row):
                 raise ValueError(
                     "conflicting TAIFEX option rows for "
-                    f"{trading_date}/{series}/{strike}/{right}: "
+                    f"{parsed_date}/{series}/{strike}/{right}: "
                     f"{previous.source_file} vs {source_name}"
                 )
-            by_date[trading_date][key] = row
+            by_date[parsed_date][key] = row
     return by_date, all_txo_dates
 
 
@@ -791,12 +815,43 @@ def _same_selected_row(left: Mapping[str, object], right: Mapping[str, object]) 
     return True
 
 
+@dataclass
+class AtmSourceProjection:
+    """One receipt's ATM candidates before cross-receipt missing-day fill."""
+
+    selected: dict[date, dict[str, object]]
+    all_txo_dates: set[date]
+
+
+def project_taifex_atm_source(
+    source_path: Path,
+    *,
+    series_scope: TaifexOptionSeriesScope,
+    tx_by_date: Mapping[date, tuple[str, float]],
+) -> AtmSourceProjection:
+    rows_by_date, all_txo_dates = _read_txo_rows(
+        source_path, series_scope=series_scope
+    )
+    selected: dict[date, dict[str, object]] = {}
+    for trading_date, rows in rows_by_date.items():
+        tx_payload = tx_by_date.get(trading_date)
+        selected[trading_date] = _select_atm_pair(
+            trading_date,
+            rows,
+            series_scope=series_scope,
+            tx_contract_month=tx_payload[0] if tx_payload else None,
+            tx_open=tx_payload[1] if tx_payload else None,
+        )
+    return AtmSourceProjection(selected, all_txo_dates)
+
+
 def build_taifex_opening_atm_straddles(
     option_source_paths: Iterable[str | Path],
     futures_path: str | Path,
     output_path: str | Path,
     *,
     series_scope: TaifexOptionSeriesScope,
+    source_projections: Mapping[Path, AtmSourceProjection] | None = None,
 ) -> Path:
     """Build one official daily opening-ATM TXO candidate per session."""
 
@@ -822,21 +877,18 @@ def build_taifex_opening_atm_straddles(
         source_path = Path(raw_path).expanduser().resolve()
         if not source_path.is_file():
             raise FileNotFoundError(f"TAIFEX option source does not exist: {source_path}")
-        source_rows, source_txo_dates = _read_txo_rows(
-            source_path,
-            series_scope=series_scope,
-        )
-        all_txo_dates.update(source_txo_dates)
-        for trading_date, rows in source_rows.items():
-            option_dates.add(trading_date)
-            tx_payload = tx_by_date.get(trading_date)
-            current = _select_atm_pair(
-                trading_date,
-                rows,
-                series_scope=series_scope,
-                tx_contract_month=tx_payload[0] if tx_payload else None,
-                tx_open=tx_payload[1] if tx_payload else None,
+        projection = (
+            project_taifex_atm_source(
+                source_path, series_scope=series_scope, tx_by_date=tx_by_date
             )
+            if source_projections is None
+            else source_projections[source_path]
+        )
+        all_txo_dates.update(projection.all_txo_dates)
+        for trading_date, current in projection.selected.items():
+            if current.get("date") != trading_date:
+                raise ValueError(f"ATM projection date mismatch: {source_path}")
+            option_dates.add(trading_date)
             previous = selected.get(trading_date)
             if previous is not None and not _same_selected_row(previous, current):
                 raise ValueError(
@@ -952,8 +1004,16 @@ def build_taifex_option_full_chain(
     output_path: str | Path,
     *,
     series_scope: TaifexOptionSeriesScope,
+    source_dates: set[date] | None = None,
+    allow_empty: bool = False,
 ) -> Path:
-    """Normalize every listed unexpired TXO leg to the fixed direct axis."""
+    """Normalize every listed unexpired TXO leg to the fixed direct axis.
+
+    ``source_dates`` also records parsed dates without an executable TX open,
+    so a per-receipt projection can detect later historical futures repairs.
+    ``allow_empty`` is only for a valid individual receipt with no rows in the
+    requested scope; the merged full-chain output must still be non-empty.
+    """
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -1017,6 +1077,8 @@ def build_taifex_option_full_chain(
                 source_path,
                 series_scope=scope,
             )
+            if source_dates is not None:
+                source_dates.update(rows_by_date)
             normalized_rows: list[dict[str, object]] = []
             for trading_date in sorted(rows_by_date):
                 if trading_date in seen_dates:
@@ -1029,10 +1091,16 @@ def build_taifex_option_full_chain(
                     continue
                 source_rows = rows_by_date[trading_date]
                 candidates = {series for series, _strike, _right in source_rows}
+                # Expiry is a property of the contract series, not of each
+                # strike/right row. A full chain has thousands of legs per
+                # session but only a handful of distinct series.
+                expiries = {
+                    series: taifex_option_expiry(series) for series in candidates
+                }
                 candidates = {
                     series
                     for series in candidates
-                    if taifex_option_expiry(series) >= trading_date
+                    if expiries[series] >= trading_date
                 }
                 ordered_series = sorted(
                     candidates,
@@ -1085,7 +1153,7 @@ def build_taifex_option_full_chain(
                                 "moneyness_rank": moneyness_rank,
                                 "option_slot": slot,
                                 "option_series": series,
-                                "expiry": taifex_option_expiry(series),
+                                "expiry": expiries[series],
                                 "strike": strike,
                                 "option_right": right,
                                 "tx_open": tx_open,
@@ -1143,7 +1211,7 @@ def build_taifex_option_full_chain(
                 total_rows += len(normalized_rows)
     finally:
         writer.close()
-    if total_rows == 0:
+    if total_rows == 0 and not allow_empty:
         temporary.unlink(missing_ok=True)
         raise ValueError(f"no normalized TXO {scope} full-chain rows were found")
     temporary.replace(target)

@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pytest
 import numpy as np
+import polars as pl
 from types import SimpleNamespace
 
 from scripts.audit_tw_day_trade_margin_replay import (
-    audit, _entry_source_path, _verify_calendar_coverage, _claim_matches_source, _verified_action_sources,
+    audit, _entry_source_path, _retained_entry_book_source_days,
+    _verify_calendar_coverage, _claim_matches_source, _verified_action_sources,
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
 
@@ -74,6 +76,175 @@ def test_fill_inventory_and_all_minute_nav_reconcile(tmp_path):
     assert any("exit exceeds inventory" in e for e in result["errors"])
 
 
+def test_audit_disclosed_paper_entry_completion_is_inventory_not_exit(tmp_path):
+    from scripts.complete_tw_day_trade_paper_entry import CONTRACT
+
+    start = datetime.fromisoformat("2026-08-13T09:01:00+08:00")
+    common = dict(market="a", position_id="p", symbol="2330", session_date="2026-08-13")
+    disclosure = dict(contract=CONTRACT, full_quantity_is_user_assumption=True,
+                      same_price_as_original_entry=True, broker_fill=False)
+    fills = [
+        dict(**common, order_id="entry", purpose="entry", side="buy", quantity=1000,
+             recorded_at=start.isoformat(), price=10.),
+        dict(**common, order_id="completion", purpose="entry_completion", side="buy",
+             quantity=1000, recorded_at=start.isoformat(), price=10.,
+             fill_contract=CONTRACT, counterfactual_paper_completion=disclosure,
+             broker_fill=False),
+        dict(**common, order_id="exit", purpose="take_profit", side="sell", quantity=2000,
+             recorded_at=(start + timedelta(minutes=1)).isoformat(), price=10.1,
+             gross_pnl_twd=200., net_pnl_twd=196., entry_fee_allocated_twd=2.,
+             fee_and_tax_twd=2.),
+    ]
+    rows = [
+        dict(session_date="2026-08-13", market="a",
+             minute=(start + timedelta(minutes=i)).isoformat(timespec="minutes"),
+             margin_carry_contract=MARGIN_CARRY_CONTRACT, initial_capital_twd=10000.,
+             cumulative_realized_net_pnl_twd=196. if i else 0.,
+             open_net_liquidation_pnl_twd=0., total_equity_twd=10196. if i else 10000.,
+             open_position_count=0 if i else 1, historical_minute_replay=True,
+             minute_valuation_contract="right_labelled_historical_last_trade_mark_v1",
+             valuation_source="fixture_kbar", valuation_executable=False,
+             fresh_trade_notional_coverage_ratio=1.,
+             fresh_trade_position_count=0 if i else 1,
+             last_trade_carried_position_count=0, missing_price_position_count=0)
+        for i in range(270)
+    ]
+    state = {"modes": {"a": {"margin_carry_contract": MARGIN_CARRY_CONTRACT,
+                            "session_date": "2026-08-13", "total_equity_twd": 10196.,
+                            "positions": {"p": {"position_id": "p", "signed_shares": 0}}}}}
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "rebuild_receipt.json").write_text(
+        json.dumps({"sessions": [{"session_date": "2026-08-13"}]}), encoding="utf-8"
+    )
+    (tmp_path / "orders.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in fills), encoding="utf-8"
+    )
+    (tmp_path / "fills.jsonl").write_text(
+        "".join(json.dumps({k: v for k, v in row.items() if k != "side"}) + "\n" for row in fills),
+        encoding="utf-8",
+    )
+    (tmp_path / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    assert audit(tmp_path, verify_sources=False)["passed"]
+
+    fills[1]["counterfactual_paper_completion"]["broker_fill"] = True
+    (tmp_path / "fills.jsonl").write_text(
+        "".join(json.dumps({k: v for k, v in row.items() if k != "side"}) + "\n" for row in fills),
+        encoding="utf-8",
+    )
+    result = audit(tmp_path, verify_sources=False)
+    assert not result["passed"]
+    assert any("unverified paper entry completion" in error for error in result["errors"])
+
+
+def test_audit_minute_sweep_completion_updates_weighted_entry_basis(tmp_path):
+    from stockagent.live.tw_day_trade_simulation import (
+        ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+        REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+    )
+
+    start = datetime.fromisoformat("2026-08-13T09:01:00+08:00")
+    common = dict(
+        market="a",
+        position_id="p",
+        symbol="2330",
+        session_date="2026-08-13",
+    )
+    fills = [
+        dict(
+            **common,
+            order_id="entry",
+            purpose="entry",
+            side="buy",
+            quantity=1000,
+            recorded_at=start.isoformat(),
+            fill_at=start.isoformat(),
+            price=10.0,
+        ),
+        dict(
+            **common,
+            order_id="completion",
+            purpose="entry_completion",
+            side="buy",
+            quantity=1000,
+            recorded_at=(start + timedelta(minutes=1)).isoformat(),
+            fill_at=(start + timedelta(minutes=1)).isoformat(),
+            price=12.0,
+            fill_contract=REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+            entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+            counterfactual_minute_sweep_fill=True,
+            simulation_replay=True,
+            observed_minute_volume_lots=2.0,
+        ),
+        dict(
+            **common,
+            order_id="exit",
+            purpose="take_profit",
+            side="sell",
+            quantity=2000,
+            recorded_at=(start + timedelta(minutes=2)).isoformat(),
+            price=13.0,
+            gross_pnl_twd=4000.0,
+            net_pnl_twd=3996.0,
+            entry_fee_allocated_twd=2.0,
+            fee_and_tax_twd=2.0,
+        ),
+    ]
+    rows = [
+        dict(
+            session_date="2026-08-13",
+            market="a",
+            minute=(start + timedelta(minutes=i)).isoformat(timespec="minutes"),
+            margin_carry_contract=MARGIN_CARRY_CONTRACT,
+            initial_capital_twd=10000.0,
+            cumulative_realized_net_pnl_twd=3996.0 if i >= 2 else 0.0,
+            open_net_liquidation_pnl_twd=0.0,
+            total_equity_twd=13996.0 if i >= 2 else 10000.0,
+            open_position_count=0 if i >= 2 else 1,
+            historical_minute_replay=True,
+            minute_valuation_contract="right_labelled_historical_last_trade_mark_v1",
+            valuation_source="fixture_kbar",
+            valuation_executable=False,
+            fresh_trade_notional_coverage_ratio=1.0,
+            fresh_trade_position_count=0 if i >= 2 else 1,
+            last_trade_carried_position_count=0,
+            missing_price_position_count=0,
+        )
+        for i in range(270)
+    ]
+    state = {
+        "modes": {
+            "a": {
+                "margin_carry_contract": MARGIN_CARRY_CONTRACT,
+                "session_date": "2026-08-13",
+                "total_equity_twd": 13996.0,
+                "positions": {"p": {"position_id": "p", "signed_shares": 0}},
+            }
+        }
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "rebuild_receipt.json").write_text(
+        json.dumps({"sessions": [{"session_date": "2026-08-13"}]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "orders.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in fills), encoding="utf-8"
+    )
+    (tmp_path / "fills.jsonl").write_text(
+        "".join(
+            json.dumps({k: v for k, v in row.items() if k != "side"}) + "\n"
+            for row in fills
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    assert audit(tmp_path, verify_sources=False)["passed"]
+
+
 @pytest.mark.parametrize("method", ["minute_vwap", "minute_close"])
 def test_entry_source_tag_is_not_part_of_file_path(method):
     path = "/source/minute_chunks/2330/2026-08-01_2026-08-31.parquet"
@@ -85,6 +256,86 @@ def test_entry_source_tag_is_not_part_of_file_path(method):
 def test_unknown_or_relative_entry_sources_are_rejected(source):
     with pytest.raises(ValueError, match="identity"):
         _entry_source_path(source)
+
+
+def test_hash_pinned_entry_book_retains_0901_only_fill_source(tmp_path):
+    from scripts.audit_tw_day_trade_margin_replay import _sha256
+
+    book_dir = tmp_path / "replay_entry_books"
+    book_dir.mkdir()
+    source = tmp_path / "minute_chunks" / "2330" / "2026-08-01_2026-08-31.parquet"
+    daily_source = (
+        tmp_path / "research_dataset" / "trade_date=2026-08-13" / "data.parquet"
+    )
+    source.parent.mkdir(parents=True)
+    book = book_dir / "2026-08-13.parquet"
+    pl.DataFrame({
+        "symbol": ["2330", "0050"],
+        "quote_at": ["2026-08-13T09:01:00+08:00", "2026-08-13T09:01:00+08:00"],
+        "source": [
+            f"local_minute_parquet_0901_minute_vwap:{source}",
+            f"local_minute_parquet_0901_minute_close:{daily_source}",
+        ],
+    }).write_parquet(book)
+    session = {
+        "session_date": "2026-08-13",
+        "historical_entry_books": {"path": str(book), "sha256": _sha256(book)},
+    }
+    signatures = {}
+    assert _retained_entry_book_source_days(
+        tmp_path, session, {"2330", "0050"}, signatures
+    ) == {
+        str(source): {date(2026, 8, 13)},
+        str(daily_source): {date(2026, 8, 13)},
+    }
+    assert str(book) in signatures
+
+    session["historical_entry_books"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="hash mismatch"):
+        _retained_entry_book_source_days(tmp_path, session, {"2330"}, {})
+
+
+def test_hash_pinned_entry_book_accepts_canonical_shioaji_0901_evidence(tmp_path):
+    from scripts.audit_tw_day_trade_margin_replay import _sha256
+
+    day = "2026-08-13"
+    book_dir = tmp_path / "replay_entry_books"
+    book_dir.mkdir()
+    book = book_dir / f"{day}.parquet"
+    pl.DataFrame(
+        {
+            "symbol": ["2330"],
+            "quote_at": [f"{day}T09:01:00+08:00"],
+            "source": [
+                "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
+            ],
+            "execution_price_0901": [100.25],
+            "tick_volume_units_0901": [12.0],
+            "source_window_start": [f"{day}T09:00:01+08:00"],
+            "source_window_end": [f"{day}T09:00:59+08:00"],
+        }
+    ).write_parquet(book)
+    session = {
+        "session_date": day,
+        "historical_entry_books": {
+            "path": str(book),
+            "sha256": _sha256(book),
+        },
+    }
+    retained = []
+
+    assert _retained_entry_book_source_days(
+        tmp_path, session, {"2330"}, {}, retained
+    ) == {}
+    assert retained == [
+        {
+            "symbol": "2330",
+            "minute_key": f"{day}T09:01",
+            "high": 100.25,
+            "low": 100.25,
+            "volume_shares": 12_000.0,
+        }
+    ]
 
 
 def test_whole_missing_sessions_cannot_be_a_full_range_pass(monkeypatch):
@@ -99,8 +350,11 @@ def test_whole_missing_sessions_cannot_be_a_full_range_pass(monkeypatch):
         with pytest.raises(ValueError, match="omitted"):
             _verify_calendar_coverage(proof, observed, prefix=prefix)
     proof["official_session_calendar"]["sha256"] = "different"
-    with pytest.raises(ValueError, match="identity"):
-        _verify_calendar_coverage(proof, dates, prefix=False)
+    appended = _verify_calendar_coverage(proof, dates, prefix=False)
+    assert appended["source_file_unchanged"] is False
+    assert appended["identity_contract"] == (
+        "receipt_validated_exact_requested_session_set_after_append"
+    )
 
 
 def test_auditor_reconciles_share_conversion_then_odd_lot_exit(tmp_path):

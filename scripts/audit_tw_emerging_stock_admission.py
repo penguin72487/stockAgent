@@ -20,13 +20,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from downloader.artifact_io import atomic_write_json, sha256_file
-from stockagent.data.tw_exchange_price_classification import (
+from stockagent.data.tw_listing_admission import (
     VERIFIED_EMERGING_TO_TPEX_LISTINGS,
+    regular_market_admission_contract,
+    regular_market_admission_mask,
 )
 
 
-def audit(root: Path) -> dict:
-    dataset = root / "data_tw_minute/research_dataset"
+def audit(root: Path, dataset: Path | None = None) -> dict:
+    dataset = dataset or (root / "data_tw_minute/research_dataset")
     manifest_path = dataset / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     rows: dict[str, dict] = defaultdict(lambda: {
@@ -71,9 +73,17 @@ def audit(root: Path) -> dict:
                 for ts in overlapping["ts"].to_list()
             )
     admitted = sum(item["feature_and_label_valid"] for item in rows.values())
+    effective_admitted = sum(
+        bool(regular_market_admission_mask([symbol], example["date"])[0])
+        for symbol, item in rows.items()
+        for example in item["examples"]
+    )
     return {
-        "status": "needs_training_eligibility_fix" if admitted else "no_overlap_detected",
+        "status": "training_admission_excludes_source_rows" if admitted and not effective_admitted else (
+            "needs_training_eligibility_fix" if effective_admitted else "no_overlap_detected"
+        ),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "dataset_root": str(dataset.resolve()),
         "manifest_sha256": sha256_file(manifest_path),
         "source_partitions_hashed": checked,
         "official_listing_dates": {
@@ -82,20 +92,28 @@ def audit(root: Path) -> dict:
         },
         "by_symbol": dict(rows),
         "emerging_feature_and_label_valid": admitted,
-        "meaning": "This is an admission audit, not a price-grid failure. Source bytes stay unchanged; training eligibility and normalizer need separately versioned remediation.",
+        "effective_emerging_feature_and_label_valid": effective_admitted,
+        "training_admission_contract": regular_market_admission_contract(),
+        "meaning": "Source masks retain the historical observations. Training admission excludes pre-listing rows from model features, labels and fitted normalization moments; raw bytes remain unchanged.",
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--dataset", type=Path, help="minute research dataset root (schema 4 or 5)")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/data_quality/tw_price_precision/emerging_admission.json")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
-    result = audit(args.root)
+    result = audit(args.root, args.dataset)
     atomic_write_json(args.output, result)
-    print(json.dumps({"status": result["status"], "rows": result["emerging_feature_and_label_valid"], "output": str(args.output)}))
-    return 2 if args.strict and result["emerging_feature_and_label_valid"] else 0
+    print(json.dumps({
+        "status": result["status"],
+        "source_rows": result["emerging_feature_and_label_valid"],
+        "effective_rows": result["effective_emerging_feature_and_label_valid"],
+        "output": str(args.output),
+    }))
+    return 2 if args.strict and result["effective_emerging_feature_and_label_valid"] else 0
 
 
 if __name__ == "__main__":

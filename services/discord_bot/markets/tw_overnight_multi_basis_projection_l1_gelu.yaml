@@ -1,6 +1,6 @@
 market: tw_overnight_multi_basis_projection_l1_gelu
 label: 台股・Multi-Basis Projection-L1 LayerNorm v12 隔日沖（初始 1,000 萬）
-enabled: true
+enabled: false
 market_type: tw
 timezone: Asia/Taipei
 # These are source-availability hours for the signal engine.  The separate

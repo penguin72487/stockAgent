@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "catalog_checked_on": "2026-09-23",
+  "free_plan_faq_claimed_end": "2021-12-31",
+  "free_plan_observed_common_end": "2018-12-31",
+  "notes": "The FAQ's 2021 cutoff conflicts with this Free account's September 2026 responses and FinLab's SDK changelog describing an end-of-2018 free cache. These dates are not universal per-key entitlements. Advertised starts are catalog claims, not verified coverage or point-in-time publication dates.",
+  "datasets": [
+    {"key": "price:收盤價", "group": "daily_price", "advertised_start": null, "gap": "官方本機日價已有2003/2004年起；用於交叉驗證，不覆蓋官方價", "url": "https://finlab.finance/docs/reference/data/"},
+    {"key": "monthly_revenue:當月營收", "group": "monthly_revenue", "advertised_start": "2005-02-10", "gap": "本機TWSE/TPEx月營收主表目前僅見2026-06起的資料期間", "url": "https://finlab.finance/data/monthly-revenue/current-month-revenue"},
+    {"key": "financial_statement:每股盈餘", "group": "financial_statement", "advertised_start": "2013-05-15", "gap": "核對2014起財報數值和實際公告時間", "url": "https://finlab.finance/data/financial-statements/eps"},
+    {"key": "trading_attention", "group": "attention", "advertised_start": "2001-01-02", "gap": "本機上市/上櫃注意股現為2026近期快照", "url": "https://finlab.finance/data/trading-attention-stocks"},
+    {"key": "disposal_information", "group": "disposal", "advertised_start": "2001-01-02", "gap": "本機上市/上櫃處置股現為2026近期快照", "url": "https://finlab.finance/data/trading-attention-stocks"},
+    {"key": "important_info_announcement", "group": "material_information", "advertised_start": "2006-01-01", "gap": "本機上市重大訊息現為2026近期快照", "url": "https://finlab.finance/data/important-announcements"},
+    {"key": "security_lending:借券餘額", "group": "securities_lending", "advertised_start": "2007-01-02", "gap": "本機上櫃借券部分現為2026近期快照", "url": "https://finlab.finance/data/securities-lending"},
+    {"key": "tw_taifex_futures_large_trader", "group": "futures_position", "advertised_start": "2004-07-01", "gap": "本機同類原始快照需驗證歷史實際覆蓋", "url": "https://finlab.finance/data/tw-taifex-futures-large-trader"},
+    {"key": "futures_institutional_investors_trading_summary:多空未平倉口數淨額", "group": "futures_position", "advertised_start": "2007-07-02", "gap": "本機法人未平倉總量目前主要為2026近期快照", "url": "https://finlab.finance/data/futures-institutional-flow"},
+    {"key": "tw_business_indicators:景氣對策信號(分)", "group": "macro", "advertised_start": "1960-02-27", "gap": "和官方總經發布期與數值版本比對", "url": "https://finlab.finance/data/macro-indicators"},
+    {"key": "tw_total_pmi:製造業PMI", "group": "macro", "advertised_start": "2012-07-01", "gap": "核對2014起的完整總經月序列", "url": "https://finlab.finance/data/macro-indicators"},
+    {"key": "taiex_total_index:收盤指數", "group": "index_price", "advertised_start": "1999-01-05", "gap": "與本機指數歷史交叉驗證", "url": "https://finlab.finance/data/macro-indicators"},
+    {"key": "cb_price:收盤價", "group": "convertible_bonds", "advertised_start": "2007-01-02", "gap": "可轉債歷史補充", "url": "https://finlab.finance/data/convertible-bonds"},
+    {"key": "foreign_investors_shareholding:全體外資及陸資持股比率", "group": "ownership", "advertised_start": "2007-04-23", "gap": "逐股外資持股歷史補充", "url": "https://finlab.finance/data/foreign-ownership"},
+    {"key": "investors_conference", "group": "corporate_event", "advertised_start": "2007-01-09", "gap": "法說會日程歷史補充", "url": "https://finlab.finance/data/investors-conference-schedule"},
+    {"key": "tw_etf_beneficiary_stats", "group": "etf", "advertised_start": "2007-01-31", "gap": "ETF受益人數歷史補充", "url": "https://finlab.finance/data/tw-etf-beneficiary-stats"},
+    {"key": "etl:inventory:大於四百張佔比", "group": "shareholding_distribution", "advertised_start": "2016-11-04", "gap": "本機集保分散目前只有2026近期快照；不能補2014-2016", "url": "https://finlab.finance/data/shareholding-distribution"},
+    {"key": "block_trade:成交金額", "group": "block_trade", "advertised_start": "2015-01-05", "gap": "鉅額交易不能補2014", "url": "https://finlab.finance/data/block-trade"},
+    {"key": "tw_etf_nav_daily:折溢價(%)", "group": "etf", "advertised_start": "2023-03-04", "gap": "本 Free 帳號實測 VIP 限定；目錄起始日不是免費授權證明", "url": "https://finlab.finance/data/etf-nav-discount-premium"}
+  ]
+}

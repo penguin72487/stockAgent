@@ -28,6 +28,16 @@ class SourceRefreshBusy(RuntimeError):
     """Another canonical refresh or publication owns the mutable source."""
 
 
+class StaleDerivedReceipts(RuntimeError):
+    """The cold source cannot be released until upstream derivatives are fresh."""
+
+    def __init__(self, codes: list[str]) -> None:
+        self.codes = sorted(set(codes))
+        super().__init__(
+            "TW public derived receipts are stale: " + ", ".join(self.codes)
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -36,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/data_refresh/tw_public/cold_publish/latest.json"),
     )
     parser.add_argument("--timeout-seconds", type=float, default=7200.0)
+    parser.add_argument(
+        "--defer-stale-derived-receipts",
+        action="store_true",
+        help="Record a deferred cold publish after a separate source-only job succeeded",
+    )
     return parser.parse_args()
 
 
@@ -120,9 +135,7 @@ def _check_training_receipts(live_root: Path) -> None:
         if finding.severity in {"critical", "high"}
     ]
     if blocking:
-        raise RuntimeError(
-            "TW public derived receipts are stale: " + ", ".join(sorted(set(blocking)))
-        )
+        raise StaleDerivedReceipts(blocking)
 
 
 def _publish_while_source_stable(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -249,6 +262,33 @@ def main() -> int:
         _persist_receipt(receipt, started=started, payload=payload)
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0
+    except StaleDerivedReceipts as exc:
+        if not args.defer_stale_derived_receipts:
+            return_code = 75
+            release = None
+            error = str(exc)
+        else:
+            completed_at = datetime.now(TAIPEI)
+            payload = {
+                "schema_version": 1,
+                "status": "deferred",
+                "reason": "stale_derived_receipts",
+                "blocking_findings": exc.codes,
+                "started_at_taipei": started.isoformat(),
+                "completed_at_taipei": completed_at.isoformat(),
+                "elapsed_seconds": (completed_at - started).total_seconds(),
+                "dataset": "tw-public",
+                "source_authority": "catalog_mutable_live_root",
+                "opening_dependency": False,
+                "runtime_link_changed": False,
+                "materialization_performed": False,
+                "return_code": 0,
+                "release": None,
+                "error": None,
+            }
+            _persist_receipt(receipt, started=started, payload=payload)
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
     except (OSError, ValueError, RuntimeError) as exc:
         return_code = 75
         release = None

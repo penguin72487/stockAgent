@@ -192,9 +192,11 @@ def classify_delisting_notice(text: str) -> DelistingNoticeRules:
 
 def extract_stock_symbols(text: str) -> list[str]:
     normalized = str(text or "").upper()
+    fund_notice = _FUND_SECURITY_CUE_RE.search(normalized) is not None
     values: set[str] = set()
     for match in _SYMBOL_LABEL_RE.finditer(normalized):
         label = "".join(match.group("label").split())
+        symbol = match.group("symbol")
         context_start = max(0, match.start() - 60)
         context = normalized[context_start : match.start()]
         context = re.split(r"[；;。\n]", context)[-1]
@@ -203,12 +205,22 @@ def extract_stock_symbols(text: str) -> list[str]:
         explicitly_equity_labeled = any(
             token in label for token in ("股票", "普通股", "公司")
         )
-        if non_equity and not explicitly_equity_labeled:
+        # A bond ETF's legal fund name necessarily contains words such as
+        # ``公司債券``.  That describes the fund's underlying assets, not a
+        # corporate-bond security code.  Once the same official notice also
+        # identifies an ETF/fund beneficiary certificate, a code that matches
+        # the canonical ETF namespace remains an ETF.  Without this exception
+        # notices such as 00883B were filtered before their detail page could
+        # supply the causal delisting and mandatory-cover dates.
+        explicitly_fund_labeled = bool(
+            fund_notice and classify_tw_stock_or_etf(symbol) == "etf"
+        )
+        if non_equity and not explicitly_equity_labeled and not explicitly_fund_labeled:
             last_non_equity = non_equity[-1].start()
             last_equity = equity[-1].start() if equity else -1
             if last_non_equity >= last_equity:
                 continue
-        values.add(match.group("symbol"))
+        values.add(symbol)
     # Some early TPEx archive notices spell a stock code digit-by-digit with
     # Chinese numerals (for example 「股票代號：三一三三」).  Limit conversion to
     # an explicit symbol label so dates, share counts, and legal citations can

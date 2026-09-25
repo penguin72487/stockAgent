@@ -12,6 +12,8 @@ import pytest
 
 from downloader.download_shioaji_tw_kbars import UniverseRow
 from downloader.download_shioaji_tw_minute_kbars import (
+    DEFAULT_REQUESTS_PER_SECOND,
+    SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS,
     SharedRequestRateLimiter,
     SymbolResult,
     _write_run_summary,
@@ -20,6 +22,8 @@ from downloader.download_shioaji_tw_minute_kbars import (
     contract_for_stock_symbol,
     minute_chunk_paths,
     minute_receipt_valid,
+    merge_retried_source_gap_chunk,
+    unresolved_source_gap_dates_after_retry,
     provisional_publication_tail_dates,
     query_minute_chunk,
     restore_extended_tail_from_archived_manifest,
@@ -31,6 +35,7 @@ from scripts.audit_shioaji_tw_minute_dataset import audit_frame
 from scripts.build_shioaji_tw_minute_dataset import (
     MODEL_FEATURE_COLUMNS,
     _available_collection_symbols,
+    _reject_subset_overwrite,
     _feature_statistics,
     _quarantine_stale_partitions,
     _split_official_session_rows,
@@ -85,6 +90,7 @@ def test_research_builder_quarantines_stale_output_without_deleting(tmp_path: Pa
     assert (destination / "data.parquet").read_bytes() == b"recoverable"
 from stockagent.research.tw_minute_kbars import (
     MinuteKbarBacktestConfig,
+    add_minute_strategy_scores,
     chronological_date_splits,
     run_minute_rebalance_backtest,
     run_minute_round_trip_backtest,
@@ -92,6 +98,21 @@ from stockagent.research.tw_minute_kbars import (
 
 
 TRADE_DATE = date(2026, 7, 24)
+
+
+def test_retry_keeps_old_broker_gap_when_current_public_daily_row_disappears() -> None:
+    old_gap = date(2020, 10, 28)
+    current_expected = date(2020, 10, 29)
+    assert unresolved_source_gap_dates_after_retry(
+        current_expected_dates={current_expected},
+        retained_gap_dates={old_gap},
+        returned_dates={current_expected},
+    ) == ["2020-10-28"]
+    assert unresolved_source_gap_dates_after_retry(
+        current_expected_dates={current_expected},
+        retained_gap_dates={old_gap},
+        returned_dates={old_gap, current_expected},
+    ) == []
 
 
 def _acquire_rate_limit_slots(
@@ -123,6 +144,7 @@ def _raw_minute_frame(
             "ts": timestamps,
             "date": [TRADE_DATE] * len(timestamps),
             "symbol": ["2330"] * len(timestamps),
+            "market": ["twse"] * len(timestamps),
             "Open": opens,
             "High": highs,
             "Low": lows,
@@ -141,6 +163,16 @@ def _raw_minute_frame(
 
 def _research_frame(**kwargs: float) -> pl.DataFrame:
     return build_research_frame(_raw_minute_frame(**kwargs).lazy()).collect()
+
+
+def test_minute_research_scores_exclude_verified_prelisting_market() -> None:
+    source = _research_frame().with_columns(
+        pl.lit("6716").alias("symbol"),
+        pl.lit(date(2020, 3, 13)).alias("date"),
+    )
+    assert add_minute_strategy_scores(source).is_empty()
+    listed = source.with_columns(pl.lit(date(2020, 3, 27)).alias("date"))
+    assert add_minute_strategy_scores(listed).height == listed.height
 
 
 def test_feature_statistics_square_integer_features_in_float64() -> None:
@@ -356,6 +388,39 @@ def test_market_hours_preflight_stop_persists_zero_request_receipt(
     assert progress["stop_reason"] == "live-priority window"
 
 
+def test_scheduled_yield_preserves_terminal_catalog_and_records_deadline(
+    tmp_path: Path,
+) -> None:
+    canonical_summary = tmp_path / "download_summary.json"
+    canonical_summary.write_text('{"end_date":"2026-09-21"}\n', encoding="utf-8")
+    row = UniverseRow(
+        symbol="2330", name="台積電", market="twse", security_type="stock",
+        base_path=tmp_path / "2330.parquet",
+    )
+    from downloader.download_shioaji_tw_minute_kbars import _write_preflight_stop
+
+    summary_path = _write_preflight_stop(
+        tmp_path,
+        args=SimpleNamespace(
+            start_date="2020-03-02", end_date="2026-09-22", chunk_days=29,
+            simulation=True, workers=3, requests_per_second=5.0,
+            stop_at="2026-09-22T14:45:00+08:00",
+        ),
+        selected=[row],
+        message="scheduled deadline reached",
+        state="stopped_for_schedule",
+    )
+    summary = json.loads(summary_path.read_text())
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert summary_path.name == "latest_run_summary.json"
+    assert summary["stopped_for_schedule"] is True
+    assert summary["scheduled_stop_at"] == "2026-09-22T14:45:00+08:00"
+    assert summary["published_terminal_catalog"] is False
+    assert summary["api_requests_started_this_run"] == 0
+    assert progress["state"] == "stopped_for_schedule"
+    assert json.loads(canonical_summary.read_text())["end_date"] == "2026-09-21"
+
+
 def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
     tmp_path: Path,
 ) -> None:
@@ -413,10 +478,62 @@ def test_research_build_uses_terminal_report_instead_of_stale_manifests(
     assert _available_collection_symbols(summary_path, payload) == {"0050", "2330"}
 
 
+def test_subset_build_cannot_overwrite_existing_full_market_partition(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "trade_date=2026-02-25"
+    partition.mkdir()
+    (partition / "data.parquet").write_bytes(b"existing")
+    with pytest.raises(RuntimeError, match="fresh isolated"):
+        _reject_subset_overwrite(tmp_path, {"0056"})
+    _reject_subset_overwrite(tmp_path, set())
+
+
+def test_official_market_data_ceiling_is_fifty_per_ten_seconds() -> None:
+    assert SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS == 10.0
+    assert DEFAULT_REQUESTS_PER_SECOND == 5.0
+
+
+def test_minute_kbar_validator_rejects_broken_price_and_notional() -> None:
+    frame = pl.DataFrame({
+        "symbol": ["0056"], "date": [date(2026, 2, 25)],
+        "ts": [datetime(2026, 2, 25, 9, 1)],
+        "Open": [10.0], "High": [9.0], "Low": [9.0], "Close": [10.0],
+        "Volume": [1.0], "Amount": [0.0], "contract_unit": [1000.0],
+    })
+    with pytest.raises(RuntimeError, match="invalid_value_rows"):
+        validate_minute_kbars(
+            frame, symbol="0056", start=date(2026, 2, 25),
+            end=date(2026, 2, 25),
+        )
+
+
+def test_gap_retry_merge_preserves_archived_bars_and_rejects_revisions() -> None:
+    columns = {
+        "symbol": ["0056"], "date": [date(2026, 2, 25)],
+        "ts": [datetime(2026, 2, 25, 9, 3)],
+        "Open": [10.0], "High": [10.0], "Low": [10.0], "Close": [10.0],
+        "Volume": [1.0], "Amount": [10000.0], "market": ["twse"],
+        "contract_unit": [1000.0],
+    }
+    archived = pl.DataFrame(columns)
+    recovered = pl.DataFrame({
+        **columns, "ts": [datetime(2026, 2, 25, 9, 1)],
+    })
+    merged = merge_retried_source_gap_chunk(archived, recovered)
+    assert merged.height == 2
+    assert merged["ts"].to_list() == [
+        datetime(2026, 2, 25, 9, 1), datetime(2026, 2, 25, 9, 3),
+    ]
+    altered = archived.with_columns(pl.lit(11.0).alias("Close"))
+    with pytest.raises(RuntimeError, match="conflicts"):
+        merge_retried_source_gap_chunk(archived, altered)
+
+
 def test_account_wide_rate_limiter_is_shared_across_processes() -> None:
     context = mp.get_context("spawn")
     output = context.Queue()
-    # Scale the configured 50/5s boundary down to a fast 50/0.05s test while
+    # Scale the configured 50/10s boundary down to a fast 50/0.05s test while
     # preserving its 50-request sliding-window shape.
     limiter = SharedRequestRateLimiter(
         context,
@@ -588,6 +705,89 @@ def test_missing_kbars_tick_fallback_keeps_raw_evidence_and_time_units(tmp_path,
     assert collector.minute_receipt_valid(receipt, symbol="3454", start=day, end=day)
     Path(audit["raw_tick_sources"][0]["path"]).write_bytes(b"corrupt")
     assert not collector.minute_receipt_valid(receipt, symbol="3454", start=day, end=day)
+
+
+def test_empty_kbars_recovers_observed_ticks_without_duplicate_day_query(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    import numpy as np
+    from downloader import download_shioaji_tw_minute_kbars as collector
+
+    day = date(2026, 2, 25)
+    base = tmp_path / "3454.parquet"
+    pl.DataFrame({"date": [day], "Trading_Volume": [3000.0]}).write_parquet(base)
+    row = UniverseRow("3454", "晶睿", "twse", "stock", base)
+    empty = {name: [] for name in ("ts", "Open", "High", "Low", "Close", "Volume", "Amount")}
+    raw = {
+        "ts": [int(np.datetime64(f"{day}T09:00:10", "ns").astype(np.int64))],
+        "close": [100.0], "volume": [1],
+    }
+
+    class API:
+        kbar_calls = 0
+
+        def kbars(self, **kwargs):
+            self.kbar_calls += 1
+            return empty
+
+        def ticks(self, **kwargs):
+            return SimpleNamespace(**raw, dict=lambda: raw)
+
+    monkeypatch.setattr(collector, "_taiwan_market_hours_now", lambda: False)
+    monkeypatch.setattr(collector, "_check_traffic_budget", lambda *_a, **_k: None)
+    monkeypatch.setattr(collector, "shioaji_query", lambda *_a, **_k: nullcontext(lambda _: None))
+    api = API()
+    slots = []
+    frame, audit = collector.query_minute_chunk(
+        api, object(), row, contract_unit=1000, start=day, end=day,
+        timeout_ms=10, retries=0, retry_backoff=0, expected_dates={day},
+        request_started=lambda: slots.append(1), tick_fallback_root=tmp_path / "raw",
+    )
+    assert api.kbar_calls == 1
+    assert len(slots) == 2
+    assert frame["ts"].to_list() == [datetime(2026, 2, 25, 9, 1)]
+    assert audit["source_gap_dates"] == []
+    assert audit["tick_fallback_queries"] == 1
+    assert audit["underlying_data_method"] == "observed_ticks_aggregated_to_right_labelled_1m"
+
+
+def test_source_gap_retry_queries_only_absent_days(monkeypatch):
+    from downloader import download_shioaji_tw_minute_kbars as collector
+
+    days = {date(2020, 3, 12), date(2020, 3, 18)}
+    calls = []
+
+    def fake_query(*_args, start, end, expected_dates, **_kwargs):
+        calls.append((start, end, expected_dates))
+        return pl.DataFrame(), {"source_gap_dates": [str(start)]}
+
+    monkeypatch.setattr(collector, "query_minute_chunk", fake_query)
+    row = UniverseRow("3454", "晶睿", "twse", "stock", Path("unused.parquet"))
+    frame, audit = collector.query_source_gap_dates(
+        object(), object(), row, contract_unit=1000, missing_dates=days,
+        timeout_ms=10, retries=0, retry_backoff=0, request_started=None,
+        tick_fallback_root=None, max_traffic_fraction=0.90,
+    )
+    assert frame.is_empty()
+    assert calls == [(day, day, {day}) for day in sorted(days)]
+    assert audit["source_gap_dates"] == [str(day) for day in sorted(days)]
+
+
+def test_retried_raw_ticks_keep_prior_evidence(tmp_path):
+    from downloader import download_shioaji_tw_minute_kbars as collector
+
+    first = collector._write_immutable_raw_ticks(
+        pl.DataFrame({"price": [100.0]}), tmp_path, symbol="3454",
+        day=date(2026, 2, 25),
+    )
+    revised = collector._write_immutable_raw_ticks(
+        pl.DataFrame({"price": [101.0]}), tmp_path, symbol="3454",
+        day=date(2026, 2, 25),
+    )
+    assert first["path"] != revised["path"]
+    assert Path(first["path"]).is_file()
+    assert Path(revised["path"]).is_file()
+    assert collector._sha256(Path(first["path"])) == first["sha256"]
+    assert collector._sha256(Path(revised["path"])) == revised["sha256"]
 
 
 def test_sealed_manifest_is_a_fast_restart_checkpoint(tmp_path: Path) -> None:
@@ -1199,6 +1399,8 @@ def test_dataset_audit_accepts_causal_synthetic_partition() -> None:
         "invalid_volume_unit_rows": 0,
         "invalid_volume_notional_rows": 0,
         "invalid_volume_shares_rows": 0,
+        "off_grid_price_values": 0,
+        "unknown_price_security_rows": 0,
         "invalid_rows_with_labels": 0,
         "invalid_session_rows_with_labels": 0,
         "bad_label_alignment_rows": 0,

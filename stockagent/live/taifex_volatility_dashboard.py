@@ -1824,6 +1824,26 @@ def build_dashboard_snapshot(
     source_age = max(0.0, (observed_now - source_updated).total_seconds())
     blocked_reason = status.get("blocked_reason")
     engine_status = str(status.get("engine_status") or "unknown")
+    engine_status_source = "status"
+    # Capture can continue in data-only mode after strategy bootstrap fails.
+    # That failure is persisted to state.json without publishing a new market
+    # status.json. Read the newer explicit block, but never treat the state
+    # timestamp as a fresh executable book or valuation.
+    state_engine_status = str(state.get("engine_status") or "")
+    if state_engine_status == "blocked_subscription_bootstrap_settlement":
+        try:
+            state_updated = _parse_utc(state.get("updated_at_utc"))
+        except (TypeError, ValueError):
+            state_updated = None
+        if state_updated is not None and state_updated > source_updated:
+            engine_status = state_engine_status
+            engine_status_source = "state"
+            reason = str(state.get("blocked_reason") or "")
+            blocked_reason = (
+                "到期結算遭未平的模擬期貨避險部位阻擋；沒有自行沖銷。"
+                if "cannot cash-settle cycle while a shadow futures hedge remains open" in reason
+                else "到期部位結算或訂閱啟動未通過；請查內部狀態收據。"
+            )
     if blocked_reason or engine_status == "blocked":
         health = "blocked"
     elif source_age > float(max_source_age_seconds) and source_fresh_expected:
@@ -2110,6 +2130,7 @@ def build_dashboard_snapshot(
         "refresh_interval_seconds": 5,
         "health": health,
         "engine_status": engine_status,
+        "engine_status_source": engine_status_source,
         "blocked_reason": blocked_reason,
         "simulation_only": status.get("simulation_only") is True,
         "production_order_possible": status.get("production_order_possible") is True,

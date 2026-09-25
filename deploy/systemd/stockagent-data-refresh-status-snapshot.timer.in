@@ -3,6 +3,7 @@ Description=Refresh public data-monitor snapshots every 30 seconds
 
 [Timer]
 OnBootSec=5s
+OnActiveSec=5s
 OnUnitActiveSec=30s
 AccuracySec=1s
 Unit=stockagent-data-refresh-status-snapshot.service

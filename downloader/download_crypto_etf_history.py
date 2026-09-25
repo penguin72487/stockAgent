@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.client import RemoteDisconnected
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -224,7 +225,7 @@ class HttpClient:
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
                 raise HttpStatusError(exc.code, url, detail) from exc
-            except (URLError, TimeoutError) as exc:
+            except (URLError, TimeoutError, RemoteDisconnected, ConnectionResetError) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     limiter.defer(retry_delay_seconds(attempt, base=self.retry_base))

@@ -146,7 +146,14 @@ function healthPresentation(snapshot) {
 }
 
 function healthMessage(snapshot) {
-  if (snapshot.health === "blocked") return `引擎已阻擋：${snapshot.blocked_reason || "原因未記錄"}`;
+  if (snapshot.health === "blocked") {
+    const reason = `引擎已阻擋：${snapshot.blocked_reason || "原因未記錄"}`;
+    const statusStale = snapshot.source_fresh_expected &&
+      Number(snapshot.source_age_seconds) > Number(snapshot.max_source_age_seconds);
+    return statusStale
+      ? `${reason}；最後行情快照距今 ${formatAge(snapshot.source_age_seconds)}，不可當成即時估值。`
+      : reason;
+  }
   if (snapshot.health === "degraded") {
     const market = snapshot.market || {};
     return `行情仍在更新，但只有 ${market.strategy_timely_valuation_count || 0} / ${market.strategy_count || 0} 條策略具備 15 秒內的新鮮或明確 CARRIED 可成交估值；其餘曲線暫停在最後可信點。`;

@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from stockagent.backtest.tw_commission_rebate import (
+from stockagent.backtest.tw_commission_rebate_policy import (
     normalize_commission_rebate_timing,
 )
 from stockagent.backtest.tw_day_trade_contract import (

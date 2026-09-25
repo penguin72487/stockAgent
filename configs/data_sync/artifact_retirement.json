@@ -1,5 +1,13 @@
 {
   "schema_version": 1,
   "authority_node_id": "penguin",
-  "required_peer_names": []
+  "required_peer_names": [],
+  "scheduled_datasets": [
+    "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9b7356396ce1b5cd",
+    "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9a43064c449d8429",
+    "artifact-auto-bybit-perpetual-daily-multi-basis-projec-682eec353e0237e9"
+  ],
+  "scheduled_legacy_datasets": [
+    "legacy-artifact-markets-crypto"
+  ]
 }

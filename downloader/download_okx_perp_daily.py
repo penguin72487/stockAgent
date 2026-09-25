@@ -38,11 +38,15 @@ from common import (  # noqa: E402
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from artifact_io import archive_run_reports  # noqa: E402
+from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
 from okx_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
+    feature_run_summary_path,
     feature_catalog_payload,
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
+    stage_latency_summary,
 )
 from ohlcv_hot_tail import (  # noqa: E402
     hot_tail_path,
@@ -193,6 +197,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Parallel workers for historical features; defaults to --workers.",
     )
+    parser.add_argument(
+        "--archive-report-dir",
+        default=None,
+        help="Optional per-run report archive before later jobs replace latest reports.",
+    )
     return parser.parse_args()
 
 
@@ -263,6 +272,38 @@ class OkxClient:
                 limiter = SharedRateLimiter(interval, name=limiter_name)
                 self._limiters[limiter_name] = limiter
             return limiter
+
+    def limiter_activity(self) -> dict[str, dict[str, float | int | str]]:
+        """Process-local grants, grouped by endpoint; not provider-wide usage."""
+
+        with self._limiter_lock:
+            limiters = list(self._limiters.items())
+        grouped: dict[str, dict[str, float | int | str]] = {}
+        for name, limiter in limiters:
+            endpoint = name.split(":", 1)[0]
+            activity = limiter.grant_activity()
+            entry = grouped.setdefault(
+                endpoint,
+                {
+                    "interval_seconds": limiter.interval_seconds,
+                    "limiter_count": 0,
+                    "sharing_scope": (
+                        "per_instrument" if endpoint == "okx_funding_rate_history"
+                        else "per_endpoint"
+                    ),
+                    "grants_total": 0,
+                    "grants_last_60s": 0,
+                    "pending_claim_observations": 0,
+                },
+            )
+            entry["limiter_count"] = int(entry["limiter_count"]) + 1
+            for key in (
+                "grants_total",
+                "grants_last_60s",
+                "pending_claim_observations",
+            ):
+                entry[key] = int(entry[key]) + int(activity[key])
+        return grouped
 
     def _defer_retry(
         self,
@@ -678,6 +719,7 @@ def _download_symbol_1m(
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
     effective_start_ms = start_ms
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
     if record.list_time:
         effective_start_ms = max(
             effective_start_ms,
@@ -733,10 +775,11 @@ def _download_symbol_1m(
     elif tail_only:
         effective_start_ms = max(
             effective_start_ms,
-            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+            closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    all_rows: list[list[str]] = []
+    candles = CandleFrameBuffer(_normalize_candles)
+    received_rows = False
     cursor_after: str | None = None
     seen_oldest: set[str] = set()
 
@@ -756,7 +799,13 @@ def _download_symbol_1m(
         if not chunk:
             break
 
-        all_rows.extend(chunk)
+        received_rows = True
+        candles.extend(
+            row
+            for row in chunk
+            if effective_start_ms <= int(row[0]) <= closed_end_ms
+            and (len(row) < 9 or str(row[8]) == "1")
+        )
 
         oldest_ms = int(chunk[-1][0])
         if oldest_ms < effective_start_ms:
@@ -767,7 +816,7 @@ def _download_symbol_1m(
             break
         seen_oldest.add(cursor_after)
 
-    if not all_rows:
+    if not received_rows:
         return DownloadResult(
             asset_class="crypto_okx_perp",
             code=record.code,
@@ -779,14 +828,7 @@ def _download_symbol_1m(
             message="No candles returned by OKX.",
         )
 
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    filtered_rows = [
-        row
-        for row in all_rows
-        if effective_start_ms <= int(row[0]) <= closed_end_ms
-        and (len(row) < 9 or str(row[8]) == "1")
-    ]
-    df = _normalize_candles(filtered_rows)
+    df = candles.finish()
     if df.is_empty():
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
@@ -1027,6 +1069,8 @@ def main() -> None:
                 "stage_status_json": pl.String,
                 "coverage_json": pl.String,
                 "errors_json": pl.String,
+                "stage_elapsed_seconds_json": pl.String,
+                "total_elapsed_seconds": pl.Float64,
             }
         )
     )
@@ -1082,6 +1126,7 @@ def main() -> None:
             historical_status_counts.get(result.status, 0) + 1
         )
 
+    ended_at = datetime.now(timezone.utc)
     summary = {
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
@@ -1095,21 +1140,43 @@ def main() -> None:
             not args.skip_historical_features and not args.skip_funding_archive
         ),
         "historical_feature_status_counts": historical_status_counts,
+        "historical_feature_stage_latency": stage_latency_summary(historical_feature_results),
+        "request_limiter_activity": client.limiter_activity(),
         "historical_feature_report": str(historical_feature_report_path),
         "historical_feature_catalog": str(feature_catalog_path),
         "start_date": start_date,
         "end_date": end_date,
+        "started_at_utc": started_at.isoformat(),
+        "ended_at_utc": ended_at.isoformat(),
+        "elapsed_seconds": (ended_at - started_at).total_seconds(),
     }
+    summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     atomic_write_text(
-        summary_path,
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        feature_run_summary_path(
+            output_dir, features_enabled=not args.skip_historical_features
+        ),
+        summary_text,
     )
-    feature_incomplete = any(
+    atomic_write_text(summary_path, summary_text)
+    if args.archive_report_dir:
+        archive_run_reports(
+            args.archive_report_dir,
+            (
+                symbols_path,
+                report_path,
+                summary_path,
+                historical_feature_report_path,
+                feature_catalog_path,
+            ),
+        )
+    source_incomplete = sum(
+        result.status in {"failed", "repair_required"} for result in results
+    )
+    feature_incomplete = sum(
         result.status in {"failed", "partial"} for result in historical_feature_results
     )
     pipeline_progress.finish(
-        failed=any(result.status in {"failed", "repair_required"} for result in results)
-        or feature_incomplete,
+        failed=bool(source_incomplete or feature_incomplete),
         require_exact=True,
     )
 
@@ -1118,7 +1185,15 @@ def main() -> None:
     print(f"[okx] download_summary.json -> {summary_path}")
     print(f"[okx] historical_feature_report.csv -> {historical_feature_report_path}")
     print(f"[okx] okx_historical_feature_catalog.json -> {feature_catalog_path}")
-    print(f"[okx] done: {json.dumps(summary, ensure_ascii=False)}")
+    print(f"[okx] report: {json.dumps(summary, ensure_ascii=False)}")
+    lock_handle.close()
+    if source_incomplete or feature_incomplete or pipeline_progress.current != pipeline_progress.total:
+        raise RuntimeError(
+            "OKX download incomplete: "
+            f"{source_incomplete} source symbols, {feature_incomplete} historical features, "
+            f"progress {pipeline_progress.current}/{pipeline_progress.total}"
+        )
+    print("[okx] complete")
 
 
 if __name__ == "__main__":

@@ -140,6 +140,7 @@
       data,
       history,
       historyMatchesSelection,
+      historyPendingRevision,
       historyLoadError,
       historyInFlight,
       hiddenSeries,
@@ -181,7 +182,9 @@
       data.modes.map((row) => [row.market, strategyLabel(row)]),
       (data.benchmarks || []).map((row) => [row.benchmark_id, row.label]),
     ]);
-    const staleNote = historyLoadError ? `；${historyLoadError}；保留上次成功資料（可能已過期）` : "";
+    const staleNote = historyLoadError
+      ? `；${historyLoadError}；保留上次成功資料（可能已過期）`
+      : historyPendingRevision ? "；資料更新中，暫顯示上一份已驗證曲線" : "";
     if (renderedHistory === history && renderedKey === renderKey) {
       note.textContent = renderedNote + staleNote;
       return;

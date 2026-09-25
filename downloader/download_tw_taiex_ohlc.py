@@ -77,6 +77,12 @@ OUTPUT_COLUMNS = (
     "_downloaded_at_utc",
     "_url",
 )
+# A polling timestamp is provenance of the latest fetch, not a price revision.
+# Keeping the accepted canonical bytes stable on a metadata-only refresh avoids
+# invalidating every downstream stock/feature receipt during release bursts.
+SEMANTIC_OUTPUT_COLUMNS = tuple(
+    column for column in OUTPUT_COLUMNS if column != "_downloaded_at_utc"
+)
 OUTPUT_SCHEMA: dict[str, pl.DataType] = {
     "date": pl.Date,
     "opening_index": pl.Float64,
@@ -1111,6 +1117,7 @@ def _run(args: argparse.Namespace) -> int:
     resumed_before = 0
     raw_resumed = 0
     promoted = False
+    semantic_noop = False
     fatal_error: str | None = None
 
     try:
@@ -1252,7 +1259,17 @@ def _run(args: argparse.Namespace) -> int:
             else:
                 output = working
             output = _validate_output_frame(output)
-            _write_parquet_atomic(canonical_path, output)
+            semantic_noop = bool(
+                args.mode == "daily"
+                and previous_summary.get("effective_start_date") == start.isoformat()
+                and previous_summary.get("effective_end_date") == end.isoformat()
+                and _summary_still_certifies_canonical(previous_summary, canonical_path)
+                and canonical.select(SEMANTIC_OUTPUT_COLUMNS).equals(
+                    output.select(SEMANTIC_OUTPUT_COLUMNS)
+                )
+            )
+            if not semantic_noop:
+                _write_parquet_atomic(canonical_path, output)
             promoted = True
     except Exception as exc:
         coverage_complete = False
@@ -1333,6 +1350,9 @@ def _run(args: argparse.Namespace) -> int:
         "rate_limit_source": provider_rate_limit("tw_public").source_url,
     }
     attempt_summary = dict(summary)
+    attempt_summary["semantic_noop"] = semantic_noop
+    if semantic_noop:
+        attempt_summary["replacement_promoted"] = False
     recovered_from_journal = False
     if not coverage_complete and start is not None and end is not None:
         try:
@@ -1371,7 +1391,7 @@ def _run(args: argparse.Namespace) -> int:
             )
             coverage_complete = True
             promoted = True
-    preserve_previous = bool(
+    preserve_previous = semantic_noop or bool(
         not coverage_complete
         and _summary_still_certifies_canonical(previous_summary, canonical_path)
     )
@@ -1385,7 +1405,7 @@ def _run(args: argparse.Namespace) -> int:
     if coverage_complete:
         print(
             f"[twse-taiex] coverage complete months={len(months)} "
-            f"rows={summary['output_rows']} output={canonical_path}",
+            f"rows={summary['output_rows']} semantic_noop={semantic_noop} output={canonical_path}",
             flush=True,
         )
         return 0

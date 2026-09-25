@@ -2,7 +2,9 @@
 Description=Refresh registered crypto data one minute after each completed cycle
 
 [Timer]
-OnBootSec=2min
+# Timer activation, including late WSL recovery, is the sole bootstrap clock.
+# An overdue OnBootSec can fire immediately when an elapsed timer is rearmed.
+OnActiveSec=1min
 OnUnitInactiveSec=1min
 Persistent=true
 Unit=stockagent-registered-data-intraday.service

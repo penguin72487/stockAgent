@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071019">
+  <title>FinMind 資料監控｜StockAgent</title>
+  <link rel="stylesheet" href="../shioaji/styles.css?v=6">
+  <link rel="stylesheet" href="../finlab/styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=1">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav data-dashboard-nav="finmind" aria-label="公開面板導覽"></nav>
+  </header>
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">FINMIND · READ-ONLY DATA MONITOR</p>
+        <h1 id="page-title">FinMind API<br>資料管線</h1>
+        <p class="lead">追蹤 Free／Sponsor 歷史來源的回補、官方帳號額度與本機容量。頁面只讀本機取樣與下載收據，不直接呼叫 FinMind API。</p>
+      </div>
+      <div class="health-panel">
+        <span>管線狀態</span>
+        <strong id="finmind-health" class="status loading" role="status" aria-live="polite"><i aria-hidden="true"></i>讀取中</strong>
+        <p id="finmind-freshness">正在取得最新觀測…</p>
+        <small>公開唯讀 · Token、帳號與原始資料不傳到瀏覽器</small>
+      </div>
+    </section>
+
+    <nav class="jump-nav" aria-label="頁內導覽">
+      <a href="#pipelines">資料管線</a>
+      <a href="#traffic">請求額度</a>
+      <a href="#storage">容量</a>
+      <a href="#backfill">歷史進度</a>
+      <a href="#capture">執行摘要</a>
+      <a href="#method">口徑</a>
+    </nav>
+
+    <section id="pipeline-alert" class="alert" hidden aria-live="polite"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+
+    <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
+      <header class="section-heading pipeline-heading"><span>01</span><div><h2 id="pipelines-title">所有已排程資料管線</h2><p>52 類免費來源：台股、期選、總經與海外股票；新聞和付費資料未排程。來源回應不等於歷史已驗證完整。</p></div></header>
+      <div class="kpi-grid overview-kpis">
+        <article class="kpi featured"><span>資料集</span><strong id="pipeline-total">—</strong><p>不含新聞與付費粒度</p></article>
+        <article class="kpi"><span>正在回補</span><strong id="pipeline-active">—</strong><p>已取得部分來源回應</p></article>
+        <article class="kpi"><span>本輪目標已查驗</span><strong id="pipeline-ready">—</strong><p>含來源空回，不等於有數值</p></article>
+        <article class="kpi"><span>待查／需注意</span><strong id="pipeline-attention">—</strong><p>尚未清點、空回與失敗</p></article>
+      </div>
+      <div class="pipeline-toolbar" role="group" aria-label="篩選 FinMind 管線">
+        <button type="button" class="filter active" data-pipeline-filter="all" aria-pressed="true">全部</button>
+        <button type="button" class="filter" data-pipeline-filter="session_history" aria-pressed="false">盤中歷史</button>
+        <button type="button" class="filter" data-pipeline-filter="reference" aria-pressed="false">主檔／日曆</button>
+        <button type="button" class="filter" data-pipeline-filter="global_history" aria-pressed="false">總經／全市場</button>
+        <button type="button" class="filter" data-pipeline-filter="symbol_history" aria-pressed="false">台股／期選逐檔</button>
+        <button type="button" class="filter" data-pipeline-filter="global_equity_history" aria-pressed="false">海外逐檔</button>
+      </div>
+      <div id="pipeline-grid" class="pipeline-grid" aria-live="polite"><article class="pipeline-card skeleton" aria-hidden="true"></article></div>
+      <p id="pipeline-empty" class="empty pipeline-empty" hidden>這個分類目前沒有資料管線。</p>
+    </section>
+
+    <section id="traffic" class="section-block" aria-labelledby="quota-title">
+      <header class="section-heading"><span>02</span><div><h2 id="quota-title">請求額度與實際用量</h2><p>官方每小時上限與本站兩支 worker 實際發出的請求分開；其他程式的帳號用量無法由本頁量測。</p></div></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>最近 60 分鐘本站請求</span><strong id="quota-used">—</strong><p id="quota-basis">觀測資料待取得</p></article>
+        <article class="kpi"><span>官方每小時上限</span><strong id="quota-limit">—</strong><p id="quota-token">依下載器目前憑證模式</p></article>
+        <article class="kpi"><span>本站可見餘裕</span><strong id="quota-headroom">—</strong><p>不含其他應用；非帳號餘額</p></article>
+        <article class="kpi"><span>重置時間</span><strong>未公布</strong><p>以滾動 60 分鐘呈現，不捏造固定重置時刻</p></article>
+      </div>
+      <div class="quota-track"><div class="quota-track-header"><span>本站觀測請求／官方上限</span><strong id="quota-ratio">—</strong></div><progress id="quota-progress" max="1" aria-label="FinMind 最近 60 分鐘本站觀測請求占官方上限比例"></progress><small id="quota-observed">目前僅量測本站下載器請求</small></div>
+      <figure class="chart-card finlab-chart"><figcaption><div><strong>滾動一小時請求量</strong><span>從本站實際請求紀錄按分鐘重建；啟用追蹤前的請求不可回推</span></div></figcaption><div id="quota-time-range" class="time-range-control" role="group" aria-label="流量曲線時間範圍"><span>時間範圍</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button></div><svg id="quota-chart" viewBox="0 0 960 270" role="img" aria-labelledby="quota-chart-title quota-chart-desc"><title id="quota-chart-title">FinMind 本站下載器請求量</title><desc id="quota-chart-desc">最近一小時本站觀測請求數，並非 FinMind 帳號總用量。</desc></svg><p id="quota-chart-empty" class="empty" hidden>累積兩筆觀測後顯示趨勢。</p></figure>
+      <p class="data-note">額度與帳號用量由背景工作每分鐘讀取 <a href="https://finmind.github.io/en/api_usage_count/" target="_blank" rel="noopener noreferrer">FinMind 官方帳號接口</a>；本站請求曲線為三支下載器共用限流器的本機紀錄，兩者不能混為一談。</p>
+    </section>
+
+    <section id="storage" class="section-block" aria-labelledby="storage-title">
+      <header class="section-heading"><span>03</span><div><h2 id="storage-title">儲存容量與訓練邊界</h2><p>按完成收據統計來源檔大小，補充來源未逐檔重新雜湊；已下載不等於發布時點可信或可供遠端訓練。</p></div></header>
+      <div class="kpi-grid capacity-kpis">
+        <article class="kpi featured"><span>收據記錄來源容量</span><strong id="storage-source">—</strong><p>日曆、逐日歷史與補充來源；未全量重驗</p></article>
+        <article class="kpi"><span>來源磁碟可用</span><strong id="storage-free">—</strong><p>本站 FinMind 工作區所在檔案系統</p></article>
+        <article class="kpi"><span>估計總容量</span><strong id="storage-total">未知</strong><p>歷史 1 分與 5 秒粒度不同，不以早期樣本外推全期</p></article>
+        <article class="kpi"><span>冷庫／遠端訓練</span><strong id="training-state">未發版</strong><p>原始研究資料尚未通過 PIT 與冷庫守門</p></article>
+      </div>
+      <div class="storage-layout"><section class="storage-bars-card" aria-labelledby="storage-bars-title"><header><strong id="storage-bars-title">各來源本機容量</strong><span>完成收據指向的檔案</span></header><div id="storage-bars" class="storage-bars"><p class="empty">讀取中</p></div></section></div>
+    </section>
+
+    <section id="backfill" class="section-block" aria-labelledby="downloads-title">
+      <header class="section-heading"><span>04</span><div><h2 id="downloads-title">逐資料集歷史進度</h2><p>分母為目前已清點的查詢任務；逐檔主檔尚未載入時分母會增加。來源空回算已查驗，但不算有數值；失敗與未知歷史不算完成。</p></div></header>
+      <div class="progress-card"><div class="progress-copy"><div><span>已查驗／目前已建立任務</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>目前已知任務最少仍需</span><strong id="download-global-eta">無可信倒數</strong><p>僅依請求節流估算下界；未知代號、重試與其他應用流量另計。</p></div></div><progress id="download-progress" class="progress-track" max="1" aria-label="FinMind 目前已建立任務的查驗率"></progress></div>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>已查驗／已建任務</span><strong id="download-count">—</strong><p>空回另列，不代表歷史完整</p></article>
+        <article class="kpi"><span>待補</span><strong id="download-pending">—</strong><p>空回另列、不冒充完成</p></article>
+        <article class="kpi"><span>失敗短期重試</span><strong id="download-deferred">—</strong><p>與未清點代號分開</p></article>
+        <article class="kpi"><span>最新工作</span><strong id="download-last">—</strong><p id="download-last-detail">—</p></article>
+      </div>
+      <div class="finlab-table-scroll table-scroll" role="region" aria-label="FinMind 各資料集歷史進度" tabindex="0"><table><thead><tr><th>資料集</th><th>狀態</th><th>已查驗／已建目標</th><th>最早資料</th><th>最新資料</th><th>總筆數</th><th>本機容量</th><th>空回／失敗</th><th>最少剩餘時間</th><th>最後請求</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="10">讀取中…</td></tr></tbody></table></div>
+    </section>
+
+    <section id="capture" class="section-block" aria-labelledby="capture-title">
+      <header class="section-heading"><span>05</span><div><h2 id="capture-title">下載執行摘要</h2><p>常駐歷史查詢，不是逐筆串流；服務存在也不代表來源已到最新。</p></div></header>
+      <div class="capture-card"><div class="capture-primary"><span id="capture-dot" class="pulse" aria-hidden="true"></span><div><span>下載器狀態</span><strong id="capture-state">—</strong><p id="capture-freshness">—</p></div></div><dl><div><dt>目前工作</dt><dd id="capture-key">—</dd></div><div><dt>最近結果</dt><dd id="capture-last">—</dd></div><div><dt>下一個待補</dt><dd id="capture-next">—</dd></div><div><dt>台股候選代號</dt><dd id="capture-universe">—</dd></div><div><dt>新聞</dt><dd>未排程</dd></div><div><dt>資料用途</dt><dd>本機原始研究</dd></div></dl></div>
+    </section>
+
+    <section id="method" class="section-block method" aria-labelledby="method-title">
+      <header class="section-heading"><span>06</span><div><h2 id="method-title">數字口徑</h2><p>完成、容量、流量與訓練可用性是不同證據。</p></div></header>
+      <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。新增 48 類的「非空」只代表目前請求有非空來源回應，「空回」只代表該次查詢已觀察到無值；兩者都不證明供應商歷史完整。法人寬表由已取得的長表於本機衍生，不另外呼叫 API。逐檔代號來自主檔快照與官方下市名單，未知的舊代號仍待查。最少剩餘時間只用已建立任務數除以官方每小時上限，不是完工承諾。新聞與需付費資料未排程；本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
+    </section>
+  </main>
+  <script src="../dashboard-core.js?v=10" defer></script>
+  <script src="app.js?v=4" defer></script>
+</body>
+</html>

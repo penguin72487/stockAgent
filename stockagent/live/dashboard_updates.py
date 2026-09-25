@@ -10,7 +10,7 @@ from pathlib import Path
 import select
 import stat as stat_module
 import threading
-from typing import Mapping
+from typing import Collection, Mapping
 
 _SIGNATURE_CACHE: OrderedDict[Path, tuple[tuple[int, ...], bytes]] = OrderedDict()
 _SIGNATURE_CACHE_LOCK = threading.Lock()
@@ -58,6 +58,19 @@ def file_signature(path: Path) -> tuple[object, ...] | None:
         return None
 
 
+def metadata_file_signature(path: Path) -> tuple[int, ...] | None:
+    """Cheap invalidation hint for large append-only or atomically replaced files.
+
+    This is not a content-integrity proof. Inode, size, mtime and ctime cover
+    the producer's append/replace contract without hashing hundreds of MiB on
+    every market-data update.
+    """
+    try:
+        return metadata_signature(path.stat())
+    except OSError:
+        return None
+
+
 class DashboardUpdateHub:
     """One watcher and one latest generation per topic, never a per-client queue.
 
@@ -66,8 +79,15 @@ class DashboardUpdateHub:
     Notifications are hints: consumers still read the authoritative public DTO.
     """
 
-    def __init__(self, paths: Mapping[str, tuple[Path, ...]], *, max_clients: int = 64):
+    def __init__(
+        self,
+        paths: Mapping[str, tuple[Path, ...]],
+        *,
+        max_clients: int = 64,
+        metadata_only_paths: Collection[Path] = (),
+    ):
         self.paths = dict(paths)
+        self.metadata_only_paths = frozenset(metadata_only_paths)
         self.max_clients = max_clients
         self._condition = threading.Condition()
         self._versions = dict.fromkeys(paths, 0)
@@ -98,6 +118,11 @@ class DashboardUpdateHub:
         with self._condition:
             self._versions[topic] += 1
             self._condition.notify_all()
+
+    def signature(self, path: Path) -> tuple[object, ...] | None:
+        if path in self.metadata_only_paths:
+            return metadata_file_signature(path)
+        return file_signature(path)
 
     def wait(self, topic: str, previous: int, timeout: float = 15.0) -> int:
         with self._condition:
@@ -139,7 +164,7 @@ class DashboardUpdateHub:
                             watched[directory] = identity
                 self.native = fd >= 0 and bool(watched)
                 for topic, paths in self.paths.items():
-                    signature = tuple(file_signature(path) for path in paths)
+                    signature = tuple(self.signature(path) for path in paths)
                     if signatures.get(topic) != signature:
                         signatures[topic] = signature
                         self.publish(topic)

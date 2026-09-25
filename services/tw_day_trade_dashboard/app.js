@@ -24,11 +24,11 @@ const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1"
 const HIDDEN_EQUITY_SERIES_STORAGE_KEY = IS_OVERNIGHT
   ? "tw-overnight-hidden-equity-series"
   : "tw-day-trade-hidden-equity-series";
-const HISTORY_CLIENT_CACHE_MS = 45000;
 const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 3;
 const DATE_FILTER_DEBOUNCE_MS = 180;
 let snapshot = null;
 let chartHistory = null;
+let chartHistoryKey = "";
 let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
@@ -76,6 +76,7 @@ let eventRecordRevision = null;
 let eventSelectionKey = null;
 let eventLoading = false;
 let eventLoadError = "";
+let eventLoadNotice = "";
 let eventRequestSequence = 0;
 let eventRequestRevisionInFlight = "";
 let eventAbortController = null;
@@ -534,7 +535,18 @@ function chartWindowLabel() {
   return `${start || "最早資料"} ～ ${end || "最新資料"}`;
 }
 function chartRequestKey() {
-  return detailDataRevision("history");
+  const service = snapshot?.service_sync || {};
+  const history = snapshot?.historical_replay || {};
+  // A status/content revision can advance without a new mark. The 14-MB chart
+  // must reload only when its source fingerprint or selected dates change.
+  // Older gateways without history_revision retain the conservative fallback.
+  const sourceRevision = service.history_revision || null;
+  return JSON.stringify([
+    detailRangeKey(),
+    sourceRevision || service.revision_token || service.content_revision || null,
+    sourceRevision ? null : (history.generated_at || null),
+    sourceRevision ? null : (history.end_date || null),
+  ]);
 }
 function chartHistoryMatchesSelection() {
   return Boolean(
@@ -545,7 +557,7 @@ function chartHistoryMatchesSelection() {
   );
 }
 function rangeSummaryFor(seriesId) {
-  if (!chartHistoryMatchesSelection()) return null;
+  if (!chartHistoryMatchesSelection() || chartHistoryKey !== chartRequestKey()) return null;
   return (chartHistory.range_summary || []).find((row) => row.series_id === seriesId) || null;
 }
 function compareByAbsoluteWeight(a, b) {
@@ -679,13 +691,14 @@ function fillOutcomePresentation(value) {
 
 function totalModeNetPnl(data) {
   const modes = Array.isArray(data?.modes) ? data.modes : [];
-  if (IS_OVERNIGHT && chartHistory?.range_summary?.length) {
-    const historical = modes.map((mode) => Number(rangeSummaryFor(mode.market)?.cumulative_net_pnl_twd));
-    if (historical.length === modes.length && historical.every(Number.isFinite)) {
-      return historical.reduce((sum, value) => sum + value, 0);
+  if (IS_OVERNIGHT && modes.length && chartHistory?.range_summary?.length) {
+    const historical = modes.map((mode) => rangeSummaryFor(mode.market)?.cumulative_net_pnl_twd);
+    if (historical.every((value) => value != null && Number.isFinite(Number(value)))) {
+      return historical.reduce((sum, value) => sum + Number(value), 0);
     }
   }
   const values = modes.map((mode) => {
+    if (mode.initial_capital_twd == null || mode.total_equity_twd == null) return null;
     const initial = Number(mode.initial_capital_twd);
     const equity = Number(mode.total_equity_twd);
     return Number.isFinite(initial) && Number.isFinite(equity) ? equity - initial : null;
@@ -737,8 +750,8 @@ function renderOverview(data) {
   const reconciled = reconciliationDifference != null && Math.abs(reconciliationDifference) <= .01;
   const returns = modes
     .map((mode) => rangeSummaryFor(mode.market)?.return_pct)
-    .map(Number)
-    .filter(Number.isFinite);
+    .filter((value) => value != null && Number.isFinite(Number(value)))
+    .map(Number);
   const best = returns.length ? Math.max(...returns) : null;
   const worst = returns.length ? Math.min(...returns) : null;
   const historicalRangeAvailable = Boolean(
@@ -785,7 +798,10 @@ function renderHeader(data) {
   const hasBenchmarkReplay = (data.benchmarks || []).some((row) => row.counterfactual_open_replay);
   const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
   const overnightHistory = data.historical_replay || {};
-  const overnightHistoryDegraded = IS_OVERNIGHT && overnightHistory.status === "ready_with_stale_unresolved_position";
+  const overnightHistoryDegraded = IS_OVERNIGHT && (
+    overnightHistory.status === "ready_with_stale_unresolved_position"
+    || Number(overnightHistory.blocked_close_signal_count || 0) > 0
+  );
   const localPaperExecution = !IS_OVERNIGHT
     && data.execution_evidence !== "shioaji_simulation_stock_deal_v1";
   const liveStaleModes = !IS_OVERNIGHT && selectedDetailEndDate() === data.session_date && data.session_progress?.phase === "active"
@@ -808,7 +824,7 @@ function renderHeader(data) {
       localPaperExecution ? "目前當沖成交來自本地紙上帳本，Shioaji 只提供行情；尚未接入 Shioaji 模擬委託與 StockDeal 成交回報，不可將紙上成交當作券商 API 成交。" : "",
       liveStaleModes.length ? `盤中 ${number(liveStaleModes.length)} 個當沖模式的持倉估值正在延用舊價格；分鐘曲線仍記錄時間，但不是即時可成交行情，最新損益不可當成即時值。` : "",
       hasBenchmarkReplay ? "舊版市場基準歷史仍含開盤起算資料；新版會計契約尚未完成原子替換，該區段暫不視為 Buy & Hold 正式結果。" : "",
-      overnightHistoryDegraded ? "隔日沖歷史含一個缺少後續官方開盤價的未解決持倉；該模式估值已標示延用，沒有補造退出。" : "",
+      overnightHistoryDegraded ? `隔日沖歷史有 ${number(overnightHistory.unresolved_prior_position_count || 0)} 個前期未解決持倉、${number(overnightHistory.blocked_close_signal_count || 0)} 次因前批未平而未新進場；估值延用與缺價均保留，沒有補造成交。` : "",
       data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
       currentMissingEligibility.size ? `所選交易日當沖資格未完整覆蓋，後續訊號已停止執行：${[...currentMissingEligibility.entries()].map(([venue, row]) => `${venue.toUpperCase()} 需要 ${row.target_date || data.session_date || "所選日"}，最新僅到 ${row.latest_date || "無資料"}`).join("；")}` : "",
       !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 訊號產生時資格資料尚未到齊，因此已 fail-closed；較晚補齊的資料不會回填成假成交。" : "",
@@ -885,8 +901,9 @@ function clearDateScopedViews() {
   signalSelectionKey = positionSelectionKey = eventSelectionKey = null;
   signalRequestRevisionInFlight = positionRequestRevisionInFlight = eventRequestRevisionInFlight = "";
   featurePanelScopeText = featurePanelSignalKey = "";
-  signalLoadError = signalLoadNotice = eventLoadError = positionLoadError = historyLoadError = "";
+  signalLoadError = signalLoadNotice = eventLoadError = eventLoadNotice = positionLoadError = historyLoadError = "";
   chartHistory = null;
+  chartHistoryKey = "";
 }
 
 function scheduleSessionRollover(serviceSync) {
@@ -1084,7 +1101,7 @@ function renderOvernightOperations(data) {
   const blockedModes = modes.filter((mode) => String(mode.engine_status || "").startsWith("blocked") || String(mode.engine_status || "").startsWith("critical")).length;
   setHtml("latency-kpis", [
     ["面板請求 → 顯示", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, "同源唯讀 API；畫面局部更新、不整頁重載"],
-    ["狀態帳本年齡", Number.isFinite(sourceAge) ? duration(sourceAge) : "—", "引擎心跳與市場價格新鮮度分開解讀"],
+    ["引擎心跳年齡", Number.isFinite(sourceAge) ? duration(sourceAge) : "—", "與最後完整帳本提交、市場價格新鮮度分開解讀"],
     ["策略切換時點", "13:00", "切換至當日交易日、完成預熱後等待"],
     ["模型計算時點", "13:20", "以當下行情特徵執行暫時的當沖模型轉接"],
     ["正式收盤撮合", "13:30／13:33", "試撮不列成交；延緩收市才可能到 13:33"],
@@ -1138,8 +1155,10 @@ function renderOperations(data) {
   const openingLatency = data.opening_signal_latency || {};
   const latencyStageLabels = {
     scheduler_wake_ms: "排程喚醒",
+    mode_dispatch_queue_ms: "前序模式排隊",
     preopen_catch_up_ms: "漏失盤前補備",
     realtime_prepare_ms: "即時狀態準備",
+    realtime_prepare_wait_ms: "狀態準備剩餘等待",
     model_lock_queue_ms: "模型鎖等待",
     signal_pre_quote_prepare_ms: "訊號盤前骨架",
     signal_quote_fetch_ms: "訊號行情",
@@ -1219,7 +1238,7 @@ function renderOperations(data) {
     ["所選日流程／成交", `${number(execution.executed_count || 0)} 已處理 · ${number(execution.filled_mode_count || 0)} 完整成交`, `${number(execution.partial_mode_count || 0)} 部分、${number(execution.zero_fill_mode_count || 0)} 零成交、${number(execution.no_order_mode_count || 0)} 無合法委託、${number(execution.failed_mode_count || 0)} 阻擋`, execution.all_modes_filled ? "good" : "bad"],
     ["盤前預熱", `${readyModes}/${totalModes || 0} 模型 READY`, `模擬執行 ${simulationWarm.status || "pending"}`, warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
-    ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
+    ["引擎心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `最後完整提交 ${duration(data.source_commit_age_seconds)} 前`, heartbeatKind],
     ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `行情與權益每 ${number(PRICE_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
     ["服務同步", syncLabel, syncNote, syncKind],
     ["無人維護守護", guardianLabel, guardianNote, guardianKind],
@@ -1515,6 +1534,7 @@ function renderChart(data) {
     data,
     history: chartHistory,
     historyMatchesSelection: chartHistoryMatchesSelection(),
+    historyPendingRevision: Boolean(chartHistory && chartHistoryKey !== chartRequestKey()),
     historyLoadError,
     historyInFlight,
     hiddenSeries: hiddenEquitySeries,
@@ -1555,8 +1575,9 @@ function validateMinuteHistory(payload, {startDate, endDate, unbounded}) {
   }
 }
 
-function applyChartHistory(payload) {
+function applyChartHistory(payload, key) {
   chartHistory = payload;
+  chartHistoryKey = key;
   historyLoadError = "";
   if (snapshot) {
     renderOverview(snapshot);
@@ -1574,12 +1595,21 @@ async function loadChartHistory({preferCache = false} = {}) {
   const requestedKey = chartRequestKey();
   const cached = chartHistoryCache.get(requestedKey);
   if (preferCache) {
-    if (cached) applyChartHistory(cached.payload);
-    else {
-      chartHistory = null;
-      if (snapshot) renderChart(snapshot);
+    if (cached && (chartHistory !== cached.payload || chartHistoryKey !== requestedKey)) {
+      applyChartHistory(cached.payload, requestedKey);
     }
-    if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
+    else if (!chartHistoryMatchesSelection()) {
+      chartHistory = null;
+      chartHistoryKey = "";
+      if (snapshot) renderChart(snapshot);
+    } else if (snapshot) {
+      // Keep the prior verified curve visible while the next minute arrives.
+      // Its range summary is excluded from current accounting until refreshed.
+      renderChart(snapshot);
+    }
+    // The key carries the exact ledger/history-source revision. An unchanged
+    // key is immutable; a time-to-live only retransfers the same large curve.
+    if (cached) return;
   }
   if (historyInFlight && historyRequestKeyInFlight === requestedKey && preferCache) return;
   if (historyAbortController) historyAbortController.abort();
@@ -1615,8 +1645,8 @@ async function loadChartHistory({preferCache = false} = {}) {
     const decoded = coversAllAvailableDates
       ? {...decodedPayload, start_date: requestedStart, end_date: requestedEnd}
       : decodedPayload;
-    chartHistoryCache.set(requestedKey, {payload: decoded, receivedAt: Date.now()});
-    applyChartHistory(decoded);
+    chartHistoryCache.set(requestedKey, {payload: decoded});
+    applyChartHistory(decoded, requestedKey);
   } catch (error) {
     if (sequence !== historyRequestSequence || error?.name === "AbortError") return;
     historyLoadError = `歷史載入失敗：${error}`;
@@ -1741,7 +1771,7 @@ function renderEvents() {
     total: acceptedSelection ? eventTotal : 0,
     loading: eventLoading || (eventViewActivated && !acceptedSelection),
     hasMore: acceptedSelection && eventHasMore, error: eventLoadError,
-    countDetail: acceptedSelection ? `（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）` : "",
+    countDetail: acceptedSelection ? `（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）${eventLoadNotice ? ` · ${eventLoadNotice}` : ""}` : "",
     renderRow: detailComponents.eventRow,
     emptyText: !eventViewActivated ? "捲動到本區時載入完整委託與成交事件。"
       : acceptedSelection && eventRecordRevision === detailDataRevision("events")
@@ -1756,6 +1786,7 @@ function renderAudit(data) {
     ["歷史反事實涵蓋", data.historical_replay?.start_date ? `${data.historical_replay.start_date} ～ ${data.historical_replay.end_date} · ${number(data.historical_replay.session_count)} 日` : "尚未發布"],
     ["13:25 缺值處理", data.historical_replay?.start_date ? `收盤替代 ${number(data.historical_replay.close_fallback_count)}／仍無計價 ${number(data.historical_replay.missing_1325_count)}` : "—"],
     ["歷史反事實訊號／事件／持倉", data.historical_replay?.start_date ? `${number(data.historical_replay.signal_count)} / ${number(data.historical_replay.event_count)} / ${number(data.historical_replay.position_count)}` : "—"],
+    ["歷史訊號阻擋／前期未平", data.historical_replay?.start_date ? `${number(data.historical_replay.blocked_close_signal_count)} / ${number(data.historical_replay.unresolved_prior_position_count)}` : "—"],
     ["即時帳本訊號／委託／成交", [counts.signals, counts.orders, counts.fills].some((value) => value != null) ? `${number(counts.signals)} / ${number(counts.orders)} / ${number(counts.fills)}` : "明細按交易日讀取"],
     ["歷史反事實權益事件", number(data.historical_replay?.mark_count)],
     ...data.modes.map((mode) => [`${strategyLabel(mode)} checkpoint`, mode.checkpoint_ready ? `READY · ${mode.checkpoint_fingerprint || "fingerprint pending"}` : "MISSING"]),
@@ -1988,6 +2019,8 @@ async function loadEvents({append = false, force = false} = {}) {
     eventOrderTotal = page.order_total;
     eventFillTotal = page.fill_total;
     eventHasMore = page.has_more;
+    eventLoadNotice = page.scan_limit_reached
+      ? `僅統計最近每種帳本最多 ${number(page.scan_limit)} 筆，較早紀錄未計入` : "";
     eventRecordRevision = requestRevision;
     eventSelectionKey = requestSelection;
   } catch (error) {
@@ -2161,7 +2194,7 @@ function filtersChanged({debounceSignals = false, includeChart = false, reloadEv
   featurePanelScopeText = "";
   signalFeatureDrivers = {};
   signalLoadError = positionLoadError = "";
-  if (reloadEvents) eventLoadError = "";
+  if (reloadEvents) eventLoadError = eventLoadNotice = "";
   if (includeChart && snapshot) renderChart(snapshot);
   renderSignalFeaturePanel();
   renderPositions();
@@ -2207,6 +2240,7 @@ function detailDateChanged(event) {
   if (positionAbortController) positionAbortController.abort();
   if (historyAbortController) historyAbortController.abort();
   chartHistory = null;
+  chartHistoryKey = "";
   historyLoadError = "";
   if (snapshot) renderChart(snapshot);
   // Native date pickers can commit the two boundaries separately. Coalesce

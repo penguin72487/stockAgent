@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from downloader.status import (
+    count_reported_source_gaps,
     command_summary_paths,
     download_counts_failure_reason,
     first_download_failure,
@@ -17,6 +18,16 @@ def test_download_counts_failure_reason_accepts_productive_download() -> None:
 
 def test_download_counts_failure_reason_accepts_unchanged_download() -> None:
     assert download_counts_failure_reason({"unchanged": 2000, "failed": 10}) is None
+
+
+def test_reported_gaps_exclude_precheck_statuses_but_include_skipped_lag() -> None:
+    assert count_reported_source_gaps({
+        "stale": 12208,
+        "metadata_invalid": 12,
+        "repaired": 12208,
+        "failed": 12,
+        "lagging_skip": 615,
+    }) == 627
 
 
 def test_command_summary_paths_prefers_asset_output_summary(tmp_path) -> None:

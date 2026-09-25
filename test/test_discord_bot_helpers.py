@@ -17,6 +17,103 @@ discord = pytest.importorskip("discord")
 from services.discord_bot import bot as discord_bot  # noqa: E402
 
 
+def test_gpu_warmup_only_precedes_verified_open_and_offhours_releases_cache(
+    monkeypatch,
+) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade_test",
+        timezone="Asia/Taipei",
+        day_trade_simulation_enabled=True,
+        preopen_prepare_time="08:15",
+        open_time="09:00",
+    )
+    monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: [cfg.market])
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda _market: cfg)
+    monkeypatch.setattr(
+        discord_bot, "_scheduled_market_session_day", lambda *_args: (True, "open")
+    )
+    monkeypatch.setattr(
+        discord_bot, "_day_trade_schedule_state", lambda *_args: "retry"
+    )
+
+    class PreopenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 21, 7, 30, tzinfo=tz)
+
+    class ClosedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 21, 18, 0, tzinfo=tz)
+
+    monkeypatch.setattr(discord_bot, "datetime", PreopenClock)
+    assert discord_bot._startup_inference_warmup_must_defer() is False
+    assert discord_bot._offhours_gpu_cache_release_allowed() is False
+    monkeypatch.setattr(discord_bot, "datetime", ClosedClock)
+    assert discord_bot._startup_inference_warmup_must_defer() is True
+    assert discord_bot._offhours_gpu_cache_release_allowed() is True
+    monkeypatch.setattr(
+        discord_bot,
+        "_scheduled_market_session_day",
+        lambda *_args: (False, "2026-09-20 is a weekend"),
+    )
+    assert discord_bot._startup_inference_warmup_must_defer() is True
+    assert discord_bot._offhours_gpu_cache_release_allowed() is True
+
+
+def test_offhours_session_gate_reuses_one_second_proof_but_opening_is_live(
+    monkeypatch,
+) -> None:
+    cfg = SimpleNamespace(
+        market="tw_test",
+        market_type="tw",
+        holidays=(),
+        day_trade_rule_data_dir="",
+        config_path="",
+        timezone="Asia/Taipei",
+    )
+    calls: list[datetime] = []
+
+    def verify(session_date, _holidays, *, parquet_root=None):
+        calls.append(session_date)
+        return True, "verified"
+
+    monkeypatch.setattr(discord_bot, "verified_tw_stock_session_day", verify)
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: 100.5)
+    discord_bot._cached_tw_session_day.cache_clear()
+    offhours = datetime(2026, 9, 21, 7, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    opening = offhours.replace(hour=8, minute=59)
+    try:
+        assert discord_bot._scheduled_market_session_day(cfg, offhours)[0]
+        assert discord_bot._scheduled_market_session_day(cfg, offhours)[0]
+        assert len(calls) == 1
+        assert discord_bot._scheduled_market_session_day(cfg, opening)[0]
+        assert discord_bot._scheduled_market_session_day(cfg, opening)[0]
+        assert len(calls) == 3
+    finally:
+        discord_bot._cached_tw_session_day.cache_clear()
+
+
+def test_offhours_gpu_cache_release_never_interrupts_inference(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        discord_bot, "_offhours_gpu_cache_release_allowed", lambda: True
+    )
+    monkeypatch.setattr(
+        discord_bot,
+        "release_idle_live_cuda_cache",
+        lambda: calls.append("release") or True,
+    )
+    assert discord_bot._MODEL_INFERENCE_LOCK.acquire(blocking=False)
+    try:
+        assert discord_bot._release_offhours_gpu_cache_sync() is False
+        assert calls == []
+    finally:
+        discord_bot._MODEL_INFERENCE_LOCK.release()
+    assert discord_bot._release_offhours_gpu_cache_sync() is True
+    assert calls == ["release"]
+
+
 def test_guide_lists_all_tw_execution_modes() -> None:
     guide = discord_bot._guide_message()
 
@@ -137,7 +234,9 @@ def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
         "tw_overnight_multi_basis_22",
         "tw_overnight_multi_basis_projection_l1_gelu",
     )
-    assert set(markets).issubset(discord_bot._scheduled_markets())
+    # These historical adapters remain replayable even when the current
+    # penguin deployment schedules only Taiwan day-trade markets.
+    assert set(markets).issubset(configs)
 
     for market in markets:
         config = configs[market]
@@ -157,6 +256,18 @@ def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
         assert kwargs["day_trade_model_observation"] == "latest_quote"
         assert kwargs["previous_signal_backfill_limit"] == 0
         assert kwargs["ensure_previous_signal"] is False
+
+
+def test_penguin_discord_deployment_only_enables_tw_day_trade_modes() -> None:
+    configs = discord_bot._market_configs()
+    enabled = {key for key, cfg in configs.items() if cfg.enabled}
+    assert enabled == {
+        "tw_day_trade_100m",
+        "tw_day_trade_attention_layernorm",
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_multi_basis_22",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
+    }
 
 
 def test_overnight_scheduler_catches_up_only_before_close(monkeypatch) -> None:
@@ -778,6 +889,7 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
         "postclose_fast_arm",
         "postclose_fast_cache",
         "startup_inference_warmup",
+        "offhours_gpu_cache_release",
         "service_heartbeat",
         "signal_now_job_resumer",
         "preopen_prepare",
@@ -914,6 +1026,64 @@ def test_artifact_maintenance_waits_through_transient_public_writer(
     ]
 
 
+def test_artifact_maintenance_rechecks_public_writer_between_markets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from scripts import run_discord_artifact_maintenance as runner
+
+    events: list[tuple[str, str | None]] = []
+    waits = iter((True, False))
+    monkeypatch.setattr(runner.discord_bot, "_rotate_error_log_if_needed", lambda: None)
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_artifact_backfill_status_path",
+        lambda: tmp_path / "artifact_status.json",
+    )
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_record_artifact_maintenance_run",
+        lambda status, **kw: events.append((status, kw.get("reason"))),
+    )
+    monkeypatch.setattr(
+        runner.discord_bot, "_opening_critical_work_pending", lambda: False
+    )
+    monkeypatch.setattr(
+        runner.discord_bot, "_interactive_signal_work_pending", lambda: False
+    )
+    monkeypatch.setattr(runner, "_wait_for_tw_public_refresh", lambda: next(waits))
+    monkeypatch.setattr(
+        runner.discord_bot, "_artifact_maintenance_markets", lambda: ["market"]
+    )
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_resolve_market",
+        lambda _market: SimpleNamespace(
+            timezone="Asia/Taipei", day_trade_simulation_enabled=False
+        ),
+    )
+    monkeypatch.setattr(
+        runner, "_populate_postclose_signal_caches", lambda _markets: (0, 0)
+    )
+    monkeypatch.setattr(
+        runner.discord_bot, "_artifact_backfill_key", lambda *_args: "key"
+    )
+    monkeypatch.setattr(runner.discord_bot, "_market_has_model", lambda _cfg: True)
+    monkeypatch.setattr(
+        runner.discord_bot, "_artifact_backfill_retry_allowed", lambda _key: True
+    )
+    monkeypatch.setattr(
+        runner.discord_bot,
+        "_begin_artifact_backfill",
+        lambda *_args: pytest.fail("inference must defer"),
+    )
+
+    assert runner.run_once() == 0
+    assert events[-1] == ("waiting_source", None)
+
+
 def test_opening_watchdog_cannot_undercut_bounded_quote_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -977,6 +1147,58 @@ def test_final_arm_is_process_scoped_and_requires_opening_source_prewarm(
     assert not discord_bot._preopen_market_final_armed_for_session(
         cfg, "2026-08-27"
     )
+
+
+def test_base_preopen_retry_preserves_current_process_final_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cfg = discord_bot._market_configs()["tw_day_trade_100m"]
+    path = tmp_path / "preopen_readiness.json"
+    monkeypatch.setattr(discord_bot, "_preopen_readiness_path", lambda: path)
+    started_at = datetime.now(ZoneInfo("Asia/Taipei")).isoformat()
+    discord_bot._write_preopen_readiness(
+        cfg,
+        status="ready",
+        started_at=started_at,
+        elapsed_seconds=1.0,
+        summary={"panel_date": "2026-09-23"},
+    )
+    discord_bot._write_preopen_final_arm(
+        cfg,
+        status="ready",
+        started_at=started_at,
+        elapsed_seconds=0.1,
+        summary={
+            "opening_source_prewarm": {
+                "ready": True,
+                "run_id": discord_bot._BOT_RUN_ID,
+                "source": "twse_tpex:mis",
+            }
+        },
+    )
+    armed = json.loads(path.read_text(encoding="utf-8"))["markets"][cfg.market][
+        "final_arm"
+    ]
+
+    # This was today's failure order: final arm finished, then base preparation
+    # completed again and replaced the market row on disk.
+    discord_bot._write_preopen_readiness(
+        cfg,
+        status="running",
+        started_at=started_at,
+        elapsed_seconds=0.0,
+    )
+    discord_bot._write_preopen_readiness(
+        cfg,
+        status="ready",
+        started_at=started_at,
+        elapsed_seconds=2.0,
+        summary={"panel_date": "2026-09-23"},
+    )
+    row = json.loads(path.read_text(encoding="utf-8"))["markets"][cfg.market]
+    assert row["status"] == "ready"
+    assert row["final_arm"] == armed
 
 
 def test_day_trade_opening_quote_symbols_keep_only_alive_rows() -> None:

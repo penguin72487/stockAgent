@@ -154,6 +154,79 @@ def test_inventory_removed_from_model_universe_is_reduced_without_fee_key_error(
     assert fills(engine)[-1]["fill_contract"] == REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
 
 
+def _minute_sweep_quote(at, *, price=1_000.0, volume=2.0):
+    return {
+        "last": price,
+        "execution_price_minute": price,
+        "execution_price_method": "minute_vwap",
+        "minute_volume_lots": volume,
+        "observed_minute_volume_lots": volume,
+        "historical_minute_valuation": True,
+        "quote_at": at.isoformat(),
+        "source": "fixture_right_labelled_1m_vwap",
+    }
+
+
+def test_inventory_reduction_sweeps_second_minute_until_complete(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    assert register(engine, spec, 1, 0, omit_target=True, volume=2) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert sum(int(p["signed_shares"]) for p in mode["positions"].values()) == 1_000
+    assert mode["pending_reduction_shares"] == 1_000
+
+    observed = _now(9, 2) + timedelta(days=1)
+    engine._retry_historical_minute_reduction_orders(
+        mode,
+        {"2330": _minute_sweep_quote(observed)},
+        observed,
+    )
+
+    assert sum(int(p["signed_shares"]) for p in mode["positions"].values()) == 0
+    assert mode["pending_reduction_shares"] == 0
+    reductions = [
+        row for row in fills(engine)
+        if str(row.get("purpose") or "").startswith("next_signal_inventory_delta")
+    ]
+    assert [row["quantity"] for row in reductions] == [1_000, 1_000]
+    assert reductions[-1]["fill_at"] == observed.isoformat()
+    assert reductions[-1]["counterfactual_minute_sweep_fill"] is True
+    assert reductions[-1]["observed_minute_volume_lots"] == 2.0
+
+
+def test_flip_reduces_before_entry_and_shares_each_minute_capacity(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    assert register(engine, spec, 1, -0.3, volume=2) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["pending_reduction_shares"] == 1_000
+    assert mode["pending_entry_shares"] == 2_000
+
+    second = _now(9, 2) + timedelta(days=1)
+    quote = {"2330": _minute_sweep_quote(second, volume=4)}
+    engine._retry_historical_minute_reduction_orders(mode, quote, second)
+    engine._retry_historical_minute_entry_orders(mode, quote, second)
+    # 50% of four lots is 2,000 shares total: 1,000 closes the old long and
+    # only the remaining 1,000 may establish the new short.
+    assert sum(int(p["signed_shares"]) for p in mode["positions"].values()) == -1_000
+    assert mode["pending_reduction_shares"] == 0
+    assert mode["pending_entry_shares"] == 1_000
+
+    third = _now(9, 3) + timedelta(days=1)
+    quote = {"2330": _minute_sweep_quote(third, price=999.0, volume=2)}
+    engine._retry_historical_minute_reduction_orders(mode, quote, third)
+    engine._retry_historical_minute_entry_orders(mode, quote, third)
+    assert sum(int(p["signed_shares"]) for p in mode["positions"].values()) == -2_000
+    assert mode["pending_entry_shares"] == 0
+    new_short_fills = [
+        row
+        for row in fills(engine)
+        if row.get("position_id") == f"{spec.market}:{third.date()}:2330"
+    ]
+    assert [row["purpose"] for row in new_short_fills] == [
+        "entry",
+        "entry_completion",
+    ]
+
+
 def test_known_share_replacement_is_not_retried_as_missing_quote(tmp_path):
     engine, spec = setup_account(tmp_path)
     path = tmp_path / "tw_share_replacement_reference.parquet"
@@ -484,6 +557,35 @@ def test_exact_no_trade_evidence_freezes_only_that_inventory(tmp_path):
     assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row(0)],
         quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={},
         now=at, counterfactual_open_replay=True) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["sizing_nav_carried_price_symbols"] == ["2330"]
+    assert sum(p["signed_shares"] for p in mode["positions"].values()) == 2000
+    assert len(fills(engine)) == 1
+
+
+def test_verified_first_minute_no_trade_uses_prior_mark_without_fill(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    at = _now(9, 1) + timedelta(days=1)
+    summary = _summary("next") | {
+        "generated_at": at.isoformat(),
+        "simulation_replay": True,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+    }
+    quote = {
+        "open": None,
+        "quote_at": at.isoformat(),
+        "opening_no_trade_print_through_0901": True,
+    }
+    assert engine.register_signal(
+        spec=spec,
+        summary=summary,
+        signal_rows=[_row(0)],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=at,
+        counterfactual_open_replay=True,
+    ) == "registered"
     mode = engine.state["modes"][spec.market]
     assert mode["sizing_nav_carried_price_symbols"] == ["2330"]
     assert sum(p["signed_shares"] for p in mode["positions"].values()) == 2000

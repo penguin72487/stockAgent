@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -13,6 +16,22 @@ from stockagent.live.data_monitor_dashboard import (
     build_data_monitor_feature_inventory,
     build_tw_public_monitor_status,
 )
+
+
+def test_runtime_progress_uses_latest_modified_log_not_filename(tmp_path: Path) -> None:
+    logs = tmp_path / "artifacts/daily_downloader/registered_intraday"
+    logs.mkdir(parents=True)
+    old_name = logs / "registered-intraday-20260920.log"
+    new_name = logs / "registered-intraday-20260921.log"
+    old_name.write_text("download:bybit: 20%|#| 2/10 [00:10<00:40, 1.0it/s]\n")
+    new_name.write_text("download:bybit: 10%|#| 1/10 [00:10<01:30, 1.0it/s]\n")
+    os.utime(old_name, ns=(3_000_000_000, 3_000_000_000))
+    os.utime(new_name, ns=(2_000_000_000, 2_000_000_000))
+
+    progress = dashboard._runtime_progress(tmp_path)
+
+    assert len(progress) == 1
+    assert progress[0]["current"] == 2
 
 
 def test_tw_feature_inventory_distinguishes_conditional_and_unverified_fields(
@@ -100,6 +119,33 @@ def test_official_release_archives_require_their_own_active_timer() -> None:
     )
     assert scheduled["automatic_update"] is True
     assert scheduled["schedule_state"] == "scheduled"
+
+
+def test_elapsed_intraday_timer_is_not_reported_as_healthy_automation() -> None:
+    row = {
+        "id": "group:crypto-reference",
+        "status": "waiting",
+        "status_label": "等待下一輪",
+        "automation_eligible": True,
+    }
+    automation = dashboard._automation_for_row(
+        row,
+        now=datetime(2026, 9, 25, 4, tzinfo=UTC),
+        refresh_services={
+            "registered_intraday": {
+                "active": False,
+                "timer_active": True,
+                "timer_state": "elapsed",
+                "next_run_at_utc": None,
+            }
+        },
+    )
+    assert automation["automatic_update"] is False
+    assert automation["schedule_state"] == "timer_unarmed"
+    assert automation["unarmed_service_keys"] == ["registered_intraday"]
+    assert dashboard._operation_state(row, automation) == (
+        "unable", "failed", "自動 timer 已啟用，但沒有下一次觸發"
+    )
 
 
 def test_dune_subscription_gate_is_not_reported_as_scheduled_catch_up(
@@ -244,10 +290,12 @@ def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    stages: dict[str, float] = {}
     payload = build_data_monitor_public_status(
         tmp_path,
         now=datetime(2026, 8, 16, tzinfo=UTC),
         refresh_services={},
+        timing_ms=stages,
     )
 
     assert payload["read_only"] is True
@@ -259,6 +307,16 @@ def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) 
     assert payload["groups"][0]["operation_state"] == "catching_up"
     assert payload["groups"][0]["coverage"]["ratio"] == 1.0
     assert payload["groups"][0]["eta"]["remaining_seconds"] is None
+    assert payload["record_inventory_progress"]["identity_unbound_files"] == 0
+    assert payload["record_inventory_progress"]["identity_rechecked_files"] == 0
+    assert {
+        "inventory_and_groups", "shioaji_status", "openbb_status",
+        "service_state_and_runtime_progress", "specialize_groups",
+        "finlab_sources_and_acquisition", "logical_sources",
+        "enrich_and_rollup", "row_stats_and_integrity",
+    } <= set(stages)
+    assert all(value >= 0 for value in stages.values())
+    assert "public_projection_stages_ms" not in payload
     json.dumps(payload, allow_nan=False)
 
 
@@ -568,7 +626,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=8"' in html
+    assert 'src="../dashboard-core.js?v=10"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript
@@ -596,11 +654,14 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "已延後／未啟用" in html
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
-    assert "styles.css?v=15" in html
-    assert "app.js?v=32" in html
+    assert "styles.css?v=16" in html
+    assert "app.js?v=40" in html
     assert 'id="feature-rows"' in html
     assert 'id="feature-search"' in html
-    assert 'fetchJson("api/features")' in javascript
+    assert "inventory.identity_unbound_files" in javascript
+    assert 'fetchWithTimeout("api/features"' in javascript
+    assert '"If-None-Match"' in javascript
+    assert "response.status === 304" in javascript
     assert 'id="category-filter"' in html
     assert 'id="category-grid"' in html
     assert 'id="inventory-filter"' in html
@@ -663,6 +724,77 @@ def test_operation_sort_and_endpoint_timing_reconcile(tmp_path: Path) -> None:
     assert all(row["automation"]["schedule_label"] for row in rows)
     assert all(row["publication"]["schedule_label"] for row in rows)
     assert all("acquisition_progress" in row for row in rows)
+
+
+def test_complete_projection_enriches_each_source_only_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Roll-up and final listing must share one observation of each child."""
+
+    original = dashboard._enrich_and_sort_rows
+    visits: Counter[str] = Counter()
+
+    def counted(rows, *, now, refresh_services):
+        selected = list(rows)
+        visits.update(str(row.get("id") or "") for row in selected)
+        return original(selected, now=now, refresh_services=refresh_services)
+
+    monkeypatch.setattr(dashboard, "_enrich_and_sort_rows", counted)
+    payload = build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 16, tzinfo=UTC),
+        refresh_services={},
+        shioaji_status={"pipelines": []},
+        openbb_status={},
+    )
+
+    assert payload["sources"]
+    assert payload["integrity_checks"]["checks"]["duplicate_endpoint_ids"] == 0
+    assert set(visits) == {str(row["id"]) for row in payload["sources"]}
+    assert set(visits.values()) == {1}
+
+
+def test_reused_child_enrichment_matches_full_rebuild_order_and_fields() -> None:
+    observed = datetime(2026, 8, 16, tzinfo=UTC)
+    group = {
+        "id": "group:fixture", "scope": "storage_group", "title": "Fixture",
+        "provider": "fixture", "status": "waiting", "eta": {"state": "waiting_schedule"},
+    }
+    children = [
+        {
+            "id": f"fixture:child:{index}", "parent_id": "group:fixture",
+            "scope": "source_registry", "title": f"Child {index}",
+            "provider": "fixture", "status": status,
+            "eta": {"state": "complete"},
+            "latest_at_utc": "2026-08-16T00:00:00Z",
+        }
+        for index, status in enumerate(("current", "blocked"))
+    ]
+    physical = {
+        "id": "inventory:fixture", "parent_id": "group:fixture",
+        "scope": "physical_inventory", "title": "Physical",
+        "provider": "fixture", "status": "legacy",
+    }
+    service_states: dict[str, dict] = {}
+
+    children_for_rollup = dashboard._enrich_and_sort_rows(
+        deepcopy(children), now=observed, refresh_services=service_states
+    )
+    dashboard._rollup_storage_groups([group], children_for_rollup)
+    expected = dashboard._enrich_and_sort_rows(
+        deepcopy([group, *children, physical]),
+        now=observed,
+        refresh_services=service_states,
+    )
+    reused = dashboard._enrich_and_sort_rows(
+        deepcopy([group, physical]), now=observed, refresh_services=service_states
+    )
+    reused.extend(children_for_rollup)
+    reused.sort(key=dashboard._row_sort_key)
+    for index, row in enumerate(reused, start=1):
+        row["sort_index"] = index
+
+    assert reused == expected
 
 
 def test_first_data_advances_next_date_without_claiming_full_completion() -> None:
@@ -1907,6 +2039,10 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert "CRYPTO_HISTORICAL_FEATURES=0" in daily_scope
     assert "CRYPTO_HISTORICAL_FEATURES=0" in intraday_scope
     assert "CRYPTO_HISTORICAL_FEATURES=1" in backfill_scope
+    assert 'OKX_WORKERS="${BACKFILL_OKX_WORKERS:-8}"' in backfill_scope
+    assert 'BYBIT_WORKERS="${BACKFILL_BYBIT_WORKERS:-8}"' in backfill_scope
+    assert 'BINANCE_WORKERS="${BACKFILL_BINANCE_WORKERS:-12}"' in backfill_scope
+    assert 'BINANCE_FEATURE_WORKERS="${BACKFILL_BINANCE_FEATURE_WORKERS:-8}"' in backfill_scope
     assert "registered-backfill" in runner
     assert "CRYPTO_TAIL_ONLY=0" in runner
     assert "registered_backfill" in dashboard._REFRESH_UNITS

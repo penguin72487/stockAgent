@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -39,12 +40,23 @@ except ImportError:  # pragma: no cover
 
 BASE = "https://www.cbc.gov.tw"
 OUTPUT_NAME = "cbc_fx_reserve_release_vintages"
-LIST_URL = BASE + "/tw/lp-302-1-{page}-20.html"
+LIST_URL = BASE + "/tw/lp-302-1-{page}-60.html"
+LEGACY_LIST_URL = BASE + "/tw/lp-302-1-{page}-20.html"
+LIST_PAGE_SIZE = 60
 MAX_BODY_BYTES = 2_000_000
 
 
 class SourceAccessBlocked(RuntimeError):
     """A source challenge is not a quota that should be retried blindly."""
+
+
+def _reject_source_error_page(body: bytes) -> None:
+    # CBC's upstream proxy has returned this HTML error with HTTP 200. It is
+    # neither a release nor evidence that the official listing has changed.
+    if b"this web server can't be reached" in body.lower():
+        raise SourceAccessBlocked("official CBC host returned an upstream error page")
+
+
 PERIOD_RE = re.compile(
     r"(?P<year>\d{2,4}|[零〇一二三四五六七八九十百]+)年\s*"
     r"(?P<month>\d{1,2}|[零〇一二三四五六七八九十]+)月(?:底|末)?外匯存底"
@@ -110,11 +122,25 @@ def _period(title: str) -> str | None:
     return f"{year:04d}-{month:02d}" if 1 <= month <= 12 else None
 
 
-def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
+@dataclass(frozen=True)
+class ListingPage:
+    rows: list[dict[str, str]]
+    page: int
+    total_pages: int
+    total_rows: int | None
+    raw_rows: int
+    page_size: int | None
+
+
+def _parse_listing_page(content: bytes) -> ListingPage:
+    _reject_source_error_page(content)
     soup = BeautifulSoup(content, "html.parser")
     rows: list[dict[str, str]] = []
+    raw_rows = 0
     for item in soup.select("li"):
         time_tag = item.find("time")
+        if time_tag is not None:
+            raw_rows += 1
         link = item.find("a", href=re.compile(r"^/tw/cp-302-"))
         if time_tag is None or link is None:
             continue
@@ -131,11 +157,27 @@ def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
             raise ValueError(f"unexpected CBC release host: {url}")
         rows.append({"period": period or "", "published_on": published_on,
                      "title": title, "release_url": url})
-    page_text = soup.get_text(" ", strip=True)
-    page_match = re.search(r"第\s*\d+\s*/\s*(\d+)\s*頁", page_text)
+    pagination = soup.select_one(".total")
+    page_text = (pagination or soup).get_text(" ", strip=True)
+    page_match = re.search(r"第\s*(\d+)\s*/\s*(\d+)\s*頁", page_text)
     if page_match is None:
         raise ValueError("CBC listing lacks a verifiable page count")
-    return rows, int(page_match[1])
+    total_match = re.search(r"共\s*(\d+)\s*筆資料", page_text)
+    selected = soup.select_one("#PageSize option[selected]")
+    selected_size = str(selected.get("value") or "") if selected else ""
+    return ListingPage(
+        rows=rows,
+        page=int(page_match[1]),
+        total_pages=int(page_match[2]),
+        total_rows=int(total_match[1]) if total_match else None,
+        raw_rows=raw_rows,
+        page_size=int(selected_size) if selected_size.isdigit() else None,
+    )
+
+
+def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
+    page = _parse_listing_page(content)
+    return page.rows, page.total_pages
 
 
 def parse_detail(content: bytes, listed: dict[str, str]) -> tuple[str, float | None, str | None]:
@@ -189,9 +231,21 @@ def _fetch(url: str, limiter: SharedRateLimiter) -> bytes:
                         attempt, base=1.0, cap=30.0,
                         retry_after=response.headers.get("Retry-After")))
                     continue
-                response.raise_for_status()
                 if 300 <= response.status_code < 400:
-                    raise ValueError(f"unexpected CBC redirect: {url}")
+                    # CBC occasionally returns a transient redirect for a valid
+                    # listing URL. Never follow it: the target may be an error
+                    # or challenge page, not the requested official release.
+                    # Retrying the original URL preserves its provenance.
+                    if attempt == 4:
+                        raise ValueError(
+                            f"unexpected CBC redirect after retries: {url} "
+                            f"(HTTP {response.status_code})"
+                        )
+                    limiter.defer(retry_delay_seconds(
+                        attempt, base=1.0, cap=30.0,
+                        retry_after=response.headers.get("Retry-After")))
+                    continue
+                response.raise_for_status()
                 if int(response.headers.get("Content-Length") or 0) > MAX_BODY_BYTES:
                     raise ValueError(f"CBC body exceeds byte cap: {url}")
                 chunks: list[bytes] = []
@@ -204,6 +258,7 @@ def _fetch(url: str, limiter: SharedRateLimiter) -> bytes:
                 body = b"".join(chunks)
                 if not body:
                     raise ValueError(f"empty CBC body: {url}")
+                _reject_source_error_page(body)
                 return body
         except requests.RequestException:
             if attempt == 4:
@@ -226,15 +281,34 @@ def _save_raw(directory: Path, prefix: str, body: bytes) -> tuple[str, str]:
     return digest, str(path)
 
 
-def _cached(directory: Path, prefix: str) -> bytes | None:
-    paths = sorted(directory.glob(f"{prefix}-*.html"), key=lambda path: path.stat().st_mtime_ns)
-    if not paths:
-        return None
-    path = paths[-1]
-    body = path.read_bytes()
-    if hashlib.sha256(body).hexdigest()[:16] != path.stem.removeprefix(f"{prefix}-"):
-        raise RuntimeError(f"CBC cached release checksum mismatch: {path}")
-    return body
+def _cached(directory: Path, prefix: str, *, listing: bool = False) -> bytes | None:
+    paths = sorted(directory.glob(f"{prefix}-*.html"), key=lambda path: path.stat().st_mtime_ns,
+                   reverse=True)
+    for path in paths:
+        body = path.read_bytes()
+        if hashlib.sha256(body).hexdigest()[:16] != path.stem.removeprefix(f"{prefix}-"):
+            raise RuntimeError(f"CBC cached release checksum mismatch: {path}")
+        if listing:
+            try:
+                parse_listing(body)
+            except (ValueError, SourceAccessBlocked):
+                # Retain the raw bytes for audit but never let a later cached
+                # run mistake a proxy error for an official listing.
+                continue
+        return body
+    return None
+
+
+def _listing_layout(root: Path, *, cached_only: bool) -> tuple[str, int, str]:
+    """Keep 20-row legacy originals usable without mixing their page numbers.
+
+    A partial 60-row cache must fail closed instead of silently combining it
+    with 20-row pages. New online runs always verify the full 60-row listing.
+    """
+    directory = root / "raw" / OUTPUT_NAME / "list"
+    if cached_only and not any(directory.glob("page-0060-0001-*.html")):
+        return LEGACY_LIST_URL, 20, "page-{page:04d}"
+    return LIST_URL, LIST_PAGE_SIZE, "page-0060-{page:04d}"
 
 
 @contextmanager
@@ -263,20 +337,20 @@ def _collect_one(listed: dict[str, str], root: Path, limiter: SharedRateLimiter,
                  *, refresh: bool, offline_cache_only: bool = False) -> dict[str, object]:
     release_id = Path(urlparse(listed["release_url"]).path).stem
     directory = root / "raw" / OUTPUT_NAME / "detail" / release_id
-    body = None if refresh else _cached(directory, "article")
+    cached_body = None if refresh else _cached(directory, "article")
+    body = cached_body
     if body is None:
         if offline_cache_only:
             raise FileNotFoundError(f"no cached original CBC article: {listed['release_url']}")
         body = _fetch(listed["release_url"], limiter)
-    digest, path = _save_raw(directory, "article", body)
     try:
         period, value, parse_warning = parse_detail(body, listed)
     except ValueError:
-        if refresh or offline_cache_only:
+        if refresh or offline_cache_only or cached_body is None:
             raise
         body = _fetch(listed["release_url"], limiter)
-        digest, path = _save_raw(directory, "article", body)
         period, value, parse_warning = parse_detail(body, listed)
+    digest, path = _save_raw(directory, "article", body)
     return {**listed, "period": period,
             "listing_period": listed["period"],
             "period_corrected_from_body": bool(listed["period"] and period != listed["period"]),
@@ -300,20 +374,25 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                         "total_releases": None, "estimated_seconds_remaining": None})
     listed: dict[str, dict[str, str]] = {}
     list_receipts: list[dict[str, object]] = []
-    def fetch_page(page: int) -> tuple[int, bytes, str, str, list[dict[str, str]], int]:
-        url = LIST_URL.format(page=page)
+    list_url, listing_page_size, page_prefix = _listing_layout(
+        root, cached_only=offline_cache_only or cached_list_pages
+    )
+    discovery_started = time.monotonic()
+    def fetch_page(page: int) -> tuple[int, str, str, ListingPage]:
+        url = list_url.format(page=page)
+        prefix = page_prefix.format(page=page)
         body = (
-            _cached(root / "raw" / OUTPUT_NAME / "list", f"page-{page:04d}")
+            _cached(root / "raw" / OUTPUT_NAME / "list", prefix, listing=True)
             if offline_cache_only or cached_list_pages else _fetch(url, limiter)
         )
         if body is None:
             raise FileNotFoundError(f"no cached CBC listing page {page}")
-        digest, path = _save_raw(root / "raw" / OUTPUT_NAME / "list", f"page-{page:04d}", body)
-        rows, reported_pages = parse_listing(body)
-        return page, body, digest, path, rows, reported_pages
+        listing = _parse_listing_page(body)
+        digest, path = _save_raw(root / "raw" / OUTPUT_NAME / "list", prefix, body)
+        return page, digest, path, listing
 
     first = fetch_page(1)
-    total_pages = first[-1]
+    total_pages = first[3].total_pages
     if not 1 <= total_pages <= 1000:
         raise ValueError(f"CBC reported implausible page count: {total_pages}")
     pages = [first]
@@ -337,17 +416,29 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                         (total_pages - completed_pages) * elapsed / completed_pages
                     ),
                 })
-    for page, _body, digest, path, rows, reported_pages in sorted(pages):
-        if reported_pages != total_pages:
-            raise ValueError("CBC total page count changed during discovery; retry")
-        url = LIST_URL.format(page=page)
+    total_rows = first[3].total_rows
+    if total_rows is None or total_rows < 1:
+        raise ValueError("CBC listing lacks a verifiable total row count")
+    if (total_rows + listing_page_size - 1) // listing_page_size != total_pages:
+        raise ValueError("CBC listing page count contradicts its total row count")
+    for page, digest, path, listing in sorted(pages):
+        if listing.page != page or listing.total_pages != total_pages:
+            raise ValueError("CBC listing page identity or count changed during discovery; retry")
+        if listing.total_rows != total_rows or listing.page_size != listing_page_size:
+            raise ValueError("CBC listing total rows or page size changed during discovery; retry")
+        expected_raw_rows = min(listing_page_size, total_rows - (page - 1) * listing_page_size)
+        if listing.raw_rows != expected_raw_rows:
+            raise ValueError(f"CBC listing page {page} has {listing.raw_rows} of {expected_raw_rows} rows")
+        url = list_url.format(page=page)
         list_receipts.append({"page": page, "url": url, "sha256": digest,
-                              "path": path, "release_rows": len(rows)})
-        for row in rows:
+                              "path": path, "raw_rows": listing.raw_rows,
+                              "release_rows": len(listing.rows)})
+        for row in listing.rows:
             previous = listed.get(row["release_url"])
             if previous is not None and previous != row:
                 raise ValueError(f"CBC listing conflict for {row['release_url']}")
             listed[row["release_url"]] = row
+    discovery_seconds = round(time.monotonic() - discovery_started, 3)
     ordered = sorted(listed.values(), key=lambda item: (item["published_on"], item["release_url"]))
     _write_state(root, {"dataset": OUTPUT_NAME, "status": "running", "phase": "downloading",
                         "started_at_utc": started_at, "completed_releases": 0,
@@ -356,6 +447,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
     failures: list[dict[str, str]] = []
     newest = {row["release_url"] for row in ordered[-refresh_recent:]} if refresh_recent else set()
     last_progress = time.monotonic()
+    detail_started = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_collect_one, row, root, limiter,
                                refresh=row["release_url"] in newest,
@@ -377,6 +469,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                                         (len(ordered) - completed) * (now - started) / completed
                                     ) if completed else None})
                 last_progress = now
+    detail_seconds = round(time.monotonic() - detail_started, 3)
     results.sort(key=lambda row: (str(row["published_on"]), str(row["release_url"])))
     periods = {str(row["period"]) for row in results if row["metric"] is not None}
     missing_periods: list[str] = []
@@ -396,6 +489,10 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         "dataset": OUTPUT_NAME, "status": "complete" if complete else "degraded",
         "offline_cache_only": offline_cache_only,
         "cached_list_pages": cached_list_pages,
+        "listing_page_size": listing_page_size,
+        "listing_pages": total_pages,
+        "stage_seconds": {"listing_discovery": discovery_seconds,
+                          "detail_collection": detail_seconds},
         "complete": complete, "registered_releases": len(ordered), "saved_releases": len(results),
         "headline_values": sum(row["metric"] is not None for row in results),
         "distinct_periods": len(periods), "earliest_period": min(periods) if periods else None,
@@ -407,6 +504,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
     # A failed detail fetch must not replace a previously complete archive
     # with a subset. Raw successful responses remain available for resume.
     if results and not failures:
+        write_started = time.monotonic()
         destination = root / f"{OUTPUT_NAME}.parquet"
         parquet_sha256, changed = write_release_rows_if_changed(
             destination, results, identity_columns=("release_url",)
@@ -414,6 +512,9 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         summary["parquet_path"] = str(destination)
         summary["parquet_sha256"] = parquet_sha256
         summary["parquet_changed"] = changed
+        summary["stage_seconds"]["parquet_proof_write"] = round(
+            time.monotonic() - write_started, 3
+        )
     _write_state(root, summary)
     return summary
 

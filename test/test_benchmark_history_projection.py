@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from stockagent.live.benchmark_history_projection import (
@@ -12,6 +13,7 @@ from stockagent.live.benchmark_history_projection import (
     write_benchmark_projection,
 )
 from stockagent.live.tw_day_trade_dashboard import build_dashboard_history_snapshot
+from scripts.promote_tw_day_trade_replay import _validate_benchmarks
 
 
 def _benchmark_mark(session_date: str, minute: str, equity: float) -> dict[str, object]:
@@ -28,6 +30,53 @@ def _benchmark_mark(session_date: str, minute: str, equity: float) -> dict[str, 
 
 def _source_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_benchmark_validator_uses_hash_matched_projection_and_falls_back_on_corruption(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from scripts import promote_tw_day_trade_replay as promotion
+
+    session_date = "2026-08-13"
+    marks = [
+        {
+            "benchmark_id": benchmark_id,
+            "session_date": session_date,
+            "minute": (datetime.fromisoformat(f"{session_date}T{start}+08:00")
+                       + timedelta(minutes=index)).isoformat(timespec="minutes"),
+        }
+        for benchmark_id, start, count in (
+            ("benchmark_0050", "09:00", 271),
+            ("benchmark_2330", "09:00", 271),
+            ("benchmark_tx_continuous", "08:45", 300),
+        )
+        for index in range(count)
+    ]
+    source = tmp_path / "benchmark_history.json"
+    source.write_text(json.dumps({"marks": marks}), encoding="utf-8")
+    write_benchmark_projection(
+        state_dir=tmp_path,
+        source_path=source,
+        source_sha256=_source_sha256(source),
+        origins={},
+        marks=marks,
+        created_at="2026-08-13T14:00:00+08:00",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(promotion, "_load_object", lambda _path: (_ for _ in ()).throw(
+            AssertionError("verified projection should avoid decoding canonical JSON")
+        ))
+        result = _validate_benchmarks(tmp_path, completed_session_dates=[session_date])
+    assert result["rows"] == {
+        "benchmark_0050": 271,
+        "benchmark_2330": 271,
+        "benchmark_tx_continuous": 300,
+    }
+
+    head = json.loads(projection_head_path(tmp_path).read_text(encoding="utf-8"))
+    shard = tmp_path / "benchmark_history_projection/v1" / head["sessions"][session_date]["path"]
+    shard.write_bytes(b"corrupt")
+    assert _validate_benchmarks(tmp_path, completed_session_dates=[session_date])["rows"] == result["rows"]
 
 
 def test_benchmark_projection_is_immutable_incremental_and_private(tmp_path: Path) -> None:

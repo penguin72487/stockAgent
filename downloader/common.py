@@ -465,12 +465,12 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
     "shioaji_quote_query": ProviderRateLimit(
         provider="shioaji_quote_query",
         requests=50,
-        seconds=5,
-        basis="user-selected account ceiling; matches legacy PDF/C# 50/5s",
+        seconds=10,
+        basis="current official Python API market-data account ceiling 50/10s",
         source_url="https://sinotrade.github.io/tutor/limit/",
         note=(
             "Ticks, snapshots, Kbars, credit and short-source queries share this "
-            "ceiling. Current Python docs also contain a conflicting 50/10s value."
+            "ceiling; older PDF/C# 50/5s text is not the current Python limit."
         ),
     ),
     "frankfurter_public": ProviderRateLimit(

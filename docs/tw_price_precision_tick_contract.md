@@ -45,7 +45,7 @@
 
 **官方文件本身也可能衝突。** 證交所 60 週年文字把早期 ETF／REIT 分界寫成「10 元」，但 [2003 年生效的 ETF 買賣辦法第 6 條](https://twse-regulation.twse.com.tw/TW/law/DAT0601_print.aspx?FLCODE=FL007114&FLDATE=20030516&LSER=001)和 [2006 年 3 月 6 日生效的 REIT 修法原文及舊條文](https://www.twse.com.tw/downloads/zh/announcement/download/market/950113-0950200080-1.pdf)都明訂「50 元」。程式採當時生效的規範原文，不採紀念刊物的回顧敘述；這是來源優先序與實際日期的判斷，不能只因為稽核零異常就省略查證。
 
-**興櫃錯分的量化證據：** 先以股票規則掃描 2020-03-02 至 2020-03-20 共 15 個分鐘分區，原有 566 個看似違例的 OHLC 值。逐檔追查為 `6716` 476 個（15 日）、`2743` 90 個（5 日）。兩檔當時已在券商資料中標示 `tpex`，但交易所正式上櫃分別是 3 月 27 日與 3 月 9 日；上櫃前採興櫃 0.01 元規則。原始價格未修改，新的格點稽核只按已查證的交易日身分判斷。這亦暴露**策略資格**另有獨立問題：上櫃前的 6716 分鐘資料共有 306 列，其中 `feature_valid` 13 列、`label_valid_1m` 59 列，兩者同時有效 **2 列**；2743 有 53 列，兩者同時有效 0 列。現有訓練載入器尚未按歷史興櫃身分遮罩那 2 列；以一般上櫃股票連續撮合／成交量假設回測它們，不能由 tick 合法性支持。要作模型安全宣告，須在入選與執行遮罩隔離，並使資料指紋、normalizer 及舊 checkpoint 版本同步更新。
+**興櫃錯分與訓練修復：** 先以股票規則掃描 2020-03-02 至 2020-03-20 共 15 個分鐘分區，原有 566 個看似違例的 OHLC 值。逐檔追查為 `6716` 476 個（15 日）、`2743` 90 個（5 日）。兩檔當時已在券商資料中標示 `tpex`，但交易所正式上櫃分別是 3 月 27 日與 3 月 9 日；上櫃前採興櫃 0.01 元規則。原始價格未修改。另一個獨立問題是普通上市櫃策略資格：上櫃前的 6716 分鐘來源共 306 列，`feature_valid` 13 列、`label_valid_1m` 59 列，兩者同時有效 **2 列**；2743 有 53 列，兩者同時有效 0 列。`stockagent/data/tw_listing_admission.py` 現以公告日期排除兩檔上櫃前的普通市場特徵與成交。`tw_minute` schema 5 載入器將其特徵、標籤、日終狀態、當日日頻上下文與引導權重遮罩，normalizer 從來源 manifest 的彙總統計扣除相關有效列；日頻 `tw_day_trade` 的 schema 4 分鐘執行帶也在載入時遮罩。研究策略評分與回測使用同一日期表。原始 Parquet 與來源 manifest 不改寫；分鐘模型資料指紋、日頻分鐘執行快取及 checkpoint／成品契約加入資格版本。舊 checkpoint 不能直接沿用，須使用新 artifact root 重新訓練並產生新報告。
 
 [證交所雙幣 ETF 制度](https://www.twse.com.tw/zh/products/system/dual-etf/introduction.html)確認外幣加掛 ETF 亦用 `<50: .01`、`≥50: .05`，但單位是自己的交易幣別。代碼第六碼 K/M/S/C 可識別外幣櫃台；不能單靠代碼判定是人民幣或美元。
 [2016-03-08 雙幣機制](https://accessibility.twse.com.tw/zh/products/system/dual-etf/introduction.html)及 [2017-04-24 加掛 ETF 交易單位可不同的修法](https://www.twse.com.tw/downloads/zh/announcement/download/market/1060208-10600015981-1.pdf)影響交易幣別及每張受益權單位，不能錯寫成數值 tick 變更；金額與數量換算要依當時商品主檔獨立驗證。
@@ -69,7 +69,9 @@
 
 該券商歷史收集器自己的 `summary.json` 狀態仍是 `waiting_source`、`coverage_state=source_gaps`；114,424,998 列現存檔案的格點檢查通過，也不能因此宣稱目標期間完整回填。
 
-另有獨立的 `artifacts/data_quality/tw_price_precision/emerging_admission.json`：查核正式上櫃日前 19 個分區的內容 SHA，報告 `needs_training_eligibility_fix`，精確指出 6716 兩筆仍可能被現有分鐘訓練載入器納入的列。這份資格收據與格點收據不可互換。
+另有獨立的 `artifacts/data_quality/tw_price_precision/emerging_admission.json`（schema 4）及 `emerging_admission_v5.json`（schema 5）：各查核正式上櫃日前 19 個分區的內容 SHA。兩份收據都保留來源雙重有效 **2 列**，並依目前訓練資格契約計算有效筆數 **0 列**，狀態 `training_admission_excludes_source_rows`。schema 5 在這 19 天的 normalizer 來源有效列為 2,236,508，新規則扣除 6716 上櫃前的 **13 列**後為 2,236,495；這與只數「特徵和標籤同時有效」的 2 列是不同統計。這只證明已核實兩檔的排除與實際資料遮罩；未知興櫃轉板、其他商品的歷史資格及策略可成交性仍需逐案核實。資格收據與報價格點收據不可互換。
+
+截至本次檢查，schema 4 原始研究資料涵蓋 2020-03-02 至 2026-09-18（1,598 日），schema 5 developing-candle 資料僅至 2026-08-04（1,567 日）。`configs/markets/tw_minute.yaml` 已改指向可載入的 schema 5 及新成品目錄；此修復不等於 schema 5 已追上原始資料，也不等於舊 checkpoint 已重訓。需要截至最新日的分鐘模型時，先用既有 `scripts/upgrade_tw_minute_developing_candles.py --resume` 完成增量升級並重新稽核。
 
 分鐘來源另有既有的 `data_tw_minute/audits/full_latest.json`：同一份 manifest SHA `30bb6b19ff25b38cda59cc615bd7bf2d7502a066e1adadb52e584d2efc86de0a`，2026-09-19 01:22 執行過 1,598 個分區／312,196,881 列的完整來源 SHA 與日曆核對，所有現有分區的 mtime 都比該稽核完成時間早；此次價格稽核另保存來源檔案狀態集合的 SHA。HFT 訓練分區 `trade_date=2026-08-11` 的內容 SHA 也與自己的 manifest `output_sha256` 相符。這些核對分別是內容身分與價格格點證據，不應把檔案 metadata digest 當作逐檔檔案內容 SHA。
 

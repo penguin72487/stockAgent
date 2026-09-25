@@ -10,16 +10,49 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.artifact_io import atomic_write_json
-from scripts.deploy_tw_overnight_history import deploy
-from scripts.rebuild_tw_overnight_history import configured_history_lineage
-from scripts.switch_tw_day_trade_strategy import _latest_completed_session
-from stockagent.live.tw_day_trade_simulation import TAIPEI
+from stockagent.live.market_config import load_market_configs
+
+
+TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def configured_history_lineage(markets_dir: Path, start_date: str) -> dict:
+    from scripts.rebuild_tw_overnight_history import configured_history_lineage as build
+
+    return build(markets_dir, start_date)
+
+
+def _source_generation(plan: dict) -> str:
+    from scripts.rebuild_tw_overnight_history import _source_generation as generate
+
+    return generate(plan)
+
+
+def _check_source_revision(plan: dict) -> object:
+    from scripts.rebuild_tw_overnight_history import _check_source_revision as check
+
+    return check(plan)
+
+
+def _latest_completed_session(
+    *, tw_public_dir: Path, start_date: date
+) -> tuple[date, list[date], str]:
+    from scripts.switch_tw_day_trade_strategy import _latest_completed_session as latest
+
+    return latest(tw_public_dir=tw_public_dir, start_date=start_date)
+
+
+def deploy(source: Path, state_dir: Path) -> dict:
+    from scripts.deploy_tw_overnight_history import deploy as publish
+
+    return publish(source, state_dir)
 
 
 def _sha256(path: Path) -> str:
@@ -34,6 +67,7 @@ def _deployment_current(
     state_dir: Path,
     end_date: str,
     lineage_fingerprint: str,
+    price_limit_dir: Path | None = None,
 ) -> bool:
     history_path = state_dir / "overnight_history.json"
     receipt_path = state_dir / "overnight_history_deployment.json"
@@ -46,15 +80,92 @@ def _deployment_current(
         receipt = json.loads(receipt_path.read_text())
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    return bool(
+    if not (
         history.get("status") in {"ready", "ready_with_stale_unresolved_position"}
         and history.get("end_date") == end_date
         and receipt.get("end_date") == end_date
-        and receipt.get("history_sha256") == _sha256(history_path)
-        and receipt.get("signal_history_sha256") == _sha256(signal_path)
-        and receipt.get("event_history_sha256") == _sha256(event_path)
         and receipt.get("history_lineage_fingerprint") == lineage_fingerprint
-    )
+    ):
+        return False
+    try:
+        outputs_current = (
+            receipt.get("history_sha256") == _sha256(history_path)
+            and receipt.get("signal_history_sha256") == _sha256(signal_path)
+            and receipt.get("event_history_sha256") == _sha256(event_path)
+        )
+    except OSError:
+        return False
+    if not outputs_current:
+        return False
+    # A published file can remain byte-identical after the official source is
+    # revised in place. The completed date alone is not a freshness receipt.
+    try:
+        source = Path(receipt["source"])
+        plan_path = source / "plan.json"
+        if _sha256(plan_path) != receipt["source_plan_sha256"]:
+            return False
+        plan = json.loads(plan_path.read_text())
+        if not plan.get("source_files"):
+            return False
+        _check_source_revision(plan)
+        sessions = plan.get("sessions")
+        if price_limit_dir is not None and (
+            not isinstance(sessions, list)
+            or not sessions
+            or str(sessions[-1]) != end_date
+        ):
+            return False
+        if price_limit_dir is not None and plan.get("price_limit_files"):
+            if set(plan["price_limit_files"]) != set(sessions):
+                return False
+        # Legacy published plans predate the per-session price-limit inventory.
+        # Verify their actual cached input receipts before allowing a no-op;
+        # the next source revision will rebuild into a fully pinned generation.
+        if price_limit_dir is not None and not plan.get("price_limit_files"):
+            for day in sessions:
+                prior = json.loads(
+                    (source / "inputs" / str(day) / "source.json").read_text()
+                )
+                expected = (prior.get("source_hashes") or {}).get("price_limits")
+                if not expected or _sha256(price_limit_dir / f"{day}.parquet") != expected:
+                    return False
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _verified_rebuild_output(
+    lineage_dir: Path, end_date: str, lineage_fingerprint: str,
+) -> Path:
+    """Accept only the source-pinned generation selected by this rebuild."""
+
+    resolved_receipt = json.loads((lineage_dir / "resolved_output.json").read_text())
+    resolved_dir = Path(str(resolved_receipt["output"])).resolve(strict=True)
+    generation_root = (lineage_dir / "source_generations").resolve()
+    if resolved_dir.parent != generation_root:
+        raise RuntimeError("overnight rebuild resolved outside source generations")
+    plan = json.loads((resolved_dir / "plan.json").read_text())
+    sessions = plan.get("sessions")
+    if (
+        not isinstance(sessions, list)
+        or not sessions
+        or str(sessions[-1]) != end_date
+        or set(plan.get("price_limit_files") or {}) != set(sessions)
+    ):
+        raise RuntimeError("overnight rebuild lacks complete session source receipts")
+    generation = _source_generation(plan)
+    if not (
+        resolved_dir.name == generation
+        and plan.get("source_generation_sha256") == generation
+        and resolved_receipt.get("source_generation_sha256") == generation
+        and plan["history_lineage"]["fingerprint_sha256"] == lineage_fingerprint
+        and resolved_receipt.get("history_lineage_fingerprint") == lineage_fingerprint
+        and plan.get("end_date") == end_date
+        and resolved_receipt.get("end_date") == end_date
+    ):
+        raise RuntimeError("overnight rebuild generation receipt does not match plan")
+    _check_source_revision(plan)
+    return resolved_dir
 
 
 def maintain(args: argparse.Namespace) -> dict[str, object]:
@@ -70,17 +181,38 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
         except BlockingIOError as exc:
             raise RuntimeError("overnight history maintenance is already running") from exc
 
+        enabled = [
+            cfg
+            for cfg in load_market_configs(markets_dir).values()
+            if cfg.enabled and cfg.overnight_simulation_enabled
+        ]
+        if not enabled:
+            idle = {
+                "schema_version": 1,
+                "status": "idle_no_enabled_modes",
+                "observed_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
+                "start_date": args.start_date,
+                "enabled_market_count": 0,
+            }
+            atomic_write_json(
+                REPO_ROOT
+                / "artifacts/operations/tw_overnight_history_maintenance/latest_attempt.json",
+                idle,
+            )
+            return idle
+        lineage = configured_history_lineage(markets_dir, args.start_date)
         latest, sessions, calendar_sha256 = _latest_completed_session(
             tw_public_dir=args.public_root,
             start_date=date.fromisoformat(args.start_date),
         )
         latest_text = latest.isoformat()
-        lineage = configured_history_lineage(markets_dir, args.start_date)
         lineage_fingerprint = str(lineage["fingerprint_sha256"])
         lineage_dir = work_dir / "lineages" / lineage_fingerprint
         lineage_dir.mkdir(parents=True, exist_ok=True)
         if (
-            _deployment_current(state_dir, latest_text, lineage_fingerprint)
+            _deployment_current(
+                state_dir, latest_text, lineage_fingerprint, args.price_limit_dir
+            )
             and not args.force
         ):
             return {
@@ -107,11 +239,17 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
             str(markets_dir),
             "--output",
             str(lineage_dir),
+            "--versioned-output",
+            "--resolved-output-receipt",
+            str(lineage_dir / "resolved_output.json"),
             "--stage",
             "all",
         ]
         subprocess.run(command, cwd=REPO_ROOT, check=True)
-        receipt = deploy(lineage_dir, state_dir)
+        resolved_dir = _verified_rebuild_output(
+            lineage_dir, latest_text, lineage_fingerprint
+        )
+        receipt = deploy(resolved_dir, state_dir)
         maintenance = {
             "schema_version": 1,
             "status": "complete",
@@ -121,7 +259,7 @@ def maintain(args: argparse.Namespace) -> dict[str, object]:
             "session_count": len(sessions),
             "calendar_sha256": calendar_sha256,
             "history_lineage_fingerprint": lineage_fingerprint,
-            "lineage_work_dir": str(lineage_dir),
+            "lineage_work_dir": str(resolved_dir),
             "deployment": receipt,
         }
         output = REPO_ROOT / "artifacts/operations/tw_overnight_history_maintenance/latest.json"

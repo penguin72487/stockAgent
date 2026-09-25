@@ -25,14 +25,14 @@ try:
     from downloader.common import SharedRateLimiter
     from downloader.download_tw_cbc_fx_release_archive import (
         BASE, LIST_URL, _fetch, _save_raw, _cached, _chinese_int,
-        SourceAccessBlocked,
+        SourceAccessBlocked, _reject_source_error_page,
     )
     from downloader.release_archive_io import write_release_rows_if_changed
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter
     from download_tw_cbc_fx_release_archive import (
         BASE, LIST_URL, _fetch, _save_raw, _cached, _chinese_int,
-        SourceAccessBlocked,
+        SourceAccessBlocked, _reject_source_error_page,
     )
     from release_archive_io import write_release_rows_if_changed
 
@@ -92,6 +92,7 @@ def _percentage(raw: str) -> float:
 
 
 def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
+    _reject_source_error_page(content)
     soup = BeautifulSoup(content, "html.parser")
     rows: list[dict[str, str]] = []
     for item in soup.select("li"):
@@ -204,11 +205,18 @@ def _collect_one(listed: dict[str, str], root: Path, limiter: SharedRateLimiter,
                  *, refresh: bool) -> list[dict[str, object]]:
     release_id = Path(urlparse(listed["release_url"]).path).stem
     directory = root / "raw" / OUTPUT_NAME / "detail" / release_id
-    body = None if refresh else _cached(directory, "article")
+    cached_body = None if refresh else _cached(directory, "article")
+    body = cached_body
     if body is None:
         body = _fetch(listed["release_url"], limiter)
+    try:
+        values, warning = parse_detail(body, listed)
+    except ValueError:
+        if refresh or cached_body is None:
+            raise
+        body = _fetch(listed["release_url"], limiter)
+        values, warning = parse_detail(body, listed)
     digest, path = _save_raw(directory, "article", body)
-    values, warning = parse_detail(body, listed)
     observed = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     return [
         {**listed, "release_id": release_id, "metric": metric,
@@ -250,13 +258,13 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                         "total_releases": None, "estimated_seconds_remaining": None})
     def fetch_page(page: int):
         url = LIST_URL.format(page=page)
-        body = (_cached(root / "raw" / OUTPUT_NAME / "list", f"page-{page:04d}")
+        body = (_cached(root / "raw" / OUTPUT_NAME / "list", f"page-{page:04d}", listing=True)
                 if cached_list_pages else _fetch(url, limiter))
         if body is None:
             raise FileNotFoundError(f"missing cached CBC listing page: {page}")
+        rows, count = parse_listing(body)
         digest, path = _save_raw(root / "raw" / OUTPUT_NAME / "list",
                                  f"page-{page:04d}", body)
-        rows, count = parse_listing(body)
         return page, digest, path, rows, count
 
     first = fetch_page(1)

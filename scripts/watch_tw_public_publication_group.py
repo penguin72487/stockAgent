@@ -44,6 +44,7 @@ from downloader.download_tw_public_data import (  # noqa: E402
     _select_specs,
     _validated_taiex_session_dates,
 )
+from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -468,6 +469,24 @@ def _download_evidence(metadata_dir: Path) -> dict[str, object]:
     }
 
 
+def _download_data_status(summary: object) -> str:
+    """Separate command success from official-data completeness."""
+
+    if not isinstance(summary, dict):
+        return "unknown"
+    try:
+        failed = int(summary.get("failed_count") or 0)
+        publication_lag = int(summary.get("publication_lag_count") or 0)
+        blocking = int(summary.get("blocking_failed_count") or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if summary.get("coverage_complete") is True and failed == 0:
+        return "complete"
+    if failed > 0 and failed == publication_lag and blocking == 0:
+        return "waiting_publication"
+    return "incomplete"
+
+
 def _preopen_acceptance_errors(
     summary: object,
     *,
@@ -573,6 +592,23 @@ def _completed_session_finalize_command(
     ]
 
 
+def _confirmed_closed_stock_session(live_root: Path, observed: datetime) -> str | None:
+    """Skip close-only work only with affirmative official closure evidence."""
+
+    opened, reason = verified_tw_stock_session_day(
+        observed.astimezone(TAIPEI).date(), parquet_root=live_root
+    )
+    if opened:
+        return None
+    if reason.endswith(" is a weekend") or (
+        reason.startswith("official TWSE schedule as-of ")
+        and "ordinary weekday session" not in reason
+    ):
+        return reason
+    # Missing, unreadable, or conflicting calendars cannot prove a holiday.
+    return None
+
+
 def main() -> int:
     args = parse_args()
     if args.workers <= 0 or args.date_workers <= 0:
@@ -606,6 +642,34 @@ def main() -> int:
     specs = _select_specs(list(phase.selectors))
     selected_names = sorted(spec.name for spec in specs)
     sources = dict(sorted(Counter(spec.source for spec in specs).items()))
+    if phase.name in COMPLETED_SESSION_FINALIZE_PHASES:
+        closed_reason = _confirmed_closed_stock_session(live_root, started)
+        if closed_reason is not None:
+            payload: dict[str, object] = {
+                "schema_version": 1,
+                "status": "skipped_verified_non_session",
+                "data_status": "not_applicable",
+                "phase": phase.name,
+                "official_basis": phase.official_basis,
+                "scheduled_boundary": phase.anchor.isoformat(),
+                "started_at_taipei": started.isoformat(),
+                "completed_at_taipei": datetime.now(TAIPEI).isoformat(),
+                "session_date": started.date().isoformat(),
+                "session_evidence": closed_reason,
+                "selected_dataset_count": len(selected_names),
+                "selected_datasets": selected_names,
+                "source_counts": sources,
+                "changed_dataset_count": 0,
+                "changed_datasets": [],
+                "content_change_observed": False,
+                "commands": [],
+                "return_codes": [],
+                "live_root": str(live_root),
+                "completed_session_finalize": "not_applicable",
+            }
+            _write_receipts(receipt_root, payload, phase=phase, started=started)
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
     lock_path = live_root.parent / ".locks" / "tw-public-refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_started = time.perf_counter()
@@ -655,6 +719,7 @@ def main() -> int:
     payload: dict[str, object] = {
         "schema_version": 1,
         "status": status,
+        "data_status": _download_data_status(preopen_evidence.get("download_summary")),
         "phase": phase.name,
         "official_basis": phase.official_basis,
         "scheduled_boundary": phase.anchor.isoformat(),

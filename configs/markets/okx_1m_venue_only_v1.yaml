@@ -1,0 +1,30 @@
+# Price-only 1m research baseline; not a funding-adjusted perpetual executor.
+base_config: crypto.yaml
+experiment_name: okx-1m-venue-only-v1
+runner:
+  output_dir: artifacts/markets/okx_1m_venue_only_v1
+  resume: true
+data:
+  crypto_exchange_scope: okx
+  parquet_root: data_okx/1m
+  benchmark_name: BTCUSDTSWAP
+  panel_cache_root: artifacts/cache/okx_1m_venue_only_v1
+  use_external_features: false
+  external_feature_path: ""
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+  feature_availability_indicators: []
