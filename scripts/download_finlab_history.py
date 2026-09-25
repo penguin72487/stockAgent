@@ -45,6 +45,10 @@ AUTOMATICALLY_DEFERRED_REASONS = {
     "tw_tick:2330": "requires_date_window",
 }
 AUTOMATICALLY_DEFERRED_KEYS = frozenset(AUTOMATICALLY_DEFERRED_REASONS)
+# A first acquisition can still extend the official archive's early history.
+# Once present locally, repeated whole-matrix price refreshes are independent
+# validation work and must not consume quota ahead of missing feature fields.
+SECONDARY_VALIDATION_REFRESH_KEYS = frozenset({"price:收盤價"})
 # Short, bounded backoff avoids both a multi-day blind spot and a tight loop
 # against a deterministic provider failure. The timer supplies the retry clock.
 ATTEMPT_RETRY_SECONDS = {
@@ -484,6 +488,7 @@ def sync_selection(
     curated_keys = [key for key in curated if key in available_set]
     extra_keys = [key for key in available if key not in curated]
     eligible_curated: list[str] = []
+    validation_refresh: list[str] = []
     missing_extra: list[str] = []
     refresh_extra: list[str] = []
     for key in [*curated_keys, *extra_keys]:
@@ -501,7 +506,10 @@ def sync_selection(
             continue
         if key in curated and (not downloaded or refresh_due(
                 key, output_root, now=now, days=refresh_days)):
-            eligible_curated.append(key)
+            if downloaded and key in SECONDARY_VALIDATION_REFRESH_KEYS:
+                validation_refresh.append(key)
+            else:
+                eligible_curated.append(key)
         elif key not in curated and not downloaded:
             missing_extra.append(key)
         elif key not in curated and refresh_due(
@@ -512,7 +520,7 @@ def sync_selection(
     # 08:00 reset while later keys can starve indefinitely.  Preserve curated
     # and missing-key priority, then visit the stalest downloaded extras first.
     refresh_extra.sort(key=lambda key: (last_source_check(key, output_root), key))
-    return [*eligible_curated, *missing_extra, *refresh_extra]
+    return [*eligible_curated, *missing_extra, *refresh_extra, *validation_refresh]
 
 
 def general_work_status(

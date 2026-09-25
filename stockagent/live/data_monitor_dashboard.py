@@ -3901,7 +3901,11 @@ def _finlab_candidate_sources(root: Path, *, now: datetime) -> list[dict[str, An
             "finlab_intraday_partitions": dict(partition) if partition_count else None,
             "finlab_last_attempt_at_utc": attempt.get("attempted_at_utc") if attempt_status else None,
             "finlab_next_retry_at_utc": _iso(retry_at),
-            "detail": str(item.get("gap") or "FinLab 歷史候選資料集"),
+            "detail": (
+                "官方台股日價已優先收集；此鍵首次取得可補早期歷史，之後整表刷新排在待補特徵後，供缺口與多源校驗。"
+                if key == "price:收盤價" else
+                str(item.get("gap") or "FinLab 歷史候選資料集")
+            ),
             "warnings": [
                 "FinLab 目錄與 FAQ 不等於帳號授權；舊 Free 快取曾只到 2018 年底，升級後以逐項雲端刷新回執為準。",
                 "收據索引是來源期別或時間，不等於盤前可用日；原始值與修訂版本尚未完成 PIT 驗證。",
@@ -4359,7 +4363,8 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
             "status": state,
             "status_label": f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}",
             "cadence": "按官方實際帳號額度共用節流；全市場日期分區增量",
-            "update_owner": "FinMind Sponsor 資料下載器",
+            "update_owner": ("FinMind Sponsor 長表本機衍生" if spec.dataset == FINMIND_DERIVED_WIDE
+                             else "FinMind Sponsor 資料下載器"),
             "latest_at_utc": item.get("last_attempt_at_utc"), "data_through": latest,
             "freshness": _freshness(_parse_time(item.get("last_attempt_at_utc")), now=now, window_seconds=30 * 86400),
             "coverage": _coverage(checked, total, unit="來源分區", label="已查驗；空回非資料") if total else None,
@@ -4367,7 +4372,13 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
                                 "官方額度只是請求下界，回應大小、服務時間及缺口未知。"),
             "rows": count, "publishable": False, "automation_eligible": running,
             "registry_alias": False,
-            "detail": "獨立原始收據；與 Free 逐檔任務重疊時先由 Sponsor 批量查詢。尚未驗證 PIT 或可訓練性。",
+            "detail": (
+                "與三大法人長表為同一來源數值；在本機由已驗雜湊的長表分區轉成寬表，不再重複呼叫 API。"
+                if spec.dataset == FINMIND_DERIVED_WIDE else
+                "官方 TWSE／TPEx 日價日期覆蓋通過時，重疊的已完成日期分區排在其他 Sponsor 資料之後；早期歷史、未覆蓋與當期仍優先補抓。"
+                if spec.dataset == "TaiwanStockPrice" else
+                "獨立原始收據；與 Free 逐檔任務重疊時先由 Sponsor 批量查詢。尚未驗證 PIT 或可訓練性。"
+            ),
             "warnings": ["來源空回不算有數值的歷史。"] if empty else [],
             "record_stats": {"count": count, "first": item.get("first_data_date"), "last": latest,
                              "files_inspected": 0, "files_total": complete,

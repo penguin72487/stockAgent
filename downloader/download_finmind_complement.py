@@ -541,7 +541,10 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime) ->
     if task.kind == "year" and len(task.partition) == 4 and rows:
         if first is None or last is None or first[:4] != task.partition or last[:4] != task.partition:
             raise SourceError("wrong_year")
-    if task.kind in {"id_history", "derived"}:
+    # Sponsor's all-market wide frame is derived from an all-market long
+    # partition and legitimately has an empty data_id. Per-symbol derivations
+    # must still match their one requested identifier exactly.
+    if task.kind == "id_history" or (task.kind == "derived" and task.data_id):
         for field in ("stock_id", "futures_id", "option_id"):
             ids = {str(row[field]) for row in rows if row.get(field) is not None}
             if ids and ids != {task.data_id}:

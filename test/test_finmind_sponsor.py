@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+import json
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,41 @@ def test_partition_end_is_exclusive_and_seed_is_idempotent(tmp_path: Path) -> No
         assert connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanStockNews'").fetchone()[0] == 0
 
 
+def test_official_price_receipts_demote_only_proven_overlap_and_migrate_queue(tmp_path: Path) -> None:
+    root = tmp_path / "official"
+    (root / "state").mkdir(parents=True)
+    catalog = tmp_path / "packed.json"
+    catalog.write_text(json.dumps({"datasets": [{"dataset": "tw-public", "source": str(root)}]}))
+    for dataset, start in (("twse_daily_ohlcv", "2004-02-11"),
+                           ("tpex_daily_ohlcv", "2003-08-01")):
+        (root / "state" / f"{dataset}.json").write_text(json.dumps({
+            "dataset": dataset, "baseline_established": True,
+            "coverage_complete": True, "coverage_calendar_kind": "receipt_verified_official_open_sessions",
+            "missing_dates_after": 0, "failed_dates": {},
+            "coverage_start": start, "coverage_end": "2026-09-24",
+        }))
+    coverage = sponsor._official_price_coverage(catalog)
+    assert coverage == (date(2004, 2, 11), date(2026, 9, 24))
+    now = datetime(2026, 9, 26, 9, tzinfo=UTC)
+    with sponsor._db(tmp_path / "queue.sqlite3") as connection:
+        sponsor._seed(connection, now)
+        old = connection.execute("SELECT partition FROM tasks WHERE dataset='TaiwanStockPrice' "
+                                 "AND partition>='2014-01-01' ORDER BY partition LIMIT 1").fetchone()[0]
+        connection.execute("UPDATE tasks SET state='complete',priority=1 WHERE dataset='TaiwanStockPrice' "
+                           "AND partition=?", (old,))
+        sponsor._seed(connection, now, official_price_coverage=coverage)
+        assert connection.execute("SELECT priority,state FROM tasks WHERE dataset='TaiwanStockPrice' "
+                                  "AND partition=?", (old,)).fetchone() == (8, "complete")
+        assert connection.execute("SELECT MAX(priority) FROM tasks WHERE dataset='TaiwanStockPrice' "
+                                  "AND partition<'2004-02-11'").fetchone()[0] < 8
+        assert connection.execute("SELECT priority FROM tasks WHERE dataset='TaiwanStockPriceAdj' "
+                                  "AND partition=?", (old,)).fetchone()[0] != 8
+    (root / "state" / "tpex_daily_ohlcv.json").write_text(json.dumps({
+        "dataset": "tpex_daily_ohlcv", "coverage_complete": False,
+    }))
+    assert sponsor._official_price_coverage(catalog) is None
+
+
 def test_fetch_uses_no_id_half_open_range_and_checks_provider_rows(monkeypatch: pytest.MonkeyPatch,
                                                                      tmp_path: Path) -> None:
     seen = []
@@ -48,6 +84,11 @@ def test_fetch_uses_no_id_half_open_range_and_checks_provider_rows(monkeypatch: 
     day = Task("TaiwanStockIndustryChainMoneyFlow", "", "2026-09-22", "day", 0, "pending")
     sponsor._fetch(day, "secret", object(), tmp_path, date(2026, 9, 26))
     assert "end_date" not in seen[1]
+    for dataset in ("TaiwanStockEvery5SecondsIndex", "TaiwanStockGovernmentBankBuySell",
+                    "TaiwanStockBlockTradingDailyReport"):
+        sponsor._fetch(Task(dataset, "", "2026-09-22", "day", 0, "pending"),
+                       "secret", object(), tmp_path, date(2026, 9, 26))
+        assert seen[-1] == {"dataset": dataset, "start_date": "2026-09-22"}
     monkeypatch.setattr(sponsor, "_fetch_rows", lambda *_args, **_kwargs: [{"date": "2026-09-24"}])
     with pytest.raises(SourceError, match="response_outside_partition"):
         sponsor._fetch(task, "secret", object(), tmp_path, date(2026, 9, 26))
@@ -64,6 +105,56 @@ def test_sponsor_year_receipt_uses_date_partition_without_free_year_assertion(tm
                                   datetime(2026, 9, 26, tzinfo=UTC))
         assert receipt["status"] == "complete"
         assert connection.execute("SELECT rows,state FROM tasks").fetchone() == (1, "complete")
+
+
+def test_query_shape_migration_reopens_only_old_400_once(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 26, 9, tzinfo=UTC)
+    with sponsor._db(tmp_path / "queue.sqlite3") as connection:
+        connection.execute(
+            "INSERT INTO tasks(dataset,data_id,partition,kind,priority,state,error_code) "
+            "VALUES ('TaiwanStockEvery5SecondsIndex','','2025-05-09','day',4,'blocked',"
+            "'provider_bad_request')"
+        )
+        sponsor._seed(connection, now)
+        assert connection.execute("SELECT state,error_code FROM tasks WHERE dataset="
+                                  "'TaiwanStockEvery5SecondsIndex' AND partition='2025-05-09'").fetchone() == (
+                                      "pending", None)
+        connection.execute("UPDATE tasks SET state='blocked',error_code='provider_bad_request' "
+                           "WHERE dataset='TaiwanStockEvery5SecondsIndex' AND partition='2025-05-09'")
+        sponsor._seed(connection, now)
+        assert connection.execute("SELECT state FROM tasks WHERE dataset="
+                                  "'TaiwanStockEvery5SecondsIndex' AND partition='2025-05-09'").fetchone() == (
+                                      "blocked",)
+
+
+def test_sponsor_wide_is_derived_only_after_verified_long_receipt(tmp_path: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 26, 9, tzinfo=UTC)
+    long = "TaiwanStockInstitutionalInvestorsBuySell"
+    wide = "TaiwanStockInstitutionalInvestorsBuySellWide"
+    with sponsor._db(tmp_path / "queue.sqlite3") as connection:
+        connection.executemany(
+            "INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
+            "VALUES (?,'','2026-09-01',?,0,'pending')",
+            ((long, "month"), (wide, "derived")),
+        )
+        task = sponsor._next(connection, now)
+        assert task is not None and task.dataset == long
+        sponsor._finish(connection, tmp_path, task, [
+            {"date": "2026-09-01", "stock_id": "2330", "name": "Foreign_Investor",
+             "buy": 10, "sell": 3},
+            {"date": "2026-09-01", "stock_id": "2330", "name": "Foreign_Investor",
+             "buy": 2, "sell": 1},
+        ], now)
+        derived = sponsor._next(connection, now)
+        assert derived is not None and derived.dataset == wide
+        monkeypatch.setattr(sponsor, "_fetch_rows", lambda *_args, **_kwargs: pytest.fail("network called"))
+        rows = sponsor._fetch(derived, "unused", object(), tmp_path, now.date())
+        assert rows[0]["Foreign_Investor_buy"] == 12
+        assert rows[0]["Foreign_Investor_sell"] == 4
+        receipt = sponsor._finish(connection, tmp_path, derived, rows, now)
+        assert receipt["derived_from"] == long
+        assert receipt["coverage_claim"] == "derived_from_observed_long_response_not_provider_completeness"
 
 
 def test_account_gate_uses_actual_tier_and_never_serializes_token(tmp_path: Path,

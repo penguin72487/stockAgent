@@ -564,6 +564,25 @@ class FinLabHistoryTest(unittest.TestCase):
                 refresh_days=1, retry_unavailable=False,
             ) == ["b:curated", "m:missing", "z:older", "a:newer"]
 
+    def test_downloaded_official_price_overlap_refresh_uses_surplus_quota(self):
+        now = datetime(2026, 9, 25, 1, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "datasets").mkdir()
+            (root / "receipts").mkdir()
+            key = "price:收盤價"
+            path = root / "datasets" / f"{safe_stem(key)}.parquet"
+            path.write_bytes(b"existing")
+            (root / "receipts" / f"{safe_stem(key)}.json").write_text(json.dumps({
+                "dataset": key, "status": "downloaded_unverified_for_pit",
+                "parquet_path": str(path.relative_to(root)),
+                "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+            }))
+            assert sync_selection(
+                [key, "missing:feature"], {key: {}}, root,
+                now=now, refresh_days=1, retry_unavailable=False,
+            ) == ["missing:feature", key]
+
     def test_failure_cooldowns_are_reason_specific_and_intraday_needs_dates(self):
         now = datetime(2026, 9, 24, 15, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as directory:
