@@ -136,6 +136,8 @@ def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
 
 
 def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) -> None:
+    monkeypatch.setattr(train_entry, "_ACTIVE_CHILD_PROCESS", None)
+    monkeypatch.setattr(train_entry, "_ACTIVE_CHILD_SHUTTING_DOWN", False)
     installed: dict[int, object] = {}
     monkeypatch.setattr(
         train_entry.signal,
@@ -158,6 +160,100 @@ def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) ->
         with pytest.raises(SystemExit) as exc_info:
             handler(signum, None)
         assert exc_info.value.code == 128 + int(signum)
+
+
+def test_managed_training_child_starts_in_owned_session_and_is_reaped(
+    monkeypatch,
+) -> None:
+    observed = {}
+
+    class FakeProcess:
+        pid = 8123
+
+        def wait(self, timeout=None):
+            observed.setdefault("wait_timeouts", []).append(timeout)
+            return 7
+
+        def poll(self):
+            return 7
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(train_entry.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        train_entry, "_owned_child_tree_exists", lambda process: False
+    )
+    monkeypatch.setattr(train_entry, "_ACTIVE_CHILD_PROCESS", None)
+
+    completed = train_entry._run_managed_subprocess(
+        ["python", "worker.py"], env={"RUN": "1"}
+    )
+
+    assert completed.returncode == 7
+    assert observed["kwargs"]["start_new_session"] is True
+    assert observed["kwargs"]["env"] == {"RUN": "1"}
+    assert observed["wait_timeouts"] == [None]
+    assert train_entry._ACTIVE_CHILD_PROCESS is None
+
+
+def test_second_ctrl_c_escalates_only_owned_child_tree(monkeypatch) -> None:
+    installed: dict[int, object] = {}
+    forwarded: list[tuple[int, int]] = []
+    child = SimpleNamespace(pid=551)
+    monkeypatch.setattr(train_entry, "_ACTIVE_CHILD_PROCESS", child)
+    monkeypatch.setattr(train_entry, "_ACTIVE_CHILD_SHUTTING_DOWN", True)
+    monkeypatch.setattr(train_entry, "_TERMINATION_SIGNAL", None)
+    monkeypatch.setattr(
+        train_entry,
+        "_signal_owned_child_tree",
+        lambda process, signum: forwarded.append((process.pid, signum)),
+    )
+    monkeypatch.setattr(
+        train_entry.signal,
+        "getsignal",
+        lambda signum: train_entry.signal.SIG_DFL,
+    )
+    monkeypatch.setattr(
+        train_entry.signal,
+        "signal",
+        lambda signum, handler: installed.update({signum: handler}),
+    )
+
+    train_entry._install_graceful_termination_handlers()
+    installed[train_entry.signal.SIGINT](train_entry.signal.SIGINT, None)
+
+    assert forwarded == [(551, train_entry.signal.SIGKILL)]
+
+
+def test_interrupted_supervisor_replaces_only_stale_running_progress(
+    monkeypatch, tmp_path
+) -> None:
+    progress_path = tmp_path / "progress.json"
+    running = {
+        "state": "running",
+        "phase": "training",
+        "failure": None,
+        "updated_at": "old",
+    }
+    progress_path.write_text(json.dumps(running), encoding="utf-8")
+    monkeypatch.setattr(train_entry, "_ACTIVE_OUTPUT_DIR", tmp_path)
+
+    train_entry._mark_active_training_interrupted(train_entry.signal.SIGINT)
+
+    interrupted = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert interrupted["state"] == "failed"
+    assert interrupted["phase"] == "failed"
+    assert interrupted["interrupted"] is True
+    assert interrupted["failure"]["type"] == "KeyboardInterrupt"
+    assert "safe to resume" in interrupted["message"]
+
+    completed = {"state": "complete", "phase": "complete"}
+    progress_path.write_text(json.dumps(completed), encoding="utf-8")
+    train_entry._mark_active_training_interrupted(train_entry.signal.SIGINT)
+    assert json.loads(progress_path.read_text(encoding="utf-8")) == completed
 
 
 def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:

@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from stockagent.config import load_config
-from stockagent.models.financial_transformer import CandleEncoder
+from stockagent.models.financial_transformer import CandleEncoder, FinancialTransformerModel
 from stockagent.training.trainer import (
     _PretrainedEpochZeroUnderperformsFlatCash,
     _PretrainedInitialization,
@@ -190,6 +190,58 @@ def test_learned_cash_stock_policy_has_an_exact_flat_checkpoint_floor() -> None:
     assert receipt["portfolio_output_mode"] == "learned_cash"
     assert torch.count_nonzero(model.score_head[-1].weight).item() == 0
     assert torch.count_nonzero(model.score_head[-1].bias).item() == 0
+
+
+@pytest.mark.parametrize("portfolio_mode", ["long_short", "long_only"])
+def test_score_entmax_cash_flat_checkpoint_restores_financial_transformer(
+    portfolio_mode: str,
+) -> None:
+    torch.manual_seed(31)
+    model = FinancialTransformerModel(
+        lookback=3,
+        num_features=4,
+        num_symbols=5,
+        d_model=8,
+        attention_mode="temporal_only",
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        head_hidden_dim=8,
+        head_layers=1,
+        dropout=0.0,
+        portfolio_mode=portfolio_mode,
+        portfolio_output_mode="score_entmax_cash",
+        center_long_short_logits=False,
+        return_aux=False,
+        execution_mode="tw_day_trade",
+    ).eval()
+    with torch.no_grad():
+        model.score_head[-1].weight.fill_(0.01)
+        model.score_head[-1].bias.fill_(2.0)
+    original_state = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    features = torch.randn(2, 3, 5, 4)
+    mask = torch.tensor(
+        [[True, True, False, True, True], [False, True, True, False, True]]
+    )
+    expected = model(features, mask).detach().clone()
+    assert torch.count_nonzero(expected).item() > 0
+
+    with _temporary_pretrained_exact_account_flat_checkpoint(model) as receipt:
+        assert receipt["schema_version"] == 3
+        assert receipt["method"] == (
+            "zero_score_head_final_linear_flat_score_entmax_cash_v3"
+        )
+        assert receipt["portfolio_output_mode"] == "score_entmax_cash"
+        assert receipt["trainable_parameter_count"] > 0
+        assert torch.count_nonzero(model(features, mask)).item() == 0
+
+    assert torch.equal(model(features, mask), expected)
+    for name, expected_value in original_state.items():
+        assert torch.equal(model.state_dict()[name], expected_value), name
 
 
 def test_flat_stock_checkpoint_restores_transferred_training_initialization() -> None:

@@ -159,7 +159,7 @@ def test_liquidity_curve_endpoint_matches_full_minute_fifo(direction):
 
 @pytest.mark.parametrize("seed", range(16))
 def test_sparse_liquidity_matches_dense_multisymbol_value_and_gradient(seed):
-    """The sparse CSR ABI is the dense side-selected FIFO integral, exactly."""
+    """The sparse CSR ABI follows dense FIFO within FP64 summation tolerance."""
     generator = torch.Generator().manual_seed(seed)
     symbols, events, cohorts = 7, 19, 4
     directions = torch.where(
@@ -266,6 +266,62 @@ def test_sparse_liquidity_matches_dense_multisymbol_value_and_gradient(seed):
     sparse_objective.backward()
     torch.testing.assert_close(
         sparse_cohorts.grad, dense_cohorts.grad, rtol=1e-10, atol=1e-10
+    )
+
+
+def test_sparse_liquidity_large_universe_preserves_physical_fills():
+    """Global sparse prefixes must not change physical shares at panel scale."""
+    symbols = 2755
+    axis = torch.arange(symbols, dtype=torch.int64)
+    direction = torch.where(axis.remainder(2) == 0, 1.0, -1.0)
+    state = DayTradeInventoryState.empty(symbols)
+    fee = torch.full((symbols,), 0.001425, dtype=torch.float64)
+    for cohort in range(3):
+        state = append_inventory_fill(
+            state,
+            signed_shares=direction * (cohort + 1) * 1000,
+            price=(20 + axis.remainder(100)).to(torch.float64),
+            buy_fee_rate=fee,
+            day_sell_fee_rate=fee,
+            normal_sell_fee_rate=fee,
+            rebate_rate=fee * 0,
+            day=DAY + cohort,
+        )
+    prices = torch.full((symbols, 270, 2), float("nan"), dtype=torch.float64)
+    capacity = torch.zeros_like(prices)
+    for minute, shares in ((3, 1000), (101, 2000), (269, 1000)):
+        prices[:, minute, :] = (30 + axis.remainder(100)).to(torch.float64)[:, None]
+        capacity[:, minute, :] = shares
+    side = (state.shares < 0).long().view(symbols, 1, 1).expand(-1, 270, 1)
+    dense = reduce_inventory_fifo_path(
+        state,
+        prices=prices.gather(2, side).squeeze(2),
+        capacity_shares=capacity.gather(2, side).squeeze(2),
+    )
+    retained = torch.isfinite(prices).reshape(-1)
+    flat = torch.nonzero(retained, as_tuple=False).flatten()
+    event_symbols = flat // 540
+    starts = torch.searchsorted(event_symbols, axis)
+    ends = torch.searchsorted(event_symbols, axis, right=True)
+    sparse = reduce_inventory_fifo_sparse_liquidity(
+        state,
+        prices=prices.reshape(-1)[flat],
+        capacity_shares=capacity.reshape(-1)[flat],
+        event_symbol_indices=event_symbols,
+        event_sides=flat.remainder(2),
+        symbol_event_starts=starts,
+        symbol_event_ends=ends,
+    )
+    torch.testing.assert_close(
+        sparse.reduction.filled_shares,
+        dense.reduction.filled_shares,
+        rtol=0,
+        atol=0,
+    )
+    # Global versus per-symbol FP64 prefixes have different summation order.
+    # This bound is monetary, not a claim of bitwise checkpoint parity.
+    torch.testing.assert_close(
+        sparse.reduction.net_pnl, dense.reduction.net_pnl, rtol=0, atol=2e-5
     )
 
 

@@ -59,11 +59,11 @@ def test_isolated_fold_runner_uses_sequential_children_and_stops_on_failure(
 ) -> None:
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    def fake_run(command, *, env, check):
+    def fake_run(command, *, env):
         calls.append((command, env))
         return subprocess.CompletedProcess(command, 0 if len(calls) == 1 else 9)
 
-    monkeypatch.setattr(train.subprocess, "run", fake_run)
+    monkeypatch.setattr(train, "_run_managed_subprocess", fake_run)
 
     try:
         train._run_isolated_train_fold_processes(

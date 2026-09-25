@@ -1620,6 +1620,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "corporate_action_mode": str(trading.tw_corporate_action_mode),
         }
+        if bool(trading.tw_day_trade_terminal_liquidation_unlimited_capacity):
+            contract["taiwan_execution"][
+                "day_trade_terminal_liquidation_unlimited_capacity"
+            ] = True
+            contract["taiwan_execution"]["terminal_liquidation_price"] = (
+                "official_close"
+            )
         benchmark_sensitive_objectives = {
             "excess_cvar_drawdown",
             "cvar",
@@ -1971,6 +1978,7 @@ def _checkpoint_manifest(
 ) -> dict[str, Any]:
     """Build a portable, content-addressed checkpoint compatibility manifest."""
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    carry_resume_compatible_release_ids: tuple[str, ...] = ()
     effective_short_open = (
         panel.can_short_open_mask
         if panel.can_short_open_mask is not None
@@ -2079,6 +2087,38 @@ def _checkpoint_manifest(
                     "universe": _stable_fingerprint(list(carry_source.universe)),
                     "rows": int(len(carry_source)),
                 }
+                audit = getattr(carry_source, "audit_receipt", None)
+                raw_predecessors = (
+                    audit.get("resume_compatible_release_ids", ())
+                    if isinstance(audit, Mapping)
+                    else ()
+                )
+                if not isinstance(raw_predecessors, (list, tuple)):
+                    raise ValueError(
+                        "physical source resume-compatible releases must be a sequence"
+                    )
+                normalized_predecessors: list[str] = []
+                for value in raw_predecessors:
+                    release_id = str(value).strip()
+                    prefix, separator, digest = release_id.partition(":")
+                    if (
+                        separator != ":"
+                        or prefix != "tw-day-trade-carry"
+                        or len(digest) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in digest
+                        )
+                        or release_id == str(carry_source.release_id)
+                    ):
+                        raise ValueError(
+                            "physical source resume-compatible release id is invalid: "
+                            f"{release_id!r}"
+                        )
+                    normalized_predecessors.append(release_id)
+                carry_resume_compatible_release_ids = tuple(
+                    dict.fromkeys(normalized_predecessors)
+                )
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
             futures_market = panel.index_futures_day_session
             if futures_market is None:
@@ -2394,6 +2434,22 @@ def _checkpoint_manifest(
         **data_schema_contract,
         "panel_arrays": panel_arrays,
     }
+    physical_source_extension_fingerprints: list[dict[str, str]] = []
+    if carry_resume_compatible_release_ids:
+        for predecessor_release_id in carry_resume_compatible_release_ids:
+            predecessor_panel_arrays = dict(panel_arrays)
+            predecessor_source = dict(
+                predecessor_panel_arrays["day_trade_carry_source"]
+            )
+            predecessor_source["release_id"] = predecessor_release_id
+            predecessor_panel_arrays["day_trade_carry_source"] = predecessor_source
+            predecessor_data_contract = {
+                **data_schema_contract,
+                "panel_arrays": predecessor_panel_arrays,
+            }
+            physical_source_extension_fingerprints.append(
+                {"data": _stable_fingerprint(predecessor_data_contract)}
+            )
     schema_2_data_schema_contract = {
         "symbols": [str(symbol) for symbol in panel.symbols],
         "feature_names": [str(name) for name in panel.feature_names],
@@ -2707,6 +2763,9 @@ def _checkpoint_manifest(
         "configuration": configuration_snapshot,
         "configuration_fingerprint": _stable_fingerprint(configuration_snapshot),
         "compatibility_fingerprints": {
+            "schema_4_physical_source_domain_extensions": (
+                physical_source_extension_fingerprints
+            ),
             "schema_4_pre_lookback_context": schema_4_pre_lookback_context_fingerprints,
             "schema_4_pre_external_feature_source": (
                 schema_4_pre_external_source_fingerprints
@@ -3067,6 +3126,24 @@ def _validate_checkpoint_manifest(
                 candidate = compatibility.get(compatibility_key, {})
                 if actual_fingerprints.get(layer) == candidate.get(layer):
                     expected_fingerprints[layer] = candidate[layer]
+            source_extensions = compatibility.get(
+                "schema_4_physical_source_domain_extensions", ()
+            )
+            if not isinstance(source_extensions, (list, tuple)):
+                raise RuntimeError(
+                    "Checkpoint physical-source compatibility candidates must be a sequence"
+                )
+            for candidate in source_extensions:
+                if (
+                    isinstance(candidate, Mapping)
+                    and actual_fingerprints.get("data") == candidate.get("data")
+                ):
+                    # This candidate is emitted only by the current receipt-
+                    # bound source builder for a predecessor whose previously
+                    # undefined held-right branch failed before an optimizer
+                    # step. Every other semantic layer remains exact.
+                    expected_fingerprints["data"] = candidate["data"]
+                    break
         expected_for_validation = {"fingerprints": expected_fingerprints}
         mismatches = [
             name
