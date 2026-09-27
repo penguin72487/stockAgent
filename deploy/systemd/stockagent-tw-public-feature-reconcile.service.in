@@ -1,6 +1,10 @@
 [Unit]
 Description=Reconcile Taiwan public training features against exact source bytes
 After=local-fs.target
+# Wake the independent cold publisher only after this oneshot releases the
+# canonical source lock.  The publisher still audits every receipt and its
+# own opening-window ExecCondition before writing an immutable release.
+OnSuccess=stockagent-tw-public-cold-publish.service
 
 [Service]
 Type=oneshot

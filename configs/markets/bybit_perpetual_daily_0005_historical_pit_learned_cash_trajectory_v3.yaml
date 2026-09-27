@@ -1,0 +1,15 @@
+# Execution-contract successor to the learned-cash trajectory experiment.
+#
+# Crypto backtest contract v3 closes a contract at its final observable mark
+# when its next daily valuation is unavailable. This prevents a historical
+# delisting from becoming either a fabricated zero return or an artificial
+# account default. The final research-horizon row remains open. A fresh output
+# root prevents resume against checkpoints created under the v2 ledger ABI.
+base_config: bybit_perpetual_daily_0005_historical_pit_learned_cash_trajectory_v2.yaml
+
+experiment_name: bybit-perpetual-daily-0005-venue-only-learned-cash-trajectory-v3
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_venue_only_learned_cash_trajectory_v3
+  resume: true
+  post_train_infer: false

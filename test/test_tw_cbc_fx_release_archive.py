@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from contextlib import nullcontext
 import hashlib
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -105,7 +108,7 @@ def test_collect_records_sixty_row_page_receipts_without_mixing_legacy(
     )
     monkeypatch.setattr(
         archive, "write_release_rows_if_changed",
-        lambda *_args, **_kwargs: ("verified-sha", True),
+        lambda *_args, **_kwargs: ("a" * 64, True),
     )
     summary = archive.collect(tmp_path, workers=1)
     assert summary["complete"] is True
@@ -119,6 +122,121 @@ def test_collect_records_sixty_row_page_receipts_without_mixing_legacy(
     assert [Path(row["path"]).name.startswith("page-0060-")
             for row in summary["listing_receipts"]] == [True, True]
     assert [row["raw_rows"] for row in summary["listing_receipts"]] == [60, 1]
+
+
+def _controlled_detail_collection(monkeypatch: pytest.MonkeyPatch, error: Exception):
+    """Run futures only when consumed, so pending-task cancellation is deterministic."""
+    pools = []
+    tasks = {}
+    detail_calls = []
+
+    class DeferredPool:
+        def __init__(self, **_kwargs):
+            self.futures = []
+            self.shutdown_calls = []
+            pools.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.shutdown(wait=True)
+
+        def submit(self, function, *args, **kwargs):
+            future = Future()
+            self.futures.append(future)
+            tasks[future] = (function, args, kwargs)
+            return future
+
+        def shutdown(self, *, wait=True, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+            if cancel_futures:
+                for future in self.futures:
+                    future.cancel()
+
+    def completed(futures):
+        for future in futures:
+            if future.cancelled():
+                continue
+            function, args, kwargs = tasks[future]
+            try:
+                future.set_result(function(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            yield future
+
+    listing = (
+        "".join(
+            f'<li><time>2026-0{index + 6}-01</time>'
+            f'<a href="/tw/cp-302-{index}-ABC-1.html">'
+            f'115年{index + 5}月底外匯存底</a></li>'
+            for index in (1, 2, 3)
+        )
+        + '<div class="total">共3筆資料，第1/1頁</div>'
+        + '<select id="PageSize"><option value="60" selected>60</option></select>'
+    ).encode()
+
+    def fetch(url, _limiter):
+        assert url == archive.LIST_URL.format(page=1)
+        return listing
+
+    def detail(row, *_args, **_kwargs):
+        detail_calls.append(row["release_url"])
+        if row["release_url"].endswith("cp-302-2-ABC-1.html"):
+            raise error
+        return {**row, "metric": "fx_reserves_usd_100m", "value": 1.0}
+
+    writer = Mock()
+    states = Mock()
+    monkeypatch.setattr(archive, "ThreadPoolExecutor", DeferredPool)
+    monkeypatch.setattr(archive, "as_completed", completed)
+    monkeypatch.setattr(archive, "_fetch", fetch)
+    monkeypatch.setattr(archive, "_collect_one", detail)
+    monkeypatch.setattr(archive, "_save_raw", lambda *_args: ("a" * 64, "mock-listing"))
+    monkeypatch.setattr(archive, "_write_state", states)
+    monkeypatch.setattr(archive, "write_release_rows_if_changed", writer)
+    return SimpleNamespace(pools=pools, detail_calls=detail_calls, writer=writer, states=states)
+
+
+def test_detail_source_block_propagates_and_cancels_queued_work_without_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = archive.SourceAccessBlocked("official CBC fixture upstream error page")
+    harness = _controlled_detail_collection(monkeypatch, blocked)
+
+    with pytest.raises(archive.SourceAccessBlocked) as caught:
+        archive.collect(tmp_path, workers=1)
+
+    assert caught.value is blocked
+    assert len(harness.detail_calls) == 2
+    detail_pool = harness.pools[-1]
+    assert detail_pool.shutdown_calls == [(False, True), (True, False)]
+    assert [future.cancelled() for future in detail_pool.futures] == [False, False, True]
+    harness.writer.assert_not_called()
+    assert not list(tmp_path.rglob("*.parquet"))
+
+
+@pytest.mark.parametrize("error", [ValueError("bad release"), requests.ConnectionError("unavailable release")])
+def test_ordinary_detail_error_remains_per_release_failure_and_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    harness = _controlled_detail_collection(monkeypatch, error)
+
+    summary = archive.collect(tmp_path, workers=1)
+
+    assert len(harness.detail_calls) == 3
+    assert summary["status"] == "degraded"
+    assert summary["complete"] is False
+    assert summary["saved_releases"] == 2
+    assert summary["registered_releases"] == 3
+    assert summary["failures"] == [{
+        "release_url": archive.BASE + "/tw/cp-302-2-ABC-1.html",
+        "error": f"{type(error).__name__}: {error}",
+    }]
+    assert harness.pools[-1].shutdown_calls == [(True, False)]
+    assert not any(future.cancelled() for future in harness.pools[-1].futures)
+    assert harness.states.call_args.args[1] == summary
+    harness.writer.assert_not_called()
 
 
 @pytest.mark.parametrize("wrong_page,first_page_rows,error", [
@@ -141,7 +259,7 @@ def test_listing_page_coverage_fails_closed(
 def test_partial_sixty_row_cache_does_not_fall_back_to_legacy_pages(tmp_path: Path) -> None:
     directory = tmp_path / "raw" / archive.OUTPUT_NAME / "list"
     directory.mkdir(parents=True)
-    body = "<p>共61筆資料，第1/2頁</p>".encode()
+    body = _sixty_row_listing_fixture(1)
     archive._save_raw(directory, "page-0060-0001", body)
     archive._save_raw(directory, "page-0001", body)
     archive._save_raw(directory, "page-0002", "<p>共61筆資料，第2/2頁</p>".encode())

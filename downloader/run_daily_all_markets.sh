@@ -68,6 +68,9 @@ BYBIT_WORKERS="${BYBIT_WORKERS:-24}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
+# Must match the Bybit catalog source_coordination_lock. Do not allow a
+# per-service override that would silently split the writer/publisher lease.
+BYBIT_SOURCE_LOCK_FILE="$ROOT_DIR/artifacts/daily_downloader/bybit_source_publish.lock"
 RUN_BINANCE_PERP="${RUN_BINANCE_PERP:-1}"
 BINANCE_WORKERS="${BINANCE_WORKERS:-32}"
 BINANCE_REQUEST_WEIGHT_PER_MINUTE="${BINANCE_REQUEST_WEIGHT_PER_MINUTE:-}"
@@ -592,6 +595,23 @@ run_pepperstone_incremental() {
   fi
 }
 
+# A head/full source reconciliation must rebuild the full daily projection.
+# Tail jobs keep their bounded two-day overlap; neither path issues more HTTP.
+run_perp_daily_materialize() {
+  local step="$1"
+  shift
+  local -a scope_args=()
+  if [[ "$CRYPTO_TAIL_ONLY" != "1" ]]; then
+    scope_args+=(--refresh)
+  fi
+  run_step "$step" \
+    env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+    OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+    OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
+    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    "$@" "${scope_args[@]}"
+}
+
 run_okx_perp_incremental() {
   local today
   local -a cmd=()
@@ -628,11 +648,7 @@ run_okx_perp_incremental() {
   fi
   run_step okx_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step okx_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    run_perp_daily_materialize okx_perp_daily_materialize \
       --input-dir data_okx/1m --output-dir data_okx/daily \
       --provider OKX --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
   else
@@ -642,6 +658,9 @@ run_okx_perp_incremental() {
 
 run_bybit_perp_incremental() {
   local today
+  local bybit_lock_fd
+  local bybit_rc=0
+  local bybit_lock_wait_start_ms
   local -a categories=()
   local -a cmd=()
 
@@ -671,18 +690,26 @@ run_bybit_perp_incremental() {
   else
     cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/bybit_source")
   fi
-  run_step bybit_perp_1m_update "${cmd[@]}" || return $?
-  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step bybit_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+  mkdir -p "$(dirname "$BYBIT_SOURCE_LOCK_FILE")"
+  exec {bybit_lock_fd}>"$BYBIT_SOURCE_LOCK_FILE"
+  bybit_lock_wait_start_ms="$(( $(date +%s%N) / 1000000 ))"
+  if ! flock -w 180 "$bybit_lock_fd"; then
+    log "step=bybit_perp_1m_update failed reason=source_publish_lock_timeout wait_ms=$(( $(date +%s%N) / 1000000 - bybit_lock_wait_start_ms ))"
+    exec {bybit_lock_fd}>&-
+    return 1
+  fi
+  log "step=bybit_source_lock acquired wait_ms=$(( $(date +%s%N) / 1000000 - bybit_lock_wait_start_ms ))"
+  run_step bybit_perp_1m_update "${cmd[@]}" || bybit_rc=$?
+  if [[ "$bybit_rc" == "0" && "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
+    run_perp_daily_materialize bybit_perp_daily_materialize \
       --input-dir data_bybit/1m --output-dir data_bybit/daily \
-      --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
-  else
+      --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS" || bybit_rc=$?
+  elif [[ "$bybit_rc" == "0" ]]; then
     log "skip=bybit_perp_daily_materialize reason=RUN_CRYPTO_DAILY_MATERIALIZE=${RUN_CRYPTO_DAILY_MATERIALIZE}"
   fi
+  flock -u "$bybit_lock_fd"
+  exec {bybit_lock_fd}>&-
+  return "$bybit_rc"
 }
 
 run_binance_perp_incremental() {
@@ -720,11 +747,7 @@ run_binance_perp_incremental() {
   fi
   run_step binance_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step binance_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    run_perp_daily_materialize binance_perp_daily_materialize \
       --input-dir data_binance/1m --output-dir data_binance/daily \
       --provider Binance --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
   else

@@ -211,6 +211,20 @@ def test_cutover_rejects_live_inventory_after_dates_match(tmp_path):
     ]
 
 
+def test_cutover_only_excludes_explicitly_retired_modes(tmp_path):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / 'live'
+    live.mkdir()
+    state = {'enabled_markets': sorted(MARKETS), 'modes': {
+        **{market: {'positions': {}} for market in MARKETS},
+        'retired': {'configured_enabled': False, 'positions': {'x': {'signed_shares': 1000}}}}}
+    (live / 'state.json').write_text(json.dumps(state))
+    assert promotion._cutover_blockers(live, candidate, MARKETS) == []
+    state['modes']['retired'].pop('configured_enabled')
+    (live / 'state.json').write_text(json.dumps(state))
+    assert promotion._cutover_blockers(live, candidate, MARKETS)
+
+
 def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:
     root = tmp_path / "candidate"
     root.mkdir()

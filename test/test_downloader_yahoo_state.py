@@ -740,6 +740,190 @@ def test_us_daily_resolution_prunes_cached_untradable_tools_from_manifest_and_sc
     assert {record.code for record in resolution.manifest_records} == {"AAPL", "OLD_DL"}
 
 
+@pytest.mark.parametrize("discovery_fails", [False, True])
+def test_us_repair_preserves_cached_and_local_history_universe(
+    tmp_path, monkeypatch, discovery_fails,
+):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    cached = [
+        yahoo.SymbolRecord("OLD_DL", "Historical Common Stock", "us_delisted", "OLD"),
+        yahoo.SymbolRecord("ADR", "Historical ADR", "us_stocks", "ADR"),
+        yahoo.SymbolRecord("ETF", "Preserved ETF Name", "us_stocks", "ETF"),
+    ]
+    fresh = [yahoo.SymbolRecord("ETF", "Fresh ETF Name", "us_stocks", "ETF")]
+    fallback = [
+        yahoo.SymbolRecord("LOCAL", "Local Common Stock", "us_stocks", "LOCAL"),
+        yahoo.SymbolRecord("LOCALW", "Local Warrants", "us_stocks", "LOCALW"),
+        yahoo.SymbolRecord("LOCALR", "Local Rights", "us_stocks", "LOCALR"),
+        yahoo.SymbolRecord("LOCALU", "Local Units", "us_stocks", "LOCALU"),
+    ]
+    originals = {}
+    for code in ("LOCAL", "LOCALW", "LOCALR", "LOCALU", "UNKNOWN"):
+        path = output_dir / f"{code}_features.parquet"
+        path.write_bytes(b"retained historical source, never read by resolver")
+        originals[path] = path.read_bytes()
+    monkeypatch.setattr(yahoo, "_resolve_cached_manifest", lambda *_: cached)
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: fallback)
+
+    def fetch(_fn, **_kwargs):
+        if discovery_fails:
+            raise TimeoutError("listing discovery unavailable")
+        return fresh
+
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", fetch)
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair"),
+    )
+    expected = {"OLD_DL", "ADR", "ETF", "LOCAL", "UNKNOWN"}
+    assert {r.code for r in resolution.scheduled_records} == expected
+    assert {r.code for r in resolution.manifest_records} == expected
+    records = {r.code: r for r in resolution.manifest_records}
+    assert records["OLD_DL"] == cached[0]
+    assert records["ETF"] == cached[2]
+    assert records["LOCAL"].name == "Local Common Stock"
+    assert records["UNKNOWN"].name == "UNKNOWN"  # Unknown is not inferred delisted.
+    assert all(path.read_bytes() == content for path, content in originals.items())
+
+
+def test_us_repair_limit_does_not_shrink_manifest_or_add_untracked_fallback(
+    tmp_path, monkeypatch,
+):
+    cached = [yahoo.SymbolRecord("OLD", "Old Common Stock", "us_stocks", "OLD")]
+    fresh = [yahoo.SymbolRecord("NEW", "New Common Stock", "us_stocks", "NEW")]
+    monkeypatch.setattr(yahoo, "_resolve_cached_manifest", lambda *_: cached)
+    monkeypatch.setattr(yahoo, "_load_local_tracked_records", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(
+        yahoo, "_load_repo_symbol_fallback",
+        lambda *_: [yahoo.SymbolRecord("OTHER", "Untracked Stock", "us_stocks", "OTHER")],
+    )
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", lambda *_a, **_kw: fresh)
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair", limit=1),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["OLD"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD", "NEW"]
+
+
+def test_us_daily_does_not_reintroduce_excluded_local_files_after_manifest_repair(
+    tmp_path, monkeypatch,
+):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    pl.DataFrame([
+        {"code": "LOCALW", "name": "LOCALW", "market": "us_stocks", "yahoo_symbol": "LOCALW"},
+        {"code": "OLD", "name": "Old Common Stock", "market": "us_stocks", "yahoo_symbol": "OLD"},
+    ]).write_csv(output_dir / "symbols.csv")
+    for code in ("LOCALW", "LOCALU", "OLD"):
+        (output_dir / f"{code}_features.parquet").write_bytes(b"untouched source")
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [
+        yahoo.SymbolRecord("LOCALW", "Local Warrants", "us_stocks", "LOCALW"),
+        yahoo.SymbolRecord("LOCALU", "Local Units", "us_stocks", "LOCALU"),
+    ])
+    monkeypatch.setattr(yahoo, "_discover_daily_stock_records", lambda *_: [])
+
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks"),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["OLD"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD"]
+    assert all(
+        (output_dir / f"{code}_features.parquet").read_bytes() == b"untouched source"
+        for code in ("LOCALW", "LOCALU", "OLD")
+    )
+
+
+def test_us_name_enrichment_preserves_identity_and_does_not_guess_archive_aliases():
+    records = [
+        yahoo.SymbolRecord("OLD", "Old Common Stock", "us_delisted", "OLD-ORIGINAL"),
+        yahoo.SymbolRecord("DUP", "DUP", "us_stocks", "DUP-ALIAS"),
+        yahoo.SymbolRecord("OLD_DL", "OLD_DL", "us_delisted", "OLD"),
+    ]
+    references = [
+        yahoo.SymbolRecord("OLD", "New Company Warrants", "us_stocks", "OLD"),
+        yahoo.SymbolRecord("DUP", "Source Description", "us_delisted", "OTHER"),
+        yahoo.SymbolRecord("DUP", "Lower Priority Description", "us_stocks", "DUP"),
+    ]
+    enriched = yahoo._enrich_us_symbol_names(records, references)
+    assert enriched[0] == records[0]
+    assert enriched[1] == yahoo.SymbolRecord("DUP", "Source Description", "us_stocks", "DUP-ALIAS")
+    assert enriched[2] == records[2]
+
+
+def test_us_targeted_repair_retains_unscheduled_manifest_metadata(tmp_path, monkeypatch):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    rows = [
+        {"code": "OLD_DL", "name": "Historical Common Stock", "market": "us_delisted", "yahoo_symbol": "OLD"},
+        {"code": "ETF", "name": "Local ETF Name", "market": "us_stocks", "yahoo_symbol": "ETF"},
+    ]
+    pl.DataFrame(rows).write_csv(output_dir / "symbols.csv")
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [])
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair", symbols=["ETF"]),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["ETF"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD_DL", "ETF"]
+    assert resolution.manifest_records[0].market == "us_delisted"
+    assert resolution.manifest_records[0].yahoo_symbol == "OLD"
+    assert resolution.manifest_records[1].name == "Local ETF Name"
+
+
+def test_us_repair_strict_discovery_failure_remains_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [])
+    monkeypatch.setattr(
+        yahoo, "_fetch_with_hard_timeout",
+        lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="strict_no_fallback=true"):
+        yahoo._resolve_us_symbols(
+            _base_args(tmp_path, asset="us_stocks", mode="repair", strict_no_fallback=True),
+            [yahoo.SymbolRecord("OLD", "Old Stock", "us_stocks", "OLD")],
+        )
+
+
+def test_us_strict_repair_does_not_expand_fresh_discovery_with_local_history(tmp_path, monkeypatch):
+    fresh = [yahoo.SymbolRecord("NEW", "New Common Stock", "us_stocks", "NEW")]
+    monkeypatch.setattr(
+        yahoo, "_load_repo_symbol_fallback",
+        lambda *_: [yahoo.SymbolRecord("REPO", "Repo Stock", "us_stocks", "REPO")],
+    )
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", lambda *_a, **_kw: fresh)
+
+    def forbidden_local_scan(*_args):
+        pytest.fail("strict discovery must not add the local universe")
+
+    monkeypatch.setattr(yahoo, "_load_local_tracked_records", forbidden_local_scan)
+    records = yahoo._resolve_us_symbols(
+        _base_args(tmp_path, asset="us_stocks", mode="repair", strict_no_fallback=True),
+        [yahoo.SymbolRecord("OLD", "Old Stock", "us_stocks", "OLD")],
+    )
+    assert records == fresh
+
+
+@pytest.mark.parametrize("source", ["cboe", None])
+def test_us_history_head_cannot_merge_unverified_source(tmp_path, monkeypatch, source):
+    info = yahoo.ExistingFileInfo(
+        "2010-01-01", "2026-06-01", None, set(yahoo.REPAIR_REQUIRED_COLUMNS),
+        checked_through_date="2026-06-11", requested_start_date="2000-01-01",
+        source=source, asset_class="us_stocks", metadata_error=f"source={source!r}",
+    )
+    monkeypatch.setattr(yahoo, "_load_existing_file_info", lambda *_: info)
+    checks = yahoo._resolve_repair_plan(
+        "us_stocks",
+        _base_args(
+            tmp_path, asset="us_stocks", mode="repair", verify_us_history_head=True,
+            start_date="1900-01-01",
+        ),
+        [yahoo.SymbolRecord("OLD", "Old Common Stock", "us_stocks", "OLD")],
+        tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("metadata_invalid", False)]
+
+
 def test_unavailable_yahoo_timezone_message_is_blacklist_trigger():
     captured = "$03003T.TW: possibly delisted; no timezone found"
 

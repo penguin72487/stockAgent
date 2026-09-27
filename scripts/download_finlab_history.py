@@ -19,6 +19,13 @@ import tempfile
 import time
 from zoneinfo import ZoneInfo
 
+try:
+    from scripts.finlab_wide_volume_units import volume_unit_contract
+except ModuleNotFoundError as exc:
+    if exc.name != "scripts":
+        raise
+    from finlab_wide_volume_units import volume_unit_contract
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG = ROOT / "configs/finlab_history_candidates.json"
@@ -49,6 +56,9 @@ AUTOMATICALLY_DEFERRED_KEYS = frozenset(AUTOMATICALLY_DEFERRED_REASONS)
 # Once present locally, repeated whole-matrix price refreshes are independent
 # validation work and must not consume quota ahead of missing feature fields.
 SECONDARY_VALIDATION_REFRESH_KEYS = frozenset({"price:收盤價"})
+NON_NUMERIC_DEFERRED_KEYS = frozenset({
+    "after_market_fixed_price:資料來源", "after_market_fixed_price:市場別",
+})
 # Short, bounded backoff avoids both a multi-day blind spot and a tight loop
 # against a deterministic provider failure. The timer supplies the retry clock.
 ATTEMPT_RETRY_SECONDS = {
@@ -340,7 +350,7 @@ def _event_bounds(values) -> dict:
     }
 
 
-def audit_local(output_root: Path) -> tuple[int, int]:
+def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, int]:
     """Recheck stored bytes and repair date bounds without another API request."""
     import pandas as pd
     import pyarrow.parquet as pq
@@ -350,6 +360,9 @@ def audit_local(output_root: Path) -> tuple[int, int]:
     for receipt_path in sorted((root / "receipts").glob("*.json")):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            unit_contract = volume_unit_contract(str(receipt.get("dataset") or ""))
+            if volume_only and unit_contract is None and "volume_units" not in receipt:
+                continue
             relative = Path(receipt["parquet_path"])
             data_path = (root / relative).resolve()
             if relative.is_absolute() or not data_path.is_relative_to(root):
@@ -374,6 +387,10 @@ def audit_local(output_root: Path) -> tuple[int, int]:
                 receipt["first_non_null_source_index"] = str(indexes.min()) if len(indexes) else None
                 receipt["last_non_null_source_index"] = str(indexes.max()) if len(indexes) else None
             receipt["schema_version"] = max(2, int(receipt.get("schema_version") or 0))
+            if unit_contract is not None:
+                receipt["volume_units"] = unit_contract
+            else:
+                receipt.pop("volume_units", None)
             receipt["storage_audited_at_utc"] = datetime.now(UTC).isoformat()
             _atomic_json(receipt_path, receipt)
             passed += 1
@@ -429,6 +446,9 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
                         previous["last_check_result"] = "unchanged"
                         previous["last_fetch_elapsed_seconds"] = round(time.monotonic() - started, 3)
                         previous["parquet_size_bytes"] = (output_root / old_relative).stat().st_size
+                        unit_contract = volume_unit_contract(key)
+                        if unit_contract is not None:
+                            previous["volume_units"] = unit_contract
                         _atomic_json(receipt_path, previous)
                         return previous
         # Content-addressed versions make a changed provider response additive.
@@ -473,17 +493,28 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
             "redistribution": "local_only_not_published",
             **stats,
         }
+        unit_contract = volume_unit_contract(key)
+        if unit_contract is not None:
+            receipt["volume_units"] = unit_contract
         _atomic_json(receipt_path, receipt)
         return receipt
     finally:
         temp.unlink(missing_ok=True)
 
 
-def sync_selection(
+def _windowed_dataset(key: str) -> bool:
+    return key.split(":", 1)[0] in {"tw_minute", "tw_tick"}
+
+
+def _sync_work_plan(
     available: list[str], curated: dict[str, dict], output_root: Path,
     *, now: datetime, refresh_days: int, retry_unavailable: bool,
-) -> list[str]:
-    """Prioritize known gaps, then a bounded pass over the TW catalog."""
+) -> dict:
+    """Separate acquisition debt from actionable work and optional validation.
+
+    A cooldown or resource defer is not completion.  Neither can release the
+    account to repeated overlap queries or its lowest-priority Tick consumer.
+    """
     available_set = set(available)
     curated_keys = [key for key in curated if key in available_set]
     extra_keys = [key for key in available if key not in curated]
@@ -491,12 +522,17 @@ def sync_selection(
     validation_refresh: list[str] = []
     missing_extra: list[str] = []
     refresh_extra: list[str] = []
+    required_outstanding: list[str] = []
     for key in [*curated_keys, *extra_keys]:
-        if key in AUTOMATICALLY_DEFERRED_KEYS:
-            continue
-        if key not in available_set:
+        if key not in available_set or _windowed_dataset(key):
             continue
         downloaded = has_local_download(key, output_root)
+        due = not downloaded or refresh_due(key, output_root, now=now, days=refresh_days)
+        secondary = downloaded and key in SECONDARY_VALIDATION_REFRESH_KEYS
+        if due and not secondary and key not in NON_NUMERIC_DEFERRED_KEYS:
+            required_outstanding.append(key)
+        if key in AUTOMATICALLY_DEFERRED_KEYS or not due:
+            continue
         if (not downloaded and unavailable_attempt(key, output_root)
                 and not retry_unavailable and not vip_retry_due(key, output_root, now=now)):
             continue
@@ -504,23 +540,38 @@ def sync_selection(
             retry_unavailable and unavailable_attempt(key, output_root)
         ):
             continue
-        if key in curated and (not downloaded or refresh_due(
-                key, output_root, now=now, days=refresh_days)):
-            if downloaded and key in SECONDARY_VALIDATION_REFRESH_KEYS:
-                validation_refresh.append(key)
-            else:
-                eligible_curated.append(key)
+        if secondary:
+            validation_refresh.append(key)
+        elif key in curated:
+            eligible_curated.append(key)
         elif key not in curated and not downloaded:
             missing_extra.append(key)
-        elif key not in curated and refresh_due(
-                key, output_root, now=now, days=refresh_days):
+        elif key not in curated:
             refresh_extra.append(key)
     # A quota-limited daily run may check only a fraction of the catalog.  If
     # extras stay in alphabetical order, the same prefix is checked after each
     # 08:00 reset while later keys can starve indefinitely.  Preserve curated
     # and missing-key priority, then visit the stalest downloaded extras first.
     refresh_extra.sort(key=lambda key: (last_source_check(key, output_root), key))
-    return [*eligible_curated, *missing_extra, *refresh_extra, *validation_refresh]
+    primary = [*eligible_curated, *missing_extra, *refresh_extra]
+    return {"primary": primary, "validation": validation_refresh,
+            "required_outstanding": required_outstanding,
+            "required_blocked": sorted(set(required_outstanding) - set(primary))}
+
+
+def sync_selection(
+    available: list[str], curated: dict[str, dict], output_root: Path,
+    *, now: datetime, refresh_days: int, retry_unavailable: bool,
+) -> list[str]:
+    plan = _sync_work_plan(available, curated, output_root, now=now,
+                          refresh_days=refresh_days, retry_unavailable=retry_unavailable)
+    if plan["required_outstanding"] or not plan["validation"]:
+        return plan["primary"]
+    from downloader.acquisition_policy import evaluate_secondary_admission
+
+    admission = evaluate_secondary_admission(now=now, caller_provider="finlab",
+                                             local_core_complete=True)
+    return [*plan["primary"], *(plan["validation"] if admission["allowed"] else [])]
 
 
 def general_work_status(
@@ -529,8 +580,8 @@ def general_work_status(
 ) -> dict:
     """Read-only gate for lower-priority Tick work; no provider API calls.
 
-    ``idle`` means no *currently actionable* whole-table work, not that every
-    historical field exists or has passed a point-in-time audit.
+    ``idle`` means no required catalog acquisition/recheck debt. It is not
+    historical row completeness or a point-in-time audit.
     """
     if not isinstance(discovery, dict) or refresh_days < 1:
         return {"state": "discovery_unverified", "actionable_pending": None,
@@ -548,25 +599,51 @@ def general_work_status(
         return {"state": "discovery_unverified", "actionable_pending": None,
                 "basis": "Recent validated local FinLab discovery is required before Tick work."}
     available = list(dict.fromkeys(keys))
-    pending = sync_selection(available, curated, output_root, now=now,
-                             refresh_days=refresh_days, retry_unavailable=False)
-    general_keys = [key for key in available if key not in {
-        "tw_minute:2330", "tw_tick:2330",
-    }]
+    plan = _sync_work_plan(available, curated, output_root, now=now,
+                           refresh_days=refresh_days, retry_unavailable=False)
+    pending = plan["primary"]
+    general_keys = [key for key in available if not _windowed_dataset(key)]
     missing_general = {key for key in general_keys
                        if not has_local_download(key, output_root)}
     return {
-        "state": "general_work_pending" if pending else "general_work_idle",
+        "state": ("general_work_pending" if pending else
+                  "general_work_blocked" if plan["required_outstanding"] else
+                  "general_work_idle"),
         "actionable_pending": len(pending),
+        "required_complete": not plan["required_outstanding"],
+        "required_pending": len(plan["required_outstanding"]),
+        "required_blocked": len(plan["required_blocked"]),
+        "required_blocked_keys": plan["required_blocked"],
+        "secondary_validation_pending": len(plan["validation"]),
+        "supplemental_allowed": not plan["required_outstanding"],
         "catalog_keys": len(available),
-        "deferred_keys": sum(key in AUTOMATICALLY_DEFERRED_KEYS for key in available),
+        "deferred_keys": sum(key in AUTOMATICALLY_DEFERRED_KEYS or _windowed_dataset(key)
+                             for key in available),
         "missing_receipts": sum(not has_local_download(key, output_root) for key in available),
         "general_catalog_keys": len(general_keys),
         "general_missing_receipts": len(missing_general),
         "general_missing_not_actionable_now": len(missing_general - set(pending)),
         "discovery_at_utc": checked.astimezone(UTC).isoformat(),
-        "basis": "Current catalog selection after per-key retry/defer rules; idle is not historical completeness or PIT readiness.",
+        "basis": "Required whole-table acquisition/recheck debt includes cooldown and resource-blocked numeric fields; windowed examples and deferred non-numeric metadata are separately reported, never historical or PIT completeness.",
     }
+
+
+def record_core_acquisition_status(available: list[str], curated: dict[str, dict],
+                                   output_root: Path, *, now: datetime,
+                                   refresh_days: int) -> dict:
+    """Small account-local proof for optional API work; no second registry."""
+    keys = sorted(set(available))
+    status = general_work_status({"keys": keys, "observed_at_utc": now.isoformat()},
+                                curated, output_root, now=now, refresh_days=refresh_days)
+    receipt = {**status, "checked_at_utc": now.isoformat(),
+               "status": "ready" if status.get("required_complete") else "blocked",
+               "catalog_sha256": hashlib.sha256(json.dumps(keys, ensure_ascii=False).encode()).hexdigest(),
+               "catalog_keys": len(keys), "refresh_days": refresh_days,
+               "non_numeric_exclusions": sorted(set(keys) & NON_NUMERIC_DEFERRED_KEYS),
+               "windowed_examples_excluded": [key for key in keys if _windowed_dataset(key)],
+               "provenance": "FinLab catalog membership plus local canonical receipts and attempt/defer policy"}
+    _atomic_json(output_root / "core_acquisition_status.json", receipt)
+    return receipt
 
 
 def record_attempt(key: str, output_root: Path, exc: Exception,
@@ -676,6 +753,8 @@ def sync_catalog(
     if not credential_available():
         raise RuntimeError("no usable FinLab session")
     now = datetime.now(UTC)
+    record_core_acquisition_status(available, curated, output_root, now=now,
+                                   refresh_days=refresh_days)
     pending = sync_selection(
         available, curated, output_root, now=now,
         refresh_days=refresh_days, retry_unavailable=retry_unavailable,
@@ -743,6 +822,12 @@ def sync_catalog(
         summary["downloaded_total"] = downloaded
         summary["known_vip_only_total"] = vip_only
         summary["not_downloaded_total"] = len(available) - downloaded
+        core = record_core_acquisition_status(available, curated, output_root,
+                                               now=datetime.now(UTC),
+                                               refresh_days=refresh_days)
+        summary["required_complete"] = core["required_complete"]
+        summary["required_pending"] = core["required_pending"]
+        summary["required_blocked"] = core["required_blocked"]
         room = quota_room_mb()
         if room is not None:
             summary["quota_remaining_mb"] = round(room[0], 2)
@@ -753,7 +838,7 @@ def sync_catalog(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("catalog", "discover", "fetch", "audit-local", "sync", "record-timeout", "pending"))
+    parser.add_argument("action", choices=("catalog", "discover", "fetch", "audit-local", "audit-volume-units", "sync", "record-timeout", "pending"))
     parser.add_argument("--dataset", action="append", default=[], help="Exact FinLab key; repeatable")
     parser.add_argument("--all-candidates", action="store_true", help="Fetch all curated candidates")
     parser.add_argument("--missing-candidates", action="store_true", help="Fetch curated candidates without a local data/receipt pair, excluding known VIP-only keys")
@@ -777,8 +862,8 @@ def main(argv: list[str] | None = None) -> int:
             f"free_plan_observed_common_end={catalog['free_plan_observed_common_end']}"
         )
         return 0
-    if args.action == "audit-local":
-        passed, failed = audit_local(args.output_root)
+    if args.action in {"audit-local", "audit-volume-units"}:
+        passed, failed = audit_local(args.output_root, volume_only=args.action == "audit-volume-units")
         print(f"local_verified={passed}; local_failed={failed}")
         return 1 if failed else 0
     if args.action == "record-timeout":

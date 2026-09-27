@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
-from typing import Iterable, Sequence
+import stat
+from typing import Callable, Iterable, Sequence
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -33,6 +34,74 @@ class SourceFileContract:
     rows: int
     bytes: int
     mtime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMetadataProof:
+    """Ephemeral, same-run footer observation; never a persisted cache contract."""
+
+    path: str
+    rows: int
+    bytes: int
+    uncompressed_bytes: int
+    schema_fingerprint: str
+    file_signature: tuple[int, int, int, int, int]
+
+
+def source_file_signature(path: str | Path) -> tuple[int, int, int, int, int]:
+    info = Path(path).stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"source is not a regular file: {path}")
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def observe_source_metadata(path: str | Path) -> SourceMetadataProof:
+    """Read one footer inside an identity fence, retaining only scalar evidence."""
+    resolved = Path(path).resolve()
+    before = source_file_signature(resolved)
+    with pq.ParquetFile(resolved) as parquet_file:
+        metadata = parquet_file.metadata
+        rows = int(metadata.num_rows)
+        uncompressed = sum(
+            int(metadata.row_group(index).total_byte_size)
+            for index in range(metadata.num_row_groups)
+        )
+        schema = parquet_file.schema_arrow.remove_metadata()
+        fingerprint = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+    if source_file_signature(resolved) != before:
+        raise RuntimeError(f"source changed during metadata observation: {resolved}")
+    return SourceMetadataProof(
+        str(resolved), rows, before[2], uncompressed, fingerprint, before
+    )
+
+
+def verify_source_metadata_proofs(
+    paths: Sequence[str | Path], proofs: Sequence[SourceMetadataProof],
+) -> None:
+    """Reject missing/substituted/stale same-run evidence without reopening footers."""
+    if len(paths) != len(proofs):
+        raise RuntimeError("source metadata proof count mismatch")
+    for path, proof in zip(paths, proofs, strict=True):
+        # The same-run loader and compactor already canonicalized these paths.
+        # stat still follows replacements; avoid re-walking every parent at
+        # each fence when the lexical path already matches the observation.
+        resolved = Path(path)
+        if not isinstance(proof, SourceMetadataProof) or str(resolved) != proof.path:
+            resolved = resolved.resolve()
+        if not isinstance(proof, SourceMetadataProof) or (
+            str(resolved) != proof.path
+            or type(proof.rows) is not int or proof.rows < 0
+            or type(proof.bytes) is not int or proof.bytes < 0
+            or type(proof.uncompressed_bytes) is not int or proof.uncompressed_bytes < 0
+            or len(proof.file_signature) != 5
+            or any(type(value) is not int for value in proof.file_signature)
+            or proof.bytes != proof.file_signature[2]
+            or len(proof.schema_fingerprint) != 64
+            or any(value not in "0123456789abcdef" for value in proof.schema_fingerprint)
+        ):
+            raise RuntimeError(f"invalid source metadata proof: {resolved}")
+        if source_file_signature(resolved) != proof.file_signature:
+            raise RuntimeError(f"source changed since metadata observation: {resolved}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +218,8 @@ def compact_parquet_files(
     compression_level: int | None = 3,
     row_group_size_rows: int = 122_880,
     temp_directory: str | Path | None = None,
+    source_metadata_proofs: Sequence[SourceMetadataProof] | None = None,
+    before_publish: Callable[[], None] | None = None,
 ) -> CompactParquetReceipt:
     """Atomically compact Parquet files and validate with three independent readers.
 
@@ -175,11 +246,17 @@ def compact_parquet_files(
     if missing:
         raise FileNotFoundError(f"source Parquet files are missing: {missing[:5]}")
 
-    source_rows = 0
-    source_bytes = 0
-    for path in paths:
-        source_rows += int(pq.ParquetFile(path).metadata.num_rows)
-        source_bytes += int(path.stat().st_size)
+    proofs = None if source_metadata_proofs is None else tuple(source_metadata_proofs)
+    if proofs is None:
+        source_rows = 0
+        source_bytes = 0
+        for path in paths:
+            source_rows += int(pq.ParquetFile(path).metadata.num_rows)
+            source_bytes += int(path.stat().st_size)
+    else:
+        verify_source_metadata_proofs(paths, proofs)
+        source_rows = sum(proof.rows for proof in proofs)
+        source_bytes = sum(proof.bytes for proof in proofs)
     if expected_rows is not None and source_rows != int(expected_rows):
         raise RuntimeError(
             "source row-count mismatch: "
@@ -222,6 +299,8 @@ def compact_parquet_files(
             f"(FORMAT parquet, COMPRESSION {codec}{level_option}, "
             f"ROW_GROUP_SIZE {max(1, int(row_group_size_rows))})"
         )
+        if proofs is not None:
+            verify_source_metadata_proofs(paths, proofs)
 
         metadata = pq.ParquetFile(temporary).metadata
         arrow_rows = int(metadata.num_rows)
@@ -239,6 +318,10 @@ def compact_parquet_files(
             )
 
         _fsync_path(temporary)
+        if before_publish is not None:
+            before_publish()
+        if proofs is not None:
+            verify_source_metadata_proofs(paths, proofs)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
         output_metadata = pq.ParquetFile(target).metadata

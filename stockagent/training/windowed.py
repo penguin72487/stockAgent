@@ -175,11 +175,17 @@ class WindowedSplitTensors:
                     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
                     11,
                 ),
+                (
+                    int(self.features.size(0)),
+                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    2,
+                    TAPE_FIELDS,
+                ),
             }
         ):
             raise ValueError(
                 "tw_stock_context_futures_portfolio execution tensor must have "
-                "shape [T,1936,4] or exact-integer [T,1936,11]"
+                "shape [T,1936,4], [T,1936,11], or intraday [T,1936,2,63]"
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))

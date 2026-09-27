@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import stat
 import struct
@@ -25,6 +26,7 @@ from uuid import uuid4
 
 INVENTORY_VERSION = 10
 FAST_INDEX_VERSION = 2
+FAST_INDEX_PREFLIGHT_HINTS = 512
 DEFAULT_REFRESH_FILES = 4_096
 DEFAULT_IDENTITY_REFRESH_FILES = 1_024
 _DATE_COLUMNS = (
@@ -227,6 +229,7 @@ def _quick_index_checksum(payload: Mapping[str, Any]) -> str:
 
 def _read_quick_index(
     root: Path, cache_path: Path, *, snapshot: InventorySnapshot | None,
+    discovered_on_miss: list[dict[str, list[Path]]] | None = None,
 ) -> dict[str, Any] | None:
     index_path = _quick_index_path(cache_path)
     index_signature = _cache_signature(index_path, trusted_index=True)
@@ -246,6 +249,7 @@ def _read_quick_index(
         or type(payload.get("cached_files")) is not int
         or payload.get("identity_unbound_files") != 0
         or not isinstance(payload.get("feature_revision"), str)
+        or len(payload["feature_revision"]) != 32
         or not isinstance(payload.get("selection_fingerprint"), str)
         or not isinstance(payload.get("checksum"), str)
     ):
@@ -255,17 +259,38 @@ def _read_quick_index(
             return None
     except (TypeError, ValueError):
         return None
+    # A changed hint can only force the already-existing complete slow path.
+    # Passing hints never replaces the full membership/file-identity scan.
+    preflight_hints = payload.get("preflight_file_hints", [])
+    if not isinstance(preflight_hints, list) or len(preflight_hints) > FAST_INDEX_PREFLIGHT_HINTS:
+        return None
+    for hint in preflight_hints:
+        if (
+            not isinstance(hint, list) or len(hint) != 2
+            or not isinstance(hint[0], str)
+            or not isinstance(hint[1], list) or len(hint[1]) != 5
+            or any(type(value) is not int for value in hint[1])
+        ):
+            return None
+        try:
+            if _file_identity(Path(hint[0]).stat()) != hint[1]:
+                return None
+        except (OSError, ValueError):
+            return None
     stage_started = time.perf_counter()
     selected = _selected_files(root)
     discover_ms = round((time.perf_counter() - stage_started) * 1_000, 3)
     stage_started = time.perf_counter()
     fingerprint = _selection_fingerprint(selected)
     signature_scan_ms = round((time.perf_counter() - stage_started) * 1_000, 3)
-    if (
-        fingerprint is None
-        or fingerprint != payload["selection_fingerprint"]
-        or _cache_signature(cache_path) != cache_signature
-    ):
+    if fingerprint is None or _cache_signature(cache_path) != cache_signature:
+        return None
+    if fingerprint != payload["selection_fingerprint"]:
+        # A source changed, but the directory membership was just discovered
+        # under a validated index/cache pair. The slow path will re-stat every
+        # selected file and re-read changed footers; it need not glob again.
+        if discovered_on_miss is not None:
+            discovered_on_miss.append(selected)
         return None
     if snapshot is not None:
         snapshot.check_root(root)
@@ -279,6 +304,7 @@ def _read_quick_index(
         "identity_unbound_files": 0,
         "feature_revision": payload["feature_revision"],
         "fast_index_hit": True,
+        "changed_dataset_ids": [],
         "timing_ms": {
             "cache_decode": cache_decode_ms,
             "discover": discover_ms,
@@ -310,6 +336,12 @@ def _write_quick_index(
         "cached_files": len(cache),
         "identity_unbound_files": 0,
         "feature_revision": feature_revision,
+        "preflight_file_hints": [
+            [key, cache[key]["file_identity"]]
+            for key in random.Random(feature_revision).sample(
+                tuple(cache), min(FAST_INDEX_PREFLIGHT_HINTS, len(cache)),
+            )
+        ],
     }
     try:
         payload["checksum"] = _quick_index_checksum(payload)
@@ -592,6 +624,8 @@ def _build_record_inventory_unlocked(
     repo_root: Path, *, refresh: bool = False, max_refresh_files: int = DEFAULT_REFRESH_FILES,
     snapshot: InventorySnapshot | None = None,
     fast_index_miss: bool = False,
+    preselected: dict[str, list[Path]] | None = None,
+    quick_index_probe_ms: float = 0.0,
 ) -> dict[str, Any]:
     """Read inventory; optionally refresh at most ``max_refresh_files`` footers."""
 
@@ -621,6 +655,7 @@ def _build_record_inventory_unlocked(
                 "identity_unbound_files": _identity_unbound_count(files),
                 "feature_revision": payload.get("feature_revision"),
                 "fast_index_hit": False,
+                "changed_dataset_ids": None,
                 "timing_ms": {"cache_decode": cache_decode_ms},
             }
     cache: dict[str, Any] = (
@@ -635,7 +670,7 @@ def _build_record_inventory_unlocked(
         and isinstance(payload.get("schemas"), Mapping) else {}
     )
     stage_start = time.perf_counter()
-    selected = _selected_files(root)
+    selected = preselected if preselected is not None else _selected_files(root)
     membership_fingerprint = _membership_fingerprint(selected)
     if snapshot is not None:
         snapshot.selected = selected
@@ -644,6 +679,7 @@ def _build_record_inventory_unlocked(
     stage_start = time.perf_counter()
     refreshed = 0
     identity_rechecked = 0
+    changed_file_keys: set[str] = set()
     unavailable_during_refresh = False
     all_entries_unchanged = True
     previous_files = payload.get("files", {}) if isinstance(payload, Mapping) else {}
@@ -697,6 +733,7 @@ def _build_record_inventory_unlocked(
                 unavailable_during_refresh = True
                 cache.pop(key, None)
                 feature_inputs_changed = True
+                changed_file_keys.add(key)
                 continue
             if _file_identity(stat) != _file_identity(after_stat):
                 # The footer may belong to an old inode or an in-flight write.
@@ -704,6 +741,7 @@ def _build_record_inventory_unlocked(
                 unavailable_during_refresh = True
                 cache.pop(key, None)
                 feature_inputs_changed = True
+                changed_file_keys.add(key)
                 continue
             if stats is not None:
                 fields = stats.pop("fields")
@@ -717,6 +755,7 @@ def _build_record_inventory_unlocked(
                 entry.get("stats"), entry.get("error")
             ) != (updated.get("stats"), updated.get("error")):
                 feature_inputs_changed = True
+                changed_file_keys.add(key)
             cache[key] = updated
         # Only reuse cached aggregates if every selected path checked so far
         # had an unchanged signature, no path was unavailable, and membership
@@ -731,6 +770,8 @@ def _build_record_inventory_unlocked(
             and isinstance(payload, Mapping)
             and payload.get("version") == INVENTORY_VERSION
             and isinstance(payload.get("datasets"), Mapping)
+            and isinstance(payload.get("feature_revision"), str)
+            and len(payload["feature_revision"]) == 32
             and payload.get("selection_membership") == membership_fingerprint
             and (not fast_index_miss or _identity_unbound_count(cache) > 0)
         ):
@@ -742,7 +783,9 @@ def _build_record_inventory_unlocked(
                 "identity_unbound_files": _identity_unbound_count(cache),
                 "feature_revision": payload.get("feature_revision"),
                 "fast_index_hit": False,
+                "changed_dataset_ids": [],
                 "timing_ms": {
+                    "quick_index_probe": quick_index_probe_ms,
                     "cache_decode": cache_decode_ms,
                     "discover": discover_ms,
                     "signature_scan": round((time.perf_counter() - stage_start) * 1_000, 3),
@@ -782,6 +825,24 @@ def _build_record_inventory_unlocked(
         )
     if not isinstance(payload, Mapping) or output != payload.get("datasets"):
         feature_inputs_changed = True
+    previous_datasets = payload.get("datasets") if isinstance(payload, Mapping) else None
+    # This is diagnostic scope, not permission to skip the full source scan.
+    # With a changed membership or old cache, the former owner of a removed
+    # path cannot be reconstructed from the newly selected paths alone.
+    changed_dataset_ids = (
+        sorted(
+            dataset for dataset, paths in selected.items()
+            if output[dataset] != previous_datasets.get(dataset)
+            or any(str(path) in changed_file_keys for path in paths)
+        )
+        if isinstance(payload, Mapping)
+        and payload.get("version") == INVENTORY_VERSION
+        and isinstance(previous_datasets, Mapping)
+        and isinstance(previous_files, Mapping)
+        and previous_files.keys() == all_paths.keys()
+        and payload.get("selection_membership") == membership_fingerprint
+        else None
+    )
     previous_revision = payload.get("feature_revision") if isinstance(payload, Mapping) else None
     feature_revision = (
         previous_revision
@@ -789,6 +850,10 @@ def _build_record_inventory_unlocked(
         and len(previous_revision) == 32
         else uuid4().hex
     )
+    if feature_revision != previous_revision and changed_dataset_ids == []:
+        # A revision can also change because of an invalid prior revision or
+        # cache contract. Do not advertise an empty safe delta in that case.
+        changed_dataset_ids = None
     if refresh:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
@@ -816,7 +881,9 @@ def _build_record_inventory_unlocked(
         "identity_unbound_files": _identity_unbound_count(cache),
         "feature_revision": feature_revision,
         "fast_index_hit": False,
+        "changed_dataset_ids": changed_dataset_ids,
         "timing_ms": {
+            "quick_index_probe": quick_index_probe_ms,
             "cache_decode": cache_decode_ms,
             "discover": discover_ms,
             "signature_scan": signature_scan_ms,
@@ -838,16 +905,21 @@ def build_record_inventory(
     with lock_path.open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            discovered_on_miss: list[dict[str, list[Path]]] = []
+            probe_started = time.perf_counter()
             quick = _read_quick_index(
                 Path(repo_root),
                 Path(repo_root) / "artifacts/live/data_monitor/record_inventory_cache.json",
                 snapshot=snapshot,
+                discovered_on_miss=discovered_on_miss,
             )
             if quick is not None:
                 return quick
             return _build_record_inventory_unlocked(
                 repo_root, refresh=True, max_refresh_files=max_refresh_files,
                 snapshot=snapshot, fast_index_miss=True,
+                preselected=discovered_on_miss[0] if discovered_on_miss else None,
+                quick_index_probe_ms=round((time.perf_counter() - probe_started) * 1_000, 3),
             )
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -920,17 +992,32 @@ def build_feature_inventory(
             row_count = sum(int(info.get("count") or 0) for info in members)
             columns = zip(*(info["non_null"] for info in members), strict=True)
             for (name, dtype), counts in zip(schemas[schema_id], columns, strict=True):
-                field = by_field.setdefault(name, {
-                    "types": set(), "files_with_field": 0,
-                    "rows_with_field": 0, "non_null_known_files": 0,
-                    "verified_non_null": 0,
-                })
+                field = by_field.get(name)
+                if field is None:
+                    field = {
+                        "types": set(), "files_with_field": 0,
+                        "rows_with_field": 0, "non_null_known_files": 0,
+                        "verified_non_null": 0,
+                    }
+                    by_field[name] = field
                 field["types"].add(dtype)
                 field["files_with_field"] += len(members)
                 field["rows_with_field"] += row_count
-                known = [value for value in counts if isinstance(value, int)]
-                field["non_null_known_files"] += len(known)
-                field["verified_non_null"] += sum(known)
+                # JSON cache values are normally all integers. Let the C
+                # accumulator handle that common case instead of creating a
+                # Python list and type-checking millions of cells each cycle.
+                # Missing or malformed statistics keep the original filter.
+                try:
+                    known_total = sum(counts)
+                except TypeError:
+                    known_total = None
+                if type(known_total) is int:
+                    field["non_null_known_files"] += len(counts)
+                    field["verified_non_null"] += known_total
+                else:
+                    known = [value for value in counts if isinstance(value, int)]
+                    field["non_null_known_files"] += len(known)
+                    field["verified_non_null"] += sum(known)
         aggregated_at = time.perf_counter()
         aggregate_seconds += aggregated_at - verified_at
         if not by_field:

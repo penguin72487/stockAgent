@@ -21,6 +21,7 @@ from stockagent.models.normalization import (
     masked_cash_asset_l1_weights,
     masked_cross_sectional_mean,
     masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
     masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -524,6 +525,10 @@ def _portfolio_weights_from_scores(
                 short_mask=torch.zeros_like(mask),
                 preserve_fp32_output=(output_mode == "score_entmax_cash"),
             ).masked_fill(~mask, 0.0)
+        if output_mode == "score_entmax_log_cash":
+            return masked_score_entmax_log_cash_weights(
+                target_logits, mask, short_mask=torch.zeros_like(mask)
+            ).masked_fill(~mask, 0.0)
         if output_mode == "projection_l1":
             return masked_l1_projection_weights(
                 target_logits,
@@ -571,6 +576,10 @@ def _portfolio_weights_from_scores(
             mask,
             short_mask=mask,
             preserve_fp32_output=(output_mode == "score_entmax_cash"),
+        ).masked_fill(~mask, 0.0)
+    if output_mode == "score_entmax_log_cash":
+        return masked_score_entmax_log_cash_weights(
+            target_logits, mask, short_mask=mask
         ).masked_fill(~mask, 0.0)
     if output_mode == "projection_l1":
         return masked_l1_projection_weights(

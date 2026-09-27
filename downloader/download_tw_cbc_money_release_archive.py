@@ -11,8 +11,9 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
-import os
 from pathlib import Path
 import re
 import time
@@ -24,17 +25,23 @@ import polars as pl
 try:
     from downloader.common import SharedRateLimiter
     from downloader.download_tw_cbc_fx_release_archive import (
-        BASE, LIST_URL, _fetch, _save_raw, _cached, _chinese_int,
+        BASE, LIST_URL, LIST_PAGE_SIZE, ListingPage, _fetch, _save_raw, _cached, _chinese_int,
         SourceAccessBlocked, _reject_source_error_page,
+        _validate_listing_page as _validate_cbc_listing_page,
     )
-    from downloader.release_archive_io import write_release_rows_if_changed
+    from downloader.release_archive_io import (
+        read_release_resume_state, write_release_rows_if_changed, write_release_state,
+    )
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter
     from download_tw_cbc_fx_release_archive import (
-        BASE, LIST_URL, _fetch, _save_raw, _cached, _chinese_int,
+        BASE, LIST_URL, LIST_PAGE_SIZE, ListingPage, _fetch, _save_raw, _cached, _chinese_int,
         SourceAccessBlocked, _reject_source_error_page,
+        _validate_listing_page as _validate_cbc_listing_page,
     )
-    from release_archive_io import write_release_rows_if_changed
+    from release_archive_io import (
+        read_release_resume_state, write_release_rows_if_changed, write_release_state,
+    )
 
 try:
     import fcntl
@@ -91,12 +98,15 @@ def _percentage(raw: str) -> float:
     return value
 
 
-def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
+def _parse_listing_page(content: bytes) -> ListingPage:
     _reject_source_error_page(content)
     soup = BeautifulSoup(content, "html.parser")
     rows: list[dict[str, str]] = []
+    raw_rows = 0
     for item in soup.select("li"):
         time_tag = item.find("time")
+        if time_tag is not None:
+            raw_rows += 1
         link = item.find("a", href=re.compile(r"^/tw/cp-302-"))
         if time_tag is None or link is None:
             continue
@@ -127,10 +137,32 @@ def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
         rows.append({"period": f"{year:04d}-{month:02d}",
                      "published_on": published_on, "title": title,
                      "release_url": url})
-    match = re.search(r"第\s*\d+\s*/\s*(\d+)\s*頁", soup.get_text(" ", strip=True))
+    pagination = soup.select_one(".total")
+    page_text = (pagination or soup).get_text(" ", strip=True)
+    match = re.search(r"第\s*(\d+)\s*/\s*(\d+)\s*頁", page_text)
     if match is None:
         raise ValueError("CBC listing lacks a verifiable page count")
-    return rows, int(match[1])
+    total_match = re.search(r"共\s*(\d+)\s*筆資料", page_text)
+    selected = soup.select_one("#PageSize option[selected]")
+    selected_size = str(selected.get("value") or "") if selected else ""
+    return ListingPage(
+        rows=rows, page=int(match[1]), total_pages=int(match[2]),
+        total_rows=int(total_match[1]) if total_match else None,
+        raw_rows=raw_rows, page_size=int(selected_size) if selected_size.isdigit() else None,
+    )
+
+
+def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
+    """Retain the historical parser API; collection requires the full proof."""
+    listing = _parse_listing_page(content)
+    return listing.rows, listing.total_pages
+
+
+def _validate_listing_page(
+    listing: ListingPage, requested_page: int, *, expected: ListingPage | None = None,
+) -> None:
+    """Prove raw page coverage before filtering monetary-policy releases."""
+    _validate_cbc_listing_page(listing, requested_page, page_size=LIST_PAGE_SIZE, expected=expected)
 
 
 def parse_detail(content: bytes, listed: dict[str, str]) -> tuple[dict[str, float], str | None]:
@@ -193,12 +225,88 @@ def _writer_lock(root: Path):
 
 
 def _write_state(root: Path, state: dict[str, object]) -> None:
-    path = root / "state" / f"{OUTPUT_NAME}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                         encoding="utf-8")
-    os.replace(temporary, path)
+    write_release_state(root, OUTPUT_NAME, state)
+
+
+def _verified_resume_rows(root: Path, prior: dict[str, object]) -> list[dict[str, object]]:
+    """Reverify pinned bytes, not the latest failed/running status, before reuse.
+
+    The enclosing collector writer lock excludes cooperative archive writers.
+    Decode the exact verified Parquet bytes, never reopen the path after hashing.
+    Mixed old/new listing receipts are legal for recent-page scans and do not
+    claim that all pages were downloaded at the latest polling time.
+    """
+    root = root.resolve()
+    verified: dict[Path, str] = {}
+
+    def verify(path: Path, digest: object, *, capture: bool = False) -> bytes | None:
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("resume proof lacks SHA-256")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            raise ValueError("resume proof path escapes archive root")
+        if resolved in verified and verified[resolved] != digest:
+            raise ValueError("resume proof has conflicting hashes")
+        if resolved in verified and not capture:
+            return None
+        before = path.stat()
+        with path.open("rb") as handle:
+            if capture:
+                body = handle.read()
+                actual = hashlib.sha256(body).hexdigest()
+            else:
+                body = None
+                actual = hashlib.file_digest(handle, "sha256").hexdigest()
+        after = path.stat()
+        def identity(st):
+            return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+        if actual != digest or identity(before) != identity(after) or path.resolve() != resolved:
+            raise ValueError("resume source changed or SHA-256 differs from receipt")
+        verified[resolved] = digest
+        return body
+
+    def raw_path(value: object, subtree: str) -> Path:
+        if not isinstance(value, str) or ".." in Path(value).parts:
+            raise ValueError("invalid resume raw path")
+        path = Path(value)
+        path = path if path.is_absolute() else root / path
+        if not path.resolve(strict=True).is_relative_to(root / "raw" / OUTPUT_NAME / subtree):
+            raise ValueError("resume raw path escapes dataset subtree")
+        return path
+
+    body = verify(root / f"{OUTPUT_NAME}.parquet", prior.get("parquet_sha256"), capture=True)
+    frame = pl.read_parquet(io.BytesIO(body))
+    required = {"release_url", "metric", "period", "published_on", "html_path", "html_sha256"}
+    if not required <= set(frame.columns) or frame.is_empty():
+        raise ValueError("resume archive lacks required release columns or rows")
+    actual_releases = frame["release_url"].n_unique()
+    if (actual_releases != prior.get("saved_releases")
+            or actual_releases != prior.get("registered_releases")
+            or frame.select("release_url", "metric").unique().height != frame.height):
+        raise ValueError("resume archive release count or identity differs from receipt")
+    receipts = prior.get("listing_receipts")
+    if not isinstance(receipts, list) or not receipts or len(receipts) > 1000:
+        raise ValueError("recent-page refresh lacks prior full listing receipts")
+    pages: set[int] = set()
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise ValueError("invalid resume listing receipt")
+        page = receipt.get("page")
+        if (type(page) is not int or not 1 <= page <= 1000 or page in pages
+                or receipt.get("url") != LIST_URL.format(page=page)):
+            raise ValueError("resume listing page identity differs from receipt")
+        pages.add(page)
+        listing_body = verify(raw_path(receipt.get("path"), "list"), receipt.get("sha256"),
+                              capture=True)
+        # A pre-fix completed receipt may pin a wrong/truncated page perfectly.
+        # Validate those exact verified bytes, never reopen the path. Recent
+        # scans mix generations, so only each page's own totals are authoritative.
+        listing = _parse_listing_page(listing_body)
+        _validate_listing_page(listing, page)
+    rows = frame.to_dicts()
+    for row in rows:
+        verify(raw_path(row.get("html_path"), "detail"), row.get("html_sha256"))
+    return rows
 
 
 def _collect_one(listed: dict[str, str], root: Path, limiter: SharedRateLimiter,
@@ -237,40 +345,41 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         raise ValueError("invalid worker, request interval, or refresh setting")
     if recent_pages and cached_list_pages:
         raise ValueError("recent-page refresh cannot use cached index pages")
+    started = time.monotonic()
+    started_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     prior_rows: list[dict[str, object]] = []
     prior_receipts: list[dict[str, object]] = []
     prior: dict[str, object] = {}
     if recent_pages:
-        state_path = root / "state" / f"{OUTPUT_NAME}.json"
-        parquet_path = root / f"{OUTPUT_NAME}.parquet"
-        prior = json.loads(state_path.read_text(encoding="utf-8"))
-        if prior.get("complete") is not True or prior.get("status") != "complete":
+        prior = read_release_resume_state(root, OUTPUT_NAME)
+        if prior is None:
             raise ValueError("recent-page refresh requires a complete prior full archive")
-        prior_rows = pl.read_parquet(parquet_path).to_dicts()
-        prior_receipts = prior.get("listing_receipts") or []
-        if not isinstance(prior_receipts, list) or not prior_receipts:
-            raise ValueError("recent-page refresh lacks prior full listing receipts")
+        _write_state(root, {"dataset": OUTPUT_NAME, "status": "running", "phase": "verifying_resume",
+                            "started_at_utc": started_at})
+        prior_rows = _verified_resume_rows(root, prior)
+        prior_receipts = prior["listing_receipts"]
+    resume_verification_seconds = round(time.monotonic() - started, 6)
     limiter = SharedRateLimiter(request_interval, name="cbc-release-archive")
-    started = time.monotonic()
-    started_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     _write_state(root, {"dataset": OUTPUT_NAME, "status": "running", "phase": "discovering",
                         "started_at_utc": started_at, "completed_releases": 0,
                         "total_releases": None, "estimated_seconds_remaining": None})
+    discovery_started = time.monotonic()
+    reference_listing: ListingPage | None = None
     def fetch_page(page: int):
         url = LIST_URL.format(page=page)
         body = (_cached(root / "raw" / OUTPUT_NAME / "list", f"page-{page:04d}", listing=True)
                 if cached_list_pages else _fetch(url, limiter))
         if body is None:
             raise FileNotFoundError(f"missing cached CBC listing page: {page}")
-        rows, count = parse_listing(body)
+        listing = _parse_listing_page(body)
+        _validate_listing_page(listing, page, expected=reference_listing)
         digest, path = _save_raw(root / "raw" / OUTPUT_NAME / "list",
                                  f"page-{page:04d}", body)
-        return page, digest, path, rows, count
+        return page, digest, path, listing
 
     first = fetch_page(1)
-    total_pages = first[-1]
-    if not 1 <= total_pages <= 1000:
-        raise ValueError(f"implausible CBC listing page count: {total_pages}")
+    reference_listing = first[-1]
+    total_pages = first[-1].total_pages
     pages = [first]
     _write_state(root, {"dataset": OUTPUT_NAME, "status": "running", "phase": "discovering",
                         "started_at_utc": started_at, "completed_pages": 1,
@@ -278,34 +387,37 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                         "total_releases": None, "estimated_seconds_remaining": None})
     pages_to_fetch = min(total_pages, recent_pages) if recent_pages else total_pages
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(fetch_page, page) for page in range(2, pages_to_fetch + 1)]
-        for future in as_completed(futures):
-            try:
+        try:
+            futures = [pool.submit(fetch_page, page) for page in range(2, pages_to_fetch + 1)]
+            for future in as_completed(futures):
                 pages.append(future.result())
-            except SourceAccessBlocked:
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
-            if len(pages) % 20 == 0 or len(pages) == pages_to_fetch:
-                elapsed = max(time.monotonic() - started, 0.001)
-                _write_state(root, {"dataset": OUTPUT_NAME, "status": "running",
-                                    "phase": "discovering", "started_at_utc": started_at,
-                                    "completed_pages": len(pages), "total_pages": pages_to_fetch,
-                                    "completed_releases": 0, "total_releases": None,
-                                    "estimated_seconds_remaining": round(
-                                        (pages_to_fetch - len(pages)) * elapsed / len(pages)
-                                    )})
+                if len(pages) % 20 == 0 or len(pages) == pages_to_fetch:
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    _write_state(root, {"dataset": OUTPUT_NAME, "status": "running",
+                                        "phase": "discovering", "started_at_utc": started_at,
+                                        "completed_pages": len(pages), "total_pages": pages_to_fetch,
+                                        "completed_releases": 0, "total_releases": None,
+                                        "estimated_seconds_remaining": round(
+                                            (pages_to_fetch - len(pages)) * elapsed / len(pages)
+                                        )})
+        except Exception:
+            # Includes progress persistence errors, not only failed requests.
+            # Already running workers still finish before leaving this pool.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     listed: dict[str, dict[str, str]] = {}
     receipts: list[dict[str, object]] = []
-    for page, digest, path, rows, count in sorted(pages):
-        if count != total_pages:
-            raise ValueError("CBC listing changed during discovery; retry")
+    for page, digest, path, listing in sorted(pages):
         receipts.append({"page": page, "url": LIST_URL.format(page=page),
-                         "sha256": digest, "path": path, "release_rows": len(rows)})
-        for row in rows:
+                         "sha256": digest, "path": path, "release_rows": len(listing.rows),
+                         "raw_rows": listing.raw_rows, "total_rows": listing.total_rows,
+                         "total_pages": listing.total_pages, "page_size": listing.page_size})
+        for row in listing.rows:
             previous = listed.get(row["release_url"])
             if previous is not None and previous != row:
                 raise ValueError(f"CBC money listing conflict: {row['release_url']}")
             listed[row["release_url"]] = row
+    discovery_seconds = round(time.monotonic() - discovery_started, 6)
     if recent_pages:
         # Old originals remain immutable evidence even when current pagination
         # shifts.  The full weekly scan detects non-recent index additions.
@@ -332,6 +444,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                         "total_releases": len(ordered), "estimated_seconds_remaining": None})
     last_progress = time.monotonic()
     completed = 0
+    detail_started = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_collect_one, item, root, limiter,
                                refresh=item["release_url"] in newest): item for item in ordered}
@@ -357,6 +470,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
                                         (len(ordered) - completed) * (now - started) / completed
                                     ) if completed else None})
                 last_progress = now
+    detail_seconds = round(time.monotonic() - detail_started, 6)
     if recent_pages:
         refreshed_urls = {str(row["release_url"]) for row in rows}
         rows.extend(row for row in prior_rows if str(row["release_url"]) not in refreshed_urls)
@@ -376,7 +490,8 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
     # Archive completeness is about discovered article bytes. Value-history
     # completeness is a separate claim: an old release may be raw-only or a
     # monthly issue may be absent from the official index altogether.
-    complete = not failures and registered_urls == {str(row["release_url"]) for row in rows}
+    complete = (not cached_list_pages and not failures
+                and registered_urls == {str(row["release_url"]) for row in rows})
     summary: dict[str, object] = {
         "dataset": OUTPUT_NAME, "status": "complete" if complete else "degraded",
         "complete": complete, "value_history_complete": not missing_periods,
@@ -396,16 +511,24 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
             if recent_pages else None if cached_list_pages else
             datetime.now(timezone.utc).isoformat(timespec="microseconds")
         ),
-        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "stage_seconds": {"resume_verification": resume_verification_seconds,
+                          "listing_discovery": discovery_seconds,
+                          "detail_collection": detail_seconds},
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
     }
     if rows and not failures:
+        write_started = time.monotonic()
         path = root / f"{OUTPUT_NAME}.parquet"
         digest, changed = write_release_rows_if_changed(path, rows,
                                                          identity_columns=("release_url", "metric"),
                                                          allow_placeholder_upgrade=True)
         summary.update({"parquet_path": str(path), "parquet_sha256": digest,
                         "parquet_changed": changed})
+        summary["stage_seconds"]["parquet_proof_write"] = round(
+            time.monotonic() - write_started, 6
+        )
+    summary["elapsed_seconds"] = round(time.monotonic() - started, 6)
+    summary["elapsed_scope"] = "through_parquet_proof_before_final_state_write"
     _write_state(root, summary)
     return summary
 

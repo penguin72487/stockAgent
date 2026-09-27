@@ -8,6 +8,7 @@ this job only replays the paths already recorded by that publisher.
 
 from __future__ import annotations
 
+import argparse
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -66,14 +67,45 @@ def _pending_datasets() -> list[str]:
     return sorted(names)
 
 
-def retry_one() -> dict[str, object]:
+def retry_one(
+    dataset: str | None = None, *, batch_object_paths: bool = False,
+) -> dict[str, object]:
+    if type(batch_object_paths) is not bool:
+        raise SnapshotError("batch_object_paths must be a boolean")
     _check_mount()
     pending = _pending_datasets()
-    if not pending:
+    if dataset is not None:
+        dataset = validate_slug(dataset, "dataset")
+        if dataset not in pending:
+            return {"status": "idle_no_pending", "dataset": dataset,
+                    "pending_before": len(pending), "pending_after": len(pending),
+                    "peer_convergence": "not_checked", "release_verification": "not_checked"}
+    elif not pending:
         return {"status": "idle_no_pending", "pending_before": 0, "pending_after": 0}
-    dataset = pending[0]
-    if not scan_after_publish(SYNC_ROOT, dataset, retry_full=True):
-        raise SnapshotError(f"pending scan disappeared before retry: {dataset}")
+    else:
+        dataset = pending[0]
+    try:
+        acknowledged = scan_after_publish(
+            SYNC_ROOT, dataset, retry_full=True,
+            **({"batch_object_paths": True} if batch_object_paths else {}),
+        )
+    except FileNotFoundError:
+        # Another retry may finish and atomically remove the same pending
+        # receipt after our directory listing. A failed scan keeps it.
+        if (SYNC_ROOT / ".local-state/scan-pending" / f"{dataset}.json").exists():
+            raise
+        acknowledged = False
+    if not acknowledged:
+        if dataset in _pending_datasets():
+            raise SnapshotError(f"pending scan was not acknowledged: {dataset}")
+        return {
+            "status": "concurrent_scan_completed",
+            "dataset": dataset,
+            "pending_before": len(pending),
+            "pending_after": len(_pending_datasets()),
+            "peer_convergence": "not_checked",
+            "release_verification": "not_checked",
+        }
     return {
         "status": "scan_request_acknowledged",
         "dataset": dataset,
@@ -84,21 +116,34 @@ def retry_one() -> dict[str, object]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", help="Drain only this already-pending dataset.")
+    parser.add_argument("--receipt", type=Path, default=RECEIPT_PATH)
+    parser.add_argument(
+        "--batch-object-paths", action="store_true",
+        help="Opt in to bounded multi-sub object scans before separate manifest/head scans.",
+    )
+    args = parser.parse_args(argv)
     started = time.monotonic()
     receipt: dict[str, object] = {
         "schema_version": 1,
         "observed_at_utc": datetime.now(UTC).isoformat(),
         "scope": "one_existing_D_primary_pending_scan_receipt",
+        # A requested policy is not evidence that any pending work existed.
+        "requested_scan_policy": {"batch_object_paths": args.batch_object_paths},
     }
     try:
-        receipt.update(retry_one())
+        receipt.update(retry_one(
+            args.dataset,
+            **({"batch_object_paths": True} if args.batch_object_paths else {}),
+        ))
         exit_code = 0
     except (OSError, ValueError, SnapshotError, subprocess.TimeoutExpired) as exc:
         receipt.update({"status": "retry_failed", "error": f"{type(exc).__name__}: {exc}"})
         exit_code = 1
     receipt["elapsed_seconds"] = round(time.monotonic() - started, 6)
-    atomic_write_json(RECEIPT_PATH, receipt)
+    atomic_write_json(args.receipt, receipt)
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True), flush=True)
     return exit_code
 

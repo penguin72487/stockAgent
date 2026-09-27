@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left, bisect_right
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
+import fcntl
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -30,9 +33,11 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.download_finlab_history import (  # noqa: E402
     DEFAULT_OUTPUT, TAIPEI, _atomic_json, credential_available, quota_cycle_start, safe_stem,
     quota_room_mb,
+    general_work_status, load_catalog,
 )
 from scripts.download_finlab_intraday import (  # noqa: E402
     _checked_this_cycle, _partition_paths, _stored_receipt, fetch_partition,
+    reconcile_stored_tick_unit,
 )
 from scripts.derive_finlab_minute import derive_partition  # noqa: E402
 
@@ -41,6 +46,40 @@ DEFAULT_PUBLIC_ROOT = REPO_ROOT / "data_tw_public"
 KINDS = ("tw_tick",)  # Only this family may consume provider quota.
 DISPLAY_KINDS = ("tw_minute", "tw_tick")
 DERIVED_INDEX_KIND = "tw_minute_derived"
+
+
+@contextmanager
+def _account_sync_lock(root: Path, inherited_fd: int | None = None):
+    """Standalone and timer paths share one real account acquisition lock."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ".sync.lock"
+    handle = None
+    if inherited_fd is None:
+        handle = path.open("a")
+        fd = handle.fileno()
+    else:
+        fd = inherited_fd
+        actual, expected = os.fstat(fd), path.stat()
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("inherited FinLab lock does not match this output root")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        # Never unlock the shell's inherited open-file description.
+        if handle is not None:
+            handle.close()
+
+
+def _general_work_admission(root: Path, *, now: datetime) -> dict:
+    try:
+        discovery = json.loads((root / "catalog/discovery.json").read_text())
+    except (OSError, ValueError):
+        discovery = {}
+    curated = {item["key"]: item for item in load_catalog()["datasets"]}
+    # The ordinary schedule uses a daily quota cycle. A manual Tick command
+    # must not silently weaken this gate to the CLI history default of 30 days.
+    return general_work_status(discovery, curated, root, now=now, refresh_days=1)
 
 
 def _dates_from_parquet(path: Path) -> tuple[date, date] | None:
@@ -264,6 +303,11 @@ def _bootstrap_derived(db: sqlite3.Connection, root: Path) -> None:
             day = date.fromisoformat(payload["trade_date"])
             receipt = _stored_receipt(path, root, key, day)
             if receipt is not None:
+                from scripts.finlab_volume_units import volume_reconciliation_due
+
+                if (receipt.get("status") == "downloaded_unverified_for_pit"
+                        and volume_reconciliation_due(receipt, symbol, day)):
+                    receipt = reconcile_stored_tick_unit(root, key, day)
                 _record_tick_and_minute(db, root, symbol, day, receipt)
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -474,6 +518,24 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     attempts = successes = 0
     state = "batch_limit"
     scanned = 0
+    general_admission: dict = {}
+    general_recheck_at = datetime.min.replace(tzinfo=UTC)
+
+    def may_acquire_tick() -> bool:
+        nonlocal general_admission, general_recheck_at, state
+        boundary = datetime.now(UTC)
+        # No other regular writer can change receipts under the account lock.
+        # Recheck at most once a minute, and always at the daily reset, instead
+        # of rereading the thousand-key catalog for every Tick partition.
+        if boundary >= general_recheck_at:
+            general_admission = _general_work_admission(root, now=boundary)
+            general_recheck_at = min(boundary + timedelta(minutes=1),
+                                    quota_cycle_start(boundary) + timedelta(days=1))
+        if not general_admission.get("supplemental_allowed", False):
+            state = "waiting_required_general_data"
+            return False
+        return True
+
     try:
         # Recent unpublished partitions can appear later the same session;
         # older failures get a fair retry after the next account reset. Do
@@ -497,6 +559,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             day = date.fromisoformat(day_text)
             if kind not in KINDS or symbol not in known or day not in days or not _eligible(known[symbol], day):
                 continue
+            if not may_acquire_tick():
+                break
             room = quota_room_mb()
             if room is None:
                 state = "quota_unknown"
@@ -524,8 +588,13 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 failure = record_failed_partition(root, key, day, exc)
                 _record(index, kind, symbol, day, failure)
                 print(f"[finlab-market] retry {key} {day}: {failure}", flush=True)
+                if failure in {"quota_exhausted", "authentication_failed"}:
+                    state = failure
+                    break
             gc.collect()
         while state == "batch_limit" and attempts < limit and scanned < max(100_000, limit * 100):
+            if not may_acquire_tick():
+                break
             room = quota_room_mb()
             if room is None:
                 state = "quota_unknown"
@@ -587,11 +656,15 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 failure = record_failed_partition(root, key, day, exc)
                 _record(index, kind, symbol, day, failure)
                 print(f"[finlab-market] {key} {day}: {failure}", flush=True)
+                if failure in {"quota_exhausted", "authentication_failed"}:
+                    state = failure
+                    break
             gc.collect()
         _atomic_json(cursor_path, cursor)
         summary = _summarize(index, universe, days, started=started,
                              attempts=attempts, successes=successes, state=state,
                              daily_price_coverage=daily_price_coverage)
+        summary["general_acquisition_admission"] = general_admission
         _atomic_json(root / "intraday/market_status.json", summary)
         return summary
     finally:
@@ -608,6 +681,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=64)
     parser.add_argument("--reserve-mb", type=float, default=50.0)
     parser.add_argument("--minimum-free-gb", type=float, default=25.0)
+    parser.add_argument("--sync-lock-fd", type=int, default=None,
+                        help="Existing parent .sync.lock descriptor; otherwise acquire the account lock")
     parser.add_argument("--status-only", action="store_true",
                         help="rebuild local candidate/receipt inventory without calling FinLab")
     parser.add_argument("--derive-existing", action="store_true",
@@ -635,14 +710,19 @@ def main() -> int:
         summary["inventory_rebuilt_without_api"] = True
         _atomic_json(args.output_root / "intraday/market_status.json", summary)
     else:
-        summary = sync_market(args.output_root, args.public_root, start=args.start_date,
-                              end=args.end_date, limit=args.limit,
-                              reserve_mb=args.reserve_mb,
-                              minimum_free_gb=args.minimum_free_gb,
-                              now=datetime.now(UTC))
+        try:
+            with _account_sync_lock(args.output_root, args.sync_lock_fd):
+                summary = sync_market(args.output_root, args.public_root, start=args.start_date,
+                                      end=args.end_date, limit=args.limit,
+                                      reserve_mb=args.reserve_mb,
+                                      minimum_free_gb=args.minimum_free_gb,
+                                      now=datetime.now(UTC))
+        except BlockingIOError:
+            print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))
+            return 0
     print(json.dumps({key: value for key, value in summary.items() if key != "symbols"},
                      ensure_ascii=False, sort_keys=True), flush=True)
-    return 1 if summary["state"] == "quota_unknown" else 0
+    return 1 if summary["state"] in {"quota_unknown", "authentication_failed"} else 0
 
 
 if __name__ == "__main__":

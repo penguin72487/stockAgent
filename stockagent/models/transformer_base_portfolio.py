@@ -17,6 +17,7 @@ from stockagent.models.normalization import (
     masked_cash_asset_l1_weights,
     masked_learned_cash_weights,
     masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
     masked_l1_projection_weights,
     masked_cross_sectional_mean_finite,
     masked_signed_action_weights,
@@ -3949,6 +3950,17 @@ class TransformerBasePortfolioModel(nn.Module):
                 weights, output_aux = cash_output
             else:
                 weights = cash_output
+        elif resolved_mode == "score_entmax_log_cash":
+            cash_output = masked_score_entmax_log_cash_weights(
+                target_logits,
+                mask_bool,
+                short_mask=torch.zeros_like(mask_bool) if long_only else mask_bool,
+                return_parts=return_parts,
+            )
+            if return_parts:
+                weights, output_aux = cash_output
+            else:
+                weights = cash_output
         elif resolved_mode == "projection_l1":
             weights = masked_l1_projection_weights(
                 target_logits,
@@ -4474,6 +4486,17 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = cash_output
                 else:
                     weights = cash_output
+            elif self.portfolio_output_mode == "score_entmax_log_cash":
+                cash_output = masked_score_entmax_log_cash_weights(
+                    target_logits,
+                    mask_bool,
+                    short_mask=torch.zeros_like(mask_bool),
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
             elif self.portfolio_output_mode == "projection_l1":
                 weights = masked_l1_projection_weights(
                     target_logits,
@@ -4578,6 +4601,17 @@ class TransformerBasePortfolioModel(nn.Module):
                     short_mask=mask_bool,
                     return_parts=include_action_aux,
                     preserve_fp32_output=(self.portfolio_output_mode == "score_entmax_cash"),
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
+            elif self.portfolio_output_mode == "score_entmax_log_cash":
+                cash_output = masked_score_entmax_log_cash_weights(
+                    target_logits,
+                    mask_bool,
+                    short_mask=mask_bool,
+                    return_parts=include_action_aux,
                 )
                 if include_action_aux:
                     weights, output_aux = cash_output

@@ -1,6 +1,5 @@
-# Independently capitalized account; old v12 account and holdings are retained.
-market: tw_day_trade_attention_layernorm
-label: 台股・Attention Full-Then-Last LayerNorm v12（獨立模擬 1,000 萬）
+market: tw_day_trade_v8_annual_log_cash
+label: 台股・V8 年度 Log Cash 當沖（初始 1,000 萬）
 enabled: true
 market_type: tw
 timezone: Asia/Taipei
@@ -18,6 +17,7 @@ day_trade_simulation_enabled: true
 day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
 day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
 day_trade_residual_margin_conversion: true
+day_trade_terminal_liquidation_unlimited_capacity: true
 day_trade_odd_lot_execution_policy: assumed_odd_lot_at_regular_board_price_v1
 day_trade_margin_action_data_dir: /srv/stockagent-live/data_tw_public/execution_actions
 day_trade_quote_interval_seconds: 60
@@ -31,14 +31,14 @@ completed_session_command:
 completed_session_timeout_seconds: 600
 formal_history_timeout_seconds: 1800
 previous_signal_backfill_limit: 512
-model_selection_path: ../models/tw_day_trade_attention_layernorm.yaml
-config_path: configs/deployments/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_fold11.yaml
-output_dir: artifacts/markets/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_commission20_capital10m_all_features_v1
+model_selection_path: ../models/tw_day_trade_v8_annual_log_cash.yaml
+config_path: configs/deployments/tw_day_trade_v8_annual_log_cash_fold10.yaml
+output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5
 live_output_dir: artifacts/live_signals
 model_scoped_live_output: true
-fold_id: 11
-checkpoint_path: artifacts/markets/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_commission20_capital10m_all_features_v1/fold_11/checkpoint_best.pt
-weights_path: artifacts/markets/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_commission20_capital10m_all_features_v1/fold_11/daily_weights.parquet
+fold_id: 10
+checkpoint_path: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5/fold_10/checkpoint_best.pt
+weights_path: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5/fold_10/daily_weights.parquet
 panel_date: latest
 device: cuda
 price_source: panel
@@ -49,4 +49,4 @@ benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
 max_gross_warning: 1.05
-unsupported_message: "Attention Full-Then-Last LayerNorm v12 獨立模擬尚未準備完成。"
+unsupported_message: "台股・V8 年度 Log Cash 當沖模型尚未通過部署驗收。"

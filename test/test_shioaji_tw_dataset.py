@@ -62,6 +62,9 @@ def test_shioaji_kbars_normalize_and_aggregate_volume_lots_to_shares() -> None:
         market="twse",
         contract_unit=1000.0,
     )
+    assert minute["Volume"].to_list() == [2.0, 3.0]  # immutable provider values
+    assert minute["volume_shares"].to_list() == [2000.0, 3000.0]
+    assert minute["volume_unit_proof"].to_list() == ["amount_ohlc"] * 2
     daily = aggregate_daily(minute, name="台積電")
     assert daily.to_dicts() == [
         {
@@ -100,6 +103,36 @@ def test_shioaji_daily_aggregation_infers_historical_volume_unit_from_amount() -
     daily = aggregate_daily(minute, name="台積電")
     assert daily["Trading_Volume"].item() == 2000.0
     assert daily["shioaji_volume_lots"].item() == 2000.0
+    assert minute["volume_shares"].item() == 2000.0
+
+
+def test_shioaji_raw_stock_volume_with_unknown_unit_has_no_share_capacity() -> None:
+    minute = normalize_kbars(
+        {
+            "ts": [1583110860000000000], "Open": [100.0], "High": [101.0],
+            "Low": [99.0], "Close": [100.0], "Volume": [2], "Amount": [500.0],
+        }, symbol="2330", market="twse", contract_unit=1000.0,
+    )
+    assert minute["Volume"].item() == 2.0
+    assert minute["volume_shares"].item() is None
+    assert minute["volume_unit_proof"].item() == "unresolved"
+    with pytest.raises(ValueError, match="Volume unit cannot"):
+        aggregate_daily(minute, name="台積電")
+
+
+@pytest.mark.parametrize("volume,amount", [(0, None), (0, -1), (None, 0), (-1, 0)])
+def test_legacy_invalid_nonpositive_row_cannot_be_summed_into_zero_shares(volume, amount):
+    minute = normalize_kbars(
+        {
+            "ts": [1583110860000000000], "Open": [100.0], "High": [101.0],
+            "Low": [99.0], "Close": [100.0], "Volume": [0], "Amount": [0],
+        }, symbol="2330", market="twse", contract_unit=1000.0,
+    ).with_columns(
+        pl.lit(volume, dtype=pl.Float64).alias("Volume"),
+        pl.lit(amount, dtype=pl.Float64).alias("Amount"),
+    )
+    with pytest.raises(ValueError, match="Volume unit cannot"):
+        aggregate_daily(minute, name="台積電")
 
 
 def _base_frame() -> pl.DataFrame:

@@ -10,8 +10,6 @@ import pyarrow.parquet as pq
 
 from scripts.download_taifex_option_daily_history import (
     _builder_fingerprint,
-    _futures_contract_open_by_date,
-    _futures_open_by_date,
     _merge_full_chain_shards,
     _prepare_atm_source_projections,
     _prepare_full_chain_shards,
@@ -33,6 +31,7 @@ from stockagent.data.tw_index_options_daily import (
     build_taifex_weekly_atm_straddles,
     iter_taifex_option_daily_rows,
     load_taifex_monthly_atm_straddles,
+    load_taifex_tx_opening_reference,
     load_taifex_weekly_atm_straddles,
 )
 
@@ -56,7 +55,7 @@ def test_atm_source_cache_matches_direct_and_invalidates_affected_futures(tmp_pa
     ]
     kwargs = {
         "scope": "monthly",
-        "tx_by_date": _futures_contract_open_by_date(futures),
+        "tx_by_date": load_taifex_tx_opening_reference(futures).contract_open_by_date,
         "builder_fingerprint": _builder_fingerprint(),
     }
     cache = tmp_path / "atm_cache"
@@ -91,7 +90,7 @@ def test_atm_source_cache_matches_direct_and_invalidates_affected_futures(tmp_pa
     )
     changed_kwargs = {
         **kwargs,
-        "tx_by_date": _futures_contract_open_by_date(changed_futures),
+        "tx_by_date": load_taifex_tx_opening_reference(changed_futures).contract_open_by_date,
     }
     changed, rebuilt = _prepare_atm_source_projections(
         manifest, cache, **changed_kwargs
@@ -150,7 +149,7 @@ def test_weekly_atm_cache_preserves_monthly_only_gap_reason(tmp_path: Path) -> N
     ]
     projected, rebuilt = _prepare_atm_source_projections(
         manifest, tmp_path / "cache", scope="weekly",
-        tx_by_date=_futures_contract_open_by_date(futures),
+        tx_by_date=load_taifex_tx_opening_reference(futures).contract_open_by_date,
         builder_fingerprint=_builder_fingerprint(),
     )
     assert rebuilt == 3
@@ -186,23 +185,23 @@ def test_full_chain_shards_match_direct_build_and_rebuild_only_changed_futures_d
     fingerprint = _builder_fingerprint()
     output_root = tmp_path / "normalized"
     cache_root = tmp_path / "node_cache"
-    opens = _futures_open_by_date(futures)
+    reference = load_taifex_tx_opening_reference(futures)
     shards, rebuilt = _prepare_full_chain_shards(
-        receipt_manifest, futures, cache_root,
-        scope="monthly", tx_open_by_date=opens,
+        receipt_manifest, reference, cache_root,
+        scope="monthly",
         builder_fingerprint=fingerprint,
     )
     assert rebuilt == 2
     merged = _merge_full_chain_shards(
-        shards, output_root / "monthly_full_chain.parquet", scope="monthly"
+        shards, output_root / "monthly_full_chain.parquet", scope="monthly", futures_reference=reference
     )
     direct = build_taifex_option_full_chain(
         sources, futures, tmp_path / "direct.parquet", series_scope="monthly"
     )
     assert pq.read_table(merged).equals(pq.read_table(direct), check_metadata=True)
     reused, rebuilt = _prepare_full_chain_shards(
-        receipt_manifest, futures, cache_root,
-        scope="monthly", tx_open_by_date=opens,
+        receipt_manifest, reference, cache_root,
+        scope="monthly",
         builder_fingerprint=fingerprint,
     )
     assert rebuilt == 0
@@ -210,13 +209,13 @@ def test_full_chain_shards_match_direct_build_and_rebuild_only_changed_futures_d
 
     Path(str(reused[0]["shard_path"])).write_bytes(b"corrupt")
     repaired, rebuilt = _prepare_full_chain_shards(
-        receipt_manifest, futures, cache_root,
-        scope="monthly", tx_open_by_date=opens,
+        receipt_manifest, reference, cache_root,
+        scope="monthly",
         builder_fingerprint=fingerprint,
     )
     assert rebuilt == 1
     assert pq.read_table(_merge_full_chain_shards(
-        repaired, output_root / "repaired.parquet", scope="monthly"
+        repaired, output_root / "repaired.parquet", scope="monthly", futures_reference=reference
     )).equals(pq.read_table(direct), check_metadata=True)
 
     changed_source = tmp_path / "changed_futures.csv"
@@ -228,14 +227,15 @@ def test_full_chain_shards_match_direct_build_and_rebuild_only_changed_futures_d
     changed_futures = build_taifex_index_futures_day_session(
         [changed_source], tmp_path / "changed_futures.parquet", products=("TX",)
     )
+    changed_reference = load_taifex_tx_opening_reference(changed_futures)
     changed_shards, rebuilt = _prepare_full_chain_shards(
-        receipt_manifest, changed_futures, cache_root,
-        scope="monthly", tx_open_by_date=_futures_open_by_date(changed_futures),
+        receipt_manifest, changed_reference, cache_root,
+        scope="monthly",
         builder_fingerprint=fingerprint,
     )
     assert rebuilt == 1  # Jan 6 is outside both receipts; only Jan 3 changed.
     changed_merged = _merge_full_chain_shards(
-        changed_shards, output_root / "changed.parquet", scope="monthly"
+        changed_shards, output_root / "changed.parquet", scope="monthly", futures_reference=changed_reference
     )
     changed_direct = build_taifex_option_full_chain(
         sources, changed_futures, tmp_path / "changed_direct.parquet",
@@ -259,24 +259,24 @@ def test_full_chain_shard_empty_scope_and_overlap_fail_closed(tmp_path: Path) ->
         {"path": str(source), "sha256": sha256_path(source)}
         for source in sources
     ]
+    reference = load_taifex_tx_opening_reference(futures)
     kwargs = {
-        "tx_open_by_date": _futures_open_by_date(futures),
         "builder_fingerprint": _builder_fingerprint(),
     }
     monthly, rebuilt = _prepare_full_chain_shards(
-        manifest, futures, tmp_path / "node_cache", scope="monthly", **kwargs
+        manifest, reference, tmp_path / "node_cache", scope="monthly", **kwargs
     )
     assert rebuilt == 2
     import pytest
 
     with pytest.raises(ValueError, match="overlapping full-chain receipts"):
-        _merge_full_chain_shards(monthly, tmp_path / "overlap.parquet", scope="monthly")
+        _merge_full_chain_shards(monthly, tmp_path / "overlap.parquet", scope="monthly", futures_reference=reference)
     weekly, rebuilt = _prepare_full_chain_shards(
-        manifest, futures, tmp_path / "node_cache", scope="weekly", **kwargs
+        manifest, reference, tmp_path / "node_cache", scope="weekly", **kwargs
     )
     assert rebuilt == 2
     with pytest.raises(ValueError, match="no normalized TXO weekly"):
-        _merge_full_chain_shards(weekly[:1], tmp_path / "empty.parquet", scope="weekly")
+        _merge_full_chain_shards(weekly[:1], tmp_path / "empty.parquet", scope="weekly", futures_reference=reference)
 
 
 _FUTURES_HEADER = [

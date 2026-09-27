@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
+import json
 from pathlib import Path
+import sys
 
 import polars as pl
 import pytest
 
 from downloader.download_tw_cbc_money_release_archive import parse_detail, parse_listing
+from downloader import download_tw_cbc_money_release_archive as money
 from stockagent.data.tw_public_features import _build_cbc_monthly_macro_features
 
 
@@ -130,3 +134,249 @@ def test_original_release_enters_first_verified_session_after_posting(tmp_path: 
     assert result.get_column("twpub_cbc_m1b_yoy").to_list() == pytest.approx([0.0734])
     assert result.get_column("twpub_cbc_m2_yoy").to_list() == pytest.approx([0.0742])
     assert result.get_column("twpub_cbc_m1b_log").null_count() == 1
+
+
+def _money_listing_html(page: int, *, total_rows: int = 121, total_pages: int = 3,
+                        raw_rows: int | None = None, money_rows: bool = True) -> bytes:
+    count = min(60, total_rows - (page - 1) * 60) if raw_rows is None else raw_rows
+    items = []
+    for index in range(count):
+        title = f"115年{7 - page}月金融情況" if index == 0 and money_rows else "一般新聞"
+        items.append(
+            f'<li><time>2026-07-01</time><a href="/tw/cp-302-{page}-{index}-1.html">'
+            f'{title}</a></li>'
+        )
+    return ("".join(items) + f'<div class="total">共{total_rows}筆資料，第{page}/{total_pages}頁</div>'
+            + '<select id="PageSize"><option value="60" selected>60</option></select>').encode()
+
+
+@pytest.fixture
+def money_listing_source(monkeypatch):
+    bodies = {page: _money_listing_html(page) for page in (1, 2, 3)}
+    requests = []
+
+    def fetch(url, _limiter):
+        requests.append(url)
+        for page in (1, 2, 3):
+            if url == money.LIST_URL.format(page=page):
+                return bodies[page]
+            if url == money.BASE + f"/tw/cp-302-{page}-0-1.html":
+                return (
+                    f'<h2 class="title">115年{7 - page}月金融情況</h2>'
+                    '<div class="publish_time"><time>2026-07-01</time></div>'
+                    '<section class="cp">貨幣總計數 M1B及M2年增率分別為1.00%及2.00%。</section>'
+                ).encode()
+        raise AssertionError(f"unexpected fixture request: {url}")
+
+    monkeypatch.setattr(money, "_fetch", fetch)
+    return bodies, requests
+
+
+def test_full_listing_proves_raw_rows_not_filtered_money_count(tmp_path, money_listing_source):
+    bodies, _requests = money_listing_source
+    bodies[2] = _money_listing_html(2, money_rows=False)
+    result = money.collect(tmp_path, workers=1, refresh_recent=0)
+    assert result["complete"] is True
+    assert result["registered_releases"] == result["saved_releases"] == 2
+    assert [receipt["raw_rows"] for receipt in result["listing_receipts"]] == [60, 60, 1]
+    assert [receipt["release_rows"] for receipt in result["listing_receipts"]] == [1, 0, 1]
+    assert all(receipt["page_size"] == 60 and receipt["total_rows"] == 121
+               and receipt["total_pages"] == 3 for receipt in result["listing_receipts"])
+
+
+@pytest.mark.parametrize("damage", ["repeated_first_page", "zero_page", "zero_total", "excessive_pages"])
+def test_first_acquisition_cannot_publish_incomplete_listing(
+    tmp_path, monkeypatch, money_listing_source, damage,
+):
+    bodies, requests = money_listing_source
+    if damage == "repeated_first_page":
+        bodies[2] = bodies[3] = bodies[1]
+    elif damage == "zero_page":
+        bodies[1] = bodies[1].replace("第1/3頁".encode(), "第0/3頁".encode())
+    elif damage == "zero_total":
+        bodies[1] = bodies[1].replace("共121筆資料".encode(), "共0筆資料".encode())
+    else:
+        bodies[1] = _money_listing_html(1, total_rows=60001, total_pages=1001)
+    monkeypatch.setattr(sys, "argv", [
+        "money", "--output-dir", str(tmp_path), "--workers", "1", "--refresh-recent", "0",
+    ])
+    with pytest.raises(ValueError):
+        money.main()
+    assert all("/lp-302-" in url for url in requests)
+    assert not (tmp_path / f"{money.OUTPUT_NAME}.parquet").exists()
+    failed = json.loads((tmp_path / "state" / f"{money.OUTPUT_NAME}.json").read_bytes())
+    assert failed["status"] == "degraded" and failed["complete"] is False
+    assert "resume_checkpoint" not in failed
+
+
+@pytest.mark.parametrize("damage", [
+    "first_wrong_page", "second_wrong_page", "duplicate_page", "short_first",
+    "short_second", "short_last", "extra_last", "changed_total_rows", "missing_total",
+    "missing_page_size", "wrong_page_size", "contradictory_page_count", "upstream_error",
+])
+def test_invalid_listing_preserves_archive_and_checkpoint_before_details(
+    tmp_path, monkeypatch, money_listing_source, damage,
+):
+    bodies, requests = money_listing_source
+    good = money.collect(tmp_path, workers=1, refresh_recent=0)
+    parquet = tmp_path / f"{money.OUTPUT_NAME}.parquet"
+    original = parquet.read_bytes()
+    if damage == "first_wrong_page":
+        bodies[1] = bodies[1].replace("第1/3頁".encode(), "第2/3頁".encode())
+    elif damage == "second_wrong_page":
+        bodies[2] = bodies[2].replace("第2/3頁".encode(), "第3/3頁".encode())
+    elif damage == "duplicate_page":
+        bodies[2] = bodies[1]
+    elif damage in {"short_first", "short_second", "short_last", "extra_last"}:
+        page = 1 if damage == "short_first" else 2 if damage == "short_second" else 3
+        count = 59 if page < 3 else 0 if damage == "short_last" else 2
+        bodies[page] = _money_listing_html(page, raw_rows=count)
+    elif damage == "changed_total_rows":
+        bodies[2] = _money_listing_html(2, total_rows=122)
+    elif damage == "missing_total":
+        bodies[1] = bodies[1].replace("共121筆資料，".encode(), b"")
+    elif damage == "missing_page_size":
+        bodies[1] = bodies[1].replace(b" selected", b"")
+    elif damage == "wrong_page_size":
+        bodies[1] = bodies[1].replace(b'value="60"', b'value="20"')
+    elif damage == "contradictory_page_count":
+        bodies[1] = _money_listing_html(1, total_pages=4)
+    else:
+        bodies[2] = b"<html>This web server can't be reached</html>"
+    requests.clear()
+    monkeypatch.setattr(sys, "argv", [
+        "money", "--output-dir", str(tmp_path), "--workers", "1", "--refresh-recent", "0",
+    ])
+    expected = money.SourceAccessBlocked if damage == "upstream_error" else ValueError
+    with pytest.raises(expected):
+        money.main()
+    assert requests and all("/lp-302-" in url for url in requests)
+    assert parquet.read_bytes() == original
+    failed = json.loads((tmp_path / "state" / f"{money.OUTPUT_NAME}.json").read_bytes())
+    assert failed["status"] == "degraded" and failed["complete"] is False
+    assert failed["resume_checkpoint"]["completed_state"] == good
+
+
+@pytest.mark.parametrize("damage", [None, "wrong_page", "short_prefix", "changed_total", "upstream_error"])
+def test_recent_prefix_is_validated_without_claiming_new_full_scan(
+    tmp_path, monkeypatch, money_listing_source, damage,
+):
+    bodies, requests = money_listing_source
+    good = money.collect(tmp_path, workers=1, refresh_recent=0)
+    parquet = tmp_path / f"{money.OUTPUT_NAME}.parquet"
+    original = parquet.read_bytes()
+    if damage == "wrong_page":
+        bodies[2] = bodies[1]
+    elif damage == "short_prefix":
+        bodies[2] = _money_listing_html(2, raw_rows=1)
+    elif damage == "changed_total":
+        bodies[2] = _money_listing_html(2, total_rows=122)
+    elif damage == "upstream_error":
+        bodies[1] = b"<html>This web server can't be reached</html>"
+    requests.clear()
+    monkeypatch.setattr(sys, "argv", [
+        "money", "--output-dir", str(tmp_path), "--workers", "1", "--refresh-recent", "0",
+        "--recent-pages", "2",
+    ])
+    if damage is None:
+        money.main()
+    else:
+        expected = money.SourceAccessBlocked if damage == "upstream_error" else ValueError
+        with pytest.raises(expected):
+            money.main()
+    assert money.LIST_URL.format(page=3) not in requests
+    assert all("/lp-302-" in url for url in requests)
+    assert parquet.read_bytes() == original
+    state = json.loads((tmp_path / "state" / f"{money.OUTPUT_NAME}.json").read_bytes())
+    if damage is None:
+        assert state["complete"] is True and state["scan_scope"] == "recent_pages"
+        assert state["scanned_pages"] == 2 and state["index_total_pages"] == 3
+        assert state["last_full_index_scan_at_utc"] == good["last_full_index_scan_at_utc"]
+        assert state["listing_receipts"][2] == good["listing_receipts"][2]
+    else:
+        assert state["status"] == "degraded" and state["complete"] is False
+        assert state["resume_checkpoint"]["completed_state"] == good
+
+
+def test_legacy_twenty_row_cache_is_rejected_without_online_fallback(
+    tmp_path, monkeypatch, money_listing_source,
+):
+    _bodies, requests = money_listing_source
+    good = money.collect(tmp_path, workers=1, refresh_recent=0)
+    parquet = tmp_path / f"{money.OUTPUT_NAME}.parquet"
+    original = parquet.read_bytes()
+    legacy = _money_listing_html(1, total_rows=41, raw_rows=20).replace(
+        b'value="60"', b'value="20"',
+    )
+    monkeypatch.setattr(money, "_cached", lambda *_args, **_kwargs: legacy)
+    monkeypatch.setattr(sys, "argv", [
+        "money", "--output-dir", str(tmp_path), "--workers", "1", "--cached-list-pages",
+    ])
+    requests.clear()
+    with pytest.raises(ValueError, match="page size"):
+        money.main()
+    assert requests == []
+    assert parquet.read_bytes() == original
+    failed = json.loads((tmp_path / "state" / f"{money.OUTPUT_NAME}.json").read_bytes())
+    assert failed["status"] == "degraded" and failed["complete"] is False
+    assert failed["resume_checkpoint"]["completed_state"] == good
+
+
+@pytest.mark.parametrize("damage", [None, "wrong_tail_page", "missing_tail_rows"])
+def test_legacy_resume_listing_bytes_need_completeness_beyond_matching_sha(
+    tmp_path, monkeypatch, money_listing_source, damage,
+):
+    _bodies, requests = money_listing_source
+    good = money.collect(tmp_path, workers=1, refresh_recent=0)
+    parquet = tmp_path / f"{money.OUTPUT_NAME}.parquet"
+    original = parquet.read_bytes()
+    # Model a pre-fix successful receipt: its exact hash is valid, but it has
+    # no new metadata fields and can pin an intrinsically wrong historical page.
+    for receipt in good["listing_receipts"]:
+        for key in ("raw_rows", "total_rows", "total_pages", "page_size"):
+            receipt.pop(key)
+    tail = good["listing_receipts"][2]
+    path = Path(tail["path"])
+    if damage == "wrong_tail_page":
+        path.write_bytes(path.read_bytes().replace("第3/3頁".encode(), "第2/3頁".encode()))
+    elif damage == "missing_tail_rows":
+        path.write_bytes(_money_listing_html(3, raw_rows=0))
+    tail["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    state_path = tmp_path / "state" / f"{money.OUTPUT_NAME}.json"
+    state_path.write_text(json.dumps(good))
+    monkeypatch.setattr(sys, "argv", [
+        "money", "--output-dir", str(tmp_path), "--workers", "1", "--refresh-recent", "0",
+        "--recent-pages", "2",
+    ])
+    requests.clear()
+    if damage is None:
+        money.main()
+        assert requests == [money.LIST_URL.format(page=page) for page in (1, 2)]
+        assert json.loads(state_path.read_bytes())["complete"] is True
+    else:
+        with pytest.raises(ValueError):
+            money.main()
+        assert requests == []
+        failed = json.loads(state_path.read_bytes())
+        assert failed["status"] == "degraded" and failed["complete"] is False
+        assert failed["resume_checkpoint"]["completed_state"] == good
+    assert parquet.read_bytes() == original
+
+
+def test_resume_listing_pages_allow_valid_mixed_generations(tmp_path, money_listing_source):
+    bodies, requests = money_listing_source
+    good = money.collect(tmp_path, workers=1, refresh_recent=0)
+    original = (tmp_path / f"{money.OUTPUT_NAME}.parquet").read_bytes()
+    # The two newly observed pages have a larger total; the pinned older tail
+    # still proves its own last-page count from the earlier full-index scan.
+    for page in (1, 2):
+        bodies[page] = _money_listing_html(page, total_rows=122)
+    first = money.collect(tmp_path, workers=1, recent_pages=2, refresh_recent=0)
+    assert [receipt["total_rows"] for receipt in first["listing_receipts"]] == [122, 122, 121]
+    requests.clear()
+    resumed = money.collect(tmp_path, workers=1, recent_pages=2, refresh_recent=0)
+    assert requests == [money.LIST_URL.format(page=page) for page in (1, 2)]
+    assert resumed["complete"] is True and resumed["scan_scope"] == "recent_pages"
+    assert resumed["last_full_index_scan_at_utc"] == good["last_full_index_scan_at_utc"]
+    assert resumed["listing_receipts"][2] == good["listing_receipts"][2]
+    assert (tmp_path / f"{money.OUTPUT_NAME}.parquet").read_bytes() == original

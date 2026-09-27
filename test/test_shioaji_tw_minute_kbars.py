@@ -707,6 +707,45 @@ def test_missing_kbars_tick_fallback_keeps_raw_evidence_and_time_units(tmp_path,
     assert not collector.minute_receipt_valid(receipt, symbol="3454", start=day, end=day)
 
 
+def test_tick_fallback_preserves_zero_placeholder_as_source_gap(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    import numpy as np
+    from downloader import download_shioaji_tw_minute_kbars as collector
+
+    day = date(2020, 3, 23)
+    base = tmp_path / "8455.parquet"
+    pl.DataFrame({"date": [day], "Trading_Volume": [1000.0]}).write_parquet(base)
+    row = UniverseRow("8455", "fixture", "twse", "stock", base)
+    raw = {"ts": [int(np.datetime64(f"{day}T13:14:59", "ns").astype(np.int64))],
+           "close": [0.0], "volume": [0]}
+    ticks = SimpleNamespace(**raw, dict=lambda: raw)
+
+    class API:
+        def ticks(self, **kwargs):
+            return ticks
+
+    monkeypatch.setattr(collector, "_taiwan_market_hours_now", lambda: False)
+    monkeypatch.setattr(collector, "_check_traffic_budget", lambda *_a, **_k: None)
+    monkeypatch.setattr(collector, "shioaji_query", lambda *_a, **_k: nullcontext(lambda _: None))
+    frame, audit = collector.query_tick_minute_fallback(
+        API(), object(), row, contract_unit=1000, days=[day], timeout_ms=10,
+        request_started=None, output_root=tmp_path / "raw",
+        max_traffic_fraction=.25,
+    )
+
+    assert frame.is_empty()
+    assert audit["zero_placeholder_rows_dropped"] == 1
+    assert audit["source_gap_dates"] == [str(day)]
+    assert len(audit["raw_tick_sources"]) == 1
+    assert Path(audit["raw_tick_sources"][0]["path"]).is_file()
+    invalid_trade = SimpleNamespace(ts=raw["ts"], close=[0.0], volume=[1])
+    with pytest.raises(ValueError, match="invalid historical trade tick"):
+        collector.ticks_to_minute_kbars(
+            invalid_trade, symbol="8455", market="twse",
+            session_date=str(day), contract_unit=1000,
+        )
+
+
 def test_empty_kbars_recovers_observed_ticks_without_duplicate_day_query(tmp_path, monkeypatch):
     from contextlib import nullcontext
     import numpy as np

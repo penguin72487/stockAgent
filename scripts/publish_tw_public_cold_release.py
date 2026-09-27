@@ -230,6 +230,7 @@ def main() -> int:
         "publish",
         "tw-public",
     ]
+    stale_derived_receipts = False
     try:
         completed = _publish_while_source_stable(command, args.timeout_seconds)
         return_code = int(completed.returncode)
@@ -264,6 +265,7 @@ def main() -> int:
         return 0
     except StaleDerivedReceipts as exc:
         if not args.defer_stale_derived_receipts:
+            stale_derived_receipts = True
             return_code = 75
             release = None
             error = str(exc)
@@ -311,7 +313,10 @@ def main() -> int:
     }
     _persist_receipt(receipt, started=started, payload=payload)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if payload["status"] == "ok" else 1
+    # Input freshness is a durable publication gate, not a crashed worker.
+    # The systemd unit suppresses only this exit status until a source receipt
+    # changes or the next scheduled backup; other failures still retry.
+    return 0 if payload["status"] == "ok" else 75 if stale_derived_receipts else 1
 
 
 if __name__ == "__main__":

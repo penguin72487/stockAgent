@@ -29,6 +29,8 @@ from stockagent.data.tw_exchange_price_classification import (  # noqa: E402
     classify_tw_exchange_security,
 )
 from stockagent.data.tw_price_rules import price_on_tick_grid_numpy  # noqa: E402
+from downloader.artifact_io import atomic_write_json  # noqa: E402
+from downloader.stock_volume_units import with_stock_share_volume  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +43,8 @@ def parse_args() -> argparse.Namespace:
         default=Path("data_tw_minute/research_dataset"),
     )
     parser.add_argument("--trade-date")
+    parser.add_argument("--volume-units-only", action="store_true",
+                        help="Project only quantity evidence across every manifest partition; do not rebuild data.")
     parser.add_argument(
         "--all-partitions",
         action="store_true",
@@ -324,8 +328,79 @@ def _audit_manifest_status(manifest: dict, *, allow_subset: bool) -> str:
                        ' or an explicitly permitted research_subset')
 
 
+def audit_volume_units(dataset_root: Path, output: Path) -> dict[str, Any]:
+    """Bounded-memory unit audit, independent of feature/PIT readiness."""
+
+    manifest_path = dataset_root / "manifest.json"
+    before = _sha256(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("partitions") or []
+    if not entries:
+        raise ValueError("no manifest partitions for share-volume audit")
+    totals = {name: 0 for name in (
+        "rows", "unsafe_stored_share_rows", "changed_stored_share_rows",
+        "newly_resolved_share_rows", "unresolved_source_rows",
+    )}
+    partitions, errors, examples = [], [], []
+    columns = ["ts", "symbol", "Volume", "Amount", "Low", "High", "contract_unit", "volume_shares"]
+    for number, item in enumerate(entries, 1):
+        day = str(item["trade_date"])
+        try:
+            path = _partition_path(dataset_root, day)
+            signature = path.stat()
+            frame = pl.read_parquet(path, columns=columns).rename({"volume_shares": "stored_volume_shares"})
+            checked = with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE)
+            old, new = pl.col("stored_volume_shares"), pl.col("volume_shares")
+            unsafe = old.is_not_null() & (new.is_null() | ~old.is_finite() | (old < 0))
+            changed = old.is_not_null() & new.is_not_null() & ((old - new).abs() > 1e-6)
+            counts = checked.select(
+                pl.len().alias("rows"), unsafe.sum().alias("unsafe_stored_share_rows"),
+                changed.sum().alias("changed_stored_share_rows"),
+                (old.is_null() & new.is_not_null()).sum().alias("newly_resolved_share_rows"),
+                (new.is_null() & ((pl.col("Volume") > 0) | (pl.col("Amount") > 0)))
+                .sum().alias("unresolved_source_rows"),
+            ).row(0, named=True)
+            after = path.stat()
+            if (signature.st_size, signature.st_mtime_ns, signature.st_ino) != (
+                    after.st_size, after.st_mtime_ns, after.st_ino):
+                raise RuntimeError("partition changed during unit audit")
+            if len(examples) < 20:
+                examples.extend(checked.filter(unsafe | changed).head(20 - len(examples))
+                                .with_columns(pl.col("ts").cast(pl.String)).to_dicts())
+            partitions.append({"trade_date": day, **counts})
+            for name in totals:
+                totals[name] += counts[name]
+        except (OSError, ValueError, RuntimeError, pl.exceptions.PolarsError) as exc:
+            errors.append({"trade_date": day, "error": type(exc).__name__})
+        if number == 1 or number % 100 == 0 or number == len(entries):
+            print(f"[stock-volume-audit] {number}/{len(entries)} rows={totals['rows']} unsafe={totals['unsafe_stored_share_rows']}", flush=True)
+    if before != _sha256(manifest_path):
+        errors.append({"error": "manifest_changed_during_audit"})
+    result = {
+        "status": "failed" if errors else "needs_repair" if (
+            totals["unsafe_stored_share_rows"] or totals["changed_stored_share_rows"]
+        ) else "passed",
+        "audit_scope": "stock_share_units_only_not_pit_or_full_data_integrity",
+        "dataset_root": str(dataset_root.resolve()), "manifest_sha256": before,
+        "source_file_checks": "size_mtime_inode_stable_per_file_content_hash_not_rechecked",
+        "expected_partitions": len(entries), "audited_partitions": len(partitions),
+        **totals, "partitions": partitions, "errors": errors, "examples": examples,
+    }
+    atomic_write_json(output, result)
+    return result
+
+
 def main() -> None:
     args = parse_args()
+    if getattr(args, "volume_units_only", False):
+        output = args.output
+        if output == Path("data_tw_minute/audits/latest.json"):
+            output = Path("data_tw_minute/audits/stock_share_units.json")
+        result = audit_volume_units(args.dataset_root, output)
+        print(f"[stock-volume-audit] status={result['status']} output={output}", flush=True)
+        if result["status"] != "passed":
+            raise SystemExit(1)
+        return
     if bool(args.all_partitions):
         manifest_path = args.dataset_root / "manifest.json"
         if not manifest_path.is_file():

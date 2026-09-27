@@ -292,18 +292,18 @@ def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
 
 
 def _merge_existing_with_fresh(
-    existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int
+    existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int,
+    *, preserve_existing: bool = False,
 ) -> tuple[pl.DataFrame, bool]:
     existing = _normalize_date_frame(existing_df)
     cutoff = _ms_to_date_string(effective_start_ms)
     kept_existing = (
         existing.filter(pl.col("date") < cutoff)
-        if "date" in existing.columns
+        if "date" in existing.columns and not preserve_existing
         else existing
     )
     combined = (
         pl.concat([kept_existing, fresh_df], how="diagonal_relaxed")
-        .sort("date")
         .unique(subset=["date"], keep="last", maintain_order=True)
         .sort("date")
     )
@@ -355,6 +355,33 @@ def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
     if latest is None:
         return None
     return int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _can_skip_existing_middle(frame: pl.DataFrame, info: ExistingCandleInfo) -> bool:
+    """Require actual nonempty, gap-free dates matching the planning bounds."""
+    if frame.is_empty() or "date" not in frame.columns:
+        return False
+    # Parse original values, not the legacy second-formatted normalization:
+    # formatting first could hide a sub-second timestamp defect.
+    try:
+        values = frame.get_column("date")
+        dates = (
+            values.str.to_datetime(strict=False, time_zone="UTC", time_unit="ns")
+            if values.dtype == pl.String
+            else values.cast(pl.Datetime("ns", "UTC"), strict=False)
+        )
+    except (pl.exceptions.PolarsError, TypeError, ValueError):
+        return False
+    if dates.null_count() or len(dates) != frame.height:
+        return False
+    timestamps = dates.dt.epoch("ns").sort()
+    minute_ns = CANDLE_INTERVAL_MS * 1_000_000
+    return (
+        timestamps[0] // 1_000_000 == info.earliest_ms
+        and timestamps[-1] // 1_000_000 == info.latest_ms
+        and bool((timestamps % minute_ns == 0).all())
+        and bool((timestamps.diff().drop_nulls() == minute_ns).all())
+    )
 
 
 def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
@@ -555,7 +582,7 @@ class BybitClient:
 
                 code = str(payload.get("retCode"))
                 message = str(payload.get("retMsg") or "")
-                retriable_code = {"10006", "429", "10000"}
+                retriable_code = {"10006", "429", "10000", "10016"}
                 if code in retriable_code and attempt < self.max_retries:
                     self._defer_retry(attempt, headers=response_headers)
                     continue
@@ -740,6 +767,7 @@ def _download_symbol_1m(
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
+    missing_head = False
     effective_start_ms = start_ms
     closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
     if record.launch_time:
@@ -780,7 +808,7 @@ def _download_symbol_1m(
             existing_info = None
 
         if existing_info is not None and existing_info.rows > 0:
-            effective_start_ms, _ = resolve_incremental_reconcile_start_ms(
+            effective_start_ms, missing_head = resolve_incremental_reconcile_start_ms(
                 expected_first_ms=effective_start_ms,
                 earliest_existing_ms=existing_info.earliest_ms,
                 latest_existing_ms=existing_info.latest_ms,
@@ -803,9 +831,39 @@ def _download_symbol_1m(
             closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
+    request_windows: list[tuple[int, int]] | None = None
+    existing_frame: pl.DataFrame | None = None
+    preserve_existing = False
+    if (
+        missing_head and not tail_only and existing_info is not None
+        and existing_info.earliest_ms is not None
+        and existing_info.latest_ms is not None
+    ):
+        # Reconcile missing history and the revision tail, not the already
+        # validated continuous middle. Empty head responses remain retryable
+        # next run; launch time is not proof of the first available candle.
+        head_end = min(existing_info.earliest_ms, closed_end_ms)
+        tail_start = max(effective_start_ms, existing_info.latest_ms - CANDLE_INTERVAL_MS)
+        if head_end < tail_start:
+            # Footer count/bounds alone can hide a duplicate plus a gap. The
+            # merge needs this logical frame anyway; read it once and require
+            # exact minute continuity before omitting any middle requests.
+            existing_frame = read_logical_parquet(output_path)
+            if _can_skip_existing_middle(existing_frame, existing_info):
+                request_windows = [
+                    *_iter_windows(effective_start_ms, head_end),
+                    *_iter_windows(tail_start, closed_end_ms),
+                ]
+                preserve_existing = True
+            else:
+                existing_info = None
+                existing_frame = None
+    if request_windows is None:
+        request_windows = _iter_windows(effective_start_ms, closed_end_ms)
+
     candles = CandleFrameBuffer(_normalize_candles)
     received_rows = False
-    for window_start, window_end in _iter_windows(effective_start_ms, closed_end_ms):
+    for window_start, window_end in request_windows:
         payload = client.get(
             KLINE_ENDPOINT,
             {
@@ -825,7 +883,7 @@ def _download_symbol_1m(
             candles.extend(
                 row
                 for row in chunk
-                if effective_start_ms <= int(row[0]) <= closed_end_ms
+                if window_start <= int(row[0]) <= window_end
             )
 
     if not received_rows:
@@ -922,7 +980,9 @@ def _download_symbol_1m(
                 output_path=str(output_path),
             )
         combined, changed = _merge_existing_with_fresh(
-            read_logical_parquet(output_path), df, effective_start_ms
+            existing_frame if existing_frame is not None else read_logical_parquet(output_path),
+            df, effective_start_ms,
+            preserve_existing=preserve_existing,
         )
         if not changed:
             if not hot_tail_path(output_path).is_file():

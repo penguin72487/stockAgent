@@ -15,6 +15,7 @@ from pathlib import Path
 from queue import Queue
 import re
 import socket
+import sys
 import threading
 import tempfile
 import time
@@ -374,11 +375,11 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         requests=2,
         seconds=1,
         basis=(
-            "OpenBB FRED provider safety ceiling; FRED documents HTTP 429 "
-            "throttling but no public numeric limit"
+            "official FRED API ceiling of 120 requests per minute, "
+            "smoothed to 2 requests/second"
         ),
         source_url="https://fred.stlouisfed.org/docs/api/fred/errors.html",
-        note="Direct FRED API v2 requests share this process-wide limiter.",
+        note="Direct FRED and OpenBB FRED requests share this host-global bucket.",
     ),
     "okx_history_candles": ProviderRateLimit(
         provider="okx_history_candles",
@@ -1269,7 +1270,13 @@ def run_parallel_tasks(
     results: list[TResult] = []
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
         futures = {executor.submit(worker, item): item for item in item_list}
-        progress = tqdm(total=len(futures), desc=desc, unit=unit)
+        # Journald keeps every carriage-return update as log traffic. Keep
+        # interactive feedback responsive, but bound the non-TTY fallback;
+        # registered crypto jobs also publish source-backed progress receipts.
+        progress = tqdm(
+            total=len(futures), desc=desc, unit=unit,
+            mininterval=0.1 if sys.stderr.isatty() else 10.0,
+        )
         try:
             for future in as_completed(futures):
                 item = futures[future]

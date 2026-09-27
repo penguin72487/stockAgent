@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import sys
 
@@ -19,6 +19,63 @@ from downloader.shioaji_capture_parts import (  # noqa: E402
     select_capture_part_paths,
 )
 from downloader.stream_shioaji_tw_microstructure import _atomic_json  # noqa: E402
+from downloader.stream_shioaji_taifex_bidask import (  # noqa: E402
+    BIDASK_STALE_TIMEOUT_SECONDS,
+    EXPIRY_HEDGE_CLOSE,
+)
+from stockagent.data.taifex_sessions import TAIPEI  # noqa: E402
+
+
+def strategy_hedge_tail_gap_seconds(
+    manifest: dict[str, object], books: pl.DataFrame
+) -> float | None:
+    """Prove the strategy worker received hedge books through capture close."""
+
+    simulation = manifest.get("strategy_simulation")
+    if not isinstance(simulation, dict) or not simulation.get("enabled"):
+        return None
+    if int(manifest.get("worker_index", -1)) != 0:
+        raise RuntimeError("strategy simulation must run on worker 0")
+    selection = manifest.get("selection")
+    if not isinstance(selection, dict):
+        raise RuntimeError("strategy worker has no contract selection")
+    hedge_code = str(selection.get("resolved_hedge_future_code") or "")
+    if not hedge_code:
+        raise RuntimeError("strategy worker has no resolved hedge future")
+    metadata = manifest.get("contract_metadata")
+    if not isinstance(metadata, list):
+        raise RuntimeError("strategy worker has no contract metadata")
+    hedge_metadata = [
+        row
+        for row in metadata
+        if isinstance(row, dict) and row.get("code") == hedge_code
+    ]
+    if len(hedge_metadata) != 1:
+        raise RuntimeError(f"strategy hedge metadata is not unique: {hedge_code}")
+    last_trading_date = date.fromisoformat(
+        str(hedge_metadata[0]["last_trading_date"])
+    )
+    hedge_books = books.filter(
+        (pl.col("worker_index") == 0) & (pl.col("code") == hedge_code)
+    )
+    if hedge_books.is_empty():
+        raise RuntimeError(f"strategy hedge has no BidAsk: {hedge_code}")
+    finished_at = datetime.fromisoformat(str(manifest["finished_at_utc"]))
+    if finished_at.tzinfo is None:
+        raise RuntimeError("capture finish time must be timezone-aware")
+    local_finished_at = finished_at.astimezone(TAIPEI)
+    if (
+        manifest.get("capture_session") == "day"
+        and local_finished_at.date() == last_trading_date
+    ):
+        finished_at = min(
+            finished_at,
+            datetime.combine(
+                last_trading_date, EXPIRY_HEDGE_CLOSE, tzinfo=TAIPEI
+            ),
+        )
+    last_receive_ns = int(hedge_books["receive_ts_ns"].max())
+    return max(0.0, finished_at.timestamp() - last_receive_ns / 1e9)
 
 
 def main() -> int:
@@ -94,6 +151,16 @@ def main() -> int:
         raise RuntimeError(f"captured books miss subscribed contracts: {missing_codes}")
     if valid.is_empty():
         raise RuntimeError("capture has no valid non-crossed best BidAsk")
+    strategy_hedge_tail_gaps = [
+        gap
+        for manifest in manifests
+        if (gap := strategy_hedge_tail_gap_seconds(manifest, books)) is not None
+    ]
+    if any(gap > BIDASK_STALE_TIMEOUT_SECONDS for gap in strategy_hedge_tail_gaps):
+        raise RuntimeError(
+            "strategy hedge BidAsk stream ended before capture close: "
+            f"tail_gaps_seconds={strategy_hedge_tail_gaps}"
+        )
     transport_ms = (valid["receive_ts_ns"] - valid["exchange_ts_ns"]).cast(
         pl.Float64
     ) / 1e6
@@ -116,6 +183,9 @@ def main() -> int:
         "receive_ts_min_ns": int(valid["receive_ts_ns"].min()),
         "receive_ts_max_ns": int(valid["receive_ts_ns"].max()),
         "dropped_events": sum(int(item["dropped_events"]) for item in manifests),
+        "strategy_hedge_tail_gap_seconds": (
+            max(strategy_hedge_tail_gaps) if strategy_hedge_tail_gaps else None
+        ),
         "queue_high_watermark": max(
             int(item["queue_high_watermark"]) for item in manifests
         ),

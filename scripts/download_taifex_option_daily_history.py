@@ -18,7 +18,7 @@ from pathlib import Path
 import stat
 import sys
 import time
-from typing import Final
+from typing import Final, Mapping
 
 import numpy as np
 
@@ -42,13 +42,12 @@ from stockagent.data.tw_index_options_daily import (  # noqa: E402
     TAIFEX_OPTIONS_FULL_CHAIN_DATA_CONTRACT_VERSION,
     TAIFEX_OPTIONS_DAILY_PRICE_SOURCE,
     AtmSourceProjection,
+    TaifexTxOpeningReference,
     build_taifex_option_full_chain,
     build_taifex_opening_atm_straddles,
     load_taifex_opening_atm_straddles,
+    load_taifex_tx_opening_reference,
     project_taifex_atm_source,
-)
-from stockagent.data.tw_index_futures import (  # noqa: E402
-    load_taifex_index_futures_day_session,
 )
 
 
@@ -159,29 +158,8 @@ def _can_reuse_normalized(
         return False
 
 
-def _futures_contract_open_by_date(
-    futures_path: Path,
-) -> dict[date, tuple[str, float]]:
-    futures = load_taifex_index_futures_day_session(futures_path, products=("TX",))
-    return {
-        date.fromisoformat(str(raw_date)): (
-            str(futures.contract_months[index, 0]),
-            float(futures.open_prices[index, 0]),
-        )
-        for index, raw_date in enumerate(futures.dates)
-        if bool(futures.tradable_mask[index, 0])
-    }
-
-
-def _futures_open_by_date(futures_path: Path) -> dict[date, float]:
-    return {
-        day: payload[1]
-        for day, payload in _futures_contract_open_by_date(futures_path).items()
-    }
-
-
 def _atm_futures_fingerprint(
-    source_dates: list[str], tx_by_date: dict[date, tuple[str, float]]
+    source_dates: list[str], tx_by_date: Mapping[date, tuple[str, float]]
 ) -> str:
     values = [
         (day, None if (payload := tx_by_date.get(date.fromisoformat(day))) is None
@@ -215,7 +193,7 @@ def _prepare_atm_source_projections(
     cache_root: Path,
     *,
     scope: str,
-    tx_by_date: dict[date, tuple[str, float]],
+    tx_by_date: Mapping[date, tuple[str, float]],
     builder_fingerprint: dict[str, str],
 ) -> tuple[dict[Path, AtmSourceProjection], int]:
     if cache_root.is_symlink() or (cache_root / scope).is_symlink():
@@ -292,7 +270,7 @@ def _prepare_atm_source_projections(
 
 
 def _futures_open_fingerprint(
-    source_dates: list[str], tx_open_by_date: dict[date, float]
+    source_dates: list[str], tx_open_by_date: Mapping[date, float]
 ) -> str:
     """Fingerprint the exact futures inputs used by one source receipt."""
 
@@ -321,7 +299,7 @@ def _load_full_chain_shard(
     scope: str,
     source_path: Path,
     source_sha256: str,
-    tx_open_by_date: dict[date, float],
+    tx_open_by_date: Mapping[date, float],
     builder_fingerprint: dict[str, str],
 ) -> dict[str, object] | None:
     if shard.is_symlink() or receipt_path.is_symlink():
@@ -360,13 +338,15 @@ def _load_full_chain_shard(
 
 def _prepare_full_chain_shards(
     receipt_manifest: list[dict[str, object]],
-    futures_path: Path,
+    futures_reference: TaifexTxOpeningReference,
     cache_root: Path,
     *,
     scope: str,
-    tx_open_by_date: dict[date, float],
     builder_fingerprint: dict[str, str],
 ) -> tuple[list[dict[str, object]], int]:
+    futures_path = futures_reference.source_path
+    futures_reference.require_unchanged(futures_path)
+    tx_open_by_date = futures_reference.open_by_date
     shards: list[dict[str, object]] = []
     built = 0
     for source in receipt_manifest:
@@ -389,6 +369,7 @@ def _prepare_full_chain_shards(
         build_taifex_option_full_chain(
             [source_path], futures_path, shard,
             series_scope=scope, source_dates=observed_dates, allow_empty=True,
+            futures_reference=futures_reference,
         )
         if sha256_path(source_path) != source_sha256:
             raise ValueError(f"TAIFEX source changed while building {source_path}")
@@ -407,19 +388,27 @@ def _prepare_full_chain_shards(
             ),
             "builder_fingerprint": builder_fingerprint,
         }
+        futures_reference.require_unchanged(futures_path)
         atomic_write_json(receipt_path, receipt)
         shards.append(receipt)
         built += 1
+    futures_reference.require_unchanged(futures_path)
     return shards, built
 
 
 def _merge_full_chain_shards(
-    shards: list[dict[str, object]], output_path: Path, *, scope: str
+    shards: list[dict[str, object]], output_path: Path, *, scope: str,
+    futures_reference: TaifexTxOpeningReference,
 ) -> Path:
     import pyarrow.parquet as pq
 
+    futures_reference.require_unchanged(futures_reference.source_path)
     seen_dates: set[str] = set()
     for receipt in shards:
+        if receipt.get("futures_open_fingerprint") != _futures_open_fingerprint(
+            receipt["source_dates"], futures_reference.open_by_date
+        ):
+            raise ValueError("full-chain shard futures reference mismatch")
         dates = set(receipt["source_dates"])
         if overlap := seen_dates & dates:
             raise ValueError(f"overlapping full-chain receipts contain {min(overlap)}")
@@ -463,6 +452,11 @@ def _merge_full_chain_shards(
     if writer is None:
         raise ValueError("no full-chain shard schema")
     writer.close()
+    try:
+        futures_reference.require_unchanged(futures_reference.source_path)
+    except (ValueError, OSError):
+        temporary.unlink(missing_ok=True)
+        raise
     temporary.replace(output_path)
     return output_path
 
@@ -695,8 +689,7 @@ def main() -> int:
     )
     futures_sha256 = str(futures_receipt["sha256"])
     builder_fingerprint = _builder_fingerprint()
-    tx_open_by_date: dict[date, float] | None = None
-    tx_contract_open_by_date: dict[date, tuple[str, float]] | None = None
+    futures_reference: TaifexTxOpeningReference | None = None
     for series_scope in selected_scopes:
         normalized = output_dir / output_names[series_scope]
         full_chain = output_dir / full_chain_output_names[series_scope]
@@ -724,11 +717,12 @@ def main() -> int:
             )
             continue
         stage_started = time.perf_counter()
-        if tx_contract_open_by_date is None:
-            tx_contract_open_by_date = _futures_contract_open_by_date(futures_path)
+        if futures_reference is None:
+            futures_reference = load_taifex_tx_opening_reference(futures_path)
+            _require_unchanged_inputs(input_signatures, builder_fingerprint)
         atm_projections, atm_rebuilt = _prepare_atm_source_projections(
             receipt_manifest, ATM_SOURCE_CACHE,
-            scope=series_scope, tx_by_date=tx_contract_open_by_date,
+            scope=series_scope, tx_by_date=futures_reference.contract_open_by_date,
             builder_fingerprint=builder_fingerprint,
         )
         build_taifex_opening_atm_straddles(
@@ -737,6 +731,7 @@ def main() -> int:
             normalized,
             series_scope=series_scope,
             source_projections=atm_projections,
+            futures_reference=futures_reference,
         )
         print(
             f"[taifex-option-daily-timing] stage={series_scope}.atm "
@@ -746,14 +741,15 @@ def main() -> int:
             flush=True,
         )
         stage_started = time.perf_counter()
-        if tx_open_by_date is None:
-            tx_open_by_date = _futures_open_by_date(futures_path)
         shards, rebuilt_shards = _prepare_full_chain_shards(
-            receipt_manifest, futures_path, FULL_CHAIN_SHARD_CACHE,
-            scope=series_scope, tx_open_by_date=tx_open_by_date,
+            receipt_manifest, futures_reference, FULL_CHAIN_SHARD_CACHE,
+            scope=series_scope,
             builder_fingerprint=builder_fingerprint,
         )
-        _merge_full_chain_shards(shards, full_chain, scope=series_scope)
+        _merge_full_chain_shards(
+            shards, full_chain, scope=series_scope,
+            futures_reference=futures_reference,
+        )
         print(
             f"[taifex-option-daily-timing] stage={series_scope}.full_chain "
             f"seconds={time.perf_counter() - stage_started:.3f} "

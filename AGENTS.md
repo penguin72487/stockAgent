@@ -265,6 +265,14 @@ coordinated code, config, test, and documentation change.
   `scripts/run_downloader_with_release.sh`.  Publication must fail closed while
   a declared writer is active or when build, strict audit, inventory hash,
   freshness receipt, coverage, rights, or atomic-head update is incomplete.
+- For `tw-public` cold publication, a stale derived receipt is a durable
+  publication veto, not a worker crash: retain the failed receipt and do not
+  restart the same exact-byte audit every five minutes. Retry after the
+  official-symbol or feature receipt changes, after successful feature
+  reconciliation releases the source lock, or at the nightly timer. The
+  publisher must still verify both receipts under the canonical source lock;
+  no retry trigger may convert stale data into a release or enter the
+  protected Taiwan opening window.
 - Partial downloads, task shards, locks, PIDs, quarantine data, reproducible
   caches, and incomplete training runs remain node-local.  Completed artifacts
   may enter cold storage only after their lifecycle/completion contract and

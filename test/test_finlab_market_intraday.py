@@ -1,17 +1,121 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 from pathlib import Path
+import sqlite3
+import fcntl
 from unittest.mock import patch
 
 import pandas as pd
 import polars as pl
+import pytest
 from finlab.exceptions import DataError
 
 from scripts.download_finlab_market_intraday import (
-    _eligible, _open_index, _record, _summarize, _target_count,
+    _account_sync_lock, _eligible, _open_index, _record, _summarize, _target_count,
     annotate_daily_close_coverage, load_universe, session_days, sync_market,
 )
 from scripts.download_finlab_history import safe_stem
+
+
+@pytest.fixture(autouse=True)
+def required_work_completed_for_partition_tests():
+    # Partition/cursor tests isolate their subject from the account-wide gate.
+    with patch("scripts.download_finlab_market_intraday._general_work_admission",
+               return_value={"supplemental_allowed": True, "required_pending": 0}):
+        yield
+
+
+def test_standalone_market_lock_respects_regular_downloader_and_inherited_lock(tmp_path):
+    with (tmp_path / ".sync.lock").open("a") as parent:
+        fcntl.flock(parent.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            with _account_sync_lock(tmp_path):
+                pytest.fail("must not acquire a competing lock")
+        with _account_sync_lock(tmp_path, parent.fileno()):
+            pass
+        with pytest.raises(BlockingIOError):
+            with _account_sync_lock(tmp_path):
+                pytest.fail("inherited context must retain its parent's lock")
+    with _account_sync_lock(tmp_path):
+        pass
+
+
+def test_tick_batch_refuses_quota_when_required_general_work_is_blocked(tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday._general_work_admission",
+        return_value={"supplemental_allowed": False, "required_blocked": 1},
+    ), patch("scripts.download_finlab_market_intraday.quota_room_mb",
+             side_effect=AssertionError("no quota API before general gate")), patch(
+        "scripts.download_finlab_market_intraday.fetch_partition",
+        side_effect=AssertionError("no tick fetch before general gate"),
+    ):
+        summary = sync_market(output, public, start=date(2026, 9, 24),
+                              end=date(2026, 9, 24), limit=5, reserve_mb=500,
+                              minimum_free_gb=0, now=datetime(2026, 9, 25, tzinfo=UTC))
+    assert summary["state"] == "waiting_required_general_data"
+    assert summary["attempted_this_run"] == 0
+
+
+@pytest.mark.parametrize("message,state", [("quota exceeded", "quota_exhausted"),
+                                          ("session expired", "authentication_failed")])
+def test_tick_batch_stops_account_wide_errors_after_one_request(tmp_path, message, state):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday.quota_room_mb", return_value=(1000.0, 5000.0),
+    ), patch("scripts.download_finlab_market_intraday.fetch_partition",
+             side_effect=RuntimeError(message)) as fetch:
+        summary = sync_market(output, public, start=date(2026, 8, 19),
+                              end=date(2026, 9, 24), limit=5, reserve_mb=500,
+                              minimum_free_gb=0, now=datetime(2026, 9, 25, tzinfo=UTC),
+                              fetch=fetch)
+    assert summary["state"] == state
+    assert summary["attempted_this_run"] == 1
+    assert fetch.call_count == 1
+
+
+def test_tick_batch_yields_when_general_admission_changes_mid_batch(tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+
+    class MovingClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            return datetime(2026, 9, 25, 1, tzinfo=UTC) + timedelta(minutes=cls.calls)
+
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday.datetime", MovingClock,
+    ), patch("scripts.download_finlab_market_intraday._general_work_admission", side_effect=[
+        {"supplemental_allowed": True}, {"supplemental_allowed": False},
+    ]) as gate, patch("scripts.download_finlab_market_intraday.quota_room_mb",
+                     return_value=(1000.0, 5000.0)), patch(
+        "scripts.download_finlab_market_intraday.derive_partition", return_value={
+            "status": "derived_unverified_for_pit", "rows": 1, "parquet_size_bytes": 10,
+        },
+    ), patch("scripts.download_finlab_market_intraday.fetch_partition", return_value={
+        "status": "downloaded_unverified_for_pit", "rows": 1, "parquet_size_bytes": 10,
+    }) as fetch:
+        summary = sync_market(output, public, start=date(2026, 8, 19),
+                              end=date(2026, 9, 24), limit=5, reserve_mb=500,
+                              minimum_free_gb=0, now=datetime(2026, 9, 25, tzinfo=UTC),
+                              fetch=fetch)
+    assert summary["state"] == "waiting_required_general_data"
+    assert gate.call_count == 2
+    assert fetch.call_count == 1
 
 
 def _fixture(root: Path) -> None:
@@ -170,6 +274,19 @@ def test_not_ready_partition_retries_after_next_quota_cycle(tmp_path):
         sync_market(output, public, start=date(2026, 8, 19),
                     end=date(2026, 9, 24), limit=1, reserve_mb=50,
                     minimum_free_gb=0, now=datetime(2026, 9, 25, tzinfo=UTC), fetch=fetch)
+        # The injected logical date does not freeze the production wall clock
+        # used by _record(). Align only this test's attempt receipt with the
+        # simulated first quota cycle before advancing to the next one.
+        index = sqlite3.connect(output / "intraday/market_index.sqlite3")
+        try:
+            index.execute(
+                "UPDATE partitions SET checked_at_utc=? "
+                "WHERE kind='tw_tick' AND symbol='2330' AND trade_date='2026-09-24'",
+                ("2026-09-25T00:00:00+00:00",),
+            )
+            index.commit()
+        finally:
+            index.close()
         sync_market(output, public, start=date(2026, 8, 19),
                     end=date(2026, 9, 24), limit=1, reserve_mb=50,
                     minimum_free_gb=0, now=datetime(2026, 9, 26, tzinfo=UTC), fetch=fetch)

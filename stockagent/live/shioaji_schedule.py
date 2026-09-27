@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from stockagent.live.market_status import is_trading_day
+from stockagent.live.market_status import is_trading_day, tw_stock_day_decision
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -16,6 +16,7 @@ HISTORICAL_QUERY_RESUME = time(14, 31)
 MINUTE_PRE_NIGHT_YIELD = time(14, 45)
 HISTORICAL_MAX_TRAFFIC_FRACTION = 0.90
 SHIOAJI_PERSON_CONNECTION_LIMIT = 5
+DEFAULT_TW_PUBLIC_ROOT = Path(__file__).resolve().parents[2] / "data_tw_public"
 
 
 def _taipei_datetime(value: datetime | None) -> datetime:
@@ -35,7 +36,12 @@ def historical_query_pause_seconds(value: datetime | None = None) -> int:
     """
 
     local = _taipei_datetime(value)
-    if local.weekday() >= 5:
+    decision = tw_stock_day_decision(
+        local.date(), parquet_root=DEFAULT_TW_PUBLIC_ROOT, observed=local,
+    )
+    # A verified stock-market closure releases the stock-opening reservation.
+    # Unknown evidence remains protected; TAIFEX reservations are independent.
+    if decision.status == "closed":
         return 0
     if not HISTORICAL_QUERY_CUTOFF <= local.time() < HISTORICAL_QUERY_RESUME:
         return 0

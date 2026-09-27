@@ -2367,8 +2367,8 @@ def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
     shape = getattr(execution, "shape", ())
     return bool(
         mode == "tw_stock_context_futures_portfolio"
-        and len(shape) == 3
-        and int(shape[-1]) == 11
+        and ((len(shape) == 3 and int(shape[-1]) == 11)
+             or (len(shape) == 4 and int(shape[-1]) == 63))
     )
 
 
@@ -3016,6 +3016,21 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    if (mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
+        payload.update(
+            frequency="daily_policy_exact_minute_execution",
+            decision_clock="08:45_completed_prior_session_features",
+            execution_clock="08:46_minute_vwap_entry_1320_limit_1324_market_until_1330",
+            terminal_policy="mandatory_1330_flat_or_absorbing_unfilled_exit_failure",
+            recurrent_state_scope="account_equity_only_no_overnight_positions",
+            benchmark_contract="flat_cash_nominal_twd_no_interest",
+            weight_snapshot_contract="signed_entry_contract_quantities",
+            mode_details={"holding_policy": "intraday", "contract_version": 1,
+                          "capacity": f"floor_{config.trading.max_volume_participation * 100:g}pct_observed_minute_contracts",
+                          "price_contract": "minute_trade_price_research_not_bidask_fill"},
+        )
+        return payload
     # Artifact-only callers may provide a minimal compatibility namespace.
     # A missing overnight flag means that the legacy/non-overnight contract
     # applies; it must not make artifact serialization fail.
@@ -3135,12 +3150,15 @@ def _mode_artifact_contract_for_config(
     terminal_unlimited = bool(
         config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
     )
+    entry_remainder_policy = config.trading.tw_day_trade_entry_remainder_policy
     payload.update(
         {
             "frequency": "daily_policy_exact_minute_execution",
             "decision_clock": "observed_session_open",
             "execution_clock": (
-                "official_open_sizing_then_0901_minute_price_entry_1320_limit_"
+                ("official_open_sizing_then_0901_to_1319_frozen_target_entries_1320_limit_"
+                 if entry_remainder_policy == "frozen_target_until_1320" else
+                 "official_open_sizing_then_0901_minute_price_entry_1320_limit_") +
                 "1324_market_1330_auction"
             ),
             "recurrent_state_scope": (
@@ -3159,6 +3177,8 @@ def _mode_artifact_contract_for_config(
             "weight_snapshot_contract": "exact_filled_entry_notional_over_nav",
             "turnover_contract": "sum_exact_minute_fill_notional_over_nav",
             "mode_details": {
+                **({"entry_remainder_policy": entry_remainder_policy}
+                   if entry_remainder_policy != "first_minute_only" else {}),
                 "execution_variant": (
                     "exact_board_lot_minute_physical_fifo_v1"
                     if physical_fifo
@@ -5143,6 +5163,14 @@ def _evaluate_windowed_aux_objective_loss(
     mean_loss = float(loss_t.detach().float().cpu())
     rank_scores = _resolve_rank_scores(weights_all, aux_all)
     sample_all = torch.cat(sample_chunks, dim=0).to(dtype=torch.bool)
+    if (execution_mode == "tw_stock_context_futures_portfolio"
+            and overnight_returns_all.ndim == 4):
+        # No stock-return IC is defined for the different futures action axis.
+        # Scheduled, size-dependent minute executions have no scalar label IC.
+        timing.metrics_s += time.perf_counter() - reduce_start
+        timing.total_s = time.perf_counter() - overall_start
+        timing.batches = int(expected_chunks)
+        return mean_loss, None, timing
     if execution_mode == "tw_stock_context_futures_portfolio":
         futures_holding_log_returns = overnight_returns_all[..., 0]
         rank_targets = torch.expm1(
@@ -16448,9 +16476,9 @@ def _split_recurrent_symbol_count(split: WindowedSplitTensors) -> int:
 
     if split.execution_mode == "tw_stock_context_futures_portfolio":
         execution = split.overnight_log_returns
-        if execution is None or execution.dim() != 3:
+        if execution is None or execution.dim() not in {3, 4}:
             raise ValueError(
-                "stock-context futures split requires packed execution [T,1936,4]"
+                "stock-context futures split requires daily or minute execution"
             )
         return int(execution.size(1))
     return int(split.num_symbols)
@@ -26857,6 +26885,9 @@ def _run_training_impl(
                             config.training.distributed_replicated_ledger_local_metadata
                         ),
                         optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+                        progress_label=(
+                            f"[Train {train_years}]" if profile_timing else None
+                        ),
                     )
                 return _train_epoch_windowed_tensor(
                     train_model,

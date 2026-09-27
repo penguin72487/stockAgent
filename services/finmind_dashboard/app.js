@@ -78,6 +78,12 @@ function renderQuota(info) {
   text("quota-used", used === null ? "—" : `${completeWindow ? "" : "≥"}${count(used)} 次`);
   text("quota-limit", limit === null ? "—" : `${count(limit)} 次／小時`);
   text("quota-headroom", completeWindow ? `${count(info.worker_headroom_60m)} 次` : "無法核定");
+  const allocation = info.backfill_allocation;
+  text("quota-backfill", allocation?.basis === "provider_observation_plus_local_starts"
+    ? `${count(Math.max(0, allocation.remaining - allocation.reserve))} 次` : "無法核定");
+  text("quota-reserved", allocation?.basis === "provider_observation_plus_local_starts"
+    ? `下一小時固定增量預留 ${count(allocation.reserve)} 次；帳號取樣後併計本站請求`
+    : "帳號用量或本機請求帳本未核實；歷史回補暫緩");
   text("quota-ratio", used === null || !limit ? "—" : `${completeWindow ? "" : "≥"}${percent(Math.min(1, used / limit))}`);
   text("quota-basis", completeWindow ? "本站 worker 滾動 60 分鐘；非帳號總用量" : "本站追蹤未滿一小時，為觀測下界");
   text("quota-token", info.account_tier ? `官方帳號層級 ${info.account_tier}；最近帳號取樣 ${count(info.provider_used_in_hour)} 次` : "尚未驗證帳號層級");
@@ -149,7 +155,10 @@ function renderBackfill(data) {
   for (const row of (Array.isArray(data.datasets) ? data.datasets : [])) {
     const tr = document.createElement("tr");
     const grains = row.observed_grains || {};
-    const grainLabel = row.kind === "session_history" ? `${count(grains["1m"] || 0)} 日 1 分 · ${count(grains["5s"] || 0)} 日 5 秒` : `空 ${count(row.observed_empty_partitions || 0)} · 失敗 ${count(row.deferred_partitions || 0)} · 權限 ${count(row.not_entitled_partitions || 0)} · 參數 ${count(row.invalid_request_partitions || 0)}`;
+    const grainLabel = row.kind === "session_history"
+      ? [["1m", "1 分"], ["15s", "15 秒"], ["10s", "10 秒"], ["5s", "5 秒"]]
+          .map(([key, label]) => `${count(grains[key] ?? 0)} 日 ${label}`).join(" · ")
+      : `空 ${count(row.observed_empty_partitions || 0)} · 失敗 ${count(row.deferred_partitions || 0)} · 權限 ${count(row.not_entitled_partitions || 0)} · 參數 ${count(row.invalid_request_partitions || 0)}`;
     const cells = [row.label, statusLabels[row.state] || "待核實", `${count(row.checked_partitions ?? row.complete_partitions)}／${count(row.target_partitions)}（非空 ${count(row.complete_partitions)}）`, row.first_data_date || "—", row.last_data_date || "—", count(row.rows), bytes(row.local_bytes), grainLabel, row.state === "complete" ? "—" : duration(row.minimum_network_seconds_remaining), timeLabel(row.last_receipt_at_utc)];
     for (const cell of cells) { const td = document.createElement("td"); td.textContent = cell; tr.append(td); }
     body.append(tr);

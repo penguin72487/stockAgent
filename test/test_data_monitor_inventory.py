@@ -13,6 +13,7 @@ from stockagent.live.data_monitor_dashboard import (
     _market_category,
     _record_stats_for_row,
     build_data_monitor_feature_inventory,
+    feature_source_metadata_sha256,
 )
 from stockagent.live.data_monitor_inventory import build_feature_inventory, build_record_inventory, parquet_footer_stats
 from stockagent.live.data_monitor_inventory import PHYSICAL_FAMILIES
@@ -61,6 +62,36 @@ def test_feature_projection_resolves_repeated_dataset_metadata_once(tmp_path, mo
     assert {row["market_category"] for row in result["rows"]} == {"cross_market"}
 
 
+def test_feature_metadata_revision_tracks_labels_not_runtime_health(tmp_path: Path) -> None:
+    source = {
+        "id": "source:example", "record_inventory_key": "dataset:example",
+        "title": "原名稱", "provider": "提供者", "market_category": "crypto",
+        "status": "current",
+    }
+    status = {"sources": [source]}
+    original = feature_source_metadata_sha256(status, ["dataset:example"])
+    source["status"] = "degraded"
+    assert feature_source_metadata_sha256(status, ["dataset:example"]) == original
+    source["provider"] = "新提供者"
+    assert feature_source_metadata_sha256(status, ["dataset:example"]) != original
+    source["provider"] = "提供者"
+    source["market_category"] = "forex"
+    assert feature_source_metadata_sha256(status, ["dataset:example"]) != original
+    source["market_category"] = "crypto"
+    source["title"] = "新名稱"
+    assert feature_source_metadata_sha256(status, ["dataset:example"]) != original
+    inventory = {
+        "rows": [{"dataset_id": "dataset:example", "field": "close"}],
+        "datasets_with_schema": 1, "datasets_total": 1,
+        "files_with_schema": 1, "files_total": 1,
+        "state": "complete", "basis": "test",
+    }
+    projected = build_data_monitor_feature_inventory(
+        tmp_path, monitor_status=status, inventory=inventory,
+    )
+    assert projected["rows"][0]["source_title"] == "新名稱"
+
+
 def test_shared_inventory_reuses_discovery_but_rechecks_changed_and_deleted_files(tmp_path, monkeypatch):
     first = tmp_path / "data_yahoo/crypto/AAA_features.parquet"
     second = tmp_path / "data_yahoo/crypto/BBB_features.parquet"
@@ -69,7 +100,8 @@ def test_shared_inventory_reuses_discovery_but_rechecks_changed_and_deleted_file
     snapshot = inventory_module.InventorySnapshot(tmp_path)
     record = build_record_inventory(tmp_path, refresh=True, snapshot=snapshot)
     assert set(record["timing_ms"]) == {
-        "cache_decode", "discover", "signature_scan", "aggregate_and_persist"
+        "quick_index_probe", "cache_decode", "discover", "signature_scan",
+        "aggregate_and_persist",
     }
     assert all(value >= 0 for value in record["timing_ms"].values())
     original = build_feature_inventory(tmp_path)
@@ -118,6 +150,38 @@ def test_schema_batch_preserves_mixed_types_missing_fields_and_null_statistics(t
     assert rows["late"]["verified_partial_non_null"] is None
 
 
+def test_feature_non_null_fast_sum_preserves_unknown_malformed_and_large_integer(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    directory = tmp_path / "data_yahoo/crypto"
+    directory.mkdir(parents=True)
+    paths = [directory / "A_features.parquet", directory / "B_features.parquet"]
+    for path in paths:
+        pq.write_table(pa.table({"value": [1]}), path)
+    snapshot = inventory_module.InventorySnapshot(tmp_path)
+    build_record_inventory(tmp_path, refresh=True, snapshot=snapshot)
+    assert snapshot.payload is not None
+    entries = [snapshot.payload["files"][str(path)]["stats"] for path in paths]
+
+    def value_row():
+        return next(
+            row for row in build_feature_inventory(tmp_path, snapshot=snapshot)["rows"]
+            if row["dataset_id"] == "yahoo:crypto" and row["field"] == "value"
+        )
+
+    assert value_row()["non_null_count"] == 2
+    entries[1]["non_null"][0] = None
+    assert value_row()["non_null_count"] is None
+    assert value_row()["verified_partial_non_null"] == 1
+    entries[1]["non_null"][0] = 1.5
+    assert value_row()["non_null_known_files"] == 1
+    assert value_row()["verified_partial_non_null"] == 1
+    entries[1]["non_null"][0] = 10**30
+    assert value_row()["non_null_count"] == 10**30 + 1
+
+
 def test_snapshot_is_updated_even_when_record_inventory_is_unchanged(tmp_path):
     first = tmp_path / "data_yahoo/crypto/A_features.parquet"
     _write_parquet(first, [date(2025, 1, 1)])
@@ -149,6 +213,7 @@ def test_unchanged_inventory_uses_small_index_without_full_cache_decode(
     snapshot = inventory_module.InventorySnapshot(tmp_path)
     second = build_record_inventory(tmp_path, refresh=True, snapshot=snapshot)
     assert second["fast_index_hit"] is True
+    assert second["changed_dataset_ids"] == []
     assert second["datasets"] == first["datasets"]
     assert second["feature_revision"] == first["feature_revision"]
     assert snapshot.selected is not None
@@ -177,6 +242,90 @@ def test_fast_index_rejects_group_reassignment_with_same_unique_files(
     assert second["fast_index_hit"] is False
     assert second["datasets"]["yahoo:crypto"]["first"] == "2025-01-02"
     assert second["feature_revision"] != first["feature_revision"]
+    assert second["changed_dataset_ids"] is None  # Reassigned membership needs full scope.
+
+
+def test_changed_file_reuses_quick_index_discovery_on_slow_path(tmp_path, monkeypatch):
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    build_record_inventory(tmp_path, refresh=True)
+    original_selected = inventory_module._selected_files
+    discoveries = 0
+
+    def counted_selected(root: Path):
+        nonlocal discoveries
+        discoveries += 1
+        return original_selected(root)
+
+    monkeypatch.setattr(inventory_module, "_selected_files", counted_selected)
+    _write_parquet(path, [date(2025, 1, 1), date(2025, 1, 2)])
+    current = build_record_inventory(tmp_path, refresh=True)
+    assert discoveries == 1
+    assert current["fast_index_hit"] is False
+    assert current["refreshed_files"] == 1
+    assert current["datasets"]["yahoo:crypto"]["count"] == 2
+    assert current["timing_ms"]["quick_index_probe"] >= 0
+
+
+def test_preflight_file_hint_skips_redundant_full_probe_on_change(tmp_path, monkeypatch):
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    build_record_inventory(tmp_path, refresh=True)
+    index_path = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert [str(path), inventory_module._file_identity(path.stat())] in index["preflight_file_hints"]
+
+    original_fingerprint = inventory_module._selection_fingerprint
+
+    def no_full_probe_on_changed_hint(selected, *, cache=None):
+        if cache is None:
+            pytest.fail("changed hint must take the full slow path before a redundant probe scan")
+        return original_fingerprint(selected, cache=cache)
+
+    monkeypatch.setattr(inventory_module, "_selection_fingerprint", no_full_probe_on_changed_hint)
+    _write_parquet(path, [date(2025, 1, 1), date(2025, 1, 2)])
+    current = build_record_inventory(tmp_path, refresh=True)
+    assert current["fast_index_hit"] is False
+    assert current["refreshed_files"] == 1
+    assert current["datasets"]["yahoo:crypto"]["count"] == 2
+
+
+def test_invalid_preflight_hint_falls_back_to_full_inventory(tmp_path):
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    original = build_record_inventory(tmp_path, refresh=True)
+    index_path = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["preflight_file_hints"] = [[str(path), [1, 2, 3]]]
+    index["checksum"] = inventory_module._quick_index_checksum(index)
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    rebuilt = build_record_inventory(tmp_path, refresh=True)
+    assert rebuilt["fast_index_hit"] is False
+    assert rebuilt["datasets"] == original["datasets"]
+    assert build_record_inventory(tmp_path, refresh=True)["fast_index_hit"] is True
+
+
+def test_unsampled_file_change_is_still_caught_by_full_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(inventory_module, "FAST_INDEX_PREFLIGHT_HINTS", 1)
+    paths = [
+        tmp_path / "data_yahoo/crypto/A_features.parquet",
+        tmp_path / "data_yahoo/crypto/B_features.parquet",
+    ]
+    for path in paths:
+        _write_parquet(path, [date(2025, 1, 1)])
+    build_record_inventory(tmp_path, refresh=True)
+    index_path = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert len(index["preflight_file_hints"]) == 1
+    sampled = index["preflight_file_hints"][0][0]
+    unsampled = next(path for path in paths if str(path) != sampled)
+
+    _write_parquet(unsampled, [date(2025, 1, 1), date(2025, 1, 2)])
+    refreshed = build_record_inventory(tmp_path, refresh=True)
+    assert refreshed["fast_index_hit"] is False
+    assert refreshed["refreshed_files"] == 1
+    assert refreshed["datasets"]["yahoo:crypto"]["count"] == 3
 
 
 def test_same_aggregate_group_swap_still_changes_feature_revision(
@@ -592,8 +741,26 @@ def test_feature_revision_changes_when_null_statistics_change(tmp_path: Path) ->
 
     assert changed["datasets"]["yahoo:crypto"]["count"] == first["datasets"]["yahoo:crypto"]["count"]
     assert changed["feature_revision"] != first["feature_revision"]
+    assert changed["changed_dataset_ids"] == ["yahoo:crypto"]
     field = next(row for row in build_feature_inventory(tmp_path)["rows"] if row["field"] == "value")
     assert field["non_null_count"] == 0
+
+
+def test_invalid_cached_feature_revision_is_rebuilt_not_reused(tmp_path: Path) -> None:
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    build_record_inventory(tmp_path, refresh=True)
+    cache_path = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache["feature_revision"] = "broken"
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+    repaired = build_record_inventory(tmp_path, refresh=True)
+
+    assert repaired["fast_index_hit"] is False
+    assert len(repaired["feature_revision"]) == 32
+    assert repaired["feature_revision"] != "broken"
+    assert repaired["changed_dataset_ids"] is None
 
 
 def test_feature_inventory_lists_every_field_by_source_without_doubling_rollups(tmp_path: Path) -> None:
@@ -670,6 +837,25 @@ def test_unchanged_feature_snapshot_is_reused_until_footer_cache_changes(
     assert snapshot_service._current_feature_snapshot(feature) is None
 
 
+def test_feature_snapshot_preserves_contract_without_sorting_json_keys(
+    tmp_path: Path,
+) -> None:
+    feature = tmp_path / "feature_inventory.json"
+    payload = {
+        "schema_version": 1,
+        "read_only": True,
+        "production_control_possible": False,
+        "rows": [{"dataset_id": "physical:example", "field": "收盤價", "non_null_count": None}],
+    }
+    snapshot_service._atomic_json(
+        feature, payload, compact=True, strict_json=True, sort_keys=False,
+    )
+    assert json.loads(feature.read_bytes()) == payload
+    assert feature.read_text(encoding="utf-8").startswith('{"schema_version":1')
+    snapshot_service._write_feature_reuse_receipt(feature, 1)
+    assert snapshot_service._current_feature_snapshot(feature) == 1
+
+
 def test_matching_inventory_revision_reuses_feature_bytes_without_touching_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,6 +894,47 @@ def test_matching_inventory_revision_reuses_feature_bytes_without_touching_snaps
     assert snapshot_service._current_feature_snapshot(
         feature, feature_revision=revision,
     ) is None
+
+
+def test_feature_reuse_refuses_changed_or_unbound_source_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(snapshot_service, "REPO_ROOT", tmp_path)
+    feature = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    feature.parent.mkdir(parents=True)
+    snapshot_service._atomic_json(feature, {
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "rows": [{"field": "close", "source_title": "原名稱"}],
+    }, compact=True, strict_json=True)
+    revision = "a" * 32
+    old_metadata = "b" * 64
+    new_metadata = "c" * 64
+    snapshot_service._write_feature_reuse_receipt(
+        feature, 1, feature_revision=revision,
+        source_metadata_sha256=old_metadata,
+    )
+    assert snapshot_service._current_feature_snapshot(
+        feature, feature_revision=revision,
+        source_metadata_sha256=old_metadata,
+    ) == 1
+    assert snapshot_service._current_feature_snapshot(
+        feature, feature_revision=revision,
+        source_metadata_sha256=new_metadata,
+    ) is None
+    snapshot_service._write_feature_reuse_receipt(
+        feature, 1, feature_revision=revision,
+    )
+    assert snapshot_service._current_feature_snapshot(
+        feature, feature_revision=revision,
+        source_metadata_sha256=old_metadata,
+    ) is None
+    snapshot_service._feature_reuse_receipt_path(feature).unlink()
+    assert snapshot_service._current_feature_snapshot(
+        feature, feature_revision=revision,
+        source_metadata_sha256=old_metadata,
+    ) is None
+    assert not snapshot_service._feature_reuse_receipt_path(feature).exists()
 
 
 def test_feature_reuse_receipt_rechecks_digest_and_falls_back_to_full_parse(

@@ -27,10 +27,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 
-from downloader.artifact_io import atomic_write_json, atomic_write_parquet
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet
+from downloader.finmind_parent_recovery import repair_content_addressed_collision
 from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, _record_request_start
-from downloader.finmind_account import rate_limiter, verified_account
+from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
+from downloader.finmind_scheduling import fixed_incremental_demand
+from downloader.finmind_volume_units import annotate_stock_share_units
 
 
 SOURCE_CATALOG = "https://github.com/FinMind/FinMind-MCP/blob/master/knowledge/datasets.md"
@@ -174,6 +177,13 @@ def _db(path: Path) -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_finmind_complement_queue "
         "ON tasks(priority, next_attempt_at_utc, state)"
+    )
+    # Sponsor rotates equally ranked whole-market datasets.  The queue can
+    # contain hundreds of thousands of daily partitions; without this index,
+    # each dispatch scans and sorts the entire priority group again.
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_finmind_priority_dataset_partition "
+        "ON tasks(priority, dataset, partition DESC)"
     )
     return connection
 
@@ -368,8 +378,11 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
 
 
 def _next_task(connection: sqlite3.Connection, now: datetime,
-               *, delegated: frozenset[str] = frozenset()) -> Task | None:
+               *, delegated: frozenset[str] = frozenset(),
+               incremental_only: bool = False) -> Task | None:
     excluded = " AND dataset NOT IN (" + ",".join("?" for _ in delegated) + ")" if delegated else ""
+    if incremental_only:
+        excluded += " AND (priority=0 OR kind='derived')"
     row = connection.execute(
         "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
         "WHERE ((state='pending' AND next_attempt_at_utc IS NULL) "
@@ -397,9 +410,15 @@ def _sponsor_delegated(root: Path, now: datetime) -> frozenset[str]:
         stamp = datetime.fromisoformat(status["observed_at_utc"])
     except (OSError, ValueError, KeyError, TypeError):
         return frozenset()
-    if now - stamp > timedelta(minutes=15) or status.get("tier") not in {"Sponsor", "SponsorPro"}:
+    state = status.get("state")
+    # The same token's hourly cooldown also applies to Free. Handing its
+    # dataset to per-ID requests cannot acquire an independent quota bucket.
+    max_age = timedelta(minutes=35 if state in {"rate_limited", "ip_banned"} else 15)
+    if (stamp.tzinfo is None or stamp > now + timedelta(minutes=1) or
+            now - stamp > max_age or status.get("tier") not in {"Sponsor", "SponsorPro"}):
         return frozenset()
-    if status.get("state") not in {"running", "batch_complete", "current_queue", "protected_opening"}:
+    if state not in {"running", "batch_complete", "current_queue", "protected_opening",
+                     "incremental_reserve", "waiting_necessary_acquisition", "rate_limited", "ip_banned"}:
         return frozenset()
     series = status.get("series")
     if not isinstance(series, dict):
@@ -447,15 +466,51 @@ def _request(session: requests.Session, limiter: SharedRateLimiter, root: Path,
 
 def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Path,
                 dataset: str, token: str, params: dict[str, str],
-                *, endpoint: str = API_URL) -> list[dict[str, Any]]:
-    """One authenticated request; shared by Free and Sponsor query plans."""
+                *, endpoint: str = API_URL,
+                max_response_bytes: int | None = None) -> list[dict[str, Any]]:
+    """One authenticated request, optionally bounding the decoded HTTP body.
+
+    The bound controls local buffering, not provider entitlement or query range.
+    ``None`` preserves the ordinary, non-streaming request path.
+    """
+    if max_response_bytes is not None and (
+        isinstance(max_response_bytes, bool)
+        or not isinstance(max_response_bytes, int)
+        or max_response_bytes <= 0
+    ):
+        raise ValueError("max_response_bytes must be a positive integer")
     limiter.wait()
     _record_request_start(root, dataset)
     try:
         response = session.get(endpoint, params=params, headers={"Authorization": f"Bearer {token}"},
-                               timeout=(10, 90))
+                               timeout=(10, 90),
+                               **({"stream": True} if max_response_bytes is not None else {}))
+        try:
+            return _response_rows(response, limiter, max_response_bytes=max_response_bytes)
+        finally:
+            if max_response_bytes is not None:
+                response.close()
     except requests.RequestException as exc:
-        raise SourceError(type(exc).__name__) from exc
+        # Request exceptions can contain URLs or provider text. Keep only their
+        # classification in persisted errors and tracebacks.
+        raise SourceError(type(exc).__name__) from None
+
+
+def _response_json(response: requests.Response, max_response_bytes: int | None) -> Any:
+    if max_response_bytes is None:
+        return response.json()
+    body = bytearray()
+    # iter_content transparently decodes transfer/content encodings. A wire
+    # Content-Length can describe compressed bytes and is not this RAM bound.
+    for chunk in response.iter_content(chunk_size=min(64 * 1024, max_response_bytes + 1)):
+        if len(body) + len(chunk) > max_response_bytes:
+            raise SourceError("response_size_limit", retry_after=0)
+        body.extend(chunk)
+    return json.loads(body)
+
+
+def _response_rows(response: requests.Response, limiter: SharedRateLimiter,
+                   *, max_response_bytes: int | None) -> list[dict[str, Any]]:
     if response.status_code in {402, 429}:
         try:
             retry = max(60, int(float(response.headers.get("Retry-After", "3600"))))
@@ -467,7 +522,7 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
         raise SourceError("invalid_token", retry_after=0)
     if response.status_code == 403:
         try:
-            message = str(response.json().get("msg", "")).lower()
+            message = str(_response_json(response, max_response_bytes).get("msg", "")).lower()
         except (ValueError, AttributeError):
             message = ""
         if "ip banned" in message:
@@ -476,7 +531,7 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
         raise SourceError("not_entitled", retry_after=0)
     if response.status_code == 400:
         try:
-            message = str(response.json().get("msg", "")).lower()
+            message = str(_response_json(response, max_response_bytes).get("msg", "")).lower()
         except (ValueError, AttributeError):
             message = ""
         if "tokenillegal" in message or "invalid token" in message:
@@ -492,9 +547,9 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
     if response.status_code != 200:
         raise SourceError(f"http_{response.status_code}", retry_after=3600)
     try:
-        payload = response.json()
-    except ValueError as exc:
-        raise SourceError("invalid_json") from exc
+        payload = _response_json(response, max_response_bytes)
+    except ValueError:
+        raise SourceError("invalid_json") from None
     if isinstance(payload, dict) and payload.get("status") in {402, 429}:
         limiter.defer(3600)
         raise SourceError("rate_limited", retry_after=3600)
@@ -530,7 +585,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
+           request_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    rows, volume_units = annotate_stock_share_units(task.dataset, rows)
     if task.kind == "year" and len(task.partition) == 4 and any(
         not isinstance(row.get("date"), str) or
         not re.match(rf"^{re.escape(task.partition)}-\d{{2}}-\d{{2}}", row["date"])
@@ -558,9 +615,12 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime) ->
         "coverage_claim": ("derived_from_observed_long_response_not_provider_completeness"
                            if task.kind == "derived" else
                            "observed_response_only_not_provider_completeness"),
+        "volume_units": volume_units,
     }
     if task.kind == "derived":
         receipt["derived_from"] = LONG_INSTITUTIONAL
+    if request_metadata is not None:
+        receipt["request"] = request_metadata
     if rows:
         id_hash = hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else "all"
         folder = root / "parquet" / task.dataset / id_hash / task.partition
@@ -571,8 +631,11 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime) ->
         final = folder / f"{digest}.parquet"
         if final.exists():
             if _sha256(final) != digest:
-                raise SourceError("existing_parquet_corrupt")
-            staged.unlink()
+                installed = repair_content_addressed_collision(staged, final, root)
+                if not installed:
+                    staged.unlink()
+            else:
+                staged.unlink()
         else:
             staged.replace(final)
         receipt.update({"parquet_path": str(final.relative_to(root)),
@@ -580,6 +643,18 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime) ->
     receipt_path = root / "receipts" / task.dataset / (
         hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else "all"
     ) / f"{task.partition}.json"
+    # Refreshing mutable provider values must not erase the old fetch-time /
+    # source-hash proof. Raw Parquet was already content-addressed; preserve
+    # the corresponding exact-byte receipt before advancing its current head.
+    if receipt_path.is_file():
+        previous = receipt_path.read_bytes()
+        previous_digest = hashlib.sha256(previous).hexdigest()
+        archived = root / "receipt_history" / receipt_path.relative_to(root / "receipts").with_suffix('') / f"{previous_digest}.json"
+        if archived.exists():
+            if archived.read_bytes() != previous:
+                raise SourceError("receipt_history_corrupt", retry_after=0)
+        else:
+            atomic_write_bytes(archived, previous, durable=True)
     atomic_write_json(receipt_path, receipt)
     receipt["receipt_path"] = str(receipt_path.relative_to(root))
     return receipt
@@ -810,9 +885,15 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             if market_session and ((local.hour == 8 and local.minute >= 20) or
                                    (local.hour == 9 and local.minute < 10)):
                 return _status(connection, root, state="protected_opening", last=last, delegated=delegated)
-            task = _next_task(connection, now, delegated=delegated)
+            budget = backfill_budget(
+                account, root.parent, fixed_incremental_requests=fixed_incremental_demand(root.parent, now),
+                in_flight=0, now=now,
+            )
+            task = _next_task(connection, now, delegated=delegated, incremental_only=not budget["allowed"])
             if task is None:
-                return _status(connection, root, state="current_queue", last=last, delegated=delegated)
+                return _status(connection, root,
+                               state="current_queue" if budget["allowed"] else "incremental_reserve",
+                               last=last, delegated=delegated)
             if time.monotonic() - last_status_at >= 55:
                 _status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
@@ -849,7 +930,7 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             if time.monotonic() - last_status_at >= 55:
                 _status(connection, root, state="running", last=last, delegated=delegated)
                 last_status_at = time.monotonic()
-    return _status(connection, root, state="batch_complete", last=last, delegated=delegated)
+        return _status(connection, root, state="batch_complete", last=last, delegated=delegated)
 
 
 def _retry_blocked(root: Path) -> int:
@@ -895,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(3600 if result["state"] in {"current_queue", "disk_guard"}
                            else 1800 if result["state"] == "ip_banned"
                            else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
-                           else 5)
+                           else 60 if result["state"] == "incremental_reserve" else 5)
         except KeyboardInterrupt:
             return 130
         finally:

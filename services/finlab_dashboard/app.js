@@ -269,11 +269,11 @@ function renderRows() {
   const fragment = document.createDocumentFragment();
   for (const row of matches.slice(0, state.visible)) {
     const tr = document.createElement("tr");
-    const rowState = row.active ? "正在抓取" : row.state === "downloaded" && !row.latest_check_within_24h ? "待追新" : stateLabels[row.state] || row.state || "待核實";
+    const rowState = row.active ? "正在抓取" : row.state === "downloaded" && !row.latest_check_within_24h ? "待核實發布" : stateLabels[row.state] || row.state || "待核實";
     const low = n(row.estimated_fetch_seconds_low), high = n(row.estimated_fetch_seconds_high);
     const blocked = ["vip_only", "provider_empty", "deferred_resource", "deferred_windowed"].includes(row.state);
     const estimate = blocked ? "無可完成估時" : low === null ? "樣本不足" : low === high ? `約 ${durationLabel(low)}` : `${durationLabel(low)}–${durationLabel(high)}`;
-    const finish = row.state === "downloaded" && row.latest_check_within_24h ? "已查最新" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
+    const finish = row.state === "downloaded" ? row.latest_check_within_24h ? "已查最新" : "發布未核實；無下載 ETA" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
     const deferredReasons = {
       oversized_metadata: "來源標籤寬表超過記憶體預算；待有界擷取",
       oversized_table: "券商整表超過記憶體／額度預算；待分區介面",
@@ -289,7 +289,7 @@ function renderRows() {
       quota_wait: "帳號額度不足；重置後再試",
       pending: "尚未嘗試；依配額排隊",
     };
-    let reason = row.state === "downloaded" ? row.latest_check_within_24h ? "來源已於 24 小時內查詢；歷史 PIT 未驗證" : "已下載，來源查詢超過 24 小時；需追新"
+    let reason = row.state === "downloaded" ? row.latest_check_within_24h ? "來源已於 24 小時內查詢；歷史 PIT 未驗證" : "已下載，來源查詢超過 24 小時；不代表來源已發布新資料，等待版本核實"
       : deferredReasons[row.deferred_reason] || failureReasons[row.state] || "待核實";
     if (row.state === "partial_windowed") reason = `已保存 ${count(row.partition_receipts)}/${count(row.partition_total)} 個所列期間工作日分區；確認未上架 ${count(row.partition_not_ready)}、其他失敗 ${count(row.partition_other_failed)}；更早歷史未證實`;
     if (row.state === "provider_empty" && n(row.provider_rows) !== null) reason += `；來源 ${count(row.provider_rows)} 列／${count(row.provider_fields)} 欄`;

@@ -1229,7 +1229,7 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=10' in page
+        assert b'app.js?v=12' in page
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
     finally:
@@ -1258,8 +1258,12 @@ def test_public_gateway_serves_finmind_page_and_assets() -> None:
 def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_server) -> None:
     playwright = pytest.importorskip("playwright.sync_api")
     from playwright.sync_api import Error as PlaywrightError
+    from scripts.probe_browser_runtime import browser_profile_launch_options
 
     now = "2026-09-25T08:00:00+00:00"
+    # This independent rolling quota chart must stay within its 1-day window
+    # and 12-minute continuity bound; dataset/session date identities stay fixed.
+    quota_now = datetime.now(UTC)
     datasets = [
         {"id": key, "label": label, "kind": kind, "state": state,
          "target_partitions": target, "complete_partitions": complete,
@@ -1291,8 +1295,10 @@ def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_ser
         "quota": {"state": "complete_worker_window", "official_requests_per_hour": 300,
                   "observed_requests_60m": 12, "worker_headroom_60m": 288,
                   "tracking_started_at_utc": "2026-09-25T06:00:00+00:00",
-                  "history": [{"at_utc": "2026-09-25T07:00:00+00:00", "observed_requests_60m": 2},
-                              {"at_utc": "2026-09-25T08:00:00+00:00", "observed_requests_60m": 12}]},
+                  "history": [{"at_utc": (quota_now - timedelta(minutes=2)).isoformat(),
+                               "observed_requests_60m": 2},
+                              {"at_utc": (quota_now - timedelta(minutes=1)).isoformat(),
+                               "observed_requests_60m": 12}]},
         "storage": {"local_bytes": 19400, "filesystem_free_bytes": 1000000000,
                     "estimated_total_bytes": None},
         "datasets": datasets,
@@ -1300,7 +1306,9 @@ def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_ser
     }
     try:
         with playwright.sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Explicit 2D runtime workaround for this SVG page: WSL's default
+            # software-GL path can stall native rAF. This is not WebGL coverage.
+            browser = p.chromium.launch(**browser_profile_launch_options("cpu-2d"))
             try:
                 for width in (1280, 390):
                     page = browser.new_page(viewport={"width": width, "height": 800})
@@ -1311,6 +1319,10 @@ def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_ser
                     assert page.locator("#pipeline-grid .pipeline-card").count() == 4
                     assert "11 / 202" in page.locator("#download-progress-label").text_content()
                     assert page.locator("#dataset-rows tr").count() == 4
+                    quota_series = page.locator("#quota-chart polyline.series")
+                    assert quota_series.count() == 1
+                    assert quota_series.get_attribute("points") == "58.00,218.69 926.00,212.16"
+                    assert page.locator("#quota-chart-empty").is_hidden()
                     page.get_by_role("button", name="盤中歷史").click()
                     assert page.locator("#pipeline-grid .pipeline-card").count() == 2
                     page.get_by_role("button", name="主檔／日曆").click()
@@ -1322,7 +1334,9 @@ def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_ser
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        pytest.skip(f"browser unavailable: {exc}")
+        if "Executable doesn't exist" in str(exc):
+            pytest.skip("Playwright Chromium is not installed")
+        raise
 
 
 def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) -> None:
@@ -1369,7 +1383,9 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 assert page.locator("#volume-downloaded").text_content() == "60 MiB"
                 assert page.locator("#volume-total").text_content() == "約 120 MiB"
                 assert page.locator("#volume-downloaded").is_visible()
-                page.locator("#volume-progress-label").scroll_into_view_if_needed()
+                # Read-only assertions must not depend on Chromium animation frames:
+                # headless WSL may suppress rAF, making scroll_into_view hang.
+                assert page.locator("#volume-progress-label").is_visible()
                 assert page.locator("#volume-progress-label").text_content() == "50.0% · 低信心情境"
                 assert page.locator("#volume-progress").get_attribute("value") == "0.5"
                 page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
@@ -1493,6 +1509,149 @@ def test_data_monitor_summary_omits_heavy_detail_rows(tmp_path: Path) -> None:
         server.server_close()
 
 
+def test_data_monitor_provider_page_and_filtered_api(tmp_path: Path) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        handler = SimpleNamespace(server=server)
+        page = PublicDashboardHandler._static_response(
+            handler, "/data-monitor/providers/MOPS%20%2F%20%E5%85%AC%E9%96%8B/"
+        )
+        assert page is not None and b'provider.js' in page.body
+        assert PublicDashboardHandler._static_response(
+            handler, "/data-monitor/providers/../"
+        ) is None
+        script = PublicDashboardHandler._static_response(handler, "/data-monitor/provider.js")
+        assert script is not None and b"provider-name" in script.body
+        payload = server.cached_local_json(
+            cache_key="provider-fixture", ttl_seconds=60, cache_control="no-store",
+            builder=lambda: {
+                "read_only": True, "production_control_possible": False,
+                "sources": [
+                    {"id": "a", "provider": "FinMind", "operation_state": "complete",
+                     "in_active_scope": True},
+                    {"id": "b", "provider": "TWSE", "operation_state": "unable",
+                     "in_active_scope": True},
+                ],
+            },
+        )
+        server.data_monitor_status = lambda **_kwargs: payload  # type: ignore[method-assign]
+        selected = json.loads(server.data_monitor_provider("FinMind").body)
+        assert selected["provider"] == "FinMind"
+        assert [row["id"] for row in selected["sources"]] == ["a"]
+        assert selected["read_only"] is True
+        assert PublicDashboardHandler._provider_query("name=FinMind") == {
+            "provider": "FinMind", "offset": 0, "limit": 30,
+            "search": "", "operation": "all", "market": "all",
+        }
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._provider_query("name=FinMind&name=TWSE")
+        with pytest.raises(PublicRouteNotFound):
+            server.data_monitor_provider("Missing")
+    finally:
+        server.server_close()
+
+
+def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Error as PlaywrightError
+
+    rows = [
+        {"id": "finlab:price:收盤價", "endpoint_id": "finlab:price:收盤價", "title": "收盤價",
+         "provider": "FinLab", "market_category": "taiwan_public",
+         "market_category_label": "臺灣公開資料", "operation_state": "reference",
+         "registry_alias": True, "record_stats": {"state": "verified", "count": 100,
+         "first": "2014-01-02", "last": "2026-09-25"},
+         "acquisition_progress": {"state": "reference", "label": "請見目錄收據"}},
+        {"id": "finlab:price:開盤價", "endpoint_id": "finlab:price:開盤價", "title": "開盤價",
+         "provider": "FinLab", "market_category": "taiwan_public",
+         "market_category_label": "臺灣公開資料", "operation_state": "reference",
+         "registry_alias": True, "record_stats": {"state": "unverified", "count": None}},
+    ]
+
+    def provider_route(route):
+        from urllib.parse import parse_qs, urlparse
+        query = parse_qs(urlparse(route.request.url).query)
+        searched = [row for row in rows if query.get("q", [""])[0] in row["title"]]
+        offset = int(query.get("offset", ["0"])[0])
+        limit = int(query.get("limit", ["30"])[0])
+        result = {
+            "read_only": True, "generated_at_utc": "2026-09-26T01:00:00Z", "provider": "FinLab",
+            "summary": {"registered": 2, "active_endpoints": 0, "registry_aliases": 2,
+                        "operation_state_counts": {"reference": 2},
+                        "active_operation_state_counts": {},
+                        "inventory_state_counts": {"verified": 1, "unverified": 1},
+                        "market_categories": {"臺灣公開資料": 2},
+                        "market_category_options": {"taiwan_public": "臺灣公開資料"},
+                        "active_current_ratio": None},
+            "finlab_acquisition": {"downloaded": 1, "catalog_total": 2, "not_downloaded": 1},
+            "page": {"offset": offset, "limit": limit, "matched_total": len(searched),
+                     "has_more": offset + limit < len(searched)},
+            "sources": searched[offset:offset + limit],
+        }
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(result))
+
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                for width in (1280, 390):
+                    page = browser.new_page(viewport={"width": width, "height": 800})
+                    page.route("**/data-monitor/api/provider?*", provider_route)
+                    page.route("**/finlab/api/status", lambda route: route.fulfill(
+                        status=200, content_type="application/json",
+                        body=json.dumps({"quota": {"used_mb": 10, "limit_mb": 5000,
+                                                   "observed_at_utc": "2026-09-26T01:00:00Z"}})))
+                    page.goto(f"http://127.0.0.1:{protocol_server.port}/data-monitor/providers/FinLab/",
+                              wait_until="domcontentloaded")
+                    page.locator("#provider-name").get_by_text("FinLab").wait_for(timeout=8000)
+                    assert page.locator("#provider-ratio").text_content() == "不適用"
+                    assert page.locator("#provider-source-rows tr").count() == 2
+                    page.locator("#provider-source-search").fill("收盤")
+                    page.get_by_text("1/1 項符合結果").wait_for(timeout=8000)
+                    assert page.locator("#provider-source-rows tr").count() == 1
+                    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                    if width == 390:
+                        assert page.locator("#provider-source-rows td").first.evaluate(
+                            "element => getComputedStyle(element).display"
+                        ) == "flex"
+                    page.close()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc):
+            pytest.skip("Playwright Chromium is not installed")
+        raise
+
+
+@pytest.mark.parametrize("browser_test_name", [
+    "test_finmind_browser_renders_and_filters_without_provider_calls",
+    "test_finlab_browser_recovers_from_temporary_status_failure",
+    "test_provider_browser_deep_link_search_and_mobile_layout",
+])
+def test_browser_interaction_errors_are_not_environment_skips(
+    browser_test_name, monkeypatch,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    playwright = pytest.importorskip("playwright.sync_api")
+
+    def broken_navigation(*_args, **_kwargs):
+        raise playwright.Error("synthetic page navigation failure after browser launch")
+
+    page = SimpleNamespace(route=lambda *_args: None, goto=broken_navigation)
+    browser = SimpleNamespace(new_page=lambda **_kwargs: page, close=lambda: None)
+
+    @contextmanager
+    def fake_playwright():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch=lambda **_kwargs: browser))
+
+    monkeypatch.setattr(playwright, "sync_playwright", fake_playwright)
+    with pytest.raises(playwright.Error, match="synthetic page navigation failure"):
+        globals()[browser_test_name](SimpleNamespace(port=1))
+
+
 def test_data_monitor_summary_uses_exact_producer_projection_and_rejects_stale_source(
     tmp_path: Path,
 ) -> None:
@@ -1575,6 +1734,181 @@ def test_data_monitor_features_reads_separate_read_only_snapshot(tmp_path: Path)
         }), encoding="utf-8")
         payload = json.loads(server.data_monitor_features().body)
         assert payload["rows"] == [{"dataset_id": "tw-public:twse_daily_ohlcv", "field": "close"}]
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_feature_page_filters_and_rebuilds_on_source_change(
+    tmp_path: Path,
+) -> None:
+    from scripts.serve_public_dashboards import PublicDashboardHandler, InvalidPublicRequest
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    try:
+        missing = json.loads(server.data_monitor_feature_page().body)
+        assert missing["summary"]["state"] == "waiting_inventory"
+        rows = [
+            {"field": name, "dataset_id": "tw:stock", "source_title": "台股",
+             "provider": "TWSE", "market_category": "taiwan_equity",
+             "market_category_label": "台股"}
+            for name in ("close", "volume", "open")
+        ]
+        payload = {
+            "schema_version": 1, "read_only": True,
+            "production_control_possible": False,
+            "summary": {"fields": 3, "state": "complete"}, "rows": rows,
+        }
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        first = json.loads(server.data_monitor_feature_page(limit=1).body)
+        assert first["matching_total"] == 3
+        assert len(first["rows"]) == 1
+        second = json.loads(server.data_monitor_feature_page(
+            offset=1, limit=2, revision=first["revision"],
+        ).body)
+        assert first["rows"] + second["rows"] == rows
+        searched = json.loads(server.data_monitor_feature_page(search="TWSE", limit=2).body)
+        assert searched["matching_total"] == 3
+        assert len(searched["rows"]) == 2
+        assert len(first["filters"]["sources"]) == 1
+        payload["rows"] = rows[:2]
+        payload["summary"]["fields"] = 2
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        updated = json.loads(server.data_monitor_feature_page(
+            offset=1, limit=2, revision=first["revision"],
+        ).body)
+        assert updated["reset_required"] is True
+        assert updated["offset"] == 0
+        assert updated["matching_total"] == 2
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._feature_page_query("offset=2&limit=2")
+        assert PublicDashboardHandler._feature_page_query(
+            f"offset=1&revision={updated['revision']}"
+        )["offset"] == 1
+    finally:
+        server.server_close()
+
+
+def test_feature_first_page_uses_verified_preview_without_full_parse(
+    tmp_path: Path,
+) -> None:
+    from scripts import snapshot_data_refresh_services as snapshot_service
+    from stockagent.live.data_monitor_feature_pages import feature_page_preview
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    payload = {
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "summary": {"fields": 2, "state": "complete"},
+        "rows": [
+            {"field": field, "dataset_id": "tw:stock", "source_title": "台股",
+             "provider": "TWSE", "market_category": "taiwan_equity",
+             "market_category_label": "台股"}
+            for field in ("close", "volume")
+        ],
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot_service._write_feature_reuse_receipt(
+        snapshot, 2, validated_contract=True, preview=feature_page_preview(payload),
+    )
+    def forbid_full_parse() -> None:
+        raise AssertionError("first page must not parse full source")
+
+    server._feature_index = forbid_full_parse
+    try:
+        first = json.loads(server.data_monitor_feature_page(limit=1).body)
+        assert first["matching_total"] == 2
+        assert first["rows"] == payload["rows"][:1]
+        assert first["has_more"] is True
+        assert server._feature_page_index is None
+        stale = json.loads(server.data_monitor_feature_page(
+            limit=1, revision="0" * 32,
+        ).body)
+        assert stale["reset_required"] is True
+        with pytest.raises(AssertionError, match="first page must not parse full source"):
+            server.data_monitor_feature_page(limit=1, search="close")
+    finally:
+        server.server_close()
+
+
+def test_feature_small_source_page_uses_bound_projection_or_full_fallback(
+    tmp_path: Path,
+) -> None:
+    from scripts import snapshot_data_refresh_services as snapshot_service
+    from stockagent.live.data_monitor_feature_pages import feature_page_projections
+    from stockagent.live.data_monitor_feature_receipt import feature_source_pages_path
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    rows = [
+        {"field": field, "dataset_id": source, "source_title": source,
+         "provider": "TWSE", "market_category": category,
+         "market_category_label": category}
+        for source, category, field in (
+            ("tw:stock", "taiwan_equity", "close"),
+            ("tw:stock", "taiwan_equity", "volume"),
+            ("crypto:minute", "crypto", "close"),
+        )
+    ]
+    payload = {
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "summary": {"fields": 3, "state": "complete"}, "rows": rows,
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    preview, pages = feature_page_projections(payload)
+    snapshot_service._write_feature_reuse_receipt(
+        snapshot, 3, validated_contract=True, preview=preview, source_pages=pages,
+    )
+    original_full_index = server._feature_index
+
+    def forbid_full_parse() -> None:
+        raise AssertionError("small source must not parse the full snapshot")
+
+    server._feature_index = forbid_full_parse
+    try:
+        page = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1, search="close",
+        ).body)
+        assert page["matching_total"] == 1
+        assert page["rows"] == rows[:1]
+        assert page["summary"]["fields"] == 3
+        assert page["read_only"] is True
+        assert page["production_control_possible"] is False
+        stale = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1, offset=1, revision="0" * 32,
+        ).body)
+        assert stale["reset_required"] is True
+        assert stale["offset"] == 0
+        assert stale["rows"] == rows[:1]
+
+        sidecar = feature_source_pages_path(snapshot)
+        sidecar.write_bytes(sidecar.read_bytes().replace(b'"close"', b'"cloze"'))
+        server._feature_source_pages = None
+        with pytest.raises(AssertionError, match="must not parse"):
+            server.data_monitor_feature_page(source="tw:stock", limit=1)
+        server._feature_index = original_full_index
+        fallback = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1,
+        ).body)
+        assert fallback["rows"] == rows[:1]
+
+        payload["rows"] = rows[:1]
+        payload["summary"]["fields"] = 1
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        changed = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=5, revision=page["revision"],
+        ).body)
+        assert changed["reset_required"] is True
+        assert changed["matching_total"] == 1
+        assert changed["rows"] == rows[:1]
     finally:
         server.server_close()
 

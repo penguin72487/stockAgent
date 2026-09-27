@@ -9,6 +9,24 @@
     return mode?.label || (typeof value === "object" && value?.label) || "策略名稱未提供";
   }
 
+  function modeOperationallyReady(mode, issues = []) {
+    const engine = String(mode.engine_status || "");
+    return mode.checkpoint_ready === true
+      && mode.total_equity_twd != null && Number.isFinite(Number(mode.total_equity_twd))
+      && Boolean(engine) && !/^(critical|blocked)/.test(engine)
+      && !["historical_session_missed", "historical_signal_blocked", "historical_session_closed_with_residual"].includes(engine)
+      && !["missed", "blocked"].includes(mode.today_execution_status)
+      && !["no_fill", "partial", "blocked"].includes(mode.today_execution_outcome)
+      && !issues.some((issue) => issue.market === mode.market && ["error", "warning"].includes(issue.severity));
+  }
+
+  function accountAdjustments(mode) {
+    const account = mode.account_performance || {};
+    const carryCost = Number(account.cumulative_carry_cost_twd ?? 0);
+    const corporateNet = Number(account.cumulative_corporate_action_net_twd ?? 0);
+    return {carryCost, corporateNet, net: corporateNet - carryCost};
+  }
+
   function futuresPresentation(membership = {}) {
     const states = {
       listed: {label: "有期貨", kind: "good"},
@@ -94,11 +112,12 @@ const SIGNAL_REASON_LABELS = {
   decision_sizing_price_missing: "決策時計價不可用",
   signal_before_13_20_decision_gate: "訊號早於 13:20 決策閘門",
   outside_13_20_close_order_window: "未在 13:20 至 13:30 間完成模擬委託",
+  waiting_valid_terminal_close_source: "等待有效收盤價後依不限容量假設平倉",
   counterfactual_official_open_price_fill_at_09_01: "09:01 開盤價重建",
   counterfactual_observed_09_01_minute_vwap_fill: "09:01 首分鐘價重建",
   counterfactual_observed_09_01_minute_price_fill: "09:01 首分鐘價重建",
 };
 const signalReasonLabel = (value) => SIGNAL_REASON_LABELS[String(value || "")] || String(value || "").replaceAll("_", " ") || "未提供原因";
 
-  global.StockAgentTwPresentation = Object.freeze({strategyLabel, futuresPresentation, entryPolicy, signalReasonLabel});
+  global.StockAgentTwPresentation = Object.freeze({strategyLabel, modeOperationallyReady, accountAdjustments, futuresPresentation, entryPolicy, signalReasonLabel});
 })(globalThis);

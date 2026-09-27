@@ -36,6 +36,7 @@ from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     SymbolResult,
     TrafficBudgetReached,
     UniverseRow,
+    VOLUME_NOTIONAL_TOLERANCE,
     _atomic_write_json,
     _check_traffic_budget,
     _load_universe,
@@ -47,6 +48,7 @@ from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     iter_date_chunks,
     normalize_kbars,
 )
+from downloader.stock_volume_units import with_stock_share_volume
 
 
 STORAGE_FREQUENCY = "minute"
@@ -573,7 +575,8 @@ def query_source_gap_dates(
 
 
 def ticks_to_minute_kbars(ticks: Any, *, symbol: str, market: str,
-                         session_date: str, contract_unit: float) -> pl.DataFrame:
+                         session_date: str, contract_unit: float,
+                         audit: dict[str, int] | None = None) -> pl.DataFrame:
     """Regular-session observed trades only; 13:30 auction belongs to 13:30."""
     frame = pl.DataFrame({"ts": ticks.ts, "price": ticks.close, "volume": ticks.volume}).with_columns(
         pl.col("ts").cast(pl.Datetime("ns")), pl.col("price").cast(pl.Float64),
@@ -583,6 +586,14 @@ def ticks_to_minute_kbars(ticks: Any, *, symbol: str, market: str,
     if frame["ts"].null_count():
         raise ValueError("historical tick has no timestamp")
     frame = frame.filter(pl.col("ts").is_between(start, end)).sort("ts", maintain_order=True)
+    # Shioaji can return a fully zero Tick as a no-trade placeholder when the
+    # K-bar is absent. Keep its immutable raw response, but do not turn it into
+    # a trade or let it fail the whole symbol's other valid history.
+    zero_placeholder = (pl.col("price") == 0) & (pl.col("volume") == 0)
+    dropped = frame.select(zero_placeholder.sum()).item() or 0
+    frame = frame.filter(~zero_placeholder.fill_null(False))
+    if audit is not None:
+        audit["zero_placeholder_rows_dropped"] = int(dropped)
     if frame.filter(pl.any_horizontal(pl.all().is_null())
                     | ~pl.col("price").is_finite() | ~pl.col("volume").is_finite()
                     | (pl.col("price") <= 0) | (pl.col("volume") <= 0)).height:
@@ -628,6 +639,7 @@ def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
                               max_traffic_fraction: float) -> tuple[pl.DataFrame, dict[str, Any]]:
     """Fallback only after an explicit missing-KBar response, retaining raw trades."""
     frames, sources = [], []
+    zero_placeholders_dropped = 0
     for day in days:
         if _taiwan_market_hours_now():
             raise MarketHoursReached("tick recovery reached protected live window")
@@ -648,8 +660,11 @@ def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
             raw, output_root, symbol=row.symbol, day=day,
         )
         sources.append({**source, "session_date": str(day), "symbol": row.symbol})
+        tick_audit: dict[str, int] = {}
         bars = ticks_to_minute_kbars(ticks, symbol=row.symbol, market=row.market,
-                                    session_date=str(day), contract_unit=contract_unit)
+                                    session_date=str(day), contract_unit=contract_unit,
+                                    audit=tick_audit)
+        zero_placeholders_dropped += tick_audit.get("zero_placeholder_rows_dropped", 0)
         if bars.height:
             # The official day total includes additional trading mechanisms;
             # regular-session tick volume cannot exceed that independent bound.
@@ -662,7 +677,8 @@ def query_tick_minute_fallback(api: Any, contract: Any, row: UniverseRow, *,
         type("EmptyTicks", (), {"ts": [], "close": [], "volume": []})(),
         symbol=row.symbol, market=row.market, session_date=str(days[0]), contract_unit=contract_unit)
     returned = set(frame["date"].to_list()) if frame.height else set()
-    return frame, {"zero_placeholder_rows_dropped": 0, "negative_correction_rows_dropped": 0,
+    return frame, {"zero_placeholder_rows_dropped": zero_placeholders_dropped,
+                   "negative_correction_rows_dropped": 0,
                    "out_of_session_rows_dropped": 0, "outside_reference_date_rows_dropped": 0,
                    "single_day_fallback_queries": 0, "tick_fallback_queries": len(days),
                    "underlying_data_method": "observed_ticks_aggregated_to_right_labelled_1m",
@@ -934,6 +950,13 @@ def merge_retried_source_gap_chunk(
 ) -> pl.DataFrame:
     """Add newly verified bars without losing or silently revising archived bars."""
 
+    # Unit columns are derived from the provider values. Old sealed chunks
+    # predate these columns; refresh both interpretations only in memory so
+    # they can share a schema without changing archived source bytes.
+    if not retained.is_empty():
+        retained = with_stock_share_volume(retained, tolerance=VOLUME_NOTIONAL_TOLERANCE)
+    if not refreshed.is_empty():
+        refreshed = with_stock_share_volume(refreshed, tolerance=VOLUME_NOTIONAL_TOLERANCE)
     if retained.is_empty():
         return refreshed
     if refreshed.is_empty():

@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -45,6 +46,7 @@ PACKED_HEAD_SCHEMA_VERSION = 1
 DEFAULT_LOOSE_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024
 DEFAULT_PACK_BUCKETS = 64
 DEFAULT_COMPRESSION_LEVEL = 6
+MAX_IN_MEMORY_PACK_VERIFY_BYTES = 64 * 1024 * 1024
 PACKED_ARCHIVE_FORMAT = "stockagent-path-bucket-zip-v1"
 INVENTORY_FORMAT = "jsonl-gzip-v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -832,6 +834,8 @@ def publish_packed_snapshot(
     maximum_file_bytes: int | None = None,
     repo_root: Path | None = None,
     recover_missing_base_objects: bool = False,
+    source_guard: Callable[[], None] | None = None,
+    defer_scan: bool = False,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
@@ -861,12 +865,16 @@ def publish_packed_snapshot(
     # Publication and rolling-retention deletion must never race. Serializing
     # local publishes is cheap compared with hashing/packing and makes the
     # atomic head/object boundary explicit.
-    with _exclusive_lock(retention_lock), _exclusive_lock(lock_path):
+    with contextlib.ExitStack() as publication_locks:
+        publication_locks.enter_context(_exclusive_lock(retention_lock))
+        publication_locks.enter_context(_exclusive_lock(lock_path))
         entries, before = _collect_entries(
             source,
             excluded_subtrees=excluded,
             maximum_file_bytes=maximum_file_bytes,
         )
+        if source_guard is not None:
+            source_guard()
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
         previous: ResolvedSnapshot | None = None
@@ -1027,6 +1035,11 @@ def publish_packed_snapshot(
                 "source tree changed while it was being packed; publish from a frozen "
                 "snapshot or under the downloader's dataset lock"
             )
+        # An optional producer proof binds these fully hashed source bytes to
+        # the inputs used to build their derived tables. It supplements, never
+        # replaces, the complete inventory and source-stability checks above.
+        if source_guard is not None:
+            source_guard()
 
         # The immutable inventory is the semantic dataset identity.  Reusing
         # the previous release when it is identical prevents a no-op publish
@@ -1039,9 +1052,10 @@ def publish_packed_snapshot(
         ):
             if recover_missing_base_objects:
                 verify_packed_snapshot(sync_root, previous)
-            from stockagent.data_sync.syncthing_scan import scan_after_publish
-
-            scan_after_publish(sync_root, dataset, retry_full=True)
+            # Transport does not read mutable source bytes. A no-op must not
+            # retain global publication locks through external scan requests.
+            publication_locks.close()
+            _notify_packed_publication(sync_root, dataset, defer_scan=defer_scan, retry_full=True)
             return previous
 
         wall_time_ns = time.time_ns()
@@ -1184,6 +1198,8 @@ def publish_packed_snapshot(
         head_path = sync_root / "heads" / dataset / f"{publisher_node}.json"
         _ensure_shared_packed_directory(sync_root, head_path.parent)
         archived_head = _archive_d_primary_head(sync_root, head_path)
+        if source_guard is not None:
+            source_guard()
         atomic_write_json(head_path, head)
         published = ResolvedSnapshot(
             manifest=manifest,
@@ -1197,10 +1213,27 @@ def publish_packed_snapshot(
         ) + (() if inventory_already_present else (inventory_relpath.as_posix(),))
         if archived_head is not None:
             scan_paths += (archived_head,)
-    from stockagent.data_sync.syncthing_scan import scan_after_publish
-
-    scan_after_publish(sync_root, dataset, new_object_paths=scan_paths)
+    _notify_packed_publication(sync_root, dataset, new_object_paths=scan_paths, defer_scan=defer_scan)
     return published
+
+
+def _notify_packed_publication(
+    sync_root: Path, dataset: str, *, new_object_paths: tuple[str, ...] = (),
+    defer_scan: bool = False, retry_full: bool = False,
+) -> None:
+    from stockagent.data_sync.syncthing_scan import queue_after_publish, scan_after_publish
+
+    if defer_scan:
+        # The caller can release its source lease only after this durable
+        # notification and the unique commit receipt have both succeeded.
+        if not queue_after_publish(sync_root, dataset, new_object_paths=new_object_paths):
+            raise SnapshotError("publication committed but durable scan intent was not queued")
+    else:
+        acknowledged = scan_after_publish(
+            sync_root, dataset, new_object_paths=new_object_paths, retry_full=retry_full,
+        )
+        if not acknowledged and (sync_root / ".local-state/scan-pending" / f"{dataset}.json").exists():
+            raise SnapshotError("publication committed but a newer scan notification remains pending")
 
 
 def _load_inventory(
@@ -1314,7 +1347,19 @@ def verify_packed_snapshot(
     verified_bytes = 0
     for item in manifest["archive"]["objects"]:
         path = _path_under(sync_root, str(item["relpath"]), "object relpath")
-        actual = sha256_file(path)
+        # Packs are already size-checked above.  For a bounded pack, use the
+        # same immutable bytes for SHA-256 and ZIP CRC instead of reading the
+        # cold volume twice.  Large packs and blobs keep the streaming path.
+        pack_bytes = (
+            path.read_bytes()
+            if item["kind"] == "pack"
+            and int(item["bytes"]) <= MAX_IN_MEMORY_PACK_VERIFY_BYTES
+            else None
+        )
+        actual = (
+            hashlib.sha256(pack_bytes).hexdigest()
+            if pack_bytes is not None else sha256_file(path)
+        )
         if actual != item["sha256"]:
             raise SnapshotError(
                 f"packed object checksum mismatch: expected {item['sha256']}, got {actual}"
@@ -1323,7 +1368,8 @@ def verify_packed_snapshot(
         if item["kind"] == "pack":
             expected_names = inventory_result["object_members"][str(item["sha256"])]
             try:
-                with zipfile.ZipFile(path, mode="r") as archive:
+                source = io.BytesIO(pack_bytes) if pack_bytes is not None else path
+                with zipfile.ZipFile(source, mode="r") as archive:
                     names = archive.namelist()
                     bad_member = archive.testzip()
             except (OSError, zipfile.BadZipFile) as exc:

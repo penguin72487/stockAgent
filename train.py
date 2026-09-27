@@ -1402,6 +1402,18 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    if (config.trading.execution_mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
+        from stockagent.data.tw_all_futures_intraday import validate_all_futures_intraday_data
+        try:
+            validate_all_futures_intraday_data(
+                config.trading.tw_futures_portfolio_data_path,
+                config.trading.tw_futures_portfolio_minute_data_path,
+                participation=config.trading.max_volume_participation,
+                start_date=config.data.panel_start_date,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"[futures-minute preflight] {exc}") from exc
     configured_output_dir = getattr(config.runner, "output_dir", None)
     _ACTIVE_OUTPUT_DIR = (
         None
@@ -1465,6 +1477,17 @@ def main() -> None:
             raise SystemExit(str(exc)) from exc
     if not args.check_data_only:
         _maybe_relaunch_for_ddp(config, args)
+    # Opt-in in-process diagnostics work in containers without ptrace/perf.
+    # Trace only the canonical worker, never the waiting torchrun supervisor.
+    trace_interval = os.environ.get("STOCKAGENT_TRAINING_STACK_INTERVAL_SECONDS")
+    if trace_interval:
+        import faulthandler
+
+        interval = float(trace_interval)
+        if not np.isfinite(interval) or interval < 1.0:
+            raise ValueError("training stack interval must be finite and >= 1 second")
+        faulthandler.dump_traceback_later(interval, repeat=True)
+        atexit.register(faulthandler.cancel_dump_traceback_later)
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = "none" if args.check_data_only else (cli_strategy or config_strategy)
@@ -1761,6 +1784,12 @@ def main() -> None:
                 config.trading.max_volume_participation
             ),
         )
+        if config.trading.tw_futures_portfolio_holding_policy == "intraday":
+            from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
+            panel = attach_all_futures_intraday(
+                panel, config.trading.tw_futures_portfolio_minute_data_path,
+                participation=config.trading.max_volume_participation,
+            )
         if (
             _distributed_rank() == 0
             and config.data.tw_futures_expiry_settlement_valuation
@@ -1911,6 +1940,10 @@ def main() -> None:
                         config.data.day_trade_minute_execution_daily_proxy_price_policy
                     ),
                     corporate_action_mode=config.trading.tw_corporate_action_mode,
+                    subscription_right_policy=(
+                        config.trading.tw_day_trade_subscription_right_policy
+                    ),
+                    entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
                     terminal_liquidation_unlimited_capacity=(
                         config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
                     ),

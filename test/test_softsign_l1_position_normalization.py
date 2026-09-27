@@ -9,6 +9,7 @@ from stockagent.models.normalization import (
     dual_branch_softmax,
     masked_activation_l1_weights,
     masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
     masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -186,6 +187,36 @@ def test_cash_entmax_zero_evidence_is_cash_and_candidate_count_is_invariant() ->
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_score_entmax_log_cash_preserves_cash_mask_and_fp32_whole_lot_boundary() -> None:
+    scores = torch.tensor(
+        [[0.0, 0.0, 0.0], [8.0, -2.0, 100.0]],
+        dtype=torch.bfloat16,
+    )
+    mask = torch.tensor([[True, True, True], [True, True, False]])
+    weights, parts = masked_score_entmax_log_cash_weights(
+        scores, mask, short_mask=mask, return_parts=True
+    )
+    assert normalize_portfolio_output_mode("score_entmax_log_cash") == "score_entmax_log_cash"
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights[0], torch.zeros(3))
+    assert weights[1, 0] > 0
+    assert weights[1, 1] < 0
+    assert weights[1, 2] == 0
+    assert bool((weights.abs().sum(dim=1) <= 1.0).all())
+    torch.testing.assert_close(parts["implicit_cash_weight"][0], torch.tensor(1.0))
+    torch.testing.assert_close(
+        parts["implicit_cash_weight"] + weights.abs().sum(dim=1),
+        torch.ones(2),
+    )
+
+    zero = torch.zeros(1, 4, requires_grad=True)
+    masked_score_entmax_log_cash_weights(zero, torch.ones_like(zero, dtype=torch.bool))[
+        0, 0
+    ].backward()
+    assert zero.grad is not None and torch.isfinite(zero.grad).all()
+    assert zero.grad[0, 0] > 0
 
 
 def test_learned_cash_is_free_gross_and_candidate_count_invariant() -> None:

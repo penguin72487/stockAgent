@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,11 +17,6 @@ from urllib.request import Request, urlopen
 
 import polars as pl
 import pyarrow.parquet as pq
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -40,6 +37,11 @@ from common import (  # noqa: E402
 )
 from artifact_io import archive_run_reports  # noqa: E402
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 from okx_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
     feature_run_summary_path,
@@ -62,6 +64,14 @@ OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Vo
 KLINE_BAR = "1m"
 CANDLE_INTERVAL_MS = 60 * 1000
 OKX_HISTORY_LIMIT = "300"
+VOLUME_UNIT_CONTRACT = {
+    "Trading_Volume": "quote_currency",
+    "okx_volume_contract": "contracts",
+    "okx_volume_base": "base_currency",
+    "okx_volume_quote": "quote_currency",
+    "missing_volume_policy": "reject_no_cross_unit_fallback",
+    "unit_source": "https://www.okx.com/docs-v5/en/#rest-api-market-data-get-candlesticks",
+}
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -201,6 +211,12 @@ def parse_args() -> argparse.Namespace:
         "--archive-report-dir",
         default=None,
         help="Optional per-run report archive before later jobs replace latest reports.",
+    )
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="Maximum dataset-writer lock wait; 0 makes one nonblocking attempt.",
     )
     return parser.parse_args()
 
@@ -674,7 +690,19 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 9:
-            continue
+            raise ValueError("OKX candle lacks documented volume/confirmation fields")
+        # Preserve the existing quote-volume training ABI. Contracts, base
+        # currency and quote currency are different dimensions; a missing quote
+        # value must never fall back to a contract count (nor to a guessed zero).
+        volumes = []
+        for field, raw in zip(("vol", "volCcy", "volCcyQuote"), row[5:8]):
+            try:
+                value = float(raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"OKX candle has missing/invalid {field}") from exc
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"OKX candle has nonfinite/negative {field}")
+            volumes.append(value)
         ts = int(row[0])
         rows.append(
             {
@@ -685,10 +713,10 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
                 "min": float(row[3]),
                 "close": float(row[4]),
                 "adjclose": float(row[4]),
-                "Trading_Volume": float(row[7]) if row[7] else float(row[5]),
-                "okx_volume_contract": float(row[5]) if row[5] else 0.0,
-                "okx_volume_base": float(row[6]) if row[6] else 0.0,
-                "okx_volume_quote": float(row[7]) if row[7] else 0.0,
+                "Trading_Volume": volumes[2],
+                "okx_volume_contract": volumes[0],
+                "okx_volume_base": volumes[1],
+                "okx_volume_quote": volumes[2],
                 "okx_confirm": int(row[8]) if row[8] else 0,
             }
         )
@@ -934,11 +962,22 @@ def main() -> None:
     if args.tail_only and (args.refresh or args.mode == "full"):
         raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_handle = (output_dir / ".download.lock").open("a+", encoding="utf-8")
-    if fcntl is not None:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    print(f"[okx] acquired exclusive dataset lock: {lock_handle.name}", flush=True)
+    with exclusive_dataset_lock(
+        output_dir / ".download.lock", provider="okx",
+        timeout_seconds=args.lock_timeout_seconds,
+    ) as acquisition:
+        _run_locked_download(
+            args, output_dir, started_at=started_at,
+            lock_wait_seconds=acquisition.wait_seconds,
+        )
+
+
+def _run_locked_download(
+    args: argparse.Namespace, output_dir: Path, *,
+    started_at: datetime, lock_wait_seconds: float,
+) -> None:
+    work_started_at = datetime.now(timezone.utc)
+    work_started = time.monotonic()
 
     start_date = args.start_date.strip()
     end_date = resolve_end_date(args.end_date)
@@ -1130,6 +1169,7 @@ def main() -> None:
     summary = {
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
+        "volume_units": VOLUME_UNIT_CONTRACT,
         "symbol_count": len(symbols),
         "row_count": row_count,
         "status_counts": status_counts,
@@ -1149,6 +1189,9 @@ def main() -> None:
         "started_at_utc": started_at.isoformat(),
         "ended_at_utc": ended_at.isoformat(),
         "elapsed_seconds": (ended_at - started_at).total_seconds(),
+        "lock_wait_seconds": round(lock_wait_seconds, 6),
+        "work_started_at_utc": work_started_at.isoformat(),
+        "work_elapsed_seconds": round(time.monotonic() - work_started, 6),
     }
     summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     atomic_write_text(
@@ -1186,7 +1229,6 @@ def main() -> None:
     print(f"[okx] historical_feature_report.csv -> {historical_feature_report_path}")
     print(f"[okx] okx_historical_feature_catalog.json -> {feature_catalog_path}")
     print(f"[okx] report: {json.dumps(summary, ensure_ascii=False)}")
-    lock_handle.close()
     if source_incomplete or feature_incomplete or pipeline_progress.current != pipeline_progress.total:
         raise RuntimeError(
             "OKX download incomplete: "

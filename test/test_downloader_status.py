@@ -5,6 +5,7 @@ from downloader.status import (
     command_summary_paths,
     download_counts_failure_reason,
     first_download_failure,
+    reported_source_gap_counts,
 )
 
 
@@ -21,13 +22,17 @@ def test_download_counts_failure_reason_accepts_unchanged_download() -> None:
 
 
 def test_reported_gaps_exclude_precheck_statuses_but_include_skipped_lag() -> None:
-    assert count_reported_source_gaps({
+    counts = {
         "stale": 12208,
         "metadata_invalid": 12,
         "repaired": 12208,
         "failed": 12,
         "lagging_skip": 615,
-    }) == 627
+    }
+    assert reported_source_gap_counts(counts) == {
+        "failed": 12, "lagging_skip": 615,
+    }
+    assert count_reported_source_gaps(counts) == 627
 
 
 def test_command_summary_paths_prefers_asset_output_summary(tmp_path) -> None:

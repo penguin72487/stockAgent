@@ -745,7 +745,7 @@ PROVIDER_RATE_POLICIES: dict[str, ProviderRatePolicy] = {
     "fred": ProviderRatePolicy(
         2,
         1,
-        "OpenBB FRED provider ceiling; FRED confirms 429 throttling but publishes no numeric limit",
+        "official FRED API ceiling of 120 requests per minute, smoothed to 2 requests/second",
         "https://fred.stlouisfed.org/docs/api/fred/errors.html",
     ),
     "government_us": ProviderRatePolicy(
@@ -8647,12 +8647,15 @@ class ProviderRuntime:
                     if provider in HTTP_BOUNDARY_PACED_PROVIDERS
                     else SharedRateLimiter
                 )
-                # Keep independently-run Yahoo downloaders on the same
-                # process-shared limiter bucket.  ``yfinance`` is OpenBB's
-                # provider name; the direct Yahoo downloader uses the
-                # canonical upstream/account bucket ``yahoo_finance``.
+                # Adapter names do not create new upstream capacity. Match
+                # independently-run collectors' host/account buckets while
+                # retaining this provider's rate and HTTP preclaim contract.
+                # CFTC stays independent: OpenBB uses publicreporting's
+                # Socrata API, not the www.cftc.gov legacy ZIP archive bucket.
                 limiter_name = {
                     "yfinance": "yahoo_finance",
+                    "fred": "fred_api",
+                    "sec": "sec_edgar",
                 }.get(provider, provider)
                 self._limiters[provider] = limiter_class(
                     1.0 / rps,

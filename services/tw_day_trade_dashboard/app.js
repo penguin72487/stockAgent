@@ -719,10 +719,8 @@ function resolvedPositionPnl(row = {}) {
 
 function renderOverview(data) {
   const modes = Array.isArray(data.modes) ? data.modes : [];
-  const healthyModes = modes.filter((mode) => (
-    mode.checkpoint_ready
-    && !String(mode.engine_status || "").startsWith("critical")
-    && !String(mode.engine_status || "").startsWith("blocked")
+  const healthyModes = modes.filter((mode) => Presentation.modeOperationallyReady(
+    mode, data.operational_issues || [],
   )).length;
   const openPositions = (data.positions || []).filter((row) => Number(row.signed_shares || 0) !== 0);
   const modeOpenPositions = modes.reduce((sum, mode) => sum + Number(mode.open_position_count || 0), 0);
@@ -744,8 +742,11 @@ function renderOverview(data) {
   const totalPnl = totalModeNetPnl(data);
   const realizedPnl = sumModeField("cumulative_realized_net_pnl_twd");
   const unrealizedPnl = sumModeField("open_net_liquidation_pnl_twd");
+  const adjustments = modes.map(Presentation.accountAdjustments);
+  const carryCost = adjustments.reduce((sum, row) => sum + row.carryCost, 0);
+  const corporateNet = adjustments.reduce((sum, row) => sum + row.corporateNet, 0);
   const reconciliationDifference = [totalPnl, realizedPnl, unrealizedPnl].every((value) => value != null)
-    ? totalPnl - realizedPnl - unrealizedPnl
+    ? totalPnl - realizedPnl - unrealizedPnl - corporateNet + carryCost
     : null;
   const reconciled = reconciliationDifference != null && Math.abs(reconciliationDifference) <= .01;
   const returns = modes
@@ -767,14 +768,17 @@ function renderOverview(data) {
       ? `${number(stalePositions)} 個估值延用`
       : "目前估值皆有新鮮報價";
   const cards = [
-    ["模式狀態", `${healthyModes}/${modes.length} 可解讀`, healthyModes === modes.length ? "所有 checkpoint 與執行狀態正常" : "有模式需要查看上方警示", healthKind],
+    ["模式狀態", `${healthyModes}/${modes.length} 無警示`, "依所選日訊號、估值與執行紀錄判定；詳細原因見上方警示", healthKind],
     [IS_OVERNIGHT ? "目前即時隔夜持倉" : "所選日持倉", `${number(openPositionCount)} 個`, positionNote, stalePositions ? "warn" : openPositionCount ? "good" : ""],
     ...(historicalRangeAvailable ? [
       ["歷史反事實總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, "各模式期末權益減初始資金；使用官方收盤／次日開盤，並非實際成交", pnlClass(totalPnl)],
     ] : [
       ["各模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
       ["各模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
-      ["各模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
+      ...(carryCost || corporateNet ? [
+        ["持有成本／企業行動", summaryMoney(corporateNet - carryCost), `持有成本 ${summaryMoney(carryCost)}；企業行動淨額 ${summaryMoney(corporateNet)}`, pnlClass(corporateNet - carryCost)],
+      ] : []),
+      ["各模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現＋企業行動－持有成本，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
     ]),
     ["各模式期間報酬", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, `${chartWindowLabel()}；每條線以所選期間第一個${IS_OVERNIGHT ? "集合競價事件" : "有效分鐘"}為 0%`, best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
@@ -1228,7 +1232,7 @@ function renderOperations(data) {
     ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : duration(Number(openingLatency.first_ready_ms) / 1000), firstOpeningMode ? `${strategyLabel(firstOpeningMode)} · 目標 ≤ ${number(openingGoalMs)} ms · ${openingLatency.first_signal_goal_met ? "達標" : "未達標"}` : "等待實測"],
     ["09:00 → 行情覆蓋", Number.isFinite(sourceReadyMs) ? latencyValue(sourceReadyMs) : "—", Number.isFinite(sourceReadyMs) ? "本機收到足夠 callback；不是交易所 RTT" : "舊樣本未記錄逐筆到達時間"],
     ["行情就緒 → 訊號", Number.isFinite(controllableP50Ms) ? `${latencyValue(controllableP50Ms)} / ${latencyValue(controllableMaxMs)}` : "—", "逐模式 P50 / 最慢；這是主要可控區段"],
-    ["09:00 → 全部模式", noOpeningLatency ? "—" : duration(Number(openingLatency.final_ready_ms) / 1000), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式${openingLatency.all_modes_goal_met ? "全數達標" : openingLatency.complete ? "完成但未達 1 秒" : "；仍缺模式"}`],
+    ["09:00 → 全部模式", noOpeningLatency ? "—" : duration(Number(openingLatency.final_ready_ms) / 1000), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式有測速紀錄${openingLatency.all_modes_goal_met ? "，全數達標" : openingLatency.complete ? "，完成但未達 1 秒" : openingLatency.replay_without_live_measurement?.length ? `；${number(openingLatency.replay_without_live_measurement.length)} 個回補模式無當時即時測速` : "；仍缺測速紀錄"}`],
     ["相較前次開盤", openingChange, openingLatency.previous_session_date ? `${openingLatency.previous_session_date} 最後訊號 ${duration(Number(openingLatency.previous_final_ready_ms) / 1000)}` : "只比較 09:00 自動樣本"],
     ["輸入 → 帳本落盤", noLatency ? "—" : `${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`, `${number(latency.sample_count || 0)} 個成功樣本 · P50 / P95`],
     ["開盤最大階段", openingBottleneck, slowestOpeningMode ? strategyLabel(slowestOpeningMode) : noLatency ? "等待實測" : "來自執行帳本樣本"],
@@ -1648,7 +1652,7 @@ async function loadChartHistory({preferCache = false} = {}) {
     chartHistoryCache.set(requestedKey, {payload: decoded});
     applyChartHistory(decoded, requestedKey);
   } catch (error) {
-    if (sequence !== historyRequestSequence || error?.name === "AbortError") return;
+    if (sequence !== historyRequestSequence || (error?.name === "AbortError" && controller.signal.aborted)) return;
     historyLoadError = `歷史載入失敗：${error}`;
     if (snapshot) renderChart(snapshot);
   } finally {
@@ -1907,7 +1911,9 @@ async function loadSignals({append = false, force = false} = {}) {
       : incomingDrivers;
   } catch (error) {
     if (sequence !== signalRequestSequence || requestRevision !== detailDataRevision("signals")) return;
-    if (error?.name === "AbortError") return;
+    // Only our own superseded selection is intentionally silent. A timeout
+    // while reading the body may also surface as AbortError in browsers.
+    if (error?.name === "AbortError" && controller.signal.aborted) return;
     signalLoadError = `訊號明細暫時無法更新：${error}`;
     signalLoadNotice = "";
     signalDataRevision = null;
@@ -1965,7 +1971,7 @@ async function loadPositions({append = false, force = false} = {}) {
     positionSelectionKey = requestSelection;
   } catch (error) {
     if (sequence !== positionRequestSequence || requestRevision !== detailDataRevision("positions")) return;
-    if (error?.name === "AbortError") return;
+    if (error?.name === "AbortError" && controller.signal.aborted) return;
     positionLoadError = `持倉明細暫時無法更新：${error}`;
     positionDataRevision = null;
   } finally {
@@ -2025,7 +2031,7 @@ async function loadEvents({append = false, force = false} = {}) {
     eventSelectionKey = requestSelection;
   } catch (error) {
     if (sequence !== eventRequestSequence || requestRevision !== detailDataRevision("events")) return;
-    if (error?.name === "AbortError") return;
+    if (error?.name === "AbortError" && controller.signal.aborted) return;
     eventLoadError = `事件明細暫時無法更新：${error}`;
     eventRecordRevision = null;
   } finally {

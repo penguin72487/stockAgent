@@ -1,0 +1,160 @@
+# Formal Bybit execution strategy with historically reproducible public inputs.
+#
+# The traded universe, marks, volume capacity, fees and funding settlement stay
+# Bybit-only. Information may additionally come from completed Binance/OKX bars,
+# FRED initial-release vintages and SEC acceptance timestamps. Families first
+# observed locally in 2026 (CoinGecko/CoinMetrics/DeFi/issuer snapshots) remain
+# stored but are deliberately absent from the 2020 training ABI.
+base_config: bybit_perpetual_daily_0005_historical_pit_learned_cash_trajectory_v3.yaml
+
+experiment_name: bybit-perpetual-daily-0005-historical-public-pit-learned-cash-trajectory-v4
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v4
+  resume: true
+  post_train_infer: false
+
+data:
+  crypto_exchange_scope: bybit
+  crypto_information_scope: historical_public_pit
+  external_feature_path: data_bybit/public_features/bybit_crypto_public_daily.parquet
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_0005_historical_public_pit_trajectory_v4
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - crypto_bybit_funding_rate_sum_1d
+    - crypto_bybit_funding_realized_annualized
+    - crypto_bybit_funding_cashflow_coefficient_1d
+    - crypto_bybit_funding_last_rate
+    - crypto_bybit_funding_age_hours
+    - crypto_bybit_funding_event_count_1d
+    - crypto_bybit_funding_available
+    - crypto_binance_mark_return_1d
+    - crypto_binance_index_return_1d
+    - crypto_binance_mark_range_log_1d
+    - crypto_binance_index_range_log_1d
+    - crypto_binance_contract_mark_basis_log
+    - crypto_binance_mark_index_basis_log
+    - crypto_binance_funding_realized_rate
+    - crypto_binance_funding_realized_annualized
+    - crypto_binance_funding_age_hours
+    - crypto_binance_funding_available
+    - crypto_binance_taker_imbalance_1d
+    - crypto_binance_quote_volume_log1p
+    - crypto_binance_trade_count_log1p
+    - crypto_binance_core_available
+    - crypto_binance_positioning_available
+    - crypto_binance_session_coverage
+    - crypto_okx_mark_return_1d
+    - crypto_okx_index_return_1d
+    - crypto_okx_mark_range_log_1d
+    - crypto_okx_index_range_log_1d
+    - crypto_okx_contract_mark_basis_log
+    - crypto_okx_mark_index_basis_log
+    - crypto_okx_funding_realized_rate
+    - crypto_okx_funding_realized_annualized
+    - crypto_okx_funding_available
+    - crypto_okx_available
+    - crypto_okx_positioning_available
+    - crypto_okx_taker_available
+    - crypto_okx_session_coverage
+    - crypto_public_macro_fed_funds_rate
+    - crypto_public_macro_sofr
+    - crypto_public_macro_treasury_2y
+    - crypto_public_macro_treasury_10y
+    - crypto_public_macro_treasury_10y_2y_spread
+    - crypto_public_macro_dollar_index_log
+    - crypto_public_macro_vix_log1p
+    - crypto_public_macro_fed_balance_sheet_log1p
+    - crypto_public_macro_reverse_repo_log1p
+    - crypto_public_macro_financial_conditions
+    - crypto_public_macro_available_fraction
+    - crypto_public_macro_max_age_days
+    - crypto_public_sec_etf_filings_1d_log1p
+    - crypto_public_sec_etf_filings_7d_log1p
+    - crypto_public_sec_etf_filings_30d_log1p
+    - crypto_public_sec_etf_registration_30d_log1p
+    - crypto_public_sec_etf_periodic_30d_log1p
+    - crypto_public_sec_etf_available
+    - crypto_public_sec_asset_filings_7d_log1p
+    - crypto_public_sec_asset_filings_30d_log1p
+    - crypto_public_sec_asset_registration_30d_log1p
+    - crypto_public_sec_asset_periodic_30d_log1p
+    - crypto_public_sec_asset_available
+  feature_exclude: []
+  feature_zero_fill: []
+  # Per-column observation masks keep a real zero distinct from no historical
+  # observation. The model, not a hand-written score, decides how to use them.
+  feature_availability_indicators:
+    - crypto_bybit_funding_rate_sum_1d
+    - crypto_bybit_funding_realized_annualized
+    - crypto_bybit_funding_cashflow_coefficient_1d
+    - crypto_bybit_funding_last_rate
+    - crypto_bybit_funding_age_hours
+    - crypto_bybit_funding_event_count_1d
+    - crypto_bybit_funding_available
+    - crypto_binance_mark_return_1d
+    - crypto_binance_index_return_1d
+    - crypto_binance_mark_range_log_1d
+    - crypto_binance_index_range_log_1d
+    - crypto_binance_contract_mark_basis_log
+    - crypto_binance_mark_index_basis_log
+    - crypto_binance_funding_realized_rate
+    - crypto_binance_funding_realized_annualized
+    - crypto_binance_funding_age_hours
+    - crypto_binance_funding_available
+    - crypto_binance_taker_imbalance_1d
+    - crypto_binance_quote_volume_log1p
+    - crypto_binance_trade_count_log1p
+    - crypto_binance_core_available
+    - crypto_binance_positioning_available
+    - crypto_binance_session_coverage
+    - crypto_okx_mark_return_1d
+    - crypto_okx_index_return_1d
+    - crypto_okx_mark_range_log_1d
+    - crypto_okx_index_range_log_1d
+    - crypto_okx_contract_mark_basis_log
+    - crypto_okx_mark_index_basis_log
+    - crypto_okx_funding_realized_rate
+    - crypto_okx_funding_realized_annualized
+    - crypto_okx_funding_available
+    - crypto_okx_available
+    - crypto_okx_positioning_available
+    - crypto_okx_taker_available
+    - crypto_okx_session_coverage
+    - crypto_public_macro_fed_funds_rate
+    - crypto_public_macro_sofr
+    - crypto_public_macro_treasury_2y
+    - crypto_public_macro_treasury_10y
+    - crypto_public_macro_treasury_10y_2y_spread
+    - crypto_public_macro_dollar_index_log
+    - crypto_public_macro_vix_log1p
+    - crypto_public_macro_fed_balance_sheet_log1p
+    - crypto_public_macro_reverse_repo_log1p
+    - crypto_public_macro_financial_conditions
+    - crypto_public_macro_available_fraction
+    - crypto_public_macro_max_age_days
+    - crypto_public_sec_etf_filings_1d_log1p
+    - crypto_public_sec_etf_filings_7d_log1p
+    - crypto_public_sec_etf_filings_30d_log1p
+    - crypto_public_sec_etf_registration_30d_log1p
+    - crypto_public_sec_etf_periodic_30d_log1p
+    - crypto_public_sec_etf_available
+    - crypto_public_sec_asset_filings_7d_log1p
+    - crypto_public_sec_asset_filings_30d_log1p
+    - crypto_public_sec_asset_registration_30d_log1p
+    - crypto_public_sec_asset_periodic_30d_log1p
+    - crypto_public_sec_asset_available

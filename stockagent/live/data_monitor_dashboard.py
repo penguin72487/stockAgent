@@ -24,6 +24,7 @@ from typing import Any, Final, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from stockagent.data.taifex_sessions import next_taifex_capture_window
+from stockagent.live.market_status import tw_stock_day_decision
 from stockagent.live.data_monitor_inventory import PHYSICAL_FAMILIES, build_feature_inventory, build_record_inventory
 from stockagent.live.openbb_archive_dashboard import build_openbb_public_status
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
@@ -40,7 +41,10 @@ from downloader.download_finmind_complement import (
     SNAPSHOTS as FINMIND_COMPLEMENT_SNAPSHOTS,
     WIDE_INSTITUTIONAL as FINMIND_DERIVED_WIDE,
 )
-from downloader.download_finmind_sponsor import SOURCES as FINMIND_SPONSOR_SOURCES
+from downloader.download_finmind_sponsor import (
+    SOURCES as FINMIND_SPONSOR_SOURCES,
+    SESSION_DAY_DATASETS as FINMIND_SESSION_DAY_DATASETS,
+)
 
 
 DATA_MONITOR_SCHEMA_VERSION: Final[int] = 8
@@ -51,6 +55,7 @@ DATA_MONITOR_SUMMARY_KEYS: Final[tuple[str, ...]] = (
     "read_only",
     "production_control_possible",
     "summary",
+    "tw_stock_calendar",
     "endpoint_inventory",
     "provider_summaries",
     "market_categories",
@@ -106,9 +111,11 @@ _GROUP_MARKET_CATEGORY: Final[dict[str, str]] = {
     "cftc-legacy-pre2000": "macro",
     "legacy-parquet": "cross_market",
 }
-OPENBB_L1_MAX_SOURCE_FILES_PER_RUN: Final[int] = 2_048
+OPENBB_L1_MAX_SOURCE_FILES_PER_RUN: Final[int] = 32_768
 OPENBB_L1_MIN_FILES_PER_SEGMENT: Final[int] = 32
-OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 20 * 60
+OPENBB_L1_TIMER_INTERVAL_SECONDS: Final[int] = 30 * 60
+OPENBB_L1_TIMER_JITTER_SECONDS: Final[int] = 2 * 60
+OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 40 * 60
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
     "finmind-free": {
@@ -537,6 +544,7 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
         "service_keys": ("shioaji_minute",),
         "schedule_label": "交易日 14:45（Asia/Taipei）",
         "calendar_weekdays": True,
+        "calendar_market": "tw_stock",
         "calendar_time": "14:45",
     },
     "group:tw-minute-source-cold": {
@@ -544,6 +552,7 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
         "service_keys": ("shioaji_minute",),
         "schedule_label": "交易日 14:45（Asia/Taipei）",
         "calendar_weekdays": True,
+        "calendar_market": "tw_stock",
         "calendar_time": "14:45",
     },
     "group:tw-microstructure-train": {
@@ -708,15 +717,17 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
 _OPERATION_ORDER: Final[dict[str, int]] = {
     "catching_up": 0,
     "streaming": 1,
-    "complete": 2,
-    "unable": 3,
-    "deferred": 4,
-    "control": 5,
-    "reference": 6,
+    "waiting_publication": 2,
+    "complete": 3,
+    "unable": 4,
+    "deferred": 5,
+    "control": 6,
+    "reference": 7,
 }
 _OPERATION_LABELS: Final[dict[str, str]] = {
     "catching_up": "正在抓／還沒到最新",
     "streaming": "正在串流",
+    "waiting_publication": "等待發布證據",
     "complete": "已完成／已到最新",
     "unable": "無法完成",
     "deferred": "已延後／未啟用",
@@ -1237,6 +1248,11 @@ def _normalize_eta(
     if operation == "reference":
         row["eta"] = _not_applicable_eta(
             "reference", "這是清冊責任映射，不建立重複下載工作或完工倒數。"
+        )
+        return
+    if operation == "waiting_publication":
+        row["eta"] = _unknown_eta(
+            "waiting_publication", "尚無新批次發布證據，不能計算下載完工時間。"
         )
         return
     if operation == "complete" and execution == "idle_current":
@@ -2605,7 +2621,8 @@ def _shioaji_sources(
 
 
 def _openbb_sources(
-    status: Mapping[str, Any], *, now: datetime
+    status: Mapping[str, Any], *, now: datetime,
+    l1_service: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     providers = status.get("providers")
     if not isinstance(providers, list):
@@ -2687,6 +2704,7 @@ def _openbb_sources(
         )
     l1 = status.get("l1_compaction")
     if isinstance(l1, Mapping) and l1.get("generated_at_utc") is not None:
+        l1_service = l1_service if isinstance(l1_service, Mapping) else {}
         success_files = _integer(l1.get("success_files")) or 0
         compacted_files = _integer(l1.get("compacted_files")) or 0
         pending_files = max(
@@ -2716,6 +2734,18 @@ def _openbb_sources(
             eta = _unknown_eta(
                 "stale_status", "L1 狀態超過兩小時未更新，不能可靠估計完成時間。"
             )
+        elif l1_service.get("active") is True:
+            row_status = "active"
+            status_label = "本輪壓實執行中"
+            eta = _unknown_eta(
+                "in_progress", "本輪仍在執行；完成收據出現後再更新剩餘時間。"
+            )
+        elif l1_service.get("timer_active") is False:
+            row_status = "deferred"
+            status_label = "壓實排程未啟用"
+            eta = _unknown_eta(
+                "timer_inactive", "排程未啟用，不能依每輪容量推算完成時間。"
+            )
         else:
             row_status = "waiting"
             status_label = "等待下一輪增量壓實"
@@ -2723,17 +2753,58 @@ def _openbb_sources(
             # systemd unit. It is a low-confidence no-new-arrivals projection,
             # not a completion promise.
             runs = math.ceil(pending_files / OPENBB_L1_MAX_SOURCE_FILES_PER_RUN)
-            seconds = runs * OPENBB_L1_WORST_CASE_RUN_SECONDS
+            seconds = runs * (
+                OPENBB_L1_TIMER_INTERVAL_SECONDS
+                + OPENBB_L1_TIMER_JITTER_SECONDS
+                + OPENBB_L1_WORST_CASE_RUN_SECONDS
+            )
+            next_run = _parse_time(l1_service.get("next_run_at_utc"))
+            started = _parse_time(l1_service.get("started_at_utc"))
+            completed = _parse_time(l1_service.get("completed_at_utc"))
+            if (
+                l1_service.get("timer_active") is True
+                and l1_service.get("result") == "success"
+                and next_run is not None
+                and next_run >= now - timedelta(minutes=1)
+                and started is not None
+                and completed is not None
+                and started <= completed
+                and 1 <= (completed - started).total_seconds()
+                <= OPENBB_L1_WORST_CASE_RUN_SECONDS
+            ):
+                last_run_seconds = math.ceil((completed - started).total_seconds())
+                seconds = (
+                    max(0, math.ceil((next_run - now).total_seconds()))
+                    + runs * last_run_seconds
+                    + max(0, runs - 1) * (
+                        OPENBB_L1_TIMER_INTERVAL_SECONDS
+                        + OPENBB_L1_TIMER_JITTER_SECONDS
+                    )
+                )
+                basis = (
+                    f"依下一次正式排程、上一輪實測 {last_run_seconds:,} 秒與"
+                    f"每輪最多 {OPENBB_L1_MAX_SOURCE_FILES_PER_RUN:,} shard 估計；"
+                    f"後續輪次以 {OPENBB_L1_TIMER_INTERVAL_SECONDS // 60} 分鐘間隔"
+                    f"加最多 {OPENBB_L1_TIMER_JITTER_SECONDS // 60} 分鐘抖動計，"
+                    "假設執行時間不變、沒有新資料與交易窗口延後；"
+                    f"小於 {OPENBB_L1_MIN_FILES_PER_SEGMENT} 檔的 endpoint tail 會等待累積。"
+                )
+            else:
+                basis = (
+                    "依每輪最多 "
+                    f"{OPENBB_L1_MAX_SOURCE_FILES_PER_RUN:,} shard、"
+                    f"{OPENBB_L1_TIMER_INTERVAL_SECONDS // 60} 分鐘輪間隔、"
+                    f"最多 {OPENBB_L1_TIMER_JITTER_SECONDS // 60} 分鐘排程抖動與 "
+                    f"{OPENBB_L1_WORST_CASE_RUN_SECONDS // 60} 分鐘單輪上限的保守容量估計；"
+                    "假設沒有新資料且沒有交易窗口延後；"
+                    f"小於 {OPENBB_L1_MIN_FILES_PER_SEGMENT} 檔的 endpoint tail 會等待累積。"
+                )
             eta = {
                 "state": "estimating",
                 "remaining_seconds": seconds,
                 "estimated_complete_at_utc": _iso(now + timedelta(seconds=seconds)),
                 "confidence": "low",
-                "basis": (
-                    "依每輪最多 "
-                    f"{OPENBB_L1_MAX_SOURCE_FILES_PER_RUN:,} shard 且沒有新資料的容量估計；"
-                    f"小於 {OPENBB_L1_MIN_FILES_PER_SEGMENT} 檔的 endpoint tail 會等待累積。"
-                ),
+                "basis": basis,
             }
         source_bytes = _integer(l1.get("source_bytes")) or 0
         output_bytes = _integer(l1.get("output_bytes")) or 0
@@ -2762,7 +2833,7 @@ def _openbb_sources(
                 "eta": eta,
                 "rows": _integer(l1.get("compacted_rows")),
                 "publishable": True,
-                "automation_eligible": True,
+                "automation_eligible": l1_service.get("timer_active") is not False,
                 "detail": (
                     f"active segments {_integer(l1.get('active_segments')) or 0:,}；"
                     f"待壓實 {pending_files:,} shards；已壓實來源空間縮減 {reduction:.2f}%。"
@@ -2858,8 +2929,59 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
         catalog = payload.get("catalog", []) if isinstance(payload, Mapping) else []
         if not isinstance(catalog, list):
             continue
-        latest = _latest_time([catalog_path, report_path], [payload])
-        fresh = _freshness(latest, now=now, window_seconds=6 * 3600)
+        # Catalog generation describes endpoint definitions, not acquisition.
+        # Candle-only runs rewrite it while deliberately retaining the previous
+        # feature report. Never let that advance a feature's freshness clock.
+        feature_latest = _mtime(report_path)
+        if feature_latest is not None and feature_latest > now:
+            feature_latest = None
+        feature_summary_path = report_path.parent / "download_summary.historical_features.json"
+        if feature_summary_path.exists():
+            feature_summary = _read_json(feature_summary_path, {})
+            feature_end = (
+                _parse_time(feature_summary.get("ended_at_utc"))
+                if isinstance(feature_summary, Mapping)
+                and feature_summary.get("historical_feature_report_is_current_run") is True
+                else None
+            )
+            if feature_end is not None and feature_end > now:
+                feature_end = None
+            # Report and summary are separate atomic files. During publication
+            # keep the older clock; an absent/invalid proof remains unknown.
+            feature_latest = (
+                min(feature_latest, feature_end)
+                if feature_latest is not None and feature_end is not None
+                else None
+            )
+        candle_summary = _read_json(report_path.parent / "download_summary.json", {})
+        candle_latest = (
+            _parse_time(candle_summary.get("ended_at_utc"))
+            if isinstance(candle_summary, Mapping)
+            else None
+        )
+        candle_counts = (
+            candle_summary.get("status_counts", {})
+            if isinstance(candle_summary, Mapping) else {}
+        )
+        if not isinstance(candle_counts, Mapping):
+            candle_counts = {}
+        candle_failures = sum(
+            _integer(candle_counts.get(key)) or 0
+            for key in ("failed", "repair_required")
+        )
+        candle_success = sum(
+            _integer(candle_counts.get(key)) or 0
+            for key in ("updated", "skipped_up_to_date")
+        )
+        candle_complete = (
+            candle_success > 0
+            and all(_integer(value) is not None for value in candle_counts.values())
+            and candle_success == sum(_integer(value) or 0 for value in candle_counts.values())
+            and candle_success == (
+                _integer(candle_summary.get("symbol_count", candle_success))
+                if isinstance(candle_summary, Mapping) else None
+            )
+        )
         report_rows: list[dict[str, str]] = []
         try:
             with report_path.open(encoding="utf-8", newline="") as handle:
@@ -2909,6 +3031,10 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             if not source_id:
                 continue
             download_status = str(item.get("download_status") or "registered")
+            latest = candle_latest if source_id == "trade_candles_1m" else feature_latest
+            if latest is not None and latest > now:
+                latest = None
+            fresh = _freshness(latest, now=now, window_seconds=6 * 3600)
             stage = id_to_stage.get(source_id)
             statuses = stage_statuses.get(stage or "", [])
             completed = sum(status == "ok" for status in statuses)
@@ -2923,22 +3049,39 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                 download_status.startswith("separate")
                 or download_status.startswith("excluded")
             )
-            if failures:
+            if source_id == "trade_candles_1m" and candle_failures:
+                status = "degraded"
+                label = f"{candle_failures:,} 個主價格商品失敗／待修復"
+                eta = _unknown_eta("waiting_schedule", "等待主價格來源重試或修復。")
+            elif failures:
                 status = "degraded"
                 label = f"{failures:,} 個商品階段失敗"
                 eta = _unknown_eta("waiting_schedule", "等待下一輪端點重試。")
             elif scheduled and total and completed == total:
-                status = "current" if fresh["state"] == "current" else "stale"
+                status = (
+                    "waiting" if latest is None
+                    else "current" if fresh["state"] == "current" else "stale"
+                )
                 label = (
-                    "已納入更新且最近批次成功"
+                    "等待可驗證的特徵完成時間" if latest is None
+                    else "已納入更新且最近批次成功"
                     if status == "current"
                     else "歷史已抓但需要增量"
                 )
-                eta = _complete_eta("最近逐商品階段均成功。")
+                eta = (
+                    _complete_eta("最近逐商品階段均成功。") if latest is not None
+                    else _unknown_eta("waiting_schedule", "特徵報告缺少有效的完成時間。")
+                )
             elif source_id == "trade_candles_1m":
-                status = "current" if fresh["state"] == "current" else "stale"
-                label = "由主 OHLCV 更新器維護"
-                eta = _complete_eta("主價格資料由同一交易所批次維護。")
+                status = (
+                    "waiting" if latest is None or not candle_complete
+                    else "current" if fresh["state"] == "current" else "stale"
+                )
+                label = "由主 OHLCV 更新器維護" if status != "waiting" else "等待主 OHLCV 完成回執"
+                eta = (
+                    _complete_eta("主價格資料由同一交易所批次維護。")
+                    if status != "waiting" else _unknown_eta("waiting_schedule", "尚無完整主價格批次證據。")
+                )
             elif registry_alias:
                 status = "current"
                 label = "與專用端點重複；只保留清冊參照"
@@ -4339,16 +4482,24 @@ def _finmind_complement_sources(storage: Path, *, now: datetime,
 def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, Any]]:
     sponsor = _read_json(storage / "sponsor" / "status.json", {})
     series = sponsor.get("series") if isinstance(sponsor.get("series"), Mapping) else {}
+    session_policy = sponsor.get("session_policy") if isinstance(sponsor.get("session_policy"), Mapping) else {}
     fresh = _parse_time(sponsor.get("observed_at_utc"))
-    running = sponsor.get("state") == "running" and fresh is not None and (now - fresh).total_seconds() < 180
+    service_running = sponsor.get("state") == "running" and fresh is not None and (now - fresh).total_seconds() < 180
+    active_tasks = sponsor.get("active_tasks") if isinstance(sponsor.get("active_tasks"), list) else []
+    active_datasets = {
+        str(task.get("dataset")) for task in active_tasks if isinstance(task, Mapping)
+    }
     rows: list[dict[str, Any]] = []
     for spec in FINMIND_SPONSOR_SOURCES:
+        running = service_running and spec.dataset in active_datasets
         item = series.get(spec.dataset) if isinstance(series.get(spec.dataset), Mapping) else {}
         total = _integer(item.get("target")) or 0
         complete = _integer(item.get("complete")) or 0
         empty = _integer(item.get("observed_empty")) or 0
         failed = _integer(item.get("failed")) or 0
         blocked = _integer(item.get("blocked")) or 0
+        non_session = _integer(item.get("non_session")) or 0
+        calendar_verified = session_policy.get("state") == "receipt_verified"
         checked = complete + empty
         latest = item.get("last_data_date")
         state = ("unavailable" if total and blocked == total else
@@ -4356,21 +4507,50 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
                  "updating" if running else
                  "degraded" if blocked or failed else "waiting")
         count = _integer(item.get("rows"))
+        publication_hint = None
+        checked_partition = str(item.get("last_checked_partition") or "")
+        if spec.dataset in FINMIND_SESSION_DAY_DATASETS and spec.grain == "day":
+            try:
+                last_checked_day = date.fromisoformat(checked_partition)
+            except ValueError:
+                last_checked_day = None
+            if last_checked_day is not None:
+                public_root = Path(__file__).resolve().parents[2] / "data_tw_public"
+                for offset in range(1, 22):
+                    candidate = last_checked_day + timedelta(days=offset)
+                    decision = tw_stock_day_decision(candidate, parquet_root=public_root, observed=now)
+                    if decision.status == "unknown":
+                        break
+                    if decision.is_session:
+                        publication_hint = {
+                            "schedule_kind": "historical_release_inference",
+                            "schedule_label": f"下個台股交易日約 {spec.release_hour:02d}:00（台北時間）",
+                            "expected_release_at_utc": _iso(datetime.combine(
+                                candidate, datetime_time(spec.release_hour), tzinfo=TAIPEI
+                            )),
+                            "expected_release_basis": (
+                                "FinMind 來源既有發布時段與 TWSE 官方交易日曆推測；"
+                                "不是供應商逐分公告保證"
+                            ),
+                        }
+                        break
         rows.append({
             "id": f"finmind:sponsor:{spec.dataset}", "parent_id": "group:finmind-free",
             "scope": "source_registry", "title": f"{spec.dataset}（Sponsor 全市場）",
             "provider": "FinMind", "category": "taiwan_market_sponsor",
             "status": state,
-            "status_label": f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}",
+            "status_label": (f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}"
+                             + (f"；已驗證非交易日排除 {non_session:,}" if calendar_verified and non_session else "")),
             "cadence": "按官方實際帳號額度共用節流；全市場日期分區增量",
             "update_owner": ("FinMind Sponsor 長表本機衍生" if spec.dataset == FINMIND_DERIVED_WIDE
                              else "FinMind Sponsor 資料下載器"),
             "latest_at_utc": item.get("last_attempt_at_utc"), "data_through": latest,
+            "last_checked_partition": checked_partition or None,
             "freshness": _freshness(_parse_time(item.get("last_attempt_at_utc")), now=now, window_seconds=30 * 86400),
             "coverage": _coverage(checked, total, unit="來源分區", label="已查驗；空回非資料") if total else None,
             "eta": _unknown_eta("running_unmeasured" if running else "waiting_schedule",
                                 "官方額度只是請求下界，回應大小、服務時間及缺口未知。"),
-            "rows": count, "publishable": False, "automation_eligible": running,
+            "rows": count, "publishable": False, "automation_eligible": service_running,
             "registry_alias": False,
             "detail": (
                 "與三大法人長表為同一來源數值；在本機由已驗雜湊的長表分區轉成寬表，不再重複呼叫 API。"
@@ -4379,11 +4559,14 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
                 if spec.dataset == "TaiwanStockPrice" else
                 "獨立原始收據；與 Free 逐檔任務重疊時先由 Sponsor 批量查詢。尚未驗證 PIT 或可訓練性。"
             ),
-            "warnings": ["來源空回不算有數值的歷史。"] if empty else [],
+            "warnings": (["來源空回不算有數值的歷史。"] if empty else [])
+                        + (["交易日曆驗證失效；未排除休市日期，避免誤刪有效資料。"]
+                           if not calendar_verified and non_session else []),
             "record_stats": {"count": count, "first": item.get("first_data_date"), "last": latest,
                              "files_inspected": 0, "files_total": complete,
                              "state": "source_receipts_not_hash_reverified" if complete else "not_downloaded",
                              "basis": "不可變 Parquet 與原子收據；公開頁未重算 SHA-256。"},
+            "_publication_hint": publication_hint,
         })
     return rows
 
@@ -5029,6 +5212,14 @@ def _rollup_storage_groups(
             group["eta"] = _unknown_eta(
                 "continuous", "串流沒有總完工日；以交易時窗與落盤心跳驗證。"
             )
+        elif active_counts["waiting_publication"]:
+            group["status"] = "waiting"
+            group["status_label"] = (
+                f"{active_counts['waiting_publication']:,} 個子端點等待發布證據"
+            )
+            group["eta"] = _unknown_eta(
+                "waiting_publication", "尚無新資料發布證據；不是下載缺口或下載完工 ETA。"
+            )
 
 
 def _specialize_groups(
@@ -5333,20 +5524,32 @@ def _specialize_groups(
             }
 
 
-def _stock_stream_window(now: datetime) -> dict[str, Any]:
+def _stock_stream_window(now: datetime, *, parquet_root: Path | None = None) -> dict[str, Any]:
     local = now.astimezone(TAIPEI)
-    candidates: list[tuple[datetime, datetime]] = []
-    for offset in range(0, 10):
+    root = parquet_root or Path(__file__).resolve().parents[2] / "data_tw_public"
+    today = tw_stock_day_decision(local.date(), parquet_root=root, observed=local)
+    candidates: list[tuple[datetime, datetime, str]] = []
+    for offset in range(0, 21):
         session_date = local.date() + timedelta(days=offset)
-        if session_date.weekday() >= 5:
+        decision = tw_stock_day_decision(session_date, parquet_root=root, observed=local)
+        if decision.status == "unknown":
+            break
+        if not decision.is_session:
             continue
         starts = datetime.combine(session_date, datetime_time(8, 45), tzinfo=TAIPEI)
         ends = datetime.combine(session_date, datetime_time(13, 30), tzinfo=TAIPEI)
         if ends > local:
-            candidates.append((starts, ends))
+            candidates.append((starts, ends, decision.reason))
+            break
     if not candidates:
-        raise RuntimeError("could not resolve next stock capture window")
-    starts, ends = min(candidates, key=lambda value: value[0])
+        return {
+            "kind": "tw_stock", "timezone": "Asia/Taipei",
+            "schedule_label": "台股日曆未驗證；不預測串流時窗",
+            "state": "calendar_unverified", "starts_at_utc": None,
+            "ends_at_utc": None, "today_status": today.status,
+            "today_evidence": today.reason,
+        }
+    starts, ends, evidence = candidates[0]
     return {
         "kind": "tw_stock",
         "timezone": "Asia/Taipei",
@@ -5354,6 +5557,9 @@ def _stock_stream_window(now: datetime) -> dict[str, Any]:
         "state": "open" if starts <= local < ends else "waiting",
         "starts_at_utc": _iso(starts.astimezone(UTC)),
         "ends_at_utc": _iso(ends.astimezone(UTC)),
+        "today_status": today.status,
+        "today_evidence": today.reason,
+        "next_session_evidence": evidence,
     }
 
 
@@ -5390,7 +5596,18 @@ def _next_declared_calendar(
     candidate = datetime.combine(local.date(), clock, tzinfo=TAIPEI)
     if candidate <= local:
         candidate += timedelta(days=1)
-    if profile.get("calendar_weekdays") is True:
+    if profile.get("calendar_market") == "tw_stock":
+        root = Path(__file__).resolve().parents[2] / "data_tw_public"
+        for _ in range(370):
+            decision = tw_stock_day_decision(candidate.date(), parquet_root=root, observed=local)
+            if decision.status == "unknown":
+                return None
+            if decision.is_session:
+                break
+            candidate += timedelta(days=1)
+        else:
+            return None
+    elif profile.get("calendar_weekdays") is True:
         while candidate.weekday() >= 5:
             candidate += timedelta(days=1)
     return candidate.astimezone(UTC)
@@ -5490,6 +5707,14 @@ def _automation_for_row(
         for state in states
         if (parsed := _parse_time(state.get("next_run_at_utc"))) is not None
     ]
+    if profile.get("calendar_market") == "tw_stock":
+        root = Path(__file__).resolve().parents[2] / "data_tw_public"
+        next_runs = [
+            candidate for candidate in next_runs
+            if tw_stock_day_decision(candidate.astimezone(TAIPEI).date(),
+                                     parquet_root=root, observed=now).is_session
+        ]
+    verified_timer_next = bool(next_runs)
     last_triggers = [
         parsed
         for state in states
@@ -5505,7 +5730,7 @@ def _automation_for_row(
         next_runs.append(declared_next)
     next_run_basis = (
         "systemd_timer"
-        if any(state.get("next_run_at_utc") for state in states)
+        if verified_timer_next
         else "declared_calendar"
         if declared_next is not None
         else "contract_only"
@@ -5613,8 +5838,61 @@ def _automation_for_row(
     }
 
 
+def _publication_expectation(
+    row: Mapping[str, Any], publication: Mapping[str, Any], now: datetime
+) -> dict[str, Any]:
+    """Only a source change or a justified release boundary creates tail work.
+
+    A local polling timer and an old receipt are not upstream publication.
+    Unknown timing remains explicit, rather than being converted to a fake SLA.
+    """
+
+    detected = _parse_time(publication.get("detected_at_utc"))
+    applied = _parse_time(publication.get("applied_at_utc")) or _parse_time(row.get("latest_at_utc"))
+    if detected is not None and applied is not None and detected > applied:
+        return {"state": "due_observed", "due_at_utc": _iso(detected),
+                "basis": "來源版本變更晚於已套用收據"}
+
+    due = _parse_time(publication.get("expected_release_at_utc"))
+    basis = str(publication.get("expected_release_basis") or "來源發布契約")
+    row_id = str(row.get("id") or "")
+    if due is None and row_id in {
+        "shioaji:stock_minute", "shioaji:minute_research",
+        "group:tw-minute-source-cold", "group:tw-minute-train",
+    }:
+        through = str(row.get("data_through") or "")[:10]
+        try:
+            last_day = date.fromisoformat(through)
+        except ValueError:
+            last_day = None
+        if last_day is not None:
+            root = Path(__file__).resolve().parents[2] / "data_tw_public"
+            for offset in range(1, 22):
+                session_day = last_day + timedelta(days=offset)
+                decision = tw_stock_day_decision(session_day, parquet_root=root, observed=now)
+                if decision.status == "unknown":
+                    break
+                if decision.is_session:
+                    due = datetime.combine(session_day, datetime_time(14, 45), tzinfo=TAIPEI)
+                    basis = "台股官方日曆與盤後分鐘線可查時段推測；不是券商發布時間保證"
+                    break
+    if due is not None:
+        return {"state": "due_inferred" if due <= now else "not_due",
+                "due_at_utc": _iso(due), "basis": basis}
+    # Exchange candles are continuous, unlike their local weekly backfill timer.
+    # The existing freshness window is a conservative publication inference.
+    venue_group = str(row.get("parent_id") or row.get("id") or "")
+    if (venue_group in {"group:okx", "group:bybit", "group:binance", "group:crypto-reference"}
+            and str((row.get("freshness") or {}).get("state") or "") == "stale"):
+        return {"state": "due_inferred", "due_at_utc": None,
+                "basis": "24/7 市場的已宣告連續資料 cadence；收據已過新鮮度時窗"}
+    return {"state": "unknown", "due_at_utc": None,
+            "basis": "尚無可驗證版本變更或可信發布邊界；本機收據過期不等於來源已發布"}
+
+
 def _operation_state(
-    row: Mapping[str, Any], automation: Mapping[str, Any]
+    row: Mapping[str, Any], automation: Mapping[str, Any],
+    expectation: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str]:
     raw_status = str(row.get("status") or "unavailable")
     scope = str(row.get("scope") or "")
@@ -5624,6 +5902,7 @@ def _operation_state(
     freshness_age = _number((row.get("freshness") or {}).get("age_seconds"))
     freshness_state = str((row.get("freshness") or {}).get("state") or "unknown")
     coverage_ratio = _number((row.get("coverage") or {}).get("ratio"))
+    release_state = str((expectation or {}).get("state") or "unknown")
     recent_stream_heartbeat = freshness_age is not None and freshness_age <= 10 * 60
 
     if scope == "credential_gate":
@@ -5717,19 +5996,34 @@ def _operation_state(
     if mode == "on_demand":
         return "complete", "on_demand", "端點按需逐次完成，沒有常駐下載佇列"
     if (
+        raw_status in {"current", "complete", "waiting", "stale"}
+        and mode != "frozen"
+        and release_state in {"due_observed", "due_inferred"}
+        and row.get("automation_eligible", True) is True
+    ):
+        return (
+            "catching_up", scheduled_execution,
+            "來源新版已觀測，尚未有對應套用收據"
+            if release_state == "due_observed" else
+            "已過有根據的推測發布邊界，尚未有對應取得收據",
+        )
+    if (
         raw_status in {"current", "complete"}
         and mode != "frozen"
         and freshness_state == "stale"
+        and not (coverage_ratio is not None and coverage_ratio < 1.0)
     ):
         if row.get("automation_eligible", True) is not True:
             return "unable", "not_configured", "最近批次已過時，且尚無自動更新管線"
+        if release_state not in {"due_observed", "due_inferred"}:
+            return "waiting_publication", "waiting_publication", "本機收據過期；尚無來源已發布新批次的證據"
         return (
             "catching_up",
             "running" if actively_working else scheduled_execution,
             "最近批次已過新鮮度時窗；歷史完成不等於目前已到最新",
         )
     if (
-        raw_status in {"current", "complete"}
+        raw_status in {"current", "complete", "waiting", "stale"}
         and coverage_ratio is not None
         and coverage_ratio < 1.0
     ):
@@ -5751,6 +6045,9 @@ def _operation_state(
         "waiting_quota",
         "waiting_schedule",
     }:
+        if (row.get("latest_at_utc") and release_state not in
+                {"due_observed", "due_inferred"}):
+            return "waiting_publication", "waiting_publication", "尚未到推測發布邊界，或發布時刻未驗證"
         return (
             "catching_up",
             scheduled_execution,
@@ -5828,6 +6125,8 @@ def _publication_for_row(
         "last_checked_at_utc": explicit.get("last_checked_at_utc"),
         "applied_at_utc": explicit.get("applied_at_utc"),
         "next_check_at_utc": explicit.get("next_check_at_utc"),
+        "expected_release_at_utc": explicit.get("expected_release_at_utc"),
+        "expected_release_basis": explicit.get("expected_release_basis"),
         "observed_at_utc": row.get("latest_at_utc"),
         "basis": basis,
         "receipt_phases": list(explicit.get("receipt_phases") or []),
@@ -5918,6 +6217,9 @@ def _acquisition_progress(
     if operation == "streaming":
         state = "streaming"
         label = "持續取得中；串流沒有總完工日"
+    elif operation == "waiting_publication":
+        state = "waiting_publication"
+        label = "已有歷史收據；等待來源發布證據，不列入待追新"
     elif up_to_date:
         state = "complete"
         label = "取得完成且已到最新"
@@ -6000,6 +6302,7 @@ def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
         "running": 0,
         "streaming": 0,
         "waiting_stream_window": 1,
+        "waiting_publication": 2,
         "scheduled": 2,
         "waiting_quota": 3,
         "waiting": 4,
@@ -6053,12 +6356,14 @@ def _enrich_and_sort_rows(
         automation = _automation_for_row(
             row, now=now, refresh_services=refresh_services
         )
-        operation, execution, reason = _operation_state(row, automation)
         publication = _publication_for_row(
             row,
             automation=automation,
             hint=(publication_hint if isinstance(publication_hint, Mapping) else None),
         )
+        expectation = _publication_expectation(row, publication, now)
+        publication["expectation"] = expectation
+        operation, execution, reason = _operation_state(row, automation, expectation)
         row["endpoint_id"] = str(row.get("id") or "")
         row["operation_state"] = operation
         row["operation_label"] = _OPERATION_LABELS[operation]
@@ -6101,17 +6406,30 @@ def _provider_summaries(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
     for provider, items in buckets.items():
         counts: dict[str, int] = {}
         operation_counts: dict[str, int] = {}
+        category_counts: dict[str, int] = {}
         for item in items:
             status = str(item.get("status") or "unavailable")
             counts[status] = counts.get(status, 0) + 1
             operation = str(item.get("operation_state") or "unable")
             operation_counts[operation] = operation_counts.get(operation, 0) + 1
+            category = str(item.get("market_category") or "cross_market")
+            category_counts[category] = category_counts.get(category, 0) + 1
         worst = max(counts, key=lambda value: _STATUS_PRIORITY.get(value, 99))
+        primary_category = min(
+            category_counts,
+            key=lambda category: (-category_counts[category],
+                                  list(_MARKET_CATEGORY_LABELS).index(category)
+                                  if category in _MARKET_CATEGORY_LABELS else 99),
+        )
         output.append(
             {
                 "provider": provider,
+                "market_category": primary_category,
+                "market_category_label": _MARKET_CATEGORY_LABELS.get(primary_category, "跨市場／其他"),
                 "status": worst,
                 "registered": len(items),
+                "active_endpoints": sum(item.get("in_active_scope") is True for item in items),
+                "registry_aliases": sum(item.get("registry_alias") is True for item in items),
                 "status_counts": counts,
                 "operation_state_counts": operation_counts,
             }
@@ -6636,7 +6954,11 @@ def build_data_monitor_public_status(
     logical = (
         _tw_public_sources(root, now=observed)
         + _shioaji_sources(shioaji, now=observed)
-        + _openbb_sources(openbb, now=observed)
+        + _openbb_sources(
+            openbb,
+            now=observed,
+            l1_service=service_states.get("openbb_l1_compaction"),
+        )
         + _crypto_feature_sources(root, now=observed)
         + _credential_registry_sources(root, now=observed)
         + _product_granularity_sources(root, now=observed)
@@ -6783,6 +7105,9 @@ def build_data_monitor_public_status(
         "health": health,
         "read_only": True,
         "production_control_possible": False,
+        "tw_stock_calendar": _stock_stream_window(
+            observed, parquet_root=root / "data_tw_public",
+        ),
         "summary": {
             "registered_items": len(rows),
             "storage_groups": len(groups),
@@ -7051,6 +7376,51 @@ def build_tw_public_monitor_status(
     }
 
 
+def _feature_source_rows(status: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(row.get("record_inventory_key") or row.get("id")): row
+        for row in status.get("sources", ())
+        if isinstance(row, Mapping)
+    }
+
+
+def _feature_source_metadata(
+    source_rows: Mapping[str, Mapping[str, Any]], dataset: str,
+) -> tuple[Any, Any, str, str]:
+    source = source_rows.get(dataset)
+    if source is None:
+        if dataset.startswith("physical:"):
+            family = dataset.removeprefix("physical:")
+            group, label, _, _ = PHYSICAL_FAMILIES[family]
+            source = {"id": f"inventory:{family}", "parent_id": f"group:{group}",
+                      "title": label, "provider": _GROUP_META.get(group, {}).get("provider", "公開資料")}
+        else:
+            source = {"id": dataset, "title": dataset, "provider": "公開資料"}
+    category = str(source.get("market_category") or _market_category(source))
+    return (
+        source.get("title") or dataset,
+        source.get("provider") or "公開資料",
+        category,
+        _MARKET_CATEGORY_LABELS.get(category, "跨市場／其他"),
+    )
+
+
+def feature_source_metadata_sha256(
+    status: Mapping[str, Any], datasets: Iterable[str],
+) -> str:
+    """Bind feature reuse to the exact public labels the projection renders."""
+
+    source_rows = _feature_source_rows(status)
+    metadata = [
+        [dataset, *_feature_source_metadata(source_rows, dataset)]
+        for dataset in sorted(set(datasets))
+    ]
+    encoded = json.dumps(
+        metadata, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_data_monitor_feature_inventory(
     repo_root: Path, *, monitor_status: Mapping[str, Any] | None = None,
     inventory: Mapping[str, Any] | None = None,
@@ -7060,11 +7430,7 @@ def build_data_monitor_feature_inventory(
     if inventory is None:
         inventory = build_feature_inventory(repo_root)
     status = monitor_status or build_data_monitor_public_status(repo_root)
-    source_rows = {
-        str(row.get("record_inventory_key") or row.get("id")): row
-        for row in status.get("sources", ())
-        if isinstance(row, Mapping)
-    }
+    source_rows = _feature_source_rows(status)
     category_order = {category: index for index, category in enumerate(_MARKET_CATEGORY_LABELS)}
     rows: list[dict[str, Any]] = []
     source_meta: dict[str, tuple[Any, Any, str, str]] = {}
@@ -7072,22 +7438,7 @@ def build_data_monitor_feature_inventory(
         dataset = field["dataset_id"]
         meta = source_meta.get(dataset)
         if meta is None:
-            source = source_rows.get(dataset)
-            if source is None:
-                if dataset.startswith("physical:"):
-                    family = dataset.removeprefix("physical:")
-                    group, label, _, _ = PHYSICAL_FAMILIES[family]
-                    source = {"id": f"inventory:{family}", "parent_id": f"group:{group}",
-                              "title": label, "provider": _GROUP_META.get(group, {}).get("provider", "公開資料")}
-                else:
-                    source = {"id": dataset, "title": dataset, "provider": "公開資料"}
-            category = str(source.get("market_category") or _market_category(source))
-            meta = (
-                source.get("title") or dataset,
-                source.get("provider") or "公開資料",
-                category,
-                _MARKET_CATEGORY_LABELS.get(category, "跨市場／其他"),
-            )
+            meta = _feature_source_metadata(source_rows, dataset)
             source_meta[dataset] = meta
         source_title, provider, category, category_label = meta
         field_name = str(field["field"])
@@ -7158,4 +7509,5 @@ __all__ = [
     "build_data_monitor_feature_inventory",
     "build_data_monitor_public_status",
     "build_tw_public_monitor_status",
+    "feature_source_metadata_sha256",
 ]

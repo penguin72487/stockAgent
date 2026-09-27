@@ -44,7 +44,7 @@ from downloader.download_tw_public_data import (  # noqa: E402
     _select_specs,
     _validated_taiex_session_dates,
 )
-from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
+from stockagent.live.market_status import tw_stock_day_decision  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -595,18 +595,10 @@ def _completed_session_finalize_command(
 def _confirmed_closed_stock_session(live_root: Path, observed: datetime) -> str | None:
     """Skip close-only work only with affirmative official closure evidence."""
 
-    opened, reason = verified_tw_stock_session_day(
-        observed.astimezone(TAIPEI).date(), parquet_root=live_root
+    decision = tw_stock_day_decision(
+        observed.astimezone(TAIPEI).date(), parquet_root=live_root, observed=observed,
     )
-    if opened:
-        return None
-    if reason.endswith(" is a weekend") or (
-        reason.startswith("official TWSE schedule as-of ")
-        and "ordinary weekday session" not in reason
-    ):
-        return reason
-    # Missing, unreadable, or conflicting calendars cannot prove a holiday.
-    return None
+    return decision.reason if decision.status == "closed" else None
 
 
 def main() -> int:

@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=16">
+  <link rel="stylesheet" href="styles.css?v=20">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
 <body>
@@ -46,6 +46,21 @@
       <article><span>實體資料集筆數核實</span><strong id="verified-inventory">—</strong><small id="inventory-detail">檢查實存 Parquet；衍生視圖不重複計入群組總筆數</small></article>
     </section>
 
+    <section class="section-block calendar-banner" aria-labelledby="tw-calendar-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">TAIWAN STOCK SESSION</p>
+          <h2 id="tw-calendar-title">台股交易日曆</h2>
+        </div>
+        <p>台股現貨專用；TAIFEX 夜盤及加密貨幣使用各自的時窗。</p>
+      </div>
+      <div class="calendar-banner-body">
+        <strong id="tw-calendar-state" role="status" aria-live="polite">日曆讀取中</strong>
+        <span id="tw-calendar-next">下一個台股串流時窗：待確認</span>
+      </div>
+      <p id="tw-calendar-evidence" class="calendar-banner-evidence">歷史逐日收據與最新官方休市表分開驗證；日曆未知時不預測開市。</p>
+    </section>
+
     <section class="section-block finlab-monitor" aria-labelledby="finlab-title">
       <div class="section-heading">
         <div>
@@ -68,6 +83,24 @@
         </div>
         <p id="finlab-basis" class="finlab-monitor-copy"></p>
       </div>
+    </section>
+
+    <section id="provider-directory" class="section-block" aria-labelledby="providers-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SOURCE OWNERS</p>
+          <h2 id="providers-title">依來源查看全資料</h2>
+        </div>
+        <p>每個來源標籤都有獨立網址；跨來源群組與清冊別名照原註冊表標明，不算成已完成的主動端點。</p>
+      </div>
+      <div class="provider-toolbar">
+        <label for="provider-search">找資料供應商或來源群組</label>
+        <input id="provider-search" type="search" placeholder="例如 永豐、FinLab、TWSE、Binance" autocomplete="off">
+        <span id="provider-count" role="status">讀取來源中</span>
+      </div>
+      <div id="provider-grid" class="provider-grid" aria-label="資料來源頁面入口"></div>
+      <div id="provider-empty" class="empty-state" hidden>沒有符合的來源標籤。</div>
+      <button id="provider-more" class="load-more" type="button" hidden>顯示更多來源</button>
     </section>
 
     <section class="section-block" aria-labelledby="category-title">
@@ -231,6 +264,6 @@
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
   <script src="../dashboard-core.js?v=10" defer></script>
-  <script src="app.js?v=40" defer></script>
+  <script src="app.js?v=46" defer></script>
 </body>
 </html>

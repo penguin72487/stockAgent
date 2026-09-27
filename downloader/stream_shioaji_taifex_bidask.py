@@ -14,7 +14,7 @@ import re
 import signal
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from downloader.stream_shioaji_tw_microstructure import (
     EventSink,
@@ -39,6 +39,133 @@ from stockagent.live.taifex_strategy_state import load_required_option_codes
 
 SOURCE_NAME = "shioaji_taifex_tick_bidask_v1"
 DEFAULT_OPTION_ROOTS = "TXO,TX1,TX2,TX4,TX5,TXU,TXV,TXX,TXY,TXZ"
+BIDASK_STALE_TIMEOUT_SECONDS = 180.0
+EXPIRY_HEDGE_CLOSE = datetime_time(13, 30)
+
+
+def bidask_watchdog_hedge(
+    *,
+    hedge_code: str,
+    hedge_last_trading_date: date | None,
+    subscribed_codes: set[str],
+) -> tuple[str | None, date | None]:
+    """Protect subscribed hedge data even when strategy bootstrap is blocked."""
+
+    if not hedge_code or hedge_code not in subscribed_codes:
+        return None, None
+    if not isinstance(hedge_last_trading_date, date):
+        raise RuntimeError("subscribed hedge has no last trading date")
+    return hedge_code, hedge_last_trading_date
+
+
+def bidask_watchdog_session_active(
+    *,
+    now: datetime,
+    capture_session: str,
+    required_book_last_trading_date: date | None,
+) -> bool:
+    """Stop expecting the expiring hedge's quotes at its 13:30 close."""
+
+    if taifex_session_kind(now) != capture_session:
+        return False
+    return not (
+        capture_session == "day"
+        and required_book_last_trading_date == now.date()
+        and now.time() >= EXPIRY_HEDGE_CLOSE
+    )
+
+
+def bidask_stream_stale(
+    *,
+    now_monotonic_ns: int,
+    last_book_monotonic_ns: int,
+    in_capture_session: bool,
+    timeout_seconds: float = BIDASK_STALE_TIMEOUT_SECONDS,
+) -> bool:
+    """Detect a silent subscribed stream, not an initially quiet market."""
+
+    return (
+        in_capture_session
+        and last_book_monotonic_ns > 0
+        and now_monotonic_ns - last_book_monotonic_ns
+        > int(timeout_seconds * 1_000_000_000)
+    )
+
+
+def bidask_watchdog_reference_ns(
+    *,
+    first_book_monotonic_ns: int,
+    last_required_book_monotonic_ns: int,
+    active_session_start_monotonic_ns: int,
+    first_required_tick_monotonic_ns: int = 0,
+) -> int:
+    """Never count pre-open quiet time as a continuous-session outage."""
+
+    if active_session_start_monotonic_ns <= 0:
+        return 0
+    if first_required_tick_monotonic_ns > 0:
+        # A current trade proves the required hedge is active even when its
+        # BidAsk subscription has delivered nothing. Other contracts' books
+        # and subsequent ticks cannot postpone this first-book deadline.
+        return max(
+            last_required_book_monotonic_ns
+            if last_required_book_monotonic_ns > 0
+            else first_required_tick_monotonic_ns,
+            active_session_start_monotonic_ns,
+        )
+    if first_book_monotonic_ns <= 0:
+        return 0
+    return max(
+        first_book_monotonic_ns,
+        last_required_book_monotonic_ns,
+        active_session_start_monotonic_ns,
+    )
+
+
+def first_required_tick_reference_ns(
+    *,
+    first_required_tick_monotonic_ns: int,
+    tick: Mapping[str, Any],
+    required_book_code: str | None,
+    required_book_last_trading_date: date | None,
+    capture_session: str,
+    capture_trade_date: date,
+    maximum_age_seconds: float,
+) -> int:
+    """Latch live hedge-trade evidence without inferring holiday sessions."""
+
+    if first_required_tick_monotonic_ns > 0:
+        return first_required_tick_monotonic_ns
+    if (
+        not required_book_code
+        or tick.get("code") != required_book_code
+        or tick.get("simtrade")
+        or tick.get("suspend")
+        or int(tick.get("volume") or 0) <= 0
+    ):
+        return 0
+    price = float(tick.get("close") or 0.0)
+    if not math.isfinite(price) or price <= 0:
+        return 0
+    receive_ns = int(tick["receive_ts_ns"])
+    exchange_ns = int(tick["exchange_ts_ns"])
+    if not 0 <= receive_ns - exchange_ns <= maximum_age_seconds * 1_000_000_000:
+        return 0
+    received_at = datetime.fromtimestamp(receive_ns / 1_000_000_000, TAIPEI)
+    exchanged_at = datetime.fromtimestamp(exchange_ns / 1_000_000_000, TAIPEI)
+    if (
+        tick.get("trade_date") != capture_trade_date
+        or taifex_trading_date(received_at) != capture_trade_date
+        or taifex_trading_date(exchanged_at) != capture_trade_date
+        or taifex_session_kind(exchanged_at) != capture_session
+        or not bidask_watchdog_session_active(
+            now=received_at,
+            capture_session=capture_session,
+            required_book_last_trading_date=required_book_last_trading_date,
+        )
+    ):
+        return 0
+    return int(tick["receive_monotonic_ns"])
 
 
 def parse_args() -> argparse.Namespace:
@@ -809,6 +936,13 @@ def main() -> int:
         )
         api.set_order_callback(strategy_engine.on_order_event)
 
+    watchdog_book_code, hedge_last_trading_date = bidask_watchdog_hedge(
+        hedge_code=str(getattr(hedge_base, "code", "")),
+        hedge_last_trading_date=getattr(hedge_info, "last_trading_date", None),
+        subscribed_codes=selected_contract_codes,
+    )
+    first_required_tick_monotonic_ns = [0]
+
     @api.on_tick_fop_v1()
     def on_tick(tick: Any) -> None:
         receive_ts_ns = time.time_ns()
@@ -822,10 +956,27 @@ def main() -> int:
                 receive_monotonic_ns=receive_monotonic_ns,
             )
             sink.enqueue("tick", row)
+            if (
+                first_required_tick_monotonic_ns[0] == 0
+                and row["code"] == watchdog_book_code
+            ):
+                first_required_tick_monotonic_ns[0] = first_required_tick_reference_ns(
+                    first_required_tick_monotonic_ns=0,
+                    tick=row,
+                    required_book_code=watchdog_book_code,
+                    required_book_last_trading_date=hedge_last_trading_date,
+                    capture_session=capture_session,
+                    capture_trade_date=capture_trade_date,
+                    maximum_age_seconds=float(args.stale_ms) / 1_000.0,
+                )
             if strategy_engine is not None:
                 strategy_engine.on_tick(row)
         except Exception:
             sink.fatal_event.set()
+
+    first_book_monotonic_ns = [0]
+    last_watchdog_book_monotonic_ns = [0]
+    last_watchdog_book_receive_ts_ns = [0]
 
     @api.on_bidask_fop_v1()
     def on_book(book: Any) -> None:
@@ -840,6 +991,11 @@ def main() -> int:
                 receive_monotonic_ns=receive_monotonic_ns,
             )
             sink.enqueue("book", row)
+            if first_book_monotonic_ns[0] == 0:
+                first_book_monotonic_ns[0] = receive_monotonic_ns
+            if watchdog_book_code is None or row["code"] == watchdog_book_code:
+                last_watchdog_book_monotonic_ns[0] = receive_monotonic_ns
+                last_watchdog_book_receive_ts_ns[0] = receive_ts_ns
             if strategy_engine is not None:
                 strategy_engine.on_book(row)
         except Exception:
@@ -873,6 +1029,7 @@ def main() -> int:
 
     subscribed = 0
     status = "running"
+    active_session_start_monotonic_ns = 0
     try:
         for contract in contracts:
             api.subscribe(
@@ -898,11 +1055,44 @@ def main() -> int:
             flush=True,
         )
         while datetime.now(TAIPEI) < stop_at and not shutdown.wait(0.5):
+            in_capture_session = bidask_watchdog_session_active(
+                now=datetime.now(TAIPEI),
+                capture_session=capture_session,
+                required_book_last_trading_date=hedge_last_trading_date,
+            )
+            now_monotonic_ns = time.monotonic_ns()
+            if in_capture_session and active_session_start_monotonic_ns == 0:
+                active_session_start_monotonic_ns = now_monotonic_ns
             if time.monotonic() - last_ledger_observation >= 60.0:
                 observe_stream_ledger()
                 last_ledger_observation = time.monotonic()
             if sink.fatal_event.is_set():
                 status = "failed_event_loss_or_normalization"
+                break
+            if bidask_stream_stale(
+                now_monotonic_ns=now_monotonic_ns,
+                last_book_monotonic_ns=bidask_watchdog_reference_ns(
+                    first_book_monotonic_ns=first_book_monotonic_ns[0],
+                    last_required_book_monotonic_ns=(
+                        last_watchdog_book_monotonic_ns[0]
+                    ),
+                    active_session_start_monotonic_ns=(
+                        active_session_start_monotonic_ns
+                    ),
+                    first_required_tick_monotonic_ns=(
+                        first_required_tick_monotonic_ns[0]
+                    ),
+                ),
+                in_capture_session=in_capture_session,
+            ):
+                status = "failed_bidask_stale"
+                print(
+                    f"[shioaji-taifex] worker={args.worker_index} "
+                    f"watchdog_code={watchdog_book_code or 'any'} "
+                    f"bidask_stale_seconds={BIDASK_STALE_TIMEOUT_SECONDS:g} "
+                    "reconnect_required=true",
+                    flush=True,
+                )
                 break
             if strategy_engine is not None:
                 strategy_engine.step()
@@ -968,6 +1158,11 @@ def main() -> int:
             "subscriptions_requested": subscribed,
             "tick_events": stats.tick_events,
             "book_events": stats.book_events,
+            "bidask_watchdog_code": watchdog_book_code,
+            "last_watchdog_book_receive_ts_ns": (
+                last_watchdog_book_receive_ts_ns[0] or None
+            ),
+            "bidask_stale_timeout_seconds": BIDASK_STALE_TIMEOUT_SECONDS,
             "book_1s_rows": stats.book_1s_rows,
             "dropped_events": stats.dropped_events,
             "queue_high_watermark": stats.queue_high_watermark,

@@ -122,6 +122,8 @@ class TaiwanStockContextFuturesPortfolioDaily:
     source_path: str
     manifest_path: str
     integer_execution: np.ndarray | None = None
+    intraday_execution: np.ndarray | None = None
+    intraday_session_mask: np.ndarray | None = None
     carry_valuation_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantined_physical_contracts: int = 0
@@ -142,6 +144,8 @@ class TaiwanStockContextFuturesPortfolioDaily:
     ) -> np.ndarray:
         """Pack executor-only channels without exposing them as model input."""
 
+        if self.intraday_execution is not None:
+            return self.intraday_execution
         liquidation = (
             self.must_liquidate_mask
             if must_liquidate_mask is None

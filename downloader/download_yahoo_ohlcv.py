@@ -2156,6 +2156,30 @@ def _filter_us_records_for_broker_tradable_universe(records: list[SymbolRecord])
     ]
 
 
+def _enrich_us_symbol_names(
+    records: list[SymbolRecord], references: list[SymbolRecord],
+) -> list[SymbolRecord]:
+    """Fill missing descriptions by exact code without changing symbol identity."""
+    descriptions: dict[str, str] = {}
+    for reference in references:
+        if reference.name.strip().upper() not in {
+            "", reference.code.upper(), reference.yahoo_symbol.upper()
+        }:
+            descriptions.setdefault(reference.code, reference.name)
+    enriched: list[SymbolRecord] = []
+    for record in records:
+        name = descriptions.get(record.code)
+        if name is not None and record.name.strip().upper() in {
+            "", record.code.upper(), record.yahoo_symbol.upper()
+        }:
+            record = SymbolRecord(
+                code=record.code, name=name,
+                market=record.market, yahoo_symbol=record.yahoo_symbol,
+            )
+        enriched.append(record)
+    return enriched
+
+
 def _filter_records_for_supported_universe(asset_class: str, records: list[SymbolRecord]) -> list[SymbolRecord]:
     if asset_class == "tw_stocks":
         return _filter_tw_records_for_supported_universe(records)
@@ -2498,6 +2522,10 @@ def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list
         records.append(cached_record if cached_record is not None else record)
         seen_codes.add(record.code)
 
+    if asset_class == "us_stocks":
+        # Excluded local files remain preserved, but must not re-enter the
+        # stock/ETF schedule merely because an old manifest lost their names.
+        records = _enrich_us_symbol_names(records, _load_repo_symbol_fallback(asset_class))
     return records
 
 
@@ -2519,7 +2547,10 @@ def _load_repo_symbol_fallback(asset_class: str) -> list[SymbolRecord]:
 
 
 def _resolve_cached_manifest(output_dir: Path, asset_class: str) -> list[SymbolRecord]:
-    return _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+    records = _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+    if asset_class == "us_stocks":
+        records = _enrich_us_symbol_names(records, _load_repo_symbol_fallback(asset_class))
+    return records
 
 
 def _asset_output_is_bootstrap_empty(output_dir: Path) -> bool:
@@ -2785,6 +2816,18 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
             )
         except Exception as exc:
             print(f"[symbols] failed to load us delisted list: {exc}")
+    if args.mode == "repair" and not _strict_no_fallback(args):
+        # Current listings are not the historical repair universe. Preserve
+        # durable identities and use reference descriptions only to fill names
+        # lost by an older manifest rewrite; never change source provenance or
+        # infer delisting from absence in today's listing response.
+        tracked = _load_local_tracked_records(
+            "us_stocks", _resolve_asset_output_dir(args, "us_stocks"), cached
+        )
+        records = _enrich_us_symbol_names(
+            _dedupe_records_by_code([*cached, *tracked, *records]),
+            [*records, *repo_fallback_records],
+        )
     before_filter = len(records)
     records = _filter_us_records_for_broker_tradable_universe(records)
     if before_filter != len(records):
@@ -3184,11 +3227,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         )
     deduped = _dedupe_records_by_code(records)
 
+    manifest_records = list(deduped)
     if args.limit is not None:
         deduped = deduped[: args.limit]
     return SymbolResolution(
         scheduled_records=deduped,
-        manifest_records=deduped,
+        manifest_records=(
+            manifest_records
+            if asset_class == "us_stocks" and args.mode == "repair"
+            else deduped
+        ),
         new_codes=set(),
         excluded_records=_dedupe_excluded_records(excluded_records),
     )
@@ -4026,6 +4074,8 @@ def _resolve_repair_plan(
             if (
                 asset_class == "us_stocks"
                 and bool(getattr(args, "verify_us_history_head", False))
+                and not info.metadata_error
+                and info.asset_class == asset_class
                 and (checked_start_dt is None or checked_start_dt > requested_start_dt)
             ):
                 checks.append(

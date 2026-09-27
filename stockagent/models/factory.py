@@ -532,6 +532,11 @@ def build_model(
             model_type = CrossSectionalIndexDerivativesDayModel
         elif executable_policy:
             model_type = ExecutablePortfolioTransformerModel
+        elif config.trading.execution_mode == "tw_stock_context_futures_portfolio":
+            from stockagent.models.financial_transformer_futures import (
+                FinancialTransformerFuturesModel,
+            )
+            model_type = FinancialTransformerFuturesModel
         else:
             model_type = FinancialTransformerModel
         derivative_kwargs = (
@@ -608,6 +613,15 @@ def build_model(
                 for index, name in enumerate(ordered_names)
                 if f"{name}__available" in name_to_index
             ]
+        if config.trading.execution_mode == "tw_stock_context_futures_portfolio":
+            derivative_kwargs.update(
+                futures_denomination_aware_output=fin_cfg.futures_denomination_aware_output,
+                futures_denomination_hard_projection=fin_cfg.futures_denomination_hard_projection,
+                futures_current_open_feature=fin_cfg.futures_current_open_feature,
+                futures_denomination_reference_capital=(
+                    config.trading.tw_futures_portfolio_integer_initial_capital
+                ),
+            )
         return model_type(
             lookback=lookback,
             num_features=num_features,

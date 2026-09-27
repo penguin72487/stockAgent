@@ -1,0 +1,29 @@
+# Candidate: do not promote or call this web-parity certified until the
+# acceptance receipt includes real-data DDP and independent paper replay.
+base_config: tw_day_trade_v8_v5_frozen_training_snapshot.yaml
+experiment_name: tw-day-trade-v8-web-parity-v7
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_web_parity_v7
+  start_fold: 10
+  resume: true
+  post_train_infer: false
+
+data:
+  panel_cache_root: artifacts/cache/tw_day_trade_v8_web_parity_v7/stocks
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_v8_web_parity_v7/minute
+
+trading:
+  tw_day_trade_entry_remainder_policy: frozen_target_until_1320
+  tw_day_trade_terminal_liquidation_unlimited_capacity: false
+  tw_day_trade_unlimited_margin_conversion: true
+  max_volume_participation: 0.5
+
+training:
+  # Never erase held inventory at an annual boundary. Year-based fold ownership
+  # is unchanged. A fresh optimizer is isolated from v5 and all other runs.
+  day_trade_training_annual_episodes: false
+  # The old backward-only one-lot labels assumed one-shot opening execution.
+  day_trade_sub_lot_recovery: false
+  day_trade_sparse_events: false
+  pretrained_initialization_root: null

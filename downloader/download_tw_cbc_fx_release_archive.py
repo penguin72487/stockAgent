@@ -27,10 +27,10 @@ import requests
 
 try:
     from downloader.common import SharedRateLimiter, retry_delay_seconds
-    from downloader.release_archive_io import write_release_rows_if_changed
+    from downloader.release_archive_io import write_release_rows_if_changed, write_release_state
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter, retry_delay_seconds
-    from release_archive_io import write_release_rows_if_changed
+    from release_archive_io import write_release_rows_if_changed, write_release_state
 
 try:
     import fcntl
@@ -180,6 +180,35 @@ def parse_listing(content: bytes) -> tuple[list[dict[str, str]], int]:
     return page.rows, page.total_pages
 
 
+def _validate_listing_page(
+    listing: ListingPage, requested_page: int, *, page_size: int = LIST_PAGE_SIZE,
+    expected: ListingPage | None = None,
+) -> None:
+    """Validate before queuing more requests or persisting a usable raw page.
+
+    The optional reference binds only pages fetched in this same discovery.
+    Historical recent-page resume receipts may describe different generations.
+    """
+    if (listing.page != requested_page
+            or not 1 <= requested_page <= listing.total_pages <= 1000):
+        raise ValueError("CBC listing page identity or count changed during discovery; retry")
+    if listing.total_rows is None or listing.total_rows < 1:
+        raise ValueError("CBC listing lacks a verifiable total row count")
+    if page_size not in (20, 60) or listing.page_size != page_size:
+        raise ValueError("CBC listing page size differs from requested layout")
+    if (listing.total_rows + page_size - 1) // page_size != listing.total_pages:
+        raise ValueError("CBC listing page count contradicts its total row count")
+    expected_rows = min(page_size, listing.total_rows - (requested_page - 1) * page_size)
+    if listing.raw_rows != expected_rows:
+        raise ValueError(
+            f"CBC listing page {requested_page} has {listing.raw_rows} of {expected_rows} rows"
+        )
+    if expected is not None and (
+        listing.total_pages, listing.total_rows, listing.page_size
+    ) != (expected.total_pages, expected.total_rows, expected.page_size):
+        raise ValueError("CBC listing changed during discovery; retry")
+
+
 def parse_detail(content: bytes, listed: dict[str, str]) -> tuple[str, float | None, str | None]:
     soup = BeautifulSoup(content, "html.parser")
     title = soup.select_one("h2.title")
@@ -326,11 +355,7 @@ def _writer_lock(root: Path):
 
 
 def _write_state(root: Path, state: dict[str, object]) -> None:
-    path = root / "state" / f"{OUTPUT_NAME}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    write_release_state(root, OUTPUT_NAME, state)
 
 
 def _collect_one(listed: dict[str, str], root: Path, limiter: SharedRateLimiter,
@@ -378,6 +403,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         root, cached_only=offline_cache_only or cached_list_pages
     )
     discovery_started = time.monotonic()
+    reference_listing: ListingPage | None = None
     def fetch_page(page: int) -> tuple[int, str, str, ListingPage]:
         url = list_url.format(page=page)
         prefix = page_prefix.format(page=page)
@@ -388,47 +414,38 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         if body is None:
             raise FileNotFoundError(f"no cached CBC listing page {page}")
         listing = _parse_listing_page(body)
+        _validate_listing_page(listing, page, page_size=listing_page_size,
+                               expected=reference_listing)
         digest, path = _save_raw(root / "raw" / OUTPUT_NAME / "list", prefix, body)
         return page, digest, path, listing
 
     first = fetch_page(1)
+    reference_listing = first[3]
     total_pages = first[3].total_pages
-    if not 1 <= total_pages <= 1000:
-        raise ValueError(f"CBC reported implausible page count: {total_pages}")
     pages = [first]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_page, page): page for page in range(2, total_pages + 1)}
-        for future in as_completed(futures):
-            try:
+        try:
+            futures = {pool.submit(fetch_page, page): page for page in range(2, total_pages + 1)}
+            for future in as_completed(futures):
                 pages.append(future.result())
-            except SourceAccessBlocked:
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
-            completed_pages = len(pages)
-            if completed_pages % 20 == 0 or completed_pages == total_pages:
-                elapsed = max(time.monotonic() - started, 0.001)
-                _write_state(root, {
-                    "dataset": OUTPUT_NAME, "status": "running", "phase": "discovering",
-                    "started_at_utc": started_at, "completed_pages": completed_pages,
-                    "total_pages": total_pages, "completed_releases": 0,
-                    "total_releases": None,
-                    "estimated_seconds_remaining": round(
-                        (total_pages - completed_pages) * elapsed / completed_pages
-                    ),
-                })
-    total_rows = first[3].total_rows
-    if total_rows is None or total_rows < 1:
-        raise ValueError("CBC listing lacks a verifiable total row count")
-    if (total_rows + listing_page_size - 1) // listing_page_size != total_pages:
-        raise ValueError("CBC listing page count contradicts its total row count")
+                completed_pages = len(pages)
+                if completed_pages % 20 == 0 or completed_pages == total_pages:
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    _write_state(root, {
+                        "dataset": OUTPUT_NAME, "status": "running", "phase": "discovering",
+                        "started_at_utc": started_at, "completed_pages": completed_pages,
+                        "total_pages": total_pages, "completed_releases": 0,
+                        "total_releases": None,
+                        "estimated_seconds_remaining": round(
+                            (total_pages - completed_pages) * elapsed / completed_pages
+                        ),
+                    })
+        except Exception:
+            # Source or progress persistence failure invalidates discovery.
+            # Cancel pending work; running HTTP calls still finish normally.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     for page, digest, path, listing in sorted(pages):
-        if listing.page != page or listing.total_pages != total_pages:
-            raise ValueError("CBC listing page identity or count changed during discovery; retry")
-        if listing.total_rows != total_rows or listing.page_size != listing_page_size:
-            raise ValueError("CBC listing total rows or page size changed during discovery; retry")
-        expected_raw_rows = min(listing_page_size, total_rows - (page - 1) * listing_page_size)
-        if listing.raw_rows != expected_raw_rows:
-            raise ValueError(f"CBC listing page {page} has {listing.raw_rows} of {expected_raw_rows} rows")
         url = list_url.format(page=page)
         list_receipts.append({"page": page, "url": url, "sha256": digest,
                               "path": path, "raw_rows": listing.raw_rows,
@@ -457,6 +474,9 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
             try:
                 results.append(future.result())
             except Exception as exc:
+                if isinstance(exc, SourceAccessBlocked):
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
                 failures.append({"release_url": row["release_url"], "error": f"{type(exc).__name__}: {exc}"})
             completed = len(results) + len(failures)
             now = time.monotonic()
@@ -498,7 +518,7 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         "distinct_periods": len(periods), "earliest_period": min(periods) if periods else None,
         "latest_period": max(periods) if periods else None, "missing_periods": missing_periods,
         "failures": failures, "listing_receipts": list_receipts,
-        "started_at_utc": started_at, "elapsed_seconds": round(time.monotonic() - started, 3),
+        "started_at_utc": started_at,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
     }
     # A failed detail fetch must not replace a previously complete archive
@@ -515,6 +535,8 @@ def collect(root: Path, *, workers: int = 8, request_interval: float = 0.1,
         summary["stage_seconds"]["parquet_proof_write"] = round(
             time.monotonic() - write_started, 3
         )
+    summary["elapsed_seconds"] = round(time.monotonic() - started, 6)
+    summary["elapsed_scope"] = "through_parquet_proof_before_final_state_write"
     _write_state(root, summary)
     return summary
 

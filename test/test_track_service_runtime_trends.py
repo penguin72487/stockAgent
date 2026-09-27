@@ -1,12 +1,111 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from types import SimpleNamespace
 
 import pytest
 
 from scripts import track_service_runtime_trends as tracker
 from scripts import benchmark_dashboard_latency as benchmark
 from scripts import audit_service_latency_coverage as audit
+
+
+def test_small_journal_sample_preserves_original_event():
+    sample = {"event": "all_service_runtime_sample", "services": [], "service_count": 0}
+    assert tracker.runtime_sample_journal_lines(sample) == [
+        json.dumps(sample, separators=(",", ":"))
+    ]
+
+
+@pytest.mark.parametrize("value", ["plain", '"\\\n\t', "台灣資料🧪"])
+def test_large_journal_sample_frames_are_bounded_and_lossless(value):
+    sample = {
+        "event": "all_service_runtime_sample", "service_count": 57,
+        "services": [{"unit": "test", "business_receipt": value * 40_000}],
+    }
+    original = json.dumps(sample, separators=(",", ":"))
+    lines = tracker.runtime_sample_journal_lines(sample)
+    assert len(lines) > 1
+    assert all(len(line.encode("utf-8")) <= 32 * 1024 for line in lines)
+    frames = [json.loads(line) for line in lines]
+    assert {f["event"] for f in frames} == {"all_service_runtime_sample_chunk"}
+    assert {f["part_count"] for f in frames} == {len(frames)}
+    assert [f["part_index"] for f in frames] == list(range(len(frames)))
+    assert len({f["sample_id"] for f in frames}) == 1
+    reconstructed = "".join(f["payload_fragment"] for f in frames)
+    assert reconstructed == original
+    assert json.loads(reconstructed) == sample
+    assert {f["payload_sha256"] for f in frames} == {
+        hashlib.sha256(reconstructed.encode("ascii")).hexdigest()
+    }
+    # Lost/changed frames cannot silently pass the recorded payload checksum.
+    incomplete = "".join(f["payload_fragment"] for f in frames[1:])
+    assert hashlib.sha256(incomplete.encode("ascii")).hexdigest() != frames[0]["payload_sha256"]
+    repeated = [json.loads(line) for line in tracker.runtime_sample_journal_lines(sample)]
+    assert repeated[0]["sample_id"] != frames[0]["sample_id"]
+    assert repeated[0]["payload_sha256"] == frames[0]["payload_sha256"]
+
+
+def test_journal_sample_frame_boundary_and_nonfinite_values():
+    prefix = {"value": ""}
+    overhead = len(json.dumps(prefix, separators=(",", ":")))
+    exact = {"value": "x" * (tracker.JOURNAL_LINE_MAX_BYTES - overhead)}
+    assert len(tracker.runtime_sample_journal_lines(exact)) == 1
+    above = {"value": exact["value"] + "x"}
+    assert len(tracker.runtime_sample_journal_lines(above)) > 1
+    for invalid in [float("nan"), float("inf"), -float("inf")]:
+        with pytest.raises(ValueError):
+            tracker.runtime_sample_journal_lines({"value": invalid})
+
+
+@pytest.mark.parametrize("serialization_fails", [False, True])
+def test_snapshot_main_isolates_journal_framing_from_status_publication(
+    tmp_path, monkeypatch, capsys, serialization_fails,
+):
+    from scripts import snapshot_data_refresh_services as snapshot
+
+    monkeypatch.setattr(snapshot, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(snapshot, "parse_args", lambda: SimpleNamespace(
+        output=tmp_path / "services.json", public_status_output=tmp_path / "public.json",
+        feature_inventory_output=tmp_path / "features.json",
+    ))
+    monkeypatch.setattr(snapshot, "_refresh_service_states", lambda **_: {
+        "fixture": {"evidence_source": "systemd_live"},
+    })
+    monkeypatch.setattr(snapshot, "InventorySnapshot", lambda *_: object())
+    inventory = {
+        "datasets": {}, "cached_files": 0, "refreshed_files": 0,
+        "identity_rechecked_files": 0, "identity_unbound_files": 0,
+    }
+    monkeypatch.setattr(snapshot, "build_record_inventory", lambda *_, **__: inventory)
+    monkeypatch.setattr(snapshot, "build_shioaji_public_status", lambda *_, **__: {
+        "read_only": True, "simulation_only": True, "production_order_possible": False,
+    })
+    monkeypatch.setattr(snapshot, "build_data_monitor_public_status", lambda *_, **__: {"sources": []})
+    monkeypatch.setattr(snapshot, "feature_source_metadata_sha256", lambda *_: "a" * 64)
+    monkeypatch.setattr(snapshot, "_current_feature_snapshot", lambda *_, **__: 0)
+    monkeypatch.setattr(snapshot, "_write_public_summary_snapshot", lambda *_: None)
+    writes = []
+    monkeypatch.setattr(snapshot, "_atomic_json", lambda path, *_, **__: writes.append(path.name))
+    sample = {"event": "all_service_runtime_sample", "services": [], "padding": "x" * 40_000}
+    monkeypatch.setattr(tracker, "sample_service_runtime", lambda *_: sample)
+    if serialization_fails:
+        def fail(_sample):
+            raise ValueError("fixture encoder failure must not stop dashboard projection")
+        monkeypatch.setattr(tracker, "runtime_sample_journal_lines", fail)
+    assert snapshot.main() == 0
+    assert {"services.json", "public.json", "shioaji_status.json"} <= set(writes)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert any(e["event"] == "data_monitor_timing" for e in events)
+    failures = [e for e in events if e["event"] == "all_service_runtime_sample_failed"]
+    chunks = [e for e in events if e["event"] == "all_service_runtime_sample_chunk"]
+    if serialization_fails:
+        assert failures == [{"event": "all_service_runtime_sample_failed", "error_type": "ValueError"}]
+        assert not chunks
+    else:
+        assert not failures
+        assert json.loads("".join(e["payload_fragment"] for e in chunks)) == sample
 
 
 @pytest.fixture(autouse=True)
@@ -266,3 +365,161 @@ def test_tracker_keeps_deferred_business_state_distinct_from_process_success(
     assert row["result"] == "success"
     assert row["business_receipt"]["matches_last_attempt"] is True
     assert row["business_receipt"]["state"] == "deferred_source_changed"
+
+
+@pytest.mark.parametrize("bad", [
+    "{", "[]", "null", "[" * 2000 + "]" * 2000,
+    '{"schema_version":1,"sample":{"monotonic":NaN,"units":{}}}',
+    '{"schema_version":1,"sample":{"monotonic":Infinity,"units":{}}}',
+    '{"schema_version":1,"sample":{"monotonic":1e999,"units":{}}}',
+    '{"schema_version":1,"sample":{"monotonic":-1,"units":{}}}',
+    '{"schema_version":true,"sample":{"monotonic":1,"units":{}}}',
+    '{"schema_version":2,"sample":{"monotonic":1,"units":{}}}',
+    '{"schema_version":1,"sample":{"monotonic":true,"units":{}}}',
+    '{"schema_version":1,"sample":{"monotonic":100,"units":[]}}',
+    '{"schema_version":1,"sample":{"monotonic":100,"units":{"stockagent-job.service":[]}}}',
+    '{"schema_version":1,"sample":{"monotonic":100,"units":{"stockagent-job.service":null}}}',
+    '{"schema_version":1,"boot_id":[],"sample":{"monotonic":100,"units":{}}}',
+])
+def test_corrupt_baseline_recovers_once_without_crossing_invalid_interval(tmp_path, monkeypatch, bad):
+    path = tmp_path / "baseline.json"
+    path.write_text(bad)
+    calls = []
+    monkeypatch.setattr(tracker, "_boot_id", lambda: "same-boot")
+
+    def current():
+        calls.append(True)
+        return _snapshot(401, active=True)
+
+    monkeypatch.setattr(benchmark, "service_snapshot", current)
+    first = tracker.sample_service_runtime(path, now_monotonic=401)
+    assert first["baseline_state"].startswith("reset_")
+    assert first["interval_seconds"] is None
+    row = first["services"][0]
+    assert row["sample_continuous"] is False
+    assert row["cpu_cores_average"] is None
+    assert row["read_bytes_delta"] is None
+    assert row["write_bytes_delta"] is None
+    assert json.loads(path.read_text())["sample"]["monotonic"] == 401
+    assert tracker.sample_service_runtime(path, now_monotonic=402) is None
+    assert len(calls) == 1  # Recovery restores the ordinary cheap cadence gate.
+    assert tracker.runtime_sample_journal_lines(first)
+
+
+def test_oversized_baseline_is_bounded_and_replaced_with_full_current_inventory(tmp_path, monkeypatch):
+    path = tmp_path / "baseline.json"
+    path.write_bytes(b" " * (tracker.BASELINE_MAX_BYTES + 1))
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: _snapshot(401, active=True))
+    measured = tracker.sample_service_runtime(path, now_monotonic=401)
+    assert measured["baseline_state"] == "reset_oversized"
+    assert measured["service_count"] == 1
+    assert set(json.loads(path.read_text())["sample"]["units"]) == {"stockagent-job.service"}
+
+
+@pytest.mark.parametrize("boot", [None, "same-boot"])
+def test_monotonic_rollback_discards_all_counter_deltas_even_with_matching_boot(tmp_path, monkeypatch, boot):
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(tracker, "_boot_id", lambda: boot)
+    snapshots = iter([_snapshot(401, active=True), _snapshot(100, active=True)])
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: next(snapshots))
+    tracker.sample_service_runtime(path, now_monotonic=401)
+    measured = tracker.sample_service_runtime(path, now_monotonic=100)
+    assert measured["baseline_state"] == "reset_clock_rollback"
+    assert measured["interval_seconds"] is None
+    assert measured["services"][0]["read_bytes_delta"] is None
+    assert measured["services"][0]["write_bytes_delta"] is None
+
+
+@pytest.mark.parametrize("stamp", [True, -1, float("nan"), float("inf")])
+def test_invalid_sampling_clock_leaves_existing_evidence_unchanged(tmp_path, monkeypatch, stamp):
+    path = tmp_path / "baseline.json"
+    path.write_text("old evidence")
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: pytest.fail("no systemd query"))
+    with pytest.raises(ValueError, match="sampling clock"):
+        tracker.sample_service_runtime(path, now_monotonic=stamp)
+    assert path.read_text() == "old evidence"
+
+
+@pytest.mark.parametrize("bad", [
+    None, [], {"monotonic": float("nan"), "units": {}},
+    {"monotonic": 500, "units": {"service": []}},
+    {"monotonic": 500, "units": {}, "query_ms": "bad"},
+    {"monotonic": 500, "units": {}, "query_ms": float("inf")},
+    {"monotonic": 500, "units": {}, "query_ms": -1},
+    {"monotonic": 500, "units": {}, "query_ms": True},
+])
+def test_invalid_current_snapshot_does_not_replace_baseline(tmp_path, monkeypatch, bad):
+    path = tmp_path / "baseline.json"
+    path.write_text("previous evidence")
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: bad)
+    with pytest.raises(ValueError, match="current service snapshot"):
+        tracker.sample_service_runtime(path, now_monotonic=500)
+    assert path.read_text() == "previous evidence"
+
+
+def test_current_baseline_serialization_failure_is_atomic_without_inventory_truncation(tmp_path, monkeypatch):
+    path = tmp_path / "baseline.json"
+    path.write_text("previous evidence")
+    current = _snapshot(500, active=True)
+    current["oversized"] = "x" * tracker.BASELINE_MAX_BYTES
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: current)
+    with pytest.raises(ValueError, match="no services truncated"):
+        tracker.sample_service_runtime(path, now_monotonic=500)
+    assert path.read_text() == "previous evidence"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_negative_baseline_counter_is_not_a_positive_usage_measurement():
+    assert tracker._counter_delta({"cpu": -1}, {"cpu": 10}, "cpu", same_process=True) is None
+
+
+def test_deactivating_service_is_not_terminal(tmp_path, monkeypatch):
+    current = _snapshot(500)
+    current["units"]["stockagent-job.service"]["ActiveState"] = "deactivating"
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: current)
+    measured = tracker.sample_service_runtime(tmp_path / "baseline.json", now_monotonic=500)
+    row = measured["services"][0]
+    assert row["last_completed_process_wall_seconds"] is None
+    assert row["exit_status"] is None
+
+
+def test_snapshot_clock_rollback_after_admission_drops_volume_and_unit_deltas(tmp_path, monkeypatch):
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(tracker, "_boot_id", lambda: "same-boot")
+    snapshots = iter([_snapshot(100, active=True), _snapshot(99, active=True)])
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: next(snapshots))
+    spaces = iter([
+        {"device_id": 7, "total_bytes": 1000, "available_bytes": 900},
+        {"device_id": 7, "total_bytes": 1000, "available_bytes": 100},
+    ])
+    monkeypatch.setattr(tracker, "_filesystem_space", lambda: next(spaces))
+    tracker.sample_service_runtime(path, now_monotonic=100)
+    measured = tracker.sample_service_runtime(path, now_monotonic=401)
+    assert measured["baseline_state"] == "reset_clock_rollback"
+    assert measured["interval_seconds"] is None
+    assert measured["filesystem"]["available_delta_bytes"] is None
+    assert measured["services"][0]["read_bytes_delta"] is None
+
+
+def test_negative_baseline_free_space_is_not_a_volume_gain(tmp_path, monkeypatch):
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(tracker, "_boot_id", lambda: "same-boot")
+    snapshots = iter([_snapshot(100), _snapshot(401)])
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(tracker, "_filesystem_space", lambda: {
+        "device_id": 7, "total_bytes": 1000, "available_bytes": 500,
+    })
+    tracker.sample_service_runtime(path, now_monotonic=100)
+    baseline = json.loads(path.read_text())
+    baseline["filesystem"]["available_bytes"] = -1
+    path.write_text(json.dumps(baseline))
+    measured = tracker.sample_service_runtime(path, now_monotonic=401)
+    assert measured["filesystem"]["available_delta_bytes"] is None
+
+
+def test_missing_query_timing_is_unknown_not_zero(tmp_path, monkeypatch):
+    current = _snapshot(100)
+    current.pop("query_ms")
+    monkeypatch.setattr(benchmark, "service_snapshot", lambda: current)
+    measured = tracker.sample_service_runtime(tmp_path / "baseline.json", now_monotonic=100)
+    assert measured["query_ms"] is None

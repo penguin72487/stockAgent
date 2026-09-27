@@ -19,6 +19,7 @@ import re
 import sys
 import tempfile
 
+import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,14 @@ from scripts.download_finlab_history import (  # noqa: E402
 
 DEFAULT_START = date(2026, 6, 1)  # FinLab's documented free sample, not earliest coverage.
 FAMILIES = ("tw_tick:2330",)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _partition_paths(root: Path, key: str, day: date) -> tuple[Path, Path]:
@@ -104,12 +113,20 @@ def _validate_frame(frame: pd.DataFrame, key: str, day: date) -> str:
             raise ValueError("tick rows need source sequence; same timestamps are distinct trades")
         if frame.duplicated(["timestamp", "sequence"]).any():
             raise ValueError("duplicate tick timestamp and source sequence")
+        if "volume" not in frame.columns:
+            raise ValueError("tick rows need source volume")
+        volume = pd.to_numeric(frame["volume"], errors="coerce")
+        if volume.isna().any() or not np.isfinite(volume.to_numpy(dtype=float)).all() or (volume < 0).any():
+            raise ValueError("invalid provider-native tick volume")
     else:
         required_prices = {"open", "high", "low", "close", "volume"}
         if not required_prices.issubset(frame.columns):
             raise ValueError("minute bars lack OHLCV")
         if frame["timestamp"].duplicated().any():
             raise ValueError("duplicate minute timestamp")
+        volume = pd.to_numeric(frame["volume"], errors="coerce")
+        if volume.isna().any() or not np.isfinite(volume.to_numpy(dtype=float)).all():
+            raise ValueError("invalid provider-native minute volume")
         if ((frame["high"] < frame[["open", "low", "close"]].max(axis=1))
                 | (frame["low"] > frame[["open", "high", "close"]].min(axis=1))
                 | (frame["volume"] < 0)).any():
@@ -117,15 +134,24 @@ def _validate_frame(frame: pd.DataFrame, key: str, day: date) -> str:
     return "downloaded_unverified_for_pit"
 
 
-def fetch_partition(root: Path, key: str, day: date, *, now: datetime) -> dict:
+def fetch_partition(root: Path, key: str, day: date, *, now: datetime,
+                    reference_root: Path | None = None) -> dict:
     from finlab import data
 
     frame = data.get(key, start=day.isoformat(), end=day.isoformat(),
                      force_download=True, progress="silent")
     status = _validate_frame(frame, key, day)
+    volume_evidence = {"raw_volume_unit": "provider_native",
+                       "canonical_volume_unit": "unresolved"}
+    if status == "downloaded_unverified_for_pit" and key.startswith(("tw_tick:", "tw_minute:")):
+        from scripts.finlab_volume_units import with_verified_volume_shares
+
+        frame, volume_evidence = with_verified_volume_shares(
+            frame, key.split(":", 1)[1], day, reference_root=reference_root,
+        )
     receipt_path, _ = _partition_paths(root, key, day)
     payload = {
-        "schema_version": 1, "dataset": key, "trade_date": day.isoformat(),
+        "schema_version": 2, "dataset": key, "trade_date": day.isoformat(),
         "status": status, "source_checked_at_utc": datetime.now(UTC).isoformat(),
         "rows": len(frame), "fields": list(map(str, frame.columns)),
         "first_timestamp": str(frame["timestamp"].min()) if len(frame) else None,
@@ -133,6 +159,7 @@ def fetch_partition(root: Path, key: str, day: date, *, now: datetime) -> dict:
         "source_grain": "stock_trade_day_tick" if key.startswith("tw_tick:")
                         else "stock_trade_day_left_labelled_minute",
         "publication_time_status": "not_verified_for_training",
+        **volume_evidence,
     }
     if status == "downloaded_unverified_for_pit":
         objects = root / "intraday/objects"
@@ -167,6 +194,64 @@ def fetch_partition(root: Path, key: str, day: date, *, now: datetime) -> dict:
             temporary.unlink(missing_ok=True)
     _atomic_json(receipt_path, payload)
     return payload
+
+
+def reconcile_stored_tick_unit(
+    root: Path, key: str, day: date, *, reference_root: Path | None = None,
+) -> dict | None:
+    """Upgrade an existing stock tick/minute partition without API or data loss."""
+
+    if not key.startswith(("tw_tick:", "tw_minute:")):
+        raise ValueError("only stock tick/minute partitions have this unit contract")
+    receipt_path, _ = _partition_paths(root, key, day)
+    old = _stored_receipt(receipt_path, root, key, day)
+    if old is None or old.get("status") != "downloaded_unverified_for_pit":
+        return old
+    original = root / old["parquet_path"]
+    digest = _file_sha256(original)
+    if digest != old["sha256"]:
+        raise ValueError("stored FinLab intraday object hash mismatch")
+    frame = pd.read_parquet(original)
+    _validate_frame(frame, key, day)
+    from scripts.finlab_volume_units import with_verified_volume_shares
+
+    normalized, evidence = with_verified_volume_shares(
+        frame, key.split(":", 1)[1], day, reference_root=reference_root,
+    )
+    if (all(old.get(name) == value for name, value in evidence.items())
+            and list(old.get("fields") or []) == list(normalized.columns)
+            and frame.equals(normalized)):
+        return old
+    objects = root / "intraday/objects"
+    with tempfile.NamedTemporaryFile(
+        dir=objects, prefix=".finlab-unit-", suffix=".parquet.tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        normalized.to_parquet(temporary, index=False, compression="zstd")
+        new_digest = _file_sha256(temporary)
+        destination = objects / f"{safe_stem(key)}-{day.isoformat()}-{new_digest[:24]}.parquet"
+        if destination.exists():
+            if _file_sha256(destination) != new_digest:
+                raise ValueError("content-addressed unit object hash mismatch")
+        else:
+            os.replace(temporary, destination)
+        archive = root / "intraday/versions" / safe_stem(key) / day.isoformat() / f"{digest}.json"
+        if not archive.is_file():
+            _atomic_json(archive, old)
+        updated = {
+            **old, "schema_version": max(2, int(old.get("schema_version") or 0)),
+            "fields": list(map(str, normalized.columns)),
+            "parquet_path": str(destination.relative_to(root)),
+            "parquet_size_bytes": destination.stat().st_size,
+            "sha256": new_digest, "raw_object_sha256": old.get("raw_object_sha256", digest),
+            "unit_reconciled_at_utc": datetime.now(UTC).isoformat(),
+            **evidence,
+        }
+        _atomic_json(receipt_path, updated)
+        return updated
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def record_failed_partition(root: Path, key: str, day: date, exc: Exception) -> str:
