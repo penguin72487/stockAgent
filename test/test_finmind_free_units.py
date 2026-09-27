@@ -171,8 +171,10 @@ def test_failed_or_unrepresentable_refresh_keeps_previous_source_recoverable(tmp
 def test_empty_refresh_keeps_previous_source_for_next_success(tmp_path):
     path, _, old, _ = _legacy(tmp_path)
     old_bytes = path.read_bytes()
-    empty = worker._record_session(tmp_path, ORDER_BOOK_DATASET, DAY, [], now=NOW)
-    assert empty["status"] == "provider_empty"
+    with pytest.raises(worker.ProviderError, match='unexpected_empty_after_nonempty') as failed:
+        worker._record_session(tmp_path, ORDER_BOOK_DATASET, DAY, [], now=NOW)
+    empty = worker._record_failure(tmp_path, ORDER_BOOK_DATASET, DAY, failed.value, now=NOW)
+    assert empty["status"] == "failed"
     assert empty["previous_source"]["sha256"] == old["sha256"]
     assert path.read_bytes() == old_bytes
     final = worker._record_session(tmp_path, ORDER_BOOK_DATASET, DAY, _rows(), now=NOW)

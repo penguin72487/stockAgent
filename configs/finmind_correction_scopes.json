@@ -1,0 +1,576 @@
+{
+  "schema_version": 1,
+  "source_url": "https://finmind.github.io/WhatIsNew/",
+  "snapshot_sha256": "decb6d1761fabed35ad455cd2ad2bc67034b2ac7d507a6942b8ee6670012f96e",
+  "reviewed_at": "2026-09-27",
+  "baseline_auto_since": "2026-09-01",
+  "scope_contract": "Manual scopes apply only to exact full semantic entry IDs and identical normalized text. Unavailable and unaffected values are never repairs.",
+  "scopes": {
+    "dadb1796f9ebc1e7ab3213186ddfdeee2008ec42281c5fd52ec0a1c27ce864c0": {
+      "notice_date": "2026-09-25",
+      "revision_family_id": "dfe38c6e21e0274f257365400bae892a32cd79ad18cfe6b575666b12d91375b9",
+      "evidence_text": "資料校正公告 : 每 5 秒指數統計 TaiwanStockEvery5SecondsIndex : 上櫃各指數 13:30:00 原本記錄的是收盤集合競價前最後一個揭示值,已全期間更正為官方收盤指數,與上市指數一致 2026-06-02 多出 7 條舊制名稱的序列(其中 CompositAveragePrice 、 IndustryAveragePrice 整天為 0),已移除 2007-07-02 ~ 2014-01-03 上櫃航運類的名稱前多一個 Tab 字元,已統一為 ShippingTransportation 2005-01-03 ~ 2008-09-18 部分上市指數同時存在新舊兩個名稱(例如 TSEWeighted 與 TAIEX 、 Electron 與 Electronic ,數值相同),已只保留現行名稱; 2005-09-16 原本只有舊名稱,已改為現行名稱,當日 TAIEX 分 K 一併補齊 2017-05-08 上櫃各指數的原始資料由 09:00:05 開始,沒有 09:00:00 這一點,無法補齊",
+      "datasets": [
+        "TaiwanStockEvery5SecondsIndex"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-25",
+      "requests": [
+        {
+          "dataset": "TaiwanStockEvery5SecondsIndex",
+          "scope_kind": "full_history",
+          "reason": "Official correction replaces TPEX 13:30 values across all history and fixes historical sequence names.",
+          "market_scope": "TPEX close plus documented index identity corrections"
+        }
+      ],
+      "issues": [
+        {
+          "status": "known_unavailable",
+          "dataset": "TaiwanStockEvery5SecondsIndex",
+          "start_date": "2017-05-08",
+          "end_date": "2017-05-08",
+          "reason": "Official source starts at 09:00:05; TPEX 09:00:00 was not provided and cannot be reconstructed."
+        }
+      ]
+    },
+    "28d46abbdbcc15a37c70a337e067a64e3a38333333a585c6a0381259a5a06c14": {
+      "notice_date": "2026-09-25",
+      "revision_family_id": "06da83865dd74c2289629ac16697230efdc730894a47cf397b90d404de373906",
+      "evidence_text": "資料校正公告 : 每5秒委託成交統計 TaiwanStockStatisticsOfOrderBookAndTrade : 2023-08-04 09:00:00 的累積成交誤為前一交易日的收盤累計值,已更正為 0; 2011-01-21 整日資料誤為其他日期的資料,已更正。另有部分日期同一時間點存有重複資料,已一併清除",
+      "datasets": [
+        "TaiwanStockStatisticsOfOrderBookAndTrade"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-25",
+      "requests": [
+        {
+          "dataset": "TaiwanStockStatisticsOfOrderBookAndTrade",
+          "start_date": "2011-01-21",
+          "end_date": "2011-01-21",
+          "reason": "Official correction of wrong session content or opening cumulative values."
+        },
+        {
+          "dataset": "TaiwanStockStatisticsOfOrderBookAndTrade",
+          "start_date": "2023-08-04",
+          "end_date": "2023-08-04",
+          "reason": "Official correction of wrong session content or opening cumulative values."
+        }
+      ],
+      "issues": [
+        {
+          "status": "needs_review",
+          "dataset": "TaiwanStockStatisticsOfOrderBookAndTrade",
+          "reason": "Notice also mentions duplicate timestamps on unspecified dates; exact affected dates require provider clarification."
+        }
+      ]
+    },
+    "4a00cc2e6a14cd7c085fad466fd8f476cb1d5a4dbcf6258e20fa5cfd669a1958": {
+      "notice_date": "2026-09-25",
+      "revision_family_id": "7e800bdab98bd47c29b2ef22401887804fcb03ab376d5a3d63c2bebb45459050",
+      "evidence_text": "資料校正公告 : 股價日成交資訊 TaiwanStockPrice 、 台灣還原股價 TaiwanStockPriceAdj 、 台股週 K 資料表 TaiwanStockWeekPrice 、 台股月 K 資料表 TaiwanStockMonthPrice : 上櫃股票在 2015-11-23 、 2020-03-09 、 2020-03-10 、 2020-04-24 的成交股數、成交金額、成交筆數未計入盤後定價與零股交易,已更正為與其他交易日一致的全日口徑;開高低收與漲跌不受影響 還原股價同步更新;上櫃週 K、月 K(2020-03 ~ 2024-12)已依日成交資料重新計算",
+      "datasets": [
+        "TaiwanStockMonthPrice",
+        "TaiwanStockPrice",
+        "TaiwanStockPriceAdj",
+        "TaiwanStockWeekPrice"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-25",
+      "requests": [
+        {
+          "dataset": "TaiwanStockPrice",
+          "start_date": "2015-11-23",
+          "end_date": "2015-11-23",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPrice",
+          "start_date": "2020-03-09",
+          "end_date": "2020-03-09",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPrice",
+          "start_date": "2020-03-10",
+          "end_date": "2020-03-10",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPrice",
+          "start_date": "2020-04-24",
+          "end_date": "2020-04-24",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPriceAdj",
+          "start_date": "2015-11-23",
+          "end_date": "2015-11-23",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPriceAdj",
+          "start_date": "2020-03-09",
+          "end_date": "2020-03-09",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPriceAdj",
+          "start_date": "2020-03-10",
+          "end_date": "2020-03-10",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockPriceAdj",
+          "start_date": "2020-04-24",
+          "end_date": "2020-04-24",
+          "reason": "Official TPEX full-day volume, turnover and transaction-count correction.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockWeekPrice",
+          "start_date": "2020-03-01",
+          "end_date": "2024-12-31",
+          "reason": "Official TPEX weekly/monthly bars were regenerated for 2020-03 through 2024-12.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockMonthPrice",
+          "start_date": "2020-03-01",
+          "end_date": "2024-12-31",
+          "reason": "Official TPEX weekly/monthly bars were regenerated for 2020-03 through 2024-12.",
+          "market_scope": "TPEX"
+        }
+      ],
+      "issues": []
+    },
+    "51ca9e49f88ba4d134cf79b8429bb2177345ecbfccd7b4cfcbc44bb7c21e7790": {
+      "notice_date": "2026-09-24",
+      "revision_family_id": "9b30e8c8521dd696c949f9c1be3bafd15c730b615e20650894cfe26df17db921",
+      "evidence_text": "資料校正公告 : 主動式ETF每日持股明細 TaiwanStockActiveETFHolding 、 主動式ETF每日持股異動(買賣)TaiwanStockActiveETFHoldingChange : 2026-02-11 (春節前最後一個交易日)有 11 檔 ETF 缺持股資料,已補齊。 曾下載或查詢過 2026-02-11、2026-02-23 資料的使用者請重新取得資料 補齊的 ETF:00980A、00981A、00981D、00982A、00983A、00985A、00988A、00990A、00992A、00994A、00995A 問題:春節前最後一個交易日的持股清單在春節後第一個交易日才公告,間隔超過收錄時的檢查上限,當日持股因此漏收;已修正,往後遇到長假也能正常收錄 持股異動同步重算:2026-02-11 補上當日買賣;2026-02-23 原本是與 2026-02-10 相減,改為與 2026-02-11 相減。2026-02-23 部分成份股會出現 buy 、 sell 皆為 0 的列,代表該成份股當日無異動,可直接略過 00981D、00983A、00988A、00990A 的 2026-02-10 資料來源本身未提供持股, 此日無法補齊",
+      "datasets": [
+        "TaiwanStockActiveETFHolding",
+        "TaiwanStockActiveETFHoldingChange"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-24",
+      "requests": [
+        {
+          "dataset": "TaiwanStockActiveETFHolding",
+          "start_date": "2026-02-11",
+          "end_date": "2026-02-11",
+          "reason": "Official ETF holdings and changes corrected for the explicitly affected dates."
+        },
+        {
+          "dataset": "TaiwanStockActiveETFHolding",
+          "start_date": "2026-02-23",
+          "end_date": "2026-02-23",
+          "reason": "Official ETF holdings and changes corrected for the explicitly affected dates."
+        },
+        {
+          "dataset": "TaiwanStockActiveETFHoldingChange",
+          "start_date": "2026-02-11",
+          "end_date": "2026-02-11",
+          "reason": "Official ETF holdings and changes corrected for the explicitly affected dates."
+        },
+        {
+          "dataset": "TaiwanStockActiveETFHoldingChange",
+          "start_date": "2026-02-23",
+          "end_date": "2026-02-23",
+          "reason": "Official ETF holdings and changes corrected for the explicitly affected dates."
+        }
+      ],
+      "issues": [
+        {
+          "status": "known_unavailable",
+          "datasets": [
+            "TaiwanStockActiveETFHolding",
+            "TaiwanStockActiveETFHoldingChange"
+          ],
+          "start_date": "2026-02-10",
+          "end_date": "2026-02-10",
+          "data_ids": [
+            "00981D",
+            "00983A",
+            "00988A",
+            "00990A"
+          ],
+          "reason": "Issuer did not provide holdings for these four ETFs; do not schedule the comparison-baseline date as repaired."
+        }
+      ]
+    },
+    "548a3d34a6c3964ad87257202b50bf5c89edecec98dccb21357565785e15e472": {
+      "notice_date": "2026-09-20",
+      "revision_family_id": "5bb99b5162652ae2a6043aa2a84c676a66c3c50911de8692e95280df3360c75f",
+      "evidence_text": "資料校正公告 : 個股三大法人買賣表 TaiwanStockInstitutionalInvestorsBuySell 、 個股三大法人買賣表(寬表)TaiwanStockInstitutionalInvestorsBuySellWide :上櫃 2017-12-18 ~ 2018-01-12 (19 個交易日)的 Foreign_Dealer_Self (外資自營商)有誤,已修正。 曾下載或查詢過這段期間上櫃資料的使用者請重新取得資料 問題:上櫃當時尚未單獨揭露外資自營商(2018-01-15 起才拆分),但此期間約 380 檔上櫃股票的 Foreign_Dealer_Self 被誤植為與 Foreign_Investor 相同的數值,加總各法人別時外資會被重複計算 修正後此期間上櫃的 Foreign_Dealer_Self 買進/賣出皆為 0;另 2018-01-12 有 7 檔上櫃股票的投信買賣股數一併校正為官方數值 已逐日比對官方公告;上市股票及其他期間不受影響",
+      "datasets": [
+        "TaiwanStockInstitutionalInvestorsBuySell",
+        "TaiwanStockInstitutionalInvestorsBuySellWide"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-20",
+      "requests": [
+        {
+          "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+          "start_date": "2017-12-18",
+          "end_date": "2018-01-12",
+          "reason": "Official TPEX foreign-dealer and investment-trust buy/sell correction; rebuild wide from corrected long without another API request.",
+          "market_scope": "TPEX",
+          "derived_datasets": [
+            "TaiwanStockInstitutionalInvestorsBuySellWide"
+          ]
+        }
+      ],
+      "issues": []
+    },
+    "a3ebaa90e41166a156a6fd9b2b23e7990f409b86337585be0778d5b432b10fe0": {
+      "notice_date": "2026-09-20",
+      "revision_family_id": "28af0661c8b1588700bdaa6a0860bc969d4eb0b8b69233e88dee8b5995c4c10e",
+      "evidence_text": "資料校正公告 : 颱風全日停市日 出現與 次一交易日盤後時段 完全相同的重複資料,已全數移除。 曾下載或查詢過這些日期的使用者請重新取得資料 影響日期: 2023-08-03 、 2024-07-24 、 2024-07-25 、 2024-10-02 、 2024-10-03 、 2024-10-31 、 2026-07-10 影響資料集: 期貨日成交資訊 TaiwanFuturesDaily 、 選擇權日成交資訊 TaiwanOptionDaily 、 期貨各卷商每日交易 TaiwanFuturesDealerTradingVolumeDaily 、 選擇權各卷商每日交易 TaiwanOptionDealerTradingVolumeDaily 問題:颱風全日停市時,當日已完成的盤後交易時段依規則改歸屬於 次一交易日 ;停市日當下寫入的那份資料在歸屬更正後成為殘留,形成與次一交易日盤後列完全相同的重複。正式歸屬日為次一交易日,停市日本身不應有資料 期貨夜盤三大法人買賣 TaiwanFuturesInstitutionalInvestorsAfterHours : 2022-07-24 (週日)有與 2022-07-25 完全相同的重複資料,一併移除 台股交易日 TaiwanStockTradingDate : 2026-07-10 先前誤列為交易日,已更正 逐筆與分 K 資料 不受影響,也不應一併剔除 :這類資料集的 date 為日曆時間,停市日 00:00~04:59 是前一交易日夜盤的真實成交",
+      "datasets": [
+        "TaiwanFuturesDaily",
+        "TaiwanFuturesDealerTradingVolumeDaily",
+        "TaiwanFuturesInstitutionalInvestorsAfterHours",
+        "TaiwanOptionDaily",
+        "TaiwanOptionDealerTradingVolumeDaily",
+        "TaiwanStockTradingDate"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-20",
+      "requests": [
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2023-08-03",
+          "end_date": "2023-08-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2024-07-24",
+          "end_date": "2024-07-24",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2024-07-25",
+          "end_date": "2024-07-25",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2024-10-02",
+          "end_date": "2024-10-02",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2024-10-03",
+          "end_date": "2024-10-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2024-10-31",
+          "end_date": "2024-10-31",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDaily",
+          "start_date": "2026-07-10",
+          "end_date": "2026-07-10",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2023-08-03",
+          "end_date": "2023-08-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2024-07-24",
+          "end_date": "2024-07-24",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2024-07-25",
+          "end_date": "2024-07-25",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2024-10-02",
+          "end_date": "2024-10-02",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2024-10-03",
+          "end_date": "2024-10-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2024-10-31",
+          "end_date": "2024-10-31",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDaily",
+          "start_date": "2026-07-10",
+          "end_date": "2026-07-10",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2023-08-03",
+          "end_date": "2023-08-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2024-07-24",
+          "end_date": "2024-07-24",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2024-07-25",
+          "end_date": "2024-07-25",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2024-10-02",
+          "end_date": "2024-10-02",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2024-10-03",
+          "end_date": "2024-10-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2024-10-31",
+          "end_date": "2024-10-31",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesDealerTradingVolumeDaily",
+          "start_date": "2026-07-10",
+          "end_date": "2026-07-10",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2023-08-03",
+          "end_date": "2023-08-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2024-07-24",
+          "end_date": "2024-07-24",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2024-07-25",
+          "end_date": "2024-07-25",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2024-10-02",
+          "end_date": "2024-10-02",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2024-10-03",
+          "end_date": "2024-10-03",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2024-10-31",
+          "end_date": "2024-10-31",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanOptionDealerTradingVolumeDaily",
+          "start_date": "2026-07-10",
+          "end_date": "2026-07-10",
+          "reason": "Authoritative empty: provider removed closure-date duplicates whose actual trading-session attribution belongs to the following trading day.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanFuturesInstitutionalInvestorsAfterHours",
+          "start_date": "2022-07-24",
+          "end_date": "2022-07-24",
+          "reason": "Authoritative empty: provider removed Sunday duplicate of 2022-07-25.",
+          "allow_empty": true
+        },
+        {
+          "dataset": "TaiwanStockTradingDate",
+          "start_date": "2026-07-10",
+          "end_date": "2026-07-10",
+          "reason": "Refresh full calendar snapshot after official removal of falsely listed trading date.",
+          "scope_kind": "snapshot"
+        }
+      ],
+      "issues": [
+        {
+          "status": "unaffected",
+          "reason": "Calendar-time tick/minute data retain genuine 00:00–04:59 trades; this daily-attribution correction must not remove them."
+        }
+      ]
+    },
+    "886a97f4fea983d7cbe96e262011c77315ca07a96225c9a3e07396fc046e9011": {
+      "notice_date": "2026-09-06",
+      "revision_family_id": "7aedb3fa7a84df06733eba3699e16dc1e1d2d2db613d8284a217c11d60084365",
+      "evidence_text": "資料校正公告 :以下資料集已完成資料校正並上線; 若您先前曾查詢或下載過相關期別/日期的資料,請重新取得 資產負債表 TaiwanStockBalanceSheet : 2024-06-30(113 年半年報) 單一期別資料缺漏,已完成回補,該期別涵蓋家數由 1,917 家增為 2,233 家 (補回 316 家);已逐季檢查 2014 ~ 2025 各期別,未再發現同規模的缺漏 另有 25 家 在 2024 上半年仍掛牌並完成申報,但公司後續已下市或終止公開發行,原始來源已不再提供其歷史財報頁面, 此部分無法補齊 同期間的 綜合損益表 TaiwanStockFinancialStatements 與 現金流量表 TaiwanStockCashFlowsStatement 資料完整,不受本次問題影響 除權除息結果表 TaiwanStockDividendResult : 2026-09-02 上市 (TWSE) 資料當日一度僅有部分公司,已補齊為當日全部 20 家 原因:當日有除權個股的權值加息值超過 1,000、數值帶千分位符號,導致該日整批資料寫入失敗;解析方式已修正,往後不會再發生",
+      "datasets": [
+        "TaiwanStockBalanceSheet",
+        "TaiwanStockCashFlowsStatement",
+        "TaiwanStockDividendResult",
+        "TaiwanStockFinancialStatements"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-06",
+      "requests": [
+        {
+          "dataset": "TaiwanStockBalanceSheet",
+          "start_date": "2024-06-30",
+          "end_date": "2024-06-30",
+          "reason": "Official 2024 half-year balance-sheet missing-company correction."
+        },
+        {
+          "dataset": "TaiwanStockDividendResult",
+          "start_date": "2026-09-02",
+          "end_date": "2026-09-02",
+          "reason": "Official TWSE ex-dividend results repaired after thousands-separator parsing failure.",
+          "market_scope": "TWSE"
+        }
+      ],
+      "issues": [
+        {
+          "status": "known_unavailable",
+          "dataset": "TaiwanStockBalanceSheet",
+          "start_date": "2024-06-30",
+          "end_date": "2024-06-30",
+          "reason": "Provider reports 25 delisted/deregistered companies whose original historical filings are no longer available; company IDs were not supplied."
+        },
+        {
+          "status": "unaffected",
+          "datasets": [
+            "TaiwanStockCashFlowsStatement",
+            "TaiwanStockFinancialStatements"
+          ],
+          "reason": "Notice explicitly states these same-period tables are complete and unaffected."
+        }
+      ]
+    },
+    "dd4041a7490cfc6174db755394c2c625b920a4ba7bfdf6265a2bba0506111c88": {
+      "notice_date": "2026-09-01",
+      "revision_family_id": "de121c548fa02609ec8d2a38e7d54f6ce664c4bc4c11547ed3d1f46af7757500",
+      "evidence_text": "資料校正公告 :以下資料集經稽核後已完成歷史資料校正並上線;若您先前已下載這些資料,建議重新取得 台灣還原股價 TaiwanStockPriceAdj :除權息遇休市順延、減資與除權息併存等情況的還原計算已修正,全歷史重算 個股融資融劵表 TaiwanStockMarginPurchaseShortSale :上櫃 (TPEX) 個股融券買進 / 賣出兩欄先前對調,已修正(融券餘額不受影響) 期貨價差行情表 TaiwanFuturesSpreadTrading :負價差先前被存成正值,已完成全歷史重建 台股產業鏈資金流向 TaiwanStockIndustryChainMoneyFlow :市場口徑固定為上市 + 上櫃 + 興櫃,全歷史重建,數值與先前不同 台股分 K TaiwanStockKBar :部分交易日成交量因重複計入而偏高,整日檔已重新產製 期貨交易明細 TaiwanFuturesTick 、 選擇權交易明細 TaiwanOptionTick :2019 ~ 2020 整日檔的 contract_date 含空白、部分交易日缺漏,已重產並補齊 台灣股票下市櫃表 TaiwanStockDelisting :補齊上櫃 (TPEX) 終止上櫃資料 股價日成交資訊 TaiwanStockPrice 等日頻資料集(PER、法人買賣、融資融券、當沖、外資持股)與 每 5 秒指數統計 TaiwanStockEvery5SecondsIndex :補齊週六補行交易日資料與缺漏的指數",
+      "datasets": [
+        "TaiwanFuturesSpreadTrading",
+        "TaiwanFuturesTick",
+        "TaiwanOptionTick",
+        "TaiwanStockDelisting",
+        "TaiwanStockEvery5SecondsIndex",
+        "TaiwanStockIndustryChainMoneyFlow",
+        "TaiwanStockKBar",
+        "TaiwanStockMarginPurchaseShortSale",
+        "TaiwanStockPrice",
+        "TaiwanStockPriceAdj"
+      ],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-01",
+      "requests": [
+        {
+          "dataset": "TaiwanStockPriceAdj",
+          "scope_kind": "full_history",
+          "reason": "Official full-history adjusted-price recalculation."
+        },
+        {
+          "dataset": "TaiwanStockMarginPurchaseShortSale",
+          "scope_kind": "full_history",
+          "reason": "Official TPEX short-sale buy/sell columns had been swapped; dates not narrowed, revalidate finite available history.",
+          "market_scope": "TPEX"
+        },
+        {
+          "dataset": "TaiwanStockIndustryChainMoneyFlow",
+          "scope_kind": "full_history",
+          "reason": "Official full-history industry-flow recalculation with TWSE + TPEX + emerging-market scope."
+        },
+        {
+          "dataset": "TaiwanStockDelisting",
+          "scope_kind": "full_history",
+          "reason": "Official TPEX delisting history was backfilled.",
+          "market_scope": "TPEX"
+        }
+      ],
+      "issues": [
+        {
+          "status": "not_scheduled",
+          "dataset": "TaiwanFuturesSpreadTrading",
+          "reason": "No enabled downloader owner for this dataset; retained as an explicit unresolved correction."
+        },
+        {
+          "status": "not_scheduled",
+          "dataset": "TaiwanStockKBar",
+          "reason": "No enabled downloader owner for this dataset; retained as an explicit unresolved correction."
+        },
+        {
+          "status": "not_scheduled",
+          "dataset": "TaiwanFuturesTick",
+          "reason": "No enabled downloader owner for this dataset; retained as an explicit unresolved correction."
+        },
+        {
+          "status": "not_scheduled",
+          "dataset": "TaiwanOptionTick",
+          "reason": "No enabled downloader owner for this dataset; retained as an explicit unresolved correction."
+        },
+        {
+          "status": "needs_review",
+          "datasets": [
+            "TaiwanStockPrice",
+            "TaiwanStockEvery5SecondsIndex"
+          ],
+          "reason": "Notice mentions missing Saturday sessions and additional daily datasets without complete dates or dataset IDs; requires precise provider scope, not blind re-fetch."
+        }
+      ]
+    }
+  }
+}

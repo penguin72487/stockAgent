@@ -34,7 +34,7 @@ _DATE_COLUMNS = (
     "date", "trade_date", "trading_date", "settlement_date",
     "observation_date", "subject_date", "report_date_utc", "report_date_as_yyyy_mm_dd",
     "filing_date", "filed_date", "report_period_end", "period_end", "as_of_date",
-    "published_on", "published_at_taipei", "datetime", "timestamp", "time", "event_time",
+    "published_on", "published_date", "published_at_taipei", "datetime", "timestamp", "time", "event_time",
     "observed_at_utc", "published_at_utc",
 )
 _DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ])?")
@@ -119,6 +119,12 @@ PHYSICAL_FAMILIES: dict[str, tuple[str, str, str, bool]] = {
     "tw-options:weekly-atm": ("tw-index-options-daily", "TXO 週選開盤 ATM 衍生表", "data_tw_index_options_daily/weekly_nearest_expiry_opening_atm_pairs.parquet", False),
     "tw-options:settlement": ("tw-index-options-daily", "TXO 最後結算價", "data_tw_index_options_daily/txo_final_settlement_history.parquet", False),
     "taifex-public:normalized": ("taifex-public-history", "TAIFEX 籌碼／風險正規化表", "data_taifex_public_history/normalized/*.parquet", True),
+    # These are linked archive/operational grains, not market observations.
+    # Keep each table inspectable without summing documents, links and their
+    # parent announcement rows into a market-data total.
+    "taifex-rules:announcements": ("taifex-public-history", "期交所歷史公告索引（非數值規則）", "data_taifex_public_history/rules/normalized/announcements.parquet", False),
+    "taifex-rules:documents": ("taifex-public-history", "期交所公告與附件下載清冊", "data_taifex_public_history/rules/normalized/documents.parquet", False),
+    "taifex-rules:document-links": ("taifex-public-history", "期交所公告與附件關聯（不可加總）", "data_taifex_public_history/rules/normalized/document_links.parquet", False),
     "taifex-ticks:tx": ("tw-index-derivatives-ticks", "台指期逐筆成交", "data_tw_index_derivatives_ticks/tx/trading_date=*/transactions.parquet", True),
     "taifex-ticks:txo": ("tw-index-derivatives-ticks", "台指選逐筆成交", "data_tw_index_derivatives_ticks/txo/trading_date=*/transactions.parquet", True),
     "cftc:legacy": ("cftc-legacy-pre2000", "CFTC 2000 年前 Legacy 合併主表", "data_cftc_legacy/normalized/legacy_pre2000.parquet", True),

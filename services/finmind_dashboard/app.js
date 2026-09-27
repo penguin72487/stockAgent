@@ -14,10 +14,95 @@ function count(value) { const parsed = valueNumber(value); return parsed === nul
 function bytes(value) { return valueNumber(value) === null ? "—" : Dashboard.formatBytes(value, {maximumFractionDigits: 1}); }
 function ratio(complete, total) { const left = valueNumber(complete), right = valueNumber(total); return left !== null && right > 0 ? Math.min(1, Math.max(0, left / right)) : null; }
 function percent(value) { return value === null ? "—" : `${(value * 100).toFixed(2)}%`; }
-function duration(seconds) { const value = valueNumber(seconds); if (value === null) return "未知"; if (value < 3600) return `至少 ${oneDecimal.format(value / 60)} 分鐘`; return `至少 ${oneDecimal.format(value / 3600)} 小時`; }
+function duration(seconds) { const value = valueNumber(seconds); if (value === null) return "未知"; if (value < 3600) return `${oneDecimal.format(value / 60)} 分鐘`; return `${oneDecimal.format(value / 3600)} 小時`; }
+function datasetStatus(row) { return row.state === "delegated" && row.source_status === "delegated_to_complement_product_history" ? "由 Complement 主責" : statusLabels[row.state] || "待核實"; }
+function networkTimeLabel(row) {
+  // Never reinterpret an older backend's partition-based legacy number as ETA.
+  return row.state === "complete" ? "已查驗目前任務" : "未知（分割數不等於請求數）";
+}
+function networkTimeBasis(row) {
+  const projection = row.unbatched_task_projection;
+  if (projection?.basis === "hypothetical_one_call_per_known_pending_partition_at_full_shared_quota"
+      && projection.is_eta === false && projection.is_lower_bound === false
+      && valueNumber(projection.seconds) !== null) {
+    return `未合批任務投影 ${duration(projection.seconds)}：假設每分割一次請求且獨占額度；非 ETA、非下界。`;
+  }
+  if (row.state === "delegated") return "由其他下載器承接；此舊 owner 不另估時間。";
+  return "合批、未知代號、刷新、重試與共用額度均會改變耗時；沒有可信倒數。";
+}
 function timeLabel(value) { const date = new Date(value || ""); return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}); }
 function ageLabel(seconds) { return Dashboard.formatAge(seconds, {emptyLabel: "時間未核實", hourDigits: 0, dayDigits: 0}); }
 function text(id, value) { $(id).textContent = value; }
+
+function estimateDuration(seconds) {
+  const value = valueNumber(seconds);
+  if (value === null || value < 0) return "未知";
+  if (value === 0) return "本輪可執行工作已查驗";
+  if (value >= 172800) return `約 ${oneDecimal.format(value / 86400)} 天`;
+  return `約 ${duration(value)}`;
+}
+
+function completionEstimateView(estimate, nowMs = Date.now()) {
+  // This finite-backlog forecast is a separate contract from legacy partition projections.
+  const info = estimate && typeof estimate === "object" ? estimate : {};
+  const expiry = Date.parse(info.valid_until_utc || "");
+  const expired = info.state === "stale" || (Number.isFinite(expiry) && expiry <= nowMs);
+  const usable = !expired && ["estimated", "conditional", "current"].includes(info.state);
+  const workload = info.workload || {};
+  const scenarios = ["fastest", "central", "slowest"].map((key) => {
+    const scenario = info.scenarios?.[key] || {};
+    const seconds = valueNumber(scenario.remaining_seconds);
+    const available = usable && scenario.state === "estimated" && seconds !== null && seconds >= 0;
+    const completedAt = available ? timeLabel(scenario.estimated_complete_at_utc) : "—";
+    const requests = valueNumber(scenario.request_count);
+    const rate = valueNumber(scenario.effective_requests_per_hour);
+    return {
+      key,
+      value: expired ? "觀測已過期" : available ? estimateDuration(seconds) : "未知",
+      complete: completedAt === "—" ? "完成日期尚無法估算" : `預計 ${completedAt}（台北）`,
+      detail: available
+        ? `估計 ${count(requests)} 次請求 · 有效 ${rate === null ? "—" : oneDecimal.format(rate)} 次／小時`
+        : "等待可核實的工作量與速度",
+      basis: typeof scenario.basis === "string" ? scenario.basis : "尚無此情境的估算依據",
+    };
+  });
+  const stateLabel = expired ? "估算觀測已過期" : ({
+    estimated: "三情境估算", conditional: "條件式三情境估算", current: "本輪可執行工作已查驗",
+    warming_up: "等待估算樣本", unavailable: "估算暫不可用",
+  })[info.state] || "尚無全域估算";
+  const blockers = Array.isArray(info.blockers) ? info.blockers.filter((row) => row && typeof row.reason === "string") : [];
+  return {
+    stateLabel, scenarios,
+    scope: typeof info.scope_label === "string" ? info.scope_label : "FinMind 已排程可執行工作（含次要校驗）",
+    basis: typeof info.basis === "string" ? info.basis : "分割數不等於請求數；等待合批後工作量、共用額度與實際速度估算。",
+    observed: `估算基準 ${timeLabel(info.observed_at_utc)}（台北）；依背景觀測更新，不以畫面倒數代替下載進度。`,
+    workload: `必要 ${count(workload.required_requests)} 次 · 次要校驗 ${count(workload.validation_requests)} 次 · 合批後共 ${count(workload.planned_requests)} 次預估請求`,
+    exclusions: `另列：阻塞 ${count(workload.blocked_tasks)} 個任務 · 未排程 ${count(workload.unscheduled_datasets)} 類 · 佇列未能盤點 ${count(workload.unknown_datasets)} 類；這些不算完成，未清點的歷史代號與未來新增工作另計。`,
+    assumptions: Array.isArray(info.assumptions) ? info.assumptions.filter((item) => typeof item === "string") : [],
+    blockers,
+  };
+}
+
+function renderCompletionEstimate(estimate) {
+  const view = completionEstimateView(estimate);
+  text("download-global-eta", view.stateLabel);
+  text("download-global-eta-basis", view.scope);
+  text("download-eta-observed", view.observed);
+  text("download-eta-workload", view.workload);
+  text("download-eta-exclusions", view.exclusions);
+  text("download-eta-method", view.basis);
+  for (const scenario of view.scenarios) {
+    text(`download-eta-${scenario.key}`, scenario.value);
+    text(`download-eta-${scenario.key}-complete`, scenario.complete);
+    text(`download-eta-${scenario.key}-detail`, scenario.detail);
+    text(`download-eta-${scenario.key}-basis`, scenario.basis);
+  }
+  const assumptions = $("download-eta-assumptions"); assumptions.replaceChildren();
+  for (const item of view.assumptions) { const li = document.createElement("li"); li.textContent = item; assumptions.append(li); }
+  const blockers = $("download-eta-blockers"); blockers.replaceChildren();
+  for (const item of view.blockers) { const li = document.createElement("li"); li.textContent = `${item.reason}（${count(item.count)}）`; blockers.append(li); }
+  blockers.hidden = view.blockers.length === 0;
+}
 
 function svgNode(name, attributes = {}) {
   const node = document.createElementNS(SVG_NS, name);
@@ -105,9 +190,9 @@ function renderPipelines(data) {
   for (const row of selected) {
     const visualState = row.state === "complete" ? "ready" : row.state === "backfilling" ? "active" : "waiting";
     const card = document.createElement("article"); card.className = `pipeline-card state-${visualState}`;
-    card.innerHTML = '<div class="pipeline-card-header"><div class="pipeline-tags"><span class="category-tag"></span><span class="pipeline-status"></span></div><span class="api-surface"></span></div><h3></h3><p class="pipeline-detail"></p><div class="mini-progress"><div class="mini-progress-copy"><span>目前任務查驗率</span><strong></strong></div><progress class="mini-progress-track" max="1"></progress><small></small></div><div class="pipeline-eta"><span class="eta-label">最少剩餘時間</span><strong class="eta-value"></strong><small class="eta-basis"></small></div><div class="pipeline-footer"></div>';
+    card.innerHTML = '<div class="pipeline-card-header"><div class="pipeline-tags"><span class="category-tag"></span><span class="pipeline-status"></span></div><span class="api-surface"></span></div><h3></h3><p class="pipeline-detail"></p><div class="mini-progress"><div class="mini-progress-copy"><span>目前任務查驗率</span><strong></strong></div><progress class="mini-progress-track" max="1"></progress><small></small></div><div class="pipeline-eta"><span class="eta-label">完成時間估算</span><strong class="eta-value"></strong><small class="eta-basis"></small></div><div class="pipeline-footer"></div>';
     card.querySelector(".category-tag").textContent = row.kind.startsWith("sponsor_") ? "Sponsor 全市場" : ({session_history: "全市場盤中", snapshot: "主檔快照", reference: "交易日曆", global_history: "全市場／總經", symbol_history: "逐檔／固定指標", global_equity_history: "海外逐檔"})[row.kind] || "來源資料";
-    const badge = card.querySelector(".pipeline-status"); badge.className += ` ${visualState}`; badge.textContent = statusLabels[row.state] || "待核實";
+    const badge = card.querySelector(".pipeline-status"); badge.className += ` ${visualState}`; badge.textContent = datasetStatus(row);
     card.querySelector(".api-surface").textContent = row.id;
     card.querySelector("h3").textContent = row.label;
     const checked = row.checked_partitions ?? row.complete_partitions;
@@ -116,8 +201,8 @@ function renderPipelines(data) {
     const progress = card.querySelector("progress"); if (completion === null) progress.removeAttribute("value"); else progress.value = completion;
     card.querySelector(".mini-progress-copy strong").textContent = percent(completion);
     card.querySelector(".mini-progress small").textContent = `資料日期 ${row.first_data_date || "未取得"} → ${row.last_data_date || "未取得"}`;
-    card.querySelector(".eta-value").textContent = row.state === "complete" ? "已取得目前任務" : duration(row.minimum_network_seconds_remaining);
-    card.querySelector(".eta-basis").textContent = row.kind === "session_history" ? "與所有 FinMind 來源共用額度；非完工承諾" : "只含已建立任務；不代表歷史完整";
+    card.querySelector(".eta-value").textContent = networkTimeLabel(row);
+    card.querySelector(".eta-basis").textContent = networkTimeBasis(row);
     card.querySelector(".pipeline-footer").textContent = `最後完成 ${timeLabel(row.last_receipt_at_utc)}`;
     grid.append(card);
   }
@@ -144,7 +229,7 @@ function renderBackfill(data) {
   const info = data.acquisition || {}, total = valueNumber(info.total_tasks), complete = valueNumber(info.complete_tasks), checked = valueNumber(info.checked_tasks) ?? complete;
   const coverage = ratio(checked, total);
   text("download-progress-label", total === null ? "分母未核實" : `已查驗 ${count(checked)} / ${count(total)} · 非空 ${count(complete)} · ${percent(coverage)} · ${count(info.unknown_universe_datasets)} 類主檔待載入；歷史下市代號待稽核`);
-  text("download-global-eta", duration(info.minimum_network_seconds_remaining));
+  renderCompletionEstimate(info.completion_estimate);
   text("download-count", `${count(checked)}／${count(total)}`);
   text("download-pending", `${count(info.pending_tasks)} · 空回 ${count(info.observed_empty_tasks)} · 權限 ${count(info.not_entitled_tasks)} · 參數 ${count(info.invalid_request_tasks)}`);
   text("download-deferred", count(info.retry_deferred_tasks));
@@ -159,7 +244,7 @@ function renderBackfill(data) {
       ? [["1m", "1 分"], ["15s", "15 秒"], ["10s", "10 秒"], ["5s", "5 秒"]]
           .map(([key, label]) => `${count(grains[key] ?? 0)} 日 ${label}`).join(" · ")
       : `空 ${count(row.observed_empty_partitions || 0)} · 失敗 ${count(row.deferred_partitions || 0)} · 權限 ${count(row.not_entitled_partitions || 0)} · 參數 ${count(row.invalid_request_partitions || 0)}`;
-    const cells = [row.label, statusLabels[row.state] || "待核實", `${count(row.checked_partitions ?? row.complete_partitions)}／${count(row.target_partitions)}（非空 ${count(row.complete_partitions)}）`, row.first_data_date || "—", row.last_data_date || "—", count(row.rows), bytes(row.local_bytes), grainLabel, row.state === "complete" ? "—" : duration(row.minimum_network_seconds_remaining), timeLabel(row.last_receipt_at_utc)];
+    const cells = [row.label, datasetStatus(row), `${count(row.checked_partitions ?? row.complete_partitions)}／${count(row.target_partitions)}（非空 ${count(row.complete_partitions)}）`, row.first_data_date || "—", row.last_data_date || "—", count(row.rows), bytes(row.local_bytes), grainLabel, networkTimeLabel(row), timeLabel(row.last_receipt_at_utc)];
     for (const cell of cells) { const td = document.createElement("td"); td.textContent = cell; tr.append(td); }
     body.append(tr);
   }
@@ -211,6 +296,8 @@ async function refresh() {
     if (state.retryTimer !== null) window.clearTimeout(state.retryTimer);
     state.retryTimer = null; state.retryDelayMs = 3000;
   } catch (error) {
+    // Failed refreshes must still expire old forecasts instead of leaving a live-looking ETA.
+    renderCompletionEstimate(state.latest?.acquisition?.completion_estimate);
     const badge = $("finmind-health"); badge.className = `status ${state.latest ? "stale" : "unavailable"}`;
     badge.lastChild.textContent = state.latest ? "更新暫停，顯示上次資料" : "面板暫時無法讀取";
     text("finmind-freshness", state.latest ? `上次成功 ${timeLabel(state.latest.generated_at_utc)}；稍後重試。` : "稍後重試；不會呼叫 FinMind API 補畫面。");

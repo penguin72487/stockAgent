@@ -11,9 +11,9 @@ import pytest
 from downloader import download_finmind_complement as complement
 
 
-def test_free_catalog_is_exactly_48_additions_without_news_or_paid() -> None:
-    assert len(complement.ALL_DATASETS) == 48
-    assert len(set(complement.ALL_DATASETS)) == 48
+def test_complement_catalog_includes_50_product_routed_sources_without_news_or_ticks() -> None:
+    assert len(complement.ALL_DATASETS) == 50
+    assert len(set(complement.ALL_DATASETS)) == 50
     assert "TaiwanStockNews" not in complement.ALL_DATASETS
     assert "TaiwanStockPriceTick" not in complement.ALL_DATASETS
     assert "TaiwanStockKBar" not in complement.ALL_DATASETS
@@ -247,7 +247,7 @@ def test_one_bulk_response_fans_out_and_checks_old_nonempty_year(tmp_path: Path)
             ], now, date(2002, 9, 25))
 
 
-def test_old_pending_year_promotes_current_empty_to_one_bulk_query(tmp_path: Path) -> None:
+def test_old_pending_year_does_not_force_refresh_of_not_due_current_year(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     with complement._db(tmp_path / "queue.sqlite3") as connection:
         complement._populate(connection, tmp_path, today=date(2026, 9, 25))
@@ -264,11 +264,10 @@ def test_old_pending_year_promotes_current_empty_to_one_bulk_query(tmp_path: Pat
         ).fetchone()
         current = complement.Task(*task)
         assert current.state == "observed_empty"
-        assert complement._bulk_needed(connection, current, date(2026, 9, 25))
         assert connection.execute(
             "SELECT next_attempt_at_utc FROM tasks WHERE dataset=? AND partition=?",
             (current.dataset, current.partition),
-        ).fetchone()[0] <= datetime.now(UTC).isoformat()
+        ).fetchone()[0] > now.isoformat()
 
 
 def test_wide_institutional_is_derived_without_api_call(tmp_path: Path) -> None:

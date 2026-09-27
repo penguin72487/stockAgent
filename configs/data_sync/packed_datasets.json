@@ -306,6 +306,26 @@
       "note": "Append-only causal snapshots from non-venue public context sources. Hyperliquid, Deribit, Coinbase, Kraken and Bitfinex adapters are retained only for old files and are disabled while active exchange acquisition is limited to Binance, OKX and Bybit."
     },
     {
+      "dataset": "public-economic-history",
+      "source": "data_public_economic",
+      "role": "local-economic-history-and-quality-audit",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": ["downloader.download_public_economic_history"],
+      "note": "Census EITS, BEA NIPA and MOI source archives; per-dataset receipt/units/quarantine. Current revised values, not historical publication vintages; no automatic training or cold publication."
+    },
+    {
+      "dataset": "keyed-public-catalogs",
+      "source": "data_keyed_public_catalogs",
+      "role": "local-metadata-discovery-and-prospective-snapshots",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": ["downloader.download_keyed_public_catalogs"],
+      "note": "Bounded catalogs and current snapshots only. Not global historical observations; no training/PIT completeness or redistribution claim. Global detailed history requires capacity and quota estimation first."
+    },
+    {
       "dataset": "coinmetrics-community",
       "source": "data_coinmetrics_community",
       "role": "local-analytics-and-vintage-audit",
@@ -409,6 +429,16 @@
     {
       "dataset": "taifex-public-history",
       "source": "data_taifex_public_history",
+      "excluded_subtrees": ["rules"],
+      "freshness": {
+        "receipt": "manifest.json",
+        "field": "effective_end_date",
+        "format": "iso-date",
+        "required_values": {
+          "status": "complete",
+          "completion_claim": "source_acquisition_not_full_pit_readiness"
+        }
+      },
       "role": "training-and-point-in-time-audit",
       "publish": true,
       "pack_buckets": 16,
@@ -418,7 +448,17 @@
         "download_taifex_openapi_catalog.py",
         "download_taifex_vix_recent.py"
       ],
-      "note": "Official post-close put/call ratios plus institutional and large-trader positioning, and non-duplicated point-in-time snapshots of the discovered TAIFEX OpenAPI catalog. Raw receipts are immutable; post-close rows use next-session causal availability. Older positioning beyond the free rolling web window requires a TAIFEX historical-data application."
+      "note": "Official post-close ratios and positioning plus non-duplicated TAIFEX OpenAPI snapshots. Acquisition is distinct from verified next-session availability. Large-trader quarterly CSV supports older history than the rolling query UI; institutional availability remains source-specific. The unfinished rule archive is excluded and registered separately."
+    },
+    {
+      "dataset": "taifex-rule-history",
+      "source": "data_taifex_public_history/rules",
+      "role": "official-rule-archive-pending-validation",
+      "publish": false,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["download_taifex_rule_history.py", "scripts.download_taifex_rule_history"],
+      "note": "Local official announcement index, immutable raw documents and extracted evidence. Incomplete documents, uncertain attachment vintages and unverified effective rules are not an audited training release. No automatic cold publication."
     },
     {
       "dataset": "cftc-legacy-pre2000",
@@ -468,6 +508,7 @@
     {
       "dataset": "forex-frankfurter",
       "source": "data_forex_frankfurter",
+      "excluded_subtrees": ["official_v2"],
       "role": "training",
       "publish": true,
       "pack_buckets": 8,
@@ -475,7 +516,17 @@
       "active_process_substrings": [
         "download_forex_frankfurter.py"
       ],
-      "note": "Frankfurter FX data."
+      "note": "Legacy ECB reference rates only. Source-separated official_v2 history stays local pending source-specific rights and training audit."
+    },
+    {
+      "dataset": "forex-frankfurter-official",
+      "source": "data_forex_frankfurter/official_v2",
+      "role": "local-official-reference-rate-history",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": ["download_forex_frankfurter.py"],
+      "note": "Provider-qualified central-bank rates; excluded from parent publication, source date is not a historical release timestamp."
     },
     {
       "dataset": "forex-pepperstone",

@@ -2,6 +2,8 @@
 
 FinMind 後續呼叫效率、批次與晚發布修正，見
 [2026-09-27 實作及驗證結果](finmind_request_efficiency_2026-09-27.md)。
+區間端點已取消本機 5 年上限，見 [最大區間與呼叫數驗收](finmind_maximum_range_2026-09-27.md)。
+後續已擴大清點105個唯一端點，見 [全清冊查詢範圍、分工與最少請求](finmind_all_query_ranges_2026-09-27.md)。
 
 本次沿用既有下載器、來源 registry、收據、共享限流及 systemd。
 清冊不是另一套下載系統，也不是「全部歷史完整」證書。

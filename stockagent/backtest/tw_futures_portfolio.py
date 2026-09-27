@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import os
 from typing import Callable, Final
@@ -14,23 +15,28 @@ import torch.nn.functional as F
 from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
 )
+from stockagent.data import tw_futures_margin as margin
+from stockagent.backtest.futures_cuda_graph import (
+    futures_cuda_graph_enabled, run_futures_cuda_graph,
+)
 
 
-# Bump whenever the explicit backward-only relaxation changes.  The exact
-# integer forward account is stable, but checkpoints trained under a different
-# surrogate objective must not be resumed as if their gradients were identical.
+# Bump whenever the exact execution or backward-only relaxation changes.
+# Partial-capacity fills, strict funding and cost/zero-action gradients changed
+# together in this revision. Old optimizer states must not silently resume.
 TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE = (
-    "grouped_fake_floor_cash_surrogate_v4"
+    "grouped_fake_floor_cash_surrogate_v5"
 )
 TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE = (
-    "grouped_fake_floor_cash_solvency_recovery_surrogate_v5"
+    "grouped_fake_floor_cash_solvency_recovery_surrogate_v7"
 )
-TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD = "exact_integer_account_v2"
+TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD = "exact_integer_account_v3"
 
 TW_FUTURES_PORTFOLIO_DEFAULT_NONE = 0
 TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING = 1
 TW_FUTURES_PORTFOLIO_DEFAULT_NONFINITE_EQUITY = 2
 TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY = 3
+TW_FUTURES_PORTFOLIO_DEFAULT_MARGIN_LIQUIDATION = 4
 
 # The exact integer account and its backward-only shadow are both recurrent.
 # Compiling a whole global batch unrolls a large graph, while eager execution
@@ -64,6 +70,8 @@ class FuturesPortfolioTensorResult:
     contract_quantities_history: torch.Tensor | None = None
     default_history: torch.Tensor | None = None
     default_reason_history: torch.Tensor | None = None
+    margin_audit_history: torch.Tensor | None = None
+    residual_contract_quantities_history: torch.Tensor | None = None
     # Internal continuation state for fixed-block compilation.  Public exact
     # accounting continues to use ``final_weights`` (whole contracts),
     # ``final_equity_scale``, and ``final_alive``.  These shadow fields never
@@ -193,7 +201,25 @@ def _integer_group_candidate_baskets(
     return torch.stack((standard_candidates, mini), dim=-1).to(torch.int64)
 
 
-def _globally_funded_group_candidate_indices(
+@torch.library.custom_op("stockagent::futures_funding_sum", mutates_args=())
+def _native_funding_sum(value: torch.Tensor) -> torch.Tensor:
+    # Funding is a discrete decision at the FP32 boundary. Preserve ATen's
+    # reduction tree instead of letting Inductor reassociate the global sum.
+    return value.contiguous().sum()
+
+
+@_native_funding_sum.register_fake
+def _fake_funding_sum(value: torch.Tensor) -> torch.Tensor:
+    return value.new_empty(())
+
+
+def _funding_sum(value: torch.Tensor) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return _native_funding_sum(value)
+    return value.sum()
+
+
+def _globally_funded_group_candidate_indices_impl(
     *,
     cash_required: torch.Tensor,
     candidate_exposure: torch.Tensor,
@@ -236,15 +262,12 @@ def _globally_funded_group_candidate_indices(
     finite_candidate = torch.isfinite(cash_required) & torch.isfinite(
         candidate_exposure
     )
-    sleeve_eps = (
-        torch.finfo(dtype).eps * target_cash.abs().clamp_min(1.0) * 16.0
-    )
     target_allowed = (
         capacity_ok[:, :target_count]
         & finite_candidate[:, :target_count]
         & (
             cash_required[:, :target_count]
-            <= target_cash[:, None] + sleeve_eps[:, None]
+            <= target_cash[:, None]
         )
     )
     safety_allowed = (
@@ -276,21 +299,21 @@ def _globally_funded_group_candidate_indices(
         score = torch.where(allowed, score, large + score.abs())
         selected = score.argmin(dim=1)
         selected_cash = cash_required.gather(1, selected[:, None])[:, 0]
-        return selected, selected_cash.sum()
+        return selected, _funding_sum(selected_cash)
 
     zero = cash_required.new_zeros(())
     one = cash_required.new_ones(())
     unconstrained, unconstrained_cash = choose(one)
-    funding_eps = (
-        torch.finfo(dtype).eps * equity.detach().abs().clamp_min(1.0) * 64.0
-    )
-    unconstrained_fits = unconstrained_cash <= equity + funding_eps
+    # These are spendable-cash limits, not approximate numerical equalities.
+    # An epsilon here can select an unaffordable basket and turn a perfectly
+    # feasible cash account into a funding default at the final ledger gate.
+    unconstrained_fits = unconstrained_cash <= equity
 
     min_cash_score = torch.where(allowed, cash_required, large * scale)
     min_cash = min_cash_score.argmin(dim=1)
-    min_cash_total = cash_required.gather(1, min_cash[:, None])[:, 0].sum()
+    min_cash_total = _funding_sum(cash_required.gather(1, min_cash[:, None])[:, 0])
     fundable = torch.isfinite(min_cash_total) & (
-        min_cash_total <= equity + funding_eps
+        min_cash_total <= equity
     )
 
     low = zero
@@ -301,25 +324,79 @@ def _globally_funded_group_candidate_indices(
     for _ in range(8):
         midpoint = (low + high) * 0.5
         midpoint_choice, midpoint_cash = choose(midpoint)
-        midpoint_fits = midpoint_cash <= equity + funding_eps
+        midpoint_fits = midpoint_cash <= equity
         low = torch.where(midpoint_fits, midpoint, low)
         high = torch.where(midpoint_fits, high, midpoint)
         best = torch.where(midpoint_fits, midpoint_choice, best)
 
     selected = torch.where(unconstrained_fits, unconstrained, best)
-    selected_cash_total = cash_required.gather(1, selected[:, None])[:, 0].sum()
+    selected_cash_total = _funding_sum(cash_required.gather(1, selected[:, None])[:, 0])
     # Reversing a carried position and fixed per-contract costs can make the
     # discrete frontier locally non-monotone.  The radial search is therefore
     # an optimization only: when its final choice misses the funding boundary,
     # fall back to the independently proven minimum-cash feasible state.  A
     # real funding default is recorded only when that state is also impossible.
     selected = torch.where(
-        selected_cash_total <= equity + funding_eps,
+        selected_cash_total <= equity,
         selected,
         min_cash,
     )
     selected = torch.where(fundable, selected, min_cash)
     return selected, fundable
+
+
+@lru_cache(maxsize=1)
+def _compiled_funding_selector():
+    # Fuse only the discrete funding search. Retain FP32 rounding, division
+    # and subnormals; the chronological ledger and surrogate remain unchanged.
+    return torch.compile(
+        _globally_funded_group_candidate_indices_impl, fullgraph=True, dynamic=False,
+        options={"triton.cudagraphs": False, "emulate_precision_casts": True,
+                 "eager_numerics.division_rounding": True,
+                 "eager_numerics.disable_ftz": True, "force_same_precision": True},
+    )
+
+
+def _globally_funded_group_candidate_indices(
+    *,
+    cash_required: torch.Tensor,
+    candidate_exposure: torch.Tensor,
+    target_exposure: torch.Tensor,
+    capacity_ok: torch.Tensor,
+    target_cash: torch.Tensor,
+    equity: torch.Tensor,
+    target_candidate_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    function = _globally_funded_group_candidate_indices_impl
+    if (cash_required.device.type == "cuda"
+            and _env_truthy("STOCKAGENT_FUTURES_FUNDING_COMPILE", "0")
+            and not torch.compiler.is_compiling()):
+        function = _compiled_funding_selector()
+    return function(
+        cash_required=cash_required, candidate_exposure=candidate_exposure,
+        target_exposure=target_exposure, capacity_ok=capacity_ok,
+        target_cash=target_cash, equity=equity,
+        target_candidate_count=target_candidate_count,
+    )
+
+
+def _absolute_cost_with_intent(
+    executed: torch.Tensor, continuous_intent: torch.Tensor,
+) -> torch.Tensor:
+    """Keep absolute executed cost, including its sub-contract shadow slope.
+
+    Quantization can make the forward exposure/delta exactly zero despite a
+    nonzero continuous request. Ordinary abs then drops the fee derivative
+    while the straight-through PnL still rewards that request. At that one
+    boundary, use the request's direction for the local cost slope. Nonzero
+    execution retains its usual derivative and exactly flat intent stays flat.
+    """
+
+    return torch.where(
+        executed == 0,
+        executed * torch.sign(continuous_intent.detach()),
+        executed.abs(),
+    )
 
 
 def run_tw_futures_portfolio_integer_surrogate_torch(
@@ -365,7 +442,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     if (
         integer_execution.ndim != 3
         or tuple(integer_execution.shape[:2]) != tuple(target_weights.shape)
-        or int(integer_execution.size(-1)) != 11
+        or int(integer_execution.size(-1)) not in {11, margin.MARGIN_EXECUTION_WIDTH}
     ):
         raise ValueError("integer_execution must have shape [T,S,11]")
     capital = float(initial_capital)
@@ -379,6 +456,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         neginf=0.0,
     )
     execution = integer_execution.to(device=weights.device, dtype=torch.float32)
+    margin_mode = int(execution.size(-1)) == margin.MARGIN_EXECUTION_WIDTH
     rows, slots = tuple(weights.shape)
     advance = (
         torch.ones((rows,), device=weights.device, dtype=torch.bool)
@@ -393,6 +471,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     must_liquidate = execution[..., 2] > 0.5
     opening_notional = execution[..., 3]
     ending_notional = execution[..., 4]
+    collateral = execution[..., margin.INITIAL] if margin_mode else opening_notional
     fixed_fee = execution[..., 5]
     opening_tax = execution[..., 6]
     ending_tax = execution[..., 7]
@@ -413,9 +492,13 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     )
     simple_asset_returns = torch.where(
         active,
-        ending_notional / opening_notional.clamp_min(1.0e-12) - 1.0,
+        ((ending_notional - opening_notional) / collateral.clamp_min(1.0e-12)
+         if margin_mode else ending_notional / opening_notional.clamp_min(1.0e-12) - 1.0),
         torch.zeros_like(opening_notional),
     )
+    if margin_mode:
+        active &= torch.isfinite(collateral) & (collateral > 0)
+        simple_asset_returns = torch.where(active, simple_asset_returns, torch.zeros_like(simple_asset_returns))
     active_f = active.to(dtype=weights.dtype)
     group_count = torch.zeros_like(weights).scatter_add(1, group_index, active_f)
     requested_group = torch.zeros_like(weights).scatter_add(
@@ -444,7 +527,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     )
     slot_capacity_cash = torch.where(
         can_trade,
-        maximum_trade * opening_notional,
+        maximum_trade * collateral,
         torch.zeros_like(opening_notional),
     )
     group_capacity_cash = torch.zeros_like(weights).scatter_add(
@@ -454,12 +537,12 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     )
     entry_cost_rate = torch.where(
         active,
-        (fixed_fee + opening_tax) / opening_notional.clamp_min(1.0e-12),
+        (fixed_fee + opening_tax) / collateral.clamp_min(1.0e-12),
         torch.zeros_like(opening_notional),
     )
     exit_cost_rate = torch.where(
         active,
-        (fixed_fee + ending_tax) / opening_notional.clamp_min(1.0e-12),
+        (fixed_fee + ending_tax) / collateral.clamp_min(1.0e-12),
         torch.zeros_like(opening_notional),
     )
     group_entry_cost_rate = torch.zeros_like(weights).scatter_add(
@@ -474,7 +557,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     ) / group_count.clamp_min(1.0)
     new_contract_cash = torch.where(
         can_trade,
-        opening_notional
+        collateral
         + (2.0 * fixed_fee)
         + (2.0 * opening_tax),
         torch.full_like(opening_notional, float("inf")),
@@ -514,7 +597,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             starting_scale,
             weights.new_ones(()),
         )
-    equity = weights.new_tensor(capital) * starting_scale
+    equity = weights.new_full((), capital) * starting_scale
     alive = (
         torch.ones((), device=weights.device, dtype=torch.bool)
         if recover_after_default_for_backward
@@ -555,7 +638,8 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             initial_q.to(weights.dtype)
             * torch.where(
                 first_active,
-                opening_notional[0],
+                (execution[0, :, margin.PREVIOUS_INITIAL].nan_to_num()
+                 if margin_mode else opening_notional[0]),
                 torch.zeros_like(opening_notional[0]),
             )
             / equity.detach().clamp_min(1.0e-12)
@@ -571,6 +655,18 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             if recover_after_default_for_backward
             else advance[row] & alive
         )
+        gap_simple = weights.new_zeros(())
+        if margin_mode:
+            previous_collateral = execution[row, :, margin.PREVIOUS_INITIAL]
+            prior_valid = active[row] & torch.isfinite(previous_collateral) & (previous_collateral > 0)
+            gap_return = torch.where(prior_valid,
+                (opening_notional[row] - execution[row, :, margin.PREVIOUS_MARK])
+                / previous_collateral.clamp_min(1e-12), torch.zeros_like(previous_collateral))
+            gap_simple = (previous_slot_weights * gap_return.nan_to_num()).sum() * row_advances
+            rescaled_prior = previous_slot_weights * torch.where(
+                prior_valid, collateral[row] / previous_collateral.clamp_min(1e-12),
+                torch.ones_like(previous_collateral))
+            previous_slot_weights = torch.where(row_advances, rescaled_prior, previous_slot_weights)
         current_group = torch.zeros_like(previous_slot_weights).scatter_add(
             0,
             group_index[row],
@@ -605,7 +701,14 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             * safe_minimum
             / equity.detach().clamp_min(1.0e-12)
         )
-        executable_request = torch.sign(raw_request) * quantized_request_abs
+        hard_signed_request = torch.sign(raw_request) * quantized_request_abs
+        # Differentiate the signed request directly. sign(w) * STE(abs(w))
+        # loses every derivative at w == 0 and traps a trainable cash-reset
+        # head there permanently. The identity STE has no directional bias;
+        # only the observed return supplies the signed first-order signal.
+        executable_request = raw_request + (
+            hard_signed_request - raw_request
+        ).detach()
         requested_delta = executable_request - current_group
         capacity_enabled_delta = torch.where(
             capacity_weight > 0.0,
@@ -657,15 +760,17 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         gross_simple = (
             held_group * group_simple_return[row]
         ).sum() * row_advances.to(weights.dtype)
-        entry_cost = (
-            group_delta.abs() * group_entry_cost_rate[row]
-        ).sum()
+        cost_delta_abs = _absolute_cost_with_intent(
+            group_delta, raw_request - current_group,
+        )
+        cost_held_abs = _absolute_cost_with_intent(held_group, raw_request)
+        entry_cost = (cost_delta_abs * group_entry_cost_rate[row]).sum()
         close_cost = torch.where(
             group_must_liquidate[row] & row_advances,
-            held_group.abs() * group_exit_cost_rate[row],
+            cost_held_abs * group_exit_cost_rate[row],
             torch.zeros_like(held_group),
         ).sum()
-        net_simple = gross_simple - entry_cost - close_cost
+        net_simple = gross_simple - entry_cost - close_cost + gap_simple
         row_survived = ~advance[row] | (
             torch.isfinite(net_simple) & (net_simple > -1.0)
         )
@@ -703,10 +808,15 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             funding_required = (
                 held_group.abs().sum()
                 + entry_cost
-                + (held_group.abs() * group_exit_cost_rate[row]).sum()
+                + (cost_held_abs * group_exit_cost_rate[row]).sum()
             )
             funding_excess = funding_required - 1.0
-            funding_barrier = F.softplus(funding_excess / 0.05) * 0.05
+            # The constraint is inactive for a funded account. A softplus
+            # barrier has a nonzero slope even far below the funding limit:
+            # at 75% gross it can reverse a profitable, fee-adjusted utility
+            # gradient. Penalize only actual shadow funding excess; preserve
+            # the exact forward ledger and recovery after a genuine breach.
+            funding_barrier = F.relu(funding_excess)
             recoverable_log_return = recoverable_log_return - (
                 funding_barrier - funding_barrier.detach()
             )
@@ -735,7 +845,15 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         else:
             turnover = torch.zeros_like(net_simple)
         denominator = (1.0 + safe_net).clamp_min(1.0e-7)
-        next_group = held_group * (1.0 + group_simple_return[row]) / denominator
+        if margin_mode:
+            collateral_change = torch.where(active[row],
+                execution[row, :, margin.END_INITIAL] / collateral[row].clamp_min(1e-12),
+                torch.zeros_like(collateral[row]))
+            group_change = torch.zeros_like(held_group).scatter_add(
+                0, group_index[row], collateral_change) / group_count[row].clamp_min(1)
+            next_group = held_group * group_change / denominator
+        else:
+            next_group = held_group * (1.0 + group_simple_return[row]) / denominator
         next_group = torch.where(
             group_must_liquidate[row] & row_advances,
             torch.zeros_like(next_group),
@@ -776,7 +894,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             equity = torch.where(
                 survived,
                 equity,
-                weights.new_tensor(capital),
+                weights.new_full((), capital),
             )
             alive = torch.ones_like(alive)
         else:
@@ -824,13 +942,15 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     _initial_surrogate_equity_scale: torch.Tensor | None = None,
     _initial_surrogate_alive: torch.Tensor | None = None,
 ) -> FuturesPortfolioTensorResult:
-    """Run the exact fully-collateralized all-futures carrying account.
+    """Run the exact notional-funded or dated-margin futures carrying account.
 
     The forward account uses signed integer contract quantities.  Standard and
     mini stock/ETF contracts sharing an underlying and delivery month receive
     one aggregate model exposure and are packed together.  Every other slot is
     a singleton group.  Unused sleeve cash is never reassigned to another
-    group, both long and short reserve full absolute notional, and actual PnL,
+    group. The eleven-channel contract reserves full absolute notional; the
+    margin contract reserves initial margin for new risk and checks maintenance
+    for carried risk. Actual PnL,
     per-side fixed fees, rounded transaction tax, and expiry closes update the
     next session's equity.  The differentiable path is a straight-through
     continuous surrogate; reported quantities and cash are always exact.
@@ -841,7 +961,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     if (
         integer_execution.ndim != 3
         or tuple(integer_execution.shape[:2]) != tuple(target_weights.shape)
-        or int(integer_execution.size(-1)) != 11
+        or int(integer_execution.size(-1)) not in {11, margin.MARGIN_EXECUTION_WIDTH}
     ):
         raise ValueError("integer_execution must have shape [T,S,11]")
     capital = float(initial_capital)
@@ -859,6 +979,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     # the explicit grouped relaxation below owns the complete backward path.
     weights = surrogate_weights.detach()
     execution = integer_execution.to(device=weights.device, dtype=torch.float32)
+    margin_mode = int(execution.size(-1)) == margin.MARGIN_EXECUTION_WIDTH
     rows, slots = tuple(weights.shape)
     advance = (
         torch.ones((rows,), device=weights.device, dtype=torch.bool)
@@ -889,7 +1010,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             dtype=weights.dtype,
         ).reshape(())
     )
-    equity = weights.new_tensor(capital) * starting_scale
+    equity = weights.new_full((), capital) * starting_scale
 
     # Every field below is exogenous execution metadata.  Grouping it inside
     # the recurrent loop repeated seven 1,936-slot scatter kernels per day,
@@ -902,6 +1023,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     must_liquidate_all = execution[..., 2] > 0.5
     opening_notional_all = execution[..., 3]
     ending_notional_all = execution[..., 4]
+    collateral_all = execution[..., margin.INITIAL] if margin_mode else opening_notional_all
     fixed_fee_all = execution[..., 5]
     opening_tax_all = execution[..., 6]
     ending_tax_all = execution[..., 7]
@@ -927,6 +1049,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         & torch.isfinite(ending_tax_all)
         & (ending_tax_all >= 0.0)
     )
+    if margin_mode:
+        active_metadata_all &= torch.isfinite(collateral_all) & (collateral_all > 0)
     flat_candidate_index_all = group_index_all * 2 + candidate_tier_all
 
     def grouped_all(values: torch.Tensor) -> torch.Tensor:
@@ -970,13 +1094,17 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         > 0
     )
     notionals_all = grouped_all(opening_notional_all)
+    collateral_group_all = grouped_all(collateral_all)
     fees_all = grouped_all(fixed_fee_all)
     entry_taxes_all = grouped_all(opening_tax_all)
     trade_caps_all = grouped_all(maximum_trade_all.to(weights.dtype)).floor().to(
         torch.int64
     )
+    if margin_mode:
+        buy_allowed_all = grouped_all(execution[..., margin.CAN_BUY]) > 0.5
+        sell_allowed_all = grouped_all(execution[..., margin.CAN_SELL]) > 0.5
     close_reserve_all = fees_all + entry_taxes_all
-    base_reserved_cash_all = notionals_all + close_reserve_all
+    base_reserved_cash_all = collateral_group_all + close_reserve_all
     requested_group_all = torch.zeros_like(weights).scatter_add(
         1,
         group_index_all,
@@ -994,6 +1122,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     equity_scale_rows: list[torch.Tensor] = []
     default_rows: list[torch.Tensor] = []
     default_reason_rows: list[torch.Tensor] = []
+    margin_audit_rows: list[torch.Tensor] = []
+    residual_rows: list[torch.Tensor] = []
     for row in range(rows):
         must_liquidate = must_liquidate_all[row]
         opening_notional = opening_notional_all[row]
@@ -1004,16 +1134,48 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         group_index = group_index_all[row]
         active_metadata = active_metadata_all[row]
         flat_candidate_index = flat_candidate_index_all[row]
+        row_start_equity = equity
+        row_start_alive = alive
+        allocation_equity = equity
+        gap_pnl = weights.new_zeros(())
+        force_margin_close = torch.zeros_like(alive)
+        margin_metadata_ok = torch.ones_like(alive)
+        if margin_mode:
+            previous_mark = execution[row, :, margin.PREVIOUS_MARK]
+            previous_mm = execution[row, :, margin.PREVIOUS_MAINTENANCE]
+            carried = quantities != 0
+            margin_metadata_ok = (~carried | (active_metadata & torch.isfinite(previous_mark)
+                & (previous_mark > 0) & torch.isfinite(previous_mm) & (previous_mm > 0))).all()
+            gap_pnl = torch.where(carried & active_metadata,
+                quantities.to(weights.dtype) * (opening_notional - previous_mark).nan_to_num(),
+                torch.zeros_like(opening_notional)).sum() * advance[row]
+            equity = equity + gap_pnl
+            # Unsettled gains on retained positions do not finance new orders.
+            allocation_equity = torch.minimum(row_start_equity, equity)
+            previous_requirement = (quantities.abs() * previous_mm.nan_to_num()).sum()
+            opening_requirement = (quantities.abs() * collateral_all[row].nan_to_num()).sum()
+            risk_ratio = execution[row, :, margin.LIQUIDATION_RATIO].max()
+            force_margin_close = advance[row] & alive & (
+                (row_start_equity < previous_requirement)
+                | (equity < opening_requirement * risk_ratio))
+            position_group = execution[row, :, margin.POSITION_GROUP].nan_to_num().long().clamp(0, slots - 1)
+            position_units = execution[row, :, margin.POSITION_UNIT].nan_to_num()
+            held_units = torch.zeros_like(opening_notional).scatter_add(0, position_group, quantities.abs() * position_units)
+            group_limits = torch.zeros_like(opening_notional).scatter_reduce(0, position_group,
+                execution[row, :, margin.POSITION_LIMIT].nan_to_num(), reduce="amax")
+            force_margin_close |= advance[row] & alive & (held_units > group_limits).any()
         group_target_weight = torch.where(
             alive,
             requested_group_all[row],
             torch.zeros_like(requested_group_all[row]),
         )
-        target_cash = group_target_weight.abs() * equity.detach().clamp_min(0.0)
+        group_target_weight = torch.where(force_margin_close, torch.zeros_like(group_target_weight), group_target_weight)
+        target_cash = group_target_weight.abs() * allocation_equity.detach().clamp_min(0.0)
         group_sign = torch.sign(group_target_weight).to(torch.int64)
         valid_candidates = valid_candidates_all[row]
         can_trade_candidates = can_trade_candidates_all[row] & alive
         notionals = notionals_all[row]
+        collateral = collateral_group_all[row]
         fees = fees_all[row]
         entry_taxes = entry_taxes_all[row]
         trade_caps = trade_caps_all[row]
@@ -1043,7 +1205,37 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         )
         target_baskets = unsigned_baskets * group_sign[:, None, None]
         current_basket = prior_group_quantities[:, None, :]
+        # A requested endpoint is an order target, not an all-or-none basket.
+        # Project its signed delta into the observed opening capacity before
+        # funding selection. Otherwise the sparse 1/32 target frontier can
+        # contain no small feasible fill (mini-only groups have just full/zero
+        # targets), even though one or more whole contracts can be executed.
+        # Existing feasible targets remain identical; no exit data enter this
+        # projection and a reversal consumes capacity closing the old side.
+        requested_delta = target_baskets - current_basket
+        permitted_delta = can_trade_candidates[:, None, :]
+        if margin_mode:
+            buy_allowed = buy_allowed_all[row]
+            sell_allowed = sell_allowed_all[row]
+            permitted_delta = permitted_delta & torch.where(
+                requested_delta > 0,
+                buy_allowed[:, None, :],
+                sell_allowed[:, None, :],
+            )
+        executed_delta = torch.where(
+            permitted_delta,
+            torch.sign(requested_delta) * torch.minimum(
+                requested_delta.abs(), trade_caps[:, None, :],
+            ),
+            torch.zeros_like(requested_delta),
+        )
+        target_baskets = current_basket + executed_delta
         close_delta = torch.minimum(prior_group_quantities.abs(), trade_caps)
+        if margin_mode:
+            buy_allowed = buy_allowed_all[row]
+            sell_allowed = sell_allowed_all[row]
+            close_allowed = can_trade_candidates & torch.where(prior_group_quantities < 0, buy_allowed, sell_allowed)
+            close_delta = torch.where(close_allowed, close_delta, torch.zeros_like(close_delta))
         close_basket = (
             prior_group_quantities
             - torch.sign(prior_group_quantities) * close_delta
@@ -1059,31 +1251,56 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 & (deltas.abs() <= trade_caps[:, None, :])
             )
         ).all(dim=-1)
+        if margin_mode:
+            direction_allowed = (deltas == 0) | torch.where(deltas > 0, buy_allowed[:, None, :], sell_allowed[:, None, :])
+            capacity_ok &= direction_allowed.all(-1)
+            capacity_ok &= ~force_margin_close | (candidate_baskets == close_basket).all(-1)
         candidate_trade_cost = (
             deltas.abs().to(weights.dtype)
             * (fees + entry_taxes)[:, None, :]
         ).sum(dim=-1)
         candidate_reserved = (
             candidate_baskets.abs().to(weights.dtype)
-            * (notionals + close_reserve)[:, None, :]
+            * (collateral + close_reserve)[:, None, :]
         ).sum(dim=-1)
         cash_required = candidate_reserved + candidate_trade_cost
         signed_exposure = (
-            candidate_baskets.to(weights.dtype) * notionals[:, None, :]
+            candidate_baskets.to(weights.dtype) * collateral[:, None, :]
         ).sum(dim=-1)
-        target_exposure = group_target_weight * equity.detach().clamp_min(0.0)
+        target_exposure = group_target_weight * allocation_equity.detach().clamp_min(0.0)
         best, globally_fundable = _globally_funded_group_candidate_indices(
             cash_required=cash_required,
             candidate_exposure=signed_exposure,
             target_exposure=target_exposure,
             capacity_ok=capacity_ok,
             target_cash=target_cash,
-            equity=equity.detach().clamp_min(0.0),
+            equity=allocation_equity.detach().clamp_min(0.0),
             target_candidate_count=int(target_baskets.size(1)),
         )
         chosen_group_quantities = candidate_baskets.gather(
             1, best[:, None, None].expand(-1, 1, 2)
         )[:, 0, :]
+        if margin_mode:
+            # An existing position below initial margin but above maintenance
+            # is not bankrupt. If fully funded reallocation is impossible,
+            # allow only holding/reducing old contracts; no new risk can use
+            # the collateral deficit as an order budget.
+            reduction_only = ((candidate_baskets == 0) | (
+                (candidate_baskets * prior_group_quantities[:, None, :] > 0)
+                & (candidate_baskets.abs() <= prior_group_quantities[:, None, :].abs())
+            )).all(-1)
+            reduction_score = torch.where(capacity_ok & reduction_only,
+                (signed_exposure - target_exposure[:, None]).abs(),
+                torch.full_like(signed_exposure, float("inf")))
+            reduction_best = reduction_score.argmin(-1)
+            reduction_basket = candidate_baskets.gather(
+                1, reduction_best[:, None, None].expand(-1, 1, 2))[:, 0, :]
+            chosen_group_quantities = torch.where(
+                globally_fundable, chosen_group_quantities, reduction_basket)
+            # Closing an insolvent account may itself create debt. Lack of
+            # collateral must never suppress an otherwise executable close.
+            chosen_group_quantities = torch.where(force_margin_close,
+                close_basket[:, 0, :], chosen_group_quantities)
         chosen_by_slot = chosen_group_quantities.reshape(-1).gather(
             0, flat_candidate_index
         )
@@ -1091,6 +1308,21 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             active_metadata, chosen_by_slot, quantities
         )
         chosen_by_slot = torch.where(advance[row], chosen_by_slot, quantities)
+        if margin_mode:
+            # Reduce positions first. Only increases compete for the remaining
+            # combined-product position limit; released capacity is not traded.
+            pg = execution[row, :, margin.POSITION_GROUP].nan_to_num().long().clamp(0, slots - 1)
+            units = execution[row, :, margin.POSITION_UNIT].nan_to_num()
+            limits = torch.zeros_like(opening_notional).scatter_reduce(
+                0, pg, execution[row, :, margin.POSITION_LIMIT].nan_to_num(), reduce="amax")
+            same_sign = chosen_by_slot * quantities > 0
+            reduced = torch.where(same_sign, torch.sign(quantities) * torch.minimum(
+                quantities.abs(), chosen_by_slot.abs()), torch.zeros_like(quantities))
+            increases = chosen_by_slot - reduced
+            used = torch.zeros_like(opening_notional).scatter_add(0, pg, reduced.abs() * units)
+            wanted = torch.zeros_like(opening_notional).scatter_add(0, pg, increases.abs() * units)
+            scale = torch.minimum(torch.ones_like(used), (limits - used).clamp_min(0) / wanted.clamp_min(1e-12))
+            chosen_by_slot = reduced + torch.trunc(increases * scale[pg]).long()
         delta_by_slot = chosen_by_slot - quantities
         trade_cost = (
             delta_by_slot.abs().to(weights.dtype)
@@ -1100,23 +1332,42 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 torch.zeros_like(fixed_fee),
             )
         ).sum()
-        collateral_and_exit_reserve = (
-            chosen_by_slot.abs().to(weights.dtype)
-            * torch.where(
-                active_metadata,
-                opening_notional + fixed_fee + opening_tax,
-                torch.zeros_like(opening_notional),
-            )
-        ).sum()
+        # Reuse the selector's cash expression and reduction tree. Summing
+        # slot reserves and trade costs separately can round to a different
+        # side of the same FP32 funding boundary. Margin position limits may
+        # change the selected basket, so recompute that basket in group units.
+        if margin_mode:
+            final_group_quantities = torch.zeros_like(
+                prior_group_quantities.reshape(-1),
+            ).scatter_add(
+                0, flat_candidate_index,
+                torch.where(active_metadata, chosen_by_slot, torch.zeros_like(chosen_by_slot)),
+            ).reshape(slots, 2)
+            final_group_cash = (
+                final_group_quantities.abs().to(weights.dtype)
+                * (collateral + close_reserve)
+            ).sum(dim=-1) + (
+                (final_group_quantities - prior_group_quantities).abs().to(weights.dtype)
+                * (fees + entry_taxes)
+            ).sum(dim=-1)
+        else:
+            final_group_cash = cash_required.gather(1, best[:, None])[:, 0]
+        final_cash_required = _funding_sum(final_group_cash)
         funded = (
             ~advance[row]
             | (
                 globally_fundable
-                & torch.isfinite(collateral_and_exit_reserve)
+                & torch.isfinite(final_cash_required)
                 & torch.isfinite(trade_cost)
-                & (collateral_and_exit_reserve + trade_cost <= equity + 1.0e-3)
+                & (final_cash_required <= allocation_equity)
+                & margin_metadata_ok
             )
         )
+        if margin_mode:
+            no_increase = ((chosen_by_slot == 0) | (
+                (chosen_by_slot * quantities > 0) & (chosen_by_slot.abs() <= quantities.abs())
+            )).all()
+            funded |= no_increase & margin_metadata_ok & torch.isfinite(trade_cost)
         gross_pnl = (
             chosen_by_slot.to(weights.dtype)
             * torch.where(
@@ -1125,10 +1376,29 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 torch.zeros_like(opening_notional),
             )
         ).sum() * advance[row].to(weights.dtype)
+        closed_by_slot = torch.where(must_liquidate & advance[row], chosen_by_slot, torch.zeros_like(chosen_by_slot))
+        liquidation_failed = torch.zeros_like(alive)
+        if margin_mode:
+            expiry_cash = execution[row, :, margin.CASH_SETTLEMENT] > 0.5
+            terminal_allowed = torch.where(chosen_by_slot < 0,
+                execution[row, :, margin.TERMINAL_CAN_BUY] > 0.5,
+                execution[row, :, margin.TERMINAL_CAN_SELL] > 0.5)
+            terminal_capacity = (execution[row, :, margin.TERMINAL_CAPACITY].nan_to_num()
+                                 - delta_by_slot.abs()).clamp_min(0).floor().long()
+            closable = torch.where(terminal_allowed, torch.minimum(chosen_by_slot.abs(), terminal_capacity),
+                                   torch.zeros_like(chosen_by_slot))
+            closable = torch.where(expiry_cash, chosen_by_slot.abs(), closable)
+            closed_by_slot = torch.where(must_liquidate & advance[row], torch.sign(chosen_by_slot) * closable,
+                                         torch.zeros_like(chosen_by_slot))
+            gross_pnl = gross_pnl + (closed_by_slot * torch.where(active_metadata,
+                execution[row, :, margin.TERMINAL_MARK] - ending_notional,
+                torch.zeros_like(ending_notional))).sum()
+            liquidation_failed = (force_margin_close & (chosen_by_slot != 0).any()) | (
+                (must_liquidate & advance[row] & (chosen_by_slot != closed_by_slot)).any())
         forced_close_cost = (
             torch.where(
                 must_liquidate & active_metadata & advance[row],
-                chosen_by_slot.abs().to(weights.dtype) * (fixed_fee + ending_tax),
+                closed_by_slot.abs().to(weights.dtype) * (fixed_fee + ending_tax),
                 torch.zeros_like(opening_notional),
             )
         ).sum()
@@ -1138,13 +1408,14 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             equity,
         )
         net_simple = (
-            exact_next_equity / equity.detach().clamp_min(1.0e-12) - 1.0
+            exact_next_equity / row_start_equity.detach().clamp_min(1.0e-12) - 1.0
         )
-        next_equity = equity * (1.0 + net_simple)
+        next_equity = exact_next_equity if margin_mode else equity * (1.0 + net_simple)
         row_alive = alive & (
             ~advance[row]
             | (
                 funded
+                & ~liquidation_failed
                 & torch.isfinite(next_equity)
                 & (next_equity > 0.0)
             )
@@ -1179,6 +1450,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 ),
             ),
         )
+        default_reason = torch.where(row_default & liquidation_failed,
+            torch.full_like(default_reason, TW_FUTURES_PORTFOLIO_DEFAULT_MARGIN_LIQUIDATION), default_reason)
         safe_net = torch.where(
             row_alive,
             net_simple,
@@ -1209,24 +1482,32 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 )
                 + torch.where(
                     must_liquidate & active_metadata,
-                    chosen_by_slot.abs().to(weights.dtype) * ending_notional,
+                    closed_by_slot.abs().to(weights.dtype) * (execution[row, :, margin.TERMINAL_MARK] if margin_mode else ending_notional),
                     torch.zeros_like(ending_notional),
                 )
             ).sum() / equity.detach().clamp_min(1.0e-12)
         else:
             turnover = torch.zeros_like(log_return)
 
-        quantities = torch.where(
-            advance[row] & must_liquidate,
-            torch.zeros_like(chosen_by_slot),
-            chosen_by_slot,
-        )
+        quantities = chosen_by_slot - closed_by_slot
+        if margin_mode:
+            end_im = (quantities.abs() * execution[row, :, margin.END_INITIAL].nan_to_num()).sum()
+            end_mm = (quantities.abs() * execution[row, :, margin.END_MAINTENANCE].nan_to_num()).sum()
+            used_im = (chosen_by_slot.abs() * collateral_all[row].nan_to_num()).sum()
+            unfilled = torch.where(must_liquidate | force_margin_close, quantities.abs(), torch.zeros_like(quantities)).sum()
+            margin_audit_rows.append(torch.stack((row_start_equity, equity, exact_next_equity,
+                used_im, end_im, end_mm, allocation_equity - trade_cost - used_im,
+                (chosen_by_slot.abs() * opening_notional.nan_to_num()).sum() / equity.clamp_min(1e-12),
+                (exact_next_equity < end_mm).to(weights.dtype), force_margin_close.to(weights.dtype),
+                unfilled.to(weights.dtype), gap_pnl)))
+            if return_weights_history:
+                residual_rows.append(quantities.clone())
         quantities = torch.where(row_alive, quantities, torch.zeros_like(quantities))
         equity = torch.where(row_alive, next_equity, torch.zeros_like(next_equity))
         alive = alive & row_alive
         return_rows.append(log_return)
         turnover_rows.append(
-            torch.where(advance[row] & alive, turnover, torch.zeros_like(turnover))
+            torch.where(advance[row] & (row_start_alive if margin_mode else alive), turnover, torch.zeros_like(turnover))
         )
         if return_weights_history:
             weight_rows.append(exact_weight)
@@ -1279,15 +1560,19 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             # full-batch call.
             _detach_initial_weights=(_initial_surrogate_weights is None),
         )
-        strategy_returns = surrogate.strategy_returns + (
-            exact_strategy_returns - surrogate.strategy_returns
-        ).detach()
-        turnovers = surrogate.turnovers + (
-            exact_turnovers - surrogate.turnovers
-        ).detach()
+        # Add an exactly zero forward tangent rather than subtracting the
+        # differently sized exact/shadow values. This preserves the integer
+        # account bit for bit under grad/no-grad while retaining the shadow
+        # derivative (including its recoverable-default protection).
+        strategy_returns = exact_strategy_returns + (
+            surrogate.strategy_returns - surrogate.strategy_returns.detach()
+        )
+        turnovers = exact_turnovers + (
+            surrogate.turnovers - surrogate.turnovers.detach()
+        )
         history = (
-            surrogate.weights_history
-            + (exact_history - surrogate.weights_history).detach()
+            exact_history
+            + (surrogate.weights_history - surrogate.weights_history.detach())
             if return_weights_history
             else exact_history
         )
@@ -1308,6 +1593,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         contract_quantities_history=quantity_history,
         default_history=torch.stack(default_rows),
         default_reason_history=torch.stack(default_reason_rows),
+        margin_audit_history=torch.stack(margin_audit_rows) if margin_mode else None,
+        residual_contract_quantities_history=torch.stack(residual_rows) if residual_rows else None,
         _surrogate_final_weights=(
             surrogate.final_weights
             if surrogate_weights.requires_grad and torch.is_grad_enabled()
@@ -1446,7 +1733,7 @@ def _initial_integer_surrogate_state(
         & torch.isfinite(ending_tax)
         & (ending_tax >= 0.0)
     )
-    shadow_equity = execution.new_tensor(float(initial_capital)) * shadow_scale
+    shadow_equity = execution.new_full((), float(initial_capital)) * shadow_scale
     shadow_weights = (
         quantities.to(dtype=torch.float32)
         * torch.where(active, opening_notional, torch.zeros_like(opening_notional))
@@ -1605,9 +1892,23 @@ def run_tw_futures_portfolio_integer_torch(
 ) -> FuturesPortfolioTensorResult:
     """Run the exact account through reusable, gradient-identical blocks."""
 
+    if futures_cuda_graph_enabled(target_weights):
+        return run_futures_cuda_graph(
+            _run_tw_futures_portfolio_integer_torch_impl,
+            target_weights, integer_execution,
+            initial_capital=initial_capital,
+            state_advance_mask=state_advance_mask,
+            initial_quantities=initial_quantities,
+            initial_equity_scale=initial_equity_scale,
+            initial_alive=initial_alive,
+            return_weights_history=return_weights_history,
+            return_turnovers=return_turnovers,
+            recoverable_backward=recoverable_backward,
+        )
     block_rows = resolve_tw_futures_portfolio_integer_compiled_block_rows()
     compile_blocks = bool(
         block_rows > 0
+        and int(integer_execution.size(-1)) == 11
         and target_weights.ndim == 2
         and int(target_weights.size(0)) >= block_rows
         and target_weights.device.type == "cuda"

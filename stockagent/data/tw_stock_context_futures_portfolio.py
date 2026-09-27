@@ -49,6 +49,10 @@ TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION: Final[
 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION: Final[
     int
 ] = 6
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION: Final[
+    int
+] = 7
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION: Final[int] = 8
 TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION: Final[int] = 1
 TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
@@ -62,6 +66,13 @@ TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS: Final[tuple[str, ...]] = 
 TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
     *TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS,
+)
+TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS: Final[
+    tuple[str, ...]
+] = (
+    *TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
+    *TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS[:2],
+    "prior_one_contract_cash_requirement_twd",
 )
 TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "current_futures_open_gap_logret",
@@ -124,11 +135,16 @@ class TaiwanStockContextFuturesPortfolioDaily:
     integer_execution: np.ndarray | None = None
     intraday_execution: np.ndarray | None = None
     intraday_session_mask: np.ndarray | None = None
+    margin_rules_path: str | None = None
+    margin_contract_version: int = 0
+    margin_session_mask: np.ndarray | None = None
     carry_valuation_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantined_physical_contracts: int = 0
     expiry_settlement_valuation: bool = False
     expiry_final_settlement_path: str | None = None
+    denomination_context_basis: str = "current_open"
+    require_prior_capacity: bool = False
     contract_version: int = TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
     futures_data_contract_version: int = (
         TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
@@ -155,9 +171,10 @@ class TaiwanStockContextFuturesPortfolioDaily:
             raise ValueError("must_liquidate_mask must match the futures [T,S] axis")
         if self.integer_execution is not None:
             execution = np.asarray(self.integer_execution, dtype=np.float32).copy()
-            if execution.shape[:2] != liquidation.shape or execution.shape[-1] != len(
-                TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS
-            ):
+            from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTH
+            if execution.shape[:2] != liquidation.shape or execution.shape[-1] not in {
+                len(TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS), MARGIN_EXECUTION_WIDTH,
+            }:
                 raise ValueError(
                     "integer all-futures execution tensor has an invalid shape"
                 )
@@ -188,6 +205,8 @@ def attach_stock_context_futures_portfolio_daily(
     fee_per_side_twd_by_group: dict[str, float],
     integer_contracts: bool = False,
     current_open_feature: bool = False,
+    denomination_context_basis: str = "current_open",
+    require_prior_capacity: bool = False,
     carry_valuation_max_abs_simple_return: float = 0.0,
     expiry_settlement_valuation: bool = False,
     final_settlement_path: str | Path | None = None,
@@ -210,9 +229,33 @@ def attach_stock_context_futures_portfolio_daily(
     receipted official TAIFEX *final* settlement price; the daily settlement
     column is deliberately not accepted as a substitute. Non-expiry exits are
     unchanged.
+
+    ``denomination_context_basis=prior_settlement`` keeps the same action ABI
+    but values the model-only one-contract cash context with the preceding
+    same-contract settlement and source-row multiplier. Known fixed fees and
+    decision-date transaction tax may enter this estimate. The integer
+    executor still sizes and values at its current OPEN; the estimate never
+    performs a second hard quantity projection.
+
+    ``require_prior_capacity`` removes model candidates whose prior completed
+    session volume permits fewer than one new contract at the configured
+    participation limit. It does not change their features or executor facts:
+    existing quantities must still be valued and carried even when a model
+    cannot request a new trade. Integer participation retains its (0,1] domain.
     """
 
     _require_dependencies()
+    if require_prior_capacity and not integer_contracts:
+        raise ValueError("prior capacity candidates require integer contracts")
+    denomination_context_basis = str(denomination_context_basis).strip().lower()
+    if denomination_context_basis not in {"current_open", "prior_settlement"}:
+        raise ValueError("unsupported futures denomination context basis")
+    prior_denomination = denomination_context_basis == "prior_settlement"
+    if prior_denomination and (not integer_contracts or current_open_feature):
+        raise ValueError(
+            "prior-settlement denomination requires integer contracts and "
+            "excludes current OPEN model features"
+        )
     if current_open_feature and not integer_contracts:
         raise ValueError(
             "current futures OPEN context requires integer contract metadata"
@@ -287,7 +330,7 @@ def attach_stock_context_futures_portfolio_daily(
                 "previous_volume",
             ]
         )
-    if current_open_feature:
+    if current_open_feature or prior_denomination:
         source_columns.append("previous_settlement")
     if expiry_settlement_valuation:
         source_columns.append("liquidation_reason")
@@ -485,6 +528,9 @@ def attach_stock_context_futures_portfolio_daily(
 
     shape = (dates.size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
     model_feature_columns = (
+        TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS
+        if prior_denomination
+        else
         TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
         if current_open_feature
         else TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
@@ -764,6 +810,24 @@ def attach_stock_context_futures_portfolio_daily(
         one_contract_cash = (
             open_notionals + (2.0 * integer_fee) + (2.0 * opening_tax)
         )
+        model_one_contract_cash = one_contract_cash
+        if prior_denomination:
+            previous_settlement = frame["previous_settlement"].to_numpy().astype(
+                np.float64
+            )
+            prior_notional = previous_settlement * multipliers
+            valid_prior = np.isfinite(prior_notional) & (prior_notional > 0.0)
+            if np.any(same_values & ~source_carry_quarantine & ~valid_prior):
+                raise ValueError(
+                    "prior-settlement denomination requires a finite positive "
+                    "previous same-contract settlement for every causal candidate"
+                )
+            prior_tax = np.floor(prior_notional * tax_rates + 0.5)
+            model_one_contract_cash = np.where(
+                valid_prior,
+                prior_notional + (2.0 * integer_fee) + (2.0 * prior_tax),
+                0.0,
+            )
         candidate_features[
             date_indices,
             symbol_indices,
@@ -778,7 +842,7 @@ def attach_stock_context_futures_portfolio_daily(
             date_indices,
             symbol_indices,
             denomination_feature_start + 2,
-        ] = one_contract_cash.astype(np.float32, copy=False)
+        ] = model_one_contract_cash.astype(np.float32, copy=False)
         prior_volume = np.nan_to_num(
             integer_frame["previous_volume"].to_numpy().astype(np.float64),
             nan=0.0,
@@ -905,6 +969,14 @@ def attach_stock_context_futures_portfolio_daily(
     if not bool(benchmark_assigned.any()):
         raise ValueError("TAIFEX TX front-month benchmark rows are missing")
 
+    # Apply this action eligibility only after constructing all ledger facts.
+    # Channel 8 is floor(previous same-contract volume * participation), never
+    # current-session volume or eventual realized fill. A zero action must not
+    # erase valuation or liquidation metadata for an existing position.
+    if require_prior_capacity:
+        assert integer_execution is not None
+        candidate_mask &= integer_execution[..., 8] >= 1.0
+
     panel.stock_context_futures_portfolio_daily = (
         TaiwanStockContextFuturesPortfolioDaily(
             dates=dates,
@@ -932,8 +1004,14 @@ def attach_stock_context_futures_portfolio_daily(
                 if resolved_final_settlement_path is not None
                 else None
             ),
+            denomination_context_basis=denomination_context_basis,
+            require_prior_capacity=bool(require_prior_capacity),
             contract_version=(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION
+                if require_prior_capacity
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION
+                if prior_denomination
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
                 if expiry_settlement_valuation
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
                 if carry_guard > 0.0
@@ -957,12 +1035,15 @@ __all__ = [
     "TW_STOCK_CONTEXT_FUTURES_EXECUTION_CHANNELS",
     "TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS",
     "TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS",
+    "TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS",
     "TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION",
     "TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION",
     "TaiwanStockContextFuturesPortfolioDaily",
     "attach_stock_context_futures_portfolio_daily",

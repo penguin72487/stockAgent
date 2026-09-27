@@ -21,10 +21,12 @@ from zoneinfo import ZoneInfo
 
 try:
     from scripts.finlab_wide_volume_units import volume_unit_contract
+    from scripts.finlab_arrow_history import STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow
 except ModuleNotFoundError as exc:
     if exc.name != "scripts":
         raise
     from finlab_wide_volume_units import volume_unit_contract
+    from finlab_arrow_history import STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,20 +34,9 @@ DEFAULT_CATALOG = ROOT / "configs/finlab_history_candidates.json"
 DEFAULT_OUTPUT = ROOT / "data_finlab"
 TAIPEI = ZoneInfo("Asia/Taipei")
 PERIOD_LABEL = re.compile(r"^\d{4}-(?:M\d{2}|Q[1-4])$")
-# This is a provider-origin label, not a numerical market feature. Its wide
-# string frame exceeded the bounded research worker's memory during a live
-# account sweep; leave it discoverable and manually fetchable, but do not let
-# it stall every subsequent daily incremental run.
+# Oversized general keys use the bounded Arrow adapter. Only intrinsically
+# windowed keys stay excluded from this whole-table scheduler.
 AUTOMATICALLY_DEFERRED_REASONS = {
-    "after_market_fixed_price:資料來源": "oversized_metadata",
-    # 2.1.1 forced refresh on 2026-09-25 reached ~9.9 GiB RSS without
-    # finishing. Preserve its existing receipt but never let a routine
-    # full-table refresh compete with the user's live WSL workload.
-    "after_market_fixed_price:市場別": "oversized_wide_refresh",
-    # 2026-09-23: one whole-table SDK fetch used ~726 MB of daily quota,
-    # stayed above the worker's 6 GiB high watermark for >50 minutes, and
-    # produced no durable receipt. Retry only after a bounded partition plan.
-    "broker_transactions": "oversized_table",
     # These are dated partitions, not whole-table matrix keys. Calling
     # data.get(key) without both dates always fails, regardless of entitlement.
     "tw_minute:2330": "requires_date_window",
@@ -65,17 +56,20 @@ ATTEMPT_RETRY_SECONDS = {
     "vip_only": (30 * 60, 4 * 60 * 60),
     "provider_error": (5 * 60, 60 * 60),
     "provider_empty": (30 * 60, 2 * 60 * 60),
+    "normalization_error": (5 * 60, 60 * 60),
     "timed_out": (30 * 60, 2 * 60 * 60),
+    "resource_deferred": (60 * 60, 2 * 60 * 60),
 }
 
 
 class EmptyProviderFrame(ValueError):
     """The SDK returned a frame, but no non-null market observation exists."""
 
-    def __init__(self, *, rows: int, fields: int):
+    def __init__(self, *, rows: int, fields: int, evidence: dict | None = None):
         super().__init__("provider returned no non-null rows")
         self.rows = rows
         self.fields = fields
+        self.evidence = evidence or {}
 
 
 def load_catalog(path: Path = DEFAULT_CATALOG) -> dict:
@@ -192,6 +186,8 @@ def refresh_due(key: str, output_root: Path, *, now: datetime, days: int) -> boo
         return False
     try:
         receipt = json.loads((output_root / "receipts" / f"{safe_stem(key)}.json").read_text())
+        if receipt.get("source_check_mode") == "sdk_cache_allowed":
+            return True
         checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
         if days == 1:
             return checked.astimezone(UTC) < quota_cycle_start(now)
@@ -235,7 +231,11 @@ def quota_room_mb() -> tuple[float, float] | None:
 def classify_provider_error(exc: Exception) -> str:
     """Persist only a bounded category; exception text may contain secrets."""
     if isinstance(exc, EmptyProviderFrame):
+        if exc.evidence.get("raw_non_null_values", 0) > 0:
+            return "normalization_error"
         return "provider_empty"
+    if isinstance(exc, FinlabResourceDeferred):
+        return "resource_deferred"
     message = str(exc).lower()
     if "only for vip" in message or (
         "vip" in message and "please" in message and "to vip" in message
@@ -373,19 +373,40 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
                     digest.update(chunk)
             if digest.hexdigest() != receipt.get("sha256"):
                 raise ValueError("stored Parquet SHA-256 mismatch")
+            if receipt.get("raw_path"):
+                raw_relative = Path(receipt["raw_path"])
+                raw_path = (root / raw_relative).resolve()
+                if raw_relative.is_absolute() or not raw_path.is_relative_to(root):
+                    raise ValueError("raw receipt path escapes FinLab root")
+                with raw_path.open("rb") as handle:
+                    raw_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                if raw_digest != receipt.get("raw_sha256"):
+                    raise ValueError("stored raw Arrow SHA-256 mismatch")
             parquet = pq.ParquetFile(data_path)
             if parquet.metadata.num_rows != receipt.get("rows"):
                 raise ValueError("stored Parquet row count mismatch")
             fields = parquet.schema_arrow.names
             if "date" in fields:
-                event_dates = parquet.read(columns=["date"]).column("date").to_pandas()
-                receipt.update(_event_bounds(event_dates))
+                bounds = {"event_time_column": "date", "event_date_rows": 0,
+                          "first_event_at": None, "last_event_at": None}
+                for batch in parquet.iter_batches(batch_size=65536, columns=["date"], use_threads=False):
+                    part = _event_bounds(batch.column(0).to_pandas())
+                    bounds["event_date_rows"] += part["event_date_rows"]
+                    for name, reduce in [("first_event_at", min), ("last_event_at", max)]:
+                        if part[name] is not None:
+                            bounds[name] = part[name] if bounds[name] is None else reduce(bounds[name], part[name])
+                receipt.update(bounds)
             if "source_index" in fields and receipt.get("rows_with_values") == receipt.get("rows"):
-                indexes = parquet.read(columns=["source_index"]).column("source_index").to_pandas()
-                if str(receipt.get("source_index_dtype")) in {"int32", "int64", "uint32", "uint64"}:
-                    indexes = pd.to_numeric(indexes, errors="raise")
-                receipt["first_non_null_source_index"] = str(indexes.min()) if len(indexes) else None
-                receipt["last_non_null_source_index"] = str(indexes.max()) if len(indexes) else None
+                low = high = None
+                for batch in parquet.iter_batches(batch_size=65536, columns=["source_index"], use_threads=False):
+                    indexes = batch.column(0).to_pandas()
+                    if str(receipt.get("source_index_dtype")) in {"int32", "int64", "uint32", "uint64"}:
+                        indexes = pd.to_numeric(indexes, errors="raise")
+                    if len(indexes):
+                        low = indexes.min() if low is None else min(low, indexes.min())
+                        high = indexes.max() if high is None else max(high, indexes.max())
+                receipt["first_non_null_source_index"] = str(low) if low is not None else None
+                receipt["last_non_null_source_index"] = str(high) if high is not None else None
             receipt["schema_version"] = max(2, int(receipt.get("schema_version") or 0))
             if unit_contract is not None:
                 receipt["volume_units"] = unit_contract
@@ -402,13 +423,7 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
 
 
 def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
-    from finlab import data
-
     started = time.monotonic()
-    frame = data.get(key, force_download=refresh, progress="silent")
-    table, stats = serialize_provider_frame(frame)
-    if not stats["rows_with_values"]:
-        raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"])
     stem = safe_stem(key)
     receipt_path = output_root / "receipts" / f"{stem}.json"
     datasets_root = output_root / "datasets"
@@ -418,13 +433,26 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
     ) as handle:
         temp = Path(handle.name)
     try:
-        table.to_parquet(temp, index=False, compression="zstd")
+        if key in STREAMING_KEYS:
+            stats = prepare_arrow(key, output_root, stem, temp, refresh=refresh)
+        else:
+            from finlab import data
+
+            frame = data.get(key, force_download=refresh, progress="silent")
+            table, stats = serialize_provider_frame(frame)
+            if not stats["rows_with_values"]:
+                evidence = capture_empty_evidence(key, output_root, stem)
+                raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"], evidence=evidence)
+            table.to_parquet(temp, index=False, compression="zstd")
+        if not stats["rows_with_values"]:
+            raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"])
         digest = hashlib.sha256()
         with temp.open("rb") as handle:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         content_hash = digest.hexdigest()
-        checked_at = datetime.now(UTC).isoformat()
+        checked_at = stats.get("source_checked_at_utc", datetime.now(UTC).isoformat())
+        check_mode = stats.get("source_check_mode", "upstream_forced" if refresh else "sdk_cache_allowed")
         previous: dict = {}
         if receipt_path.is_file():
             try:
@@ -442,10 +470,11 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
                             existing.update(chunk)
                     if existing.hexdigest() == content_hash:
                         previous["source_checked_at_utc"] = checked_at
-                        previous["source_check_mode"] = "upstream_forced" if refresh else "sdk_cache_allowed"
+                        previous["source_check_mode"] = check_mode
                         previous["last_check_result"] = "unchanged"
                         previous["last_fetch_elapsed_seconds"] = round(time.monotonic() - started, 3)
                         previous["parquet_size_bytes"] = (output_root / old_relative).stat().st_size
+                        previous.update(stats)
                         unit_contract = volume_unit_contract(key)
                         if unit_contract is not None:
                             previous["volume_units"] = unit_contract
@@ -482,7 +511,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
             "status": "downloaded_unverified_for_pit",
             "fetched_at_utc": checked_at,
             "source_checked_at_utc": checked_at,
-            "source_check_mode": "upstream_forced" if refresh else "sdk_cache_allowed",
+            "source_check_mode": check_mode,
             "last_check_result": "downloaded",
             "last_fetch_elapsed_seconds": round(time.monotonic() - started, 3),
             "parquet_size_bytes": data_path.stat().st_size,
@@ -554,6 +583,9 @@ def _sync_work_plan(
     # and missing-key priority, then visit the stalest downloaded extras first.
     refresh_extra.sort(key=lambda key: (last_source_check(key, output_root), key))
     primary = [*eligible_curated, *missing_extra, *refresh_extra]
+    # Source-label metadata must not spend the whole-table budget before
+    # missing numeric financial fields, but it is no longer permanently stuck.
+    primary.sort(key=lambda key: key in NON_NUMERIC_DEFERRED_KEYS)
     return {"primary": primary, "validation": validation_refresh,
             "required_outstanding": required_outstanding,
             "required_blocked": sorted(set(required_outstanding) - set(primary))}
@@ -661,6 +693,7 @@ def record_attempt(key: str, output_root: Path, exc: Exception,
         "exception_class": type(exc).__name__,
         "message_retained": False,
         "last_attempt_elapsed_seconds": round(elapsed_seconds, 3) if elapsed_seconds is not None else None,
+        **(exc.evidence if isinstance(exc, EmptyProviderFrame) else {}),
     })
     return reason
 

@@ -709,6 +709,7 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     futures_denomination_hard_projection: object,
     futures_current_open_feature: object,
     data_futures_current_open_feature: object,
+    denomination_context_basis: str,
     carry_valuation_max_abs_simple_return: object,
     expiry_settlement_valuation: object,
     final_settlement_path: object,
@@ -734,7 +735,8 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
         (bool(day_trade_open_feature)
          and DAY_TRADE_OPEN_GAP_FEATURE not in tuple(feature_shift_next_session))
         or bool(futures_current_open_feature)
-        or bool(futures_denomination_aware_output)
+        or (bool(futures_denomination_aware_output)
+            and denomination_context_basis != "prior_settlement")
         or futures_denomination_hard_projection is not False
     ):
         raise ValueError("financial futures require prior-session features and executor-only denomination rounding")
@@ -1554,6 +1556,10 @@ class DataConfig:
     # exposed as current information and used by the execution proxy, while
     # the cash-stock panel remains complete only through session t-1.
     tw_futures_current_open_feature: bool = False
+    # Optional causal sizing context; the executor still uses observed OPEN.
+    tw_futures_denomination_context_basis: str = "current_open"
+    # Exclude known zero-capacity orders from policy actions, never valuation.
+    tw_futures_require_prior_capacity: bool = False
     # Optional data-integrity guard for stock/ETF futures whose physical
     # contract cannot be valued consistently across adjacent daily OPENs.
     # Zero preserves historical contracts. A positive threshold fails the
@@ -1847,6 +1853,10 @@ class TradingConfig:
     # Explicit account policy; intraday uses receipt-backed 08:46..13:30 bars.
     tw_futures_portfolio_holding_policy: str = "carry"
     tw_futures_portfolio_minute_data_path: str | None = None
+    tw_futures_portfolio_capital_basis: str = "notional"
+    tw_futures_portfolio_margin_rules_path: str | None = None
+    tw_futures_portfolio_broker_margin_multiplier: float = 1.0
+    tw_futures_portfolio_margin_liquidation_ratio: float = 0.25
     # Full cash-stock feature universe, but only causally known nearby
     # single-stock futures may receive a target. The aligned source owns
     # physical contract selection, multiplier, prices, and statutory tax.
@@ -2146,6 +2156,8 @@ class TransformerBasePortfolioModelConfig:
     # denomination.  Hard whole-unit values own forward; identity STE owns
     # backward.  This is disabled for legacy checkpoint compatibility.
     futures_denomination_aware_output: bool = False
+    # Train-window-only RMS for the 17 continuous futures candidate features.
+    futures_feature_rms_normalization: bool = False
     # Historical models quantized group actions against one fixed reference
     # capital before the recurrent integer executor quantized them again against
     # live equity. New exact-account experiments may retain denomination context
@@ -2392,6 +2404,10 @@ class TrainingConfig:
     # all-futures mode uses a shadow account. The 08:45 minute mode uses adjacent
     # executable basket slopes and counterfactual days, with the same deadline.
     futures_portfolio_recoverable_backward: bool = False
+    # Replay unchanged futures tensor operations to reduce CUDA launch overhead.
+    # Runtime-only acceleration; the accounting and optimizer ABI is unchanged.
+    futures_cuda_graph: bool = False
+    futures_funding_compile: bool = False
     # Minute-only opt-in: retain the feasible inward basket secant when entry
     # capacity is saturated. False preserves the v3-v5 optimization contract.
     futures_minute_saturation_recovery: bool = False
@@ -3890,6 +3906,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["tw_futures_current_open_feature"] = bool(
         data["tw_futures_current_open_feature"]
     )
+    data["tw_futures_denomination_context_basis"] = str(
+        data["tw_futures_denomination_context_basis"]
+    ).strip().lower()
+    data["tw_futures_require_prior_capacity"] = bool(data["tw_futures_require_prior_capacity"])
+    if data["tw_futures_denomination_context_basis"] not in {
+        "current_open", "prior_settlement",
+    }:
+        raise ValueError("futures denomination context must be current_open or prior_settlement")
+    if (data["tw_futures_denomination_context_basis"] == "prior_settlement"
+            and data["tw_futures_current_open_feature"]):
+        raise ValueError("prior-settlement denomination cannot expose current futures OPEN")
     data["tw_futures_expiry_settlement_valuation"] = bool(
         data["tw_futures_expiry_settlement_valuation"]
     )
@@ -4228,6 +4255,45 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
     holding_policy = trading["tw_futures_portfolio_holding_policy"]
+    if training["futures_funding_compile"] and (
+        not training["futures_cuda_graph"] or training["backtest_compile"]
+    ):
+        raise ValueError("futures funding fusion requires futures_cuda_graph and an eager outer ledger")
+    capital_basis = trading["tw_futures_portfolio_capital_basis"]
+    if capital_basis not in {"notional", "initial_margin"}:
+        raise ValueError("futures capital basis must be notional or initial_margin")
+    if (data["tw_futures_denomination_context_basis"] == "prior_settlement"
+            or data["tw_futures_require_prior_capacity"]) and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or not trading["tw_futures_portfolio_integer_contracts"]
+        or holding_policy != "carry"
+        or capital_basis != "notional"
+    ):
+        raise ValueError("prior-settlement denomination/prior capacity currently requires integer notional futures carry")
+    if phase_model_config["futures_feature_rms_normalization"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+    ):
+        raise ValueError("futures feature RMS requires the all-futures candidate sidecar")
+    if capital_basis == "initial_margin":
+        if (trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+                or holding_policy != "carry"
+                or not trading["tw_futures_portfolio_integer_contracts"]
+                or not trading["tw_futures_portfolio_margin_rules_path"]
+                or training["model_name"] != "financial_transformer"
+                or training["futures_portfolio_training_surrogate_only"]
+                or training["backtest_compile"] or training["eval_backtest_compile"]
+                or training["compile_loss"]
+                or data["tw_futures_current_open_feature"]
+                or training["financial_transformer"]["futures_denomination_aware_output"]
+                or training["financial_transformer"]["portfolio_output_mode"] not in {"learned_cash", "score_entmax_log_cash"}
+                or not data["tw_futures_expiry_settlement_valuation"]):
+            raise ValueError("margin requires dated rules, FinancialTransformer, exact carry and eager ledger")
+        multiplier = float(trading["tw_futures_portfolio_broker_margin_multiplier"])
+        ratio = float(trading["tw_futures_portfolio_margin_liquidation_ratio"])
+        if not math.isfinite(multiplier) or multiplier < 1:
+            raise ValueError("broker margin multiplier must be finite and >= 1")
+        if not math.isfinite(ratio) or not 0.25 <= ratio <= 1:
+            raise ValueError("margin liquidation ratio must be in [0.25,1]")
     if holding_policy not in {"carry", "intraday"}:
         raise ValueError("tw_futures_portfolio_holding_policy must be carry or intraday")
     if holding_policy == "intraday" and (
@@ -4270,6 +4336,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         data_futures_current_open_feature=data[
             "tw_futures_current_open_feature"
         ],
+        denomination_context_basis=data["tw_futures_denomination_context_basis"],
         carry_valuation_max_abs_simple_return=data[
             "tw_futures_carry_valuation_max_abs_simple_return"
         ],
@@ -5221,6 +5288,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             futures_portfolio_recoverable_backward=training_raw[
                 "futures_portfolio_recoverable_backward"
             ],
+            futures_cuda_graph=training_raw["futures_cuda_graph"],
+            futures_funding_compile=training_raw["futures_funding_compile"],
             futures_minute_saturation_recovery=training_raw["futures_minute_saturation_recovery"],
             futures_minute_recovery_objective=training_raw["futures_minute_recovery_objective"],
             futures_portfolio_optimizer_step_per_trajectory=training_raw[

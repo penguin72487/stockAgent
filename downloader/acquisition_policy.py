@@ -114,7 +114,8 @@ def _finmind_required(path: str, epoch: int) -> int:
                          timeout=2) as connection:
         count = connection.execute(
             "SELECT COUNT(*) FROM tasks WHERE priority < 8 "
-            "AND state NOT IN ('complete','observed_empty','non_session')"
+            "AND state NOT IN ('complete','observed_empty','non_session',"
+            "'not_observation_date','deprecated_query_shape')"
         ).fetchone()[0]
         total = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     if not total:

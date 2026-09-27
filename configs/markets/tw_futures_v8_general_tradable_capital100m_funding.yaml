@@ -1,0 +1,9 @@
+# Same TWD 100M experiment with the corrected v7 recoverable funding gradient.
+# Funded accounts receive no solvency penalty; exact execution is unchanged.
+base_config: tw_futures_v8_general_tradable_capital100m.yaml
+experiment_name: tw-futures-v8-general-prior-capacity-capital100m-funding
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_tradable_capital100m_funding_fold10
+  start_fold: 10
+  resume: true

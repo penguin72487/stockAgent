@@ -74,11 +74,14 @@ def attach_all_futures_intraday(panel, minute_path: str | Path, *, participation
     daily = panel.stock_context_futures_portfolio_daily
     if daily is None or daily.integer_execution is None:
         raise ValueError("all-futures intraday requires the exact futures sidecar")
+    # Canonical stock panels store datetime64[ns]; source identities are
+    # trading dates. Normalize the join key without changing the panel axis.
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
     source, selected, bars = validate_all_futures_intraday_data(
-        daily.source_path, minute_path, participation=participation, dates=panel.dates,
+        daily.source_path, minute_path, participation=participation, dates=panel_dates,
     )
     keys = ["date", "physical_contract"]
-    dates = {str(d): i for i, d in enumerate(panel.dates)}
+    dates = {str(d): i for i, d in enumerate(panel_dates)}
     slots = {s: i for i, s in enumerate(daily.symbols)}
     shape = daily.candidate_mask.shape
     # Slot 0 owns one physical contract. Slot 1 stays unavailable. This reuses
@@ -104,7 +107,7 @@ def attach_all_futures_intraday(panel, minute_path: str | Path, *, participation
     panel.stock_context_futures_portfolio_daily = replace(
         daily, intraday_execution=tape, candidate_mask=eligible,
         intraday_session_mask=np.isin(
-            np.asarray(panel.dates, dtype="datetime64[D]"),
+            panel_dates,
             np.asarray(source["date"].unique().to_list(), dtype="datetime64[D]"),
         ),
         must_liquidate_mask=eligible.copy(), can_hold_overnight_mask=np.zeros(shape, dtype=bool),

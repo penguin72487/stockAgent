@@ -91,6 +91,47 @@ def test_claim_preserves_callers_transaction_boundary(tmp_path: Path) -> None:
         assert conn.execute("SELECT state FROM tasks WHERE partition='2024-01-01'").fetchone() == ("pending",)
 
 
+def test_claim_maximum_span_crosses_training_horizon_priority_not_completed_holes(tmp_path: Path):
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        _years(conn, *range(1982, 2026))
+        conn.execute("UPDATE tasks SET priority=4 WHERE partition<'2014-01-01'")
+        conn.commit()
+        batch = sponsor._claim_batch(conn, sponsor._next(conn, NOW), NOW)
+        assert batch and len(batch.tasks) == 44
+        assert batch.start_date.isoformat() == '1982-01-01'
+        assert conn.execute("SELECT count(*) FROM tasks WHERE state='inflight'").fetchone()[0] == 44
+
+
+@pytest.mark.parametrize('error', ['response_size_limit','batch_response_row_limit','ReadTimeout','http_504'])
+def test_resource_failure_learns_smaller_batch_and_preserves_acquisition(tmp_path: Path, error: str):
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        _years(conn, *range(1982, 2026))
+        batch = sponsor._claim_batch(conn, sponsor._next(conn, NOW), NOW)
+        assert len(batch.tasks) == 44
+        result = sponsor._defer_failed_batch(conn, batch, error, NOW)
+        assert result == 'batch_reduced_retry'
+        assert conn.execute('SELECT count(*) FROM request_batch_policy').fetchone()[0] == 0
+        assert conn.execute('SELECT max_partitions FROM request_batch_limits').fetchone()[0] == 22
+        retry_at = NOW + timedelta(seconds=61)
+        smaller = sponsor._claim_batch(conn, sponsor._next(conn, retry_at), retry_at)
+        assert len(smaller.tasks) == 22
+        assert conn.execute("SELECT count(*) FROM tasks WHERE state='pending'").fetchone()[0] == 22
+
+
+def test_reserved_incremental_lane_does_not_expand_into_history(tmp_path: Path, monkeypatch):
+    _runtime(monkeypatch)
+    monkeypatch.setattr(sponsor, 'backfill_budget', lambda *_a, **_kw: {'allowed': False, 'basis': 'reserve'})
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        _years(conn, 2024, 2025, 2026)
+        conn.execute("UPDATE tasks SET priority=0 WHERE partition='2026-01-01'")
+    calls = []
+    monkeypatch.setattr(sponsor, '_fetch_rows', lambda *_a, **_kw: calls.append(_a[-1]) or [{'date':'2026-01-01'}])
+    sponsor.run_once(tmp_path, workers=1, max_requests=1)
+    assert len(calls) == 1 and calls[0]['start_date'] == '2026-01-01'
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        assert conn.execute("SELECT count(*) FROM tasks WHERE state='pending'").fetchone()[0] == 2
+
+
 def test_rejected_batch_disables_only_batching_and_preserves_exact_audit(tmp_path: Path) -> None:
     with sponsor._db(tmp_path / "queue.sqlite3") as conn:
         _years(conn, 2020, 2023, 2024, 2025)

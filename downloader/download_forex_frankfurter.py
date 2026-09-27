@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import sys
 import threading
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,7 +15,10 @@ import polars as pl
 import pyarrow.parquet as pq
 import requests
 
-from common import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from downloader.common import (
     SharedRateLimiter,
     describe_rate_limit,
     resolve_end_date,
@@ -20,6 +26,7 @@ from common import (
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from downloader.artifact_io import atomic_write_json, sha256_file
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
@@ -27,6 +34,9 @@ _RATE_LIMITER: SharedRateLimiter | None = None
 _HTTP_LOCAL = threading.local()
 _MAX_RETRIES = 4
 _RETRY_BASE = 0.6
+_BASE_RESPONSES: dict[tuple[str, str, str, int], Future] = {}
+_BASE_RESPONSE_LOCK = threading.Lock()
+_BASE_RESPONSE_CACHE_LIMIT = 8
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -103,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         help="daily-update: append only missing dates; full: skip existing unless --refresh.",
     )
     parser.add_argument(
-        "--start-date", default="2000-01-01", help="Inclusive start date (YYYY-MM-DD)"
+        "--start-date", default="1999-01-04", help="Inclusive ECB history start date (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--end-date",
@@ -141,6 +151,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not overwrite output_dir/symbols.csv",
     )
+    parser.add_argument("--official-history", action="store_true",
+                        help="Also resume source-separated v2 central-bank history (not blended FX).")
+    parser.add_argument("--official-history-max-requests", type=int, default=16)
     return parser.parse_args()
 
 
@@ -148,6 +161,7 @@ def _get_json(url: str, timeout: int) -> dict:
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
+        session.headers.update({"User-Agent": "stockAgent-economic-research/1.0"})
         adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -185,6 +199,79 @@ def _get_json(url: str, timeout: int) -> dict:
 def _load_supported_currencies(timeout: int) -> set[str]:
     payload = _get_json(f"{API_BASE}/currencies", timeout)
     return {str(code).upper() for code in payload.keys()}
+
+
+def _base_rates(base: str, start: str, end: str, timeout: int) -> dict:
+    """One HTTP response per base/date window, shared by all quote workers."""
+    key = (base, start, end, timeout)
+    with _BASE_RESPONSE_LOCK:
+        future = _BASE_RESPONSES.get(key)
+        owner = future is None
+        if owner:
+            # Bound retained full-history JSON. In-flight futures cannot be
+            # evicted or sibling quote workers could duplicate their request.
+            for old_key in list(_BASE_RESPONSES):
+                if len(_BASE_RESPONSES) < _BASE_RESPONSE_CACHE_LIMIT:
+                    break
+                if _BASE_RESPONSES[old_key].done():
+                    del _BASE_RESPONSES[old_key]
+            future = Future()
+            _BASE_RESPONSES[key] = future
+    if owner:
+        try:
+            future.set_result(_get_json(f"{API_BASE}/{start}..{end}?from={base}", timeout))
+        except Exception as exc:
+            future.set_exception(exc)
+    return future.result()
+
+
+def _repair_history_head(record: SymbolRecord, start: str, end: str, path: Path, timeout: int) -> None:
+    """Changing --start-date must actually repair the front, not only the tail."""
+    proof_path = path.with_suffix(".head.json")
+    try:
+        proof = json.loads(proof_path.read_text())
+    except (OSError, ValueError):
+        proof = {}
+    if (proof.get("requested_start", "9999") <= start and proof.get("source_sha256") == sha256_file(path)):
+        return
+    dates = _normalize_date_frame(_read_date_column(path))
+    if dates.is_empty():
+        raise ValueError("existing FX file has no valid dates")
+    first = dates.select(pl.col("date").min()).item().date()
+    through = min(end, (first - timedelta(days=1)).isoformat())
+    if start <= through:
+        payload = _base_rates(record.base, start, through, timeout)
+        rates = payload.get("rates")
+        if not isinstance(rates, dict):
+            raise ValueError("invalid ECB historical response")
+        rows = []
+        for day, items in rates.items():
+            value = items.get(record.quote) if isinstance(items, dict) else None
+            if value is not None:
+                number = float(value)
+                if not math.isfinite(number) or number <= 0:
+                    raise ValueError("nonpositive or nonfinite FX rate")
+                rows.append({"date": day, "open": number, "max": number, "min": number,
+                             "close": number, "adjclose": number, "Trading_Volume": None})
+        head = _normalize_rate_rows(rows, start, through)
+        if not head.is_empty():
+            old = _normalize_date_frame(_read_parquet(path))
+            merged = pl.concat([head, old], how="diagonal_relaxed").unique(subset=["date"], keep="last").sort("date")
+            _write_parquet(merged, path)
+    atomic_write_json(proof_path, {"provider": "ECB", "requested_start": start,
+                                  "checked_through": through, "source_sha256": sha256_file(path),
+                                  "coverage_basis": "queried source; non-publication days are not fabricated"})
+
+
+def _advance_head_proof_after_tail(path: Path, requested_start: str) -> None:
+    proof_path = path.with_suffix(".head.json")
+    try:
+        proof = json.loads(proof_path.read_text())
+    except (OSError, ValueError):
+        proof = {"provider": "ECB", "requested_start": requested_start,
+                 "coverage_basis": "original full-window source query"}
+    proof["source_sha256"] = sha256_file(path)
+    atomic_write_json(proof_path, proof)
 
 
 def _resolve_api_end_date(timeout: int) -> str:
@@ -352,6 +439,7 @@ def _download_pair(
 
     if output_path.exists() and incremental:
         try:
+            _repair_history_head(record, start_date, end_date, output_path, timeout)
             existing_rows, latest_date = _existing_row_count_and_latest_date(
                 output_path
             )
@@ -399,9 +487,8 @@ def _download_pair(
                 message=str(exc),
             )
 
-    url = f"{API_BASE}/{fetch_start_date}..{end_date}?from={record.base}&to={record.quote}"
     try:
-        payload = _get_json(url, timeout)
+        payload = _base_rates(record.base, fetch_start_date, end_date, timeout)
         rates = payload.get("rates", {})
         if not isinstance(rates, dict) or not rates:
             return DownloadResult(
@@ -420,6 +507,8 @@ def _download_pair(
             if close_value is None:
                 continue
             close_num = float(close_value)
+            if not math.isfinite(close_num) or close_num <= 0:
+                raise ValueError("nonpositive or nonfinite FX rate")
             rows.append(
                 {
                     "date": d,
@@ -463,6 +552,7 @@ def _download_pair(
                 .sort("date")
             )
             _write_parquet(merged, output_path)
+            _advance_head_proof_after_tail(output_path, start_date)
             return DownloadResult(
                 code=record.code,
                 status="updated_incremental",
@@ -471,6 +561,7 @@ def _download_pair(
             )
 
         _write_parquet(frame, output_path)
+        _advance_head_proof_after_tail(output_path, start_date)
         return DownloadResult(
             code=record.code,
             status="updated",
@@ -490,6 +581,7 @@ def _download_pair(
 def main() -> None:
     global _MAX_RETRIES, _RATE_LIMITER, _RETRY_BASE
     args = parse_args()
+    _BASE_RESPONSES.clear()
     _MAX_RETRIES = max(0, int(args.max_retries))
     _RETRY_BASE = max(0.1, float(args.retry_base))
     incremental_mode = args.incremental or args.mode == "daily-update"
@@ -581,6 +673,10 @@ def main() -> None:
         output_dir / "download_summary.json",
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
     )
+    _BASE_RESPONSES.clear()
+    if args.official_history:
+        from downloader.frankfurter_official_history import run_official_history
+        run_official_history(output_dir / "official_v2", max_requests=args.official_history_max_requests)
 
     print(
         "[download] provider=frankfurter "

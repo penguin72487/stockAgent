@@ -1,0 +1,27 @@
+[Unit]
+Description=StockAgent resumable TAIFEX announcements and contract rule archive
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="POLARS_MAX_THREADS=2"
+Environment="TZ=Asia/Taipei"
+ExecStart=/usr/bin/bash -c 'source "@REPO_ROOT@/scripts/runtime_env.sh"; run_fintech_python -m scripts.download_taifex_rule_history --max-documents 1200 --max-seconds 1500'
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=768M
+MemoryMax=1G
+TimeoutStartSec=35min
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

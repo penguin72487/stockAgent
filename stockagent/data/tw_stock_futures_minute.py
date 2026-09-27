@@ -7,6 +7,7 @@ The dense tape is executor-only. Bars are right labelled: 08:46 covers
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 import shlex
 
@@ -33,6 +34,22 @@ TAPE_FIELDS = len(TAPE_CHANNELS)
 HYBRID_CONTRACT_VERSION = 2
 HYBRID_TAPE_CHANNELS = (*TAPE_CHANNELS, "daily_open_close_regime", "daily_open", "daily_close", "daily_capacity")
 HYBRID_TAPE_FIELDS = len(HYBRID_TAPE_CHANNELS)
+MINUTE_SOURCE_SCOPES = ("stock_front", "all_futures_intraday")
+
+
+def select_futures_minute_candidates(frame: pl.DataFrame, *, scope: str = "stock_front") -> pl.DataFrame:
+    """Use the execution mode's existing causal universe for source coverage."""
+    if scope == "stock_front":
+        from stockagent.data.tw_stock_futures_day_trade import select_causal_front_stock_futures_candidates
+        selected = select_causal_front_stock_futures_candidates(frame)
+    elif scope == "all_futures_intraday":
+        from stockagent.data.tw_all_futures_intraday import select_intraday_contracts
+        selected = select_intraday_contracts(frame)
+    else:
+        raise ValueError(f"unknown futures minute source scope: {scope}")
+    if selected.select("date", "physical_contract").is_duplicated().any():
+        raise ValueError("futures source selection has duplicate physical contract-days")
+    return selected.sort("date", "physical_contract")
 
 
 def build_futures_minute_bars(transactions: pl.DataFrame) -> pl.DataFrame:
@@ -79,6 +96,7 @@ def validate_futures_minute_data(
     capacity_rounding: str = "floor",
     quarantine_dates: tuple[str, ...] | list[str] = (),
     quarantine_contract_days: tuple[dict, ...] | list[dict] = (),
+    require_complete: bool = True,
 ) -> tuple[pl.DataFrame, dict]:
     """Validate source facts without allocating a dense execution tensor."""
     if capacity_rounding not in {"floor", "ceil"}:
@@ -101,10 +119,10 @@ def validate_futures_minute_data(
     if contract_days and daily_proxy_before is None:
         raise ValueError('contract-day quarantine requires historical minute evidence')
     if daily_proxy_before is not None:
-        from stockagent.data.tw_stock_futures_history import HISTORY_DATASET, HISTORY_SOURCE, ACCEPTED
+        from stockagent.data.tw_stock_futures_history import HISTORY_DATASET, HISTORY_SOURCE, MULTISOURCE_INTRADAY_SOURCE, ACCEPTED
         from stockagent.data.tw_stock_futures_repair import REPAIR_SOURCE, NO_TRADE, NO_CAPACITY
         if (receipt.get("dataset") != HISTORY_DATASET or receipt.get("contract_version") != HYBRID_CONTRACT_VERSION
-                or receipt.get("source_kind") not in {HISTORY_SOURCE, REPAIR_SOURCE} or receipt.get("status") not in {"complete", "partial", "complete_with_quarantine"}
+                or receipt.get("source_kind") not in {HISTORY_SOURCE, REPAIR_SOURCE, MULTISOURCE_INTRADAY_SOURCE} or receipt.get("status") not in {"complete", "partial", "complete_with_quarantine"}
                 or receipt.get("daily_proxy_before") != daily_proxy_before
                 or receipt.get("source_daily_sha256") != daily_sha256):
             raise ValueError("hybrid futures history source/cutoff contract mismatch")
@@ -114,6 +132,7 @@ def validate_futures_minute_data(
             if item.get("file") != expected_name or sha256_file(path.parent / expected_name) != item.get("sha256"):
                 raise ValueError(f"hybrid {key} SHA mismatch")
         coverage = pl.read_parquet(path.parent / "coverage.parquet")
+        official = None
         if coverage.select("date", "physical_contract").is_duplicated().any():
             raise ValueError("duplicate historical contract-day evidence")
         no_trade = coverage.filter(pl.col('status') == NO_TRADE)
@@ -138,7 +157,8 @@ def validate_futures_minute_data(
             covered_dates = requested_dates - set(quarantine_dates) - set(map(str, unresolved['date'].to_list()))
             if set(receipt.get('usable_dates', [])) != covered_dates:
                 raise ValueError('usable dates differ from exact contract-day quarantine evidence')
-        if receipt.get('source_kind') == REPAIR_SOURCE:
+        if receipt.get('source_kind') == REPAIR_SOURCE or (receipt.get('source_kind') == MULTISOURCE_INTRADAY_SOURCE
+                                                         and 'official_evidence' in receipt.get('outputs', {})):
             item = receipt.get('outputs', {}).get('official_evidence', {})
             official_path = path.parent/'official_evidence.parquet'
             if (receipt.get('repair_contract_version') != 1 or item.get('file') != official_path.name
@@ -172,7 +192,7 @@ def validate_futures_minute_data(
         required_dates = (set(map(str, dates)) if dates is not None else set(receipt["requested_dates"])) - set(quarantine_dates)
         missing_dates = required_dates - covered_dates
         gaps = unresolved.filter(pl.col("date").cast(pl.String).is_in(required_dates))
-        if missing_dates or gaps.height:
+        if require_complete and (missing_dates or gaps.height):
             raise ValueError(f"hybrid futures history has {gaps.height} unresolved contract-days across "
                              f"{len(missing_dates)} uncovered panel dates; first={sorted(missing_dates)[:5]}; "
                              "see gaps.parquet; post-cutoff missing ticks cannot become daily fills or zero-return labels")
@@ -180,6 +200,20 @@ def validate_futures_minute_data(
                            & (pl.col("date").cast(pl.String) >= daily_proxy_before)).height:
             raise ValueError("daily OPEN/CLOSE approximation crosses the exclusive cutoff")
         frame = pl.read_parquet(path)
+        if (receipt.get('source_kind') == MULTISOURCE_INTRADAY_SOURCE
+                and receipt.get('source_scope_version', 0) >= 2):
+            from stockagent.data.tw_stock_futures_history import _selection_sha256, _volume_bound_violations
+            if (receipt.get('expected_contract_days') != coverage.height
+                    or receipt.get('expected_keys_sha256') != _selection_sha256(coverage)):
+                raise ValueError('all-futures history coverage differs from its exact selected universe')
+            if receipt.get('official_volume_bounds_complete'):
+                if official is None or coverage.join(
+                    official.filter(pl.col('outright_volume').is_not_null()).select('date', 'physical_contract'),
+                    on=['date', 'physical_contract'], how='anti').height:
+                    raise ValueError('all-futures history lacks complete official volume bounds')
+            selected_bounds = coverage.select('date', 'physical_contract', pl.col('official_volume').alias('volume'))
+            if _volume_bound_violations(coverage, frame, selected_bounds, official).height:
+                raise ValueError('accepted minute source volume exceeds official capacity')
         verified = coverage.filter(pl.col("status") == "minute_verified").select("date", "physical_contract", "source_file_sha256")
         if frame.select("date", "physical_contract", "source_file_sha256").unique().join(
                 verified, on=["date", "physical_contract", "source_file_sha256"], how="anti").height:
@@ -193,9 +227,13 @@ def validate_futures_minute_data(
         ).height:
             raise ValueError("invalid historical minute price/capacity")
         return frame, receipt
+    partial_supplement = (not require_complete and receipt.get("status") == "partial"
+                          and receipt.get("partial_supplement_only") is True
+                          and receipt.get("source_scope") == "all_futures_intraday"
+                          and receipt.get("source_kind") == "shioaji_exact_futures_kbars_1m")
     if (receipt.get("dataset") != MINUTE_DATASET
             or receipt.get("contract_version") != MINUTE_CONTRACT_VERSION
-            or receipt.get("status") != "complete"
+            or (receipt.get("status") != "complete" and not partial_supplement)
             or receipt.get("source_daily_sha256") != daily_sha256
             or receipt.get("outputs", {}).get("minutes", {}).get("sha256") != sha256_file(path)):
         raise ValueError("futures minute identity, completeness or source/output SHA mismatch")
@@ -223,7 +261,9 @@ def validate_futures_minute_data(
     if (set(sources) != covered or len(sources) != len(receipt.get("sources", []))
             or len(covered) != len(receipt.get("covered_dates", []))):
         raise ValueError("minute source inventory and covered dates disagree")
-    from stockagent.data.tw_stock_futures_kbars import KBAR_SOURCE, contract_sources_digest, validate_kbar_completion
+    from stockagent.data.tw_stock_futures_kbars import (
+        KBAR_SOURCE, contract_sources_digest, validate_kbar_completion, validate_kbar_product_session,
+    )
 
     if receipt.get("source_kind") == KBAR_SOURCE:
         contract_sources = {}
@@ -232,7 +272,10 @@ def validate_futures_minute_data(
             if source["sha256"] != contract_sources_digest(contracts):
                 raise ValueError("KBar dated contract inventory SHA mismatch")
             for item in contracts:
-                validate_kbar_completion(item)
+                if receipt.get("source_scope") == "all_futures_intraday":
+                    validate_kbar_product_session(item, day=date.fromisoformat(source["date"]))
+                else:
+                    validate_kbar_completion(item)
                 key = (source["date"], item["physical_contract"])
                 if (key in contract_sources or not item["start"] <= source["date"] <= item["end"]
                         or item["status"] not in {"complete", "source_empty"}):
@@ -250,6 +293,27 @@ def validate_futures_minute_data(
         for row in frame.select("date", "source_file_sha256").unique().iter_rows(named=True):
             if sources.get(str(row["date"])) != row["source_file_sha256"]:
                 raise ValueError("minute row is not bound to its dated source receipt")
+    if receipt.get("source_scope") == "all_futures_intraday":
+        import hashlib
+        coverage_path = path.parent / "coverage.parquet"
+        if (receipt.get("source_scope_version") != 1 or
+                receipt.get("outputs", {}).get("coverage", {}).get("sha256") != sha256_file(coverage_path)):
+            raise ValueError("all-futures coverage scope or SHA mismatch")
+        coverage = pl.read_parquet(coverage_path)
+        keys = coverage.select("date", "physical_contract").sort("date", "physical_contract")
+        expected_digest = hashlib.sha256(json.dumps(keys.rows(), default=str, separators=(",", ":")).encode()).hexdigest()
+        if (keys.is_duplicated().any() or keys.height != receipt.get("expected_contract_days")
+                or expected_digest != receipt.get("expected_keys_sha256")):
+            raise ValueError("all-futures expected physical contract-day inventory differs")
+        for row in coverage.iter_rows(named=True):
+            expected = (contract_sources.get((str(row["date"]), row["physical_contract"]))
+                        if receipt.get("source_kind") == KBAR_SOURCE else sources.get(str(row["date"])))
+            if row["status"] != "minute_verified" or not expected or expected != row["source_file_sha256"]:
+                raise ValueError("all-futures coverage lacks its completed raw contract/date receipt")
+        if frame.select("date", "physical_contract", "source_file_sha256").unique().join(
+                coverage.select("date", "physical_contract", "source_file_sha256"),
+                on=["date", "physical_contract", "source_file_sha256"], how="anti").height:
+            raise ValueError("minute facts fall outside the all-futures covered physical keys")
     if frame.filter(
         ~pl.col("minute").is_in(EVENT_MINUTES)
         | ~pl.all_horizontal(pl.col(c).is_finite() & (pl.col(c) > 0)

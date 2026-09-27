@@ -160,7 +160,8 @@ def test_monitor_keeps_source_series_separate_and_news_disabled(tmp_path: Path) 
     }))
     rows = _finmind_free_sources(tmp_path, now=now, service={"active": True})
     from downloader.download_finmind_sponsor import SOURCES
-    assert len(rows) == 52 + len(SOURCES)
+    from downloader.download_finmind_complement import ALL_DATASETS
+    assert len(rows) == 4 + len(ALL_DATASETS) + len(SOURCES)
     assert {row["id"] for row in rows[:4]} == {
         "finmind:TaiwanStockStatisticsOfOrderBookAndTrade",
         "finmind:TaiwanVariousIndicators5Seconds",

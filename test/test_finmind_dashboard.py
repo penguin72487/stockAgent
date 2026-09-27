@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 from downloader import download_finmind_free as worker
-from stockagent.live.finmind_dashboard import build_finmind_public_status
+from stockagent.live.finmind_dashboard import _network_time_projection, build_finmind_public_status
 
 
 def _write(path: Path, value: dict) -> None:
@@ -73,7 +77,8 @@ def test_finmind_page_uses_receipts_and_worker_only_quota(tmp_path: Path, monkey
     assert "TaiwanStockNews" in result["scope"]["excluded"]
     assert "TaiwanStockPriceTick" in result["scope"]["excluded"]
     from downloader.download_finmind_sponsor import SOURCES, UNSCHEDULED
-    assert len(result["datasets"]) == 52 + len(SOURCES) + len(UNSCHEDULED)
+    from downloader.download_finmind_complement import ALL_DATASETS
+    assert len(result["datasets"]) == 4 + len(ALL_DATASETS) + len(SOURCES) + len(UNSCHEDULED)
     assert next(row for row in result["datasets"] if row["id"] == "TaiwanExchangeRate")["state"] == "unavailable"
     assert "SECRET" not in json.dumps(result)
     assert "parquet_path" not in json.dumps(result)
@@ -140,3 +145,106 @@ def test_sparse_global_history_counts_verified_empty_as_checked_not_rows(tmp_pat
     assert item["complete_partitions"] == 1
     assert item["observed_empty_partitions"] == 2
     assert item["rows"] == 4
+
+
+@pytest.mark.parametrize("pending", [None, 0, 120])
+def test_partition_projection_never_claims_eta_or_minimum(pending) -> None:
+    result = _network_time_projection(pending, 6000)
+    assert result["minimum_network_seconds_remaining"] is None
+    assert "request_count_unknown" in result["network_time_basis"]
+    projection = result["unbatched_task_projection"]
+    if pending is None:
+        assert projection is None
+    else:
+        assert projection["seconds"] == round(pending * 3600 / 6000)
+        assert projection["pending_partitions"] == pending
+        assert projection["is_eta"] is False
+        assert projection["is_lower_bound"] is False
+        assert "hypothetical_one_call" in projection["basis"]
+        assert {"batching", "unknown_identifiers", "refreshes", "retries"} <= set(projection["excludes"])
+
+
+def test_batched_sources_and_legacy_owners_do_not_publish_request_based_minimum(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 27, tzinfo=UTC)
+    root = tmp_path / "data_finmind"
+    _write(root / "status.json", {
+        "observed_at_utc": now.isoformat(), "official_requests_per_hour": 6000,
+        "total_session_day_tasks": 0, "complete_session_day_tasks": 0,
+    })
+    _write(root / "complement/status.json", {
+        "observed_at_utc": now.isoformat(),
+        "series": {
+            "TaiwanStockSplitPrice": {"target": 80, "complete": 10, "observed_empty": 20},
+            "TaiwanFuturesFinalSettlementPrice": {"target": 3, "complete": 1},
+            "TaiwanStockInstitutionalInvestorsBuySellWide": {"target": 10, "complete": 0},
+        },
+    })
+    _write(root / "sponsor/status.json", {
+        "observed_at_utc": now.isoformat(),
+        "series": {
+            "TaiwanBusinessIndicator": {"target": 45, "complete": 5},
+            # Stale pre-v6 receipt: preserve alias observations, not totals.
+            "TaiwanFuturesFinalSettlementPrice": {"target": 29, "observed_empty": 27, "failed": 2},
+        },
+    })
+    result = build_finmind_public_status(tmp_path, now=now)
+    rows = {row["id"]: row for row in result["datasets"]}
+    assert all(row["minimum_network_seconds_remaining"] is None for row in rows.values())
+    assert all(row["network_time_basis"] for row in rows.values())
+    assert result["acquisition"]["minimum_network_seconds_remaining"] is None
+    assert rows["TaiwanBusinessIndicator:all_market"]["unbatched_task_projection"]["pending_partitions"] == 40
+    assert rows["TaiwanStockSplitPrice"]["unbatched_task_projection"]["pending_partitions"] == 50
+    assert rows["TaiwanStockInstitutionalInvestorsBuySellWide"]["unbatched_task_projection"] is None
+    alias = rows["TaiwanFuturesFinalSettlementPrice:all_market"]
+    assert alias["state"] == "delegated"
+    assert alias["source_status"] == "delegated_to_complement_product_history"
+    assert alias["unbatched_task_projection"] is None
+    assert alias["observed_empty_partitions"] == 27
+    assert result["acquisition"]["total_tasks"] == 2 + 80 + 3 + 10 + 45
+    assert result["acquisition"]["observed_empty_tasks"] == 20
+    assert result["acquisition"]["failed_tasks"] == 0
+
+
+def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
+    root = Path(__file__).resolve().parents[1] / "services/finmind_dashboard"
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    html = (root / "index.html").read_text(encoding="utf-8")
+    assert "minimum_network_seconds_remaining" not in javascript
+    assert "最少剩餘時間" not in javascript + html
+    assert "目前已知任務最少仍需" not in html
+    assert "分割數不等於請求數" in javascript + html
+    assert "非 ETA、非下界" in javascript
+    assert 'id="download-global-eta-basis"' in html
+    assert 'app.js?v=8' in html
+
+
+def test_finmind_ui_legacy_numeric_values_still_render_unknown() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node runtime not installed")
+    path = Path(__file__).resolve().parents[1] / "services/finmind_dashboard/app.js"
+    script = """
+const fs = require('fs'), vm = require('vm');
+const source = fs.readFileSync(process.argv[1], 'utf8').split('function svgNode')[0];
+const context = {window: {StockAgentDashboard: {createJsonFetcher: () => () => {}, byId: () => {}}}};
+vm.createContext(context);
+vm.runInContext(source + `
+globalThis.result = {
+  legacy: networkTimeLabel({state: 'backfilling', minimum_network_seconds_remaining: 1200}),
+  complete: networkTimeLabel({state: 'complete'}),
+  delegated: datasetStatus({state: 'delegated', source_status: 'delegated_to_complement_product_history'}),
+  basis: networkTimeBasis({unbatched_task_projection: {
+    seconds: 1200, basis: 'hypothetical_one_call_per_known_pending_partition_at_full_shared_quota',
+    is_eta: false, is_lower_bound: false
+  }})
+};`, context);
+process.stdout.write(JSON.stringify(context.result));
+"""
+    result = subprocess.run([node, "-e", script, str(path)], capture_output=True, text=True, check=True, timeout=10)
+    rendered = json.loads(result.stdout)
+    assert rendered["legacy"] == "未知（分割數不等於請求數）"
+    assert rendered["complete"] == "已查驗目前任務"
+    assert rendered["delegated"] == "由 Complement 主責"
+    assert "未合批任務投影 20 分鐘" in rendered["basis"]
+    assert "非 ETA、非下界" in rendered["basis"]
+    assert "至少" not in rendered["basis"]

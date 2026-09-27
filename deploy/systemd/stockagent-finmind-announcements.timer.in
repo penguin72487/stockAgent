@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily FinMind correction check including weekends and market holidays
+
+[Timer]
+OnCalendar=*-*-* 06:10:00 Asia/Taipei
+Persistent=true
+AccuracySec=1min
+Unit=stockagent-finmind-announcements.service
+
+[Install]
+WantedBy=timers.target

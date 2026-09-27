@@ -1,0 +1,1585 @@
+{
+  "schema_version": 1,
+  "purpose": "Hash-bound visual transcription of legacy TX/MTX notices and verified numerical tables; never unchecked OCR.",
+  "reviews": [
+    {
+      "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20230130保證金調整公告.pdf",
+      "content_sha256": "a7f234b0fcb270cc3aea1e2073aed578dc3f64874ab430497beebe4e89198905",
+      "pdf_pages_one_based": [
+        1,
+        2
+      ],
+      "method": "Visual inspection of the original embedded page images extracted by pypdf; no inferred date.",
+      "reviewed_at": "2026-09-27",
+      "clock_text": "發文日期：中華民國112年1月30日。發文字號：台期結字第11203001201號。並自112年1月31日一般交易時段結束後實施，請查照。"
+    }
+  ],
+  "legacy": {
+    "verified_start": "2011-01-03",
+    "index_start": "2010-08-25",
+    "until_exclusive": "2021-04-01",
+    "notices": [
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/09900096660函.pdf",
+        "published_date": "2010-08-25",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/09900096660函.pdf",
+        "content_sha256": "ef59812e3a263db4ec1e87bdf91d9ec4adc4f593a1ed210c9777fdae0b1ddd3b",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2010-08-26",
+        "issued_date": "2010-08-25",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            64000,
+            49000,
+            47000,
+            77000,
+            59000,
+            57000
+          ],
+          "MTX": [
+            16000,
+            12250,
+            11750,
+            19250,
+            14750,
+            14250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告0040_001.pdf",
+        "published_date": "2011-08-22",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告0040_001.pdf",
+        "content_sha256": "73bb1db1b03ab7daa129d19c9b4ffc8ae7322bf0ddc14667d4d55d2359b7394e",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2011-08-23",
+        "issued_date": "2011-08-22",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            75000,
+            57000,
+            55000,
+            64000,
+            49000,
+            47000
+          ],
+          "MTX": [
+            18750,
+            14250,
+            13750,
+            16000,
+            12250,
+            11750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告(3).pdf",
+        "published_date": "2011-09-07",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告(3).pdf",
+        "content_sha256": "723824bc7dbc45042c5e17990e4b7ab9a3d830c7eae9dc21bc04b7226d8ec9d0",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2011-09-08",
+        "issued_date": "2011-09-07",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            75000,
+            57000,
+            55000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            18750,
+            14250,
+            13750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2164_001.pdf",
+        "published_date": "2012-01-17",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2164_001.pdf",
+        "content_sha256": "ffaef434c9db47aca56d7768d82778a8b1bc6efc6d4e2269e827e5be2b3c6ab0",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2012-01-18",
+        "issued_date": "2012-01-17",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/3945_001.pdf",
+        "published_date": "2012-01-30",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/3945_001.pdf",
+        "content_sha256": "17fe46ca0bb0b3446a9e8f455e3dc221df5616ae8294e3d5e26e2933eb86a492",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2012-01-31",
+        "issued_date": "2012-01-30",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金調整公告.pdf",
+        "published_date": "2013-02-05",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金調整公告.pdf",
+        "content_sha256": "b306712b0fb5aba863b155775f305412db98d38c5c44e78801c7c9b34138e314",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2013-02-06",
+        "issued_date": "2013-02-05",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金調整公告1020218.pdf",
+        "published_date": "2013-02-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金調整公告1020218.pdf",
+        "content_sha256": "f48912ce78f62fecfe377df986ca39160c5d8f1b048ff01207b1820ffb203bd5",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2013-02-19",
+        "issued_date": "2013-02-18",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/103年春節調高保證金市場公告.pdf",
+        "published_date": "2014-01-24",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/103年春節調高保證金市場公告.pdf",
+        "content_sha256": "832723a293be77f23fab350d4677f70c92edbecc789885c1052e0b8556618ed3",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2014-01-27",
+        "issued_date": "2014-01-24",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20140205調整保證金公告(1).pdf",
+        "published_date": "2014-02-05",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20140205調整保證金公告(1).pdf",
+        "content_sha256": "831700fe0f9136fba13269c0ab67db450c629d07d50361ac7f8f4ba54c5be39d",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2014-02-06",
+        "issued_date": "2014-02-05",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10403001720號.pdf",
+        "published_date": "2015-02-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10403001720號.pdf",
+        "content_sha256": "cf547c84b1ec9cdcfce8ff08bd84f6ea6d6cfa5d49a22ef50adf761162d0ab4e",
+        "pages_one_based": [
+          2,
+          4
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2015-02-13",
+        "issued_date": "2015-02-12",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10403001901號函.pdf",
+        "published_date": "2015-02-24",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10403001901號函.pdf",
+        "content_sha256": "dae9f9c15c3b16486196ffeac4de2dfa17fea93510722022d95201f67c73ff5b",
+        "pages_one_based": [
+          3,
+          7
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2015-02-25",
+        "issued_date": "2015-02-24",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10503001141號.pdf",
+        "published_date": "2016-02-02",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10503001141號.pdf",
+        "content_sha256": "b0b1009c779b56c2f2bbfa06356ad04ef0043104a8d048414e7c584b49f2b5d0",
+        "pages_one_based": [
+          3,
+          9
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2016-02-03",
+        "issued_date": "2016-02-02",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10503001590號函.pdf",
+        "published_date": "2016-02-15",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10503001590號函.pdf",
+        "content_sha256": "19a8a19d763939c8d8061d606d9ff5e6f729cbe72db4045af49b3575ca0f560a",
+        "pages_one_based": [
+          3,
+          9
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2016-02-16",
+        "issued_date": "2016-02-15",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/106年春節調高保證金.pdf",
+        "published_date": "2017-01-23",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/106年春節調高保證金.pdf",
+        "content_sha256": "b40a7604e34e62d350f2cb583e440fc0298cdd5bf0d253d0ab9464cdf5524731",
+        "pages_one_based": [
+          1,
+          7
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2017-01-24",
+        "issued_date": "2017-01-23",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金公告.pdf",
+        "published_date": "2017-02-02",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/保證金公告.pdf",
+        "content_sha256": "7860f90e534386da81248ab064ca24284a5a641e7e3728a84b20b01007d8b569",
+        "pages_one_based": [
+          1,
+          5
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2017-02-03",
+        "issued_date": "2017-02-02",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/107年春節調高保證金公告函稿(副本_本公司網站)(2).pdf",
+        "published_date": "2018-02-09",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/107年春節調高保證金公告函稿(副本_本公司網站)(2).pdf",
+        "content_sha256": "b222c60f05bbbd5c3dea1c40f15dd6ada5469027fa23d841f74a97087e43290b",
+        "pages_one_based": [
+          1,
+          7
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2018-02-12",
+        "issued_date": "2018-02-09",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            92000,
+            71000,
+            68000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            23000,
+            17750,
+            17000,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10703001500號函.pdf",
+        "published_date": "2018-02-21",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10703001500號函.pdf",
+        "content_sha256": "368498678fb99debbbc8ffad1204901c438cdf896879dbe7ee06cac5451ee973",
+        "pages_one_based": [
+          1,
+          7
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2018-02-22",
+        "issued_date": "2018-02-21",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            83000,
+            64000,
+            61000,
+            92000,
+            71000,
+            68000
+          ],
+          "MTX": [
+            20750,
+            16000,
+            15250,
+            23000,
+            17750,
+            17000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20181012公告_保證金調整.pdf",
+        "published_date": "2018-10-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20181012公告_保證金調整.pdf",
+        "content_sha256": "e1e96e3a08f70e9df40e2a045f6d06c96b0e1bb627669a682affbf508a401891",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2018-10-15",
+        "issued_date": "2018-10-12",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            96000,
+            74000,
+            71000,
+            83000,
+            64000,
+            61000
+          ],
+          "MTX": [
+            24000,
+            18500,
+            17750,
+            20750,
+            16000,
+            15250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告1080129.pdf",
+        "published_date": "2019-01-29",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告1080129.pdf",
+        "content_sha256": "50953566f0ebd0936c70c8c2044dfc37c4e4368e22ca56c65eba6cb8fcbbd91e",
+        "pages_one_based": [
+          1,
+          5
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-01-30",
+        "issued_date": "2019-01-29",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            107000,
+            82000,
+            79000,
+            96000,
+            74000,
+            71000
+          ],
+          "MTX": [
+            26750,
+            20500,
+            19750,
+            24000,
+            18500,
+            17750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10803001090號.pdf",
+        "published_date": "2019-02-11",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10803001090號.pdf",
+        "content_sha256": "a065b9387f73a359261b50c5b777a363dc5b71ede11632bd3bc7d0a83852074a",
+        "pages_one_based": [
+          1,
+          5
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-02-12",
+        "issued_date": "2019-02-11",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            96000,
+            74000,
+            71000,
+            107000,
+            82000,
+            79000
+          ],
+          "MTX": [
+            24000,
+            18500,
+            17750,
+            26750,
+            20500,
+            19750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告-本公司網站(51).pdf",
+        "published_date": "2019-02-19",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告-本公司網站(51).pdf",
+        "content_sha256": "7c21b8cf7880caa02aab59ed6887a32e807c982bd13788494cb65afd9b4a8713",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-02-20",
+        "issued_date": "2019-02-19",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            107000,
+            82000,
+            79000,
+            96000,
+            74000,
+            71000
+          ],
+          "MTX": [
+            26750,
+            20500,
+            19750,
+            24000,
+            18500,
+            17750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告稿(9).pdf",
+        "published_date": "2019-07-05",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告稿(9).pdf",
+        "content_sha256": "4f28cd1740dfcfe63604d14f345c1b2a563d6b422dded743cdcf5d988af4d551",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-07-08",
+        "issued_date": "2019-07-05",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            94000,
+            72000,
+            69000,
+            107000,
+            82000,
+            79000
+          ],
+          "MTX": [
+            23500,
+            18000,
+            17250,
+            26750,
+            20500,
+            19750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告稿(11).pdf",
+        "published_date": "2019-10-01",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告稿(11).pdf",
+        "content_sha256": "682d21611d2965b47f1a15c4ce5868d2ed08ee6663dfec5b108f22fb9121de9f",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-10-02",
+        "issued_date": "2019-10-01",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            103000,
+            79000,
+            76000,
+            94000,
+            72000,
+            69000
+          ],
+          "MTX": [
+            25750,
+            19750,
+            19000,
+            23500,
+            18000,
+            17250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/3095_001.pdf",
+        "published_date": "2019-10-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/3095_001.pdf",
+        "content_sha256": "1fa4b2da92d14b008d0dbc6bf8c48a11e3b217f4c0a50ba18102775908ef92a7",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-10-21",
+        "issued_date": "2019-10-18",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            91000,
+            70000,
+            67000,
+            103000,
+            79000,
+            76000
+          ],
+          "MTX": [
+            22750,
+            17500,
+            16750,
+            25750,
+            19750,
+            19000
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=10882",
+        "published_date": "2020-01-17",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/0117春節調高保證金.pdf",
+        "content_sha256": "f0321aa9a14afb61979b4c75022c0c8537146da13e5745b9d20432e75f00115e",
+        "pages_one_based": [
+          1,
+          5
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-01-20",
+        "issued_date": "2020-01-17",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            100000,
+            77000,
+            74000,
+            91000,
+            70000,
+            67000
+          ],
+          "MTX": [
+            25000,
+            19250,
+            18500,
+            22750,
+            17500,
+            16750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=10892",
+        "published_date": "2020-01-30",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/0130保證金調整.pdf",
+        "content_sha256": "cf6525a0c6f8a1953aa0faff048e22f0b2d2b60a37019d27ac54ac3539cc1601",
+        "pages_one_based": [
+          1,
+          5
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-01-31",
+        "issued_date": "2020-01-30",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            110000,
+            84000,
+            81000,
+            100000,
+            77000,
+            74000
+          ],
+          "MTX": [
+            27500,
+            21000,
+            20250,
+            25000,
+            19250,
+            18500
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=10955",
+        "published_date": "2020-03-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/0312公告保證金調整.pdf",
+        "content_sha256": "2fce7d3620899627e0120eb2cdf54f78088b40b36d577d11ea73dd525426febb",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-03-13",
+        "issued_date": "2020-03-12",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            122000,
+            94000,
+            90000,
+            110000,
+            84000,
+            81000
+          ],
+          "MTX": [
+            30500,
+            23500,
+            22500,
+            27500,
+            21000,
+            20250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=10960",
+        "published_date": "2020-03-16",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/公告稿(67).pdf",
+        "content_sha256": "69c6539a800eef1b1c0a266e334a4de08b59ff7724761ba1ba6d9702c99dc3b6",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-03-17",
+        "issued_date": "2020-03-16",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            134000,
+            103000,
+            99000,
+            122000,
+            94000,
+            90000
+          ],
+          "MTX": [
+            33500,
+            25750,
+            24750,
+            30500,
+            23500,
+            22500
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=10972",
+        "published_date": "2020-03-19",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/0319指數類商品保證金公告.pdf",
+        "content_sha256": "fa32bf345f973a23a15147cd1dbcd9d067597ed0485d865fe360a1b3e3ef1650",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-03-20",
+        "issued_date": "2020-03-19",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            148000,
+            113000,
+            109000,
+            134000,
+            103000,
+            99000
+          ],
+          "MTX": [
+            37000,
+            28250,
+            27250,
+            33500,
+            25750,
+            24750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=11511",
+        "published_date": "2020-11-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20201112.pdf",
+        "content_sha256": "b90b7e4c9668818b559be10fe0039ac4bed6046a23176a3f06d5ca97a11b1705",
+        "pages_one_based": [
+          1,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-11-13",
+        "issued_date": "2020-11-12",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            133000,
+            102000,
+            98000,
+            148000,
+            113000,
+            109000
+          ],
+          "MTX": [
+            33250,
+            25500,
+            24500,
+            37000,
+            28250,
+            27250
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=11600",
+        "published_date": "2021-01-06",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第1100300014號.pdf",
+        "content_sha256": "3fa351eb4ad71de6c953063df664945f38fa4abeabc85a693b397301efcafadf",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2021-01-07",
+        "issued_date": "2021-01-06",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            150000,
+            115000,
+            111000,
+            133000,
+            102000,
+            98000
+          ],
+          "MTX": [
+            37500,
+            28750,
+            27750,
+            33250,
+            25500,
+            24500
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/cht/11/newsDetail?newsType=1&idx=11660",
+        "published_date": "2021-02-04",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第1100300123號.pdf",
+        "content_sha256": "63a3c921d5167adadf658594e17a3232075ddd22c426d7e2e84920331f93a216",
+        "pages_one_based": [
+          1,
+          2,
+          3
+        ],
+        "kind": "margin",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2021-02-05",
+        "issued_date": "2021-02-04",
+        "currency": "TWD",
+        "column_order": [
+          "after",
+          "before"
+        ],
+        "values": {
+          "TX": [
+            167000,
+            128000,
+            123000,
+            150000,
+            115000,
+            111000
+          ],
+          "MTX": [
+            41750,
+            32000,
+            30750,
+            37500,
+            28750,
+            27750
+          ]
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/99Q4_001.pdf",
+        "published_date": "2010-10-13",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/99Q4_001.pdf",
+        "content_sha256": "5123a996f963c170be8d03218d335289bc6d33e39c149ae29568fe2eda2144d5",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2010-11-18",
+        "issued_date": "2010-10-12",
+        "after": 5000,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2011Q2指數部位公告.pdf",
+        "published_date": "2011-04-08",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2011Q2指數部位公告.pdf",
+        "content_sha256": "fc7ee571c3d2f2b10a7898463f02a22c0de6ab83919059c57cd5f4d51eedc291",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2011-04-07",
+        "issued_date": "2011-04-07",
+        "after": 6000,
+        "immediate": true
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20111011市場公告.pdf",
+        "published_date": "2011-10-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20111011市場公告.pdf",
+        "content_sha256": "9eb7dad7e4b338d6320fa237e9955ee5649e81c1660a64e2482b7ec81d8363b6",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2011-10-11",
+        "issued_date": "2011-10-11",
+        "after": 8000,
+        "immediate": true
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20111212部位限制.pdf",
+        "published_date": "2011-12-12",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20111212部位限制.pdf",
+        "content_sha256": "4306741e0207748d84005e24491034e2ca02fb8191b0b2a85c501844994f0d3e",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2011-12-12",
+        "issued_date": "2011-12-09",
+        "after": 6000,
+        "immediate": false,
+        "publication_date_confirmation": {
+          "url": "https://www.taifex.com.tw/file/taifex/CHINESE/6/attach/每月法令彙整100年12月份.pdf",
+          "content_sha256": "3784f74baaac32f17038d71d1cdfbb8fe740b130071361c87ded96591735d2f0",
+          "pages_one_based": [
+            2
+          ],
+          "reason": "Official monthly legal digest explicitly identifies 2011-12-09 announcement 10002024110 and 2011-12-12 effectiveness."
+        }
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2012第4季指數類公告.pdf",
+        "published_date": "2012-10-19",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2012第4季指數類公告.pdf",
+        "content_sha256": "a67d32af9c7ee0fdd97a6e2cbf6d1aa4c57e10c13c32dca5c67324d8cfb468f9",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2012-12-20",
+        "issued_date": "2012-10-19",
+        "after": 5000,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/非個股類交易人部位限制數.pdf",
+        "published_date": "2014-04-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/非個股類交易人部位限制數.pdf",
+        "content_sha256": "ce1e4ade67518ba95cbb0daedeb3229942265679270b0a3684bb0c06b860617e",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2014-06-19",
+        "issued_date": "2014-04-18",
+        "after": 4500,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2014Q4部位限制數公告.pdf",
+        "published_date": "2014-11-21",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2014Q4部位限制數公告.pdf",
+        "content_sha256": "e9bd433ae4644402c4e24360e0d3d7fb3d50bc9ca8f80a54584a34e652b906d7",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2014-11-20",
+        "issued_date": "2014-11-20",
+        "after": 6000,
+        "immediate": true
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2015Q4指數類公告.pdf",
+        "published_date": "2015-10-13",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2015Q4指數類公告.pdf",
+        "content_sha256": "a91a4945d4aad14d963ae5dc0e132528dfbdd431151c95b429319064a8a98843",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2015-10-13",
+        "issued_date": "2015-10-13",
+        "after": 8000,
+        "immediate": true
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2017Q1公告.pdf",
+        "published_date": "2017-01-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2017Q1公告.pdf",
+        "content_sha256": "e5bfe63a55d3665eaf54474aa71474b8078707ad8122d1be17be238dd68298b2",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2017-03-16",
+        "issued_date": "2017-01-18",
+        "after": 7000,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2017Q4_部位限制公告.pdf",
+        "published_date": "2017-10-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2017Q4_部位限制公告.pdf",
+        "content_sha256": "421447c5a690c61b5b2519cd24f6c797f8aad67a08d62220037ebced0175edf9",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2017-10-19",
+        "issued_date": "2017-10-18",
+        "after": 8000,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2018Q2公告.pdf",
+        "published_date": "2018-04-18",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2018Q2公告.pdf",
+        "content_sha256": "d4f91fd1c60934f376dcec5b721e525980d2bdde485750d407e22a50dbc4fc15",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2018-04-19",
+        "issued_date": "2018-04-18",
+        "after": 10000,
+        "immediate": false
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/108年第4季_部位限制公告.pdf",
+        "published_date": "2019-10-16",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/108年第4季_部位限制公告.pdf",
+        "content_sha256": "bca06d42384ae636ad880797aa1c2ad2d8710c00a6c083a37183363bc3862409",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2019-12-19",
+        "issued_date": "2019-10-16",
+        "after": 9000,
+        "immediate": false,
+        "before": 10000
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/109年第1季_部位限制公告.pdf",
+        "published_date": "2020-01-15",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/109年第1季_部位限制公告.pdf",
+        "content_sha256": "f4b4a76e3d5c5d2a7664e19c5894407650345abd795cd97120be5658c439c2cb",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-03-19",
+        "issued_date": "2020-01-15",
+        "after": 8000,
+        "immediate": false,
+        "before": 9000
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/109年第2季_部位限制_中文.pdf",
+        "published_date": "2020-04-15",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/109年第2季_部位限制_中文.pdf",
+        "content_sha256": "98c87e374ade9940d58de6420e470dc79367edfb7fc77486b190e838a7e1713a",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "position",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "effective_date": "2020-04-16",
+        "issued_date": "2020-04-15",
+        "after": 10000,
+        "immediate": false,
+        "before": 8000
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期交字第10202002970號公告.pdf",
+        "published_date": "2013-03-25",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期交字第10202002970號公告.pdf",
+        "content_sha256": "76b7d786acadab7caa776170205109e2dad72bb31bc5e24ca04a35a7d0add843",
+        "pages_one_based": [
+          1,
+          2
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "MTX weekly listing and spread labels; monthly margin amounts unchanged"
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/新聞稿_春節回調_20210217.pdf",
+        "published_date": "2021-02-17",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/新聞稿_春節回調_20210217.pdf",
+        "content_sha256": "98e5ae6a1556678754ec1d6b83cf9d1e132ae87a76307c78983a2c7a01cb884b",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "Explicitly retains TX/MTX holiday margins; does not apply the projected holiday reversal"
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/1030425國際合作商品到期部位保證金規定.pdf",
+        "published_date": "2014-04-25",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/1030425國際合作商品到期部位保證金規定.pdf",
+        "content_sha256": "ecb3cd3a0ce6d73e35816d3b8857fd061353c2abff3410055f01655f9d4fec20",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "Eurex position transfer and day-trade eligibility; no change to outright overnight TX/MTX margin levels"
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/10803000641.pdf",
+        "published_date": "2019-01-31",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/10803000641.pdf",
+        "content_sha256": "cb8e7ae251acaed40c1c16c81816a686b9607c5cf72c4ac65d115556ce5f421e",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "Clearing procedures and India index delisting; no TX/MTX outright margin amount change"
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10803009120號(網站)(1).pdf",
+        "published_date": "2019-09-23",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/台期結字第10803009120號(網站)(1).pdf",
+        "content_sha256": "e4da3d7597f8de3edda1f5127f35c7d04a7a61df6f31cd5604fcb2bd630bb385",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "G2F/UNF margins and option mixed-position risk; no TX/MTX outright margin change"
+      },
+      {
+        "announcement_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2019Q2部位限制公告.pdf",
+        "published_date": "2019-04-17",
+        "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2019Q2部位限制公告.pdf",
+        "content_sha256": "316ebcf9ba76d20e634b07af12c56eb532e2e57389733ddd2040154b195ad077",
+        "pages_one_based": [
+          1
+        ],
+        "kind": "excluded",
+        "reviewed_at": "2026-09-28",
+        "method": "Human visual verification of archived original PDF pages; amounts in TWD, columns after(initial,maintenance,clearing), before(initial,maintenance,clearing).",
+        "reason": "Only corporate TX position limit changes; natural person limit unchanged"
+      }
+    ]
+  },
+  "supplemental_sources": [
+    {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/earliest_history_audit_20260928/supplemental_official/raw/37/3784f74baaac32f17038d71d1cdfbb8fe740b130071361c87ded96591735d2f0.pdf.gz",
+      "sha256": "ed532daaa77f0e1ee4b731c780d6d4cddbddeac027fbedbb51de8aecc594c138",
+      "content_sha256": "3784f74baaac32f17038d71d1cdfbb8fe740b130071361c87ded96591735d2f0",
+      "url": "https://www.taifex.com.tw/file/taifex/CHINESE/6/attach/每月法令彙整100年12月份.pdf",
+      "purpose": "independent official confirmation of 2011-12-09 announcement date"
+    },
+    {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/earliest_history_audit_20260928/supplemental_official/raw/d2/d28bbea7fbf7e134db6b6586f868bb8720feb2c90a131118c3bd256a73699318.html.gz",
+      "sha256": "6430431cc72d6037339551a466d076706ad5935c033bbea906d91acbbd502a59",
+      "content_sha256": "d28bbea7fbf7e134db6b6586f868bb8720feb2c90a131118c3bd256a73699318",
+      "url": "https://www.cftc.gov/sites/default/files/tm/letters/04letters/tm04-16.htm",
+      "purpose": "2004 TX/MTX tick 1, multipliers 200/50, regular 08:45-13:45; settlement convention is historical and NOT reused"
+    },
+    {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/earliest_history_audit_20260928/supplemental_official/raw/c0/c0fc84143936e6dbe1f21b4ed245f7e68f11959d8f39bd0c42c8ebe24b1b3961.pdf.gz",
+      "sha256": "8f589e1fa123ce609fc78d6fc11715bfe456510d943768c38dc6330b6b638a56",
+      "content_sha256": "c0fc84143936e6dbe1f21b4ed245f7e68f11959d8f39bd0c42c8ebe24b1b3961",
+      "url": "https://www.taifex.com.tw/chinese/WeeklyMTX/摺頁文宣.pdf",
+      "purpose": "2013 printed spec confirms 7% limits and expiry clock 13:30"
+    },
+    {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/earliest_history_audit_20260928/supplemental_official/raw/ab/ab1579d571e442c9e0db55885199c4c20f3ee55262eb33b84086a72b2b0ce2a0.html.gz",
+      "sha256": "581689c343a84778e0c27434c98508e0a5540457faeb7a65b7cab68316f0d9c9",
+      "content_sha256": "ab1579d571e442c9e0db55885199c4c20f3ee55262eb33b84086a72b2b0ce2a0",
+      "url": "https://www.taifex.com.tw/chinese/event/train1040414/event.asp",
+      "purpose": "2015-06-01 transition from 7% to 10%"
+    }
+  ]
+}

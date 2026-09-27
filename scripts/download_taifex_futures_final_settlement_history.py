@@ -335,6 +335,8 @@ def main() -> int:
         ),
     )
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Fetch only official index-futures final settlements; skip stock/ETF month queries.")
     parser.add_argument(
         "--refresh-current", action="store_true",
         help="Refresh the requested end year's index page and current/prior stock-futures months; reuse older receipts.",
@@ -396,10 +398,10 @@ def main() -> int:
             }
         )
 
-    query_months = set(_months(args.start_date, args.end_date))
+    query_months = set() if args.index_only else set(_months(args.start_date, args.end_date))
     portfolio_path = args.portfolio_path.expanduser().resolve()
     portfolio_sha256: str | None = None
-    if portfolio_path.is_file():
+    if portfolio_path.is_file() and not args.index_only:
         portfolio_sha256 = sha256_path(portfolio_path)
         portfolio_contract_months = (
             pl.scan_parquet(portfolio_path)
@@ -489,6 +491,7 @@ def main() -> int:
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "requested_start_date": args.start_date.isoformat(),
         "requested_end_date": args.end_date.isoformat(),
+        "scope": "index_futures_only" if args.index_only else "all_supported_futures",
         "official_sources": {
             "index_futures": INDEX_FINAL_SETTLEMENT_PAGE,
             "stock_etf_futures": STOCK_FINAL_SETTLEMENT_PAGE,

@@ -903,6 +903,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     # Calendar/source admission owns row selection. A future
                     # minute with no fill must still contribute a cash day.
                     executable_or_terminal = np.asarray(intraday_sessions, dtype=bool)[valid_indices]
+                margin_sessions = getattr(stock_context_futures_daily, "margin_session_mask", None)
+                if margin_sessions is not None:
+                    # No-fill days still settle and can generate margin calls.
+                    executable_or_terminal = np.asarray(margin_sessions, dtype=bool)[valid_indices]
                 valid_indices = valid_indices[executable_or_terminal]
             elif (valid_indices.size > 0 and stock_futures_day_trade_execution
                   and self.execution_mode != MINUTE_MODE):
@@ -938,10 +942,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if stock_context_futures_portfolio_execution:
             assert stock_context_futures_daily is not None
             assert stock_context_futures_liquidation is not None
-            # A research fold cannot retain an unreported terminal liability.
-            # This extra close is independent of the source-owned expiry rows;
-            # stitched deployment later replays folds without these resets.
-            if self.valid_indices.size > 0:
+            # A margin account reports official settlement NAV and residual
+            # whole contracts at a sample boundary. That boundary is not a
+            # broker liquidation order: a failed synthetic exit must not turn
+            # a solvent marked account into absorbing default. Preserve the
+            # historical forced-close convention for notional experiments.
+            if (self.valid_indices.size > 0
+                    and not getattr(stock_context_futures_daily, "margin_contract_version", 0)):
                 stock_context_futures_liquidation[
                     int(self.valid_indices[-1]), :
                 ] = True

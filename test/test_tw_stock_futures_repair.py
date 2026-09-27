@@ -84,6 +84,23 @@ def test_official_zero_spread_only_and_absence_are_independent_of_carried_prices
         official_day_evidence(manifest,keys,tmp_path/'proof')
 
 
+@pytest.mark.parametrize('day,allowed', [('2011-01-03',True), ('2017-05-12',True), ('2017-05-15',False)])
+def test_official_legacy_session_is_bounded_by_night_launch(tmp_path, day, allowed):
+    raw = tmp_path/'daily.csv'
+    raw.write_text('交易日期,契約,到期月份(週別),成交量,開盤價,最高價,最低價,收盤價,結算價\n'
+                   + day.replace('-','/') + ',TX,201706,1,100,100,100,100,100.5\n', encoding='cp950')
+    manifest = tmp_path/'manifest.json'
+    atomic_write_json(manifest, dict(receipts=[dict(path=str(raw), sha256=sha256_file(raw))]))
+    keys = pl.DataFrame(dict(date=[date.fromisoformat(day)], physical_contract=['TX:201706']))
+    if allowed:
+        result = official_day_evidence(manifest, keys, tmp_path/'proof')
+        assert result['official_settlement'].to_list() == ['100.5']
+        assert result['outright_volume'].to_list() == [1]
+    else:
+        with pytest.raises(ValueError, match='session missing'):
+            official_day_evidence(manifest, keys, tmp_path/'proof')
+
+
 def test_repair_workspace_never_enters_cold_publication():
     catalog=json.loads(Path('configs/data_sync/packed_datasets.json').read_text())
     entry=next(e for e in catalog['datasets'] if e['dataset']=='tw-futures')

@@ -1,0 +1,26 @@
+[Unit]
+Description=StockAgent bounded public API catalogs and current weather snapshots
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+UMask=0077
+ExecStart=/usr/bin/bash -c 'source "@REPO_ROOT@/scripts/runtime_env.sh"; run_fintech_python -m downloader.download_keyed_public_catalogs --execute --max-requests 12 --max-response-mb 16 --min-free-gb 20'
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=384M
+MemoryMax=512M
+TimeoutStartSec=10min
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

@@ -1402,6 +1402,15 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
+        from stockagent.data.tw_futures_margin import validate_margin_rule_source
+        try:
+            validate_margin_rule_source(
+                config.trading.tw_futures_portfolio_margin_rules_path,
+                config.trading.tw_futures_portfolio_data_path,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"[futures-margin preflight] {exc}") from exc
     if (config.trading.execution_mode == "tw_stock_context_futures_portfolio"
             and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
         from stockagent.data.tw_all_futures_intraday import validate_all_futures_intraday_data
@@ -1768,6 +1777,8 @@ def main() -> None:
             current_open_feature=bool(
                 config.data.tw_futures_current_open_feature
             ),
+            denomination_context_basis=config.data.tw_futures_denomination_context_basis,
+            require_prior_capacity=config.data.tw_futures_require_prior_capacity,
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return
             ),
@@ -1788,6 +1799,14 @@ def main() -> None:
             from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
             panel = attach_all_futures_intraday(
                 panel, config.trading.tw_futures_portfolio_minute_data_path,
+                participation=config.trading.max_volume_participation,
+            )
+        if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            from stockagent.data.tw_futures_margin import attach_futures_margin_rules
+            panel = attach_futures_margin_rules(
+                panel, config.trading.tw_futures_portfolio_margin_rules_path,
+                broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
+                liquidation_ratio=config.trading.tw_futures_portfolio_margin_liquidation_ratio,
                 participation=config.trading.max_volume_participation,
             )
         if (

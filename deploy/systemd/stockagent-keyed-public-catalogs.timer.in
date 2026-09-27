@@ -1,0 +1,12 @@
+[Unit]
+Description=Bounded metadata discovery and hourly public snapshots, including holidays
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=30s
+AccuracySec=30s
+Unit=stockagent-keyed-public-catalogs.service
+
+[Install]
+WantedBy=timers.target

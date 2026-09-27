@@ -24,6 +24,16 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_dated_futures_sessions_preserve_early_and_extended_day_trades():
+    assert MODULE._session_for_time(80000, row_number=1, day_minutes=(480, 975)) == "day"
+    assert MODULE._session_for_time(161500, row_number=1, day_minutes=(525, 975)) == "day"
+    assert MODULE._session_for_time(180000, row_number=1, day_minutes=(525, 975)) == "night"
+    with pytest.raises(ValueError, match="outside"):
+        MODULE._session_for_time(140000, row_number=1, day_minutes=(525, 825))
+    with pytest.raises(ValueError, match="TX/TXO"):
+        MODULE._session_for_time(140000, row_number=1)
+
+
 def test_extracts_latest_common_taifex_dates() -> None:
     futures_page = b"""
     https://www.taifex.com.tw/file/taifex/Dailydownload/DailydownloadCSV/Daily_2026_08_05.zip

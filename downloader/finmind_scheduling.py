@@ -12,6 +12,15 @@ from stockagent.live.market_status import tw_stock_day_decision
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 
+# No-ID settlement queries returned empty while explicit TX/TXO queries over
+# the same full span returned rows. The Complement product-history worker owns
+# these endpoints, not Sponsor's whole-market daily/year partition queue.
+# Evidence: finmind_max_ranges_20260927T024357385865Z.json.
+PRODUCT_HISTORY_STARTS = {
+    "TaiwanFuturesFinalSettlementPrice": date(1998, 1, 1),
+    "TaiwanOptionFinalSettlementPrice": date(2001, 1, 1),
+}
+
 
 def protected_stock_opening(now: datetime, *, day_decision=tw_stock_day_decision) -> bool:
     """Protect real/unknown stock openings without idling on a verified holiday."""

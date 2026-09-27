@@ -175,6 +175,7 @@ class WindowedSplitTensors:
                     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
                     11,
                 ),
+                (int(self.features.size(0)), TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT, 29),
                 (
                     int(self.features.size(0)),
                     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
@@ -260,6 +261,7 @@ class WindowedSplitTensors:
                 len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS),
                 len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS),
                 len(TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS),
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS) + 2,
             }
             if (
                 self.derivative_candidate_features is None

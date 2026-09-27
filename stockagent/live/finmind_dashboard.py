@@ -28,6 +28,8 @@ from downloader.download_finmind_sponsor import (
     _fixed_incremental_demand,
 )
 from downloader.finmind_account import backfill_budget
+from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS
+from stockagent.live.finmind_eta_projection import public_completion_estimate
 
 
 LABELS = {
@@ -58,6 +60,29 @@ def _stamp(value: object) -> datetime | None:
 
 def _nonnegative_int(value: object) -> int | None:
     return value if type(value) is int and value >= 0 else None
+
+
+def _network_time_projection(pending: int | None, limit: int, *,
+                             excluded: str | None = None) -> dict[str, Any]:
+    """Preserve the old API key without treating storage partitions as calls.
+
+    The optional projection is a counterfactual, not an ETA or either bound:
+    batching can reduce calls, while retries, refreshes and discovery add work.
+    Even a verified quota ceiling does not imply this job owns that capacity.
+    """
+    return {
+        "minimum_network_seconds_remaining": None,
+        "network_time_basis": excluded or "request_count_unknown_after_batching_and_historical_universe_discovery",
+        "unbatched_task_projection": {
+            "seconds": round(pending * 3600 / limit),
+            "pending_partitions": pending,
+            "quota_requests_per_hour": limit,
+            "basis": "hypothetical_one_call_per_known_pending_partition_at_full_shared_quota",
+            "is_eta": False, "is_lower_bound": False,
+            "excludes": ["batching", "unknown_identifiers", "refreshes", "retries",
+                         "inflight_work", "other_quota_consumers", "response_processing"],
+        } if pending is not None and excluded is None else None,
+    }
 
 
 def _receipt_file_size(root: Path, receipt: Mapping[str, Any]) -> int | None:
@@ -173,7 +198,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                 key: value for key, value in (item.get("observed_grains") or {}).items()
                 if key in {"1m", "15s", "10s", "5s"} and _nonnegative_int(value) is not None
             } if isinstance(item.get("observed_grains"), Mapping) else {},
-            "minimum_network_seconds_remaining": round(pending * 3600 / limit) if pending is not None else None,
+            **_network_time_projection(pending, limit),
         })
 
     calendar = _read_json(root / "calendar.json")
@@ -194,7 +219,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         "first_data_date": min(dates) if dates else None,
         "last_data_date": max(dates) if dates else None,
         "last_receipt_at_utc": calendar.get("observed_at_utc"),
-        "minimum_network_seconds_remaining": None,
+        **_network_time_projection(int(not calendar_complete), limit),
     })
 
     master_receipts = sorted((root / "receipts" / MASTER_DATASET).glob("*.json"), reverse=True)
@@ -216,7 +241,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         "last_data_date": master.get("source_last_date"),
         "snapshot_date_taipei": master.get("snapshot_date_taipei"),
         "last_receipt_at_utc": master.get("fetched_at_utc"),
-        "minimum_network_seconds_remaining": None,
+        **_network_time_projection(int(not master_complete), limit),
         "point_in_time_history_available": False,
     })
 
@@ -267,7 +292,10 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "first_data_date": item.get("first_data_date"),
             "last_data_date": item.get("last_data_date"),
             "last_receipt_at_utc": item.get("last_attempt_at_utc"),
-            "minimum_network_seconds_remaining": round(pending * 3600 / limit) if pending is not None and not blocked and dataset not in delegated else None,
+            **_network_time_projection(pending, limit, excluded=(
+                "delegated_owner_no_independent_request_estimate" if dataset in delegated else
+                "local_derivation_parent_acquisition_excluded" if dataset == WIDE_INSTITUTIONAL else
+                "source_request_unavailable" if blocked or invalid else None)),
             "source_status": ("locally_derived_from_institutional_long"
                               if dataset == WIDE_INSTITUTIONAL else
                               "observed_response_only_not_provider_completeness"),
@@ -285,16 +313,20 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         empty = _nonnegative_int(item.get("observed_empty")) or 0
         failed = _nonnegative_int(item.get("failed")) or 0
         blocked = _nonnegative_int(item.get("blocked")) or 0
-        sponsor_total += total
-        sponsor_complete += complete
-        sponsor_empty += empty
-        sponsor_failed += failed
-        sponsor_blocked += blocked
+        # Stale pre-migration receipts remain visible on the legacy alias, but
+        # must not inflate the current owner's acquisition denominator.
+        if spec.dataset not in PRODUCT_HISTORY_STARTS:
+            sponsor_total += total
+            sponsor_complete += complete
+            sponsor_empty += empty
+            sponsor_failed += failed
+            sponsor_blocked += blocked
         remaining = max(0, total - complete - empty - blocked)
         datasets.append({
             "id": f"{spec.dataset}:all_market", "label": f"{spec.dataset}（Sponsor 全市場）",
             "kind": "sponsor_" + spec.grain,
-            "state": "unavailable" if blocked and blocked == total else
+            "state": "delegated" if spec.dataset in PRODUCT_HISTORY_STARTS else
+                     "unavailable" if blocked and blocked == total else
                      "complete" if total and remaining == 0 else
                      "backfilling" if complete or empty or failed else "pending",
             "target_partitions": total or None,
@@ -309,8 +341,13 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "first_data_date": item.get("first_data_date"),
             "last_data_date": item.get("last_data_date"),
             "last_receipt_at_utc": item.get("last_attempt_at_utc"),
-            "minimum_network_seconds_remaining": round(remaining * 3600 / limit) if total and not blocked else None,
-            "source_status": "observed_sponsor_market_response_not_provider_completeness",
+            **_network_time_projection(remaining if total else None, limit, excluded=(
+                "delegated_owner_no_independent_request_estimate" if spec.dataset in PRODUCT_HISTORY_STARTS else
+                "local_derivation_parent_acquisition_excluded" if spec.dataset == WIDE_INSTITUTIONAL else
+                "source_request_unavailable" if blocked else None)),
+            "source_status": ("delegated_to_complement_product_history"
+                              if spec.dataset in PRODUCT_HISTORY_STARTS else
+                              "observed_sponsor_market_response_not_provider_completeness"),
             "excluded_observation_dates": _nonnegative_int(item.get("not_observation_date")) or 0,
         })
     for dataset, reason in SPONSOR_UNSCHEDULED.items():
@@ -321,7 +358,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "checked_partitions": 0, "pending_partitions": None,
             "rows": None, "local_bytes": None,
             "first_data_date": None, "last_data_date": None,
-            "minimum_network_seconds_remaining": None,
+            **_network_time_projection(None, limit, excluded="source_not_scheduled"),
             "source_status": reason,
         })
 
@@ -366,6 +403,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         "status_age_seconds": round(min(value for value in (age, complement_age, sponsor_age) if value is not None))
             if age is not None or complement_age is not None or sponsor_age is not None else None,
         "acquisition": {
+            "completion_estimate": public_completion_estimate(root, observed),
             "state": state,
             "observed_at_utc": status.get("observed_at_utc"),
             "total_session_day_tasks": session_total,
@@ -405,7 +443,8 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                 for key in ("dataset", "data_id", "partition", "status", "rows", "error_code")
             } if isinstance(complement.get("last_task"), Mapping) else None,
             "retry_deferred_tasks": (_nonnegative_int(status.get("retry_deferred_tasks")) or 0) + companion_failed + sponsor_failed,
-            "minimum_network_seconds_remaining": round(all_pending * 3600 / limit) if all_pending is not None and not companion_blocked and not sponsor_blocked else None,
+            **_network_time_projection(all_pending, limit, excluded=(
+                "global_contracts_or_entitlements_unresolved" if companion_blocked or companion_invalid or sponsor_blocked else None)),
             "last_task": {key: status.get("last_task", {}).get(key) for key in ("dataset", "date", "status", "rows")}
                 if isinstance(status.get("last_task"), Mapping) else None,
             "active_task": {key: status.get("active_task", {}).get(key) for key in ("dataset", "date", "started_at_utc")}

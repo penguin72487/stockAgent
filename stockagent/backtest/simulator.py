@@ -1474,6 +1474,7 @@ class BacktestResult:
     receivables_history: np.ndarray | None = None
     settlement_default: np.ndarray | None = None
     default_reason_history: np.ndarray | None = None
+    futures_margin_audit: np.ndarray | None = None
     equity_scale_history: np.ndarray | None = None
     final_cash: np.ndarray | None = None
     final_payables: np.ndarray | None = None
@@ -1541,6 +1542,7 @@ class BacktestResultTensor:
     receivables_history: torch.Tensor | None = None
     settlement_default: torch.Tensor | None = None
     default_reason_history: torch.Tensor | None = None
+    futures_margin_audit: torch.Tensor | None = None
     equity_scale_history: torch.Tensor | None = None
     final_cash: torch.Tensor | None = None
     final_payables: torch.Tensor | None = None
@@ -1604,6 +1606,7 @@ class BacktestResultTensor:
             minute_nav=(None if self.minute_nav is None else self.minute_nav.detach().cpu().numpy()),
             shares_history=(None if self.shares_history is None else self.shares_history.detach().cpu().numpy()),
             default_reason_history=(None if self.default_reason_history is None else self.default_reason_history.detach().cpu().numpy()),
+            futures_margin_audit=optional_float(self.futures_margin_audit),
             futures_contract_quantities_history=(None if self.futures_contract_quantities_history is None else self.futures_contract_quantities_history.detach().cpu().numpy()),
             final_futures_carry_state=optional_float(self.final_futures_carry_state),
             futures_carry_state_history=optional_float(self.futures_carry_state_history),
@@ -3451,10 +3454,15 @@ def run_backtest_torch(
             # The canonical scheduled executor owns every fill, fee and
             # residual failure. Only the stock-context action ABI differs.
             from dataclasses import replace
+            # Incoming masks describe the stock-context axis, not the futures
+            # action axis. Futures permit both sides; the causal model mask and
+            # physical minute tape independently govern eligibility and fills.
+            futures_side_mask = torch.ones_like(weights, dtype=torch.bool)
             result = run_backtest_torch(
                 weights=weights, future_returns=torch.zeros_like(weights),
                 benchmark_returns=benchmark_returns,
-                tradable_mask=torch.ones_like(weights, dtype=torch.bool),
+                tradable_mask=futures_side_mask,
+                can_buy_mask=futures_side_mask, can_sell_mask=futures_side_mask,
                 execution_mode="tw_stock_futures_day_trade_0845_minute",
                 overnight_returns=overnight_returns,
                 buy_fee_rate=buy_fee_rate, sell_fee_rate=sell_fee_rate,
@@ -3483,7 +3491,7 @@ def run_backtest_torch(
         if (
             execution.ndim != 3
             or tuple(execution.shape[:2]) != tuple(weights.shape)
-            or int(execution.size(-1)) not in {4, 11}
+            or int(execution.size(-1)) not in {4, 11, 29}
         ):
             raise ValueError(
                 "stock-context futures execution tensor must have shape "
@@ -3505,7 +3513,7 @@ def run_backtest_torch(
             prepped_weights,
             float(min_trade_weight),
         )
-        if int(execution.size(-1)) == 11:
+        if int(execution.size(-1)) in {11, 29}:
             if float(max_turnover_ratio) != 0.0:
                 raise ValueError(
                     "integer stock-context futures requires max_turnover_ratio=0"
@@ -3564,6 +3572,9 @@ def run_backtest_torch(
                 final_equity_scale=result.final_equity_scale,
                 settlement_default=result.default_history,
                 default_reason_history=result.default_reason_history,
+                futures_margin_audit=result.margin_audit_history,
+                futures_contract_quantities_history=result.contract_quantities_history if result.margin_audit_history is not None else None,
+                futures_residual_contract_quantities_history=result.residual_contract_quantities_history,
                 execution_mode=mode,
                 settlement_ledger_unit=(
                     "notional_weight_training_surrogate"
