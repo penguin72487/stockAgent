@@ -428,6 +428,9 @@ def build_model(
                 "futures_current_open_feature": (
                     tbp_cfg.futures_current_open_feature
                 ),
+                "futures_feature_rms_normalization": (
+                    tbp_cfg.futures_feature_rms_normalization
+                ),
                 "futures_denomination_reference_capital": (
                     config.trading.tw_futures_portfolio_integer_initial_capital
                 ),
@@ -615,9 +618,13 @@ def build_model(
             ]
         if config.trading.execution_mode == "tw_stock_context_futures_portfolio":
             derivative_kwargs.update(
+                futures_margin_budget_output=(
+                    config.trading.tw_futures_portfolio_capital_basis == "initial_margin"
+                ),
                 futures_denomination_aware_output=fin_cfg.futures_denomination_aware_output,
                 futures_denomination_hard_projection=fin_cfg.futures_denomination_hard_projection,
                 futures_current_open_feature=fin_cfg.futures_current_open_feature,
+                futures_feature_rms_normalization=fin_cfg.futures_feature_rms_normalization,
                 futures_denomination_reference_capital=(
                     config.trading.tw_futures_portfolio_integer_initial_capital
                 ),

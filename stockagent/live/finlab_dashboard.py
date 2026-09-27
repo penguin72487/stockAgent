@@ -292,7 +292,7 @@ def build_finlab_public_status(
     }
     public_attempts = {
         "provider_error", "provider_empty", "timed_out", "vip_only",
-        "authentication_failed", "quota_exhausted",
+        "authentication_failed", "quota_exhausted", "resource_deferred", "normalization_error",
     }
     public_deferred_reasons = {
         "oversized_metadata", "oversized_table", "oversized_wide_refresh", "requires_date_window",

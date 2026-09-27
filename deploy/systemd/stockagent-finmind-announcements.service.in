@@ -1,0 +1,24 @@
+[Unit]
+Description=Check official FinMind correction announcements and plan targeted repairs
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.watch_finmind_announcements'
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=15min
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=512M

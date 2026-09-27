@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from downloader import download_finmind_complement as complement
 
@@ -196,6 +197,70 @@ def test_timeout_is_safe_and_request_counted_once(tmp_path: Path, during_stream:
     assert TOKEN not in "".join(traceback.format_exception(failure.value))
     if isinstance(response, Response):
         assert response.closes == 1
+    assert_one_request(tmp_path, session, limiter)
+
+
+def test_requests_iter_content_wrapped_read_timeout_is_classified(tmp_path: Path) -> None:
+    class RawTimeout:
+        closes = 0
+
+        def stream(self, _size: int, *, decode_content: bool):
+            assert decode_content
+            yield b"{"
+            raise ReadTimeoutError(None, f"/private/{TOKEN}", f"private body {TOKEN}")
+
+        def close(self) -> None:
+            self.closes += 1
+
+        def release_conn(self) -> None:
+            pass
+
+    response = requests.Response()
+    response.status_code = 200
+    response.raw = RawTimeout()
+    session, limiter = Session(response), Limiter()
+    with pytest.raises(complement.SourceError) as failure:
+        complement._fetch_rows(session, limiter, tmp_path, DATASET, TOKEN, {},
+                               max_response_bytes=1024)
+
+    assert failure.value.code == "ReadTimeout"
+    assert TOKEN not in "".join(traceback.format_exception(failure.value))
+    assert response.raw.closes == 1
+    assert_one_request(tmp_path, session, limiter)
+
+
+@pytest.mark.parametrize("wrapper", ["args", "cause", "context"])
+def test_nested_read_timeout_is_found_without_exposing_text(tmp_path: Path, wrapper: str) -> None:
+    nested = ReadTimeoutError(None, f"/private/{TOKEN}", TOKEN)
+    if wrapper == "args":
+        error = requests.ConnectionError(RuntimeError(nested))
+    else:
+        error = requests.ConnectionError(f"private connection text {TOKEN}")
+        setattr(error, f"__{wrapper}__", nested)
+    response = Response([error])
+    session, limiter = Session(response), Limiter()
+    with pytest.raises(complement.SourceError) as failure:
+        complement._fetch_rows(session, limiter, tmp_path, DATASET, TOKEN, {},
+                               max_response_bytes=1024)
+
+    assert failure.value.code == "ReadTimeout"
+    assert TOKEN not in "".join(traceback.format_exception(failure.value))
+    assert response.closes == 1
+    assert_one_request(tmp_path, session, limiter)
+
+
+def test_general_connection_failure_does_not_become_read_timeout(tmp_path: Path) -> None:
+    error = requests.ConnectionError(f"ReadTimeoutError text is not proof: {TOKEN}")
+    error.__cause__ = RuntimeError(error)
+    response = Response([error])
+    session, limiter = Session(response), Limiter()
+    with pytest.raises(complement.SourceError) as failure:
+        complement._fetch_rows(session, limiter, tmp_path, DATASET, TOKEN, {},
+                               max_response_bytes=1024)
+
+    assert failure.value.code == "ConnectionError"
+    assert TOKEN not in "".join(traceback.format_exception(failure.value))
+    assert response.closes == 1
     assert_one_request(tmp_path, session, limiter)
 
 

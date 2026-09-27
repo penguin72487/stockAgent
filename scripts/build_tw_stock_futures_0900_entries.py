@@ -33,11 +33,11 @@ from stockagent.data.tw_stock_futures_day_trade import (
     TAIFEX_STOCK_FUTURES_0900_ENTRY_DATA_CONTRACT_VERSION,
     _REQUIRED_COLUMNS,
     select_causal_front_stock_futures,
-    select_causal_front_stock_futures_candidates,
 )
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from stockagent.data.tw_stock_futures_minute import (
     MINUTE_CONTRACT_VERSION, MINUTE_DATASET, build_futures_minute_bars,
+    MINUTE_SOURCE_SCOPES, select_futures_minute_candidates,
 )
 from stockagent.data.tw_futures_portfolio_daily import TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
 
@@ -46,6 +46,34 @@ DATASET: Final[str] = "taifex_stock_futures_0900_entry_v1"
 ARCHIVE_RE: Final[re.Pattern[str]] = re.compile(
     r"^Daily_(\d{4})_(\d{2})_(\d{2})\.zip$"
 )
+
+
+def _all_futures_coverage(selected: pl.DataFrame, sources: list[dict], *, kbars: bool) -> pl.DataFrame:
+    """Bind every selected physical day to a complete raw source receipt."""
+    by_day = {item["date"]: item for item in sources}
+    rows = []
+    for item in selected.iter_rows(named=True):
+        source = by_day[str(item["date"])]
+        digest = source["sha256"]
+        if kbars:
+            matches = [c for c in source["contracts"] if c["physical_contract"] == item["physical_contract"]]
+            if len(matches) != 1 or matches[0]["status"] != "complete":
+                raise ValueError("all-futures KBar coverage requires a completed observed contract-day")
+            digest = matches[0]["sha256"]
+        rows.append({"date": item["date"], "physical_contract": item["physical_contract"],
+                     "status": "minute_verified", "source_file_sha256": digest,
+                     **({"tick_volume": matches[0]["observed_day_volume"]} if kbars else {})})
+    return pl.DataFrame(rows).sort("date", "physical_contract")
+
+
+def _add_all_futures_coverage_manifest(manifest: dict, coverage: pl.DataFrame, directory: Path) -> None:
+    atomic_write_parquet(directory / "coverage.parquet", coverage)
+    manifest.update(source_scope="all_futures_intraday", source_scope_version=1,
+                    expected_contract_days=coverage.height,
+                    expected_keys_sha256=hashlib.sha256(json.dumps(
+                        coverage.select("date", "physical_contract").rows(), default=str,
+                        separators=(",", ":")).encode()).hexdigest())
+    manifest["outputs"]["coverage"] = {"file": "coverage.parquet", "sha256": sha256_file(directory / "coverage.parquet")}
 
 
 def _sha256_file(path: Path) -> str:
@@ -183,9 +211,23 @@ def parse_args() -> argparse.Namespace:
                         help="08:45 training config; inherit daily source, output and panel start date.")
     parser.add_argument("--check-only", action="store_true",
                         help="Read-only source check (KBar receipts/content or legacy ZIP inventory).")
+    parser.add_argument("--scope", choices=MINUTE_SOURCE_SCOPES, default=None,
+                        help="Source universe; defaults to the selected config or legacy stock_front.")
     sources = parser.add_mutually_exclusive_group(required=True)
     sources.add_argument("--shioaji-ticks-root", type=Path,
                          help="Continuous Shioaji history; validate dated physical identity before aggregation.")
+    parser.add_argument("--additional-shioaji-ticks-root", type=Path, action="append", default=[],
+                        help="Additional existing continuous-tick source root, e.g. the separate TX history.")
+    parser.add_argument("--base-minute-bundle", type=Path,
+                        help="Read-only SHA-verified minute bundle; reuse accepted facts and fill missing keys into a different output.")
+    parser.add_argument("--supplemental-minute-bundle", type=Path, action="append", default=[],
+                        help="Additional canonical verified ZIP/KBar/history bundle; fill keys not already accepted by earlier bundles.")
+    parser.add_argument("--allow-partial-supplement", action="store_true",
+                        help="Export verified all-futures KBar keys for later merging; the output is not a trainable complete bundle.")
+    parser.add_argument("--supplement-contract-days", type=Path,
+                        help="Explicit JSON physical contract-day keys to read for a partial KBar supplement.")
+    parser.add_argument("--revalidate-contract-days", type=Path,
+                        help="JSON list of date/physical_contract keys to recheck from raw sources instead of trusting the base; never removes candidates.")
     parser.add_argument("--daily-proxy-before", default=None,
                         help="Explicit exclusive cutoff for early futures daily OPEN-to-CLOSE approximation.")
     parser.add_argument("--workers", type=int, default=8)
@@ -194,6 +236,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=Path("artifacts/cache/futures_minute_history"))
     parser.add_argument('--repair-root', type=Path, help='Canonical exact-month KBar gap-repair workspace.')
     parser.add_argument('--official-evidence-dir', type=Path, help='SHA-bound complete official daily/spread evidence for repair.')
+    parser.add_argument('--finmind-ticks-root', type=Path,
+                        help='Existing receipt-backed FinMind raw ticks; requires official evidence and never downloads.')
     parser.add_argument('--refresh-dates', nargs='+', help='Refresh only these dates; preserve every other SHA-verified cached shard.')
     parser.add_argument('--capacity-participation', type=float, help='Prove zero integer capacity from an official daily volume upper bound.')
     parser.add_argument('--capacity-rounding', choices=['floor', 'ceil'], default=None,
@@ -229,27 +273,53 @@ def parse_args() -> argparse.Namespace:
         from stockagent.data.tw_stock_futures_minute import MINUTE_MODE
 
         config = load_config(args.config)
+        all_futures = (config.trading.execution_mode == "tw_stock_context_futures_portfolio"
+                       and config.trading.tw_futures_portfolio_holding_policy == "intraday")
+        config_scope = "all_futures_intraday" if all_futures else "stock_front"
+        if args.scope is not None and args.scope != config_scope:
+            parser.error("--scope differs from the configured execution universe")
+        args.scope = config_scope
         if args.capacity_participation is None:
             args.capacity_participation = config.trading.max_volume_participation
         if args.capacity_rounding is None:
-            args.capacity_rounding = config.trading.tw_stock_futures_day_trade_minute_capacity_rounding
+            args.capacity_rounding = ("floor" if all_futures else
+                                      config.trading.tw_stock_futures_day_trade_minute_capacity_rounding)
         if args.quarantine_dates is None:
-            args.quarantine_dates = config.trading.tw_stock_futures_day_trade_quarantine_dates
+            args.quarantine_dates = [] if all_futures else config.trading.tw_stock_futures_day_trade_quarantine_dates
         if args.quarantine_contract_days is None:
-            args.quarantine_contract_days = config.trading.tw_stock_futures_day_trade_quarantine_contract_days
-        if config.trading.execution_mode != MINUTE_MODE:
+            args.quarantine_contract_days = [] if all_futures else config.trading.tw_stock_futures_day_trade_quarantine_contract_days
+        if config.trading.execution_mode != MINUTE_MODE and not all_futures:
             parser.error("--config must select the 08:45 futures minute execution mode")
         if args.execution_policy not in (None, "scheduled_0846"):
             parser.error("--config cannot be combined with a different execution policy")
         args.execution_policy = "scheduled_0846"
-        args.daily_data_path = args.daily_data_path or Path(config.trading.tw_stock_futures_day_trade_data_path)
-        minute_path = Path(config.trading.tw_stock_futures_day_trade_minute_data_path)
+        args.daily_data_path = args.daily_data_path or Path(
+            config.trading.tw_futures_portfolio_data_path if all_futures
+            else config.trading.tw_stock_futures_day_trade_data_path)
+        minute_path = Path(config.trading.tw_futures_portfolio_minute_data_path if all_futures
+                           else config.trading.tw_stock_futures_day_trade_minute_data_path)
         if args.output_dir is None and minute_path.name != "minutes.parquet":
             parser.error("configured minute output must be named minutes.parquet")
         args.output_dir = args.output_dir or minute_path.parent
         args.start_date = args.start_date or config.data.panel_start_date
-        args.daily_proxy_before = args.daily_proxy_before or config.trading.tw_stock_futures_day_trade_daily_proxy_before
+        if not all_futures:
+            args.daily_proxy_before = args.daily_proxy_before or config.trading.tw_stock_futures_day_trade_daily_proxy_before
+    args.scope = args.scope or "stock_front"
     args.execution_policy = args.execution_policy or "post_0900"
+    if args.scope == "all_futures_intraday" and args.execution_policy != "scheduled_0846":
+        parser.error("all_futures_intraday requires --execution-policy scheduled_0846")
+    if args.allow_partial_supplement and (args.scope != "all_futures_intraday" or args.minute_root is None):
+        parser.error("--allow-partial-supplement requires all_futures_intraday --minute-root")
+    if args.supplement_contract_days and not args.allow_partial_supplement:
+        parser.error("--supplement-contract-days requires --allow-partial-supplement")
+    if (args.additional_shioaji_ticks_root or args.base_minute_bundle or args.supplemental_minute_bundle) and args.shioaji_ticks_root is None:
+        parser.error("additional source roots and base bundles require --shioaji-ticks-root")
+    if args.finmind_ticks_root is not None and (args.shioaji_ticks_root is None or args.official_evidence_dir is None):
+        parser.error("--finmind-ticks-root requires continuous-history mode and --official-evidence-dir")
+    if args.scope == "all_futures_intraday":
+        args.daily_proxy_before = args.daily_proxy_before or args.start_date or "2014-01-01"
+        if args.start_date and args.daily_proxy_before > args.start_date:
+            parser.error("all-futures intraday cannot substitute daily proxies in the requested interval")
     args.capacity_rounding = args.capacity_rounding or 'floor'
     if args.capacity_participation is not None and not 0 < args.capacity_participation <= 1:
         parser.error('--capacity-participation must be within (0,1]')
@@ -301,15 +371,30 @@ def main() -> int:
         if (daily_manifest.get("contract_version") != TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
                 or daily_manifest.get("outputs", {}).get("continuous_daily", {}).get("sha256") != daily_digest):
             raise ValueError("daily candidate source contract or SHA mismatch")
+    columns = list(_REQUIRED_COLUMNS)
+    if (getattr(args, "shioaji_ticks_root", None) is not None
+            or getattr(args, "scope", "stock_front") == "all_futures_intraday"):
+        columns = list(dict.fromkeys([*columns, "contract", "shioaji_roots", "high", "low"]))
+    if (getattr(args, "scope", "stock_front") == "all_futures_intraday"
+            and "resolved_last_trade_date" in pq.read_schema(args.daily_data_path).names):
+        columns.append("resolved_last_trade_date")
     source = pl.from_arrow(
         pq.read_table(
             args.daily_data_path,
-            columns=(list(dict.fromkeys([*_REQUIRED_COLUMNS, "contract", "shioaji_roots", "high", "low"]))
-                     if getattr(args, "shioaji_ticks_root", None) is not None else list(_REQUIRED_COLUMNS)),
-            filters=[("asset_class", "=", "stock_future")],
+            columns=columns,
+            filters=([("asset_class", "=", "stock_future")]
+                     if getattr(args, "scope", "stock_front") == "stock_front" else None),
             memory_map=True,
         )
-    ).filter(
+    )
+    if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+        # The next query partition can contain this session's late prints.
+        # Resolve its date and physical identity from the complete pinned
+        # calendar before slicing the requested output interval.
+        args.source_calendar = source.select("date", "product", "contract", "physical_contract", "source_row_observed")
+        calendar_dates = source["date"].unique().sort().to_list()
+        args.source_next_dates = dict(zip(calendar_dates[:-1], calendar_dates[1:]))
+    source = source.filter(
         (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
     )
     minute_policy = args.execution_policy == "scheduled_0846"
@@ -359,7 +444,7 @@ def main() -> int:
         )
         return 2
 
-    selected = (select_causal_front_stock_futures_candidates(source) if minute_policy
+    selected = (select_futures_minute_candidates(source, scope=getattr(args, "scope", "stock_front")) if minute_policy
                 else select_causal_front_stock_futures(source))
     if selected.is_empty():
         raise ValueError("daily source has no selected stock futures in range")
@@ -373,6 +458,14 @@ def main() -> int:
         if archive is None:
             continue
         source_sha256 = _sha256_file(archive)
+        day_sessions = None
+        if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+            from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+            day_sessions = {
+                product: taifex_futures_day_session_minutes(
+                    trading_date, product_code=product, asset_class=asset_class,
+                ) for product, asset_class in selected.select("product", "asset_class").unique().iter_rows()
+            }
         transactions = _parse_zip(
             archive,
             kind="futures",
@@ -380,8 +473,20 @@ def main() -> int:
             source_sha256=source_sha256,
             futures_products=products,
             futures_outright_contracts_only=True,
+            futures_day_sessions=day_sessions,
         )
         selected_date = selected.filter(pl.col("date") == pl.lit(trading_date))
+        if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+            from stockagent.data.tw_price_rules import price_on_taifex_futures_tick_grid_numpy
+            transactions = transactions.with_columns(
+                pl.concat_str("product", pl.lit(":"), "delivery_month_week").alias("physical_contract"),
+            ).join(selected_date.select("physical_contract", "asset_class"),
+                   on="physical_contract", how="inner", validate="m:1")
+            if not price_on_taifex_futures_tick_grid_numpy(
+                transactions["price"].to_numpy(), transactions["trading_date"].to_numpy(),
+                product_codes=transactions["product"].to_numpy(), asset_classes=transactions["asset_class"].to_numpy(),
+            ).all():
+                raise ValueError(f"off-grid dated all-futures official prints: {trading_date}")
         entries = (build_futures_minute_bars(transactions) if minute_policy
                    else _first_strictly_later_entries(transactions, selected_date))
         if sha256_file(archive) != source_sha256:
@@ -414,7 +519,7 @@ def main() -> int:
             return 2
         output = pl.concat(frames, how="vertical_relaxed")
         atomic_write_parquet(output_path, output)
-        atomic_write_json(args.output_dir / "manifest.json", {
+        manifest = {
             "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
             "status": "complete", "timezone": "Asia/Taipei",
             "source_daily_path": str(args.daily_data_path), "source_daily_sha256": daily_digest,
@@ -424,7 +529,10 @@ def main() -> int:
             "execution_claim": "historical_minute_vwap_not_order_book_or_guaranteed_fill",
             "rows": output.height,
             "outputs": {"minutes": {"path": str(output_path), "sha256": sha256_file(output_path)}},
-        })
+        }
+        if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+            _add_all_futures_coverage_manifest(manifest, _all_futures_coverage(selected, source_receipts, kbars=False), args.output_dir)
+        atomic_write_json(args.output_dir / "manifest.json", manifest)
         print(f"[futures minutes] complete dates={len(expected_dates)} rows={output.height} output={output_path}", flush=True)
         return 0
 
@@ -482,10 +590,25 @@ def _build_from_kbars(args, source: pl.DataFrame, expected_dates: list[date], da
     from stockagent.data.tw_stock_futures_kbars import KBAR_SOURCE, read_futures_kbar_sources
     from stockagent.data.tw_stock_futures_minute import validate_futures_minute_data
 
-    selected = select_causal_front_stock_futures_candidates(source)
+    selected = select_futures_minute_candidates(source, scope=getattr(args, "scope", "stock_front"))
     if selected.is_empty():
         raise ValueError("daily source has no selected stock futures in range")
-    output, sources, missing = read_futures_kbar_sources(args.minute_root, selected, expected_dates)
+    key_path = getattr(args, "supplement_contract_days", None)
+    key_digest = None
+    if key_path:
+        from stockagent.data.tw_stock_futures_quarantine import normalize_contract_days
+        key_digest = sha256_file(key_path)
+        keys = pl.DataFrame(normalize_contract_days(json.loads(key_path.read_text()))).with_columns(
+            pl.col("date").str.to_date(),
+        )
+        if keys.join(selected.select("date", "physical_contract"), on=["date", "physical_contract"], how="anti").height:
+            raise ValueError("supplement keys fall outside the requested canonical selection")
+        selected = selected.join(keys, on=["date", "physical_contract"], how="semi")
+        expected_dates = selected["date"].unique().sort().to_list()
+    output, sources, missing = read_futures_kbar_sources(
+        args.minute_root, selected, expected_dates,
+        all_futures=getattr(args, "scope", "stock_front") == "all_futures_intraday",
+    )
     report = {
         "status": "partial" if missing else "source_inventory_complete",
         "stage": "one_minute_kbars", "minute_root": str(args.minute_root),
@@ -494,20 +617,35 @@ def _build_from_kbars(args, source: pl.DataFrame, expected_dates: list[date], da
         "missing_contract_days": len(missing), "missing": missing,
         "source_daily_sha256": daily_digest, "contents_validated": not missing,
     }
-    if args.check_only or missing:
+    partial = getattr(args, "allow_partial_supplement", False)
+    if args.check_only or (missing and not partial):
         if missing and not args.check_only:
             atomic_write_json(args.output_dir / "build_failure.json", report)
         print(json.dumps({**report, "missing": missing[:20]}, ensure_ascii=False, indent=2), flush=True)
         return 2 if missing else 0
+    if partial and missing:
+        missing_frame = pl.DataFrame(missing).with_columns(pl.col("date").str.to_date())
+        selected = selected.join(missing_frame, on=["date", "physical_contract"], how="anti")
+        sources = [item for item in sources if item["contracts"]]
+        expected_dates = [date.fromisoformat(item["date"]) for item in sources]
+        if selected.is_empty():
+            atomic_write_json(args.output_dir / "build_failure.json", report)
+            return 2
     if sha256_file(args.daily_data_path) != daily_digest:
         raise ValueError("daily candidate source changed during KBar build")
+    if key_path and sha256_file(key_path) != key_digest:
+        raise ValueError("supplement contract-day selection changed during read")
     # Validate the complete pair before replacing an accepted output.
     with tempfile.TemporaryDirectory(prefix="futures-kbars-") as temporary:
         staged = Path(temporary) / "minutes.parquet"
         atomic_write_parquet(staged, output)
         manifest = {
             "dataset": MINUTE_DATASET, "contract_version": MINUTE_CONTRACT_VERSION,
-            "source_kind": KBAR_SOURCE, "status": "complete", "timezone": "Asia/Taipei",
+            "source_kind": KBAR_SOURCE, "status": "partial" if partial else "complete", "timezone": "Asia/Taipei",
+            "partial_supplement_only": partial,
+            "requested_contract_days": report["selected_contract_days"],
+            "missing_contract_days": missing,
+            "supplement_contract_days_sha256": key_digest,
             "source_daily_path": str(args.daily_data_path), "source_daily_sha256": daily_digest,
             "covered_dates": list(map(str, expected_dates)), "sources": sources,
             "clock": "right_labelled_minutes_[label-1min,label)",
@@ -517,13 +655,19 @@ def _build_from_kbars(args, source: pl.DataFrame, expected_dates: list[date], da
             "outputs": {"minutes": {"sha256": sha256_file(staged)}},
         }
         atomic_write_json(staged.with_name("manifest.json"), manifest)
-        validate_futures_minute_data(staged, daily_sha256=daily_digest)
+        if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+            coverage = _all_futures_coverage(selected, sources, kbars=True)
+            _add_all_futures_coverage_manifest(manifest, coverage, staged.parent)
+            atomic_write_json(staged.with_name("manifest.json"), manifest)
+        validate_futures_minute_data(staged, daily_sha256=daily_digest, require_complete=not partial)
         output_path = args.output_dir / "minutes.parquet"
         atomic_write_parquet(output_path, output)
         manifest["outputs"]["minutes"] = {"path": str(output_path), "sha256": sha256_file(output_path)}
+        if getattr(args, "scope", "stock_front") == "all_futures_intraday":
+            _add_all_futures_coverage_manifest(manifest, coverage, args.output_dir)
         atomic_write_json(args.output_dir / "manifest.json", manifest)
-    print(f"[futures minutes] complete source=kbars dates={len(expected_dates)} rows={output.height} output={output_path}", flush=True)
-    return 0
+    print(f"[futures minutes] {'partial_supplement' if partial else 'complete'} source=kbars dates={len(expected_dates)} rows={output.height} output={output_path}", flush=True)
+    return 2 if partial else 0
 
 
 if __name__ == "__main__":

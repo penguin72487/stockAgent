@@ -1,17 +1,73 @@
 from __future__ import annotations
 
 import argparse
+import io
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import sys
 from typing import Any, Callable
 
 
 DEFAULT_REGISTRY = Path("configs/data_api_credentials.json")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CREDENTIAL_NAME = re.compile(
+    r"(?:^|_)(?:API_KEY(?:_ID)?|API_TOKEN|SECRET(?:_KEY)?|TOKEN|PASSWORD|"
+    r"PASSCODE|SESSION_ID|CLIENT_ID|CLIENT_SECRET|PRIVATE_KEY|ACCESS_KEY(?:_ID)?)$",
+    re.IGNORECASE,
+)
+_PLACEHOLDERS = {
+    "none", "null", "nil", "undefined", "changeme", "change_me", "change-me",
+    "replace_me", "replace-me", "placeholder", "todo", "tbd", "n/a", "...",
+}
+_FINLAB_NAMES = ("FINLAB_REFRESH_TOKEN", "FINLAB_SESSION_ID", "FINLAB_API_KEY")
+
+# get_session is the SDK's local env/file/decrypt reader. Never call login,
+# get_id_token, get_status or get_data_status here: those can consume network.
+# Isolate it so SDK logging/errors cannot leak tokens into our public receipt.
+_FINLAB_SESSION_PROBE = r'''
+import contextlib, importlib, json, os, socket
+
+def blocked(*args, **kwargs):
+    raise RuntimeError("network_disabled")
+
+socket.socket.connect = blocked
+socket.socket.connect_ex = blocked
+socket.create_connection = blocked
+socket.getaddrinfo = blocked
+result = {"state": "unknown", "reason": "sdk_unavailable", "sdk_available": False}
+with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+    try:
+        auth = importlib.import_module("finlab.auth")
+    except ImportError:
+        pass
+    except Exception:
+        result["reason"] = "sdk_import_failed"
+        result["sdk_available"] = None
+    else:
+        result["sdk_available"] = True
+        result["reason"] = "session_unreadable"
+        try:
+            session = auth.get_session()
+            if session is None:
+                exists = os.path.exists(auth.CREDENTIALS_FILE)
+                result.update(state="unknown" if exists else "missing",
+                              reason="session_unusable" if exists else "session_absent")
+            elif isinstance(session, dict):
+                fields = {name: isinstance(session.get(name), str) and bool(session[name].strip())
+                          for name in ("refresh_token", "session_id", "api_key")}
+                count = sum(fields.values())
+                result.update(state="configured" if count == 3 else "partial" if count else "unknown",
+                              reason="session_complete" if count == 3 else "session_incomplete",
+                              field_presence=fields)
+        except Exception:
+            pass
+print(json.dumps(result))
+'''
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +75,7 @@ def parse_args() -> argparse.Namespace:
         description="Publish a non-secret credential presence and file-permission receipt."
     )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--env-example", type=Path, default=Path(".env.example"))
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument(
         "--openbb-settings",
@@ -33,29 +90,178 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _value_present(value: Any) -> bool:
+    """Literal presence only; never resolve variables, shell code or templates."""
+    if not isinstance(value, str):
+        return False
+    literal = value.strip()
+    lowered = literal.casefold()
+    if not literal or lowered in _PLACEHOLDERS:
+        return False
+    if (re.search(r"\$\{|\$\(|`|\{\{", literal)
+            or re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", literal)
+            or re.fullmatch(r"<[^>]+>", literal)
+            or re.fullmatch(r"[xX*]+", literal)):
+        return False
+    return not bool(re.fullmatch(
+        r"(?:your|replace|insert|enter|put|paste)[_ -]+.*(?:key|token|secret|password|id|here).*",
+        lowered,
+    ))
+
+
+def _parse_env_inventory(path: Path) -> dict[str, Any]:
+    """Return names/booleans/line numbers only, including dotenv parse failures.
+
+    Reuse the runtime's dotenv lexer, not dotenv_values/load_dotenv: the lexer
+    accepts export/quotes/comments/multiline values without any interpolation,
+    mutation of os.environ or warnings containing input text.
+    """
+    result: dict[str, Any] = {
+        "state": "missing", "presence": {}, "duplicate_names": [],
+        "invalid_line_numbers": [],
+    }
+    try:
+        if not path.is_file():
+            return result
+        from dotenv.parser import parse_stream
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError, ImportError):
+        result["state"] = "unknown"
+        return result
+    lines: dict[str, list[int]] = {}
+    result["state"] = "readable"
+    for binding in parse_stream(io.StringIO(content)):
+        # Original.line can start on preceding blank lines; expose the actual
+        # assignment's line number, never Original.string or a parse exception.
+        line_number = binding.original.line
+        line_number += len(re.findall(r"\r\n|\r|\n", re.match(r"\s*", binding.original.string)[0]))
+        if binding.error or (binding.key and not _ENV_NAME.fullmatch(binding.key)):
+            result["invalid_line_numbers"].append(line_number)
+            continue
+        if binding.key is None:
+            continue
+        lines.setdefault(binding.key, []).append(line_number)
+        empty_comment = re.match(
+            rf"\s*(?:export\s+)?(?:{re.escape(binding.key)}|'{re.escape(binding.key)}')\s*=\s*#",
+            binding.original.string,
+        )
+        result["presence"][binding.key] = not empty_comment and _value_present(binding.value)
+    result["duplicate_names"] = [
+        {"name": name, "lines": numbers}
+        for name, numbers in sorted(lines.items()) if len(numbers) > 1
+    ]
+    return result
+
+
 def _parse_env_presence(path: Path) -> dict[str, bool]:
-    values: dict[str, bool] = {}
-    if not path.is_file():
-        return values
-    pattern = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = pattern.match(line)
-        if not match:
-            continue
-        raw_value = match.group(2).strip()
-        if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in {"'", '"'}:
-            raw_value = raw_value[1:-1]
-        values[match.group(1)] = bool(raw_value.strip())
-    return values
+    """Backward-compatible boolean-only projection for existing callers."""
+    return _parse_env_inventory(path)["presence"]
+
+
+def _effective_presence(env_presence: dict[str, bool], name: str) -> bool:
+    # Match load_dotenv(override=False): even an empty process variable masks
+    # the file. Presence is not an attempt to execute an interpolated .env.
+    return _value_present(os.environ[name]) if name in os.environ else bool(env_presence.get(name))
+
+
+def _environment_inventory(
+    environment: dict[str, Any], example: dict[str, Any], registry: list[dict[str, Any]],
+) -> dict[str, Any]:
+    env_names, example_names = set(environment["presence"]), set(example["presence"])
+    declared = {
+        name for item in registry if item["location"] == "environment"
+        for field in ("required_names", "any_of_names", "optional_names")
+        for name in item.get(field, [])
+    }
+    candidates = {name for name in env_names | example_names if _CREDENTIAL_NAME.search(name)}
+    return {
+        "scope": "env_file_and_example_names; registered_names_include_process_environment",
+        "classification": "registered_names_then_credential_suffix_candidates",
+        "environment_parse_state": environment["state"],
+        "example_parse_state": example["state"],
+        "environment_names": sorted(env_names), "example_names": sorted(example_names),
+        "environment_only_names": sorted(env_names - example_names),
+        "example_only_names": sorted(example_names - env_names),
+        "declared_names_missing_example": sorted(declared - example_names),
+        "unregistered_credential_names": sorted(candidates - declared),
+        "unregistered_credential_slots": [
+            {"name": name, "present": _effective_presence(environment["presence"], name),
+             "env_file_declared": name in env_names, "example_declared": name in example_names,
+             "process_environment_declared": name in os.environ}
+            for name in sorted(candidates - declared)
+        ],
+        "noncredential_configuration_names": sorted((env_names | example_names) - declared - candidates),
+        "duplicate_names": {"environment": environment["duplicate_names"], "example": example["duplicate_names"]},
+        "invalid_line_numbers": {"environment": environment["invalid_line_numbers"], "example": example["invalid_line_numbers"]},
+        "source_precedence": "process_environment_then_env_file; no_interpolation",
+    }
+
+
+def _finlab_session_presence() -> dict[str, Any]:
+    """Check local SDK session without leaking child output or using the API."""
+    child_env = {key: value for key, value in os.environ.items()
+                 if key not in {*_FINLAB_NAMES, "FINLAB_API_TOKEN"}}
+    unknown = {"state": "unknown", "reason": "probe_failed", "sdk_available": None}
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _FINLAB_SESSION_PROBE], env=child_env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=10, check=False,
+        )
+        if child.returncode or len(child.stdout) > 4096:
+            return unknown
+        result = json.loads(child.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
+        return unknown
+    reasons = {"sdk_unavailable", "sdk_import_failed", "session_unreadable", "session_unusable",
+               "session_absent", "session_complete", "session_incomplete"}
+    if (not isinstance(result, dict) or not isinstance(result.get("reason"), str)
+            or result["reason"] not in reasons):
+        return unknown
+    state = result.get("state")
+    sdk_available = result.get("sdk_available")
+    fields = result.get("field_presence", {})
+    if (not isinstance(state, str) or state not in {"configured", "partial", "missing", "unknown"}
+            or sdk_available is not None and type(sdk_available) is not bool
+            or not isinstance(fields, dict)
+            or any(type(fields.get(name, False)) is not bool for name in ("refresh_token", "session_id", "api_key"))):
+        return unknown
+    safe_fields = {name: fields.get(name, False) for name in ("refresh_token", "session_id", "api_key")}
+    count = sum(safe_fields.values())
+    if state == "configured" and (count != 3 or sdk_available is not True):
+        return unknown
+    return {"state": state, "reason": result["reason"], "sdk_available": sdk_available,
+            "field_presence": safe_fields}
+
+
+def _apply_finlab_presence(row: dict[str, Any], env_presence: dict[str, bool]) -> None:
+    session = _finlab_session_presence()
+    row.update(environment_state=row["state"], environment_configured_count=row["configured_count"],
+               sdk_session=session, credential_mode="unavailable")
+    legacy = _effective_presence(env_presence, "FINLAB_API_TOKEN")
+    row["legacy_fallback_configured"] = legacy
+    if row["state"] == "configured":
+        row["credential_mode"] = "environment_session"
+    elif session["state"] == "configured":
+        row.update(state="configured", configured_count=3, source="finlab_sdk_session",
+                   credential_mode="local_sdk_session")
+    elif legacy:
+        row.update(state="configured", configured_count=1, required_count=1,
+                   credential_mode="legacy_environment_token")
+    elif session["state"] == "unknown":
+        row["state"] = "unknown"
+    elif session["state"] == "partial" and row["state"] == "missing":
+        row.update(state="partial", configured_count=sum(session["field_presence"].values()),
+                   source="finlab_sdk_session")
 
 
 def _safe_mode(path: Path) -> tuple[str | None, bool | None]:
-    if not path.exists():
+    try:
+        if not path.exists():
+            return None, None
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
         return None, None
-    mode = stat.S_IMODE(path.stat().st_mode)
     return f"{mode:03o}", (mode & 0o077) == 0
 
 
@@ -183,7 +389,7 @@ def _openbb_rows(
     rows = [
         _presence_row(
             item,
-            configured=lambda name, values=credentials: bool(values.get(name)),
+            configured=lambda name, values=credentials: _value_present(values.get(name)),
             source="openbb_settings",
         )
         for item in declared
@@ -200,7 +406,7 @@ def _openbb_rows(
     declared_names.update(known_names or set())
     for name, value in sorted(credentials.items()):
         lowered = str(name).lower()
-        if name in declared_names or not any(
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name) or name in declared_names or not any(
             token in lowered for token in ("key", "token", "secret", "password")
         ):
             continue
@@ -209,11 +415,11 @@ def _openbb_rows(
                 "id": f"openbb:{name}",
                 "catalog_id": f"openbb_unregistered:{name}",
                 "provider": f"OpenBB credential: {name}",
-                "state": "configured" if bool(value) else "missing",
+                "state": "configured" if _value_present(value) else "missing",
                 "required_names": [str(name)],
                 "any_of_names": [],
                 "optional_names": [],
-                "configured_count": 1 if bool(value) else 0,
+                "configured_count": 1 if _value_present(value) else 0,
                 "required_count": 1,
                 "source": "openbb_settings",
                 "storage_location": "openbb_settings",
@@ -228,7 +434,9 @@ def _openbb_rows(
 def main() -> None:
     args = parse_args()
     registry_rows = _read_registry(args.registry)
-    env_presence = _parse_env_presence(args.env_file)
+    environment = _parse_env_inventory(args.env_file)
+    example = _parse_env_inventory(args.env_example)
+    env_presence = environment["presence"]
     environment_rows = [
         item for item in registry_rows if item["location"] == "environment"
     ]
@@ -239,17 +447,19 @@ def main() -> None:
     rows = [
         _presence_row(
             item,
-            configured=lambda name: bool(
-                env_presence.get(name) or os.environ.get(name, "").strip()
-            ),
+            configured=lambda name: _effective_presence(env_presence, name),
             source="environment",
         )
         for item in environment_rows
     ]
     for row, item in zip(rows, environment_rows, strict=True):
+        if environment["state"] == "unknown" and row["state"] != "configured":
+            row["state"] = "unknown"
+        if item.get("local_session") == "finlab_sdk":
+            _apply_finlab_presence(row, env_presence)
         openbb_field = str(item.get("openbb_field", "")).strip()
         if openbb_field:
-            row["legacy_fallback_configured"] = bool(
+            row["legacy_fallback_configured"] = _value_present(
                 legacy_credentials.get(openbb_field)
             )
     canonical_openbb_fields = {
@@ -274,19 +484,22 @@ def main() -> None:
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "secret_values_included": False,
+        "validation_scope": "local_presence_only; no_authentication_or_entitlement_check",
+        "environment_inventory": _environment_inventory(environment, example, registry_rows),
         "files": {
             "registry": {
                 "path": str(args.registry),
                 "exists": args.registry.is_file(),
             },
             "environment": {"exists": args.env_file.is_file(), "mode": env_mode, "owner_only": env_private},
+            "environment_example": {"exists": args.env_example.is_file()},
             "openbb_settings": {
                 "exists": args.openbb_settings.is_file(),
                 "mode": openbb_mode,
                 "owner_only": openbb_private,
                 "role": "legacy_fallback",
                 "configured_mapped_count": sum(
-                    bool(legacy_credentials.get(name))
+                    _value_present(legacy_credentials.get(name))
                     for name in canonical_openbb_fields
                 ),
             },
@@ -303,6 +516,7 @@ def main() -> None:
         "[credentials] "
         f"providers={len(rows)} configured={state_counts.get('configured', 0)} "
         f"partial={state_counts.get('partial', 0)} missing={state_counts.get('missing', 0)} "
+        f"unknown={state_counts.get('unknown', 0)} "
         "secret_values_included=false"
     )
 

@@ -10413,6 +10413,10 @@ def _fetch_un_comtrade_export_destinations(
                 payload = _un_comtrade_json(url, page_limiter)
                 progress.update(1)
                 data = payload.get("data", []) if isinstance(payload, Mapping) else []
+                if not isinstance(data, list) or len(data) >= 500:
+                    # Public preview is capped at 500 records. Never label a
+                    # possibly truncated response as a complete country slice.
+                    raise ProviderResponseShapeError("UN Comtrade preview cap reached; narrower or entitled query required")
                 records: list[dict[str, Any]] = []
                 for row in data:
                     if not isinstance(row, Mapping):
@@ -10439,6 +10443,8 @@ def _fetch_un_comtrade_export_destinations(
                             ),
                             "reference_year": year,
                             "source": "UN Comtrade",
+                            "history_complete": False,
+                            "source_scope": "latest_available_annual_export_destinations_public_preview",
                             "source_url": url,
                         }
                     )
@@ -11259,11 +11265,33 @@ def _fetch_eia_petroleum_status_workaround(kwargs: Mapping[str, Any]) -> list[An
         EiaPetroleumStatusReportFetcher,
     )
 
-    query = EiaPetroleumStatusReportFetcher.transform_query(dict(kwargs))
+    post_filter = str(kwargs.get("table")) in {
+        "ulta_low_sulfur_distillate_reclassification", "ulta_low_sulfur_distillate_reclassification_avg",
+    }
+    # These discontinued tables have valid old rows but no recent rows. The
+    # SDK concatenates an empty list after date filtering and reports a parser
+    # failure. Validate the full workbook first; only then prove window-empty.
+    query_kwargs = dict(kwargs)
+    if post_filter:
+        query_kwargs.update(start_date=None, end_date=None)
+    query = EiaPetroleumStatusReportFetcher.transform_query(query_kwargs)
     raw = asyncio.run(EiaPetroleumStatusReportFetcher.aextract_data(query, None))
-    return _provider_result_rows(
+    rows = _provider_result_rows(
         EiaPetroleumStatusReportFetcher.transform_data(query, raw)
     )
+    if post_filter:
+        selected = []
+        for row in rows:
+            value = row.get("date") if isinstance(row, Mapping) else getattr(row, "date", None)
+            observed = date.fromisoformat(str(value)[:10])
+            if ((not kwargs.get("start_date") or observed >= date.fromisoformat(str(kwargs["start_date"])[:10]))
+                    and (not kwargs.get("end_date") or observed <= date.fromisoformat(str(kwargs["end_date"])[:10]))):
+                selected.append(row)
+        if not selected:
+            from openbb_core.provider.utils.errors import EmptyDataError
+            raise EmptyDataError("Validated EIA workbook has no observations in this requested window")
+        return selected
+    return rows
 
 
 def _fetch_federal_reserve_central_bank_holdings_workaround(
@@ -16456,6 +16484,18 @@ def classify_error(exc: Exception) -> str:
         r"(?<!\d)(?:401|403)(?!\d)", text
     ):
         return "auth"
+    # SDK wrappers can erase the text of asyncio's TimeoutError. Preserve its
+    # typed cause so a temporary network stall cannot become a terminal gap.
+    cause, seen_causes = exc, set()
+    for _ in range(8):
+        if id(cause) in seen_causes:
+            break
+        seen_causes.add(id(cause))
+        if isinstance(cause, (TimeoutError, ConnectionError)):
+            return "transient"
+        cause = cause.__cause__ or cause.__context__
+        if cause is None:
+            break
     status_code = getattr(exc, "code", None) or getattr(exc, "status", None)
     if (
         any(marker in text for marker in TRANSIENT_ERROR_MARKERS)
@@ -17240,11 +17280,27 @@ class OpenBBWorker:
                                     page_limiter=limiter,
                                     show_progress=self.show_progress,
                                 )
+                        elif task.endpoint == "commodity.energy_history" and provider == "eia":
+                            if __package__:
+                                from .openbb_eia_history import fetch_history
+                            else:  # canonical shell invokes this file directly
+                                from openbb_eia_history import fetch_history
+
+                            result = ColumnarTaskPayload(fetch_history(provider_kwargs, self.obb))
+                        elif task.endpoint == "economy.gdp.forecast" and provider == "oecd":
+                            if __package__:
+                                from .openbb_oecd_history import fetch_gdp_forecast
+                            else:
+                                from openbb_oecd_history import fetch_gdp_forecast
+                            result = ColumnarTaskPayload(fetch_gdp_forecast(provider_kwargs))
                         elif (
                             task.endpoint == "commodity.petroleum_status_report"
                             and provider == "eia"
                             and str(provider_kwargs.get("table"))
-                            in _eia_petroleum_schema_mismatch_tables()
+                            in (_eia_petroleum_schema_mismatch_tables() | {
+                                "ulta_low_sulfur_distillate_reclassification",
+                                "ulta_low_sulfur_distillate_reclassification_avg",
+                            })
                         ):
                             result = _fetch_eia_petroleum_status_workaround(
                                 provider_kwargs
@@ -18510,6 +18566,15 @@ def _pop_fairest_endpoint_task(
         tasks.rotate(best_index)
 
 
+def _external_queue_revision(output_dir: Path) -> tuple[int, int] | None:
+    """Cheap wake signal, not a data/completeness proof or a manifest scan."""
+    try:
+        stat = (output_dir / "_state/public_priority_queue_event.json").stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
 def execute_download_tasks(
     context: PlannerContext,
     manifest: Manifest,
@@ -18601,6 +18666,7 @@ def execute_download_tasks(
     )
     completion_backpressure_limit = min(COMPLETION_BACKPRESSURE_CAP, target_inflight)
     last_full_refill_monotonic = 0.0
+    external_queue_revision = _external_queue_revision(context.output_dir)
     runtime = getattr(worker, "runtime", None)
     preload_provider_queues = bool(getattr(worker, "preload_provider_queues", False))
     unavailable_bucket = "__runtime_unavailable__"
@@ -19136,6 +19202,10 @@ def execute_download_tasks(
         nonlocal wave_number, provider_endpoint_selection_order
         nonlocal refill_threshold, provider_refill_thresholds
         nonlocal last_full_refill_monotonic
+        nonlocal external_queue_revision
+        # Capture before the query: an event arriving during that query must
+        # still wake the next refill rather than being accidentally consumed.
+        external_queue_revision = _external_queue_revision(context.output_dir)
         last_full_refill_monotonic = time.monotonic()
         capacity = target_inflight - len(futures) - buffered_task_count()
         if max_tasks is not None:
@@ -19692,6 +19762,8 @@ def execute_download_tasks(
                         # unrelated retry deadline after an expensive empty scan.
                         wait_deadline = time.monotonic() + max(0.05, delay + 0.1)
                         while True:
+                            if _external_queue_revision(context.output_dir) != external_queue_revision:
+                                break
                             remaining = max(0.0, wait_deadline - time.monotonic())
                             if remaining <= 0:
                                 break
@@ -19982,6 +20054,7 @@ def execute_download_tasks(
                     full_refill_due = (
                         time.monotonic() - last_full_refill_monotonic
                         >= full_fair_refill_interval_seconds
+                        or _external_queue_revision(context.output_dir) != external_queue_revision
                     )
                     if not completion_backpressure_active and (
                         (queued_count <= refill_threshold and provider_refilled == 0)
@@ -20286,6 +20359,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                 for item in coverage
                 if item.decision in {"included", "deferred"}
             }
+            # Official EIA routes absent from the installed OpenBB SDK still
+            # belong to this worker, manifest, limiter and atomic writer.
+            followup_endpoints.add("commodity.energy_history")
             migrated_plan_followups, retired_other_plan_tasks = (
                 manifest.reconcile_active_plan_membership(
                     plan_token,

@@ -989,6 +989,8 @@ systemctl list-timers 'stockagent-tw-public-release-archives.timer'
 
 期交所年度免費歷史在本機另有 2014 年 TX 日盤合約、TX 月契約最後結算價與臺指選擇權 Put/Call 比；`run_fintech_python scripts/build_tw_public_research_taifex.py` 會把 10 個原值依來源盤後、下一交易日可用的規則接到獨立本機 v2 表。使用 `configs/markets/tw_public_preopen_wide_research_taifex_2014_v2.yaml` 預檢或研究訓練，欄位與仍未補齊的付費／授權缺口見[免費來源稽核](docs/tw_free_feature_download_training_audit_2026-09-19.md)。
 
+期交所來源盤點與新下載器見[公開資料清冊／回補操作](docs/taifex_public_acquisition_2026-09-27.md)：涵蓋官方 135 個 OpenAPI、全市場大額交易人季度 CSV，以及公告／保證金／限額／契約調整附件。`bash scripts/run_taifex_public_history.sh --phase large-trader-range` 續補全商品歷史；`stockagent-taifex-rules.timer` 在休市日也續補公告。各端點最早／最新日期、筆數與缺口可用 `run_fintech_python -m scripts.audit_taifex_public_inventory --output-dir artifacts/data_quality/taifex_public_inventory_2026-09-27` 更新，網頁沿用 `/data-monitor/providers/TAIFEX/`。文件已保存不等於歷史規則／PIT 已核對，尚未完整者不發布成完成的冷庫版本。
+
 若研究要把**所有本機已觀測的去重特徵**納入同一個台股日資料 ABI，先依序更新正式表、寬研究表與期交所 v2 表，再執行 `run_fintech_python scripts/build_tw_public_research_all_features.py`。v3 以研究表為主，從原值重算 15 個早期衍生欄，並補入正式表獨有欄及同鍵研究空值；輸入未變則重用雜湊驗證的成品。`run_fintech_python scripts/report_tw_public_research_all_features.py` 會更新[全部去重特徵與 2014 覆蓋](docs/tw_stock_all_observed_training_features_2014_v3.md)，訓練前以 `run_fintech_python train.py --config configs/markets/tw_public_preopen_all_observed_research_2014_v3.yaml --check-data-only` 預檢。每日來源 reconcile 已接入 v3 重建；此表只供接受現修值、推估公告日與晚起始欄的研究實驗，不代表嚴格歷史 PIT 或可執行成交。
 
 ### Yahoo、外匯與加密市場
@@ -1308,6 +1310,36 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 ```
 
 把 pin 與實驗 artifacts 一起保存；不要在 resume 時重新解析 `latest`。
+
+## API 與全來源資料清冊
+
+`.env` 只放機密值；`.env.example` 與 `configs/data_api_credentials.json` 列出設定位置。
+下列清點只讀本機收據，不會為了顯示面板重新抓原始資料：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_data_credentials.py
+run_fintech_python scripts/export_data_acquisition_inventory.py \
+  --bundle-dir artifacts/data_quality/api_data_inventory_2026-09-27
+```
+
+清冊將來源宣稱的歷史範圍、本機首末筆、收據筆數、查詢下界、發布時間與下載排程分開。
+空白是尚未量測；憑證存在不是權限驗證；目錄或最新快照不是全史完成。
+
+新公共 API 先做有界目錄／目前快照探測，全球明細先估容量與配額：
+
+```bash
+run_fintech_python -m downloader.download_keyed_public_catalogs --plan
+run_fintech_python -m downloader.download_keyed_public_catalogs \
+  --execute --max-requests 12 --max-response-mb 16 --min-free-gb 20
+# 只安裝此低流量工作，不重啟金融、行情或交易服務：
+sudo bash scripts/install_registered_data_refresh_services.sh keyed-public-catalogs-only
+```
+
+每小時檢查、目錄快取 24 小時；CWA／MOENV 目前快照按小時更新。原始證據留在
+`data_keyed_public_catalogs`，本機研究 `publish:false`；不會自動同步或啟動全球衛星影像下載。
+容量、官方歷史入口、配額單位與尚未驗證項見
+[全球公開資料容量與配額](docs/global_public_data_capacity_2026-09-27.md)。
 
 ## 文件分類
 

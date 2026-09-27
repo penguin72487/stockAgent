@@ -1509,7 +1509,7 @@ def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
     assert futures_contract["integer_training_surrogate"] == (
         TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
     )
-    assert futures_contract["integer_training_forward"] == "exact_integer_account_v2"
+    assert futures_contract["integer_training_forward"] == "exact_integer_account_v3"
     assert futures_contract["denomination_aware_model_output"] is True
     assert futures_contract["candidate_feature_columns"] == list(
         TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
@@ -1768,7 +1768,7 @@ def test_integer_0845_funding_safe_trajectory_v3_is_a_fresh_contract() -> None:
     futures_contract = manifest["contracts"]["trading"][
         "taiwan_stock_context_futures_portfolio"
     ]
-    assert futures_contract["integer_training_forward"] == "exact_integer_account_v2"
+    assert futures_contract["integer_training_forward"] == "exact_integer_account_v3"
     assert futures_contract["denomination_hard_projection_owner"] == (
         "exact_integer_executor_dynamic_equity"
     )

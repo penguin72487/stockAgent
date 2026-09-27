@@ -30,7 +30,7 @@ from downloader.artifact_io import atomic_write_json
 from downloader.common import load_env_file
 from downloader.download_finmind_complement import (
     INSTITUTIONAL_NAMES, LONG_INSTITUTIONAL, WIDE_INSTITUTIONAL,
-    SourceError, Task, _db, _fetch_rows, _sha256, _store,
+    SourceError, Task, _db, _fetch_rows, _sha256, _store, _preflight_bulk_year_schemas,
 )
 from downloader.download_finmind_free import TAIPEI
 from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
@@ -40,7 +40,8 @@ from downloader.finmind_batching import (
 )
 from downloader.finmind_parent_recovery import recover_failed_long_parent
 from downloader.finmind_scheduling import (
-    SOURCES, SPECS, SESSION_DAY_DATASETS, Source, _s, fixed_incremental_demand, protected_stock_opening,
+    SOURCES, SPECS, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS, Source, _s,
+    fixed_incremental_demand, protected_stock_opening,
 )
 from downloader.finmind_observation_dates import (
     EXCLUDED_STATE, PERIOD_DATASETS, next_period_refresh, reconcile_observation_dates,
@@ -97,14 +98,14 @@ REPAIRED_400_DATASETS = frozenset({
 })
 # All ``day`` specs use the provider's whole-market, one-date query shape.
 START_DATE_ONLY_DATASETS = frozenset(spec.dataset for spec in SOURCES if spec.grain == "day")
-# These four range endpoints were individually probed: each returned the
-# exact end_date in addition to the requested local half-open partition.
-# Evidence: artifacts/data_quality/finmind_partition_semantics_2026-09-27.json.
+# Range endpoints are individually probed for rows exactly on end_date before
+# admission, including sparse event sources. See the partition_semantics and
+# max_ranges boundary receipts in artifacts/data_quality.
 INCLUSIVE_END_DATE_DATASETS = frozenset({
     "TaiwanStockInfoWithWarrantSummary", "TaiwanBusinessIndicator",
     "CnnFearGreedIndex", "TaiwanOptionVix",
-})
-QUERY_SHAPE_VERSION = 5
+}) | frozenset(RANGE_CONTRACTS)
+QUERY_SHAPE_VERSION = 6
 
 
 def _official_price_coverage(catalog_path: Path | None = None) -> tuple[date, date] | None:
@@ -235,6 +236,28 @@ def _migrate_query_shape(conn: sqlite3.Connection, root: Path) -> None:
                 "WHERE dataset=? AND state='blocked' AND error_code='response_outside_partition'",
                 (dataset,),
             )
+    if version < 6:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS product_query_migration_audit ("
+            "dataset TEXT,partition TEXT,old_row_json TEXT,changed_at_utc TEXT,"
+            "PRIMARY KEY(dataset,partition))"
+        )
+        for dataset in PRODUCT_HISTORY_STARTS:
+            cursor = conn.execute("SELECT * FROM tasks WHERE dataset=? AND data_id=''", (dataset,))
+            columns = [column[0] for column in cursor.description]
+            for values in cursor.fetchall():
+                old = dict(zip(columns, values))
+                conn.execute(
+                    "INSERT OR IGNORE INTO product_query_migration_audit VALUES (?,?,?,?)",
+                    (dataset, old['partition'], json.dumps(old, sort_keys=True), datetime.now(UTC).isoformat()),
+                )
+            # Preserve raw receipts and all observed values; retire only the
+            # unsupported no-ID query shape, not the endpoint's product work.
+            conn.execute(
+                "UPDATE tasks SET state='deprecated_query_shape',next_attempt_at_utc=NULL,"
+                "error_code='requires_product_id' WHERE dataset=? AND data_id=''",
+                (dataset,),
+            )
     conn.execute(f"PRAGMA user_version={QUERY_SHAPE_VERSION}")
     conn.commit()
 
@@ -253,6 +276,8 @@ def _seed(conn: sqlite3.Connection, now: datetime,
     local = now.astimezone(TAIPEI)
     rows: list[tuple[str, str, str, str, int]] = []
     for spec in SOURCES:
+        if spec.dataset in PRODUCT_HISTORY_STARTS:
+            continue
         if spec.grain == "snapshot":
             rows.append((spec.dataset, "", "latest", "snapshot", spec.priority))
             continue
@@ -432,6 +457,8 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
     if incremental_only:
         due += " AND (priority=0 OR kind='derived')"
     values = (now.isoformat(), now.isoformat(), WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL)
+    due += f" AND dataset NOT IN ({','.join('?' for _ in PRODUCT_HISTORY_STARTS)})"
+    values += tuple(PRODUCT_HISTORY_STARTS)
     if datasets is not None:
         if not datasets:
             return None
@@ -450,7 +477,7 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
         # Keep this global even when dispatch is restricted to selected datasets.
         if conn.execute(
             "SELECT 1 FROM tasks WHERE priority<? AND "
-            "state NOT IN ('complete','observed_empty','non_session','not_observation_date') LIMIT 1",
+            "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape') LIMIT 1",
             (SECONDARY_VALIDATION_PRIORITY,),
         ).fetchone():
             return None
@@ -505,6 +532,11 @@ def _derive_wide(root: Path, partition: str) -> list[dict[str, Any]]:
         raise SourceError("invalid_long_receipt", retry_after=0)
     if receipt.get("status") == "observed_empty":
         return []
+    from downloader.finmind_corrections import verified_authoritative_empty
+
+    if verified_authoritative_empty(receipt, owner='sponsor', dataset=LONG_INSTITUTIONAL,
+                                    data_id='', partition=partition):
+        return []
     relative = receipt.get("parquet_path")
     if receipt.get("status") != "complete" or not isinstance(relative, str):
         raise SourceError("missing_long_parquet", retry_after=900)
@@ -537,6 +569,8 @@ def _derive_wide(root: Path, partition: str) -> list[dict[str, Any]]:
 
 def _fetch(task: Task, token: str, limiter: Any, root: Path,
            today: date) -> list[dict[str, Any]]:
+    if task.dataset in PRODUCT_HISTORY_STARTS:
+        raise SourceError("requires_product_id", retry_after=0)
     if task.kind == "derived":
         return _derive_wide(root, task.partition)
     session = getattr(_THREAD, "session", None)
@@ -636,12 +670,14 @@ def _fetch_batch(batch: RangeBatch[Task], token: str, limiter: Any,
         _THREAD.session = session
     rows = _fetch_rows(session, limiter, root.parent, batch.dataset, token, batch.params(),
                        max_response_bytes=RANGE_CONTRACTS[batch.dataset].max_response_bytes)
-    return split_batch_rows(batch, rows)
+    grouped = split_batch_rows(batch, rows)
+    _preflight_bulk_year_schemas(batch.dataset, grouped)
+    return grouped
 
 
 def _defer_failed_batch(conn: sqlite3.Connection, batch: RangeBatch[Task],
-                        error_code: str, now: datetime) -> None:
-    """Keep exact queue evidence and fall back to scheduled single requests.
+                        error_code: str, now: datetime) -> str:
+    """Keep exact queue evidence; shrink resource failures, isolate bad contracts.
 
     A rejected optimization must not permanently block a valid dataset or be
     retried as the same rejected multi-partition request after every restart.
@@ -693,11 +729,12 @@ def _defer_failed_batch(conn: sqlite3.Connection, batch: RangeBatch[Task],
                 "UPDATE tasks SET state='pending',error_code=?,last_attempt_at_utc=?,"
                 "next_attempt_at_utc=? WHERE dataset=? AND data_id=? AND partition=? "
                 "AND state='inflight'",
-                (f"batch_disabled:{error_code}", now.isoformat(),
+                (f"{'batch_reduced' if resource_failure else 'batch_disabled'}:{error_code}", now.isoformat(),
                  (now + timedelta(seconds=60)).isoformat(),
                  task.dataset, task.data_id, task.partition),
             )
         conn.execute("RELEASE SAVEPOINT finmind_batch_disable")
+        return 'batch_reduced_retry' if resource_failure else 'batch_disabled_single_retry'
     except BaseException:
         conn.execute("ROLLBACK TO SAVEPOINT finmind_batch_disable")
         conn.execute("RELEASE SAVEPOINT finmind_batch_disable")
@@ -750,7 +787,10 @@ def _reconcile_daily_refresh(conn: sqlite3.Connection, now: datetime) -> None:
 def _finish(conn: sqlite3.Connection, root: Path, task: Task,
             rows: list[dict[str, Any]], now: datetime, *,
             request_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not rows:
+    from downloader.finmind_corrections import correction_context
+
+    context = correction_context(conn, task)
+    if not rows and not context.get('allow_empty'):
         previous = conn.execute(
             "SELECT rows,receipt_path FROM tasks WHERE dataset=? AND data_id=? AND partition=?",
             (task.dataset, task.data_id, task.partition),
@@ -765,8 +805,14 @@ def _finish(conn: sqlite3.Connection, root: Path, task: Task,
                  'request': request_metadata},
             )
             raise SourceError('unexpected_empty_after_nonempty', retry_after=900)
-    receipt = (_store(root, task, rows, now, request_metadata=request_metadata)
-               if request_metadata is not None else _store(root, task, rows, now))
+    if task.dataset in RANGE_CONTRACTS and request_metadata is None:
+        # A rejected batch may fall back to one period; it must not bypass the
+        # same flat-schema checks and silently lose fields absent in row one.
+        _preflight_bulk_year_schemas(task.dataset, {task.partition: rows})
+    store_options = {'correction': context} if context else {}
+    if request_metadata is not None:
+        store_options['request_metadata'] = request_metadata
+    receipt = _store(root, task, rows, now, **store_options)
     current = task.kind == "snapshot" or (task.kind != "snapshot" and
               _end(date.fromisoformat(task.partition), SPECS[task.dataset].grain) >
               now.astimezone(TAIPEI).date())
@@ -776,7 +822,7 @@ def _finish(conn: sqlite3.Connection, root: Path, task: Task,
     next_at = (now + (timedelta(hours=4) if rows else timedelta(minutes=15))) if current else None
     if task.dataset in PERIOD_DATASETS:
         next_at = next_period_refresh(task.dataset, task.partition, now)
-    elif not rows and task.kind in {'day', 'derived'} and _late_daily_retry(task.dataset, task.partition, now):
+    elif not rows and not context.get('allow_empty') and task.kind in {'day', 'derived'} and _late_daily_retry(task.dataset, task.partition, now):
         next_at = now + timedelta(hours=4)
     conn.execute(
         "UPDATE tasks SET state=?,next_attempt_at_utc=?,last_attempt_at_utc=?,"
@@ -816,6 +862,10 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
     series = {spec.dataset: {"target": 0, "complete": 0, "observed_empty": 0,
                              "failed": 0, "blocked": 0, "non_session": 0,
                              "not_observation_date": 0,
+                             "deprecated_query_shape": 0,
+                             "source_status": ("delegated_to_complement_product_history"
+                                               if spec.dataset in PRODUCT_HISTORY_STARTS else
+                                               "observed_sponsor_market_response_not_provider_completeness"),
                              "rows": 0, "bytes": 0,
                              "first_data_date": None, "last_data_date": None,
                              "last_attempt_at_utc": None,
@@ -828,7 +878,7 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
         if dataset not in series:
             continue
         item = series[dataset]
-        if task_state not in {"non_session", EXCLUDED_STATE}:
+        if task_state not in {"non_session", EXCLUDED_STATE, "deprecated_query_shape"}:
             item["target"] += count
         if task_state in item:
             item[task_state] += count
@@ -857,12 +907,12 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
         "acquisition_policy": {
             "required_unfinished": conn.execute(
                 "SELECT count(*) FROM tasks WHERE priority<? AND "
-                "state NOT IN ('complete','observed_empty','non_session','not_observation_date')",
+                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape')",
                 (SECONDARY_VALIDATION_PRIORITY,),
             ).fetchone()[0],
             "secondary_unfinished": conn.execute(
                 "SELECT count(*) FROM tasks WHERE priority>=? AND "
-                "state NOT IN ('complete','observed_empty','non_session','not_observation_date')",
+                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape')",
                 (SECONDARY_VALIDATION_PRIORITY,),
             ).fetchone()[0],
             "secondary_rule": "global_required_acquisition_then_spare_shared_quota",
@@ -901,10 +951,18 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
 
         secondary_admission = evaluate_secondary_admission
     with _db(root / "queue.sqlite3") as conn:
+        from downloader.finmind_corrections import apply_worker_corrections, reconcile_worker_corrections
+
         session_policy = _seed(
             conn, datetime.now(UTC), official_price_coverage=_official_price_coverage(),
             official_sessions=_official_session_calendar(), root=root,
         )
+        reconcile_worker_corrections(conn, root, 'sponsor', datetime.now(UTC))
+        correction_summary = apply_worker_corrections(conn, root, 'sponsor', datetime.now(UTC))
+        conn.commit()
+        atomic_write_json(root / 'correction_status.json', {
+            'observed_at_utc': datetime.now(UTC).isoformat(), **correction_summary,
+        })
         _status(conn, root, "running", account=account, session_policy=session_policy)
         last_status_at = time.monotonic()
         last: dict[str, Any] | None = None
@@ -967,6 +1025,8 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                         # before any constituent receipt becomes visible.
                         if batch is not None:
                             metadata = batch.metadata()
+                            metadata['response_rows'] = sum(len(part_rows) for part_rows in result.values())
+                            metadata['response_partition_rows'] = {key: len(value) for key, value in result.items()}
                             rows_total = 0
                             for part in batch.tasks:
                                 rows = result[part.partition]
@@ -983,20 +1043,21 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                             last = {"dataset": task.dataset, "partition": task.partition,
                                     "status": receipt["status"], "rows": len(result)}
                     except BatchContractError as error:
+                        retry_status = 'failed'
                         if batch is None:
                             for part in unfinished:
                                 _fail(conn, part, SourceError("invalid_batch_contract", retry_after=900), now)
                         else:
-                            _defer_failed_batch(conn, batch, str(error), now)
+                            retry_status = _defer_failed_batch(conn, batch, str(error), now)
                         last = {"dataset": task.dataset, "partition": task.partition,
-                                "status": "batch_disabled_single_retry", "error_code": str(error)}
+                                "status": retry_status, "error_code": str(error)}
                     except SourceError as error:
                         if batch is not None and error.code in {
-                                "provider_bad_request", "response_outside_partition", "invalid_rows",
+                                "provider_bad_request", "response_outside_partition", "invalid_rows", "invalid_bulk_schema",
                                 "response_size_limit", "ReadTimeout", "ConnectTimeout", "Timeout", "http_504", "http_502"}:
-                            _defer_failed_batch(conn, batch, error.code, now)
+                            retry_status = _defer_failed_batch(conn, batch, error.code, now)
                             last = {"dataset": task.dataset, "partition": task.partition,
-                                    "status": "batch_disabled_single_retry", "error_code": error.code}
+                                    "status": retry_status, "error_code": error.code}
                         else:
                             recovered = None
                             for part in unfinished:
@@ -1025,6 +1086,12 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                                 active=active_tasks(), last=last,
                                 session_policy=session_policy)
                         last_status_at = time.monotonic()
+        correction_progress = reconcile_worker_corrections(conn, root, 'sponsor', datetime.now(UTC))
+        conn.commit()
+        atomic_write_json(root / 'correction_status.json', {
+            'observed_at_utc': datetime.now(UTC).isoformat(), **correction_summary,
+            'verification': correction_progress,
+        })
         return _status(conn, root, reason if halt else "batch_complete", account=account,
                        last=last, session_policy=session_policy)
 

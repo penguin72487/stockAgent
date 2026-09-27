@@ -1397,6 +1397,7 @@ def risk_aware_loss(
         valid_execution_shapes = {
             (int(weights.size(0)), 1936, 4),
             (int(weights.size(0)), 1936, 11),
+            (int(weights.size(0)), 1936, 29),
             (int(weights.size(0)), 1936, 2, TAPE_FIELDS),
         }
         if overnight_log_returns is None or tuple(

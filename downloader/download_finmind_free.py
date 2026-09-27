@@ -30,6 +30,7 @@ from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic
 from downloader.common import SharedRateLimiter, load_env_file
 from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
 from downloader.finmind_scheduling import fixed_incremental_demand
+from downloader.finmind_corrections import free_correction_due, correction_receipt_metadata
 from downloader.finmind_volume_units import (
     ORDER_BOOK_CANONICAL_FIELDS, ORDER_BOOK_DATASET, annotate_stock_share_units,
 )
@@ -223,6 +224,7 @@ def _load_calendar(
 ) -> tuple[list[date], int]:
     path = root / "calendar.json"
     cached = _read_json(path)
+    correction = free_correction_due(root, CALENDAR_DATASET, now.astimezone(TAIPEI).date(), cached, now)
     observed = cached.get("observed_at_utc")
     fresh = False
     if isinstance(observed, str):
@@ -230,7 +232,7 @@ def _load_calendar(
             fresh = now - datetime.fromisoformat(observed.replace("Z", "+00:00")) < timedelta(hours=20)
         except ValueError:
             pass
-    if fresh:
+    if fresh and not correction['due']:
         try:
             return _calendar_dates([{"date": item} for item in cached["dates"]]), 0
         except (KeyError, TypeError, ProviderError):
@@ -241,11 +243,15 @@ def _load_calendar(
         if isinstance(cached.get("dates"), list):
             return _calendar_dates([{"date": item} for item in cached["dates"]]), 1
         raise
+    if path.is_file():
+        previous = path.read_bytes()
+        atomic_write_bytes(root / 'versions' / CALENDAR_DATASET / f'{hashlib.sha256(previous).hexdigest()}.json', previous, durable=True)
     atomic_write_json(path, {
         "schema_version": SCHEMA_VERSION,
         "source_dataset": CALENDAR_DATASET,
         "observed_at_utc": _iso(now),
         "dates": [item.isoformat() for item in dates],
+        **correction_receipt_metadata(correction['context']),
     })
     return dates, 1
 
@@ -310,6 +316,7 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
     eligible = [item for item in dates if item <= cutoff]
     recent = set(eligible[-5:])
     pending_recent: list[tuple[str, date]] = []
+    pending_corrections: list[tuple[str, date]] = []
     pending_old: list[tuple[str, date]] = []
     counts: dict[str, Any] = {
         "total": len(eligible) * len(SESSION_DATASETS),
@@ -325,6 +332,10 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
     for day in eligible:
         for dataset in SESSION_DATASETS:
             receipt = _read_json(root / "receipts" / dataset / f"{day}.json")
+            correction = free_correction_due(root, dataset, day, receipt, now)
+            if correction['due']:
+                (pending_recent if day in recent else pending_corrections).append((dataset, day))
+                continue
             if receipt.get("status") == "complete" and _receipt_usable(receipt, root, now=now):
                 counts["complete"] += 1
                 item = counts["series"][dataset]
@@ -346,7 +357,7 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
                 continue
             task = (dataset, day)
             (pending_recent if day in recent else pending_old).append(task)
-    return sorted(pending_recent, key=lambda item: (-item[1].toordinal(), item[0])) + pending_old, counts
+    return sorted(pending_recent, key=lambda item: (-item[1].toordinal(), item[0])) + pending_corrections + pending_old, counts
 
 
 def _session_path(root: Path, dataset: str, day: date) -> Path:
@@ -646,7 +657,32 @@ def revalidate_sessions_local(root: Path) -> dict[str, Any]:
     return result
 
 
-def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, Any]], *, now: datetime) -> dict[str, Any]:
+def _archive_free_head(root: Path, receipt_path: Path, data_path: Path) -> None:
+    """Keep verified previous bytes when correcting non-order-book Free data."""
+    if not receipt_path.is_file():
+        return
+    previous = receipt_path.read_bytes()
+    old = json.loads(previous)
+    proof = old if old.get('parquet_path') else old.get('previous_source_receipt', {})
+    folder = root / 'receipt_history' / receipt_path.relative_to(root / 'receipts').with_suffix('')
+    if data_path.is_file():
+        if (proof.get('parquet_path') != str(data_path.relative_to(root)) or
+                proof.get('parquet_size_bytes') != data_path.stat().st_size or
+                proof.get('sha256') != sha256_file(data_path)):
+            raise ValueError('previous Free source proof mismatch')
+        archived = folder / f"{proof['sha256']}.parquet"
+        if not archived.exists():
+            atomic_write_bytes(archived, data_path.read_bytes(), durable=True)
+        elif sha256_file(archived) != proof['sha256']:
+            raise ValueError('previous Free archive proof mismatch')
+    atomic_write_bytes(folder / f'{hashlib.sha256(previous).hexdigest()}.json', previous, durable=True)
+
+
+def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, Any]], *, now: datetime,
+                    correction_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    previous = _read_json(root / 'receipts' / dataset / f'{day}.json')
+    if not rows and (_session_path(root, dataset, day).is_file() or int(previous.get('rows') or 0) > 0):
+        raise ProviderError('unexpected_empty_after_nonempty', retry_after=3600)
     status, grain, expected, missing = _validated_session_rows(dataset, day, rows)
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -660,11 +696,14 @@ def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, An
         "missing_grid_points": missing,
         "fetched_at_utc": _iso(now),
         "point_in_time_training_safe": False,
+        **correction_receipt_metadata(correction_context or {}),
     }
     path = _session_path(root, dataset, day)
     if dataset == ORDER_BOOK_DATASET and path.is_file():
         old = _read_json(root / "receipts" / dataset / f"{day}.json")
         receipt["previous_source"] = _archive_order_book_source(root, day, old)
+    elif path.is_file():
+        _archive_free_head(root, root / 'receipts' / dataset / f'{day}.json', path)
     if rows:
         if dataset == ORDER_BOOK_DATASET:
             _, units = annotate_stock_share_units(dataset, rows)
@@ -724,12 +763,23 @@ def _record_failure(root: Path, dataset: str, day: date, error: ProviderError, *
     if dataset == ORDER_BOOK_DATASET and _session_path(root, dataset, day).is_file():
         old = _read_json(root / "receipts" / dataset / f"{day}.json")
         receipt["previous_source"] = _archive_order_book_source(root, day, old)
+    elif dataset in {*SESSION_DATASETS, MASTER_DATASET}:
+        data_path = (_session_path(root, dataset, day) if dataset in SESSION_DATASETS else
+                     root / 'snapshots' / dataset / f'snapshot={day}-full.parquet')
+        if data_path.is_file():
+            receipt_path = root / 'receipts' / dataset / f'{day}.json'
+            old = _read_json(receipt_path)
+            _archive_free_head(root, receipt_path, data_path)
+            receipt['previous_source_receipt'] = old if old.get('parquet_path') else old.get('previous_source_receipt', {})
     atomic_write_json(root / "receipts" / dataset / f"{day}.json", receipt)
     return receipt
 
 
 def _master_due(root: Path, now: datetime) -> bool:
     local = now.astimezone(TAIPEI)
+    receipt = _read_json(root / "receipts" / MASTER_DATASET / f"{local.date()}.json")
+    if free_correction_due(root, MASTER_DATASET, local.date(), receipt, now)['due']:
+        return True
     if local.time() < wall_time(14, 0):
         return False
     receipt = _read_json(root / "receipts" / MASTER_DATASET / f"{local.date()}.json")
@@ -738,11 +788,14 @@ def _master_due(root: Path, now: datetime) -> bool:
     return receipt.get("query_scope") != "full_table_snapshot" or not _receipt_usable(receipt, root, now=now)
 
 
-def _record_master(root: Path, rows: list[dict[str, Any]], *, now: datetime) -> dict[str, Any]:
+def _record_master(root: Path, rows: list[dict[str, Any]], *, now: datetime,
+                   correction_context: dict[str, Any] | None = None) -> dict[str, Any]:
     local_day = now.astimezone(TAIPEI).date()
     if not rows or not all(isinstance(row.get("stock_id"), str) for row in rows):
         raise ProviderError("invalid_master")
     path = root / "snapshots" / MASTER_DATASET / f"snapshot={local_day}-full.parquet"
+    receipt_path = root / 'receipts' / MASTER_DATASET / f'{local_day}.json'
+    _archive_free_head(root, receipt_path, path)
     atomic_write_parquet(path, pa.Table.from_pylist(rows), compression="zstd")
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -758,6 +811,7 @@ def _record_master(root: Path, rows: list[dict[str, Any]], *, now: datetime) -> 
         "parquet_size_bytes": path.stat().st_size,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "point_in_time_history_available": False,
+        **correction_receipt_metadata(correction_context or {}),
     }
     atomic_write_json(root / "receipts" / MASTER_DATASET / f"{local_day}.json", receipt)
     return receipt
@@ -830,9 +884,12 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
         _write_status(root, state="running" if tasks else "current", counts=counts, requests_used=used, quota=quota, token=bool(token))
         if _master_due(root, now) and (not max_requests or used < max_requests):
             try:
+                master_day = _utc_now().astimezone(TAIPEI).date()
+                correction = free_correction_due(root, MASTER_DATASET, master_day,
+                    _read_json(root / 'receipts' / MASTER_DATASET / f'{master_day}.json'), _utc_now())
                 rows = _request(session, limiter, MASTER_DATASET, start_date=None, token=token, traffic_root=root)
                 used += 1
-                _record_master(root, rows, now=_utc_now())
+                _record_master(root, rows, now=_utc_now(), correction_context=correction['context'])
             except ProviderError as error:
                 used += 1
                 local_day = _utc_now().astimezone(TAIPEI).date()
@@ -858,9 +915,12 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task,
                           active={"dataset": dataset, "date": day.isoformat(), "started_at_utc": _iso(_utc_now())})
             try:
+                correction = free_correction_due(root, dataset, day,
+                    _read_json(root / 'receipts' / dataset / f'{day}.json'), _utc_now())
                 rows = _request(session, limiter, dataset, start_date=day, token=token, traffic_root=root)
                 used += 1
-                result = _record_session(root, dataset, day, rows, now=_utc_now())
+                result = _record_session(root, dataset, day, rows, now=_utc_now(),
+                                         correction_context=correction['context'])
             except ProviderError as error:
                 used += 1
                 result = _record_failure(root, dataset, day, error, now=_utc_now())

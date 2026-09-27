@@ -11546,6 +11546,53 @@ def test_executor_waits_for_provider_cooldown_without_task_churn(
         manifest.close()
 
 
+def test_external_queue_event_wakes_idle_worker_before_unrelated_quota_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from downloader import download_openbb_archive as archive
+
+    context = _context(tmp_path)
+    blocked = make_task(context, "equity.profile", "AAPL", {"symbol": "AAPL"}, ("fmp",))
+    added = make_task(context, "commodity.energy_history", "gas", {"dataset": "gas_prices_daily"}, ("eia",))
+    runtime = ProviderRuntime({"fmp": 1000.0, "eia": 1000.0}, {"fmp": 1, "eia": 1}, 1.0)
+    runtime._blocked_until["fmp"] = time.time() + 600
+    calls = []
+    sleeps = []
+
+    class Worker:
+        def __init__(self):
+            self.runtime = runtime
+
+        def __call__(self, current):
+            calls.append(current.task_id)
+            return TaskResult(current, "empty", "eia", 0, None, 1)
+
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    real_sleep = time.sleep
+
+    def inject_during_idle(seconds):
+        if seconds < 1:
+            real_sleep(seconds)
+            return
+        sleeps.append(seconds)
+        assert len(sleeps) == 1, "worker slept again instead of accepting newly committed work"
+        manifest.upsert_tasks([added], plan_token="wake")
+        (context.output_dir / "_state/public_priority_queue_event.json").write_text('{"tasks":1}')
+
+    try:
+        manifest.upsert_tasks([blocked], plan_token="wake")
+        monkeypatch.setattr(archive.time, "sleep", inject_during_idle)
+        attempted, totals = execute_download_tasks(
+            context, manifest, Worker(), plan_token="wake", workers=1, batch_size=1,
+            max_tasks=1, max_total_attempts=20, no_discovery=True, no_progress=True,
+        )
+        assert attempted == 1 and totals["empty"] == 1
+        assert calls == [added.task_id] and len(sleeps) == 1
+        assert runtime._blocked_until["fmp"] > time.time()
+    finally:
+        manifest.close()
+
+
 def test_executor_does_not_block_available_provider_behind_cooldown_fallback(
     tmp_path: Path,
 ) -> None:

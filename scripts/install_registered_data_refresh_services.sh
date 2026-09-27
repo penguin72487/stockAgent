@@ -30,6 +30,8 @@ units=(
   stockagent-finmind-quota-snapshot.timer
   stockagent-finmind-source-audit.service
   stockagent-finmind-source-audit.timer
+  stockagent-finmind-announcements.service
+  stockagent-finmind-announcements.timer
   stockagent-crypto-training-refresh.service
   stockagent-crypto-training-refresh.timer
   stockagent-registered-data-daily.service
@@ -48,6 +50,14 @@ units=(
   stockagent-taifex-auxiliary-daily.timer
   stockagent-taifex-public-history.service
   stockagent-taifex-public-history.timer
+  stockagent-taifex-rules.service
+  stockagent-taifex-rules.timer
+  stockagent-keyed-public-catalogs.service
+  stockagent-keyed-public-catalogs.timer
+  stockagent-public-economic-history.service
+  stockagent-public-economic-history.timer
+  stockagent-openbb-public-priority.service
+  stockagent-openbb-public-priority.timer
 )
 if [[ "${1:-}" == "features-only" ]]; then
   # A targeted deployment must not reinstall unrelated dirty service templates
@@ -76,9 +86,19 @@ elif [[ "${1:-}" == "finlab-only" ]]; then
 elif [[ "${1:-}" == "finmind-only" ]]; then
   units=(stockagent-finmind-free.service stockagent-finmind-complement.service stockagent-finmind-sponsor.service
          stockagent-finmind-quota-snapshot.service stockagent-finmind-quota-snapshot.timer
-         stockagent-finmind-source-audit.service stockagent-finmind-source-audit.timer)
+         stockagent-finmind-source-audit.service stockagent-finmind-source-audit.timer
+         stockagent-finmind-announcements.service stockagent-finmind-announcements.timer)
+elif [[ "${1:-}" == "finmind-announcements-only" ]]; then
+  units=(stockagent-finmind-announcements.service stockagent-finmind-announcements.timer)
+elif [[ "${1:-}" == "taifex-rules-only" ]]; then
+  units=(stockagent-taifex-rules.service stockagent-taifex-rules.timer)
+elif [[ "${1:-}" == "keyed-public-catalogs-only" ]]; then
+  units=(stockagent-keyed-public-catalogs.service stockagent-keyed-public-catalogs.timer)
+elif [[ "${1:-}" == "public-economic-only" ]]; then
+  units=(stockagent-public-economic-history.service stockagent-public-economic-history.timer
+         stockagent-openbb-public-priority.service stockagent-openbb-public-priority.timer)
 elif [[ $# -gt 0 ]]; then
-  echo "usage: $0 [features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only]" >&2
+  echo "usage: $0 [features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only|finmind-announcements-only|taifex-rules-only|keyed-public-catalogs-only|public-economic-only]" >&2
   exit 2
 fi
 temporary_dir="$(mktemp -d)"
@@ -108,7 +128,7 @@ if [[ "${1:-}" == "finmind-only" || $# -eq 0 ]]; then
 fi
 systemd-analyze verify "${verify_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
-if [[ "${1:-}" != "intraday-timer-only" ]]; then
+if [[ "${1:-}" != "intraday-timer-only" && "${1:-}" != "finmind-announcements-only" && "${1:-}" != "taifex-rules-only" && "${1:-}" != "keyed-public-catalogs-only" && "${1:-}" != "public-economic-only" ]]; then
   chmod 0755 \
     "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
     "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
@@ -121,6 +141,26 @@ if [[ "${1:-}" != "intraday-timer-only" ]]; then
     "$repo_root/scripts/run_taifex_public_history.sh"
 fi
 systemctl daemon-reload
+if [[ "${1:-}" == "public-economic-only" ]]; then
+  systemctl enable --now stockagent-public-economic-history.timer stockagent-openbb-public-priority.timer
+  echo "[registered-data] economic history and canonical OpenBB planner timers enabled; trading services untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "keyed-public-catalogs-only" ]]; then
+  systemctl enable --now stockagent-keyed-public-catalogs.timer
+  echo "[registered-data] bounded catalog timer enabled; global bulk and trading services left untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "taifex-rules-only" ]]; then
+  systemctl enable --now stockagent-taifex-rules.timer
+  echo "[registered-data] TAIFEX rule archive timer enabled; trading services left untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "finmind-announcements-only" ]]; then
+  systemctl enable --now stockagent-finmind-announcements.timer
+  echo "[registered-data] FinMind announcement timer enabled; data workers left untouched"
+  exit 0
+fi
 if [[ "${1:-}" == "features-only" ]]; then
   systemctl enable --now stockagent-registered-data-features.timer
   echo "[registered-data] crypto feature timer enabled; existing jobs left untouched"
@@ -149,7 +189,7 @@ if [[ "${1:-}" == "finlab-only" ]]; then
   exit 0
 fi
 if [[ "${1:-}" == "finmind-only" ]]; then
-  systemctl enable --now stockagent-finmind-free.service stockagent-finmind-complement.service stockagent-finmind-sponsor.service stockagent-finmind-quota-snapshot.timer stockagent-finmind-source-audit.timer
+  systemctl enable --now stockagent-finmind-free.service stockagent-finmind-complement.service stockagent-finmind-sponsor.service stockagent-finmind-quota-snapshot.timer stockagent-finmind-source-audit.timer stockagent-finmind-announcements.timer
   echo "[registered-data] FinMind Free and Sponsor history services enabled"
   exit 0
 fi
@@ -159,6 +199,7 @@ systemctl enable --now \
   stockagent-finmind-sponsor.service \
   stockagent-finmind-quota-snapshot.timer \
   stockagent-finmind-source-audit.timer \
+  stockagent-finmind-announcements.timer \
   stockagent-crypto-training-refresh.timer \
   stockagent-registered-data-daily.timer \
   stockagent-registered-data-intraday.timer \
@@ -167,7 +208,11 @@ systemctl enable --now \
   stockagent-wsl-backfill-memory-reclaim.timer \
   stockagent-binance-public-archive.timer \
   stockagent-taifex-auxiliary-daily.timer \
-  stockagent-taifex-public-history.timer
+  stockagent-taifex-public-history.timer \
+  stockagent-taifex-rules.timer \
+  stockagent-keyed-public-catalogs.timer \
+  stockagent-public-economic-history.timer \
+  stockagent-openbb-public-priority.timer
 
 if [[ "${START_DATA_REFRESH_NOW:-1}" == "1" ]]; then
   systemctl start --no-block stockagent-registered-data-daily.service

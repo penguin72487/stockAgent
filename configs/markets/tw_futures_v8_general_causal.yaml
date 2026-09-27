@@ -1,0 +1,22 @@
+# Controlled extension of the same v5 futures trainer and exact integer ledger.
+# No current OPEN enters the model; no forced gross, top-K, or hard projection.
+base_config: tw_futures_v8_general.yaml
+experiment_name: tw-futures-v8-general-causal-denomination-rms
+
+data:
+  tw_futures_denomination_context_basis: prior_settlement
+
+training:
+  financial_transformer:
+    futures_denomination_aware_output: true
+    futures_denomination_hard_projection: false
+    futures_feature_rms_normalization: true
+  transformer_base_portfolio:
+    futures_denomination_aware_output: true
+    futures_denomination_hard_projection: false
+    futures_feature_rms_normalization: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_causal
+  start_fold: 10
+  resume: true

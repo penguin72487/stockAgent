@@ -560,6 +560,8 @@ run_frankfurter_incremental() {
     cmd=(
       "$PYTHON_BIN" downloader/download_forex_frankfurter.py
       --mode daily-update
+      --start-date 1999-01-04
+      --official-history
       --output-dir "$FRANKFURTER_OUTPUT_DIR"
       --symbols-file "$FRANKFURTER_SYMBOLS_FILE"
       --end-date "$today"

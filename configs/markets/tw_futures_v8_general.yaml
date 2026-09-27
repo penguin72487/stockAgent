@@ -45,8 +45,12 @@ training:
   compile_loss: false
   backtest_compile: false
   eval_backtest_compile: false
-  cache_train_tensors_on_gpu: false
-  cache_eval_tensors_on_gpu: false
+  # Fold 10: dual RTX 5090, global batch 32, exact six-epoch parity.
+  # Keep the chronological ledger eager; capture launches and fuse funding only.
+  futures_cuda_graph: true
+  futures_funding_compile: true
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
   pretrained_initialization_root: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5
   pretrained_initialization_fold_policy: matching_train_and_validation_years
   pretrained_initialization_feature_adapter: identity_by_feature_name

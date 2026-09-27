@@ -68,10 +68,10 @@ class FinLabHistoryTest(unittest.TestCase):
                 {"observed_at_utc": now.isoformat(), "keys": ["broker_transactions"]},
                 {}, root, now=now, refresh_days=1,
             )
-            self.assertEqual(blocked["state"], "general_work_blocked")
+            self.assertEqual(blocked["state"], "general_work_pending")
             self.assertEqual(blocked["missing_receipts"], 1)
-            self.assertEqual(blocked["deferred_keys"], 1)
-            self.assertEqual(blocked["required_blocked"], 1)
+            self.assertEqual(blocked["deferred_keys"], 0)
+            self.assertEqual(blocked["required_blocked"], 0)
             self.assertFalse(blocked["supplemental_allowed"])
 
     def test_pending_cli_uses_local_discovery_without_provider_query(self):
@@ -269,15 +269,15 @@ class FinLabHistoryTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(json.loads(run_path.read_text())["state"], "partial")
 
-    def test_oversized_broker_table_is_visible_but_not_auto_retried(self):
-        self.assertIn("broker_transactions", AUTOMATICALLY_DEFERRED_KEYS)
+    def test_oversized_broker_table_uses_bounded_adapter_and_is_auto_scheduled(self):
+        self.assertNotIn("broker_transactions", AUTOMATICALLY_DEFERRED_KEYS)
         with tempfile.TemporaryDirectory() as directory:
             pending = sync_selection(
                 ["broker_transactions", "small:key"], {}, Path(directory),
                 now=datetime(2026, 9, 23, 12, tzinfo=UTC),
                 refresh_days=1, retry_unavailable=False,
             )
-        self.assertEqual(pending, ["small:key"])
+        self.assertEqual(pending, ["broker_transactions", "small:key"])
 
     def test_all_candidates_are_distinct(self):
         catalog = load_catalog()
@@ -350,7 +350,8 @@ class FinLabHistoryTest(unittest.TestCase):
             downloaded = _finlab_candidate_sources(root, now=datetime.now())
             self.assertEqual(downloaded[0]["record_stats"]["count"], 1)
             self.assertEqual(downloaded[0]["record_stats"]["first"], "2014-M01")
-            self.assertEqual(downloaded[0]["status"], "legacy")
+            self.assertEqual(downloaded[0]["status"], "stale")
+            self.assertIn("快取", downloaded[0]["status_label"])
             with patch("finlab.data.get", return_value=source):
                 fetch_one("extra:field", root / "data_finlab")
             expanded = _finlab_candidate_sources(root, now=datetime.now())
@@ -435,7 +436,7 @@ class FinLabHistoryTest(unittest.TestCase):
             assert len(rows) == 3
             by_key = {row["title"]: row for row in rows}
             assert by_key["extra:field"]["finlab_acquisition_state"] == "pending"
-            assert by_key["after_market_fixed_price:資料來源"]["finlab_acquisition_state"] == "deferred_resource"
+            assert by_key["after_market_fixed_price:資料來源"]["finlab_acquisition_state"] == "pending"
             assert all(row["registry_alias"] for row in rows)
             summary = _finlab_acquisition_status(
                 root, rows, now=now,
@@ -447,7 +448,7 @@ class FinLabHistoryTest(unittest.TestCase):
             assert summary["downloaded"] == 1
             assert summary["not_downloaded"] == 2
             assert summary["ratio"] == 1 / 3
-            assert summary["deferred_resource"] == 1
+            assert summary["deferred_resource"] == 0
             assert summary["quota_remaining_mb"] == 1000
             assert summary["cold_publish_configured"] is False
             assert summary["eta"]["remaining_seconds"] is None
@@ -545,7 +546,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 ["missing:field", "later:field"],
             )
 
-    def test_sync_selection_defers_known_unbounded_non_feature_metadata(self):
+    def test_sync_selection_schedules_bounded_metadata_after_numeric_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(
                 sync_selection(
@@ -553,7 +554,7 @@ class FinLabHistoryTest(unittest.TestCase):
                     {}, Path(directory), now=datetime.now(UTC), refresh_days=1,
                     retry_unavailable=False,
                 ),
-                ["after_market_fixed_price:成交價"],
+                ["after_market_fixed_price:成交價", "after_market_fixed_price:資料來源"],
             )
 
     def test_quota_limited_refresh_visits_oldest_extra_before_alphabetical_prefix(self):
@@ -722,7 +723,7 @@ class FinLabHistoryTest(unittest.TestCase):
                                   retry_unavailable=False) == []
             assert sync_selection([key], {}, root, now=now + timedelta(minutes=31),
                                   refresh_days=1, retry_unavailable=False) == [key]
-            assert "after_market_fixed_price:市場別" in AUTOMATICALLY_DEFERRED_KEYS
+            assert "after_market_fixed_price:市場別" not in AUTOMATICALLY_DEFERRED_KEYS
 
     def test_next_run_uses_earlier_monotonic_retry_timer(self):
         with patch("stockagent.live.data_monitor_dashboard.clock.monotonic", return_value=1000.0):
@@ -814,7 +815,7 @@ class FinLabHistoryTest(unittest.TestCase):
             assert summary["catalog_total"] == 8
             assert summary["not_downloaded"] == 8
             assert summary["not_downloaded_by_reason"] == {
-                "pending": 0, "deferred_resource": 2, "deferred_windowed": 2,
+                "pending": 2, "deferred_resource": 0, "deferred_windowed": 2,
                 "partial_windowed": 0,
                 "partial_windowed": 0,
                 "provider_error": 2, "provider_empty": 0,

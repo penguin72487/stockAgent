@@ -215,12 +215,13 @@ def _project_temporal_basis_model_config(
         projected.pop("feature_bottleneck_dim", None)
     if not bool(projected.get("causal_feature_rms_normalization", False)):
         # The disabled branch is the exact historical forward: no scale or
-        # active-mask buffers are consulted.  The threshold and epsilon are
-        # consequently unreachable configuration, so adding their defaults to
-        # the dataclass must not invalidate older inference checkpoints.
+        # active-mask buffers are consulted. Keep the shared threshold/epsilon
+        # when the futures normalizer still consumes them; otherwise omit these
+        # defaults to preserve older inference checkpoints.
         projected.pop("causal_feature_rms_normalization", None)
-        projected.pop("causal_feature_min_active_dates", None)
-        projected.pop("causal_feature_scale_epsilon", None)
+        if not bool(projected.get("futures_feature_rms_normalization", False)):
+            projected.pop("causal_feature_min_active_dates", None)
+            projected.pop("causal_feature_scale_epsilon", None)
     if str(projected.get("causal_feature_compression", "none")) == "none":
         # A disabled compression is the exact historical feature path.
         projected.pop("causal_feature_compression", None)
@@ -230,6 +231,7 @@ def _project_temporal_basis_model_config(
     for field_name in (
         "futures_denomination_aware_output",
         "futures_current_open_feature",
+        "futures_feature_rms_normalization",
     ):
         if not bool(projected.get(field_name, False)):
             # These futures-only branches were added after the cash-equity
@@ -280,6 +282,10 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if config.data.tw_futures_denomination_context_basis == "current_open":
+        snapshot["data"].pop("tw_futures_denomination_context_basis", None)
+    if not config.data.tw_futures_require_prior_capacity:
+        snapshot["data"].pop("tw_futures_require_prior_capacity", None)
     if config.data.overnight_decision_time == "13:25":
         snapshot["data"].pop("overnight_decision_time", None)
     if config.data.overnight_1325_missing_price_policy == "reject":
@@ -369,13 +375,16 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
             CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION,
+            CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION,
         )
 
         return {
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_all_futures",
             "contract_version": int(
-                CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION
+                CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION
+                if config.training.transformer_base_portfolio.futures_feature_rms_normalization
+                else CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION
                 if (
                     config.training.transformer_base_portfolio
                     .futures_current_open_feature
@@ -1056,6 +1065,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "accounting": "continuous_notional_research_surrogate",
         }
     if execution_mode == "tw_stock_context_futures_portfolio":
+        if trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            contract["futures_margin_contract"] = {
+                "version": 1,
+                "capital_basis": "signed_initial_margin_budget",
+                "rules_path": trading.tw_futures_portfolio_margin_rules_path,
+                "broker_multiplier": trading.tw_futures_portfolio_broker_margin_multiplier,
+                "liquidation_ratio": trading.tw_futures_portfolio_margin_liquidation_ratio,
+                "marking": "official_settlement_then_next_open_gap",
+                "margin_call_policy": "next_open_flat_no_external_capital",
+                "surrogate": "grouped_margin_cash_solvency_recovery_v2",
+                "risk_clock": "daily_open_and_settlement_only",
+            }
         if (config.training.model_name == "financial_transformer"
                 or trading.tw_futures_portfolio_holding_policy == "intraday"):
             contract["futures_holding_policy"] = {
@@ -1082,11 +1103,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION,
         )
 
         contract["taiwan_stock_context_futures_portfolio"] = {
             "cross_domain_contract_version": int(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION
+                if config.data.tw_futures_require_prior_capacity
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
                 if config.data.tw_futures_expiry_settlement_valuation
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
                 if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
@@ -1112,14 +1140,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
             ),
             "candidate_feature_columns": list(
-                TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+                TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
                 if config.data.tw_futures_current_open_feature
                 else TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
                 if trading.tw_futures_portfolio_integer_contracts
                 else TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
             ),
             "candidate_clock": (
-                "market_features_t_minus_1_plus_session_t_08:45_futures_open"
+                "completed_futures_session_t_minus_1_and_prior_settlement_denomination"
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else "market_features_t_minus_1_plus_session_t_08:45_futures_open"
                 if config.data.tw_futures_current_open_feature
                 else "market_features_t_minus_1_plus_09:00_known_denomination_metadata"
                 if trading.tw_futures_portfolio_integer_contracts
@@ -1139,7 +1171,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "configured_daily_futures_execution_proxy"
             ),
             "policy_mask": (
-                "prior_slot_context_same_physical_contract_valid_current_open_"
+                "prior_slot_context_same_physical_contract_and_positive_prior_volume_capacity"
+                if config.data.tw_futures_require_prior_capacity
+                else "prior_slot_context_same_physical_contract_valid_current_open_"
                 "and_physical_contract_carry_valuation_integrity"
                 if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
                 else "prior_slot_context_same_physical_contract_and_valid_current_open"
@@ -1229,7 +1263,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "model_fixed_reference_capital_then_exact_integer_executor"
             ),
             "denomination_clock": (
-                "08:45_same_print_group_tier_and_open_notional_research_proxy"
+                "prior_settlement_dated_multiplier_and_known_fees_executor_open_only"
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else "08:45_same_print_group_tier_and_open_notional_research_proxy"
                 if config.data.tw_futures_current_open_feature
                 else "09:00_known_group_tier_and_observed_08:45_open_notional"
                 if trading.tw_futures_portfolio_integer_contracts
@@ -1245,6 +1281,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "disabled"
             ),
         }
+        if trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            from stockagent.data.tw_futures_margin import MARGIN_FEATURE_COLUMNS
+            contract["taiwan_stock_context_futures_portfolio"].update({
+                "candidate_feature_columns": list(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS + MARGIN_FEATURE_COLUMNS),
+                "candidate_clock": "prior_completed_prices_and_rules_known_before_0845",
+                "accounting": "integer_initial_margin_budget_daily_settlement_and_overnight_gap_v1",
+                "integer_training_surrogate": "grouped_margin_cash_solvency_recovery_v2",
+                "integer_training_forward": "exact_integer_margin_account_v3_marked_boundary",
+                "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
+                "denomination_clock": "prior_settlement_margin_ratios_model_current_open_executor_only",
+                "unfilled_notional": "unused_margin_budget_no_cross_group_redistribution",
+            })
     if execution_mode in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
@@ -2233,6 +2281,8 @@ def _checkpoint_manifest(
                 )
             if daily.intraday_session_mask is not None:
                 panel_arrays["stock_context_futures_intraday_session_mask"] = _array_content_fingerprint(daily.intraday_session_mask)
+            if daily.margin_session_mask is not None:
+                panel_arrays["stock_context_futures_margin_session_mask"] = _array_content_fingerprint(daily.margin_session_mask)
             panel_arrays.update(
                 {
                     "stock_context_futures_symbols": _array_content_fingerprint(

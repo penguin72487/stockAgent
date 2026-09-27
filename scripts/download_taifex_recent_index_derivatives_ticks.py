@@ -382,7 +382,16 @@ def _parse_time(value: str, *, row_number: int) -> int:
     return int(value)
 
 
-def _session_for_time(value: int, *, row_number: int) -> str:
+def _session_for_time(value: int, *, row_number: int,
+                      day_minutes: tuple[int, int] | None = None) -> str:
+    if day_minutes is not None:
+        start, end = (hour * 10000 + minute * 100 for hour, minute in
+                      (divmod(v, 60) for v in day_minutes))
+        if start <= value <= end:
+            return "day"
+        if value >= 150000 or value < start:
+            return "night"
+        raise ValueError(f"row {row_number}: event falls outside dated futures sessions")
     if value >= 150000 or value < 84500:
         return "night"
     if value <= 134500:
@@ -556,6 +565,7 @@ def _parse_futures_rows(
     source_sha256: str,
     products: tuple[str, ...] = ("TX",),
     outright_contracts_only: bool = False,
+    day_sessions: dict[str, tuple[int, int]] | None = None,
 ) -> pl.DataFrame:
     normalized_products = tuple(str(value).strip().upper() for value in products)
     if not normalized_products or any(not value for value in normalized_products):
@@ -602,7 +612,10 @@ def _parse_futures_rows(
             raise ValueError(f"row {row_number}: invalid auction marker {cells[8]!r}")
         raw["event_date_raw"].append(cells[0])
         raw["event_time"].append(cells[3])
-        raw["session"].append(_session_for_time(event_time, row_number=row_number))
+        raw["session"].append(_session_for_time(
+            event_time, row_number=row_number,
+            day_minutes=day_sessions[cells[1]] if day_sessions is not None else None,
+        ))
         raw["product"].append(cells[1])
         raw["delivery_month_week"].append(cells[2])
         is_spread = "/" in cells[2]
@@ -639,6 +652,7 @@ def _parse_zip(
     source_sha256: str,
     futures_products: tuple[str, ...] = ("TX",),
     futures_outright_contracts_only: bool = False,
+    futures_day_sessions: dict[str, tuple[int, int]] | None = None,
 ) -> pl.DataFrame:
     expected_member = (
         f"OptionsDaily_{trading_date.strftime('%Y_%m_%d')}.csv"
@@ -661,6 +675,7 @@ def _parse_zip(
                 source_sha256=source_sha256,
                 products=futures_products,
                 outright_contracts_only=futures_outright_contracts_only,
+                day_sessions=futures_day_sessions,
             )
 
 

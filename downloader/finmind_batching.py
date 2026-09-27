@@ -8,9 +8,10 @@ therefore are deliberately absent from this allowlist.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Generic, Iterable, Mapping, Protocol, TypeVar
+import uuid
 
 
 class PartitionTask(Protocol):
@@ -39,8 +40,9 @@ class RangeContract:
     max_response_bytes: int = 64 * 1024 * 1024
 
 
-# These three endpoints have documented range queries AND locally verified
-# inclusive end_date behavior; see finmind_partition_semantics_2026-09-27.json.
+# Only allow documented range queries with locally verified inclusive end_date
+# behavior. Full-span and event-boundary probes are retained in data_quality;
+# a long response alone is not proof that the last requested day is included.
 # No artificial calendar-length ceiling. Protect memory with a bounded decoded
 # HTTP body and a row safety check; learn smaller batches only after actual
 # resource/transport failures. These are local safeguards, not provider limits.
@@ -56,6 +58,42 @@ RANGE_CONTRACTS = {
     "TaiwanOptionVix": RangeContract(
         "month", date(2026, 3, 1), None, 1_000_000,
         "https://finmind.github.io/tutor/TaiwanMarket/Derivative/",
+    ),
+    # Full-span request vs hash-verified local overlap evidence:
+    # artifacts/data_quality/finmind_max_ranges_20260927T022704903318Z.json
+    "TaiwanTotalExchangeMarginMaintenance": RangeContract(
+        "year", date(2001, 1, 5), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Chip/",
+    ),
+    "TaiwanStockCapitalReductionReferencePrice": RangeContract(
+        "year", date(2011, 1, 1), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Fundamental/",
+    ),
+    "TaiwanStockSuspended": RangeContract(
+        "year", date(2011, 10, 6), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
+    ),
+    "TaiwanStockConvertibleBondPutProvision": RangeContract(
+        "year", date(2011, 6, 22), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/ConvertibleBond/",
+    ),
+    "TaiwanStockInfoWithWarrantSummary": RangeContract(
+        "month", date(2011, 1, 3), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
+    ),
+    # Full-span schema/multiset parity AND rows on the exact inclusive end:
+    # artifacts/data_quality/finmind_max_ranges_20260927T024359706616Z.json.
+    "TaiwanStockMarginShortSaleSuspension": RangeContract(
+        "year", date(2015, 1, 1), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Chip/",
+    ),
+    "TaiwanStockDayTradingSuspension": RangeContract(
+        "year", date(2014, 6, 1), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
+    ),
+    "TaiwanStockDispositionSecuritiesPeriod": RangeContract(
+        "year", date(2001, 1, 1), None, 1_000_000,
+        "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
     ),
 }
 BATCH_CONTRACT_VERSION = 2
@@ -92,6 +130,7 @@ class RangeBatch(Generic[TaskT]):
     start_date: date
     end_date: date
     observed_through: date | None = None
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def params(self) -> dict[str, str]:
         return {
@@ -108,6 +147,7 @@ class RangeBatch(Generic[TaskT]):
             "request_end_date": self.end_date.isoformat(),
             "request_end_inclusive": True,
             "request_count": 1,
+            "request_id": self.request_id,
             "partition_count": len(self.tasks),
             "partitions": [task.partition for task in self.tasks],
             "documentation_url": RANGE_CONTRACTS[self.dataset].documentation_url,

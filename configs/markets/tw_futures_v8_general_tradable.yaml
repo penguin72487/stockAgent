@@ -1,0 +1,12 @@
+# One-factor feasibility experiment: known zero-capacity actions are unavailable.
+# Preserve the original model and features; retain the corrected exact ledger.
+base_config: tw_futures_v8_general.yaml
+experiment_name: tw-futures-v8-general-prior-capacity
+
+data:
+  tw_futures_require_prior_capacity: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_tradable
+  start_fold: 10
+  resume: true

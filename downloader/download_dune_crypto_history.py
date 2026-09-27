@@ -49,6 +49,40 @@ TERMINAL_FAILURE_STATES = {
 }
 
 
+def acquisition_progress_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Migration/projection for receipts that formerly counted attempts as fills."""
+    counts = payload.get("status_counts") or {}
+    acquired = int(counts.get("complete", 0))
+    total = int(payload.get("total", 0))
+    blocked = payload.get("state") in {"blocked", "failed", "partial"}
+    processed = sum(int(value) for value in counts.values())
+    elapsed = max(0.0, float(payload.get("elapsed_seconds") or 0))
+    return {**payload, "processed": processed,
+            "current": acquired, "acquired_partitions": acquired,
+            "phase": payload.get("state") if blocked else payload.get("phase"),
+            "items_per_second": acquired / elapsed if elapsed else 0.0,
+            "processed_per_second": processed / elapsed if elapsed else 0.0,
+            "ratio": acquired / total if total else 1.0,
+            "remaining_seconds": None if blocked else payload.get("remaining_seconds"),
+            "estimated_complete_at_utc": None if blocked else payload.get("estimated_complete_at_utc"),
+            "basis": "Acquired due partitions only; processed attempts are separate; unknown permission/credit wait has no ETA."}
+
+
+class DuneAcquisitionProgress(PersistentProgress):
+    def update(self, phase: str, status: str, *, count: int = 1) -> None:
+        with self._lock:
+            increment = max(0, int(count))
+            if status == "complete":
+                self.current = min(self.total, self.current + increment)
+            self.status_counts[status] = self.status_counts.get(status, 0) + increment
+            self._write("running", phase)
+
+    def _write(self, state: str, phase: str) -> None:
+        super()._write(state, phase)
+        payload = json.loads(self.path.read_text())
+        _atomic_json(self.path, acquisition_progress_fields(payload))
+
+
 @dataclass(frozen=True, slots=True)
 class QueryContract:
     query_id: str
@@ -500,8 +534,9 @@ class DuneClient:
             time.sleep(self.poll_seconds)
 
     def results(self, execution_id: str) -> Iterator[tuple[int, dict[str, Any]]]:
-        rows: list[dict[str, Any]] = []
         offset = 0
+        received = 0
+        expected_total: int | None = None
         while True:
             query = urlencode({"limit": self.page_size, "offset": offset})
             payload = self._request(
@@ -509,9 +544,18 @@ class DuneClient:
             )
             result = payload.get("result") or {}
             page_rows = result.get("rows") or []
-            if not isinstance(page_rows, list):
+            if not isinstance(page_rows, list) or any(not isinstance(row, dict) for row in page_rows):
                 raise RuntimeError("Dune result rows are not a list")
-            rows.extend(row for row in page_rows if isinstance(row, dict))
+            # The consumer owns persistence. Retaining every previous page here
+            # doubled memory without contributing to the returned iterator.
+            metadata = result.get("metadata") or {}
+            total = metadata.get("total_row_count")
+            if total is not None:
+                total = int(total)
+                if total < 0 or (expected_total is not None and total != expected_total):
+                    raise RuntimeError("Dune result total changed during pagination")
+                expected_total = total
+            received += len(page_rows)
             yield offset, payload
             next_offset = payload.get("next_offset")
             if next_offset is None:
@@ -519,8 +563,13 @@ class DuneClient:
             if next_offset is None and len(page_rows) >= self.page_size:
                 next_offset = offset + len(page_rows)
             if next_offset is None or not page_rows:
+                if expected_total is not None and received != expected_total:
+                    raise RuntimeError("Dune result pagination ended before declared total")
                 break
-            offset = int(next_offset)
+            next_value = int(next_offset)
+            if next_value != offset + len(page_rows):
+                raise RuntimeError("Dune result pagination repeats or skips rows")
+            offset = next_value
 
 
 def _render_sql(partition: Partition) -> str:
@@ -734,12 +783,12 @@ def main() -> int:
     ]
     if args.max_partitions > 0:
         due = due[: args.max_partitions]
-    progress = PersistentProgress(
+    progress = DuneAcquisitionProgress(
         output_dir / "progress.json",
         label="Dune crypto history",
         total=len(due),
         unit="partitions",
-        basis="ETA uses completed calendar partitions; Dune queueing and credit exhaustion can change it.",
+        basis="Only acquired partitions advance completion; failed or gated attempts do not. ETA excludes unknown account/credit waiting time.",
     )
     client = DuneClient(
         api_key,
@@ -825,7 +874,7 @@ def main() -> int:
             result = PartitionResult(
                 partition.contract.query_id,
                 partition.partition_id,
-                "not_started_subscription",
+                "not_started_credits" if results[0].status == "blocked_credits" else "not_started_subscription",
                 0,
                 message="not submitted after subscription capability gate",
             )
@@ -852,6 +901,7 @@ def main() -> int:
             "blocked_subscription",
             "not_started",
             "not_started_subscription",
+            "not_started_credits",
         }
         for item in results
     )
@@ -867,7 +917,7 @@ def main() -> int:
         "completed_partitions": sum(item.status == "complete" for item in results),
         "failed_partitions": sum(item.status == "failed" for item in results),
         "blocked_credit_partitions": sum(
-            item.status == "blocked_credits" for item in results
+            item.status in {"blocked_credits", "not_started_credits"} for item in results
         ),
         "blocked_subscription_partitions": sum(
             item.status in {"blocked_subscription", "not_started_subscription"}
