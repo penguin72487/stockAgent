@@ -24,6 +24,22 @@ from stockagent.live.tw_day_trade_simulation import (
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_replay_parser_accepts_isolated_market_filter() -> None:
+    args = replay.build_parser().parse_args(
+        [
+            "--state-dir", "artifacts/candidates/new_strategy/state",
+            "--start-date", "2026-09-24",
+            "--end-date", "2026-09-24",
+            "--only-market", "tw_day_trade_v8_annual_log_cash",
+            "--single-market-signal-dir", "artifacts/candidates/new_strategy/signals",
+            "--include-disabled",
+        ]
+    )
+    assert args.only_market == ["tw_day_trade_v8_annual_log_cash"]
+    assert args.single_market_signal_dir == Path("artifacts/candidates/new_strategy/signals")
+    assert args.include_disabled is True
+
+
 def test_benchmark_history_timestamp_only_rebuild_is_a_noop(tmp_path: Path) -> None:
     destination = tmp_path / "benchmark_history.json"
     original = {
@@ -1039,6 +1055,85 @@ def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
             "symbol_count": 1,
         }
     ]
+
+
+@pytest.mark.parametrize("layout", ["partition", "chunk"])
+@pytest.mark.parametrize(
+    ("raw_volume", "amount", "canonical_shares", "expected_shares"),
+    [
+        (1_000.0, 100_500.0, None, 1_000.0),
+        (1.0, 100_500.0, None, 1_000.0),
+        (1.0, None, None, None),
+        (1.0, 5_000.0, None, None),
+        (1_000.0, None, 1_000.0, 1_000.0),
+        (1.0, 100_500.0, 1_000.5, None),
+    ],
+)
+def test_intraday_legacy_volume_requires_observed_unit_proof(
+    tmp_path: Path,
+    layout: str,
+    raw_volume: float,
+    amount: float | None,
+    canonical_shares: float | None,
+    expected_shares: float | None,
+) -> None:
+    root = tmp_path / "minute"
+    if layout == "partition":
+        source = root / "trade_date=2026-02-25" / "data.parquet"
+    else:
+        source = root / "minute_chunks" / "2330" / "2026-02-01_2026-02-28.parquet"
+    source.parent.mkdir(parents=True)
+    values = {
+        "symbol": ["2330"],
+        "ts": [datetime(2026, 2, 25, 13, 24)],
+        "Open": [100.0], "High": [102.0], "Low": [99.0], "Close": [101.0],
+        "Volume": [raw_volume], "contract_unit": [1_000.0],
+    }
+    if amount is not None:
+        values["Amount"] = [amount]
+    if canonical_shares is not None:
+        values["volume_shares"] = [canonical_shares]
+    pl.DataFrame(values).write_parquet(source)
+
+    bars, receipt = replay._minute_bar_rows(
+        (root,), trading_date=date(2026, 2, 25), symbols={"2330"},
+    )
+
+    if expected_shares is None:
+        assert bars == {}
+        assert receipt["missing_symbols"] == ["2330"]
+        assert receipt["ignored_unverified_volume_rows"] == 1
+        assert receipt["ignored_zero_volume_rows"] == 0
+    else:
+        row = bars["2330"]["2026-02-25T13:24+08:00"]
+        assert row["volume_shares"] == expected_shares
+        assert row["vwap"] == (100.5 if amount is not None else 101.0)
+        assert receipt["ignored_unverified_volume_rows"] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"raw_volume": 1.0, "amount": 10_000.0, "low": 10.0, "high": 100.0},
+        {"raw_volume": 1.5, "amount": 150.0, "low": 99.0, "high": 101.0},
+        {"raw_volume": 0.001, "amount": 1.0, "low": 1.0, "high": 10.0},
+        {"volume_shares": 1.5, "amount": 150.0},
+        {"volume_shares": 0.0000001, "amount": 0.00001},
+        {"volume_shares": 1.5, "raw_volume": 1.0, "amount": 100_000.0,
+         "low": 99.0, "high": 101.0},
+    ],
+)
+def test_minute_price_rejects_ambiguous_or_fractional_share_capacity(kwargs) -> None:
+    price, method, shares = replay.resolve_observed_minute_execution_price(
+        close=100.0, contract_unit=1_000.0, **kwargs,
+    )
+    assert (price, method, shares) == (100.0, "minute_close", None)
+
+
+def test_minute_price_share_tolerance_matches_ingestion() -> None:
+    assert replay.resolve_observed_minute_execution_price(
+        close=100.0, amount=100_000.0, volume_shares=1_000.0000001,
+    ) == (100.0, "minute_vwap", 1_000.0)
 
 
 def test_intraday_zero_volume_padding_cannot_refresh_price_or_trigger_orders(tmp_path):

@@ -35,6 +35,34 @@ def execution_feature_lag(execution_mode: str) -> int:
     return 0 if mode in {"naive", "crypto_perpetual"} else 1
 
 
+def _crypto_lifecycle_force_exit_mask(
+    alive_mask: np.ndarray,
+    finite_forward_return: np.ndarray,
+) -> np.ndarray:
+    """Close a disappearing contract at its final observable execution mark.
+
+    A crypto row owns the execution mark at ``t`` and the return label from
+    that mark to ``t+1``.  If the mark exists but the forward label does not,
+    carrying an existing position would require inventing an unobservable
+    liquidation value.  Force the position to cash at the real ``t`` mark and
+    prohibit a same-row re-entry through the executor's force-exit gate.
+
+    The final panel row is intentionally excluded: its missing forward label
+    is the research horizon, not evidence that the contract disappeared.
+    """
+
+    alive = np.asarray(alive_mask, dtype=bool)
+    finite = np.asarray(finite_forward_return, dtype=bool)
+    if alive.shape != finite.shape or alive.ndim != 2:
+        raise ValueError(
+            "crypto lifecycle masks must be matching two-dimensional [T,S] arrays"
+        )
+    force_exit = np.zeros_like(alive, dtype=bool)
+    if alive.shape[0] > 1:
+        force_exit[:-1] = alive[:-1] & ~finite[:-1]
+    return force_exit
+
+
 def _dual_session_return_components(
     panel: PanelData,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -802,6 +830,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             force_exit = np.zeros_like(tradable, dtype=bool)
         elif stock_futures_day_trade_execution:
             force_exit = np.zeros_like(tradable, dtype=bool)
+        elif self.execution_mode == "crypto_perpetual":
+            force_exit = np.asarray(force_exit, dtype=bool).copy()
+            force_exit |= _crypto_lifecycle_force_exit_mask(
+                panel.alive_mask,
+                finite_target,
+            )
         if self.date_indices.size == 0:
             valid_indices = self.date_indices
             if not allow_empty:
@@ -864,6 +898,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 executable_or_terminal = futures_executable[valid_indices].any(
                     axis=1
                 ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
+                intraday_sessions = getattr(stock_context_futures_daily, "intraday_session_mask", None)
+                if intraday_sessions is not None:
+                    # Calendar/source admission owns row selection. A future
+                    # minute with no fill must still contribute a cash day.
+                    executable_or_terminal = np.asarray(intraday_sessions, dtype=bool)[valid_indices]
                 valid_indices = valid_indices[executable_or_terminal]
             elif (valid_indices.size > 0 and stock_futures_day_trade_execution
                   and self.execution_mode != MINUTE_MODE):

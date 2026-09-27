@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, date, datetime, time as wall_time, timedelta
+import errno
 import fcntl
 import hashlib
 import json
@@ -22,11 +23,16 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
-from downloader.artifact_io import atomic_write_json, atomic_write_parquet
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, sha256_file
 from downloader.common import SharedRateLimiter, load_env_file
-from downloader.finmind_account import rate_limiter, verified_account
+from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
+from downloader.finmind_scheduling import fixed_incremental_demand
+from downloader.finmind_volume_units import (
+    ORDER_BOOK_CANONICAL_FIELDS, ORDER_BOOK_DATASET, annotate_stock_share_units,
+)
 
 
 API_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -39,6 +45,8 @@ SESSION_DATASETS = (
 )
 HISTORY_START = date(2005, 1, 1)
 SCHEMA_VERSION = 1
+SESSION_GRID_CONTRACT_VERSION = 2
+SESSION_GRAINS = frozenset({"1m", "15s", "10s", "5s"})
 
 
 class ProviderError(RuntimeError):
@@ -242,8 +250,17 @@ def _load_calendar(
     return dates, 1
 
 
+def _order_book_step(day: date) -> int:
+    """FinMind's documented historical cadence, not an inferred gap size."""
+    if day < date(2011, 1, 17):
+        return 60
+    if day < date(2014, 2, 24):
+        return 15
+    return 10 if day < date(2014, 12, 29) else 5
+
+
 def _validated_session_rows(dataset: str, day: date, rows: list[dict[str, Any]]) -> tuple[str, str | None, int | None, int | None]:
-    """Accept only exact 1m or 5s grids; retain any imperfect raw response."""
+    """Accept exact source-native grids; retain every imperfect raw response."""
     if not rows:
         return "provider_empty", None, None, None
     seconds: list[int] = []
@@ -271,11 +288,14 @@ def _validated_session_rows(dataset: str, day: date, rows: list[dict[str, Any]])
         seconds.append(stamp.hour * 3600 + stamp.minute * 60 + stamp.second)
     if len(seconds) < 2 or seconds != sorted(set(seconds)):
         return "partial", None, None, None
-    step = seconds[1] - seconds[0]
-    grain = {5: "5s", 60: "1m"}.get(step)
+    # The local index archive shares these dated native TWSE calculation
+    # grids. Use the dated grid, not the first observed delta: losing every
+    # other row must never reclassify a damaged 5s response as complete 10s.
+    step = _order_book_step(day)
+    grain = {5: "5s", 10: "10s", 15: "15s", 60: "1m"}.get(step)
     if grain is None:
         return "partial", None, None, None
-    expected = 3241 if step == 5 else 271
+    expected = (4 * 3600 + 30 * 60) // step + 1
     first, last = 9 * 3600, 13 * 3600 + 30 * 60
     missing = expected - len(seconds)
     if seconds[0] == first and seconds[-1] == last and missing == 0 and all(
@@ -317,7 +337,7 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
                 if isinstance(fetched, str) and (item["last_receipt_at_utc"] is None or fetched > item["last_receipt_at_utc"]):
                     item["last_receipt_at_utc"] = fetched
                 grain = receipt.get("observed_grain")
-                if grain in {"1m", "5s"}:
+                if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
                 continue
             if receipt.get("status") != "complete" and _receipt_usable(receipt, root, now=now):
@@ -329,10 +349,308 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
     return sorted(pending_recent, key=lambda item: (-item[1].toordinal(), item[0])) + pending_old, counts
 
 
+def _session_path(root: Path, dataset: str, day: date) -> Path:
+    return root / "market_intraday" / dataset / f"year={day.year}" / f"date={day}.parquet"
+
+
+def _verified_session_source(root: Path, dataset: str, day: date, receipt: dict[str, Any]) -> Path:
+    path = _session_path(root, dataset, day)
+    if (dataset not in SESSION_DATASETS or receipt.get("dataset") != dataset or receipt.get("date") != str(day)
+            or receipt.get("parquet_path") != str(path.relative_to(root))
+            or not path.resolve().is_relative_to(root.resolve()) or not path.is_file()):
+        raise ValueError("invalid order-book source identity/path")
+    digest = receipt.get("sha256")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or path.stat().st_size != receipt.get("parquet_size_bytes")
+            or sha256_file(path) != digest):
+        raise ValueError("order-book source size/SHA256 mismatch")
+    return path
+
+
+def _verified_order_book_source(root: Path, day: date, receipt: dict[str, Any]) -> Path:
+    return _verified_session_source(root, ORDER_BOOK_DATASET, day, receipt)
+
+
+def _archive_order_book_source(root: Path, day: date, receipt: dict[str, Any]) -> dict[str, str]:
+    """Preserve the verified old source and receipt before an atomic replacement."""
+    if not receipt.get("parquet_path") and isinstance(receipt.get("previous_source"), dict):
+        # A malformed later response may have been preserved as raw JSON only.
+        # Its receipt keeps the exact preceding Parquet version for this case.
+        prior = receipt["previous_source"]
+        digest = prior.get("sha256", "")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("invalid previous order-book source digest")
+        version_root = root / "versions" / ORDER_BOOK_DATASET / str(day)
+        archived = version_root / f"{digest}.parquet"
+        archived_receipt = version_root / f"{digest}.json"
+        if (prior.get("parquet_path") != str(archived.relative_to(root))
+                or prior.get("receipt_path") != str(archived_receipt.relative_to(root))):
+            raise ValueError("invalid previous order-book source paths")
+        old = _read_json(archived_receipt)
+        _verified_order_book_source(root, day, old)
+        if sha256_file(archived) != digest or old.get("sha256") != digest:
+            raise ValueError("previous order-book source hash mismatch")
+        return prior
+    path = _verified_order_book_source(root, day, receipt)
+    receipt_path = root / "receipts" / ORDER_BOOK_DATASET / f"{day}.json"
+    if _read_json(receipt_path) != receipt:
+        raise ValueError("order-book receipt changed during unit normalization")
+    version_root = root / "versions" / ORDER_BOOK_DATASET / str(day)
+    version_root.mkdir(parents=True, exist_ok=True)
+    digest = receipt["sha256"]
+    archived = version_root / f"{digest}.parquet"
+    archived_receipt = version_root / f"{digest}.json"
+    if not archived.exists():
+        try:
+            os.link(path, archived)
+        except OSError as exc:
+            if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
+                raise
+            atomic_write_bytes(archived, path.read_bytes(), durable=True)
+    if archived.stat().st_size != receipt["parquet_size_bytes"] or sha256_file(archived) != digest:
+        raise ValueError("archived order-book source hash mismatch")
+    if not archived_receipt.exists():
+        atomic_write_bytes(archived_receipt, receipt_path.read_bytes(), durable=True)
+    version = _read_json(archived_receipt)
+    if (version.get("dataset") != ORDER_BOOK_DATASET or version.get("date") != str(day)
+            or version.get("sha256") != digest):
+        raise ValueError("archived order-book receipt mismatch")
+    return {"sha256": digest, "parquet_path": str(archived.relative_to(root)),
+            "receipt_path": str(archived_receipt.relative_to(root))}
+
+
+def _order_book_share_table(table: pa.Table) -> tuple[pa.Table, dict[str, Any]]:
+    # Rebuild only our derived columns. Original Arrow arrays/dtypes remain
+    # intact, including null/invalid provider values and order counts.
+    raw = table.drop([name for name in ORDER_BOOK_CANONICAL_FIELDS if name in table.column_names])
+    rows, units = annotate_stock_share_units(ORDER_BOOK_DATASET, raw.to_pylist())
+    result = raw
+    for name in ORDER_BOOK_CANONICAL_FIELDS:
+        dtype = pa.float64() if name.endswith("_twd") else pa.int64()
+        result = result.append_column(name, pa.array([row[name] for row in rows], type=dtype))
+    return result, units
+
+
+def _recover_interrupted_order_book_receipt(
+    root: Path, day: date, old: dict[str, Any],
+) -> bool:
+    """Complete only a proven interrupted local Parquet/receipt pair commit.
+
+    The old sealed source must reconstruct every current column, dtype and row
+    exactly. A changed provider row or canonical quantity remains a hard error.
+    This never replaces the current Parquet or infers provenance for an orphan.
+    """
+    digest = old.get("sha256", "")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)):
+        return False
+    path = _session_path(root, ORDER_BOOK_DATASET, day)
+    receipt_path = root / "receipts" / ORDER_BOOK_DATASET / f"{day}.json"
+    version_root = root / "versions" / ORDER_BOOK_DATASET / str(day)
+    archived = version_root / f"{digest}.parquet"
+    archived_receipt = version_root / f"{digest}.json"
+    if not archived.is_file() or not archived_receipt.is_file():
+        return False
+    if (not archived.resolve().is_relative_to(root.resolve())
+            or not archived_receipt.resolve().is_relative_to(root.resolve())
+            or _read_json(archived_receipt) != old
+            or _read_json(receipt_path) != old
+            or archived.stat().st_size != old.get("parquet_size_bytes")
+            or sha256_file(archived) != digest):
+        raise ValueError("interrupted order-book normalization archive/receipt mismatch")
+    source = pq.ParquetFile(archived).read()
+    if source.num_rows != old.get("rows"):
+        raise ValueError("interrupted order-book normalization source row count mismatch")
+    expected, units = _order_book_share_table(source)
+    if not units["normalization_valid"]:
+        raise ValueError("interrupted order-book normalization has invalid source units")
+
+    def signature() -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    original_signature = signature()
+    current_sha = sha256_file(path)
+    current = pq.ParquetFile(path).read()
+    if not current.equals(expected, check_metadata=True):
+        raise ValueError("interrupted order-book normalization canonical table mismatch")
+    if (signature() != original_signature or sha256_file(path) != current_sha
+            or sha256_file(archived) != digest or _read_json(receipt_path) != old):
+        raise ValueError("interrupted order-book normalization source changed during verification")
+    recovered_at = _iso(_utc_now())
+    archive = {"sha256": digest, "parquet_path": str(archived.relative_to(root)),
+               "receipt_path": str(archived_receipt.relative_to(root))}
+    updated = {
+        **old, "volume_units": units, "parquet_size_bytes": original_signature[2],
+        "sha256": current_sha, "unit_normalized_at_utc": recovered_at,
+        "unit_normalization_previous_source": archive,
+        "unit_normalization_recovery": {
+            "reason": "interrupted_parquet_receipt_commit", "recovered_at_utc": recovered_at,
+            "reconstructed_from_sha256": digest, "verified_new_sha256": current_sha,
+            "canonical_table_equal": True,
+        },
+    }
+    atomic_write_json(receipt_path, updated)
+    return True
+
+
+def normalize_units_local(root: Path) -> dict[str, Any]:
+    """Called under worker.lock; upgrade only existing order-book partitions."""
+    result: dict[str, Any] = {
+        "dataset": ORDER_BOOK_DATASET, "mode": "normalize_units_local", "api_requests": 0,
+        "scanned": 0, "updated": 0, "already_current": 0, "recovered_interrupted": 0,
+        "without_source": 0, "failures": [],
+    }
+    for receipt_path in sorted((root / "receipts" / ORDER_BOOK_DATASET).glob("*.json")):
+        result["scanned"] += 1
+        try:
+            day = date.fromisoformat(receipt_path.stem)
+            old = _read_json(receipt_path)
+            if not old:
+                raise ValueError("invalid order-book receipt JSON")
+            if not old.get("parquet_path"):
+                if old.get("status") in {"complete", "partial"}:
+                    raise ValueError("order-book data receipt lacks source Parquet path")
+                result["without_source"] += 1
+                continue
+            try:
+                path = _verified_order_book_source(root, day, old)
+            except ValueError as exc:
+                if (str(exc) != "order-book source size/SHA256 mismatch"
+                        or not _recover_interrupted_order_book_receipt(root, day, old)):
+                    raise
+                result["updated"] += 1
+                result["recovered_interrupted"] += 1
+                continue
+            table = pq.ParquetFile(path).read()
+            if table.num_rows != old.get("rows"):
+                raise ValueError("order-book source row count mismatch")
+            normalized, units = _order_book_share_table(table)
+            if not units["normalization_valid"]:
+                raise ValueError("invalid order-book source values: " + json.dumps(units["invalid_fields"], sort_keys=True))
+            same_table = normalized.equals(table)
+            if same_table and old.get("volume_units") == units:
+                result["already_current"] += 1
+                continue
+            archive = _archive_order_book_source(root, day, old)
+            if not same_table:
+                atomic_write_parquet(
+                    path, normalized, compression="zstd",
+                    before_replace=lambda: _verified_order_book_source(root, day, old),
+                )
+            updated = {
+                **old, "volume_units": units,
+                "parquet_size_bytes": path.stat().st_size, "sha256": sha256_file(path),
+                "unit_normalized_at_utc": _iso(_utc_now()), "unit_normalization_previous_source": archive,
+            }
+            atomic_write_json(receipt_path, updated)
+            result["updated"] += 1
+        except (OSError, ValueError, TypeError, KeyError, pa.ArrowException) as exc:
+            result["failures"].append({"receipt": receipt_path.name, "error": str(exc)})
+        if result["scanned"] % 100 == 0:
+            print(f"[finmind-units] scanned={result['scanned']} updated={result['updated']} failures={len(result['failures'])}", flush=True)
+    result["state"] = "failed" if result["failures"] else "complete"
+    atomic_write_json(root / "unit_normalization" / f"{ORDER_BOOK_DATASET}.json", result)
+    return result
+
+
+def revalidate_sessions_local(root: Path) -> dict[str, Any]:
+    """Under worker.lock, verify dated grids without downloading the same bytes."""
+    result: dict[str, Any] = {
+        "mode": "revalidate_sessions_local", "api_requests": 0,
+        "datasets": list(SESSION_DATASETS), "scanned": 0, "updated": 0,
+        "newly_complete": 0, "still_partial": 0, "already_current": 0,
+        "without_source": 0, "failures": [], "newly_complete_by_dataset": {},
+    }
+    for dataset, receipt_path in (
+        (dataset, path) for dataset in SESSION_DATASETS
+        for path in sorted((root / "receipts" / dataset).glob("*.json"))
+    ):
+        result["scanned"] += 1
+        try:
+            old = _read_json(receipt_path)
+            day = date.fromisoformat(receipt_path.stem)
+            if not old:
+                raise ValueError("invalid source receipt")
+            if not old.get("parquet_path"):
+                result["without_source"] += 1
+                continue
+            source = _verified_session_source(root, dataset, day, old)
+            table = pq.ParquetFile(source).read()
+            if table.num_rows != old.get("rows"):
+                raise ValueError("source row count mismatch")
+            status, grain, expected, missing = _validated_session_rows(
+                dataset, day, table.to_pylist(),
+            )
+            if dataset == ORDER_BOOK_DATASET:
+                _, units = _order_book_share_table(table)
+                if not units["normalization_valid"]:
+                    status = "partial"
+            proof = {
+                "status": status, "observed_grain": grain,
+                "expected_rows_for_observed_grain": expected, "missing_grid_points": missing,
+                "session_grid_contract_version": SESSION_GRID_CONTRACT_VERSION,
+            }
+            result["still_partial"] += status != "complete"
+            if all(old.get(key) == value for key, value in proof.items()):
+                result["already_current"] += 1
+                continue
+            version_root = root / "versions" / dataset / str(day)
+            version_root.mkdir(parents=True, exist_ok=True)
+            archived_source = version_root / f"{old['sha256']}.parquet"
+            if not archived_source.exists():
+                try:
+                    os.link(source, archived_source)
+                except OSError as exc:
+                    if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
+                        raise
+                    atomic_write_bytes(archived_source, source.read_bytes(), durable=True)
+            if sha256_file(archived_source) != old["sha256"]:
+                raise ValueError("archived source hash mismatch")
+            previous = {"sha256": old["sha256"], "parquet_path": str(archived_source.relative_to(root))}
+            old_bytes = receipt_path.read_bytes()
+            if json.loads(old_bytes) != old:
+                raise ValueError("source receipt changed during grid revalidation")
+            old_digest = hashlib.sha256(old_bytes).hexdigest()
+            exact_receipt = version_root / f"{old_digest}.grid-receipt.json"
+            if exact_receipt.exists():
+                if sha256_file(exact_receipt) != old_digest:
+                    raise ValueError("archived grid receipt hash mismatch")
+            else:
+                atomic_write_bytes(exact_receipt, old_bytes, durable=True)
+            previous = {**previous, "receipt_path": str(exact_receipt.relative_to(root)),
+                        "receipt_sha256": old_digest}
+            updated = {
+                **old, **proof,
+                "grid_revalidated_at_utc": _iso(_utc_now()),
+                "grid_revalidation_previous_source": previous,
+                "grid_cadence_source": "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
+            }
+            if status == "complete":
+                updated.pop("retry_at_utc", None)
+                result["newly_complete"] += old.get("status") != "complete"
+                result["newly_complete_by_dataset"][dataset] = (
+                    result["newly_complete_by_dataset"].get(dataset, 0) + (old.get("status") != "complete")
+                )
+            else:
+                updated["retry_at_utc"] = _iso(_utc_now())
+            _verified_session_source(root, dataset, day, old)
+            atomic_write_json(receipt_path, updated)
+            result["updated"] += 1
+        except (OSError, ValueError, TypeError, KeyError, pa.ArrowException) as exc:
+            result["failures"].append({"dataset": dataset, "receipt": receipt_path.name, "error": str(exc)})
+        if result["scanned"] % 100 == 0:
+            print(f"[finmind-grids] scanned={result['scanned']} newly_complete={result['newly_complete']} failures={len(result['failures'])}", flush=True)
+    result["state"] = "failed" if result["failures"] else "complete"
+    atomic_write_json(root / "grid_revalidation" / "session_grids.json", result)
+    return result
+
+
 def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, Any]], *, now: datetime) -> dict[str, Any]:
     status, grain, expected, missing = _validated_session_rows(dataset, day, rows)
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "session_grid_contract_version": SESSION_GRID_CONTRACT_VERSION,
         "dataset": dataset,
         "date": day.isoformat(),
         "status": status,
@@ -343,15 +661,48 @@ def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, An
         "fetched_at_utc": _iso(now),
         "point_in_time_training_safe": False,
     }
+    path = _session_path(root, dataset, day)
+    if dataset == ORDER_BOOK_DATASET and path.is_file():
+        old = _read_json(root / "receipts" / dataset / f"{day}.json")
+        receipt["previous_source"] = _archive_order_book_source(root, day, old)
     if rows:
-        path = root / "market_intraday" / dataset / f"year={day.year}" / f"date={day}.parquet"
-        table = pa.Table.from_pylist(rows)
-        atomic_write_parquet(path, table, compression="zstd")
-        receipt.update({
-            "parquet_path": str(path.relative_to(root)),
-            "parquet_size_bytes": path.stat().st_size,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        })
+        if dataset == ORDER_BOOK_DATASET:
+            _, units = annotate_stock_share_units(dataset, rows)
+            receipt["volume_units"] = units
+            if not units["normalization_valid"] and status == "complete":
+                status = receipt["status"] = "partial"
+        try:
+            if dataset == ORDER_BOOK_DATASET:
+                # Explicit union keeps a later provider field even if the
+                # first malformed row omitted it.
+                fields = dict.fromkeys(field for row in rows for field in row)
+                table = pa.Table.from_pydict({field: [row.get(field) for row in rows] for field in fields})
+                table, _ = _order_book_share_table(table)
+            else:
+                table = pa.Table.from_pylist(rows)
+        except (pa.ArrowException, TypeError, OverflowError):
+            if dataset != ORDER_BOOK_DATASET:
+                raise
+            # Arrow cannot losslessly put mixed numeric/string/bool provider
+            # values in one column. Preserve the exact response values as JSON.
+            status = receipt["status"] = "partial"
+            raw_bytes = json.dumps({"rows": rows, "fetched_at_utc": _iso(now)}, ensure_ascii=False).encode("utf-8")
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            raw_path = root / "versions" / dataset / str(day) / f"{digest}.raw.json"
+            if raw_path.exists():
+                if sha256_file(raw_path) != digest:
+                    raise ValueError("raw order-book response archive hash mismatch")
+            else:
+                atomic_write_bytes(raw_path, raw_bytes, durable=True)
+            receipt.update({"raw_response_path": str(raw_path.relative_to(root)),
+                            "raw_response_sha256": digest, "raw_storage_error": "unrepresentable_arrow_source_types"})
+        else:
+            atomic_write_parquet(path, table, compression="zstd")
+            receipt.update({
+                "parquet_path": str(path.relative_to(root)),
+                "parquet_size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
     if status != "complete":
         receipt["retry_at_utc"] = _iso(now + timedelta(hours=1 if day >= now.astimezone(TAIPEI).date() - timedelta(days=7) else 6))
     atomic_write_json(root / "receipts" / dataset / f"{day}.json", receipt)
@@ -370,6 +721,9 @@ def _record_failure(root: Path, dataset: str, day: date, error: ProviderError, *
         "retry_at_utc": _iso(now if error.code in {"not_entitled", "invalid_token", "invalid_request"}
                               else now + timedelta(seconds=wait)),
     }
+    if dataset == ORDER_BOOK_DATASET and _session_path(root, dataset, day).is_file():
+        old = _read_json(root / "receipts" / dataset / f"{day}.json")
+        receipt["previous_source"] = _archive_order_book_source(root, day, old)
     atomic_write_json(root / "receipts" / dataset / f"{day}.json", receipt)
     return receipt
 
@@ -441,6 +795,7 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
     load_env_file(Path(__file__).resolve().parents[1] / ".env", allowed_names=("FINMIND_TOKEN",))
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     used = 0
+    account: dict[str, Any] = {"official_requests_per_hour": 300}
     with requests.Session() as session:
         if token:
             try:
@@ -450,6 +805,7 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                 # Continue the public worker at the registered Free ceiling;
                 # paid access is never inferred from an unreachable account API.
                 quota = 600
+                account = {"official_requests_per_hour": quota}
         else:
             quota = 300
         limiter = rate_limiter({"official_requests_per_hour": quota})
@@ -485,10 +841,19 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                     _write_status(root, state=error.code, counts=counts, requests_used=used, quota=quota, token=bool(token))
                     return {"state": error.code, "requests": used, **counts}
         last_task: dict[str, Any] | None = None
+        latest_session = max((day for day in dates if day <= _session_cutoff(now)), default=None)
+        reserve_wait = False
         for dataset, day in tasks:
             if max_requests and used >= max_requests:
                 break
             if _opening_window(_utc_now(), sessions):
+                break
+            dispatch_now = _utc_now()
+            if day != latest_session and not backfill_budget(
+                account, root, fixed_incremental_requests=fixed_incremental_demand(root, dispatch_now),
+                in_flight=0, now=dispatch_now,
+            )["allowed"]:
+                reserve_wait = True
                 break
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task,
                           active={"dataset": dataset, "date": day.isoformat(), "started_at_utc": _iso(_utc_now())})
@@ -516,11 +881,12 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                 )
                 item["last_receipt_at_utc"] = result.get("fetched_at_utc")
                 grain = result.get("observed_grain")
-                if grain in {"1m", "5s"}:
+                if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
             last_task = {"dataset": dataset, "date": day.isoformat(), "status": result["status"], "rows": result.get("rows")}
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task)
         state = (
+            "incremental_reserve" if reserve_wait else
             "current" if counts["complete"] >= counts["total"]
             else "waiting_retry" if not tasks
             else "backfilling"
@@ -534,9 +900,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path("data_finmind"))
     parser.add_argument("--max-requests", type=int, default=0, help="0 means complete all due work at the official pace")
     parser.add_argument("--loop", action="store_true", help="stay alive; recheck new sessions and repairs hourly")
+    parser.add_argument("--normalize-units-local", action="store_true",
+                        help="verify and add share/TWD fields to local order-book partitions; no API calls")
+    parser.add_argument("--revalidate-sessions-local", action="store_true",
+                        help="verify historical native grids and update receipts locally; no API calls")
     args = parser.parse_args(argv)
     if args.max_requests < 0:
         parser.error("--max-requests must be nonnegative")
+    if (args.normalize_units_local or args.revalidate_sessions_local) and (args.loop or args.max_requests):
+        parser.error("local migrations cannot be combined with --loop or --max-requests")
+    if args.normalize_units_local and args.revalidate_sessions_local:
+        parser.error("run one local migration at a time")
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / "worker.lock"
@@ -547,6 +921,14 @@ def main(argv: list[str] | None = None) -> int:
             print("FinMind worker already running", file=sys.stderr)
             return 2
         try:
+            if args.revalidate_sessions_local:
+                result = revalidate_sessions_local(root)
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 1 if result["failures"] else 0
+            if args.normalize_units_local:
+                result = normalize_units_local(root)
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 1 if result["failures"] else 0
             while True:
                 result = run_once(root, max_requests=args.max_requests)
                 print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -557,7 +939,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(
                     1800 if result["state"] == "ip_banned"
                     else 600 if result["state"] in {"rate_limited", "protected_opening", "waiting_retry"}
-                    else 3600 if result["state"] == "current" else 5
+                    else 3600 if result["state"] == "current"
+                    else 60 if result["state"] == "incremental_reserve" else 5
                 )
         except KeyboardInterrupt:
             return 130

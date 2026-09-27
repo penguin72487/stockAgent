@@ -28,6 +28,7 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from downloader.artifact_io import atomic_write_parquet
+from downloader.stock_volume_units import with_stock_share_volume
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -402,6 +403,9 @@ def normalize_kbars(
                 "Volume": pl.Float64,
                 "Amount": pl.Float64,
                 "contract_unit": pl.Float64,
+                "source_volume_multiplier": pl.Float64,
+                "volume_shares": pl.Float64,
+                "volume_unit_proof": pl.String,
             }
         )
     frame = (
@@ -447,6 +451,12 @@ def normalize_kbars(
         raise ValueError(
             f"Shioaji returned {duplicate} duplicate timestamps for {symbol}"
         )
+    # The broker's stock Volume is provider-native, not a share count.  Some
+    # historical rows are in board lots while others are already in shares.
+    # Establish the factor from the independently supplied trade notional and
+    # OHLC range.  Unknown rows retain the raw value but have no usable share
+    # volume; never silently give a model/executor 1,000x the liquidity.
+    frame = with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE)
     return frame.sort("ts")
 
 
@@ -469,49 +479,10 @@ def aggregate_daily(frame: pl.DataFrame, *, name: str) -> pl.DataFrame:
                 "data_source": pl.String,
             }
         )
-    positive_volume = (pl.col("Volume") > 0.0) & (pl.col("Amount") > 0.0)
-
-    def volume_multiplier_matches(multiplier: pl.Expr | float) -> pl.Expr:
-        candidate = (
-            multiplier if isinstance(multiplier, pl.Expr) else pl.lit(multiplier)
-        )
-        notional = pl.col("Volume") * candidate
-        return (
-            positive_volume
-            & (
-                pl.col("Amount")
-                >= notional * pl.col("Low") * (1.0 - VOLUME_NOTIONAL_TOLERANCE)
-            )
-            & (
-                pl.col("Amount")
-                <= notional * pl.col("High") * (1.0 + VOLUME_NOTIONAL_TOLERANCE)
-            )
-        )
-
-    multiplier_candidates: tuple[pl.Expr | float, ...] = (
-        pl.col("contract_unit"),
-        1_000.0,
-        100.0,
-        10.0,
-        1.0,
-    )
-    source_volume_multiplier = pl.coalesce(
-        *[
-            pl.when(volume_multiplier_matches(candidate))
-            .then(candidate)
-            .otherwise(None)
-            for candidate in multiplier_candidates
-        ]
-    )
-    normalized = frame.with_columns(
-        pl.when((pl.col("Volume") == 0.0) & (pl.col("Amount") == 0.0))
-        .then(pl.col("contract_unit"))
-        .otherwise(source_volume_multiplier)
-        .cast(pl.Float64)
-        .alias("source_volume_multiplier")
-    )
+    normalized = with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE)
     unknown_volume_units = normalized.filter(
-        positive_volume & pl.col("source_volume_multiplier").is_null()
+        pl.col("source_volume_multiplier").is_null()
+        | pl.col("volume_shares").is_null()
     ).height
     if unknown_volume_units:
         raise ValueError(
@@ -526,9 +497,7 @@ def aggregate_daily(frame: pl.DataFrame, *, name: str) -> pl.DataFrame:
             pl.col("High").max().alias("max"),
             pl.col("Low").min().alias("min"),
             pl.col("Close").last().alias("close"),
-            (pl.col("Volume") * pl.col("source_volume_multiplier"))
-            .sum()
-            .alias("Trading_Volume"),
+            pl.col("volume_shares").sum().alias("Trading_Volume"),
             pl.col("Amount").sum().alias("Trading_Value"),
             (
                 pl.col("Volume")
@@ -750,8 +719,11 @@ def _cached_minute_chunk(
             ):
                 return None
             frames.append(
-                pl.read_parquet(data_path).filter(
-                    (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
+                with_stock_share_volume(
+                    pl.read_parquet(data_path).filter(
+                        (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
+                    ),
+                    tolerance=VOLUME_NOTIONAL_TOLERANCE,
                 )
             )
         except (OSError, pl.exceptions.PolarsError):
@@ -975,7 +947,7 @@ def _verified_minute_symbol_frame(
             & (pl.col("date") <= pl.lit(requested_end))
         )
         if frame.height:
-            frames.append(frame)
+            frames.append(with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE))
     ranges.sort()
     if not ranges or ranges[0][0] > requested_start or ranges[-1][1] < requested_end:
         raise RuntimeError(

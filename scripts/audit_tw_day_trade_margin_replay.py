@@ -29,8 +29,28 @@ from stockagent.live.tw_day_trade_simulation import (
 )
 from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid
 from downloader.download_tw_public_data import _validated_taiex_session_dates
+from downloader.stock_volume_units import with_stock_share_volume
 from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE, load_share_replacements
 from stockagent.data.panel import _CorporateActionReferencePaths, _load_corporate_action_reference
+
+
+def _with_verified_share_volume(frame: pl.LazyFrame) -> pl.LazyFrame:
+    """Keep canonical shares or prove the encoding of legacy raw stock KBars."""
+
+    schema = frame.collect_schema()
+    if "volume_shares" in schema:
+        shares = pl.col("volume_shares").cast(pl.Float64, strict=False)
+        return frame.with_columns(
+            pl.when(shares.is_finite() & (shares >= 0)
+                    & ((shares - shares.round(0)).abs() <= 1e-6))
+            .then(shares.round(0)).otherwise(None).alias("volume_shares")
+        )
+    frame = frame.with_columns(*[
+        (pl.col(name).cast(pl.Float64, strict=False) if name in schema
+         else pl.lit(None, dtype=pl.Float64)).alias(name)
+        for name in ("Volume", "Amount", "Low", "High", "contract_unit")
+    ])
+    return with_stock_share_volume(frame, tolerance=0.001)
 
 
 def _entry_source_path(source: str) -> Path:
@@ -233,6 +253,86 @@ def _claim_matches_source(claim: dict, reference) -> bool:
                 and str(terms[2][matches[0]]) == claim["payment_date"])
 
 
+def _verify_terminal_close_fills(fills, rebuild, modes, *, verify_sources=True):
+    """Verify the sole capacity exception against raw official close reports.
+
+    A contract string alone never exempts an arbitrary exit from minute volume.
+    Ordinary exits remain in the existing shared-capacity audit below.
+    """
+    from scripts.settle_tw_day_trade_official_close import official_closes
+    from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT as contract
+    from stockagent.data.tw_security import classify_tw_stock_or_etf
+    from stockagent.data.tw_price_rules import price_on_tick_grid_numpy
+    selected = [f for f in fills if f.get("fill_contract") == contract
+                or f.get("terminal_close_receipt") is not None
+                or f.get("purpose") == "13_30_unlimited_close_paper_settlement"]
+    enabled = (rebuild.get("replay_contract") or {}).get("terminal_close_contract") == contract
+    if selected and not enabled:
+        raise ValueError("terminal close fills lack explicit replay authorization")
+    if not enabled:
+        return {}
+    if any(m.get("terminal_close_contract") != contract for m in modes.values()):
+        raise ValueError("terminal close state/replay policy mismatch")
+    sessions = {s["session_date"]: s for s in rebuild["sessions"]}
+    source_hashes, prices, counts, seen = {}, {}, defaultdict(int), set()
+    for fill in selected:
+        day, market, symbol = fill["session_date"], fill["market"], fill["symbol"]
+        proof = fill.get("terminal_close_receipt") or {}
+        evidence = proof.get("source_evidence") or {}
+        stamp = f"{day}T13:30:00+08:00"
+        kind = classify_tw_stock_or_etf(symbol)
+        if not (enabled and fill.get("fill_contract") == contract
+                and proof.get("contract") == contract
+                and proof.get("broker_fill") is False
+                and proof.get("full_quantity_is_user_assumption") is True
+                and fill.get("simulation_only") is True
+                and fill.get("purpose") == "13_30_unlimited_close_paper_settlement"
+                and fill.get("fill_at") == proof.get("effective_at") == stamp
+                and datetime.fromisoformat(fill["recorded_at"]) >= datetime.fromisoformat(stamp)
+                and fill.get("quote_at") is None and fill.get("exchange_match_at") is None
+                and fill["quantity"] == fill["requested_quantity"] > 0
+                and fill.get("remaining_quantity") == 0
+                and evidence.get("session_date") == day
+                and evidence.get("price_basis") == "official_session_close"
+                and evidence.get("price") == fill["price"]
+                and kind is not None
+                and price_on_tick_grid_numpy(np.array([fill["price"]]), np.array([date.fromisoformat(day)]),
+                                              security_types=kind)[0]):
+            raise ValueError(f"invalid terminal close receipt: {market}/{day}/{symbol}")
+        identity = (market, day, fill["position_id"])
+        if identity in seen:
+            raise ValueError(f"duplicate terminal close: {identity}")
+        seen.add(identity)
+        counts[(market, day)] += 1
+        if verify_sources:
+            if day not in prices:
+                prices[day] = {}
+                for source in sessions[day]["close"]["terminal_close_sources"]:
+                    path = Path(source["path"])
+                    exchange = path.parent.name.removesuffix("_daily_ohlcv")
+                    if exchange not in ("twse", "tpex") or path.name != f"{day}.json" or _sha256(path) != source["sha256"]:
+                        raise ValueError(f"terminal close raw source mismatch: {path}")
+                    rows, _ = official_closes(path.parent.parent, date.fromisoformat(day), exchanges=(exchange,))
+                    if prices[day].keys() & rows.keys():
+                        raise ValueError(f"duplicate terminal close source: {day}")
+                    prices[day].update(rows)
+                    source_hashes[str(path)] = source["sha256"]
+            row = prices[day].get(symbol) or {}
+            raw = row.get("official_row") or {}
+            volume = float(str(raw.get("成交股數", raw.get("成交量", 0))).replace(",", ""))
+            if (row.get("price") != fill["price"] or row.get("source") != evidence.get("source")
+                    or row.get("source_sha256") != evidence.get("source_sha256") or not volume > 0):
+                raise ValueError(f"terminal close differs from traded official source: {market}/{day}/{symbol}")
+    for day, session in sessions.items():
+        for row in session["modes"]:
+            close = row.get("after_close") or {}
+            if (close.get("terminal_close_contract") != contract
+                    or close.get("open_position_rows") != 0
+                    or int(close.get("terminal_flatten_count") or 0) != counts[(row["market"], day)]):
+                raise ValueError(f"terminal close count/flat proof mismatch: {row['market']}/{day}")
+    return source_hashes
+
+
 def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: bool = False) -> dict:
     names = ("state.json", "rebuild_receipt.json", "fills.jsonl", "marks.jsonl", "orders.jsonl")
     before = {name: _sha256(state_dir / name) for name in names}
@@ -258,6 +358,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     calendar_check = (_verify_calendar_coverage(rebuild, dates, prefix=bool(incomplete))
                       if verify_sources else None)
     fills, marks = _read_jsonl(state_dir / "fills.jsonl"), _read_jsonl(state_dir / "marks.jsonl")
+    terminal_source_hashes = _verify_terminal_close_fills(
+        fills, rebuild, state["modes"], verify_sources=verify_sources)
     order_sides = {}
     for order in _read_jsonl(state_dir / "orders.jsonl"):
         key, side = (order["market"], order["order_id"]), order.get("side")
@@ -569,14 +671,11 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                                 or entry.get("trade_date") not in {d.isoformat() for d in days}
                                 or _sha256(path) != entry.get("output_sha256")):
                             raise ValueError("research partition hash/date mismatch")
-                        schema = pl.read_parquet_schema(path)
-                        volume = (pl.col("volume_shares") if "volume_shares" in schema else
-                                  pl.col("Volume") * (pl.col("contract_unit") if "contract_unit" in schema else 1000))
-                        source_bars.append(pl.scan_parquet(path)
+                        source_bars.append(_with_verified_share_volume(pl.scan_parquet(path))
                             .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
                                     pl.col("High").cast(pl.Float64).alias("high"),
                                     pl.col("Low").cast(pl.Float64).alias("low"),
-                                    volume.cast(pl.Float64).alias("volume_shares"))
+                                    pl.col("volume_shares"))
                             .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
                         continue
                     except (OSError, ValueError, StopIteration, KeyError) as exc:
@@ -596,13 +695,11 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             if not minute_receipt_valid(receipt_path, symbol=path.parent.name, start=start, end=end, required_dates=days):
                 errors.append(f"invalid minute source receipt: {name}")
                 continue
-            schema = pl.read_parquet_schema(path)
-            volume = (pl.col("volume_shares") if "volume_shares" in schema else
-                      pl.col("Volume") * (pl.col("contract_unit") if "contract_unit" in schema else 1000))
-            source_bars.append(pl.scan_parquet(path).filter(pl.col("date").is_in(sorted(days)))
+            source_bars.append(_with_verified_share_volume(pl.scan_parquet(path))
+                .filter(pl.col("date").is_in(sorted(days)))
                 .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
                         pl.col("High").cast(pl.Float64).alias("high"), pl.col("Low").cast(pl.Float64).alias("low"),
-                        volume.cast(pl.Float64).alias("volume_shares"))
+                        pl.col("volume_shares"))
                 .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
         if source_bars or retained_opening_bars:
             retained_by_key = {
@@ -634,6 +731,10 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             for fill in fills:
                 if fill.get("prior_paper_fill_reused"):
                     continue
+                if fill.get("terminal_close_receipt") is not None:
+                    # Fully verified separately against the exact official raw
+                    # close; never add user-assumed liquidity to minute volume.
+                    continue
                 key = (fill["symbol"], fill["recorded_at"][:16])
                 bar = bars.get(key)
                 if bar is None:
@@ -642,6 +743,10 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 price = float(fill["price"])
                 if not bar["low"] - 1e-7 <= price <= bar["high"] + 1e-7:
                     errors.append(f"fill outside source OHLC range: {key}: {price}")
+                volume = bar.get("volume_shares")
+                if volume is None or not math.isfinite(volume) or volume <= 0:
+                    errors.append(f"fill minute has no verified share volume: {key}")
+                    continue
                 usage[(fill["market"], *key)] += int(fill["quantity"])
             for (market, symbol, minute), quantity in usage.items():
                 capacity = math.floor(bars[(symbol, minute)]["volume_shares"] * .5 / 1000) * 1000
@@ -653,6 +758,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
         raise RuntimeError("calendar changed during replay audit")
     if any(_sha256(Path(name)) != digest for name, digest in action_source_hashes.items()):
         raise RuntimeError("corporate-action source changed during replay audit")
+    if any(_sha256(Path(name)) != digest for name, digest in terminal_source_hashes.items()):
+        raise RuntimeError("terminal close source changed during replay audit")
     for name, signature in minute_source_signatures.items():
         stat = Path(name).stat()
         if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != signature:
@@ -667,6 +774,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             "minute_stats": minute_stats, "accounts": accounts, "max_accounting_error_twd": max_error,
             "source_files_checked": len(source_days) if verify_sources else 0,
             "source_hashes": before, "corporate_action_source_hashes": action_source_hashes,
+            "terminal_close_source_hashes": terminal_source_hashes,
             "minute_source_signatures": minute_source_signatures,
             "errors": errors[:100], "error_count": len(errors)}
 

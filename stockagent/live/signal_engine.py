@@ -3487,7 +3487,7 @@ def generate_live_signal(
         )
 
     if execution_mode == "tw_day_trade":
-        # The canonical day-trade account starts every session flat. Reading a
+        # The signal is a target allocation, not the account's carried state. Reading a
         # 2,700-column prior-weight parquet on the opening path cannot change
         # the model input, target, turnover, or executable order and cost about
         # 0.2 s on this host. Retain the prior close only as the price basis.
@@ -3642,8 +3642,8 @@ def generate_live_signal(
     execution_constraints_notice: str | None = None
     current_weights = np.asarray(drift.weights, dtype=np.float64).copy()
     if execution_mode == "tw_day_trade":
-        # Day-trade positions are opened and closed in the same session.  The
-        # prior day's intraday exposure is not an overnight holding.
+        # The independent execution engine owns actual FIFO inventory. Do not
+        # interpret yesterday's requested model weights as current holdings.
         current_weights = np.zeros_like(current_weights)
 
     unconstrained_aux: dict[str, torch.Tensor] | None = None
@@ -4054,6 +4054,16 @@ def generate_live_signal(
         "day_trade_model_observation": normalized_day_trade_observation,
         "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1" if execution_mode == "tw_day_trade" else None,
         "day_trade_policy_eligibility": day_trade_policy_proof,
+        "day_trade_historical_execution": (
+            {
+                "entry_remainder_policy": config.trading.tw_day_trade_entry_remainder_policy,
+                "terminal_unlimited_capacity": config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity,
+                "residual_margin_conversion": config.trading.tw_day_trade_unlimited_margin_conversion,
+                "minute_volume_participation": config.trading.max_volume_participation,
+                "daily_proxy_allowed": config.data.day_trade_minute_execution_allow_daily_proxy,
+                "live_fill_evidence": "owned_by_runtime_backend_not_this_historical_contract",
+            } if execution_mode == "tw_day_trade" else None
+        ),
         "weights_date": weights_timestamp,
         "trading_frequency": trading_frequency,
         "execution_mode": execution_mode,
@@ -4062,7 +4072,7 @@ def generate_live_signal(
         "execution_constraints_notice": execution_constraints_notice,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
         "previous_weights_policy": (
-            "session_starts_flat"
+            "execution_engine_owns_actual_inventory_signal_is_target_only"
             if execution_mode == "tw_day_trade"
             else (
                 "live_signal_before_asof"

@@ -729,7 +729,16 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
 ) -> None:
     if execution_mode != "tw_stock_context_futures_portfolio":
         return
-    if _normalized_contract_name(model_name) not in (
+    financial_futures = _normalized_contract_name(model_name) == "financial_transformer"
+    if financial_futures and (
+        (bool(day_trade_open_feature)
+         and DAY_TRADE_OPEN_GAP_FEATURE not in tuple(feature_shift_next_session))
+        or bool(futures_current_open_feature)
+        or bool(futures_denomination_aware_output)
+        or futures_denomination_hard_projection is not False
+    ):
+        raise ValueError("financial futures require prior-session features and executor-only denomination rounding")
+    if not financial_futures and _normalized_contract_name(model_name) not in (
         _TW_STOCK_CONTEXT_ALL_FUTURES_MODEL_NAMES
     ):
         raise ValueError(
@@ -742,15 +751,14 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
             "training.train_symbol_compaction=false; the input stock axis and "
             "fixed futures action axis have different identities"
         )
-    if normalize_portfolio_output_mode(str(model_portfolio_output_mode)) != (
-        "projection_l1"
-    ):
+    allowed_outputs = {"score_entmax_log_cash"} if financial_futures else {"projection_l1"}
+    if normalize_portfolio_output_mode(str(model_portfolio_output_mode)) not in allowed_outputs:
         raise ValueError(
             "tw_stock_context_futures_portfolio requires model "
             "portfolio_output_mode='projection_l1'"
         )
     if bool(integer_contracts):
-        if not bool(futures_denomination_aware_output):
+        if not financial_futures and not bool(futures_denomination_aware_output):
             raise ValueError(
                 "integer tw_stock_context_futures_portfolio requires "
                 "futures_denomination_aware_output=true"
@@ -1490,8 +1498,15 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
-    # Opt-in, checkpoint-affecting strict single-exchange source boundary.
+    # Opt-in, checkpoint-affecting execution-universe boundary. The traded
+    # instruments and valuation rows must remain on this venue even when an
+    # explicitly registered public information scope is enabled below.
     crypto_exchange_scope: str = ""
+    # ``venue_only`` admits only the execution venue's own information.
+    # ``historical_public_pit`` additionally admits the registered, explicit
+    # cross-venue/FRED/SEC columns whose publication clocks are historically
+    # reproducible. Prospective snapshots remain unavailable to old dates.
+    crypto_information_scope: str = "venue_only"
     # Inclusive lower bound for the model panel.  Source archives may retain
     # older rows for provenance even when that interval cannot support an
     # unbiased training universe.
@@ -1720,6 +1735,11 @@ class TradingConfig:
     # ceiling.  This is an explicit semantic/checkpoint boundary, not an
     # observed auction-liquidity claim.
     tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
+    tw_day_trade_entry_remainder_policy: str = "first_minute_only"
+    # Legacy cash-equivalent rights valuation is retained only for replay.
+    # New no-subscription experiments reject an affected held position instead
+    # of inventing an exercise, cash payment, or disappearance of ownership.
+    tw_day_trade_subscription_right_policy: str = "reference_value_cash"
     tw_day_trade_margin_financing_ratio: float = 0.60
     tw_day_trade_margin_financing_annual_rate: float = 0.16
     tw_day_trade_margin_short_handling_fee_rate: float = 0.001
@@ -1824,6 +1844,9 @@ class TradingConfig:
     tw_futures_portfolio_integer_contracts: bool = False
     tw_futures_portfolio_integer_initial_capital: float = 10_000_000.0
     tw_futures_portfolio_integer_fee_per_contract_per_side_twd: float = 40.0
+    # Explicit account policy; intraday uses receipt-backed 08:46..13:30 bars.
+    tw_futures_portfolio_holding_policy: str = "carry"
+    tw_futures_portfolio_minute_data_path: str | None = None
     # Full cash-stock feature universe, but only causally known nearby
     # single-stock futures may receive a target. The aligned source owns
     # physical contract selection, multiplier, prices, and statutory tax.
@@ -2385,6 +2408,10 @@ class TrainingConfig:
     # the same policy that validation replays.  This is deliberately opt-in so
     # historical batch-cadence artifacts remain reproducible.
     day_trade_optimizer_step_per_trajectory: bool = False
+    # Compatibility for resolved remote v5 manifests. Their opt-in trainers
+    # live on Vast; this runtime accepts only the disabled continuous account.
+    day_trade_training_annual_episodes: bool = False
+    day_trade_sub_lot_recovery: bool = False
     # Daily crypto shares the bounded recurrent executor. Keep one policy for
     # all training dates and weight each chunk by its valid-date count before
     # one optimizer update; this is an opt-in optimization-semantic change.
@@ -3910,6 +3937,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["crypto_exchange_scope"] = str(
         data["crypto_exchange_scope"] or ""
     ).strip().lower()
+    data["crypto_information_scope"] = str(
+        data["crypto_information_scope"] or "venue_only"
+    ).strip().lower()
     validate_crypto_exchange_scope(
         data, repo_root=Path(__file__).resolve().parents[1]
     )
@@ -4197,6 +4227,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
+    holding_policy = trading["tw_futures_portfolio_holding_policy"]
+    if holding_policy not in {"carry", "intraday"}:
+        raise ValueError("tw_futures_portfolio_holding_policy must be carry or intraday")
+    if holding_policy == "intraday" and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or not trading["tw_futures_portfolio_integer_contracts"]
+        or not trading["tw_futures_portfolio_minute_data_path"]
+        or data["tw_futures_expiry_settlement_valuation"]
+    ):
+        raise ValueError("intraday requires exact all-futures minute data and cannot use expiry valuation")
     _validate_tw_futures_portfolio_mode_contract(
         execution_mode=trading["execution_mode"],
         frequency=trading["frequency"],
@@ -4319,7 +4359,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if recovery_objective not in {"residual_notional", "execution_utility"}:
         raise ValueError("futures minute recovery objective must be residual_notional or execution_utility")
     if recovery_objective != "residual_notional" and (
-        trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+        (trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+         and not (trading["execution_mode"] == "tw_stock_context_futures_portfolio"
+                  and holding_policy == "intraday"))
         or not training["futures_portfolio_recoverable_backward"]
     ):
         raise ValueError("execution utility recovery requires minute recoverable backward")
@@ -4534,6 +4576,27 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    subscription_policy = str(trading["tw_day_trade_subscription_right_policy"])
+    if subscription_policy not in {"reference_value_cash", "reject_held"}:
+        raise ValueError("unsupported tw_day_trade_subscription_right_policy")
+    if subscription_policy == "reject_held" and (
+        trading["execution_mode"] != "tw_day_trade"
+        or not trading["tw_day_trade_unlimited_margin_conversion"]
+        or data["day_trade_minute_execution_root"] is None
+    ):
+        raise ValueError("reject_held subscription policy requires physical FIFO day trade")
+    remainder_policy = str(trading["tw_day_trade_entry_remainder_policy"])
+    if remainder_policy not in {"first_minute_only", "frozen_target_until_1320"}:
+        raise ValueError("unsupported tw_day_trade_entry_remainder_policy")
+    if remainder_policy == "frozen_target_until_1320":
+        if (trading["execution_mode"] != "tw_day_trade"
+                or float(trading["max_volume_participation"]) != 0.5
+                or not trading["tw_day_trade_unlimited_margin_conversion"]
+                or data["day_trade_minute_execution_root"] is None
+                or training["day_trade_sparse_events"]
+                or training.get("day_trade_training_annual_episodes", False)):
+            raise ValueError("frozen target entry sweep requires dense continuous physical "
+                             "carry without annual account resets")
     if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
         if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
             raise ValueError(
@@ -4552,6 +4615,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "unlimited terminal day-trade liquidation requires the "
                 "scheduled 50%-minute execution policy"
             )
+    if training.get("day_trade_training_annual_episodes", False) or training.get("day_trade_sub_lot_recovery", False):
+        raise ValueError("this runtime supports only disabled remote annual/sub-lot "
+                         "research mechanisms; use the continuous web-parity config")
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(

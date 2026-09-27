@@ -108,6 +108,13 @@ def test_expensive_recovery_jobs_are_timer_only_and_staggered() -> None:
     )
     assert "Persistent=true" not in compaction_timer
     assert "OnUnitInactiveSec=30min" in compaction_timer
+    compaction_service = _read("deploy/systemd/stockagent-openbb-l1-compaction.service.in")
+    assert "--schema-grouped-sec-views" in compaction_service
+    assert "--archive-idle-only --incremental-source-audit" in compaction_service
+    assert "--minimum-runway-minutes 45 --protected-until 13:35" in compaction_service
+    assert "MemoryHigh=2816M" in compaction_service
+    assert "MemoryMax=3G" in compaction_service
+    assert "--max-source-files 32768" in compaction_service
     minute_timer = _read(
         "deploy/systemd/stockagent-shioaji-minute-backfill.timer.in"
     )

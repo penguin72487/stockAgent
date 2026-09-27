@@ -21,7 +21,7 @@ import math
 
 import torch
 from torch import Tensor
-from stockagent.backtest.tw_inventory_scan import fifo_cumsum
+from stockagent.backtest.tw_inventory_scan import fifo_cumsum, fifo_searchsorted, fifo_stack_columns
 
 from stockagent.backtest.tw_day_trade_contract import (
     MARGIN_CARRY_CONTRACT,
@@ -71,7 +71,8 @@ def _require(condition: Tensor, message: str) -> Tensor:
     valid = condition.all()
     if not torch.compiler.is_compiling() and condition.device.type == "cpu":
         if not bool(valid):
-            raise RuntimeError(message)
+            bad = torch.nonzero(~condition.bool(), as_tuple=False)[:32].tolist()
+            raise RuntimeError(f"{message}; invalid_indices={bad} shape={tuple(condition.shape)}")
     return valid
 
 
@@ -86,7 +87,13 @@ def _physical_shares(value: Tensor) -> Tensor:
     )
 
 
-def _calendar_day(state: DayTradeInventoryState, day: int) -> Tensor:
+def _calendar_day(state: DayTradeInventoryState, day: int | Tensor) -> Tensor:
+    if isinstance(day, Tensor):
+        if day.shape != () or day.dtype != state.observed_day.dtype or day.device != state.observed_day.device:
+            raise ValueError("event day tensor must match the inventory scalar ABI")
+        return (_require(torch.isfinite(day) & (day == day.round()) & (day > 0) & (day <= 3652059),
+                         "event requires a Gregorian day ordinal")
+                & _require(state.observed_day <= day, "inventory event clock moved backwards"))
     if not isinstance(day, int) or isinstance(day, bool) or not 0 < day <= 3652059:
         raise ValueError("event requires a Gregorian day ordinal")
     return _require(state.observed_day <= day, "inventory event clock moved backwards")
@@ -369,8 +376,8 @@ def _vector(state: DayTradeInventoryState, value: Tensor | float | int) -> Tenso
 def _columns(cohorts: Tensor, updates: dict[F, Tensor]) -> Tensor:
     # PyTorch 2.11 cannot inline EnumType.__iter__ in a fullgraph CUDA kernel.
     # Materialize the fixed ABI indices at import time, outside the hot path.
-    return torch.stack(
-        [updates.get(f, cohorts[..., f]) for f in _COHORT_FIELD_INDICES], dim=-1
+    return fifo_stack_columns(
+        [updates.get(f, cohorts[..., f]) for f in _COHORT_FIELD_INDICES]
     )
 
 
@@ -401,6 +408,7 @@ def append_inventory_fill(
     normal_sell_fee_rate: Tensor,
     rebate_rate: Tensor,
     day: int,
+    extend_session_cohort: bool = False,
 ) -> DayTradeInventoryState:
     """Append already-funded observed fills; do NOT size or invent liquidity.
 
@@ -459,20 +467,55 @@ def append_inventory_fill(
             torch.where(q >= 0, sell, buy) - rebate,
             torch.where(q >= 0, normal, buy) - rebate,
             (normal - sell).clamp_min(0) + MARGIN_SHORT_HANDLING_FEE_RATE,
-            torch.full_like(q, day),
+            torch.ones_like(q) * day,
             torch.zeros_like(q),
-            torch.full_like(q, day),
+            torch.ones_like(q) * day,
             torch.zeros_like(q),
             torch.zeros_like(q),
         ],
         dim=-1,
     )
+    if extend_session_cohort:
+        # A frozen daily order may fill over many minutes.  Paper records one
+        # acquisition cohort for that order, with an unrounded weighted basis.
+        # Reuse its last row; growing 270 rows per session makes chronological
+        # training quadratic in the number of minute observations.
+        if state.cohorts.shape[0] == 0:
+            raise ValueError("entry continuation requires its opening cohort")
+        last = state.cohorts[-1]
+        active = last[..., F.SHARES] != 0
+        valid = _require(
+            (~active | ((last[..., F.ACQUIRED_DAY] == day)
+                        & (last[..., F.CONVERTED] == 0)
+                        & (last[..., F.LOCKED_SHARES] == 0)))
+            & (q * last[..., F.SHARES] >= 0),
+            "entry continuation cannot merge another day or opposite cohort",
+        ) & valid
+        for field in (F.DAY_EXIT_RATE, F.CARRY_EXIT_RATE, F.SHORT_CONVERSION_RATE):
+            valid = _require(~active | (q == 0) | ((last[..., field] - row[..., field]).abs() <= 1e-12),
+                             "entry continuation changed its cohort fee contract") & valid
+        total = last[..., F.SHARES].abs() + q.abs()
+        updates = {F.SHARES: last[..., F.SHARES] + q}
+        for field in (F.BASIS, F.ENTRY_PRICE):
+            updates[field] = (
+                last[..., F.SHARES].abs() * last[..., field] + q.abs() * p
+            ) / total.clamp_min(1)
+        updates[F.ENTRY_COST] = last[..., F.ENTRY_COST] + row[..., F.ENTRY_COST]
+        # Pure column construction avoids differentiable slice mutations.
+        # Functionalizing four clone/view writes inflates the AOT backward
+        # graph at the full-universe ABI although their algebra is O(S).
+        combined = _columns(row, updates)
+        # No fill is a true no-op, including historical dates and fee fields.
+        combined = torch.where((q != 0)[:, None], combined, last)
+        cohorts = torch.cat((state.cohorts[:-1], combined.unsqueeze(0)), dim=0)
+    else:
+        cohorts = torch.cat((state.cohorts, row.unsqueeze(0)), dim=0)
     return _commit_inventory(
         state,
         replace(
             state,
-            cohorts=torch.cat((state.cohorts, row.unsqueeze(0)), dim=0),
-            observed_day=state.observed_day.new_tensor(day),
+            cohorts=cohorts,
+            observed_day=day.clone() if isinstance(day, Tensor) else state.observed_day.new_tensor(day),
         ),
         valid,
     )
@@ -663,7 +706,7 @@ def inventory_path_nav(
     # Cash integral at cohort starts/ends, bounded by the final filled amount.
     def cash_at(quantity):
         x = torch.minimum(quantity, closed[:, -1:])
-        index = torch.searchsorted(closed.contiguous(), x.contiguous()).clamp_max(
+        index = fifo_searchsorted(closed.contiguous(), x.contiguous()).clamp_max(
             prices.shape[1] - 1
         )
         left_q = torch.cat((zero, closed[:, :-1]), -1).gather(1, index)
@@ -679,7 +722,7 @@ def inventory_path_nav(
     quantity_rates = absolute.transpose(0, 1) * rate
     tradable_rates = tradable.transpose(0, 1) * rate
     rate_before = fifo_cumsum(tradable_rates, -1) - tradable_rates
-    index = torch.searchsorted(boundary, closed.contiguous()).clamp_max(q.shape[0] - 1)
+    index = fifo_searchsorted(boundary, closed.contiguous()).clamp_max(q.shape[0] - 1)
     marginal_rate = rate.gather(1, index)
     paid = (
         paid_before.gather(1, index)
@@ -753,7 +796,7 @@ def reduce_inventory_fifo_path(
 
     def integral(quantity: Tensor) -> Tensor:
         x = torch.minimum(quantity, closed).transpose(0, 1).contiguous()
-        index = torch.searchsorted(cumulative.contiguous(), x, right=False).clamp_max(
+        index = fifo_searchsorted(cumulative.contiguous(), x, right=False).clamp_max(
             prices.shape[1] - 1
         )
         amount = cash_left.gather(1, index) + (
@@ -849,7 +892,7 @@ def reduce_inventory_fifo_liquidity(
 
     def integral(quantity: Tensor) -> Tensor:
         x = torch.minimum(quantity, closed).transpose(0, 1).contiguous()
-        index = torch.searchsorted(
+        index = fifo_searchsorted(
             cumulative.contiguous(), x, right=False
         ).clamp_max(prices.shape[1] - 1)
         amount = cash_left.gather(1, index) + (
@@ -1008,7 +1051,7 @@ def reduce_inventory_fifo_sparse_liquidity(
         x = torch.minimum(quantity, closed)
         positive = x > 0
         query = (x + base_capacity).contiguous()
-        index = torch.searchsorted(
+        index = fifo_searchsorted(
             cumulative.contiguous(), query, right=False
         ).clamp_max(event_count - 1)
         left_volume = capacity_before.gather(0, index.reshape(-1)).reshape(index.shape)
@@ -1695,6 +1738,8 @@ def rebalance_inventory_at_open(
     halted: Tensor | None = None,
     daily_proxy_mask: Tensor | None = None,
     state_already_advanced: bool = False,
+    frozen_target_shares: Tensor | None = None,
+    frozen_sizing_nav: Tensor | None = None,
 ) -> InventoryOpeningResult:
     """One daily decision and its 09:01 historical inventory-delta execution.
 
@@ -1735,15 +1780,22 @@ def rebalance_inventory_at_open(
     ]
     original = state
     valid = _require(torch.isfinite(w), "nonfinite target weight")
+    continuing = frozen_target_shares is not None
+    if continuing != (frozen_sizing_nav is not None):
+        raise ValueError("entry continuation requires both frozen target and sizing NAV")
     valid = (
-        _require(state.decision_day < day, "duplicate or out-of-order daily decision")
+        _require(
+            state.decision_day == day if continuing else state.decision_day < day,
+            "duplicate or out-of-order daily decision (or missing opening decision)",
+        )
         & valid
     )
     c = state.cohorts
     active = c[..., F.SHARES] != 0
     valid = (
         _require(
-            ~active | ((c[..., F.ACQUIRED_DAY] < day) & (c[..., F.CONVERTED] != 0)),
+            ~active | ((c[..., F.ACQUIRED_DAY] < day) & (c[..., F.CONVERTED] != 0))
+            | (continuing & (c[..., F.ACQUIRED_DAY] == day)),
             "opening requires converted PRIOR-session inventory, not duplicate same-day entries",
         )
         & valid
@@ -1769,7 +1821,13 @@ def rebalance_inventory_at_open(
     )
     # Invalid economic/source state cannot submit or fund another order. Its
     # failure flag is absorbing; NAV is never reset to the initial capital.
-    nav_for_sizing = torch.where(valid, nav, torch.zeros_like(nav))
+    sizing_nav = nav if frozen_sizing_nav is None else frozen_sizing_nav
+    if (not isinstance(sizing_nav, Tensor) or sizing_nav.shape != ()
+            or sizing_nav.dtype != nav.dtype or sizing_nav.device != nav.device):
+        raise ValueError("frozen sizing NAV must be a matching scalar tensor")
+    valid = _require(torch.isfinite(sizing_nav) & (sizing_nav > 0),
+                     "invalid frozen opening sizing NAV") & valid
+    nav_for_sizing = torch.where(valid, sizing_nav, torch.zeros_like(nav))
     w = torch.where(torch.isfinite(w), w, torch.zeros_like(w))
     open_ok = torch.isfinite(opening) & (opening > 0)
     safe_open = torch.where(open_ok, opening, torch.ones_like(opening))
@@ -1793,6 +1851,9 @@ def rebalance_inventory_at_open(
     target = w.sign() * _ste_floor_lots(
         w.abs() * nav_for_sizing.clamp_min(0) / safe_open
     )
+    if frozen_target_shares is not None:
+        target = _vector(state, frozen_target_shares)
+        valid = _physical_shares(target) & valid
     target = torch.where(enter, target, torch.zeros_like(target))
     source_limited_price = (
         torch.isfinite(price)
@@ -1839,8 +1900,22 @@ def rebalance_inventory_at_open(
         - reduction.exit_fee.sum()
         - state.corporate_action_receivable
     ).clamp_min(0)
+    if continuing:
+        # A remainder is part of the same order, not a new opening auction.
+        # Reserve the actual cohort entry notional and its remaining NET fee;
+        # repricing existing reservations at each minute would change buying
+        # power without a fill. The paper adapter uses this same proportional
+        # allocation, independent of the symbol iteration order.
+        held_cohorts = reduction.state.cohorts
+        reserved = (held_cohorts[..., F.SHARES].abs()
+                    * held_cohorts[..., F.ENTRY_PRICE]
+                    + held_cohorts[..., F.ENTRY_COST]).sum()
+        budget = (nav_for_sizing - reserved
+                  - reduction.state.corporate_action_receivable).clamp_min(0)
     safe_price = torch.where(price_ok, price, torch.zeros_like(price))
     gross_rate = torch.where(wanted >= 0, buy, sell)
+    if continuing:
+        gross_rate = gross_rate - rebate
     valid = _finite_nonnegative(gross_rate, "gross funding fee") & valid
     gross_cost = (wanted.abs() * safe_price * (1 + gross_rate)).sum()
     tolerance = torch.maximum(budget.new_tensor(1e-9), budget.abs() * 1e-12)
@@ -1878,8 +1953,9 @@ def rebalance_inventory_at_open(
         normal_sell_fee_rate=normal,
         rebate_rate=rebate,
         day=day,
+        extend_session_cohort=continuing,
     )
-    updated = replace(updated, decision_day=updated.decision_day.new_tensor(day))
+    updated = replace(updated, decision_day=day.clone() if isinstance(day, Tensor) else updated.decision_day.new_tensor(day))
     updated = _commit_inventory(original, updated, valid)
     accepted = updated.failed == 0
     reduction = replace(

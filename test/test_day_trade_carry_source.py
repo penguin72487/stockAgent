@@ -298,8 +298,9 @@ def test_exact_pending_stock_action_maps_ratio_and_delivery_without_price_proxy(
     assert counts["mapped_pending_stock_events"] == 1
 
 
+@pytest.mark.parametrize("policy", ["reference_value_cash", "reject_held"])
 def test_pure_subscription_right_maps_symmetric_official_reference_value(
-    tmp_path,
+    tmp_path, policy,
 ):
     public = tmp_path / "public-release"
     _write_parquet(
@@ -335,10 +336,18 @@ def test_pure_subscription_right_maps_symmetric_official_reference_value(
             / "features/tw_public_stock_daily.parquet",
             dates=np.asarray(["2020-10-23"], dtype="datetime64[D]"),
             symbols=("6625",),
+            subscription_right_policy=policy,
         )
     )
 
     expected = 0.113576395 * (37.39 - 30.0)
+    if policy == "reject_held":
+        assert not mask.any()
+        assert not cash.any()
+        assert counts["mapped_subscription_right_events"] == 0
+        assert counts["rejected_subscription_right_events"] == 1
+        assert counts["_rejected_subscription_right_flat_indices"] == [0]
+        return
     assert mask.tolist() == [[True]]
     assert ratio.tolist() == [[1.0]]
     assert cash[0, 0] == pytest.approx(expected)
@@ -620,6 +629,24 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
         (tmp_path / "cache").glob("physical-price-limits-*/READY.json")
     )
     assert len(price_limit_caches) == 1
+    swept = build_prepared_day_trade_carry_source(
+        panel=panel, minute_root=minute,
+        public_feature_path=public / "features/tw_public_stock_daily.parquet",
+        cache_dir=tmp_path / "sweep-cache", allow_daily_proxy=True,
+        daily_proxy_price_policy="official_open_close", corporate_action_mode="avoid",
+        entry_remainder_policy="frozen_target_until_1320",
+    )
+    assert swept.release_id != source.release_id
+    assert swept.audit_receipt["entry_remainder_policy"] == "frozen_target_until_1320"
+    packed_rows = tuple(swept.packed_session_loader(row) for row in (0, 1))
+    rebuilt_rows = PreparedDayTradeCarryBatch.from_packed_sessions(
+        packed_rows, 2, event_compression=True).sessions(torch.device("cpu"))
+    for row, rebuilt in enumerate(rebuilt_rows):
+        expected = swept.session_at(row)
+        expected.validate_shape(3, torch.device("cpu"))
+        for name in ("entry_path", "stop_hits"):
+            torch.testing.assert_close(getattr(rebuilt, name), getattr(expected, name),
+                                       rtol=0, atol=0, equal_nan=True)
 
 
 def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(tmp_path):

@@ -1,0 +1,11 @@
+# Prepared ONLY; no live selector is switched until a new checkpoint and
+# independent same-state minute replay have passed promotion acceptance.
+# Inherit all model, feature and execution assumptions from the training file.
+base_config: tw_day_trade_v8_web_parity_v7.yaml
+runner:
+  resume: false
+  post_train_infer: false
+data:
+  parquet_root: data_tw_public/stocks
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
+  panel_cache_root: artifacts/cache/tw_day_trade_v8_web_parity_v7/live_stocks

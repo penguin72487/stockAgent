@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable, Final, Iterable, Sequence
 
 from stockagent.data.taifex_sessions import taifex_session_kind
+from stockagent.live.tw_day_trade_monitor_projection import validated_shioaji_monitor_projection
 
 
 HISTORY_UNIT: Final[str] = "stockagent-shioaji-tx-history-backfill.service"
@@ -59,6 +60,13 @@ HISTORY_RATE_SAMPLE_LIMIT: Final[int] = 120
 QUOTA_WINDOW_SCENARIO_SECONDS: Final[int] = 24 * 60 * 60
 JOURNAL_CACHE_SECONDS: Final[float] = 30.0
 MAX_JSON_FILE_CACHE_ENTRIES: Final[int] = 8_192
+_CAPTURE_RECEIPT_FIELDS: Final[tuple[str, ...]] = (
+    "capture_id", "worker_index", "trade_date", "capture_session", "status",
+    "contract_count", "symbol_count", "subscriptions_requested",
+    "tick_rows_written", "book_rows_written", "book_1s_rows_written",
+    "dropped_events", "missed_snapshot_seconds", "started_at_utc",
+    "finished_at_utc",
+)
 
 _FILE_CACHE_LOCK = threading.Lock()
 _JSON_FILE_CACHE: OrderedDict[
@@ -94,6 +102,7 @@ class ShioajiMonitorPaths:
     hft_audit_root: Path | None = None
     contract_inventory_manifest: Path | None = None
     snapshot_state: Path | None = None
+    snapshot_status: Path | None = None
     traffic_ledger_summary: Path | None = None
     storage_summary: Path | None = None
     minute_target_end_date: Path | None = None
@@ -133,6 +142,7 @@ class ShioajiMonitorPaths:
             contract_inventory_manifest=root
             / "data_tw_futures/shioaji_contracts/manifest.json",
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
+            snapshot_status=root / "artifacts/live/tw_day_trade_simulation/status.json",
             traffic_ledger_summary=root / "artifacts/live/shioaji_traffic/summary.json",
             storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
             minute_target_end_date=root
@@ -392,7 +402,9 @@ def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[
     )
 
 
-def _read_json_with_mtime(path: Path) -> tuple[dict[str, Any] | None, float | None]:
+def _read_json_with_mtime(
+    path: Path, *, use_cache: bool = True,
+) -> tuple[dict[str, Any] | None, float | None]:
     try:
         # The file signature, not a resolved path, controls cache validity.
         # Resolving every receipt follows symlinks and repeats filesystem
@@ -403,12 +415,27 @@ def _read_json_with_mtime(path: Path) -> tuple[dict[str, Any] | None, float | No
             stat.st_dev, stat.st_ino, stat.st_size,
             stat.st_mtime_ns, stat.st_ctime_ns,
         )
-        with _FILE_CACHE_LOCK:
-            cached = _JSON_FILE_CACHE.get(cache_key)
-            if cached is not None and cached[:5] == signature:
-                _JSON_FILE_CACHE.move_to_end(cache_key)
-                payload = cached[5]
-                return (dict(payload) if isinstance(payload, dict) else None, stat.st_mtime)
+        cache_hit = False
+        if use_cache:
+            with _FILE_CACHE_LOCK:
+                cached = _JSON_FILE_CACHE.get(cache_key)
+                if cached is not None and cached[:5] == signature:
+                    _JSON_FILE_CACHE.move_to_end(cache_key)
+                    payload = cached[5]
+                    cache_hit = True
+        if cache_hit:
+            # A producer may atomically replace the receipt after the first
+            # stat. Do not hold the shared cache lock over this filesystem IO.
+            try:
+                current = path.stat()
+            except OSError:
+                return None, None
+            if (
+                current.st_dev, current.st_ino, current.st_size,
+                current.st_mtime_ns, current.st_ctime_ns,
+            ) != signature:
+                return None, None
+            return (dict(payload) if isinstance(payload, dict) else None, stat.st_mtime)
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None, None
@@ -425,12 +452,16 @@ def _read_json_with_mtime(path: Path) -> tuple[dict[str, Any] | None, float | No
         # A writer replaced this receipt during the read. Do not publish the
         # previous generation as current even for a single snapshot.
         return None, None
-    with _FILE_CACHE_LOCK:
-        _JSON_FILE_CACHE[cache_key] = (*signature, selected)
-        _JSON_FILE_CACHE.move_to_end(cache_key)
-        while len(_JSON_FILE_CACHE) > MAX_JSON_FILE_CACHE_ENTRIES:
-            _JSON_FILE_CACHE.popitem(last=False)
-    return (dict(selected) if selected is not None else None, stat.st_mtime)
+    if use_cache:
+        with _FILE_CACHE_LOCK:
+            _JSON_FILE_CACHE[cache_key] = (*signature, selected)
+            _JSON_FILE_CACHE.move_to_end(cache_key)
+            while len(_JSON_FILE_CACHE) > MAX_JSON_FILE_CACHE_ENTRIES:
+                _JSON_FILE_CACHE.popitem(last=False)
+    return (
+        dict(selected) if use_cache and selected is not None else selected,
+        stat.st_mtime,
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -1139,10 +1170,16 @@ def _latest_capture_receipt(root: Path | None) -> dict[str, Any]:
     try:
         manifests = root.glob("manifests/**/worker=*.json")
         for manifest in manifests:
-            payload = _read_json(manifest)
+            # The monitor needs only scalar totals. Retaining every capture's
+            # large contract metadata in the process-wide JSON cache increases
+            # peak memory on each short-lived 30-second producer run.
+            payload, _mtime = _read_json_with_mtime(manifest, use_cache=False)
             started = _parse_datetime((payload or {}).get("started_at_utc"))
             if payload and started is not None:
-                candidates.append((started, payload))
+                candidates.append((
+                    started,
+                    {field: payload.get(field) for field in _CAPTURE_RECEIPT_FIELDS},
+                ))
     except OSError:
         return {}
     if not candidates:
@@ -1581,7 +1618,17 @@ def _build_pipelines(
     top200_entries: list[dict[str, Any]],
     minute_entries: list[dict[str, Any]],
     traffic: dict[str, Any],
+    timing_ms: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
+    stage_started = time.perf_counter()
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        if timing_ms is not None:
+            completed = time.perf_counter()
+            timing_ms[name] = round((completed - stage_started) * 1_000, 3)
+            stage_started = completed
+
     historical_market_summary = (
         _read_json(paths.historical_market_summary)
         if paths.historical_market_summary is not None
@@ -1746,6 +1793,7 @@ def _build_pipelines(
         paths.contract_inventory_manifest,
         "generated_at",
     )
+    mark_stage("receipt_files")
 
     fop_receipt = _latest_capture_receipt(paths.capture_root)
     fop_audit = _latest_audit(paths.capture_root / "audits")
@@ -1775,6 +1823,7 @@ def _build_pipelines(
     else:
         top_state, top_label = "stopped", "服務停止"
     top_latest = top_receipt.get("finished_at_utc")
+    mark_stage("capture_manifests")
 
     hft_totals = _hft_partition_totals(paths.hft_dataset_root)
     hft_audit = _latest_audit(paths.hft_audit_root, "hft_*.json")
@@ -1793,29 +1842,53 @@ def _build_pipelines(
     )
     hft_latest = hft_totals.get("latest_at_utc") or hft_audit.get("_observed_at")
 
-    snapshot_state = _read_json(paths.snapshot_state) if paths.snapshot_state else None
-    benchmarks = (snapshot_state or {}).get("benchmarks")
-    modes = (snapshot_state or {}).get("modes")
-    safe_benchmarks = benchmarks if isinstance(benchmarks, dict) else {}
-    safe_modes = modes if isinstance(modes, dict) else {}
-    quote_times = [
-        parsed
-        for item in safe_benchmarks.values()
-        if isinstance(item, dict)
-        if str(item.get("source") or "").startswith("shioaji:")
-        if (parsed := _parse_datetime(item.get("last_quote_at"))) is not None
-    ]
-    snapshot_latest = (
-        max(quote_times).isoformat().replace("+00:00", "Z")
-        if quote_times
-        else _payload_time(snapshot_state, paths.snapshot_state, "updated_at")
+    snapshot_status = _read_json(paths.snapshot_status) if paths.snapshot_status else None
+    snapshot_projection = (
+        validated_shioaji_monitor_projection(snapshot_status, paths.snapshot_state)
+        if paths.snapshot_state else None
     )
-    snapshot_sources = {
-        str(item.get("source") or "")
-        for item in safe_benchmarks.values()
-        if isinstance(item, dict)
-        and str(item.get("source") or "").startswith("shioaji:")
-    }
+    if snapshot_projection is not None:
+        mode_count = snapshot_projection["mode_count"]
+        benchmark_count = snapshot_projection["benchmark_count"]
+        source_count = snapshot_projection["source_count"]
+        quote_times = [
+            parsed
+            for value in snapshot_projection["quote_times"]
+            if (parsed := _parse_datetime(value)) is not None
+        ]
+        snapshot_latest = (
+            max(quote_times).isoformat().replace("+00:00", "Z")
+            if quote_times
+            else _payload_time(snapshot_status, paths.snapshot_status, "updated_at")
+        )
+    else:
+        # Old producers and mismatched generations retain the full-state path.
+        snapshot_state = _read_json(paths.snapshot_state) if paths.snapshot_state else None
+        benchmarks = (snapshot_state or {}).get("benchmarks")
+        modes = (snapshot_state or {}).get("modes")
+        safe_benchmarks = benchmarks if isinstance(benchmarks, dict) else {}
+        safe_modes = modes if isinstance(modes, dict) else {}
+        mode_count = len(safe_modes)
+        benchmark_count = len(safe_benchmarks)
+        quote_times = [
+            parsed
+            for item in safe_benchmarks.values()
+            if isinstance(item, dict)
+            if str(item.get("source") or "").startswith("shioaji:")
+            if (parsed := _parse_datetime(item.get("last_quote_at"))) is not None
+        ]
+        snapshot_latest = (
+            max(quote_times).isoformat().replace("+00:00", "Z")
+            if quote_times
+            else _payload_time(snapshot_state, paths.snapshot_state, "updated_at")
+        )
+        source_count = len({
+            str(item.get("source") or "")
+            for item in safe_benchmarks.values()
+            if isinstance(item, dict)
+            and str(item.get("source") or "").startswith("shioaji:")
+        })
+    mark_stage("hft_and_snapshot")
 
     backfill_state = str(backfill.get("state") or "stopped")
     history_state = {
@@ -2312,9 +2385,9 @@ def _build_pipelines(
                 "漲跌停價",
             ],
             "metrics": [
-                _metric("策略模式", len(safe_modes)),
-                _metric("行情基準", len(safe_benchmarks)),
-                _metric("永豐來源類型", len(snapshot_sources)),
+                _metric("策略模式", mode_count),
+                _metric("行情基準", benchmark_count),
+                _metric("永豐來源類型", source_count),
                 _metric("最新報價", snapshot_latest, value_format="datetime"),
             ],
             "warnings": [
@@ -2471,6 +2544,7 @@ def _build_pipelines(
         pipeline["latest_age_seconds"] = _age_seconds(
             pipeline.get("latest_at_utc"), now=now
         )
+    mark_stage("assemble")
     return pipelines
 
 
@@ -2669,6 +2743,7 @@ def build_shioaji_public_status(
         ),
         "history": traffic_history,
     }
+    pipeline_timing_ms: dict[str, float] = {}
     pipelines = _build_pipelines(
         selected_paths,
         now=observed,
@@ -2683,7 +2758,13 @@ def build_shioaji_public_status(
         top200_entries=top200_entries,
         minute_entries=minute_entries,
         traffic=traffic,
+        timing_ms=pipeline_timing_ms if timing_ms is not None else None,
     )
+    if timing_ms is not None:
+        timing_ms.update({
+            f"pipeline.{name}": elapsed
+            for name, elapsed in pipeline_timing_ms.items()
+        })
     mark_stage("pipeline_receipts")
     history_pipeline = next(
         (item for item in pipelines if item.get("id") == "futures_history"), None

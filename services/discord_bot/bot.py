@@ -7296,10 +7296,14 @@ def _risk_message(
 
 
 def _guide_message() -> str:
+    enabled_market_configs = {
+        key: cfg
+        for key, cfg in _market_configs().items()
+        if _market_enabled(cfg)
+    }
     markets = ", ".join(
         f"`{key}`"
-        for key, cfg in sorted(_market_configs().items())
-        if _market_enabled(cfg)
+        for key in sorted(enabled_market_configs)
     )
     lines = [
         "**stockAgent guide**",
@@ -7311,8 +7315,18 @@ def _guide_message() -> str:
         "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）；使用 raw-feature lookback-32 fold 11。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "`tw_day_trade_multi_basis_22` 多基底22 現股當沖（初始 1,000 萬）；使用 22 組 effective-rank 時間基底與 Projection-L1 fold 11。",
-        "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 LayerNorm v12 現股當沖（初始 1,000 萬）。",
-        "`tw_day_trade_attention_layernorm` Attention Full-Then-Last LayerNorm v12（獨立模擬 1,000 萬）；原 v12 帳戶與持倉另行保留。",
+        *(
+            ["`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 LayerNorm v12 現股當沖（初始 1,000 萬）。"]
+            if "tw_day_trade_multi_basis_projection_l1_gelu" in enabled_market_configs else []
+        ),
+        *(
+            ["`tw_day_trade_attention_layernorm` Attention Full-Then-Last LayerNorm v12（獨立模擬 1,000 萬）。"]
+            if "tw_day_trade_attention_layernorm" in enabled_market_configs else []
+        ),
+        *(
+            ["`tw_day_trade_v8_annual_log_cash` V8 年度 Log Cash 現股當沖（初始 1,000 萬）。"]
+            if "tw_day_trade_v8_annual_log_cash" in enabled_market_configs else []
+        ),
         "",
         "**日常看盤**",
         "`/latest market:<市場>` 最新訊號，不重跑模型。",
@@ -9672,6 +9686,8 @@ async def _handle_signal_now_command(
     try:
         shown_rows = _top_n(top_n)
         cfg = _resolve_market(market)
+        if hasattr(cfg, "enabled") and not _market_enabled(cfg):
+            raise BotUserError(f"`{cfg.market}` 已停用，不能再執行 /{command_name}。")
         status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
         ready_checked_at = time.perf_counter()
         postclose_fast_source = (

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 import polars as pl
@@ -33,7 +34,7 @@ from stockagent.data.crypto_public_web import (
     fred_macro_rows,
     sec_etf_filing_rows,
 )
-from downloader.ohlcv_hot_tail import read_logical_parquet
+from downloader.ohlcv_hot_tail import logical_parts, read_logical_parquet
 
 
 BOUNDARY_MINUTES_UTC = 0
@@ -84,6 +85,39 @@ BINANCE_FEATURES = (
     "crypto_binance_core_available",
     "crypto_binance_positioning_available",
     "crypto_binance_session_coverage",
+)
+
+OKX_REQUIRED_SOURCE_COLUMNS = (
+    "date",
+    "okx_mark_open", "okx_mark_high", "okx_mark_low", "okx_mark_close",
+    "okx_index_open", "okx_index_high", "okx_index_low", "okx_index_close",
+)
+OKX_SOURCE_COLUMNS = (
+    *OKX_REQUIRED_SOURCE_COLUMNS,
+    "okx_funding_age_hours", "okx_funding_realized_rate",
+    "okx_contract_mark_basis_log", "okx_mark_index_basis_log",
+    "okx_open_interest_usd", "okx_open_interest_usd_to_volume_log",
+    "okx_long_short_account_ratio_log", "okx_top_trader_account_ratio_log",
+    "okx_top_trader_position_ratio_log", "okx_taker_buy_volume_contracts",
+    "okx_taker_sell_volume_contracts",
+)
+
+BINANCE_REQUIRED_SOURCE_COLUMNS = (
+    "date", "binance_volume_quote", "binance_trade_count",
+    "binance_taker_buy_quote_volume",
+    "binance_mark_open", "binance_mark_high", "binance_mark_low",
+    "binance_mark_close", "binance_index_open", "binance_index_high",
+    "binance_index_low", "binance_index_close", "binance_funding_rate",
+    "binance_funding_age_hours",
+)
+BINANCE_SOURCE_COLUMNS = (
+    *BINANCE_REQUIRED_SOURCE_COLUMNS,
+    "binance_contract_mark_basis_log",
+    "binance_mark_index_basis_log",
+    "binance_open_interest_value_usd",
+    "binance_global_long_short_account_ratio_log",
+    "binance_top_long_short_account_ratio_log",
+    "binance_top_long_short_position_ratio_log",
 )
 
 BYBIT_FEATURES = (
@@ -471,22 +505,26 @@ def _positive_log_ratio(last: str, first: str, alias: str) -> pl.Expr:
     )
 
 
+def _read_public_source_projection(
+    path: Path, columns: tuple[str, ...]
+) -> pl.DataFrame:
+    # The logical reader fills requested but absent columns with null.  Only
+    # request columns physically present in either base or tail so optional
+    # field presence checks keep their original meaning.
+    present = {
+        name for part in logical_parts(path) for name in pq.read_schema(part).names
+    }
+    return read_logical_parquet(
+        path, columns=tuple(name for name in columns if name in present)
+    )
+
+
 def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
     # Tail-only collectors publish recent immutable rows under ``_hot_tail``.
     # Reading only the base silently freezes daily public features at the last
     # compaction date and can keep prospective fields unavailable forever.
-    frame = read_logical_parquet(path)
-    required = {
-        "date",
-        "okx_mark_open",
-        "okx_mark_high",
-        "okx_mark_low",
-        "okx_mark_close",
-        "okx_index_open",
-        "okx_index_high",
-        "okx_index_low",
-        "okx_index_close",
-    }
+    frame = _read_public_source_projection(path, OKX_SOURCE_COLUMNS)
+    required = set(OKX_REQUIRED_SOURCE_COLUMNS)
     if missing := required - set(frame.columns):
         raise ValueError(f"{path.name} missing OKX public columns: {sorted(missing)}")
     timestamps = frame.select(_parse_utc_expr("date", frame.schema).alias("__ts"))
@@ -504,7 +542,7 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
         raise ValueError(f"unsupported OKX bar interval: {interval_minutes} minutes")
     normalized = (
         frame.with_columns(
-            _parse_utc_expr("date", frame.schema).alias("__bar_open_utc")
+            timestamps.get_column("__ts").alias("__bar_open_utc")
         )
         .with_columns(
             (
@@ -770,23 +808,8 @@ def _okx_daily(path: Path, symbol: str) -> pl.DataFrame:
 
 
 def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
-    frame = read_logical_parquet(path)
-    required = {
-        "date",
-        "binance_volume_quote",
-        "binance_trade_count",
-        "binance_taker_buy_quote_volume",
-        "binance_mark_open",
-        "binance_mark_high",
-        "binance_mark_low",
-        "binance_mark_close",
-        "binance_index_open",
-        "binance_index_high",
-        "binance_index_low",
-        "binance_index_close",
-        "binance_funding_rate",
-        "binance_funding_age_hours",
-    }
+    frame = _read_public_source_projection(path, BINANCE_SOURCE_COLUMNS)
+    required = set(BINANCE_REQUIRED_SOURCE_COLUMNS)
     if missing := required - set(frame.columns):
         raise ValueError(
             f"{path.name} missing Binance public columns: {sorted(missing)}"
@@ -808,7 +831,7 @@ def _binance_daily(path: Path, symbol: str) -> pl.DataFrame:
         )
     normalized = (
         frame.with_columns(
-            _parse_utc_expr("date", frame.schema).alias("__bar_open_utc")
+            timestamps.get_column("__ts").alias("__bar_open_utc")
         )
         .with_columns(
             (
@@ -1325,6 +1348,15 @@ def _input_receipts(
 def main() -> None:
     args = parse_args()
     started = datetime.now(timezone.utc)
+    started_monotonic = time.perf_counter()
+    stage_seconds: dict[str, float] = {}
+
+    def record_stage(name: str, stage_started: float) -> None:
+        stage_seconds[name] = stage_seconds.get(name, 0.0) + (
+            time.perf_counter() - stage_started
+        )
+
+    setup_started = time.perf_counter()
     bybit_dir = Path(args.bybit_daily_dir)
     okx_dir = Path(args.okx_dir)
     binance_dir = Path(args.binance_dir)
@@ -1335,10 +1367,12 @@ def main() -> None:
     instruments = _instrument_rows(bybit_dir, requested)
     okx_map = _okx_base_map(okx_dir)
     binance_map = _binance_base_map(binance_dir)
+    record_stage("source_registry", setup_started)
     frames: list[pl.DataFrame] = []
     coverage: list[SymbolCoverage] = []
     all_dates: set[str] = set()
     symbol_bases: dict[str, str] = {}
+    symbol_loop_started = time.perf_counter()
     for record in instruments:
         symbol = str(record["code"])
         base = str(record["base_coin"] or "").upper()
@@ -1348,14 +1382,16 @@ def main() -> None:
         source_frames: list[pl.DataFrame] = []
         bybit_failed = False
         if bybit_path.is_file():
-            all_dates.update(
-                pl.read_parquet(bybit_path, columns=["date"])["date"].cast(pl.String)
-            )
+            source_started = time.perf_counter()
             try:
-                frames.append(_bybit_funding_features(bybit_path, symbol))
+                bybit_frame = _bybit_funding_features(bybit_path, symbol)
+                frames.append(bybit_frame)
+                all_dates.update(bybit_frame["date"])
             except Exception as exc:
                 messages.append(f"Bybit funding features: {type(exc).__name__}: {exc}")
                 bybit_failed = True
+            finally:
+                record_stage("bybit_symbol_features", source_started)
         else:
             messages.append(f"missing Bybit daily feature file: {bybit_path}")
             bybit_failed = True
@@ -1363,6 +1399,7 @@ def main() -> None:
         okx_status = "unmapped"
         okx_rows = 0
         if okx_code is not None:
+            source_started = time.perf_counter()
             try:
                 frame = _okx_daily(okx_dir / f"{okx_code}_features.parquet", symbol)
                 frames.append(frame)
@@ -1372,10 +1409,13 @@ def main() -> None:
             except Exception as exc:
                 okx_status = "failed"
                 messages.append(f"OKX: {type(exc).__name__}: {exc}")
+            finally:
+                record_stage("okx_symbol_features", source_started)
         binance_code, binance_mapping_basis = _resolve_base_mapping(base, binance_map)
         binance_status = "unmapped"
         binance_rows = 0
         if binance_code is not None:
+            source_started = time.perf_counter()
             try:
                 frame = _binance_daily(
                     binance_dir / f"{binance_code}_features.parquet", symbol
@@ -1387,6 +1427,8 @@ def main() -> None:
             except Exception as exc:
                 binance_status = "failed"
                 messages.append(f"Binance: {type(exc).__name__}: {exc}")
+            finally:
+                record_stage("binance_symbol_features", source_started)
         date_values = [
             str(value)
             for frame in source_frames
@@ -1414,8 +1456,7 @@ def main() -> None:
                 binance_rows=binance_rows,
             )
         )
-    if not all_dates:
-        raise RuntimeError("no Bybit daily dates found")
+    record_stage("symbol_loop_total", symbol_loop_started)
     # Public-feature artifacts are a single contract.  A source-schema failure
     # for even one mapped symbol must not publish a smaller replacement and
     # only raise afterwards: that leaves readers with a new partial artifact
@@ -1442,6 +1483,13 @@ def main() -> None:
                     "requested_symbols": len(instruments),
                     "failed_coverage_path": str(failed_coverage_path),
                     "output_preserved": str(output_path),
+                    "stage_seconds": {
+                        name: round(seconds, 3)
+                        for name, seconds in stage_seconds.items()
+                    },
+                    "elapsed_seconds": round(
+                        time.perf_counter() - started_monotonic, 3
+                    ),
                     "started_at_utc": started.isoformat(),
                     "ended_at_utc": datetime.now(timezone.utc).isoformat(),
                 },
@@ -1455,9 +1503,13 @@ def main() -> None:
             f"public feature materialization failed for {len(failed)} symbols "
             "before canonical output publication"
         )
+    if not all_dates:
+        raise RuntimeError("no Bybit daily dates found")
+    free_started = time.perf_counter()
     free_frame, free_receipt = _free_public_rows(
         Path(args.free_public_path), sorted(all_dates), symbol_bases
     )
+    record_stage("free_public", free_started)
     if free_frame.height:
         frames.append(free_frame)
     source_receipts: dict[str, dict[str, object]] = {"free_public": free_receipt}
@@ -1493,12 +1545,15 @@ def main() -> None:
         ),
     )
     for source_name, builder, builder_args in web_builders:
+        web_started = time.perf_counter()
         frame, receipt = builder(*builder_args)
+        record_stage(f"web_{source_name}", web_started)
         source_receipts[source_name] = receipt
         if frame.height:
             frames.append(frame)
     if not frames:
         raise RuntimeError("no causal public feature rows materialized")
+    projection_started = time.perf_counter()
     output = (
         pl.concat(frames, how="diagonal_relaxed")
         .group_by(["date", "symbol"], maintain_order=True)
@@ -1518,17 +1573,24 @@ def main() -> None:
             for name in numeric_columns
         ]
     )
+    record_stage("final_projection", projection_started)
+    write_started = time.perf_counter()
     _write_parquet_atomic(output, output_path)
+    record_stage("parquet_write", write_started)
     quality_path = output_path.with_name(f"{output_path.stem}_quality.csv")
+    quality_started = time.perf_counter()
     quality = _feature_quality_rows(output)
     _write_text_atomic(quality.write_csv(), quality_path)
+    record_stage("quality_report", quality_started)
     coverage_path = output_path.with_name(f"{output_path.stem}_coverage.csv")
+    coverage_started = time.perf_counter()
     _write_text_atomic(
         pl.DataFrame(
             [asdict(item) for item in coverage], infer_schema_length=None
         ).write_csv(),
         coverage_path,
     )
+    record_stage("coverage_report", coverage_started)
     summary = {
         "contract_version": 5,
         "decision_boundary_utc": "00:00",
@@ -1576,6 +1638,12 @@ def main() -> None:
         },
         "source_decisions": _source_decisions(),
         "input_receipts": _input_receipts(bybit_dir, binance_dir, okx_dir),
+        "stage_seconds": {
+            name: round(seconds, 3) for name, seconds in stage_seconds.items()
+        },
+        "elapsed_seconds_before_summary": round(
+            time.perf_counter() - started_monotonic, 3
+        ),
         "started_at_utc": started.isoformat(),
         "ended_at_utc": datetime.now(timezone.utc).isoformat(),
     }

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import math
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +38,11 @@ from artifact_io import (  # noqa: E402
     atomic_write_text,
 )
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 from binance_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
     feature_run_summary_path,
@@ -260,6 +265,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--output-dir", default="data_binance/1m")
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="Maximum dataset-writer lock wait; 0 makes one nonblocking attempt.",
+    )
     parser.add_argument(
         "--mode",
         choices=["incremental", "daily-update", "full"],
@@ -1162,12 +1173,17 @@ def main() -> None:
     if args.tail_only and (args.refresh or args.mode == "full"):
         raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / ".download.lock"
-    lock_handle = lock_path.open("a+", encoding="utf-8")
-    print(f"[binance] waiting for exclusive dataset lock: {lock_path}", flush=True)
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    print(f"[binance] acquired exclusive dataset lock: {lock_path}", flush=True)
+    with exclusive_dataset_lock(
+        output_dir / ".download.lock", provider="binance",
+        timeout_seconds=args.lock_timeout_seconds,
+    ) as acquisition:
+        _run_locked_download(args, output_dir, lock_wait_seconds=acquisition.wait_seconds)
+
+
+def _run_locked_download(
+    args: argparse.Namespace, output_dir: Path, *, lock_wait_seconds: float,
+) -> None:
+    work_started = time.monotonic()
     symbols_path = output_dir / "symbols.csv"
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
@@ -1371,6 +1387,9 @@ def main() -> None:
         "started_at_utc": started_at.isoformat(),
         "ended_at_utc": ended_at.isoformat(),
         "elapsed_seconds": (ended_at - started_at).total_seconds(),
+        "lock_wait_seconds": round(lock_wait_seconds, 6),
+        "work_started_at_utc": started_at.isoformat(),
+        "work_elapsed_seconds": round(time.monotonic() - work_started, 6),
         "exchange_server_time_ms": exchange_info.get("serverTime"),
         "request_weight_per_minute": client.weight_per_minute,
         "kline_limit": KLINE_LIMIT,
@@ -1441,7 +1460,6 @@ def main() -> None:
     print(f"[binance] feature report -> {historical_feature_report_path}")
     print(f"[binance] feature catalog -> {feature_catalog_path}")
     print(f"[binance] report: {json.dumps(summary, ensure_ascii=False)}")
-    lock_handle.close()
     if failed:
         raise RuntimeError(f"Binance download incomplete: {failed} symbols failed")
     if feature_incomplete:

@@ -39,6 +39,7 @@ def test_okx_feature_result_matches_exit_and_archived_receipts(
         inst_family="BTC-USDT",
     )
     args = SimpleNamespace(
+        lock_timeout_seconds=180.0,
         output_dir=str(output), mode="incremental", start_date="2026-09-01",
         end_date="2026-09-01", workers=1, feature_workers=1,
         refresh=False, tail_only=False, limit=None, request_interval=None,
@@ -87,6 +88,10 @@ def test_okx_feature_result_matches_exit_and_archived_receipts(
     assert json.loads((archive / "download_summary.json").read_text())[
         "historical_feature_status_counts"
     ] == {feature_status: 1}
+    summary = json.loads((archive / "download_summary.json").read_text())
+    assert summary["lock_wait_seconds"] >= 0
+    assert summary["work_elapsed_seconds"] >= 0
+    assert summary["started_at_utc"] <= summary["work_started_at_utc"] <= summary["ended_at_utc"]
     assert "BTC-USDT-SWAP" in (archive / "download_report.csv").read_text()
     (output / "download_report.csv").write_text("replaced\n")
     assert "BTC-USDT-SWAP" in (archive / "download_report.csv").read_text()

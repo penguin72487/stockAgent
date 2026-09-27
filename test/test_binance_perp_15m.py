@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -336,6 +337,91 @@ def test_binance_run_report_archive_survives_latest_report_replacement(
     latest.write_bytes(b"symbol,status\nBTCUSDT,updated\n")
 
     assert (archive / latest.name).read_bytes() == b"symbol,status\nBTCUSDT,failed\n"
+
+
+def test_binance_main_archives_failure_before_raise_and_preserves_it_after_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "candles"
+    archive_dir = tmp_path / "backfill-run" / "binance_source"
+    record = binance.SymbolRecord(
+        code="BTCUSDT", name="BTCUSDT", market="binance_usdm_perp",
+        binance_symbol="BTCUSDT", pair="BTCUSDT", base_asset="BTC",
+        quote_asset="USDT", margin_asset="USDT", contract_type="PERPETUAL",
+        status="TRADING", onboard_time=None,
+    )
+    mock_client = SimpleNamespace(
+        weight_per_minute=2400,
+        limiter=SimpleNamespace(grant_activity=lambda: {}),
+        endpoint_limiter_activity=lambda: {},
+    )
+    monkeypatch.setattr(binance, "BinanceClient", lambda **kwargs: mock_client)
+    monkeypatch.setattr(
+        binance, "_fetch_symbols",
+        lambda client, path, *, limit: ([record], {"serverTime": 0}),
+    )
+    observed_tail_modes: list[bool] = []
+
+    def mock_download(client, symbol, path, *, tail_only, **kwargs):
+        assert client is mock_client
+        assert symbol is record
+        assert path == output_dir
+        observed_tail_modes.append(tail_only)
+        if not tail_only:
+            raise RuntimeError("synthetic candle failure")
+        return binance.DownloadResult(
+            "crypto_binance_usdm_perp", record.code, record.binance_symbol,
+            record.market, "updated", 1,
+            str(output_dir / "BTCUSDT_features.parquet"),
+            first_date="2026-01-01 00:00:00", last_date="2026-01-01 00:00:00",
+        )
+
+    monkeypatch.setattr(binance, "_download_symbol", mock_download)
+    common_argv = [
+        "download_binance_perp_1m.py", "--output-dir", str(output_dir),
+        "--start-date", "2026-01-01", "--end-date", "2026-01-01",
+        "--workers", "1", "--skip-historical-features",
+    ]
+    monkeypatch.setattr(
+        binance.sys, "argv",
+        common_argv + ["--mode", "full", "--archive-report-dir", str(archive_dir)],
+    )
+
+    with pytest.raises(RuntimeError, match="^Binance download incomplete: 1 symbols failed$"):
+        binance.main()
+
+    archived_report = pl.read_csv(archive_dir / "download_report.csv")
+    assert archived_report.height == 1
+    assert archived_report.select("code", "binance_symbol", "status", "message").row(0) == (
+        "BTCUSDT", "BTCUSDT", "failed", "RuntimeError: synthetic candle failure",
+    )
+    archived_receipt = json.loads((archive_dir / "download_receipt.json").read_text())
+    archived_summary = json.loads((archive_dir / "download_summary.json").read_text())
+    assert archived_receipt["status_counts"] == archived_summary["status_counts"] == {"failed": 1}
+    assert archived_receipt["tail_only"] is archived_summary["tail_only"] is False
+    assert archived_summary["lock_wait_seconds"] >= 0
+    assert archived_summary["work_elapsed_seconds"] >= 0
+    assert archived_summary["work_started_at_utc"] == archived_summary["started_at_utc"]
+    assert set(archived_receipt["artifacts"]) == {
+        "symbols.csv", "download_report.csv", "download_summary.json",
+        "historical_feature_report.csv", "binance_historical_feature_catalog.json",
+    }
+    for name, proof in archived_receipt["artifacts"].items():
+        payload = (archive_dir / name).read_bytes()
+        assert len(payload) == proof["bytes"]
+        assert hashlib.sha256(payload).hexdigest() == proof["sha256"]
+    archived_bytes = {path.name: path.read_bytes() for path in archive_dir.iterdir()}
+
+    monkeypatch.setattr(binance.sys, "argv", common_argv + ["--tail-only"])
+    binance.main()
+
+    assert observed_tail_modes == [False, True]
+    assert pl.read_csv(output_dir / "download_report.csv")["status"].to_list() == ["updated"]
+    latest_receipt = json.loads((output_dir / "download_receipt.json").read_text())
+    assert latest_receipt["status_counts"] == {"updated": 1}
+    assert latest_receipt["tail_only"] is True
+    assert {path.name: path.read_bytes() for path in archive_dir.iterdir()} == archived_bytes
 
 
 def test_binance_funding_asof_never_uses_a_future_settlement() -> None:

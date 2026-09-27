@@ -30,6 +30,7 @@ if [[ -z "${SHIOAJI_API_KEY:-}" || -z "${SHIOAJI_SECRET_KEY:-}" ]]; then
   exit 2
 fi
 source scripts/runtime_env.sh
+CAPTURE_PYTHON="$(resolve_fintech_python)"
 
 # Fail at service startup if the package entry point cannot be imported.  Running
 # the collector with ``-m`` keeps the repository root on sys.path; executing the
@@ -181,7 +182,9 @@ while true; do
         --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"
       )
     fi
-    run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
+    # Launch the Python worker directly so the recorded PID can be terminated
+    # without leaving a child holding a Shioaji login after a sibling fails.
+    "$CAPTURE_PYTHON" -m downloader.stream_shioaji_taifex_bidask \
       --simulation \
       "${strategy_args[@]}" \
       --capture-id "$capture_id" \
@@ -209,12 +212,44 @@ while true; do
   }
   trap cleanup_workers TERM INT
   capture_rc=0
-  for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
-    wait "${worker_pids[$worker_index]}"
-    worker_rc=$?
-    worker_rcs+=("$worker_rc")
-    if (( worker_rc != 0 )); then
-      capture_rc=1
+  remaining_workers=$WORKERS
+  worker_finished=()
+  while (( remaining_workers > 0 )); do
+    for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+      if [[ "${worker_finished[$worker_index]:-}" == true ]]; then
+        continue
+      fi
+      if kill -0 "${worker_pids[$worker_index]}" 2>/dev/null; then
+        continue
+      fi
+      wait "${worker_pids[$worker_index]}"
+      worker_rc=$?
+      worker_rcs[$worker_index]="$worker_rc"
+      worker_finished[$worker_index]=true
+      (( remaining_workers-- ))
+      if (( worker_rc != 0 )); then
+        capture_rc=1
+        break
+      fi
+    done
+    if (( capture_rc != 0 )); then
+      # One worker's missing market data invalidates the shared capture. Stop
+      # its siblings now instead of waiting until the session close to retry.
+      for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+        if [[ "${worker_finished[$worker_index]:-}" != true ]]; then
+          kill -TERM "${worker_pids[$worker_index]}" 2>/dev/null || true
+        fi
+      done
+      for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+        if [[ "${worker_finished[$worker_index]:-}" != true ]]; then
+          wait "${worker_pids[$worker_index]}"
+          worker_rcs[$worker_index]=$?
+        fi
+      done
+      break
+    fi
+    if (( remaining_workers > 0 )); then
+      sleep 0.5
     fi
   done
   trap - TERM INT

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,38 @@ from types import SimpleNamespace
 from scripts.audit_tw_day_trade_margin_replay import (
     audit, _entry_source_path, _retained_entry_book_source_days,
     _verify_calendar_coverage, _claim_matches_source, _verified_action_sources,
+    _with_verified_share_volume,
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+
+
+@pytest.mark.parametrize("raw_volume", [1.0, 1_000.0])
+def test_audit_legacy_stock_volume_resolves_lots_and_shares(raw_volume):
+    frame = pl.DataFrame({
+        "Volume": [raw_volume], "Amount": [100_500.0],
+        "Low": [100.0], "High": [101.0], "contract_unit": [1_000.0],
+    })
+    shares = _with_verified_share_volume(frame.lazy()).collect()["volume_shares"][0]
+    assert shares == 1_000.0
+    assert math.floor(shares * 0.5 / 1_000.0) * 1_000 == 0
+
+
+@pytest.mark.parametrize("amount", [None, 5_000.0])
+def test_audit_unknown_stock_volume_does_not_supply_capacity(amount):
+    values = {"Volume": [1.0], "Low": [100.0], "High": [101.0]}
+    if amount is not None:
+        values["Amount"] = [amount]
+    frame = _with_verified_share_volume(pl.DataFrame(values).lazy()).collect()
+    assert frame["volume_shares"][0] is None
+
+
+@pytest.mark.parametrize("shares", [1_000.0, 1_000.5, float("inf"), -1.0])
+def test_audit_canonical_share_volume_is_not_multiplied(shares):
+    frame = pl.DataFrame({
+        "Volume": [1_000.0], "volume_shares": [shares], "contract_unit": [1_000.0],
+    })
+    actual = _with_verified_share_volume(frame.lazy()).collect()["volume_shares"][0]
+    assert actual == (1_000.0 if shares == 1_000.0 else None)
 
 
 def test_claim_arithmetic_cannot_substitute_for_official_cash_terms():

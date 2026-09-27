@@ -18,6 +18,14 @@ def test_recent_scan_requires_completed_full_archive(tmp_path: Path) -> None:
     state_path.write_text(json.dumps({"status": "running", "complete": False}))
     assert _money_recent_pages(tmp_path, full_index=False) == 0
     state_path.write_text(json.dumps({"status": "complete", "complete": True}))
+    # Bare green flags are not a recoverable full-index proof.
+    assert _money_recent_pages(tmp_path, full_index=False) == 0
+    state_path.write_text(json.dumps({
+        "dataset": "cbc_money_release_vintages", "status": "complete", "complete": True,
+        "saved_releases": 1, "registered_releases": 1,
+        "parquet_sha256": "a" * 64, "listing_receipts": [{"page": 1}],
+        "scan_scope": "full_index", "generated_at_utc": "2026-09-25T00:00:00+00:00",
+    }))
     assert _money_recent_pages(tmp_path, full_index=False) == 2
     assert _money_recent_pages(tmp_path, full_index=True) == 0
 

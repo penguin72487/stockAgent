@@ -212,6 +212,7 @@
       "source": "data_bybit",
       "role": "training",
       "publish": true,
+      "source_coordination_lock": "artifacts/daily_downloader/bybit_source_publish.lock",
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "excluded_subtrees": [

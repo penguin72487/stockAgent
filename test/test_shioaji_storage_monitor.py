@@ -48,6 +48,7 @@ def test_storage_snapshot_reconciles_size_growth_and_disk(tmp_path: Path) -> Non
     )
     payload = build_shioaji_storage_snapshot(tmp_path, now=now, specs=specs)
     assert payload["summary"]["total_bytes"] == 150
+    assert payload["definitions"]["total_bytes"].startswith("2 個")
     assert payload["summary"]["source_bytes"] == 100
     assert payload["summary"]["derived_bytes"] == 50
     assert payload["summary"]["growth_window_bytes"] == 150

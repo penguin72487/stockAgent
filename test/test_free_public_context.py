@@ -345,9 +345,28 @@ def test_blockscout_adapters_keep_gas_snapshot_and_block_event_times() -> None:
 
 
 def test_every_public_dataset_has_an_adapter_and_rate_profile() -> None:
-    assert len(public.DATASETS) == 26
+    assert len(public.DATASETS) == 28
     for spec in public.DATASETS:
         assert spec.adapter in public.ADAPTERS
         assert (
             public.provider_rate_limit(spec.provider_profile).requests_per_second <= 10
         )
+
+
+def test_defillama_histories_keep_capture_clock_and_peg_units() -> None:
+    observed = "2026-09-26T17:00:00+00:00"
+    tvl = public._adapt_defillama_tvl_history(
+        _spec("defillama_tvl_history", "defillama_tvl_history"),
+        [{"date": 1577836800, "tvl": 100.0}], observed, "a" * 64,
+    )
+    assert tvl[0]["event_ts_utc"].startswith("2020-01-01")
+    assert tvl[0]["available_at_utc"] == observed
+    rows = public._adapt_defillama_stablecoin_supply_history(
+        _spec("defillama_stablecoin_supply_history", "defillama_stablecoin_supply_history"),
+        [{"date": "1577836800", "totalCirculating": {"peggedUSD": 10, "peggedEUR": 5},
+          "totalCirculatingUSD": {"peggedUSD": 10, "peggedEUR": 6}}], observed, "b" * 64,
+    )
+    assert len(rows) == 4
+    eur = [r for r in rows if r["entity"] == "all_chains:peggedEUR"]
+    assert {(r["value_float"], r["unit"]) for r in eur} == {(5.0, "peggedEUR"), (6.0, "USD")}
+    assert all(r["available_at_utc"] == observed for r in rows)

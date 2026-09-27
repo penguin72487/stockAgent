@@ -1,0 +1,76 @@
+# Inherit the exact requested v5 artifact snapshot; override futures semantics only.
+base_config: ../deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml
+experiment_name: tw-futures-v8-general
+
+environment:
+  cpu_threads: 16
+  torch_compile_threads: 16
+
+data:
+  use_tw_public_rules: false
+  feature_shift_next_session: [next_session_open_gap_logret]
+  tw_futures_current_open_feature: false
+  tw_futures_expiry_settlement_valuation: true
+  panel_cache_root: artifacts/cache/tw_futures_v8_general
+  day_trade_minute_execution_root: null
+  day_trade_minute_execution_cache_dir: null
+  day_trade_minute_execution_allow_daily_proxy: false
+
+trading:
+  execution_mode: tw_stock_context_futures_portfolio
+  tw_futures_portfolio_holding_policy: carry
+  tw_futures_portfolio_integer_contracts: true
+  tw_futures_portfolio_integer_initial_capital: 10000000.0
+  volume_participation_equity: 10000000.0
+  tw_futures_portfolio_integer_fee_per_contract_per_side_twd: 40.0
+  tw_futures_portfolio_data_path: artifacts/data_preparation/futures_daily_70a57dd76de74fd0a365/continuous_daily.parquet
+  tw_futures_portfolio_final_settlement_path: data_tw_futures/final_settlement_v1/futures_final_settlement_history.parquet
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.5
+  tw_day_trade_unlimited_margin_conversion: false
+  tw_day_trade_terminal_liquidation_unlimited_capacity: false
+
+training:
+  distributed_symbol_sharded_ledger: false
+  train_symbol_compaction: false
+  day_trade_optimizer_step_per_trajectory: false
+  day_trade_training_annual_episodes: false
+  day_trade_sub_lot_recovery: false
+  futures_portfolio_optimizer_step_per_trajectory: true
+  futures_portfolio_recoverable_backward: true
+  futures_portfolio_training_surrogate_only: false
+  futures_minute_recovery_objective: residual_notional
+  compile_loss: false
+  backtest_compile: false
+  eval_backtest_compile: false
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  pretrained_initialization_root: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: identity_by_feature_name
+  pretrained_initialization_require_exact_backbone: false
+  pretrained_initialization_validation_guard: true
+  pretrained_initialization_require_improvement_over_flat_cash: true
+  pretrained_initialization_trainable_parameter_prefixes: []
+  lr_scheduler_warmup_steps: 32
+  financial_transformer:
+    futures_denomination_aware_output: false
+    futures_denomination_hard_projection: false
+    futures_current_open_feature: false
+  transformer_base_portfolio:
+    futures_denomination_aware_output: false
+    futures_denomination_hard_projection: false
+    futures_current_open_feature: false
+  multitask_loss:
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general
+  start_fold: 1
+  resume: true
+  post_train_infer: false

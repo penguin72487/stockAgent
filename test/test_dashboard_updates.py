@@ -98,7 +98,11 @@ def test_sse_flushes_initial_and_committed_view_without_polling():
 def test_history_cache_invalidates_immediately_on_content_revision(monkeypatch, topic):
     server = _test_server()
     token = {"value": "one"}
-    server.content_token = lambda *_: token["value"]
+    def content_token(_topic="tw", *, history_only=False):
+        assert history_only is True
+        return token["value"]
+
+    server.content_token = content_token
     calls = []
 
     def build(**kwargs):
@@ -150,7 +154,8 @@ def test_signals_are_requested_before_lossless_history_and_client_keys_include_r
     key = source[source.index("function detailDataRevision"):source.index("function chartHistoryMatchesSelection")]
     assert "service.content_revision" in key
     assert "history.generated_at" in key
-    assert "service.history_revision || service.revision_token" in key
+    assert "const sourceRevision = service.history_revision || null;" in key
+    assert "sourceRevision || service.revision_token || service.content_revision || null" in key
     assert "detailRangeKey()" in key
     assert "signalLoading && signalRequestRevisionInFlight === requestRevision" in source
     assert "positionLoading && positionRequestRevisionInFlight === requestRevision" in source

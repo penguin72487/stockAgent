@@ -870,6 +870,27 @@ def load_taifex_index_futures_day_session(
             f"{mismatched_metadata}"
         )
 
+    # Preserve the complete source calendar, including dates containing only
+    # unselected products. Normalize distinct strings with the same Python
+    # semantics as the canonical loops before boxing the selected rows.
+    all_source_dates = None
+    if len(normalized_products) < len(TAIFEX_INDEX_FUTURES_PRODUCTS):
+        product_column = table.column("product")
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        if pa.types.is_string(product_column.type) or pa.types.is_large_string(product_column.type):
+            product_values = product_column.unique().to_pylist()
+            selected_values = [
+                value for value in product_values
+                if str(value).strip().upper() in normalized_products
+            ]
+            if len(selected_values) != len(product_values):
+                all_source_dates = np.asarray(table.column("date").to_pylist(), dtype="datetime64[D]")
+                table = table.filter(pc.is_in(
+                    product_column, value_set=pa.array(selected_values, type=product_column.type)
+                ))
+
     payload = table.select(
         [
             "date",
@@ -889,7 +910,7 @@ def load_taifex_index_futures_day_session(
     ).to_pydict()
     source_dates = np.asarray(payload["date"], dtype="datetime64[D]")
     if panel_dates is None:
-        dates = np.unique(source_dates)
+        dates = np.unique(all_source_dates if all_source_dates is not None else source_dates)
     else:
         dates = np.asarray(panel_dates, dtype="datetime64[D]")
         if dates.ndim != 1 or dates.size == 0:

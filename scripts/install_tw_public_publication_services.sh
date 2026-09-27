@@ -36,6 +36,7 @@ units=(
   stockagent-tw-public-0830-check.timer
   stockagent-tw-public-cold-publish.service
   stockagent-tw-public-cold-publish.timer
+  stockagent-tw-public-cold-publish.path
 )
 for unit in "${units[@]}"; do
   sed \
@@ -49,6 +50,7 @@ done
 systemd-analyze verify \
   "$temporary_dir"/*.service \
   "$temporary_dir"/*.timer \
+  "$temporary_dir"/*.path \
   "$temporary_dir"/*.slice
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
@@ -70,7 +72,8 @@ systemctl enable --now \
   stockagent-tw-day-trade-margin-actions.timer \
   stockagent-tw-public-publication-sweep.timer \
   stockagent-tw-public-0830-check.timer \
-  stockagent-tw-public-cold-publish.timer
+  stockagent-tw-public-cold-publish.timer \
+  stockagent-tw-public-cold-publish.path
 
 if [[ "${START_ELIGIBILITY_FETCH_NOW:-0}" == "1" ]]; then
   systemctl start stockagent-tw-day-trade-eligibility.service

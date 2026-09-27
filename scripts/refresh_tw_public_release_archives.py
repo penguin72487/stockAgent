@@ -22,6 +22,11 @@ from zoneinfo import ZoneInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from downloader.release_archive_io import read_release_resume_state  # noqa: E402
+
 ARCHIVES = ("dgbas_release_vintages", "cbc_fx_reserve_release_vintages",
             "cbc_money_release_vintages", "cbc_overnight_official_pages")
 SCRIPTS = {
@@ -35,15 +40,9 @@ SCRIPTS = {
 def _money_recent_pages(root: Path, *, full_index: bool) -> int:
     if full_index:
         return 0
-    try:
-        state = json.loads((root / "state" / "cbc_money_release_vintages.json").read_text(
-            encoding="utf-8"
-        ))
-        if state.get("complete") is True and state.get("status") == "complete":
-            return 2
-    except (OSError, ValueError, TypeError):
-        pass
-    return 0
+    # Planning hint only. The collector revalidates every pinned source under
+    # its writer lock; a checkpoint never changes current health/completeness.
+    return 2 if read_release_resume_state(root, "cbc_money_release_vintages") else 0
 
 
 def _mof_recent_pages(root: Path) -> int:

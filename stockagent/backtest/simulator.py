@@ -3447,6 +3447,38 @@ def run_backtest_torch(
                 "tw_stock_context_futures_portfolio requires packed futures "
                 "execution channels"
             )
+        if overnight_returns.ndim == 4:
+            # The canonical scheduled executor owns every fill, fee and
+            # residual failure. Only the stock-context action ABI differs.
+            from dataclasses import replace
+            result = run_backtest_torch(
+                weights=weights, future_returns=torch.zeros_like(weights),
+                benchmark_returns=benchmark_returns,
+                tradable_mask=torch.ones_like(weights, dtype=torch.bool),
+                execution_mode="tw_stock_futures_day_trade_0845_minute",
+                overnight_returns=overnight_returns,
+                buy_fee_rate=buy_fee_rate, sell_fee_rate=sell_fee_rate,
+                long_only=long_only, gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+                max_turnover_ratio=max_turnover_ratio,
+                state_advance_mask=state_advance_mask,
+                initial_equity_scale=initial_equity_scale,
+                initial_alive=initial_alive,
+                return_weights_history=return_weights_history,
+                return_turnovers=return_turnovers,
+                day_trade_execution_initial_capital=day_trade_execution_initial_capital,
+                futures_portfolio_recoverable_backward=futures_portfolio_recoverable_backward,
+                futures_minute_saturation_recovery=futures_minute_saturation_recovery,
+                futures_minute_recovery_objective=futures_minute_recovery_objective,
+            )
+            quantities = result.futures_contract_quantities_history
+            return replace(
+                result, execution_mode=mode,
+                weights_history=(quantities[..., 0].to(torch.float32)
+                                 if quantities is not None else result.weights_history),
+                settlement_ledger_unit="contract_quantity",
+            )
         execution = overnight_returns.to(device=weights.device, dtype=torch.float32)
         if (
             execution.ndim != 3

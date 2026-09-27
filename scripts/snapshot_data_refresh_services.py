@@ -22,6 +22,7 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     _refresh_service_states,
     build_data_monitor_feature_inventory,
     build_data_monitor_public_status,
+    feature_source_metadata_sha256,
     project_data_monitor_summary,
 )
 from stockagent.live.dashboard_updates import metadata_signature  # noqa: E402
@@ -31,9 +32,18 @@ from stockagent.live.data_monitor_inventory import (  # noqa: E402
     build_record_inventory,
 )
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
+    FEATURE_SOURCE_PAGES_MAX_BYTES,
+    feature_preview_checksum as _feature_preview_checksum,
+    feature_revision_binding as _feature_revision_binding,
     feature_reuse_checksum as _feature_reuse_checksum,
     feature_reuse_receipt_path as _feature_reuse_receipt_path,
+    feature_source_pages_path as _feature_source_pages_path,
     feature_source_signature as _feature_source_signature,
+)
+from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
+    feature_page_projections,
+    valid_feature_page_preview,
+    valid_feature_source_pages,
 )
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status  # noqa: E402
 
@@ -60,23 +70,22 @@ def parse_args() -> argparse.Namespace:
 
 def _atomic_json(
     path: Path, payload: dict[str, object], *, compact: bool = False,
-    strict_json: bool = False,
+    strict_json: bool = False, sort_keys: bool = True,
+    max_bytes: int | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
     try:
-        temporary.write_text(
+        encoded = (
             json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=None if compact else 2,
+                payload, ensure_ascii=False, indent=None if compact else 2,
                 separators=(",", ":") if compact else None,
-                sort_keys=True,
-                allow_nan=not strict_json,
-            )
-            + "\n",
-            encoding="utf-8",
+                sort_keys=sort_keys, allow_nan=not strict_json,
+            ) + "\n"
         )
+        if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
+            raise ValueError("atomic JSON exceeds bounded projection size")
+        temporary.write_text(encoded, encoding="utf-8")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -135,6 +144,9 @@ def _stable_feature_digest(path: Path, expected: list[int]) -> str | None:
 def _write_feature_reuse_receipt(
     path: Path, fields: int, *, validated_contract: bool = False,
     feature_revision: str | None = None,
+    source_metadata_sha256: str | None = None,
+    preview: dict[str, object] | None = None,
+    source_pages: dict[str, list[dict[str, object]]] | None = None,
 ) -> None:
     """Publish a compact proof only after the complete snapshot is stable."""
     try:
@@ -155,32 +167,57 @@ def _write_feature_reuse_receipt(
         signature = _feature_source_signature(path.stat())
         digest = _stable_feature_digest(path, signature)
         if digest is not None:
-            revision_binding = (
-                hashlib.sha256(json.dumps(
-                    [signature, digest, fields, feature_revision],
-                    separators=(",", ":"),
-                ).encode("ascii")).hexdigest()
-                if isinstance(feature_revision, str) and len(feature_revision) == 32
-                else None
+            revision_binding = _feature_revision_binding(
+                signature, digest, fields, feature_revision,
+                source_metadata_sha256,
             )
-            _atomic_json(
-                _feature_reuse_receipt_path(path),
-                {
-                    "schema_version": 3,
-                    "read_only": True,
-                    "production_control_possible": False,
-                    "source_signature": signature,
-                    "source_sha256": digest,
-                    "fields": fields,
-                    "receipt_sha256": _feature_reuse_checksum(
-                        signature, digest, fields
-                    ),
-                    "feature_revision": feature_revision if revision_binding else None,
-                    "feature_revision_sha256": revision_binding,
-                },
-                compact=True,
-            )
-    except (OSError, ValueError, UnicodeError):
+            receipt: dict[str, object] = {
+                "schema_version": 3,
+                "read_only": True,
+                "production_control_possible": False,
+                "source_signature": signature,
+                "source_sha256": digest,
+                "fields": fields,
+                "receipt_sha256": _feature_reuse_checksum(signature, digest, fields),
+                "feature_revision": feature_revision if revision_binding else None,
+                "feature_revision_sha256": revision_binding,
+                "source_metadata_sha256": source_metadata_sha256,
+            }
+            if preview is not None and valid_feature_page_preview(preview, fields=fields):
+                receipt["first_page_preview"] = preview
+                receipt["first_page_preview_sha256"] = _feature_preview_checksum(
+                    digest, preview,
+                )
+                if source_pages is not None and valid_feature_source_pages(
+                    source_pages, fields=fields,
+                ):
+                    try:
+                        pages_path = _feature_source_pages_path(path)
+                        _atomic_json(
+                            pages_path,
+                            {
+                                "schema_version": 1,
+                                "read_only": True,
+                                "production_control_possible": False,
+                                "source_signature": signature,
+                                "source_sha256": digest,
+                                "fields": fields,
+                                "pages": source_pages,
+                            },
+                            compact=True, strict_json=True, sort_keys=False,
+                            max_bytes=FEATURE_SOURCE_PAGES_MAX_BYTES,
+                        )
+                        pages_signature = _feature_source_signature(pages_path.stat())
+                        pages_digest = _stable_feature_digest(pages_path, pages_signature)
+                        if pages_digest is not None:
+                            receipt["source_pages_sha256"] = pages_digest
+                    except (OSError, ValueError, UnicodeError, TypeError) as exc:
+                        print(json.dumps({
+                            "event": "feature_source_pages_projection_failed",
+                            "error_type": type(exc).__name__,
+                        }), flush=True)
+            _atomic_json(_feature_reuse_receipt_path(path), receipt, compact=True)
+    except (OSError, ValueError, UnicodeError, TypeError):
         # This is an optional acceleration receipt. The next run will validate
         # and parse the full source rather than weaken the publication gate.
         pass
@@ -188,6 +225,7 @@ def _write_feature_reuse_receipt(
 
 def _current_feature_snapshot(
     path: Path, *, feature_revision: str | None = None,
+    source_metadata_sha256: str | None = None,
 ) -> int | None:
     """Reuse field count only after source and dependency proof is current."""
 
@@ -196,6 +234,7 @@ def _current_feature_snapshot(
         REPO_ROOT / "stockagent/live/data_monitor_inventory.py",
         REPO_ROOT / "stockagent/live/data_monitor_dashboard.py",
         REPO_ROOT / "stockagent/live/data_monitor_feature_receipt.py",
+        REPO_ROOT / "stockagent/live/data_monitor_feature_pages.py",
         REPO_ROOT / "configs/data_sync/packed_datasets.json",
         REPO_ROOT / "data_tw_public/dataset_manifest.json",
         Path(__file__),
@@ -217,19 +256,24 @@ def _current_feature_snapshot(
             and isinstance(feature_revision, str)
             and len(feature_revision) == 32
             and receipt.get("feature_revision") == feature_revision
-            and receipt.get("feature_revision_sha256") == hashlib.sha256(
-                json.dumps(
-                    [signature, receipt.get("source_sha256"), receipt.get("fields"), feature_revision],
-                    separators=(",", ":"),
-                ).encode("ascii")
-            ).hexdigest()
+            and (
+                source_metadata_sha256 is None
+                or receipt.get("source_metadata_sha256") == source_metadata_sha256
+            )
+            and receipt.get("feature_revision_sha256") == _feature_revision_binding(
+                signature, receipt.get("source_sha256"), receipt.get("fields"),
+                feature_revision, source_metadata_sha256,
+            )
         )
-        if (
-            isinstance(receipt, dict)
-            and isinstance(feature_revision, str)
-            and receipt.get("feature_revision") is not None
-            and not revision_bound
-        ):
+        requires_binding = (
+            source_metadata_sha256 is not None
+            or (
+                isinstance(receipt, dict)
+                and isinstance(feature_revision, str)
+                and receipt.get("feature_revision") is not None
+            )
+        )
+        if requires_binding and not revision_bound:
             return None
         if not dependencies_current(snapshot_mtime, revision_bound=revision_bound):
             return None
@@ -253,6 +297,11 @@ def _current_feature_snapshot(
             return receipt["fields"]
     except (OSError, ValueError, UnicodeError):
         pass
+    if source_metadata_sha256 is not None:
+        # A full JSON parse proves the file contract, not that its labels were
+        # projected from today's public source metadata. Rebuild on missing or
+        # damaged binding rather than blessing stale labels with a new receipt.
+        return None
     try:
         signature = _feature_source_signature(path.stat())
         with path.open("rb") as stream:
@@ -379,18 +428,43 @@ def main() -> int:
         }), flush=True)
     public_elapsed = time.perf_counter() - started - services_elapsed
     feature_revision = record_inventory.get("feature_revision")
+    source_metadata_sha256 = feature_source_metadata_sha256(
+        public_status, record_inventory["datasets"],
+    )
+    feature_stage_started = time.perf_counter()
     feature_count = _current_feature_snapshot(
         feature_inventory_output, feature_revision=feature_revision,
+        source_metadata_sha256=source_metadata_sha256,
     )
+    feature_stages_ms = {
+        "reuse_check": round((time.perf_counter() - feature_stage_started) * 1_000, 3),
+    }
     feature_reused = feature_count is not None
     feature_inventory_timing_ms: dict[str, float] = {}
     if feature_count is None:
+        feature_stage_started = time.perf_counter()
+        raw_feature_inventory = build_feature_inventory(
+            REPO_ROOT, snapshot=inventory_snapshot,
+            timing_ms=feature_inventory_timing_ms,
+        )
+        # The footer projection has consumed the decoded 45 MB record cache.
+        # Do not keep its much larger Python object graph alive while building
+        # and serializing the public feature rows below.
+        inventory_snapshot.payload = None
+        inventory_snapshot.selected = None
+        feature_stages_ms["footer_projection"] = round(
+            (time.perf_counter() - feature_stage_started) * 1_000, 3
+        )
+        feature_stage_started = time.perf_counter()
         feature_inventory = build_data_monitor_feature_inventory(
             REPO_ROOT, monitor_status=public_status,
-            inventory=build_feature_inventory(
-                REPO_ROOT, snapshot=inventory_snapshot,
-                timing_ms=feature_inventory_timing_ms,
-            ),
+            inventory=raw_feature_inventory,
+        )
+        # Public rows copy the raw field values; retaining both 87k-row lists
+        # through the 55 MB atomic JSON write only raises peak RSS.
+        del raw_feature_inventory
+        feature_stages_ms["public_projection"] = round(
+            (time.perf_counter() - feature_stage_started) * 1_000, 3
         )
         if (
             feature_inventory.get("schema_version") != 1
@@ -399,26 +473,46 @@ def main() -> int:
             or not isinstance(feature_inventory.get("rows"), list)
         ):
             raise ValueError("data-monitor feature projection violates public contract")
+        feature_stage_started = time.perf_counter()
+        preview, source_pages = feature_page_projections(feature_inventory)
+        feature_stages_ms["preview"] = round(
+            (time.perf_counter() - feature_stage_started) * 1_000, 3
+        )
+        feature_stage_started = time.perf_counter()
         _atomic_json(
             feature_inventory_output, feature_inventory,
-            compact=True, strict_json=True,
+            compact=True, strict_json=True, sort_keys=False,
+        )
+        feature_stages_ms["atomic_write"] = round(
+            (time.perf_counter() - feature_stage_started) * 1_000, 3
         )
         feature_count = len(feature_inventory.get("rows") or ())
+        feature_stage_started = time.perf_counter()
         _write_feature_reuse_receipt(
             feature_inventory_output, feature_count, validated_contract=True,
             feature_revision=feature_revision,
+            source_metadata_sha256=source_metadata_sha256,
+            preview=preview,
+            source_pages=source_pages,
+        )
+        feature_stages_ms["receipt"] = round(
+            (time.perf_counter() - feature_stage_started) * 1_000, 3
         )
     feature_elapsed = time.perf_counter() - started - services_elapsed - public_elapsed
     # Reuse this supervised, every-30-second worker instead of installing one
     # more polling daemon. The tracker checks its durable due time before doing
     # any systemd query, and measurement failure cannot invalidate data status.
-    sample = None
+    sample_lines = []
     try:
-        from scripts.track_service_runtime_trends import sample_service_runtime
+        from scripts.track_service_runtime_trends import (
+            runtime_sample_journal_lines, sample_service_runtime,
+        )
 
         sample = sample_service_runtime(
             REPO_ROOT / "artifacts/live/data_monitor/all_service_runtime_baseline.json"
         )
+        if sample is not None:
+            sample_lines = runtime_sample_journal_lines(sample)
     except Exception as exc:
         print(
             json.dumps({
@@ -449,11 +543,13 @@ def main() -> int:
         "inventory_fast_index_hit": bool(record_inventory.get("fast_index_hit")),
         "public_projection_stages_ms": public_status_timing_ms,
         "feature_inventory_stages_ms": feature_inventory_timing_ms,
+        "feature_stages_ms": feature_stages_ms,
         "feature_reused": feature_reused,
         "sources": len(public_status.get("sources") or ()),
         "features": feature_count,
         "cached_files": record_inventory["cached_files"],
         "refreshed_files": record_inventory["refreshed_files"],
+        "changed_dataset_ids": record_inventory.get("changed_dataset_ids"),
         "identity_rechecked_files": record_inventory["identity_rechecked_files"],
         "identity_unbound_files": record_inventory["identity_unbound_files"],
     }, separators=(",", ":")), flush=True)
@@ -468,8 +564,8 @@ def main() -> int:
         f"feature_s={feature_elapsed:.3f} trend_s={trend_elapsed:.3f}",
         flush=True,
     )
-    if sample is not None:
-        print(json.dumps(sample, separators=(",", ":")), flush=True)
+    for line in sample_lines:
+        print(line, flush=True)
     return 0
 
 

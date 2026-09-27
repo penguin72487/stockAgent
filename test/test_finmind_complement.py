@@ -55,6 +55,58 @@ def test_queue_has_all_reference_and_historical_ranges(tmp_path: Path) -> None:
         assert complement._next_task(connection, datetime(2026, 9, 25, tzinfo=UTC)) is not None
 
 
+@pytest.mark.parametrize("state,age", [("incremental_reserve", 10), ("waiting_necessary_acquisition", 10),
+                                       ("rate_limited", 31), ("ip_banned", 31)])
+def test_shared_account_wait_does_not_duplicate_sponsor_work(tmp_path: Path, state: str, age: int) -> None:
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    root = tmp_path / "complement"
+    path = tmp_path / "sponsor" / "status.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({
+        "tier": "Sponsor", "state": state,
+        "observed_at_utc": (now - timedelta(minutes=age)).isoformat(),
+        "series": {"TaiwanStockPrice": {"target": 100, "blocked": 0}},
+    }))
+    assert complement._sponsor_delegated(root, now) == frozenset({"TaiwanStockPrice"})
+    assert not complement._sponsor_delegated(root, now + timedelta(minutes=36))
+
+
+def test_background_reserve_keeps_incremental_and_zero_api_derivation(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    with complement._db(tmp_path / "queue.sqlite3") as connection:
+        complement._add_tasks(connection, [
+            ("Historical", "2330", "history", "id_history", 1),
+            ("Incremental", "", "2026", "year", 0),
+            (complement.LONG_INSTITUTIONAL, "2330", "history", "id_history", 1),
+            (complement.WIDE_INSTITUTIONAL, "2330", "history", "derived", 3),
+        ])
+        assert complement._next_task(connection, now, incremental_only=True).dataset == "Incremental"
+        connection.execute("UPDATE tasks SET state='complete' WHERE dataset IN (?,?)",
+                           ("Incremental", complement.LONG_INSTITUTIONAL))
+        assert complement._next_task(connection, now, incremental_only=True).kind == "derived"
+
+
+def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
+    monkeypatch.setenv("FINMIND_TOKEN", "test-only")
+    monkeypatch.setattr(complement, "load_env_file", lambda *_a, **_kw: None)
+    monkeypatch.setattr(complement, "_now", lambda: now)
+    monkeypatch.setattr(complement, "verified_account", lambda *_a: {"tier": "Free", "official_requests_per_hour": 600})
+    monkeypatch.setattr(complement, "rate_limiter", lambda *_a: object())
+    monkeypatch.setattr(complement, "backfill_budget", lambda *_a, **_kw: {"allowed": True})
+    monkeypatch.setattr(complement, "fixed_incremental_demand", lambda *_a: 0)
+    monkeypatch.setattr(complement.shutil, "disk_usage", lambda *_a: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(complement, "_populate", lambda conn, *_a, **_kw: complement._add_tasks(
+        conn, [("TaiwanStockInfo", "", "latest", "snapshot", 0)],
+    ))
+    monkeypatch.setattr(complement, "_request", lambda *_a, **_kw: [{"stock_id": "2330", "date": "2026-09-24"}])
+    result = complement.run_once(tmp_path, max_requests=1)
+    assert result["state"] == "batch_complete"
+    assert result["series"]["TaiwanStockInfo"]["complete"] == 1
+
+
 def test_master_snapshot_expands_free_per_symbol_jobs(tmp_path: Path) -> None:
     snapshot = complement.Task("TaiwanStockInfo", "", "latest", "snapshot", 0, "pending")
     complement._store(tmp_path, snapshot, [

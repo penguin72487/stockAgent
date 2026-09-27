@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, time
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -17,7 +18,10 @@ import numpy as np
 import pandas as pd
 
 from scripts.download_finlab_history import _atomic_json, safe_stem
-from scripts.download_finlab_intraday import _partition_paths, _stored_receipt, _validate_frame
+from scripts.download_finlab_intraday import (
+    _partition_paths, _stored_receipt, _validate_frame, reconcile_stored_tick_unit,
+)
+from scripts.finlab_volume_units import volume_reconciliation_due
 
 
 def derived_receipt_path(root: Path, symbol: str, day: date) -> Path:
@@ -37,12 +41,12 @@ def stored_derived_receipt(root: Path, symbol: str, day: date,
                            source_sha256: str) -> dict | None:
     path = derived_receipt_path(root, symbol, day)
     try:
-        import json
         receipt = json.loads(path.read_text(encoding="utf-8"))
         if (receipt.get("dataset") != f"tw_minute:{symbol}"
                 or receipt.get("trade_date") != day.isoformat()
                 or receipt.get("source_tick_sha256") != source_sha256
-                or receipt.get("source_kind") != "derived_from_tw_tick"):
+                or receipt.get("source_kind") != "derived_from_tw_tick"
+                or int(receipt.get("schema_version") or 0) < 3):
             return None
         if receipt.get("status") in {"verified_closed_date", "verified_no_trade",
                                      "derived_no_regular_trades"}:
@@ -63,8 +67,9 @@ def stored_derived_receipt(root: Path, symbol: str, day: date,
 def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFrame:
     """Regular-session trades only; 13:30 auction stays its own minute.
 
-    Do not fill zero-trade minutes.  Volume remains provider-native rather than
-    silently claiming shares, and identical timestamps retain source sequence.
+    Do not fill zero-trade minutes. ``volume`` remains provider-native;
+    ``volume_shares`` is nullable unless the whole-day source unit is proved.
+    Identical timestamps retain source sequence.
     """
     _validate_frame(ticks, f"tw_tick:{symbol}", day)
     required = {"close", "volume", "session", "sequence"}
@@ -78,9 +83,12 @@ def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFram
     if not local.dt.date.eq(day).all():
         raise ValueError("tick timestamp outside declared trade date")
     regular = ticks.loc[ticks["session"].eq("regular") & ticks["volume"].gt(0)].copy()
+    if "volume_shares" not in regular:
+        regular["volume_shares"] = pd.Series(pd.NA, index=regular.index, dtype="Int64")
     if regular.empty:
         return pd.DataFrame(columns=["stock_id", "trade_date", "timestamp", "session",
                                      "open", "high", "low", "close", "volume",
+                                     "volume_shares",
                                      "tick_count", "vwap"])
     if (regular["close"].isna().any()
             or not np.isfinite(regular["close"].to_numpy(dtype=float)).all()
@@ -96,6 +104,7 @@ def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFram
         open=("close", "first"), high=("close", "max"),
         low=("close", "min"), close=("close", "last"),
         volume=("volume", "sum"), tick_count=("close", "size"),
+        volume_shares=("volume_shares", lambda values: values.sum(min_count=len(values))),
         notional=("notional", "sum"),
     ).reset_index().rename(columns={"minute": "timestamp"})
     bars["vwap"] = bars["notional"] / bars["volume"]
@@ -107,16 +116,25 @@ def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFram
     return bars
 
 
-def derive_partition(root: Path, symbol: str, day: date) -> dict:
+def derive_partition(root: Path, symbol: str, day: date,
+                     *, reference_root: Path | None = None) -> dict:
     key = f"tw_tick:{symbol}"
     source = _stored_receipt(_partition_paths(root, key, day)[0], root, key, day)
     if source is None:
         raise ValueError("verified local tick receipt required for minute derivation")
+    if (source.get("status") == "downloaded_unverified_for_pit"
+            and volume_reconciliation_due(source, symbol, day, reference_root)):
+        source = reconcile_stored_tick_unit(root, key, day, reference_root=reference_root)
     source_sha = source.get("sha256", "")
     existing = stored_derived_receipt(root, symbol, day, source_sha)
     if existing is not None:
-        if existing.get("source_checked_at_utc") != source.get("source_checked_at_utc"):
-            existing = {**existing, "source_checked_at_utc": source["source_checked_at_utc"]}
+        changes = {name: source.get(name) for name in (
+            "source_checked_at_utc", "canonical_volume_unit", "canonical_volume_scope",
+            "volume_multiplier", "volume_unit_reference", "volume_unit_contract_version",
+            "unit_reference_revision", "unit_resolution_error",
+        )}
+        if any(existing.get(name) != value for name, value in changes.items()):
+            existing = {**existing, **changes}
             _atomic_json(derived_receipt_path(root, symbol, day), existing)
         return existing
     status = source["status"]
@@ -125,10 +143,32 @@ def derive_partition(root: Path, symbol: str, day: date) -> dict:
         tick_path = root / source["parquet_path"]
         if _sha256(tick_path) != source_sha:
             raise ValueError("tick object hash differs from source receipt")
-        bars = ticks_to_minutes(pd.read_parquet(tick_path), symbol, day)
+        ticks = pd.read_parquet(tick_path)
+        volume_evidence = {
+            "raw_volume_unit": source.get("raw_volume_unit", "provider_native"),
+            "canonical_volume_unit": source.get("canonical_volume_unit", "unresolved"),
+            "canonical_volume_scope": source.get("canonical_volume_scope", "regular_session_only"),
+            "volume_multiplier": source.get("volume_multiplier"),
+            "volume_unit_reference": source.get("volume_unit_reference"),
+            "volume_unit_contract_version": source.get("volume_unit_contract_version"),
+            "unit_reference_revision": source.get("unit_reference_revision"),
+            "unit_resolution_error": source.get("unit_resolution_error"),
+        }
+        if ("volume_shares" not in ticks
+                or volume_evidence["canonical_volume_unit"] != "shares"):
+            from scripts.finlab_volume_units import with_verified_volume_shares
+
+            ticks, volume_evidence = with_verified_volume_shares(
+                ticks, symbol, day, reference_root=reference_root,
+            )
+        bars = ticks_to_minutes(ticks, symbol, day)
         status = "derived_unverified_for_pit" if len(bars) else "derived_no_regular_trades"
+    else:
+        volume_evidence = {"raw_volume_unit": "provider_native",
+                           "canonical_volume_unit": "unresolved",
+                           "canonical_volume_scope": "regular_session_only"}
     payload = {
-        "schema_version": 1, "dataset": f"tw_minute:{symbol}",
+        "schema_version": 3, "dataset": f"tw_minute:{symbol}",
         "trade_date": day.isoformat(), "status": status,
         "source_kind": "derived_from_tw_tick", "source_dataset": key,
         "source_tick_sha256": source_sha,
@@ -141,6 +181,7 @@ def derive_partition(root: Path, symbol: str, day: date) -> dict:
         "last_timestamp": str(bars["timestamp"].max()) if bars is not None and len(bars) else None,
         "source_grain": "stock_trade_day_left_labelled_minute",
         "volume_unit": "provider_native",
+        **volume_evidence,
         "publication_time_status": "not_verified_for_training",
     }
     if bars is not None and len(bars):
@@ -163,5 +204,16 @@ def derive_partition(root: Path, symbol: str, day: date) -> dict:
                             "sha256": digest})
         finally:
             temporary.unlink(missing_ok=True)
-    _atomic_json(derived_receipt_path(root, symbol, day), payload)
+    receipt_path = derived_receipt_path(root, symbol, day)
+    if receipt_path.is_file():
+        previous = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if previous.get("source_tick_sha256") != source_sha:
+            old_sha = previous.get("sha256") or previous.get("source_tick_sha256")
+            if isinstance(old_sha, str) and len(old_sha) == 64:
+                archive = (root / "intraday/derived_minute/versions"
+                           / safe_stem(f"tw_minute:{symbol}") / day.isoformat()
+                           / f"{old_sha}.json")
+                if not archive.is_file():
+                    _atomic_json(archive, previous)
+    _atomic_json(receipt_path, payload)
     return payload

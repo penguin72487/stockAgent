@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -10,6 +11,7 @@ import threading
 
 import pytest
 from stockagent.live import shioaji_api_dashboard as monitor
+from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 
 
 def test_json_receipt_cache_has_bounded_lru_without_stale_reads(tmp_path, monkeypatch):
@@ -27,6 +29,47 @@ def test_json_receipt_cache_has_bounded_lru_without_stale_reads(tmp_path, monkey
     paths[1].write_text('{"index": 99}', encoding="utf-8")
     assert monitor._read_json(paths[1]) == {"index": 99}
     assert len(cache) == 2
+
+
+def test_capture_receipts_keep_only_public_totals_not_large_cached_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = OrderedDict()
+    monkeypatch.setattr(monitor, "_JSON_FILE_CACHE", cache)
+    root = tmp_path / "captures"
+
+    def write(worker: int, rows: int, *, session: bool) -> Path:
+        directory = root / "manifests/trade_date=2026-09-25"
+        if session:
+            directory /= "session=day"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"worker={worker:02d}.json"
+        path.write_text(json.dumps({
+            "capture_id": "private-capture-id",
+            "worker_index": worker,
+            "trade_date": "2026-09-25",
+            "capture_session": "day",
+            "status": "complete",
+            "started_at_utc": f"2026-09-25T01:00:0{worker}+00:00",
+            "finished_at_utc": "2026-09-25T05:00:00+00:00",
+            "tick_rows_written": rows,
+            "contract_metadata": ["unused-large-value" * 1000],
+        }), encoding="utf-8")
+        return path
+
+    write(0, 5, session=False)  # Compatibility mirror of the same worker.
+    write(0, 5, session=True)
+    worker_one = write(1, 7, session=True)
+    first = monitor._latest_capture_receipt(root)
+    assert first["workers"] == 2
+    assert first["tick_rows"] == 12
+    assert "capture_id" not in first
+    assert not cache
+
+    worker_one = write(1, 9, session=True)
+    assert worker_one.exists()
+    assert monitor._latest_capture_receipt(root)["tick_rows"] == 14
+    assert not cache
 
 
 def test_json_receipt_cache_tracks_symlink_target_and_same_size_rewrite(tmp_path):
@@ -63,6 +106,91 @@ def test_json_receipt_changed_during_read_is_not_published(tmp_path, monkeypatch
     assert monitor._read_json(target) is None
     monkeypatch.setattr(Path, "read_text", original)
     assert monitor._read_json(target) == {"state": "new"}
+
+
+def test_json_receipt_cache_hit_rejects_atomic_replace_between_stats(tmp_path, monkeypatch):
+    target = tmp_path / "current.json"
+    replacement = tmp_path / "replacement.json"
+    target.write_text('{"state":"old"}', encoding="utf-8")
+    replacement.write_text('{"state":"new"}', encoding="utf-8")
+    assert monitor._read_json(target) == {"state": "old"}
+    original_stat = Path.stat
+    replaced = False
+
+    def replacing_stat(path, *args, **kwargs):
+        nonlocal replaced
+        before = original_stat(path, *args, **kwargs)
+        if path == target and not replaced:
+            replacement.replace(target)
+            replaced = True
+        return before
+
+    monkeypatch.setattr(Path, "stat", replacing_stat)
+    assert monitor._read_json(target) is None
+    assert replaced is True
+    assert monitor._read_json(target) == {"state": "new"}
+
+
+def test_snapshot_projection_matches_full_state_and_falls_back_after_replacement(
+    tmp_path, monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    status_path = tmp_path / "status.json"
+    state = {
+        "state_revision": 3,
+        "updated_at": "2026-09-26T01:01:00Z",
+        "modes": {"a": {}, "b": {}},
+        "benchmarks": {
+            "stock": {"source": "local"},
+            "tx": {"source": "shioaji:fop", "last_quote_at": "2026-09-26T01:02:00Z"},
+        },
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    projection = build_shioaji_monitor_projection(state, state_path, state_revision=3)
+    status_path.write_text(json.dumps({
+        "state_revision": 3,
+        "simulation_only": True,
+        "production_order_possible": False,
+        "shioaji_monitor_projection": projection,
+        "updated_at": state["updated_at"],
+    }), encoding="utf-8")
+    base_paths = ShioajiMonitorPaths(
+        alias_inventory=tmp_path / "aliases",
+        txfr1_manifest=tmp_path / "tx",
+        futures_history_root=tmp_path / "futures",
+        target_end_date=tmp_path / "target",
+        capture_root=tmp_path / "captures",
+        snapshot_state=state_path,
+    )
+    observed = datetime(2026, 9, 26, tzinfo=UTC)
+    runner = lambda args: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def snapshot(paths):
+        payload = monitor.build_shioaji_public_status(
+            tmp_path, now=observed, runner=runner, paths=paths,
+        )
+        item = next(row for row in payload["pipelines"] if row["id"] == "on_demand_snapshots")
+        return item["metrics"], item["latest_at_utc"]
+
+    expected = snapshot(base_paths)
+    compact_paths = replace(base_paths, snapshot_status=status_path)
+    original_read = monitor._read_json
+
+    def compact_read(path):
+        if path == state_path:
+            raise AssertionError("valid projection must not read the large state")
+        return original_read(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor, "_read_json", compact_read)
+        assert snapshot(compact_paths) == expected
+
+    replacement = tmp_path / "replacement.json"
+    updated = {**state, "state_revision": 4, "modes": {"a": {}}}
+    replacement.write_text(json.dumps(updated), encoding="utf-8")
+    replacement.replace(state_path)
+    assert snapshot(compact_paths) == snapshot(base_paths)
+    assert snapshot(compact_paths)[0][0]["value"] == 1
 
 
 def test_history_manifest_time_matches_verified_generation(tmp_path, monkeypatch):
@@ -467,7 +595,13 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
         "local_service_journal_and_manifests",
         "traffic_and_storage_receipts", "backfill_and_capture",
         "pipeline_receipts", "health_and_traffic",
+        "pipeline.receipt_files", "pipeline.capture_manifests",
+        "pipeline.hft_and_snapshot", "pipeline.assemble",
     }
+    assert sum(
+        value for name, value in timing_ms.items()
+        if name.startswith("pipeline.")
+    ) == pytest.approx(timing_ms["pipeline_receipts"], abs=1.0)
     assert all(value >= 0 for value in timing_ms.values())
     journal_commands = [
         command for command in observed_commands if command[0] == "journalctl"

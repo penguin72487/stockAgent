@@ -77,6 +77,31 @@ def test_composition_preserves_open_old_book_and_every_old_ledger_byte(accounts)
     assert engine.state["modes"]["old"] == old
 
 
+def test_engine_created_empty_placeholder_can_be_replaced_without_old_book_change(
+    accounts,
+):
+    live, candidate, merged = accounts
+    state_path = live / "state.json"
+    state = json.loads(state_path.read_text())
+    state["modes"]["new"] = {
+        "initial_capital_twd": 10_000_000,
+        "total_equity_twd": 10_000_000,
+        "positions": {},
+        "processed_signal_ids": [],
+        "cumulative_realized_net_pnl_twd": 0,
+    }
+    state["enabled_markets"] = ["old", "new"]
+    state_path.write_text(json.dumps(state))
+
+    receipt = compose_account(live, candidate, merged, "new")
+    after = json.loads((merged / "state.json").read_text())
+    assert after["enabled_markets"] == ["old", "new"]
+    assert after["modes"]["old"] == state["modes"]["old"]
+    assert after["modes"]["new"]["positions"]
+    assert receipt["configured_empty_placeholder_replaced"] is True
+    assert receipt["preserved_markets"] == ["old"]
+
+
 @pytest.mark.parametrize(
     "conflict", ["mode", "history", "foreign", "symlink", "existing_destination"]
 )
@@ -185,8 +210,9 @@ def test_account_discovery_does_not_freeze_the_number_of_models(tmp_path, monkey
 
 
 @pytest.mark.parametrize("remove_minute", [False, True])
+@pytest.mark.parametrize("last_session_live_drift", [False, True])
 def test_composed_history_validates_full_grid_without_rewriting_old_marks(
-    accounts, remove_minute
+    accounts, remove_minute, last_session_live_drift
 ):
     live, candidate, merged = accounts
     from scripts.promote_tw_day_trade_replay import _sha256, MINUTE_CURVE_CONTRACT
@@ -251,6 +277,19 @@ def test_composed_history_validates_full_grid_without_rewriting_old_marks(
             },
             "outputs": {"marks": {"sha256": _sha256(root / "marks.jsonl")}},
         }
+        if root == live and last_session_live_drift:
+            receipt.update(
+                independent_carried_valuation_parity_passed=False,
+                independent_carried_valuation_parity_required=False,
+                opening_marks_revalued_at_completed_minute=True,
+                accepted_13_30_endpoints_preserved=True,
+                accepted_09_01_strategy_and_13_30_endpoints_preserved=False,
+            )
+            receipt["strategy"].update(
+                differing_original_equity_points=1,
+                maximum_original_equity_difference_twd=100.0,
+                equity_difference_counts_by_market_date={f"old:{day}": 1},
+            )
         (root / "minute_curve_receipt.json").write_text(json.dumps(receipt))
     compose_account(live, candidate, merged, "new")
     before = (merged / "marks.jsonl").read_bytes()
@@ -262,4 +301,5 @@ def test_composed_history_validates_full_grid_without_rewriting_old_marks(
         result = validate_composed_history(live, candidate, merged, "new")
         assert result["minute_curves"]["validated_rows"] == 540
         assert result["minute_curves"]["unverified_historical_interior_rows"] == 0
+        assert result["strict_joint_parity"] is not last_session_live_drift
         assert (merged / "marks.jsonl").read_bytes() == before

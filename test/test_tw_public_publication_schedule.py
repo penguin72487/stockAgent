@@ -22,6 +22,7 @@ from scripts import finalize_tw_public_completed_session as completed_session
 from scripts import watch_tw_public_publication_group as publication
 from scripts import watch_tw_public_source_events as source_events
 from stockagent.live import tw_public_opening_revision as opening_revision
+from stockagent.live.market_status import TwStockDayDecision
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -84,19 +85,19 @@ def test_close_command_requires_verified_publication(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("opened", "reason", "expected"),
+    ("status", "reason", "expected"),
     [
-        (False, "official TWSE schedule as-of 2026-09-16: 中秋節", True),
-        (True, "official TWSE schedule as-of 2026-09-16: ordinary weekday session", False),
-        (False, "official TWSE holiday schedule is missing", False),
-        (False, "official TWSE holiday schedule has conflicting open/closed events", False),
+        ("closed", "official TWSE schedule as-of 2026-09-16: 中秋節", True),
+        ("scheduled_open", "official TWSE schedule as-of 2026-09-16: ordinary weekday session", False),
+        ("unknown", "official TWSE holiday schedule is missing", False),
+        ("unknown", "official TWSE holiday schedule has conflicting open/closed events", False),
     ],
 )
 def test_close_sweep_skips_only_verified_non_sessions(
-    tmp_path: Path, monkeypatch, opened: bool, reason: str, expected: bool,
+    tmp_path: Path, monkeypatch, status: str, reason: str, expected: bool,
 ) -> None:
     monkeypatch.setattr(
-        publication, "verified_tw_stock_session_day", lambda *_args, **_kwargs: (opened, reason)
+        publication, "tw_stock_day_decision", lambda *_args, **_kwargs: TwStockDayDecision(status, reason)
     )
     evidence = publication._confirmed_closed_stock_session(
         tmp_path, datetime(2026, 9, 25, 14, 0, tzinfo=TAIPEI)
@@ -969,13 +970,31 @@ def test_systemd_timers_have_no_random_delay() -> None:
     cold_service = Path(
         "deploy/systemd/stockagent-tw-public-cold-publish.service.in"
     ).read_text(encoding="utf-8")
+    cold_path = Path(
+        "deploy/systemd/stockagent-tw-public-cold-publish.path.in"
+    ).read_text(encoding="utf-8")
+    cold_installer = Path(
+        "scripts/install_tw_public_publication_services.sh"
+    ).read_text(encoding="utf-8")
+    feature_service = Path(
+        "deploy/systemd/stockagent-tw-public-feature-reconcile.service.in"
+    ).read_text(encoding="utf-8")
     cold_runner = Path("scripts/run_tw_public_cold_publish.sh").read_text(
         encoding="utf-8"
     )
     assert "Mon..Fri *-*-* 23:50:00 Asia/Taipei" in cold_timer
     assert "RandomizedDelaySec=0" in cold_timer
     assert "Restart=on-failure" in cold_service
+    assert "RestartPreventExitStatus=75" in cold_service
     assert "RestartSec=5min" in cold_service
+    assert "--minimum-runway-minutes 180 --protected-until 13:30" in cold_service
+    assert "official_symbol_build_summary.json" in cold_path
+    assert "tw_public_stock_daily.summary.json" in cold_path
+    assert "stockagent-tw-public-cold-publish.path" in cold_installer
+    assert "  stockagent-tw-public-cold-publish.timer \\" in (
+        cold_installer.splitlines()
+    )
+    assert "OnSuccess=stockagent-tw-public-cold-publish.service" in feature_service
     assert "run_tw_public_cold_publish.sh" in cold_service
     assert "publish_tw_public_cold_release.py" in cold_runner
     assert " use " not in cold_runner
@@ -1097,7 +1116,7 @@ def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
         )
 
     monkeypatch.setattr(cold_publication, "_publish_while_source_stable", stale)
-    assert cold_publication.main() == (0 if defer else 1)
+    assert cold_publication.main() == (0 if defer else 75)
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == expected_status
     assert receipt["release"] is None

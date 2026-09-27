@@ -17,6 +17,8 @@ import csv
 import math
 from pathlib import Path
 import re
+import stat
+from types import MappingProxyType
 from typing import Final, Iterable, Iterator, Literal, Mapping, Sequence
 
 import numpy as np
@@ -823,6 +825,54 @@ class AtmSourceProjection:
     all_txo_dates: set[date]
 
 
+def _futures_source_identity(source: Path) -> tuple[int, int, int, int, int]:
+    info = source.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"TAIFEX futures source is not a regular file: {source}")
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+@dataclass(frozen=True)
+class TaifexTxOpeningReference:
+    """Immutable, build-scoped result of the canonical full TX loader.
+
+    Construct through ``load_taifex_tx_opening_reference``. This is neither a
+    persistent cache nor an executable quote; raw-source SHA and publication
+    fingerprints remain owned by the canonical producer.
+    """
+
+    source_path: Path
+    source_identity: tuple[int, int, int, int, int]
+    contract_open_by_date: Mapping[date, tuple[str, float]]
+    open_by_date: Mapping[date, float]
+
+    def require_unchanged(self, futures_path: str | Path) -> None:
+        if (Path(futures_path).expanduser().resolve() != self.source_path
+                or _futures_source_identity(self.source_path) != self.source_identity):
+            raise ValueError("TAIFEX futures source changed since opening reference load")
+
+
+def load_taifex_tx_opening_reference(futures_path: str | Path) -> TaifexTxOpeningReference:
+    """Validate every TX tenor once and share only immutable opening scalars."""
+
+    source = Path(futures_path).expanduser().resolve()
+    before = _futures_source_identity(source)
+    futures = load_taifex_index_futures_day_session(source, products=("TX",))
+    contract_open = {
+        date.fromisoformat(str(raw_date)): (
+            str(futures.contract_months[index, 0]), float(futures.open_prices[index, 0]),
+        )
+        for index, raw_date in enumerate(futures.dates)
+        if bool(futures.tradable_mask[index, 0])
+    }
+    reference = TaifexTxOpeningReference(
+        source, before, MappingProxyType(contract_open),
+        MappingProxyType({day: value[1] for day, value in contract_open.items()}),
+    )
+    reference.require_unchanged(futures_path)
+    return reference
+
+
 def project_taifex_atm_source(
     source_path: Path,
     *,
@@ -852,23 +902,15 @@ def build_taifex_opening_atm_straddles(
     *,
     series_scope: TaifexOptionSeriesScope,
     source_projections: Mapping[Path, AtmSourceProjection] | None = None,
+    futures_reference: TaifexTxOpeningReference | None = None,
 ) -> Path:
     """Build one official daily opening-ATM TXO candidate per session."""
 
     series_scope = _normalize_series_scope(series_scope)
 
-    futures = load_taifex_index_futures_day_session(
-        futures_path,
-        products=("TX",),
-    )
-    tx_by_date: dict[date, tuple[str, float]] = {}
-    for index, raw_date in enumerate(futures.dates):
-        if not bool(futures.tradable_mask[index, 0]):
-            continue
-        tx_by_date[date.fromisoformat(str(raw_date))] = (
-            str(futures.contract_months[index, 0]),
-            float(futures.open_prices[index, 0]),
-        )
+    reference = futures_reference or load_taifex_tx_opening_reference(futures_path)
+    reference.require_unchanged(futures_path)
+    tx_by_date = reference.contract_open_by_date
 
     selected: dict[date, dict[str, object]] = {}
     option_dates: set[date] = set()
@@ -888,6 +930,10 @@ def build_taifex_opening_atm_straddles(
         for trading_date, current in projection.selected.items():
             if current.get("date") != trading_date:
                 raise ValueError(f"ATM projection date mismatch: {source_path}")
+            if (current.get("tx_contract_month"), current.get("tx_open")) != (
+                tx_by_date.get(trading_date, (None, None))
+            ):
+                raise ValueError(f"ATM projection futures reference mismatch: {source_path}")
             option_dates.add(trading_date)
             previous = selected.get(trading_date)
             if previous is not None and not _same_selected_row(previous, current):
@@ -968,6 +1014,11 @@ def build_taifex_opening_atm_straddles(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     pq.write_table(table, temporary, compression="zstd")
+    try:
+        reference.require_unchanged(futures_path)
+    except (ValueError, OSError):
+        temporary.unlink(missing_ok=True)
+        raise
     temporary.replace(target)
     return target
 
@@ -1006,6 +1057,7 @@ def build_taifex_option_full_chain(
     series_scope: TaifexOptionSeriesScope,
     source_dates: set[date] | None = None,
     allow_empty: bool = False,
+    futures_reference: TaifexTxOpeningReference | None = None,
 ) -> Path:
     """Normalize every listed unexpired TXO leg to the fixed direct axis.
 
@@ -1019,12 +1071,9 @@ def build_taifex_option_full_chain(
     import pyarrow.parquet as pq
 
     scope = _normalize_series_scope(series_scope)
-    futures = load_taifex_index_futures_day_session(futures_path, products=("TX",))
-    tx_by_date = {
-        date.fromisoformat(str(raw_date)): float(futures.open_prices[index, 0])
-        for index, raw_date in enumerate(futures.dates)
-        if bool(futures.tradable_mask[index, 0])
-    }
+    reference = futures_reference or load_taifex_tx_opening_reference(futures_path)
+    reference.require_unchanged(futures_path)
+    tx_by_date = reference.open_by_date
     schema = pa.schema(
         [
             ("date", pa.date32()),
@@ -1214,6 +1263,11 @@ def build_taifex_option_full_chain(
     if total_rows == 0 and not allow_empty:
         temporary.unlink(missing_ok=True)
         raise ValueError(f"no normalized TXO {scope} full-chain rows were found")
+    try:
+        reference.require_unchanged(futures_path)
+    except (ValueError, OSError):
+        temporary.unlink(missing_ok=True)
+        raise
     temporary.replace(target)
     return target
 

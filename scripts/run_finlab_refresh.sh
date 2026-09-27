@@ -166,20 +166,21 @@ if [[ "$finlab_state" == "pass_complete" ]]; then
     run_fintech_python "$finlab_repo_root/scripts/download_finlab_history.py" pending \
       --refresh-days "${FINLAB_SYNC_REFRESH_DAYS:-1}"
   )"; then
-    finlab_actionable_pending="$(run_fintech_python -c \
-      'import json,sys; print(json.loads(sys.argv[1])["actionable_pending"])' \
+    finlab_tick_allowed="$(run_fintech_python -c \
+      'import json,sys; print(str(json.loads(sys.argv[1]).get("supplemental_allowed", False)).lower())' \
       "$finlab_general_status")"
-    if [[ "$finlab_actionable_pending" == "0" ]]; then
+    if [[ "$finlab_tick_allowed" == "true" ]]; then
       finlab_tick_reserve_mb="$(run_fintech_python -c \
         'import os; from dotenv import dotenv_values; print(os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB") or "500")')"
       if ! timeout --signal=TERM --kill-after=10s 1200s \
           "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
             --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-256}" \
+            --sync-lock-fd 9 \
             --reserve-mb "$finlab_tick_reserve_mb"; then
         echo "[finlab] residual-quota Tick pass incomplete; general history remains higher priority" >&2
       fi
     else
-      echo "[finlab] Tick deferred: $finlab_actionable_pending actionable general history keys remain"
+      echo "[finlab] Tick deferred: required general acquisition is incomplete (including cooldown/resource-blocked fields)"
     fi
   else
     echo "[finlab] Tick deferred: general-work inventory is unverified" >&2

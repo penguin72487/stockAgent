@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import sqlite3
 
 import requests
 
@@ -25,7 +26,7 @@ def verified_account(session: requests.Session, token: str, root: Path) -> dict[
     if not token:
         raise RuntimeError("FINMIND_TOKEN is missing")
     now = datetime.now(UTC)
-    if _CACHE and _CACHE[0] == token and now - _CACHE[1] < timedelta(minutes=15):
+    if _CACHE and _CACHE[0] == token and now - _CACHE[1] < timedelta(minutes=1):
         return _CACHE[2]
     response = session.get(USER_INFO_URL, headers={"Authorization": f"Bearer {token}"},
                            timeout=(10, 20))
@@ -60,3 +61,57 @@ def rate_limiter(account: dict[str, object]) -> SharedRateLimiter:
     limit = account["official_requests_per_hour"]
     assert type(limit) is int
     return SharedRateLimiter(3600.0 / limit + 0.01, name="finmind-v4-data")
+
+
+def backfill_budget(
+    account: dict[str, object], traffic_root: Path, *,
+    fixed_incremental_requests: int, in_flight: int = 0,
+    now: datetime | None = None,
+) -> dict[str, int | bool | str]:
+    """Admit historical work only after protecting the fixed incremental lane.
+
+    The account observation is authoritative at its timestamp. Local request
+    starts after it are added once. Earlier local calls are already included in
+    the provider sample; a rolling local-hour count would incorrectly carry
+    old-hour traffic across the provider's observed reset.
+    No request here is sent to FinMind.
+    """
+
+    limit = account.get("official_requests_per_hour")
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("verified hourly FinMind quota required")
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    observed_raw = account.get("observed_at_utc")
+    try:
+        observed = datetime.fromisoformat(str(observed_raw).replace("Z", "+00:00")).astimezone(UTC)
+    except (ValueError, TypeError):
+        observed = None
+    provider_used = account.get("provider_used_in_hour")
+    if type(provider_used) is not int or provider_used < 0 or observed is None:
+        return {"allowed": False, "remaining": 0, "reserve": limit,
+                "used_estimate": limit, "basis": "provider_usage_unverified"}
+    if observed > current + timedelta(minutes=1) or current - observed > timedelta(minutes=5):
+        return {"allowed": False, "remaining": 0, "reserve": limit,
+                "used_estimate": limit, "basis": "provider_usage_stale"}
+    since_observation = 0
+    ledger = traffic_root / "request_traffic.sqlite3"
+    if ledger.is_file():
+        try:
+            with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=2.0) as connection:
+                since_observation = int(connection.execute(
+                    "SELECT count(*) FROM requests WHERE started_at_utc>?",
+                    (observed.isoformat(),),
+                ).fetchone()[0])
+        except sqlite3.Error:
+            return {"allowed": False, "remaining": 0, "reserve": limit,
+                    "used_estimate": limit, "basis": "local_traffic_unverified"}
+    used = provider_used + since_observation
+    if fixed_incremental_requests < 0 or in_flight < 0:
+        raise ValueError("incremental demand and in-flight requests must be nonnegative")
+    # Reserve the actual named demand plus the two other serial FinMind worker
+    # lanes, not an arbitrary percentage that strands a large paid entitlement.
+    reserve = min(limit, fixed_incremental_requests + 2)
+    remaining = max(0, limit - used)
+    return {"allowed": remaining > reserve + in_flight,
+            "remaining": remaining, "reserve": reserve,
+            "used_estimate": used, "basis": "provider_observation_plus_local_starts"}

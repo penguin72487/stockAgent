@@ -27,7 +27,10 @@ from stockagent.data.panel import (
 from stockagent.models.transformer_base_portfolio import (
     action_channels_for_execution_mode,
 )
-from stockagent.training.dataset import CrossSectionalDataset
+from stockagent.training.dataset import (
+    CrossSectionalDataset,
+    _crypto_lifecycle_force_exit_mask,
+)
 from stockagent.training.loss import risk_aware_loss
 
 DOWNLOADER_DIR = Path(__file__).resolve().parents[1] / "downloader"
@@ -61,6 +64,10 @@ from download_fred_crypto_macro_vintages import (  # noqa: E402
 from repair_bybit_1m_gaps import (  # noqa: E402
     _missing_timestamp_ms,
     _request_windows,
+)
+from scripts import build_bybit_crypto_public_daily_features as public_builder  # noqa: E402
+from scripts.benchmark_crypto_public_source_projection import (  # noqa: E402
+    benchmark as benchmark_public_source_projection,
 )
 from scripts.build_bybit_crypto_public_daily_features import (  # noqa: E402
     _binance_daily,
@@ -616,6 +623,115 @@ def test_funding_materialization_matches_event_level_cash_identity(
     assert features[1, "crypto_bybit_funding_available"] == 1.0
 
 
+def test_public_feature_builder_keeps_failure_receipt_when_all_bybit_sources_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bybit_dir = tmp_path / "bybit"
+    bybit_dir.mkdir()
+    (bybit_dir / "BTCUSDT_features.parquet").write_bytes(b"invalid source")
+    output_path = tmp_path / "public_features.parquet"
+    output_path.write_bytes(b"prior canonical output")
+    monkeypatch.setattr(
+        public_builder, "_instrument_rows",
+        lambda *_: [{"code": "BTCUSDT", "base_coin": "BTC"}],
+    )
+    monkeypatch.setattr(public_builder, "_okx_base_map", lambda *_: {})
+    monkeypatch.setattr(public_builder, "_binance_base_map", lambda *_: {})
+    monkeypatch.setattr(
+        sys, "argv", [
+            "build_bybit_crypto_public_daily_features.py",
+            "--bybit-daily-dir", str(bybit_dir),
+            "--output-path", str(output_path),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="failed for 1 symbols"):
+        public_builder.main()
+    assert output_path.read_bytes() == b"prior canonical output"
+    failure = json.loads(
+        (tmp_path / "public_features_failure.json").read_text()
+    )
+    assert failure["status"] == "failed_before_publish"
+    assert failure["failed_symbols"] == 1
+    assert failure["stage_seconds"]["bybit_symbol_features"] >= 0
+    assert failure["elapsed_seconds"] >= 0
+
+
+def test_public_feature_builder_reuses_bybit_dates_and_records_stage_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bybit_dir = tmp_path / "bybit"
+    bybit_dir.mkdir()
+    (bybit_dir / "BTCUSDT_features.parquet").write_bytes(b"not read twice")
+    output_path = tmp_path / "public_features.parquet"
+    monkeypatch.setattr(
+        public_builder, "_instrument_rows",
+        lambda *_: [{"code": "BTCUSDT", "base_coin": "BTC"}],
+    )
+    monkeypatch.setattr(public_builder, "_okx_base_map", lambda *_: {})
+    monkeypatch.setattr(public_builder, "_binance_base_map", lambda *_: {})
+    monkeypatch.setattr(
+        public_builder, "_bybit_funding_features",
+        lambda *_: pl.DataFrame({
+            "date": ["2024-01-02"],
+            "symbol": ["BTCUSDT"],
+            "crypto_bybit_funding_rate_sum_1d": [0.001],
+        }),
+    )
+    monkeypatch.setattr(
+        public_builder, "_free_public_rows", lambda *_: (pl.DataFrame(), {})
+    )
+    for name in (
+        "fred_macro_rows", "sec_etf_filing_rows", "coinmetrics_vintage_rows",
+        "coingecko_snapshot_rows", "etf_issuer_snapshot_rows",
+    ):
+        monkeypatch.setattr(
+            public_builder, name, lambda *_: (pl.DataFrame(), {})
+        )
+    monkeypatch.setattr(public_builder, "_source_decisions", lambda: {})
+    monkeypatch.setattr(public_builder, "_input_receipts", lambda *_: {})
+    monkeypatch.setattr(
+        sys, "argv", [
+            "build_bybit_crypto_public_daily_features.py",
+            "--bybit-daily-dir", str(bybit_dir),
+            "--output-path", str(output_path),
+        ],
+    )
+    public_builder.main()
+    assert pl.read_parquet(output_path)["date"].to_list() == ["2024-01-02"]
+    summary = json.loads(
+        (tmp_path / "public_features_summary.json").read_text()
+    )
+    assert summary["output_rows"] == 1
+    assert summary["stage_seconds"]["bybit_symbol_features"] >= 0
+    assert summary["stage_seconds"]["final_projection"] >= 0
+    assert summary["elapsed_seconds_before_summary"] >= 0
+
+
+def test_public_source_projection_keeps_tail_only_optional_columns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source_features.parquet"
+    pl.DataFrame({
+        "date": ["2024-01-01 00:00:00", "2024-01-01 00:01:00"],
+        "value": [1.0, 2.0],
+        "unrelated": [100, 200],
+    }).write_parquet(path)
+    tail = hot_tail_path(path)
+    tail.parent.mkdir()
+    pl.DataFrame({
+        "date": ["2024-01-01 00:01:00", "2024-01-01 00:02:00"],
+        "value": [3.0, 4.0],
+        "optional": [7.0, 8.0],
+        "unrelated": [300, 400],
+    }).write_parquet(tail)
+    projected = public_builder._read_public_source_projection(
+        path, ("date", "value", "optional", "absent")
+    )
+    assert projected.columns == ["date", "value", "optional"]
+    assert projected["value"].to_list() == [1.0, 3.0, 4.0]
+    assert projected["optional"].to_list() == [None, 7.0, 8.0]
+
+
 def test_midnight_execution_settles_boundary_funding_before_new_target(
     tmp_path: Path,
 ) -> None:
@@ -1158,9 +1274,7 @@ def test_crypto_feature_gap_blocks_new_policy_but_keeps_close_execution() -> Non
     assert dataset.can_sell_mask_t[0, 0].item() is True
 
 
-def test_crypto_dataset_retains_an_unvalued_interior_day_for_absorbing_failure() -> (
-    None
-):
+def test_crypto_dataset_closes_at_last_mark_before_an_unvalued_interior_day() -> None:
     rows = 4
     current = np.ones((rows, 1), dtype=bool)
     panel = PanelData(
@@ -1184,6 +1298,36 @@ def test_crypto_dataset_retains_an_unvalued_interior_day_for_absorbing_failure()
     )
     assert dataset.valid_indices.tolist() == [0, 1, 2]
     assert torch.isnan(dataset.future_log_returns_t[1, 0])
+    assert dataset.force_exit_mask_t[:, 0].tolist() == [False, True, False, False]
+
+    result = run_crypto_perpetual_torch(
+        torch.full((3, 1), 0.5),
+        dataset.future_log_returns_t[:3],
+        dataset.overnight_log_returns_t[:3],
+        dataset.tradable_mask_t[:3],
+        dataset.can_buy_mask_t[:3],
+        dataset.can_sell_mask_t[:3],
+        dataset.can_short_open_mask_t[:3],
+        dataset.force_exit_mask_t[:3],
+        buy_fee_rate=0.00055,
+        sell_fee_rate=0.00055,
+        long_only=False,
+        maximum_gross=1.0,
+    )
+    assert result.final_alive.item() is True
+    assert result.executed_weights[1, 0].item() == 0.0
+    assert result.turnovers[1].item() > 0.0
+
+
+def test_crypto_lifecycle_never_treats_the_open_research_horizon_as_delisting() -> None:
+    alive = np.asarray([[True, True], [True, True], [True, True]], dtype=bool)
+    finite = np.asarray([[True, True], [False, True], [False, False]], dtype=bool)
+    force_exit = _crypto_lifecycle_force_exit_mask(alive, finite)
+    assert force_exit.tolist() == [
+        [False, False],
+        [True, False],
+        [False, False],
+    ]
 
 
 def test_okx_public_daily_requires_a_complete_causally_available_session(
@@ -1228,6 +1372,7 @@ def test_okx_public_daily_requires_a_complete_causally_available_session(
     assert output[0, "crypto_okx_source_available_at_utc"] == datetime(
         2024, 1, 2, 0, 0, tzinfo=timezone.utc
     )
+    assert benchmark_public_source_projection("okx", path, "BTCUSDT")["parity"] == "equal"
 
 
 def test_okx_mapping_handles_only_explicit_contract_denomination_prefixes() -> None:
@@ -1486,6 +1631,7 @@ def test_binance_public_daily_delays_bars_and_requires_complete_positioning(
     assert output[0, "crypto_binance_source_available_at_utc"] == datetime(
         2024, 1, 2, 0, 0, tzinfo=timezone.utc
     )
+    assert benchmark_public_source_projection("binance", path, "BTCUSDT")["parity"] == "equal"
 
 
 def test_binance_public_daily_accepts_complete_native_5m_positioning_on_1m_bars(

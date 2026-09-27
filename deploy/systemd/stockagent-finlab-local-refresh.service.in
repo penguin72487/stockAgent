@@ -18,7 +18,11 @@ Nice=10
 CPUWeight=20
 IOWeight=20
 MemoryAccounting=true
-MemoryHigh=6G
+# Exact live cgroup evidence on 2026-09-26: the 6 GiB soft limit caused
+# sustained ~90% memory.full stalls for a single SDK key while the host had
+# >80 GiB available. Keep the 10 GiB hard stop and zero swap; allow a bounded
+# 2 GiB larger working set before reclaim.
+MemoryHigh=8G
 MemoryMax=10G
 MemorySwapMax=0
 OOMScoreAdjust=700

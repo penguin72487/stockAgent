@@ -172,9 +172,19 @@ class PackedDayTradeCarrySession:
     unresolved_action_gap_mask: torch.Tensor
     daily_proxy_mask: torch.Tensor
     terminal_liquidation_price: torch.Tensor | None = None
+    entry_path: torch.Tensor | None = None
+    stop_hits: torch.Tensor | None = None
 
     def validate(self) -> None:
         symbols = int(self.official_open.numel())
+        if (self.entry_path is None) != (self.stop_hits is None):
+            raise ValueError("incomplete frozen entry transport")
+        if self.entry_path is not None:
+            for value in (self.entry_path, self.stop_hits):
+                if value.shape != (symbols, 270, 2) or value.dtype != torch.float64:
+                    raise ValueError("invalid frozen entry transport")
+            if not bool(((self.stop_hits == 0) | (self.stop_hits == 1)).all()):
+                raise ValueError("invalid fresh stop observations")
         vector_fields = (
             self.official_open,
             self.opening_marks,
@@ -363,6 +373,13 @@ class PreparedDayTradeCarryBatch:
         terminal_prices = tuple(
             session.terminal_liquidation_price for session in sessions
         )
+        for name in ("entry_path", "stop_hits"):
+            values = tuple(getattr(session, name) for session in sessions)
+            if all(value is None for value in values):
+                continue
+            if any(value is None for value in values):
+                raise ValueError("packed batch mixes entry remainder policies")
+            packed[name] = torch.stack(values)
         if any(value is None for value in terminal_prices) and not all(
             value is None for value in terminal_prices
         ):

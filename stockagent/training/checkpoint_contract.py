@@ -1056,6 +1056,14 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "accounting": "continuous_notional_research_surrogate",
         }
     if execution_mode == "tw_stock_context_futures_portfolio":
+        if (config.training.model_name == "financial_transformer"
+                or trading.tw_futures_portfolio_holding_policy == "intraday"):
+            contract["futures_holding_policy"] = {
+                "policy": trading.tw_futures_portfolio_holding_policy,
+                "minute_data_path": trading.tw_futures_portfolio_minute_data_path,
+                "intraday_adapter_version": 1,
+                "financial_encoder_futures_adapter_version": 1,
+            }
         from stockagent.data.tw_futures_portfolio_daily import (
             FUTURES_MODEL_FEATURE_COLUMNS,
             TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
@@ -1620,6 +1628,14 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "corporate_action_mode": str(trading.tw_corporate_action_mode),
         }
+        if trading.tw_day_trade_subscription_right_policy != "reference_value_cash":
+            contract["taiwan_execution"]["subscription_right_policy"] = (
+                trading.tw_day_trade_subscription_right_policy
+            )
+        if trading.tw_day_trade_entry_remainder_policy != "first_minute_only":
+            contract["taiwan_execution"]["entry_remainder_policy"] = (
+                trading.tw_day_trade_entry_remainder_policy
+            )
         if bool(trading.tw_day_trade_terminal_liquidation_unlimited_capacity):
             contract["taiwan_execution"][
                 "day_trade_terminal_liquidation_unlimited_capacity"
@@ -1833,6 +1849,8 @@ def _transformer_base_checkpoint_model_values(
         contract["portfolio_output_contract"] = (
             "contextual_cash_gate_signed_direction_v1"
         )
+    elif output_mode == "score_entmax_log_cash":
+        contract["portfolio_output_contract"] = "score_entmax_log_cash_v1"
     if not bool(values.get("sanitize_inputs", True)):
         contract["sanitize_inputs"] = False
     if bool(values.get("amp_native_position_add", False)):
@@ -1963,6 +1981,8 @@ def _checkpoint_model_values(
             contract["portfolio_output_contract"] = (
                 "contextual_cash_gate_signed_direction_v1"
             )
+        elif output_mode == "score_entmax_log_cash":
+            contract["portfolio_output_contract"] = "score_entmax_log_cash_v1"
     if output_mode in {None, "activation_l1"}:
         contract["portfolio_activation"] = normalize_portfolio_activation(
             config.trading.portfolio_activation
@@ -2211,6 +2231,8 @@ def _checkpoint_manifest(
                     "stock-context futures checkpoint manifest requires its "
                     "causal sidecar"
                 )
+            if daily.intraday_session_mask is not None:
+                panel_arrays["stock_context_futures_intraday_session_mask"] = _array_content_fingerprint(daily.intraday_session_mask)
             panel_arrays.update(
                 {
                     "stock_context_futures_symbols": _array_content_fingerprint(
@@ -2244,6 +2266,10 @@ def _checkpoint_manifest(
             if daily.integer_execution is not None:
                 panel_arrays["stock_context_futures_integer_execution"] = (
                     _array_content_fingerprint(daily.integer_execution)
+                )
+            if daily.intraday_execution is not None:
+                panel_arrays["stock_context_futures_intraday_execution"] = (
+                    _array_content_fingerprint(daily.intraday_execution)
                 )
             if daily.carry_valuation_quarantine_mask is not None:
                 panel_arrays["stock_context_futures_carry_valuation_quarantine"] = (
@@ -2385,6 +2411,10 @@ def _checkpoint_manifest(
         preprocessing_contract["crypto_exchange_scope"] = str(
             config.data.crypto_exchange_scope
         )
+        if config.data.crypto_information_scope != "venue_only":
+            preprocessing_contract["crypto_information_scope"] = str(
+                config.data.crypto_information_scope
+            )
     if not bool(config.data.day_trade_minute_execution_allow_daily_proxy):
         # True is the historical hybrid-loader behavior and remains omitted for
         # checkpoint compatibility.  Strict no-proxy mode changes the label

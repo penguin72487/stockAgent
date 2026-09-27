@@ -38,6 +38,15 @@
       "completion_contract": "training-lifecycle-v1"
     },
     {
+      "dataset": "artifact-tw-day-trade-v8-combined-annual-log-cash-v5",
+      "relative_root": "markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5",
+      "maximum_file_bytes": null,
+      "loose_file_threshold_bytes": 8388608,
+      "pack_buckets": 32,
+      "min_stable_hours": 0,
+      "completion_contract": "training-lifecycle-v1"
+    },
+    {
       "dataset": "artifact-auto-layernorm-b6f2e047a3a466e0",
       "relative_root": "ablations/tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_finetune_ofat_v2/layernorm",
       "maximum_file_bytes": null,

@@ -2812,6 +2812,50 @@ def test_completed_session_publication_rejects_stale_core_close(
     assert not _completed_session_publication_ready(status)
 
 
+def test_signal_now_rejects_retired_market_before_data_work(monkeypatch) -> None:
+    from services.discord_bot import bot as discord_bot
+
+    messages: list[str] = []
+
+    class Response:
+        async def defer(self, **kwargs):
+            del kwargs
+
+    class Followup:
+        async def send(self, content, **kwargs):
+            del kwargs
+            messages.append(str(content))
+
+    interaction = SimpleNamespace(
+        response=Response(),
+        followup=Followup(),
+        user=SimpleNamespace(id=101),
+    )
+    cfg = SimpleNamespace(market="retired", enabled=False)
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda market: cfg)
+    monkeypatch.setattr(discord_bot, "_record_audit_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        discord_bot,
+        "_ensure_signal_ready_cached",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("retired model ran")),
+    )
+
+    asyncio.run(
+        _handle_signal_now_command(
+            interaction,
+            market="retired",
+            mode="signal",
+            price_source="auto",
+            top_n=20,
+            min_abs_delta=0.001,
+            refresh_data=False,
+            debug=False,
+        )
+    )
+    assert len(messages) == 1
+    assert "已停用" in messages[0]
+
+
 def test_signal_now_stale_response_says_waiting_source_not_background_update(
     monkeypatch,
 ) -> None:

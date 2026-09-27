@@ -92,6 +92,38 @@ def test_finmind_page_rejects_partial_master_and_missing_status(tmp_path: Path) 
     assert result["acquisition"]["total_session_day_tasks"] is None
 
 
+def test_session_grain_breakdown_preserves_all_historical_cadences(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 27, tzinfo=UTC)
+    grains = {"1m": 1503, "15s": 764, "10s": 214, "5s": 2862}
+    _write(tmp_path / "data_finmind/status.json", {
+        "state": "current", "observed_at_utc": now.isoformat(),
+        "series": {worker.SESSION_DATASETS[0]: {
+            "complete": 5343, "total": 5343,
+            "observed_grains": {**grains, "secret": "do-not-export"},
+        }},
+    })
+    result = build_finmind_public_status(tmp_path, now=now)
+    row = next(row for row in result["datasets"] if row["id"] == worker.SESSION_DATASETS[0])
+    assert row["observed_grains"] == grains
+    assert sum(row["observed_grains"].values()) == row["complete_partitions"]
+    assert "do-not-export" not in json.dumps(result)
+
+
+def test_finmind_page_exposes_protected_incremental_budget_without_token(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 26, 4, tzinfo=UTC)
+    root = tmp_path / "data_finmind"
+    _write(root / "account_status.json", {
+        "observed_at_utc": now.isoformat(), "tier": "Sponsor",
+        "official_requests_per_hour": 6000, "provider_used_in_hour": 100,
+    })
+    result = build_finmind_public_status(tmp_path, now=now)
+    allocation = result["quota"]["backfill_allocation"]
+    assert allocation["basis"] == "provider_observation_plus_local_starts"
+    assert allocation["reserve"] >= 6
+    assert allocation["remaining"] == 5900
+    assert "token" not in json.dumps(allocation).lower()
+
+
 def test_sparse_global_history_counts_verified_empty_as_checked_not_rows(tmp_path: Path) -> None:
     root = tmp_path / "data_finmind"
     _write(root / "complement/status.json", {

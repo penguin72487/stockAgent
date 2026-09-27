@@ -120,6 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--live-output-dir", type=Path, help="Isolated candidate signal root; never overwrite accepted live artifacts.")
     parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        help="Verified candidate model root; requires --live-output-dir and never changes the market selector.",
+    )
+    parser.add_argument(
         "--input-root",
         type=Path,
         default=Path("artifacts/live/tw_day_trade_counterfactual_open_inputs"),
@@ -161,6 +166,23 @@ def main() -> None:
 
     market_config_path = args.market_config.resolve()
     market_config = load_market_config(market_config_path)
+    candidate_artifact_root = args.artifact_root.resolve() if args.artifact_root else None
+    if candidate_artifact_root is not None:
+        if args.live_output_dir is None:
+            raise ValueError("--artifact-root requires an isolated --live-output-dir")
+        candidate_live_root = args.live_output_dir.resolve()
+        accepted_live_root = resolved_live_output_dir(market_config).resolve()
+        if (
+            candidate_live_root == accepted_live_root
+            or candidate_live_root in accepted_live_root.parents
+            or accepted_live_root in candidate_live_root.parents
+        ):
+            raise ValueError("candidate live output must not overlap the accepted live output")
+        if market_config.fold_id is None:
+            raise ValueError("--artifact-root requires a pinned market fold_id")
+        checkpoint = candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}" / "checkpoint_best.pt"
+        if not checkpoint.is_file():
+            raise FileNotFoundError(checkpoint)
     experiment = load_config(market_config.config_path)
     if str(experiment.trading.execution_mode) != "tw_day_trade":
         raise ValueError("market config must resolve to execution_mode=tw_day_trade")
@@ -209,6 +231,7 @@ def main() -> None:
         },
         "market_config_path": str(market_config_path),
         "market_config_sha256": _sha256(market_config_path),
+        "candidate_artifact_root": str(candidate_artifact_root) if candidate_artifact_root else None,
         "sessions": [],
         "skipped": [],
     }
@@ -267,6 +290,13 @@ def main() -> None:
             ),
             write=True,
         )
+        if candidate_artifact_root is not None:
+            fold_dir = candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}"
+            kwargs.update(
+                output_dir=str(candidate_artifact_root),
+                checkpoint_path=str(fold_dir / "checkpoint_best.pt"),
+                weights_path=str(fold_dir / "daily_weights.parquet"),
+            )
         kwargs["_panel_override"] = panel
         result = generate_live_signal(**kwargs)
         if not result.output_dir:

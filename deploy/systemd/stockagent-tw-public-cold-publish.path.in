@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry TW public cold publication after derived receipts change
+
+[Path]
+# Both receipts must pass the publisher's exact-byte audits.  A change only
+# wakes the publisher; it does not make either receipt trustworthy by itself.
+PathChanged=@REPO_ROOT@/data_tw_public/stocks/official_symbol_build_summary.json
+PathChanged=@REPO_ROOT@/data_tw_public/features/tw_public_stock_daily.summary.json
+Unit=stockagent-tw-public-cold-publish.service
+
+[Install]
+WantedBy=multi-user.target

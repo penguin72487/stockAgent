@@ -931,6 +931,8 @@ run_fintech_python scripts/build_tw_public_training_features.py \
 [FinMind 免費歷史下載與排程](docs/finmind_free_history.md)涵蓋 52 類官方 Free／Free(w/ data_id) 非新聞資料集：原本 4 類盤中／日曆／主檔，加上 48 類台股、期選、總經、海外股票來源。新聞依目前要求停用；原始資料與 FinLab 分開留本機，不自動當成 PIT 訓練特徵。逐檔尚未清點的代號及空回不冒充完整歷史。
 
 FinMind 獨立追蹤頁：`/finmind/`。顯示逐資料集進度、最早／最新資料、筆數、容量、官方每小時上限與本站兩支下載器的滾動請求用量；用量不代表帳號其他程式的請求。
+
+[成交量單位與本機驗證](docs/tw_stock_volume_unit_contract_2026-09-26.md)：股票可用數量統一為股，原始提供者欄位另行保留；張、千股、元、筆數與期貨／加密貨幣的數量不可混用。文件列出永豐、FinLab、FinMind 的單位證據、未知值處理、既有資料修正結果與可重跑稽核指令。
 台股多基底的原始 OHLCV／官方成交原值輸入另見
 [獨立 raw-input 實驗](docs/tw_raw_feature_input.md)；既有模型與 checkpoint 不會自動切換。
 官方資料與 ToAlpha 的分工、新增基金/ETF 開放資料、單次 MCP 查詢及歷史版本驗收見

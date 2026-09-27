@@ -18,8 +18,10 @@ from download_finlab_history import (
     credential_available, fetch_one, has_local_download,
     general_work_status, load_catalog, main, quota_cycle_start, refresh_due, safe_stem,
     serialize_provider_frame, unavailable_attempt,
-    record_attempt, record_timed_out_sync, sync_catalog, sync_selection,
+    record_attempt, record_timed_out_sync, record_core_acquisition_status,
+    sync_catalog, sync_selection,
 )
+from finlab_wide_volume_units import volume_unit_contract
 from stockagent.live.data_monitor_dashboard import (
     _automation_for_row, _finlab_acquisition_status, _finlab_candidate_sources,
     _finlab_receipt_file_exists, _operation_state, _service_state,
@@ -28,6 +30,16 @@ from stockagent.live.data_monitor_dashboard import (
 
 
 class FinLabHistoryTest(unittest.TestCase):
+    def test_wide_quantity_units_do_not_treat_lots_or_contracts_as_shares(self):
+        self.assertEqual(volume_unit_contract("price:成交股數")["canonical_unit"], "shares")
+        self.assertEqual(volume_unit_contract("after_market_fixed_price:成交張數")["source_unit"], "stock_trading_lots")
+        self.assertIsNone(volume_unit_contract("after_market_fixed_price:成交張數")["canonical_unit"])
+        self.assertEqual(volume_unit_contract("cb_price:成交張數")["source_unit"], "convertible_bond_lots")
+        self.assertEqual(volume_unit_contract("futures_price:成交量")["source_unit"], "contracts")
+        self.assertIsNone(volume_unit_contract("world_index:volume")["canonical_unit"])
+        self.assertIsNone(volume_unit_contract("block_trade:逐筆交易單一證券成交股數占市場比重(%)"))
+        self.assertIsNone(volume_unit_contract("price:成交筆數"))
+
     def test_tick_gate_requires_fresh_discovery_and_no_actionable_general_work(self):
         now = datetime(2026, 9, 25, 3, tzinfo=UTC)
         discovery = {"observed_at_utc": now.isoformat(), "keys": ["price:收盤價"]}
@@ -56,9 +68,11 @@ class FinLabHistoryTest(unittest.TestCase):
                 {"observed_at_utc": now.isoformat(), "keys": ["broker_transactions"]},
                 {}, root, now=now, refresh_days=1,
             )
-            self.assertEqual(blocked["state"], "general_work_idle")
+            self.assertEqual(blocked["state"], "general_work_blocked")
             self.assertEqual(blocked["missing_receipts"], 1)
             self.assertEqual(blocked["deferred_keys"], 1)
+            self.assertEqual(blocked["required_blocked"], 1)
+            self.assertFalse(blocked["supplemental_allowed"])
 
     def test_pending_cli_uses_local_discovery_without_provider_query(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,8 +108,10 @@ class FinLabHistoryTest(unittest.TestCase):
             assert quota_cycle_start(after).isoformat() == "2026-09-25T00:00:00+00:00"
             assert not refresh_due(key, root, now=before, days=1)
             assert refresh_due(key, root, now=after, days=1)
-            assert sync_selection([key], {}, root, now=after, refresh_days=1,
-                                  retry_unavailable=False) == [key]
+            with patch("downloader.acquisition_policy.evaluate_secondary_admission",
+                       return_value={"allowed": True}):
+                assert sync_selection([key], {}, root, now=after, refresh_days=1,
+                                      retry_unavailable=False) == [key]
 
     def test_failure_can_retry_once_quota_resets(self):
         key = "provider:field"
@@ -221,6 +237,9 @@ class FinLabHistoryTest(unittest.TestCase):
         service = Path("deploy/systemd/stockagent-finlab-local-refresh.service.in").read_text()
         self.assertIn('ExecStartPre=/usr/bin/bash -n "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"', service)
         self.assertIn('ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"', service)
+        self.assertIn("MemoryHigh=8G", service)
+        self.assertIn("MemoryMax=10G", service)
+        self.assertIn("MemorySwapMax=0", service)
         installer = Path("scripts/install_registered_data_refresh_services.sh").read_text()
         self.assertIn('bash -n "$repo_root/scripts/run_finlab_refresh.sh"', installer)
         self.assertIn('bash -n "$repo_root/scripts/run_finlab_refresh_frozen.sh"', installer)
@@ -581,7 +600,61 @@ class FinLabHistoryTest(unittest.TestCase):
             assert sync_selection(
                 [key, "missing:feature"], {key: {}}, root,
                 now=now, refresh_days=1, retry_unavailable=False,
-            ) == ["missing:feature", key]
+            ) == ["missing:feature"]
+
+    def test_cooling_required_field_does_not_release_optional_validation_or_tick(self):
+        now = datetime(2026, 9, 25, 1, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "datasets").mkdir()
+            (root / "receipts").mkdir()
+            (root / "attempts").mkdir()
+            key = "price:收盤價"
+            (root / "datasets/price.parquet").write_bytes(b"existing")
+            (root / "receipts" / f"{safe_stem(key)}.json").write_text(json.dumps({
+                "dataset": key, "status": "downloaded_unverified_for_pit",
+                "parquet_path": "datasets/price.parquet",
+                "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+            }))
+            (root / "attempts" / f"{safe_stem('missing:feature')}.json").write_text(json.dumps({
+                "dataset": "missing:feature", "status": "provider_error",
+                "attempted_at_utc": now.isoformat(), "failure_streak": 1,
+            }))
+            keys = [key, "missing:feature", "tw_tick:2317", "tw_minute:2317"]
+            with patch("downloader.acquisition_policy.evaluate_secondary_admission",
+                       side_effect=AssertionError("must not need global gate")):
+                assert sync_selection(keys, {}, root, now=now, refresh_days=1,
+                                      retry_unavailable=False) == []
+            status = record_core_acquisition_status(keys, {}, root, now=now, refresh_days=1)
+            assert status["status"] == "blocked"
+            assert status["required_blocked"] == 1
+            assert status["required_blocked_keys"] == ["missing:feature"]
+            assert status["secondary_validation_pending"] == 1
+            assert status["windowed_examples_excluded"] == ["tw_minute:2317", "tw_tick:2317"]
+            assert (root / "core_acquisition_status.json").is_file()
+
+    def test_validation_requires_global_admission_even_when_local_core_is_ready(self):
+        now = datetime(2026, 9, 25, 1, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "datasets").mkdir()
+            (root / "receipts").mkdir()
+            key = "price:收盤價"
+            (root / "datasets/price.parquet").write_bytes(b"existing")
+            (root / "receipts" / f"{safe_stem(key)}.json").write_text(json.dumps({
+                "dataset": key, "status": "downloaded_unverified_for_pit",
+                "parquet_path": "datasets/price.parquet",
+                "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+            }))
+            for allowed in (False, True):
+                with patch("downloader.acquisition_policy.evaluate_secondary_admission",
+                           return_value={"allowed": allowed}) as gate:
+                    assert sync_selection([key], {}, root, now=now, refresh_days=1,
+                                          retry_unavailable=False) == ([key] if allowed else [])
+                    gate.assert_called_once_with(now=now, caller_provider="finlab", local_core_complete=True)
+            status = record_core_acquisition_status([key], {}, root, now=now, refresh_days=1)
+            assert status["status"] == "ready"
+            assert status["required_pending"] == 0
 
     def test_failure_cooldowns_are_reason_specific_and_intraday_needs_dates(self):
         now = datetime(2026, 9, 24, 15, tzinfo=UTC)

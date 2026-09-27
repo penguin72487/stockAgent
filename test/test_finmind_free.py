@@ -25,7 +25,9 @@ def _rows(dataset: str, day: date, *, step: int) -> list[dict[str, object]]:
     for seconds in range(9 * 3600, 13 * 3600 + 30 * 60 + 1, step):
         stamp = f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
         result.append(
-            {"Time": stamp, "date": day.isoformat(), "TotalBuyOrder": 1, "TotalDealVolume": 0}
+            {"Time": stamp, "date": day.isoformat(), "TotalBuyOrder": 1, "TotalSellOrder": 1,
+             "TotalBuyVolume": 2, "TotalSellVolume": 3, "TotalDealOrder": 0,
+             "TotalDealVolume": 0, "TotalDealMoney": 0}
             if dataset == SESSION_DATASETS[0]
             else {"date": f"{day} {stamp}", "TAIEX": 10000.0}
         )
@@ -35,7 +37,7 @@ def _rows(dataset: str, day: date, *, step: int) -> list[dict[str, object]]:
 @pytest.mark.parametrize("step,grain,expected", [(60, "1m", 271), (5, "5s", 3241)])
 @pytest.mark.parametrize("dataset", SESSION_DATASETS)
 def test_exact_historical_grains_are_complete(dataset: str, step: int, grain: str, expected: int) -> None:
-    day = date(2015, 1, 5)
+    day = date(2010, 1, 4) if step == 60 else date(2015, 1, 5)
     rows = _rows(dataset, day, step=step)
     assert _validated_session_rows(dataset, day, rows) == ("complete", grain, expected, 0)
 
@@ -45,6 +47,72 @@ def test_gap_and_duplicate_are_not_complete() -> None:
     rows = _rows(SESSION_DATASETS[0], day, step=5)
     assert _validated_session_rows(SESSION_DATASETS[0], day, rows[:10] + rows[11:])[0] == "partial"
     assert _validated_session_rows(SESSION_DATASETS[0], day, rows[:10] + [rows[9]] + rows[10:])[0] == "partial"
+
+
+@pytest.mark.parametrize("day,step,grain,expected", [
+    (date(2011, 1, 14), 60, "1m", 271),
+    (date(2011, 1, 17), 15, "15s", 1081),
+    (date(2014, 2, 21), 15, "15s", 1081),
+    (date(2014, 2, 24), 10, "10s", 1621),
+    (date(2014, 12, 26), 10, "10s", 1621),
+    (date(2014, 12, 29), 5, "5s", 3241),
+])
+@pytest.mark.parametrize("dataset", SESSION_DATASETS)
+def test_order_book_dated_native_grid(day: date, step: int, grain: str, expected: int, dataset: str) -> None:
+    rows = _rows(dataset, day, step=step)
+    assert _validated_session_rows(dataset, day, rows) == ("complete", grain, expected, 0)
+    assert _validated_session_rows(dataset, day, rows[::2])[0] == "partial"
+    assert _validated_session_rows(dataset, day, rows[:3] + rows[4:])[0] == "partial"
+
+
+@pytest.mark.parametrize("dataset", SESSION_DATASETS)
+def test_local_grid_revalidation_preserves_bytes_and_avoids_new_api(tmp_path: Path, monkeypatch, dataset) -> None:
+    day = date(2013, 5, 22)
+    now = datetime(2026, 9, 27, tzinfo=UTC)
+    receipt = _record_session(tmp_path, dataset, day, _rows(dataset, day, step=15), now=now)
+    path = tmp_path / "receipts" / dataset / f"{day}.json"
+    receipt.update({"status": "partial", "observed_grain": None,
+                    "session_grid_contract_version": 1, "retry_at_utc": now.isoformat()})
+    path.write_text(json.dumps(receipt))
+    old_bytes = path.read_bytes()
+    source_bytes = (tmp_path / receipt["parquet_path"]).read_bytes()
+    monkeypatch.setattr(finmind, "_request", lambda *_a, **_kw: pytest.fail("no API"))
+    result = finmind.revalidate_sessions_local(tmp_path)
+    updated = json.loads(path.read_text())
+    assert result["newly_complete"] == 1 and result["api_requests"] == 0 and not result["failures"]
+    assert updated["observed_grain"] == "15s" and updated["fetched_at_utc"] == receipt["fetched_at_utc"]
+    assert "retry_at_utc" not in updated
+    assert (tmp_path / updated["grid_revalidation_previous_source"]["receipt_path"]).read_bytes() == old_bytes
+    assert (tmp_path / receipt["parquet_path"]).read_bytes() == source_bytes
+    assert finmind.revalidate_sessions_local(tmp_path)["already_current"] == 1
+    damaged = (tmp_path / receipt["parquet_path"])
+    damaged.write_bytes(source_bytes[:-1] + b"x")
+    assert len(finmind.revalidate_sessions_local(tmp_path)["failures"]) == 1
+
+
+def test_free_history_cannot_consume_incremental_reserve(tmp_path: Path, monkeypatch) -> None:
+    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
+    days = [date(2026, 9, 23), date(2026, 9, 24)]
+    seen = []
+    monkeypatch.setenv("FINMIND_TOKEN", "test-only")
+    monkeypatch.setattr(finmind, "load_env_file", lambda *_a, **_kw: None)
+    monkeypatch.setattr(finmind, "_utc_now", lambda: now)
+    monkeypatch.setattr(finmind, "verified_account", lambda *_a: {"official_requests_per_hour": 600})
+    monkeypatch.setattr(finmind, "rate_limiter", lambda *_a: object())
+    monkeypatch.setattr(finmind, "_load_calendar", lambda *_a: (days, 0))
+    monkeypatch.setattr(finmind, "_master_due", lambda *_a: False)
+    monkeypatch.setattr(finmind, "fixed_incremental_demand", lambda *_a: 0)
+    monkeypatch.setattr(finmind, "backfill_budget", lambda *_a, **_kw: {"allowed": False})
+
+    def fetch(_session, _limiter, dataset, *, start_date, **_kw):
+        seen.append((dataset, start_date))
+        return _rows(dataset, start_date, step=5)
+
+    monkeypatch.setattr(finmind, "_request", fetch)
+    result = finmind.run_once(tmp_path)
+    assert result["state"] == "incremental_reserve"
+    assert result["complete"] == 2 and result["total"] == 4
+    assert {day for _, day in seen} == {days[-1]}
 
 
 def test_session_cutoff_never_accepts_unfinished_current_day() -> None:
@@ -60,7 +128,7 @@ def test_calendar_rejects_broken_rows() -> None:
 def test_receipt_requires_real_parquet_and_prioritizes_recent(tmp_path: Path) -> None:
     now = datetime(2026, 9, 25, 7, 0, tzinfo=UTC)
     days = [date(2026, 9, 22), date(2026, 9, 23), date(2026, 9, 24)]
-    done = _record_session(tmp_path, SESSION_DATASETS[0], days[0], _rows(SESSION_DATASETS[0], days[0], step=60), now=now)
+    done = _record_session(tmp_path, SESSION_DATASETS[0], days[0], _rows(SESSION_DATASETS[0], days[0], step=5), now=now)
     assert done["status"] == "complete"
     assert _receipt_usable(done, tmp_path, now=now)
     deferred = tmp_path / "receipts" / SESSION_DATASETS[1] / f"{days[0]}.json"

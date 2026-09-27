@@ -84,6 +84,16 @@ class DatasetResult:
 
 DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
+        "defillama_tvl_history", "DefiLlama", "defillama_public", "GET",
+        "https://api.llama.fi/v2/historicalChainTvl", None,
+        "defillama_tvl_history", "historical_archive_first_observed_now",
+    ),
+    DatasetSpec(
+        "defillama_stablecoin_supply_history", "DefiLlama", "defillama_public", "GET",
+        "https://stablecoins.llama.fi/stablecoincharts/all", None,
+        "defillama_stablecoin_supply_history", "historical_archive_first_observed_now",
+    ),
+    DatasetSpec(
         "defillama_chains",
         "DefiLlama",
         "defillama_public",
@@ -602,6 +612,50 @@ def _metrics(
         )
         is not None
     ]
+
+
+def _adapt_defillama_tvl_history(
+    spec: DatasetSpec, payload: Any, observed_at: str, digest: str
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise ValueError("DefiLlama TVL history must be a row array")
+    output: list[dict[str, Any]] = []
+    for item in payload:
+        event_ts = _iso_from_seconds(item.get("date"))
+        if event_ts is None:
+            raise ValueError("DefiLlama TVL history has no valid event timestamp")
+        output.extend(_metrics(
+            spec, observed_at, digest, entity="all_chains", event_ts=event_ts,
+            values={"tvl_usd": (item.get("tvl"), "USD")},
+        ))
+    return output
+
+
+def _adapt_defillama_stablecoin_supply_history(
+    spec: DatasetSpec, payload: Any, observed_at: str, digest: str
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise ValueError("DefiLlama stablecoin history must be a row array")
+    output: list[dict[str, Any]] = []
+    for item in payload:
+        event_ts = _iso_from_seconds(item.get("date"))
+        if event_ts is None:
+            raise ValueError("DefiLlama stablecoin history has no valid event timestamp")
+        # Keep peg units separate. Never add EUR/gold/native quantities as USD.
+        for field, metric, usd in (
+            ("totalCirculating", "circulating", False),
+            ("totalCirculatingUSD", "circulating_usd", True),
+        ):
+            values = item.get(field) or {}
+            if not isinstance(values, dict):
+                raise ValueError(f"DefiLlama {field} must be keyed by peg type")
+            for peg, value in values.items():
+                output.extend(_metrics(
+                    spec, observed_at, digest, entity=f"all_chains:{peg}",
+                    event_ts=event_ts,
+                    values={metric: (value, "USD" if usd else str(peg))},
+                ))
+    return output
 
 
 def _adapt_defillama_chains(
@@ -1396,6 +1450,8 @@ def _adapt_blockscout_ethereum_latest_block(
 
 
 ADAPTERS: dict[str, Callable[[DatasetSpec, Any, str, str], list[dict[str, Any]]]] = {
+    "defillama_tvl_history": _adapt_defillama_tvl_history,
+    "defillama_stablecoin_supply_history": _adapt_defillama_stablecoin_supply_history,
     "defillama_chains": _adapt_defillama_chains,
     "defillama_stablecoins": _adapt_defillama_stablecoins,
     "defillama_yields": _adapt_defillama_yields,

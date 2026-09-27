@@ -23,7 +23,11 @@ from downloader.download_finmind_complement import (
     FIXED_ID_HISTORY,
     WIDE_INSTITUTIONAL,
 )
-from downloader.download_finmind_sponsor import SOURCES as SPONSOR_SOURCES, UNSCHEDULED as SPONSOR_UNSCHEDULED
+from downloader.download_finmind_sponsor import (
+    SOURCES as SPONSOR_SOURCES, UNSCHEDULED as SPONSOR_UNSCHEDULED,
+    _fixed_incremental_demand,
+)
+from downloader.finmind_account import backfill_budget
 
 
 LABELS = {
@@ -134,6 +138,16 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     account_fresh = bool(account_stamp and observed - account_stamp <= timedelta(minutes=30))
     official_limit = account.get("official_requests_per_hour") if account_fresh else status.get("official_requests_per_hour")
     limit = official_limit if type(official_limit) is int and 1 <= official_limit <= 100_000 else 300
+    allocation: dict[str, Any] | None = None
+    if account_fresh:
+        try:
+            allocation = backfill_budget(
+                account, root,
+                fixed_incremental_requests=_fixed_incremental_demand(root, observed),
+                now=observed,
+            )
+        except (OSError, ValueError):
+            allocation = None
     series = status.get("series") if isinstance(status.get("series"), Mapping) else {}
     datasets: list[dict[str, Any]] = []
     for dataset in SESSION_DATASETS:
@@ -157,7 +171,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "last_receipt_at_utc": item.get("last_receipt_at_utc"),
             "observed_grains": {
                 key: value for key, value in (item.get("observed_grains") or {}).items()
-                if key in {"1m", "5s"} and _nonnegative_int(value) is not None
+                if key in {"1m", "15s", "10s", "5s"} and _nonnegative_int(value) is not None
             } if isinstance(item.get("observed_grains"), Mapping) else {},
             "minimum_network_seconds_remaining": round(pending * 3600 / limit) if pending is not None else None,
         })
@@ -297,6 +311,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "last_receipt_at_utc": item.get("last_attempt_at_utc"),
             "minimum_network_seconds_remaining": round(remaining * 3600 / limit) if total and not blocked else None,
             "source_status": "observed_sponsor_market_response_not_provider_completeness",
+            "excluded_observation_dates": _nonnegative_int(item.get("not_observation_date")) or 0,
         })
     for dataset, reason in SPONSOR_UNSCHEDULED.items():
         datasets.append({
@@ -406,7 +421,8 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         "quota": {**traffic,
                   "account_tier": account.get("tier") if account_fresh else None,
                   "provider_used_in_hour": _nonnegative_int(account.get("provider_used_in_hour")) if account_fresh else None,
-                  "provider_observed_at_utc": account.get("observed_at_utc") if account_fresh else None},
+                  "provider_observed_at_utc": account.get("observed_at_utc") if account_fresh else None,
+                  "backfill_allocation": allocation},
         "storage": {"local_bytes": local_bytes, "filesystem_free_bytes": filesystem_free,
                     "unit": "receipt_backed_local_bytes", "estimated_total_bytes": None},
         "datasets": datasets,

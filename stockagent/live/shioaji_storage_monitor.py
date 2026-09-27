@@ -418,7 +418,10 @@ def build_shioaji_storage_snapshot(
         "daily_totals": historical_totals,
         "datasets": sorted(datasets, key=lambda item: int(item["bytes"]), reverse=True),
         "definitions": {
-            "total_bytes": "九個互不重疊資料群組的實體檔案大小加總；不跟隨 symlink。",
+            "total_bytes": (
+                f"{len(datasets)} 個互不重疊資料群組的實體檔案大小加總；"
+                "不跟隨 symlink。"
+            ),
             "average_daily_growth": (
                 "最近 30 個完整台北曆日內，依檔案最後修改日歸屬的變動檔案完整大小除以 30；"
                 "這是寫入活動量，不是淨容量增加量，大量一次性回補或重寫會使數值偏高。"

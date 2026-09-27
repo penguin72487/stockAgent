@@ -70,8 +70,17 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     build_tw_public_monitor_status,
     project_data_monitor_summary,
 )
+from stockagent.live.data_monitor_providers import project_provider_detail  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
+    trusted_feature_preview,
     trusted_feature_snapshot,
+    trusted_feature_source_pages,
+)
+from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
+    FEATURE_PREVIEW_LIMIT,
+    FeaturePageIndex,
+    feature_page_revision,
+    page_from_source_rows,
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
@@ -179,7 +188,9 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/data-monitor/api/status",
         "/data-monitor/api/summary",
         "/data-monitor/api/details",
+        "/data-monitor/api/provider",
         "/data-monitor/api/features",
+        "/data-monitor/api/features/page",
         "/traffic/api/status",
         "/traffic/api/history",
     }
@@ -195,6 +206,7 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/finmind/",
         "/openbb/",
         "/data-monitor/",
+        "/data-monitor/providers/{provider}/",
         "/traffic/",
     }
 )
@@ -208,6 +220,8 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/events",
         "/openbb/api/history",
+        "/data-monitor/api/provider",
+        "/data-monitor/api/features/page",
         "/tw-overnight/api/status",
         "/tw-overnight/api/history",
         "/tw-overnight/api/summary",
@@ -481,6 +495,8 @@ class PublicTrafficObserver:
             return path, "api"
         if path in _PUBLIC_PAGE_ROUTES:
             return path, "page"
+        if path.startswith("/data-monitor/providers/") and path.endswith("/"):
+            return "/data-monitor/providers/{provider}/", "page"
         if path.endswith((".css", ".js", ".ico", ".txt")):
             return "靜態資源", "asset"
         return "其他／未命中", "other"
@@ -1622,6 +1638,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self._refreshing: set[str] = set()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
+        self._feature_page_lock = threading.Lock()
+        self._feature_page_index: tuple[Path, tuple[int, ...], FeaturePageIndex] | None = None
+        self._feature_page_preview: tuple[Path, tuple[int, ...], Mapping[str, Any]] | None = None
+        self._feature_source_pages: tuple[
+            Path, tuple[int, ...], Mapping[str, list[Mapping[str, Any]]], Mapping[str, Any],
+        ] | None = None
         bot = self.repo_root / "artifacts/discord_bot"
         self.update_hub = DashboardUpdateHub(
             {
@@ -2087,6 +2109,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     maximum_event_rows=500,
                     maximum_mark_rows=32,
                     include_position_rows=False,
+                    include_order_fill_rows=False,
                     # Completed-session position snapshots and immutable
                     # benchmark history already enumerate the public selector.
                     include_ledger_session_dates=False,
@@ -2491,6 +2514,32 @@ class PublicDashboardServer(ThreadingHTTPServer):
             builder=build,
         )
 
+    def data_monitor_provider(
+        self, provider: str, *, offset: int = 0, limit: int = 30,
+        search: str = "", operation: str = "all", market: str = "all",
+    ) -> PreparedResponse:
+        """Only serialize the selected owner label, not the full registry."""
+
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            selected = project_provider_detail(
+                payload, provider, offset=offset, limit=limit, search=search,
+                operation=operation, market=market,
+            )
+            if selected is None:
+                raise PublicRouteNotFound(provider)
+            return selected
+
+        request_key = json.dumps([provider, offset, limit, search, operation, market], ensure_ascii=False)
+        digest = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
+        return self.cached_local_json(
+            cache_key=f"data-monitor-provider:{digest}",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=build,
+        )
+
     def data_monitor_features(self) -> PreparedResponse:
         """Serve the separately materialized, read-only field inventory."""
 
@@ -2548,6 +2597,156 @@ class PublicDashboardServer(ThreadingHTTPServer):
             stale_grace_seconds=60.0,
             builder=build,
         )
+
+    def _trusted_feature_page_preview(self) -> tuple[tuple[int, ...], Mapping[str, Any]] | None:
+        """Use a source-digest-bound first page without parsing all 53 MiB."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            source_stat = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        signature = metadata_signature(source_stat)
+        with self._feature_page_lock:
+            cached = self._feature_page_preview
+            if cached is not None and cached[0] == snapshot and cached[1] == signature:
+                return signature, cached[2]
+            preview = trusted_feature_preview(snapshot, source_stat=source_stat)
+            if preview is None:
+                return None
+            self._feature_page_preview = (snapshot, signature, preview)
+            return signature, preview
+
+    def _feature_index(self) -> FeaturePageIndex:
+        """Parse one producer generation once, then page it without re-reading 53 MiB."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            signature = metadata_signature(snapshot.stat())
+        except FileNotFoundError:
+            return FeaturePageIndex.from_payload(
+                {
+                    "schema_version": 1,
+                    "read_only": True,
+                    "production_control_possible": False,
+                    "summary": {"state": "waiting_inventory", "fields": 0},
+                    "rows": [],
+                },
+                source_signature=(0, 0, 0, 0, 0),
+            )
+        with self._feature_page_lock:
+            cached = self._feature_page_index
+            if cached is not None and cached[0] == snapshot and cached[1] == signature:
+                return cached[2]
+            with snapshot.open("rb") as stream:
+                opened = metadata_signature(os.fstat(stream.fileno()))
+                body = stream.read()
+                finished = metadata_signature(os.fstat(stream.fileno()))
+            if (
+                signature != opened or signature != finished
+                or signature != metadata_signature(snapshot.stat())
+            ):
+                raise ValueError("data-monitor feature snapshot changed during read")
+
+            def reject_nonfinite(value: str) -> None:
+                raise ValueError(f"data-monitor feature snapshot has non-finite JSON: {value}")
+
+            # Paging must inspect the DTO even if a producer sidecar exists;
+            # the sidecar is only an accelerator for the legacy full-byte route.
+            payload = json.loads(body, parse_constant=reject_nonfinite)
+            index = FeaturePageIndex.from_payload(payload, source_signature=signature)
+            if signature != metadata_signature(snapshot.stat()):
+                raise ValueError("data-monitor feature snapshot changed during validation")
+            self._feature_page_index = (snapshot, signature, index)
+            return index
+
+    def _small_source_page(
+        self, *, offset: int, limit: int, search: str, category: str,
+        source: str, revision: str | None,
+    ) -> dict[str, Any] | None:
+        """Use source-bound small pages; missing proof takes the full path."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            source_stat = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        signature = metadata_signature(source_stat)
+        with self._feature_page_lock:
+            cached = self._feature_source_pages
+            if cached is None or cached[0] != snapshot or cached[1] != signature:
+                trusted = trusted_feature_source_pages(snapshot, source_stat=source_stat)
+                try:
+                    current_signature = metadata_signature(snapshot.stat())
+                except OSError:
+                    return None
+                if trusted is None or signature != current_signature:
+                    return None
+                pages, preview = trusted
+                self._feature_source_pages = (snapshot, signature, pages, preview)
+            else:
+                pages, preview = cached[2], cached[3]
+            source_rows = pages.get(source)
+            if source_rows is None:
+                return None
+            return page_from_source_rows(
+                rows=source_rows, preview=preview,
+                revision=feature_page_revision(signature),
+                requested_revision=revision, offset=offset, limit=limit,
+                search=search, category=category,
+            )
+
+    def data_monitor_feature_page(
+        self, *, offset: int = 0, limit: int = 80, search: str = "",
+        category: str = "all", source: str = "all", revision: str | None = None,
+    ) -> PreparedResponse:
+        """Return all matching fields through bounded, generation-safe pages."""
+
+        def build() -> PreparedResponse:
+            source_page = (
+                self._small_source_page(
+                    offset=offset, limit=limit, search=search,
+                    category=category, source=source, revision=revision,
+                ) if source != "all" else None
+            )
+            preview = (
+                self._trusted_feature_page_preview()
+                if source_page is None and offset == 0 and limit <= FEATURE_PREVIEW_LIMIT
+                and not search and category == "all" and source == "all"
+                else None
+            )
+            if source_page is not None:
+                page = source_page
+            elif preview is None:
+                page = self._feature_index().page(
+                    offset=offset, limit=limit, search=search,
+                    category=category, source=source, requested_revision=revision,
+                )
+            else:
+                signature, projection = preview
+                current_revision = feature_page_revision(signature)
+                page = {
+                    "schema_version": 1,
+                    "read_only": True,
+                    "production_control_possible": False,
+                    "generated_at_utc": projection.get("generated_at_utc"),
+                    "revision": current_revision,
+                    "reset_required": revision is not None and revision != current_revision,
+                    "offset": 0,
+                    "limit": limit,
+                    "matching_total": projection["summary"]["fields"],
+                    "has_more": limit < projection["summary"]["fields"],
+                    "summary": projection["summary"],
+                    "filters": projection["filters"],
+                    "rows": projection["rows"][:limit],
+                }
+            return _prepared(
+                (json.dumps(page, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8"),
+                content_type="application/json; charset=utf-8",
+                cache_control="no-store",
+            )
+
+        return self._measured_build(build)
 
     def public_overview(self) -> Mapping[str, Any]:
         # These sources are independent.  Build their verified snapshots on
@@ -2916,6 +3115,17 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             self._write_body(body)
 
     def _static_response(self, path: str) -> PreparedResponse | None:
+        provider_prefix = "/data-monitor/providers/"
+        if path.startswith(provider_prefix) and path.endswith("/"):
+            segment = path[len(provider_prefix):-1]
+            if (segment not in {"", ".", ".."} and len(segment) <= 512 and
+                    re.fullmatch(r"(?:[A-Za-z0-9_.~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+", segment)):
+                return self.server.cached_static(
+                    self.server.data_monitor_static_root / "provider.html",
+                    content_type="text/html; charset=utf-8",
+                    cache_control="no-cache, must-revalidate",
+                )
+            return None
         routes: dict[str, tuple[Path, str, str]] = {
             "/": (
                 self.server.public_static_root / "index.html",
@@ -2986,7 +3196,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/"} else "public, max-age=60",
                 )
-            elif suffix == "app.js" or (
+            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix == "provider.js") or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
                 and suffix
                 in {
@@ -3040,6 +3250,67 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise
         except (ValueError, OverflowError) as error:
             raise InvalidPublicRequest("invalid date query") from error
+
+    @staticmethod
+    def _provider_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=6)
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid provider query") from error
+        allowed = {"name", "offset", "limit", "q", "state", "market"}
+        if "name" not in query or set(query) - allowed or any(len(values) != 1 for values in query.values()):
+            raise InvalidPublicRequest("provider name required")
+        provider = query["name"][0]
+        if not 0 < len(provider) <= 200 or any(ord(char) < 32 for char in provider):
+            raise InvalidPublicRequest("invalid provider name")
+        try:
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["30"])[0])
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid provider page") from error
+        search = query.get("q", [""])[0].strip()
+        operation = query.get("state", ["all"])[0]
+        market = query.get("market", ["all"])[0]
+        if (not 0 <= offset <= 10000 or not 1 <= limit <= 1500 or len(search) > 120 or
+                any(ord(char) < 32 for char in search) or
+                operation not in {"all", "catching_up", "streaming", "complete", "unable",
+                                  "deferred", "control", "reference"} or
+                not re.fullmatch(r"all|[a-z_]{1,40}", market)):
+            raise InvalidPublicRequest("invalid provider filters")
+        return {"provider": provider, "offset": offset, "limit": limit,
+                "search": search, "operation": operation, "market": market}
+
+    @staticmethod
+    def _feature_page_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=6)
+            allowed = {"offset", "limit", "q", "category", "source", "revision"}
+            if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+                raise InvalidPublicRequest("unsupported or repeated feature query field")
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["80"])[0])
+            search = query.get("q", [""])[0].strip()
+            category = query.get("category", ["all"])[0]
+            source = query.get("source", ["all"])[0]
+            revision = query.get("revision", [None])[0]
+            if (
+                not 0 <= offset <= 1_000_000 or not 1 <= limit <= 5_000
+                or len(search) > 120 or any(ord(char) < 32 for char in search)
+                or not re.fullmatch(r"all|[a-z_]{1,40}", category)
+                or not 0 < len(source) <= 200
+                or any(ord(char) < 32 for char in source)
+                or (revision is not None and not re.fullmatch(r"[0-9a-f]{32}", revision))
+                or (offset > 0 and revision is None)
+            ):
+                raise InvalidPublicRequest("invalid feature page query")
+            return {
+                "offset": offset, "limit": limit, "search": search,
+                "category": category, "source": source, "revision": revision,
+            }
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid feature page query") from error
 
     @staticmethod
     def _signal_query(raw_query: str) -> str:
@@ -3536,8 +3807,14 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_summary()
         if path == "/data-monitor/api/details":
             return self.server.data_monitor_details()
+        if path == "/data-monitor/api/provider":
+            return self.server.data_monitor_provider(**self._provider_query(raw_query))
         if path == "/data-monitor/api/features":
             return self.server.data_monitor_features()
+        if path == "/data-monitor/api/features/page":
+            return self.server.data_monitor_feature_page(
+                **self._feature_page_query(raw_query)
+            )
         if path == "/traffic/api/status":
             payload = self.server.traffic_observer.snapshot(
                 exclude_current_request=True

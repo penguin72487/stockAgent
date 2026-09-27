@@ -659,7 +659,13 @@ def resolve_observed_minute_execution_price(
     parsed_low = _float_or_none(low)
     parsed_high = _float_or_none(high)
     parsed_close = _float_or_none(close)
-    if parsed_shares is None and parsed_raw_volume is not None:
+    if parsed_shares is not None:
+        parsed_shares = (
+            float(round(parsed_shares))
+            if (round(parsed_shares) > 0
+                and abs(parsed_shares - round(parsed_shares)) <= 1e-6) else None
+        )
+    if volume_shares is None and parsed_raw_volume is not None:
         multipliers: list[float] = []
         parsed_contract_unit = _float_or_none(contract_unit)
         if parsed_contract_unit is not None:
@@ -670,16 +676,23 @@ def resolve_observed_minute_execution_price(
             and parsed_low is not None
             and parsed_high is not None
         ):
+            candidates: list[float] = []
             for multiplier in dict.fromkeys(multipliers):
                 candidate_shares = parsed_raw_volume * multiplier
+                if not np.isfinite(candidate_shares) or candidate_shares <= 0.0:
+                    continue
                 candidate_price = parsed_amount / candidate_shares
                 if (
                     np.isfinite(candidate_price)
                     and candidate_price > 0.0
                     and parsed_low * 0.999 <= candidate_price <= parsed_high * 1.001
                 ):
-                    parsed_shares = candidate_shares
-                    break
+                    candidates.append(candidate_shares)
+            # A wide historical bar may admit more than one encoding.  The
+            # first multiplier that fits is not proof of its share quantity.
+            if (len(candidates) == 1 and round(candidates[0]) > 0
+                    and abs(candidates[0] - round(candidates[0])) <= 1e-6):
+                parsed_shares = float(round(candidates[0]))
     if parsed_amount is not None and parsed_shares is not None:
         vwap = parsed_amount / parsed_shares
         if np.isfinite(vwap) and vwap > 0.0:

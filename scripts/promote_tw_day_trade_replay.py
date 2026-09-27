@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.data.tw_price_rules import move_price_ticks_numpy
 from stockagent.live.benchmark_history_projection import load_benchmark_projection
+from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT
 from scripts.rebuild_tw_day_trade_minute_curves import (
     historical_minute_mark_has_source,
 )
@@ -990,6 +991,9 @@ def _validate_rebuild(
     if set(modes) != expected_markets:
         failures.append(f"mode set={sorted(modes)} expected={sorted(expected_markets)}")
     margin_audit = None
+    terminal_unlimited = isinstance(replay_contract, dict) and replay_contract.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
+    if terminal_unlimited and not allow_margin_carry:
+        failures.append("unlimited close requires full source/accounting audit via --allow-margin-carry")
     if allow_margin_carry:
         from scripts.audit_tw_day_trade_margin_replay import audit
         from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
@@ -1173,7 +1177,7 @@ def _validate_rebuild(
                 ):
                     failures.append(f"{session_date}/{market}: not flat after close")
                 if receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT and isinstance(after_close, dict):
-                    if int(after_close.get("terminal_flatten_count") or 0):
+                    if int(after_close.get("terminal_flatten_count") or 0) and not terminal_unlimited:
                         failures.append(f"{session_date}/{market}: v3 uses synthetic terminal flatten")
             terminal_entry = (
                 row.get("current_open") if is_allowed_current_open else row.get("after_close")
@@ -1447,10 +1451,17 @@ def _cutover_blockers(
     live_path = live / "state.json"
     if not live_path.is_file():
         return [f"live paper state is missing: {live_path}"]
-    live_modes = _load_object(live_path).get("modes") or {}
+    live_state = _load_object(live_path)
+    live_modes = live_state.get("modes") or {}
     candidate_modes = _load_object(candidate / "state.json").get("modes") or {}
     blockers: list[str] = []
-    if set(live_modes) != expected_markets:
+    # Explicitly retired modes remain immutable rollback evidence, not active
+    # accounts. Both runtime enablement and per-mode retirement must agree.
+    retired = {m for m, row in live_modes.items()
+               if row.get("configured_enabled") is False
+               and isinstance(live_state.get("enabled_markets"), list)
+               and m not in live_state["enabled_markets"]}
+    if set(live_modes) - retired != expected_markets:
         blockers.append(
             f"live mode set differs from expected: {sorted(live_modes)}"
         )
@@ -1540,6 +1551,9 @@ def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> N
     for name, digest in audit["corporate_action_source_hashes"].items():
         if _sha256(Path(name)) != digest:
             raise RuntimeError(f"audited corporate-action source changed: {name}")
+    for name, digest in audit.get("terminal_close_source_hashes", {}).items():
+        if _sha256(Path(name)) != digest:
+            raise RuntimeError(f"audited terminal close source changed: {name}")
     for name, expected in audit.get("minute_source_signatures", {}).items():
         stat = Path(name).stat()
         if [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns] != list(expected):
@@ -1631,6 +1645,10 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
                 config = load_market_config(REPO_ROOT / "services/discord_bot/markets" / f"{market}.yaml")
                 if not config.day_trade_residual_margin_conversion or config.day_trade_odd_lot_execution_policy != ODD_LOT_BOARD_PRICE:
                     raise RuntimeError(f"runtime margin/odd-lot policy not enabled: {market}")
+                candidate_mode = _load_object(candidate / "state.json")["modes"][market]
+                if (candidate_mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                        and not config.day_trade_terminal_liquidation_unlimited_capacity):
+                    raise RuntimeError(f"runtime terminal close policy not enabled: {market}")
         _exchange_directories(live, candidate)
         exchanged = True
         promotion_receipt = {

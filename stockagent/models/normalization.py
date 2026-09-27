@@ -462,6 +462,63 @@ def masked_cash_entmax15_weights(
     }
 
 
+def masked_score_entmax_log_cash_weights(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    short_mask: torch.Tensor | None = None,
+    return_parts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Map signed scores to sparse stock weights and residual cash.
+
+    The selector uses log1p of score magnitude, while conviction retains the
+    signed score / (1 + magnitude). Keep weights in FP32 at the whole-lot
+    execution boundary, including under BF16 autocast.
+    """
+
+    if logits.ndim != 2:
+        raise ValueError("score-entmax-log-cash logits must have shape [B,S]")
+    mask_bool = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if mask is None
+        else mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if tuple(mask_bool.shape) != tuple(logits.shape):
+        raise ValueError("score-entmax-log-cash mask must match logits")
+    if short_mask is None:
+        short_mask_bool = mask_bool
+    else:
+        short_mask_bool = short_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(short_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError("score-entmax-log-cash short mask must match logits")
+        short_mask_bool = short_mask_bool & mask_bool
+
+    clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    legal_scores = torch.where(
+        short_mask_bool, clean, clean.clamp_min(0.0)
+    ).masked_fill(~mask_bool, 0.0)
+    evidence = legal_scores.abs()
+    selector_evidence = torch.log1p(evidence)
+    selector_logits = selector_evidence - selector_evidence.max(dim=1, keepdim=True).values
+    relative = _masked_entmax15(selector_logits, mask_bool).float()
+    signed_conviction = legal_scores / (1.0 + evidence)
+    weights = (relative * signed_conviction).masked_fill(~mask_bool, 0.0)
+    gross = weights.abs().sum(dim=1, keepdim=True)
+    weights = weights * torch.minimum(
+        torch.ones_like(gross), gross.clamp_min(1.0).reciprocal()
+    )
+    if not return_parts:
+        return weights
+    gross = weights.abs().sum(dim=1)
+    return weights, {
+        "score_entmax_log_relative_alloc": relative,
+        "score_entmax_log_selector_evidence": selector_evidence,
+        "score_entmax_log_risk_fraction": gross,
+        "score_entmax_log_cash_fraction": (1.0 - gross).clamp_min(0.0),
+        "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
+    }
+
+
 def masked_l1_projection_weights(
     logits: torch.Tensor,
     mask: torch.Tensor | None,

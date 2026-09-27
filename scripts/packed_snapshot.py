@@ -76,6 +76,20 @@ def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _process_read_counters() -> dict[str, int] | None:
+    """Observe this process only; not host, Syncthing, or peer traffic."""
+
+    try:
+        lines = Path("/proc/self/io").read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    values = dict(line.split(": ", 1) for line in lines if ": " in line)
+    try:
+        return {name: int(values[name]) for name in ("rchar", "read_bytes")}
+    except (KeyError, ValueError):
+        return None
+
+
 def _add_resolution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("dataset")
     parser.add_argument("--snapshot-id")
@@ -149,6 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="verify all object and file metadata")
     _add_resolution_arguments(verify)
     verify.add_argument("--materialized", type=Path)
+    verify.add_argument(
+        "--profile", action="store_true",
+        help="include this process's resolution-plus-verification time and read counters",
+    )
 
     fetch = subparsers.add_parser("fetch", help="atomically materialize a snapshot")
     _add_resolution_arguments(fetch)
@@ -245,14 +263,29 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "verify":
+            started = time.perf_counter()
+            io_before = _process_read_counters() if args.profile else None
             root = _sync_root(args.sync_root)
-            _print(
-                verify_packed_snapshot(
-                    root,
-                    _resolved(args),
-                    materialized_path=args.materialized,
-                )
+            verification = verify_packed_snapshot(
+                root,
+                _resolved(args),
+                materialized_path=args.materialized,
             )
+            if args.profile:
+                io_after = _process_read_counters()
+                verification["profile"] = {
+                    "scope": "local_process_resolution_and_full_verify_only",
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                    "rchar_bytes": (
+                        io_after["rchar"] - io_before["rchar"]
+                        if io_before is not None and io_after is not None else None
+                    ),
+                    "read_bytes": (
+                        io_after["read_bytes"] - io_before["read_bytes"]
+                        if io_before is not None and io_after is not None else None
+                    ),
+                }
+            _print(verification)
             return 0
         if args.command == "fetch":
             root = _sync_root(args.sync_root)

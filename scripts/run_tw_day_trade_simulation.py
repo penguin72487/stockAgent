@@ -520,6 +520,9 @@ def _mode_specs(
                     entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
                     entry_price_offset_ticks=0,
                     residual_margin_conversion=live.day_trade_residual_margin_conversion,
+                    terminal_liquidation_unlimited_capacity=(
+                        live.day_trade_terminal_liquidation_unlimited_capacity
+                    ),
                     strict_intraday=live.day_trade_strict_intraday,
                     odd_lot_execution_policy=live.day_trade_odd_lot_execution_policy,
                     margin_corporate_action_reference_path=((_repo_path(live.day_trade_margin_action_data_dir)
@@ -529,6 +532,11 @@ def _mode_specs(
                     )) / "tw_corporate_action_reference.parquet"),
                     margin_financing_ratio=float(experiment.trading.tw_day_trade_margin_financing_ratio),
                     margin_financing_annual_rate=float(experiment.trading.tw_day_trade_margin_financing_annual_rate),
+                    entry_sweep_funding_policy=(
+                        "proportional_net_reservation_v1"
+                        if experiment.trading.tw_day_trade_entry_remainder_policy == "frozen_target_until_1320"
+                        else "legacy_sequential"
+                    ),
                     margin_short_annual_borrow_rate=float(experiment.trading.tw_day_trade_margin_short_annual_borrow_rate),
                     margin_short_handling_fee_rate=float(experiment.trading.tw_day_trade_margin_short_handling_fee_rate),
                 )
@@ -773,6 +781,56 @@ def _fetch_quotes(
         snapshot,
         trading_date=trading_date.date(),
     )
+
+
+def _attach_terminal_official_close_context(quotes, *, engine, specs, configs, observed):
+    """Read canonical retained official reports; never request broker orders.
+
+    This runs only for current-session, opt-in residuals after close and reuses
+    the existing official-close reconciliation parser and source SHA receipts.
+    The auction callback remains the low-latency path when already available.
+    """
+    from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT
+    if observed.time() < datetime_time(13, 30):
+        return
+    from scripts.settle_tw_day_trade_official_close import official_closes
+    by_root: dict[Path, set[str]] = {}
+    for spec in specs:
+        mode = engine.state.get("modes", {}).get(spec.market, {})
+        if (mode.get("terminal_close_contract") != TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                or mode.get("session_date") != observed.date().isoformat()):
+            continue
+        symbols = {p["symbol"] for p in (mode.get("positions") or {}).values() if p.get("signed_shares")}
+        if not symbols:
+            continue
+        root = resolve_day_trade_rule_data_dir(
+            configs[spec.market].day_trade_rule_data_dir,
+            parquet_root=spec.parquet_root, repo_root=REPO_ROOT,
+        ) / "raw"
+        by_root.setdefault(root, set()).update(symbols)
+    for root, symbols in by_root.items():
+        try:
+            prices, _ = official_closes(root, observed.date())
+        except FileNotFoundError:
+            continue  # Official publication may follow the actual auction.
+        except (ValueError, OSError) as exc:
+            print(f"[tw-day-trade-sim] terminal_close_source_error={type(exc).__name__}: {exc}", flush=True)
+            continue
+        for symbol in symbols:
+            row = prices.get(symbol) or {}
+            raw_row = row.get("official_row") or {}
+            raw_volume = next((raw_row[k] for k in ("成交股數", "成交量") if k in raw_row), None)
+            try:
+                has_trade = float(str(raw_volume).replace(",", "")) > 0
+            except (ValueError, TypeError):
+                has_trade = False
+            if row.get("price") is None or not has_trade:
+                continue  # A halted/no-trade carried close is not an execution price.
+            quotes.setdefault(symbol, {})["session_close_evidence"] = {
+                "session_date": row["official_date"], "price": row["price"],
+                "source": row["source"], "source_sha256": row["source_sha256"],
+                "price_basis": row["price_basis"],
+            }
 
 
 def _attach_benchmark_previous_close_context(
@@ -2203,6 +2261,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"[tw-day-trade-sim] quote_error={type(exc).__name__}: {exc}",
                     flush=True,
                 )
+
+        if quote_due:
+            _attach_terminal_official_close_context(
+                quotes, engine=engine, specs=specs, configs=live_configs, observed=observed
+            )
 
         if (use_execution_stream and active_symbols and not quote_due
                 and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)

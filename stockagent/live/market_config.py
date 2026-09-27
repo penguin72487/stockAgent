@@ -64,6 +64,7 @@ class LiveMarketConfig:
     current_capital: float | None = None
     day_trade_simulation_enabled: bool = False
     day_trade_residual_margin_conversion: bool = False
+    day_trade_terminal_liquidation_unlimited_capacity: bool = False
     day_trade_strict_intraday: bool = False
     day_trade_odd_lot_execution_policy: str = "reject"
     day_trade_margin_action_data_dir: str | None = None
@@ -331,6 +332,9 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
             raw.get("day_trade_simulation_enabled"), False
         ),
         day_trade_residual_margin_conversion=_bool_value(raw.get("day_trade_residual_margin_conversion"), False),
+        day_trade_terminal_liquidation_unlimited_capacity=_bool_value(
+            raw.get("day_trade_terminal_liquidation_unlimited_capacity"), False
+        ),
         day_trade_strict_intraday=_bool_value(raw.get("day_trade_strict_intraday"), False),
         day_trade_odd_lot_execution_policy=str(raw.get("day_trade_odd_lot_execution_policy") or "reject"),
         day_trade_margin_action_data_dir=raw.get("day_trade_margin_action_data_dir") or None,

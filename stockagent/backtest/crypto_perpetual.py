@@ -14,9 +14,10 @@ from stockagent.backtest.portfolio_allocator import (
 )
 
 
-# v2 makes non-advancing rows an exact identity transition, including finite
-# duplicated tail labels and carried gross exposure above the cap.
-CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION = 2
+# v2 made non-advancing rows an exact identity transition. v3 also requires
+# the dataset to liquidate a disappearing contract at its final observable
+# execution mark instead of carrying it into an unvalued forward interval.
+CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION = 3
 _MIN_WEALTH_FACTOR = 1.0e-6
 _DAY_KERNEL_CACHE: dict[
     tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]

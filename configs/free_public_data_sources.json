@@ -29,7 +29,7 @@
       "access": "configured_account",
       "implementation_status": "reused_existing",
       "cadence": "realtime_and_backfill",
-      "history_contract": "account entitlement and traffic quota; host-global 10 req/s ceiling",
+      "history_contract": "account entitlement and observed daily traffic quota; shared person quote-query ceiling 50 per 10 seconds; one session per process, subscription-first live data, cached off-hours history",
       "feature_status": "ticks, bid/ask and completed historical bars use separate contracts",
       "documentation": "https://sinotrade.github.io/"
     },
@@ -130,6 +130,19 @@
       "history_contract": "raw append-only snapshots",
       "feature_status": "usable only after local observed_at",
       "documentation": "https://defillama.com/docs/api"
+    },
+    {
+      "id": "defillama_aggregate_history",
+      "provider": "DefiLlama",
+      "dataset_group": "free-public-context",
+      "category": "historical_defi_tvl_and_stablecoin_supply",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_free_endpoints",
+      "dataset_ids": ["defillama_tvl_history", "defillama_stablecoin_supply_history"],
+      "cadence": "daily",
+      "history_contract": "full upstream daily aggregates retained with retrieval vintages; peg denominations remain separate",
+      "feature_status": "research-only historical values; availability starts at capture, not event date",
+      "documentation": "https://github.com/DefiLlama/api-docs/blob/main/llms-pro.txt"
     },
     {
       "id": "defillama_stablecoins",

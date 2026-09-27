@@ -20,6 +20,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
 from artifact_io import atomic_write_parquet  # noqa: E402
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet  # noqa: E402
 
 
@@ -47,6 +52,10 @@ def parse_args() -> argparse.Namespace:
         "--workers", type=int, default=max(1, min(16, os.cpu_count() or 1))
     )
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--lock-timeout-seconds", type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+    )
     return parser.parse_args()
 
 
@@ -56,7 +65,8 @@ def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
 
 def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
     required = {"date", "open", "max", "min", "close", "Trading_Volume"}
-    schema = set(pq.read_schema(path).names)
+    arrow_schema = pq.read_schema(path)
+    schema = set(arrow_schema.names)
     missing = required - schema
     if missing:
         raise ValueError(f"missing canonical one-minute columns: {sorted(missing)}")
@@ -68,14 +78,13 @@ def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
             "max",
             "min",
             "close",
-            "adjclose",
             "Trading_Volume",
         )
         if name in schema
     ]
     filters = None
     if start_day is not None:
-        date_type = pq.read_schema(path).field("date").type
+        date_type = arrow_schema.field("date").type
         if pa.types.is_string(date_type) or pa.types.is_large_string(date_type):
             filter_value: object = start_day.isoformat()
         elif pa.types.is_date(date_type):
@@ -166,6 +175,22 @@ def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
 def main() -> None:
     args = parse_args()
     started = datetime.now(timezone.utc)
+    # Reuse the collectors' source lock, not a parallel projection-only lock.
+    # Keep it through the final receipt so a cooperative source writer cannot
+    # replace the base or hot tail midway through full-history aggregation.
+    with exclusive_dataset_lock(
+        Path(args.input_dir) / ".download.lock",
+        provider=f"{args.provider.lower()}_daily_materialize",
+        timeout_seconds=args.lock_timeout_seconds,
+    ) as acquisition:
+        _run_locked_materialization(
+            args, started=started, lock_wait_seconds=acquisition.wait_seconds,
+        )
+
+
+def _run_locked_materialization(
+    args: argparse.Namespace, *, started: datetime, lock_wait_seconds: float,
+) -> None:
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     paths = sorted(input_dir.glob("*_features.parquet"))
@@ -205,13 +230,28 @@ def main() -> None:
             )
         existing: pl.DataFrame | None = None
         recompute_start: date | None = None
-        if target.is_file() and "minute_grid_complete" in pq.read_schema(target).names:
+        # Full reconciliation must ignore the existing projection, including its
+        # mtime/schema. Historical head repairs and older corrections cannot be
+        # discovered by a two-day tail read.
+        if (
+            not args.refresh
+            and target.is_file()
+            and "minute_grid_complete" in pq.read_schema(target).names
+        ):
             existing = pl.read_parquet(target)
             if existing.height and "date" in existing.columns:
                 last_day = date.fromisoformat(str(existing["date"].max())[:10])
                 recompute_start = last_day - timedelta(days=1)
         frame = _daily_frame(source, start_day=recompute_start)
         if frame.is_empty():
+            # An empty refresh is not deletion authority. Preserve an existing
+            # projection and report a skip, without treating it as rebuilt.
+            if (
+                args.refresh
+                and target.is_file()
+                and "minute_grid_complete" in pq.read_schema(target).names
+            ):
+                existing = pl.read_parquet(target)
             if existing is not None:
                 partial_days = int(
                     existing.select((~pl.col("minute_grid_complete")).sum()).item()
@@ -282,6 +322,8 @@ def main() -> None:
         "schema_version": 1,
         "provider": args.provider,
         "source_granularity": "1m",
+        "requested_reconciliation_scope": "full_source" if args.refresh else "incremental",
+        "lock_wait_seconds": lock_wait_seconds,
         "output_granularity": "daily",
         "timestamp_contract": "UTC calendar day aggregated from completed one-minute bars",
         "input_dir": str(input_dir),

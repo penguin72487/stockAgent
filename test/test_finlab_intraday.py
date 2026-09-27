@@ -21,7 +21,7 @@ def _tick_frame() -> pd.DataFrame:
         "timestamp": pd.to_datetime([
             "2026-06-01T09:00:00+08:00", "2026-06-01T09:00:00+08:00",
         ]),
-        "sequence": [1, 2], "close": [100.0, 101.0],
+        "sequence": [1, 2], "close": [100.0, 101.0], "volume": [1, 2],
     })
 
 
