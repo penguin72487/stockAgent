@@ -14,6 +14,9 @@ main{width:min(1180px,calc(100% - 36px))}
 .data-note a{color:var(--cyan)}
 #backfill .progress-copy{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(240px,1fr);align-items:start}
 #backfill .fleet-eta{max-width:none}
+/* This small summary must remain rendered when reached by an anchor below
+   the long source list; deferred containment can leave an empty 420px card. */
+#traffic,#backfill,#backfill .progress-card{content-visibility:visible;contain-intrinsic-size:none}
 #download-global-eta{font-size:23px;line-height:1.4}
 .completion-estimates{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:20px}
 .completion-estimate{min-width:0;padding:16px;border:1px solid var(--line);border-radius:12px;background:rgba(5,17,27,.6);overflow-wrap:anywhere}
@@ -33,4 +36,11 @@ main{width:min(1180px,calc(100% - 36px))}
 .estimate-method summary:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
 .estimate-method p{margin:0 0 8px}
 .estimate-method ul{padding-left:20px;margin:0 0 4px}
+.estimate-rate-bridge{margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:10px;background:rgba(26,56,69,.32);overflow-wrap:anywhere}
+.estimate-rate-bridge h3,.estimate-stage-heading{font-size:14px;margin:0 0 10px}
+.estimate-rate-bridge p{font-size:13px;line-height:1.8;margin:0 0 8px}
+.estimate-rate-bridge small,.estimate-stage-table small{display:block;color:var(--muted);font-size:11px;line-height:1.7;margin-top:7px}
+.estimate-stage-heading{margin-top:22px}
+.estimate-stage-table table{min-width:760px;table-layout:fixed;width:100%}
+.estimate-stage-table td{white-space:normal;overflow-wrap:anywhere;vertical-align:top;font-size:12px;line-height:1.7}
 @media(max-width:720px){#backfill .progress-copy{grid-template-columns:minmax(0,1fr)}.completion-estimates{grid-template-columns:1fr}.completion-estimate>strong{font-size:25px}.completion-estimate h3{margin-bottom:9px}}

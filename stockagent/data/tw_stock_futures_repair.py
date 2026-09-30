@@ -84,12 +84,16 @@ def _check_price_bounds(bars: pl.DataFrame, fact: dict, evidence: dict) -> pl.Da
     return bars
 
 
-def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path) -> pl.DataFrame:
+def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path, *,
+                          allow_unreported_volume: bool = False) -> pl.DataFrame:
     needed = {(str(d), c) for d, c in keys.select('date', 'physical_contract').iter_rows()}
     wanted_dates = {d for d, _ in needed}
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
     records, spreads, days = {}, {}, {}
+    # Official files repeat the same date across thousands of contracts. Parse
+    # each exact source token once without changing accepted date semantics.
+    parsed_dates = {}
     sources = []
     for item in manifest['receipts']:
         path = Path(item['path'])
@@ -106,7 +110,10 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
                 raise ValueError(f'incomplete official daily schema: {name}')
             has_session = '交易時段' in reader.fieldnames
             for raw in reader:
-                day = str(_parse_trading_date(raw.get('交易日期')))
+                date_token = raw.get('交易日期')
+                if date_token not in parsed_dates:
+                    parsed_dates[date_token] = str(_parse_trading_date(date_token))
+                day = parsed_dates[date_token]
                 if day not in wanted_dates:
                     continue
                 if not has_session and day >= '2017-05-15':
@@ -124,9 +131,10 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
                     # infer zero outright capacity when known legs already
                     # account for every reported contract lot.
                     continue
-                if not volume_text.isdigit():
+                unreported = allow_unreported_volume and volume_text in ('', '-')
+                if not volume_text.isdigit() and not unreported:
                     raise ValueError(f'invalid official volume: {name} {day} {product} {month}')
-                volume = int(volume_text)
+                volume = None if unreported else int(volume_text)
                 if '/' in month:
                     legs = month.split('/')
                     if len(legs) != 2 or any(len(v) != 6 or not v.isdigit() for v in legs):
@@ -157,9 +165,11 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
             reason = 'absent_from_complete_day' if days.get(day) and not spread else 'missing_official_day'
             outright = 0 if reason == 'absent_from_complete_day' else None
         else:
-            outright = row['official_volume'] - spread
-            reason = 'zero_total_volume' if row['official_volume'] == 0 else ('spread_legs_only' if outright == 0 else 'outright_volume')
-            if outright < 0:
+            outright = None if row['official_volume'] is None else row['official_volume'] - spread
+            reason = ('unreported_volume' if outright is None else
+                'zero_total_volume' if row['official_volume'] == 0 else
+                'spread_legs_only' if outright == 0 else 'outright_volume')
+            if outright is not None and outright < 0:
                 raise ValueError(f'spread legs exceed total volume: {day} {physical}')
         rows.append(dict(date=date.fromisoformat(day), physical_contract=physical, **row,
                          spread_leg_volume=spread, outright_volume=outright, official_reason=reason,
@@ -171,6 +181,7 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
         source='taifex_complete_daily_and_spread_legs_v1', rows=frame.height,
         sha256=sha256_file(output/'official_evidence.parquet'), sources=sources,
         input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        unreported_volume_policy='preserve_unknown_never_zero' if allow_unreported_volume else 'reject',
         rule_reference='https://www.taifex.com.tw/cht/3/futDailyMarketReport'))
     return frame
 

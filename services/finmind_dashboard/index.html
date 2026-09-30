@@ -8,7 +8,7 @@
   <title>FinMind 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
   <link rel="stylesheet" href="../finlab/styles.css?v=3">
-  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=5">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
@@ -45,9 +45,9 @@
     <section id="pipeline-alert" class="alert" hidden aria-live="polite"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
 
     <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
-      <header class="section-heading pipeline-heading"><span>01</span><div><h2 id="pipelines-title">FinMind 資料管線清冊</h2><p>依下載器清冊列出台股、期選、總經與海外股票；未排程來源與新聞另列。來源回應不等於歷史已驗證完整。</p></div></header>
+      <header class="section-heading pipeline-heading"><span>01</span><div><h2 id="pipelines-title">FinMind 資料管線清冊</h2><p>台股、期選、總經、海外股票與全市場新聞均納入排程；來源回應不等於歷史已驗證完整。</p></div></header>
       <div class="kpi-grid overview-kpis">
-        <article class="kpi featured"><span>資料集</span><strong id="pipeline-total">—</strong><p>不含新聞與付費粒度</p></article>
+        <article class="kpi featured"><span>資料集</span><strong id="pipeline-total">—</strong><p>含新聞與目前授權可取得粒度</p></article>
         <article class="kpi"><span>正在回補</span><strong id="pipeline-active">—</strong><p>已取得部分來源回應</p></article>
         <article class="kpi"><span>本輪目標已查驗</span><strong id="pipeline-ready">—</strong><p>含來源空回，不等於有數值</p></article>
         <article class="kpi"><span>待查／需注意</span><strong id="pipeline-attention">—</strong><p>尚未清點、空回與失敗</p></article>
@@ -70,7 +70,7 @@
         <article class="kpi featured"><span>最近 60 分鐘本站請求</span><strong id="quota-used">—</strong><p id="quota-basis">觀測資料待取得</p></article>
         <article class="kpi"><span>官方每小時上限</span><strong id="quota-limit">—</strong><p id="quota-token">依下載器目前憑證模式</p></article>
         <article class="kpi"><span>本站可見餘裕</span><strong id="quota-headroom">—</strong><p>不含其他應用；非帳號餘額</p></article>
-        <article class="kpi"><span>歷史回補可用</span><strong id="quota-backfill">—</strong><p id="quota-reserved">固定增量預留待核實</p></article>
+        <article class="kpi"><span>歷史回補可用</span><strong id="quota-backfill">—</strong><p id="quota-reserved">本發布時段預留待核實</p></article>
         <article class="kpi"><span>重置時間</span><strong>未公布</strong><p>以滾動 60 分鐘呈現，不捏造固定重置時刻</p></article>
       </div>
       <div class="quota-track"><div class="quota-track-header"><span>本站觀測請求／官方上限</span><strong id="quota-ratio">—</strong></div><progress id="quota-progress" max="1" aria-label="FinMind 最近 60 分鐘本站觀測請求占官方上限比例"></progress><small id="quota-observed">目前僅量測本站下載器請求</small></div>
@@ -100,6 +100,10 @@
           <article class="completion-estimate"><h3>最慢 <span>保守情境</span></h3><strong id="download-eta-slowest">—</strong><p id="download-eta-slowest-complete">完成日期待估算</p><small id="download-eta-slowest-detail">工作量與速度待核實</small><small id="download-eta-slowest-basis">—</small></article>
         </div>
         <p class="estimate-caveat">三個數字是條件式情境，不是保證完成期限或統計信賴區間。「最慢」不是硬上界；持續故障或權限未解決時，實際完成時間可能無限延後。</p>
+        <p class="estimate-exclusions">分鐘／tick 的工作量包含「已知代號 × 日曆天」候選，尚未全部扣除上市前與休市日；遠期日期是此候選量的上側工作量投影，不是已確認缺漏的完成期限。持續追新沒有永久完工日。</p>
+        <div class="estimate-rate-bridge"><h3>流量與估時對帳</h3><p id="download-eta-rate-bridge">等待同一取樣窗的流量與追新模型。</p><small id="download-eta-rate-window">流量窗待核實。</small><small>當下預留配額是排程守門；未來追新模型是長期負載，兩者不重複扣除。上方全程速度按階段加權；下表順序共用一個帳號，不是各自獨占額度。</small></div>
+        <h3 class="estimate-stage-heading">依現行優先順序 · 階段與累計完成時間</h3>
+        <div class="table-scroll estimate-stage-table" role="region" aria-label="依資料優先級估算完成時間" tabindex="0"><table><thead><tr><th>階段／已知剩餘請求</th><th>最快 · 累計完成</th><th>中間 · 累計完成</th><th>保守 · 累計完成</th></tr></thead><tbody id="download-eta-milestones"></tbody></table></div>
         <p id="download-eta-observed" class="fleet-progress-detail">估算觀測尚未取得。</p>
         <p id="download-eta-workload" class="fleet-progress-detail">工作量待核實。</p>
         <p id="download-eta-exclusions" class="estimate-exclusions">阻塞、未排程與未能盤點佇列另列，不算完成；未清點的歷史代號與未來新增工作另計。</p>
@@ -117,15 +121,15 @@
 
     <section id="capture" class="section-block" aria-labelledby="capture-title">
       <header class="section-heading"><span>05</span><div><h2 id="capture-title">下載執行摘要</h2><p>常駐歷史查詢，不是逐筆串流；服務存在也不代表來源已到最新。</p></div></header>
-      <div class="capture-card"><div class="capture-primary"><span id="capture-dot" class="pulse" aria-hidden="true"></span><div><span>下載器狀態</span><strong id="capture-state">—</strong><p id="capture-freshness">—</p></div></div><dl><div><dt>目前工作</dt><dd id="capture-key">—</dd></div><div><dt>最近結果</dt><dd id="capture-last">—</dd></div><div><dt>下一個待補</dt><dd id="capture-next">—</dd></div><div><dt>台股候選代號</dt><dd id="capture-universe">—</dd></div><div><dt>新聞</dt><dd>未排程</dd></div><div><dt>資料用途</dt><dd>本機原始研究</dd></div></dl></div>
+      <div class="capture-card"><div class="capture-primary"><span id="capture-dot" class="pulse" aria-hidden="true"></span><div><span>下載器狀態</span><strong id="capture-state">—</strong><p id="capture-freshness">—</p></div></div><dl><div><dt>目前工作</dt><dd id="capture-key">—</dd></div><div><dt>最近結果</dt><dd id="capture-last">—</dd></div><div><dt>下一個待補</dt><dd id="capture-next">—</dd></div><div><dt>台股候選代號</dt><dd id="capture-universe">—</dd></div><div><dt>新聞</dt><dd>全市場逐日回補；最近三天每小時追新</dd></div><div><dt>資料用途</dt><dd>本機原始研究</dd></div></dl></div>
     </section>
 
     <section id="method" class="section-block method" aria-labelledby="method-title">
       <header class="section-heading"><span>06</span><div><h2 id="method-title">數字口徑</h2><p>完成、容量、流量與訓練可用性是不同證據。</p></div></header>
-      <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。補充來源的「非空」只代表目前請求有非空來源回應，「空回」只代表該次查詢已觀察到無值；兩者都不證明供應商歷史完整。法人寬表由已取得的長表於本機衍生，不另外呼叫 API。逐檔代號來自主檔快照與官方下市名單，未知的舊代號仍待查。全域三情境估算針對已排程的有限工作清單，使用合批後請求、共用額度與速度觀測；不表示所有可獲取資料已完整，也不證明理論最快或絕對最慢時間。分割數不等於請求數；個別資料集的「未合批任務投影」仍是假設每個已知待補分割各請求一次且獨占官方額度的算式，非 ETA、非上下界，未計刷新、重試及未知代號。新聞與另列的未排程來源維持停用；本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
+      <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。非空回應與查詢空回都不證明供應商歷史完整。法人寬表與分點彙總由驗證過的父資料在本機衍生，不另外呼叫 API。未知歷史代號仍待查。新聞採全市場逐日查詢，包含休市日；1900 年為向前搜尋起點，不代表來源從該年就有資料。保留來源時間字串，不宣稱為已驗證發布時點。三情境估時針對固定截止日的已知工作，扣除未來週期性增量；大範圍候選含未剔除的上市前／休市日，並非錯誤缺失筆數。超過一年的日曆僅按平日投影。本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
     </section>
   </main>
   <script src="../dashboard-core.js?v=10" defer></script>
-  <script src="app.js?v=8" defer></script>
+  <script src="app.js?v=11" defer></script>
 </body>
 </html>

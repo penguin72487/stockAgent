@@ -114,7 +114,12 @@ def test_scheduled_stock_closure_defers_request_without_faking_non_session(
             "SELECT state,next_attempt_at_utc FROM tasks WHERE dataset='TaiwanStockPrice'"
         ).fetchone()
         assert policy["today_status"] == "closed"
-        assert state[0] == "pending" and state[1] is not None
+        assert state[0] == "calendar_wait" and state[1] is not None
+        assert policy['calendar_wait'] == 1
+        status = sponsor._status(connection, tmp_path, 'current_queue')
+        assert status['series']['TaiwanStockPrice']['target'] == 0
+        assert status['series']['TaiwanStockPrice']['complete'] == 0
+        assert status['acquisition_policy']['required_unfinished'] == 0
         assert sponsor._next(connection, now) is None
         monkeypatch.setattr(
             sponsor, "tw_stock_day_decision",
@@ -124,23 +129,49 @@ def test_scheduled_stock_closure_defers_request_without_faking_non_session(
         assert sponsor._next(connection, now).dataset == "TaiwanStockPrice"
 
 
-def test_next_hour_reserve_skips_closed_stock_release_but_not_issuer_event(
+def test_calendar_hold_does_not_veto_secondary_but_still_requires_global_admission(tmp_path):
+    now = datetime(2026, 9, 28, 8, tzinfo=UTC)
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        conn.executemany(
+            "INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) VALUES (?,'',?,'day',?,?)",
+            [('TaiwanStockMarginPurchaseShortSale', '2026-09-28', 0, 'calendar_wait'),
+             ('TaiwanStockPrice', '2010-01-04', 8, 'pending')],
+        )
+        assert sponsor._next(conn, now, secondary_admission=lambda: {'allowed': False}) is None
+        assert sponsor._next(conn, now, secondary_admission=lambda: {'allowed': True}).dataset == 'TaiwanStockPrice'
+
+
+def test_old_calendar_hold_reopens_when_evidence_is_lost(tmp_path, monkeypatch):
+    from stockagent.live.market_status import TwStockDayDecision
+    monkeypatch.setattr(sponsor, 'SOURCES', ())
+    monkeypatch.setattr(sponsor, 'tw_stock_day_decision',
+                        lambda *_a, **_kw: TwStockDayDecision('unknown', 'missing calendar'))
+    with sponsor._db(tmp_path / 'queue.sqlite3') as conn:
+        conn.execute("INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
+                     "VALUES ('TaiwanStockPrice','','2026-09-01','day',0,'calendar_wait')")
+        sponsor._seed(conn, datetime(2026, 9, 28, 8, tzinfo=UTC))
+        assert conn.execute('SELECT state FROM tasks').fetchone() == ('pending',)
+
+
+def test_current_hour_reserve_skips_closed_stock_release_but_not_issuer_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from stockagent.live.market_status import TwStockDayDecision
 
     monkeypatch.setattr(sponsor, "SOURCES", (
-        sponsor._s("TaiwanStockPrice", "2026-09-01", "day", 1, 12),
-        sponsor._s("TaiwanStockDividend", "2026-09-01", "day", 1, 12),
+        sponsor._s("TaiwanStockPrice", "2026-09-01", "day", 1, 12, 30),
+        sponsor._s("TaiwanStockDividend", "2026-09-01", "day", 1, 12, 30),
     ))
     monkeypatch.setattr(
         sponsor, "tw_stock_day_decision",
         lambda *_args, **_kwargs: TwStockDayDecision("closed", "official holiday"),
     )
-    # 11:30 Taipei: both have a declared 12:00 boundary in the next hour,
-    # but issuer events can publish on a stock-market holiday.
+    # No reservation in the preceding hour. The uninitialized calendar needs
+    # one real check, NOT four permanently protected Free calls.
     now = datetime(2026, 9, 26, 3, 30, tzinfo=UTC)
-    assert sponsor._fixed_incremental_demand(tmp_path, now) == 5
+    assert sponsor._fixed_incremental_demand(tmp_path, now) == 1
+    # Same release hour: issuer events can publish on a stock holiday.
+    assert sponsor._fixed_incremental_demand(tmp_path, now + timedelta(hours=1) - timedelta(minutes=15)) == 2
 
 
 def test_background_opening_gate_uses_session_evidence_not_just_weekday() -> None:
@@ -194,7 +225,8 @@ def test_sponsor_catalog_is_explicit_about_expensive_unavailable_shapes() -> Non
     assert len(sponsor.SOURCES) >= 50
     assert "TaiwanStockNews" not in sponsor.SPECS
     assert "TaiwanStockPriceTick" not in sponsor.SPECS
-    assert sponsor.UNSCHEDULED["TaiwanStockKBar"].endswith("sponsorpro_bulk")
+    assert "TaiwanStockKBar" not in sponsor.UNSCHEDULED
+    assert not sponsor.UNSCHEDULED
     assert sponsor.SPECS["TaiwanStockPrice"].grain == "day"
 
 
@@ -239,7 +271,8 @@ def test_verified_sessions_skip_only_session_facts_and_reopen_revised_dates(
             "SELECT state FROM tasks WHERE dataset='TaiwanStockDividend' AND partition='2026-09-24'"
         ).fetchone() == ("pending",)  # Issuer event dates are not exchange sessions.
         status = sponsor._status(connection, tmp_path, "running", session_policy=first)
-        assert status["series"]["TaiwanStockPrice"]["target"] == 4
+        assert status["series"]["TaiwanStockPrice"]["target"] == 3
+        assert status["series"]["TaiwanStockPrice"]["calendar_wait"] == 1
         assert status["series"]["TaiwanStockPrice"]["non_session"] == 2
         assert sponsor._seed(connection, now, official_sessions=calendar)["newly_excluded"] == 0
 

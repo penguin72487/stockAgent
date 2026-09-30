@@ -58,6 +58,40 @@ def test_minute_timer_skips_official_holiday_not_just_weekend(monkeypatch: pytes
     assert next_run == datetime(2026, 9, 29, 6, 45, tzinfo=UTC)
 
 
+@pytest.mark.parametrize('observed,calendar_unknown,expected_state', [
+    (datetime(2026, 9, 28, 9, tzinfo=UTC), False, 'current'),
+    (datetime(2026, 9, 29, 5, 59, tzinfo=UTC), False, 'current'),
+    (datetime(2026, 9, 29, 6, tzinfo=UTC), False, 'stale'),
+    (datetime(2026, 9, 28, 9, tzinfo=UTC), True, 'unknown'),
+])
+def test_finmind_free_freshness_uses_release_session_not_72_wall_hours(
+    tmp_path, monkeypatch, observed, calendar_unknown, expected_state,
+):
+    from stockagent.live.market_status import TwStockDayDecision
+    root = tmp_path / 'data_finmind'
+    root.mkdir()
+    (root / 'status.json').write_text(json.dumps({
+        'state': 'current', 'series': {'TaiwanVariousIndicators5Seconds': {
+            'total': 5, 'complete': 5, 'last_complete_date': '2026-09-24', 'rows': 500,
+            'last_receipt_at_utc': '2026-09-26T12:06:37Z',
+        }}}))
+    monkeypatch.setattr(dashboard, 'tw_stock_day_decision', lambda day, **_kw:
+                        TwStockDayDecision('unknown' if calendar_unknown else
+                                           'closed' if '2026-09-25' <= day.isoformat() <= '2026-09-28'
+                                           else 'actual_open', 'fixture official session'))
+    rows = dashboard._finmind_free_sources(tmp_path, now=observed, service={'active': True})
+    row = next(row for row in rows if row['id'] == 'finmind:TaiwanVariousIndicators5Seconds')
+    assert row['freshness']['state'] == expected_state
+    assert row['freshness']['threshold_seconds'] is None
+    assert row['coverage']['ratio'] == 1
+    enriched = dashboard._enrich_and_sort_rows([row], now=observed, refresh_services={})[0]
+    if expected_state == 'current':
+        assert enriched['operation_state'] == 'complete'
+        assert enriched['acquisition_progress']['preparing_for_date'] == '2026-09-29'
+    else:
+        assert enriched['operation_state'] != 'complete'
+
+
 def test_finmind_sponsor_progress_explains_verified_non_sessions(tmp_path: Path) -> None:
     sponsor = tmp_path / "sponsor"
     sponsor.mkdir()
@@ -2034,6 +2068,18 @@ def test_monitor_integrity_checks_recompute_final_public_dto_contracts() -> None
     assert passed["violations"] == 0
     assert failed["state"] == "fail"
     assert failed["checks"]["complete_with_stale_freshness"] == 1
+
+
+def test_on_demand_snapshot_is_not_a_freshness_or_completion_certificate():
+    from stockagent.live import data_monitor_dashboard as dashboard
+    row = {'id': 'shioaji:on_demand_snapshots', 'status': 'current',
+           'freshness': {'state': 'stale', 'age_seconds': 400000},
+           'automation_eligible': False, 'eta': {'state': 'unknown'}}
+    operation, execution, _ = dashboard._operation_state(row, {'mode': 'on_demand'})
+    assert (operation, execution) == ('reference', 'on_demand')
+    checks = dashboard._monitor_integrity_checks(
+        [{**row, 'operation_state': operation, 'in_active_scope': False}], active_data_endpoints=0)
+    assert checks['state'] == 'pass'
 
 
 def test_crypto_feature_catalog_separates_reference_from_deferred_scope(

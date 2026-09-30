@@ -46,6 +46,7 @@ def _contracts() -> dict[str, dict[str, Any]]:
     # can import consumer/planner helpers without a module-initialization cycle.
     from downloader.download_finmind_complement import ALL_DATASETS, GLOBAL_START_YEAR, SNAPSHOTS
     from downloader.download_finmind_free import CALENDAR_DATASET, HISTORY_START, MASTER_DATASET, SESSION_DATASETS
+    from downloader.finmind_supplemental import SOURCES as supplemental_sources
 
     result = {dataset: {"owner": "complement", "first_date": (
         date(GLOBAL_START_YEAR[dataset], 1, 1) if dataset in GLOBAL_START_YEAR else None),
@@ -54,6 +55,8 @@ def _contracts() -> dict[str, dict[str, Any]]:
                             "snapshot": spec.grain == "snapshot"} for dataset, spec in SPECS.items()})
     result.update({dataset: {"owner": "complement", "first_date": first, "snapshot": False}
                    for dataset, first in PRODUCT_HISTORY_STARTS.items()})
+    result.update({dataset: {"owner": "complement", "first_date": spec.first, "snapshot": False}
+                   for dataset, spec in supplemental_sources.items()})
     result.update({dataset: {"owner": "free", "first_date": HISTORY_START, "snapshot": False}
                    for dataset in SESSION_DATASETS})
     result.update({dataset: {"owner": "free", "first_date": None, "snapshot": True}

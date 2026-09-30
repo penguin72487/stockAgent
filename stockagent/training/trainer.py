@@ -39,6 +39,7 @@ from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
 from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.backtest.futures_data_validity import FuturesCarryDataError
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 
 from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
 from stockagent.backtest.report import (
@@ -2368,7 +2369,7 @@ def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
     shape = getattr(execution, "shape", ())
     return bool(
         mode == "tw_stock_context_futures_portfolio"
-        and ((len(shape) == 3 and int(shape[-1]) in {11, 29})
+        and ((len(shape) == 3 and int(shape[-1]) in {11, *MARGIN_EXECUTION_WIDTHS})
              or (len(shape) == 4 and int(shape[-1]) == 63))
     )
 
@@ -3019,7 +3020,7 @@ def _mode_artifact_contract_for_config(
     payload = canonical_mode_artifact_contract(mode)
     if (mode == "tw_stock_context_futures_portfolio"
             and getattr(config.trading, "tw_futures_portfolio_capital_basis", "notional") == "initial_margin"):
-        from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
+        from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS, MARGIN_ACCOUNTING_CONTRACT_VERSION
         payload.update(
             decision_clock="08:45_prior_completed_features_and_effective_margin_rules",
             execution_clock="daily_open_trade_proxy_official_settlement_mark",
@@ -3032,7 +3033,7 @@ def _mode_artifact_contract_for_config(
                           "settlement_ledger_unit": "contract_quantity",
                           "allocation_report_source": "requested_weights_history",
                           "allocation_report_unit": "requested_initial_margin_budget_over_equity",
-                          "margin_contract_version": 2,
+                          "margin_contract_version": MARGIN_ACCOUNTING_CONTRACT_VERSION,
                           "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
                           "risk_clock": "daily_open_and_settlement_not_intraday_broker_replay",
                           "margin_call_policy": "next_open_flat_no_external_topups",
@@ -8793,8 +8794,12 @@ def _validate_futures_margin_audit(result: BacktestResult, rows: int, symbols: i
             raise ValueError(f"margin artifact requires integer {name} [T,S]")
     if result.default_reason_history is None or result.settlement_default is None:
         raise ValueError("margin artifact requires failure reason history")
-    if np.any((audit[:, 10] > 0) & ~np.asarray(result.settlement_default, dtype=bool)):
-        raise ValueError("unfilled margin liquidation cannot be reported as successful")
+    # An unfilled risk-reduction order is a surviving physical position, not
+    # automatic insolvency. Reports must retain it even on solvent rows.
+    unfilled = audit[:, 10]
+    residual = np.abs(np.asarray(result.futures_residual_contract_quantities_history)).sum(axis=1)
+    if np.any((unfilled < 0) | (unfilled != np.floor(unfilled)) | (unfilled > residual)):
+        raise ValueError("unfilled margin liquidation must be backed by retained whole contracts")
 
 
 def _validate_futures_minute_audit(result: BacktestResult, rows: int, symbols: int) -> None:
@@ -15225,7 +15230,7 @@ def _run_eval_backtest_from_weight_buffers(
         execution_mode == "tw_stock_context_futures_portfolio"
         and overnight_log_returns_all is not None
         and overnight_log_returns_all.dim() == 3
-        and int(overnight_log_returns_all.size(-1)) in {11, 29}
+        and int(overnight_log_returns_all.size(-1)) in {11, *MARGIN_EXECUTION_WIDTHS}
     )
     num_symbols = int(
         future_log_returns_all.size(-1)
@@ -15273,7 +15278,7 @@ def _run_eval_backtest_from_weight_buffers(
     settlement_default_out: torch.Tensor | None = None
     default_reason_history_out: torch.Tensor | None = None
     margin_audit_out = None
-    if integer_stock_context_execution and int(overnight_log_returns_all.size(-1)) == 29:
+    if integer_stock_context_execution and int(overnight_log_returns_all.size(-1)) in MARGIN_EXECUTION_WIDTHS:
         from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
         margin_audit_out = torch.empty((total_rows, len(MARGIN_AUDIT_COLUMNS)), device=device)
     equity_scale_history_out: torch.Tensor | None = None

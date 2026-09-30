@@ -1108,6 +1108,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION,
         )
 
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
         contract["taiwan_stock_context_futures_portfolio"] = {
             "cross_domain_contract_version": int(
                 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION
@@ -1124,9 +1125,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 if trading.tw_futures_portfolio_integer_contracts
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION
             ),
-            "data_contract_version": int(
-                TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
-            ),
+            "data_contract_version": futures_slot_layout_version(config.data.tw_futures_portfolio_slot_count),
             "feature_contract_version": int(
                 TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION
             ),
@@ -1137,7 +1136,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "input_universe": "full_ordered_cash_stock_feature_panel",
             "action_universe": "fixed_all_taifex_futures_slots",
             "fixed_model_output_slots": int(
-                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+                config.data.tw_futures_portfolio_slot_count
             ),
             "candidate_feature_columns": list(
                 TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS
@@ -1283,12 +1282,20 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         }
         if trading.tw_futures_portfolio_capital_basis == "initial_margin":
             from stockagent.data.tw_futures_margin import MARGIN_FEATURE_COLUMNS
+            from stockagent.data.tw_futures_margin import (
+                MARGIN_ACCOUNTING_CONTRACT_VERSION, MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION,
+            )
             contract["taiwan_stock_context_futures_portfolio"].update({
                 "candidate_feature_columns": list(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS + MARGIN_FEATURE_COLUMNS),
                 "candidate_clock": "prior_completed_prices_and_rules_known_before_0845",
-                "accounting": "integer_initial_margin_budget_daily_settlement_and_overnight_gap_v1",
-                "integer_training_surrogate": "grouped_margin_cash_solvency_recovery_v2",
-                "integer_training_forward": "exact_integer_margin_account_v3_marked_boundary",
+                "accounting": "integer_initial_margin_budget_with_causal_corporate_inventory_v2",
+                "accounting_contract_version": MARGIN_ACCOUNTING_CONTRACT_VERSION,
+                "training_gradient_contract_version": MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION,
+                "integer_training_surrogate": "physical_executed_inventory_anchored_backward_with_unit_zero_inventory_tangent_v11",
+                "integer_training_forward": "exact_integer_margin_account_v7_unfilled_risk_carry",
+                "unfilled_risk_liquidation_policy": "retain_whole_contracts_mark_pnl_retry_if_margin_requires_no_extra_penalty",
+                "corporate_carry_contract": "one_to_one_prior_slot_rational_quantity_signed_cash_once",
+                "position_constraint_policy": "intersect_dated_caps_share_close_capacity_preserve_permitted_existing_excess_without_additions",
                 "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
                 "denomination_clock": "prior_settlement_margin_ratios_model_current_open_executor_only",
                 "unfilled_notional": "unused_margin_budget_no_cross_group_redistribution",
@@ -2004,12 +2011,18 @@ def _checkpoint_model_values(
 ) -> dict[str, Any]:
     config_name = str(active_model["config_name"])
     values = dict(active_model["values"])
+    action_layout = {}
+    if (normalize_execution_mode(config.trading.execution_mode)=='tw_stock_context_futures_portfolio'
+            and config.data.tw_futures_portfolio_slot_count!=1936):
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        action_layout=dict(futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+            futures_slot_layout_version=futures_slot_layout_version(config.data.tw_futures_portfolio_slot_count))
     if config_name == "transformer_base_portfolio":
-        return _transformer_base_checkpoint_model_values(
+        return {**_transformer_base_checkpoint_model_values(
             config,
             values,
             feature_names,
-        )
+        ),**action_layout}
 
     contract = {
         name: value
@@ -2035,6 +2048,7 @@ def _checkpoint_model_values(
         contract["portfolio_activation"] = normalize_portfolio_activation(
             config.trading.portfolio_activation
         )
+    contract.update(action_layout)
     return contract
 
 

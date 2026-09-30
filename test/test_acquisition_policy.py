@@ -111,3 +111,32 @@ def test_projection_requires_actual_owner_and_cannot_hide_its_debt():
 
 def test_snapshot_needs_local_proof_not_infinite_history_denominator():
     assert not evaluate([row(), row("finmind:TaiwanStockTradingDate")])["allowed"]
+
+
+@pytest.mark.parametrize('required,unknown,expected', [(0, 0, True), (1, 0, False), (0, 1, False)])
+def test_finmind_opt_in_only_uses_spare_local_quota(tmp_path, monkeypatch, required, unknown, expected):
+    import json
+    from downloader import acquisition_policy as policy
+    config = tmp_path / 'policy.json'
+    config.write_text(json.dumps({'schema_version': 1, 'secondary_validation': 'provider_spare_quota'}))
+    monkeypatch.setattr(policy, '_finmind_spare_work', lambda *_a: {
+        'state': 'partial' if unknown else 'observed',
+        'summary': {'required_requests': required, 'unknown_datasets': unknown, 'blocked_tasks': 13},
+    })
+    def unrelated_gate(**_kwargs):
+        raise AssertionError('opt-in FinMind quota is independent of other providers')
+    monkeypatch.setattr(policy, 'evaluate_secondary_admission', unrelated_gate)
+    result = policy.evaluate_finmind_secondary_admission(root=tmp_path, now=NOW, config_path=config)
+    assert result['allowed'] is expected
+    assert result['scope'] == 'finmind_shared_account'
+    assert result['blocked_tasks'] == 13  # No fake completion for terminal errors.
+
+
+def test_finmind_missing_policy_preserves_global_gate_and_invalid_policy_never_grants(tmp_path, monkeypatch):
+    from downloader import acquisition_policy as policy
+    monkeypatch.setattr(policy, 'evaluate_secondary_admission', lambda **_kw: {
+        'allowed': False, 'reason': 'global_still_required'})
+    path = tmp_path / 'policy.json'
+    assert policy.evaluate_finmind_secondary_admission(config_path=path)['reason'] == 'global_still_required'
+    path.write_text('{"schema_version": 1, "secondary_validation": "typo"}')
+    assert not policy.evaluate_finmind_secondary_admission(config_path=path)['allowed']

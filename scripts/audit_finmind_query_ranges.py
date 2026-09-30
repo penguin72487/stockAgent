@@ -65,7 +65,7 @@ def registry() -> dict[str, dict[str, Any]]:
             contract = _contract('derived_no_api', first, 'verified_long_parent_partition')
         elif spec.dataset in batching.RANGE_CONTRACTS:
             range_spec = batching.RANGE_CONTRACTS[spec.dataset]
-            contract = _contract('whole_market_date_range', first, 'all_due_contiguous_pending_periods',
+            contract = _contract('whole_market_date_range', first, 'all_due_contiguous_periods',
                                  calendar_partition_limit=range_spec.max_partitions,
                                  decoded_response_byte_limit=range_spec.max_response_bytes,
                                  response_row_limit=range_spec.max_response_rows,
@@ -90,7 +90,26 @@ def registry() -> dict[str, dict[str, Any]]:
                  'TaiwanOptionDealerTradingVolumeDaily': '2021-04-01',
                  'TaiwanStockCapitalReductionReferencePrice': '2011-01-01'}
     for dataset in complement.ALL_DATASETS:
-        if dataset in PRODUCT_HISTORY_STARTS:
+        if dataset == complement.news.DATASET:
+            contract = _contract('whole_market_calendar_day', complement.news.SEARCH_FLOOR.isoformat(), 'one_calendar_day',
+                                 storage_grain='market_day', first_date_basis='search_floor_not_provider_earliest',
+                                 source_urls=[complement.news.DOCUMENTATION_URL],
+                                 contract_evidence=complement.news.PROBE_EVIDENCE,
+                                 contract_version=complement.news.CONTRACT_VERSION,
+                                 historical_universe_verified_complete=False)
+        elif dataset in complement.supplemental.SOURCES:
+            source = complement.supplemental.SOURCES[dataset]
+            contract = _contract('derived_no_api' if source.grain == 'derived' else
+                                 'whole_market_date_range' if source.universe == 'market' else f'per_{source.universe}_{source.grain}', source.first.isoformat(),
+                                 'full_market_history' if source.universe == 'market' else
+                                 'full_id_history' if source.grain == 'history' else f'one_{source.grain}',
+                                 endpoint=source.endpoint, storage_grain=source.grain,
+                                 historical_universe_verified_complete=False,
+                                 lazy_frontier=source.grain not in {'history', 'derived'},
+                                 decoded_response_byte_limit=complement.BULK_MAX_RESPONSE_BYTES,
+                                 release_hour_taipei=source.release_hour,
+                                 contract_version=complement.supplemental.CONTRACT_VERSION)
+        elif dataset in PRODUCT_HISTORY_STARTS:
             contract = _contract('per_product_history', PRODUCT_HISTORY_STARTS[dataset].isoformat(),
                                  'one_product_documented_start_through_today_inclusive',
                                  first_date_basis='documented_floor_not_first_returned_event',
@@ -150,9 +169,6 @@ def registry() -> dict[str, dict[str, Any]]:
         else:
             shape, span = 'unscheduled_per_id_or_special_endpoint', 'not_verified_in_current_worker'
         add(dataset, 'unscheduled', _contract(shape, None, span, unscheduled_reason=reason))
-    add('TaiwanStockNews', 'disabled_policy', _contract('disabled_news', None, 'not_requested_explicitly_disabled',
-                                                      disabled_reason='news_explicitly_disabled'))
-    result['TaiwanStockNews']['disabled'] = True
     for row in result.values():
         preferred = (('complement', 'sponsor', 'free', 'unscheduled', 'disabled_policy')
                      if row['dataset'] in PRODUCT_HISTORY_STARTS else
@@ -323,7 +339,7 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
     alias_count = len(sponsor.SOURCES) + len(complement.ALL_DATASETS) + len(free.SESSION_DATASETS) + 2 + len(sponsor.UNSCHEDULED)
     migrated_alias_count = len(set(PRODUCT_HISTORY_STARTS) & set(complement.ALL_DATASETS))
     return {
-        'schema_version': 1, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
+        'schema_version': 2, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
         'production_queue_writes': 0, 'parquet_scans': 0,
         'global_minimum_requests': None,
         'global_minimum_basis': 'not_proven_contracts_universes_overlap_and_refresh_work_differ',
@@ -331,9 +347,10 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
                      'legacy_catalog_alias_count': alias_count - migrated_alias_count,
                      'legacy_catalog_basis': 'before_two_settlement_complement_owner_aliases_were_added',
                      'product_history_migration_alias_count': migrated_alias_count,
-                     'legacy_aliases_are_unique_datasets': False, 'explicit_disabled_news_rows': 1,
+                     'legacy_aliases_are_unique_datasets': False,
+                     'explicit_disabled_news_rows': int(rows.get('TaiwanStockNews', {}).get('disabled', False)),
                      'runtime_range_contract_count': len(batching.RANGE_CONTRACTS),
-                     'scope': 'configured_registry_union_plus_unscheduled_and_disabled_news_not_all_provider_products'},
+                     'scope': 'configured_registry_union_including_news_not_unknown_provider_products'},
         'queue_observations': queue_states,
         'status_observations': {owner: {'state': value.get('state'), 'observed_at_utc': value.get('observed_at_utc')}
                                 for owner, value in statuses.items()},

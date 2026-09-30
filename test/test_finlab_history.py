@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -27,6 +28,13 @@ from stockagent.live.data_monitor_dashboard import (
     _finlab_receipt_file_exists, _operation_state, _service_state,
     _systemd_monotonic_time,
 )
+
+
+def _stored_fields(path):
+    """Scheduling fixtures must satisfy the same receipt contract as real data."""
+    pd.DataFrame({"source_index": ["2026-09-24"], "2330": [1.]}).to_parquet(path, index=False)
+    return {"rows": 1, "rows_with_values": 1, "parquet_size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 class FinLabHistoryTest(unittest.TestCase):
@@ -57,6 +65,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 "dataset": "price:收盤價", "status": "downloaded_unverified_for_pit",
                 "parquet_path": "datasets/price.parquet",
                 "source_checked_at_utc": now.isoformat(),
+                **_stored_fields(dataset),
             }))
             idle = general_work_status(discovery, {}, root, now=now, refresh_days=1)
             self.assertEqual(idle["state"], "general_work_idle")
@@ -101,6 +110,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 "dataset": key, "status": "downloaded_unverified_for_pit",
                 "parquet_path": "datasets/price.parquet",
                 "source_checked_at_utc": "2026-09-24T15:00:00+00:00",
+                **_stored_fields(data_path),
             }))
             before = datetime(2026, 9, 24, 23, 59, tzinfo=UTC)
             after = datetime(2026, 9, 25, 0, 1, tzinfo=UTC)
@@ -577,6 +587,7 @@ class FinLabHistoryTest(unittest.TestCase):
                         "status": "downloaded_unverified_for_pit",
                         "parquet_path": str(path.relative_to(root)),
                         "source_checked_at_utc": checked,
+                        **_stored_fields(path),
                     })
                 )
             assert sync_selection(
@@ -597,6 +608,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 "dataset": key, "status": "downloaded_unverified_for_pit",
                 "parquet_path": str(path.relative_to(root)),
                 "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+                **_stored_fields(path),
             }))
             assert sync_selection(
                 [key, "missing:feature"], {key: {}}, root,
@@ -616,6 +628,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 "dataset": key, "status": "downloaded_unverified_for_pit",
                 "parquet_path": "datasets/price.parquet",
                 "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+                **_stored_fields(root / "datasets/price.parquet"),
             }))
             (root / "attempts" / f"{safe_stem('missing:feature')}.json").write_text(json.dumps({
                 "dataset": "missing:feature", "status": "provider_error",
@@ -646,6 +659,7 @@ class FinLabHistoryTest(unittest.TestCase):
                 "dataset": key, "status": "downloaded_unverified_for_pit",
                 "parquet_path": "datasets/price.parquet",
                 "source_checked_at_utc": "2026-09-23T00:00:00+00:00",
+                **_stored_fields(root / "datasets/price.parquet"),
             }))
             for allowed in (False, True):
                 with patch("downloader.acquisition_policy.evaluate_secondary_admission",

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from stockagent.backtest.distributed_reduction import global_symbol_tensor_sum
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 from stockagent.backtest.crypto_perpetual import run_crypto_perpetual_torch
 from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
@@ -3491,7 +3492,7 @@ def run_backtest_torch(
         if (
             execution.ndim != 3
             or tuple(execution.shape[:2]) != tuple(weights.shape)
-            or int(execution.size(-1)) not in {4, 11, 29}
+            or int(execution.size(-1)) not in {4, 11, *MARGIN_EXECUTION_WIDTHS}
         ):
             raise ValueError(
                 "stock-context futures execution tensor must have shape "
@@ -3513,7 +3514,7 @@ def run_backtest_torch(
             prepped_weights,
             float(min_trade_weight),
         )
-        if int(execution.size(-1)) in {11, 29}:
+        if int(execution.size(-1)) in {11, *MARGIN_EXECUTION_WIDTHS}:
             if float(max_turnover_ratio) != 0.0:
                 raise ValueError(
                     "integer stock-context futures requires max_turnover_ratio=0"

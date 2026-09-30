@@ -62,10 +62,45 @@ def test_current_filename_is_never_a_historical_date():
     assert result["temporal_mentions"] == []
 
 
+def test_restoration_after_a_session_boundary_comma_is_not_an_unspecified_date():
+    rows=parser.temporal_mentions('自115年8月12日一般交易時段結束後起實施，'
+        '115年8月17日一般交易時段結束後，恢復為115年8月12日調整前之保證金。')
+    assert rows[1]['date_iso']=='2026-08-17'
+    assert rows[1]['role']=='effective_end'
+    assert rows[1]['boundary']=='after_regular_session'
+    assert rows[2]['role']=='unspecified'
+
+
 def test_explicit_effective_date_interval_does_not_invent_time_of_day():
     rows = parser.temporal_mentions("適用期間自115年9月24日起至115年10月5日止。")
     assert [r["role"] for r in rows] == ["effective_start", "effective_end"]
     assert [r["boundary"] for r in rows] == ["date_only", "date_only"]
+
+
+def test_operative_self_clause_is_not_a_reference_to_another_notice():
+    text=('期交所依規定調高晟德期貨契約所有月份保證金適用比例，'
+          '自109年6月11日(證券市場處置生效日次一營業日)該契約交易時段結束後起實施，'
+          '並於109年6月23日該契約交易時段結束後恢復為調整前之保證金。')
+    rows=parser.temporal_mentions(text)
+    assert [(r['date_iso'],r['role'],r['boundary']) for r in rows]==[
+        ('2020-06-11','effective_start','after_trading_session'),
+        ('2020-06-23','effective_end','after_trading_session')]
+    reference=parser.temporal_mentions('依本公司109年6月11日台期字第109001號函，自即日起實施。')
+    assert reference[0]['role']=='reference'
+
+
+def test_parenthetical_effective_reference_does_not_override_publication():
+    rows=parser.temporal_mentions(
+        '期交所於115年2月10日(調整生效日前一日)公告調整保證金，'
+        '實施期間為115年2月11日一般交易時段結束後生效。')
+    assert [(r['date_iso'],r['role'],r['boundary']) for r in rows]==[
+        ('2026-02-10','publication','date_only'),
+        ('2026-02-11','effective_start','after_regular_session')]
+    rows=parser.temporal_mentions(
+        '期交所依規定自115年1月13日(證券市場處置生效日次一營業日)'
+        '一般交易時段結束後起調高保證金。')
+    assert rows[0]['role']=='effective_start'
+    assert rows[0]['boundary']=='after_regular_session'
 
 
 def test_unitless_margintable_is_not_assumed_twd_or_ratio():
@@ -111,6 +146,41 @@ def test_binary_legacy_doc_is_retained_as_unparsed_not_decoded_csv():
     result = parser.extract_document(b"\xd0\xcf\x11\xe0" + b"a" * 20, "application/msword", "https://www.taifex.com.tw/old.doc")
     assert result["parsing_status"] == "unsupported"
     assert result["text"] == ""
+
+
+def test_legacy_word_text_recovers_dates_but_does_not_invent_aligned_tables(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(parser.shutil, "which", lambda name: "/test/antiword")
+    def run(args, **kwargs):
+        assert kwargs["timeout"] == parser.LEGACY_WORD_TIMEOUT_SECONDS
+        assert "shell" not in kwargs
+        kwargs["stdout"].write("自99年1月25日起實施。\n原始 維持\nCDF 13.50% 10.35%".encode())
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(parser.subprocess, "run", run)
+    result = parser.extract_document(b"\xd0\xcf\x11\xe0", "application/msword", "https://www.taifex.com.tw/old.doc")
+    assert result["parsing_status"] == "parsed"
+    assert result["format"] == "legacy_word"
+    assert result["tables"] == []
+    assert result["temporal_mentions"][0]["date_iso"] == "2010-01-25"
+    assert "legacy_word_tables_require_layout_validation" in result["warnings"]
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "timeout", "oversize"])
+def test_legacy_word_limits_and_missing_dependency_do_not_fabricate_rules(monkeypatch, failure):
+    from types import SimpleNamespace
+    monkeypatch.setattr(parser.shutil, "which", lambda name: None if failure == "unavailable" else "/test/antiword")
+    monkeypatch.setattr(parser, "MAX_TEXT_CHARACTERS", 10)
+    def run(args, **kwargs):
+        if failure == "timeout":
+            raise parser.subprocess.TimeoutExpired(args, 20)
+        kwargs["stdout"].write(b"x" * 41)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(parser.subprocess, "run", run)
+    result = parser.extract_document(b"\xd0\xcf\x11\xe0", "application/msword", "https://www.taifex.com.tw/old.doc")
+    assert result["parsing_status"] in {"unsupported", "failed"}
+    assert result["text"] == ""
+    assert result["tables"] == []
+    assert result["temporal_mentions"] == []
 
 
 def test_pdf_without_text_is_pending_ocr_and_never_invents_table():
@@ -220,7 +290,7 @@ def test_docx_extracts_main_text_and_physical_tables_without_executing_embeds():
         ('word/_rels/document.xml.rels', '<Relationships Target="https://example.invalid/private"/>'),
     ])
     result = parser.extract_document(raw, 'application/octet-stream', 'https://www.taifex.com.tw/file.docx')
-    assert result['parser_version'] == parser.PARSER_VERSION == 2
+    assert result['parser_version'] == parser.PARSER_VERSION == 6
     assert result['format'] == 'docx' and result['parsing_status'] == 'parsed'
     assert result['temporal_mentions'][0]['date_iso'] == '2026-09-24'
     assert result['temporal_mentions'][0]['role'] == 'effective_start'
@@ -295,4 +365,4 @@ def test_ordinary_zip_is_not_recursively_parsed_even_with_office_url():
 
 @pytest.mark.parametrize('content', [b'', b'\xd0\xcf\x11\xe0legacy', b'%PDF-1.7\ninvalid', b'code,value\nTX,0\n'])
 def test_parser_version_is_present_on_every_result_including_failures(content):
-    assert parser.extract_document(content, '', 'https://www.taifex.com.tw/test')['parser_version'] == 2
+    assert parser.extract_document(content, '', 'https://www.taifex.com.tw/test')['parser_version'] == parser.PARSER_VERSION

@@ -19,6 +19,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from downloader.finmind_runtime import wait_for_next_cycle
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,8 +29,8 @@ import requests
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, sha256_file
 from downloader.common import SharedRateLimiter, load_env_file
-from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
-from downloader.finmind_scheduling import fixed_incremental_demand
+from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
+from downloader.finmind_scheduling import calendar_next_check, fixed_incremental_demand, protected_stock_opening
 from downloader.finmind_corrections import free_correction_due, correction_receipt_metadata
 from downloader.finmind_volume_units import (
     ORDER_BOOK_CANONICAL_FIELDS, ORDER_BOOK_DATASET, annotate_stock_share_units,
@@ -84,6 +85,8 @@ def _retry_at(receipt: dict[str, Any]) -> datetime | None:
 
 
 def _receipt_usable(receipt: dict[str, Any], root: Path, *, now: datetime) -> bool:
+    from downloader.parquet_integrity import parquet_receipt_error
+
     if receipt.get("status") == "complete":
         relative = receipt.get("parquet_path")
         if not isinstance(relative, str):
@@ -91,7 +94,7 @@ def _receipt_usable(receipt: dict[str, Any], root: Path, *, now: datetime) -> bo
         path = (root / relative).resolve()
         if not path.is_relative_to(root.resolve()) or not path.is_file():
             return False
-        return path.stat().st_size == receipt.get("parquet_size_bytes")
+        return parquet_receipt_error(root, receipt) is None
     retry = _retry_at(receipt)
     return retry is not None and retry > now
 
@@ -211,8 +214,8 @@ def _session_cutoff(now: datetime) -> date:
 
 
 def _opening_window(now: datetime, sessions: set[date]) -> bool:
-    local = now.astimezone(TAIPEI)
-    return local.date() in sessions and wall_time(8, 20) <= local.time() < wall_time(9, 10)
+    # Provider annual dates are not proof against emergency exchange closures.
+    return protected_stock_opening(now)
 
 
 def _load_calendar(
@@ -225,21 +228,25 @@ def _load_calendar(
     path = root / "calendar.json"
     cached = _read_json(path)
     correction = free_correction_due(root, CALENDAR_DATASET, now.astimezone(TAIPEI).date(), cached, now)
-    observed = cached.get("observed_at_utc")
-    fresh = False
-    if isinstance(observed, str):
-        try:
-            fresh = now - datetime.fromisoformat(observed.replace("Z", "+00:00")) < timedelta(hours=20)
-        except ValueError:
-            pass
+    fresh = now < calendar_next_check(root, now)
     if fresh and not correction['due']:
         try:
             return _calendar_dates([{"date": item} for item in cached["dates"]]), 0
         except (KeyError, TypeError, ProviderError):
-            pass
+            attempt = _read_json(root / 'calendar_refresh.json')
+            retry = _retry_at(attempt)
+            if retry and now < retry:
+                raise ProviderError(str(attempt.get('state', 'invalid_calendar')),
+                                    retry_after=(retry - now).total_seconds())
     try:
         dates = _calendar_dates(_request(session, limiter, CALENDAR_DATASET, start_date=HISTORY_START, token=token, traffic_root=root))
-    except ProviderError:
+    except ProviderError as error:
+        atomic_write_json(root / 'calendar_refresh.json', {
+            'observed_at_utc': _iso(now), 'state': error.code,
+            'retry_at_utc': _iso(now + timedelta(seconds=max(300, error.retry_after))),
+        })
+        if error.code in {'invalid_token', 'invalid_request', 'not_entitled', 'ip_banned', 'rate_limited'}:
+            raise
         if isinstance(cached.get("dates"), list):
             return _calendar_dates([{"date": item} for item in cached["dates"]]), 1
         raise
@@ -252,6 +259,9 @@ def _load_calendar(
         "observed_at_utc": _iso(now),
         "dates": [item.isoformat() for item in dates],
         **correction_receipt_metadata(correction['context']),
+    })
+    atomic_write_json(root / 'calendar_refresh.json', {
+        'observed_at_utc': _iso(now), 'state': 'complete', 'retry_at_utc': None,
     })
     return dates, 1
 
@@ -546,7 +556,7 @@ def normalize_units_local(root: Path) -> dict[str, Any]:
             archive = _archive_order_book_source(root, day, old)
             if not same_table:
                 atomic_write_parquet(
-                    path, normalized, compression="zstd",
+                    path, normalized, compression="zstd", durable=True,
                     before_replace=lambda: _verified_order_book_source(root, day, old),
                 )
             updated = {
@@ -736,7 +746,7 @@ def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, An
             receipt.update({"raw_response_path": str(raw_path.relative_to(root)),
                             "raw_response_sha256": digest, "raw_storage_error": "unrepresentable_arrow_source_types"})
         else:
-            atomic_write_parquet(path, table, compression="zstd")
+            atomic_write_parquet(path, table, compression="zstd", durable=True)
             receipt.update({
                 "parquet_path": str(path.relative_to(root)),
                 "parquet_size_bytes": path.stat().st_size,
@@ -796,7 +806,7 @@ def _record_master(root: Path, rows: list[dict[str, Any]], *, now: datetime,
     path = root / "snapshots" / MASTER_DATASET / f"snapshot={local_day}-full.parquet"
     receipt_path = root / 'receipts' / MASTER_DATASET / f'{local_day}.json'
     _archive_free_head(root, receipt_path, path)
-    atomic_write_parquet(path, pa.Table.from_pylist(rows), compression="zstd")
+    atomic_write_parquet(path, pa.Table.from_pylist(rows), compression="zstd", durable=True)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "dataset": MASTER_DATASET,
@@ -839,7 +849,7 @@ def _write_status(root: Path, *, state: str, counts: dict[str, Any], requests_us
         "last_task": last,
         "active_task": active,
         "queue_preview": counts.get("queue_preview", []),
-        "news": "disabled_by_user",
+        "news": "owned_by_complement",
         "training_status": "raw_downloaded_not_pit_validated",
     })
 
@@ -864,6 +874,16 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             quota = 300
         limiter = rate_limiter({"official_requests_per_hour": quota})
         now = _utc_now()
+        # A priority calendar/master request still consumes the SAME quota.
+        if token and backfill_budget(account, root, fixed_incremental_requests=0, now=now).get('remaining', 1) <= 0:
+            previous = _read_json(root / 'status.json')
+            counts = {'total': previous.get('total_session_day_tasks', 0),
+                      'complete': previous.get('complete_session_day_tasks', 0),
+                      'deferred': previous.get('retry_deferred_tasks', 0),
+                      'series': previous.get('series', {}), 'queue_preview': previous.get('queue_preview', [])}
+            _write_status(root, state='incremental_reserve', counts=counts,
+                          requests_used=0, quota=quota, token=bool(token))
+            return {'state': 'incremental_reserve', 'requests': 0}
         try:
             dates, calendar_requests = _load_calendar(root, session, limiter, token, now)
             used += calendar_requests
@@ -883,6 +903,9 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             return {"state": "protected_opening", "requests": used, **counts}
         _write_status(root, state="running" if tasks else "current", counts=counts, requests_used=used, quota=quota, token=bool(token))
         if _master_due(root, now) and (not max_requests or used < max_requests):
+            if token and backfill_budget(account, root, fixed_incremental_requests=0, now=_utc_now()).get('remaining', 1) <= 0:
+                _write_status(root, state='incremental_reserve', counts=counts, requests_used=used, quota=quota, token=bool(token))
+                return {'state': 'incremental_reserve', 'requests': used, **counts}
             try:
                 master_day = _utc_now().astimezone(TAIPEI).date()
                 correction = free_correction_due(root, MASTER_DATASET, master_day,
@@ -906,10 +929,12 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             if _opening_window(_utc_now(), sessions):
                 break
             dispatch_now = _utc_now()
-            if day != latest_session and not backfill_budget(
+            account = refresh_dispatch_account(account, token, root, dispatch_now)
+            budget = backfill_budget(
                 account, root, fixed_incremental_requests=fixed_incremental_demand(root, dispatch_now),
-                in_flight=0, now=dispatch_now,
-            )["allowed"]:
+                in_flight=0, now=dispatch_now, prioritize_due=True,
+            )
+            if budget.get('remaining', 1) <= 0 or (day != latest_session and not budget['allowed']):
                 reserve_wait = True
                 break
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task,
@@ -996,12 +1021,13 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 if result["state"] in {"invalid_token", "invalid_request", "not_entitled"}:
                     return 0  # Wait for corrected credentials/parameters and explicit restart.
-                time.sleep(
+                delay = (
                     1800 if result["state"] == "ip_banned"
                     else 600 if result["state"] in {"rate_limited", "protected_opening", "waiting_retry"}
                     else 3600 if result["state"] == "current"
                     else 60 if result["state"] == "incremental_reserve" else 5
                 )
+                wait_for_next_cycle(root, result, delay, snapshot_hours=(0, 14, 18))
         except KeyboardInterrupt:
             return 130
         finally:

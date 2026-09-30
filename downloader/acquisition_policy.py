@@ -115,7 +115,7 @@ def _finmind_required(path: str, epoch: int) -> int:
         count = connection.execute(
             "SELECT COUNT(*) FROM tasks WHERE priority < 8 "
             "AND state NOT IN ('complete','observed_empty','non_session',"
-            "'not_observation_date','deprecated_query_shape')"
+            "'not_observation_date','deprecated_query_shape','calendar_wait')"
         ).fetchone()[0]
         total = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     if not total:
@@ -230,3 +230,61 @@ def evaluate_secondary_admission(*, snapshot_path: Path = DEFAULT_SNAPSHOT,
               for name in FINMIND_SNAPSHOTS}
     return evaluate_snapshot(snapshot, now=checked, finlab_core_complete=core,
                              finmind_required=remaining, snapshot_proofs=proofs)
+
+
+def finmind_secondary_mode(config_path: Path = ROOT / 'configs/finmind_acquisition_policy.json') -> str:
+    """Missing config preserves global priority; malformed config grants nothing."""
+    if not config_path.is_file():
+        return 'global_required_first'
+    try:
+        config = _read(config_path)
+        mode = config.get('secondary_validation')
+        if config.get('schema_version') == 1 and mode in {'global_required_first', 'provider_spare_quota'}:
+            return mode
+    except (OSError, ValueError):
+        pass
+    return 'invalid'
+
+
+@lru_cache(maxsize=8)
+def _finmind_spare_work(root: str, epoch: int) -> dict[str, Any]:
+    # Reuse the existing read-only, primary-owner inventory. Bound expensive
+    # queue grouping to once per 30s, not once per API dispatch. The Sponsor
+    # dispatcher separately rechecks its live primary queue before each claim.
+    from downloader.finmind_eta_work import build_finmind_workload
+    del epoch
+    return build_finmind_workload(Path(root), datetime.now(UTC))
+
+
+def evaluate_finmind_secondary_admission(*, root: Path = ROOT / 'data_finmind',
+                                        now: datetime | None = None,
+                                        config_path: Path = ROOT / 'configs/finmind_acquisition_policy.json') -> dict[str, Any]:
+    """FinMind-only opt-in: other providers cannot spend its independent quota.
+
+This grants no quota itself. All calls still pass the existing shared budget,
+fixed-publication reserve, primary-work priority, official pacing and cooldown.
+Terminal source errors remain visible, not completed; they consume no currently
+executable requests. Unknown owner queues fail closed.
+"""
+    mode = finmind_secondary_mode(config_path)
+    if mode == 'global_required_first':
+        return evaluate_secondary_admission(now=now)
+    result = {'policy_version': 2, 'scope': 'finmind_shared_account', 'mode': mode,
+              'allowed': False, 'reason': 'finmind_policy_or_queue_unverified'}
+    if mode != 'provider_spare_quota':
+        return result
+    checked = now or datetime.now(UTC)
+    try:
+        workload = _finmind_spare_work(str(root.resolve()), int(checked.timestamp() // 30))
+        summary = workload['summary']
+        result.update(required_requests=summary['required_requests'],
+                      unknown_datasets=summary['unknown_datasets'],
+                      blocked_tasks=summary['blocked_tasks'])
+        if workload['state'] != 'observed' or summary['unknown_datasets']:
+            return result
+        result['allowed'] = summary['required_requests'] == 0
+        result['reason'] = ('finmind_required_acquisition_pending' if not result['allowed'] else
+                            'finmind_spare_quota_after_incremental_reserve')
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        pass
+    return result

@@ -395,3 +395,44 @@ def test_all_futures_duplicate_bar_fails_closed(tmp_path: Path) -> None:
         build_taifex_all_futures_daily_sessions(
             [first, second], tmp_path / "all.parquet"
         )
+
+
+def test_all_reported_outrights_keep_settlements_without_inventing_trades(tmp_path: Path) -> None:
+    import pyarrow.parquet as pq
+    source = tmp_path/'reported.csv'
+    no_print = _row('2005/01/03','GBF','200503',100.,101.,volume=0)
+    no_print[3:7] = ['-']*4
+    unknown_volume = _row('2005/01/03','CPF','200506',99.,99.5)
+    unknown_volume[3:7] = ['-']*4
+    unknown_volume[8] = '-'
+    _write_csv(source,[_row('2005/01/03','TX','200501',6000,6010),no_print,unknown_volume])
+    default = pq.read_table(build_taifex_all_futures_daily_sessions([source],tmp_path/'trades.parquet'))
+    assert default['product'].to_pylist() == ['TX']
+    all_rows = pq.read_table(build_taifex_all_futures_daily_sessions(
+        [source],tmp_path/'valuations.parquet',include_valuation_rows=True))
+    assert all_rows['product'].to_pylist() == ['TX','GBF','CPF']
+    assert all_rows['open'].to_pylist() == [6000.,None,None]
+    assert all_rows['volume'].to_pylist() == [100,0,None]
+    assert all_rows['settlement'].to_pylist() == [6010.,101.,99.5]
+    assert all_rows.schema.metadata[b'stockagent.contract_version'] == b'2'
+    assert all_rows.schema.metadata[b'stockagent.row_policy'] == b'all_reported_outrights'
+
+
+def test_source_change_cells_preserved_without_inferred_reference(tmp_path: Path) -> None:
+    import pyarrow.parquet as pq
+    source=tmp_path/'changes.csv'
+    source.write_text('交易日期,契約,到期月份(週別),開盤價,最高價,最低價,收盤價,漲跌價,漲跌%,成交量,結算價,未沖銷契約數\n'
+                      '2011/01/25,DL1,201103,100,101,99,100,+1,1.01%,20,100,40\n'
+                      '2011/01/25,DL2,201106,-,-,-,-,-,-,0,99,1\n',encoding='cp950')
+    frame=pq.read_table(build_taifex_all_futures_daily_sessions([source],tmp_path/'out.parquet',
+        include_valuation_rows=True,include_reference_evidence=True))
+    assert frame['reported_price_change'].to_pylist()==['+1','-']
+    assert frame['reported_price_change_percent'].to_pylist()==['1.01%','-']
+    assert frame['open'].to_pylist()==[100.,None]
+    assert frame.schema.metadata[b'stockagent.contract_version']==b'3'
+    assert 'opening_reference_price' not in frame.column_names
+    from scripts.download_tw_index_futures_day_session import _all_futures_quality
+    quality=_all_futures_quality(tmp_path/'out.parquet',include_valuation_rows=True,include_reference_evidence=True)
+    assert quality['rows']==2 and quality['product_count']==2
+    with pytest.raises(ValueError,match='unsupported all-futures'):
+        _all_futures_quality(tmp_path/'out.parquet',include_valuation_rows=True)

@@ -14,3 +14,13 @@ main{width:min(1180px,calc(100% - 36px))}.finlab-traffic-details{margin-top:18px
 .finlab-market h3{margin:0 0 9px;color:var(--ink)}
 .finlab-market .kpi-grid{margin-top:18px}
 .finlab-market .progress-track{display:block;width:100%;height:9px;margin-top:12px}
+.workload-records{display:grid;gap:18px;margin-top:24px;padding-top:20px;border-top:1px solid var(--line)}
+.workload-records article{min-width:0}.workload-records strong{font-size:15px}
+.workload-records p{margin:9px 0 0;color:var(--muted);font-size:12px;line-height:1.6}
+#workload .progress-track{display:block;width:100%;height:10px;margin-top:12px}
+#workload .fleet-progress-detail{line-height:1.7}#workload .data-note{overflow-wrap:anywhere}
+.workload-eta{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:18px}
+.workload-eta .kpi strong{font-size:clamp(17px,2.2vw,24px);line-height:1.5;overflow-wrap:anywhere}
+.workload-scenarios{display:flex;gap:12px 30px;flex-wrap:wrap;margin-top:18px;color:var(--muted);font-size:12px}
+.workload-scenarios strong{display:inline-block;margin-left:8px;color:var(--ink)}
+@media(max-width:720px){.workload-eta{grid-template-columns:1fr}.workload-records .finlab-volume-heading{align-items:start;flex-direction:column;gap:7px}}

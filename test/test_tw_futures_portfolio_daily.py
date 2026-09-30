@@ -67,6 +67,26 @@ def _write_official_codes(path: Path, rows: list[tuple[str, str]]) -> None:
     pl.DataFrame(rows, schema=["code", "product_name"], orient="row").write_csv(path)
 
 
+def test_reissued_product_month_keeps_separate_quarantined_instance_slots():
+    dates=[date(2024,1,1)+timedelta(days=i) for i in range(12)]
+    meta=pl.DataFrame([
+        dict(product='CN1',contract='202406',physical_instance='CN1:202406@old',
+            first_observed_date=dates[0],last_observed_date=dates[4]),
+        dict(product='CN1',contract='202406',physical_instance='CN1:202406@new',
+            first_observed_date=dates[5],last_observed_date=dates[10]),
+    ])
+    mapping=_fixed_portfolio_slot_map(meta,dates,fixed_slot_count=2816,cooldown_sessions=3)
+    assert mapping['portfolio_slot'].n_unique()==2
+    assert mapping['physical_instance'].n_unique()==2
+    assert set(mapping['contract'])=={'202406'}  # Preserve the exchange lookup key.
+    assert mapping.equals(_fixed_portfolio_slot_map(meta.reverse(),dates,
+        fixed_slot_count=2816,cooldown_sessions=3))
+    with pytest.raises(ValueError,match='reused codes require physical_instance'):
+        _fixed_portfolio_slot_map(meta.drop('physical_instance'),dates)
+    with pytest.raises(ValueError,match='duplicate futures lifetime identity'):
+        _fixed_portfolio_slot_map(pl.concat([meta,meta.head(1)]),dates)
+
+
 def test_portfolio_build_rejects_dated_stock_future_off_grid_quotes() -> None:
     fields = ("open", "high", "low", "close", "last_bid", "last_ask")
     frame = pl.DataFrame({
@@ -367,6 +387,23 @@ def test_historical_product_master_does_not_require_current_broker_catalogue(
     assert master["fixed_fee_research_supported"].to_list() == [False, True, True]
     assert master["contract_multiplier"].to_list() == [None, 2000.0, 200.0]
     assert master["sinopac_network_fee_group"].to_list() == [None, "stock", "large"]
+
+
+def test_all_twd_scope_includes_commodity_and_retired_interest_contracts(tmp_path: Path) -> None:
+    stocks = tmp_path / "stocks.csv"
+    official = tmp_path / "official.csv"
+    pl.DataFrame({'code':['2330'],'name':['台積電'],'security_type':['stock']}).write_csv(stocks)
+    names = [('BRF','布蘭特原油期貨'),('TGF','臺幣黃金期貨'),('CPF','三十天期利率期貨'),
+             ('GBF','十年期公債期貨'),('TJF','東證期貨'),('MSF','摩臺期貨'),
+             ('GDF','黃金期貨'),('RHF','人民幣期貨'),('CDF','台積電期貨')]
+    _write_official_codes(official, names)
+    frame = build_product_master(tmp_path/'absent.csv', stocks, official,
+        source_products=[x[0] for x in names], product_scope='all_twd')
+    assert set(frame['official_product']) == {'BRF','TGF','CPF','GBF','TJF','CDF'}
+    assert frame.filter(pl.col('asset_class')=='commodity_future').height == 2
+    assert frame.filter(pl.col('asset_class')=='interest_rate_future').height == 2
+    # Selecting a product does not pretend that today's units are historical rules.
+    assert frame.filter(pl.col('official_product').is_in(['TGF','BRF','GBF','CPF']))['contract_multiplier'].null_count() == 4
 
 
 def test_futures_portfolio_uses_one_signed_target_action_channel() -> None:

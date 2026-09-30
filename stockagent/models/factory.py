@@ -419,6 +419,7 @@ def build_model(
             }
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
             else {
+                "futures_slot_count": config.data.tw_futures_portfolio_slot_count,
                 "futures_denomination_aware_output": (
                     tbp_cfg.futures_denomination_aware_output
                 ),
@@ -618,6 +619,7 @@ def build_model(
             ]
         if config.trading.execution_mode == "tw_stock_context_futures_portfolio":
             derivative_kwargs.update(
+                futures_slot_count=config.data.tw_futures_portfolio_slot_count,
                 futures_margin_budget_output=(
                     config.trading.tw_futures_portfolio_capital_basis == "initial_margin"
                 ),

@@ -273,6 +273,21 @@ def test_reconciler_does_not_starve_finished_tasks_behind_pending_or_invalid_pro
     assert c.reconcile_worker_corrections(conn, root, 'sponsor', NOW + timedelta(seconds=1), max_receipts=1)['repaired'] == 1
 
 
+def test_checked_empty_correction_is_not_pending_network_or_verified_complete(tmp_path):
+    root = tmp_path / 'sponsor'
+    conn = _conn()
+    task = _task(conn)
+    _plan(root, [_request()])
+    c.apply_worker_corrections(conn, root, 'sponsor', NOW)
+    _install(conn, root, task, status='observed_empty', rows=0)
+    assert c.reconcile_worker_corrections(conn, root, 'sponsor', NOW)['repaired'] == 0
+    assert conn.execute('SELECT state,completed_at_utc FROM finmind_correction_tasks').fetchone() == ('observed_empty_unverified', None)
+    assert c.apply_worker_corrections(conn, root, 'sponsor', NOW)['unchanged'] == 1
+    assert c.correction_context(conn, task)['correction_ids']
+    _install(conn, root, task, rows=1)
+    assert c.reconcile_worker_corrections(conn, root, 'sponsor', NOW)['repaired'] == 1
+
+
 def test_long_notice_marks_only_existing_wide_derived_tasks_dirty(tmp_path):
     root = tmp_path / 'sponsor'
     conn = _conn()

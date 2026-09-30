@@ -107,6 +107,23 @@ def test_repair_workspace_never_enters_cold_publication():
     assert 'shioaji_gap_repair' in entry['excluded_subtrees']
 
 
+def test_unreported_volume_can_retain_official_mark_without_zero_trade_claim(tmp_path):
+    raw=tmp_path/'daily.csv'
+    raw.write_text('交易日期,契約,到期月份(週別),成交量,開盤價,最高價,最低價,收盤價,結算價\n'
+        '2011/01/03,CDF,201101,-,-,-,-,-,100.5\n',encoding='cp950')
+    manifest=tmp_path/'manifest.json'
+    atomic_write_json(manifest,dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
+    keys=pl.DataFrame(dict(date=[date(2011,1,3)],physical_contract=['CDF:201101']))
+    with pytest.raises(ValueError,match='invalid official volume'):
+        official_day_evidence(manifest,keys,tmp_path/'strict')
+    result=official_day_evidence(manifest,keys,tmp_path/'proof',allow_unreported_volume=True)
+    assert result['outright_volume'].to_list()==[None]
+    assert result['official_reason'].to_list()==['unreported_volume']
+    from stockagent.data.tw_stock_futures_carry import load_carry_no_trade_evidence,load_carry_daily_settlements
+    assert load_carry_no_trade_evidence(tmp_path/'proof/official_evidence.parquet').is_empty()
+    assert load_carry_daily_settlements(tmp_path/'proof/official_evidence.parquet')['official_daily_settlement'].item()==100.5
+
+
 def recovery_fixture(tmp_path, *, volume=0, empty=True):
     day=date(2020,3,23)
     atomic_write_json(tmp_path/'repair_plan.json',dict(tasks=[dict(physical_contract='CDF:202004',code='CDFD0',start=str(day),end=str(day))]))

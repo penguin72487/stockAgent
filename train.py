@@ -398,6 +398,11 @@ def _resolve_multi_gpu_strategy(value: object) -> str:
 
 
 def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
+    # Inference is one canonical account replay and artifact publisher. The
+    # training strategy must not launch duplicate, uncoordinated publishers.
+    mode = getattr(args, "mode", None) or getattr(config.runner, "mode", "train")
+    if mode == "infer":
+        return
     strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     if args.multi_gpu_strategy is not None:
         strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
@@ -954,6 +959,8 @@ def _isolated_inference_command(argv: Sequence[str]) -> list[str]:
         *argv,
         "--mode",
         "infer",
+        "--multi-gpu-strategy",
+        "none",
         "--no-post-train-infer",
         "--no-isolate-train-folds",
     ]
@@ -1778,6 +1785,9 @@ def main() -> None:
                 config.data.tw_futures_current_open_feature
             ),
             denomination_context_basis=config.data.tw_futures_denomination_context_basis,
+            futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+            margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
+                               if config.trading.tw_futures_portfolio_capital_basis == 'initial_margin' else None),
             require_prior_capacity=config.data.tw_futures_require_prior_capacity,
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return

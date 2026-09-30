@@ -313,6 +313,21 @@ Rules:
   weaken the solvency guard or accept the clamped dead-account loss.
 - If compiled loss hits CUDA Graph overwritten-output errors, only fall back the loss wrapper to eager tensor loss; do not disable model `torch.compile` globally.
 
+The user's 2026-09-30 futures policy retains unfilled day-trade exits into the
+next session without an invented penalty or automatic account default. Keep
+the actual signed whole contracts, daily mark-to-market, ordinary executed-side
+fees/tax, and applicable overnight margin. The same distinction applies to an
+unfilled margin-risk reduction: the dated-margin account v6 retains its residual
+and re-evaluates the next session's margin; gradient contract v10 adds no loss
+merely for an unfilled order. Non-positive economic equity remains absorbing.
+Contract expiry, physical delivery, missing continuation evidence and dated
+position limits are separate obligations. A flat-only minute source cannot be
+silently treated as verified overnight data. The existing physical minute carry
+executor owns that continuation; all-futures minute attachment still needs its
+own complete physical-history evidence before admission. See
+[the dated implementation report](../tw_futures_unfilled_carry_2026-09-30.md) and
+[TAIFEX's day-trade margin procedure](https://www.taifex.com.tw/chinese/11/attach/111年7月25日台期結字第1110002405號.pdf).
+
 The user's 2026-09-16 stock day-trade v7 assumption makes only the final 13:30
 liquidation capacity-unbounded.  Preserve source-derived 50% capacity for entry
 and the ordinary 13:20/13:24 exit path; at the terminal step, close every

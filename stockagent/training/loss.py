@@ -1378,11 +1378,14 @@ def risk_aware_loss(
                 f"{mode} requires integer candidate execution tensor [T,S,2,{candidate_fields}]"
             )
     if mode == "tw_stock_context_futures_portfolio":
-        if weights.dim() != 2 or int(weights.size(1)) != 1936:
+        if weights.dim() != 2:
             raise ValueError(
                 "tw_stock_context_futures_portfolio requires direct model "
-                f"actions [T,1936], got {tuple(weights.shape)}"
+                f"actions [T,S], got {tuple(weights.shape)}"
             )
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        slots = int(weights.size(1))
+        futures_slot_layout_version(slots)
         if objective_norm not in {
             "log_utility",
             "log_util",
@@ -1394,18 +1397,19 @@ def risk_aware_loss(
                 "tw_stock_context_futures_portfolio supports only canonical "
                 "log utility"
             )
+        from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
         valid_execution_shapes = {
-            (int(weights.size(0)), 1936, 4),
-            (int(weights.size(0)), 1936, 11),
-            (int(weights.size(0)), 1936, 29),
-            (int(weights.size(0)), 1936, 2, TAPE_FIELDS),
+            (int(weights.size(0)), slots, 4),
+            (int(weights.size(0)), slots, 11),
+            *((int(weights.size(0)), slots, width) for width in MARGIN_EXECUTION_WIDTHS),
+            (int(weights.size(0)), slots, 2, TAPE_FIELDS),
         }
         if overnight_log_returns is None or tuple(
             overnight_log_returns.shape
         ) not in valid_execution_shapes:
             raise ValueError(
                 "tw_stock_context_futures_portfolio requires packed execution "
-                "tensor [T,1936,4] or exact-integer [T,1936,11]"
+                f"tensor [T,{slots},C] matching the declared execution ABI"
             )
     if mode in TW_CARRYING_EXECUTION_MODES:
         phase_actions = mode == "tw_overnight" or weights.dim() == 3

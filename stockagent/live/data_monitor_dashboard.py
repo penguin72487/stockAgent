@@ -45,6 +45,7 @@ from downloader.download_finmind_sponsor import (
     SOURCES as FINMIND_SPONSOR_SOURCES,
     SESSION_DAY_DATASETS as FINMIND_SESSION_DAY_DATASETS,
 )
+from downloader.finmind_scheduling import latest_released_stock_session
 
 
 DATA_MONITOR_SCHEMA_VERSION: Final[int] = 8
@@ -4348,6 +4349,23 @@ def _finlab_acquisition_status(
     }
 
 
+def _finmind_stock_release_hint(last_day: date, hour: int, minute: int, *,
+                                 public_root: Path, now: datetime) -> dict[str, Any] | None:
+    for offset in range(1, 22):
+        candidate = last_day + timedelta(days=offset)
+        decision = tw_stock_day_decision(candidate, parquet_root=public_root, observed=now)
+        if decision.status == 'unknown':
+            return None
+        if decision.is_session:
+            return {
+                'schedule_kind': 'historical_release_inference',
+                'schedule_label': f'下個台股交易日約 {hour:02d}:{minute:02d}（台北時間）',
+                'expected_release_at_utc': _iso(datetime.combine(candidate, datetime_time(hour, minute), TAIPEI)),
+                'expected_release_basis': 'FinMind 既有發布邊界與官方交易日曆推測；不是精確公告時間',
+            }
+    return None
+
+
 def _finmind_free_sources(
     root: Path, *, now: datetime, service: Mapping[str, Any],
     complement_service: Mapping[str, Any] | None = None,
@@ -4364,18 +4382,33 @@ def _finmind_free_sources(
         "TaiwanStockStatisticsOfOrderBookAndTrade": "全市場委託／成交統計（實測 1 分或 5 秒）",
         "TaiwanVariousIndicators5Seconds": "盤中加權指數（實測 1 分或 5 秒）",
     }
+    expected = latest_released_stock_session(
+        now, public_root=root / 'data_tw_public', day_decision=tw_stock_day_decision)
     for dataset, title in labels.items():
         item = series.get(dataset) if isinstance(series.get(dataset), Mapping) else {}
         total = _integer(item.get("total")) or 0
         complete = _integer(item.get("complete")) or 0
         latest = str(item.get("last_complete_date") or "") or None
-        date_freshness = _freshness(_parse_time(latest), now=now, window_seconds=72 * 3600)
+        try:
+            last_day = date.fromisoformat(latest or '')
+        except ValueError:
+            last_day = None
+        release_hint = (_finmind_stock_release_hint(last_day, 14, 0, public_root=root / 'data_tw_public', now=now)
+                        if last_day else None)
+        date_freshness = _freshness(_parse_time(latest), now=now, window_seconds=None)
+        date_freshness.update(
+            state=('unknown' if expected is None or not latest else
+                   'current' if latest >= expected.isoformat() else 'stale'),
+            expected_data_date=expected.isoformat() if expected else None,
+            basis='official_stock_session_calendar_and_existing_14h_worker_release',
+        )
         if not summary:
             row_state = "waiting"
         elif state.startswith("calendar_") or state == "not_entitled":
             row_state = "degraded"
         elif complete >= total and total:
-            row_state = "current" if date_freshness["state"] == "current" else "stale"
+            row_state = ("current" if date_freshness["state"] == "current" else
+                         "stale" if date_freshness["state"] == "stale" else "waiting")
         elif active and state in {"running", "backfilling"}:
             row_state = "updating"
         else:
@@ -4392,11 +4425,11 @@ def _finmind_free_sources(
             "status_label": f"已驗證 {complete:,}/{total:,} 個交易日分區；{state}",
             "cadence": "交易日 14:00 後嘗試追新；歷史按官方速率續補",
             "update_owner": "FinMind 免費資料下載器",
-            "latest_at_utc": None,
+            "latest_at_utc": item.get('last_receipt_at_utc'),
             "data_through": latest,
             "freshness": date_freshness,
             "coverage": _coverage(complete, total, unit="交易日分區", label="逐日完整格點") if total else None,
-            "eta": _unknown_eta(
+            "eta": _complete_eta('已登記分區均有逐日格點收據，並已到發布邊界的預期交易日。') if row_state == 'current' else _unknown_eta(
                 "running_unmeasured" if row_state == "updating" else "waiting_schedule",
                 "總網路時間至少受 FinMind 每小時配額限制；重試及來源缺口使精確完工時間未知。",
             ),
@@ -4406,6 +4439,7 @@ def _finmind_free_sources(
             "registry_alias": False,
             "detail": "只有交易所盤中全市場彙總，不是逐檔 L2 或逐筆；原始來源尚非 PIT 訓練特徵。",
             "warnings": ["早期來源實測為 1 分鐘；逐日收據記錄實際格點，不將 1 分鐘偽標為 5 秒。"],
+            "_publication_hint": release_hint,
             "record_stats": {
                 "count": record_count,
                 "first": item.get("first_complete_date"),
@@ -4571,6 +4605,7 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
         failed = _integer(item.get("failed")) or 0
         blocked = _integer(item.get("blocked")) or 0
         non_session = _integer(item.get("non_session")) or 0
+        calendar_wait = _integer(item.get("calendar_wait")) or 0
         calendar_verified = session_policy.get("state") == "receipt_verified"
         checked = complete + empty
         latest = item.get("last_data_date")
@@ -4588,31 +4623,17 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
                 last_checked_day = None
             if last_checked_day is not None:
                 public_root = Path(__file__).resolve().parents[2] / "data_tw_public"
-                for offset in range(1, 22):
-                    candidate = last_checked_day + timedelta(days=offset)
-                    decision = tw_stock_day_decision(candidate, parquet_root=public_root, observed=now)
-                    if decision.status == "unknown":
-                        break
-                    if decision.is_session:
-                        publication_hint = {
-                            "schedule_kind": "historical_release_inference",
-                            "schedule_label": f"下個台股交易日約 {spec.release_hour:02d}:00（台北時間）",
-                            "expected_release_at_utc": _iso(datetime.combine(
-                                candidate, datetime_time(spec.release_hour), tzinfo=TAIPEI
-                            )),
-                            "expected_release_basis": (
-                                "FinMind 來源既有發布時段與 TWSE 官方交易日曆推測；"
-                                "不是供應商逐分公告保證"
-                            ),
-                        }
-                        break
+                publication_hint = _finmind_stock_release_hint(
+                    last_checked_day, spec.release_hour, spec.release_minute,
+                    public_root=public_root, now=now)
         rows.append({
             "id": f"finmind:sponsor:{spec.dataset}", "parent_id": "group:finmind-free",
             "scope": "source_registry", "title": f"{spec.dataset}（Sponsor 全市場）",
             "provider": "FinMind", "category": "taiwan_market_sponsor",
             "status": state,
             "status_label": (f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}"
-                             + (f"；已驗證非交易日排除 {non_session:,}" if calendar_verified and non_session else "")),
+                             + (f"；已驗證非交易日排除 {non_session:,}" if calendar_verified and non_session else "")
+                             + (f"；等待日曆重判 {calendar_wait:,}（不計下載完成）" if calendar_wait else "")),
             "cadence": "按官方實際帳號額度共用節流；全市場日期分區增量",
             "update_owner": ("FinMind Sponsor 長表本機衍生" if spec.dataset == FINMIND_DERIVED_WIDE
                              else "FinMind Sponsor 資料下載器"),
@@ -6438,7 +6459,9 @@ def _operation_state(
             return "catching_up", "running", "正在修復已知缺口"
         return "unable", "failed", str(row.get("status_label") or "完整性稽核未通過")
     if mode == "on_demand":
-        return "complete", "on_demand", "端點按需逐次完成，沒有常駐下載佇列"
+        # No standing acquisition target exists. The last snapshot's age must
+        # remain visible, but an on-demand capability cannot certify freshness.
+        return "reference", "on_demand", "隨需查詢；沒有常駐下載目標，不代表最新資料已取得"
     if (
         raw_status in {"current", "complete", "waiting", "stale"}
         and mode != "frozen"
@@ -6662,6 +6685,11 @@ def _acquisition_progress(
     # day would invent a target on weekends/holidays (e.g. 2026-09-25).
     main_history = row.get("id") == "taifex:public-history"
     preparing_for_date = None if rule_archive or aggregate_archive or main_history else _next_data_date(data_through)
+    if str(row.get('id', '')).startswith('finmind:'):
+        release_hint = publication
+        if isinstance(release_hint, Mapping) and release_hint.get('schedule_kind') == 'historical_release_inference':
+            release = _parse_time(release_hint.get('expected_release_at_utc'))
+            preparing_for_date = release.astimezone(TAIPEI).date().isoformat() if release else None
     first_data_observed = bool(
         data_through
         or (current is not None and current > 0)

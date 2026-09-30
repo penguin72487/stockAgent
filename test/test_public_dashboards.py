@@ -894,7 +894,23 @@ def test_day_trade_clock_ends_at_auction_without_overnight_contract_details() ->
     assert re.findall(r"<time>([^<]+)</time>", timeline) == [
         "09:00", "盤中", "13:20", "13:24", "13:25", "13:30",
     ]
-    assert "沒有成交證據的部位仍顯示未平倉" in timeline
+    closing_step = re.search(r"<li><time>13:30</time>.*?</li>", timeline, re.DOTALL)
+    assert closing_step is not None
+    # Closing capacity was explicitly removed from the paper contract. Price
+    # provenance and deliverability still govern whether a position can close.
+    # Assert those requirements in the closing step, not obsolete generic copy.
+    for requirement in (
+        "收盤價不限容量紙上平倉",
+        "有效的當日官方收盤",
+        "非試撮收盤價格",
+        "不限制成交量",
+        "缺收盤價",
+        "停牌",
+        "未交付",
+        "仍顯示未平倉",
+        "不是券商成交回報",
+    ):
+        assert requirement in closing_step.group(0)
     assert '<template id="overnight-source-contract"><dl class="source-list">' in panel
     assert 'timeline.after(sourceTemplate.content.cloneNode(true))' in javascript
     assert "if (!IS_OVERNIGHT) return;" in javascript
@@ -1229,7 +1245,7 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=12' in page
+        assert b'app.js?v=13' in page
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
     finally:
@@ -1347,13 +1363,19 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
         "health": "active", "monitor_age_seconds": 4, "quota_age_seconds": 6,
         "quota": {}, "quota_history": [], "acquisition": {}, "release_gate": {},
         "training": {}, "storage": {}, "datasets": [],
-        "volume_estimate": {
-            "measured_bytes": 60 * 1024 ** 2, "estimated_remaining_bytes": 60 * 1024 ** 2,
-            "estimated_total_bytes": 120 * 1024 ** 2,
-            "high_scenario_total_bytes": 180 * 1024 ** 2,
-            "estimated_coverage_ratio": .5, "measured_files": 3,
-            "catalog_keys": 6, "global_estimated_keys": 2,
-            "small_category_estimated_keys": 0,
+        "workload": {
+            "state": "available", "generated_at_utc": "2026-09-28T02:00:00Z",
+            "transfer": {"completed_bytes": 60 * 1024 ** 2,
+                         "remaining_bytes_estimate": 60 * 1024 ** 2,
+                         "total_bytes_estimate": 120 * 1024 ** 2, "ratio": .5},
+            "unknown_transfer_keys": 0, "unknown_record_keys": 0,
+            "work_time": {"completed_seconds": 300, "remaining_seconds_estimate": 100,
+                          "total_seconds_estimate": 400, "unknown_keys": 0, "ratio": .75},
+            "records": [{"unit": "wide_values", "label": "寬表非空資料格",
+                         "local_count": 10000, "completed_count": 5000,
+                         "remaining_estimate": 5000, "total_estimate": 10000, "ratio": .5}],
+            "scenarios": {"reference": {"finish_at_utc": "2026-09-29T00:07:00Z",
+                                         "processing_seconds": 420, "quota_opening_wait_seconds": 78000}},
         },
     }
     attempts = 0
@@ -1386,8 +1408,14 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 # Read-only assertions must not depend on Chromium animation frames:
                 # headless WSL may suppress rAF, making scroll_into_view hang.
                 assert page.locator("#volume-progress-label").is_visible()
-                assert page.locator("#volume-progress-label").text_content() == "50.0% · 低信心情境"
+                assert page.locator("#volume-progress-label").text_content() == "50.0% · 可估範圍"
                 assert page.locator("#volume-progress").get_attribute("value") == "0.5"
+                assert page.locator("#workload-time-progress").get_attribute("value") == "0.75"
+                assert "75.0%" in page.locator("#workload-time-ratio").text_content()
+                assert "2026" in page.locator("#download-global-eta").text_content()
+                assert "10,000" in page.locator("#workload-records").text_content()
+                assert "5,000" in page.locator("#workload-records").text_content()
+                assert page.locator("#download-progress").count() == 0
                 page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
                 page.locator("#finlab-health").get_by_text("更新暫停，顯示上次資料").wait_for(timeout=5000)
                 assert page.locator("#pipeline-grid .pipeline-card").count() == 5

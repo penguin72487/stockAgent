@@ -37,9 +37,11 @@ from scripts.taifex_daily_download_common import sha256_path
 
 BASE = 'https://www.taifex.com.tw'
 INDEX_URL = BASE + '/cht/11/hisNews'
+LEGAL_INDEX_URL = BASE + '/cht/6/infor'
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_COMPRESSED_BYTES = MAX_RESPONSE_BYTES + 1024 * 1024
 SEEDS = (
+    ('legal_revisions', '歷史法規修訂資訊與原始附件', LEGAL_INDEX_URL),
     ('contract_adjustments', '契約調整近期表', BASE + '/cht/4/contractAdj'),
     ('position_limits_non_equity', '非個股部位限額', BASE + '/cht/4/traderPLNonEquity'),
     ('position_limits_equity', '個股部位限額', BASE + '/cht/4/traderPLEquity'),
@@ -205,6 +207,44 @@ def document_links(content: bytes, url: str, *, discover_specs: bool = False) ->
     return list(links.values())
 
 
+def parse_legal_index(content: bytes) -> list[dict]:
+    """The separate legal archive retains attachments lost from old news pages.
+
+    Its complete, unpaginated listing uses #printhere, not #content. Bind
+    publication dates to its rows; neither the capture time nor a linked PDF's
+    file name supplies the historical publication clock.
+    """
+    soup = BeautifulSoup(content, 'html.parser')
+    node = soup.select_one('#printhere')
+    tables = [] if node is None else [t for t in node.select('table')
+        if [c.get_text(strip=True) for c in t.select('tr th')] == ['日期', '標題']]
+    if len(tables) != 1:
+        raise ValueError('legal_revision_table_missing_or_ambiguous')
+    rows = {}
+    for tr in tables[0].select('tr'):
+        cells = tr.find_all('td', recursive=False)
+        if not cells:
+            continue
+        if len(cells) != 2:
+            raise ValueError('unexpected_legal_revision_row')
+        match = DATE.fullmatch(cells[0].get_text(strip=True))
+        link = cells[1].find('a', href=True)
+        url = official_url(link['href'], LEGAL_INDEX_URL) if link else None
+        if not match or not url or urlsplit(url).path != '/cht/6/inforDetail':
+            raise ValueError('invalid_legal_revision_date_or_link')
+        published = date(*map(int, match.groups()))
+        title = link.get_text(' ', strip=True)
+        if not title:
+            raise ValueError('empty_legal_revision_title')
+        identity = digest(f'{published}|{title}|{url}'.encode())
+        rows[identity] = dict(id=identity, published_date=str(published), title=title,
+                             url=url, category=topic(title), download_allowed=True,
+                             published_at=None, publication_precision='date_only')
+    if not rows:
+        raise ValueError('empty_legal_revision_archive')
+    return list(rows.values())
+
+
 def open_queue(root: Path) -> sqlite3.Connection:
     state = root / 'state'
     state.mkdir(parents=True, exist_ok=True)
@@ -217,6 +257,7 @@ def open_queue(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS announcements (
             id TEXT PRIMARY KEY, published_date TEXT, title TEXT, url TEXT,
             category TEXT, download_allowed INTEGER, publication_precision TEXT);
+        CREATE INDEX IF NOT EXISTS announcements_url ON announcements(url);
         CREATE TABLE IF NOT EXISTS documents (
             url TEXT PRIMARY KEY, kind TEXT, source_id TEXT, priority INTEGER,
             state TEXT DEFAULT 'pending', checked_at TEXT, next_retry TEXT,
@@ -516,6 +557,15 @@ def persist_parse_version(conn, root: Path, task, body: bytes, *, content_type: 
 
 def discover_preserved_links(conn, body: bytes, task, parsed_format: str, *, refresh_existing: bool = True) -> None:
     if parsed_format == 'html':
+        if task['url'] == LEGAL_INDEX_URL:
+            for row in parse_legal_index(body):
+                conn.execute('INSERT OR IGNORE INTO announcements VALUES(?,?,?,?,?,?,?)',
+                    tuple(row[key] for key in ('id', 'published_date', 'title', 'url',
+                        'category', 'download_allowed', 'publication_precision')))
+                enqueue(conn, row['url'], 'announcement', row['category'],
+                        1 if row['category'] != 'other_announcements' else 5)
+                conn.execute('INSERT OR IGNORE INTO links VALUES(?,?,?)',
+                             (task['url'], row['url'], row['title']))
         for url, label, kind in document_links(body, task['url'], discover_specs=task['source_id'] == 'contract_specs'):
             enqueue(conn, url, kind, task['source_id'], 0)
             if refresh_existing:
@@ -548,6 +598,30 @@ def process_document(conn, root: Path, task, session, limiter) -> None:
                   result['table_rows'], result['temporal_rows'], result['parser_version'], result['parsed_at'],
                   content_type, task['url']))
     conn.commit()
+
+
+def next_document(conn, *, prioritize_rules: bool = False):
+    """Prioritize dated rules while retaining the full queue and retry clocks."""
+    order = "(d.state='failed'),d.priority,d.url DESC"
+    if prioritize_rules:
+        order = """CASE
+            WHEN d.kind='attachment' AND d.source_id IN
+                ('margins','position_limits','contract_specs') THEN 0
+            WHEN EXISTS (SELECT 1 FROM announcements a WHERE a.url=d.url
+                AND a.category='margins' AND a.title NOT LIKE '%抵繳%'
+                AND (a.title LIKE '%金金額%' OR a.title LIKE '%級距%'
+                     OR a.title LIKE '%適用比例%' OR a.title LIKE '%金比例%'
+                     OR a.title LIKE '%金計收%' OR a.title LIKE '%原始保證金%')) THEN 1
+            WHEN d.source_id='position_limits' THEN 2
+            WHEN d.source_id='contract_specs' THEN 3
+            ELSE 4 END,(d.state='failed'),d.priority,
+            COALESCE((SELECT MIN(a.published_date) FROM announcements a
+                      WHERE a.url=d.url),'9999'),d.url"""
+    return conn.execute(
+        "SELECT d.* FROM documents d WHERE d.state IN ('pending','failed') "
+        "AND (d.next_retry IS NULL OR d.next_retry<=?) ORDER BY " + order + " LIMIT 1",
+        (now_iso(),),
+    ).fetchone()
 
 
 def reparse_document(conn, root: Path, task) -> dict:
@@ -654,13 +728,16 @@ def publish_status(conn, root: Path, *, start_year: int, end: date, running: boo
 
 
 def reparse_batch(conn, root: Path, *, started: float, max_documents: int, max_seconds: float,
-                  errors: list[dict], explicit: bool, start_year: int, end: date) -> tuple[int, int]:
+                  errors: list[dict], explicit: bool, start_year: int, end: date,
+                  statuses: tuple[str, ...] = ()) -> tuple[int, int]:
     version = current_parser_version()
+    status_filter = (' AND parsing_status IN (' + ','.join('?' for _ in statuses) + ')') if statuses else ''
     tasks = conn.execute('''SELECT * FROM documents WHERE content_sha256 IS NOT NULL
         AND parser_version<? AND (? OR last_reparse_attempt_version<?)
+        ''' + status_filter + '''
         ORDER BY (parsing_status='unsupported' AND
             (lower(url) LIKE '%.docx' OR lower(url) LIKE '%.odt' OR lower(url) LIKE '%.ods')) DESC,
-            priority,url LIMIT ?''', (version, int(explicit), version, max_documents)).fetchall()
+            priority,url LIMIT ?''', (version, int(explicit), version, *statuses, max_documents)).fetchall()
     attempted = succeeded = 0
     for task in tasks:
         if time.monotonic() - started >= max_seconds:
@@ -694,13 +771,26 @@ def main(argv=None) -> int:
     parser.add_argument('--max-seconds', type=float, default=1800)
     parser.add_argument('--request-interval', type=float, default=1.0)
     parser.add_argument('--index-only', action='store_true')
+    parser.add_argument('--prioritize-rules', action='store_true',
+                        help='Collect dated margin, position and specification notices first; preserve the full queue')
+    parser.add_argument('--legal-revisions-only', action='store_true',
+                        help='Seed the separate historical legal archive without querying annual news indexes')
+    parser.add_argument('--download-only', action='store_true',
+                        help='Prioritize missing raw documents without spending the HTTP budget on offline reparse')
     parser.add_argument('--reparse-only', action='store_true',
                         help='Verify and reparse old local captures under the newest parser; never create HTTP or limiter objects')
+    parser.add_argument('--reparse-status', action='append', default=[],
+                        choices=('unsupported', 'pending_ocr', 'failed', 'partial', 'empty', 'parsed'),
+                        help='Restrict an offline reparse to these previous statuses; repeat to select multiple')
     parser.add_argument('--offline-audit', action='store_true',
                         help='Export local inventory without HTTP; not a full payload-hash audit')
     args = parser.parse_args(argv)
     if args.reparse_only and (args.index_only or args.offline_audit):
         parser.error('--reparse-only cannot be combined with --index-only or --offline-audit')
+    if args.download_only and (args.reparse_only or args.index_only or args.offline_audit):
+        parser.error('--download-only cannot be combined with offline or index-only modes')
+    if args.reparse_status and not args.reparse_only:
+        parser.error('--reparse-status requires --reparse-only')
     if not 1997 <= args.start_year <= args.end.year or args.end > date.today():
         parser.error('valid 1997..today date range required')
     if args.request_interval < 1 or args.max_documents < 1 or args.max_seconds <= 0:
@@ -724,11 +814,12 @@ def main(argv=None) -> int:
                 return 0
             started, attempted, reparsed = time.monotonic(), 0, 0
             errors = []
-            if not args.index_only:
+            if not args.index_only and not args.download_only:
                 attempted, reparsed = reparse_batch(
                     conn, root, started=started, max_documents=args.max_documents,
                     max_seconds=args.max_seconds, errors=errors, explicit=args.reparse_only,
                     start_year=args.start_year, end=args.end,
+                    statuses=tuple(args.reparse_status),
                 )
             if args.reparse_only or attempted >= args.max_documents or time.monotonic() - started >= args.max_seconds:
                 report = publish_status(conn, root, start_year=args.start_year, end=args.end,
@@ -754,6 +845,8 @@ def main(argv=None) -> int:
                 return 0
             provider_deferred = False
             for source_id, _, url in SEEDS:
+                if args.legal_revisions_only and source_id != 'legal_revisions':
+                    continue
                 enqueue(conn, url, 'snapshot', source_id, 0)
             # Current pages refresh independently from immutable historical
             # documents. Repeated URL bodies get new content-addressed versions.
@@ -773,7 +866,7 @@ def main(argv=None) -> int:
             limiter = SharedRateLimiter(args.request_interval, name='taifex_public_history')
             with requests.Session() as session:
                 session.headers['User-Agent'] = 'stockAgent/taifex-official-rule-research (bounded archive)'
-                for year in range(args.end.year, args.start_year-1, -1):
+                for year in (() if args.legal_revisions_only else range(args.end.year, args.start_year-1, -1)):
                     if time.monotonic()-started >= args.max_seconds:
                         break
                     try:
@@ -787,7 +880,7 @@ def main(argv=None) -> int:
                     publish_status(conn, root, start_year=args.start_year, end=args.end, running=True, errors=errors,
                                    offline_reparsed_count=reparsed)
                 while not provider_deferred and not args.index_only and attempted < args.max_documents and time.monotonic()-started < args.max_seconds:
-                    task = conn.execute("SELECT * FROM documents WHERE state IN ('pending','failed') AND (next_retry IS NULL OR next_retry<=?) ORDER BY (state='failed'),priority,url DESC LIMIT 1", (now_iso(),)).fetchone()
+                    task = next_document(conn, prioritize_rules=args.prioritize_rules)
                     if task is None:
                         break
                     attempted += 1

@@ -23,6 +23,8 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+from downloader.artifact_io import durable_replace
+
 
 STREAMING_KEYS = frozenset({
     "broker_transactions", "after_market_fixed_price:市場別", "after_market_fixed_price:資料來源",
@@ -33,6 +35,14 @@ RAW_CONTRACT = 1
 
 class FinlabResourceDeferred(RuntimeError):
     """Known transfer cannot fit the remaining account or disk budget."""
+
+
+def whole_table_reserve_bytes(key: str, previous_bytes: int) -> int:
+    """One admission policy shared by the downloader and its ETA projection."""
+    if key not in STREAMING_KEYS:
+        return previous_bytes
+    floor = 1024 * 1024**2 if key == "broker_transactions" else 192 * 1024**2
+    return max(floor, int(previous_bytes * 1.2))
 
 
 def _sha256(path: Path) -> str:
@@ -56,7 +66,7 @@ def _atomic_json(path: Path, payload: dict) -> None:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode())
             handle.flush()
             os.fsync(handle.fileno())
-            os.replace(temp, path)
+            durable_replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
 
@@ -166,8 +176,7 @@ def acquire_raw(key: str, root: Path, stem: str, *, refresh: bool,
         raise FinlabResourceDeferred("FinLab quota unknown")
     # The SDK signs/account-charges whole tables. Date slicing is not remote
     # partitioning. Reserve before signing, not after wasting the allocation.
-    floor = 1024 * 1024**2 if key == "broker_transactions" else 192 * 1024**2
-    estimate = max(floor, int(previous.get("raw_bytes", 0) * 1.2))
+    estimate = whole_table_reserve_bytes(key, int(previous.get("raw_bytes", 0)))
     if room_mb * 1024**2 < estimate + quota_reserve_mb * 1024**2:
         raise FinlabResourceDeferred("FinLab remaining quota insufficient for bounded whole table")
     if shutil.disk_usage(raw_root).free < MAX_RAW_BYTES * 4 + 4 * 1024**3:
@@ -204,7 +213,7 @@ def _commit_raw(temp: Path, root: Path, stem: str, key: str, mode: str, origin: 
         if _sha256(target) != digest:
             raise ValueError("FinLab raw object hash mismatch")
     else:
-        os.replace(temp, target)
+        durable_replace(temp, target)
     return {"contract_version": RAW_CONTRACT, "dataset": key, "status": "raw_acquired_unvalidated",
             "raw_path": str(target.relative_to(root)), "raw_sha256": digest, "raw_bytes": target.stat().st_size,
             "source_checked_at_utc": datetime.now(UTC).isoformat(), "source_check_mode": mode,

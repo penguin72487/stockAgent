@@ -74,14 +74,15 @@ def test_registry_covers_live_source_union_once_and_retains_owner_contracts():
     assert {"sponsor", "complement"} <= set(shared["owners"])
     assert {"sponsor", "complement"} <= set(shared["owner_contracts"])
     assert shared["primary_owner"] == "sponsor"
-    assert registry["TaiwanStockNews"]["disabled"] is True
-    assert registry["TaiwanStockNews"]["owners"] == ["disabled_policy"]
+    assert registry["TaiwanStockNews"]["disabled"] is False
+    assert registry["TaiwanStockNews"]["owners"] == ["complement"]
 
 
 def test_missing_queues_are_unknown_and_inventory_has_no_side_effects(tmp_path):
     report = audit.build_inventory(tmp_path, now=NOW)
 
     assert report["coverage"]["unique_dataset_count"] == len(expected_datasets())
+    assert report['coverage']['explicit_disabled_news_rows'] == 0
     current_alias_count = (
         len(sponsor.SOURCES) + len(complement.ALL_DATASETS)
         + len(free.SESSION_DATASETS) + 2 + len(sponsor.UNSCHEDULED)
@@ -217,7 +218,7 @@ def test_inventory_rechecks_current_range_contracts(monkeypatch, tmp_path):
     )
     contract = registry[candidate]["owner_contracts"]["sponsor"]
     assert contract["query_shape"] == "whole_market_date_range"
-    assert contract["max_span"] == "all_due_contiguous_pending_periods"
+    assert contract["max_span"] == "all_due_contiguous_periods"
     report = audit.build_inventory(tmp_path, now=NOW)
     assert dataset_row(report, candidate)["owner_contracts"]["sponsor"] == contract
 

@@ -19,6 +19,9 @@ SHARE_FIELDS: dict[str, tuple[str, ...]] = {
     "TaiwanStockMonthPrice": ("trading_volume",),
     "TaiwanStockBlockTrade": ("volume",),
     "TaiwanStockBlockTradingDailyReport": ("buy", "sell"),
+    "TaiwanStockTradingDailyReport": ("buy", "sell"),
+    "TaiwanStockWarrantTradingDailyReport": ("buy", "sell"),
+    "TaiwanStockTradingDailyReportSecIdAgg": ("buy_volume", "sell_volume"),
     "TaiwanStockIndustryChainMoneyFlow": ("trading_volume",),
 }
 COLLATERAL_PREFIXES = (

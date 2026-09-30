@@ -46,12 +46,26 @@ def test_isolated_inference_command_overrides_train_mode_in_fresh_process() -> N
         ["--config", "experiment.yaml", "--mode", "train"]
     )
 
-    assert command[-4:] == [
+    assert command[-6:] == [
         "--mode",
         "infer",
+        "--multi-gpu-strategy",
+        "none",
         "--no-post-train-infer",
         "--no-isolate-train-folds",
     ]
+
+
+def test_inference_does_not_relaunch_training_ddp(monkeypatch) -> None:
+    config = SimpleNamespace(
+        training=SimpleNamespace(multi_gpu_strategy="distributed_data_parallel"),
+        runner=SimpleNamespace(mode="infer", isolate_train_folds=False),
+    )
+    args = SimpleNamespace(mode=None, multi_gpu_strategy="distributed_data_parallel")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inference must not enter training DDP setup")
+    monkeypatch.setattr(train, "_resolve_multi_gpu_strategy", forbidden)
+    train._maybe_relaunch_for_ddp(config, args)
 
 
 def test_isolated_fold_runner_uses_sequential_children_and_stops_on_failure(

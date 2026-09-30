@@ -19,14 +19,46 @@ def evidence():
     }}
     telemetry = {'quota': {'official_requests_per_hour': 6000, 'paced_requests_per_hour': 5900,
                           'reserved_requests_per_hour': 100, 'account_fresh': True},
-                 'traffic': {'rate_distributions': {'24h': {'p50': 5600, 'p10': 5100,
+                 'traffic': {'windows': {'1h': {'attempts': 5600, 'wall_requests_per_hour': 5600,
+                                               'complete_window': True}},
+                             'rate_distributions': {'24h': {'p50': 5600, 'p10': 5100, 'wall_p10': 5100,
                                                           'active_bin_count': 96, 'idle_bin_count': 0}}}}
     return work, telemetry
 
 
 def estimate(work=None, telemetry=None):
     a, b = evidence()
-    return estimate_completion(work or a, telemetry or b, NOW, day_is_protected=lambda _: False)
+    return estimate_completion(work or a, telemetry or b, NOW, day_is_protected=lambda _: False,
+                               secondary_admission={'allowed': True})
+
+
+@pytest.mark.parametrize('admission', [None, {'allowed': False}])
+def test_blocked_or_unknown_admission_has_work_duration_but_no_completion_clock(admission):
+    work, telemetry = evidence()
+    result = estimate_completion(work, telemetry, NOW, secondary_admission=admission)
+    assert result['state'] == 'waiting_admission'
+    for row in result['scenarios'].values():
+        assert row['active_work_seconds'] > 0
+        assert row['remaining_seconds'] is None
+        assert row['estimated_complete_at_utc'] is None
+
+
+def test_quota_pause_does_not_start_eta_from_now():
+    work, telemetry = evidence()
+    telemetry['quota']['current_budget'] = {'allowed': False}
+    result = estimate(work, telemetry)
+    assert result['state'] == 'waiting_quota'
+    assert all(row['estimated_complete_at_utc'] is None for row in result['scenarios'].values())
+
+
+def test_public_waiting_projection_drops_old_finish_but_keeps_active_work(tmp_path):
+    payload = estimate()
+    payload['state'] = 'waiting_admission'
+    (tmp_path / 'eta_status.json').write_text(json.dumps({'schema_version': 1, 'estimate': payload}))
+    result = public_completion_estimate(tmp_path, NOW)
+    assert result['state'] == 'waiting_admission'
+    assert result['scenarios']['fastest']['active_work_seconds'] > 0
+    assert all(row['estimated_complete_at_utc'] is None for row in result['scenarios'].values())
 
 
 def test_scenarios_share_one_quota_and_preserve_uncertain_tail():
@@ -43,6 +75,7 @@ def test_scenarios_share_one_quota_and_preserve_uncertain_tail():
 def test_invalid_observed_rate_is_not_zero_time(rate):
     work, telemetry = evidence()
     telemetry['traffic']['rate_distributions']['24h'].update(p50=rate, p10=rate)
+    telemetry['traffic']['windows']['1h']['wall_requests_per_hour'] = rate
     result = estimate(work, telemetry)
     assert result['state'] == 'warming_up'
     assert result['scenarios']['central']['remaining_seconds'] is None
@@ -94,6 +127,43 @@ def test_long_horizon_converges_and_naive_datetime_rejected():
     assert finish > NOW + timedelta(days=300) and pause > 0
     with pytest.raises(ValueError):
         scheduled_finish(NOW.replace(tzinfo=None), 1, day_is_protected=lambda _: False)
+    finish, _ = scheduled_finish(NOW, 800 * 86400, day_is_protected=lambda _: False)
+    assert finish == NOW + timedelta(days=800)
+
+
+def test_recent_full_hour_and_future_load_replace_old_idle_rates_and_backlog_reserve():
+    work, telemetry = evidence()
+    telemetry['traffic']['rate_distributions']['1h'] = {'complete_bin_count':4, 'active_bin_count':4,
+                                                       'p50':5200, 'p10':4000, 'wall_p10':4000}
+    telemetry['traffic']['windows']['1h'].update(attempts=5000, wall_requests_per_hour=5000)
+    telemetry['quota'].update(reserved_requests_per_hour=6000, forecast_recurring_requests_per_hour=1000)
+    result = estimate(work, telemetry)
+    assert result['rate_evidence']['observation_window'] == 'rolling_60m'
+    assert result['scenarios']['central']['effective_requests_per_hour'] == 4000
+    assert result['scenarios']['central']['remaining_seconds'] == 5400
+
+
+def test_incomplete_hour_never_silently_falls_back_to_active_bin_median():
+    work, telemetry = evidence()
+    telemetry['traffic']['windows']['1h']['complete_window'] = False
+    result = estimate(work, telemetry)
+    assert result['scenarios']['central']['remaining_seconds'] is None
+    assert result['scenarios']['fastest']['remaining_seconds'] > 0
+
+
+def test_conservative_idle_bins_are_not_removed():
+    work, telemetry = evidence()
+    telemetry['traffic']['rate_distributions']['24h'].update(wall_p10=0, idle_bin_count=15)
+    result = estimate(work, telemetry)
+    assert result['scenarios']['central']['remaining_seconds'] > 0
+    assert result['scenarios']['slowest']['remaining_seconds'] is None
+
+
+def test_reserved_quota_is_not_total_worker_stop_when_incremental_work_continues():
+    work, telemetry = evidence()
+    work['summary']['incremental_requests'] = 100
+    telemetry['quota']['current_budget'] = {'allowed':False, 'remaining':100}
+    assert estimate(work, telemetry)['state'] == 'conditional'
 
 
 def write_snapshot(tmp_path, payload):

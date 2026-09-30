@@ -36,7 +36,7 @@ CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION = 6
 
 
 class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
-    """Read all stock histories and emit a fixed 1,936-slot futures action.
+    """Read all stock histories and emit a versioned fixed futures action axis.
 
     Every stock/ETF futures token first receives a learned gated residual from
     its own cash-underlying embedding. Four learned market queries then read
@@ -50,6 +50,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self,
         *args: Any,
         futures_product_capacity: int = 1024,
+        futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
         futures_joint_market_tokens: int = 4,
         futures_denomination_aware_output: bool = False,
         futures_denomination_hard_projection: bool | None = None,
@@ -60,6 +61,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        futures_slot_layout_version(futures_slot_count)
+        self.futures_slot_count = int(futures_slot_count)
         if int(futures_product_capacity) < 2:
             raise ValueError("futures_product_capacity must be at least two")
         if int(futures_joint_market_tokens) < 1:
@@ -126,7 +130,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             self.d_model,
         )
         self.futures_slot_embedding = nn.Embedding(
-            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+            self.futures_slot_count,
             self.d_model,
         )
         self.futures_underlying_norm = PortfolioRMSNorm(self.d_model)
@@ -186,7 +190,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             self.futures_current_open_encoder = None
         self.register_buffer(
             "futures_slot_indices",
-            torch.arange(TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT),
+            torch.arange(self.futures_slot_count),
             persistent=False,
         )
 
@@ -257,7 +261,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         if (
             features.ndim != 3
             or tuple(features.shape[:2])
-            != (batch_size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
+            != (batch_size, self.futures_slot_count)
             or int(features.size(-1))
             not in {
                 base_features,
@@ -269,13 +273,13 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         ):
             raise ValueError(
                 "all-futures candidate_features must have shape "
-                f"[B,{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT},"
+                f"[B,{self.futures_slot_count},"
                 f"{base_features}, {prior_features}, {expected_features}, or "
                 f"{current_open_features}], "
                 f"got {tuple(features.shape)}"
             )
         if tuple(mask.shape) != tuple(features.shape[:2]):
-            raise ValueError("all-futures candidate_mask must match [B,1936]")
+            raise ValueError(f"all-futures candidate_mask must match [B,{self.futures_slot_count}]")
         features = features.to(device=device)
         feature_width = int(features.size(-1))
         if self.futures_margin_budget_output != (feature_width == margin_features):

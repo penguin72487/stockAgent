@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>FinLab API 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=4">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
@@ -33,6 +33,7 @@
     </section>
 
     <nav class="jump-nav" aria-label="頁內導覽">
+      <a href="#workload">流量與完成時間</a>
       <a href="#pipelines">全部管線</a>
       <a href="#traffic">流量與費用</a>
       <a href="#storage">儲存容量</a>
@@ -42,6 +43,27 @@
     </nav>
 
     <section id="pipeline-alert" class="alert" hidden aria-live="polite"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+
+    <section id="workload" class="section-block" aria-labelledby="workload-title">
+      <header class="section-heading"><span>00</span><div><h2 id="workload-title">下載工作量與預估完成時間</h2><p id="workload-freshness">正在讀取本機工作量快照；不會額外呼叫 FinLab。</p></div></header>
+      <div class="progress-card">
+        <div class="finlab-volume-heading"><span>一般歷史追新 · 按來源檔傳輸量加權</span><strong id="volume-progress-label">待量測</strong></div>
+        <progress id="volume-progress" class="progress-track" max="1" aria-label="可估一般歷史追新的流量加權進度"></progress>
+        <div class="finlab-volume-values"><span>已查新工作量 <strong id="volume-downloaded">—</strong></span><span>預估仍需下載 <strong id="volume-remaining">—</strong></span><span>這輪工作總量 <strong id="volume-total">—</strong></span></div>
+        <p id="volume-basis" class="fleet-progress-detail">原始傳輸量與壓縮後落地容量分開計算。</p>
+        <div class="finlab-volume"><div class="finlab-volume-heading"><span>下載與轉存工作時間 · 依過往耗時加權</span><strong id="workload-time-ratio">—</strong></div><progress id="workload-time-progress" class="progress-track" max="1" aria-label="依過往耗時加權的追新進度"></progress><p id="workload-time-detail" class="fleet-progress-detail">不把配額等待算成下載進度。</p></div>
+        <div id="workload-records" class="workload-records" aria-label="按筆數口徑分開的追新進度"></div>
+      </div>
+      <div class="kpi-grid workload-eta">
+        <article class="kpi featured"><span>可排程待辦清完 · 參考情境</span><strong id="download-global-eta">待估算</strong><p id="workload-time-left">—</p></article>
+        <article class="kpi"><span>實際下載加處理 · 估計工作時間</span><strong id="workload-processing">—</strong><p>不含等待配額、排程和開盤保護</p></article>
+        <article class="kpi"><span>等待配額／排程／開盤保護</span><strong id="workload-wait">—</strong><p id="workload-reset-count">—</p></article>
+      </div>
+      <div class="workload-scenarios"><span>快速情境 <strong id="workload-fast">—</strong></span><span>較慢情境 <strong id="workload-slow">—</strong></span></div>
+      <p id="workload-eta-basis" class="data-note">估時僅涵蓋有來源大小與耗時樣本的固定待辦。時間均為台北時間。</p>
+      <p id="workload-budget" class="data-note">—</p>
+      <p id="workload-blockers" class="data-note">來源空值、未知歷史及最低優先級 Tick 另列，不會假算完成。</p>
+    </section>
 
     <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
       <header class="section-heading pipeline-heading"><span>01</span><div><h2 id="pipelines-title">所有資料管線</h2><p>先看是否可用，再看是否執行；服務運行不等於全目錄或逐檔歷史完整。</p></div></header>
@@ -100,7 +122,7 @@
 
     <section id="backfill" class="section-block" aria-labelledby="downloads-title">
       <header class="section-heading"><span>04</span><div><h2 id="downloads-title">全部歷史資料鍵</h2><p>SDK 目錄是分母；只有本機檔案與完成收據同時存在才列為已取得。</p></div></header>
-      <div class="progress-card"><div class="progress-copy"><div><span>全目錄鍵數進度</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>全部完成預計還要</span><strong id="download-global-eta">無可信倒數</strong><p>帳號共用額度與暫緩鍵使排隊完成時間無法可靠推算。</p></div></div><progress id="download-progress" class="progress-track" max="1" aria-label="FinLab 歷史鍵下載覆蓋率"></progress><div class="finlab-volume"><div class="finlab-volume-heading"><span>壓縮後來源檔容量進度 · 粗估</span><strong id="volume-progress-label">—</strong></div><progress id="volume-progress" class="progress-track" max="1" aria-label="FinLab 本機 Parquet 容量估計進度"></progress><div class="finlab-volume-values"><span>已抓 <strong id="volume-downloaded">—</strong></span><span>估計剩餘 <strong id="volume-remaining">—</strong></span><span>估計總量 <strong id="volume-total">—</strong></span></div><p id="volume-basis" class="fleet-progress-detail">正在核對本機檔案與目錄樣本…</p></div><p id="release-gate" class="fleet-progress-detail">正在核對全目錄最新查詢與打包條件…</p></div>
+      <p id="release-gate" class="fleet-progress-detail">正在核對全目錄最新查詢與打包條件…</p>
       <div class="kpi-grid">
         <article class="kpi featured"><span>已取得／目錄鍵</span><strong id="download-count">—</strong><p id="download-percent">—</p></article>
         <article class="kpi"><span>未下載</span><strong id="download-pending">—</strong><p>包含資源限制暫緩的鍵</p></article>
@@ -109,7 +131,7 @@
       </div>
       <p id="download-breakdown" class="data-note">—</p>
       <div class="finlab-toolbar"><label>搜尋資料鍵<input id="dataset-search" type="search" autocomplete="off" placeholder="鍵名或類別"></label><label>狀態<select id="dataset-filter"><option value="all">全部（未取得優先）</option><option value="not_downloaded">未取得（全部）</option><option value="downloaded">已取得</option><option value="pending">尚未嘗試</option><option value="attention">失敗／權限／暫緩</option></select></label><span id="dataset-result-count">—</span></div>
-      <div class="finlab-table-scroll" role="region" aria-label="FinLab 資料鍵明細" tabindex="0"><table><thead><tr><th>資料鍵</th><th>狀態</th><th>原因／下一步</th><th>最早</th><th>最新</th><th>非空列／事件列</th><th>本機容量</th><th>單鍵估計耗時</th><th>預計完成</th><th>最後嘗試</th><th>最後來源查詢</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="11">讀取中…</td></tr></tbody></table></div>
+      <div class="finlab-table-scroll" role="region" aria-label="FinLab 資料鍵明細" tabindex="0"><table><thead><tr><th>資料鍵</th><th>狀態</th><th>原因／下一步</th><th>最早</th><th>最新</th><th>資料量</th><th>筆數口徑</th><th>本機容量</th><th>需再下載 · 估</th><th>單鍵估計耗時</th><th>預計完成 · 條件情境</th><th>最後嘗試</th><th>最後來源查詢</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="13">讀取中…</td></tr></tbody></table></div>
       <button type="button" id="dataset-more" class="finlab-more" hidden>載入更多</button>
       <section class="finlab-market" aria-labelledby="market-title">
         <h3 id="market-title">全市場原始 Tick 與本機合成分鐘</h3>
@@ -135,10 +157,10 @@
 
     <section id="method" class="section-block method" aria-labelledby="method-title">
       <header class="section-heading"><span>06</span><div><h2 id="method-title">你看到的數字怎麼來</h2><p>公開面板只呈現必要的聚合證據。</p></div></header>
-      <p class="limitation">容量進度的已抓量是目前收據指向的本機 Parquet 位元組，與 FinLab 帳號流量 MB 不同；未下載鍵以同類檔案大小中位數估算，無同類樣本才使用全域中位數。較大情境是樣本第 90 百分位，不是上限；Tick、分鐘與券商資料等未取得時可能遠超推估總量。只有鍵數與收據／檔案守門可判定取得狀態，容量比例不能證明完整。單鍵估時只取本機完整 SDK 抓取的實測秒數：同鍵上次實測，或至少 3 個同類鍵的中位數至較慢樣本；沒有足夠樣本就顯示未知。排隊、共用額度和單鍵未知大小不納入耗時，所以未開始的鍵不虛構完成日；正在抓的鍵只在實測範圍內顯示預計完成。每日 5 GB 等額度以帳號實測為準，可能包括其他程式。新私有包須所有目錄鍵在 24 小時內強制來源查詢且本地 SHA-256 通過；舊包可保留但不得宣稱最新。鍵數與日期尾端不驗證逐股完整或歷史 PIT。遠端研究限定私人、非商業用途。</p>
+      <p class="limitation">流量進度以既有原始 Feather 物件大小為整表下載基準，不是壓縮後 Parquet，也不是帳號累計用量。分子是本輪已查新來源的大小，分母再加目前可估待辦；未知大小、來源全空與全市場 Tick 不會被假補成零。筆數依寬表非空資料格、明細列、來源標籤分開，不把一個交易日當成一筆全市場資料，也不混加不同口徑。估時使用上次強制下載及轉存耗時、逐表配額容納、日額度重置與交易日開盤保護；未來新增、重新到期工作及來源失敗不在固定待辦情境內。每分鐘只更新本機量測，瀏覽器不查 FinLab。新私有包仍須既有全目錄來源與雜湊守門；上述進度不保證逐股歷史完整或 PIT。遠端研究限定私人、非商業用途。</p>
     </section>
   </main>
   <script src="../dashboard-core.js?v=10" defer></script>
-  <script src="app.js?v=12" defer></script>
+  <script src="app.js?v=13" defer></script>
 </body>
 </html>

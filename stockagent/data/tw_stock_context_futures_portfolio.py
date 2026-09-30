@@ -104,12 +104,14 @@ TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS: Final[tuple[str, ...]] = (
 )
 
 
-def fixed_futures_slot_symbols() -> tuple[str, ...]:
+def fixed_futures_slot_symbols(slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT) -> tuple[str, ...]:
     """Return the immutable ordered all-futures action ABI."""
 
+    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+    futures_slot_layout_version(slot_count)
     return tuple(
         f"TAIFEX_SLOT_{slot:04d}"
-        for slot in range(1, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT + 1)
+        for slot in range(1, slot_count + 1)
     )
 
 
@@ -171,9 +173,9 @@ class TaiwanStockContextFuturesPortfolioDaily:
             raise ValueError("must_liquidate_mask must match the futures [T,S] axis")
         if self.integer_execution is not None:
             execution = np.asarray(self.integer_execution, dtype=np.float32).copy()
-            from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTH
+            from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
             if execution.shape[:2] != liquidation.shape or execution.shape[-1] not in {
-                len(TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS), MARGIN_EXECUTION_WIDTH,
+                len(TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS), *MARGIN_EXECUTION_WIDTHS,
             }:
                 raise ValueError(
                     "integer all-futures execution tensor has an invalid shape"
@@ -212,6 +214,8 @@ def attach_stock_context_futures_portfolio_daily(
     final_settlement_path: str | Path | None = None,
     integer_fee_per_contract_per_side_twd: float = 40.0,
     max_volume_participation: float = 0.0,
+    margin_rules_path: str | Path | None = None,
+    futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 ) -> PanelData:
     """Attach prior-session futures tokens and current execution facts.
 
@@ -278,17 +282,26 @@ def attach_stock_context_futures_portfolio_daily(
             f"{source_path}, {manifest_path}"
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if int(manifest.get("contract_version", -1)) != int(
-        TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
-    ):
+    if "materialization_version" in manifest:
+        from stockagent.data.tw_futures_margin_release import MARGIN_MATERIALIZATION_VERSION
+        if (manifest["materialization_version"] != MARGIN_MATERIALIZATION_VERSION
+                or manifest.get("status") != "complete"
+                or manifest.get("point_in_time_verified") is not True
+                or manifest.get("all_products_execution_ready") is not True):
+            raise ValueError("all-TWD market rows require complete dated accounting admission before training")
+        if margin_rules_path is None:
+            raise ValueError("all-TWD materialization requires its admitted margin rule tape")
+        if manifest.get("execution_rules_sha256") != _sha256_file(Path(margin_rules_path)):
+            raise ValueError("all-TWD daily release and execution rule tape differ")
+    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+    data_version=futures_slot_layout_version(futures_slot_count)
+    if int(manifest.get("contract_version", -1)) != data_version:
         raise ValueError("TAIFEX futures portfolio contract version mismatch")
     if int(manifest.get("feature_contract_version", -1)) != int(
         TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION
     ):
         raise ValueError("TAIFEX futures portfolio feature contract mismatch")
-    if int(manifest.get("fixed_model_output_slots", -1)) != int(
-        TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
-    ):
+    if int(manifest.get("fixed_model_output_slots", -1)) != futures_slot_count:
         raise ValueError("TAIFEX futures portfolio fixed-slot count mismatch")
     expected_sha = (
         manifest.get("outputs", {})
@@ -298,11 +311,33 @@ def attach_stock_context_futures_portfolio_daily(
     if expected_sha != _sha256_file(source_path):
         raise ValueError("TAIFEX futures portfolio data SHA-256 differs from manifest")
 
+    corporate_rules = None
+    terminal_component_terms = terminal_subscription_values = None
+    if margin_rules_path is not None:
+        from stockagent.data.tw_futures_margin import validate_margin_rule_source, MARGIN_CORPORATE_CONTRACT_VERSION
+        dated_rules, dated_manifest = validate_margin_rule_source(margin_rules_path, source_path)
+        if dated_manifest['schema_version'] >= MARGIN_CORPORATE_CONTRACT_VERSION:
+            if not integer_contracts or current_open_feature or carry_guard > 0:
+                raise ValueError('corporate margin requires whole contracts and prior-only candidate features')
+            corporate_rules = dated_rules
+            from stockagent.data.tw_futures_margin import (
+                MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION, load_margin_terminal_components)
+            if dated_manifest['schema_version'] >= MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION:
+                terminal_component_terms,terminal_subscription_values=load_margin_terminal_components(
+                    margin_rules_path,dated_manifest)
+
     dates = np.asarray(panel.dates, dtype="datetime64[D]")
     if dates.ndim != 1 or dates.size == 0 or np.isnat(dates).any():
         raise ValueError("stock panel dates must be a non-empty finite 1-D axis")
     if np.any(dates[1:] <= dates[:-1]):
         raise ValueError("stock panel dates must be strictly increasing")
+    if manifest.get("require_all_source_dates_in_stock_context") is True:
+        calendar = pl.from_arrow(pq.read_table(source_path, columns=["date"], memory_map=True))
+        source_calendar = calendar["date"].unique().to_numpy().astype("datetime64[D]")
+        missing_dates = np.setdiff1d(source_calendar, dates)
+        if missing_dates.size:
+            raise ValueError(f"stock context omits {missing_dates.size} all-TWD futures sessions; "
+                             f"first={missing_dates[0]} last={missing_dates[-1]}")
     source_columns = [
         "date",
         "product",
@@ -330,7 +365,7 @@ def attach_stock_context_futures_portfolio_daily(
                 "previous_volume",
             ]
         )
-    if current_open_feature or prior_denomination:
+    if current_open_feature or prior_denomination or corporate_rules is not None:
         source_columns.append("previous_settlement")
     if expiry_settlement_valuation:
         source_columns.append("liquidation_reason")
@@ -363,7 +398,7 @@ def attach_stock_context_futures_portfolio_daily(
         )["slot"]
         .to_numpy()
     )
-    if np.any((slot_numbers < 1) | (slot_numbers > TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)):
+    if np.any((slot_numbers < 1) | (slot_numbers > futures_slot_count)):
         raise ValueError("TAIFEX source contains a symbol outside the fixed-slot ABI")
     symbol_indices = slot_numbers.astype(np.int64, copy=False) - 1
     date_indices = date_indices[aligned].astype(np.int64, copy=False)
@@ -371,10 +406,19 @@ def attach_stock_context_futures_portfolio_daily(
     frame = frame.filter(pl.Series("aligned", aligned))
     if frame.height == 0:
         raise ValueError("TAIFEX futures rows do not intersect the stock date axis")
+    from stockagent.data.tw_futures_portfolio_daily import _validate_fixed_contract_units
+    if corporate_rules is None:
+        _validate_fixed_contract_units(frame)
+    else:
+        from stockagent.data.tw_futures_margin import corporate_margin_base_values
+        frame = corporate_margin_base_values(frame, corporate_rules, final_settlement_path,
+            terminal_component_terms=terminal_component_terms,
+            terminal_subscription_values=terminal_subscription_values)
     frame = frame.with_row_index("_aligned_source_row")
 
-    resolved_final_settlement_path: Path | None = None
-    if expiry_settlement_valuation:
+    resolved_final_settlement_path: Path | None = (
+        Path(final_settlement_path) if corporate_rules is not None and final_settlement_path is not None else None)
+    if expiry_settlement_valuation and corporate_rules is None:
         if final_settlement_path is None or not str(final_settlement_path).strip():
             raise ValueError(
                 "expiry settlement valuation requires a receipt-backed official "
@@ -456,7 +500,7 @@ def attach_stock_context_futures_portfolio_daily(
     # return-selection or portfolio-ranking heuristic.
     source_expiry_quarantine = np.zeros(frame.height, dtype=bool)
     incomplete_contracts: set[str] = set()
-    if expiry_settlement_valuation:
+    if expiry_settlement_valuation and corporate_rules is None:
         source_liquidation_reasons = np.asarray(
             [str(value or "").strip() for value in frame["liquidation_reason"].to_list()],
             dtype=object,
@@ -522,11 +566,11 @@ def attach_stock_context_futures_portfolio_daily(
                 .to_numpy()
             )
 
-    flat_keys = date_indices * TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT + symbol_indices
+    flat_keys = date_indices * futures_slot_count + symbol_indices
     if np.unique(flat_keys).size != flat_keys.size:
         raise ValueError("TAIFEX source contains duplicate date/fixed-slot rows")
 
-    shape = (dates.size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
+    shape = (dates.size, futures_slot_count)
     model_feature_columns = (
         TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS
         if prior_denomination
@@ -607,7 +651,12 @@ def attach_stock_context_futures_portfolio_daily(
     ] = True
 
     holding_values = frame["holding_log_return"].to_numpy().astype(np.float64)
-    if expiry_settlement_valuation:
+    if corporate_rules is not None:
+        ending_values = np.where(frame['_rule_terminal_event'].to_numpy() == 'cash_settlement',
+                                frame['_rule_terminal_contract_value_twd'].to_numpy(),
+                                frame['_rule_settlement_contract_value_twd'].to_numpy())
+        holding_values = np.log(ending_values / frame['_rule_opening_contract_value_twd'].to_numpy())
+    elif expiry_settlement_valuation:
         liquidation_reasons = np.asarray(
             [str(value or "").strip() for value in frame["liquidation_reason"].to_list()],
             dtype=object,
@@ -702,9 +751,9 @@ def attach_stock_context_futures_portfolio_daily(
     )
     if not np.all(valid_notional):
         raise ValueError("active TAIFEX rows require finite positive open and multiplier")
-    fee_rates[date_indices, symbol_indices] = (
-        fees / (opening_values * multipliers)
-    ).astype(np.float32)
+    full_open_values = (frame['_rule_opening_contract_value_twd'].to_numpy().astype(np.float64)
+                        if corporate_rules is not None else opening_values * multipliers)
+    fee_rates[date_indices, symbol_indices] = (fees / full_open_values).astype(np.float32)
 
     if integer_contracts:
         integer_fee = float(integer_fee_per_contract_per_side_twd)
@@ -790,19 +839,23 @@ def attach_stock_context_futures_portfolio_daily(
         integer_holding_values = integer_frame[
             "_effective_holding_log_return"
         ].to_numpy().astype(np.float64, copy=False)
-        open_notionals = opening_values * multipliers
+        open_notionals = full_open_values
         ending_notionals = open_notionals * np.exp(integer_holding_values)
-        unique_dates = integer_frame.select("date").unique().sort("date")
-        tax_schedule = {
-            value: stock_index_futures_tax_rate(value)
-            for value in unique_dates["date"].to_list()
-        }
-        tax_rates = np.asarray(
-            [tax_schedule[value] for value in integer_frame["date"].to_list()],
-            dtype=np.float64,
-        )
-        opening_tax = np.floor(open_notionals * tax_rates + 0.5)
-        ending_tax = np.floor(ending_notionals * tax_rates + 0.5)
+        if corporate_rules is not None:
+            opening_tax = integer_frame['_rule_opening_tax_twd'].to_numpy().astype(np.float64)
+            ending_tax = integer_frame['_rule_terminal_tax_twd'].to_numpy().astype(np.float64)
+        else:
+            unique_dates = integer_frame.select("date").unique().sort("date")
+            tax_schedule = {
+                value: stock_index_futures_tax_rate(value)
+                for value in unique_dates["date"].to_list()
+            }
+            tax_rates = np.asarray(
+                [tax_schedule[value] for value in integer_frame["date"].to_list()],
+                dtype=np.float64,
+            )
+            opening_tax = np.floor(open_notionals * tax_rates + 0.5)
+            ending_tax = np.floor(ending_notionals * tax_rates + 0.5)
         # Full notional plus both entry and eventual exit fee/tax cash is
         # reserved identically for long and short contracts.  In the optional
         # 08:45 research contract, current OPEN-derived sizing is the same-print
@@ -811,18 +864,20 @@ def attach_stock_context_futures_portfolio_daily(
             open_notionals + (2.0 * integer_fee) + (2.0 * opening_tax)
         )
         model_one_contract_cash = one_contract_cash
-        if prior_denomination:
+        if prior_denomination or corporate_rules is not None:
             previous_settlement = frame["previous_settlement"].to_numpy().astype(
                 np.float64
             )
-            prior_notional = previous_settlement * multipliers
+            prior_notional = (integer_frame['_rule_known_margin_contract_value_twd'].to_numpy().astype(np.float64)
+                              if corporate_rules is not None else previous_settlement * multipliers)
             valid_prior = np.isfinite(prior_notional) & (prior_notional > 0.0)
             if np.any(same_values & ~source_carry_quarantine & ~valid_prior):
                 raise ValueError(
                     "prior-settlement denomination requires a finite positive "
                     "previous same-contract settlement for every causal candidate"
                 )
-            prior_tax = np.floor(prior_notional * tax_rates + 0.5)
+            prior_tax = (integer_frame['_rule_known_tax_twd'].to_numpy().astype(np.float64)
+                         if corporate_rules is not None else np.floor(prior_notional * tax_rates + 0.5))
             model_one_contract_cash = np.where(
                 valid_prior,
                 prior_notional + (2.0 * integer_fee) + (2.0 * prior_tax),
@@ -966,7 +1021,9 @@ def attach_stock_context_futures_portfolio_daily(
         benchmark_values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
     )
     benchmark_assigned[benchmark_dates] = True
-    if not bool(benchmark_assigned.any()):
+    # The dated-margin adapter owns its cash comparator. A scoped margin
+    # release need not trade TX just to supply an unused legacy benchmark.
+    if not bool(benchmark_assigned.any()) and margin_rules_path is None:
         raise ValueError("TAIFEX TX front-month benchmark rows are missing")
 
     # Apply this action eligibility only after constructing all ledger facts.
@@ -980,7 +1037,7 @@ def attach_stock_context_futures_portfolio_daily(
     panel.stock_context_futures_portfolio_daily = (
         TaiwanStockContextFuturesPortfolioDaily(
             dates=dates,
-            symbols=fixed_futures_slot_symbols(),
+            symbols=fixed_futures_slot_symbols(futures_slot_count),
             candidate_features=candidate_features,
             candidate_mask=candidate_mask,
             holding_log_returns=returns,
@@ -1023,6 +1080,7 @@ def attach_stock_context_futures_portfolio_daily(
             ),
             source_path=str(source_path),
             manifest_path=str(manifest_path),
+            futures_data_contract_version=data_version,
         )
     )
     return panel

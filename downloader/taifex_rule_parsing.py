@@ -10,15 +10,19 @@ from __future__ import annotations
 import csv
 import io
 import re
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 import zipfile
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
-PARSER_VERSION = 2
+PARSER_VERSION = 6
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_PDF_PAGES = 80
 MAX_TEXT_CHARACTERS = 2_000_000
@@ -26,6 +30,7 @@ MAX_TABLE_ROWS = 100_000
 MAX_TABLE_COLUMNS = 256
 MAX_ZIP_MEMBERS = 256
 MAX_OFFICE_XML_BYTES = 4 * 1024 * 1024
+LEGACY_WORD_TIMEOUT_SECONDS = 20
 
 _WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _ODF_OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
@@ -107,16 +112,28 @@ def temporal_mentions(text: str) -> list[dict[str, str]]:
         before = _PUNCTUATION.split(before)[-1]
         after = _PUNCTUATION.split(after)[0]
         after_clause = after.split(",", 1)[0]
+        operative_after = re.sub(r"\([^()]*\)", "", after_clause)
         role = "unspecified"
         if re.search(r"(?:發文日期|公告日期|發布日期|發布時間|發佈日期)[:：]?\s*$", before):
             role = "publication"
+        elif (re.search(r"(?:期交所|[臺台]灣期貨交易所)於$", before)
+              and operative_after.startswith("公告")):
+            role = "publication"
+        elif (before.endswith("自")
+              and re.search(r"(?:起實施|起生效|起適用|起施行|開始實施|起調高|起調整)", operative_after[:100])
+              and not re.match(r"[^，,。]{0,35}(?:號函|號令)", after)):
+            # 「依規定調高……，自 DATE 起實施」 is an operative clause.
+            # A preceding 依 must not turn its explicit effective date into a
+            # citation of another notice; dated 號函/號令 remain references.
+            role = "effective_start"
         elif re.search(r"(?:依|依據|參照|參考)[^。；;]{0,30}$", before) or re.match(r"[^，,。]{0,35}(?:號函|號令)", after):
             role = "reference"
-        elif re.search(r"(?:恢復|恢复|終止|停止適用|截止|屆滿|廢止)", after_clause[:90]):
+        elif (re.search(r"(?:恢復|恢复|終止|停止適用|截止|屆滿|廢止)", after_clause[:90])
+              or re.match(r"(?:一般)?交易時段(?:結束|收盤)後[,，](?:恢復|恢复)為", after)):
             role = "effective_end"
         elif before.endswith("至") and re.match(r"(?:止|屆滿)", after_clause):
             role = "effective_end"
-        elif re.search(r"(?:起實施|起生效|起適用|起施行|生效|開始實施)", after_clause[:100]):
+        elif re.search(r"(?:起實施|起生效|起適用|起施行|生效|開始實施)", operative_after[:100]):
             role = "effective_start"
         elif before.endswith("自") and re.match(r"(?:起至|起|至|實施|施行)", after_clause):
             role = "effective_start"
@@ -349,6 +366,50 @@ def _office_zip(content: bytes, result: dict[str, Any]) -> None:
         result["parsing_status"] = "parsed" if result["text"].strip() or result["tables"] else "empty"
 
 
+def _legacy_word(content: bytes, result: dict[str, Any]) -> None:
+    """Recover old Word text without treating its flattened tables as rules.
+
+    antiword only reads the local, size-limited input; no Office application,
+    macros, external links or shell is invoked. Keep output off the pipe and
+    impose a deadline so corrupt official attachments cannot stall a batch.
+    """
+    executable = shutil.which("antiword")
+    if executable is None:
+        result["warnings"].append("legacy_word_parser_unavailable")
+        return
+    with tempfile.TemporaryDirectory(prefix="taifex-rule-word-") as directory:
+        source, output = Path(directory) / "source.doc", Path(directory) / "text.txt"
+        source.write_bytes(content)
+        try:
+            with output.open("wb") as stream:
+                process = subprocess.run(
+                    [executable, "-m", "UTF-8.txt", "-w", "0", str(source)],
+                    stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.DEVNULL, check=False,
+                    timeout=LEGACY_WORD_TIMEOUT_SECONDS,
+                )
+            if process.returncode:
+                result["warnings"].append("legacy_word_not_recognized_or_damaged")
+                return
+            with output.open("rb") as stream:
+                raw = stream.read(MAX_TEXT_CHARACTERS * 4 + 1)
+            # Decode complete output strictly; a cut UTF-8 character at the
+            # extraction bound is never used as a financial fact.
+            if len(raw) > MAX_TEXT_CHARACTERS * 4:
+                result["parsing_status"] = "failed"
+                result["warnings"].append("legacy_word_output_limit_exceeded")
+                return
+            result["text"] = raw.decode("utf-8", errors="strict")
+            result["format"] = "legacy_word"
+            result["parsing_status"] = "parsed" if result["text"].strip() else "empty"
+            result["warnings"].append("legacy_word_tables_require_layout_validation")
+        except subprocess.TimeoutExpired:
+            result["parsing_status"] = "failed"
+            result["warnings"].append("legacy_word_timeout")
+        except (OSError, UnicodeDecodeError):
+            result["parsing_status"] = "failed"
+            result["warnings"].append("legacy_word_extraction_failed")
+
+
 def extract_document(content: bytes, content_type: str, url: str) -> dict[str, Any]:
     """Extract bounded text/tables and explicit date evidence from public bytes.
 
@@ -382,15 +443,24 @@ def extract_document(content: bytes, content_type: str, url: str) -> dict[str, A
             if page_count > MAX_PDF_PAGES:
                 warnings.append("pdf_page_limit_reached")
             chunks: list[str] = []
+            layout_chunks: list[str] = []
             characters = 0
             for page in reader.pages[:MAX_PDF_PAGES]:
                 chunk = page.extract_text() or ""
                 chunks.append(chunk)
+                try:
+                    layout_chunks.append(page.extract_text(extraction_mode="layout") or "")
+                except Exception as exc:
+                    # Optional layout extraction may reject a blank or scanned
+                    # page. Preserve its native-text/OCR status independently.
+                    layout_chunks.append("")
+                    warnings.append(f"pdf_layout_unavailable:{type(exc).__name__}")
                 characters += len(chunk)
                 if characters > MAX_TEXT_CHARACTERS:
                     warnings.append("text_character_limit_reached")
                     break
             result["text"] = "\n\n".join(chunks)[:MAX_TEXT_CHARACTERS]
+            result["layout_text"] = "\n\n".join(layout_chunks)[:MAX_TEXT_CHARACTERS]
             warnings.append("pdf_tables_require_layout_validation")
             result["parsing_status"] = "parsed" if result["text"].strip() else "pending_ocr"
         except ImportError:
@@ -408,8 +478,7 @@ def extract_document(content: bytes, content_type: str, url: str) -> dict[str, A
             warnings.append(f"office_parse_error:{type(exc).__name__}:{exc}")
     elif content.startswith(b"\xd0\xcf\x11\xe0"):
         result["format"] = "office_or_archive"
-        warnings.append("binary_attachment_preserved_not_parsed")
-        return result
+        _legacy_word(content, result)
     else:
         try:
             text = _decode(content)

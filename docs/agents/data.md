@@ -116,6 +116,41 @@ Rules:
   source coverage is a separate channel and pre-capture zeros are unknown.
   Current revisions and estimated dates are research approximations, not
   verified historical PIT values. See `docs/tw_public_wide_research_2014.md`.
+- The 2026-09-28 request additionally permits documented historical release
+  schedules in the separate `tw_preopen_release_schedule_research_v3` ABI.
+  Preserve the audited strict base, original-value missingness, source receipts,
+  late-upload lower bounds and explicit estimated-time/current-revision flags.
+  Invalid state observations are NULL barriers, not permission to carry the
+  previous value through an invalid report. This does not authorize retrocasting
+  current snapshots or enabling these channels in strict/live configs. See
+  `docs/tw_release_schedule_research_2026-09-28.md` and
+  `scripts/build_tw_release_schedule_dataset.py` for the opt-in contract.
+- The later 2026-09-28 request caps **additional safety delay** at one calendar
+  day in `tw_preopen_release_schedule_research_v4_delay1d` and allows genuine
+  missing-only alternate observations in a separate cross-source research ABI.
+  Distinguish reporting period, estimated/known publication, safety delay and
+  exchange-closed wait; a known upload replaces a guessed later deadline.
+  Compare original economic keys/units before daily alignment, preserve finite
+  primary observations and explicit official-conflict masks, and retain invalid
+  state NULL barriers through sparse overlays. Do not equate FinMind monthly
+  `create_time` with an issuer announcement (its 2026-04-21 bootstrap is not
+  historical release evidence). Provider quota, unimplemented semantic mapping,
+  and licensing restrictions are not proof that a value is unavailable online.
+  The measured gate and unresolved scope live in
+  `docs/tw_feature_gap_repair_2026-09-28.md`, not strict/live eligibility rules.
+- In the separate 2026-09-28 semantic-repair research ABI, NULL is not a source
+  corruption verdict. Diagnose cadence, applicability, missing report items,
+  formula domains, warmup and publication history separately. TDCC was monthly
+  before May 2015 and weekly thereafter; use the dated carry rule, not today's
+  weekly expiry across all history. NMI's retrospective 2014 observations were
+  first released on 2015-02-02 and cannot be used earlier. Preserve the one-day
+  safety delay. An event absence may become zero only after reconciling the
+  complete venue/day report, and financial identities require exact issuer,
+  period, units, validated overlap and the latest operand's availability clock.
+  Optional missing accounts are not automatically zero. Rebuild a new dataset
+  and pass `scripts/verify_tw_feature_semantics.py` before refreshing the
+  worklist; keep original sources, explicit conflict masks and strict/live
+  configs unchanged. Evidence: `docs/tw_feature_gap_repair_2026-09-28.md`.
 
 ### TW Phase-Aware Current-Open Feature Contract
 
@@ -138,4 +173,3 @@ Rules:
   layer, not in the model input.
 - Historical 98-feature close-complete checkpoints remain a separate schema.
   Use a new artifact root and retrain for the 99-feature open-aware model.
-

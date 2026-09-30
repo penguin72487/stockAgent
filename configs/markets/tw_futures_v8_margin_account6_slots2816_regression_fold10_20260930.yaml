@@ -1,0 +1,5 @@
+# Real TX/MTX control for solvent unfilled-risk carry. Not all-product admission.
+base_config: tw_futures_v8_margin_rule5_slots2816_regression_fold10_20260930.yaml
+experiment_name: tw-futures-v8-margin-account6-slots2816-regression-fold10-20260930
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_smoke3_20260930

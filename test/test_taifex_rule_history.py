@@ -50,6 +50,34 @@ def test_index_validates_each_row_against_requested_range():
         collector.parse_index(index_html(("2026/09/23", "公告", "newsDetail?idx=1")), date(2004, 1, 1), date(2004, 12, 31))
 
 
+def test_legal_archive_binds_old_attachment_notices_to_publication_dates(queue):
+    body = index_html(("2010/12/15", "臺灣50期貨契約規格", "inforDetail?idx=812&thetype=1"))
+    body = body.replace(b"id='content'", b"id='printhere'")
+    rows = collector.parse_legal_index(body)
+    assert rows[0]['url'] == collector.BASE + '/cht/6/inforDetail?idx=812&thetype=1'
+    assert rows[0]['published_date'] == '2010-12-15'
+    assert rows[0]['published_at'] is None
+    task = dict(url=collector.LEGAL_INDEX_URL, source_id='legal_revisions')
+    collector.discover_preserved_links(queue, body, task, 'html')
+    notice = queue.execute('SELECT * FROM documents').fetchone()
+    assert notice['source_id'] == 'contract_specs'
+    queue.execute("UPDATE documents SET state='complete'")
+    collector.discover_preserved_links(queue, body, task, 'html')
+    assert queue.execute('SELECT state FROM documents').fetchone()[0] == 'complete'
+    assert queue.execute('SELECT count(*) FROM announcements').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('body', [
+    b'<div id="printhere">login required</div>',
+    index_html().replace(b"id='content'", b"id='printhere'"),
+    index_html(('2010/12/15', '規格', 'https://example.org/inforDetail?idx=1')).replace(
+        b"id='content'", b"id='printhere'"),
+])
+def test_legal_archive_rejects_empty_error_or_external_listing(body):
+    with pytest.raises(ValueError):
+        collector.parse_legal_index(body)
+
+
 @pytest.mark.parametrize("html", [
     b"<html><title>Request Rejected</title>FOR SECURITY REASONS</html>",
     b"<div id='content'>FOR SECURITY REASONS</div>",
@@ -595,6 +623,16 @@ def test_offline_reparse_versions_preserve_capture_and_noop_on_current_parser(tm
     queue.rollback()
 
 
+def test_targeted_reparse_leaves_other_source_versions_untouched(tmp_path, queue, monkeypatch):
+    selected = legacy_capture(queue, tmp_path, url='https://www.taifex.com.tw/selected.csv', parsing_status='unsupported')
+    untouched = legacy_capture(queue, tmp_path, url='https://www.taifex.com.tw/untouched.csv')
+    forbid_http_and_limiter(monkeypatch)
+    assert collector.main(['--output-dir', str(tmp_path), '--start-year', '1997', '--end', '1997-12-31',
+                           '--reparse-only', '--reparse-status', 'unsupported']) == 0
+    assert queue.execute('SELECT parser_version FROM documents WHERE url=?', (selected['url'],)).fetchone()[0] == collector.current_parser_version()
+    assert dict(queue.execute('SELECT * FROM documents WHERE url=?', (untouched['url'],)).fetchone()) == untouched
+
+
 @pytest.mark.parametrize('damage', ['compressed_hash', 'content_hash', 'missing', 'gzip', 'oversize', 'outside', 'symlink'])
 def test_offline_reparse_integrity_failure_is_visible_without_http_or_overwrite(tmp_path, monkeypatch, damage):
     root = tmp_path / 'archive'
@@ -796,3 +834,21 @@ def test_failed_raw_integrity_is_not_automatically_repaired_over_http(tmp_path, 
         assert not session.calls
         assert raw.read_bytes() == b'corrupt evidence, preserve for investigation'
         assert queue.execute('SELECT state FROM documents').fetchone()[0] == 'integrity_failed'
+
+
+def test_download_only_does_not_spend_budget_on_old_parses(tmp_path, queue, monkeypatch):
+    old=legacy_capture(queue,tmp_path)
+    pending=collector.BASE+'/file/new.csv'
+    collector.enqueue(queue,pending,'attachment','margins',0);queue.commit()
+    monkeypatch.setattr(collector,'SEEDS',())
+    monkeypatch.setattr(collector,'index_year',lambda *a,**k:0)
+    session=FakeSession([FakeResponse(b'code,value\nTX,123\n',headers={'Content-Type':'text/csv'})])
+    monkeypatch.setattr(collector.requests,'Session',lambda:session)
+    monkeypatch.setattr(collector,'SharedRateLimiter',lambda *a,**k:FakeLimiter())
+    assert collector.main(['--output-dir',str(tmp_path),'--start-year','1997','--end','1997-12-31',
+                           '--download-only','--max-documents','1'])==1
+    # The isolated index stub supplied no completed year. Downloading this
+    # attachment must not turn that incomplete archive into a green result.
+    assert len(session.calls)==1 and session.calls[0][1]==pending
+    assert queue.execute('SELECT parser_version FROM documents WHERE url=?',(old['url'],)).fetchone()[0]==0
+    assert queue.execute('SELECT state FROM documents WHERE url=?',(pending,)).fetchone()[0]=='complete'

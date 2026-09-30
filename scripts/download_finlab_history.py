@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -19,17 +20,19 @@ import tempfile
 import time
 from zoneinfo import ZoneInfo
 
-try:
-    from scripts.finlab_wide_volume_units import volume_unit_contract
-    from scripts.finlab_arrow_history import STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow
-except ModuleNotFoundError as exc:
-    if exc.name != "scripts":
-        raise
-    from finlab_wide_volume_units import volume_unit_contract
-    from finlab_arrow_history import STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow
-
-
 ROOT = Path(__file__).resolve().parents[1]
+# systemd invokes this file by absolute path in a fresh interpreter. Its import
+# path starts at scripts/, not the repository; cwd and an interactive shell's
+# PYTHONPATH must not be prerequisites for canonical shared modules.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.finlab_wide_volume_units import volume_unit_contract  # noqa: E402
+from scripts.finlab_arrow_history import (  # noqa: E402
+    STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow,
+)
+
+
 DEFAULT_CATALOG = ROOT / "configs/finlab_history_candidates.json"
 DEFAULT_OUTPUT = ROOT / "data_finlab"
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -86,7 +89,22 @@ def safe_stem(key: str) -> str:
     return f"{readable}-{hashlib.sha256(key.encode()).hexdigest()[:12]}"
 
 
+@lru_cache(maxsize=8)
+def _local_integrity_cache(root: str) -> dict:
+    from downloader.parquet_integrity import read_verification_cache
+    return read_verification_cache(Path(root) / 'local_integrity_cache.json')
+
+
+def persist_local_integrity_cache(output_root: Path) -> bool:
+    from downloader.parquet_integrity import write_verification_cache
+    root = output_root.resolve()
+    return write_verification_cache(root / 'local_integrity_cache.json',
+                                    _local_integrity_cache(str(root)))
+
+
 def has_local_download(key: str, output_root: Path) -> bool:
+    from downloader.parquet_integrity import parquet_receipt_error
+
     stem = safe_stem(key)
     receipt_path = output_root / "receipts" / f"{stem}.json"
     if not receipt_path.is_file():
@@ -95,13 +113,17 @@ def has_local_download(key: str, output_root: Path) -> bool:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
+    if not isinstance(receipt, dict):
+        return False
     relative = Path(str(receipt.get("parquet_path") or ""))
     if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("datasets",):
         return False
     return (
         receipt.get("dataset") == key
-        and (output_root / relative).is_file()
         and receipt.get("status") == "downloaded_unverified_for_pit"
+        and type(receipt.get("rows_with_values")) is int and receipt["rows_with_values"] > 0
+        and parquet_receipt_error(output_root, receipt,
+                                  verification_cache=_local_integrity_cache(str(output_root.resolve()))) is None
     )
 
 
@@ -189,6 +211,12 @@ def refresh_due(key: str, output_root: Path, *, now: datetime, days: int) -> boo
         if receipt.get("source_check_mode") == "sdk_cache_allowed":
             return True
         checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
+        # A concurrent writer can finish after this plan's as-of time. Such a
+        # receipt is not current *as of now*: keep it pending until the next
+        # plan, rather than excluding a key the progress snapshot still owes.
+        # Naive timestamps also cannot establish a UTC freshness boundary.
+        if checked.tzinfo is None or checked.astimezone(UTC) > now:
+            return True
         if days == 1:
             return checked.astimezone(UTC) < quota_cycle_start(now)
         return now - checked.astimezone(UTC) >= timedelta(days=days)
@@ -272,6 +300,8 @@ def provider_catalog() -> list[str]:
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
+    from downloader.artifact_io import durable_replace
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, prefix=".finlab-",
@@ -282,7 +312,7 @@ def _atomic_json(path: Path, payload: dict) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, path)
+    durable_replace(temp, path)
 
 
 def serialize_provider_frame(frame):
@@ -292,7 +322,10 @@ def serialize_provider_frame(frame):
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("FinLab response was not a DataFrame")
     source = pd.DataFrame(frame)
+    if source.columns.map(str).duplicated().any():
+        raise ValueError("duplicate FinLab source field labels")
     valid = source.notna().any(axis=1)
+    observed_per_column = source.notna().sum(axis=0)
     index_frame = source.index.to_frame(index=False)
     index_columns = [
         "source_index" if len(index_frame.columns) == 1 else f"source_index_{n}"
@@ -322,6 +355,9 @@ def serialize_provider_frame(frame):
         "rows": len(source),
         "rows_with_values": int(valid.sum()),
         "field_columns": len(values.columns),
+        "non_null_values": int(observed_per_column.sum()),
+        "all_null_source_columns": [str(name) for name, count in observed_per_column.items() if count == 0],
+        "column_axis_semantics": "source_instruments_or_dimensions_not_independent_model_features",
         "source_index_columns": index_columns,
         "source_index_dtype": str(source.index.dtype),
         "first_non_null_source_index": first,
@@ -423,6 +459,9 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
 
 
 def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
+    from downloader.artifact_io import durable_replace
+    from downloader.parquet_integrity import parquet_receipt_error
+
     started = time.monotonic()
     stem = safe_stem(key)
     receipt_path = output_root / "receipts" / f"{stem}.json"
@@ -451,6 +490,12 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         content_hash = digest.hexdigest()
+        validation = parquet_receipt_error(datasets_root, {
+            "parquet_path": temp.name, "rows": stats["rows"],
+            "parquet_size_bytes": temp.stat().st_size, "sha256": content_hash,
+        }, verify_hash=False)
+        if validation:
+            raise ValueError(f"FinLab staged parquet failed validation: {validation}")
         checked_at = stats.get("source_checked_at_utc", datetime.now(UTC).isoformat())
         check_mode = stats.get("source_check_mode", "upstream_forced" if refresh else "sdk_cache_allowed")
         previous: dict = {}
@@ -489,9 +534,17 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
                 for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                     existing.update(chunk)
             if existing.hexdigest() != content_hash:
-                raise ValueError("content-addressed FinLab file has a hash mismatch")
+                from downloader.artifact_io import atomic_write_bytes
+                from downloader.finmind_parent_recovery import repair_content_addressed_collision
+
+                if receipt_path.is_file():
+                    old_receipt = receipt_path.read_bytes()
+                    proof = output_root / "receipt_history" / stem / f"{hashlib.sha256(old_receipt).hexdigest()}.json"
+                    atomic_write_bytes(proof, old_receipt, durable=True)
+                repair_content_addressed_collision(temp, data_path, output_root,
+                                                   finlab_digest=content_hash)
         else:
-            os.replace(temp, data_path)
+            durable_replace(temp, data_path)
         if previous.get("dataset") == key and previous.get("sha256") != content_hash:
             old_relative = Path(str(previous.get("parquet_path") or ""))
             if (not old_relative.is_absolute() and ".." not in old_relative.parts
@@ -507,6 +560,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
                         _atomic_json(archive, previous)
         receipt = {
             "schema_version": 3,
+            "storage_contract_version": 2,
             "dataset": key,
             "status": "downloaded_unverified_for_pit",
             "fetched_at_utc": checked_at,
@@ -675,6 +729,7 @@ def record_core_acquisition_status(available: list[str], curated: dict[str, dict
                "windowed_examples_excluded": [key for key in keys if _windowed_dataset(key)],
                "provenance": "FinLab catalog membership plus local canonical receipts and attempt/defer policy"}
     _atomic_json(output_root / "core_acquisition_status.json", receipt)
+    persist_local_integrity_cache(output_root)
     return receipt
 
 
