@@ -74,8 +74,10 @@ def test_finmind_page_uses_receipts_and_worker_only_quota(tmp_path: Path, monkey
     assert result["datasets"][0]["rows"] == 542
     assert result["datasets"][2]["rows"] == 2
     assert result["datasets"][3]["rows"] == 200976
-    assert "TaiwanStockNews" in result["scope"]["excluded"]
-    assert "TaiwanStockPriceTick" in result["scope"]["excluded"]
+    assert "TaiwanStockNews" not in result["scope"]["excluded"]
+    assert result['acquisition']['news'] == 'enabled_whole_market_calendar_day'
+    assert "TaiwanStockPriceTick" in result["scope"]["scheduled_datasets"]
+    assert "taiwan_stock_tick_snapshot" in result["scope"]["scheduled_datasets"]
     from downloader.download_finmind_sponsor import SOURCES, UNSCHEDULED
     from downloader.download_finmind_complement import ALL_DATASETS
     assert len(result["datasets"]) == 4 + len(ALL_DATASETS) + len(SOURCES) + len(UNSCHEDULED)
@@ -124,7 +126,9 @@ def test_finmind_page_exposes_protected_incremental_budget_without_token(tmp_pat
     result = build_finmind_public_status(tmp_path, now=now)
     allocation = result["quota"]["backfill_allocation"]
     assert allocation["basis"] == "provider_observation_plus_local_starts"
-    assert allocation["reserve"] >= 6
+    assert allocation["reserve"] == 3  # One missing calendar check + two in-flight slots.
+    assert allocation['ready_incremental_requests'] == 1
+    assert allocation['priority_wait']
     assert allocation["remaining"] == 5900
     assert "token" not in json.dumps(allocation).lower()
 
@@ -215,7 +219,7 @@ def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
     assert "分割數不等於請求數" in javascript + html
     assert "非 ETA、非下界" in javascript
     assert 'id="download-global-eta-basis"' in html
-    assert 'app.js?v=8' in html
+    assert 'app.js?v=11' in html
 
 
 def test_finmind_ui_legacy_numeric_values_still_render_unknown() -> None:

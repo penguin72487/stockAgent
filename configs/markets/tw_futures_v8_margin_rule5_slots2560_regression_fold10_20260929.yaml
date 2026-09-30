@@ -1,0 +1,11 @@
+# Real TX/MTX interface control for the full-inventory slot capacity.
+# This does not constitute all-product rule admission.
+base_config: tw_futures_v8_margin_rule5_tx_mtx_regression_fold10_20260929.yaml
+experiment_name: tw-futures-v8-margin-rule5-slots2560-regression-fold10-20260929
+data:
+  tw_futures_portfolio_slot_count: 2560
+trading:
+  tw_futures_portfolio_data_path: artifacts/markets/tw_futures_v8_margin_preparation/carry_abi5_slots2560_real_index_regression_20260929/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/carry_abi5_slots2560_real_index_regression_20260929/rules.parquet
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_rule5_slots2560_regression_fold10_smoke3_20260929

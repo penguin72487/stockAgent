@@ -1,11 +1,43 @@
 {
   "schema_version": 1,
   "source_url": "https://finmind.github.io/WhatIsNew/",
-  "snapshot_sha256": "decb6d1761fabed35ad455cd2ad2bc67034b2ac7d507a6942b8ee6670012f96e",
-  "reviewed_at": "2026-09-27",
+  "snapshot_sha256": "a68c1bd05aeec7c19bf656efd242768dd08050921a3a8208aa67195f9e287518",
+  "reviewed_at": "2026-09-29",
   "baseline_auto_since": "2026-09-01",
   "scope_contract": "Manual scopes apply only to exact full semantic entry IDs and identical normalized text. Unavailable and unaffected values are never repairs.",
   "scopes": {
+    "65aedc1ae0a14c0f6088ae9ebc8e876ca25d2e81647bb72c896e8382fbb4ad0c": {
+      "notice_date": "2026-09-29",
+      "revision_family_id": "dc6c05fe5c14058bc66267c554008eb2dbf3fc14a782f7266184192664e53de8",
+      "evidence_text": "資料校正公告 : 台灣股價歷史逐筆資料表 TaiwanStockPriceTick 、 台股分 K 資料表 TaiwanStockKBar : 2021-03-05 ~ 2021-04-14 (27 個交易日)興櫃股票的原始逐筆資料中,每 5 分鐘(xx:x0:00、xx:x5:00)重複出現一筆與前一筆相同的非實際成交紀錄,使逐筆與分 K 成交量偏高,並多出 15:00 之後的分 K,已移除並重新計算分 K(API 與整日下載檔皆已更新)。 曾下載或查詢過這段期間興櫃股票逐筆或分 K 的使用者請重新取得資料",
+      "datasets": ["TaiwanStockKBar", "TaiwanStockPriceTick"],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-29",
+      "requests": [
+        {"dataset": "TaiwanStockKBar", "start_date": "2021-03-05", "end_date": "2021-04-14", "reason": "Redownload affected period; no trusted historical emerging-market membership filter is available."},
+        {"dataset": "TaiwanStockPriceTick", "start_date": "2021-03-05", "end_date": "2021-04-14", "reason": "Remove source-reported non-trade duplicates via corrected provider data, never synthesize ticks."}
+      ],
+      "issues": []
+    },
+    "7cd754eb83ba28226547f666c7c44537e364a2fbbea4f5a4114c270e7f376ff8": {
+      "notice_date": "2026-09-28",
+      "revision_family_id": "6f3166effa01a74a5c5a37a276b2d731ea7ec272cccab6f4fd5919e83b852a50",
+      "evidence_text": "資料校正公告 : 台股分 K 資料表 TaiwanStockKBar :移除 2023-03-13 ~ 2026-01-22 期間 stock_id 為 001 的加權指數分 K,大盤分 K 統一以 TAIEX 為準(API 與整日下載檔皆已更新)。 曾使用 001 的使用者請改用 TAIEX",
+      "datasets": ["TaiwanStockKBar"],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-28",
+      "requests": [
+        {"dataset": "TaiwanStockKBar", "data_ids": ["TAIEX"], "start_date": "2023-03-13", "end_date": "2026-01-22", "reason": "Use the named canonical TAIEX source, not removed 001 series."}
+      ],
+      "issues": [{"status": "known_unavailable", "dataset": "TaiwanStockKBar", "reason": "Legacy stock_id 001 was removed upstream; canonical TAIEX is scheduled separately, not an alias fabricated from 001 values."}]
+    },
+    "937ed7c6699d451c4f0fff01faef1046b0e50fbb56e23f50850e3fa0943c7449": {
+      "notice_date": "2026-09-28",
+      "revision_family_id": "45355c1a4bed2c50f63c6157bc66cf269a0d4f248938bb00b949dbc61efcda5c",
+      "evidence_text": "資料校正公告 : 每 5 秒指數統計 TaiwanStockEvery5SecondsIndex :上櫃各指數 13:30:00 的歷史資料已完成全期間(2005-01-03 起)更正,現在皆為官方收盤指數,與上市指數一致。 曾下載或查詢過上櫃指數的使用者請重新取得資料 2005-01 ~ 2005-03 有 23 個交易日,原始資料公布的收盤值與日收盤指數相差 0.01,屬來源端的尾數差異",
+      "datasets": ["TaiwanStockEvery5SecondsIndex"],
+      "source_url": "https://finmind.github.io/WhatIsNew/#2026-09-28",
+      "requests": [{"dataset": "TaiwanStockEvery5SecondsIndex", "scope_kind": "full_history", "reason": "Official completion notice requests redownload of TPEX historical 13:30 closes."}],
+      "issues": [{"status": "known_unavailable", "dataset": "TaiwanStockEvery5SecondsIndex", "start_date": "2005-01-03", "end_date": "2005-03-31", "reason": "Provider documents 23 sessions with a 0.01 source rounding discrepancy; preserve evidence, do not overwrite with invented precision."}]
+    },
     "dadb1796f9ebc1e7ab3213186ddfdeee2008ec42281c5fd52ec0a1c27ce864c0": {
       "notice_date": "2026-09-25",
       "revision_family_id": "dfe38c6e21e0274f257365400bae892a32cd79ad18cfe6b575666b12d91375b9",

@@ -18,7 +18,7 @@ import sqlite3
 from typing import Any, Iterator
 import uuid
 
-from downloader.artifact_io import atomic_write_json, sha256_file
+from downloader.artifact_io import atomic_write_json, sha256_file, durable_replace
 
 
 _LONG = "TaiwanStockInstitutionalInvestorsBuySell"
@@ -187,7 +187,8 @@ def recover_failed_long_parent(connection: sqlite3.Connection, root: Path,
                 "error_code": code, "validation": evidence}
 
 
-def repair_content_addressed_collision(staged: Path, final: Path, root: Path) -> bool:
+def repair_content_addressed_collision(staged: Path, final: Path, root: Path, *,
+                                      finlab_digest: str | None = None) -> bool:
     """Preserve one corrupt digest-named file before installing its verified bytes.
 
     The caller must own the downloader's normal writer lock. This operates only
@@ -202,11 +203,23 @@ def repair_content_addressed_collision(staged: Path, final: Path, root: Path) ->
             raise ValueError("unsafe FinMind collision path")
         if not path.is_file():
             raise ValueError("missing FinMind collision file")
-    if staged.parent.resolve() != final.parent.resolve() or staged.name != "latest.parquet":
+    if staged.parent.resolve() != final.parent.resolve():
         raise ValueError("FinMind collision must use the canonical sibling staging file")
-    if re.fullmatch(r"[0-9a-f]{64}\.parquet", final.name) is None:
-        raise ValueError("FinMind collision target must be content-addressed")
-    expected = final.stem
+    if finlab_digest is None:
+        if staged.name != "latest.parquet":
+            raise ValueError("FinMind collision must use the canonical sibling staging file")
+        if re.fullmatch(r"[0-9a-f]{64}\.parquet", final.name) is None:
+            raise ValueError("FinMind collision target must be content-addressed")
+        expected = final.stem
+    else:
+        # FinLab uses a 24-hex filename prefix but receipts carry the full hash.
+        # Reuse the same preservation transaction, never a guessed replacement.
+        if (re.fullmatch(r"[0-9a-f]{64}", finlab_digest) is None
+                or not final.name.endswith(f"-{finlab_digest[:24]}.parquet")
+                or final.parent.resolve() != root / "datasets"
+                or not staged.name.startswith(".finlab-") or not staged.name.endswith(".parquet.tmp")):
+            raise ValueError("unsafe FinLab content-addressed collision")
+        expected = finlab_digest
     staged_signature = _signature(staged)
     if sha256_file(staged) != expected or staged_signature != _signature(staged):
         raise ValueError("FinMind collision replacement digest mismatch")
@@ -239,7 +252,7 @@ def repair_content_addressed_collision(staged: Path, final: Path, root: Path) ->
     if (_signature(final) != old_signature or _signature(staged) != staged_signature or
             sha256_file(staged) != expected):
         raise ValueError("FinMind collision files changed before replacement")
-    os.replace(staged, final)
+    durable_replace(staged, final)
     atomic_write_json(evidence_root / "installed.json", {
         **receipt, "status": "installed", "installed_at_utc": datetime.now(UTC).isoformat(),
     })

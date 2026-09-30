@@ -399,6 +399,388 @@ def _absolute_cost_with_intent(
     )
 
 
+def _project_margin_position_limits_impl(
+    proposed: torch.Tensor,
+    previous: torch.Tensor,
+    *,
+    position_group: torch.Tensor,
+    position_units: torch.Tensor,
+    group_limits: torch.Tensor,
+    close_capacity: torch.Tensor,
+    whole_contracts: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Share the legal position geometry between execution and its relaxation.
+
+    Preserve reductions, allocate remaining group capacity to increases, then
+    close only a dated limit's remaining excess through permitted physical
+    capacity. The relaxation omits integer rounding, never the legal boundary.
+    """
+    pg, units, limits = position_group, position_units, group_limits
+    same_sign = proposed * previous > 0
+    reduced = torch.where(same_sign, previous.sign() * torch.minimum(
+        previous.abs(), proposed.abs()), torch.zeros_like(previous))
+    increases = proposed - reduced
+    used = torch.zeros_like(units).scatter_add(0, pg, reduced.abs() * units)
+    wanted = torch.zeros_like(units).scatter_add(0, pg, increases.abs() * units)
+    scale = torch.minimum(torch.ones_like(used), (limits - used).clamp_min(0) / wanted.clamp_min(1e-12))
+    scaled = increases * scale[pg]
+    selected = reduced + (torch.trunc(scaled).long() if whole_contracts else scaled)
+    selected_units = torch.zeros_like(units).scatter_add(0, pg, selected.abs() * units)
+    excess = (selected_units - limits).clamp_min(0.)
+    minimum_residual = (previous.abs() - close_capacity).clamp_min(0)
+    available = torch.where(selected * previous > 0,
+        (selected.abs() - minimum_residual).clamp_min(0), torch.zeros_like(previous))
+    available_units = torch.zeros_like(units).scatter_add(0, pg, available * units)
+    fraction = torch.minimum(torch.ones_like(excess), excess / available_units.clamp_min(1e-12))
+    additional = available * fraction[pg]
+    if whole_contracts:
+        additional = torch.ceil(additional).long()
+    additional = torch.minimum(available, additional)
+    selected = selected - selected.sign() * additional
+    remaining = torch.zeros_like(units).scatter_add(0, pg, selected.abs() * units)
+    return selected, remaining > limits, (additional != 0).any()
+
+
+@lru_cache(maxsize=1)
+def _compiled_margin_position_projection():
+    # Fuse the detached integer projection only. Autograd's accumulation order
+    # in the continuous relaxation remains the original eager implementation.
+    return torch.compile(
+        _project_margin_position_limits_impl, fullgraph=True, dynamic=False,
+        options={"triton.cudagraphs": False, "emulate_precision_casts": True,
+                 "eager_numerics.division_rounding": True,
+                 "eager_numerics.disable_ftz": True, "force_same_precision": True},
+    )
+
+
+def _project_margin_position_limits(proposed, previous, **kwargs):
+    function = _project_margin_position_limits_impl
+    if (kwargs['whole_contracts'] and proposed.device.type == 'cuda'
+            and _env_truthy('STOCKAGENT_FUTURES_FUNDING_COMPILE', '0')
+            and _env_truthy('STOCKAGENT_FUTURES_POSITION_COMPILE', '1')
+            and not torch.compiler.is_compiling()):
+        function = _compiled_margin_position_projection()
+    return function(proposed, previous, **kwargs)
+
+
+def _grandfather_position_limit(proposed, previous, groups, units, limits, permission):
+    """Keep only reductions while already above a dated lower limit.
+
+    No rolling to another month, sign flip or new slot can consume the old
+    holding permission. Old inventory expires through the ordinary terminal
+    ledger. Restricting additions until the next account decision is explicit
+    and conservative; it does not model intradecision sell-then-buy sequences.
+    """
+    held=torch.zeros_like(limits).scatter_add(0,groups,previous.abs()*units)
+    allowed=torch.zeros_like(limits).scatter_reduce(0,groups,permission,reduce='amax')>.5
+    legacy=allowed & (held>limits)
+    reducing=torch.where(proposed*previous>0,
+        previous.sign()*torch.minimum(previous.abs(),proposed.abs()),torch.zeros_like(proposed))
+    return torch.where(legacy[groups],reducing,proposed),torch.where(legacy,held,limits)
+
+
+def _positive_inventory_half_slope(quantity: torch.Tensor) -> torch.Tensor:
+    """Split one net position without doubling its tangent at zero.
+
+    clamp_min has slope one at zero. Using it for both q+ and q- makes
+    d(q+ - q-)/dq equal two, so an unconstrained zero-position carry can
+    amplify its gradient as 2**days. The symmetric half slope preserves the
+    exact forward inventory and makes their recombination the identity.
+    """
+    if not quantity.is_floating_point():
+        return quantity.clamp_min(0)
+    return torch.where(quantity == 0, quantity * 0.5, quantity.clamp_min(0))
+
+
+def _project_margin_position_limit_axes(proposed, previous, *, execution_row,
+                                       position_group, position_units, group_limits,
+                                       close_capacity, whole_contracts):
+    """Apply schema-5 same-direction caps on independent long/short inventories.
+
+    Splitting the two directions does not create a second tradable position:
+    the request was already bounded by the physical net order's capacity and
+    each physical slot has only one signed ending quantity.
+    """
+    if execution_row.shape[-1] < margin.MARGIN_GRANDFATHER_EXECUTION_WIDTH:
+        return _project_margin_position_limit_axes_impl(proposed,previous,
+            execution_row=execution_row,position_group=position_group,
+            position_units=position_units,group_limits=group_limits,
+            close_capacity=close_capacity,whole_contracts=whole_contracts)
+    n=len(previous)
+    second_group=execution_row[:,margin.SECOND_POSITION_GROUP].nan_to_num().long().clamp(0,n-1)
+    second_limits=torch.zeros_like(group_limits).scatter_reduce(0,second_group,
+        execution_row[:,margin.SECOND_POSITION_LIMIT].nan_to_num(),reduce='amax')
+    for groups,units,limits,permission in (
+        (position_group,position_units,group_limits,execution_row[:,margin.POSITION_GRANDFATHER]),
+        (second_group,execution_row[:,margin.SECOND_POSITION_UNIT],second_limits,
+         execution_row[:,margin.SECOND_POSITION_GRANDFATHER])):
+        long_used=torch.zeros_like(limits).scatter_add(0,groups,previous.clamp_min(0)*units)
+        short_used=torch.zeros_like(limits).scatter_add(0,groups,(-previous).clamp_min(0)*units)
+        permitted=torch.zeros_like(limits).scatter_reduce(0,groups,permission,reduce='amax')>.5
+        locked=permitted & (torch.maximum(long_used,short_used)>limits)
+        reduction=torch.where(proposed*previous>0,
+            previous.sign()*torch.minimum(previous.abs(),proposed.abs()),torch.zeros_like(proposed))
+        proposed=torch.where(locked[groups],reduction,proposed)
+    ex=torch.cat((execution_row,execution_row),dim=0).clone()
+    ex[n:,margin.SECOND_POSITION_GROUP]+=n
+    q,failed,reduced=_project_margin_position_limit_axes_impl(
+        torch.cat((_positive_inventory_half_slope(proposed),
+                   _positive_inventory_half_slope(-proposed))),
+        torch.cat((_positive_inventory_half_slope(previous),
+                   _positive_inventory_half_slope(-previous))),
+        execution_row=ex,position_group=torch.cat((position_group,position_group+n)),
+        position_units=position_units.repeat(2),group_limits=group_limits.repeat(2),
+        close_capacity=close_capacity.repeat(2),whole_contracts=whole_contracts)
+    return q[:n]-q[n:],failed[:n]|failed[n:],reduced
+
+
+def _project_margin_position_limit_axes_impl(proposed, previous, *, execution_row,
+                                       position_group, position_units, group_limits,
+                                       close_capacity, whole_contracts):
+    """Intersect dated monthly and aggregate caps without doubling liquidity.
+
+    Each projection preserves feasible reductions and only shrinks increases.
+    Both use the same original inventory and cumulative close capacity, so a
+    second constraint cannot spend the same close volume twice. Recheck both
+    axes at the end: the second can also resolve a first-axis violation.
+    """
+    grandfather=execution_row.shape[-1] >= margin.MARGIN_GRANDFATHER_EXECUTION_WIDTH
+    if grandfather:
+        proposed,group_limits=_grandfather_position_limit(proposed,previous,position_group,
+            position_units,group_limits,execution_row[:,margin.POSITION_GRANDFATHER])
+    selected, failed, reduced = _project_margin_position_limits(
+        proposed, previous, position_group=position_group, position_units=position_units,
+        group_limits=group_limits, close_capacity=close_capacity, whole_contracts=whole_contracts)
+    if execution_row.shape[-1] < margin.MARGIN_MULTI_LIMIT_EXECUTION_WIDTH:
+        return selected, failed[position_group], reduced
+    second_group=execution_row[:,margin.SECOND_POSITION_GROUP].nan_to_num().long().clamp(0,len(previous)-1)
+    second_units=execution_row[:,margin.SECOND_POSITION_UNIT].nan_to_num()
+    second_limits=torch.zeros_like(group_limits).scatter_reduce(0,second_group,
+        execution_row[:,margin.SECOND_POSITION_LIMIT].nan_to_num(),reduce='amax')
+    if grandfather:
+        selected,second_limits=_grandfather_position_limit(selected,previous,second_group,
+            second_units,second_limits,execution_row[:,margin.SECOND_POSITION_GRANDFATHER])
+    selected, _, reduced_second = _project_margin_position_limits(
+        selected, previous, position_group=second_group, position_units=second_units,
+        group_limits=second_limits, close_capacity=close_capacity, whole_contracts=whole_contracts)
+    used=torch.zeros_like(group_limits).scatter_add(0,position_group,selected.abs()*position_units)
+    used_second=torch.zeros_like(second_limits).scatter_add(0,second_group,selected.abs()*second_units)
+    failed_slots=(used>group_limits)[position_group] | (used_second>second_limits)[second_group]
+    return selected, failed_slots, reduced | reduced_second
+
+
+def _margin_position_slack(held,previous,groups,units,limits,permission=None):
+    if permission is None:
+        used=torch.zeros_like(limits).scatter_add(0,groups,held.abs()*units)
+        return torch.where(limits>0,1.-used/limits.clamp_min(1e-12),
+                           torch.full_like(limits,float('inf'))).min()
+    sides=[]
+    for sign in (1.,-1.):
+        inventory=(sign*held).clamp_min(0)
+        _,allowed=_grandfather_position_limit(inventory,(sign*previous).clamp_min(0),
+                                               groups,units,limits,permission)
+        sides.append(_margin_position_slack(inventory,previous,groups,units,allowed))
+    return torch.minimum(*sides)
+
+
+def _transfer_margin_inventory(quantities: torch.Tensor, execution: torch.Tensor,
+                               *, whole_contracts: bool):
+    """Apply a dated legal transfer without a trade, fee, or invented position.
+
+    The map is destination -> old slot, so a renamed contract can coexist with
+    a freshly listed standard contract. A rational split cannot round away
+    residual contracts. Missing/duplicated old inventory fails the account.
+    """
+    slots = quantities.shape[0]
+    raw = execution[:, margin.CARRY_SOURCE_SLOT]
+    valid_index = torch.isfinite(raw) & (raw == raw.round()) & (raw >= 0) & (raw <= slots)
+    incoming = valid_index & (raw > 0)
+    origin = (raw.nan_to_num().long() - 1).clamp(0, slots - 1)
+    num = execution[:, margin.CARRY_QUANTITY_NUMERATOR]
+    den = execution[:, margin.CARRY_QUANTITY_DENOMINATOR]
+    valid_ratio = (torch.isfinite(num) & torch.isfinite(den)
+                   & (num > 0) & (den > 0) & (num <= 1_000_000) & (den <= 1_000_000)
+                   & (num == num.round()) & (den == den.round()))
+    cash = execution[:, margin.CARRY_CASH]
+    counts = torch.zeros(slots, device=quantities.device, dtype=torch.int64).scatter_add(
+        0, origin, incoming.long())
+    source = torch.where(incoming, quantities.gather(0, origin), torch.zeros_like(quantities))
+    metadata_ok = (valid_index & (~incoming | (valid_ratio & torch.isfinite(cash)))).all()
+    metadata_ok &= ((quantities == 0) | (counts == 1)).all() & (counts <= 1).all()
+    safe_num = torch.where(valid_ratio, num, 1.).long()
+    safe_den = torch.where(valid_ratio, den, 1.).long()
+    if whole_contracts:
+        scaled = source * safe_num
+        metadata_ok &= ((scaled % safe_den) == 0).all()
+        moved = torch.div(scaled, safe_den, rounding_mode="trunc")
+    else:
+        moved = source * safe_num / safe_den
+    cash_flow = (source.to(execution.dtype) * torch.where(incoming, cash, 0.).nan_to_num()).sum()
+    return moved, cash_flow, metadata_ok
+
+
+def _margin_physical_backward(
+    weights: torch.Tensor,
+    execution: torch.Tensor,
+    *,
+    initial_capital: float,
+    initial_quantities: torch.Tensor,
+    advance: torch.Tensor,
+    active_metadata: torch.Tensor,
+    trace: list[tuple[torch.Tensor, ...]],
+    recover: bool,
+    return_weights_history: bool,
+    return_turnovers: bool,
+) -> FuturesPortfolioTensorResult:
+    """Linearize the executed physical account, never a fungible group book.
+
+    Basket selection is discrete. Its local STE distributes a group's target
+    over its actually selected denominations; at cash it uses the cheapest
+    legally tradable denomination (equal ties). Every fill/carry/mark is then
+    anchored to the exact trace. Only discrete basket/lot selection uses an
+    STE: capacity and position constraints retain their feasible derivative.
+    Mandatory closes retain the residual-position derivative. A denomination
+    with no permitted capacity cannot close an untradeable physical contract.
+    A default is absorbing in both paths: recovery differentiates the failed
+    boundary while it can still credit prior actions, never a re-funded future.
+    This is an explicit biased estimator, not an integer function derivative.
+    """
+    capital = float(initial_capital)
+    slots = weights.shape[1]
+    q = initial_quantities.to(weights.dtype).round()
+    position_groups = execution[..., margin.POSITION_GROUP].nan_to_num().long().clamp(0, slots - 1)
+    position_limits = torch.zeros_like(weights).scatter_reduce(
+        1, position_groups, execution[..., margin.POSITION_LIMIT].nan_to_num(), reduce='amax')
+    # Immutable physical tape fields have no recurrent dependencies. Prepare
+    # their exact pointwise values once, rather than launch the same kernels
+    # independently on every date of the captured recurrence.
+    initial_margins = torch.where(active_metadata, execution[..., margin.INITIAL], 1.)
+    groups = execution[..., 9].round().long().clamp(0, slots - 1)
+    gaps = torch.where(active_metadata, execution[..., 3] - execution[..., margin.PREVIOUS_MARK], 0.).nan_to_num()
+    moves = torch.where(active_metadata, execution[..., 4] - execution[..., 3], 0.).nan_to_num()
+    terminal_moves = torch.where(active_metadata, execution[..., margin.TERMINAL_MARK] - execution[..., 4], 0.).nan_to_num()
+    entry_fees = (execution[..., 5] + execution[..., 6]).nan_to_num()
+    exit_fees = (execution[..., 5] + execution[..., 7]).nan_to_num()
+    capacities = execution[..., 8].clamp_min(0.).floor()
+    position_units = execution[..., margin.POSITION_UNIT].nan_to_num()
+    terminal_capacities = execution[..., margin.TERMINAL_CAPACITY].nan_to_num()
+    reserves = initial_margins + 2 * entry_fees
+    nav = trace[0][0]
+    returns, turnovers, histories, equities = [], [], [], []
+    for row, (start_nav, start_alive, chosen, closed, next_q, next_nav, force_close, position_failed) in enumerate(trace):
+        x = execution[row]
+        active = active_metadata[row]
+        im = initial_margins[row]
+        group = groups[row]
+        do_row = advance[row] & start_alive
+        # Retain the self-financing derivative until (and including) default.
+        # Later returns are identically zero in this episode; resurrecting the
+        # shadow would optimize unavailable future profits against survival.
+        # The positive placeholder only makes inactive arithmetic well-defined.
+        nav = torch.where(start_alive, nav + (start_nav - nav).detach(), weights.new_full((), capital))
+        q = torch.where(start_alive, q, torch.zeros_like(q))
+        denominator = nav.clamp_min(1.0e-12)
+        event_cash = weights.new_zeros(())
+        if execution.shape[-1] >= margin.MARGIN_CORPORATE_EXECUTION_WIDTH:
+            moved, transferred_cash, _ = _transfer_margin_inventory(q, x, whole_contracts=False)
+            q = torch.where(do_row, moved, q)
+            event_cash = torch.where(do_row, transferred_cash, event_cash)
+        gap = (q * gaps[row]).sum()
+        marked_nav = nav + event_cash + gap
+        allocation_nav = torch.minimum(nav, marked_nav).clamp_min(0.)
+        requested = torch.zeros_like(q).scatter_add(0, group, torch.where(active, weights[row], 0.))
+        mandatory_failed = force_close | position_failed
+        requested = torch.where(mandatory_failed, torch.zeros_like(requested), requested)
+        capacity = torch.where(active & (x[:, 1] > .5) & do_row, capacities[row], 0.)
+        buy_cap = torch.where(x[:, margin.CAN_BUY] > .5, capacity, 0.)
+        sell_cap = torch.where(x[:, margin.CAN_SELL] > .5, capacity, 0.)
+
+        allocated = chosen.abs().to(weights.dtype) * im
+        group_allocated = torch.zeros_like(q).scatter_add(0, group, allocated)
+        sign_request = requested.gather(0, group)
+        can_enter = torch.where(sign_request > 0, buy_cap > 0,
+                               torch.where(sign_request < 0, sell_cap > 0, (buy_cap + sell_cap) > 0))
+        reserve = reserves[row]
+        cost = torch.where(can_enter, reserve, torch.full_like(q, float('inf')))
+        cheapest = torch.full_like(q, float('inf')).scatter_reduce(0, group, cost, reduce='amin')
+        fallback = (can_enter & (cost == cheapest.gather(0, group))).to(weights.dtype)
+        count = torch.zeros_like(q).scatter_add(0, group, fallback).gather(0, group)
+        share = torch.where(group_allocated.gather(0, group) > 0,
+                            allocated / group_allocated.gather(0, group).clamp_min(1.0e-12),
+                            fallback / count.clamp_min(1.))
+        desired = sign_request * allocation_nav * share / im
+        delta = desired - q
+        # At an identically forbidden interval PyTorch min/max tie derivatives
+        # are not an executable direction; explicitly give it zero sensitivity.
+        bounded = torch.minimum(torch.maximum(delta, -sell_cap), buy_cap)
+        bounded = torch.where((buy_cap + sell_cap) > 0, bounded, torch.zeros_like(bounded))
+        proposed = q + bounded
+        proposed, _, _ = _project_margin_position_limit_axes(
+            proposed, q, execution_row=x, position_group=position_groups[row],
+            position_units=position_units[row],
+            group_limits=position_limits[row],
+            close_capacity=torch.where(q < 0, buy_cap, sell_cap),
+            whole_contracts=False,
+        )
+        held = proposed + (chosen.to(weights.dtype) - proposed).detach()
+        traded = held - q
+        entry_cost = (_absolute_cost_with_intent(traded, desired - q) * entry_fees[row]).sum()
+        terminal_capacity = (terminal_capacities[row] - traded.abs()).clamp_min(0.).floor()
+        terminal_allowed = torch.where(held < 0, x[:, margin.TERMINAL_CAN_BUY] > .5,
+                                       x[:, margin.TERMINAL_CAN_SELL] > .5)
+        closable = torch.where(terminal_allowed, torch.minimum(held.abs(), terminal_capacity), 0.)
+        close_proposal = torch.where(x[:, margin.CASH_SETTLEMENT] > .5, held,
+                                     held.sign() * closable)
+        close_proposal = torch.where((x[:, 2] > .5) & do_row, close_proposal, 0.)
+        closing = close_proposal + (closed.to(weights.dtype) - close_proposal).detach()
+        exit_cost = (_absolute_cost_with_intent(closing, desired) * exit_fees[row]).sum()
+        end_nav = marked_nav - entry_cost - exit_cost + (
+            held * moves[row] + closing * terminal_moves[row]
+        ).sum()
+        wealth = end_nav / denominator
+        if recover:
+            # A capacity-limited risk reduction carries its actual residual.
+            # Its return (and gradient) is the retained position's marked P&L;
+            # an unfilled order is neither a fee nor economic insolvency.
+            # Terminal delivery and dated position permissions remain separate
+            # obligations; they cannot be relaxed into an invented fill.
+            dated_hold=execution.shape[-1]>=margin.MARGIN_GRANDFATHER_EXECUTION_WIDTH
+            position_slack=_margin_position_slack(held,q,position_groups[row],position_units[row],
+                position_limits[row],x[:,margin.POSITION_GRANDFATHER] if dated_hold else None)
+            if execution.shape[-1] >= margin.MARGIN_MULTI_LIMIT_EXECUTION_WIDTH:
+                second_group=x[:,margin.SECOND_POSITION_GROUP].nan_to_num().long().clamp(0,slots-1)
+                second_limits=torch.zeros_like(q).scatter_reduce(0,second_group,
+                    x[:,margin.SECOND_POSITION_LIMIT].nan_to_num(),reduce='amax')
+                second_slack=_margin_position_slack(held,q,second_group,
+                    x[:,margin.SECOND_POSITION_UNIT].nan_to_num(),second_limits,
+                    x[:,margin.SECOND_POSITION_GRANDFATHER] if dated_hold else None)
+                position_slack=torch.minimum(position_slack,second_slack)
+            wealth = torch.where(position_failed, position_slack, wealth)
+            terminal_failed = ((x[:, 2] > .5) & (chosen != closed)).any()
+            residual = held - closing
+            wealth = torch.where(terminal_failed, -(residual.abs() * im).sum() / denominator, wealth)
+            soft_wealth = F.softplus(torch.nan_to_num(wealth, nan=-1., posinf=3., neginf=-1.) / .10) * .10 + 1.0e-7
+            log_return = soft_wealth.log()
+        else:
+            log_return = wealth.clamp_min(1.0e-7).log()
+        returns.append(torch.where(do_row, log_return, 0.))
+        turnovers.append(torch.where(do_row, (traded.abs() * x[:, 3].nan_to_num()
+                         + closing.abs() * x[:, 4].nan_to_num()).sum() / denominator, 0.)
+                         if return_turnovers else weights.new_zeros(()))
+        if return_weights_history:
+            histories.append(held * torch.where(active, x[:, 3], 0.) / marked_nav.clamp_min(1.0e-12))
+        q = held - closing
+        q = q + (next_q.to(weights.dtype) - q).detach()
+        nav = end_nav + (next_nav - end_nav).detach()
+        equities.append(nav / capital)
+    return FuturesPortfolioTensorResult(
+        strategy_returns=torch.stack(returns), turnovers=torch.stack(turnovers),
+        weights_history=torch.stack(histories) if histories else weights.new_empty((0, slots)),
+        final_weights=q, final_alive=trace[-1][5] > 0,
+        equity_scale_history=torch.stack(equities), final_equity_scale=nav / capital,
+    )
+
+
 def run_tw_futures_portfolio_integer_surrogate_torch(
     target_weights: torch.Tensor,
     integer_execution: torch.Tensor,
@@ -435,6 +817,9 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     training it can also be selected directly, with continuous ``initial_weights``
     carried between batches; exact integer execution remains authoritative for
     validation, test, reports, and deployment artifacts.
+
+    Dated-margin exact training uses ``_margin_physical_backward`` instead;
+    this unanchored grouped model remains a legacy research relaxation.
     """
 
     if target_weights.ndim != 2 or target_weights.numel() == 0:
@@ -442,7 +827,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     if (
         integer_execution.ndim != 3
         or tuple(integer_execution.shape[:2]) != tuple(target_weights.shape)
-        or int(integer_execution.size(-1)) not in {11, margin.MARGIN_EXECUTION_WIDTH}
+        or int(integer_execution.size(-1)) not in {11, *margin.MARGIN_EXECUTION_WIDTHS}
     ):
         raise ValueError("integer_execution must have shape [T,S,11]")
     capital = float(initial_capital)
@@ -456,7 +841,9 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         neginf=0.0,
     )
     execution = integer_execution.to(device=weights.device, dtype=torch.float32)
-    margin_mode = int(execution.size(-1)) == margin.MARGIN_EXECUTION_WIDTH
+    margin_mode = int(execution.size(-1)) in margin.MARGIN_EXECUTION_WIDTHS
+    if execution.size(-1) >= margin.MARGIN_CORPORATE_EXECUTION_WIDTH:
+        raise ValueError("corporate margin carry requires the physical exact account and its anchored backward")
     rows, slots = tuple(weights.shape)
     advance = (
         torch.ones((rows,), device=weights.device, dtype=torch.bool)
@@ -498,6 +885,16 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     )
     if margin_mode:
         active &= torch.isfinite(collateral) & (collateral > 0)
+        # Cash-settled expiry is valued at the official final mark, which can
+        # differ from the ordinary daily settlement. The backward payoff must
+        # price that same endpoint; it must not learn from a discarded mark.
+        cash_settled = must_liquidate & (execution[..., margin.CASH_SETTLEMENT] > 0.5)
+        simple_asset_returns = torch.where(
+            cash_settled,
+            (execution[..., margin.TERMINAL_MARK] - opening_notional)
+            / collateral.clamp_min(1.0e-12),
+            simple_asset_returns,
+        )
         simple_asset_returns = torch.where(active, simple_asset_returns, torch.zeros_like(simple_asset_returns))
     active_f = active.to(dtype=weights.dtype)
     group_count = torch.zeros_like(weights).scatter_add(1, group_index, active_f)
@@ -535,6 +932,11 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         group_index,
         slot_capacity_cash,
     )
+    if margin_mode:
+        group_buy_capacity_cash = torch.zeros_like(weights).scatter_add(
+            1, group_index, slot_capacity_cash * (execution[..., margin.CAN_BUY] > 0.5))
+        group_sell_capacity_cash = torch.zeros_like(weights).scatter_add(
+            1, group_index, slot_capacity_cash * (execution[..., margin.CAN_SELL] > 0.5))
     entry_cost_rate = torch.where(
         active,
         (fixed_fee + opening_tax) / collateral.clamp_min(1.0e-12),
@@ -656,6 +1058,8 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             else advance[row] & alive
         )
         gap_simple = weights.new_zeros(())
+        allocation_scale = weights.new_ones(())
+        force_margin_close = torch.zeros((), device=weights.device, dtype=torch.bool)
         if margin_mode:
             previous_collateral = execution[row, :, margin.PREVIOUS_INITIAL]
             prior_valid = active[row] & torch.isfinite(previous_collateral) & (previous_collateral > 0)
@@ -663,10 +1067,25 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
                 (opening_notional[row] - execution[row, :, margin.PREVIOUS_MARK])
                 / previous_collateral.clamp_min(1e-12), torch.zeros_like(previous_collateral))
             gap_simple = (previous_slot_weights * gap_return.nan_to_num()).sum() * row_advances
+            # All shadow weights/PnL below use the row's starting NAV. Rebase
+            # new margin requests onto min(start NAV, marked opening NAV), as
+            # the exact account does. Gains cannot finance opening orders;
+            # losses must reduce their funding. Do not detach the shadow's
+            # overnight sensitivity inside a truncated-BPTT batch.
+            allocation_scale = (1.0 + gap_simple).clamp(min=0.0, max=1.0)
+            previous_maintenance = (previous_slot_weights.abs() * torch.where(
+                prior_valid,
+                execution[row, :, margin.PREVIOUS_MAINTENANCE]
+                / previous_collateral.clamp_min(1e-12),
+                torch.zeros_like(previous_collateral))).sum()
             rescaled_prior = previous_slot_weights * torch.where(
                 prior_valid, collateral[row] / previous_collateral.clamp_min(1e-12),
                 torch.ones_like(previous_collateral))
             previous_slot_weights = torch.where(row_advances, rescaled_prior, previous_slot_weights)
+            force_margin_close = row_advances & (
+                (previous_maintenance > 1.0)
+                | ((1.0 + gap_simple) < rescaled_prior.abs().sum()
+                   * execution[row, :, margin.LIQUIDATION_RATIO].max()))
         current_group = torch.zeros_like(previous_slot_weights).scatter_add(
             0,
             group_index[row],
@@ -680,6 +1099,9 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             group_capacity_cash[row] / equity.detach().clamp_min(1.0e-12)
         )
         raw_request = requested_group[row]
+        if margin_mode:
+            raw_request = torch.where(force_margin_close, torch.zeros_like(raw_request),
+                                      raw_request * allocation_scale)
         minimum_cash = group_minimum_contract_cash[row]
         valid_minimum = torch.isfinite(minimum_cash) & (minimum_cash > 0.0)
         safe_minimum = torch.where(
@@ -710,6 +1132,10 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             hard_signed_request - raw_request
         ).detach()
         requested_delta = executable_request - current_group
+        if margin_mode:
+            capacity_weight = torch.where(
+                requested_delta < 0, group_sell_capacity_cash[row], group_buy_capacity_cash[row]
+            ) / equity.detach().clamp_min(1.0e-12)
         capacity_enabled_delta = torch.where(
             capacity_weight > 0.0,
             requested_delta,
@@ -739,7 +1165,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         gross_after_reductions = (
             current_abs.sum() - reductions.sum()
         ).clamp_min(0.0)
-        available_increase = (1.0 - gross_after_reductions).clamp_min(0.0)
+        available_increase = (allocation_scale - gross_after_reductions).clamp_min(0.0)
         increase_scale = torch.minimum(
             torch.ones_like(available_increase),
             available_increase / increases.sum().clamp_min(1.0e-12),
@@ -810,7 +1236,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
                 + entry_cost
                 + (cost_held_abs * group_exit_cost_rate[row]).sum()
             )
-            funding_excess = funding_required - 1.0
+            funding_excess = funding_required - allocation_scale
             # The constraint is inactive for a funded account. A softplus
             # barrier has a nonzero slope even far below the funding limit:
             # at 75% gross it can reverse a profitable, fee-adjusted utility
@@ -937,6 +1363,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
     return_turnovers: bool = True,
+    return_margin_audit: bool = True,
     recoverable_backward: bool = False,
     _initial_surrogate_weights: torch.Tensor | None = None,
     _initial_surrogate_equity_scale: torch.Tensor | None = None,
@@ -961,7 +1388,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     if (
         integer_execution.ndim != 3
         or tuple(integer_execution.shape[:2]) != tuple(target_weights.shape)
-        or int(integer_execution.size(-1)) not in {11, margin.MARGIN_EXECUTION_WIDTH}
+        or int(integer_execution.size(-1)) not in {11, *margin.MARGIN_EXECUTION_WIDTHS}
     ):
         raise ValueError("integer_execution must have shape [T,S,11]")
     capital = float(initial_capital)
@@ -979,7 +1406,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     # the explicit grouped relaxation below owns the complete backward path.
     weights = surrogate_weights.detach()
     execution = integer_execution.to(device=weights.device, dtype=torch.float32)
-    margin_mode = int(execution.size(-1)) == margin.MARGIN_EXECUTION_WIDTH
+    margin_mode = int(execution.size(-1)) in margin.MARGIN_EXECUTION_WIDTHS
     rows, slots = tuple(weights.shape)
     advance = (
         torch.ones((rows,), device=weights.device, dtype=torch.bool)
@@ -1122,6 +1549,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     equity_scale_rows: list[torch.Tensor] = []
     default_rows: list[torch.Tensor] = []
     default_reason_rows: list[torch.Tensor] = []
+    margin_backward_trace: list[tuple[torch.Tensor, ...]] = []
     margin_audit_rows: list[torch.Tensor] = []
     residual_rows: list[torch.Tensor] = []
     for row in range(rows):
@@ -1141,14 +1569,22 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         force_margin_close = torch.zeros_like(alive)
         margin_metadata_ok = torch.ones_like(alive)
         if margin_mode:
+            event_cash = weights.new_zeros(())
+            if execution.shape[-1] >= margin.MARGIN_CORPORATE_EXECUTION_WIDTH:
+                moved, transferred_cash, transfer_ok = _transfer_margin_inventory(
+                    quantities, execution[row], whole_contracts=True)
+                quantities = torch.where(advance[row], moved, quantities)
+                event_cash = torch.where(advance[row], transferred_cash, event_cash)
+                margin_metadata_ok &= ~advance[row] | transfer_ok
             previous_mark = execution[row, :, margin.PREVIOUS_MARK]
             previous_mm = execution[row, :, margin.PREVIOUS_MAINTENANCE]
             carried = quantities != 0
-            margin_metadata_ok = (~carried | (active_metadata & torch.isfinite(previous_mark)
+            margin_metadata_ok &= (~carried | (active_metadata & torch.isfinite(previous_mark)
                 & (previous_mark > 0) & torch.isfinite(previous_mm) & (previous_mm > 0))).all()
             gap_pnl = torch.where(carried & active_metadata,
                 quantities.to(weights.dtype) * (opening_notional - previous_mark).nan_to_num(),
                 torch.zeros_like(opening_notional)).sum() * advance[row]
+            gap_pnl = gap_pnl + event_cash
             equity = equity + gap_pnl
             # Unsettled gains on retained positions do not finance new orders.
             allocation_equity = torch.minimum(row_start_equity, equity)
@@ -1160,10 +1596,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 | (equity < opening_requirement * risk_ratio))
             position_group = execution[row, :, margin.POSITION_GROUP].nan_to_num().long().clamp(0, slots - 1)
             position_units = execution[row, :, margin.POSITION_UNIT].nan_to_num()
-            held_units = torch.zeros_like(opening_notional).scatter_add(0, position_group, quantities.abs() * position_units)
             group_limits = torch.zeros_like(opening_notional).scatter_reduce(0, position_group,
                 execution[row, :, margin.POSITION_LIMIT].nan_to_num(), reduce="amax")
-            force_margin_close |= advance[row] & alive & (held_units > group_limits).any()
         group_target_weight = torch.where(
             alive,
             requested_group_all[row],
@@ -1309,20 +1743,21 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         )
         chosen_by_slot = torch.where(advance[row], chosen_by_slot, quantities)
         if margin_mode:
-            # Reduce positions first. Only increases compete for the remaining
-            # combined-product position limit; released capacity is not traded.
-            pg = execution[row, :, margin.POSITION_GROUP].nan_to_num().long().clamp(0, slots - 1)
-            units = execution[row, :, margin.POSITION_UNIT].nan_to_num()
-            limits = torch.zeros_like(opening_notional).scatter_reduce(
-                0, pg, execution[row, :, margin.POSITION_LIMIT].nan_to_num(), reduce="amax")
-            same_sign = chosen_by_slot * quantities > 0
-            reduced = torch.where(same_sign, torch.sign(quantities) * torch.minimum(
-                quantities.abs(), chosen_by_slot.abs()), torch.zeros_like(quantities))
-            increases = chosen_by_slot - reduced
-            used = torch.zeros_like(opening_notional).scatter_add(0, pg, reduced.abs() * units)
-            wanted = torch.zeros_like(opening_notional).scatter_add(0, pg, increases.abs() * units)
-            scale = torch.minimum(torch.ones_like(used), (limits - used).clamp_min(0) / wanted.clamp_min(1e-12))
-            chosen_by_slot = reduced + torch.trunc(increases * scale[pg]).long()
+            physical_capacity = torch.where(
+                active_metadata & executable_all[row] & alive & advance[row],
+                maximum_trade_all[row],
+                torch.zeros_like(quantities))
+            close_permitted = torch.where(quantities < 0,
+                execution[row, :, margin.CAN_BUY] > .5,
+                execution[row, :, margin.CAN_SELL] > .5)
+            chosen_by_slot, position_limit_failed_slots, position_reduction = _project_margin_position_limit_axes(
+                chosen_by_slot, quantities, execution_row=execution[row], position_group=position_group,
+                position_units=position_units, group_limits=group_limits,
+                close_capacity=torch.where(close_permitted, physical_capacity, torch.zeros_like(physical_capacity)),
+                whole_contracts=True,
+            )
+            position_limit_failed_slots &= advance[row] & alive
+            position_limit_failed = position_limit_failed_slots.any()
         delta_by_slot = chosen_by_slot - quantities
         trade_cost = (
             delta_by_slot.abs().to(weights.dtype)
@@ -1393,7 +1828,11 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             gross_pnl = gross_pnl + (closed_by_slot * torch.where(active_metadata,
                 execution[row, :, margin.TERMINAL_MARK] - ending_notional,
                 torch.zeros_like(ending_notional))).sum()
-            liquidation_failed = (force_margin_close & (chosen_by_slot != 0).any()) | (
+            # Risk liquidation is an order, not a guaranteed execution. Keep
+            # unfilled whole contracts and their marked equity; the next
+            # session re-evaluates margin and can continue reducing them.
+            # A terminal obligation has no automatic next tradable session.
+            liquidation_failed = position_limit_failed | (
                 (must_liquidate & advance[row] & (chosen_by_slot != closed_by_slot)).any())
         forced_close_cost = (
             torch.where(
@@ -1490,21 +1929,26 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             turnover = torch.zeros_like(log_return)
 
         quantities = chosen_by_slot - closed_by_slot
-        if margin_mode:
+        if margin_mode and return_margin_audit:
             end_im = (quantities.abs() * execution[row, :, margin.END_INITIAL].nan_to_num()).sum()
             end_mm = (quantities.abs() * execution[row, :, margin.END_MAINTENANCE].nan_to_num()).sum()
             used_im = (chosen_by_slot.abs() * collateral_all[row].nan_to_num()).sum()
-            unfilled = torch.where(must_liquidate | force_margin_close, quantities.abs(), torch.zeros_like(quantities)).sum()
+            unfilled = torch.where(must_liquidate | force_margin_close
+                | position_limit_failed_slots, quantities.abs(), torch.zeros_like(quantities)).sum()
             margin_audit_rows.append(torch.stack((row_start_equity, equity, exact_next_equity,
                 used_im, end_im, end_mm, allocation_equity - trade_cost - used_im,
                 (chosen_by_slot.abs() * opening_notional.nan_to_num()).sum() / equity.clamp_min(1e-12),
-                (exact_next_equity < end_mm).to(weights.dtype), force_margin_close.to(weights.dtype),
+                (exact_next_equity < end_mm).to(weights.dtype),
+                (force_margin_close | position_reduction).to(weights.dtype),
                 unfilled.to(weights.dtype), gap_pnl)))
-            if return_weights_history:
-                residual_rows.append(quantities.clone())
+        if margin_mode and return_weights_history:
+            residual_rows.append(quantities.clone())
         quantities = torch.where(row_alive, quantities, torch.zeros_like(quantities))
         equity = torch.where(row_alive, next_equity, torch.zeros_like(next_equity))
         alive = alive & row_alive
+        if margin_mode and surrogate_weights.requires_grad and torch.is_grad_enabled():
+            margin_backward_trace.append((row_start_equity, row_start_alive,
+                chosen_by_slot, closed_by_slot, quantities, equity, force_margin_close, position_limit_failed))
         return_rows.append(log_return)
         turnover_rows.append(
             torch.where(advance[row] & (row_start_alive if margin_mode else alive), turnover, torch.zeros_like(turnover))
@@ -1529,7 +1973,16 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         if return_weights_history
         else torch.empty((0, slots), device=weights.device, dtype=torch.int64)
     )
-    if surrogate_weights.requires_grad and torch.is_grad_enabled():
+    if margin_mode and surrogate_weights.requires_grad and torch.is_grad_enabled():
+        surrogate = _margin_physical_backward(
+            surrogate_weights, execution, initial_capital=capital,
+            initial_quantities=(torch.zeros(slots, device=weights.device)
+                                if initial_quantities is None else initial_quantities.detach()),
+            advance=advance, active_metadata=active_metadata_all,
+            trace=margin_backward_trace, recover=recoverable_backward,
+            return_weights_history=return_weights_history, return_turnovers=return_turnovers,
+        )
+    elif surrogate_weights.requires_grad and torch.is_grad_enabled():
         surrogate = run_tw_futures_portfolio_integer_surrogate_torch(
             surrogate_weights,
             integer_execution,
@@ -1560,6 +2013,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             # full-batch call.
             _detach_initial_weights=(_initial_surrogate_weights is None),
         )
+    if surrogate_weights.requires_grad and torch.is_grad_enabled():
         # Add an exactly zero forward tangent rather than subtracting the
         # differently sized exact/shadow values. This preserves the integer
         # account bit for bit under grad/no-grad while retaining the shadow
@@ -1593,7 +2047,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         contract_quantities_history=quantity_history,
         default_history=torch.stack(default_rows),
         default_reason_history=torch.stack(default_reason_rows),
-        margin_audit_history=torch.stack(margin_audit_rows) if margin_mode else None,
+        margin_audit_history=(torch.stack(margin_audit_rows)
+                              if margin_mode and return_margin_audit else None),
         residual_contract_quantities_history=torch.stack(residual_rows) if residual_rows else None,
         _surrogate_final_weights=(
             surrogate.final_weights
@@ -1888,6 +2343,7 @@ def run_tw_futures_portfolio_integer_torch(
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
     return_turnovers: bool = True,
+    return_margin_audit: bool = True,
     recoverable_backward: bool = False,
 ) -> FuturesPortfolioTensorResult:
     """Run the exact account through reusable, gradient-identical blocks."""
@@ -1903,6 +2359,7 @@ def run_tw_futures_portfolio_integer_torch(
             initial_alive=initial_alive,
             return_weights_history=return_weights_history,
             return_turnovers=return_turnovers,
+            return_margin_audit=return_margin_audit,
             recoverable_backward=recoverable_backward,
         )
     block_rows = resolve_tw_futures_portfolio_integer_compiled_block_rows()
@@ -1927,6 +2384,7 @@ def run_tw_futures_portfolio_integer_torch(
             initial_alive=initial_alive,
             return_weights_history=return_weights_history,
             return_turnovers=return_turnovers,
+            return_margin_audit=return_margin_audit,
             recoverable_backward=recoverable_backward,
         )
 

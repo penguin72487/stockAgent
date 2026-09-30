@@ -20,10 +20,11 @@ from typing import Any
 
 from downloader.finmind_batching import RANGE_CONTRACTS, coalesce_pending_tasks
 from downloader.finmind_scheduling import TAIPEI
+from downloader.finmind_runtime import idle_heartbeat
 
 
 EXCLUDED_STATES = frozenset({"non_session", "not_observation_date", "deprecated_query_shape",
-                             "outside_documented_range", "disabled", "delegated"})
+                             "outside_documented_range", "disabled", "delegated", "calendar_wait", "identifier_alias"})
 DONE_STATES = frozenset({"complete", "observed_empty"})
 PENDING_STATES = frozenset({"pending", "failed"})
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -32,7 +33,8 @@ FREE_STATUS_MAX_AGE = timedelta(minutes=30)
 COUNT_FIELDS = ("required_requests", "incremental_requests", "backfill_requests", "validation_requests",
                 "unbatched_requests", "fastest_requests", "current_plan_requests", "batch_savings",
                 "completed_tasks", "pending_tasks", "blocked_tasks", "cooling_tasks", "inflight_tasks",
-                "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests")
+                "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests",
+                "calendar_wait_tasks")
 
 
 def _registry() -> dict[str, dict[str, Any]]:
@@ -112,6 +114,10 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                                                       "inflight_network": 0, "retry_first": None, "retry_last": None})
                 item["states"][state] += count
                 work = _work_class(state, priority, bool(due))
+                if work == 'validation' and owner == 'complement':
+                    from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL_SOURCES
+                    if dataset in SUPPLEMENTAL_SOURCES:
+                        work = 'backfill'  # Low-priority tick is acquisition, not duplicate validation.
                 if work in {"incremental", "backfill", "validation"}:
                     if kind == "derived":
                         item["derived"] += count
@@ -128,6 +134,36 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                 elif work == "inflight" and kind != "derived":
                     item["inflight_network"] += count
             tables = {value[0] for value in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if owner == 'complement' and 'finmind_priority_tasks' in tables:
+                # The worker's finite, user-selected priority override precedes
+                # normal background work. Count it in the SAME queue snapshot,
+                # not as extra work or a whole-dataset priority promotion.
+                for dataset, kind, state, count, last in conn.execute('''
+                    SELECT t.dataset,t.kind,t.state,count(*),max(t.next_attempt_at_utc)
+                    FROM tasks t WHERE EXISTS (SELECT 1 FROM finmind_priority_tasks p
+                        WHERE p.dataset=t.dataset AND p.data_id=t.data_id AND p.partition=t.partition)
+                    GROUP BY t.dataset,t.kind,t.state'''):
+                    item = aggregate[dataset].setdefault('priority_override', {
+                        'requests': 0, 'inflight_tasks': 0, 'blocked_tasks': 0,
+                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 0})
+                    if state in PENDING_STATES:
+                        if kind == 'id_day':
+                            item['requests'] += count  # Proven one day/ID per request.
+                            retry = _stamp(last)
+                            item['max_retry_wait_seconds'] = max(item['max_retry_wait_seconds'],
+                                                                 (retry - now).total_seconds() if retry else 0)
+                        else:
+                            item['unsupported_tasks'] += count
+                    elif state == 'inflight':
+                        item['inflight_tasks'] += count
+                    elif state not in EXCLUDED_STATES | DONE_STATES:
+                        item['blocked_tasks'] += count
+            if owner == 'complement' and 'finmind_source_frontiers' in tables:
+                from downloader.finmind_supplemental import frontier_status
+                for dataset, frontier in frontier_status(conn).items():
+                    if dataset in aggregate:
+                        aggregate[dataset]['frontier'] = frontier
+                        aggregate[dataset]['classes']['backfill'] += frontier['unseeded_partition_candidates']
             disabled = (set(value[0] for value in conn.execute("SELECT dataset FROM request_batch_policy"))
                         if "request_batch_policy" in tables else set())
             table = "request_batch_limits" if owner == "sponsor" else "complement_year_batch_policy"
@@ -183,7 +219,8 @@ def _range_groups(rows: list[tuple[Any, ...]], owner: str, now: datetime,
         seed = (max if owner == "sponsor" else min)(candidates, key=lambda task: task.partition)
         selected = (seed,)
         if not disabled and owner == "sponsor" and seed.dataset in RANGE_CONTRACTS:
-            batch = coalesce_pending_tasks(seed, ready.values(), today=today, max_years=limit, max_months=limit)
+            batch = coalesce_pending_tasks(seed, ready.values(), today=today, max_years=limit, max_months=limit,
+                                           include_due_refresh=True)
             if batch is not None:
                 selected = batch.tasks
         elif not disabled and owner == "complement" and seed.dataset in BULK_GLOBAL_HISTORY:
@@ -215,6 +252,8 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
         fast.update(item["fast_range_classes"])
     row.update({f"{name}_requests": central[name] for name in ("incremental", "backfill", "validation")})
     row["required_requests"] = central["incremental"] + central["backfill"]
+    row['unbatched_incremental_requests'] = unbatched['incremental']
+    row['fastest_incremental_requests'] = fast['incremental']
     row["current_plan_requests"] = sum(central.values())
     row["fastest_requests"] = sum(fast.values())
     row["unbatched_requests"] = sum(unbatched.values())
@@ -226,9 +265,15 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
                blocked_tasks=sum(count for state, count in states.items()
                                  if state not in EXCLUDED_STATES | DONE_STATES | PENDING_STATES | {"inflight"}),
                excluded_tasks=sum(states[state] for state in EXCLUDED_STATES),
+               calendar_wait_tasks=states['calendar_wait'],
                inflight_tasks=states["inflight"], inflight_requests=item["inflight_network"],
                local_derived_tasks=item["derived"], cooling_tasks=item["cooling"],
                earliest_retry_at_utc=item["retry_first"], state_counts=dict(states))
+    if item.get('frontier'):
+        row['historical_frontier'] = item['frontier']
+        row['request_estimate_basis'] = 'includes_unseeded_calendar_candidates_not_verified_instrument_lifetimes'
+    if item.get('priority_override'):
+        row['priority_override'] = item['priority_override']
     latest = _stamp(item["retry_last"])
     if latest:
         row["max_retry_wait_seconds"] = max(0, (latest - now).total_seconds())
@@ -243,7 +288,9 @@ def _free_rows(root: Path, now: datetime, catalog: dict[str, dict[str, Any]]) ->
     try:
         status = _json(root / "status.json")
         observed = _stamp(status.get("observed_at_utc"))
-        if observed is None or observed > now + timedelta(minutes=1) or now - observed > FREE_STATUS_MAX_AGE:
+        idle_proof = idle_heartbeat(root, status, now)
+        if (observed is None or observed > now + timedelta(minutes=1)
+                or (now - observed > FREE_STATUS_MAX_AGE and not idle_proof['alive'])):
             raise ValueError("stale_free_status")
         for dataset in SESSION_DATASETS:
             item = status["series"][dataset]
@@ -289,7 +336,8 @@ def _free_rows(root: Path, now: datetime, catalog: dict[str, dict[str, Any]]) ->
                        current_plan_requests=int(due), unbatched_requests=int(due), fastest_requests=int(due))
             result[dataset] = row
         return result, {"state": "observed", "observed_at_utc": status["observed_at_utc"],
-                        "basis": "fresh_status_plus_two_snapshot_heads"}
+                        "basis": "fresh_status_or_matching_idle_lease_plus_two_snapshot_heads",
+                        "idle_heartbeat": idle_proof}
     except (OSError, ValueError, KeyError, TypeError) as error:
         return {}, {"state": "free_status_unreadable_or_stale", "error_type": type(error).__name__}
 
@@ -325,6 +373,8 @@ def build_finmind_workload(root: Path, now: datetime | None = None) -> dict[str,
             row = free[dataset]
         elif owner in observations and dataset in observations[owner]:
             row = _observed_row(dataset, owner, contract, observations[owner][dataset], now)
+        elif contract['query_shape'] == 'derived_no_api':
+            row.update(state='awaiting_parent', basis='derived_after_parent_receipt_no_additional_api')
         else:
             row.update(state="unknown", basis="missing_unseeded_or_unreadable_primary_owner")
             row.update(dict.fromkeys(COUNT_FIELDS))

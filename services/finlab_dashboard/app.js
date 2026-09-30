@@ -122,7 +122,6 @@ function renderDownloads(info) {
   text("download-last", info.last_receipt_at_utc ? `上次成功 ${timeLabel(info.last_receipt_at_utc)}` : "尚無成功收據");
   text("download-next", timeLabel(info.next_run_at_utc));
   text("download-state", ({running: "執行中", scheduled: "等待排程", waiting_quota: "等待額度重置", service_failed: "服務失敗", timer_disabled: "排程未啟用"})[info.state] || info.state || "待核實");
-  text("download-progress-label", total > 0 ? `${count(downloaded)} / ${count(total)} · ${pct(ratio)}` : "—");
   const reasons = info.not_downloaded_by_reason || {};
   const accounted = Object.values(reasons).reduce((sum, value) => sum + (n(value) ?? 0), 0);
   const parts = [
@@ -140,32 +139,55 @@ function renderDownloads(info) {
   text("download-breakdown", Object.keys(reasons).length
     ? `${parts.join(" · ")}；合計 ${count(accounted)}／未取得 ${count(info.not_downloaded)}。已下載但待追新另計，不代表歷史完整。`
     : `未取得 ${count(info.not_downloaded)}；細項分類待下一次監控快照。`);
-  const progress = $("download-progress");
-  if (ratio === null || total === null || total <= 0) progress.removeAttribute("value");
-  else progress.value = Math.min(1, Math.max(0, ratio));
 }
 
-function renderVolume(info) {
-  const measured = n(info.measured_bytes), total = n(info.estimated_total_bytes);
-  const ratio = n(info.estimated_coverage_ratio);
-  text("volume-downloaded", bytes(measured));
-  text("volume-remaining", bytes(info.estimated_remaining_bytes));
-  text("volume-total", total === null ? "樣本不足" : `約 ${bytes(total)}`);
-  const fallbackKeys = n(info.global_estimated_keys) || 0;
-  const smallSampleKeys = n(info.small_category_estimated_keys) || 0;
-  text("volume-progress-label", ratio === null ? "無足夠樣本"
-    : `${pct(ratio)} · ${fallbackKeys || smallSampleKeys ? "低信心情境" : "樣本推估"}`);
+function renderWorkload(info) {
+  const transfer = info.transfer || {}, valid = info.state === "available";
+  const ratio = valid ? n(transfer.ratio) : null;
+  text("volume-downloaded", bytes(transfer.completed_bytes));
+  text("volume-remaining", n(transfer.remaining_bytes_estimate) === null ? "待量測" : `約 ${bytes(transfer.remaining_bytes_estimate)}`);
+  text("volume-total", n(transfer.total_bytes_estimate) === null ? "待量測" : `約 ${bytes(transfer.total_bytes_estimate)}`);
+  text("volume-progress-label", ratio === null ? "工作量觀測待更新" : `${pct(ratio)} · 可估範圍`);
   const progress = $("volume-progress");
   if (ratio === null) progress.removeAttribute("value");
   else progress.value = Math.min(1, Math.max(0, ratio));
-  const sampled = count(info.measured_files), totalKeys = count(info.catalog_keys);
-  const fallback = count(info.global_estimated_keys), small = count(info.small_category_estimated_keys);
-  const upper = n(info.high_scenario_total_bytes);
-  text("volume-basis", info.catalog_verified === false
-    ? `目錄 ${count(info.expected_catalog_keys)} 鍵與面板 ${totalKeys} 筆逐鍵清單不一致，或鍵名重複；已抓量仍為本機實測，總容量暫停估算。`
-    : total === null
-    ? `目前 ${sampled}／${totalKeys} 鍵有本機大小；沒有可外推的已下載檔案，總容量未知。`
-    : `已抓量為 ${sampled} 個本機檔案實測；${fallback} 鍵無同類樣本、${small} 鍵同類樣本少於 3 個。較大樣本情境約 ${bytes(upper)}，不是上限；高容量鍵可能使總量大幅上修。此容量比例不是完成率，也不是 FinLab 帳號流量。`);
+  text("workload-freshness", info.generated_at_utc
+    ? `${timeLabel(info.generated_at_utc)} 觀測 · ${valid ? "每分鐘重算" : "快照過期或清冊未核實，暫停估時"} · 追新週期自 ${timeLabel(info.cycle_started_at_utc)}；已有歷史與本輪查新分開。`
+    : "尚無工作量快照；流量、筆數與完成時間不以目錄張數代替。");
+  text("volume-basis", `${transfer.basis || "來源檔傳輸大小尚未量測。"} 未知大小 ${count(info.unknown_transfer_keys)} 鍵。`);
+  const workTime = info.work_time || {}, timeRatio = valid ? n(workTime.ratio) : null;
+  text("workload-time-ratio", timeRatio === null ? "耗時樣本待補" : `${pct(timeRatio)} · 工作量加權`);
+  const timeProgress = $("workload-time-progress");
+  if (timeRatio === null) timeProgress.removeAttribute("value"); else timeProgress.value = Math.max(0, Math.min(1, timeRatio));
+  text("workload-time-detail", `已查新 ${durationLabel(workTime.completed_seconds)}／可估總工作量 ${durationLabel(workTime.total_seconds_estimate)}；待辦約 ${durationLabel(workTime.remaining_seconds_estimate)}。不含配額等待，不是從啟動起計時；未知耗時 ${count(workTime.unknown_keys)} 鍵。`);
+  const container = $("workload-records"); container.replaceChildren();
+  for (const measure of info.records || []) {
+    const article = document.createElement("article"), heading = document.createElement("div"), label = document.createElement("span"), value = document.createElement("strong"), bar = document.createElement("progress"), detail = document.createElement("p");
+    const completeMeasurement = valid && n(info.unknown_record_keys) === 0;
+    heading.className = "finlab-volume-heading";
+    label.textContent = measure.label;
+    value.textContent = `${completeMeasurement ? "本機已有" : "已量測至少"} ${count(measure.local_count)}`;
+    heading.append(label, value); bar.max = 1; bar.className = "progress-track";
+    bar.setAttribute("aria-label", `${measure.label}追新工作量`);
+    if (completeMeasurement && n(measure.ratio) !== null) bar.value = Math.max(0, Math.min(1, measure.ratio));
+    detail.textContent = `本輪已查新 ${count(measure.completed_count)}／可估總量 ${count(measure.total_estimate)}；約需重讀 ${count(measure.remaining_estimate)}。${completeMeasurement ? "重讀筆數不是缺少的歷史筆數。" : `尚有 ${count(info.unknown_record_keys)} 鍵未完成筆數量測。`}`;
+    article.append(heading, bar, detail); container.append(article);
+  }
+  const scenarios = valid ? info.scenarios || {} : {}, reference = scenarios.reference || {};
+  const eta = (scenario) => scenario?.finish_at_utc ? timeLabel(scenario.finish_at_utc) : ({object_exceeds_daily_budget: "單表超過可用日額度", insufficient_samples: "耗時／流量樣本不足", scheduler_unverified: "排程未核實", quota_unverified: "額度觀測待更新", unscheduled_work: "有未排入的待辦", blocked: "等待來源／優先權"}[scenario?.state] || "暫無可估時間");
+  text("download-global-eta", eta(reference));
+  text("workload-time-left", reference.finish_at_utc ? `距現在約 ${durationLabel(reference.remaining_seconds)}；不含下方阻塞項目` : "保留未知，不顯示假倒數。");
+  text("workload-processing", durationLabel(reference.processing_seconds));
+  text("workload-wait", durationLabel(reference.total_wait_seconds ?? reference.quota_opening_wait_seconds));
+  text("workload-reset-count", reference.quota_resets == null ? "配額與開盤保護待核實" : `跨 ${count(reference.quota_resets)} 次日額度重置；FinLab MB 沿用下載器 1024² 位元組換算`);
+  text("workload-fast", eta(scenarios.fast)); text("workload-slow", eta(scenarios.slow));
+  text("workload-eta-basis", `${info.eta_basis || "待取得同鍵的完整下載加轉存耗時，以及新鮮帳號配額。"}${n(info.overhead_seconds_per_key_estimate) === null ? " 尚無鍵間開銷樣本，耗時可能低估。" : ` 已加入相鄰完成收據推估的鍵間開銷：每鍵約 ${decimal.format(info.overhead_seconds_per_key_estimate)} 秒（${count(info.overhead_samples)} 個間隔樣本）。`}`);
+  const budget = n(info.daily_budget_bytes), size = n(transfer.total_bytes_estimate);
+  text("workload-budget", budget > 0 && size !== null
+    ? `全量強制重抓約 ${bytes(size)}／每日保留額度後約 ${bytes(budget)}。${size > budget ? "一天配額不足以完整重抓一次；不能承諾所有表永遠在同一日內查新。" : "只代表容量能容納，不代表來源已發布或沒有其他消耗。"}`
+    : "每日可用額度或整體傳輸量尚未量測。");
+  const blocked = Array.isArray(info.blocked_keys) ? info.blocked_keys : [], validation = Array.isArray(info.validation_waiting_keys) ? info.validation_waiting_keys : [];
+  text("workload-blockers", `無法承諾全資料完成日。${blocked.length ? `來源／權限阻塞：${blocked.join("、")}。` : ""}${validation.length ? `優先權等待：${validation.join("、")}。` : ""}全市場 Tick 另計且最低優先；已有 ${count(info.tick?.local_rows)} 筆（${timeLabel(info.tick?.observed_at_utc)} 快照），總傳輸量與完成日仍未驗證。`);
 }
 
 function renderStorage(info) {
@@ -190,7 +212,7 @@ function renderPipelines(data) {
   const gate = data.release_gate || {}, acquired = data.acquisition || {}, training = data.training || {};
   const pipelines = [
     {category: "reference", title: "FinLab SDK 目錄", api: "data.search()", status: gate.catalog_fresh ? "ready" : "waiting", detail: `${count(gate.catalog_total)} 個目錄鍵；目錄清點時間 ${timeLabel(gate.catalog_observed_at_utc)}`, progress: gate.catalog_fresh ? 1 : null, note: "目錄存在不代表帳號可下載。"},
-    {category: "historical", title: "全目錄歷史下載", api: "data.get(force_download=True)", status: acquired.service_active ? "active" : gate.ready ? "ready" : "partial", detail: `${count(acquired.downloaded)}／${count(acquired.catalog_total)} 鍵已取得；最近 24 小時查新 ${count(gate.verified)} 鍵`, progress: n(acquired.ratio), note: "資源暫緩與配額等候不列為完成；原始表不進冷庫。"},
+    {category: "historical", title: "一般歷史追新", api: "data.get(force_download=True)", status: acquired.service_active ? "active" : gate.ready ? "ready" : "partial", detail: `已查新工作量 ${bytes(data.workload?.transfer?.completed_bytes)}；預估仍需 ${bytes(data.workload?.transfer?.remaining_bytes_estimate)}`, progress: data.workload?.state === "available" ? n(data.workload?.transfer?.ratio) : null, note: "按可估來源檔傳輸量加權；空值、未知範圍與 Tick 另外列示。"},
     {category: "derived", title: "研究特徵建表", api: "local research overlay", status: training.local_rows ? (gate.ready ? "ready" : "partial") : "waiting", detail: `${count(training.local_rows)} 列，${count(training.local_finlab_channels)} 個 FinLab 欄位`, progress: training.local_rows ? 1 : 0, note: "只映射已驗證語義的來源，非嚴格歷史 PIT。"},
     {category: "derived", title: "私人冷庫版本", api: "stockagent-data publish", status: training.cold_publication === "verified_exact_release" ? (gate.ready ? "ready" : "partial") : "waiting", detail: training.cold_snapshot_id || "尚無可核驗 release", progress: training.cold_publication === "verified_exact_release" ? 1 : 0, note: gate.ready ? "精確版已驗證；遠端仍須 READY。" : "既有版本可保留，新版須全目錄追新才打包。"},
     {category: "derived", title: "遠端訓練準備", api: "exact release + READY", status: training.remote_materialization === "verified_ready" ? "ready" : "waiting", detail: training.remote_materialization === "verified_ready" ? "遠端 READY 已核驗" : "遠端 READY 未核驗", progress: training.remote_materialization === "verified_ready" ? 1 : null, note: "本機冷庫完成不等於遠端可訓練。"},
@@ -223,7 +245,7 @@ function renderPipelines(data) {
 function renderCapture(data) {
   const acquired = data.acquisition || {}, gate = data.release_gate || {};
   const running = acquired.service_active === true;
-  text("capture-state", running ? "正在下載" : acquired.timer_active ? "等待排程" : "排程未啟用／未知");
+  text("capture-state", running ? "正在下載" : acquired.state === "waiting_quota" ? "等待額度重置" : acquired.timer_active ? "等待排程" : "排程未啟用／未知");
   text("capture-freshness", running ? `開始 ${timeLabel(data.current_fetch?.started_at_utc)}` : "無即時串流；下次 timer 啟動才會查來源");
   text("capture-key", data.current_fetch?.key || "目前無單鍵請求");
   text("capture-last", timeLabel(acquired.last_receipt_at_utc));
@@ -269,11 +291,12 @@ function renderRows() {
   const fragment = document.createDocumentFragment();
   for (const row of matches.slice(0, state.visible)) {
     const tr = document.createElement("tr");
-    const rowState = row.active ? "正在抓取" : row.state === "downloaded" && !row.latest_check_within_24h ? "待核實發布" : stateLabels[row.state] || row.state || "待核實";
+    const work = row.workload || {};
+    const rowState = row.active ? "正在抓取" : work.needs_refresh && row.state === "downloaded" ? "本輪待查新" : row.state === "downloaded" && !row.latest_check_within_24h ? "待核實發布" : stateLabels[row.state] || row.state || "待核實";
     const low = n(row.estimated_fetch_seconds_low), high = n(row.estimated_fetch_seconds_high);
     const blocked = ["vip_only", "provider_empty", "deferred_resource", "deferred_windowed"].includes(row.state);
     const estimate = blocked ? "無可完成估時" : low === null ? "樣本不足" : low === high ? `約 ${durationLabel(low)}` : `${durationLabel(low)}–${durationLabel(high)}`;
-    const finish = row.state === "downloaded" ? row.latest_check_within_24h ? "已查最新" : "發布未核實；無下載 ETA" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
+    const finish = work.estimated_finish_at_utc ? `情境 ${timeLabel(work.estimated_finish_at_utc)}` : work.needs_refresh ? "配額／條件待確認" : row.state === "downloaded" ? row.latest_check_within_24h ? "已查最新" : "發布未核實；無下載 ETA" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
     const deferredReasons = {
       oversized_metadata: "來源標籤寬表超過記憶體預算；待有界擷取",
       oversized_table: "券商整表超過記憶體／額度預算；待分區介面",
@@ -291,11 +314,13 @@ function renderRows() {
     };
     let reason = row.state === "downloaded" ? row.latest_check_within_24h ? "來源已於 24 小時內查詢；歷史 PIT 未驗證" : "已下載，來源查詢超過 24 小時；不代表來源已發布新資料，等待版本核實"
       : deferredReasons[row.deferred_reason] || failureReasons[row.state] || "待核實";
+    if (row.state === "downloaded" && work.needs_refresh) reason = "歷史已保存；依下載器本輪日額度週期待重新查源，不代表缺少這些歷史筆數";
     if (row.state === "partial_windowed") reason = `已保存 ${count(row.partition_receipts)}/${count(row.partition_total)} 個所列期間工作日分區；確認未上架 ${count(row.partition_not_ready)}、其他失敗 ${count(row.partition_other_failed)}；更早歷史未證實`;
     if (row.state === "provider_empty" && n(row.provider_rows) !== null) reason += `；來源 ${count(row.provider_rows)} 列／${count(row.provider_fields)} 欄`;
     if (row.state === "downloaded" && !row.latest_check_within_24h && row.attempt_status === "timed_out") reason += "；最近重查逾時";
     if (row.next_retry_at_utc && row.state !== "downloaded") reason += `；最早重試 ${timeLabel(row.next_retry_at_utc)}`;
-    const cells = [row.key, rowState, reason, row.first || "—", row.last || "—", count(row.rows), bytes(row.local_bytes), estimate, finish, timeLabel(row.last_attempt_at_utc), timeLabel(row.source_checked_at_utc)];
+    const units = {wide_values: "非空資料格", event_rows: "事件／明細列", metadata_values: "來源標籤資料格"};
+    const cells = [row.key, rowState, reason, row.first || "—", row.last || "—", count(work.record_count ?? row.rows), work.record_count == null ? "原收據列（非資料格）" : units[work.record_unit] || "待核實", bytes(row.local_bytes), work.needs_refresh ? bytes(work.transfer_bytes) : work.downloaded ? "本輪已查新" : "未知", n(work.fetch_seconds) === null ? estimate : `約 ${durationLabel(work.fetch_seconds)}`, finish, timeLabel(row.last_attempt_at_utc), timeLabel(row.source_checked_at_utc)];
     cells.forEach((value, index) => {
       const td = document.createElement("td");
       if (index === 1) {
@@ -310,7 +335,7 @@ function renderRows() {
   }
   if (!matches.length) {
     const tr = document.createElement("tr"), td = document.createElement("td");
-    td.colSpan = 11;
+    td.colSpan = 13;
     td.textContent = "目前沒有符合條件的資料鍵。";
     tr.append(td); fragment.append(tr);
   }
@@ -369,7 +394,7 @@ function render(data) {
   const labels = {active: "資料觀測正常", waiting: "執行中但暫無新收據", stale: "面板快照逾時", degraded: "觀測需注意", unavailable: "暫時無資料"};
   renderQuota(data);
   renderDownloads(data.acquisition || {});
-  renderVolume(data.volume_estimate || {});
+  renderWorkload(data.workload || {});
   renderReleaseGate(data.release_gate || {});
   renderTraining(data.training || {}, data.release_gate || {});
   renderStorage(data.storage || {});

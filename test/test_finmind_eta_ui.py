@@ -103,6 +103,65 @@ def test_estimate_does_not_decrease_without_a_new_measurement() -> None:
     assert first == later
 
 
+def test_rate_bridge_distinguishes_rolling_starts_future_load_and_weighted_total():
+    payload = _estimate()
+    payload['rate_evidence'] = dict(rolling_complete_window=True, rolling_requests_60m=5307,
+                                    gross_requests_per_hour=5307, future_recurring_requests_per_hour=1400,
+                                    effective_requests_per_hour=3907, stage_label='指定優先回補',
+                                    overall_rate_basis='stage_weighted', rolling_window_end_at_utc=NOW)
+    view = _view(payload)
+    assert '5,307' in view['rateBridge']
+    assert '1,400' in view['rateBridge']
+    assert '3,907' in view['rateBridge']
+    assert '指定優先回補' in view['rateBridge']
+    assert '全程加權' in view['scenarios'][0]['detail']
+    assert '每分鐘快照' in view['rateWindow']
+    expired = _view(payload, now='2026-09-27T04:06:00+00:00')
+    assert '5,307' not in expired['rateBridge']
+
+
+def test_release_clock_bridge_does_not_describe_daily_average_as_hourly_reserve():
+    payload = _estimate()
+    payload['rate_evidence'] = dict(rolling_complete_window=True, rolling_requests_60m=5307,
+        gross_requests_per_hour=5307, future_recurring_requests_per_hour=0,
+        effective_requests_per_hour=5100, current_reserved_requests=19,
+        scheduling_basis='release_clock_events', stage_label='指定優先回補')
+    bridge = _view(payload)['rateBridge']
+    assert '此刻實際保留 19 次' in bridge
+    assert '未到期不扣容量' in bridge
+    assert '扣除未來追新模型' not in bridge
+
+
+@pytest.mark.parametrize('state', ['waiting_admission', 'waiting_quota'])
+def test_waiting_keeps_active_work_duration_but_never_a_calendar_finish(state):
+    payload = _estimate()
+    payload['state'] = state
+    for row in payload['scenarios'].values():
+        row['active_work_seconds'] = 3600
+    view = _view(payload)
+    assert all(row['value'] == '放行後 約 1 小時' for row in view['scenarios'])
+    assert all(row['complete'] == '完成日期尚無法估算' for row in view['scenarios'])
+    assert all('未知等待時間' in row['detail'] for row in view['scenarios'])
+
+
+def test_expired_waiting_does_not_leave_active_work_numbers_live():
+    payload = _estimate()
+    payload['state'] = 'waiting_admission'
+    payload['scenarios']['fastest']['active_work_seconds'] = 3600
+    view = _view(payload, now='2026-09-27T04:06:00+00:00')
+    assert all(row['value'] == '觀測已過期' for row in view['scenarios'])
+
+
+def test_long_horizon_keeps_duration_without_inventing_a_completion_day():
+    payload = _estimate()
+    payload['scenarios']['slowest'].update(state='unknown', remaining_seconds=None,
+                                          estimated_complete_at_utc=None, active_work_seconds=400000000)
+    view = _view(payload)
+    assert view['scenarios'][0]['value'] == '約 1 小時'
+    assert view['scenarios'][2]['value'].startswith('有效工時')
+    assert view['scenarios'][2]['complete'] == '完成日期尚無法估算'
+
+
 def test_failed_refresh_rechecks_expiry_and_clears_old_numeric_estimates() -> None:
     node = shutil.which("node")
     if node is None:
@@ -185,8 +244,11 @@ def test_scenario_card_and_important_caveats_are_visible_in_markup() -> None:
     assert "最慢」不是硬上界" in html
     assert "不是保證完成期限或統計信賴區間" in html
     assert 'id="download-eta-exclusions" class="estimate-exclusions"' in html
-    assert 'styles.css?v=2' in html
-    assert 'app.js?v=8' in html
+    assert 'styles.css?v=3' in html
+    assert 'app.js?v=11' in html
+    assert 'styles.css?v=5' in html
+    assert '流量與估時對帳' in html
+    assert '階段／已知剩餘請求' in html
 
 
 @pytest.mark.parametrize("width", [390, 1440])
@@ -197,6 +259,14 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
 
     estimate = _estimate()
     estimate["valid_until_utc"] = "2099-01-01T00:00:00+00:00"
+    # Exercise the actual new stage table, not an empty container that can hide
+    # mobile overflow or a renderer regression.
+    from test_finmind_eta_stages import run
+    staged = run()
+    estimate['stages'] = staged['stages']
+    estimate['rate_evidence'] = staged['rate_evidence']
+    for item in estimate['stages']:
+        item['valid_until_utc'] = '2099-01-01T00:00:00+00:00'
     payload = {
         "read_only": True, "production_control_possible": False, "health": "waiting",
         "generated_at_utc": NOW, "datasets": [], "acquisition": {"completion_estimate": estimate},
@@ -243,6 +313,11 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
             playwright.expect(page.locator("#download-eta-exclusions")).to_contain_text("阻塞 7 個任務")
             playwright.expect(page.locator("#download-eta-blockers")).to_contain_text("來源權限未滿足")
             assert page.locator(".completion-estimate").count() == 3
+            assert page.locator('#download-eta-milestones tr').count() == 5
+            playwright.expect(page.locator('#download-eta-rate-bridge')).to_contain_text('5,600')
+            playwright.expect(page.locator('#download-eta-milestones')).to_contain_text('本階段')
+            playwright.expect(page.locator('#download-eta-milestones')).to_contain_text('新增日分區模型')
+            assert page.locator('#backfill .progress-card').evaluate('(el) => getComputedStyle(el).contentVisibility') == 'visible'
             assert page.evaluate("document.documentElement.scrollWidth-document.documentElement.clientWidth") <= 1
             page.get_by_text("估算依據與條件", exact=True).click(timeout=5000)
             assert page.locator(".estimate-method").get_attribute("open") is not None

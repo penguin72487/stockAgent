@@ -27,6 +27,7 @@ from stockagent.data.tw_index_futures import (
 from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 )
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
@@ -94,6 +95,12 @@ class WindowedSplitTensors:
                 f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"
             )
         expected_symbol_shape = tuple(self.future_log_returns.shape)
+        futures_slots=TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+        if (self.execution_mode=='tw_stock_context_futures_portfolio'
+                and self.overnight_log_returns is not None and self.overnight_log_returns.ndim>=2):
+            from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+            futures_slots=int(self.overnight_log_returns.size(1))
+            futures_slot_layout_version(futures_slots)
         if self.overnight_log_returns is None:
             self.overnight_log_returns = torch.zeros_like(
                 self.future_log_returns
@@ -167,18 +174,19 @@ class WindowedSplitTensors:
             not in {
                 (
                     int(self.features.size(0)),
-                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    futures_slots,
                     4,
                 ),
                 (
                     int(self.features.size(0)),
-                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    futures_slots,
                     11,
                 ),
-                (int(self.features.size(0)), TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT, 29),
+                *((int(self.features.size(0)), futures_slots, width)
+                  for width in MARGIN_EXECUTION_WIDTHS),
                 (
                     int(self.features.size(0)),
-                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    futures_slots,
                     2,
                     TAPE_FIELDS,
                 ),
@@ -186,7 +194,8 @@ class WindowedSplitTensors:
         ):
             raise ValueError(
                 "tw_stock_context_futures_portfolio execution tensor must have "
-                "shape [T,1936,4], [T,1936,11], or intraday [T,1936,2,63]"
+                f"shape [T,{futures_slots},C] with C in {(4, 11, *MARGIN_EXECUTION_WIDTHS)}, "
+                f"or intraday [T,{futures_slots},2,63]"
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
@@ -255,7 +264,7 @@ class WindowedSplitTensors:
             expected_rows = int(self.features.size(0))
             expected_context_prefix = (
                 expected_rows,
-                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                futures_slots,
             )
             valid_context_widths = {
                 len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS),
@@ -273,7 +282,7 @@ class WindowedSplitTensors:
             ):
                 raise ValueError(
                     "tw_stock_context_futures_portfolio model context must have "
-                    f"shape [T,{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT},F] "
+                    f"shape [T,{futures_slots},F] "
                     f"where F is one of {sorted(valid_context_widths)}"
                 )
             if self.derivative_candidate_mask is None or tuple(

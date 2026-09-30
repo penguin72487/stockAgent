@@ -545,18 +545,22 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 stock_context_futures_daily.must_liquidate_mask,
                 dtype=bool,
             ).copy()
+            from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+            slots = len(stock_context_futures_daily.symbols)
+            if futures_slot_layout_version(slots) != stock_context_futures_daily.futures_data_contract_version:
+                raise ValueError("stock-context futures sidecar slot layout/version mismatch")
             if (
                 derivative_candidate_features.ndim != 3
                 or derivative_candidate_features.shape[:2]
                 != derivative_candidate_mask.shape
                 or derivative_candidate_features.shape[0] != panel.num_dates
-                or derivative_candidate_mask.shape[1] != 1936
+                or derivative_candidate_mask.shape[1] != slots
                 or stock_context_futures_liquidation.shape
                 != derivative_candidate_mask.shape
             ):
                 raise ValueError(
-                    "stock-context futures sidecar requires context [T,1936,F], "
-                    "mask [T,1936], and liquidation [T,1936]"
+                    f"stock-context futures sidecar requires context [T,{slots},F], "
+                    f"mask [T,{slots}], and liquidation [T,{slots}]"
                 )
             # Stock returns remain a shape-compatible placeholder for generic
             # dataset/report plumbing. The dedicated executor consumes only

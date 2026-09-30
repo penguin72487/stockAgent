@@ -1,0 +1,28 @@
+[Unit]
+Description=Refresh official TWSE calendar through the canonical public collector
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+Environment="POLARS_MAX_THREADS=1"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_tw_public_calendar_refresh.sh
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryAccounting=true
+MemoryHigh=512M
+MemoryMax=1G
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__REPO_ROOT__/artifacts /srv/stockagent-live/data_tw_public /srv/stockagent-live/.locks
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures

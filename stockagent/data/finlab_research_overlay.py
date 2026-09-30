@@ -112,31 +112,47 @@ def _date_lookup(indexes: list[str], calendar: list[date]) -> pl.DataFrame:
     }).filter(pl.col("date").is_not_null())
 
 
-def _wide_stock(path: Path, feature: str, calendar: list[date]) -> pl.DataFrame:
+def _wide_stock(
+    path: Path, feature: str, calendar: list[date], *,
+    date_lookup: pl.DataFrame | None = None, keep_source_index: bool = False,
+    defer_collapse: bool = False,
+) -> pl.DataFrame:
     frame = pl.read_parquet(path)
     fields = [name for name in frame.columns if name != "source_index"]
     if not fields:
         raise ValueError(f"no stock fields for {feature}")
-    lookup = _date_lookup(frame.get_column("source_index").to_list(), calendar)
+    lookup = (date_lookup if date_lookup is not None else
+              _date_lookup(frame.get_column("source_index").to_list(), calendar))
     long = (
         frame.join(lookup, on="source_index", how="inner")
         .unpivot(on=fields, index=["date", "source_index"], variable_name="symbol", value_name=feature)
         .with_columns(pl.col(feature).cast(pl.Float64, strict=False))
         .filter(pl.col(feature).is_finite())
     )
+    if defer_collapse:
+        # A caller with issuer-specific filing dates must resolve those dates
+        # BEFORE collapsing periods onto a shared fallback calendar date.
+        return long
     # Weekend/holiday observations can all become usable on the same next
     # session. The latest provider observation then supersedes earlier ones.
+    aggregations = [pl.col(feature).last()]
+    if keep_source_index:
+        aggregations.append(pl.col("source_index").last())
     return long.sort("date", "symbol", "source_index").group_by(
         "date", "symbol", maintain_order=True,
-    ).agg(pl.col(feature).last())
+    ).agg(*aggregations)
 
 
-def _wide_market(path: Path, feature: str, calendar: list[date]) -> pl.DataFrame:
+def _wide_market(
+    path: Path, feature: str, calendar: list[date], *,
+    date_lookup: pl.DataFrame | None = None,
+) -> pl.DataFrame:
     frame = pl.read_parquet(path)
     values = [name for name in frame.columns if name != "source_index" and name.strip()]
     if len(values) != 1:
         raise ValueError(f"expected one market value for {feature}")
-    lookup = _date_lookup(frame.get_column("source_index").to_list(), calendar)
+    lookup = (date_lookup if date_lookup is not None else
+              _date_lookup(frame.get_column("source_index").to_list(), calendar))
     return (
         frame.join(lookup, on="source_index", how="inner")
         .sort("source_index")

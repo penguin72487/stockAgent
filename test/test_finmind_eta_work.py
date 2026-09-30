@@ -77,6 +77,16 @@ def test_done_refresh_only_due_priority_zero_is_incremental(tmp_path, monkeypatc
     assert rows[dataset]['completed_tasks'] == 4
 
 
+def test_calendar_wait_is_visible_but_neither_download_work_nor_completion(tmp_path, monkeypatch):
+    dataset = 'TaiwanStockPrice'
+    _database(tmp_path, 'sponsor', [(dataset, '', '2026-09-28', 'day', 0, 'calendar_wait',
+                                    (NOW + timedelta(hours=1)).isoformat())])
+    result, rows = _result(tmp_path, monkeypatch, [_spec(dataset)])
+    assert result['summary']['current_plan_requests'] == 0
+    assert rows[dataset]['calendar_wait_tasks'] == 1
+    assert rows[dataset]['completed_tasks'] == rows[dataset]['blocked_tasks'] == 0
+
+
 def test_sponsor_contiguous_ranges_obey_learned_limit(tmp_path, monkeypatch):
     dataset = 'TaiwanBusinessIndicator'
     _database(tmp_path, 'sponsor', [
@@ -140,6 +150,27 @@ def test_missing_queue_unknown_is_not_zero(tmp_path, monkeypatch):
     assert rows['Price']['required_requests'] is None
     assert result['state'] == 'partial'
     assert result['summary']['count_basis'] == 'known_partial_subtotal'
+
+
+def test_finite_priority_override_is_a_subset_not_an_extra_dataset(tmp_path, monkeypatch):
+    dataset = 'TaiwanFuturesKBar'
+    path = _database(tmp_path, 'complement', [
+        (dataset, 'TX', '2026-09-21', 'id_day', 8, 'pending', None),
+        (dataset, 'TX', '2026-09-22', 'id_day', 8, 'failed', (NOW + timedelta(hours=1)).isoformat()),
+        (dataset, 'TX', '2026-09-23', 'id_day', 8, 'complete', None),
+        (dataset, 'TX', '2026-09-24', 'id_day', 8, 'not_entitled', None),
+        (dataset, 'TX', '2026-09-25', 'id_day', 8, 'inflight', None),
+        (dataset, 'MTX', '2026-09-21', 'id_day', 8, 'pending', None),
+    ])
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE finmind_priority_tasks(dataset TEXT,data_id TEXT,partition TEXT,PRIMARY KEY(dataset,data_id,partition))')
+        conn.execute("INSERT INTO finmind_priority_tasks SELECT dataset,data_id,partition FROM tasks WHERE data_id='TX'")
+    result, rows = _result(tmp_path, monkeypatch, [_spec(dataset, 'complement', 'per_futures_day')])
+    priority = rows[dataset]['priority_override']
+    assert priority == {'requests': 2, 'inflight_tasks': 1, 'blocked_tasks': 1,
+                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 3600}
+    assert result['summary']['current_plan_requests'] == 3
+    assert result['state'] == 'observed'
 
 
 def test_unreadable_queue_unknown_and_no_database_created(tmp_path, monkeypatch):
@@ -215,13 +246,13 @@ def test_invalid_retry_timestamp_is_unknown_not_ready(tmp_path, monkeypatch):
     assert result['sources']['sponsor']['state'] == 'queue_unreadable'
 
 
-def test_failed_sponsor_neighbors_cannot_all_join_one_call(tmp_path, monkeypatch):
+def test_due_failed_sponsor_neighbors_join_one_call(tmp_path, monkeypatch):
     dataset = 'TaiwanBusinessIndicator'
     _database(tmp_path, 'sponsor', [
         (dataset, '', f'{year}-01-01', 'year', 2, 'failed', NOW.isoformat()) for year in range(2010, 2013)
     ])
     _, rows = _result(tmp_path, monkeypatch, [_spec(dataset, shape='whole_market_date_range')])
-    assert rows[dataset]['current_plan_requests'] == 3
+    assert rows[dataset]['current_plan_requests'] == 1
 
 
 @pytest.mark.parametrize('next_attempt', [None, 'invalid-timestamp'])

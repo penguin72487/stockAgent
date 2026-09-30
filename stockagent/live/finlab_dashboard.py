@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import sqlite3
@@ -17,6 +18,62 @@ from scripts.snapshot_finlab_quota import load_quota_history
 
 
 STAGE_DATASET = "tw-public-research-finlab-2014-v4"
+
+
+def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
+    """Project only workload counters; no cache paths, raw frames or SDK calls."""
+    raw = _read_json(root / "artifacts/live/finlab/workload_latest.json", {})
+    if not isinstance(raw, Mapping) or raw.get("contract_version") != 1:
+        return {"contract_version": 1, "state": "unavailable"}
+
+    def fields(value, names):
+        if not isinstance(value, Mapping):
+            return {}
+        return {k: (None if isinstance(value[k], float) and not math.isfinite(value[k]) else value[k])
+                for k in names.split() if k in value
+                and (value[k] is None or isinstance(value[k], (str, int, float, bool)))}
+
+    result = fields(raw, "contract_version state generated_at_utc catalog_sha256 catalog_observed_at_utc "
+                    "catalog_keys scope cycle_started_at_utc refresh_days general_keys refresh_pending "
+                    "unknown_transfer_keys unknown_record_keys stored_parquet_bytes eta_basis "
+                    "all_data_finish_at_utc all_data_finish_reason daily_budget_bytes "
+                    "overhead_seconds_per_key_estimate overhead_samples")
+    known = {row["key"] for row in datasets}
+    result["blocked_keys"] = [key for key in raw.get("blocked_keys", []) if isinstance(key, str) and key in known]
+    result["validation_waiting_keys"] = [key for key in raw.get("validation_waiting_keys", []) if isinstance(key, str) and key in known]
+    result["transfer"] = fields(raw.get("transfer"), "completed_bytes remaining_bytes_estimate total_bytes_estimate local_source_bytes ratio basis")
+    result["work_time"] = fields(raw.get("work_time"), "completed_seconds remaining_seconds_estimate total_seconds_estimate unknown_keys ratio")
+    result["records"] = [fields(row, "unit label local_count completed_count remaining_estimate total_estimate ratio")
+                         for row in raw.get("records", []) if isinstance(row, Mapping)
+                         and row.get("unit") in {"wide_values", "event_rows", "metadata_values"}]
+    result["tick"] = fields(raw.get("tick"), "observed_at_utc local_rows local_parquet_bytes candidate_partitions "
+                             "receipted_partitions remaining_transfer_bytes finish_at_utc reason")
+    result["scenarios"] = {name: fields(raw.get("scenarios", {}).get(name),
+                                       "state finish_at_utc remaining_seconds processing_seconds quota_opening_wait_seconds "
+                                       "queue_wait_seconds total_wait_seconds "
+                                       "quota_resets quota_share duration_factor") for name in ("fast", "reference", "slow")}
+    rows = raw.get("datasets", [])
+    result["datasets"] = [fields(row, "key downloaded needs_refresh blocked_reason queue_role scheduled "
+                                  "transfer_bytes transfer_basis fetch_seconds time_basis record_count record_unit "
+                                  "stored_rows estimated_finish_at_utc")
+                          for row in rows if isinstance(row, Mapping) and row.get("key") in known]
+    age = _age_seconds(raw.get("generated_at_utc"), now)
+    result["age_seconds"] = age
+    expected = {key for key in known if key.split(":", 1)[0] not in {"tw_tick", "tw_minute"}}
+    if age is None or age > 180 or _utc(raw.get("generated_at_utc")) > now:
+        result["state"] = "stale"
+    elif (set(row["key"] for row in result["datasets"]) != expected
+          or len(result["datasets"]) != len(expected)):
+        result["state"] = "catalog_mismatch"
+    if result["state"] != "available":
+        result["transfer"]["ratio"] = None
+        result["work_time"]["ratio"] = None
+        for measure in result["records"]:
+            measure["ratio"] = None
+        result["scenarios"] = {}
+        for row in result["datasets"]:
+            row["estimated_finish_at_utc"] = None
+    return result
 
 
 def _public_quota_series(history: list[dict], now: datetime) -> list[dict]:
@@ -338,6 +395,12 @@ def build_finlab_public_status(
             "fetched_at_utc": item.get("latest_at_utc"),
         })
     _per_key_estimates(root, datasets, observed)
+    workload = _public_workload(root, datasets, observed)
+    by_key = {row["key"]: row for row in datasets}
+    for detail in workload.pop("datasets", []):
+        target = by_key.get(detail["key"])
+        if target is not None:
+            target["workload"] = detail
     order = {
         "resource_timeout": 1, "provider_error": 1, "provider_empty": 1,
         "authentication_failed": 1,
@@ -453,6 +516,7 @@ def build_finlab_public_status(
         },
         "acquisition": safe_acquisition,
         "volume_estimate": volume_estimate,
+        "workload": workload,
         "current_fetch": current_fetch,
         "release_gate": readiness,
         "storage": {

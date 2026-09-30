@@ -191,11 +191,11 @@ def _bounds(task: dict[str, Any], now: datetime) -> tuple[date, date] | None:
             start = date(int(partition), 1, 1) if re.fullmatch(r'\d{4}', partition) else _day(partition)
             return start, date(start.year, 12, 31)
         start = _day(partition)
-        if kind in {'day', 'derived'}:
+        if kind in {'day', 'id_day', 'derived'}:
             return start, start
         if kind == 'two_day':
             return start, start + timedelta(days=1)
-        if kind == 'month':
+        if kind in {'month', 'id_month'}:
             return start, date(start.year + (start.month == 12), start.month % 12 + 1, 1) - timedelta(days=1)
     except (TypeError, ValueError):
         return None
@@ -277,7 +277,8 @@ def correction_context(connection: sqlite3.Connection, task: Any) -> dict[str, A
         return {}
     records = connection.execute(
         "SELECT owner,request_json FROM finmind_correction_tasks WHERE dataset=? AND data_id=? AND partition=? "
-        "AND state='queued' ORDER BY correction_id", (task['dataset'], task['data_id'], task['partition']),
+        "AND state IN ('queued','observed_empty_unverified','calendar_excluded_unverified') ORDER BY correction_id",
+        (task['dataset'], task['data_id'], task['partition']),
     ).fetchall()
     if not records:
         return {}
@@ -442,7 +443,7 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
                 # Only the exact day authorization can recover its queued job.
                 retry_excluded = (old and old[1] == 'queued' and empty_authorized
                                   and task['state'] in {'non_session', 'not_observation_date'})
-                if old and old[1] in {'queued', 'repaired', 'already_refreshed'} and not retry_excluded:
+                if old and old[1] in {'queued', 'repaired', 'already_refreshed', 'observed_empty_unverified', 'calendar_excluded_unverified'} and not retry_excluded:
                     summary['unchanged'] += 1
                     continue
                 state, evidence = 'deferred', None
@@ -497,7 +498,8 @@ def reconcile_worker_corrections(connection: sqlite3.Connection, root: Path, own
         records = connection.execute(
             "SELECT c.correction_id,c.dataset,c.data_id,c.partition,c.request_json FROM finmind_correction_tasks c "
             "JOIN tasks t ON t.dataset=c.dataset AND t.data_id=c.data_id AND t.partition=c.partition "
-            "WHERE c.owner=? AND c.state='queued' AND t.state IN ('complete','non_session','not_observation_date') "
+            "WHERE c.owner=? AND ((c.state='queued' AND t.state IN ('complete','observed_empty','non_session','not_observation_date')) "
+            "OR (c.state IN ('observed_empty_unverified','calendar_excluded_unverified') AND t.state='complete')) "
             "ORDER BY COALESCE(c.last_checked_at_utc,''),c.first_seen_at_utc,c.correction_id,c.dataset,c.data_id,c.partition LIMIT ?",
             (owner, max_receipts),
         ).fetchall()
@@ -519,6 +521,24 @@ def reconcile_worker_corrections(connection: sqlite3.Connection, root: Path, own
                         if task['state'] == 'complete' or authorized_excluded else None)
             if evidence is None:
                 summary['unverified'] += 1
+                state = None
+                if task['state'] == 'observed_empty':
+                    receipt = _read_receipt(root, task)
+                    try:
+                        stamp = _stamp(receipt.get('fetched_at_utc'))
+                        if (receipt.get('status') == 'observed_empty' and receipt.get('rows') == 0
+                                and all(receipt.get(key) == task[key] for key in ('dataset','data_id','partition','kind'))
+                                and stamp >= _stamp(request['required_after_utc'])
+                                and _post_notice_proven(receipt, request, owner, task, stamp)):
+                            state = 'observed_empty_unverified'
+                    except (ValueError, TypeError):
+                        pass
+                elif task['state'] in {'non_session', 'not_observation_date'} and not authorized_excluded:
+                    state = 'calendar_excluded_unverified'
+                if state:
+                    connection.execute("UPDATE finmind_correction_tasks SET state=?,completed_at_utc=NULL "
+                                       "WHERE owner=? AND correction_id=? AND dataset=? AND data_id=? AND partition=?",
+                                       (state, owner, correction_id, dataset, data_id, partition))
                 continue
             connection.execute("UPDATE finmind_correction_tasks SET state='repaired',completed_at_utc=?,receipt_evidence_json=? "
                                "WHERE owner=? AND correction_id=? AND dataset=? AND data_id=? AND partition=?",

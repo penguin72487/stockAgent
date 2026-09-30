@@ -11,12 +11,13 @@ import pytest
 from downloader import download_finmind_complement as complement
 
 
-def test_complement_catalog_includes_50_product_routed_sources_without_news_or_ticks() -> None:
-    assert len(complement.ALL_DATASETS) == 50
-    assert len(set(complement.ALL_DATASETS)) == 50
-    assert "TaiwanStockNews" not in complement.ALL_DATASETS
-    assert "TaiwanStockPriceTick" not in complement.ALL_DATASETS
-    assert "TaiwanStockKBar" not in complement.ALL_DATASETS
+def test_complement_catalog_includes_all_sponsor_per_id_sources_and_news() -> None:
+    assert len(complement.ALL_DATASETS) == 69
+    assert len(set(complement.ALL_DATASETS)) == 69
+    assert "TaiwanStockNews" in complement.ALL_DATASETS
+    assert "TaiwanStockPriceTick" in complement.ALL_DATASETS
+    assert "TaiwanStockKBar" in complement.ALL_DATASETS
+    assert complement.supplemental.SOURCES['TaiwanStockPriceTick'].priority > complement.supplemental.SOURCES['TaiwanStockKBar'].priority
 
 
 def test_live_sponsor_delegates_duplicate_finmind_tasks_and_stale_state_falls_back(tmp_path: Path) -> None:
@@ -44,10 +45,11 @@ def test_queue_has_all_reference_and_historical_ranges(tmp_path: Path) -> None:
     with complement._db(tmp_path / "queue.sqlite3") as connection:
         complement._populate(connection, tmp_path, today=date(2026, 9, 25))
         count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        assert count == (8 + sum(2026 - first + 1 for first in complement.GLOBAL_START_YEAR.values())
+        news_days = (date(2026, 9, 25) - complement.news.SEARCH_FLOOR).days + 1
+        assert count == (news_days + len(complement.SNAPSHOTS) - len(complement.DERIVATIVE_SNAPSHOTS) + sum(2026 - first + 1 for first in complement.GLOBAL_START_YEAR.values())
                          + sum(len(ids) for ids in complement.FIXED_ID_HISTORY.values())
-                         + len(complement.CURRENCIES))
-        assert connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanStockNews'").fetchone()[0] == 0
+                         + len(complement.CURRENCIES) + len(complement.supplemental.MARKET_HISTORY_DATASETS))
+        assert connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanStockNews'").fetchone()[0] == news_days
         assert connection.execute("SELECT priority FROM tasks WHERE dataset='GoldPrice' AND partition='1900'").fetchone()[0] == 3
         assert connection.execute("SELECT priority FROM tasks WHERE dataset='GoldPrice' AND partition='2014'").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanExchangeRate' AND data_id=''").fetchone()[0] == 0
@@ -203,7 +205,7 @@ def test_status_keeps_unknown_universes_unknown(tmp_path: Path) -> None:
         status = complement._status(connection, tmp_path, state="running")
     assert status["series"]["TaiwanStockPrice"]["target"] == 0
     assert status["series"]["GoldPrice"]["target"] == 127
-    assert status["news"] == "disabled_by_user"
+    assert status["news"] == "enabled_whole_market_calendar_day"
     assert "token" not in json.dumps(status)
 
 

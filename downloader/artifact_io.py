@@ -40,6 +40,34 @@ def _sync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
+def durable_replace(source: str | Path, destination: str | Path) -> None:
+    """Publish data durably *before* a durable receipt may point at it.
+
+    Atomic rename alone only protects concurrent readers, not power loss. Both
+    the data and the destination directory must reach storage before success.
+    """
+    source, destination = Path(source), Path(destination)
+    with source.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(source, destination)
+    _sync_parent(destination)
+
+
+def table_from_records(rows: list[dict[str, Any]]) -> Any:
+    """Preserve late top-level fields instead of inferring only from row one."""
+    import pyarrow as pa
+
+    if not rows:
+        return pa.Table.from_pylist([])
+    names = dict.fromkeys(name for row in rows for name in row)
+    if any(not isinstance(name, str) for name in names):
+        raise ValueError("record fields must be strings")
+    if set(names) == set(rows[0]):
+        return pa.Table.from_pylist(rows)
+    # The sentinel contributes schema, never an observation or a synthetic zero.
+    return pa.Table.from_pylist([dict.fromkeys(names), *rows]).slice(1)
+
+
 def atomic_write_bytes(
     path: str | Path,
     payload: bytes,

@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.config import ExperimentConfig, load_config
 from stockagent.data.panel import build_panel, load_cached_panel
+from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.data.tw_public_features import (
     FEATURE_COLUMNS,
@@ -343,6 +344,43 @@ def _selected_features(config: ExperimentConfig) -> list[str]:
     included = list(dict.fromkeys(str(name) for name in config.data.feature_include))
     excluded = tuple(str(pattern) for pattern in config.data.feature_exclude)
     return [feature for feature in included if not _matches(feature, excluded)]
+
+
+def audit_panel_feature_schema(panel, config: ExperimentConfig) -> list[Finding]:
+    """Audit the ordered value + derived-availability ABI, not raw values alone.
+
+    Availability channels inherit their value's publication clock and are
+    appended by the canonical panel. They are not independent source fields.
+    Only explicitly requested indicators may appear; each must be binary.
+    """
+    values = _selected_features(config)
+    indicators = [name + "__available" for name in values
+                  if _matches(name, config.data.feature_availability_indicators)]
+    expected = values + indicators
+    actual = list(panel.feature_names)
+    findings = []
+    if actual != expected:
+        findings.append(Finding(
+            "critical", "panel_feature_schema_mismatch", "panel", "feature_names",
+            f"expected={expected}, actual={actual}",
+            "The panel does not match the exact configured value/availability input order.",
+            "Fix feature selection/cache invalidation before training.",
+        ))
+        return findings
+    for name in indicators:
+        index = actual.index(name)
+        invalid = 0
+        for start in range(0, panel.features.shape[0], 64):
+            flags = np.asarray(panel.features[start:start + 64, :, index])
+            invalid += int(((flags != 0) & (flags != 1)).sum())
+        if invalid:
+            findings.append(Finding(
+                "critical", "invalid_feature_availability_indicator", "panel", name,
+                f"non_binary={invalid}",
+                "Missingness must distinguish unobserved values from observed zero.",
+                "Rebuild indicators before numerical missing-value replacement.",
+            ))
+    return findings
 
 
 def _source_selected_features(
@@ -2844,6 +2882,9 @@ def _audit_input_signatures(
     paths = {
         *public_dir.glob("*.parquet"),
         *public_dir.glob("*.json"),
+        # Original-release completeness lives beside, not inside, its data.
+        # A collector may replace this receipt without changing value rows.
+        *public_dir.glob("state/*.json"),
         *parquet_root.glob("*_features.parquet"),
         parquet_root / "official_symbol_build_summary.json",
         parquet_root / "symbols.csv",
@@ -3584,7 +3625,7 @@ def audit_public_feature_table(
         ]
 
     schema = pq.read_schema(path).names
-    public_selected = [feature for feature in selected_features if feature.startswith("twpub_")]
+    public_selected = [feature for feature in selected_features if feature.startswith(("twpub_", "twfl_"))]
     missing_features = [feature for feature in public_selected if feature not in schema]
     missing_rules = [rule for rule in RULE_COLUMNS if rule not in schema]
     if missing_features:
@@ -4453,20 +4494,7 @@ def main() -> None:
         panel_cache_root=panel_cache_root,
     )
     checkpoint("panel_load_or_build")
-    missing_selected = [feature for feature in selected if feature not in panel.feature_names]
-    extra_selected = [feature for feature in panel.feature_names if feature not in selected]
-    if missing_selected or extra_selected:
-        findings.append(
-            Finding(
-                "critical",
-                "panel_feature_schema_mismatch",
-                "panel",
-                "feature_names",
-                f"missing={missing_selected}, extra={extra_selected}",
-                "The panel does not match the exact configured model input order.",
-                "Fix feature selection/cache invalidation before training.",
-            )
-        )
+    findings.extend(audit_panel_feature_schema(panel, config))
     feature_profiles, panel_annual_rows, panel_findings = _panel_feature_profiles(
         panel,
         raw_stats,
@@ -4512,6 +4540,10 @@ def main() -> None:
     summary = {
         "generated_on": date.today().isoformat(),
         "config": str(args.config),
+        "resolved_config_sha256": hashlib.sha256(
+            json.dumps(asdict(config), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "panel_feature_fingerprint": array_content_fingerprint(panel.features),
         "panel": panel_summary,
         "walk_forward": walk_forward_summary,
         "source_receipts": receipt_summary,

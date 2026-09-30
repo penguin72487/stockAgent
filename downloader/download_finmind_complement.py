@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import sys
 import time
+from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle
 from typing import Any
 
 import pyarrow as pa
@@ -28,14 +29,21 @@ import pyarrow.parquet as pq
 import requests
 from urllib3.exceptions import ReadTimeoutError
 
-from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet
+from downloader.artifact_io import (atomic_write_bytes, atomic_write_json, atomic_write_parquet,
+                                    durable_replace, table_from_records)
 from downloader.finmind_parent_recovery import repair_content_addressed_collision
 from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, _record_request_start
-from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
+from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import RangeBatch
 from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, fixed_incremental_demand
 from downloader.finmind_volume_units import annotate_stock_share_units
+from downloader.finmind_history_refresh import (
+    DAILY_EQUITY, canonical_us_id, migrate_us_aliases, read_baseline,
+    request_plan, merge_response, adjusted_history_changed,
+)
+from downloader import finmind_supplemental as supplemental
+from downloader import finmind_news as news
 
 
 SOURCE_CATALOG = "https://github.com/FinMind/FinMind-MCP/blob/master/knowledge/datasets.md"
@@ -44,6 +52,8 @@ SNAPSHOTS = (
     "TaiwanStockInfo", "TaiwanSecuritiesTraderInfo", "TaiwanStockActiveETFInfo",
     "TaiwanFutOptDailyInfo", "USStockInfo", "UKStockInfo", "EuropeStockInfo",
     "JapanStockInfo",
+    "TaiwanFutOptTickInfo", "taiwan_stock_tick_snapshot",
+    "taiwan_futures_snapshot", "taiwan_options_snapshot",
 )
 GLOBAL_HISTORY = (
     "TaiwanStockTotalMarginPurchaseShortSale",
@@ -122,6 +132,8 @@ GLOBAL_EQUITY_HISTORY = {
     "EuropeStockPrice": "EuropeStockInfo",
     "JapanStockPrice": "JapanStockInfo",
 }
+LIVE_SNAPSHOT_ENDPOINTS = frozenset({'taiwan_stock_tick_snapshot', 'taiwan_futures_snapshot', 'taiwan_options_snapshot'})
+DERIVATIVE_SNAPSHOTS = frozenset({'taiwan_futures_snapshot', 'taiwan_options_snapshot'})
 FIXED_ID_HISTORY = {
     "TaiwanStockTotalReturnIndex": ("TAIEX", "TPEx"),
     "InterestRate": ("FED", "ECB", "BOJ", "BOE", "RBA", "PBOC", "BOC", "RBNZ", "RBI", "CBR", "BCB", "SNB"),
@@ -137,9 +149,9 @@ ALL_DATASETS = (
     *DERIVATIVE_HISTORY, "TaiwanStockTotalReturnIndex",
     *SNAPSHOTS[4:], *GLOBAL_EQUITY_HISTORY,
     *GLOBAL_HISTORY[8:], "InterestRate", "CrudeOilPrices", "GovernmentBondsYield",
+    *supplemental.SOURCES, news.DATASET,
 )
-assert len(ALL_DATASETS) == len(set(ALL_DATASETS)) == 50
-assert "TaiwanStockNews" not in ALL_DATASETS
+assert len(ALL_DATASETS) == len(set(ALL_DATASETS)) == 69
 
 
 @dataclass(frozen=True)
@@ -194,6 +206,7 @@ def _db(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_finmind_priority_dataset_partition "
         "ON tasks(priority, dataset, partition DESC)"
     )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_dataset_state ON tasks(dataset,state)")
     return connection
 
 
@@ -225,6 +238,9 @@ def _snapshot_ids(root: Path, dataset: str, column: str) -> list[str]:
     if not path.is_relative_to(root.resolve()) or not path.is_file():
         return []
     if path.stat().st_size != receipt.get("parquet_size_bytes"):
+        return []
+    from downloader.parquet_integrity import parquet_receipt_error
+    if parquet_receipt_error(root, receipt):
         return []
     try:
         table = pq.read_table(path, columns=[column, "type"] if dataset == "TaiwanFutOptDailyInfo" else [column])
@@ -270,6 +286,22 @@ def _official_delisted_ids(root: Path) -> set[str]:
     return symbols
 
 
+def _snapshot_derivative_products(root: Path) -> dict[str, list[str]]:
+    from downloader.parquet_integrity import parquet_receipt_error
+    receipt = _snapshot_receipt(root, 'TaiwanFutOptTickInfo')
+    if not receipt or parquet_receipt_error(root, receipt):
+        return {}
+    groups = {dataset: set() for dataset in DERIVATIVE_SNAPSHOTS}
+    for row in pq.read_table(root / receipt['parquet_path'], columns=['code','callput']).to_pylist():
+        code, callput = str(row.get('code','')), str(row.get('callput',''))
+        if not re.fullmatch(r'[A-Z0-9]{3}', code[:3]) or len(code) < 5:
+            continue
+        dataset = 'taiwan_options_snapshot' if '權' in callput else 'taiwan_futures_snapshot' if callput == '-' else None
+        if dataset:
+            groups[dataset].add(code[:3])
+    return {dataset: sorted(ids) for dataset, ids in groups.items()}
+
+
 def _add_missing_identifiers(connection: sqlite3.Connection, dataset: str,
                              identifiers: list[str], *, priority: int) -> None:
     if not identifiers:
@@ -284,7 +316,14 @@ def _add_missing_identifiers(connection: sqlite3.Connection, dataset: str,
 def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> None:
     _recover_bulk_year_claims(connection)
     jobs: list[tuple[str, str, str, str, int]] = []
-    jobs.extend((dataset, "", "latest", "snapshot", 0) for dataset in SNAPSHOTS)
+    jobs.extend((dataset, "", "latest", "snapshot", 0) for dataset in SNAPSHOTS if dataset not in DERIVATIVE_SNAPSHOTS)
+    # Empty-ID bulk snapshots are rejected by these endpoints despite an old
+    # documentation comment. The verified live master gives product prefixes.
+    for dataset, ids in _snapshot_derivative_products(root).items():
+        jobs.extend((dataset, identifier, 'latest', 'snapshot', 0) for identifier in ids)
+    connection.execute("UPDATE tasks SET state='deprecated_query_shape',next_attempt_at_utc=NULL "
+                       "WHERE dataset IN ('taiwan_futures_snapshot','taiwan_options_snapshot') AND data_id='' "
+                       "AND state IN ('invalid_request','pending','observed_empty')")
     for dataset, first_year in GLOBAL_START_YEAR.items():
         jobs.extend((dataset, "", str(year), "year",
                      0 if year == today.year else 1 if year >= 2014 else 3)
@@ -323,8 +362,8 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
     )
     _migrate_gold_timestamp_boundary(connection, root, _now())
     connection.commit()
-    for dataset, partition, kind, task_state, last_attempt, next_attempt in connection.execute(
-        "SELECT dataset,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc "
+    for dataset, data_id, partition, kind, task_state, last_attempt, next_attempt in connection.execute(
+        "SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc "
         "FROM tasks WHERE state IN ('complete','observed_empty') "
         "AND (kind='snapshot' OR (kind='year' AND partition=?))",
         (str(today.year),),
@@ -335,12 +374,12 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
             refreshed_at = datetime.fromisoformat(last_attempt)
         except ValueError:
             continue
-        earlier = _next_refresh(Task(dataset, "", partition, kind, 0, task_state),
+        earlier = _next_refresh(Task(dataset, data_id, partition, kind, 0, task_state),
                                 refreshed_at, empty=task_state == "observed_empty")
         if next_attempt is None or earlier < next_attempt:
             connection.execute(
-                "UPDATE tasks SET next_attempt_at_utc=? WHERE dataset=? AND data_id='' AND partition=?",
-                (earlier, dataset, partition),
+                "UPDATE tasks SET next_attempt_at_utc=? WHERE dataset=? AND data_id=? AND partition=?",
+                (earlier, dataset, data_id, partition),
             )
     connection.commit()
     stocks = sorted(set(_snapshot_ids(root, "TaiwanStockInfo", "stock_id")) |
@@ -365,7 +404,50 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
     _add_missing_identifiers(connection, "TaiwanExchangeRate", list(CURRENCIES), priority=1)
     for dataset, source in GLOBAL_EQUITY_HISTORY.items():
         identifiers = _snapshot_ids(root, source, "stock_id")
+        if dataset == "USStockPrice":
+            identifiers = sorted({canonical_us_id(value) for value in identifiers})
         _add_missing_identifiers(connection, dataset, identifiers, priority=4)
+    migrate_us_aliases(connection)
+    # Recover interrupted parent publication without creating another API lane.
+    connection.execute("INSERT OR IGNORE INTO tasks(dataset,data_id,partition,kind,priority,state) "
+                       "SELECT 'TaiwanStockTradingDailyReportSecIdAgg',data_id,partition,'derived',7,'pending' "
+                       "FROM tasks WHERE dataset='TaiwanStockTradingDailyReport' AND state='complete'")
+    from stockagent.live.market_status import tw_stock_day_decision
+    from functools import lru_cache
+
+    @lru_cache(maxsize=128)
+    def day_decision(day: date):
+        return tw_stock_day_decision(day, parquet_root=root.parents[1] / 'data_tw_public', observed=_now())
+
+    news.seed(connection, today)
+    supplemental.seed(connection, {
+        "stocks": stocks,
+        "futures": _derivative_ids(root, "TaiwanFuturesDaily"),
+        "options": _derivative_ids(root, "TaiwanOptionDaily"),
+        "bonds": _snapshot_ids(root.parent / "sponsor", "TaiwanStockConvertibleBondInfo", "cb_id"),
+        "brokers": _snapshot_ids(root, "TaiwanSecuritiesTraderInfo", "securities_trader_id"),
+        "us": sorted({canonical_us_id(value) for value in _snapshot_ids(root, "USStockInfo", "stock_id")}),
+    }, _now(), day_decision=day_decision)
+    # A completed history is a renewable observation, not a one-off archive.
+    # Migrate the former 30-day delay, preserving the last actual fetch clock.
+    for dataset, identifier, partition, state, attempted, due, priority, latest in connection.execute(
+        "SELECT dataset,data_id,partition,state,last_attempt_at_utc,next_attempt_at_utc,priority,last_data_date FROM tasks "
+        "WHERE dataset IN (?,?,?,?) AND state IN ('complete','observed_empty')",
+        tuple(sorted(DAILY_EQUITY)),
+    ).fetchall():
+        if not attempted:
+            continue
+        task = Task(dataset, identifier, partition, "id_history", 0, state)
+        earlier = _next_refresh(task, datetime.fromisoformat(attempted), empty=state == "observed_empty", latest_date=latest)
+        next_due = min(earlier, due) if due else earlier
+        next_priority = 0 if state == 'complete' and latest and latest >= (today - timedelta(days=14)).isoformat() else 4
+        if priority == next_priority and due == next_due:
+            continue
+        connection.execute(
+            "UPDATE tasks SET priority=?,next_attempt_at_utc=? WHERE dataset=? AND data_id=? AND partition=?",
+            (next_priority, next_due,
+             dataset, identifier, partition),
+        )
     # Invalid requests and account denials must not be retried automatically:
     # FinMind documents that repeated 4xx responses can block the entire IP.
     for (dataset,) in connection.execute(
@@ -382,7 +464,27 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
 def _next_task(connection: sqlite3.Connection, now: datetime,
                *, delegated: frozenset[str] = frozenset(),
                incremental_only: bool = False,
-               datasets: tuple[str, ...] | None = None) -> Task | None:
+               background_only: bool = False,
+               datasets: tuple[str, ...] | None = None,
+               advance_cursor: bool = False) -> Task | None:
+    # A finite, operator-requested backfill shares this worker and its quota.
+    # Never bypass the caller's incremental-only reserve or terminal failures.
+    if not incremental_only and datasets is None and connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='finmind_priority_tasks'").fetchone():
+        if background_only or not connection.execute(
+                "SELECT 1 FROM tasks WHERE priority=0 AND "
+                "((state='pending' AND next_attempt_at_utc IS NULL) OR "
+                "(state IN ('pending','complete','observed_empty','failed') "
+                "AND next_attempt_at_utc<=?)) LIMIT 1", (_iso(now),)).fetchone():
+            row = connection.execute(
+                "SELECT t.dataset,t.data_id,t.partition,t.kind,t.priority,t.state "
+                "FROM finmind_priority_tasks p JOIN tasks t "
+                "ON t.dataset=p.dataset AND t.data_id=p.data_id AND t.partition=p.partition "
+                "WHERE t.state IN ('pending','failed') AND "
+                "(t.next_attempt_at_utc IS NULL OR t.next_attempt_at_utc<=?) "
+                "ORDER BY p.partition DESC,p.data_id LIMIT 1", (_iso(now),)).fetchone()
+            if row and row[0] not in delegated:
+                return Task(*row)
     excluded = " AND dataset NOT IN (" + ",".join("?" for _ in delegated) + ")" if delegated else ""
     selected = tuple(datasets) if datasets is not None else ()
     if datasets is not None:
@@ -391,18 +493,39 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
         excluded += " AND dataset IN (" + ",".join("?" for _ in selected) + ")"
     if incremental_only:
         excluded += " AND (priority=0 OR kind='derived')"
+    if background_only:
+        excluded += ' AND priority>0'
+    # Round-robin ONLY within the highest-priority lane. A 20k-symbol overseas
+    # release must not starve hourly news or a small settlement refresh. Status
+    # previews can read this cursor but never advance it or create a table.
+    if advance_cursor:
+        connection.execute('CREATE TABLE IF NOT EXISTS dispatch_cursor '
+                           '(priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)')
+    previous = None
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='dispatch_cursor'").fetchone():
+        previous = connection.execute('SELECT last_dataset FROM dispatch_cursor WHERE priority=0').fetchone()
+    cursor = previous[0] if previous else ''
     row = connection.execute(
         "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
         "WHERE ((state='pending' AND next_attempt_at_utc IS NULL) "
         "OR (state IN ('pending','complete','observed_empty','failed') "
         "AND next_attempt_at_utc <= ?)) "
-        + excluded + " AND (kind!='derived' OR EXISTS (SELECT 1 FROM tasks AS source "
+        + excluded + " AND (kind!='derived' OR "
+        "(dataset='TaiwanStockTradingDailyReportSecIdAgg' AND EXISTS (SELECT 1 FROM tasks AS source "
+        "WHERE source.dataset='TaiwanStockTradingDailyReport' AND source.data_id=tasks.data_id "
+        "AND source.partition=tasks.partition AND source.state='complete')) OR (dataset=? AND EXISTS (SELECT 1 FROM tasks AS source "
         "WHERE source.dataset=? AND source.data_id=tasks.data_id "
-        "AND source.partition='history' AND source.state='complete')) "
-        "ORDER BY priority, CASE WHEN state='pending' THEN 0 ELSE 1 END, "
+        "AND source.partition='history' AND source.state='complete'))) "
+        "ORDER BY priority, CASE WHEN priority=0 AND dataset>? THEN 0 WHEN priority=0 THEN 1 ELSE 0 END, "
+        "CASE WHEN priority=0 THEN dataset ELSE '' END, "
+        "CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, "
+        "CASE WHEN state='pending' THEN 0 ELSE 1 END, "
         "COALESCE(next_attempt_at_utc,''), dataset, data_id LIMIT 1",
-        (_iso(now), *sorted(delegated), *selected, LONG_INSTITUTIONAL),
+        (_iso(now), *sorted(delegated), *selected, WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL, cursor),
     ).fetchone()
+    if row and row[4] == 0 and advance_cursor:
+        connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (0,?)', (row[0],))
+        connection.commit()
     return Task(*row) if row else None
 
 
@@ -412,33 +535,12 @@ def _sponsor_delegated(root: Path, now: datetime) -> frozenset[str]:
     An unavailable/stale/blocked Sponsor worker returns ownership to Free.
     No task or receipt is deleted or marked complete by this routing decision.
     """
-    path = root.parent / "sponsor" / "status.json"
-    try:
-        status = json.loads(path.read_text(encoding="utf-8"))
-        stamp = datetime.fromisoformat(status["observed_at_utc"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return frozenset()
-    state = status.get("state")
-    # The same token's hourly cooldown also applies to Free. Handing its
-    # dataset to per-ID requests cannot acquire an independent quota bucket.
-    max_age = timedelta(minutes=35 if state in {"rate_limited", "ip_banned"} else 15)
-    if (stamp.tzinfo is None or stamp > now + timedelta(minutes=1) or
-            now - stamp > max_age or status.get("tier") not in {"Sponsor", "SponsorPro"}):
-        return frozenset()
-    if state not in {"running", "batch_complete", "current_queue", "protected_opening",
-                     "incremental_reserve", "waiting_necessary_acquisition", "rate_limited", "ip_banned"}:
-        return frozenset()
-    series = status.get("series")
-    if not isinstance(series, dict):
-        return frozenset()
+    from downloader.finmind_scheduling import active_sponsor_aliases
     candidates = set(TW_SYMBOL_HISTORY) | (set(DERIVATIVE_HISTORY) - set(PRODUCT_HISTORY_STARTS)) | {
         WIDE_INSTITUTIONAL, "TaiwanStockCapitalReductionReferencePrice",
         "TaiwanFuturesDealerTradingVolumeDaily", "TaiwanOptionDealerTradingVolumeDaily",
     }
-    return frozenset(dataset for dataset in candidates
-                     if isinstance(series.get(dataset), dict)
-                     and series[dataset].get("target", 0) > 0
-                     and not series[dataset].get("blocked", 0))
+    return active_sponsor_aliases(root.parent, now, candidates)
 
 
 def _bulk_needed(connection: sqlite3.Connection, task: Task, today: date) -> bool:
@@ -714,6 +816,10 @@ def _request(session: requests.Session, limiter: SharedRateLimiter, root: Path,
              task: Task, token: str, *, today: date,
              full_history: bool = False) -> list[dict[str, Any]]:
     params: dict[str, str] = {"dataset": task.dataset}
+    if task.dataset in LIVE_SNAPSHOT_ENDPOINTS and task.kind == 'snapshot':
+        return _fetch_rows(session, limiter, root, task.dataset, token, {'data_id': task.data_id},
+                           endpoint=f'https://api.finmindtrade.com/api/v4/{task.dataset}',
+                           max_response_bytes=BULK_MAX_RESPONSE_BYTES)
     product_history = task.dataset in PRODUCT_HISTORY_STARTS
     if product_history and (task.kind != "id_history" or not task.data_id):
         raise SourceError("provider_bad_request", retry_after=0)
@@ -908,7 +1014,11 @@ def _sha256(path: Path) -> str:
 def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
            request_metadata: dict[str, Any] | None = None,
            correction: dict[str, Any] | None = None) -> dict[str, Any]:
-    if correction and not rows and not correction.get('allow_empty'):
+    # A current quote can legitimately disappear when its contract expires;
+    # archive that prior capture but do not invent a continuing live quote.
+    # Historical ranges and reference masters retain the stronger empty guard.
+    live_capture = task.kind == 'snapshot' and task.dataset in LIVE_SNAPSHOT_ENDPOINTS
+    if not rows and not live_capture and not (correction and correction.get('allow_empty')):
         previous_path = root / 'receipts' / task.dataset / (
             hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else 'all'
         ) / f'{task.partition}.json'
@@ -930,7 +1040,7 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
     # Sponsor's all-market wide frame is derived from an all-market long
     # partition and legitimately has an empty data_id. Per-symbol derivations
     # must still match their one requested identifier exactly.
-    if task.kind == "id_history" or (task.kind == "derived" and task.data_id):
+    if task.dataset not in supplemental.SOURCES and (task.kind == "id_history" or (task.kind == "derived" and task.data_id)):
         for field in ("stock_id", "futures_id", "option_id"):
             ids = {str(row[field]) for row in rows if row.get(field) is not None}
             if ids and ids != {task.data_id}:
@@ -941,13 +1051,16 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
         "status": "complete" if rows else "observed_empty", "rows": len(rows),
         "source_first_date": first, "source_last_date": last,
         "fetched_at_utc": _iso(now), "historical_point_in_time": False,
-        "coverage_claim": ("derived_from_observed_long_response_not_provider_completeness"
+        "coverage_claim": ("derived_from_verified_broker_detail_not_independent_provider_response"
+                           if task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and task.kind == 'derived' else
+                           "derived_from_observed_long_response_not_provider_completeness"
                            if task.kind == "derived" else
                            "observed_response_only_not_provider_completeness"),
         "volume_units": volume_units,
     }
     if task.kind == "derived":
-        receipt["derived_from"] = LONG_INSTITUTIONAL
+        receipt["derived_from"] = ('TaiwanStockTradingDailyReport' if task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg'
+                                   else LONG_INSTITUTIONAL)
     if request_metadata is not None:
         receipt["request"] = request_metadata
     if correction:
@@ -965,7 +1078,12 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
         folder = root / "parquet" / task.dataset / id_hash / task.partition
         folder.mkdir(parents=True, exist_ok=True)
         staged = folder / "latest.parquet"
-        atomic_write_parquet(staged, pa.Table.from_pylist(rows), compression="zstd")
+        table = table_from_records(rows)
+        field_non_null = {name: table.num_rows - column.null_count
+                          for name, column in zip(table.column_names, table.columns)}
+        if not any(field_non_null.values()):
+            raise SourceError("all_null_response", retry_after=3600)
+        atomic_write_parquet(staged, table, compression="zstd", durable=True)
         digest = _sha256(staged)
         final = folder / f"{digest}.parquet"
         if final.exists():
@@ -976,9 +1094,12 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
             else:
                 staged.unlink()
         else:
-            staged.replace(final)
+            durable_replace(staged, final)
         receipt.update({"parquet_path": str(final.relative_to(root)),
-                        "parquet_size_bytes": final.stat().st_size, "sha256": digest})
+                        "parquet_size_bytes": final.stat().st_size, "sha256": digest,
+                        "storage_contract_version": 2,
+                        "field_non_null_counts": field_non_null,
+                        "all_null_fields": [name for name, count in field_non_null.items() if count == 0]})
     receipt_path = root / "receipts" / task.dataset / (
         hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else "all"
     ) / f"{task.partition}.json"
@@ -1037,6 +1158,26 @@ def _derive_wide(root: Path, connection: sqlite3.Connection, task: Task) -> list
                 raise SourceError("invalid_long_row", retry_after=0)
             wide[f"{name}_{side}"] += value
     return [grouped[key] for key in sorted(grouped)]
+
+
+def _derive_broker_aggregate(root: Path, task: Task) -> tuple[list[dict], dict]:
+    from downloader.parquet_integrity import parquet_receipt_error
+
+    path = root / 'receipts' / 'TaiwanStockTradingDailyReport' / hashlib.sha256(task.data_id.encode()).hexdigest()[:12] / f'{task.partition}.json'
+    parent = json.loads(path.read_bytes())
+    if (parent.get('status') != 'complete' or parent.get('dataset') != 'TaiwanStockTradingDailyReport'
+            or parent.get('data_id') != task.data_id or parent.get('partition') != task.partition
+            or parquet_receipt_error(root, parent)):
+        raise SourceError('invalid_broker_parent', retry_after=900)
+    rows = pq.read_table(root / parent['parquet_path']).to_pylist()
+    supplemental.validate_response('TaiwanStockTradingDailyReport', task.data_id, task.partition, date.fromisoformat(task.partition), rows)
+    return supplemental.aggregate_brokers(rows), {
+        'supplemental_contract_version': supplemental.CONTRACT_VERSION,
+        'query_shape': 'local_broker_aggregate_from_verified_raw', 'request_count': 0,
+        'parent_sha256': parent['sha256'], 'parent_receipt': str(path.relative_to(root)),
+        'price_semantics': 'unrounded_quantity_weighted_average_not_independent_provider_response',
+        'contract_probe': 'artifacts/data_quality/finmind_repair_2026-09-29/broker_aggregation_probe.json',
+    }
 
 
 def _preflight_bulk_year_schemas(dataset: str, grouped: dict[str, list[dict[str, Any]]]) -> None:
@@ -1138,12 +1279,48 @@ def _store_bulk_years(connection: sqlite3.Connection, root: Path, task: Task,
     return len(rows)
 
 
-def _next_refresh(task: Task, now: datetime, *, empty: bool) -> str:
+def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | None = None) -> str:
+    if task.dataset == news.DATASET:
+        return news.next_refresh(task.partition, now, empty=empty)
+    if task.dataset in supplemental.SOURCES:
+        spec = supplemental.SOURCES[task.dataset]
+        if spec.grain == 'derived':
+            return _iso(now + timedelta(days=3650))
+        local = now.astimezone(TAIPEI)
+        if task.dataset in supplemental.MARKET_HISTORY_DATASETS:
+            # Provider publishes Mon-Sat at 18:00. One all-bond history request
+            # catches late months and revisions, without 1,846 per-bond renewals.
+            # An empty result is not accepted over last-good nonempty history.
+            next_check = local.replace(hour=spec.release_hour, minute=0, second=0, microsecond=0)
+            if next_check <= local:
+                next_check += timedelta(days=1)
+            while next_check.weekday() == 6:
+                next_check += timedelta(days=1)
+            return _iso(next_check)
+        if task.kind == "id_day" or (task.kind == "id_month" and task.partition[:7] != local.strftime("%Y-%m")):
+            # Immutable past requests remain checked-empty, not complete. A
+            # reviewed correction notice may requeue either state immediately.
+            return _iso(now + timedelta(days=90 if empty else 365))
+        if empty:
+            return _iso(now + timedelta(days=7))
+        next_check = local.replace(hour=spec.release_hour, minute=15, second=0, microsecond=0)
+        if next_check <= local:
+            next_check += timedelta(days=1)
+        return _iso(next_check)
+    if task.dataset in DAILY_EQUITY and task.kind == "id_history":
+        if empty or (latest_date and latest_date[:10] < (now.astimezone(TAIPEI).date() - timedelta(days=14)).isoformat()):
+            return _iso(now + timedelta(days=7))  # Unknown/inactive identity, not a success claim.
+        local = now.astimezone(TAIPEI)
+        next_check = local.replace(hour=8, minute=5, second=0, microsecond=0)
+        if next_check <= local:
+            next_check += timedelta(days=1)
+        return _iso(next_check)
     if task.dataset in PRODUCT_HISTORY_STARTS and task.kind == "id_history" and not empty:
         return _iso(now + timedelta(hours=3))
     if task.kind == "snapshot":
         local = now.astimezone(TAIPEI)
-        next_check = local.replace(hour=14, minute=0, second=0, microsecond=0)
+        hour = 17 if task.dataset in {'taiwan_futures_snapshot', 'taiwan_options_snapshot'} else 14
+        next_check = local.replace(hour=hour, minute=0, second=0, microsecond=0)
         if next_check <= local:
             next_check += timedelta(days=1)
         return _iso(next_check)
@@ -1174,13 +1351,16 @@ def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, 
         "UPDATE tasks SET state=?, next_attempt_at_utc=?, last_attempt_at_utc=?, "
         "rows=?,bytes=?,first_data_date=?,last_data_date=?,receipt_path=?,error_code=NULL "
         "WHERE dataset=? AND data_id=? AND partition=?",
-        (receipt["status"], _next_refresh(task, now, empty=receipt["status"] == "observed_empty"),
+        (receipt["status"], _next_refresh(task, now, empty=receipt["status"] == "observed_empty", latest_date=receipt.get('source_last_date')),
          _iso(now), receipt["rows"], receipt.get("parquet_size_bytes", 0),
          receipt.get("source_first_date"), receipt.get("source_last_date"), receipt["receipt_path"],
          task.dataset, task.data_id, task.partition),
     )
-    if task.dataset in PRODUCT_HISTORY_STARTS and receipt["status"] == "complete" and receipt["rows"] > 0:
+    if task.dataset in {*PRODUCT_HISTORY_STARTS, *DAILY_EQUITY} and receipt["status"] == "complete" and receipt["rows"] > 0:
         connection.execute("UPDATE tasks SET priority=0 WHERE dataset=? AND data_id=? AND partition=?",
+                           (task.dataset, task.data_id, task.partition))
+    if task.dataset in DAILY_EQUITY and (receipt.get('source_last_date') or '') < (now.astimezone(TAIPEI).date() - timedelta(days=14)).isoformat():
+        connection.execute('UPDATE tasks SET priority=4 WHERE dataset=? AND data_id=? AND partition=?',
                            (task.dataset, task.data_id, task.partition))
     if task.dataset == LONG_INSTITUTIONAL and receipt["status"] == "complete":
         connection.execute(
@@ -1188,6 +1368,11 @@ def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, 
             "WHERE dataset=? AND data_id=? AND partition='history' AND kind='derived'",
             (WIDE_INSTITUTIONAL, task.data_id),
         )
+    if task.dataset == 'TaiwanStockTradingDailyReport' and receipt['status'] == 'complete':
+        connection.execute("INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
+                           "VALUES ('TaiwanStockTradingDailyReportSecIdAgg',?,?,'derived',7,'pending') "
+                           "ON CONFLICT(dataset,data_id,partition) DO UPDATE SET state='pending',next_attempt_at_utc=NULL",
+                           (task.data_id, task.partition))
     connection.commit()
 
 
@@ -1226,7 +1411,7 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
         "MAX(last_data_date),MAX(last_attempt_at_utc) FROM tasks GROUP BY dataset,state"
     ):
         dataset, task_state, count, rows, size, first, last_date, attempted = row
-        if task_state in {"deprecated_query_shape", "outside_documented_range"}:
+        if task_state in {"deprecated_query_shape", "outside_documented_range", "identifier_alias", "non_session", "not_observation_date"}:
             continue
         item = summary[dataset]
         item["target"] += count
@@ -1248,8 +1433,9 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
         "schema_version": 1, "state": state, "observed_at_utc": _iso(_now()),
         "delegated_to_sponsor": sorted(delegated),
         "catalog_source": SOURCE_CATALOG, "scheduled_datasets": list(ALL_DATASETS),
-        "news": "disabled_by_user", "training": "raw_not_pit_validated",
+        "news": "enabled_whole_market_calendar_day", "training": "raw_not_pit_validated",
         "series": summary,
+        "historical_frontiers": supplemental.frontier_status(connection),
         "candidate_universe": {
             "finmind_current_master_stock_ids": len(current_stock_ids),
             "official_delisted_stock_ids": len(delisted_stock_ids),
@@ -1290,6 +1476,11 @@ def run_once(root: Path, *, max_requests: int = 0,
         from downloader.finmind_corrections import apply_worker_corrections, correction_context, reconcile_worker_corrections
 
         _populate(connection, root, today=_now().astimezone(TAIPEI).date())
+        from downloader.finmind_integrity import audit_completed_batch
+        from downloader.finmind_scheduling import protected_stock_opening
+
+        if not protected_stock_opening(_now()):
+            audit_completed_batch(connection, root)
         reconcile_worker_corrections(connection, root, 'complement', _now())
         correction_summary = apply_worker_corrections(connection, root, 'complement', _now())
         connection.commit()
@@ -1299,26 +1490,28 @@ def run_once(root: Path, *, max_requests: int = 0,
         last_status_at = time.monotonic()
         while not max_requests or completed < max_requests:
             now = _now()
+            account = refresh_dispatch_account(account, token, root.parent, now)
             delegated = _sponsor_delegated(root, now) if account["tier"] in {"Sponsor", "SponsorPro"} else frozenset()
             local = now.astimezone(TAIPEI)
             if shutil.disk_usage(root).free < MIN_FREE_BYTES:
                 return _status(connection, root, state="disk_guard", last=last, delegated=delegated)
-            calendar = root.parent / "calendar.json"
-            try:
-                sessions = set(json.loads(calendar.read_text(encoding="utf-8")).get("dates", []))
-            except (OSError, ValueError):
-                sessions = set()
-            market_session = local.date().isoformat() in sessions if sessions else local.weekday() < 5
-            if market_session and ((local.hour == 8 and local.minute >= 20) or
-                                   (local.hour == 9 and local.minute < 10)):
+            if protected_stock_opening(now):
                 return _status(connection, root, state="protected_opening", last=last, delegated=delegated)
             budget = backfill_budget(
                 account, root.parent, fixed_incremental_requests=fixed_incremental_demand(root.parent, now),
-                in_flight=0, now=now,
+                in_flight=0, now=now, prioritize_due=True,
             )
+            if budget.get('remaining', 1) <= 0:
+                return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
             task = _next_task(connection, now, delegated=delegated,
-                              incremental_only=not budget["allowed"], datasets=datasets)
+                              incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True)
             if task is None:
+                if budget['allowed'] and datasets is None and any(
+                    item.get('unseeded_partition_candidates', 0) for item in supplemental.frontier_status(connection).values()
+                ):
+                    # A holiday-only working set still has an older frontier.
+                    # Seed the next bounded batch instead of sleeping an hour.
+                    return _status(connection, root, state='batch_complete', last=last, delegated=delegated)
                 return _status(connection, root,
                                state="current_queue" if budget["allowed"] else "incremental_reserve",
                                last=last, delegated=delegated)
@@ -1334,8 +1527,63 @@ def run_once(root: Path, *, max_requests: int = 0,
                     stored_rows = _store_bulk_years(connection, root, task, rows, _now(), local.date(), batch=bulk)
                     result_status = "complete" if stored_rows else "observed_empty"
                 else:
-                    rows = (_derive_wide(root, connection, task) if task.kind == "derived" else
-                            _request(session, limiter, root.parent, task, token, today=local.date()))
+                    history_metadata = None
+                    if task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and task.kind == 'derived':
+                        rows, history_metadata = _derive_broker_aggregate(root, task)
+                    elif task.dataset == news.DATASET:
+                        params, history_metadata = news.request_contract(task.partition)
+                        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
+                                           max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+                        history_metadata['validation'] = news.validate_response(task.partition, rows)
+                    elif task.dataset in supplemental.SOURCES:
+                        endpoint, params, history_metadata = supplemental.request_contract(
+                            task.dataset, task.data_id, task.partition, local.date())
+                        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
+                                           endpoint=endpoint, max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+                        if len(rows) > BULK_MAX_RESPONSE_ROWS:
+                            raise SourceError("response_row_limit")
+                        supplemental.validate_response(task.dataset, task.data_id, task.partition, local.date(), rows)
+                    elif task.dataset in DAILY_EQUITY and task.kind == "id_history":
+                        baseline_error = None
+                        try:
+                            baseline, old_rows = read_baseline(root, task)
+                        except (OSError, ValueError, pa.ArrowException):
+                            # Integrity failure is repair work, not a permanent
+                            # retry of an unreadable incremental baseline.
+                            baseline, old_rows = {}, []
+                            baseline_error = "invalid_local_baseline_full_refetch"
+                        history_metadata = request_plan(baseline, now, local.date())
+                        context = correction_context(connection, task)
+                        if context:
+                            # Correction notices require their complete historical scope.
+                            history_metadata = request_plan({}, now, local.date())
+                        incoming = _fetch_rows(
+                            session, limiter, root.parent, task.dataset, token,
+                            {"dataset": task.dataset, "data_id": task.data_id,
+                             "start_date": history_metadata["request_start_date"],
+                             "end_date": history_metadata["request_end_date"]},
+                            max_response_bytes=BULK_MAX_RESPONSE_BYTES,
+                        )
+                        if len(incoming) > BULK_MAX_RESPONSE_ROWS:
+                            raise SourceError("response_row_limit")
+                        if history_metadata['query_shape'] == 'per_id_incremental_overlap' and adjusted_history_changed(old_rows, incoming):
+                            history_metadata = request_plan({}, now, local.date())
+                            incoming = _fetch_rows(session, limiter, root.parent, task.dataset, token,
+                                                   {"dataset": task.dataset, "data_id": task.data_id,
+                                                    "start_date": history_metadata['request_start_date'],
+                                                    "end_date": history_metadata['request_end_date']},
+                                                   max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+                            if len(incoming) > BULK_MAX_RESPONSE_ROWS:
+                                raise SourceError("response_row_limit")
+                            history_metadata.update(request_count=2, full_refetch_reason='adjusted_history_changed')
+                            completed += 1
+                        rows = merge_response(old_rows, incoming, task.data_id, history_metadata)
+                        history_metadata["response_rows"] = len(incoming)
+                        if baseline_error:
+                            history_metadata['baseline_recovery'] = baseline_error
+                    else:
+                        rows = (_derive_wide(root, connection, task) if task.kind == "derived" else
+                                _request(session, limiter, root.parent, task, token, today=local.date()))
                     if not rows and ((task.kind == "year" and task.dataset in BULK_GLOBAL_HISTORY)
                                      or task.dataset in PRODUCT_HISTORY_STARTS):
                         previous = connection.execute(
@@ -1352,7 +1600,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                         "request_end_inclusive": True, "request_count": 1,
                         "source_date_semantics": "expiry_date",
                         "historical_product_universe_verified_complete": False,
-                    } if task.dataset in PRODUCT_HISTORY_STARTS else None)
+                    } if task.dataset in PRODUCT_HISTORY_STARTS else history_metadata)
                     if task.kind == "year" and task.dataset in BULK_GLOBAL_HISTORY:
                         _preflight_bulk_year_schemas(task.dataset, {task.partition: rows})
                     context = correction_context(connection, task)
@@ -1442,10 +1690,11 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 if result["state"] == "invalid_token":
                     return 0  # Requires token replacement and an explicit restart.
-                time.sleep(3600 if result["state"] in {"current_queue", "disk_guard"}
-                           else 1800 if result["state"] == "ip_banned"
-                           else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
-                           else 60 if result["state"] == "incremental_reserve" else 5)
+                delay = (3600 if result["state"] in {"current_queue", "disk_guard"}
+                         else 1800 if result["state"] == "ip_banned"
+                         else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
+                         else 60 if result["state"] == "incremental_reserve" else 5)
+                wait_for_next_cycle(root, result, delay)
         except KeyboardInterrupt:
             return 130
         finally:

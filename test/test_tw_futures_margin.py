@@ -91,8 +91,75 @@ def test_margin_call_flattens_or_records_unfilled_liquidation(locked):
     assert result.margin_audit_history[1, 9] == 1
     assert result.margin_audit_history[1, 2] == 350
     assert result.residual_contract_quantities_history[1].item() == (5 if locked else 0)
-    assert result.default_reason_history[1] == (4 if locked else 0)
-    assert bool(result.final_alive) is not locked
+    assert result.default_reason_history[1] == 0
+    assert result.final_alive
+    assert result.final_equity_scale == pytest.approx(.35)
+    assert result.final_weights.item() == (5 if locked else 0)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("partial", [False, True])
+def test_unfilled_risk_close_carries_real_pnl_then_reduces_next_session(sign, partial):
+    x = tape(3)
+    x[0, :, 4] = 1000 - sign * 140
+    x[1, :, 3:5] = 1000 - sign * 140
+    x[1, :, m.PREVIOUS_MARK] = x[0, :, 4]
+    x[1, :, 8] = 2 if partial else 0
+    x[2, :, m.PREVIOUS_MARK] = x[1, :, 4]
+    x[2, :, 3:5] = x[1, :, 4] + sign * 10
+    weights = [[sign * .5], [sign * .9], [0.]]
+    result = run(weights, x)
+    residual = 3 if partial else 5
+    expected_nav = 300 + 10 * residual
+    assert result.residual_contract_quantities_history[:, 0].tolist() == [sign * 5, sign * residual, 0]
+    assert result.margin_audit_history[1, 10] == residual
+    assert result.margin_audit_history[:, 2].tolist() == [300, 300, expected_nav]
+    assert result.final_equity_scale == pytest.approx(expected_nav / 1000)
+    assert result.strategy_returns.exp().prod() == pytest.approx(expected_nav / 1000)
+    assert result.default_reason_history.tolist() == [0, 0, 0]
+    assert result.final_alive
+    # A training chunk boundary must preserve the same actual inventory/NAV.
+    first = run(weights[:2], x[:2])
+    rest = run(weights[2:], x[2:], initial_quantities=first.final_weights,
+               initial_equity_scale=first.final_equity_scale, initial_alive=first.final_alive)
+    torch.testing.assert_close(rest.margin_audit_history, result.margin_audit_history[2:])
+
+
+def test_locked_risk_close_with_nonpositive_equity_still_has_absorbing_ruin():
+    x = tape(3)
+    x[1, :, 3:5] = 700
+    x[1, :, m.CAN_SELL] = 0
+    x[2, :, 3:5] = 2000
+    x[2, :, m.PREVIOUS_MARK] = 700
+    result = run([[.5], [.5], [.9]], x)
+    assert result.margin_audit_history[1, 2] == -500
+    assert result.margin_audit_history[1, 10] == 5
+    assert result.default_reason_history.tolist() == [0, 3, 0]
+    assert result.final_equity_scale == 0
+    assert not result.final_alive
+    assert result.contract_quantities_history[2].item() == 0
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_unfilled_risk_notice_adds_no_return_or_gradient_penalty(recover):
+    outputs = []
+    for previous_maintenance in (25., 75.):
+        x = tape(2)
+        x[0, :, 4] = 860
+        x[1, :, 3:5] = 870
+        x[1, :, 8] = 0
+        x[1, :, m.PREVIOUS_MARK] = 860
+        x[1, :, m.PREVIOUS_MAINTENANCE] = previous_maintenance
+        weights = torch.tensor([[.5], [0.]], requires_grad=True)
+        result = run(weights, x, recoverable_backward=recover)
+        result.strategy_returns.sum().backward()
+        outputs.append((result, weights.grad))
+    normal, noticed = outputs
+    assert normal[0].margin_audit_history[1, 9] == 0
+    assert noticed[0].margin_audit_history[1, 9] == 1
+    # Identical inventory, prices and fills have identical returns/gradients.
+    torch.testing.assert_close(normal[0].strategy_returns, noticed[0].strategy_returns, rtol=0, atol=0)
+    torch.testing.assert_close(normal[1], noticed[1], rtol=0, atol=0)
 
 
 def test_opening_risk_close_can_realize_debt_and_never_resurrects():
@@ -248,6 +315,31 @@ def test_margin_rule_alignment_prior_features_and_no_fill_calendar(tmp_path, dat
     assert not dataset.overnight_log_returns_t[-1, :, 2].any(), "A margin sample boundary must retain marked positions"
 
 
+@pytest.mark.parametrize('reported_volume', [None, 100.])
+def test_missing_executable_quote_has_no_terminal_capacity_and_carries(tmp_path, reported_volume):
+    panel, rows = rule_panel(tmp_path)
+    daily = panel.stock_context_futures_portfolio_daily
+    daily.executable_mask[1, 0] = False
+    daily.integer_execution[1, 0, 1] = 0.
+    source = Path(daily.source_path)
+    pl.read_parquet(source).with_columns(
+        pl.when(pl.col('date') == date(2026, 1, 3)).then(pl.lit(reported_volume, dtype=pl.Float64))
+        .otherwise(pl.col('volume')).alias('volume'),
+    ).write_parquet(source)
+    attached = m.attach_futures_margin_rules(panel, write_rules(tmp_path, panel, rows))
+    execution = torch.from_numpy(attached.stock_context_futures_portfolio_daily.integer_execution[:, :1])
+    assert execution[1, 0, m.TERMINAL_CAPACITY] == 0
+    assert torch.isfinite(execution[:, :, m.TERMINAL_CAPACITY]).all()
+    # Force a risk reduction on a day without an executable quote. The old
+    # contracts remain, incur no fictitious fills/fees, and retain solvency.
+    execution[1, 0, m.END_INITIAL] = 200.
+    execution[1, 0, m.END_MAINTENANCE] = 190.
+    result = run([[.6], [0.], [0.]], execution)
+    assert result.residual_contract_quantities_history[1, 0] == 6
+    assert result.final_alive
+    assert result.turnovers[1] == 0
+
+
 @pytest.mark.parametrize("failure", ["future", "missing", "hash", "hierarchy", "group", "timezone"])
 def test_historical_rule_release_rejects_unsafe_inputs(tmp_path, failure):
     panel, rows = rule_panel(tmp_path)
@@ -281,7 +373,9 @@ def test_margin_config_keeps_v5_and_separates_action_abi():
     general_contract = build_checkpoint_manifest(_stock_panel(), general, include_data_content=False)
     assert margin_contract["contracts"]["trading"] != general_contract["contracts"]["trading"]
     detail = margin_contract["contracts"]["trading"]["taiwan_stock_context_futures_portfolio"]
-    assert detail["integer_training_forward"] == "exact_integer_margin_account_v3_marked_boundary"
+    assert detail["integer_training_forward"] == "exact_integer_margin_account_v7_unfilled_risk_carry"
+    assert detail["corporate_carry_contract"] == "one_to_one_prior_slot_rational_quantity_signed_cash_once"
+    assert detail["accounting_contract_version"] == m.MARGIN_ACCOUNTING_CONTRACT_VERSION
     assert detail["sample_boundary_policy"] == "official_settlement_mark_keep_open_positions"
     assert detail["candidate_feature_columns"][-2:] == list(m.MARGIN_FEATURE_COLUMNS)
 
@@ -363,8 +457,15 @@ def test_canonical_evaluation_and_npz_keep_margin_audit(tmp_path, chunk_rows):
     loaded, _ = t._load_backtest_artifact(path)
     np.testing.assert_array_equal(loaded.futures_margin_audit, truth.margin_audit_history.numpy())
     assert loaded.futures_residual_contract_quantities_history[1, 0] == 5
+    assert not loaded.settlement_default.any()
+    assert loaded.equity_scale_history[1] == pytest.approx(.35)
     with np.load(path) as saved:
         assert list(saved["futures_margin_audit_columns"]) == list(m.MARGIN_AUDIT_COLUMNS)
+    # A report cannot erase real residual inventory to claim a flat account.
+    corrupted = result.to_numpy()
+    corrupted.futures_residual_contract_quantities_history = np.zeros((3, 1), dtype=np.int64)
+    with pytest.raises(ValueError, match="retained whole contracts"):
+        t._validate_futures_margin_audit(corrupted, 3, 1)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

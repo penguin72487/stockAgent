@@ -96,7 +96,7 @@ RANGE_CONTRACTS = {
         "https://finmind.github.io/tutor/TaiwanMarket/Technical/",
     ),
 }
-BATCH_CONTRACT_VERSION = 2
+BATCH_CONTRACT_VERSION = 3
 
 
 def _period_start(day: date, contract: RangeContract) -> date:
@@ -164,43 +164,49 @@ def coalesce_pending_tasks(
     today: date,
     max_years: int | None = None,
     max_months: int | None = None,
+    include_due_refresh: bool = False,
 ) -> RangeBatch[TaskT] | None:
     """Join older, contiguous pending tasks without crossing ownership or gaps.
 
     The caller must select candidates whose retry/release time is already due
     and claim every returned task atomically before dispatch.  This pure helper
-    performs no database writes or requests.  The seed may be a due retry, but
-    only pending neighbors can be added. All required background priorities may
+    performs no database writes or requests. With include_due_refresh the caller
+    must also filter completed/empty/retry neighbors by their actual due time.
+    Those already-due revisions join both sides of the seed. The default keeps
+    the legacy pending-only contract. All required background priorities may
     share a request; the arbitrary 2014 priority boundary is not an API limit.
     A new current-period seed may include history when the caller has admitted
-    background quota. Existing completed refreshes are never re-downloaded just
-    to join batches. Optional limits are learned resource bounds, not year caps.
+    background quota. Not-due completed periods must not be supplied to bridge
+    a hole. Optional limits are learned resource bounds, not year caps.
     """
 
     for value in (max_years, max_months):
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError("batch limits must be positive integers")
     contract = RANGE_CONTRACTS.get(seed.dataset)
+    seed_states = {"pending", "failed", "complete", "observed_empty"} if include_due_refresh else {"pending", "failed"}
+    neighbor_states = seed_states if include_due_refresh else {"pending"}
     if (contract is None or seed.kind != contract.grain or seed.data_id
-            or not 0 <= seed.priority < 8 or seed.state not in {"pending", "failed"}):
+            or not 0 <= seed.priority < 8 or seed.state not in seed_states):
         return None
     seed_start = _task_start(seed, contract)
     if seed_start > today:
         return None
     supplied = max_years if contract.grain == "year" else max_months
     # The catalog's first date bounds the finite possible partition universe.
-    available = ((seed_start.year - contract.first_date.year + 1) if seed.kind == 'year' else
-                 (seed_start.year - contract.first_date.year) * 12 + seed_start.month - contract.first_date.month + 1)
+    ceiling = today if include_due_refresh else seed_start
+    available = ((ceiling.year - contract.first_date.year + 1) if seed.kind == 'year' else
+                 (ceiling.year - contract.first_date.year) * 12 + ceiling.month - contract.first_date.month + 1)
     limit = min(available, supplied or available, contract.max_partitions or available)
     if limit < 2:
         return None
     eligible: dict[date, TaskT] = {}
     for task in candidates:
         if (task.dataset != seed.dataset or task.data_id or task.kind != seed.kind
-                or not 0 <= task.priority < 8 or task.state != "pending"):
+                or not 0 <= task.priority < 8 or task.state not in neighbor_states):
             continue
         start = _task_start(task, contract)
-        if start >= seed_start:
+        if start == seed_start or start > today or (start > seed_start and not include_due_refresh):
             continue
         if start in eligible:
             raise BatchContractError("duplicate_partition")
@@ -215,10 +221,21 @@ def coalesce_pending_tasks(
         selected.append(neighbor)
         cursor = older
     if len(selected) < 2:
+        if not include_due_refresh:
+            return None
+    newest = seed_start
+    while include_due_refresh and len(selected) < limit:
+        newer = _period_end(newest, seed.kind)
+        neighbor = eligible.get(newer)
+        if neighbor is None:
+            break
+        selected.append(neighbor)
+        newest = newer
+    if len(selected) < 2:
         return None
     return RangeBatch(
-        seed.dataset, seed.kind, tuple(reversed(selected)), cursor,
-        min(_period_end(seed_start, seed.kind) - timedelta(days=1), today), today,
+        seed.dataset, seed.kind, tuple(sorted(selected, key=lambda task: task.partition)), cursor,
+        min(_period_end(newest, seed.kind) - timedelta(days=1), today), today,
     )
 
 

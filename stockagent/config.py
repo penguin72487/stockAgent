@@ -1556,6 +1556,8 @@ class DataConfig:
     # exposed as current information and used by the execution proxy, while
     # the cash-stock panel remains complete only through session t-1.
     tw_futures_current_open_feature: bool = False
+    # Must match the immutable futures release and model action layout.
+    tw_futures_portfolio_slot_count: int = 1936
     # Optional causal sizing context; the executor still uses observed OPEN.
     tw_futures_denomination_context_basis: str = "current_open"
     # Exclude known zero-capacity orders from policy actions, never valuation.
@@ -3906,6 +3908,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["tw_futures_current_open_feature"] = bool(
         data["tw_futures_current_open_feature"]
     )
+    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+    futures_slot_layout_version(data["tw_futures_portfolio_slot_count"])
+    data["tw_futures_portfolio_slot_count"] = int(data["tw_futures_portfolio_slot_count"])
     data["tw_futures_denomination_context_basis"] = str(
         data["tw_futures_denomination_context_basis"]
     ).strip().lower()

@@ -37,14 +37,14 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--source-schema", action="store_true",
-        help="Inventory every twpub_* column in the selected research parquet instead of the canonical strict ABI.",
+        help="Inventory every twpub_*/twfl_* column in the selected research parquet instead of the canonical strict ABI.",
     )
     args = parser.parse_args()
     path = Path(args.feature_path).resolve()
     output_dir = Path(args.output_dir)
     before = _signature(path)
     feature_columns = (
-        [name for name in pq.read_schema(path).names if name.startswith("twpub_")]
+        [name for name in pq.read_schema(path).names if name.startswith(("twpub_", "twfl_"))]
         if args.source_schema else list(FEATURE_COLUMNS)
     )
     stats, annual, findings = audit_public_feature_table(

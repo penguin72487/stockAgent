@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "secondary_validation": "provider_spare_quota",
+  "authorization": "2026-09-28 user: allow FinMind spare quota validation after reserving its incremental work",
+  "quota_policy": "existing_verified_shared_account_budget",
+  "other_providers": "unchanged_global_required_first"
+}

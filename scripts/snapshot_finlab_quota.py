@@ -244,6 +244,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[finlab-quota] invalid provider status: {type(error).__name__}", file=sys.stderr)
         return 1
     samples = persist_observation(args.output_root, observation)
+    # Reuse the minute worker and its authenticated status sample. Workload
+    # metering reads only local receipts/cache sizes/Parquet footers; opening
+    # the public page never imports the SDK or spends provider quota.
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from finlab import utils
+        from scripts.finlab_workload import snapshot_workload
+
+        snapshot_workload(ROOT, args.output_root, sdk_cache_root=Path(utils.get_tmp_dir()),
+                          quota=observation)
+    except Exception as error:
+        # Quota sampling must survive a broken local metadata file. A missing
+        # or aged workload snapshot is displayed as unavailable, not fresh.
+        print(f"[finlab-workload] local snapshot failed: {type(error).__name__}", file=sys.stderr)
     print(json.dumps({
         "event": "finlab_quota_observed",
         "observed_at_utc": observation["observed_at_utc"],

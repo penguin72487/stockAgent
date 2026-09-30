@@ -51,6 +51,18 @@ TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION: Final[int] = 3
 # contract lifetime-stable, leaves 31 blank rows before a slot can be reused,
 # and deliberately fails closed if a future research snapshot exceeds it.
 TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT: Final[int] = 1_936
+# The full TWD observation inventory needs 2,505 simultaneous slots after the
+# same 31-session isolation. The wider layout has a distinct data/checkpoint
+# contract; existing 1,936-slot releases retain their original ABI.
+TAIFEX_FUTURES_PORTFOLIO_SLOT_LAYOUTS: Final[dict[int, int]] = {1936: 4, 2560: 5, 2816: 6}
+
+
+def futures_slot_layout_version(slot_count: int) -> int:
+    if isinstance(slot_count, bool) or slot_count not in TAIFEX_FUTURES_PORTFOLIO_SLOT_LAYOUTS:
+        raise ValueError('futures slot count must select a versioned 1936, 2560 or 2816 layout')
+    return TAIFEX_FUTURES_PORTFOLIO_SLOT_LAYOUTS[slot_count]
+
+
 TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS: Final[int] = 31
 TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK: Final[int] = (
     TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS + 1
@@ -87,6 +99,18 @@ _EXCLUDED_NON_EQUITY_ROOTS: Final[frozenset[str]] = frozenset(
         "XEF",
         "XJF",
     }
+)
+
+# Currency selects the research universe; underlying geography does not.
+# Non-equity contract units/taxes/session rules still require dated admission.
+_NON_EQUITY_CLASSES: Final[dict[str, str]] = {
+    "BRF": "commodity_future", "TGF": "commodity_future", "GDF": "commodity_future",
+    "CPF": "interest_rate_future", "GBF": "interest_rate_future",
+    "RHF": "fx_future", "RTF": "fx_future", "XAF": "fx_future",
+    "XBF": "fx_future", "XEF": "fx_future", "XJF": "fx_future",
+}
+_NON_TWD_ROOTS: Final[frozenset[str]] = frozenset(
+    {"MSF", "GDF", "RHF", "RTF", "XAF", "XBF", "XEF", "XJF"}
 )
 
 _FOREIGN_INDEX_ROOTS: Final[frozenset[str]] = frozenset(
@@ -189,6 +213,7 @@ _UNDERLYING_OVERRIDES: Final[dict[str, str]] = {
     "LA1": "2905",
     "LAF": "2905",  # 三商行 -> 三商
     "LGF": "3705",  # 永信；price-ratio audited
+    "LG1": "3705",  # TAIFEX 3705_20150828.pdf: LGF -> LG1, effective 2015-08-28
     "PS1": "3706",
     "PSF": "3706",  # 2020+ 新神達
 }
@@ -252,7 +277,7 @@ def _fixed_fee_contract_metadata(
     )
     if product == "MSF":
         return None, None, "legacy_usd_notional_requires_historical_fx"
-    if asset_class in {"stock_future", "etf_future"} and product.endswith("1"):
+    if asset_class in {"stock_future", "etf_future"} and re.search(r"\d$", product):
         return None, None, "adjusted_contract_unit_requires_historical_notice"
     if asset_class == "index_future":
         multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS_TWD.get(product)
@@ -273,6 +298,20 @@ def _fixed_fee_contract_metadata(
             "micro" if is_small else "standard"
         ), None
     return None, None, f"unsupported_asset_class:{asset_class}"
+
+
+def _validate_fixed_contract_units(frame: Any) -> None:
+    """The v4 fixed-unit ABI cannot value adjusted cash/share deliverables.
+
+    Earlier preparation rejected suffix 1 but accidentally admitted suffix 2
+    with the ordinary multiplier. A data-file hash cannot make that valuation
+    correct. Preserve the evidence for a dated successor ABI, and reject its
+    use by this fixed-unit adapter before constructing returns or features.
+    """
+    adjusted = frame.filter(pl.col('product').str.contains(r'\d$'))
+    if adjusted.height:
+        raise ValueError('fixed-unit futures ABI lacks dated adjusted deliverables: '
+                         + ','.join(sorted(adjusted['product'].unique().to_list())))
 
 
 def _require_dependencies() -> None:
@@ -330,10 +369,13 @@ def build_product_master(
     official_product_code_path: str | Path = DEFAULT_OFFICIAL_PRODUCT_CODE_PATH,
     *,
     source_products: list[str] | tuple[str, ...] | None = None,
+    product_scope: str = "equity",
 ) -> Any:
     """Classify every requested historical TAIFEX product code."""
 
     _require_dependencies()
+    if product_scope not in {"equity", "all_twd"}:
+        raise ValueError("product_scope must be equity or all_twd")
     products_path = Path(product_master_path)
     stocks_path = Path(stock_master_path)
     official_path = Path(official_product_code_path)
@@ -397,7 +439,8 @@ def build_product_master(
 
     records: list[dict[str, Any]] = []
     for official_product in requested:
-        if official_product in _EXCLUDED_NON_EQUITY_ROOTS:
+        excluded = _EXCLUDED_NON_EQUITY_ROOTS if product_scope == "equity" else _NON_TWD_ROOTS
+        if official_product in excluded:
             continue
         product_name = official_names.get(official_product) or current_names.get(
             official_product
@@ -410,7 +453,10 @@ def build_product_master(
         security_type: str | None = None
         asset_class: str
         region: str
-        if official_product in _FOREIGN_INDEX_ROOTS:
+        if official_product in _NON_EQUITY_CLASSES:
+            asset_class = _NON_EQUITY_CLASSES[official_product]
+            region = "foreign" if official_product == "BRF" else "domestic"
+        elif official_product in _FOREIGN_INDEX_ROOTS:
             asset_class = "index_future"
             region = "foreign"
         elif official_product in _DOMESTIC_INDEX_ROOTS:
@@ -543,6 +589,7 @@ def _stable_expiry_slot_map(contract_meta: Any) -> Any:
     contracts never migrate between lanes merely because a nearer expiry ends.
     """
 
+    instance_keys = ["physical_instance"] if "physical_instance" in contract_meta.columns else []
     records: list[dict[str, Any]] = []
     for row in contract_meta.iter_rows(named=True):
         matched = re.fullmatch(
@@ -601,6 +648,7 @@ def _stable_expiry_slot_map(contract_meta: Any) -> Any:
                 {
                     "product": product,
                     "contract": str(row["contract"]),
+                    **{key: row[key] for key in instance_keys},
                     "delivery_year": int(row["delivery_year"]),
                     "delivery_month": int(row["delivery_month"]),
                     "delivery_week": int(row["delivery_week"]),
@@ -609,7 +657,7 @@ def _stable_expiry_slot_map(contract_meta: Any) -> Any:
                     "symbol": f"{product}_{base}_L{lane}",
                 }
             )
-    return pl.DataFrame(assigned).sort("product", "contract")
+    return pl.DataFrame(assigned).sort("product", "contract", *instance_keys)
 
 
 def _fixed_portfolio_slot_map(
@@ -640,7 +688,11 @@ def _fixed_portfolio_slot_map(
         raise ValueError("TAIFEX fixed portfolio slots require a market calendar")
     calendar_index = {value: index for index, value in enumerate(calendar)}
 
-    intervals: list[tuple[int, int, str, str]] = []
+    identity_column = 'physical_instance' if 'physical_instance' in contract_meta.columns else None
+    identity_keys = ['product', identity_column or 'contract']
+    if contract_meta.select(identity_keys).is_duplicated().any():
+        raise ValueError('duplicate futures lifetime identity; reused codes require physical_instance')
+    intervals: list[tuple[int, int, str, str, str]] = []
     for row in contract_meta.iter_rows(named=True):
         first = row["first_observed_date"]
         last = row["last_observed_date"]
@@ -652,9 +704,10 @@ def _fixed_portfolio_slot_map(
                 min(int(calendar_index[last]) + cooldown, len(calendar) - 1),
                 str(row["product"]),
                 str(row["contract"]),
+                str(row[identity_column]) if identity_column else '',
             )
         )
-    intervals.sort(key=lambda value: (value[0], value[1], value[2], value[3]))
+    intervals.sort()
 
     # Active heap is ordered by inclusive release session.  Free slots use a
     # second min-heap so a rebuild is deterministic regardless of input order.
@@ -662,7 +715,7 @@ def _fixed_portfolio_slot_map(
     free_slots: list[int] = []
     next_slot = 1
     assigned: list[dict[str, Any]] = []
-    for first_index, quarantine_end, product, contract in intervals:
+    for first_index, quarantine_end, product, contract, instance in intervals:
         while active and active[0][0] < first_index:
             _, released_slot = heapq.heappop(active)
             heapq.heappush(free_slots, released_slot)
@@ -682,11 +735,12 @@ def _fixed_portfolio_slot_map(
             {
                 "product": product,
                 "contract": contract,
+                **({'physical_instance': instance} if identity_column else {}),
                 "portfolio_slot": slot,
                 "symbol": f"TAIFEX_SLOT_{slot:04d}",
             }
         )
-    return pl.DataFrame(assigned).sort("product", "contract")
+    return pl.DataFrame(assigned).sort(identity_keys)
 
 
 def build_continuous_daily(
@@ -933,8 +987,18 @@ def build_continuous_daily(
     ):
         raise RuntimeError("fixed-fee TAIFEX rows lost multiplier/fee classification")
 
-    previous_valid = same_previous
-    frame = frame.with_columns(
+    frame = add_futures_daily_market_features(frame)
+    return frame.sort("date", "product", "tenor_rank", "symbol"), product_master
+
+
+def add_futures_daily_market_features(frame: Any) -> Any:
+    """Canonical completed-session features, shared by both daily builders.
+
+    The attachment layer, not this function, shifts these rows to the next
+    decision session. Missing observations stay missing here.
+    """
+    previous_valid = pl.col("same_contract_as_previous_session")
+    return frame.with_columns(
         pl.when(previous_valid & pl.col("settlement").is_finite() & (pl.col("settlement") > 0.0)
                 & pl.col("previous_settlement").is_finite() & (pl.col("previous_settlement") > 0.0))
         .then((pl.col("settlement") / pl.col("previous_settlement")).log())
@@ -990,9 +1054,6 @@ def build_continuous_daily(
         ((pl.col("asset_class") == "index_future") & (pl.col("region") == "foreign"))
         .cast(pl.Float64).alias("taifex_is_foreign_index_future"),
     )
-    return frame.sort("date", "product", "tenor_rank", "symbol"), product_master
-
-
 def _write_symbol_parquets(frame: Any, output_dir: Path) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     columns = {
@@ -1246,6 +1307,8 @@ def build_dataset(
         "dataset": "taifex_futures_portfolio_daily",
         "contract_version": TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
         "feature_contract_version": TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION,
+        "fixed_unit_admission_policy": "v2_all_adjusted_suffixes_require_dated_deliverable_contract",
+        "unit_policy_source_sha256": _sha256_file(Path(__file__)),
         "execution_contract": (
             "features_through_t_minus_1_execute_only_observed_open_t_hold_"
             "same_physical_contract_across_zero_trade_days_with_last_known_"
@@ -1436,6 +1499,7 @@ def attach_futures_portfolio_daily(
         pl.col("date").cast(pl.Date),
         pl.col("symbol").cast(pl.String),
     )
+    _validate_fixed_contract_units(frame)
     symbols = tuple(str(symbol) for symbol in panel.symbols)
     date_index = {
         int(value.astype(np.int64)): idx for idx, value in enumerate(dates)

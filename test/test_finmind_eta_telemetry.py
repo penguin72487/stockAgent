@@ -47,6 +47,10 @@ def test_complete_active_bins_keep_low_rates_and_report_idle(tmp_path):
     assert rates["minimum"] == 4
     assert rates["p50"] == 40
     assert rates["maximum"] == 400
+    assert rates['wall_p10'] == pytest.approx(1.2)
+    assert out['traffic']['windows']['1h']['attempts'] == 310
+    assert out['traffic']['windows']['1h']['wall_requests_per_hour'] == 310
+    assert out['traffic']['windows']['1h']['ended_at_utc'] == NOW.isoformat()
     assert out["quota"]["reserved_requests_per_hour"] == 12
     assert out["quota"]["backfill_capacity_requests_per_hour"] == 5988
     assert out["quota"]["paced_requests_per_hour"] < 6000
@@ -61,6 +65,35 @@ def test_short_instrumentation_does_not_extrapolate_partial_bin(tmp_path):
     assert out["traffic"]["rate_distributions"]["24h"]["p50"] is None
     assert out["traffic"]["windows"]["1h"]["complete_window"] is False
     assert out["traffic"]["windows"]["1h"]["attempts"] == 2
+
+
+def test_recurring_model_separates_worker_priorities_and_new_daily_arrivals(tmp_path, monkeypatch):
+    from scripts import audit_finmind_query_ranges
+    from test_finmind_eta_work import _database
+
+    datasets = ('TaiwanFuturesKBar', 'TaiwanFuturesTick')
+    catalog = {name: {'primary_owner': 'complement', 'query_shape': 'per_id_day'} for name in datasets}
+    catalog['TaiwanStockPrice'] = {'primary_owner': 'sponsor', 'query_shape': 'whole_market_day'}
+    monkeypatch.setattr(audit_finmind_query_ranges, 'registry', lambda: catalog)
+    _database(tmp_path, 'sponsor', [])
+    path = _database(tmp_path, 'complement', [
+        ('TaiwanFuturesKBar', 'TX', '2020-01-02', 'id_day', 8, 'complete', NOW.isoformat()),
+        ('TaiwanFuturesTick', 'TX', '2020-01-02', 'id_day', 10, 'observed_empty', NOW.isoformat()),
+    ])
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE finmind_source_frontiers(dataset TEXT)')
+        conn.executemany('INSERT INTO finmind_source_frontiers VALUES (?)',
+                         [('TaiwanFuturesKBar',), ('TaiwanFuturesKBar',), ('TaiwanFuturesTick',), ('Delegated',)])
+    before = path.read_bytes()
+    model = telemetry.recurring_forecast(tmp_path)
+    assert model['state'] == 'modeled'
+    parts = model['requests_per_hour_by_phase']
+    assert parts['incremental'] == pytest.approx(3 + 5 / 24)
+    assert parts['core'] == 0
+    assert parts['detail'] == pytest.approx(2 / 24 + 1 / (365 * 24))
+    assert parts['tick'] == pytest.approx(1 / 24 + 1 / (90 * 24))
+    assert model['new_partition_requests_per_hour_by_phase'] == {'core': 0, 'detail': 2 / 24, 'tick': 1 / 24}
+    assert path.read_bytes() == before
 
 
 def test_future_events_are_not_rate_evidence(tmp_path):

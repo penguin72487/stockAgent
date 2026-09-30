@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import io
+import json
 import math
 from pathlib import Path
 import re
+import shutil
 import sys
 from typing import Final, Iterable
 from urllib import parse
@@ -51,6 +53,8 @@ from stockagent.data.tw_stock_context_futures_portfolio import (  # noqa: E402
 
 INDEX_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/futIndxFSP"
 STOCK_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/sSFFSP"
+COMMODITY_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/goldFSP"
+INTEREST_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/interestRateFSP"
 INDEX_COMMODITY_IDS: Final[tuple[str, ...]] = (
     "1",
     "40",
@@ -102,7 +106,7 @@ def _positive_float(value: object) -> float | None:
         result = float(text)
     except (TypeError, ValueError):
         return None
-    return result if result > 0.0 else None
+    return result if math.isfinite(result) and result > 0.0 else None
 
 
 def _parsed_date(value: object) -> date | None:
@@ -128,12 +132,21 @@ def parse_index_futures_final_settlement_html(
     source_file: str,
     source_sha256: str,
     source_url: str,
+    source_kind: str = "official_index_futures_html",
+    allowed_products: frozenset[str] | None = None,
 ) -> pl.DataFrame:
-    """Normalize the official wide index-futures final-settlement table."""
+    """Normalize the exchange's wide tables without inventing empty periods.
+
+    Commodity pages also contain TGO options; callers select explicit futures
+    codes. Interest-rate pages label the reported date as the last trading day,
+    so their caller must preserve this distinction in the versioned release.
+    """
 
     text = body.decode("utf-8")
     tables = pd.read_html(io.StringIO(text))
-    candidates = [table for table in tables if table.shape[1] >= 3]
+    candidates = [table for table in tables if table.shape[1] >= 2
+                  and "契約" in _normalized_text(table.columns[1])
+                  and "最後" in _normalized_text(table.columns[0])]
     if len(candidates) != 1:
         raise ValueError(
             "expected exactly one index-futures final-settlement table, "
@@ -160,13 +173,15 @@ def parse_index_futures_final_settlement_html(
                     f"index final-settlement column has no product code: {column!r}"
                 )
             for product in products:
+                if allowed_products is not None and product not in allowed_products:
+                    continue
                 records.append(
                     {
                         "settlement_date": settlement_date,
                         "product": product,
                         "contract": contract,
                         "final_settlement_price": price,
-                        "source_kind": "official_index_futures_html",
+                        "source_kind": source_kind,
                         "source_file": source_file,
                         "source_sha256": source_sha256,
                         "source_url": source_url,
@@ -275,14 +290,40 @@ def _months(start_date: date, end_date: date) -> Iterable[tuple[int, int]]:
 
 
 def _index_url(year: int) -> str:
+    return _wide_url(INDEX_FINAL_SETTLEMENT_PAGE, INDEX_COMMODITY_IDS, year)
+
+
+def _wide_url(page: str, commodity_ids: tuple[str, ...], year: int) -> str:
     query: list[tuple[str, str]] = [
-        *(("commodityIds", value) for value in INDEX_COMMODITY_IDS),
+        *(("commodityIds", value) for value in commodity_ids),
         ("start_year", str(year)),
         ("start_month", "01"),
         ("end_year", str(year)),
         ("end_month", "12"),
     ]
-    return f"{INDEX_FINAL_SETTLEMENT_PAGE}?{parse.urlencode(query)}"
+    return f"{page}?{parse.urlencode(query)}"
+
+
+def reuse_raw_receipts(parent: Path, output_dir: Path) -> int:
+    """Reuse verified receipts, not another untracked fetch/cache mechanism."""
+    manifest = json.loads((parent / "manifest.json").read_text())
+    if manifest.get("status") != "complete":
+        raise ValueError("cannot reuse an incomplete final-settlement release")
+    count = 0
+    for receipt in manifest["receipts"]:
+        original = Path(receipt["path"])
+        relative = original.relative_to(parent.resolve() / "raw")
+        if sha256_path(original) != receipt["sha256"]:
+            raise ValueError("reused final-settlement receipt SHA mismatch")
+        target = output_dir / "raw" / relative
+        if target.exists():
+            if sha256_path(target) != receipt["sha256"]:
+                raise ValueError("conflicting raw receipt in destination")
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, target)
+        count += 1
+    return count
 
 
 def _stock_url(year: int, month: int) -> str:
@@ -337,6 +378,10 @@ def main() -> int:
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--index-only", action="store_true",
                         help="Fetch only official index-futures final settlements; skip stock/ETF month queries.")
+    parser.add_argument("--include-non-equity", action="store_true",
+                        help="Also capture commodity and interest-rate futures; emits schema 2 with explicit date/delivery semantics.")
+    parser.add_argument("--reuse-raw-from", type=Path,
+                        help="Copy hash-verified receipts from a completed release before fetching missing periods.")
     parser.add_argument(
         "--refresh-current", action="store_true",
         help="Refresh the requested end year's index page and current/prior stock-futures months; reuse older receipts.",
@@ -347,6 +392,8 @@ def main() -> int:
         parser.error("--end-date precedes --start-date")
     if args.request_delay_seconds < 0.0:
         parser.error("--request-delay-seconds cannot be negative")
+    if args.index_only and args.include_non_equity:
+        parser.error("--index-only cannot be combined with --include-non-equity")
 
     request_interval = resolve_request_interval(
         "taifex_public", args.request_delay_seconds
@@ -362,6 +409,10 @@ def main() -> int:
     )
 
     output_dir = args.output_dir.expanduser().resolve()
+    if (output_dir / "manifest.json").exists() and args.include_non_equity:
+        raise FileExistsError("extended final-settlement releases are immutable; select a new output directory")
+    if args.reuse_raw_from:
+        reuse_raw_receipts(args.reuse_raw_from.resolve(), output_dir)
     raw_dir = output_dir / "raw"
     frames: list[pl.DataFrame] = []
     receipts: list[dict[str, object]] = []
@@ -464,6 +515,27 @@ def main() -> int:
             }
         )
 
+    if args.include_non_equity:
+        for family, page, ids, products in (
+            ("commodity", COMMODITY_FINAL_SETTLEMENT_PAGE, ("10", "17", "31"), frozenset({"GDF", "TGF", "BRF"})),
+            ("interest_rate", INTEREST_FINAL_SETTLEMENT_PAGE, ("6", "7"), frozenset({"GBF", "CPF"})),
+        ):
+            for year in range(args.start_date.year, args.end_date.year + 1):
+                url = _wide_url(page, ids, year)
+                receipt = _download_html(url, raw_dir / family / f"{year:04d}.html",
+                    refresh=bool(args.refresh or (args.refresh_current and year == args.end_date.year)),
+                    transport=transport)
+                digest = sha256_path(receipt)
+                frame = parse_index_futures_final_settlement_html(receipt.read_bytes(),
+                    start_date=args.start_date, end_date=args.end_date,
+                    source_file=str(receipt), source_sha256=digest, source_url=url,
+                    source_kind=f"official_{family}_futures_html", allowed_products=products)
+                frames.append(frame)
+                receipts.append(dict(kind=family+"_futures", period=str(year),
+                    path=str(receipt), bytes=receipt.stat().st_size, sha256=digest,
+                    rows=frame.height, url=url))
+                print(f"{family} {year}: {frame.height} official records", flush=True)
+
     combined = pl.concat(frames, how="vertical") if frames else _empty_frame()
     if combined.height == 0:
         raise RuntimeError("official TAIFEX pages produced no final settlements")
@@ -481,20 +553,32 @@ def main() -> int:
     combined = combined.unique(
         subset=["settlement_date", "product", "contract"], keep="first"
     ).sort("settlement_date", "product", "contract")
+    if args.include_non_equity:
+        combined = combined.with_columns(
+            pl.when(pl.col("source_kind") == "official_interest_rate_futures_html")
+            .then(pl.lit("last_trading_day")).otherwise(pl.lit("final_settlement_day"))
+            .alias("reported_date_role"),
+            pl.when(pl.col("product") == "GBF").then(pl.lit("physical_delivery"))
+            .otherwise(pl.lit("cash_settlement")).alias("settlement_method"),
+        )
 
     normalized_path = output_dir / "futures_final_settlement_history.parquet"
     _atomic_write_parquet(combined, normalized_path)
     output_sha = sha256_path(normalized_path)
     manifest = {
-        "schema_version": TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
+        "schema_version": 2 if args.include_non_equity else TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
         "status": "complete",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "requested_start_date": args.start_date.isoformat(),
         "requested_end_date": args.end_date.isoformat(),
-        "scope": "index_futures_only" if args.index_only else "all_supported_futures",
+        "scope": ("all_listed_futures" if args.include_non_equity else
+                  "index_futures_only" if args.index_only else "index_stock_etf_futures"),
+        "requires_product_specific_settlement_clock": bool(args.include_non_equity),
         "official_sources": {
             "index_futures": INDEX_FINAL_SETTLEMENT_PAGE,
             "stock_etf_futures": STOCK_FINAL_SETTLEMENT_PAGE,
+            **({"commodity_futures": COMMODITY_FINAL_SETTLEMENT_PAGE,
+                "interest_rate_futures": INTEREST_FINAL_SETTLEMENT_PAGE} if args.include_non_equity else {}),
         },
         "key": ["settlement_date", "product", "contract"],
         "rows": combined.height,

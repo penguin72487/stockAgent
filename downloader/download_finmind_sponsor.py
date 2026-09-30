@@ -33,12 +33,13 @@ from downloader.download_finmind_complement import (
     SourceError, Task, _db, _fetch_rows, _sha256, _store, _preflight_bulk_year_schemas,
 )
 from downloader.download_finmind_free import TAIPEI
-from downloader.finmind_account import backfill_budget, rate_limiter, verified_account
+from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import (
     BATCH_CONTRACT_VERSION, RANGE_CONTRACTS, BatchContractError, RangeBatch,
     coalesce_pending_tasks, split_batch_rows,
 )
 from downloader.finmind_parent_recovery import recover_failed_long_parent
+from downloader.finmind_runtime import wait_for_next_cycle
 from downloader.finmind_scheduling import (
     SOURCES, SPECS, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS, Source, _s,
     fixed_incremental_demand, protected_stock_opening,
@@ -46,7 +47,7 @@ from downloader.finmind_scheduling import (
 from downloader.finmind_observation_dates import (
     EXCLUDED_STATE, PERIOD_DATASETS, next_period_refresh, reconcile_observation_dates,
 )
-from stockagent.live.market_status import tw_stock_day_decision
+from stockagent.live.market_status import TwStockDayDecision, tw_stock_day_decision
 
 
 CATALOG_URL = "https://finmind.github.io/llms-full.txt"
@@ -140,25 +141,7 @@ def _official_price_coverage(catalog_path: Path | None = None) -> tuple[date, da
 
 # Provider-documented paid datasets that lack an efficient full-history Sponsor
 # query are explicit, not silently absent. SponsorPro objects are a separate tier.
-UNSCHEDULED = {
-    "TaiwanStockPriceTick": "per_symbol_per_day_only_sponsorpro_bulk",
-    "TaiwanStockKBar": "per_symbol_per_day_only_sponsorpro_bulk",
-    "TaiwanStockTradingDailyReport": "per_stock_or_broker_per_day_sponsorpro_bulk",
-    "TaiwanStockWarrantTradingDailyReport": "per_stock_or_broker_per_day_sponsorpro_bulk",
-    "TaiwanStockTradingDailyReportSecIdAgg": "per_symbol_history_special_endpoint",
-    "TaiwanFuturesKBar": "per_product_per_day_sponsorpro_bulk",
-    "TaiwanFuturesTick": "per_product_per_day_sponsorpro_bulk",
-    "TaiwanFuturesSpreadTick": "per_product_per_day_only",
-    "TaiwanOptionTick": "per_product_per_day_sponsorpro_bulk",
-    "TaiwanFuturesSpreadTrading": "per_product_only",
-    "TaiwanStockConvertibleBondMonthlyAnalysis": "per_bond_only",
-    "TaiwanAssetSwapFixedIncomeDaily": "per_bond_only",
-    "TaiwanAssetSwapOptionDaily": "per_bond_only",
-    "USStockPriceMinute": "per_symbol_only_outside_taiwan_scope",
-    "taiwan_stock_tick_snapshot": "live_snapshot_not_history",
-    "taiwan_futures_snapshot": "live_snapshot_not_history",
-    "taiwan_options_snapshot": "live_snapshot_not_history",
-}
+UNSCHEDULED: dict[str, str] = {}  # Per-ID histories and daily captured snapshots belong to Complement.
 
 
 def _end(start: date, grain: str) -> date:
@@ -358,6 +341,12 @@ def _seed(conn: sqlite3.Connection, now: datetime,
         if eligible:
             allowed = ",".join("?" for _ in eligible)
             conn.execute(
+                f"UPDATE tasks SET state='pending',next_attempt_at_utc=NULL "
+                f"WHERE dataset IN ({allowed}) AND state='calendar_wait' AND "
+                "EXISTS (SELECT 1 FROM finmind_verified_sessions WHERE day=tasks.partition)",
+                eligible,
+            )
+            conn.execute(
                 f"UPDATE tasks SET state='pending' WHERE dataset IN ({allowed}) "
                 "AND state='non_session' AND (partition NOT BETWEEN ? AND ? OR "
                 "EXISTS (SELECT 1 FROM finmind_verified_sessions WHERE day=tasks.partition))",
@@ -366,7 +355,7 @@ def _seed(conn: sqlite3.Connection, now: datetime,
             conn.execute(
                 f"UPDATE tasks SET state='non_session',next_attempt_at_utc=NULL "
                 f"WHERE dataset IN ({allowed}) AND partition BETWEEN ? AND ? "
-                "AND state IN ('pending','observed_empty','failed') AND rows=0 "
+                "AND state IN ('pending','observed_empty','failed','calendar_wait') AND rows=0 "
                 "AND NOT EXISTS (SELECT 1 FROM finmind_verified_sessions "
                 "WHERE day=tasks.partition)", (*eligible, *bounds),
             )
@@ -376,7 +365,7 @@ def _seed(conn: sqlite3.Connection, now: datetime,
             blocked_placeholders = ",".join("?" for _ in blocked)
             conn.execute(
                 f"UPDATE tasks SET state='pending' WHERE dataset IN ({blocked_placeholders}) "
-                "AND state='non_session'", blocked,
+                "AND state IN ('non_session','calendar_wait')", blocked,
             )
         session_policy.update({
             "state": "receipt_verified", "calendar_start": bounds[0],
@@ -387,25 +376,55 @@ def _seed(conn: sqlite3.Connection, now: datetime,
         f"SELECT COUNT(*) FROM tasks WHERE dataset IN ({placeholders}) "
         "AND state='non_session'", datasets,
     ).fetchone()[0]
-    # A scheduled closure is enough to avoid a *current-day request*, but not
-    # enough to mark historical absence as verified. Keep tasks pending and
-    # re-evaluate on the next run if the official schedule changes.
+    # A scheduled closure is not an acquired observation or a historical
+    # non-session receipt. Keep a reversible, separately counted calendar hold;
+    # otherwise undownloadable holidays become mandatory debt forever. Revisit
+    # held dates as well as recent dates so a changed schedule reopens the work.
+    conn.execute("CREATE TABLE IF NOT EXISTS calendar_holds ("
+                 "day TEXT PRIMARY KEY,status TEXT NOT NULL,reason TEXT NOT NULL,"
+                 "observed_at_utc TEXT NOT NULL,policy_version INTEGER NOT NULL)")
     today_decision = tw_stock_day_decision(
         local.date(), parquet_root=Path(__file__).resolve().parents[1] / "data_tw_public",
         observed=now,
     )
-    for day in (local.date(), local.date() - timedelta(days=1)):
+    days_to_check = {local.date(), local.date() - timedelta(days=1)}
+    days_to_check.update(date.fromisoformat(row[0]) for row in conn.execute(
+        f"SELECT DISTINCT partition FROM tasks WHERE dataset IN ({placeholders}) "
+        "AND (state='calendar_wait' OR (partition>=? AND rows=0 "
+        "AND state IN ('pending','observed_empty'))) AND partition<=?",
+        (*datasets, (local.date() - timedelta(days=7)).isoformat(), local.date().isoformat()),
+    ))
+    closure_datasets = tuple(name for name in datasets if name not in session_policy['conflicting_datasets'])
+    closure_placeholders = ','.join('?' for _ in closure_datasets)
+    for day in sorted(days_to_check):
         decision = today_decision if day == local.date() else tw_stock_day_decision(
             day, parquet_root=Path(__file__).resolve().parents[1] / 'data_tw_public', observed=now,
         )
-        if decision.status == "closed":
+        if official_sessions is not None and day in official_sessions.days:
+            decision = TwStockDayDecision('actual_open', 'receipt-verified official session')
+        conn.execute(
+            "INSERT INTO calendar_holds VALUES (?,?,?,?,1) ON CONFLICT(day) DO UPDATE SET "
+            "status=excluded.status,reason=excluded.reason,observed_at_utc=excluded.observed_at_utc,"
+            "policy_version=excluded.policy_version",
+            (day.isoformat(), decision.status, decision.reason, now.isoformat()),
+        )
+        if decision.status == "closed" and closure_datasets:
             next_check = (now + timedelta(hours=1)).isoformat()
             conn.execute(
-                f"UPDATE tasks SET next_attempt_at_utc=? WHERE dataset IN ({placeholders}) "
-                "AND partition=? AND state IN ('pending','observed_empty') AND rows=0",
-                (next_check, *datasets, day.isoformat()),
+                f"UPDATE tasks SET state='calendar_wait',next_attempt_at_utc=? "
+                f"WHERE dataset IN ({closure_placeholders}) AND partition=? "
+                "AND state IN ('pending','observed_empty','calendar_wait') AND rows=0",
+                (next_check, *closure_datasets, day.isoformat()),
             )
-        elif decision.is_session:
+        else:
+            # Loss of calendar evidence is not permission to keep excluding a
+            # date. A nonempty source/calendar conflict likewise reopens holds.
+            conn.execute(
+                f"UPDATE tasks SET state='pending',next_attempt_at_utc=NULL "
+                f"WHERE dataset IN ({placeholders}) AND partition=? AND state='calendar_wait'",
+                (*datasets, day.isoformat()),
+            )
+        if decision.is_session:
             conn.execute(
                 f"UPDATE tasks SET next_attempt_at_utc=NULL WHERE dataset IN ({placeholders}) "
                 "AND partition=? AND state='pending' AND next_attempt_at_utc>?",
@@ -413,6 +432,10 @@ def _seed(conn: sqlite3.Connection, now: datetime,
             )
     session_policy["today_status"] = today_decision.status
     session_policy["today_evidence"] = today_decision.reason
+    session_policy["calendar_hold_policy_version"] = 1
+    session_policy["calendar_wait"] = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE state='calendar_wait'",
+    ).fetchone()[0]
     session_policy["observation_dates"] = reconcile_observation_dates(
         conn, now, {spec.dataset for spec in SOURCES},
     )
@@ -441,11 +464,9 @@ def _seed(conn: sqlite3.Connection, now: datetime,
     return session_policy
 
 
-def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = False,
-          secondary_admission: Callable[[], dict[str, Any]] | None = None,
-          datasets: tuple[str, ...] | None = None) -> Task | None:
-    conn.execute("CREATE TABLE IF NOT EXISTS dispatch_cursor ("
-                 "priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)")
+def _due_query(now: datetime, *, incremental_only: bool = False,
+               datasets: tuple[str, ...] | None = None) -> tuple[str, tuple]:
+    """One eligibility predicate for both dispatch and read-only wake checks."""
     due = (
         "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
         "OR (state IN ('complete','observed_empty','failed') "
@@ -461,9 +482,46 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
     values += tuple(PRODUCT_HISTORY_STARTS)
     if datasets is not None:
         if not datasets:
-            return None
+            return '0', ()
         due += f" AND dataset IN ({','.join('?' for _ in datasets)})"
         values += tuple(datasets)
+    return due, values
+
+
+def _primary_unfinished(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM tasks WHERE priority<? AND "
+        "state NOT IN ('complete','observed_empty','non_session','not_observation_date',"
+        "'deprecated_query_shape','calendar_wait') LIMIT 1", (SECONDARY_VALIDATION_PRIORITY,),
+    ).fetchone() is not None
+
+
+def _ready_after_wait(root: Path, now: datetime, *, secondary_admission: Callable[[], dict[str, Any]],
+                       datasets: tuple[str, ...] | None = None) -> bool:
+    """A primary retry becoming due must wake even while validation is vetoed."""
+    try:
+        due, values = _due_query(now, datasets=datasets)
+        with sqlite3.connect((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro', uri=True,
+                             timeout=0.2) as conn:
+            first = conn.execute(f'SELECT priority FROM tasks WHERE {due} ORDER BY priority LIMIT 1',
+                                 values).fetchone()
+            if first is None:
+                return False
+            if first[0] < SECONDARY_VALIDATION_PRIORITY:
+                return True
+            if _primary_unfinished(conn):
+                return False
+        return secondary_admission().get('allowed') is True
+    except (sqlite3.Error, OSError):
+        return False
+
+
+def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = False,
+          secondary_admission: Callable[[], dict[str, Any]] | None = None,
+          datasets: tuple[str, ...] | None = None) -> Task | None:
+    conn.execute("CREATE TABLE IF NOT EXISTS dispatch_cursor ("
+                 "priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)")
+    due, values = _due_query(now, incremental_only=incremental_only, datasets=datasets)
     first = conn.execute(
         f"SELECT priority FROM tasks WHERE {due} ORDER BY priority LIMIT 1", values
     ).fetchone()
@@ -475,11 +533,7 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
         # not spare capacity. Priority ordering among *due* rows alone allowed
         # secondary requests to jump this gate whenever necessary work slept.
         # Keep this global even when dispatch is restricted to selected datasets.
-        if conn.execute(
-            "SELECT 1 FROM tasks WHERE priority<? AND "
-            "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape') LIMIT 1",
-            (SECONDARY_VALIDATION_PRIORITY,),
-        ).fetchone():
+        if _primary_unfinished(conn):
             return None
         if secondary_admission is None or secondary_admission().get("allowed") is not True:
             return None
@@ -490,13 +544,13 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
     row = conn.execute(
         "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
         f"WHERE priority=? AND dataset>? AND {due} "
-        "ORDER BY dataset,partition DESC LIMIT 1",
+        "ORDER BY CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, dataset,partition DESC LIMIT 1",
         (priority, cursor, *values),
     ).fetchone()
     if not row:
         row = conn.execute(
             "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
-            f"WHERE priority=? AND {due} ORDER BY dataset,partition DESC LIMIT 1",
+            f"WHERE priority=? AND {due} ORDER BY CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, dataset,partition DESC LIMIT 1",
             (priority, *values),
         ).fetchone()
     if not row:
@@ -614,7 +668,7 @@ def _claim_batch(conn: sqlite3.Connection, task: Task,
     """Atomically extend the normal single-owner claim into a bounded range."""
     contract = RANGE_CONTRACTS.get(task.dataset)
     if (contract is None or not 0 <= task.priority < SECONDARY_VALIDATION_PRIORITY or task.data_id
-            or task.kind != contract.grain or task.state not in {"pending", "failed"}):
+            or task.kind != contract.grain or task.state not in {"pending", "failed", "complete", "observed_empty"}):
         return None
     conn.execute("SAVEPOINT finmind_batch_claim")
     try:
@@ -632,24 +686,25 @@ def _claim_batch(conn: sqlite3.Connection, task: Task,
             return None
         candidates = [Task(*row) for row in conn.execute(
             "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
-            "WHERE dataset=? AND data_id='' AND kind=? AND priority>=0 AND priority<? AND state='pending' "
-            "AND partition<? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?) "
+            "WHERE dataset=? AND data_id='' AND kind=? AND priority>=0 AND priority<? "
+            "AND ((state='pending' AND next_attempt_at_utc IS NULL) OR "
+            "(state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc<=?)) "
             "ORDER BY partition DESC",
-            (task.dataset, task.kind, SECONDARY_VALIDATION_PRIORITY, task.partition, now.isoformat()),
+            (task.dataset, task.kind, SECONDARY_VALIDATION_PRIORITY, now.isoformat()),
         )]
         learned = conn.execute("SELECT max_partitions FROM request_batch_limits WHERE dataset=?", (task.dataset,)).fetchone()
         bound = learned[0] if learned else contract.max_partitions
         batch = coalesce_pending_tasks(task, candidates, today=now.astimezone(TAIPEI).date(),
-                                       max_years=bound, max_months=bound)
+                                       max_years=bound, max_months=bound, include_due_refresh=True)
         if batch is not None:
             for neighbor in batch.tasks:
                 if neighbor.partition == task.partition:
                     continue
                 claimed = conn.execute(
                     "UPDATE tasks SET state='inflight' WHERE dataset=? AND data_id='' "
-                    "AND partition=? AND state='pending' "
-                    "AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)",
-                    (neighbor.dataset, neighbor.partition, now.isoformat()),
+                    "AND partition=? AND state=? "
+                    "AND ((state='pending' AND next_attempt_at_utc IS NULL) OR next_attempt_at_utc<=?)",
+                    (neighbor.dataset, neighbor.partition, neighbor.state, now.isoformat()),
                 )
                 if claimed.rowcount != 1:
                     raise BatchContractError("batch_claim_changed")
@@ -859,9 +914,11 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
             *, account: dict[str, object] | None = None,
             active: list[Task] | None = None, last: dict[str, Any] | None = None,
             session_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    from downloader.acquisition_policy import finmind_secondary_mode
     series = {spec.dataset: {"target": 0, "complete": 0, "observed_empty": 0,
                              "failed": 0, "blocked": 0, "non_session": 0,
                              "not_observation_date": 0,
+                             "calendar_wait": 0,
                              "deprecated_query_shape": 0,
                              "source_status": ("delegated_to_complement_product_history"
                                                if spec.dataset in PRODUCT_HISTORY_STARTS else
@@ -878,7 +935,7 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
         if dataset not in series:
             continue
         item = series[dataset]
-        if task_state not in {"non_session", EXCLUDED_STATE, "deprecated_query_shape"}:
+        if task_state not in {"non_session", EXCLUDED_STATE, "deprecated_query_shape", "calendar_wait"}:
             item["target"] += count
         if task_state in item:
             item[task_state] += count
@@ -903,19 +960,19 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
         "session_policy": session_policy or {"state": "calendar_unverified"},
         "active_tasks": [{"dataset": task.dataset, "partition": task.partition} for task in active or []],
         "last_task": last, "catalog_source": CATALOG_URL,
-        "training": "raw_not_point_in_time_validated", "news": "disabled_by_user",
+        "training": "raw_not_point_in_time_validated", "news": "owned_by_complement",
         "acquisition_policy": {
             "required_unfinished": conn.execute(
                 "SELECT count(*) FROM tasks WHERE priority<? AND "
-                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape')",
+                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape','calendar_wait')",
                 (SECONDARY_VALIDATION_PRIORITY,),
             ).fetchone()[0],
             "secondary_unfinished": conn.execute(
                 "SELECT count(*) FROM tasks WHERE priority>=? AND "
-                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape')",
+                "state NOT IN ('complete','observed_empty','non_session','not_observation_date','deprecated_query_shape','calendar_wait')",
                 (SECONDARY_VALIDATION_PRIORITY,),
             ).fetchone()[0],
-            "secondary_rule": "global_required_acquisition_then_spare_shared_quota",
+            "secondary_rule": finmind_secondary_mode(),
             "observed_empty_is_data_complete": False,
         },
     }
@@ -947,9 +1004,9 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
             return _status(conn, root, "not_entitled", account=account)
     limiter = rate_limiter(account)
     if secondary_admission is None:
-        from downloader.acquisition_policy import evaluate_secondary_admission
+        from downloader.acquisition_policy import evaluate_finmind_secondary_admission
 
-        secondary_admission = evaluate_secondary_admission
+        secondary_admission = lambda: evaluate_finmind_secondary_admission(root=root.parent)
     with _db(root / "queue.sqlite3") as conn:
         from downloader.finmind_corrections import apply_worker_corrections, reconcile_worker_corrections
 
@@ -957,6 +1014,10 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
             conn, datetime.now(UTC), official_price_coverage=_official_price_coverage(),
             official_sessions=_official_session_calendar(), root=root,
         )
+        from downloader.finmind_integrity import audit_completed_batch
+
+        if not protected_stock_opening(datetime.now(UTC)):
+            audit_completed_batch(conn, root)
         reconcile_worker_corrections(conn, root, 'sponsor', datetime.now(UTC))
         correction_summary = apply_worker_corrections(conn, root, 'sponsor', datetime.now(UTC))
         conn.commit()
@@ -985,11 +1046,16 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                     reason = "protected_opening"
                 while not halt and len(in_flight) < workers and (not max_requests or sent < max_requests):
                     dispatch_now = datetime.now(UTC)
+                    account = refresh_dispatch_account(account, token, root.parent, dispatch_now)
                     budget = backfill_budget(
                         account, root.parent,
                         fixed_incremental_requests=_fixed_incremental_demand(root.parent, dispatch_now),
-                        in_flight=len(in_flight), now=dispatch_now,
+                        in_flight=len(in_flight), now=dispatch_now, prioritize_due=True,
                     )
+                    if budget.get('remaining', len(in_flight) + 1) <= len(in_flight):
+                        halt = True
+                        reason = 'incremental_reserve'
+                        break
                     task = _next(conn, dispatch_now, incremental_only=not budget["allowed"],
                                  secondary_admission=secondary_admission, datasets=datasets)
                     if task is None:
@@ -1121,10 +1187,17 @@ def main(argv: list[str] | None = None) -> int:
                                  ensure_ascii=False), flush=True)
                 if not args.loop or result["state"] in {"account_unverified", "not_entitled", "invalid_token"}:
                     return 0 if result["state"] not in {"account_unverified", "not_entitled"} else 2
-                time.sleep(1800 if result["state"] in {"rate_limited", "ip_banned"} else
-                           600 if result["state"] in {"current_queue", "protected_opening", "disk_guard",
-                                                       "waiting_necessary_acquisition"} else
-                           60 if result["state"] == "incremental_reserve" else 2)
+                delay = (1800 if result["state"] in {"rate_limited", "ip_banned"} else
+                         600 if result["state"] in {"current_queue", "protected_opening", "disk_guard",
+                                                     "waiting_necessary_acquisition"} else
+                         60 if result["state"] == "incremental_reserve" else 2)
+                from downloader.acquisition_policy import evaluate_finmind_secondary_admission
+                wake_if = (lambda: _ready_after_wait(
+                    root, datetime.now(UTC),
+                    secondary_admission=lambda: evaluate_finmind_secondary_admission(root=root.parent),
+                    datasets=tuple(args.dataset) if args.dataset is not None else None,
+                )) if result['state'] == 'waiting_necessary_acquisition' else None
+                wait_for_next_cycle(root, result, delay, sources=SOURCES, wake_if=wake_if)
         except KeyboardInterrupt:
             return 130
 

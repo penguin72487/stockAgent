@@ -98,9 +98,11 @@ def test_simple_exact_interval_is_automatically_scheduled():
 def test_old_unreviewed_and_unsupported_not_marked_repaired():
     old = plan([entry(notice_date="2020-01-03")])
     assert old["notices"][0]["status"] == "not_scheduled"
+    unsupported = plan([entry("UnknownDataset 2020-01-01 已更正", datasets=("UnknownDataset",))])
+    assert not unsupported["requests"]
+    assert unsupported["notices"][0]["issues"][0]["reason"] == "dataset_has_no_enabled_acquisition_owner"
     tick = plan([entry("TaiwanFuturesTick 2020-01-01 已更正", datasets=("TaiwanFuturesTick",))])
-    assert not tick["requests"]
-    assert tick["notices"][0]["issues"][0]["reason"] == "dataset_has_no_enabled_acquisition_owner"
+    assert tick['requests'][0]['owner'] == 'complement'
 
 
 def test_nested_or_unavailable_scope_requires_review():
@@ -118,7 +120,7 @@ def test_owner_priority_avoids_complement_sponsor_duplicates():
     assert resolve_owner("TaiwanVariousIndicators5Seconds") == "free"
     assert resolve_owner("TaiwanStockTradingDate") == "free"
     assert resolve_owner(WIDE_INSTITUTIONAL) == "sponsor"
-    assert resolve_owner("TaiwanFuturesTick") is None
+    assert resolve_owner("TaiwanFuturesTick") == 'complement'
 
 
 def test_long_and_wide_share_one_raw_request():
@@ -131,7 +133,8 @@ def test_long_and_wide_share_one_raw_request():
 
 def test_curated_full_hash_change_requires_new_review_even_if_family_changes():
     registry = load_scope_registry()
-    e = curated_entries(registry)[1]
+    e = next(item for item in curated_entries(registry)
+             if item['datasets'] == ['TaiwanStockStatisticsOfOrderBookAndTrade'] and item['notice_date'] <= NOW.date().isoformat())
     first = build_repair_plan([e], now=NOW, scopes=registry)
     changed = {**e, "entry_id": "e" * 64, "revision_family_id": "changed-family",
                "text": "TaiwanStockStatisticsOfOrderBookAndTrade 2020-01-01 已更正",
@@ -143,7 +146,7 @@ def test_curated_full_hash_change_requires_new_review_even_if_family_changes():
 
 
 def test_same_curated_id_with_changed_text_is_rejected():
-    e = curated_entries()[0]
+    e = next(item for item in curated_entries() if item['notice_date'] <= NOW.date().isoformat())
     e["text"] += " modified"
     p = build_repair_plan([e], now=NOW)
     assert not p["requests"]

@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh official exchange calendar every thirty minutes, including holidays
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00 Asia/Taipei
+Persistent=true
+AccuracySec=1s
+Unit=stockagent-tw-public-calendar-refresh.service
+
+[Install]
+WantedBy=timers.target
