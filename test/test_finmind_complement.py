@@ -176,7 +176,7 @@ def test_current_snapshot_refreshes_at_next_taipei_14_and_current_year_in_four_h
     assert complement._next_refresh(snapshot, observed, empty=False) == "2026-09-26T06:00:00+00:00"
     assert complement._next_refresh(current, observed, empty=False) == "2026-09-25T19:00:00+00:00"
     margin = complement.Task("TaiwanStockTotalMarginPurchaseShortSale", "", "2026", "year", 0, "complete")
-    assert complement._next_refresh(margin, observed, empty=False) == "2026-09-28T13:10:00+00:00"
+    assert complement._next_refresh(margin, observed, empty=False) == "2026-09-28T13:00:00+00:00"
 
 
 def test_receipt_keeps_raw_dates_and_rejects_wrong_identity(tmp_path: Path) -> None:

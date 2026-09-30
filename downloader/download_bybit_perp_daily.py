@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from http.client import IncompleteRead, RemoteDisconnected
 import json
 import os
 import sys
@@ -11,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -41,7 +40,9 @@ from common import (
 )
 from artifact_io import archive_run_reports
 from candle_frame_buffer import CandleFrameBuffer
+from http_transport import RETRYABLE_NETWORK_ERRORS
 from ohlcv_hot_tail import (
+    has_contiguous_timestamps,
     hot_tail_path,
     read_logical_parquet,
     remove_hot_tail,
@@ -358,31 +359,10 @@ def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
 
 
 def _can_skip_existing_middle(frame: pl.DataFrame, info: ExistingCandleInfo) -> bool:
-    """Require actual nonempty, gap-free dates matching the planning bounds."""
-    if frame.is_empty() or "date" not in frame.columns:
-        return False
-    # Parse original values, not the legacy second-formatted normalization:
-    # formatting first could hide a sub-second timestamp defect.
-    try:
-        values = frame.get_column("date")
-        dates = (
-            values.str.to_datetime(strict=False, time_zone="UTC", time_unit="ns")
-            if values.dtype == pl.String
-            else values.cast(pl.Datetime("ns", "UTC"), strict=False)
-        )
-    except (pl.exceptions.PolarsError, TypeError, ValueError):
-        return False
-    if dates.null_count() or len(dates) != frame.height:
-        return False
-    timestamps = dates.dt.epoch("ns").sort()
-    minute_ns = CANDLE_INTERVAL_MS * 1_000_000
-    return (
-        timestamps[0] // 1_000_000 == info.earliest_ms
-        and timestamps[-1] // 1_000_000 == info.latest_ms
-        and bool((timestamps % minute_ns == 0).all())
-        and bool((timestamps.diff().drop_nulls() == minute_ns).all())
+    return has_contiguous_timestamps(
+        frame, earliest_ms=info.earliest_ms, latest_ms=info.latest_ms,
+        interval_ms=CANDLE_INTERVAL_MS,
     )
-
 
 def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
     if frame.is_empty() or "date" not in frame.columns:
@@ -601,13 +581,7 @@ class BybitClient:
                     )
                     continue
                 raise
-            except (
-                URLError,
-                TimeoutError,
-                IncompleteRead,
-                RemoteDisconnected,
-                ConnectionError,
-            ) as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(attempt)

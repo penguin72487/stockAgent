@@ -203,8 +203,8 @@ def test_sponsor_status_tracks_last_checked_partition_even_when_empty(tmp_path: 
 def test_current_empty_partition_retries_same_day_not_tomorrow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    now = datetime(2026, 9, 26, 4, tzinfo=UTC)
-    task = Task("TaiwanStockPrice", "", "2026-09-26", "day", 0, "inflight")
+    now = datetime(2026, 9, 30, 10, tzinfo=UTC)  # Weekday, after the 17:30 release.
+    task = Task("TaiwanStockPrice", "", "2026-09-30", "day", 0, "inflight")
     monkeypatch.setattr(sponsor, "_store", lambda *_args: {
         "status": "observed_empty", "rows": 0, "receipt_path": "receipts/fixture.json",
         "source_first_date": None, "source_last_date": None,
@@ -212,7 +212,7 @@ def test_current_empty_partition_retries_same_day_not_tomorrow(
     with sponsor._db(tmp_path / "queue.sqlite3") as connection:
         connection.execute(
             "INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
-            "VALUES ('TaiwanStockPrice','','2026-09-26','day',0,'inflight')"
+            "VALUES ('TaiwanStockPrice','','2026-09-30','day',0,'inflight')"
         )
         sponsor._finish(connection, tmp_path, task, [], now)
         next_attempt = connection.execute(

@@ -32,6 +32,22 @@ function networkTimeBasis(row) {
 }
 function timeLabel(value) { const date = new Date(value || ""); return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}); }
 function ageLabel(seconds) { return Dashboard.formatAge(seconds, {emptyLabel: "時間未核實", hourDigits: 0, dayDigits: 0}); }
+function updateMonitorLines(info = {}) {
+  const labels = {first_nonempty: "首次取得", first_empty: "來源尚空", unchanged: "未變更", new_data: "追加資料", revision: "內容修訂", coverage_changed: "覆蓋改變", first_nonempty_after_empty: "首次由空回轉有資料"};
+  if (info.state === "derived_local") return [
+    `本機衍生，不另呼叫 API · 源 ${info.derived_from}`,
+    `最近本機寫入 ${timeLabel(info.local_materialized_at_utc)}`,
+    `源資料最後檢查 ${timeLabel(info.checked_at_utc)} · ${labels[info.event] || "尚未觀測"}`,
+    `下次源資料可排 ${timeLabel(info.next_check_at_utc)}（仍受配額／優先級限制）`];
+  const lines = [info.release?.label || "發布規律待確認",
+    `最後檢查 ${timeLabel(info.checked_at_utc)} · ${labels[info.event] || "尚未觀測"}`,
+    `新內容首次看到 ${timeLabel(info.last_data_observed_at_utc)} · 修訂／追加 ${timeLabel(info.last_changed_at_utc)}`,
+    `下次可排 ${timeLabel(info.next_check_at_utc)}（仍受配額／優先級限制）`];
+  if (info.availability_by_utc) lines.push(`更新觀測區間 ${timeLabel(info.availability_after_utc)} → ${timeLabel(info.availability_by_utc)}`);
+  if (valueNumber(info.response_rows) !== null) lines.push(`最近一 call 回應 ${count(info.response_rows)} 筆 · 網路 ${valueNumber(info.network_seconds) === null ? "未知" : `${oneDecimal.format(info.network_seconds)} 秒`}`);
+  if (info.last_error_code) lines.push(`最近失敗 ${timeLabel(info.last_failed_check_at_utc)} · ${info.last_error_code}`);
+  return lines;
+}
 function text(id, value) { $(id).textContent = value; }
 
 function estimateDuration(seconds) {
@@ -249,7 +265,11 @@ function renderPipelines(data) {
     card.querySelector(".mini-progress small").textContent = `資料日期 ${row.first_data_date || "未取得"} → ${row.last_data_date || "未取得"}`;
     card.querySelector(".eta-value").textContent = networkTimeLabel(row);
     card.querySelector(".eta-basis").textContent = networkTimeBasis(row);
-    card.querySelector(".pipeline-footer").textContent = `最後完成 ${timeLabel(row.last_receipt_at_utc)}`;
+    const footer = card.querySelector(".pipeline-footer");
+    footer.classList.add("update-monitor");
+    for (const line of updateMonitorLines(row.update_monitor)) {
+      const entry = document.createElement("p"); entry.textContent = line; footer.append(entry);
+    }
     grid.append(card);
   }
 }
@@ -290,7 +310,7 @@ function renderBackfill(data) {
       ? [["1m", "1 分"], ["15s", "15 秒"], ["10s", "10 秒"], ["5s", "5 秒"]]
           .map(([key, label]) => `${count(grains[key] ?? 0)} 日 ${label}`).join(" · ")
       : `空 ${count(row.observed_empty_partitions || 0)} · 失敗 ${count(row.deferred_partitions || 0)} · 權限 ${count(row.not_entitled_partitions || 0)} · 參數 ${count(row.invalid_request_partitions || 0)}`;
-    const cells = [row.label, datasetStatus(row), `${count(row.checked_partitions ?? row.complete_partitions)}／${count(row.target_partitions)}（非空 ${count(row.complete_partitions)}）`, row.first_data_date || "—", row.last_data_date || "—", count(row.rows), bytes(row.local_bytes), grainLabel, networkTimeLabel(row), timeLabel(row.last_receipt_at_utc)];
+    const cells = [row.label, datasetStatus(row), `${count(row.checked_partitions ?? row.complete_partitions)}／${count(row.target_partitions)}（非空 ${count(row.complete_partitions)}）`, row.first_data_date || "—", row.last_data_date || "—", count(row.rows), bytes(row.local_bytes), grainLabel, networkTimeLabel(row), updateMonitorLines(row.update_monitor).join("\n")];
     for (const cell of cells) { const td = document.createElement("td"); td.textContent = cell; tr.append(td); }
     body.append(tr);
   }

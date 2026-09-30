@@ -5433,7 +5433,8 @@ class TwDayTradeSimulationEngine:
                 p[key] = float(p.get(key) or 0) + amount
             common = {"recorded_at": now.isoformat(), "session_date": now.date().isoformat(),
                       "market": mode["market"], "signal_id": mode["signal_id"], "symbol": symbol,
-                      "position_id": p["position_id"], "order_id": order_id, "purpose": "entry",
+                      "position_id": p["position_id"], "order_id": order_id,
+                      "purpose": "entry" if old == 0 else "entry_completion",
                       "quantity": quantity, "simulation_only": True,
                       "entry_fill_policy": entry_fill_policy}
             self._order(common | {"order_type": "MKT", "price": None, "status": "filled",
@@ -5632,7 +5633,7 @@ class TwDayTradeSimulationEngine:
                 "symbol": symbol,
                 "position_id": position["position_id"],
                 "order_id": order_id,
-                "purpose": "entry",
+                "purpose": "entry" if previous_filled == 0 else "entry_completion",
                 "quantity": quantity,
                 "simulation_only": True,
                 "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,

@@ -36,12 +36,13 @@ from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, _record_request_start
 from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import RangeBatch
-from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, fixed_incremental_demand
+from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, fixed_incremental_demand, next_release_check
 from downloader.finmind_volume_units import annotate_stock_share_units
 from downloader.finmind_history_refresh import (
     DAILY_EQUITY, canonical_us_id, migrate_us_aliases, read_baseline,
     request_plan, merge_response, adjusted_history_changed,
 )
+from downloader.finmind_updates import received_rows, retain_observation, record_success, set_next_check, record_failure
 from downloader import finmind_supplemental as supplemental
 from downloader import finmind_news as news
 
@@ -100,8 +101,8 @@ GLOBAL_RELEASE_HOUR_TAIPEI = {
     "TaiwanStockTotalInstitutionalInvestors": 15,
     # The official docs give no intraday publish time for these event tables.
     # One daily check after the TW close is a request budget, not a PIT claim.
-    "TaiwanStockDelisting": 14,
-    "TaiwanStockSplitPrice": 14,
+    "TaiwanStockDelisting": 23,
+    "TaiwanStockSplitPrice": 18,
     "TaiwanStockParValueChange": 14,
 }
 TW_SYMBOL_HISTORY = (
@@ -703,7 +704,7 @@ def _claim_bulk_years(connection: sqlite3.Connection, task: Task, now: datetime,
     """Claim one contiguous due interval without importing not-due years."""
     if task.dataset not in BULK_GLOBAL_HISTORY or task.kind != "year" or task.data_id:
         return None
-    if not allow_history and (task.dataset != "GoldPrice" or task.priority != 0):
+    if not allow_history and task.priority != 0:
         return None
     today = now.astimezone(TAIPEI).date()
     connection.execute("SAVEPOINT complement_year_claim")
@@ -713,8 +714,6 @@ def _claim_bulk_years(connection: sqlite3.Connection, task: Task, now: datetime,
             "SELECT max_partitions FROM complement_year_batch_policy WHERE dataset=?", (task.dataset,),
         ).fetchone()
         limit = policy[0] if policy else today.year - GLOBAL_START_YEAR[task.dataset] + 1
-        if not allow_history:
-            limit = 1
         rows = connection.execute(
             "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
             "WHERE dataset=? AND data_id='' AND kind='year' AND priority>=0 AND priority<8 "
@@ -724,6 +723,7 @@ def _claim_bulk_years(connection: sqlite3.Connection, task: Task, now: datetime,
         ).fetchall()
         eligible = {int(row[2]): Task(*row) for row in rows
                     if re.fullmatch(r"\d{4}", row[2])
+                    and (allow_history or row[4] == 0)
                     and GLOBAL_START_YEAR[task.dataset] <= int(row[2]) <= today.year}
         year = int(task.partition)
         if year not in eligible or (limit < 2 and task.dataset != "GoldPrice"):
@@ -836,7 +836,7 @@ def _request(session: requests.Session, limiter: SharedRateLimiter, root: Path,
             params["end_date"] = (covered_end + timedelta(days=1)).isoformat()
             rows = _fetch_rows(session, limiter, root, task.dataset, token, params,
                                max_response_bytes=BULK_MAX_RESPONSE_BYTES)
-            return _gold_covered_rows(rows, date.fromisoformat(params["start_date"]), covered_end)[0]
+            return retain_observation(_gold_covered_rows(rows, date.fromisoformat(params["start_date"]), covered_end)[0], rows)
     elif task.kind == "id_history":
         params["start_date"] = {
             "TaiwanExchangeRate": "2006-01-01",
@@ -888,12 +888,13 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
         raise ValueError("max_response_bytes must be a positive integer")
     limiter.wait()
     _record_request_start(root, dataset)
+    started = datetime.now(UTC)
     try:
         response = session.get(endpoint, params=params, headers={"Authorization": f"Bearer {token}"},
                                timeout=(10, 90),
                                **({"stream": True} if max_response_bytes is not None else {}))
         try:
-            return _response_rows(response, limiter, max_response_bytes=max_response_bytes)
+            return received_rows(_response_rows(response, limiter, max_response_bytes=max_response_bytes), started)
         finally:
             if max_response_bytes is not None:
                 response.close()
@@ -1014,6 +1015,7 @@ def _sha256(path: Path) -> str:
 def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
            request_metadata: dict[str, Any] | None = None,
            correction: dict[str, Any] | None = None) -> dict[str, Any]:
+    transport = getattr(rows, 'observation', None)
     # A current quote can legitimately disappear when its contract expires;
     # archive that prior capture but do not invent a continuing live quote.
     # Historical ranges and reference masters retain the stronger empty guard.
@@ -1115,6 +1117,9 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
                 raise SourceError("receipt_history_corrupt", retry_after=0)
         else:
             atomic_write_bytes(archived, previous, durable=True)
+    observation = record_success(root, task, rows, receipt, now, transport=transport)
+    if observation is not None:
+        receipt['update_observation'] = observation
     atomic_write_json(receipt_path, receipt)
     receipt["receipt_path"] = str(receipt_path.relative_to(root))
     return receipt
@@ -1220,6 +1225,9 @@ def _store_bulk_years(connection: sqlite3.Connection, root: Path, task: Task,
                       rows: list[dict[str, Any]], now: datetime, today: date,
                       *, batch: _GlobalYearBatch | None = None) -> int:
     """Fan out one range response into existing per-year, auditable receipts."""
+    transport_rows = rows
+    if batch is not None and getattr(rows, 'observation', None):
+        rows.observation['request_id'] = batch.request_id
     first_year = GLOBAL_START_YEAR[task.dataset]
     # Old explicit full-history callers retain their selected full interval;
     # the worker always supplies the exact due tasks claimed before its HTTP.
@@ -1273,7 +1281,7 @@ def _store_bulk_years(connection: sqlite3.Connection, root: Path, task: Task,
         from downloader.finmind_corrections import correction_context
 
         context = correction_context(connection, year_task)
-        receipt = _store(root, year_task, grouped[year_task.partition], now, request_metadata=metadata,
+        receipt = _store(root, year_task, retain_observation(grouped[year_task.partition], transport_rows), now, request_metadata=metadata,
                          **({'correction': context} if context else {}))
         _save_result(connection, year_task, receipt, now)
     return len(rows)
@@ -1303,7 +1311,9 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
             return _iso(now + timedelta(days=90 if empty else 365))
         if empty:
             return _iso(now + timedelta(days=7))
-        next_check = local.replace(hour=spec.release_hour, minute=15, second=0, microsecond=0)
+        if task.dataset == 'TaiwanFuturesSpreadTrading':
+            return _iso(now + timedelta(hours=3))
+        next_check = local.replace(hour=spec.release_hour, minute=spec.release_minute, second=0, microsecond=0)
         if next_check <= local:
             next_check += timedelta(days=1)
         return _iso(next_check)
@@ -1311,7 +1321,7 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
         if empty or (latest_date and latest_date[:10] < (now.astimezone(TAIPEI).date() - timedelta(days=14)).isoformat()):
             return _iso(now + timedelta(days=7))  # Unknown/inactive identity, not a success claim.
         local = now.astimezone(TAIPEI)
-        next_check = local.replace(hour=8, minute=5, second=0, microsecond=0)
+        next_check = local.replace(hour=8, minute=0, second=0, microsecond=0)
         if next_check <= local:
             next_check += timedelta(days=1)
         return _iso(next_check)
@@ -1325,6 +1335,9 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
             next_check += timedelta(days=1)
         return _iso(next_check)
     if task.kind == "year" and task.partition == str(now.astimezone(TAIPEI).year) and task.dataset in GLOBAL_RELEASE_HOUR_TAIPEI:
+        official = next_release_check(task.dataset, now)
+        if official is not None:
+            return _iso(official)
         local = now.astimezone(TAIPEI)
         next_check = local.replace(hour=GLOBAL_RELEASE_HOUR_TAIPEI[task.dataset],
                                    minute=10, second=0, microsecond=0)
@@ -1347,15 +1360,20 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
 
 
 def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, Any], now: datetime) -> None:
+    next_at = _next_refresh(task, now, empty=receipt['status'] == 'observed_empty',
+                            latest_date=receipt.get('source_last_date'))
     connection.execute(
         "UPDATE tasks SET state=?, next_attempt_at_utc=?, last_attempt_at_utc=?, "
         "rows=?,bytes=?,first_data_date=?,last_data_date=?,receipt_path=?,error_code=NULL "
         "WHERE dataset=? AND data_id=? AND partition=?",
-        (receipt["status"], _next_refresh(task, now, empty=receipt["status"] == "observed_empty", latest_date=receipt.get('source_last_date')),
+        (receipt["status"], next_at,
          _iso(now), receipt["rows"], receipt.get("parquet_size_bytes", 0),
          receipt.get("source_first_date"), receipt.get("source_last_date"), receipt["receipt_path"],
          task.dataset, task.data_id, task.partition),
     )
+    queue_path = connection.execute('PRAGMA database_list').fetchone()[2]
+    if queue_path:
+        set_next_check(Path(queue_path).parent, task, next_at)
     if task.dataset in {*PRODUCT_HISTORY_STARTS, *DAILY_EQUITY} and receipt["status"] == "complete" and receipt["rows"] > 0:
         connection.execute("UPDATE tasks SET priority=0 WHERE dataset=? AND data_id=? AND partition=?",
                            (task.dataset, task.data_id, task.partition))
@@ -1377,6 +1395,9 @@ def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, 
 
 
 def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError, now: datetime) -> None:
+    queue_path = connection.execute('PRAGMA database_list').fetchone()[2]
+    if queue_path:
+        record_failure(Path(queue_path).parent, task, error.code, now)
     if error.code == "not_entitled":
         connection.execute(
             "UPDATE tasks SET state='not_entitled', error_code='not_entitled', "
@@ -1577,7 +1598,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                                 raise SourceError("response_row_limit")
                             history_metadata.update(request_count=2, full_refetch_reason='adjusted_history_changed')
                             completed += 1
-                        rows = merge_response(old_rows, incoming, task.data_id, history_metadata)
+                        rows = retain_observation(merge_response(old_rows, incoming, task.data_id, history_metadata), incoming)
                         history_metadata["response_rows"] = len(incoming)
                         if baseline_error:
                             history_metadata['baseline_recovery'] = baseline_error
@@ -1694,7 +1715,8 @@ def main(argv: list[str] | None = None) -> int:
                          else 1800 if result["state"] == "ip_banned"
                          else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
                          else 60 if result["state"] == "incremental_reserve" else 5)
-                wait_for_next_cycle(root, result, delay)
+                wait_for_next_cycle(root, result, delay,
+                                    sources=supplemental.SOURCES.values(), snapshot_hours=(0, 8, 14, 17))
         except KeyboardInterrupt:
             return 130
         finally:

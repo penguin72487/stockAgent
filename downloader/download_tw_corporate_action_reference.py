@@ -120,6 +120,51 @@ def _parse_roc_date(value: Any) -> date | None:
         return None
 
 
+def _parse_tpex_disposition_payload(payload: dict[str, Any], *, start: date, end: date,
+                                    source_sha256: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Retain official measures and issuing dates for overlapping active periods.
+
+    A prior-year notice may still be active in the requested year. The literal
+    no-data rows remain separate observations, never synthetic disposition
+    events or evidence that no security was under an earlier disposition.
+    """
+    if start > end or not re.fullmatch(r'[a-f0-9]{64}', source_sha256):
+        raise ValueError('invalid disposition query or source identity')
+    expected = start.strftime('%Y%m%d') + '~' + end.strftime('%Y%m%d')
+    if str(payload.get('stat', '')).lower() != 'ok' or payload.get('date') != expected:
+        raise ValueError('disposition response does not identify the requested query')
+    tables = payload.get('tables', [])
+    if len(tables) != 1:
+        raise ValueError('disposition response requires one official table')
+    table = tables[0]
+    fields = table.get('fields', [])
+    required = {'公布日期', '證券代號', '處置起訖時間', '處置內容'}
+    if not required <= set(fields) or len(fields) != len(set(fields)):
+        raise ValueError('incomplete or duplicate disposition fields')
+    rows, no_data_dates = [], []
+    for values in table['data']:
+        row = dict(zip(fields, values, strict=True))
+        published = _parse_roc_date(row['公布日期'])
+        if published is None:
+            raise ValueError('invalid disposition issuing date')
+        if row['處置內容'] == '本日無處置資料':
+            if row['證券代號'] != '' or row['處置起訖時間'] != '' or not start <= published <= end:
+                raise ValueError('invalid official no-data disposition row')
+            no_data_dates.append(str(published))
+            continue
+        period = str(row['處置起訖時間']).split('~')
+        if len(period) != 2:
+            raise ValueError('invalid disposition period')
+        first, last = map(_parse_roc_date, period)
+        code = str(row['證券代號'])
+        if (not first or not last or not published <= first <= last or first > end or last < start
+                or not code or code.strip() != code or not str(row['處置內容']).strip()):
+            raise ValueError('disposition identity, period or measure is not source-bound')
+        rows.append(dict(date=str(published), stock_id=code, period_start=str(first), period_end=str(last),
+                         measure=row['處置內容'], source_sha256=source_sha256))
+    return rows, no_data_dates
+
+
 def _number(value: Any) -> float | None:
     text = str(value or "").strip().replace(",", "")
     if text in {"", "--", "---", "N/A", "nan", "null"}:

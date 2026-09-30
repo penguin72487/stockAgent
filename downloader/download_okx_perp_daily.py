@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -37,6 +37,7 @@ from common import (  # noqa: E402
 )
 from artifact_io import archive_run_reports  # noqa: E402
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     exclusive_dataset_lock,
@@ -50,7 +51,8 @@ from okx_historical_features import (  # noqa: E402
     run_historical_feature_downloads,
     stage_latency_summary,
 )
-from ohlcv_hot_tail import (  # noqa: E402
+from ohlcv_hot_tail import (
+    plan_candle_reconcile_windows,  # noqa: E402
     hot_tail_path,
     read_logical_parquet,
     remove_hot_tail,
@@ -379,7 +381,7 @@ class OkxClient:
                     )
                     continue
                 raise
-            except URLError as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(limiter, attempt)
@@ -419,7 +421,7 @@ class OkxClient:
                     )
                     continue
                 raise
-            except URLError as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(limiter, attempt)
@@ -759,6 +761,7 @@ def _download_symbol_1m(
             ),
         )
 
+    requested_start_ms = effective_start_ms
     if output_path.exists() and not refresh:
         existing_info = _load_logical_existing_candle_info(output_path)
         if existing_info.error is not None or not existing_info.interval_ok:
@@ -790,7 +793,7 @@ def _download_symbol_1m(
                 overlap_ms=CANDLE_INTERVAL_MS,
                 repair_missing_head=not tail_only,
             )
-            if effective_start_ms > end_ms:
+            if tail_only and effective_start_ms > closed_end_ms:
                 return DownloadResult(
                     asset_class="crypto_okx_perp",
                     code=record.code,
@@ -806,43 +809,73 @@ def _download_symbol_1m(
             closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
+    request_windows = [(effective_start_ms, closed_end_ms)]
+    existing_frame: pl.DataFrame | None = None
+    if not tail_only and existing_info is not None and existing_info.rows > 0:
+        # The merge needs this logical frame anyway. Inspect actual dates,
+        # rather than trusting footer counts or ignoring internal minute gaps.
+        existing_frame = read_logical_parquet(output_path)
+        planned = plan_candle_reconcile_windows(
+            existing_frame, earliest_ms=existing_info.earliest_ms,
+            latest_ms=existing_info.latest_ms, start_ms=requested_start_ms,
+            end_ms=closed_end_ms, interval_ms=CANDLE_INTERVAL_MS,
+        )
+        if planned is None:
+            # No proof for omitting middle requests is not permission to drop
+            # old observations or historical feature columns. Keep the legacy
+            # merge contract after a full network reconciliation.
+            request_windows = [(requested_start_ms, closed_end_ms)]
+        else:
+            request_windows = planned
+            if not request_windows:
+                return DownloadResult(
+                    asset_class="crypto_okx_perp", code=record.code,
+                    okx_symbol=record.okx_symbol, market=record.market,
+                    status="skipped_up_to_date", rows=existing_info.rows,
+                    output_path=str(output_path),
+                )
+
+    if request_windows:
+        # Gap/head responses may precede the revision tail. Their old boundary
+        # rows must enter the merge's overlap, not remain in a separate prefix.
+        effective_start_ms = min(start for start, _ in request_windows)
     candles = CandleFrameBuffer(_normalize_candles)
     received_rows = False
-    cursor_after: str | None = None
-    seen_oldest: set[str] = set()
-
-    while True:
-        params: dict[str, Any] = {
-            "instId": record.okx_symbol,
-            "bar": KLINE_BAR,
-            "limit": OKX_HISTORY_LIMIT,
-        }
-        if cursor_after:
-            params["after"] = cursor_after
-
-        payload = client.get(HISTORY_CANDLES_ENDPOINT, params)
-        if page_progress_callback is not None:
-            page_progress_callback(record.code)
-        chunk = payload.get("data", [])
-        if not chunk:
-            break
-
-        received_rows = True
-        candles.extend(
-            row
-            for row in chunk
-            if effective_start_ms <= int(row[0]) <= closed_end_ms
-            and (len(row) < 9 or str(row[8]) == "1")
-        )
-
-        oldest_ms = int(chunk[-1][0])
-        if oldest_ms < effective_start_ms:
-            break
-
-        cursor_after = chunk[-1][0]
-        if cursor_after in seen_oldest:
-            break
-        seen_oldest.add(cursor_after)
+    for window_start, window_end in request_windows:
+        if window_start > window_end:
+            continue
+        # OKX 'after' returns older records. +1 includes the exact boundary
+        # without walking down from today's latest page for historical heads.
+        cursor_after = window_end + 1
+        while True:
+            payload = client.get(
+                HISTORY_CANDLES_ENDPOINT,
+                {
+                    "instId": record.okx_symbol,
+                    "bar": KLINE_BAR,
+                    "limit": OKX_HISTORY_LIMIT,
+                    "after": str(cursor_after),
+                },
+            )
+            if page_progress_callback is not None:
+                page_progress_callback(record.code)
+            chunk = payload.get("data", [])
+            if not chunk:
+                break
+            oldest_ms = min(int(row[0]) for row in chunk)
+            if oldest_ms >= cursor_after:
+                raise RuntimeError(
+                    f"OKX pagination made no progress for {record.okx_symbol}"
+                )
+            received_rows = True
+            candles.extend(
+                row for row in chunk
+                if window_start <= int(row[0]) <= window_end
+                and (len(row) < 9 or str(row[8]) == "1")
+            )
+            if oldest_ms <= window_start:
+                break
+            cursor_after = oldest_ms
 
     if not received_rows:
         return DownloadResult(
@@ -926,7 +959,8 @@ def _download_symbol_1m(
                 output_path=str(output_path),
             )
         combined, changed = _merge_existing_with_fresh(
-            read_logical_parquet(output_path), df, effective_start_ms
+            existing_frame if existing_frame is not None else read_logical_parquet(output_path),
+            df, effective_start_ms,
         )
         if not changed:
             if not hot_tail_path(output_path).is_file():

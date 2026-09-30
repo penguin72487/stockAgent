@@ -8,7 +8,7 @@
   <title>FinMind 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
   <link rel="stylesheet" href="../finlab/styles.css?v=3">
-  <link rel="stylesheet" href="styles.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=7">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
@@ -62,6 +62,7 @@
       </div>
       <div id="pipeline-grid" class="pipeline-grid" aria-live="polite"><article class="pipeline-card skeleton" aria-hidden="true"></article></div>
       <p id="pipeline-empty" class="empty pipeline-empty" hidden>這個分類目前沒有資料管線。</p>
+      <p class="data-note">追新觀測不另打 API：查詢時間、資料日期與發布時間分開。首次取得不是首次發布；內容未變更不推進更新時間。來源沒有精確發布時點時，顯示上次舊內容請求到本次新內容回應之間的觀測區間。紀錄自監測啟用後累積，不回填成歷史發布證據。</p>
     </section>
 
     <section id="traffic" class="section-block" aria-labelledby="quota-title">
@@ -116,7 +117,7 @@
         <article class="kpi"><span>失敗短期重試</span><strong id="download-deferred">—</strong><p>與未清點代號分開</p></article>
         <article class="kpi"><span>最新工作</span><strong id="download-last">—</strong><p id="download-last-detail">—</p></article>
       </div>
-      <div class="finlab-table-scroll table-scroll" role="region" aria-label="FinMind 各資料集歷史進度" tabindex="0"><table><thead><tr><th>資料集</th><th>狀態</th><th>已查驗／已建目標</th><th>最早資料</th><th>最新資料</th><th>總筆數</th><th>本機容量</th><th>空回／失敗</th><th>完成時間估算</th><th>最後請求</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="10">讀取中…</td></tr></tbody></table></div>
+      <div class="finlab-table-scroll table-scroll" role="region" aria-label="FinMind 各資料集歷史進度" tabindex="0"><table><thead><tr><th>資料集</th><th>狀態</th><th>已查驗／已建目標</th><th>最早資料</th><th>最新資料</th><th>總筆數</th><th>本機容量</th><th>空回／失敗</th><th>完成時間估算</th><th>追新檢查／更新觀測</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="10">讀取中…</td></tr></tbody></table></div>
     </section>
 
     <section id="capture" class="section-block" aria-labelledby="capture-title">
@@ -130,6 +131,6 @@
     </section>
   </main>
   <script src="../dashboard-core.js?v=10" defer></script>
-  <script src="app.js?v=11" defer></script>
+  <script src="app.js?v=13" defer></script>
 </body>
 </html>

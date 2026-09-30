@@ -58,3 +58,73 @@
 - Playwright 已檢查 1440／390 寬的面板，無 JavaScript 錯誤與橫向頁面溢出；查看實際截圖後，修正流量／估時區塊跳轉時的延遲渲染空白。截圖在 `artifacts/data_quality/finmind_schedule_20260930/`。外部既有 `/finmind/` 頁面回傳 200；數值驗收使用本機唯讀 API。
 
 主要實作在 `downloader/finmind_scheduling.py`、`finmind_account.py`、三個既有下載器、`finmind_eta_schedule.py` 與原 ETA／面板路徑。安裝日曆 timer：`bash scripts/install_tw_public_calendar_refresh_service.sh`。
+
+## 追加：全清冊追新觀測與每 call 合批
+
+本輪範圍是 FinMind 的完整既有註冊清冊：106 個不重複 dataset、132 個 owner／別名展示列，不是所有其他 provider 的發布時鐘。新聞已納入；tick 仍維持最低優先級。清冊含已排程來源與其缺口，不能把註冊、查驗或來源空回當成全部歷史完整。
+
+### 時間與更新事件契約
+
+沿用 Free、Sponsor、Complement 的下載回應及驗證結果，新增 `downloader/finmind_updates.py`。**觀測紀錄本身不新增 API 呼叫**；發布後確實空回的重試仍會消耗配額。
+
+| 欄位／事件 | 定義 |
+| --- | --- |
+| `request_started_at_utc`／`checked_at_utc` | 真實送出前時鐘與收到、解碼回應的時鐘，與原始資料日期分開。 |
+| `source_first_date`／`source_last_date` | 本次比較內容的資料日期，不是發布時間。全市場分區與逐檔 stream 分開比較。 |
+| `first_nonempty`／`first_empty` | 監測啟用後的初始基線；首次取得不能推定來源首次發布。 |
+| `unchanged` | 正規化欄位／值及重複列均未變；只推進檢查時間，不推進內容更新時間。 |
+| `new_data`／`revision` | 內容改變且最新資料日期增加／未增加。後者包含同日期內容修訂，不只判斷最大日期。 |
+| `first_nonempty_after_empty`／`coverage_changed` | 從空回取得值／內容縮小或轉空；下載器原有「非空後意外空回」防護仍保留。 |
+| `last_data_observed_at_utc`／`last_changed_at_utc` | 最近取得新非空內容、最近比較發現內容改變的時間；初始基線不冒充修訂。 |
+| `availability_after_utc`／`availability_by_utc` | 前次舊內容的請求開始，到本次新內容回應完成的 API 觀測區間，**不是精確發布區間或 PIT 證據**。來源快取與處理延遲可能使之更寬。 |
+| `provider_published_at_utc` | 無精確來源證據時保持 `null`；不拿資料日期、表定時間或抓取時間代填。 |
+| `response_rows`／`network_seconds` | 最近真實 call 的回應列數與請求至回應解碼耗時；歷史合併後列數另列，不能相加冒充下載量。 |
+| `next_check_at_utc` | 優先讀實際佇列期限；僅預計可排，不保證配額、前置依賴或網路允許準時完成。 |
+
+每個 worker 在既有資料根目錄新增 `update_observations.sqlite3`，保留逐次 `checks`、逐 stream 比較頭與有界 dataset 頭。收據加上 `update_observation` v1，發布／檢查階段設定為 v2。舊收據及原始 Parquet 仍保留；不回填成監測啟用以前的發布證據。失敗紀錄獨立，不抹掉最後有效內容與更新時間。
+
+同 dataset 不同分區並行完成時，內容／觀測區間／失敗時間各自依實際時間保護；較早成功不能抹掉較晚失敗，逆序處理不讓公開更新時間倒退。
+
+比較使用逐列 canonical JSON 的多重集合 fingerprint，列順序不影響結果，但重複列、NULL、欄位缺少與負值均被區分。複雜度為 O(回應內容 bytes)，不全量排序、不讀歷史 Parquet。歷史低優先 tick 不逐次加入追新 fingerprint；當期／近期已排下載仍可觀測。批次 fan-out 共用 transport request ID，重試同一 request 不重複累加檢查。
+
+### 發布邊界、失敗與省配額
+
+- 對照 [技術面](https://finmind.github.io/tutor/TaiwanMarket/Technical/)、[籌碼面](https://finmind.github.io/tutor/TaiwanMarket/Chip/)、[基本面](https://finmind.github.io/tutor/TaiwanMarket/Fundamental/)、[期選](https://finmind.github.io/tutor/TaiwanMarket/Derivative/) 與 [可轉債](https://finmind.github.io/tutor/TaiwanMarket/ConvertibleBond/) 官方文件，整理 45 個明確鐘點。它們是預期發布邊界，不是已發布證明；其平日／週六規則只用於未來檢查，不能刪除歷史特殊交易日。
+- 例如還原股價 17:30、法人 20:00、融資融券 21:00、股票分鐘 15:50、期貨分鐘 16:30、借券餘額 21:00。對應主責 worker 與預留／喚醒時間一起修正，避免只改 UI。
+- 非空取得後，有確認規律的資料改排下一個發布階段，取消無意義的固定四小時回查。空回先 1、2、4、8 分鐘重試，再封頂 15 分鐘；表定發布以前／非其發布星期則等待有效窗口。失敗、節流、權限與意外空回仍沿用既有分類和守門。
+- 當沖成交量值官方為 21:30：保留原 18:00 名單補查政策，另在 21:30 查最終欄位。**18:00 不是盤前名單的實際發布時間**。最終欄位取得後排下一個有效階段，不再顯示凌晨四小時重查；ETA 分別計入兩階段，不重複把成功佇列續期再算一次。
+- 舊佇列的當期成功／空回期限經 `finmind_release_clock_migrations` 逐版本保留審計，資料與收據不被覆寫成新證據。發布前成功取樣亦不能阻止當天較晚的官方最終更新。
+- 「每天 1:30」但未說上午／下午、時間範圍、事件型更新及其他未確認來源，明示既有檢查政策／發布未確認，沒有把推測當作精確鐘點。尚未到第一次排程者顯示尚未觀測，不為了填滿畫面重抓。
+- 非空但未變更且無來源最終版本／完整性指標的回應，不能證明表定更新已完成；也不盲目重打所有非空來源。如果來源延後修訂，首次看到時間仍取決於後續既有追新／更正排程。本輪沒有宣稱即時、精確偵測所有來源內部版本更新。
+- 配額預留仍只發生在所需發布小時；到期最高優先，三支 worker 共用同一帳號 limiter。未改成每個 worker 各拿一份 [官方 Sponsor 6,000 次／小時](https://finmind.github.io/api_usage_count/) 配額。
+
+### 每 call 最大有效資料量
+
+1. 已驗證的 11 個 Sponsor range contracts，追新也能把已到期、連續、同 dataset 的分區合成一次請求。此前背景預算不允許時，追新也被迫取消合批；現改成只合併 p0 到期任務，不順帶領走歷史低優先或尚未到重試時間的任務。
+2. Complement 的已驗證總經／全市場年度 range 亦採相同到期合併；原最大歷史範圍與每週完整重驗保留。合併寫入不能把保留歷史算成本 call 的回應量。
+3. 官方單日全市場、逐檔逐日、新聞與其他受方向／日期限制的端點不硬拼超限日期。安全 body／row guard 與資源失敗縮批機制繼續有效；它們是本機保護，不冒稱官方限額。
+4. 未知歷史商品集合、端點未證實最大跨度及可能來源截斷仍是限制：`global_minimum_requests=null`，不宣稱已證明全站理論最少呼叫。目標是最大有效新資料量，而非反覆載入已取得數值來提高列數。
+
+### 網頁、清冊與驗收
+
+既有 [FinMind 頁面](https://penguin72487.ddnsgeek.com/finmind/) 的卡片及進度表新增發布規律、最後檢查、內容首次觀測／變更、下次可排、更新觀測區間與每 call 列數。委派別名讀取實際 owner 的同一觀測，不再呈現舊 owner 的空白監測。寬表等本機衍生顯示本機寫入及源資料檢查，不能冒充獨立 API 更新。
+
+公開投影只讀三個小型 dataset 頭與有索引佇列；不掃描原始 Parquet、不向 FinMind 呼叫補畫面，金鑰、request ID、原始列及內部路徑不傳到瀏覽器。觀測資料庫損壞時明示不可讀，不讓頁面整體崩潰。static app v13／FinMind CSS v7。
+
+- 最終 FinMind／日曆回歸 **691 項通過**；另外 JS 語法與 `git diff --check` 通過。測試含內容重排、重複列、NULL、修訂、空回轉非空、失敗保留、時間倒退、跨分區逆序完成／成功失敗逆序、批次 request 冪等、發布／休市邊界、別名／衍生、實際佇列期限與無 API 的公開投影。
+- 部署後已驗證真正新收據包含 observer v1，不只檢查 systemd active。2026-09-30 21:37 法人一次回應 126,443 列、當沖一次 2,072 列；這是該次 API 回應量，不是所有歷史完整。
+- 網頁 1440／390 寬檢查全部 132 列、主檔篩選往返、當沖新觀測與進度表，無 JS 錯誤、無頁面橫向溢出；真實截圖及 API 驗收保存在 `artifacts/data_quality/finmind_update_monitor_2026-09-30/`。使用 CPU 2D browser profile，並非 GPU／WebGL 驗收。
+- 公開頁及 API 已驗證為新版本。原始投影兩次單次量測分別約 0.14／0.38 秒；不是全系統效能基準，也不保證所有佇列規模都相同。
+- 21:57:32–38 台北：發布階段 v2 三個 worker 與 gateway 重載；22:06 最終桌機／手機驗收完成。22:22:50 台北：補上跨分區逆序觀測時間保護後，再重載三個 worker。當時既有 Free／Sponsor／Complement 的 49 次觀測未發現 ledger 與公開新內容時間不一致，不需改寫舊收據。
+
+完整獨立資料集 JSON／CSV 由現有清點工具零 API 呼叫產生，包含原查詢形狀、起迄日期、觀測列數、owner、失敗／缺口、發布規律及更新觀測。可重新產生：
+
+本輪最終清冊：[106 類資料集 CSV](../artifacts/data_quality/finmind_update_monitor_2026-09-30/finmind_query_ranges_20260930T142425570530Z.csv)、[完整 JSON](../artifacts/data_quality/finmind_update_monitor_2026-09-30/finmind_query_ranges_20260930T142425570530Z.json)。清冊是 22:24:25 台北的觀測快照；持續追新狀態看網頁，不把快照時間當作發布時間。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python -m scripts.audit_finmind_query_ranges \
+  --output-dir artifacts/data_quality/finmind_update_monitor_2026-09-30
+```
+
+實作與部署只證明本輪排程、觀測及網頁行為；**不宣稱全部歷史已完整、所有來源真實發布時間可考或可直接 PIT／實盤使用**。精確來源時點有新證據時再增補，不替已保存的推測或觀測區間改寫成歷史事實。

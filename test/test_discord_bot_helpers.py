@@ -16,6 +16,13 @@ discord = pytest.importorskip("discord")
 
 from services.discord_bot import bot as discord_bot  # noqa: E402
 
+PENGUIN_DAY_TRADE_MARKETS = (
+    "tw_day_trade_100m",
+    "tw_day_trade_multi_basis",
+    "tw_day_trade_multi_basis_22",
+    "tw_day_trade_v8_annual_log_cash",
+)
+
 
 def test_gpu_warmup_only_precedes_verified_open_and_offhours_releases_cache(
     monkeypatch,
@@ -122,19 +129,24 @@ def test_guide_lists_all_tw_execution_modes() -> None:
     assert "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）" in guide
     assert "`tw_day_trade_100m` 現股當沖（初始 1 億）" in guide
     assert "`tw_day_trade_multi_basis_22` 多基底22 現股當沖" in guide
-    assert "`tw_day_trade_multi_basis_projection_l1_gelu`" in guide
+    assert "`tw_day_trade_v8_annual_log_cash`" in guide
 
 
-def test_both_enabled_multi_basis_day_trades_are_available_in_market_autocomplete(
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("multi_basis", {"tw_day_trade_multi_basis", "tw_day_trade_multi_basis_22"}),
+        ("v8", {"tw_day_trade_v8_annual_log_cash"}),
+        ("", set(PENGUIN_DAY_TRADE_MARKETS)),
+    ],
+)
+def test_enabled_day_trade_modes_are_available_in_market_autocomplete(
     monkeypatch,
+    query,
+    expected,
 ) -> (
     None
 ):
-    expected = {
-        "tw_day_trade_multi_basis",
-        "tw_day_trade_multi_basis_22",
-        "tw_day_trade_multi_basis_projection_l1_gelu",
-    }
     # Autocomplete availability must be deterministic in a clean checkout;
     # ignored deployment artifacts are tested separately by the missing-model
     # filter test below.
@@ -143,7 +155,7 @@ def test_both_enabled_multi_basis_day_trades_are_available_in_market_autocomplet
         "_market_has_model",
         lambda cfg: cfg.market in expected,
     )
-    choices = asyncio.run(discord_bot.market_autocomplete(None, "multi_basis"))
+    choices = asyncio.run(discord_bot.market_autocomplete(None, query))
 
     values = {choice.value for choice in choices}
     assert values == expected
@@ -191,14 +203,7 @@ def test_signal_market_autocomplete_contains_only_scheduled_models(
 
 def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
     configs = discord_bot._market_configs()
-    markets = (
-        "tw_day_trade_multi_basis",
-        "tw_day_trade_100m",
-        "tw_day_trade_multi_basis_22",
-        "tw_day_trade_multi_basis_projection_l1_gelu",
-    )
-
-    for market in markets:
+    for market in PENGUIN_DAY_TRADE_MARKETS:
         config = configs[market]
         assert config.schedule_time == "09:00"
         assert config.day_trade_simulation_enabled is True
@@ -215,12 +220,7 @@ def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> N
 def test_all_four_day_trade_modes_are_in_the_runtime_schedule() -> None:
     scheduled = set(discord_bot._scheduled_markets())
 
-    assert {
-        "tw_day_trade_multi_basis",
-        "tw_day_trade_100m",
-        "tw_day_trade_multi_basis_22",
-        "tw_day_trade_multi_basis_projection_l1_gelu",
-    }.issubset(scheduled)
+    assert set(PENGUIN_DAY_TRADE_MARKETS).issubset(scheduled)
 
 
 def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
@@ -261,13 +261,7 @@ def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
 def test_penguin_discord_deployment_only_enables_tw_day_trade_modes() -> None:
     configs = discord_bot._market_configs()
     enabled = {key for key, cfg in configs.items() if cfg.enabled}
-    assert enabled == {
-        "tw_day_trade_100m",
-        "tw_day_trade_attention_layernorm",
-        "tw_day_trade_multi_basis",
-        "tw_day_trade_multi_basis_22",
-        "tw_day_trade_multi_basis_projection_l1_gelu",
-    }
+    assert enabled == set(PENGUIN_DAY_TRADE_MARKETS)
 
 
 def test_overnight_scheduler_catches_up_only_before_close(monkeypatch) -> None:
@@ -529,12 +523,12 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
     assert json.loads(path.read_text(encoding="utf-8"))["signal_id"] == "signal-a"
 
 
+@pytest.mark.parametrize("market", PENGUIN_DAY_TRADE_MARKETS)
 def test_day_trade_signal_kwargs_never_recomputes_irrelevant_previous_holdings(
     monkeypatch,
+    market,
 ) -> None:
-    cfg = discord_bot._market_configs()[
-        "tw_day_trade_multi_basis_projection_l1_gelu"
-    ]
+    cfg = discord_bot._market_configs()[market]
     monkeypatch.setattr(discord_bot, "_effective_market_config", lambda value: value)
     monkeypatch.setattr(discord_bot, "_resolve_market", lambda _market: cfg)
     monkeypatch.setattr(discord_bot, "_ensure_signal_ready", lambda *_args, **_kwargs: object())
@@ -570,13 +564,15 @@ def test_day_trade_failure_retry_ignores_slow_batch_retry_setting(monkeypatch) -
     assert second == 0.5
 
 
+@pytest.mark.parametrize("market", PENGUIN_DAY_TRADE_MARKETS)
 def test_artifact_backfill_reconciles_completed_external_recovery(
     monkeypatch: pytest.MonkeyPatch,
+    market: str,
 ) -> None:
-    cfg = discord_bot._market_configs()["tw_day_trade_multi_basis_projection_l1_gelu"]
+    cfg = discord_bot._market_configs()[market]
     finished: list[tuple[str, str, str]] = []
     synced: list[str] = []
-    key = "2026-08-26:tw_day_trade_multi_basis_projection_l1_gelu:artifact_backfill"
+    key = f"2026-09-30:{market}:artifact_backfill"
     discord_bot.bot._last_artifact_backfill_keys.discard(key)
     monkeypatch.setattr(discord_bot, "_effective_market_config", lambda value: value)
     monkeypatch.setattr(discord_bot, "_ensure_signal_ready", lambda _cfg: object())

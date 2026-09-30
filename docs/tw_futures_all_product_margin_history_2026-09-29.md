@@ -5,7 +5,81 @@
 初始資金一億元、保證金槓桿、多空與跨日留倉不變。
 有償付能力但無法成交的持倉保留，不能僅因當日未沖銷而虛構違約、罰款或成交。
 
-## 剩餘缺口修復：規格 v3、來源 v64、會計條款 v9（2026-09-30）
+## 最新修復：規格 v5、來源 v79、會計條款 v18（2026-09-30）
+
+全範圍受阻會計列由 **712,907 降至 333,640，淨減 379,267 列（53.2%）**。
+保留 765 個歷史代碼及原始行情 SHA；240 個代碼改善，69 個代碼的受阻列
+較基準增加，完整差異仍保留，不能稱為全商品改善或已達零缺口。
+[實際資料驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/acceptance.json)、
+[逐商品差異](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/final_product_delta.csv)。
+實體日曆由 4,968,246 改為 4,968,156 列，原因是原始公司行動公告修正了契約
+承接關係；生命週期及首次觀測暖身也隨之重建。這是受阻列的淨變動，並非所有
+比較列都有相同的生命週期身分。沒有刪除原始報價或填造估值。
+逐日期／商品／契約比對另證明：相同會計座標有 385,574 列解除阻擋、6,284 列
+新增阻擋，日曆及暖身差異合計抵銷 23 列淨改善。
+[逐列轉換驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/row_transition_audit.json)。
+
+第一性原理是逐日證明「一口值多少、何時生效、需要多少保證金與可持有多少、
+舊持倉與到期利益如何接續」。資料取得、候選數值解析、時間准入及 GPU 訓練
+各有自己的驗收；其中一項通過不能替其他項目宣告完成。
+
+- 以原始上市公告及交易規則接入 5 個指數、28 個 ETF 商品的日期化規格，
+  包括漲跌幅、交易時間與小型契約單位。規格候選涵蓋 755 個代碼；10 個完全
+  未接規格，另有早期／新制期間仍受阻，不能用目前官網規格回填所有歷史。
+- 完成 718 份本輪選定公告的文字／表格提取，依原頁核對 21 組公司行動數值；
+  個別 OCR 批次的失敗與未處理項目保留。接入櫃買 2010～2026 年 3,887 筆
+  官方處置原文，修正多商品公告借錯恢復基準、缺失發文頁與部位上限第二段期間。
+- 智原原公告明載遇休市則恢復日順延。證交所原件證明 2023-08-03 全日休市；
+  十二個實際股票成交日於 2023-08-10 完成，因此保證金恢復由 8 月 9 日順延
+  至 8 月 10 日收盤。盤前仍採提高後金額，不能提前採恢復值；缺行情、其他
+  處置延長及中途另改保證金的反例仍保留阻擋。
+  [證交所休市原件](https://investoredu.twse.com.tw/FileSystem/FileUpload/be0109d1-76a0-4412-a00d-58a88c6e1714.pdf)、
+  [期交所原公告](https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20230725智原保證金(公告).pdf)。
+
+167 項 parser／binding／execution terms／release／scope 測試通過。
+資料已傳至遠端 `/root/stockAgent`，**55,009 個檔案 SHA 校驗通過，六個資料包
+的遠端重算與本機逐欄一致**。
+[測試結果](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/delivery_regression_tests.log)、
+[交付收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/remote_delivery_receipt.json)、
+[遠端重算](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/remote_acceptance.json)。
+另以真正輸出的 `rules.parquet` 驗證智原五個月份、三個日期，共 15 筆可執行
+條款：8 月 10 日開盤原始保證金率 30.38%，收盤才恢復 20.25%；8 月 11 日
+開盤為 20.25%。
+[執行日期邊界驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/execution_boundary_acceptance.json)。
+遠端使用獨立程式快照驗證候選資料，原有訓練程式及 437 商品 release 未變更；
+本次唯讀檢查時原正式訓練已進入 fold7。新包尚未接入正式訓練或 GPU smoke。
+
+| 剩餘互斥原因 | 受阻會計列 | 受影響代碼數 | 必須補齊的內容 |
+| --- | ---: | ---: | --- |
+| 日期化商品規格 | 162,150 | 31 | 10 個未接商品、早期 T+1 結算及分段漲跌幅等來源與執行支援 |
+| 調整契約條款 | 27,925 | 116 | 月份、獨立標的數量、現金及增資權利的原件數值 |
+| 保證金規則 | 93,595 | 105 | 缺失歷史金額、生效時刻、完整恢復條件與中間轉換 |
+| 部位限制 | 41,959 | 316 | 遺漏期間、公告時間及互相衝突的上限／合併規則 |
+| 持倉接續 | 1,846 | 325 | 來源身分、轉換及終端承接關係 |
+| 估值與其他 | 6,165 | 107 | 真實到期／結算價格與其他會計欄位 |
+| **合計** | **333,640** | — | **全商品仍未可訓練** |
+
+[缺口統計](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/remaining_gap_counts.json)、
+[10 個未接規格清單](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/remaining_10_no_specification.csv)、
+[逐商品工作表](../artifacts/markets/tw_futures_v8_margin_preparation/all_twd_execution_terms_v18_20260930/rule_worklist.csv)。
+另有 39 段實體生命週期、2,538 列估值及 166 筆調整終端事件的輸入未完整；
+它們與上表重疊，不可加總。既有 FinMind 日資料對 634 個估值缺口日期的比對
+只找到 65 筆匹配、零筆有效正結算價；重抓相同資料並不能解決這批缺口。
+
+既有 FinMind 分鐘插隊持續執行。本次單次唯讀快照為 24,750 個成功任務、
+6,692,817 列；12,735 個空回應、1 個失敗及 94,950 個待抓任務。
+[排程快照](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/finmind_priority_snapshot.json)
+只證明當時的取得進度，不能證明分鐘歷史完整或已可用於會計准入。
+本輪新增休市／處置原件直接來自官方來源，未重複消耗 FinMind 查詢額度。
+
+[最新準備收據 v13](../artifacts/markets/tw_futures_v8_margin_preparation/all_twd_products_readiness_v13_20260930.json)
+及 active pointer 均保留 `all_products_training_ready=false`。
+[重算入口](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v2_20260930/rebuild.sh)
+沿用共用 CLI；資料編譯仍回報全範圍阻擋。獨立 validator 的 `status=passed`
+只表示資料、差異及指定邊界檢查通過，不能轉解成全商品訓練可用。
+下面保留 437 商品的已驗證指令及先前階段紀錄。
+
+## 前一輪修復：規格 v3、來源 v64、會計條款 v9（2026-09-30）
 
 本輪維持 **765 個代碼、4,968,246 列來源**，受阻會計列由 **847,659 降至
 712,907**，修復 **134,752 列（15.9%）**；87 個商品改善，沒有商品的受阻列增加。
@@ -43,7 +117,7 @@
 由 2,473,978 增至 2,495,539，契約生命週期由 32,108 增至 32,422。
 [範圍診斷](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v1_20260930/updated_stock_scope_diagnostic.json)
 尚不等於來源准入或 GPU 訓練通過。**既有 437 商品的 release、啟動器與正在執行的
-fold14 訓練不受本輪變更影響；沒有把新資料接進舊 checkpoint。**
+當輪訓練不受該批變更影響；沒有把候選資料接進舊 checkpoint。**
 
 剩餘缺口如下。每列依順序只歸入第一個原因，列數可以相加；同一商品可出現在
 多個原因中，商品數不可相加。補掉上游原因後，下游原因可能變得可見，不代表退步。

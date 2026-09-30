@@ -32,6 +32,7 @@ class Source:
     release_hour: int
     endpoint: str = "data"
     identity_field: str = "stock_id"
+    release_minute: int = 0
 
 
 SOURCES = {
@@ -43,19 +44,19 @@ SOURCES = {
     "TaiwanAssetSwapOptionDaily": Source("bonds", date(2011, 5, 3), "history", 2, 0),
     "TaiwanStockTradingDailyReportSecIdAgg": Source("stocks", date(2021, 6, 30), "derived", 7, 21,
                                                                  "taiwan_stock_trading_daily_report_secid_agg"),
-    "TaiwanStockKBar": Source("stocks", date(2019, 1, 1), "day", 8, 16),
-    "TaiwanFuturesKBar": Source("futures", date(2011, 1, 3), "day", 8, 17, identity_field="futures_id"),
+    "TaiwanStockKBar": Source("stocks", date(2019, 1, 1), "day", 8, 15, release_minute=50),
+    "TaiwanFuturesKBar": Source("futures", date(2011, 1, 3), "day", 8, 16, identity_field="futures_id", release_minute=30),
     "TaiwanStockTradingDailyReport": Source("stocks", date(2021, 6, 30), "day", 8, 21,
                                                       "taiwan_stock_trading_daily_report"),
     # A broker request covers all warrants that day without requiring a current
     # warrant-only universe (which omits expired warrants). Preserve broker grain.
-    "TaiwanStockWarrantTradingDailyReport": Source("brokers", date(2023, 6, 21), "day", 8, 22,
+    "TaiwanStockWarrantTradingDailyReport": Source("brokers", date(2023, 6, 21), "day", 8, 23,
                                                              endpoint="taiwan_stock_warrant_trading_daily_report",
                                                              identity_field="securities_trader_id"),
     "USStockPriceMinute": Source("us", date(2021, 4, 28), "day", 8, 8),
-    "TaiwanStockPriceTick": Source("stocks", date(2018, 12, 7), "day", 10, 16),
-    "TaiwanFuturesTick": Source("futures", date(2011, 1, 3), "day", 10, 17, identity_field="futures_id"),
-    "TaiwanOptionTick": Source("options", date(2011, 1, 3), "day", 10, 17, identity_field="option_id"),
+    "TaiwanStockPriceTick": Source("stocks", date(2018, 12, 7), "day", 10, 15, release_minute=30),
+    "TaiwanFuturesTick": Source("futures", date(2011, 1, 3), "day", 10, 6, identity_field="futures_id"),
+    "TaiwanOptionTick": Source("options", date(2011, 1, 3), "day", 10, 6, identity_field="option_id"),
     "TaiwanFuturesSpreadTick": Source("futures", date(2026, 4, 27), "day", 10, 17, identity_field="futures_id"),
 }
 
@@ -177,7 +178,7 @@ def seed(connection: sqlite3.Connection, universes: dict[str, list[str]], now: d
             ids = sorted(set(ids) | {'TAIEX'})
         if not ids:
             continue
-        eligible = local.date() - timedelta(days=int(local.hour < source.release_hour))
+        eligible = local.date() - timedelta(days=int((local.hour, local.minute) < (source.release_hour, source.release_minute)))
         # Midnight sources describe an update window ending at 24:00.
         if source.release_hour == 0 or source.universe == "us":
             eligible = local.date() - timedelta(days=1)

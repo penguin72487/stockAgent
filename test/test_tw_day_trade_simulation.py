@@ -2251,6 +2251,59 @@ def test_interrupted_entry_retry_recovers_from_matching_durable_ledgers(
     ]
 
 
+@pytest.mark.parametrize("policy", [
+    ENTRY_FILL_POLICY_CAUSAL_BOOK, ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+])
+@pytest.mark.parametrize("recover", [False, True])
+def test_pending_retry_completes_one_cohort_and_recovers_without_duplicate_entry(
+    tmp_path: Path, policy: str, recover: bool,
+) -> None:
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote(ask_volume=1.0)
+    quote.update(
+        quote_at=_now(9, 0, 6).isoformat(), book_exchange_at=_now(9, 0, 6).isoformat(),
+        cumulative_volume_lots=100.0, source="shioaji_stock_quote_stream", simtrade=False,
+    )
+    assert engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row(0.5)], quotes={"2330": quote},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 0, 7),
+    ) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["entry_filled_shares"] == 1_000
+    # A retained partially filled cohort can be resumed under either existing
+    # causal policy; neither policy is allowed to create a second cohort.
+    mode["configured_entry_fill_policy"] = policy
+    before_retry = json.loads(json.dumps(engine.state))
+    next_quote = _quote(ask=1_005.0, ask_volume=20.0)
+    next_quote.update(
+        quote_at=_now(9, 1, 1).isoformat(), book_exchange_at=_now(9, 1, 1).isoformat(),
+        cumulative_volume_lots=200.0, source="shioaji_stock_quote_stream", simtrade=False,
+    )
+    engine.process_quotes(quotes={"2330": next_quote}, now=_now(9, 1, 2))
+    fill_bytes = engine.fills_path.read_bytes()
+    order_bytes = engine.orders_path.read_bytes()
+    fills = [json.loads(line) for line in fill_bytes.splitlines()]
+    assert [row["purpose"] for row in fills] == ["entry", "entry_completion"]
+    assert [row["quantity"] for row in fills] == [1_000, 4_000]
+    if recover:
+        before_retry["modes"][spec.market]["entry_retry_pending_commit"] = fills[-1]["order_id"]
+        engine.state_path.write_text(json.dumps(before_retry))
+        engine = TwDayTradeSimulationEngine(tmp_path / "state")
+        mode = engine.state["modes"][spec.market]
+        assert mode.get("ledger_state_divergence") is None
+        assert mode.get("entry_retry_pending_commit") is None
+    assert len(mode["positions"]) == 1
+    position = next(iter(mode["positions"].values()))
+    assert position["filled_shares"] == 5_000
+    assert position["entry_price"] == pytest.approx(1_004.0)
+    assert position["entry_fee_twd"] == pytest.approx(sum(row["fee_and_tax_twd"] for row in fills))
+    assert mode["entry_unfilled_shares"] == 0
+    assert mode["pending_entry_shares"] == 0
+    assert engine.fills_path.read_bytes() == fill_bytes
+    assert engine.orders_path.read_bytes() == order_bytes
+
+
 def test_paper_market_order_uses_adverse_open_tick_only_without_causal_quote(
     tmp_path: Path,
 ) -> None:

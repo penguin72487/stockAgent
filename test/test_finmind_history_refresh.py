@@ -73,7 +73,7 @@ def test_unexpected_empty_preserves_existing_head_even_without_correction(tmp_pa
 def test_daily_history_does_not_wait_thirty_days():
     task = worker.Task('USStockPrice', 'BRK-A', 'history', 'id_history', 0, 'complete')
     due = datetime.fromisoformat(worker._next_refresh(task, NOW, empty=False))
-    assert due == datetime(2026, 9, 30, 0, 5, tzinfo=UTC)
+    assert due == datetime(2026, 9, 30, 0, 0, tzinfo=UTC)
 
 
 def test_supplemental_special_routes_and_signed_spread():

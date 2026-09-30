@@ -1254,6 +1254,58 @@ def _is_terminal_carry_cost(cost: Mapping[str, Any]) -> bool:
     )
 
 
+def _validated_legacy_paper_entry_retries(
+    events: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Mapping[str, Any]],
+    *,
+    market: str,
+) -> frozenset[str]:
+    """Recognize old paper retry labels without changing the immutable fills.
+
+    A second positive paper retry extends an existing cohort, even when an old
+    producer labelled it `entry`. Only our explicit retry order IDs and paper
+    fill contracts qualify. This is not broker-event deduplication; arbitrary
+    duplicate entries and repeated paper order IDs remain hard errors.
+    Validate identities before reading all session prices or valuing minutes.
+    """
+
+    seen_positions: set[str] = set()
+    seen_orders: set[str] = set()
+    legacy_orders: set[str] = set()
+    for event in events:
+        if event.get("share_action") or not _is_entry_inventory_fill(event):
+            continue
+        identity = str(event.get("position_id") or "")
+        order_id = str(event.get("order_id") or "")
+        if identity not in metadata:
+            raise RuntimeError(f"minute entry has no accepted position: {market}:{identity}")
+        if int(event.get("quantity") or 0) <= 0:
+            raise RuntimeError(f"minute entry has invalid quantity: {market}:{identity}")
+        if order_id and order_id in seen_orders:
+            raise RuntimeError(f"duplicate paper entry order: {market}:{order_id}")
+        if event.get("purpose") == "entry" and identity in seen_positions:
+            prefix = f"{identity}:entry_retry:"
+            sequence = order_id[len(prefix):] if order_id.startswith(prefix) else ""
+            if not (
+                event.get("simulation_only") is True
+                and event.get("fill_contract") in {
+                    "causal_best_quote_remaining_order",
+                    "paper_market_full_target_at_causal_shioaji_best_quote",
+                }
+                and event.get("symbol") == metadata[identity].get("symbol")
+                and sequence and sequence[0] != "0"
+                and sequence.isascii() and sequence.isdecimal()
+            ):
+                raise RuntimeError(f"duplicate minute entry identity: {market}:{identity}")
+            legacy_orders.add(order_id)
+        elif event.get("purpose") == "entry_completion" and identity not in seen_positions:
+            raise RuntimeError(f"minute entry completion has no accepted original entry: {market}:{identity}")
+        seen_positions.add(identity)
+        if order_id:
+            seen_orders.add(order_id)
+    return frozenset(legacy_orders)
+
+
 def rebuild_carried_strategy_marks(
     source_rows,
     positions,
@@ -1280,6 +1332,7 @@ def rebuild_carried_strategy_marks(
     opening_valuation_prices = opening_valuation_prices or {}
     days = sorted({r["session_date"] for r in selected.values()})
     output = [r for r in source_rows if not _in_range(r["session_date"], start, end)]
+    legacy_retry_rows = 0
     for market, mode in state["modes"].items():
         metadata = {p["position_id"]: p for modes in positions.values() for p in modes.get(market, [])}
         fills = [f for f in fill_rows if f["market"] == market]
@@ -1288,6 +1341,8 @@ def rebuild_carried_strategy_marks(
         events = sorted([*(f | {"clock": str(f.get("fill_at") or f["recorded_at"])} for f in fills),
                          *(a | {"clock": a["recorded_at"], "share_action": True}
                            for a in mode.get("share_replacement_ledger", []))], key=lambda e: e["clock"])
+        legacy_orders = _validated_legacy_paper_entry_retries(events, metadata, market=market)
+        legacy_retry_rows += len(legacy_orders)
         book, prices, price_times, seen_entries = {}, {}, {}, set()
         # A new paper entry is a price for that cohort, not a market-wide
         # trade. Until a sourced minute print arrives, older carried cohorts
@@ -1330,7 +1385,7 @@ def rebuild_carried_strategy_marks(
                             entry_fallbacks[identity] = (
                                 (fallback - event["cash_per_old_share"]) / event["ratio"], started
                             )
-                    elif event["purpose"] == "entry":
+                    elif event["purpose"] == "entry" and event.get("order_id") not in legacy_orders:
                         if identity in seen_entries or identity not in metadata:
                             raise RuntimeError("minute entry identity is duplicate or has no accepted position")
                         seen_entries.add(identity)
@@ -1341,7 +1396,7 @@ def rebuild_carried_strategy_marks(
                                  remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
                         book[identity] = p
                         entry_fallbacks[identity] = (float(event["price"]), event["clock"])
-                    elif event["purpose"] == "entry_completion":
+                    elif event["purpose"] == "entry_completion" or event.get("order_id") in legacy_orders:
                         if identity not in seen_entries or identity not in book:
                             raise RuntimeError("minute entry completion has no accepted original entry")
                         p = book[identity]
@@ -1450,6 +1505,7 @@ def rebuild_carried_strategy_marks(
     output.sort(key=lambda r: (r["minute"], r["market"]))
     _, stats = validate_existing_strategy_marks(output, start=start, end=end)
     stats["carried_fill_book_revalued_without_execution"] = True
+    stats["legacy_paper_entry_retry_rows_reclassified_for_valuation"] = legacy_retry_rows
     differences = [{"market": r["market"], "minute": r["minute"],
                     "original_equity_twd": float(selected[(r["market"], r["minute"])]["total_equity_twd"]),
                     "revalued_equity_twd": float(r["total_equity_twd"]),
@@ -2127,12 +2183,23 @@ def _replay_opening_valuation_prices(
             raise RuntimeError(f"duplicate replay session receipt: {day}")
         selected_days.add(day)
         book = session.get("historical_entry_books") or {}
-        path = Path(str(book.get("path") or "")).resolve()
+        recorded_path = Path(str(book.get("path") or ""))
         expected = (
             state_root / "replay_entry_books" / f"{day}.parquet"
         ).resolve()
         digest = str(book.get("sha256") or "")
-        if path != expected or not path.is_file() or len(digest) != 64:
+        # Atomic promotion/retained replay copies move the state directory.
+        # The recorded location remains provenance; read only the canonical
+        # local book and require its original content hash. Never follow an
+        # external path from a receipt or fall back to an old source directory.
+        path = expected
+        if (
+            recorded_path.name != f"{day}.parquet"
+            or recorded_path.parent.name != "replay_entry_books"
+            or not path.is_relative_to(state_root)
+            or not path.is_file()
+            or len(digest) != 64
+        ):
             raise RuntimeError(
                 f"invalid replay entry-book pin for opening valuation: {day}:{path}"
             )
