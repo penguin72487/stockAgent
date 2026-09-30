@@ -137,6 +137,10 @@ def test_same_day_grade_change_keeps_combined_share_constraint_and_source_chain(
         known_at='2021-10-18T23:59:59+08:00')
     a = SimpleNamespace(bundle=tmp_path, sources={}, document=lambda url:dict(
         content_sha256='c'*64,text='部位限制數應依本契約最新適用部位限制級數計算'))
+    simultaneous = [dict(old), dict(new, known_at=corporate['known_at']), dict(corporate),
+                    dict(corporate, product='EY1', position_unit=2080)]
+    assert len(builder.repair_same_day_position_grade(a, simultaneous)) == 1
+    assert simultaneous[2]['natural_person_limit'] == 8000000
     rows=[old,new,corporate,dict(corporate,product='EY1',position_unit=2080)]
     result=builder.repair_same_day_position_grade(a,rows)
     assert len(result)==1 and result[0]['corrected_share_limit']==8000000
@@ -172,6 +176,14 @@ def test_restoration_does_not_borrow_immediately_prior_amount_for_earlier_refere
     for clause in ['恢復為115年1月7日調整前保證金', '恢復為1月7日調整前之保證金']:
         assert not builder.has_local_before_restoration([clause], '2026-01-12')
         assert not builder.has_local_before_restoration(['恢復為調整前之保證金', clause], '2026-01-12')
+
+
+def test_closure_postponement_requires_the_literal_original_clause():
+    clause='調整期間如遇休市、有價證券停止買賣、全\n日暫停交易，則恢復日順延執行。'
+    assert builder.has_closed_cash_postponement_clause([clause])
+    assert builder.has_closed_cash_postponement_clause([builder.compact(clause)])
+    assert not builder.has_closed_cash_postponement_clause(['如遇休市則恢復日不順延執行'])
+    assert not builder.has_closed_cash_postponement_clause([clause.replace('則恢復日順延執行','另行公告')])
 
 
 def test_restoration_short_date_needs_unique_explicit_year_and_forward_boundary():

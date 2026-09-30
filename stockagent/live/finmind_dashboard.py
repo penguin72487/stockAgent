@@ -28,7 +28,8 @@ from downloader.download_finmind_sponsor import (
     _fixed_incremental_demand,
 )
 from downloader.finmind_account import backfill_budget
-from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS
+from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, release_details, next_release_check, calendar_next_check
+from downloader.finmind_updates import read_summary, queued_next_checks, CONTRACT_VERSION as UPDATE_CONTRACT_VERSION
 from downloader.finmind_runtime import idle_heartbeat
 from stockagent.live.finmind_eta_projection import public_completion_estimate
 
@@ -396,6 +397,35 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         })
 
     session_total = _nonnegative_int(status.get("total_session_day_tasks"))
+    update_sources = {name: read_summary(path) for name, path in (
+        ('free', root), ('sponsor', root / 'sponsor'), ('complement', root / 'complement'))}
+    next_checks = {name: queued_next_checks(root / name, observed) for name in ('sponsor', 'complement')}
+    for row in datasets:
+        dataset = row['id'].split(':')[0]
+        owner = ('complement' if dataset in PRODUCT_HISTORY_STARTS else
+                 'sponsor' if row['kind'].startswith('sponsor_') or dataset in delegated else
+                 'free' if dataset in {*SESSION_DATASETS, CALENDAR_DATASET, MASTER_DATASET} else 'complement')
+        derived = dataset == WIDE_INSTITUTIONAL or (row['kind'] == 'derived' and row['state'] != 'delegated')
+        monitored_dataset = ('TaiwanStockInstitutionalInvestorsBuySell' if dataset == WIDE_INSTITUTIONAL else
+                             'TaiwanStockTradingDailyReport' if derived else dataset)
+        source = update_sources[owner]
+        item = source['datasets'].get(monitored_dataset, {})
+        due = next_checks.get(owner, {}).get(monitored_dataset)
+        if dataset == CALENDAR_DATASET:
+            due = calendar_next_check(root, observed).isoformat()
+        if due is None:
+            expected = next_release_check(monitored_dataset, observed)
+            due = expected.isoformat() if expected else item.get('next_check_at_utc')
+        row['update_monitor'] = {
+            'contract_version': UPDATE_CONTRACT_VERSION,
+            'state': 'observed' if item else source['state'] if source['state'] == 'unreadable' else 'not_observed',
+            **item, 'next_check_at_utc': due, 'release': release_details(monitored_dataset),
+            'owner': owner,
+            'provider_published_at_utc': None,
+        }
+        if derived:
+            row['update_monitor'].update(state='derived_local', derived_from=monitored_dataset,
+                                         local_materialized_at_utc=row.get('last_receipt_at_utc'))
     session_complete = _nonnegative_int(status.get("complete_session_day_tasks"))
     pending = max(0, session_total - session_complete) if session_total is not None and session_complete is not None else None
     all_total = session_total + 2 + companion_total + sponsor_total if session_total is not None else None
@@ -503,6 +533,12 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         "storage": {"local_bytes": local_bytes, "filesystem_free_bytes": filesystem_free,
                     "unit": "receipt_backed_local_bytes", "estimated_total_bytes": None},
         "datasets": datasets,
+        "update_monitor": {
+            'contract_version': UPDATE_CONTRACT_VERSION,
+            'workers': {name: value['state'] for name, value in update_sources.items()},
+            'basis': 'validated_download_observations_not_exact_publication',
+            'extra_provider_calls': 0,
+        },
         "scope": {
             "scheduled_datasets": [*SESSION_DATASETS, CALENDAR_DATASET, MASTER_DATASET,
                                    *COMPLEMENT_DATASETS, *[f"{spec.dataset}:all_market" for spec in SPONSOR_SOURCES]],

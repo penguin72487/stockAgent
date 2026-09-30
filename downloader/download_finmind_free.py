@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import time
 from downloader.finmind_runtime import wait_for_next_cycle
+from downloader.finmind_updates import received_rows, record_success, record_failure, free_task, set_next_check
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -116,6 +117,7 @@ def _request(
         params["start_date"] = start_date.isoformat()
     if token:
         params["token"] = token
+    started = _utc_now()
     try:
         response = session.get(API_URL, params=params, timeout=(10, 45))
     except requests.RequestException as exc:
@@ -168,7 +170,7 @@ def _request(
     rows = payload.get("data")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ProviderError("invalid_rows")
-    return rows
+    return received_rows(rows, started)
 
 
 def _record_request_start(root: Path, dataset: str) -> None:
@@ -239,12 +241,14 @@ def _load_calendar(
                 raise ProviderError(str(attempt.get('state', 'invalid_calendar')),
                                     retry_after=(retry - now).total_seconds())
     try:
-        dates = _calendar_dates(_request(session, limiter, CALENDAR_DATASET, start_date=HISTORY_START, token=token, traffic_root=root))
+        rows = _request(session, limiter, CALENDAR_DATASET, start_date=HISTORY_START, token=token, traffic_root=root)
+        dates = _calendar_dates(rows)
     except ProviderError as error:
         atomic_write_json(root / 'calendar_refresh.json', {
             'observed_at_utc': _iso(now), 'state': error.code,
             'retry_at_utc': _iso(now + timedelta(seconds=max(300, error.retry_after))),
         })
+        record_failure(root, free_task(CALENDAR_DATASET, 'latest', kind='snapshot'), error.code, now)
         if error.code in {'invalid_token', 'invalid_request', 'not_entitled', 'ip_banned', 'rate_limited'}:
             raise
         if isinstance(cached.get("dates"), list):
@@ -253,16 +257,27 @@ def _load_calendar(
     if path.is_file():
         previous = path.read_bytes()
         atomic_write_bytes(root / 'versions' / CALENDAR_DATASET / f'{hashlib.sha256(previous).hexdigest()}.json', previous, durable=True)
-    atomic_write_json(path, {
+    completed = getattr(rows, 'observation', {}).get('response_received_at_utc')
+    checked = datetime.fromisoformat(completed) if completed else now
+    calendar_receipt = {
         "schema_version": SCHEMA_VERSION,
         "source_dataset": CALENDAR_DATASET,
-        "observed_at_utc": _iso(now),
+        "observed_at_utc": _iso(checked),
         "dates": [item.isoformat() for item in dates],
         **correction_receipt_metadata(correction['context']),
-    })
+    }
+    observation = record_success(root, free_task(CALENDAR_DATASET, 'latest', kind='snapshot'),
+                                [{'date': item.isoformat()} for item in dates],
+                                {'source_first_date': min(dates).isoformat() if dates else None,
+                                 'source_last_date': max(dates).isoformat() if dates else None},
+                                checked, transport=getattr(rows, 'observation', None))
+    calendar_receipt['update_observation'] = observation
+    atomic_write_json(path, calendar_receipt)
     atomic_write_json(root / 'calendar_refresh.json', {
-        'observed_at_utc': _iso(now), 'state': 'complete', 'retry_at_utc': None,
+        'observed_at_utc': _iso(checked), 'state': 'complete', 'retry_at_utc': None,
     })
+    set_next_check(root, free_task(CALENDAR_DATASET, 'latest', kind='snapshot'),
+                   calendar_next_check(root, checked).isoformat())
     return dates, 1
 
 
@@ -754,11 +769,18 @@ def _record_session(root: Path, dataset: str, day: date, rows: list[dict[str, An
             })
     if status != "complete":
         receipt["retry_at_utc"] = _iso(now + timedelta(hours=1 if day >= now.astimezone(TAIPEI).date() - timedelta(days=7) else 6))
+    task = free_task(dataset, day.isoformat())
+    if status in {'complete', 'observed_empty'}:
+        receipt['update_observation'] = record_success(root, task, rows, receipt, now)
+    else:
+        record_failure(root, task, 'partial_session_response', now)
+    set_next_check(root, task, receipt.get('retry_at_utc'))
     atomic_write_json(root / "receipts" / dataset / f"{day}.json", receipt)
     return receipt
 
 
 def _record_failure(root: Path, dataset: str, day: date, error: ProviderError, *, now: datetime) -> dict[str, Any]:
+    record_failure(root, free_task(dataset, day.isoformat()), error.code, now)
     wait = max(300.0, error.retry_after)
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -823,6 +845,7 @@ def _record_master(root: Path, rows: list[dict[str, Any]], *, now: datetime,
         "point_in_time_history_available": False,
         **correction_receipt_metadata(correction_context or {}),
     }
+    receipt['update_observation'] = record_success(root, free_task(MASTER_DATASET, 'latest', kind='snapshot'), rows, receipt, now)
     atomic_write_json(root / "receipts" / MASTER_DATASET / f"{local_day}.json", receipt)
     return receipt
 

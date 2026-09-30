@@ -251,7 +251,7 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
     """
     from collections import Counter
     from downloader.finmind_scheduling import (SOURCES, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS,
-                                               TAIPEI, calendar_next_check)
+                                               TAIPEI, calendar_next_check, RELEASE_CLOCKS)
     from downloader.finmind_history_refresh import DAILY_EQUITY
     from downloader.finmind_observation_dates import PERIOD_DATASETS
     from scripts.audit_finmind_query_ranges import registry
@@ -280,6 +280,11 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
         if release <= now:
             release += timedelta(days=1)
         add(release, 86400, session_only=spec.dataset in SESSION_DAY_DATASETS)
+        if spec.dataset == 'TaiwanStockDayTrading':
+            final_fields = local.replace(hour=21, minute=30, second=0, microsecond=0)
+            if final_fields <= now:
+                final_fields += timedelta(days=1)
+            add(final_fields, 86400, session_only=True)
     add(calendar_next_check(root, now), 3600)
     release = local.replace(hour=14, minute=0, second=0, microsecond=0)
     if release <= now:
@@ -298,7 +303,12 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
                     continue
                 stamp = _stamp(raw)
                 if owner == 'sponsor':
-                    period = 0 if dataset in daily else 4 * 3600
+                    # Daily successful heads expire at the next seed; the new
+                    # day's source event above already pays for that request.
+                    if dataset in daily and state == 'complete' and (
+                            dataset in RELEASE_CLOCKS or dataset == 'TaiwanStockDayTrading'):
+                        continue
+                    period = 0 if dataset in daily else 86400 if dataset in RELEASE_CLOCKS else 4 * 3600
                 elif dataset == 'TaiwanStockNews':
                     period = 3600
                 elif dataset in DAILY_EQUITY:
@@ -340,6 +350,8 @@ def recurring_forecast(root: Path) -> dict[str, Any]:
     arrivals = dict.fromkeys(('core', 'detail', 'tick'), 0.0)
     components['incremental'] += sum(row['primary_owner'] == 'sponsor' and row['query_shape'] != 'derived_no_api'
                               for row in catalog.values()) / 24
+    if catalog.get('TaiwanStockDayTrading', {}).get('primary_owner') == 'sponsor':
+        components['incremental'] += 1 / 24  # Final volume/value phase, separate from the earlier sample.
     def phase(dataset: str) -> str:
         source = SUPPLEMENTAL.get(dataset)
         return 'tick' if source and source.priority >= 10 else 'detail' if source and source.priority >= 8 else 'core'

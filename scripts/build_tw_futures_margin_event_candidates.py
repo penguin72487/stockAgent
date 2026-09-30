@@ -45,6 +45,12 @@ def candidate_notice_clock(text: str, published: str) -> dict:
         else: errors.append(str(exc))
     mentions=temporal_mentions(text)
     ends=[m for m in mentions if m['role']=='effective_end']
+    # Match margin_effective's existing single-session boundary before the
+    # 2017-05-15 after-hours launch. This bounds the temporary level only;
+    # it does not prove that a scheduled restoration actually took place.
+    ends=[dict(m,boundary='after_regular_session')
+          if m['boundary']=='after_trading_session' and m['date_iso']<'2017-05-15' else m
+          for m in ends]
     effective=None;phase='unresolved'
     try:
         effective=margin_effective(text)[:10];phase='after_product_regular_close'
@@ -162,6 +168,19 @@ def source_review_candidates(archive, path):
             effective_phase=review['effective_phase'],extraction='source_bound_visual_transcription',
             issue_date_bound=True,chronological=True,candidate_only=True,point_in_time_verified=False,
             amendment_evidence=json.dumps(review.get('amendments',[]),ensure_ascii=False))
+        ends = []
+        if review.get('temporary_end_evidence'):
+            if not review.get('pages') or not review.get('transcribed_text'):
+                raise ValueError('reviewed temporary boundary requires inspected issuing pages')
+            clock = candidate_notice_clock(review['transcribed_text'], review['published_date'])
+            if (not clock['issue_date_bound'] or clock['effective_date'] != review['effective_date']
+                    or clock['effective_phase'] != review['effective_phase']):
+                raise ValueError('reviewed temporary clock differs from the inspected clause')
+            ends = json.loads(clock['temporary_end_evidence'])
+            expected = {(e['date_iso'], e['boundary']) for e in review['temporary_end_evidence']}
+            if (not ends or {(e['date_iso'], e['boundary']) for e in ends} != expected
+                    or any(e['date_iso'] <= review['effective_date'] for e in ends)):
+                raise ValueError('reviewed temporary end differs from the inspected clause')
         for row in rows:
             if review.get('pages') and row.get('page') not in {p['page'] for p in review['pages']}:
                 raise ValueError('margin cell has no inspected page')
@@ -178,8 +197,9 @@ def source_review_candidates(archive, path):
                     raise ValueError('invalid reviewed prior margin hierarchy or unit')
             facts.append(dict(provenance,product=row['product'],margin_kind=review['margin_kind'],
                 after=values,before=before,requires_dated_session_rule=True,
-                requires_reversion_review=review.get('requires_effective_date_review',False),
-                temporary_end_evidence='[]',event_type='before_after' if before is not None else 'absolute_level'))
+                requires_reversion_review=bool(ends) or review.get('requires_effective_date_review',False),
+                temporary_end_evidence=json.dumps(ends,ensure_ascii=False),
+                event_type='before_after' if before is not None else 'absolute_level'))
             if 'natural_person_limit' in row:
                 amount=row['natural_person_limit']
                 if isinstance(amount,bool) or not isinstance(amount,int) or amount<=0:
@@ -901,6 +921,11 @@ def referenced_before_restoration(views, fact, facts):
         restoration_reference_evidence=json.dumps(evidence,ensure_ascii=False))
 
 
+def has_closed_cash_postponement_clause(views):
+    clause=compact('調整期間如遇休市、有價證券停止買賣、全日暫停交易，則恢復日順延執行')
+    return any(clause in compact(text) for text in views)
+
+
 def verified_disposal_restorations(archive, facts, path):
     """Attach observed conditional events without treating provider rows as law."""
     evidence=json.loads(path.read_text())
@@ -922,6 +947,8 @@ def verified_disposal_restorations(archive, facts, path):
                 texts[url]=(doc['content_sha256'],[compact(t) for t,k in retained_document_text_views(archive,url,doc)])
             digest,views=texts[url]
             if digest!=row['source_content_sha256']:raise ValueError('restoration notice SHA mismatch')
+            if has_closed_cash_postponement_clause(views):
+                row['restoration_delay_rule']='postpone_for_closed_cash_sessions'
             # A notice can restore a level from an EARLIER adjustment, not its
             # own before column. Do not turn any matching sibling clause into
             # permission to restore this product's immediately preceding level.
@@ -935,9 +962,29 @@ def verified_disposal_restorations(archive, facts, path):
                 row.pop('restoration_rule', None)
                 row.pop('restoration_target', None)
         verified.append(row)
-    rows,issues=disposal_margin_restorations(verified,loaded['universe'],loaded['dispositions'],loaded['observations'])
+    rows,issues=disposal_margin_restorations(verified,loaded['universe'],loaded['dispositions'],loaded['observations'],
+        market_closures=evidence.get('market_closures',[]))
+    changes=[]
+    for restored in rows:
+        proof=json.loads(restored['restoration_evidence'])
+        delay=proof.get('delayed_for_official_closure')
+        if not delay:continue
+        original=[r for r in facts if r['product']==restored['product']
+                  and r['source_content_sha256']==restored['source_content_sha256']
+                  and r.get('known_at')==restored['original_rule_known_at']
+                  and r.get('requires_reversion_review')]
+        if not original:raise ValueError('delayed restoration has no matching original margin boundary')
+        for row in original:
+            ends=json.loads(row.get('temporary_end_evidence') or '[]')
+            if not ends or any(e['date_iso']!=delay['nominal_end'] for e in ends):
+                raise ValueError('closure postponement cannot revise an unrelated boundary')
+            row['original_temporary_end_evidence']=row['temporary_end_evidence']
+            row['temporary_end_evidence']=json.dumps([dict(e,date_iso=delay['actual_end']) for e in ends],ensure_ascii=False)
+            row['temporary_end_postponement_evidence']=restored['restoration_evidence']
+        changes.append(dict(product=restored['product'],source_content_sha256=restored['source_content_sha256'],**delay))
     archive.copy(path,sha256_file(path),url='',kind='restoration_evidence_manifest')
     atomic_write_json(archive.bundle/'restoration_condition_issues.json',issues)
+    atomic_write_json(archive.bundle/'restoration_closure_postponements.json',changes)
     return rows
 
 
@@ -1218,7 +1265,7 @@ def repair_position_source_context(archive, facts, lifetimes, market_dates):
 
 
 def repair_same_day_position_grade(archive, facts):
-    """Compose an explicit latest-grade clause with a later dated cap notice.
+    """Compose a latest-grade clause with a same-day or later cap notice.
 
     This bounded case requires the corporate table to have returned to the
     standard share basis on the exact grade-change date. Temporary enlarged
@@ -1255,7 +1302,7 @@ def repair_same_day_position_grade(archive, facts):
                   and (not r['valid_until_date_exclusive'] or known[:10] < r['valid_until_date_exclusive'])
                   and r['known_at'] <= known and not r['legal_date_only']]
         after = [r for r in levels if r['product'] == base and r['effective_date'] == day
-                 and known < r['known_at'] < timestamp(date.fromisoformat(day), '00:00:00')
+                 and known <= r['known_at'] < timestamp(date.fromisoformat(day), '00:00:00')
                  and not r['legal_date_only']]
         if len(before) != 1 or len(after) != 1:
             continue
@@ -1629,7 +1676,8 @@ def main():
         position_facts.extend(native_position_candidates(archive,root,market_dates=position_dates))
     for path in a.source_reviews:
         reviewed_margins,reviewed_positions=source_review_candidates(archive,path)
-        facts.extend(reviewed_margins);position_facts.extend(reviewed_positions)
+        facts=replace_reviewed_product_facts(facts, reviewed_margins)
+        position_facts.extend(reviewed_positions)
     corporate_refreshed=refresh_corporate_candidates(archive,corporate_facts) if a.reextract_corporate else 0
     corporate_text_issues=[];corporate_text_added=0
     if a.extract_corporate_text:

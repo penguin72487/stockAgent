@@ -40,9 +40,12 @@ from downloader.finmind_batching import (
 )
 from downloader.finmind_parent_recovery import recover_failed_long_parent
 from downloader.finmind_runtime import wait_for_next_cycle
+from downloader.finmind_updates import retain_observation, empty_retry, set_next_check, record_failure
 from downloader.finmind_scheduling import (
     SOURCES, SPECS, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS, Source, _s,
     fixed_incremental_demand, protected_stock_opening,
+    next_release_check,
+    reconcile_release_deadlines,
 )
 from downloader.finmind_observation_dates import (
     EXCLUDED_STATE, PERIOD_DATASETS, next_period_refresh, reconcile_observation_dates,
@@ -439,6 +442,7 @@ def _seed(conn: sqlite3.Connection, now: datetime,
     session_policy["observation_dates"] = reconcile_observation_dates(
         conn, now, {spec.dataset for spec in SOURCES},
     )
+    reconcile_release_deadlines(conn, now)
     _reconcile_daily_refresh(conn, now)
     if official_price_coverage:
         start, end = official_price_coverage
@@ -664,7 +668,7 @@ def _batch_policy_schema(conn: sqlite3.Connection) -> None:
 
 
 def _claim_batch(conn: sqlite3.Connection, task: Task,
-                 now: datetime) -> RangeBatch[Task] | None:
+                 now: datetime, *, allow_history: bool = True) -> RangeBatch[Task] | None:
     """Atomically extend the normal single-owner claim into a bounded range."""
     contract = RANGE_CONTRACTS.get(task.dataset)
     if (contract is None or not 0 <= task.priority < SECONDARY_VALIDATION_PRIORITY or task.data_id
@@ -691,7 +695,7 @@ def _claim_batch(conn: sqlite3.Connection, task: Task,
             "(state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc<=?)) "
             "ORDER BY partition DESC",
             (task.dataset, task.kind, SECONDARY_VALIDATION_PRIORITY, now.isoformat()),
-        )]
+        ) if allow_history or row[4] == 0]
         learned = conn.execute("SELECT max_partitions FROM request_batch_limits WHERE dataset=?", (task.dataset,)).fetchone()
         bound = learned[0] if learned else contract.max_partitions
         batch = coalesce_pending_tasks(task, candidates, today=now.astimezone(TAIPEI).date(),
@@ -725,9 +729,11 @@ def _fetch_batch(batch: RangeBatch[Task], token: str, limiter: Any,
         _THREAD.session = session
     rows = _fetch_rows(session, limiter, root.parent, batch.dataset, token, batch.params(),
                        max_response_bytes=RANGE_CONTRACTS[batch.dataset].max_response_bytes)
+    if getattr(rows, 'observation', None):
+        rows.observation['request_id'] = batch.request_id
     grouped = split_batch_rows(batch, rows)
     _preflight_bulk_year_schemas(batch.dataset, grouped)
-    return grouped
+    return {partition: retain_observation(part_rows, rows) for partition, part_rows in grouped.items()}
 
 
 def _defer_failed_batch(conn: sqlite3.Connection, batch: RangeBatch[Task],
@@ -780,6 +786,7 @@ def _defer_failed_batch(conn: sqlite3.Connection, batch: RangeBatch[Task],
              json.dumps(batch.metadata(), sort_keys=True), json.dumps(prior, sort_keys=True)),
         )
         for task in batch.tasks:
+            record_failure(Path(conn.execute('PRAGMA database_list').fetchone()[2]).parent, task, error_code, now)
             conn.execute(
                 "UPDATE tasks SET state='pending',error_code=?,last_attempt_at_utc=?,"
                 "next_attempt_at_utc=? WHERE dataset=? AND data_id=? AND partition=? "
@@ -874,7 +881,17 @@ def _finish(conn: sqlite3.Connection, root: Path, task: Task,
     # A current-period empty response may mean "not published yet" rather than
     # a genuine zero event. Probe again within the same session; never impose
     # an arbitrary whole-day delay on fixed incremental data.
-    next_at = (now + (timedelta(hours=4) if rows else timedelta(minutes=15))) if current else None
+    next_at = (now + timedelta(hours=4) if rows else empty_retry(
+        now, receipt.get('update_observation'), default_seconds=900)) if current else None
+    if current and not rows:
+        from downloader.finmind_scheduling import RELEASE_CLOCKS
+        clock = RELEASE_CLOCKS.get(task.dataset)
+        local = now.astimezone(TAIPEI)
+        if clock and (local.weekday() not in clock['weekdays'] or
+                      (local.hour, local.minute) < (clock['hour'], clock['minute'])):
+            next_at = next_release_check(task.dataset, now)
+    if current and rows:
+        next_at = next_release_check(task.dataset, now) or next_at
     if task.dataset in PERIOD_DATASETS:
         next_at = next_period_refresh(task.dataset, task.partition, now)
     elif not rows and not context.get('allow_empty') and task.kind in {'day', 'derived'} and _late_daily_retry(task.dataset, task.partition, now):
@@ -888,10 +905,14 @@ def _finish(conn: sqlite3.Connection, root: Path, task: Task,
          receipt.get("source_last_date"), receipt["receipt_path"], task.dataset, task.partition),
     )
     conn.commit()
+    set_next_check(root, task, next_at.isoformat() if next_at else None)
     return receipt
 
 
 def _fail(conn: sqlite3.Connection, task: Task, error: SourceError, now: datetime) -> None:
+    queue_path = conn.execute('PRAGMA database_list').fetchone()[2]
+    if queue_path:
+        record_failure(Path(queue_path).parent, task, error.code, now)
     terminal = error.code in {"not_entitled", "invalid_token", "provider_bad_request",
                               "response_outside_partition"}
     if terminal:
@@ -1068,7 +1089,7 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                         ).fetchone():
                             reason = "waiting_necessary_acquisition"
                         break
-                    batch = _claim_batch(conn, task, dispatch_now) if budget['allowed'] else None
+                    batch = _claim_batch(conn, task, dispatch_now, allow_history=budget['allowed'])
                     future = (pool.submit(_fetch_batch, batch, token, limiter, root)
                               if batch is not None else
                               pool.submit(_fetch, task, token, limiter, root, local.date()))

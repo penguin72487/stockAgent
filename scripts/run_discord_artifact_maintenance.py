@@ -167,6 +167,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
         attempted = 0
         failures = 0
         deferred = 0
+        retry_deferred = 0
         for market in markets:
             cfg = discord_bot._resolve_market(market)
             if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
@@ -189,11 +190,23 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             if key is None or not discord_bot._market_has_model(cfg):
                 continue
             if not discord_bot._artifact_backfill_retry_allowed(key):
-                discord_bot._reconcile_artifact_backfill_if_current(
+                recovered = discord_bot._reconcile_artifact_backfill_if_current(
                     cfg,
                     key=key,
                     market=market,
                 )
+                if not recovered:
+                    # Skipping a failed job during backoff does not prove its
+                    # artifacts are current. Preserve its per-market receipt
+                    # and make the worker's unfinished work visible as well.
+                    deferred += 1
+                    retry_deferred += 1
+                    _emit(
+                        status="deferred",
+                        reason="artifact_retry_deferred",
+                        market=market,
+                        key=key,
+                    )
                 continue
 
             # A multi-market pass can run for hours. Recheck the independent
@@ -273,9 +286,11 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             attempted=attempted,
             failures=failures,
             deferred=deferred,
+            retry_deferred=retry_deferred,
         )
         discord_bot._record_artifact_maintenance_run(
             final_status,
+            reason="artifact_retry_deferred" if retry_deferred else None,
             attempted=attempted,
             failures=failures,
             deferred=deferred,

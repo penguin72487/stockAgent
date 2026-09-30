@@ -12,6 +12,9 @@ main{width:min(1180px,calc(100% - 36px))}
 .finlab-table-scroll table{min-width:1100px}
 .finlab-table-scroll td:first-child{max-width:270px}
 .data-note a{color:var(--cyan)}
+.update-monitor{display:block;line-height:1.65;overflow-wrap:anywhere;color:var(--muted)}
+.update-monitor p{margin:5px 0;font-size:12px}
+#dataset-rows td:last-child{white-space:pre-line;min-width:220px;max-width:340px;font-size:12px;line-height:1.65}
 #backfill .progress-copy{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(240px,1fr);align-items:start}
 #backfill .fleet-eta{max-width:none}
 /* This small summary must remain rendered when reached by an anchor below

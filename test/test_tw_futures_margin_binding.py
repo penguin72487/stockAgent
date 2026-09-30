@@ -9,6 +9,46 @@ import pytest
 from stockagent.data.tw_futures_margin_preparation import align_product_margin_intervals
 
 
+def test_disposal_closure_postponement_requires_complete_prints_and_explicit_rule():
+    from stockagent.data.tw_futures_margin_preparation import disposal_margin_restorations
+    fact=dict(product='AAF',margin_kind='notional_rate',after=[.3,.23,.22],before=[.2,.15,.14],
+        effective_date='2023-07-26',published_date='2023-07-25',issue_date_bound=True,
+        known_at='2023-07-25T23:59:59+08:00',source_content_sha256='a'*64,
+        requires_reversion_review=True,restoration_rule='return_to_declared_before',
+        restoration_delay_rule='postpone_for_closed_cash_sessions',temporary_end_evidence=json.dumps([
+            dict(date_iso='2023-08-09',boundary='after_regular_session')]))
+    u=pl.DataFrame(dict(product=['AAF'],underlying_symbol=['1000']))
+    disposition=pl.DataFrame([dict(date='2023-07-24',stock_id='1000',period_start='2023-07-25',
+        period_end='2023-08-09',measure='處置期間（十二個營業日）',source_sha256='b'*64)])
+    days=['2023-07-25','2023-07-26','2023-07-27','2023-07-28','2023-07-31',
+          '2023-08-01','2023-08-02','2023-08-04','2023-08-07','2023-08-08','2023-08-09','2023-08-10']
+    obs=pl.DataFrame(dict(date=days,symbol=['1000']*12,volume=[1.]*12,source_sha256=['c'*64]*12))
+    closure=dict(date='2023-08-03',known_at='2023-08-02T23:59:59+08:00',
+        source_content_sha256='d'*64,stock_ids=['1000'],disposition_source_sha256s=['b'*64])
+    def resolve(facts=(fact,),observations=obs,closures=(closure,),dispositions=disposition):
+        return disposal_margin_restorations(list(facts),u,dispositions,observations,market_closures=closures)
+    rows,issues=resolve()
+    assert not issues and len(rows)==1
+    restored=rows[0]
+    assert restored['effective_date']=='2023-08-10' and restored['after']==fact['before']
+    assert restored['effective_phase']=='after_product_regular_close'
+    proof=json.loads(restored['restoration_evidence'])
+    assert proof['completed_cash_dates']==days and proof['required_sessions']==12
+    assert proof['delayed_for_official_closure']['nominal_end']=='2023-08-09'
+    # Neither missing observations nor an unrelated closure prove postponement.
+    assert not resolve(closures=())[0]
+    assert not resolve(closures=[dict(closure,stock_ids=['2000'])])[0]
+    assert not resolve(closures=[dict(closure,disposition_source_sha256s=['e'*64])])[0]
+    assert not resolve(observations=obs.filter(pl.col('date')!='2023-08-02'))[0]
+    assert not resolve(facts=[dict(fact,restoration_delay_rule=None)])[0]
+    # A later extension or an intervening amount still needs composed rules.
+    extended=pl.concat([disposition,disposition.with_columns(pl.lit('2023-08-11').alias('period_end'))])
+    assert not resolve(dispositions=extended)[0]
+    assert not resolve(facts=[fact,dict(fact,effective_date='2023-08-10',requires_reversion_review=False)])[0]
+    with pytest.raises(ValueError,match='prior-publication'):
+        resolve(closures=[dict(closure,known_at='2023-08-03T23:59:59+08:00')])
+
+
 def test_revoked_notice_ends_old_caps_and_cannot_activate_a_future_exception():
     from stockagent.data.tw_futures_margin_preparation import position_candidate_intervals
     proof=dict(issue_date_bound=True,source_content_sha256='a'*64,source_url='official',

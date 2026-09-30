@@ -11,11 +11,32 @@ from downloader.download_tw_corporate_action_reference import (
     MonthlyDocumentIdentityError,
     _monthly_query_document_id,
     _parse_tpex_monthly_ods,
+    _parse_tpex_disposition_payload,
     _payload_rows,
     _resolve_tpex_monthly_rows,
     _tpex_event_candidates,
     _write_immutable_raw,
 )
+
+
+def test_tpex_disposition_query_retains_cross_year_notice_and_literal_no_data():
+    payload = dict(stat='ok', date='20100101~20101231', tables=[dict(
+        fields=['公布日期','證券代號','處置起訖時間','處置內容'], data=[
+            ['98/12/31','3577','99/01/04~99/01/08','自99年01月04日起5個營業日'],
+            ['99/01/05','','','本日無處置資料']])])
+    rows, empty = _parse_tpex_disposition_payload(payload, start=date(2010,1,1), end=date(2010,12,31),
+                                                source_sha256='a'*64)
+    assert len(rows)==1 and rows[0]['date']=='2009-12-31'
+    assert rows[0]['period_start']=='2010-01-04' and rows[0]['source_sha256']=='a'*64
+    assert empty==['2010-01-05']
+    for values in [['99/01/05','','','未知'], ['99/01/05','3577','','本日無處置資料'],
+                   ['99/01/05','3577','98/01/04~98/01/08','5個營業日']]:
+        invalid=dict(payload,tables=[dict(payload['tables'][0],data=[values])])
+        with pytest.raises(ValueError):
+            _parse_tpex_disposition_payload(invalid,start=date(2010,1,1),end=date(2010,12,31),source_sha256='a'*64)
+    with pytest.raises(ValueError,match='requested query'):
+        _parse_tpex_disposition_payload(dict(payload,date='20090101~20091231'),
+            start=date(2010,1,1),end=date(2010,12,31),source_sha256='a'*64)
 
 
 def _ods_bytes(rows: list[list[str]]) -> bytes:

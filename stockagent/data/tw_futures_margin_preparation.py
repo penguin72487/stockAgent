@@ -2510,8 +2510,40 @@ def margin_candidate_intervals(facts: list[dict]) -> tuple[list[dict], list[dict
     return sorted(intervals,key=lambda r:(r['product'],r['effective_date'],r['effective_phase'])),issues
 
 
+def delayed_disposal_end(start, nominal_end, required, cash_dates, closures):
+    """Prove a closure-only postponement; a missing print is never a closure.
+
+    This bounded case requires the stated duration to equal the original
+    weekday span. Every later weekday must have either a positive cash print
+    or an independently dated official full-day closure. Individual halts,
+    planned holidays, Saturday sessions and incomplete histories stay gaps.
+    """
+    first, nominal = date.fromisoformat(start), date.fromisoformat(nominal_end)
+    days = sorted(d for d in cash_dates if d >= start)
+    if not isinstance(required, int) or required <= 0 or len(days) < required:
+        return None
+    actual = date.fromisoformat(days[required - 1])
+    if actual <= nominal:
+        return None
+    def weekdays(stop):
+        return {str(first + timedelta(days=i)) for i in range((stop-first).days+1)
+                if (first + timedelta(days=i)).weekday() < 5}
+    planned = weekdays(nominal)
+    if len(planned) != required:
+        return None
+    proven = {r['date']: r for r in closures if start <= r['date'] <= str(actual)}
+    observed = {d for d in days if d <= str(actual)}
+    expected = weekdays(actual)
+    if (not proven or observed & set(proven) or observed | set(proven) != expected
+            or len(observed) != required):
+        return None
+    return dict(actual_end=str(actual), nominal_end=nominal_end,
+                official_closures=[proven[d] for d in sorted(proven)])
+
+
 def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
-                                dispositions: pl.DataFrame, observations: pl.DataFrame):
+                                dispositions: pl.DataFrame, observations: pl.DataFrame,
+                                *, market_closures=()):
     """Resolve conditional restorations using actual completed cash sessions.
 
     A provider disposition row alone is not authority for the margin amount.
@@ -2522,6 +2554,14 @@ def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
     """
     from downloader.taifex_rule_parsing import _integer
     import math
+    for row in market_closures:
+        day = date.fromisoformat(row['date'])
+        known = datetime.fromisoformat(row['known_at'])
+        if (known.tzinfo is None or known >= datetime.combine(day,time(),TAIPEI)
+                or not re.fullmatch('[a-f0-9]{64}',row['source_content_sha256'])
+                or not row.get('stock_ids') or not row.get('disposition_source_sha256s')
+                or any(not re.fullmatch('[a-f0-9]{64}',s) for s in row['disposition_source_sha256s'])):
+            raise ValueError('closure requires prior-publication official and cash-market identities')
     securities=dict(universe.select('product','underlying_symbol').iter_rows())
     disposition_fields={'date','stock_id','period_start','period_end','measure','source_sha256'}
     if disposition_fields-set(dispositions.columns):
@@ -2563,7 +2603,8 @@ def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
         ends=json.loads(fact.get('temporary_end_evidence') or '[]')
         candidates={(r['date_iso'],r['boundary']) for r in ends}
         if len(candidates)!=1:continue
-        end,boundary=next(iter(candidates));product=fact['product'];security=securities.get(product)
+        end,boundary=next(iter(candidates));nominal_end=end
+        product=fact['product'];security=securities.get(product)
         key=(product,fact.get('effective_date'),end,fact.get('source_content_sha256'))
         if key in seen:continue
         seen.add(key)
@@ -2571,7 +2612,7 @@ def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
         matches=[r for r in by_security.get(security,[]) if r['period_end']==end
                  and r['period_start']<=fact['effective_date'] and r['date']<=fact['published_date']]
         signatures={(r['period_start'],r['period_end'],r['measure']) for r in matches}
-        reason=None
+        reason=None;delay=None
         if len(signatures)!=1:reason='disposition_period_missing_or_ambiguous'
         else:
             start,_,measure=next(iter(signatures))
@@ -2580,9 +2621,18 @@ def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
             if not counts:
                 counts={_integer(m[1]) for m in re.finditer(r'[﹝〔（(\[]([0-9零〇一二三四五六七八九十]+)個營業日',compact(measure))}
             days=sorted(d for d in traded.get(security,{}) if start<=d<=end)
+            if (len(counts)==1 and len(days)<next(iter(counts))
+                    and fact.get('restoration_delay_rule')=='postpone_for_closed_cash_sessions'):
+                applicable=[r for r in market_closures if security in r['stock_ids']
+                    and any(m['source_sha256'] in r['disposition_source_sha256s'] for m in matches)]
+                delay=delayed_disposal_end(start,end,next(iter(counts)),traded.get(security,{}),applicable)
+                if delay:
+                    end=delay['actual_end']
+                    days=sorted(d for d in traded.get(security,{}) if start<=d<=end)
             if len(counts)!=1 or not days or days[-1]!=end or len(days)!=next(iter(counts),-1):
                 reason='completed_cash_session_count_does_not_prove_announced_restoration'
-            elif any(r['period_start']<=end<r['period_end'] for r in by_security.get(security,[])):
+            elif any(r['period_start']<=end and r['period_end']>=nominal_end
+                     and r not in matches for r in by_security.get(security,[])):
                 reason='overlapping_extended_disposition'
             elif any(r['product']==product and fact['effective_date']<str(r.get('effective_date') or '')<=end
                      for r in facts):
@@ -2594,6 +2644,7 @@ def disposal_margin_restorations(facts: list[dict], universe: pl.DataFrame,
             completed_cash_dates=days,required_sessions=next(iter(counts)),
             disposition_source_sha256s=sorted({r['source_sha256'] for r in matches}),
             cash_source_sha256s=sorted({s for d in days for s in traded[security][d]}),
+            delayed_for_official_closure=delay,
             confirmation_scope='completed_cash_sessions_only_not_a_provider_completeness_claim')
         resolved.append(dict(fact,after=list(target),before=list(fact['after']),
             effective_date=end,effective_phase='after_product_regular_close',

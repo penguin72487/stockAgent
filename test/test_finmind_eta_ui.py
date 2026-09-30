@@ -245,8 +245,8 @@ def test_scenario_card_and_important_caveats_are_visible_in_markup() -> None:
     assert "不是保證完成期限或統計信賴區間" in html
     assert 'id="download-eta-exclusions" class="estimate-exclusions"' in html
     assert 'styles.css?v=3' in html
-    assert 'app.js?v=11' in html
-    assert 'styles.css?v=5' in html
+    assert 'app.js?v=13' in html
+    assert 'href="styles.css?v=7"' in html
     assert '流量與估時對帳' in html
     assert '階段／已知剩餘請求' in html
 

@@ -313,6 +313,43 @@ def _require_executable_tape_coverage(
     )
 
 
+def discover_day_trade_minute_execution_source(
+    root: str | Path,
+) -> tuple[tuple[Path, ...], np.datetime64]:
+    """Check partition availability without reading prices or building a panel.
+
+    This is the loader's source discovery, also used before expensive setup.
+    Partition contents, coverage and execution semantics still belong to the
+    full loader; an existing directory alone is not a completeness proof.
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        raise FileNotFoundError(
+            "daily minute-execution root does not exist or is not a directory: "
+            f"{root_path}. Materialize the canonical tw-minute-train release "
+            "before training."
+        )
+    partition_paths = tuple(root_path.glob("trade_date=*/data.parquet"))
+    if not partition_paths:
+        raise FileNotFoundError(
+            "daily minute-execution root contains no trade_date=*/data.parquet "
+            f"partitions: {root_path}"
+        )
+    minute_partition_dates: list[np.datetime64] = []
+    for partition_path in partition_paths:
+        day_text = partition_path.parent.name.removeprefix("trade_date=")
+        try:
+            minute_partition_dates.append(np.datetime64(day_text, "D"))
+        except ValueError:
+            continue
+    if not minute_partition_dates:
+        raise ValueError(
+            "daily minute-execution root has no parseable ISO trade_date "
+            f"partitions: {root_path}"
+        )
+    return partition_paths, min(minute_partition_dates)
+
+
 def load_tw_day_trade_execution_tape(
     root: str | Path,
     *,
@@ -342,31 +379,7 @@ def load_tw_day_trade_execution_tape(
     if pq is None or pc is None:
         raise RuntimeError("PyArrow is required for day-trade minute execution")
     root_path = Path(root)
-    if not root_path.is_dir():
-        raise FileNotFoundError(
-            "daily minute-execution root does not exist or is not a directory: "
-            f"{root_path}. Materialize the canonical tw-minute-train release "
-            "before training."
-        )
-    partition_paths = tuple(root_path.glob("trade_date=*/data.parquet"))
-    if not partition_paths:
-        raise FileNotFoundError(
-            "daily minute-execution root contains no trade_date=*/data.parquet "
-            f"partitions: {root_path}"
-        )
-    minute_partition_dates: list[np.datetime64] = []
-    for partition_path in partition_paths:
-        day_text = partition_path.parent.name.removeprefix("trade_date=")
-        try:
-            minute_partition_dates.append(np.datetime64(day_text, "D"))
-        except ValueError:
-            continue
-    if not minute_partition_dates:
-        raise ValueError(
-            "daily minute-execution root has no parseable ISO trade_date "
-            f"partitions: {root_path}"
-        )
-    first_minute_date = min(minute_partition_dates)
+    partition_paths, first_minute_date = discover_day_trade_minute_execution_source(root_path)
 
     dates = np.asarray(panel_dates, dtype="datetime64[D]").reshape(-1)
     opens = np.asarray(official_open_prices, dtype=np.float64)

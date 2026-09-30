@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -13,6 +13,143 @@ from zoneinfo import ZoneInfo
 from stockagent.live.market_status import tw_stock_day_decision
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+RELEASE_CLOCK_VERSION = 2
+# Primary tutorial pages, checked 2026-09-30. These are expected release
+# boundaries, not actual publication evidence; the observation ledger owns it.
+RELEASE_CLOCKS: dict[str, dict] = {}
+
+
+def _clocks(topic: str, values: dict[str, tuple[int, int]], *, saturday: bool = False) -> None:
+    for dataset, (hour, minute) in values.items():
+        RELEASE_CLOCKS[dataset] = {
+            'hour': hour, 'minute': minute, 'weekdays': list(range(6 if saturday else 5)),
+            'basis': 'official_schedule_not_actual_publication', 'timezone': 'Asia/Taipei',
+            'source_url': f'https://finmind.github.io/tutor/TaiwanMarket/{topic}/',
+            'label': f"{'週一至六' if saturday else '週一至五'} {hour:02}:{minute:02}",
+        }
+
+
+_clocks('Technical', {
+    'TaiwanStockTradingDate': (18, 0), 'TaiwanStockPrice': (17, 30),
+    'TaiwanStockPriceAdj': (17, 30), 'TaiwanStockWeekPrice': (17, 30),
+    'TaiwanStockMonthPrice': (17, 30), 'TaiwanStockPriceTick': (15, 30),
+    'TaiwanStockPER': (18, 0), 'TaiwanStockPriceLimit': (18, 0),
+    'TaiwanStock10Year': (20, 0), 'TaiwanStockKBar': (15, 50),
+    'TaiwanStockTotalReturnIndex': (16, 50),
+})
+_clocks('Chip', {
+    'TaiwanStockMarginPurchaseShortSale': (21, 0), 'TaiwanStockTotalMarginPurchaseShortSale': (21, 0),
+    'TaiwanStockInstitutionalInvestorsBuySell': (20, 0), 'TaiwanStockInstitutionalInvestorsBuySellWide': (20, 0),
+    'TaiwanStockTotalInstitutionalInvestors': (15, 0), 'TaiwanStockShareholding': (21, 0),
+    'TaiwanStockSecuritiesLending': (15, 0), 'TaiwanStockMarginShortSaleSuspension': (21, 0),
+    'TaiwanDailyShortSaleBalances': (21, 0), 'TaiwanStockGovernmentBankBuySell': (23, 30),
+    'TaiwanTotalExchangeMarginMaintenance': (21, 0), 'TaiwanStockTradingDailyReport': (21, 0),
+    'TaiwanStockTradingDailyReportSecIdAgg': (21, 0),
+    # This worker uses the broker-ID endpoint, not the stock-ID endpoint.
+    'TaiwanStockWarrantTradingDailyReport': (23, 0),
+})
+_clocks('Chip', {'TaiwanStockMarginMaintenance': (22, 30)}, saturday=True)
+_clocks('Fundamental', {'TaiwanStockMarketValue': (23, 30), 'TaiwanStockDelisting': (23, 30),
+                        'TaiwanStockSplitPrice': (18, 0)})
+_clocks('Derivative', {
+    'TaiwanFuturesDaily': (16, 30), 'TaiwanOptionDaily': (16, 30), 'TaiwanFuturesKBar': (16, 30),
+    'TaiwanFuturesInstitutionalInvestors': (18, 0), 'TaiwanOptionInstitutionalInvestors': (16, 0),
+    'TaiwanFuturesDealerTradingVolumeDaily': (19, 0), 'TaiwanOptionDealerTradingVolumeDaily': (18, 0),
+    'TaiwanFuturesOpenInterestLargeTraders': (16, 30), 'TaiwanOptionOpenInterestLargeTraders': (16, 30),
+    'TaiwanFuturesTick': (6, 0), 'TaiwanOptionTick': (6, 0),
+})
+_clocks('Derivative', {'TaiwanFuturesInstitutionalInvestorsAfterHours': (5, 0),
+                       'TaiwanOptionInstitutionalInvestorsAfterHours': (5, 0),
+                       'TaiwanOptionVix': (18, 0)}, saturday=True)
+_clocks('ConvertibleBond', {'TaiwanStockConvertibleBondPutProvision': (19, 0)})
+_clocks('ConvertibleBond', {'TaiwanStockConvertibleBondMonthlyAnalysis': (18, 0)}, saturday=True)
+
+
+def release_details(dataset: str) -> dict:
+    if dataset in RELEASE_CLOCKS:
+        return {'contract_version': RELEASE_CLOCK_VERSION, **RELEASE_CLOCKS[dataset]}
+    if dataset == 'TaiwanStockDayTrading':
+        return {'contract_version': RELEASE_CLOCK_VERSION, 'label': '盤前名單（18:00 補查）；成交量值 21:30',
+                'basis': 'official_multi_phase_schedule', 'timezone': 'Asia/Taipei',
+                'phases': [{'hour': 18, 'minute': 0, 'basis': 'existing_poll_policy_not_publication'},
+                           {'hour': 21, 'minute': 30, 'basis': 'official_final_field_schedule'}],
+                'source_url': 'https://finmind.github.io/tutor/TaiwanMarket/Technical/'}
+    spec = SPECS.get(dataset)
+    return {'contract_version': RELEASE_CLOCK_VERSION,
+            'label': (f'每日 {spec.release_hour:02}:{spec.release_minute:02} 檢查（發布時間未確認）' if spec else
+                      '依既有追新週期（發布時間未確認）'),
+            'basis': 'polling_policy_not_publication', 'timezone': 'Asia/Taipei'}
+
+
+def next_release_check(dataset: str, now: datetime) -> datetime | None:
+    """Next release/check phase; weekdays are NOT historical exclusions."""
+    if dataset == 'TaiwanStockDayTrading':
+        local = now.astimezone(TAIPEI)
+        for offset in range(8):
+            day = local + timedelta(days=offset)
+            if day.weekday() >= 5:
+                continue
+            for hour, minute in ((18, 0), (21, 30)):
+                candidate = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate > local:
+                    return candidate.astimezone(UTC)
+        return None
+    clock = RELEASE_CLOCKS.get(dataset)
+    if clock is None:
+        return None
+    local = now.astimezone(TAIPEI)
+    candidate = local.replace(hour=clock['hour'], minute=clock['minute'], second=0, microsecond=0)
+    while candidate <= local or candidate.weekday() not in clock['weekdays']:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(UTC)
+
+
+def reconcile_release_deadlines(conn: sqlite3.Connection, now: datetime) -> None:
+    """Move already-seeded current jobs to the new clock, with audit evidence.
+
+    Changing constants alone leaves old four-hour deadlines in a live queue.
+    Failures/holds are untouched, and a successful pre-release sample cannot
+    suppress the later documented release or day-trading final-field update.
+    """
+    conn.execute('CREATE TABLE IF NOT EXISTS finmind_release_clock_migrations ('
+                 'version INTEGER,dataset TEXT,partition TEXT,prior_deadline TEXT,new_deadline TEXT,'
+                 'changed_at_utc TEXT,PRIMARY KEY(version,dataset,partition))')
+    local = now.astimezone(TAIPEI)
+    rows = conn.execute("SELECT dataset,partition,state,last_attempt_at_utc,next_attempt_at_utc FROM tasks "
+                        "WHERE priority=0 AND kind!='derived' AND state IN ('complete','observed_empty') "
+                        "AND partition>=?", (f'{local.year}-01-01',)).fetchall()
+    for dataset, partition, state, attempted, prior in rows:
+        spec = SPECS.get(dataset)
+        try:
+            day = date.fromisoformat(partition)
+        except ValueError:
+            continue
+        if spec is None or (spec.grain == 'day' and day != local.date()) or (
+                spec.grain == 'two_day' and day + timedelta(days=2) <= local.date()) or (
+                spec.grain == 'month' and (day.year, day.month) != (local.year, local.month)):
+            continue
+        clock = RELEASE_CLOCKS.get(dataset)
+        if dataset == 'TaiwanStockDayTrading':
+            clock = {'hour': 21, 'minute': 30, 'weekdays': list(range(5))}
+        if not clock or conn.execute('SELECT 1 FROM finmind_release_clock_migrations '
+                                     'WHERE version=? AND dataset=? AND partition=?',
+                                     (RELEASE_CLOCK_VERSION, dataset, partition)).fetchone():
+            continue
+        stamp = _stamp(attempted)
+        if stamp is None or stamp > now:
+            continue
+        release = local.replace(hour=clock['hour'], minute=clock['minute'], second=0, microsecond=0)
+        due = _stamp(prior)
+        if release.weekday() in clock['weekdays'] and stamp < release:
+            due = min(due, release.astimezone(UTC)) if due else release.astimezone(UTC)
+        elif state == 'complete':
+            due = next_release_check(dataset, stamp)
+        if due is None:
+            continue
+        conn.execute('INSERT INTO finmind_release_clock_migrations VALUES (?,?,?,?,?,?)',
+                     (RELEASE_CLOCK_VERSION, dataset, partition, prior, due.isoformat(), now.isoformat()))
+        conn.execute("UPDATE tasks SET next_attempt_at_utc=? WHERE dataset=? AND data_id='' AND partition=?",
+                     (due.isoformat(), dataset, partition))
 OVERSEAS_DAILY_DATASETS = frozenset({
     "USStockPrice", "UKStockPrice", "EuropeStockPrice", "JapanStockPrice",
 })
@@ -171,6 +308,9 @@ SOURCES = (
     _s("CnnFearGreedIndex", "2011-01-03", "year"),
 )
 assert len({source.dataset for source in SOURCES}) == len(SOURCES)
+SOURCES = tuple(replace(source, release_hour=RELEASE_CLOCKS[source.dataset]['hour'],
+                        release_minute=RELEASE_CLOCKS[source.dataset]['minute'])
+                if source.dataset in RELEASE_CLOCKS else source for source in SOURCES)
 SPECS = {source.dataset: source for source in SOURCES}
 # These provider dates are exchange sessions, unlike fundamentals, dividends,
 # revenue, and issuer events, which can legitimately have non-session dates.

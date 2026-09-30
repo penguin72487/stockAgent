@@ -295,10 +295,15 @@ def _lower_bound(row: dict[str, Any]) -> tuple[int | None, str]:
 
 
 def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
+    from downloader.finmind_updates import read_summary, queued_next_checks
+    from downloader.finmind_scheduling import release_details, next_release_check, calendar_next_check
     now = (now or datetime.now(UTC)).astimezone(UTC)
     rows = registry()
     statuses = {owner: _json(root / owner / 'status.json') for owner in ('sponsor', 'complement')}
     statuses['free'] = _json(root / 'status.json')
+    update_observations = {owner: read_summary(root if owner == 'free' else root / owner)
+                           for owner in ('free', 'sponsor', 'complement')}
+    next_checks = {owner: queued_next_checks(root / owner, now) for owner in ('sponsor', 'complement')}
     observations, queue_states = {}, {}
     for owner in ('sponsor', 'complement'):
         observations[owner], queue_states[owner] = _queue_observations(root / owner / 'queue.sqlite3', now)
@@ -329,6 +334,15 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
         row['count_basis'] = 'primary_owner_only_alias_counts_not_added'
         row['remaining_lower_bound_requests'], row['lowerbound_basis'] = _lower_bound(row)
         row['lower_bound_scope'] = 'conditional_observed_pending_acquisition_only_excludes_refresh_retry_inflight'
+        row['release_schedule'] = release_details(dataset)
+        expected = next_release_check(dataset, now)
+        due = next_checks.get(row['primary_owner'], {}).get(dataset)
+        if dataset == free.CALENDAR_DATASET:
+            due = calendar_next_check(root, now).isoformat()
+        row['next_check_at_utc'] = due or (expected.isoformat() if expected else None)
+        observation = update_observations.get(row['primary_owner'], {}).get('datasets', {}).get(dataset)
+        row['update_observation'] = ({**observation, 'next_check_at_utc': row['next_check_at_utc']}
+                                     if observation else None)
         if row['query_shape'] in {'whole_market_day', 'whole_market_period_anchor'} and 'complement' in row['owners']:
             row['conditional_per_id_alternative'] = {
                 'formula': 'min(required_missing_dates_or_periods, sum(per_id_required_range_requests)+universe_and_overlap_validation_calls)',
@@ -339,7 +353,7 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
     alias_count = len(sponsor.SOURCES) + len(complement.ALL_DATASETS) + len(free.SESSION_DATASETS) + 2 + len(sponsor.UNSCHEDULED)
     migrated_alias_count = len(set(PRODUCT_HISTORY_STARTS) & set(complement.ALL_DATASETS))
     return {
-        'schema_version': 2, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
+        'schema_version': 3, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
         'production_queue_writes': 0, 'parquet_scans': 0,
         'global_minimum_requests': None,
         'global_minimum_basis': 'not_proven_contracts_universes_overlap_and_refresh_work_differ',
@@ -371,7 +385,8 @@ def write_inventory(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
               *COUNT_STATES, 'max_span',
               'pending_due', 'failed_or_blocked', 'excluded_deprecated', 'observation_basis',
               'remaining_lower_bound_requests', 'lowerbound_basis', 'lower_bound_scope',
-              'count_basis', 'owner_contracts', 'owner_observations', 'source_urls')
+              'count_basis', 'owner_contracts', 'owner_observations', 'source_urls',
+              'release_schedule', 'next_check_at_utc', 'update_observation')
     buffer = io.StringIO(newline='')
     writer = csv.DictWriter(buffer, fieldnames=fields)
     writer.writeheader()
