@@ -45,6 +45,7 @@ from dataset_lock import (  # noqa: E402
 )
 from okx_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
+    feature_acquisition_payload,
     feature_run_summary_path,
     feature_catalog_payload,
     result_rows as historical_feature_result_rows,
@@ -272,6 +273,7 @@ class OkxClient:
                 "okx_history_mark_price_candles"
             ),
             "/api/v5/market/history-index-candles": "okx_history_index_candles",
+            "/api/v5/market/index-candles": "okx_index_candles",
             "/api/v5/public/funding-rate-history": "okx_funding_rate_history",
         }
         profile_name = profile_by_path.get(path)
@@ -1144,6 +1146,7 @@ def _run_locked_download(
                 "errors_json": pl.String,
                 "stage_elapsed_seconds_json": pl.String,
                 "total_elapsed_seconds": pl.Float64,
+                "index_acquisition_json": pl.String,
             }
         )
     )
@@ -1215,6 +1218,7 @@ def _run_locked_download(
         ),
         "historical_feature_status_counts": historical_status_counts,
         "historical_feature_stage_latency": stage_latency_summary(historical_feature_results),
+        "historical_feature_acquisition": feature_acquisition_payload(),
         "request_limiter_activity": client.limiter_activity(),
         "historical_feature_report": str(historical_feature_report_path),
         "historical_feature_catalog": str(feature_catalog_path),

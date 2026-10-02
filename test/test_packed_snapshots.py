@@ -113,6 +113,63 @@ def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
     assert by_id.manifest["snapshot_id"] == published.manifest["snapshot_id"]
 
 
+def test_selected_reconstruction_checks_pack_and_shared_blob_paths(tmp_path):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(
+        cold, "prices", source, loose_file_threshold_bytes=1024
+    )
+    result = verify_packed_snapshot(
+        cold,
+        resolved,
+        reconstruct_paths=["text/first.json", "large-a.bin", "large-b.bin", "large-a.bin"],
+    )
+    assert result["independently_reconstructed_files"] == 3
+    assert result["objects"] == resolved.manifest["archive"]["object_count"]
+    assert not result["materialized_verified"]
+
+
+@pytest.mark.parametrize("requested", ["current", "empty", "missing", "../escape"])
+def test_selected_reconstruction_rejects_non_file_inventory_paths(tmp_path, requested):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    with pytest.raises(SnapshotError, match="non-file or unknown"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=[requested])
+
+
+def test_selected_reconstruction_checks_file_hash_independent_of_zip_crc(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    load_inventory = packed_snapshots._load_inventory
+
+    def wrong_file_hash(*args):
+        rows = load_inventory(*args)
+        next(row for row in rows if row["path"] == "text/first.json")["sha256"] = "0" * 64
+        return rows
+
+    monkeypatch.setattr(packed_snapshots, "_load_inventory", wrong_file_hash)
+    with pytest.raises(SnapshotError, match="exact cold reconstruction failed"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=["text/first.json"])
+
+
+def test_empty_reconstruction_request_still_hashes_all_cold_objects(tmp_path):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    obj = cold / resolved.manifest["archive"]["objects"][0]["relpath"]
+    payload = bytearray(obj.read_bytes())
+    payload[0] ^= 1
+    obj.write_bytes(payload)
+    with pytest.raises(SnapshotError, match="checksum mismatch"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=[])
+
+
 def test_explicit_missing_object_recovery_publishes_current_bytes_under_new_identity(tmp_path):
     source = _source_tree(tmp_path)
     root = tmp_path / "cold"

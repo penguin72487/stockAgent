@@ -102,6 +102,46 @@ def test_parse_json_table_payload_keeps_stock_codes_as_strings():
     assert frame["date"].to_list() == ["2024-06-03", "2024-06-03"]
 
 
+def test_snapshot_json_row_arrays_preserve_halt_episode_without_backdating_capture():
+    payload={"stat":"OK", "title":"暫停交易證券 107/05/15 到 107/05/30",
+        "fields":["編號","證券代號","暫停交易日期","暫停交易時間","恢復交易日期","恢復交易時間"],
+        "data":[[1,"0050","107/05/22","8:00","107/05/23","8:00"]]}
+    frame=twpub._parse_resource_bytes(json.dumps(payload).encode(),url="https://www.twse.com.tw/rwd/zh/afterTrading/TWTAWU")
+    assert frame.height==1 and frame["證券代號"].item()=="0050"
+    assert frame["暫停交易日期"].item()=="107/05/22"
+    assert frame["恢復交易日期"].item()=="107/05/23"
+    assert "date" not in frame.columns
+    spec=twpub.DatasetSpec(name="halt_episode",kind="snapshot_url",source="TWSE",
+        description="historical episode",tags=("test",))
+    captured=twpub._append_common_columns(frame,spec,fetched_at="2026-10-01T01:00:00+00:00",
+        url="official",as_of_date="2026-10-01")
+    assert captured["date"].item()==captured["_as_of_date"].item()=="2026-10-01"
+    assert captured["暫停交易日期"].item()=="107/05/22"
+    assert captured["_resource_table_parser_version"].item()==twpub.RESOURCE_JSON_TABLE_PARSER_CONTRACT_VERSION
+
+
+@pytest.mark.parametrize("problem",["no_fields","empty_fields","short_row","long_row","mixed_rows","blank_field"])
+def test_snapshot_json_row_arrays_cannot_be_silently_discarded_or_truncated(problem):
+    payload={"fields":["code","value"],"data":[["0050","1"]]}
+    if problem=="no_fields":payload.pop("fields")
+    if problem=="empty_fields":payload["fields"]=[]
+    if problem=="short_row":payload["data"]=[["0050"]]
+    if problem=="long_row":payload["data"]=[["0050","1","unexpected"]]
+    if problem=="mixed_rows":payload["data"].append({"code":"2330","value":"2"})
+    if problem=="blank_field":payload["fields"][1]=" "
+    with pytest.raises(ValueError,match="complete column fields"):
+        twpub._parse_json_bytes(json.dumps(payload).encode())
+
+
+def test_snapshot_json_table_duplicate_headers_and_legacy_records_remain_distinct():
+    frame=twpub._parse_json_bytes(json.dumps({"fields":["code","value","value"],
+        "data":[["0050","1","2"]]}).encode())
+    assert frame.select("code","value","value_2").to_dicts()==[{"code":"0050","value":"1","value_2":"2"}]
+    for payload in ([{"code":"0050","value":"1"}], {"data":[{"code":"0050","value":"1"}]}):
+        assert twpub._parse_json_bytes(json.dumps(payload).encode()).to_dicts()==[{"code":"0050","value":"1"}]
+    assert twpub._parse_json_bytes(b'{"fields":["code"],"data":[]}').is_empty()
+
+
 def test_download_modes_have_stable_legacy_aliases():
     assert twpub._canonical_mode("from-zero") == "rebuild"
     assert twpub._canonical_mode("full") == "repair"

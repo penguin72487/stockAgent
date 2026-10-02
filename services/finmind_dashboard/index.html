@@ -93,7 +93,7 @@
     <section id="backfill" class="section-block" aria-labelledby="downloads-title">
       <header class="section-heading"><span>04</span><div><h2 id="downloads-title">逐資料集歷史進度</h2><p>分母為目前已清點的查詢任務；逐檔主檔尚未載入時分母會增加。來源空回算已查驗，但不算有數值；失敗與未知歷史不算完成。</p></div></header>
       <div class="progress-card">
-        <div class="progress-copy"><div><span>已查驗／目前已建立任務</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>全域剩餘時間 · FinMind</span><strong id="download-global-eta">讀取估算中</strong><p id="download-global-eta-basis">目前已排程工作；未知與未排程範圍另列。</p></div></div>
+        <div class="progress-copy"><div><span>已查驗／目前已建立任務</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>全域剩餘工作估算 · FinMind</span><strong id="download-global-eta">讀取估算中</strong><p id="download-global-eta-basis">目前已排程工作；未知與未排程範圍另列。</p></div></div>
         <progress id="download-progress" class="progress-track" max="1" aria-label="FinMind 目前已建立任務的查驗率"></progress>
         <div class="completion-estimates" role="group" aria-label="FinMind 全域剩餘時間三情境估算">
           <article class="completion-estimate"><h3>最快 <span>樂觀情境</span></h3><strong id="download-eta-fastest">—</strong><p id="download-eta-fastest-complete">完成日期待估算</p><small id="download-eta-fastest-detail">工作量與速度待核實</small><small id="download-eta-fastest-basis">—</small></article>
@@ -101,7 +101,7 @@
           <article class="completion-estimate"><h3>最慢 <span>保守情境</span></h3><strong id="download-eta-slowest">—</strong><p id="download-eta-slowest-complete">完成日期待估算</p><small id="download-eta-slowest-detail">工作量與速度待核實</small><small id="download-eta-slowest-basis">—</small></article>
         </div>
         <p class="estimate-caveat">三個數字是條件式情境，不是保證完成期限或統計信賴區間。「最慢」不是硬上界；持續故障或權限未解決時，實際完成時間可能無限延後。</p>
-        <p class="estimate-exclusions">分鐘／tick 的工作量包含「已知代號 × 日曆天」候選，尚未全部扣除上市前與休市日；遠期日期是此候選量的上側工作量投影，不是已確認缺漏的完成期限。持續追新沒有永久完工日。</p>
+        <p class="estimate-exclusions">時間是取樣時的工作量預估，不是成功倒數。失敗／部分回應仍待重試時，先顯示待重試，不用其他資料的請求速度推定它會成功。分鐘／tick 含尚未扣除上市前與休市日的日曆候選；持續追新沒有永久完工日。</p>
         <div class="estimate-rate-bridge"><h3>流量與估時對帳</h3><p id="download-eta-rate-bridge">等待同一取樣窗的流量與追新模型。</p><small id="download-eta-rate-window">流量窗待核實。</small><small>當下預留配額是排程守門；未來追新模型是長期負載，兩者不重複扣除。上方全程速度按階段加權；下表順序共用一個帳號，不是各自獨占額度。</small></div>
         <h3 class="estimate-stage-heading">依現行優先順序 · 階段與累計完成時間</h3>
         <div class="table-scroll estimate-stage-table" role="region" aria-label="依資料優先級估算完成時間" tabindex="0"><table><thead><tr><th>階段／已知剩餘請求</th><th>最快 · 累計完成</th><th>中間 · 累計完成</th><th>保守 · 累計完成</th></tr></thead><tbody id="download-eta-milestones"></tbody></table></div>
@@ -130,7 +130,7 @@
       <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。非空回應與查詢空回都不證明供應商歷史完整。法人寬表與分點彙總由驗證過的父資料在本機衍生，不另外呼叫 API。未知歷史代號仍待查。新聞採全市場逐日查詢，包含休市日；1900 年為向前搜尋起點，不代表來源從該年就有資料。保留來源時間字串，不宣稱為已驗證發布時點。三情境估時針對固定截止日的已知工作，扣除未來週期性增量；大範圍候選含未剔除的上市前／休市日，並非錯誤缺失筆數。超過一年的日曆僅按平日投影。本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=10" defer></script>
+  <script src="../dashboard-core.js?v=11" defer></script>
   <script src="app.js?v=13" defer></script>
 </body>
 </html>

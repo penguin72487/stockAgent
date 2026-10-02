@@ -217,7 +217,7 @@ def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
     assert "最少剩餘時間" not in javascript + html
     assert "目前已知任務最少仍需" not in html
     assert "分割數不等於請求數" in javascript + html
-    assert "非 ETA、非下界" in javascript
+    assert 'unbatched_task_projection' not in javascript
     assert 'id="download-global-eta-basis"' in html
     assert 'app.js?v=13' in html
 
@@ -249,6 +249,6 @@ process.stdout.write(JSON.stringify(context.result));
     assert rendered["legacy"] == "未知（分割數不等於請求數）"
     assert rendered["complete"] == "已查驗目前任務"
     assert rendered["delegated"] == "由 Complement 主責"
-    assert "未合批任務投影 20 分鐘" in rendered["basis"]
-    assert "非 ETA、非下界" in rendered["basis"]
+    assert "沒有可信倒數" in rendered['basis']
+    assert "20 分鐘" not in rendered['basis']
     assert "至少" not in rendered["basis"]

@@ -232,6 +232,26 @@ def test_schema3_adapter_keeps_distinct_limit_axes_and_rejects_missing_axis(tmp_
         m.validate_margin_second_position_limit(pl.DataFrame(rows).drop('second_position_limit'))
 
 
+@pytest.mark.parametrize('sign',[1,-1])
+def test_independent_root_contract_cap_and_combined_shares_project_both_axes(sign):
+    from stockagent.backtest.tw_futures_portfolio import _project_margin_position_limit_axes
+    x=torch.zeros(2,m.MARGIN_GRANDFATHER_EXECUTION_WIDTH)
+    x[:,m.SECOND_POSITION_GROUP]=torch.tensor([0.,1.])
+    x[:,m.SECOND_POSITION_UNIT]=torch.tensor([1.,2200.])
+    x[:,m.SECOND_POSITION_LIMIT]=torch.tensor([350.,2500000.])
+    for wanted in ([350.,0.],[0.,1136.],[300.,800.],[351.,0.],[0.,1137.]):
+        q,failed,_=_project_margin_position_limit_axes(sign*torch.tensor(wanted),torch.zeros(2),
+            execution_row=x,position_group=torch.zeros(2,dtype=torch.long),
+            position_units=torch.tensor([2000.,2200.]),group_limits=torch.tensor([2500000.,0.]),
+            close_capacity=torch.full((2,),10000.),whole_contracts=True)
+        assert not failed.any()
+        assert q[0].abs()<=350 and (q.abs()*torch.tensor([2000.,2200.])).sum()<=2500000
+        if wanted in ([350.,0.],[0.,1136.],[300.,800.]):
+            torch.testing.assert_close(q,sign*torch.tensor(wanted))
+        else:
+            assert not torch.equal(q,sign*torch.tensor(wanted))
+
+
 def test_schema5_same_direction_limits_do_not_net_or_add_opposite_months():
     from stockagent.backtest.tw_futures_portfolio import _project_margin_position_limit_axes,_margin_position_slack
     x=torch.zeros(2,m.MARGIN_GRANDFATHER_EXECUTION_WIDTH)

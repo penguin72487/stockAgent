@@ -87,6 +87,8 @@ CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
+YAHOO_ACQUISITION_CONTRACT_VERSION = 2
+YAHOO_PRICE_SCHEMA_VERSION = 1
 PARQUET_META_SOURCE_KEY = b"stockagent.source"
 PARQUET_META_ASSET_CLASS_KEY = b"stockagent.asset_class"
 PARQUET_META_REQUESTED_START_KEY = b"stockagent.yahoo_requested_start"
@@ -95,6 +97,8 @@ PARQUET_META_REQUESTED_END_KEY = b"stockagent.yahoo_requested_end"
 PARQUET_META_FIRST_DATE_KEY = b"stockagent.first_date"
 PARQUET_META_LAST_DATE_KEY = b"stockagent.last_date"
 PARQUET_META_WRITE_TS_UTC_KEY = b"stockagent.write_ts_utc"
+PARQUET_META_ACQUISITION_VERSION_KEY = b"stockagent.yahoo_acquisition_contract_version"
+PARQUET_META_ACQUISITION_FINGERPRINT_KEY = b"stockagent.yahoo_acquisition_fingerprint"
 UNVERIFIED_YAHOO_QUARANTINE_DIR = Path("quarantine") / "unverified_yahoo"
 UNVERIFIED_YAHOO_QUARANTINE_JOURNAL = "events.jsonl"
 QUARANTINE_ELIGIBLE_PRECHECK_STATUSES = frozenset(
@@ -1100,6 +1104,32 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
     )
 
 
+def _repair_required_columns(asset_class: str) -> set[str]:
+    if asset_class not in ASSET_CLASSES:
+        raise ValueError(f"Unknown Yahoo asset class: {asset_class}")
+    # The canonical forex writer deliberately removes all-zero/null volume.
+    # Requiring that column here would re-download the full history every day.
+    # Stock and crypto volumes remain mandatory; no synthetic volume is added.
+    if asset_class == "forex":
+        return REPAIR_REQUIRED_COLUMNS - {"Trading_Volume"}
+    return REPAIR_REQUIRED_COLUMNS.copy()
+
+
+def acquisition_contract(asset_class: str) -> dict[str, object]:
+    contract = {
+        "version": YAHOO_ACQUISITION_CONTRACT_VERSION,
+        "price_schema_version": YAHOO_PRICE_SCHEMA_VERSION,
+        "source": "yahoo",
+        "asset_class": asset_class,
+        "interval": YF_CRYPTO_INTRADAY_INTERVAL if asset_class == "crypto" else "1d",
+        "required_columns": sorted(_repair_required_columns(asset_class)),
+        "volume_policy": "optional_nonzero" if asset_class == "forex" else "required",
+        "source_metadata_validation": "strict",
+    }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**contract, "fingerprint": hashlib.sha256(encoded).hexdigest()}
+
+
 def _prepare_arrow_table_for_write(frame: object) -> object:
     _require_polars()
     ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + [
@@ -1266,6 +1296,14 @@ def _write_feature_parquet_atomic(
                     ),
                 }
             )
+            if source == "yahoo":
+                contract = acquisition_contract(asset_class)
+                metadata[PARQUET_META_ACQUISITION_VERSION_KEY] = str(
+                    contract["version"]
+                ).encode("utf-8")
+                metadata[PARQUET_META_ACQUISITION_FINGERPRINT_KEY] = str(
+                    contract["fingerprint"]
+                ).encode("utf-8")
             if requested_start_date is not None:
                 metadata[PARQUET_META_REQUESTED_START_KEY] = requested_start_date.encode(
                     "utf-8"
@@ -3825,6 +3863,7 @@ def _resolve_repair_plan(
     new_codes: set[str] | None = None,
 ) -> list[RepairCheck]:
     checks: list[RepairCheck] = []
+    required_columns = _repair_required_columns(asset_class)
     new_codes = new_codes or set()
     target_end = args.end_date or _today_str()
     requested_target_end_dt = _parse_date(target_end).date()
@@ -4000,7 +4039,7 @@ def _resolve_repair_plan(
                 )
                 continue
 
-            missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
+            missing_required = sorted(required_columns - columns)
             if missing_required:
                 if _is_delisted_record(record) and not verify_tw_delisted:
                     checks.append(
@@ -4688,6 +4727,7 @@ def main() -> None:
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(asset_elapsed_seconds[asset_class], 3),
             "status_counts": counts,
+            "acquisition_contract": acquisition_contract(asset_class),
         }
         if getattr(args, "run_id", None):
             source_summary["run_id"] = str(args.run_id)

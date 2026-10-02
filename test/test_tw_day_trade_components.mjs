@@ -123,6 +123,14 @@ test("mode card keeps filtered returns separate from the shared Discord account 
   context.renderModes({modes: [mode]});
   assert.match(output, /資料不可用/);
   assert.doesNotMatch(output, />\+25\.00%</);
+  mode.indicative_valuation_position_count = 7;
+  context.renderModes({modes: [mode]});
+  assert.match(output, /參考快照估值（非成交證據）/);
+  assert.match(output, />7 個持倉</);
+  assert.match(output, />\+3\.00%</);
+  mode.indicative_valuation_position_count = 0;
+  context.renderModes({modes: [mode]});
+  assert.doesNotMatch(output, /參考快照估值（非成交證據）/);
 });
 
 test("both TW charts key large history by date and source revision only", () => {

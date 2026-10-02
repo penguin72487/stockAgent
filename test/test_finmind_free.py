@@ -144,6 +144,23 @@ def test_receipt_requires_real_parquet_and_prioritizes_recent(tmp_path: Path) ->
     assert counts["complete"] == 0
 
 
+def test_session_retry_times_are_projected_from_existing_receipts_without_new_calls(tmp_path):
+    now = datetime(2026, 9, 25, 7, 0, tzinfo=UTC)
+    days = [date(2026, 9, 23), date(2026, 9, 24)]
+    for day, wait in zip(days, (60, 900)):
+        path = tmp_path / 'receipts' / SESSION_DATASETS[0] / f'{day}.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'status': 'partial',
+            'retry_at_utc': (now + timedelta(seconds=wait)).isoformat()}))
+    tasks, counts = _candidate_days(days, tmp_path, now=now)
+    item = counts['series'][SESSION_DATASETS[0]]
+    assert item['retry_tasks'] == 2
+    assert item['earliest_retry_at_utc'] == (now + timedelta(seconds=60)).isoformat()
+    assert item['latest_retry_at_utc'] == (now + timedelta(seconds=900)).isoformat()
+    assert item['deferred'] == 2
+    assert all(dataset != SESSION_DATASETS[0] for dataset, day in tasks)
+
+
 def test_monitor_keeps_source_series_separate_and_news_disabled(tmp_path: Path) -> None:
     now = datetime(2026, 9, 25, 7, 0, tzinfo=UTC)
     folder = tmp_path / "data_finmind"

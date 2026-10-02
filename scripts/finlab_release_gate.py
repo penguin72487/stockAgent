@@ -1,9 +1,8 @@
 """Fail-closed FinLab catalog freshness check for a private derived release.
 
-The SDK has no per-key version watermark.  A successful force-refresh check is
-therefore evidence only that this account observed the current SDK response at
-that instant; it does not prove historical point-in-time values or future
-updates.  All catalog keys must pass within one rolling day before packaging.
+A forced source response or a verified SDK incremental source check establishes
+only this account's observation at that instant. SDK publication hashes are not
+historical point-in-time proof. All keys still must pass within a rolling day.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts.download_finlab_history import safe_stem  # noqa: E402
+from stockagent.data.finlab_acquisition_contract import UPSTREAM_CHECK_MODES, safe_stem  # noqa: E402
 MAX_CHECK_AGE = timedelta(hours=24)
 
 
@@ -69,7 +68,7 @@ def catalog_readiness(output_root: Path, *, now: datetime | None = None,
             counts["invalid"] += 1
             continue
         checked = _time(receipt.get("source_checked_at_utc"))
-        if (receipt.get("source_check_mode") != "upstream_forced"
+        if (receipt.get("source_check_mode") not in UPSTREAM_CHECK_MODES
                 or checked is None or not observed - MAX_CHECK_AGE <= checked <= observed):
             counts["stale"] += 1
             continue

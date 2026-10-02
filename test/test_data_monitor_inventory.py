@@ -105,6 +105,7 @@ def test_shared_inventory_reuses_discovery_but_rechecks_changed_and_deleted_file
     }
     assert all(value >= 0 for value in record["timing_ms"].values())
     original = build_feature_inventory(tmp_path)
+    assert original["source_observation_root"] == record["source_observation_root"]
     def unexpected(*args):
         pytest.fail("same-build discovery/JSON must not run twice")
     monkeypatch.setattr(inventory_module, "_selected_files", unexpected)
@@ -120,11 +121,16 @@ def test_shared_inventory_reuses_discovery_but_rechecks_changed_and_deleted_file
     assert all(value >= 0 for value in feature_timing.values())
     _write_parquet(second, [date(2025, 1, 1), date(2025, 1, 2)])
     changed = build_feature_inventory(tmp_path, snapshot=snapshot)
+    assert changed["source_observation_root"] != record["source_observation_root"]
     assert changed["state"] == "partial"
     assert changed["files_with_schema"] == 1
     assert all(row["schema_state"] == "partial" and row["non_null_count"] is None for row in changed["rows"])
     second.unlink()
-    assert build_feature_inventory(tmp_path, snapshot=snapshot) == changed
+    removed = build_feature_inventory(tmp_path, snapshot=snapshot)
+    assert removed["source_observation_root"] != changed["source_observation_root"]
+    assert {key: value for key, value in removed.items() if key != "source_observation_root"} == {
+        key: value for key, value in changed.items() if key != "source_observation_root"
+    }
     with pytest.raises(ValueError, match="another repository"):
         build_feature_inventory(tmp_path / "other", snapshot=snapshot)
 
@@ -217,6 +223,8 @@ def test_unchanged_inventory_uses_small_index_without_full_cache_decode(
     assert second["datasets"] == first["datasets"]
     assert second["feature_revision"] == first["feature_revision"]
     assert snapshot.selected is not None
+    assert second["preflight_observation"]["outcome"] == "unchanged_full_probe"
+    assert second["preflight_observation"]["full_signature_probe"] is True
 
 
 def test_fast_index_rejects_group_reassignment_with_same_unique_files(
@@ -242,7 +250,7 @@ def test_fast_index_rejects_group_reassignment_with_same_unique_files(
     assert second["fast_index_hit"] is False
     assert second["datasets"]["yahoo:crypto"]["first"] == "2025-01-02"
     assert second["feature_revision"] != first["feature_revision"]
-    assert second["changed_dataset_ids"] is None  # Reassigned membership needs full scope.
+    assert second["changed_dataset_ids"] == ["yahoo:crypto", "yahoo:forex"]
 
 
 def test_changed_file_reuses_quick_index_discovery_on_slow_path(tmp_path, monkeypatch):
@@ -267,6 +275,31 @@ def test_changed_file_reuses_quick_index_discovery_on_slow_path(tmp_path, monkey
     assert current["timing_ms"]["quick_index_probe"] >= 0
 
 
+def test_preflight_observation_distinguishes_early_hint_reject_from_full_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(inventory_module, "FAST_INDEX_PREFLIGHT_HINTS", 1)
+    paths = [tmp_path / f"data_yahoo/crypto/{name}_features.parquet" for name in ("A", "B")]
+    for path in paths:
+        _write_parquet(path, [date(2025, 1, 1)])
+    first = build_record_inventory(tmp_path, refresh=True)
+    assert first["preflight_observation"]["outcome"] == "index_unavailable"
+    index_path = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    index = json.loads(index_path.read_text())
+    sampled = Path(index["preflight_file_hints"][0][0])
+    unhinted = next(path for path in paths if path != sampled)
+    _write_parquet(unhinted, [date(2025, 1, 1), date(2025, 1, 2)])
+    full = build_record_inventory(tmp_path, refresh=True)
+    assert full["preflight_observation"]["full_signature_probe"] is True
+    assert full["preflight_observation"]["outcome"] == "full_signature_changed"
+    _write_parquet(unhinted, [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)])
+    early = build_record_inventory(tmp_path, refresh=True)
+    assert early["preflight_observation"]["policy"] == "refreshed-priority-uniform-v1"
+    assert early["preflight_observation"]["full_signature_probe"] is False
+    assert early["preflight_observation"]["outcome"] == "source_hint_changed"
+    assert early["preflight_observation"]["hints_checked"] == 1
+    assert early["preflight_observation"]["wall_ms"] >= 0
+    assert early["datasets"]["yahoo:crypto"]["count"] == 4
+
+
 def test_preflight_file_hint_skips_redundant_full_probe_on_change(tmp_path, monkeypatch):
     path = tmp_path / "data_yahoo/crypto/A_features.parquet"
     _write_parquet(path, [date(2025, 1, 1)])
@@ -288,6 +321,51 @@ def test_preflight_file_hint_skips_redundant_full_probe_on_change(tmp_path, monk
     assert current["fast_index_hit"] is False
     assert current["refreshed_files"] == 1
     assert current["datasets"]["yahoo:crypto"]["count"] == 2
+
+
+def test_preflight_priority_is_bounded_deterministic_and_uses_actual_refreshes(monkeypatch):
+    monkeypatch.setattr(inventory_module, "FAST_INDEX_PREFLIGHT_HINTS", 4)
+    cache = {f"/{i}": {"file_identity": [1, 2, 3, 999, 10 - i]} for i in range(10)}
+    arguments = {"recently_refreshed": ["/9", "/8", "/7", "/6", "/missing", "/9"], "seed": "fixture"}
+    priority = inventory_module._preflight_keys(cache, **arguments)
+    assert len(priority) == len(set(priority)) == 4
+    assert set(priority[:3]) <= {"/9", "/8", "/7", "/6"}
+    assert set(priority) <= cache.keys()
+    assert inventory_module._preflight_keys(dict(reversed(list(cache.items()))), **arguments) == priority
+    assert inventory_module._preflight_keys(cache) == inventory_module._preflight_keys(cache, recently_refreshed=[])
+    assert inventory_module._preflight_keys({}) == []
+
+
+def test_refreshed_unsampled_path_is_promoted_to_next_preflight(tmp_path, monkeypatch):
+    monkeypatch.setattr(inventory_module, "FAST_INDEX_PREFLIGHT_HINTS", 1)
+    paths = [tmp_path / f"data_yahoo/crypto/{name}_features.parquet" for name in ("A", "B", "C")]
+    for path in paths:
+        _write_parquet(path, [date(2025, 1, 1)])
+    build_record_inventory(tmp_path, refresh=True)
+    index_path = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    original = json.loads(index_path.read_text(encoding="utf-8"))
+    assert original["preflight_policy"] == "refreshed-priority-uniform-v1"
+    sampled = original["preflight_file_hints"][0][0]
+    changed = next(path for path in paths if str(path) != sampled)
+    _write_parquet(changed, [date(2025, 1, 1), date(2025, 1, 2)])
+    first_refresh = build_record_inventory(tmp_path, refresh=True)
+    assert first_refresh["refreshed_files"] == 1  # unsampled still fully checked
+    promoted = json.loads(index_path.read_text(encoding="utf-8"))
+    assert promoted["preflight_file_hints"][0][0] == str(changed)
+    assert promoted["preflight_file_hints"][0][1] == inventory_module._file_identity(changed.stat())
+
+    _write_parquet(changed, [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)])
+    real_fingerprint = inventory_module._selection_fingerprint
+
+    def no_redundant_full_probe(selected, *, cache=None):
+        if cache is None:
+            pytest.fail("recently changed source must be rejected by its hint before probing all history")
+        return real_fingerprint(selected, cache=cache)
+
+    monkeypatch.setattr(inventory_module, "_selection_fingerprint", no_redundant_full_probe)
+    refreshed = build_record_inventory(tmp_path, refresh=True)
+    assert refreshed["refreshed_files"] == 1
+    assert refreshed["datasets"]["yahoo:crypto"]["count"] == 5  # 3 changed rows + two unchanged files
 
 
 def test_invalid_preflight_hint_falls_back_to_full_inventory(tmp_path):
@@ -429,6 +507,56 @@ def test_file_disappearing_after_discovery_cannot_reuse_verified_counts(
     assert current["datasets"]["yahoo:crypto"]["count"] is None
 
 
+def test_transient_directory_move_cannot_pin_partial_counts_in_fast_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    first = build_record_inventory(tmp_path, refresh=True)
+    index = tmp_path / "artifacts/live/data_monitor/record_inventory_fast_index.json"
+    index.unlink()
+    original_aggregate = inventory_module._aggregate
+    hidden = path.parent.with_name("temporarily-hidden")
+
+    def moved_during_aggregation(paths, cache, **kwargs):
+        if kwargs.get("dataset") != "yahoo:crypto":
+            return original_aggregate(paths, cache, **kwargs)
+        path.parent.rename(hidden)
+        try:
+            return original_aggregate(paths, cache, **kwargs)
+        finally:
+            hidden.rename(path.parent)
+
+    monkeypatch.setattr(inventory_module, "_aggregate", moved_during_aggregation)
+    partial = build_record_inventory(tmp_path, refresh=True)
+    assert partial["datasets"]["yahoo:crypto"]["count"] is None
+    assert partial["source_observation_root"] != first["source_observation_root"]
+    assert not index.exists(), "a transient absence must not create a reusable partial index"
+
+    monkeypatch.setattr(inventory_module, "_aggregate", original_aggregate)
+    recovered = build_record_inventory(tmp_path, refresh=True)
+    assert recovered["fast_index_hit"] is False
+    assert recovered["datasets"]["yahoo:crypto"]["count"] == 1
+    assert recovered["source_observation_root"] == first["source_observation_root"]
+    assert build_record_inventory(tmp_path, refresh=True)["fast_index_hit"] is True
+
+
+def test_same_footer_replacement_changes_source_observation_and_revision(tmp_path: Path) -> None:
+    path = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(path, [date(2025, 1, 1)])
+    first = build_record_inventory(tmp_path, refresh=True)
+    replacement = tmp_path / "replacement.parquet"
+    replacement.write_bytes(path.read_bytes())
+    os.replace(replacement, path)
+    current = build_record_inventory(tmp_path, refresh=True)
+    assert current["datasets"] == first["datasets"]
+    assert current["source_observation_root"] != first["source_observation_root"]
+    assert current["feature_revision"] != first["feature_revision"]
+    assert current["changed_dataset_ids"] == ["yahoo:crypto"]
+    assert current["source_observation_matches_cache"] is True
+    assert build_feature_inventory(tmp_path)["source_observation_root"] == current["source_observation_root"]
+
+
 def test_bybit_venue_training_table_is_registered_without_group_double_count() -> None:
     group, _, path, primary = PHYSICAL_FAMILIES["bybit:venue-training-features"]
     assert group == "bybit"
@@ -450,6 +578,55 @@ def _write_parquet(path: Path, dates: list[date]) -> None:
         path,
         row_group_size=2,
     )
+
+
+@pytest.mark.parametrize("prior_version", [10, 11])
+def test_membership_contract_migration_retains_footer_rows_with_zero_read_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_version: int,
+) -> None:
+    for name in ("A", "B"):
+        _write_parquet(tmp_path / f"data_yahoo/crypto/{name}_features.parquet", [date(2025, 1, 1)])
+    original = build_record_inventory(tmp_path, refresh=True)
+    cache_path = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
+    prior = json.loads(cache_path.read_text(encoding="utf-8"))
+    prior["version"] = prior_version
+    if prior_version == 10:
+        prior.pop("dataset_memberships")
+        prior.pop("dataset_membership_version")
+        prior["selection_membership"] = "legacy-global-fingerprint"
+    cache_path.write_text(json.dumps(prior), encoding="utf-8")
+
+    def no_footer(*args):
+        pytest.fail("identical footer semantics must not discard all cached observations")
+
+    monkeypatch.setattr(inventory_module, "parquet_footer_stats", no_footer)
+    restored = build_record_inventory(tmp_path, refresh=True, max_refresh_files=0)
+    current = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert current["version"] == 10
+    assert current["dataset_membership_version"] == 1
+    assert inventory_module._bound_dataset_memberships(current) is not None
+    assert restored["refreshed_files"] == 0
+    assert restored["changed_dataset_ids"] is None
+    assert restored["datasets"] == original["datasets"]
+    assert current["files"] == prior["files"]
+    assert current["schemas"] == prior["schemas"]
+    assert build_record_inventory(tmp_path, refresh=True)["fast_index_hit"] is True
+
+
+def test_corrupt_membership_binding_is_repaired_before_safe_delta_reuse(tmp_path: Path) -> None:
+    _write_parquet(tmp_path / "data_yahoo/crypto/A_features.parquet", [date(2025, 1, 1)])
+    original = build_record_inventory(tmp_path, refresh=True)
+    cache_path = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
+    corrupted = json.loads(cache_path.read_text(encoding="utf-8"))
+    corrupted["dataset_memberships"]["yahoo:crypto"] = "0" * 32
+    cache_path.write_text(json.dumps(corrupted), encoding="utf-8")
+    repaired = build_record_inventory(tmp_path, refresh=True)
+    assert repaired["fast_index_hit"] is False
+    assert repaired["changed_dataset_ids"] is None
+    assert repaired["datasets"] == original["datasets"]
+    restored = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert inventory_module._bound_dataset_memberships(restored) is not None
+    assert build_record_inventory(tmp_path, refresh=True)["fast_index_hit"] is True
 
 
 def test_parquet_footer_proves_actual_bounds_not_requested_start(tmp_path: Path) -> None:
@@ -935,6 +1112,51 @@ def test_feature_reuse_refuses_changed_or_unbound_source_metadata(
         source_metadata_sha256=old_metadata,
     ) is None
     assert not snapshot_service._feature_reuse_receipt_path(feature).exists()
+
+
+@pytest.mark.parametrize("tamper", ["root", "digest", "missing_root", "missing_receipt", "invalid_json"])
+def test_feature_reuse_requires_exact_source_observation_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    monkeypatch.setattr(snapshot_service, "REPO_ROOT", tmp_path)
+    feature = tmp_path / "feature_inventory.json"
+    feature.write_text(json.dumps({
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False, "rows": [{"field": "close"}],
+    }))
+    root = "a" * 32
+    snapshot_service._write_feature_reuse_receipt(feature, 1, source_observation_root=root)
+    assert snapshot_service._current_feature_snapshot(feature, source_observation_root=root) == 1
+    assert snapshot_service._current_feature_snapshot(feature, source_observation_root="b" * 32) is None
+    receipt_path = snapshot_service._feature_reuse_receipt_path(feature)
+    receipt = json.loads(receipt_path.read_text())
+    if tamper == "missing_receipt":
+        receipt_path.unlink()
+    elif tamper == "invalid_json":
+        receipt_path.write_text("{invalid")
+    else:
+        if tamper == "missing_root":
+            receipt.pop("source_observation_root")
+        elif tamper == "root":
+            receipt["source_observation_root"] = "b" * 32
+        else:
+            receipt["source_observation_sha256"] = "0" * 64
+        receipt_path.write_text(json.dumps(receipt))
+    assert snapshot_service._current_feature_snapshot(feature, source_observation_root=root) is None
+
+
+@pytest.mark.parametrize("root", ["", "A" * 32, "a" * 31, "a" * 33, [], {"invalid": True}])
+def test_malformed_source_observation_never_becomes_a_reuse_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root,
+) -> None:
+    monkeypatch.setattr(snapshot_service, "REPO_ROOT", tmp_path)
+    feature = tmp_path / "feature_inventory.json"
+    feature.write_text(json.dumps({
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False, "rows": [],
+    }))
+    snapshot_service._write_feature_reuse_receipt(feature, 0, source_observation_root=root)
+    assert snapshot_service._current_feature_snapshot(feature, source_observation_root=root) is None
 
 
 def test_feature_reuse_receipt_rechecks_digest_and_falls_back_to_full_parse(

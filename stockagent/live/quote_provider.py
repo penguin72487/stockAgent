@@ -19,6 +19,7 @@ import numpy as np
 import requests
 
 from stockagent.live.shioaji_traffic_ledger import (
+    QUERY_OBSERVATION_CONTRACT,
     record_avoided_query,
     shioaji_query,
 )
@@ -40,6 +41,8 @@ _SHIOAJI_STOCK_CACHE: dict[str, tuple[float, dict[str, float | int | None]]] = {
 _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
 _SHIOAJI_STOCK_LAST_LOGIN_ERROR: str | None = None
 _SHIOAJI_STOCK_LOGIN_FAILURES = 0
+_SHIOAJI_HISTORY_REQUEST_LOCK = threading.Lock()
+_SHIOAJI_HISTORY_REQUEST_TIMES: deque[float] = deque()
 _SHIOAJI_STREAM_LOCK = threading.RLock()
 _SHIOAJI_STREAM_API: object | None = None
 _SHIOAJI_STREAM_SUBSCRIPTIONS: set[tuple[str, str]] = set()
@@ -460,8 +463,6 @@ def fetch_shioaji_historical_stock_entry_books(
     contract_missing = 0
     queried = 0
     stopped_for_traffic = False
-    request_times: deque[float] = deque()
-
     for index, symbol in enumerate(requested, start=1):
         current_usage = usage()
         if current_usage is not None and float(current_usage["fraction"]) >= float(
@@ -477,15 +478,7 @@ def fetch_shioaji_historical_stock_entry_books(
             contract_missing += 1
             continue
 
-        now_monotonic = time.monotonic()
-        while request_times and now_monotonic - request_times[0] >= 5.0:
-            request_times.popleft()
-        if len(request_times) >= 50:
-            time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
-            now_monotonic = time.monotonic()
-            while request_times and now_monotonic - request_times[0] >= 5.0:
-                request_times.popleft()
-        request_times.append(time.monotonic())
+        _wait_stock_history_request_slot()
         try:
             with shioaji_query(
                 api,
@@ -930,6 +923,62 @@ def load_local_stock_0901_vwaps(
     }
 
 
+def _wait_stock_history_request_slot() -> None:
+    """Share the current broker window across this process's history readers.
+
+    The canonical provider profile is 50 market-data calls per *10* seconds,
+    not the obsolete 50/5s. History keeps its existing 20% reserve for live
+    reads. This gate does not claim to account for snapshots or other clients;
+    it is not a website/global application limit.
+    """
+
+    from downloader.common import provider_rate_limit
+
+    profile = provider_rate_limit("shioaji_quote_query")
+    window_seconds = float(profile.seconds)
+    history_budget = max(1, int(profile.requests * 0.8))
+
+    with _SHIOAJI_HISTORY_REQUEST_LOCK:
+        now = time.monotonic()
+        while _SHIOAJI_HISTORY_REQUEST_TIMES and now - _SHIOAJI_HISTORY_REQUEST_TIMES[0] >= window_seconds:
+            _SHIOAJI_HISTORY_REQUEST_TIMES.popleft()
+        if len(_SHIOAJI_HISTORY_REQUEST_TIMES) >= history_budget:
+            time.sleep(max(0.0, window_seconds + 0.01 - (now - _SHIOAJI_HISTORY_REQUEST_TIMES[0])))
+            now = time.monotonic()
+            while _SHIOAJI_HISTORY_REQUEST_TIMES and now - _SHIOAJI_HISTORY_REQUEST_TIMES[0] >= window_seconds:
+                _SHIOAJI_HISTORY_REQUEST_TIMES.popleft()
+        _SHIOAJI_HISTORY_REQUEST_TIMES.append(time.monotonic())
+
+
+def _stock_history_result(method, *, timeout_ms: int, nonblocking: bool, **kwargs):
+    """Use the callback result, not the timeout=0 placeholder, on live recovery.
+
+    Python's Event wait releases the interpreter to the executor loop. A late
+    callback after the bounded wait is discarded; it cannot publish a result
+    into another request or into a subsequent trading session.
+    """
+
+    if not nonblocking:
+        return method(timeout=int(timeout_ms), **kwargs)
+    received, closed = threading.Event(), threading.Event()
+    values = []
+
+    def callback(value):
+        if not closed.is_set():
+            values[:] = [value]
+            received.set()
+
+    try:
+        method(timeout=0, cb=callback, **kwargs)
+        if not received.wait(timeout=max(0.001, int(timeout_ms) / 1000.0)):
+            raise TimeoutError("Shioaji historical data callback timed out")
+        if values[0] is None:
+            raise ValueError("Shioaji historical data callback returned no result")
+        return values[0]
+    finally:
+        closed.set()
+
+
 def fetch_shioaji_historical_stock_0901_vwaps(
     symbols: list[str],
     *,
@@ -938,6 +987,8 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     timeout_ms: int = 30_000,
     progress_every: int = 50,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
+    nonblocking: bool = False,
+    resolved_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, dict[str, float | int | str]], dict[str, Any]]:
     """Fetch the observed right-labelled 09:01 minute price per stock.
 
@@ -958,18 +1009,37 @@ def fetch_shioaji_historical_stock_0901_vwaps(
 
     if not 0.0 < float(max_traffic_fraction) <= 1.0:
         raise ValueError("max_traffic_fraction must be in (0, 1]")
+    fetch_started = time.monotonic()
     requested = list(dict.fromkeys(str(symbol).strip() for symbol in symbols))
     requested = [symbol for symbol in requested if symbol]
     api = _shioaji_stock_api()
     import shioaji as sj
 
+    api_ready_ms = (time.monotonic() - fetch_started) * 1000.0
+    guard_usage_ms = 0.0
+    guard_usage_calls = 0
+    contract_resolution_ms = 0.0
+    history_admission_ms = 0.0
+    resolved_callback_ms = 0.0
+    resolved_callback_calls = 0
+    query_phases = {name: 0.0 for name in (
+        "usage_before_ms", "request_body_ms", "usage_after_ms", "pre_record_ms",
+        "ledger_record_ms", "total_context_ms",
+    )}
+    measured_queries = unmeasured_queries = ledger_record_failures = 0
+
     def usage() -> dict[str, int | float] | None:
+        nonlocal guard_usage_ms, guard_usage_calls
+        started = time.monotonic()
+        guard_usage_calls += 1
         try:
             current = api.usage()
             used = int(current.bytes)
             limit = int(current.limit_bytes)
         except Exception:
             return None
+        finally:
+            guard_usage_ms += (time.monotonic() - started) * 1000.0
         if used < 0 or limit <= 0:
             return None
         return {
@@ -977,6 +1047,32 @@ def fetch_shioaji_historical_stock_0901_vwaps(
             "limit_bytes": limit,
             "fraction": used / limit,
         }
+
+    @contextmanager
+    def history_query(*, consumer: str, method: str, details: dict[str, Any]):
+        nonlocal measured_queries, unmeasured_queries, ledger_record_failures
+        timing: dict[str, Any] = {}
+        try:
+            with shioaji_query(
+                api, consumer=consumer, method=method, asset_class="stock",
+                details=details, timing=timing,
+            ) as set_result:
+                yield set_result
+        finally:
+            try:
+                measured = (
+                    {name: float(timing[name]) for name in query_phases}
+                    if timing.get("contract") == QUERY_OBSERVATION_CONTRACT else None
+                )
+            except (KeyError, TypeError, ValueError):
+                measured = None
+            if measured is not None:
+                measured_queries += 1
+                for name in query_phases:
+                    query_phases[name] += measured[name]
+                ledger_record_failures += int(bool(timing.get("ledger_record_failed")))
+            else:
+                unmeasured_queries += 1
 
     usage_before = usage()
     resolved: dict[str, dict[str, float | int | str]] = {}
@@ -988,8 +1084,10 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     price_method_counts: dict[str, int] = {}
     contract_missing = 0
     stopped_for_traffic = False
-    queried_symbol_codes: list[str] = []
-    request_times: deque[float] = deque()
+    attempted_symbol_codes: list[str] = []
+    failed_symbol_codes: list[str] = []
+    deferred_kbar_symbol_codes: list[str] = []
+    missing_contract_codes: list[str] = []
     window_start = datetime.combine(
         trading_date,
         datetime_time(9, 0),
@@ -1010,29 +1108,25 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         ):
             stopped_for_traffic = True
             break
+        contract_started = time.monotonic()
         with _SHIOAJI_STOCK_LOCK:
             if symbol not in _SHIOAJI_STOCK_CONTRACTS:
                 _SHIOAJI_STOCK_CONTRACTS[symbol] = api.contracts.get(symbol)
             contract = _SHIOAJI_STOCK_CONTRACTS[symbol]
+        contract_resolution_ms += (time.monotonic() - contract_started) * 1000.0
         if contract is None:
             contract_missing += 1
+            missing_contract_codes.append(symbol)
             continue
 
-        now_monotonic = time.monotonic()
-        while request_times and now_monotonic - request_times[0] >= 5.0:
-            request_times.popleft()
-        if len(request_times) >= 50:
-            time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
-            now_monotonic = time.monotonic()
-            while request_times and now_monotonic - request_times[0] >= 5.0:
-                request_times.popleft()
-        request_times.append(time.monotonic())
+        admission_started = time.monotonic()
+        _wait_stock_history_request_slot()
+        history_admission_ms += (time.monotonic() - admission_started) * 1000.0
+        attempted_symbol_codes.append(symbol)
         try:
-            with shioaji_query(
-                api,
+            with history_query(
                 consumer="tw_day_trade_missed_open_0901_vwap",
                 method="ticks",
-                asset_class="stock",
                 details={
                     "contract": symbol,
                     "date": trading_date.isoformat(),
@@ -1041,17 +1135,17 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                     "right_label": "09:01:00",
                 },
             ) as set_ledger_result:
-                ticks = api.ticks(
+                ticks = _stock_history_result(
+                    api.ticks,
                     contract=contract,
                     date=trading_date.isoformat(),
                     query_type=sj.TicksQueryType.RangeTime,
                     time_start="09:00:00",
                     time_end="09:00:59",
-                    timeout=int(timeout_ms),
+                    timeout_ms=int(timeout_ms), nonblocking=nonblocking,
                 )
                 set_ledger_result(ticks)
             queried += 1
-            queried_symbol_codes.append(symbol)
             timestamps = list(getattr(ticks, "ts", ()))
             closes = list(getattr(ticks, "close", ()))
             volumes = list(getattr(ticks, "volume", ()))
@@ -1097,33 +1191,28 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                     current_usage["fraction"]
                 ) >= float(max_traffic_fraction):
                     stopped_for_traffic = True
-                    source_empty += 1
+                    # Empty ticks are not an authoritative missing minute bar:
+                    # its KBar fallback has not been requested at all.
+                    deferred_kbar_symbol_codes.append(symbol)
                     continue
-                now_monotonic = time.monotonic()
-                while request_times and now_monotonic - request_times[0] >= 5.0:
-                    request_times.popleft()
-                if len(request_times) >= 50:
-                    time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
-                    now_monotonic = time.monotonic()
-                    while request_times and now_monotonic - request_times[0] >= 5.0:
-                        request_times.popleft()
-                request_times.append(time.monotonic())
-                with shioaji_query(
-                    api,
+                admission_started = time.monotonic()
+                _wait_stock_history_request_slot()
+                history_admission_ms += (time.monotonic() - admission_started) * 1000.0
+                with history_query(
                     consumer="tw_day_trade_missed_open_0901_kbar_fallback",
                     method="kbars",
-                    asset_class="stock",
                     details={
                         "contract": symbol,
                         "date": trading_date.isoformat(),
                         "right_label": "09:01:00",
                     },
                 ) as set_kbar_ledger_result:
-                    kbars = api.kbars(
+                    kbars = _stock_history_result(
+                        api.kbars,
                         contract=contract,
                         start=trading_date.isoformat(),
                         end=trading_date.isoformat(),
-                        timeout=int(timeout_ms),
+                        timeout_ms=int(timeout_ms), nonblocking=nonblocking,
                     )
                     set_kbar_ledger_result(kbars)
                 kbar_fallback_queries += 1
@@ -1224,6 +1313,14 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         except Exception as exc:
             key = type(exc).__name__
             error_counts[key] = error_counts.get(key, 0) + 1
+            failed_symbol_codes.append(symbol)
+        if symbol in resolved and resolved_callback is not None:
+            callback_started = time.monotonic()
+            resolved_callback_calls += 1
+            try:
+                resolved_callback(symbol, dict(resolved[symbol]))
+            finally:
+                resolved_callback_ms += (time.monotonic() - callback_started) * 1000.0
         if progress_every > 0 and (
             index % progress_every == 0 or index == len(requested)
         ):
@@ -1236,6 +1333,12 @@ def fetch_shioaji_historical_stock_0901_vwaps(
             if progress_callback is not None:
                 progress_callback(index, len(requested), queried, len(resolved))
 
+    usage_after = usage()
+    total_fetch_ms = (time.monotonic() - fetch_started) * 1000.0
+    separately_measured_ms = (
+        api_ready_ms + guard_usage_ms + contract_resolution_ms + history_admission_ms
+        + resolved_callback_ms + query_phases["total_context_ms"]
+    )
     return resolved, {
         "source": "shioaji:historical_0901_minute_price_ticks_then_kbar",
         "trading_date": trading_date.isoformat(),
@@ -1244,19 +1347,48 @@ def fetch_shioaji_historical_stock_0901_vwaps(
         "price_contract": "sum(close*volume)/sum(volume)",
         "requested_symbols": len(requested),
         "queried_symbols": queried,
-        "attempted_symbols": queried_symbol_codes,
+        "attempted_symbols": attempted_symbol_codes,
+        "failed_symbols": failed_symbol_codes,
+        "retry_symbols": sorted(set(failed_symbol_codes + deferred_kbar_symbol_codes)),
+        "deferred_kbar_symbols": deferred_kbar_symbol_codes,
+        "contract_missing_symbol_codes": missing_contract_codes,
         "resolved_symbols": len(resolved),
         "source_empty_symbols": source_empty,
         "kbar_fallback_queries": kbar_fallback_queries,
         "kbar_fallback_resolved_symbols": kbar_fallback_resolved,
         "price_method_counts": price_method_counts,
         "contract_missing_symbols": contract_missing,
-        "unqueried_symbols": max(0, len(requested) - queried - contract_missing),
+        "unqueried_symbols": max(0, len(requested) - len(attempted_symbol_codes) - contract_missing),
         "error_counts": error_counts,
         "stopped_for_traffic": stopped_for_traffic,
         "max_traffic_fraction": float(max_traffic_fraction),
         "usage_before": usage_before,
-        "usage_after": usage(),
+        "usage_after": usage_after,
+        "timing": {
+            "contract": "historical-0901-fetch-phases-v1",
+            "query_observation_contract": QUERY_OBSERVATION_CONTRACT,
+            "clock": "monotonic",
+            "scope": "remote fetch including callbacks; excludes local scans, final outer receipt and NAV processing",
+            "total_fetch_ms": round(total_fetch_ms, 3),
+            "api_ready_ms": round(api_ready_ms, 3),
+            "guard_usage_calls": guard_usage_calls,
+            "guard_usage_ms": round(guard_usage_ms, 3),
+            "contract_resolution_ms": round(contract_resolution_ms, 3),
+            "history_admission_ms": round(history_admission_ms, 3),
+            "resolved_callback_calls": resolved_callback_calls,
+            "resolved_callback_ms": round(resolved_callback_ms, 3),
+            "measured_query_contexts": measured_queries,
+            "unmeasured_query_contexts": unmeasured_queries,
+            "query_phase_totals_ms": {
+                name: round(value, 3) if measured_queries else None
+                for name, value in query_phases.items()
+            },
+            "ledger_record_failures": ledger_record_failures,
+            "remaining_processing_ms": (
+                round(max(0.0, total_fetch_ms - separately_measured_ms), 3)
+                if unmeasured_queries == 0 else None
+            ),
+        },
     }
 
 
@@ -1309,7 +1441,6 @@ def fetch_shioaji_current_stock_minute_bars(
     zero_volume_rows = 0
     contract_missing = 0
     stopped_for_traffic = False
-    request_times: deque[float] = deque()
     usage_before = usage()
     for index, symbol in enumerate(requested, start=1):
         current_usage = usage()
@@ -1325,15 +1456,7 @@ def fetch_shioaji_current_stock_minute_bars(
         if contract is None:
             contract_missing += 1
             continue
-        now_monotonic = time.monotonic()
-        while request_times and now_monotonic - request_times[0] >= 1.0:
-            request_times.popleft()
-        if len(request_times) >= 5:
-            time.sleep(max(0.0, 1.01 - (now_monotonic - request_times[0])))
-            now_monotonic = time.monotonic()
-            while request_times and now_monotonic - request_times[0] >= 1.0:
-                request_times.popleft()
-        request_times.append(time.monotonic())
+        _wait_stock_history_request_slot()
         try:
             with shioaji_query(
                 api,
@@ -1615,6 +1738,7 @@ def fetch_shioaji_stock_live_quotes(symbols: list[str], *, trading_date: date) -
         lower = lower or _contract_positive(contract, "limit_down")
         reference = reference or _contract_positive(contract, "reference")
         q = {"symbol": code, "source": "shioaji_stock_quote_stream", "available": bool(row),
+             "stream_reconciliation_pending": not _SHIOAJI_STREAM_TARGET_READY,
              "stream_subscribed": code in selected_set and (code, "quote") in _SHIOAJI_STREAM_SUBSCRIPTIONS,
              "stream_capacity_limited": code not in selected_set,
              "last": row.get("close"), "open": row.get("open"),

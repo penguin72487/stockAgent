@@ -46,6 +46,55 @@ def commands(root: Path, output: Path, start_year: int, day: date) -> list[list[
              "--request-interval", "1.0"]]
 
 
+def sync_historical_share_catalog(root: Path, output: Path, day: date) -> dict:
+    """Reuse an accepted action tail instead of downloading the baseline again.
+
+    Historical catalog readiness is separate from current-session action
+    readiness: a missing or rejected baseline must not disable valid opening
+    action receipts. The existing merger owns overlap, raw-source, and lock
+    acceptance; this orchestrator never extends coverage by editing a date.
+    """
+    started = time.monotonic()
+    baseline_path = root / "tw_share_replacement_reference.summary.json"
+    result = {"status": "waiting_baseline"}
+    try:
+        if not baseline_path.is_file():
+            result["reason"] = "accepted_historical_catalog_absent"
+            return result
+        baseline = json.loads(baseline_path.read_text())
+        first = date.fromisoformat(baseline["coverage_start"])
+        last = date.fromisoformat(baseline["coverage_end"])
+        if last >= day:
+            from scripts.merge_tw_share_replacement_reference import _accepted
+            _accepted(root, start=first, end=day)
+            result.update(status="ready", action="no_op_verified", coverage_end=str(last))
+            return result
+        tail = json.loads((output / "tw_share_replacement_reference.summary.json").read_text())
+        cutover = date.fromisoformat(tail["coverage_start"])
+        tail_end = date.fromisoformat(tail["coverage_end"])
+        if tail_end < day:
+            raise ValueError("accepted action tail does not reach the requested day")
+        command = [sys.executable, str(ROOT / "scripts/merge_tw_share_replacement_reference.py"),
+                   "--public-root", str(root), "--tail-root", str(output),
+                   "--cutover-date", str(cutover), "--required-start-date", str(first),
+                   "--required-end-date", str(day), "--apply"]
+        process = subprocess.run(command, cwd=ROOT, timeout=300, check=False,
+                                 capture_output=True, text=True)
+        if process.returncode:
+            raise RuntimeError(f"canonical historical catalog merge failed ({process.returncode}): "
+                               + process.stderr[-2000:])
+        proof = json.loads(process.stdout)
+        if proof.get("verified") is not True or proof.get("coverage") != [str(first), str(tail_end)]:
+            raise ValueError("canonical historical catalog merge did not accept the requested horizon")
+        result.update(status="ready", action="merged_verified_tail", merge=proof)
+        return result
+    except (OSError, TypeError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as error:
+        result.update(status="blocked", error_type=type(error).__name__, error=str(error)[-2500:])
+        return result
+    finally:
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--public-root", type=Path)
@@ -99,10 +148,13 @@ def main() -> None:
             if verified.coverage_end < np.datetime64(day) or verified.exact_coverage_end < np.datetime64(day):
                 raise RuntimeError("execution-action source horizon does not reach the session")
             events = load_share_replacements(output, required_start=date(args.start_year, 1, 1), required_end=day)
+            validation_elapsed = round(time.monotonic() - validation_started, 3)
+            historical_sync = sync_historical_share_catalog(root, output, day)
             receipt.update(status="source_ready", share_replacement_events=len(events),
                 exact_terms_are_position_gated=True,
                 sources={p.name: sha256_file(p) for p in output.glob("*.parquet")},
-                validation_elapsed_seconds=round(time.monotonic() - validation_started, 3),
+                validation_elapsed_seconds=validation_elapsed,
+                historical_catalog_sync=historical_sync,
                 total_elapsed_seconds=round(time.monotonic() - refresh_started, 3),
                 completed_at=datetime.now(ZoneInfo("Asia/Taipei")).isoformat())
             atomic_write_json(target, receipt)

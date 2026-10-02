@@ -30,7 +30,10 @@ function renderQuota(data) {
   text("quota-limit", mb(limit));
   text("quota-remaining", mb(quota.remaining_mb));
   text("quota-safe-remaining", limit === null || used === null ? "—" : mb(Math.max(0, limit - used - reserve)));
-  text("quota-reserve-basis", `依下載器最近收據保留 ${mb(reserve)}；供應商可能另有單次請求成本`);
+  const incrementalExempt = data.workload?.state === "available" && data.workload?.incremental_quota_policy === "provider_enforced_no_local_reserve";
+  text("quota-reserve-basis", incrementalExempt
+    ? `歷史回補／整表保留 ${mb(reserve)}；已驗證 SDK 追新不受此本機門檻限制。帳號用量每分鐘取樣，官方實際限額仍有效。`
+    : `歷史回補／整表保留 ${mb(reserve)}；追新規則待新鮮快照核實，官方帳號觀測另列。`);
   text("quota-percent", ratio === null ? "無帳號觀測" : `${pct(ratio)} 的每日額度`);
   text("quota-ratio", pct(ratio));
   text("quota-reset", timeLabel(quota.reset_at_utc));
@@ -174,12 +177,12 @@ function renderWorkload(info) {
     article.append(heading, bar, detail); container.append(article);
   }
   const scenarios = valid ? info.scenarios || {} : {}, reference = scenarios.reference || {};
-  const eta = (scenario) => scenario?.finish_at_utc ? timeLabel(scenario.finish_at_utc) : ({object_exceeds_daily_budget: "單表超過可用日額度", insufficient_samples: "耗時／流量樣本不足", scheduler_unverified: "排程未核實", quota_unverified: "額度觀測待更新", unscheduled_work: "有未排入的待辦", blocked: "等待來源／優先權"}[scenario?.state] || "暫無可估時間");
+  const eta = (scenario) => scenario?.state === "complete" ? "本次已查核" : scenario?.finish_at_utc ? timeLabel(scenario.finish_at_utc) : ({object_exceeds_daily_budget: "單表超過可用日額度", capacity_constrained: "新增追新排擠；容量受限", insufficient_samples: "耗時／流量樣本不足", scheduler_unverified: "排程未核實", quota_unverified: "額度觀測待更新", unscheduled_work: "有未排入的待辦", not_required: "目前沒有待辦", blocked: "來源條件未解決"}[scenario?.state] || "暫無可估時間");
   text("download-global-eta", eta(reference));
-  text("workload-time-left", reference.finish_at_utc ? `距現在約 ${durationLabel(reference.remaining_seconds)}；不含下方阻塞項目` : "保留未知，不顯示假倒數。");
+  text("workload-time-left", reference.finish_at_utc ? `距現在約 ${durationLabel(reference.remaining_seconds)}；包含插隊的高優先新到期，不是所有未來追新或來源問題的完成日。` : "保留未知，不顯示假倒數。");
   text("workload-processing", durationLabel(reference.processing_seconds));
   text("workload-wait", durationLabel(reference.total_wait_seconds ?? reference.quota_opening_wait_seconds));
-  text("workload-reset-count", reference.quota_resets == null ? "配額與開盤保護待核實" : `跨 ${count(reference.quota_resets)} 次日額度重置；FinLab MB 沿用下載器 1024² 位元組換算`);
+  text("workload-reset-count", reference.quota_resets == null ? "配額與開盤保護待核實" : `跨 ${count(reference.quota_resets)} 次重置；加入 ${count(reference.newly_due_checks)} 次新到期檢查。${reference.finish_at_utc ? "" : "未完成情境的耗時只代表模擬至停止點。"}`);
   text("workload-fast", eta(scenarios.fast)); text("workload-slow", eta(scenarios.slow));
   text("workload-eta-basis", `${info.eta_basis || "待取得同鍵的完整下載加轉存耗時，以及新鮮帳號配額。"}${n(info.overhead_seconds_per_key_estimate) === null ? " 尚無鍵間開銷樣本，耗時可能低估。" : ` 已加入相鄰完成收據推估的鍵間開銷：每鍵約 ${decimal.format(info.overhead_seconds_per_key_estimate)} 秒（${count(info.overhead_samples)} 個間隔樣本）。`}`);
   const budget = n(info.daily_budget_bytes), size = n(transfer.total_bytes_estimate);
@@ -188,6 +191,28 @@ function renderWorkload(info) {
     : "每日可用額度或整體傳輸量尚未量測。");
   const blocked = Array.isArray(info.blocked_keys) ? info.blocked_keys : [], validation = Array.isArray(info.validation_waiting_keys) ? info.validation_waiting_keys : [];
   text("workload-blockers", `無法承諾全資料完成日。${blocked.length ? `來源／權限阻塞：${blocked.join("、")}。` : ""}${validation.length ? `優先權等待：${validation.join("、")}。` : ""}全市場 Tick 另計且最低優先；已有 ${count(info.tick?.local_rows)} 筆（${timeLabel(info.tick?.observed_at_utc)} 快照），總傳輸量與完成日仍未驗證。`);
+  const stageContainer = $("workload-stages"); stageContainer.replaceChildren();
+  const stageStates = {pending: "待執行", awaiting_release: "已查核 · 等下次到期", not_required: "本階段無待辦", blocked: "仍有來源問題", unmeasured: "未量測全市場", stale: "快照待更新"};
+  const units = {wide_values: "非空數值格", event_rows: "事件／明細列", metadata_values: "標籤格"};
+  for (const [index, stage] of (info.stages || []).entries()) {
+    const card = document.createElement("article"); card.className = "finlab-stage-card";
+    const title = document.createElement("h4"), state = document.createElement("p"), bar = document.createElement("progress"), detail = document.createElement("p"), times = document.createElement("dl"), note = document.createElement("small");
+    title.textContent = `${index + 1}. ${stage.label}`;
+    state.className = "finlab-stage-state"; state.textContent = stageStates[stage.state] || "待核實";
+    bar.className = "progress-track"; bar.max = 1;
+    bar.setAttribute("aria-label", `${stage.label}來源工作量加權查核進度`);
+    const stageRatio = valid ? n(stage.progress_ratio) : null;
+    if (stageRatio !== null) bar.value = Math.max(0, Math.min(1, stageRatio));
+    const records = (stage.records || []).map(r => `${count(r.count)} ${units[r.unit] || "待確認單位"}`).join("；");
+    detail.textContent = `待辦 ${count(stage.pending_keys)} 鍵 · 預估下載 ${bytes(stage.remaining_bytes_estimate)} · 工作 ${durationLabel(stage.remaining_work_seconds_estimate)}${records ? `；需查核 ${records}` : ""}。${stageRatio === null ? "工作量無可信百分比。" : `來源大小加權 ${pct(stageRatio)}，不是帳號累計流量。`}`;
+    for (const [name, label] of [["fast", "快速"], ["reference", "參考"], ["slow", "較慢"]]) {
+      const dt = document.createElement("dt"), dd = document.createElement("dd");
+      dt.textContent = label; dd.textContent = stage.state === "unmeasured" ? "缺全市場樣本，未知" : !valid ? "快照待更新" : eta(stage.scenarios?.[name]);
+      times.append(dt, dd);
+    }
+    note.textContent = stage.reason || (stage.next_check_at_utc ? `下次檢查 ${timeLabel(stage.next_check_at_utc)}；這是排程，不是發布證明。` : stage.state === "not_required" ? "不以目錄存在推論可取得歷史。" : `未知傳輸量 ${count(stage.unknown_transfer_keys)} 鍵、未知耗時 ${count(stage.unknown_time_keys)} 鍵。`);
+    card.append(title, state, bar, detail, times, note); stageContainer.append(card);
+  }
 }
 
 function renderStorage(info) {
@@ -212,7 +237,7 @@ function renderPipelines(data) {
   const gate = data.release_gate || {}, acquired = data.acquisition || {}, training = data.training || {};
   const pipelines = [
     {category: "reference", title: "FinLab SDK 目錄", api: "data.search()", status: gate.catalog_fresh ? "ready" : "waiting", detail: `${count(gate.catalog_total)} 個目錄鍵；目錄清點時間 ${timeLabel(gate.catalog_observed_at_utc)}`, progress: gate.catalog_fresh ? 1 : null, note: "目錄存在不代表帳號可下載。"},
-    {category: "historical", title: "一般歷史追新", api: "data.get(force_download=True)", status: acquired.service_active ? "active" : gate.ready ? "ready" : "partial", detail: `已查新工作量 ${bytes(data.workload?.transfer?.completed_bytes)}；預估仍需 ${bytes(data.workload?.transfer?.remaining_bytes_estimate)}`, progress: data.workload?.state === "available" ? n(data.workload?.transfer?.ratio) : null, note: "按可估來源檔傳輸量加權；空值、未知範圍與 Tick 另外列示。"},
+    {category: "historical", title: "一般歷史追新", api: "SDK checked .recent merge / full fallback", status: acquired.service_active ? "active" : gate.ready ? "ready" : "partial", detail: `已查新工作量 ${bytes(data.workload?.transfer?.completed_bytes)}；預估待辦傳輸 ${bytes(data.workload?.expected_pending_payload_bytes)}`, progress: data.workload?.state === "available" ? n(data.workload?.transfer?.ratio) : null, note: "按原始來源大小加權；實際增量與帳號計費另外觀測。"},
     {category: "derived", title: "研究特徵建表", api: "local research overlay", status: training.local_rows ? (gate.ready ? "ready" : "partial") : "waiting", detail: `${count(training.local_rows)} 列，${count(training.local_finlab_channels)} 個 FinLab 欄位`, progress: training.local_rows ? 1 : 0, note: "只映射已驗證語義的來源，非嚴格歷史 PIT。"},
     {category: "derived", title: "私人冷庫版本", api: "stockagent-data publish", status: training.cold_publication === "verified_exact_release" ? (gate.ready ? "ready" : "partial") : "waiting", detail: training.cold_snapshot_id || "尚無可核驗 release", progress: training.cold_publication === "verified_exact_release" ? 1 : 0, note: gate.ready ? "精確版已驗證；遠端仍須 READY。" : "既有版本可保留，新版須全目錄追新才打包。"},
     {category: "derived", title: "遠端訓練準備", api: "exact release + READY", status: training.remote_materialization === "verified_ready" ? "ready" : "waiting", detail: training.remote_materialization === "verified_ready" ? "遠端 READY 已核驗" : "遠端 READY 未核驗", progress: training.remote_materialization === "verified_ready" ? 1 : null, note: "本機冷庫完成不等於遠端可訓練。"},
@@ -296,7 +321,7 @@ function renderRows() {
     const low = n(row.estimated_fetch_seconds_low), high = n(row.estimated_fetch_seconds_high);
     const blocked = ["vip_only", "provider_empty", "deferred_resource", "deferred_windowed"].includes(row.state);
     const estimate = blocked ? "無可完成估時" : low === null ? "樣本不足" : low === high ? `約 ${durationLabel(low)}` : `${durationLabel(low)}–${durationLabel(high)}`;
-    const finish = work.estimated_finish_at_utc ? `情境 ${timeLabel(work.estimated_finish_at_utc)}` : work.needs_refresh ? "配額／條件待確認" : row.state === "downloaded" ? row.latest_check_within_24h ? "已查最新" : "發布未核實；無下載 ETA" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
+    const finish = work.estimated_finish_at_utc ? `情境 ${timeLabel(work.estimated_finish_at_utc)}` : work.needs_refresh ? "配額／條件待確認" : row.state === "downloaded" && work.next_source_check_at_utc ? `下次查核 ${timeLabel(work.next_source_check_at_utc)}` : row.state === "downloaded" ? row.latest_check_within_24h ? "已查核來源" : "發布未核實；無下載 ETA" : row.estimated_finish_at_utc ? `約 ${timeLabel(row.estimated_finish_at_utc)}` : row.active ? low === null ? `已跑 ${durationLabel(row.running_elapsed_seconds)}；估時未知` : "已超過實測範圍" : blocked ? "待來源／授權條件；無 ETA" : "排隊／配額時間未知";
     const deferredReasons = {
       oversized_metadata: "來源標籤寬表超過記憶體預算；待有界擷取",
       oversized_table: "券商整表超過記憶體／額度預算；待分區介面",

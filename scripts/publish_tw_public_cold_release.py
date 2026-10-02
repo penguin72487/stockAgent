@@ -31,8 +31,15 @@ class SourceRefreshBusy(RuntimeError):
 class StaleDerivedReceipts(RuntimeError):
     """The cold source cannot be released until upstream derivatives are fresh."""
 
-    def __init__(self, codes: list[str]) -> None:
+    def __init__(
+        self, codes: list[str], *, failed_checks: Mapping[str, list[str]] | None = None
+    ) -> None:
         self.codes = sorted(set(codes))
+        self.failed_checks = {
+            stage: sorted(set(checks))
+            for stage, checks in (failed_checks or {}).items()
+            if checks
+        }
         super().__init__(
             "TW public derived receipts are stale: " + ", ".join(self.codes)
         )
@@ -127,15 +134,23 @@ def _check_training_receipts(live_root: Path) -> None:
 
     stocks = live_root / "stocks"
     features = live_root / "features/tw_public_stock_daily.parquet"
-    _, symbol_findings = audit_official_symbol_build(stocks, live_root)
-    _, feature_findings = audit_feature_build_receipt(features, live_root, stocks)
+    symbol_stats, symbol_findings = audit_official_symbol_build(stocks, live_root)
+    feature_stats, feature_findings = audit_feature_build_receipt(features, live_root, stocks)
     blocking = [
         finding.code
         for finding in [*symbol_findings, *feature_findings]
         if finding.severity in {"critical", "high"}
     ]
     if blocking:
-        raise StaleDerivedReceipts(blocking)
+        raise StaleDerivedReceipts(
+            blocking,
+            failed_checks={
+                stage: [name for name, passed in stats.get("checks", {}).items() if passed is False]
+                for stage, stats in (
+                    ("official_symbols", symbol_stats), ("public_features", feature_stats)
+                )
+            },
+        )
 
 
 def _publish_while_source_stable(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -231,6 +246,8 @@ def main() -> int:
         "tw-public",
     ]
     stale_derived_receipts = False
+    blocking_findings: list[str] = []
+    blocking_checks: dict[str, list[str]] = {}
     try:
         completed = _publish_while_source_stable(command, args.timeout_seconds)
         return_code = int(completed.returncode)
@@ -264,6 +281,8 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0
     except StaleDerivedReceipts as exc:
+        blocking_findings = exc.codes
+        blocking_checks = exc.failed_checks
         if not args.defer_stale_derived_receipts:
             stale_derived_receipts = True
             return_code = 75
@@ -276,6 +295,7 @@ def main() -> int:
                 "status": "deferred",
                 "reason": "stale_derived_receipts",
                 "blocking_findings": exc.codes,
+                "blocking_checks": exc.failed_checks,
                 "started_at_taipei": started.isoformat(),
                 "completed_at_taipei": completed_at.isoformat(),
                 "elapsed_seconds": (completed_at - started).total_seconds(),
@@ -310,6 +330,8 @@ def main() -> int:
         "return_code": return_code,
         "release": release,
         "error": error,
+        "blocking_findings": blocking_findings,
+        "blocking_checks": blocking_checks,
     }
     _persist_receipt(receipt, started=started, payload=payload)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))

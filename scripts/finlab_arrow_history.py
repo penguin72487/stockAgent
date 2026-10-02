@@ -24,11 +24,10 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import durable_replace
+from stockagent.data.finlab_acquisition_contract import WHOLE_TABLE_KEYS, source_check_due
 
 
-STREAMING_KEYS = frozenset({
-    "broker_transactions", "after_market_fixed_price:市場別", "after_market_fixed_price:資料來源",
-})
+STREAMING_KEYS = WHOLE_TABLE_KEYS
 MAX_RAW_BYTES = 1536 * 1024**2
 RAW_CONTRACT = 1
 
@@ -132,14 +131,12 @@ def acquire_raw(key: str, root: Path, stem: str, *, refresh: bool,
     receipt_path = root / "raw_receipts" / f"{stem}.json"
     previous = _json(receipt_path)
     path = _verified_raw(root, previous, key)
-    # Interrupted normalization reuses a today's-quota-cycle upstream proof.
-    # A copied old SDK cache has no such proof and cannot claim freshness.
-    try:
-        checked = datetime.fromisoformat(previous["source_checked_at_utc"])
-        current_cycle = checked.tzinfo is not None and checked.astimezone(UTC).date() == datetime.now(UTC).date()
-    except (KeyError, ValueError, TypeError):
-        current_cycle = False
-    if path and (not refresh or (current_cycle and previous.get("source_check_mode") == "upstream_forced")):
+    # A normalization retry can reuse an upstream raw proof only until its
+    # provider expiry. Daily fallback must not hide a same-day release slot.
+    raw_policy = {**previous, "next_source_check_at_utc": previous.get("provider_expiry_at_utc")}
+    current = previous.get("source_check_mode") == "upstream_forced" and not source_check_due(
+        raw_policy, now=datetime.now(UTC), days=1)
+    if path and (not refresh or current):
         return path, previous
 
     from finlab import utils
@@ -324,6 +321,8 @@ def prepare_arrow(key: str, root: Path, stem: str, destination: Path, *, refresh
     raw, evidence = acquire_raw(key, root, stem, refresh=refresh)
     stats = convert_raw(key, raw, destination)
     stats.update({k: evidence[k] for k in ["raw_path", "raw_sha256", "raw_bytes", "source_check_mode", "source_checked_at_utc"]})
+    stats["next_source_check_at_utc"] = evidence.get("provider_expiry_at_utc")
+    stats["last_full_source_bytes"] = evidence["raw_bytes"]
     return stats
 
 

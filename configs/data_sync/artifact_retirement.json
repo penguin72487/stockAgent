@@ -8,6 +8,29 @@
     "artifact-auto-bybit-perpetual-daily-multi-basis-projec-682eec353e0237e9"
   ],
   "scheduled_legacy_datasets": [
-    "legacy-artifact-markets-crypto"
+    "legacy-artifact-markets-crypto",
+    "legacy-artifact-markets-us",
+    "legacy-markets-tw_boost-c1ce61281a06",
+    "legacy-markets-tw_day_trade_10m_free_mix_projection_l-afbe1b024743",
+    "legacy-markets-tw_day_trade_daily_multi_basis_raw_ohl-e188d70b5f3c",
+    "legacy-markets-tw_index_futures_day-e99c9e311151",
+    "legacy-markets-tw_minute-1f4190c194e8",
+    "legacy-markets-tw_overnight_1320_close_fallback_next_-d027ca5af80a",
+    "legacy-markets-tw_public_candles_full_gross_naive_dua-ffe1e72d98a8",
+    "legacy-markets-tw_public_candles_multi_basis_lookback-4c5fbfca5044",
+    "legacy-markets-tw_public_candles_snapshot_safe99_open-5440d1ee26a2",
+    "legacy-markets-tw_public_lanten_market_candles_tw_cas-23fb39efe7fa",
+    "legacy-markets-tw_public_lanten_market_candles_tw_cas-42ee0e37ca24",
+    "legacy-markets-tw_public_lanten_market_token_all_avai-96caaab6722e",
+    "legacy-markets-tw_public_official_2005_all_available_-f367fd7f4707",
+    "legacy-markets-tw_public_preopen_all_observed_researc-4faa09b68fd7",
+    "legacy-markets-tw_public_preopen_pit-b235fbdcd669",
+    "legacy-markets-tw_public_preopen_pit_pinned_20260916-f6211f50fbfd",
+    "legacy-markets-tw_public_preopen_raw_2014_v1-b4e8af22fd18",
+    "legacy-markets-tw_public_preopen_raw_long_history_v1-a5cc6f58d6d2",
+    "legacy-markets-tw_public_preopen_raw_v1-cfb476f16459",
+    "legacy-markets-tw_public_preopen_wide_research_2014_v-7ea847d41e04",
+    "legacy-markets-tw_public_preopen_wide_research_taifex-2854893718ee",
+    "legacy-markets-tw_day_trade_10m_free_mix_raw_l1_v1-ef30bd4930a3"
   ]
 }

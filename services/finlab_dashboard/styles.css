@@ -24,3 +24,11 @@ main{width:min(1180px,calc(100% - 36px))}.finlab-traffic-details{margin-top:18px
 .workload-scenarios{display:flex;gap:12px 30px;flex-wrap:wrap;margin-top:18px;color:var(--muted);font-size:12px}
 .workload-scenarios strong{display:inline-block;margin-left:8px;color:var(--ink)}
 @media(max-width:720px){.workload-eta{grid-template-columns:1fr}.workload-records .finlab-volume-heading{align-items:start;flex-direction:column;gap:7px}}
+.finlab-stage-title { margin-top: 1.5rem; }
+.finlab-stage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 1rem; margin-top: 1rem; }
+.finlab-stage-card { min-width: 0; border: 1px solid var(--line); border-radius: 12px; padding: 1rem; background: rgba(7,21,32,.8); overflow-wrap: anywhere; }
+.finlab-stage-card h4 { margin: 0 0 .5rem; font-size: 1rem; }
+.finlab-stage-card p, .finlab-stage-card small { line-height: 1.6; }
+.finlab-stage-state { color: var(--cyan); }
+.finlab-stage-card dl { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: .5rem; }
+.finlab-stage-card dd { margin: 0; font-variant-numeric: tabular-nums; }

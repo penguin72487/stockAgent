@@ -53,11 +53,31 @@ def test_weekly_full_refresh_and_future_clock_fail_safe():
 
 @pytest.mark.parametrize('incoming', [[row('2026-09-29'), row('2026-09-29')],
                                     [{'date': '2026-09-29', 'stock_id': 'OTHER'}],
-                                    [row('2026-10-01')], []])
+                                    [row('2026-10-01')]])
 def test_invalid_tail_cannot_replace_history(incoming):
     plan = refresh.request_plan({'fetched_at_utc': NOW.isoformat(), 'source_last_date': '2026-09-25'}, NOW, NOW.date())
     with pytest.raises(ValueError):
         refresh.merge_response([row('2026-09-25')], incoming, 'BRK-A', plan)
+
+
+def test_empty_incremental_retains_all_verified_history_and_original_dates():
+    old = [row('2014-01-02'), row('2026-09-25', 3)]
+    plan = refresh.request_plan({'fetched_at_utc': NOW.isoformat(), 'source_last_date': '2026-09-25'}, NOW, NOW.date())
+    assert refresh.merge_response(old, [], 'BRK-A', plan) == old
+    assert plan['empty_response_policy'] == 'retain_verified_baseline_no_new_observation'
+    assert plan['history_refresh_contract_version'] == 2
+
+
+def test_empty_full_refetch_never_erases_verified_history():
+    plan = refresh.request_plan({}, NOW, NOW.date())
+    with pytest.raises(ValueError, match='unexpected_empty_after_nonempty'):
+        refresh.merge_response([row('2026-09-25')], [], 'BRK-A', plan)
+
+
+def test_empty_incremental_does_not_bless_invalid_old_values():
+    plan = refresh.request_plan({'fetched_at_utc': NOW.isoformat(), 'source_last_date': '2026-09-25'}, NOW, NOW.date())
+    with pytest.raises(ValueError, match='history_wrong_data_id'):
+        refresh.merge_response([{'date': '2026-09-25', 'stock_id': 'WRONG'}], [], 'BRK-A', plan)
 
 
 def test_unexpected_empty_preserves_existing_head_even_without_correction(tmp_path):

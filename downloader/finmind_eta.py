@@ -17,6 +17,7 @@ from downloader.artifact_io import atomic_write_json
 
 TAIPEI = ZoneInfo('Asia/Taipei')
 SCOPE_LABEL = 'FinMind 已排程可執行工作（含次要校驗）'
+SNAPSHOT_CONTRACT_VERSION = 3  # Retry debt is not successful throughput or a finite completion clock.
 
 
 def _number(value: Any) -> float | None:
@@ -83,7 +84,7 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     slow_rate = min(central_rate, max(0.0, observed_slow - reserved)) if None not in (central_rate, observed_slow, reserved) else None
     counts = {key: summary.get(key) for key in ('required_requests', 'validation_requests', 'unbatched_requests',
               'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-              'batch_savings', 'calendar_wait_tasks')}
+              'batch_savings', 'calendar_wait_tasks', 'retry_tasks')}
     counts['planned_requests'] = int(planned) if planned is not None else None
     blockers: list[dict[str, Any]] = []
     for field, reason in (
@@ -156,6 +157,13 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     if workload.get('state') == 'partial':
         estimate['scope_label'] = 'FinMind 已知可盤點佇列小計（部分來源缺少證據）'
     cooldown = _number(summary.get('max_retry_wait_seconds')) or 0
+    retry_pending = bool(_number(summary.get('retry_tasks')))
+    if retry_pending:
+        estimate['blockers'].append({
+            'code': 'retry_tasks', 'count': summary['retry_tasks'],
+            'reason': '失敗／部分回應仍待重試；請求發出速度不等於成功消化速度。重試成功前不提供完工倒數。',
+        })
+    estimate['retry_wait_seconds'] = cooldown if retry_pending else None
     for name, requests, rate, basis in (
         ('fastest', planned, fastest_rate, '現行合批／限速上限，扣除追新預留'),
         ('central', planned, central_rate, '現行合批／滾動 60 分鐘實發吞吐扣除本階段未來追新'),
@@ -174,9 +182,10 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
                 scenario['basis'] = '無額外網路請求，但仍等待在途回應／本機衍生收據'
             else:
                 scenario['active_work_seconds'] = math.ceil(duration)
-                if admission_blocked or quota_blocked:
-                    scenario.update(state='waiting_admission' if admission_blocked else 'waiting_quota',
-                                    basis=basis + '；僅為放行後有效工時，不含未知等待與額外重試')
+                if admission_blocked or quota_blocked or retry_pending:
+                    scenario.update(state='waiting_admission' if admission_blocked else
+                                    'waiting_quota' if quota_blocked else 'waiting_retry',
+                                    basis=basis + '；僅為成功後有效工時，不含未知等待與額外重試')
                     estimate['scenarios'][name] = scenario
                     continue
                 try:
@@ -198,9 +207,10 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     if not ready:
         estimate['state'] = 'unavailable'
         estimate['basis'] = '佇列或帳戶額度證據缺少／過期，不將未知工作當成零。'
-    elif admission_blocked or quota_blocked:
-        estimate['state'] = 'waiting_admission' if admission_blocked else 'waiting_quota'
-        estimate['basis'] = '工作尚未放行；有效工時與未知等待時間分列，不能由現在起算完工。'
+    elif admission_blocked or quota_blocked or retry_pending:
+        estimate['state'] = ('waiting_admission' if admission_blocked else
+                             'waiting_quota' if quota_blocked else 'waiting_retry')
+        estimate['basis'] = '工作尚未放行或尚未成功重試；有效工時與未知等待分列，不能由現在起算完工。'
     elif planned == 0 and all(x['remaining_seconds'] == 0 for x in estimate['scenarios'].values()):
         estimate['state'] = 'conditional' if blockers else 'current'
     elif any(x['state'] == 'unknown' for x in estimate['scenarios'].values()):
@@ -262,7 +272,8 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
     estimate['calendar_states'] = calendar
     if 'unknown' in calendar.values():
         estimate['assumptions'].append('部分日期缺少官方日曆證據，依現行下載器以平日套用開盤保護。')
-    evidence = {'schema_version': 1, 'estimate': estimate, 'workload': workload, 'telemetry': telemetry,
+    evidence = {'schema_version': 1, 'snapshot_contract_version': SNAPSHOT_CONTRACT_VERSION,
+                'estimate': estimate, 'workload': workload, 'telemetry': telemetry,
                 'secondary_admission': admission}
     atomic_write_json(root / 'eta_status.json', evidence)
     return estimate

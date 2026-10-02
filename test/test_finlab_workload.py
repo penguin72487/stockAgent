@@ -154,6 +154,83 @@ def test_no_footer_budget_keeps_counts_unknown_not_zero(tmp_path):
     assert all(row["record_count"] is None for row in result["datasets"])
 
 
+def test_live_incremental_quota_policy_and_v2_footer_cache_are_shared_with_projection(tmp_path):
+    keys = setup_root(tmp_path)
+    _, cache = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                              quota=quota(), footer_budget_seconds=10)
+    cache["contract_version"] = 2
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                               quota=quota(.001), cache=cache, footer_budget_seconds=0)
+    assert result["contract_version"] == 3 and result["quota_policy_version"] == 1
+    assert result["measurement"]["footer_reads"] == 0
+    row = next(r for r in result["datasets"] if r["key"] == "price:b")
+    assert row["incremental_quota_exempt"] is True and row["record_count"] == 1
+    assert result["scenarios"]["reference"]["quota_resets"] == 0
+    write(tmp_path/"artifacts/live/finlab/workload_latest.json", result)
+    public = _public_workload(tmp_path, [{"key": key} for key in keys], NOW)
+    assert public["incremental_quota_policy"] == "provider_enforced_no_local_reserve"
+    assert next(r for r in public["datasets"] if r["key"] == "price:b")["incremental_quota_exempt"] is True
+
+
+@pytest.mark.parametrize("status", ["vip_only", "authentication_failed", "provider_empty"])
+def test_old_verified_data_does_not_hide_a_new_source_refresh_denial(tmp_path, status):
+    setup_root(tmp_path)
+    key = "price:b"
+    write(tmp_path/"data_finlab/attempts"/(safe_stem(key)+".json"), {
+        "dataset": key, "status": status, "attempted_at_utc": (NOW-timedelta(minutes=1)).isoformat()})
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                               quota=quota(), footer_budget_seconds=10)
+    row = next(r for r in result["datasets"] if r["key"] == key)
+    assert row["downloaded"] and row["incremental_quota_exempt"] and row["needs_refresh"]
+    assert row["blocked_reason"] == status and row["queue_role"] == "source_issues"
+    assert row["estimated_finish_at_utc"] is None
+    assert result["scenarios"]["reference"]["finish_at_utc"] is None
+
+
+def test_later_success_supersedes_a_previous_source_permission_failure(tmp_path):
+    setup_root(tmp_path)
+    key = "price:b"
+    write(tmp_path/"data_finlab/attempts"/(safe_stem(key)+".json"), {
+        "dataset": key, "status": "vip_only", "attempted_at_utc": (NOW-timedelta(days=2)).isoformat()})
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                               quota=quota(), footer_budget_seconds=10)
+    row = next(r for r in result["datasets"] if r["key"] == key)
+    assert row["blocked_reason"] is None and row["queue_role"] == "priority_updates"
+
+
+def test_forecast_retry_clock_matches_collectors_computed_failure_backoff(tmp_path):
+    setup_root(tmp_path)
+    key = "price:b"
+    attempted = NOW-timedelta(minutes=1)
+    write(tmp_path/"data_finlab/attempts"/(safe_stem(key)+".json"), {
+        "dataset": key, "status": "timed_out", "attempted_at_utc": attempted.isoformat(), "failure_streak": 1})
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                               quota=quota(5000), footer_budget_seconds=10)
+    row = next(r for r in result["datasets"] if r["key"] == key)
+    assert row["blocked_reason"] is None
+    assert row["retry_at_utc"] == (attempted+timedelta(minutes=15)).isoformat()
+    assert row["estimated_finish_at_utc"] > row["retry_at_utc"]
+
+
+def test_optional_metadata_in_backoff_is_scheduled_not_a_missing_work_plan(tmp_path):
+    keys = setup_root(tmp_path)
+    key = "after_market_fixed_price:市場別"
+    write(tmp_path/"data_finlab/catalog/discovery.json", {"keys": [*keys, key], "observed_at_utc": NOW.isoformat()})
+    receipt = json.loads((tmp_path/"data_finlab/receipts"/(safe_stem("price:b")+".json")).read_text())
+    write(tmp_path/"data_finlab/receipts"/(safe_stem(key)+".json"), {**receipt, "dataset": key})
+    (tmp_path/"sdk"/(key.replace(":", "#")+".feather")).write_bytes(b"x"*100)
+    attempted = NOW-timedelta(minutes=1)
+    write(tmp_path/"data_finlab/attempts"/(safe_stem(key)+".json"), {
+        "dataset": key, "status": "resource_deferred", "attempted_at_utc": attempted.isoformat()})
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
+                               quota=quota(5000), footer_budget_seconds=10)
+    row = next(r for r in result["datasets"] if r["key"] == key)
+    assert row["scheduled"] and row["queue_role"] == "metadata" and not row["incremental_quota_exempt"]
+    assert row["retry_at_utc"] == (attempted+timedelta(hours=1)).isoformat()
+    assert result["scenarios"]["reference"]["state"] != "unscheduled_work"
+    assert row["estimated_finish_at_utc"] > row["retry_at_utc"]
+
+
 def test_changed_file_cannot_remain_current_through_workload_cache(tmp_path):
     setup_root(tmp_path)
     _, cache = build_workload(tmp_path, sdk_cache_root=tmp_path / 'sdk', now=NOW,

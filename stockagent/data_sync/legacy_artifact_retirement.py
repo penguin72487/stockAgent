@@ -12,10 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-import yaml
-
+from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
-from stockagent.data_sync.artifact_retirement import _hot_mirror
+from stockagent.data_sync.artifact_retirement import _assert_unlink_gates, _hot_mirror, _reclaimable_file_bytes
 from stockagent.data_sync.cold_artifacts import COLD_ACTIVATION_SCHEMA_VERSION, rebuild_cold_ignore
 from stockagent.data_sync.cold_primary import verify_cold_resilience
 from stockagent.data_sync.desync_snapshots import (
@@ -30,7 +29,7 @@ from stockagent.data_sync.legacy_artifact_archive import (
     source_plan,
     verify_archive_directory,
 )
-from stockagent.data_sync.materialized_cache import process_references
+from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
 from stockagent.data_sync.packed_snapshots import (
     resolve_latest_packed,
     verify_packed_snapshot,
@@ -38,36 +37,7 @@ from stockagent.data_sync.packed_snapshots import (
 
 
 def _active_service_references(source: Path, repo_root: Path) -> list[str]:
-    refs = []
-    state_path = repo_root / "artifacts/discord_bot/state.json"
-    runtime_markets: dict[str, Any] = {}
-    if state_path.is_file():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(state, dict) or not isinstance(state.get("markets"), dict):
-            raise SnapshotError("Discord runtime market state is invalid")
-        runtime_markets = state["markets"]
-    for path in sorted((repo_root / "services/discord_bot/markets").glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise SnapshotError(f"Discord market config is invalid: {path}")
-        market = str(raw.get("market") or path.stem)
-        runtime = runtime_markets.get(market, {})
-        if runtime and not isinstance(runtime, dict):
-            raise SnapshotError(f"Discord runtime market state is invalid: {market}")
-        enabled = runtime.get("enabled", raw.get("enabled"))
-        if enabled is not True:
-            continue
-        for key in ("output_dir", "checkpoint_path", "weights_path"):
-            value = raw.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            reference = Path(value)
-            if not reference.is_absolute():
-                reference = repo_root / reference
-            reference = reference.resolve(strict=False)
-            if source == reference or source in reference.parents or reference in source.parents:
-                refs.append(f"{path}:{key}")
-    return refs
+    return artifact_service_references((source,), repo_root)[str(source.absolute())]
 
 
 def _state_path(state_root: Path, dataset: str) -> Path:
@@ -118,6 +88,42 @@ def renew_legacy_lease(
         }
 
 
+def enroll_legacy_lease(
+    spec: LegacyArchiveSpec, *, artifact_root: Path, state_root: Path
+) -> dict[str, Any]:
+    """Start observation without asserting preservation or deleting any bytes.
+
+    Full source/cold/mirror/peer verification remains mandatory at retirement.
+    Enrollment is deliberately cheap so awaiting cold publication does not
+    postpone the beginning of the seven-day observation period.
+    """
+
+    artifact_root = artifact_root.resolve()
+    source = artifact_root / spec.relative_root
+    inventory = source_plan(source, spec)
+    if artifact_process_references(source, artifact_root / "markets"):
+        raise SnapshotError("legacy lease enrollment source is in use")
+    state_path = _state_path(state_root, spec.dataset)
+    with _exclusive_lock(state_root / "retirements" / f"{spec.dataset}.lock"):
+        state = _read_state(state_path)
+        if state is not None:
+            if (state.get("dataset") != spec.dataset
+                or state.get("relative_root") != spec.relative_root
+                or state.get("state") != "hot-enrolled"):
+                raise SnapshotError("legacy lease enrollment state identity mismatch")
+            action = "already-enrolled"
+        else:
+            now_ns = time.time_ns()
+            state = {"schema_version": 1, "dataset": spec.dataset,
+                     "relative_root": spec.relative_root, "state": "hot-enrolled",
+                     "last_used_ns": now_ns, "last_used_at": _utc_iso_from_ns(now_ns)}
+            atomic_write_json(state_path, state)
+            action = "enrolled"
+    return {**state, "action": action, "deleted": False,
+            "files": len(inventory), "cold_verified": False,
+            "lease_expires_at": _utc_iso_from_ns(int(state["last_used_ns"]) + 7 * 86_400_000_000_000)}
+
+
 def plan_legacy_retirement(
     spec: LegacyArchiveSpec,
     *,
@@ -125,14 +131,18 @@ def plan_legacy_retirement(
     artifact_root: Path,
     hot_root: Path,
     sync_root: Path,
+    materialized_root: Path,
     state_root: Path,
     activation_root: Path,
     backup_config: Path,
     peer_proof: Mapping[str, Any],
     peer_probe: Callable[[], Mapping[str, Any]] | None = None,
     bridge_inactive: bool,
+    manual_immediate: bool = False,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
+    if type(manual_immediate) is not bool:
+        raise SnapshotError("manual immediate retirement must be an explicit boolean")
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     repo_root = repo_root.resolve()
     artifact_root = artifact_root.resolve()
@@ -150,6 +160,8 @@ def plan_legacy_retirement(
         raise SnapshotError("legacy retirement source/hot path is missing or redirected")
     if source.stat().st_dev != state_root.parent.stat().st_dev:
         raise SnapshotError("legacy retirement quarantine must share source filesystem")
+    if hot_tree.exists() and hot_tree.stat().st_dev != source.stat().st_dev:
+        raise SnapshotError("legacy retirement hot mirror must share source filesystem")
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     metadata = resolved.manifest.get("metadata", {})
     if (
@@ -182,17 +194,20 @@ def plan_legacy_retirement(
     service_refs = _active_service_references(source, repo_root)
     blockers = []
     if state is None:
-        blockers.append("seven-day-use-lease-not-enrolled")
+        if not manual_immediate:
+            blockers.append("seven-day-use-lease-not-enrolled")
     elif state.get("state") == "retiring":
         blockers.append("unfinished-retirement-quarantine")
     elif state.get("state") != "hot-enrolled":
         blockers.append("retirement-state-is-not-hot-enrolled")
-    elif now_ns < expires_ns:
+    elif now_ns < expires_ns and not manual_immediate:
         blockers.append("seven-day-use-lease-active")
     if process_refs:
         blockers.append("artifact-has-process-references")
     if service_refs:
         blockers.append("enabled-service-references-artifact")
+    if str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(materialized_root):
+        blockers.append("artifact-release-is-pinned")
     # A full C + D + original-source audit can outlive a five-minute transport
     # receipt. Observe Syncthing again after those expensive reads, immediately
     # before deciding whether a hot source may be retired.
@@ -201,6 +216,8 @@ def plan_legacy_retirement(
         blockers.append("cold-peer-not-converged")
     try:
         checked = datetime.fromisoformat(str(current_peer_proof["checked_at"]))
+        if checked.tzinfo is None:
+            raise ValueError("peer proof timestamp has no timezone")
         age = (datetime.now(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds()
         if age < -5 or age > 300:
             blockers.append("peer-proof-stale")
@@ -221,6 +238,7 @@ def plan_legacy_retirement(
         ).hexdigest(),
         "hot_fingerprint": mirror["fingerprint"],
         "last_used_ns": last_used_ns,
+        "manual_immediate": manual_immediate,
     }
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     return {
@@ -230,10 +248,12 @@ def plan_legacy_retirement(
         "hot_tree": str(hot_tree),
         "original_files": proof["files"],
         "original_bytes": proof["original_bytes"],
+        "source_metadata_drift": proof.get("source_metadata_drift", []),
         "cold_bytes": resolved.manifest["archive"]["stored_bytes"],
         "hot_mirror": mirror,
         "process_references": process_refs,
         "service_references": service_refs,
+        "peer_proof": dict(current_peer_proof),
         **cold_proof,
         "lease_expires_at": _utc_iso_from_ns(expires_ns),
         "blockers": blockers,
@@ -263,7 +283,7 @@ def apply_legacy_retirement(
             }
             atomic_write_json(state_path, state)
             return {**plan, "action": "enrolled", "deleted": False}
-        if plan["process_references"]:
+        if plan["process_references"] and not plan["manual_immediate"]:
             state = _read_state(state_path)
             assert state is not None
             state.update(last_used_ns=now_ns, last_used_at=_utc_iso_from_ns(now_ns))
@@ -271,6 +291,19 @@ def apply_legacy_retirement(
             return {**plan, "action": "renewed-in-use", "deleted": False}
         if plan["blockers"]:
             raise SnapshotError("legacy retirement blocked: " + ", ".join(plan["blockers"]))
+        state = _read_state(state_path)
+        if state is None:
+            state = {
+                "schema_version": 1,
+                "dataset": spec.dataset,
+                "relative_root": spec.relative_root,
+                "state": "hot-enrolled",
+                "last_used_ns": now_ns,
+                "last_used_at": _utc_iso_from_ns(now_ns),
+            }
+        state.update(manual_immediate=plan["manual_immediate"],
+                     plan_fingerprint=plan["plan_fingerprint"])
+        atomic_write_json(state_path, state)
         source = Path(plan["source"])
         hot_tree = Path(plan["hot_tree"])
         activation_root = Path(options["activation_root"])
@@ -307,10 +340,20 @@ def apply_legacy_retirement(
                 for row in proof["files"]
             ]
             _hot_mirror(quarantine / "source", quarantine / "hot", inventory)
+        resolved = resolve_latest_packed(Path(options["sync_root"]), spec.dataset)
+        if (resolved.manifest["snapshot_id"] != plan["snapshot_id"]
+            or resolved.manifest_sha256 != plan["manifest_sha256"]):
+            raise SnapshotError("legacy cold head changed after rename; quarantine retained")
+        verify_cold_resilience(Path(options["sync_root"]), resolved, Path(options["backup_config"]))
+        unlink_peer_proof = _assert_unlink_gates(plan, quarantine, **options)
+        reclaimed_bytes = _reclaimable_file_bytes(quarantine / "source", quarantine / "hot")
+        if (quarantine / "hot").is_dir():
             shutil.rmtree(quarantine / "hot")
         shutil.rmtree(quarantine / "source")
         quarantine.rmdir()
-        state.update(state="cold-only", retired_at=_utc_iso_from_ns(time.time_ns()))
+        state.update(state="cold-only", retired_at=_utc_iso_from_ns(time.time_ns()),
+                     reclaimed_allocated_file_bytes=reclaimed_bytes)
         state.pop("quarantine", None)
         atomic_write_json(state_path, state)
-        return {**plan, "action": "retired", "deleted": True}
+        return {**plan, "action": "retired", "deleted": True,
+                "reclaimed_allocated_file_bytes": reclaimed_bytes, "unlink_peer_proof": unlink_peer_proof}

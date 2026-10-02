@@ -725,6 +725,7 @@ function renderOverview(data) {
   const openPositions = (data.positions || []).filter((row) => Number(row.signed_shares || 0) !== 0);
   const modeOpenPositions = modes.reduce((sum, mode) => sum + Number(mode.open_position_count || 0), 0);
   const modeStalePositions = modes.reduce((sum, mode) => sum + Number(mode.stale_position_count || 0), 0);
+  const indicativePositions = modes.reduce((sum, mode) => sum + Number(mode.indicative_valuation_position_count || 0), 0);
   const openPositionCount = Number.isFinite(Number(data.open_position_count))
     ? Number(data.open_position_count)
     : modes.length ? modeOpenPositions : openPositions.length;
@@ -762,19 +763,21 @@ function renderOverview(data) {
     && modes.every((mode) => rangeSummaryFor(mode.market)),
   );
   const healthKind = healthyModes === modes.length ? "good" : healthyModes ? "warn" : "bad";
+  const valuationNote = [
+    stalePositions ? `${number(stalePositions)} 個估值延用` : "",
+    indicativePositions ? `${number(indicativePositions)} 個參考快照估值（非成交證據）` : "",
+  ].filter(Boolean).join("；");
   const positionNote = openPositionCount === 0
     ? (IS_OVERNIGHT ? "尚未由實際收盤撮合建立隔夜部位" : "目前沒有未平倉部位")
-    : stalePositions
-      ? `${number(stalePositions)} 個估值延用`
-      : "目前估值皆有新鮮報價";
+    : valuationNote || "目前估值皆有新鮮報價";
   const cards = [
     ["模式狀態", `${healthyModes}/${modes.length} 無警示`, "依所選日訊號、估值與執行紀錄判定；詳細原因見上方警示", healthKind],
-    [IS_OVERNIGHT ? "目前即時隔夜持倉" : "所選日持倉", `${number(openPositionCount)} 個`, positionNote, stalePositions ? "warn" : openPositionCount ? "good" : ""],
+    [IS_OVERNIGHT ? "目前即時隔夜持倉" : "所選日持倉", `${number(openPositionCount)} 個`, positionNote, stalePositions || indicativePositions ? "warn" : openPositionCount ? "good" : ""],
     ...(historicalRangeAvailable ? [
       ["歷史反事實總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, "各模式期末權益減初始資金；使用官方收盤／次日開盤，並非實際成交", pnlClass(totalPnl)],
     ] : [
       ["各模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
-      ["各模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
+      ["各模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, valuationNote || "以可清算 bid／ask 並扣剩餘成本", stalePositions || indicativePositions ? "warn" : pnlClass(unrealizedPnl)],
       ...(carryCost || corporateNet ? [
         ["持有成本／企業行動", summaryMoney(corporateNet - carryCost), `持有成本 ${summaryMoney(carryCost)}；企業行動淨額 ${summaryMoney(corporateNet)}`, pnlClass(corporateNet - carryCost)],
       ] : []),
@@ -811,6 +814,9 @@ function renderHeader(data) {
   const liveStaleModes = !IS_OVERNIGHT && selectedDetailEndDate() === data.session_date && data.session_progress?.phase === "active"
     ? data.modes.filter((mode) => mode.valuation_stale && Number(mode.open_position_count || 0) > 0)
     : [];
+  const liveIndicativeModes = !IS_OVERNIGHT && selectedDetailEndDate() === data.session_date && data.session_progress?.phase === "active"
+    ? data.modes.filter((mode) => Number(mode.indicative_valuation_position_count || 0) > 0)
+    : [];
   const signalMissingEligibility = new Map();
   const currentMissingEligibility = new Map();
   for (const mode of data.modes) {
@@ -823,10 +829,11 @@ function renderHeader(data) {
       if (!coverage.covered && !currentMissingEligibility.has(venue)) currentMissingEligibility.set(venue, coverage);
     }
   }
-  if (localPaperExecution || operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || liveStaleModes.length || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+  if (localPaperExecution || operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || liveStaleModes.length || liveIndicativeModes.length || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
       localPaperExecution ? "目前當沖成交來自本地紙上帳本，Shioaji 只提供行情；尚未接入 Shioaji 模擬委託與 StockDeal 成交回報，不可將紙上成交當作券商 API 成交。" : "",
       liveStaleModes.length ? `盤中 ${number(liveStaleModes.length)} 個當沖模式的持倉估值正在延用舊價格；分鐘曲線仍記錄時間，但不是即時可成交行情，最新損益不可當成即時值。` : "",
+      liveIndicativeModes.length ? "部分持倉使用當日參考快照買賣一檔估值；快照未提供非試撮證據，不用於成交、停損或停利。各模型卡片列出參考估值筆數。" : "",
       hasBenchmarkReplay ? "舊版市場基準歷史仍含開盤起算資料；新版會計契約尚未完成原子替換，該區段暫不視為 Buy & Hold 正式結果。" : "",
       overnightHistoryDegraded ? `隔日沖歷史有 ${number(overnightHistory.unresolved_prior_position_count || 0)} 個前期未解決持倉、${number(overnightHistory.blocked_close_signal_count || 0)} 次因前批未平而未新進場；估值延用與缺價均保留，沒有補造成交。` : "",
       data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
@@ -1006,6 +1013,7 @@ function renderModes(data) {
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>紙上執行結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
+        ${Number(mode.indicative_valuation_position_count || 0) > 0 ? `<div><span>參考快照估值（非成交證據）</span><strong>${number(mode.indicative_valuation_position_count)} 個持倉</strong></div>` : ""}
         <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
         ${account?.margin_carry_contract ? `<div><span>累積現金權益（含減資退款）</span><strong>${summaryMoney(account.cumulative_corporate_action_net_twd || 0)}</strong></div><div><span>累積跨日成本</span><strong>${summaryMoney(account.cumulative_carry_cost_twd || 0)}</strong></div>` : ""}
@@ -1832,7 +1840,7 @@ function revisionOf(data) {
     data.unattended_guardian?.observed_at_taipei,
     data.modes.map((row) => [
       row.market, row.label, row.total_equity_twd, row.open_position_count,
-      row.stale_position_count, row.force_exit_failures,
+      row.stale_position_count, row.indicative_valuation_position_count, row.force_exit_failures,
       row.terminal_flatten_count, row.terminal_flatten_degraded_count,
       row.engine_status,
     ]),

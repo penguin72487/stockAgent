@@ -31,9 +31,26 @@ Use the section for the service being changed. Operational acceptance requires f
   Keep the tighter opening path protected by its progress-aware hot/cold
   watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.
 - Bound and rotate traceback logs. Service acceptance requires the Gateway to
-  be connected, command sync to succeed or be explicitly deferred, the three
-  intended TW modes to acknowledge the engine revision with zero lag, and logs
+  be connected, command sync to succeed or be explicitly deferred, all enabled
+  TW modes to acknowledge the engine revision with zero lag, and logs
   since the current restart to contain no watchdog or fatal error.
+
+## TW Day-Trade Engine Responsiveness
+
+- The ledger/execution loop owns watchdog liveness. Historical-query progress
+  may publish status, but must not keep a stalled execution loop falsely alive.
+- Missed-open source recovery runs off the ledger loop, publishes each resolved
+  symbol durably, and releases each mode from its own source dependencies rather
+  than waiting for every mode. Prune only provably zero whole-lot targets using
+  frozen session sizing NAV; carried inventory and unknown prices remain in scope.
+- A current-session Snapshot book may supply explicitly labelled indicative
+  valuation only. Unknown `simtrade` remains unknown; these fields must not
+  supply execution prices, volume, bracket triggers or non-trial evidence.
+  Missing liquidation-side prices remain stale, including locked-limit books.
+- Subscription rotation must respect the provider's subscription cap. Faster
+  reconciliation is not proof of complete executable-price coverage. Preserve
+  missed opening SLO and missing minute-curve evidence after service recovery.
+- Evidence and regression commands: [2026-10-01 web-service repair](../tw_day_trade_web_service_repair_2026-10-01.md).
 
 ## TAIFEX Live Strategy Dashboard Contract
 
@@ -72,4 +89,3 @@ Use the section for the service being changed. Operational acceptance requires f
   executable strategy valuation, recent explicitly labelled `CARRIED`
   valuation, and unavailable valuation as separate metrics. Never show generic
   `100/100` callbacks as proof that all strategy curves are currently valued.
-

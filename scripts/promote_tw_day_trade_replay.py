@@ -27,7 +27,10 @@ from stockagent.data.tw_price_rules import move_price_ticks_numpy
 from stockagent.live.benchmark_history_projection import load_benchmark_projection
 from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT
 from scripts.rebuild_tw_day_trade_minute_curves import (
+    MINUTE_CONTRACT as MINUTE_CURVE_CONTRACT,
+    MINUTE_SESSION_POINTS as MINUTE_CURVE_SESSION_POINTS,
     historical_minute_mark_has_source,
+    minute_curve_scope_failures,
 )
 
 
@@ -78,8 +81,6 @@ MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
     "minute_price_volume_capped_nav_counterfactual_v3",
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_price_counterfactual_v2",
 }
-MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
-MINUTE_CURVE_SESSION_POINTS = 270
 
 
 def _sha256(path: Path) -> str:
@@ -197,19 +198,11 @@ def _validate_minute_curve_coverage(
         failures.append("minute curve receipt did not preserve accepted endpoints")
     if int(coverage.get("missing_pairs") or 0) != 0:
         failures.append("minute curve receipt still has missing symbol-date pairs")
-    if sorted(str(value) for value in strategy.get("session_dates") or ()) != completed_session_dates:
-        failures.append("minute curve session dates do not match completed replay sessions")
-    if {str(value) for value in strategy.get("markets") or ()} != expected_markets:
-        failures.append("minute curve markets do not match the promoted mode set")
-    if int(strategy.get("generated_rows") or 0) != expected_rows:
-        failures.append(
-            "minute curve generated row count does not equal "
-            f"{MINUTE_CURVE_SESSION_POINTS} points per completed session and mode"
-        )
-    if str(receipt.get("start_date") or "") != completed_session_dates[0]:
-        failures.append("minute curve start date does not match the replay start")
-    if str(receipt.get("end_date") or "") != completed_session_dates[-1]:
-        failures.append("minute curve end date does not match the latest completed replay")
+    failures.extend(minute_curve_scope_failures(
+        receipt,
+        completed_session_dates=completed_session_dates,
+        expected_markets=expected_markets,
+    ))
 
     for path, key in (
         (marks_path, "marks"),

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import sys
 import time
@@ -14,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.manage_cold_artifacts import _bridge_inactive  # noqa: E402
-from scripts.manage_packed_retention import _syncthing  # noqa: E402
+from scripts.manage_packed_retention import _syncthing, _wait_for_convergence  # noqa: E402
 from stockagent.data_sync.artifact_retirement import (  # noqa: E402
     apply_artifact_retirement,
     load_retirement_peer_names,
@@ -24,6 +25,7 @@ from stockagent.data_sync.cold_artifacts import load_cold_artifact_registry  # n
 from stockagent.data_sync.desync_snapshots import (  # noqa: E402
     SnapshotError,
     _utc_iso_from_ns,
+    atomic_write_json,
 )
 from stockagent.data_sync.legacy_artifact_archive import load_legacy_specs  # noqa: E402
 from stockagent.data_sync.legacy_artifact_retirement import (  # noqa: E402
@@ -108,6 +110,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
+        "--manual-immediate", action="store_true",
+        help="explicit one-shot lease-age bypass; automatic timers never use this flag",
+    )
+    parser.add_argument("--dataset", action="append", help="select one enrolled allowlisted dataset; repeatable")
+    parser.add_argument("--receipt-dir", type=Path, help="persist each plan/result before advancing to the next dataset")
+    parser.add_argument(
         "--registry", type=Path, default=REPO_ROOT / "configs/data_sync/cold_artifacts.json"
     )
     parser.add_argument(
@@ -138,11 +146,34 @@ def main() -> int:
         legacy_specs = scheduled_legacy_specs(
             args.policy, args.legacy_catalog, cfg.authority_node_id
         )
+        if args.dataset:
+            allowed = {spec.dataset for spec in [*specs, *legacy_specs]}
+            if len(set(args.dataset)) != len(args.dataset) or set(args.dataset) - allowed:
+                raise SnapshotError("selected datasets must be unique members of the retirement allowlist")
+            order = {name: index for index, name in enumerate(args.dataset)}
+            specs = sorted((spec for spec in specs if spec.dataset in order), key=lambda spec: order[spec.dataset])
+            legacy_specs = sorted((spec for spec in legacy_specs if spec.dataset in order), key=lambda spec: order[spec.dataset])
         required_peers = load_retirement_peer_names(
             args.policy, authority_node_id=cfg.authority_node_id
         )
+        cfg = replace(cfg, required_peer_names=required_peers)
+        # A periodic D: rescan is not a reason to relax convergence, but a
+        # manual run can wait briefly for it instead of repeatedly hashing
+        # large sources or stranding verified bytes in quarantine mid-scan.
+        # Automatic runs retain the immediate, fail-closed observation.
+        def transport_probe():
+            return _wait_for_convergence(cfg, 300) if args.manual_immediate else _syncthing(cfg)
+
         rows = []
-        peer_proof = _syncthing(cfg)
+        def record(dataset: str, phase: str, value: dict) -> None:
+            if args.receipt_dir is not None:
+                atomic_write_json(args.receipt_dir / f"{dataset}.{phase}.json", value)
+                atomic_write_json(args.receipt_dir / "progress.json", {
+                    "apply": args.apply, "manual_immediate": args.manual_immediate,
+                    "current_dataset": dataset, "phase": phase, "rows": rows,
+                    "checked_at": _utc_iso_from_ns(time.time_ns()),
+                })
+        peer_proof = transport_probe()
         if peer_proof.get("ok") is not True:
             print(json.dumps({"state": "deferred", "reason": "cold-peer-not-converged", "peer": peer_proof}))
             return 0
@@ -162,7 +193,7 @@ def main() -> int:
                 continue
             lease_row = _active_lease_deferred_row(
                 spec.dataset, state, now_ns=time.time_ns()
-            )
+            ) if not args.manual_immediate else None
             if lease_row is not None:
                 rows.append(lease_row)
                 continue
@@ -174,10 +205,22 @@ def main() -> int:
                 "state_root": args.state_root,
                 "backup_config": cfg.backup_config,
                 "peer_proof": peer_proof,
+                "peer_probe": transport_probe,
                 "required_peer_names": required_peers,
                 "bridge_inactive": _bridge_inactive(args.hot_root),
+                "manual_immediate": args.manual_immediate,
             }
-            plan = plan_artifact_retirement(spec, **options)
+            record(spec.dataset, "planning", {"dataset": spec.dataset, "deleted": False})
+            try:
+                plan = plan_artifact_retirement(spec, **options)
+            except (OSError, ValueError, SnapshotError) as exc:
+                rows.append({"dataset": spec.dataset, "action": "deferred",
+                             "blockers": ["cold-or-hot-proof-failed"],
+                             "verification": "failed_read_only", "error": str(exc),
+                             "deleted": False})
+                record(spec.dataset, "blocked", rows[-1])
+                continue
+            record(spec.dataset, "plan", plan)
             row = {
                 "dataset": spec.dataset,
                 "action": "eligible" if plan["apply_ready"] else "deferred",
@@ -189,14 +232,18 @@ def main() -> int:
             # blocked; otherwise a short gap between daily scans could retire
             # a recently used run immediately after its original expiry.
             if args.apply and (
-                plan["apply_ready"] or "artifact-has-process-references" in plan["blockers"]
+                plan["apply_ready"] or (not args.manual_immediate and "artifact-has-process-references" in plan["blockers"])
             ):
+                record(spec.dataset, "applying", {"dataset": spec.dataset, "plan_fingerprint": plan["plan_fingerprint"]})
                 result = apply_artifact_retirement(
                     spec, expected_fingerprint=plan["plan_fingerprint"], **options
                 )
                 row["action"] = result["action"]
                 row["deleted"] = result["deleted"]
+                row["reclaimed_allocated_file_bytes"] = result.get("reclaimed_allocated_file_bytes", 0)
+                record(spec.dataset, "result", result)
             rows.append(row)
+            record(spec.dataset, "completed", row)
         for spec in legacy_specs:
             state_path = args.legacy_state_root / "retirements" / f"{spec.dataset}.json"
             if not state_path.is_file():
@@ -213,7 +260,7 @@ def main() -> int:
                 continue
             lease_row = _active_lease_deferred_row(
                 spec.dataset, state, now_ns=time.time_ns()
-            )
+            ) if not args.manual_immediate else None
             if lease_row is not None:
                 rows.append(lease_row)
                 continue
@@ -223,13 +270,25 @@ def main() -> int:
                 "hot_root": args.hot_root,
                 "sync_root": cfg.sync_root,
                 "state_root": args.legacy_state_root,
+                "materialized_root": cfg.materialized_root,
                 "activation_root": args.state_root / "activations",
                 "backup_config": cfg.backup_config,
                 "peer_proof": peer_proof,
-                "peer_probe": lambda: _syncthing(cfg),
+                "peer_probe": transport_probe,
                 "bridge_inactive": _bridge_inactive(args.hot_root),
+                "manual_immediate": args.manual_immediate,
             }
-            plan = plan_legacy_retirement(spec, **options)
+            record(spec.dataset, "planning", {"dataset": spec.dataset, "deleted": False})
+            try:
+                plan = plan_legacy_retirement(spec, **options)
+            except (OSError, ValueError, SnapshotError) as exc:
+                rows.append({"dataset": spec.dataset, "action": "deferred",
+                             "blockers": ["cold-or-hot-proof-failed"],
+                             "verification": "failed_read_only", "error": str(exc),
+                             "deleted": False})
+                record(spec.dataset, "blocked", rows[-1])
+                continue
+            record(spec.dataset, "plan", plan)
             row = {
                 "dataset": spec.dataset,
                 "action": "eligible" if plan["apply_ready"] else "deferred",
@@ -238,15 +297,24 @@ def main() -> int:
                 "snapshot_id": plan["snapshot_id"],
             }
             if args.apply and (
-                plan["apply_ready"] or "artifact-has-process-references" in plan["blockers"]
+                plan["apply_ready"] or (not args.manual_immediate and "artifact-has-process-references" in plan["blockers"])
             ):
+                record(spec.dataset, "applying", {"dataset": spec.dataset, "plan_fingerprint": plan["plan_fingerprint"]})
                 result = apply_legacy_retirement(
                     spec, expected_fingerprint=plan["plan_fingerprint"], **options
                 )
                 row["action"] = result["action"]
                 row["deleted"] = result["deleted"]
+                row["reclaimed_allocated_file_bytes"] = result.get("reclaimed_allocated_file_bytes", 0)
+                record(spec.dataset, "result", result)
             rows.append(row)
-        print(json.dumps({"state": "ok", "apply": args.apply, "rows": rows}, ensure_ascii=False, indent=2))
+            record(spec.dataset, "completed", row)
+        summary = {"state": "partial_deferred" if any(row.get("action") == "deferred" for row in rows) else "ok",
+                   "apply": args.apply, "manual_immediate": args.manual_immediate, "rows": rows,
+                   "reclaimed_allocated_file_bytes": sum(row.get("reclaimed_allocated_file_bytes", 0) for row in rows)}
+        if args.receipt_dir is not None:
+            atomic_write_json(args.receipt_dir / "summary.json", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     except (OSError, ValueError, SnapshotError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

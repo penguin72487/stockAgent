@@ -399,7 +399,9 @@ run_yahoo_incremental_assets() {
   local prev_assets="$YAHOO_ASSETS"
   local rc=0
   YAHOO_ASSETS="$assets_text"
-  if ! run_yahoo_incremental; then
+  if run_yahoo_incremental; then
+    :
+  else
     rc=$?
   fi
   YAHOO_ASSETS="$prev_assets"

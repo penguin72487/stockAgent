@@ -593,9 +593,9 @@ class FinLabHistoryTest(unittest.TestCase):
             assert sync_selection(
                 keys, {"b:curated": {}}, root, now=now,
                 refresh_days=1, retry_unavailable=False,
-            ) == ["b:curated", "m:missing", "z:older", "a:newer"]
+            ) == ["m:missing", "z:older", "b:curated", "a:newer"]
 
-    def test_downloaded_official_price_overlap_refresh_uses_surplus_quota(self):
+    def test_current_close_is_required_not_optional_validation(self):
         now = datetime(2026, 9, 25, 1, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -613,7 +613,7 @@ class FinLabHistoryTest(unittest.TestCase):
             assert sync_selection(
                 [key, "missing:feature"], {key: {}}, root,
                 now=now, refresh_days=1, retry_unavailable=False,
-            ) == ["missing:feature"]
+            ) == [key, "missing:feature"]
 
     def test_cooling_required_field_does_not_release_optional_validation_or_tick(self):
         now = datetime(2026, 9, 25, 1, tzinfo=UTC)
@@ -638,16 +638,16 @@ class FinLabHistoryTest(unittest.TestCase):
             with patch("downloader.acquisition_policy.evaluate_secondary_admission",
                        side_effect=AssertionError("must not need global gate")):
                 assert sync_selection(keys, {}, root, now=now, refresh_days=1,
-                                      retry_unavailable=False) == []
+                                      retry_unavailable=False) == [key]
             status = record_core_acquisition_status(keys, {}, root, now=now, refresh_days=1)
             assert status["status"] == "blocked"
             assert status["required_blocked"] == 1
             assert status["required_blocked_keys"] == ["missing:feature"]
-            assert status["secondary_validation_pending"] == 1
+            assert status["secondary_validation_pending"] == 0
             assert status["windowed_examples_excluded"] == ["tw_minute:2317", "tw_tick:2317"]
             assert (root / "core_acquisition_status.json").is_file()
 
-    def test_validation_requires_global_admission_even_when_local_core_is_ready(self):
+    def test_required_close_refresh_does_not_need_optional_global_admission(self):
         now = datetime(2026, 9, 25, 1, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -665,11 +665,11 @@ class FinLabHistoryTest(unittest.TestCase):
                 with patch("downloader.acquisition_policy.evaluate_secondary_admission",
                            return_value={"allowed": allowed}) as gate:
                     assert sync_selection([key], {}, root, now=now, refresh_days=1,
-                                          retry_unavailable=False) == ([key] if allowed else [])
-                    gate.assert_called_once_with(now=now, caller_provider="finlab", local_core_complete=True)
+                                          retry_unavailable=False) == [key]
+                    gate.assert_not_called()
             status = record_core_acquisition_status([key], {}, root, now=now, refresh_days=1)
-            assert status["status"] == "ready"
-            assert status["required_pending"] == 0
+            assert status["status"] == "blocked"
+            assert status["required_pending"] == 1
 
     def test_failure_cooldowns_are_reason_specific_and_intraday_needs_dates(self):
         now = datetime(2026, 9, 24, 15, tzinfo=UTC)
@@ -830,7 +830,6 @@ class FinLabHistoryTest(unittest.TestCase):
             assert summary["not_downloaded"] == 8
             assert summary["not_downloaded_by_reason"] == {
                 "pending": 2, "deferred_resource": 0, "deferred_windowed": 2,
-                "partial_windowed": 0,
                 "partial_windowed": 0,
                 "provider_error": 2, "provider_empty": 0,
                 "resource_timeout": 2, "vip_only": 0,

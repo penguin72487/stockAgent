@@ -74,6 +74,9 @@ run_fintech_python "$finlab_repo_root/scripts/download_finlab_history.py" discov
 # gigabytes in the SDK cache when ten keys shared a process; this keeps peak
 # memory independent of the number of catalog keys attempted that day.
 # The SDK owns its delta handling and authoritative account quota.
+# Verified SDK incremental checks ignore FINLAB_SYNC_MIN_QUOTA_MB. That local
+# reserve applies only to new history / whole-object streaming; quota-deferred
+# prefixes are scanned past before the per-process actual-attempt limit.
 # A single oversized key is already recorded and cooled down by sync_selection.
 # Stop only after consecutive SDK timeouts: an intervening completed SDK call
 # proves the worker can still advance to later catalog keys.
@@ -159,8 +162,10 @@ fi
 # use only residual capacity after the general history sweep and its private
 # research publication have had their turn.  A fresh local selection recheck
 # closes the gap between the last sync receipt and this request boundary.
-# The larger Tick-only reserve protects later high-priority revisions today;
-# the general downloader keeps its independent 50 MB reserve.
+# Tick reserves only observed higher-priority checks before this account reset,
+# plus a 50 MB floor. Unmeasured future checks retain a conservative 500 MB
+# reserve; an explicit user reserve is still a floor. Verified all-null sources
+# remain incomplete, but cannot indefinitely block unrelated residual Tick.
 if [[ "$finlab_state" == "pass_complete" ]]; then
   if finlab_general_status="$(
     run_fintech_python "$finlab_repo_root/scripts/download_finlab_history.py" pending \
@@ -171,7 +176,8 @@ if [[ "$finlab_state" == "pass_complete" ]]; then
       "$finlab_general_status")"
     if [[ "$finlab_tick_allowed" == "true" ]]; then
       finlab_tick_reserve_mb="$(run_fintech_python -c \
-        'import os; from dotenv import dotenv_values; print(os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB") or "500")')"
+        'import json,os,sys; from dotenv import dotenv_values; status=json.loads(sys.argv[1]); configured=os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB"); print(max(float(status.get("scheduled_reserve_mb",500)), float(configured) if configured else 50))' \
+        "$finlab_general_status")"
       if ! timeout --signal=TERM --kill-after=10s 1200s \
           "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
             --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-256}" \

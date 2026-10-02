@@ -53,3 +53,33 @@ def test_zero_work_does_not_wait_for_tomorrow_and_invalid_rate_rejected():
     assert finish(0, [event(NOW, 100)])[0] == NOW
     with pytest.raises(ValueError):
         finish(100, [], rate=0)
+
+
+def test_intraday_calendar_decision_is_cached_per_day_not_per_release():
+    checks = []
+
+    def protected(day):
+        checks.append(day)
+        return False
+
+    events = [event(NOW + timedelta(minutes=i), 1, period=0, session=True) for i in range(20)]
+    done, pause, calls = finish(100, events, rate=100, protected=protected)
+    assert done == NOW + timedelta(hours=1)
+    assert (pause, calls) == (0, 0)
+    assert checks == [NOW.date()]
+
+
+def test_cached_boundaries_change_at_taipei_midnight_and_session_closure():
+    start = datetime(2026, 9, 30, 15, 50, tzinfo=UTC)  # 23:50 Taipei
+    checks = []
+
+    def protected(day):
+        checks.append(day)
+        return day.day == 1
+
+    events = [event(start + timedelta(minutes=5 * i), 1, period=0, session=True) for i in range(12)]
+    done, pause, calls = finish(100, events, start=start, rate=10, protected=protected)
+    # Two closed-day events are skipped; ten Oct 1 events consume capacity.
+    assert calls == 10 and pause == 3000
+    assert done == start + timedelta(hours=11, minutes=50)
+    assert len(checks) == len(set(checks)) == 2

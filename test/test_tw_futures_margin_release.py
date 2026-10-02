@@ -52,6 +52,25 @@ def test_full_market_rows_keep_zero_print_product_and_no_synthetic_fills():
     assert daily['contract_multiplier'].null_count() == daily.height
 
 
+def test_scoped_materialization_keeps_parent_calendar_gaps_visible():
+    source,raw,universe=source_rows()
+    calendar=source.select('date').unique()
+    missing=date(2026,1,3)
+    source=source.filter(pl.col('date')!=missing)
+    raw=raw.filter(pl.col('date')!=missing)
+    daily,_=materialize_margin_market_rows(source,raw,universe,market_dates=calendar)
+    assert daily.height==source.height and missing not in daily['date']
+    after=daily.filter(pl.col('date')==date(2026,1,4))
+    assert after['previous_market_date'].to_list()==[missing]*2
+    assert after['previous_symbol_date'].to_list()==[date(2026,1,2)]*2
+    assert not after['same_contract_as_previous_session'].any()
+    assert not daily.filter(pl.col('date')==date(2026,1,2))['can_hold_overnight'].any()
+    for invalid in [pl.concat([calendar,calendar.head(1)]),
+                    calendar.filter(pl.col('date')!=date(2026,1,4))]:
+        with pytest.raises(ValueError,match='repair calendar'):
+            materialize_margin_market_rows(source,raw,universe,market_dates=invalid)
+
+
 def test_future_price_perturbation_cannot_change_earlier_features():
     source, raw, universe = source_rows()
     first, _ = materialize_margin_market_rows(source, raw, universe)

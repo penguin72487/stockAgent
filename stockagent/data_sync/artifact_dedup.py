@@ -18,6 +18,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from stockagent.data_sync.desync_snapshots import _fsync_directory, sha256_file
+
 
 DEFAULT_EXCLUDED_TOP = frozenset(
     {
@@ -89,6 +91,83 @@ class DuplicateGroup:
     @property
     def reclaimable_allocated_bytes(self) -> int:
         return sum(item.blocks * 512 for item in self.duplicates)
+
+
+def link_immutable_source(
+    source: Path, destination: Path, object_root: Path, expected_sha256: str
+) -> None:
+    """Copy a verified source once, then link immutable local evidence aliases.
+
+    Never hard-link the mutable producer itself. This is node-local working
+    state, not a packed release, a cold authority, or a completeness proof.
+    Existing objects and aliases are verified and never overwritten.
+    """
+
+    if (
+        len(expected_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in expected_sha256)
+    ):
+        raise ValueError("invalid immutable source SHA-256")
+    destination = destination.absolute()
+    object_root = object_root.absolute()
+    for directory in (destination.parent, object_root / expected_sha256[:2]):
+        if directory.resolve(strict=False) != directory:
+            raise ValueError("immutable evidence directory is redirected")
+        directory.mkdir(parents=True, exist_ok=True)
+        if directory.resolve() != directory:
+            raise ValueError("immutable evidence directory is redirected")
+    object_path = object_root / expected_sha256[:2] / expected_sha256
+    if destination.parent.stat().st_dev != object_path.parent.stat().st_dev:
+        raise ValueError("immutable evidence aliases must share a filesystem")
+
+    def verify(path: Path) -> None:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or sha256_file(path) != expected_sha256:
+            raise ValueError(f"immutable source hash/type mismatch: {path}")
+        after = path.lstat()
+        # Adding another immutable alias changes ctime/nlink, not the payload.
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise ValueError(f"immutable source changed during verification: {path}")
+
+    if os.path.lexists(destination):
+        verify(destination)
+        return
+    if not os.path.lexists(object_path):
+        temporary = object_path.with_name(f".{expected_sha256}.{uuid.uuid4().hex}.partial")
+        try:
+            before = source.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("immutable source input is not a regular file")
+            digest = hashlib.sha256()
+            with source.open("rb") as reader, temporary.open("xb") as writer:
+                while chunk := reader.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+                    writer.write(chunk)
+                writer.flush()
+                os.fchmod(writer.fileno(), 0o444)
+                os.fsync(writer.fileno())
+            after = source.lstat()
+            if digest.hexdigest() != expected_sha256 or (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+            ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("immutable source changed during copy")
+            try:
+                os.link(temporary, object_path, follow_symlinks=False)
+                _fsync_directory(object_path.parent)
+            except FileExistsError:
+                pass  # Another publisher won; independently verify its bytes.
+        finally:
+            temporary.unlink(missing_ok=True)
+    verify(object_path)
+    if stat.S_IMODE(object_path.stat().st_mode) & 0o222:
+        raise ValueError("immutable evidence object is writable")
+    try:
+        os.link(object_path, destination, follow_symlinks=False)
+        _fsync_directory(destination.parent)
+    except FileExistsError:
+        verify(destination)
 
 
 def _iter_files(
@@ -448,4 +527,5 @@ __all__ = [
     "apply_duplicate_groups",
     "find_duplicate_groups",
     "groups_as_json",
+    "link_immutable_source",
 ]

@@ -20,7 +20,7 @@
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">九個面板，<br>一個可信的即時視角</h1>
+      <h1 id="page-title">全來源面板，<br>一個可信的即時視角</h1>
       <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
       <div class="trust-row" aria-label="面板資料原則">
         <span>只讀模擬</span>
@@ -126,6 +126,13 @@
         <span class="card-action">開啟 FinMind 面板 <b aria-hidden="true">→</b></span>
       </a>
 
+      <a class="dashboard-card finlab" href="tej/">
+        <div class="card-topline"><span class="market">TEJ SMART WIZARD</span><span id="tej-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span></div>
+        <div><strong>TEJ 歷史資料監控</strong><p>帳號完整目錄、逐欄原始單位、桌面匯出量、查詢範圍、容量與條件式估時。</p></div>
+        <dl class="card-stats" aria-label="TEJ 資料管線摘要"><div><dt>完整目錄</dt><dd id="tej-catalog">—</dd></div><div><dt>實際匯出</dt><dd id="tej-progress">—</dd></div></dl>
+        <span class="card-action">開啟 TEJ 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
       <a class="dashboard-card openbb" href="openbb/">
         <div class="card-topline">
           <span class="market">OPENBB ARCHIVE</span>
@@ -149,7 +156,7 @@
         </div>
         <div>
           <strong>全資料來源監控</strong>
-          <p>永豐、yfinance、MOPS、臺灣官方資料、OpenBB、加密貨幣與外匯的完整度、新鮮度、進度與 ETA。</p>
+          <p>永豐、FinLab、FinMind、TEJ、MOPS、官方資料、OpenBB、加密貨幣與外匯的完整度、新鮮度、進度與 ETA。</p>
         </div>
         <dl class="card-stats" aria-label="全資料來源即時摘要">
           <div><dt>監控項目</dt><dd id="data-registered">—</dd></div>
@@ -184,7 +191,7 @@
     </aside>
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
-  <script src="dashboard-core.js?v=10" defer></script>
-  <script src="public.js?v=12" defer></script>
+  <script src="dashboard-core.js?v=11" defer></script>
+  <script src="public.js?v=13" defer></script>
 </body>
 </html>

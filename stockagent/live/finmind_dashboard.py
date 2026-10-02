@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -121,7 +122,7 @@ def _traffic(root: Path, now: datetime, limit: int) -> dict[str, Any]:
                 "history": [], "tracking_started_at_utc": None}
     cutoff = now - timedelta(hours=25)
     try:
-        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0) as conn:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)) as conn:
             first_row = conn.execute("SELECT MIN(started_at_utc) FROM requests").fetchone()
             raw = conn.execute(
                 "SELECT started_at_utc FROM requests WHERE started_at_utc >= ? "

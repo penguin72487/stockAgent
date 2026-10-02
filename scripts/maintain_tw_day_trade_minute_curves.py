@@ -44,7 +44,10 @@ from stockagent.live.shioaji_schedule import (  # noqa: E402
     TAIPEI,
     historical_query_is_protected,
 )
-from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+from stockagent.live.tw_day_trade_simulation import (
+    MARGIN_CARRY_CONTRACT,
+    TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+)
 from downloader.download_shioaji_tx_futures_ticks import _valid_receipt  # noqa: E402
 from downloader.download_tw_public_data import (  # noqa: E402
     _validated_taiex_session_dates,
@@ -143,7 +146,18 @@ def _completed_scope(
     events_path = state_dir / "events.jsonl"
     if events_path.is_file():
         for event in _iter_jsonl(events_path):
-            if event.get("event") != "closing_auction_settled" or event.get("market") not in markets:
+            if event.get("market") not in markets:
+                continue
+            official_settlement = event.get("event") == "closing_auction_settled"
+            paper_settlement = (
+                event.get("event") == "unlimited_close_paper_settlement"
+                and event.get("assumption_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                and type(event.get("remaining_count")) is int
+                and event["remaining_count"] == 0
+                and type(event.get("settled_count")) is int
+                and event["settled_count"] > 0
+            )
+            if not (official_settlement or paper_settlement):
                 continue
             settled_at = datetime.fromisoformat(str(event["recorded_at"]))
             if settled_at.tzinfo is None:
@@ -829,6 +843,10 @@ def main() -> None:
             str(HISTORICAL_MAX_TRAFFIC_FRACTION),
             "--publish",
         ]
+        for session_date in completed:
+            command.extend(["--expected-session-date", session_date])
+        for market in sorted(markets):
+            command.extend(["--expected-market", market])
         if not args.no_fetch:
             command.append("--fetch-missing-kbars")
         if price_validation is not None and int(price_validation.get("unverified_opening_rows") or 0) > 0:
@@ -880,32 +898,49 @@ def main() -> None:
         if completed_process.stderr.strip():
             print(completed_process.stderr.strip(), file=sys.stderr, flush=True)
         validation_clock = time.monotonic()
-        strategy_validation = _validate_current(
-            state_dir,
-            completed_session_dates=completed,
-            expected_markets=markets,
-        )
-        price_validation = _proven_price_state_from_curve_validation(
-            strategy_validation,
-            completed_session_dates=completed,
-            expected_markets=markets,
-        )
-        if price_validation is None:
-            price_validation = _inspect_strategy_price_provenance(
+        try:
+            strategy_validation = _validate_current(
                 state_dir,
                 completed_session_dates=completed,
                 expected_markets=markets,
             )
-        if (int(price_validation.get("unverified_opening_rows") or 0) != 0
-                or int(price_validation.get("unverified_interior_rows") or 0) != 0):
-            raise RuntimeError(
-                "minute-curve rebuild left unverified opening/interior strategy prices: "
-                f"{price_validation['unverified_sample']}"
+            price_validation = _proven_price_state_from_curve_validation(
+                strategy_validation,
+                completed_session_dates=completed,
+                expected_markets=markets,
             )
-        benchmark_validation = _validate_benchmarks(
-            state_dir,
-            completed_session_dates=completed,
-        )
+            if price_validation is None:
+                price_validation = _inspect_strategy_price_provenance(
+                    state_dir,
+                    completed_session_dates=completed,
+                    expected_markets=markets,
+                )
+            if (int(price_validation.get("unverified_opening_rows") or 0) != 0
+                    or int(price_validation.get("unverified_interior_rows") or 0) != 0):
+                raise RuntimeError(
+                    "minute-curve rebuild left unverified opening/interior strategy prices: "
+                    f"{price_validation['unverified_sample']}"
+                )
+            benchmark_validation = _validate_benchmarks(
+                state_dir,
+                completed_session_dates=completed,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            preflight_seconds["post_validation"] = round(time.monotonic() - validation_clock, 6)
+            _atomic_json(status_path, {
+                "schema_version": 1,
+                "status": "failed",
+                "failed_stage": "post_publication_validation",
+                "observed_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
+                "started_at": started.isoformat(timespec="seconds"),
+                "completed_session_dates": completed,
+                "stage_seconds": preflight_seconds,
+                "error_type": type(error).__name__,
+                "error": str(error)[-4000:],
+                "simulation_only": True,
+                "production_order_possible": False,
+            })
+            raise
         preflight_seconds["post_validation"] = round(time.monotonic() - validation_clock, 6)
         public_history_prewarm = _prewarm_public_history()
         preflight_seconds["public_history_prewarm"] = public_history_prewarm.get(

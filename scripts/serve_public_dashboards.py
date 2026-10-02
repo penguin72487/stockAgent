@@ -58,6 +58,10 @@ from stockagent.live.finlab_dashboard import (  # noqa: E402
 from stockagent.live.finmind_dashboard import (  # noqa: E402
     build_finmind_public_status,
 )
+from stockagent.live.tej_dashboard import (  # noqa: E402
+    build_tej_public_status,
+    build_tej_feature_page,
+)
 from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
     build_openbb_public_history,
     build_openbb_public_status,
@@ -183,6 +187,8 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/shioaji/api/status",
         "/finlab/api/status",
         "/finmind/api/status",
+        "/tej/api/status",
+        "/tej/api/features",
         "/openbb/api/status",
         "/openbb/api/history",
         "/data-monitor/api/status",
@@ -204,6 +210,7 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/shioaji/",
         "/finlab/",
         "/finmind/",
+        "/tej/",
         "/openbb/",
         "/data-monitor/",
         "/data-monitor/providers/{provider}/",
@@ -222,6 +229,7 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/openbb/api/history",
         "/data-monitor/api/provider",
         "/data-monitor/api/features/page",
+        "/tej/api/features",
         "/tw-overnight/api/status",
         "/tw-overnight/api/history",
         "/tw-overnight/api/summary",
@@ -1448,6 +1456,7 @@ def build_public_overview(
     overnight: Mapping[str, Any] | None = None,
     finlab_quota: Mapping[str, Any] | None = None,
     finmind_status: Mapping[str, Any] | None = None,
+    tej_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return only the fields required by the public landing cards."""
 
@@ -1472,6 +1481,9 @@ def build_public_overview(
     finlab_acquisition = finlab_acquisition if isinstance(finlab_acquisition, Mapping) else {}
     finlab_quota = finlab_quota if isinstance(finlab_quota, Mapping) else {}
     finmind_status = finmind_status if isinstance(finmind_status, Mapping) else {}
+    tej_status = tej_status if isinstance(tej_status, Mapping) else {}
+    tej_catalog = tej_status.get("catalog") if isinstance(tej_status.get("catalog"), Mapping) else {}
+    tej_workload = tej_status.get("workload") if isinstance(tej_status.get("workload"), Mapping) else {}
     finmind_acquisition = finmind_status.get("acquisition")
     finmind_acquisition = finmind_acquisition if isinstance(finmind_acquisition, Mapping) else {}
     finmind_quota = finmind_status.get("quota")
@@ -1568,6 +1580,11 @@ def build_public_overview(
             "official_requests_per_hour": finmind_quota.get("official_requests_per_hour"),
             "quota_state": finmind_quota.get("state"),
         },
+        "tej": {
+            "state": tej_status.get("state"), "tables": tej_catalog.get("tables"),
+            "fields": tej_catalog.get("fields"), "exported_rows": tej_workload.get("exported_rows"),
+            "catalog_scan_complete": tej_catalog.get("catalog_scan_complete"),
+        },
         "data_monitor": {
             "health": data_monitor.get("health"),
             "registered_items": data_summary.get("registered_items", 0),
@@ -1600,6 +1617,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         shioaji_static_root: Path,
         finlab_static_root: Path | None = None,
         finmind_static_root: Path | None = None,
+        tej_static_root: Path | None = None,
         openbb_static_root: Path,
         data_monitor_static_root: Path,
         traffic_static_root: Path,
@@ -1617,6 +1635,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.shioaji_static_root = Path(shioaji_static_root)
         self.finlab_static_root = Path(finlab_static_root or repo_root / "services/finlab_dashboard")
         self.finmind_static_root = Path(finmind_static_root or repo_root / "services/finmind_dashboard")
+        self.tej_static_root = Path(tej_static_root or repo_root / "services/tej_dashboard")
         self.openbb_static_root = Path(openbb_static_root)
         self.data_monitor_static_root = Path(data_monitor_static_root)
         self.traffic_static_root = Path(traffic_static_root)
@@ -2818,6 +2837,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             overnight=overnight,
             finlab_quota=finlab_quota,
             finmind_status=build_finmind_public_status(self.repo_root),
+            tej_status=build_tej_public_status(self.repo_root),
         )
 
     def prewarm_overview(self) -> None:
@@ -3185,6 +3205,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             ("/shioaji/", self.server.shioaji_static_root),
             ("/finlab/", self.server.finlab_static_root),
             ("/finmind/", self.server.finmind_static_root),
+            ("/tej/", self.server.tej_static_root),
             ("/openbb/", self.server.openbb_static_root),
             ("/data-monitor/", self.server.data_monitor_static_root),
             ("/traffic/", self.server.traffic_static_root),
@@ -3194,7 +3215,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / "index.html",
                     "text/html; charset=utf-8",
-                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/"} else "public, max-age=60",
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else "public, max-age=60",
                 )
             elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix == "provider.js") or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
@@ -3208,7 +3229,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / suffix,
                     "text/javascript; charset=utf-8",
-                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
             elif suffix == "styles.css" or (
                 prefix == "/traffic/" and suffix == "performance.css"
@@ -3250,6 +3271,23 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise
         except (ValueError, OverflowError) as error:
             raise InvalidPublicRequest("invalid date query") from error
+
+    @staticmethod
+    def _tej_feature_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=5)
+            if set(query) - {"offset", "limit", "q", "table", "phase"} or any(len(v) != 1 for v in query.values()):
+                raise ValueError("invalid fields")
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["50"])[0])
+            search, table_id, phase = (query.get(k, [default])[0] for k, default in (("q", ""), ("table", ""), ("phase", "all")))
+            if (not 0 <= offset <= 1_000_000 or not 1 <= limit <= 100 or len(search) > 120
+                    or any(ord(c) < 32 for c in search) or phase not in {"all", "P1", "P2", "P3"}
+                    or table_id and not re.fullmatch(r"[a-f0-9]{24}", table_id)):
+                raise ValueError("invalid parameters")
+            return {"offset": offset, "limit": limit, "search": search, "table_id": table_id, "phase": phase}
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid TEJ feature page") from error
 
     @staticmethod
     def _provider_query(raw_query: str) -> dict[str, Any]:
@@ -3797,6 +3835,20 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
                 builder=lambda: build_finmind_public_status(self.server.repo_root),
             )
+        if path == "/tej/api/status":
+            return self.server.cached_local_json(
+                cache_key="tej-status", ttl_seconds=20.0, cache_control="no-store",
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                builder=lambda: build_tej_public_status(self.server.repo_root),
+            )
+        if path == "/tej/api/features":
+            filters = self._tej_feature_query(raw_query)
+            key = json.dumps(filters, sort_keys=True)
+            return self.server.cached_local_json(
+                cache_key=f"tej-features:{key}", ttl_seconds=20.0, cache_control="no-store",
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                builder=lambda: build_tej_feature_page(self.server.repo_root, **filters),
+            )
         if path == "/openbb/api/status":
             return self.server.openbb_status()
         if path == "/openbb/api/history":
@@ -3967,6 +4019,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "/shioaji",
             "/finlab",
             "/finmind",
+            "/tej",
             "/openbb",
             "/data-monitor",
             "/traffic",
@@ -4173,6 +4226,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("services/finmind_dashboard"),
     )
+    parser.add_argument("--tej-static-root", type=Path, default=Path("services/tej_dashboard"))
     parser.add_argument(
         "--openbb-static-root",
         type=Path,
@@ -4218,6 +4272,7 @@ def main(argv: list[str] | None = None) -> int:
         shioaji_static_root=Path(args.shioaji_static_root),
         finlab_static_root=Path(args.finlab_static_root),
         finmind_static_root=Path(args.finmind_static_root),
+        tej_static_root=Path(args.tej_static_root),
         openbb_static_root=Path(args.openbb_static_root),
         data_monitor_static_root=Path(args.data_monitor_static_root),
         traffic_static_root=Path(args.traffic_static_root),

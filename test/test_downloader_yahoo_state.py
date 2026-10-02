@@ -43,6 +43,8 @@ def test_daily_asset_summary_survives_separate_asset_invocations(
     assert us["run_id"] == args.run_id
     assert forex["asset_class"] == "forex"
     assert forex["run_id"] == args.run_id
+    assert forex["acquisition_contract"] == yahoo.acquisition_contract("forex")
+    assert us["acquisition_contract"] == yahoo.acquisition_contract("us_stocks")
     assert legacy == {"forex": {"repaired": 1}}
 
 
@@ -1478,6 +1480,111 @@ def test_normalize_can_drop_zero_volume_for_assets_without_meaningful_volume():
     normalized = yahoo._normalize_download_frame(frame, keep_zero_volume=False)
 
     assert "Trading_Volume" not in normalized.columns
+
+
+@pytest.mark.parametrize("mode", ["daily-update", "incremental", "repair"])
+@pytest.mark.parametrize("volume", [None, [0.0, 0.0], [100.0, 200.0]])
+def test_forex_writer_and_repair_share_optional_volume_contract(tmp_path, mode, volume):
+    frame = pl.DataFrame({
+        "date": ["2026-06-10", "2026-06-11"],
+        "open": [1.1, 1.2], "max": [1.2, 1.3], "min": [1.0, 1.1],
+        "close": [1.15, 1.25], "adjclose": [1.15, 1.25],
+    })
+    if volume is not None:
+        frame = frame.with_columns(pl.Series("Trading_Volume", volume))
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex",
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    before = path.read_bytes()
+    record = yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex", mode=mode), [record], tmp_path,
+    )
+    assert [(c.status, c.repair_start_date) for c in checks] == [("current", None)]
+    assert path.read_bytes() == before
+    written = yahoo._read_parquet_frame(path)
+    assert ("Trading_Volume" in written.columns) == (volume == [100.0, 200.0])
+    assert written["close"].to_list() == [1.15, 1.25]
+    metadata = pq.read_metadata(path).metadata
+    assert metadata[yahoo.PARQUET_META_ACQUISITION_VERSION_KEY] == b"2"
+    assert metadata[yahoo.PARQUET_META_ACQUISITION_FINGERPRINT_KEY].decode() == (
+        yahoo.acquisition_contract("forex")["fingerprint"]
+    )
+
+
+def test_forex_stale_prices_get_incremental_merge_not_full_schema_repair(tmp_path):
+    frame = pl.DataFrame({
+        "date": ["2026-06-10"], "open": [1.1], "max": [1.2],
+        "min": [1.0], "close": [1.15], "adjclose": [1.15],
+    })
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex",
+        requested_start_date="2000-01-01", requested_end_date="2026-06-10",
+    )
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex"),
+        [yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")], tmp_path,
+    )
+    assert [(c.status, c.repair_start_date, c.merge_existing) for c in checks] == [
+        ("stale", "2026-06-03", True),
+    ]
+
+
+@pytest.mark.parametrize("asset", ["tw_stocks", "us_stocks", "crypto"])
+def test_non_forex_repair_still_requires_volume(tmp_path, asset):
+    frame = pl.DataFrame({
+        "date": ["2026-06-11"], "open": [10.0], "max": [11.0],
+        "min": [9.0], "close": [10.5], "adjclose": [10.5],
+    })
+    yahoo._write_feature_parquet_atomic(
+        frame, tmp_path / "TEST_features.parquet", asset_class=asset,
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    checks = yahoo._resolve_repair_plan(
+        asset, _base_args(tmp_path, asset=asset),
+        [yahoo.SymbolRecord("TEST", "Test", asset, "TEST")], tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("schema_mismatch", False)]
+    assert checks[0].message == "missing_required_columns=Trading_Volume"
+
+
+@pytest.mark.parametrize("source", ["cboe", "legacy_unknown"])
+def test_optional_forex_volume_does_not_waive_source_metadata(tmp_path, source):
+    frame = pl.DataFrame({
+        "date": ["2026-06-11"], "open": [1.1], "max": [1.2],
+        "min": [1.0], "close": [1.15], "adjclose": [1.15],
+    })
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex", source=source,
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    before = path.read_bytes()
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex"),
+        [yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")], tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("metadata_invalid", False)]
+    assert source in checks[0].message
+    assert path.read_bytes() == before
+    assert yahoo.PARQUET_META_ACQUISITION_FINGERPRINT_KEY not in pq.read_metadata(path).metadata
+
+
+def test_yahoo_acquisition_contract_is_asset_scoped_and_deterministic():
+    forex = yahoo.acquisition_contract("forex")
+    stock = yahoo.acquisition_contract("us_stocks")
+    assert forex["version"] == 2 and forex["price_schema_version"] == 1
+    assert "Trading_Volume" not in forex["required_columns"]
+    assert "Trading_Volume" in stock["required_columns"]
+    assert forex["fingerprint"] != stock["fingerprint"]
+    assert yahoo.acquisition_contract("forex") == forex
+    forex["required_columns"].append("mutated")
+    assert "mutated" not in yahoo.acquisition_contract("forex")["required_columns"]
+    with pytest.raises(ValueError, match="Unknown Yahoo asset class"):
+        yahoo.acquisition_contract("unknown")
 
 
 def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monkeypatch):
