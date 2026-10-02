@@ -523,6 +523,25 @@ def _synthetic_open_tick_entry_price(
     return moved
 
 
+def whole_lot_target_shares(weight: float, nav: float, price: float, lot_size: int) -> int:
+    """The common target-sizing operation, before independent fill constraints."""
+
+    return int(math.floor(abs(weight) * nav / price / int(lot_size))) * int(lot_size)
+
+
+def realized_account_nav(
+    mode: Mapping[str, Any], *, deduct_carry_cost: bool = True
+) -> float:
+    """Economic NAV before valuing any carried inventory at the session open."""
+
+    return (
+        float(mode["initial_capital_twd"])
+        + float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
+        + float(mode.get("cumulative_corporate_action_net_twd") or 0.0)
+        - (float(mode.get("cumulative_carry_cost_twd") or 0.0) if deduct_carry_cost else 0.0)
+    )
+
+
 def _prepare_entry_plan(
     raw_row: Mapping[str, Any],
     *,
@@ -628,14 +647,12 @@ def _prepare_entry_plan(
     top_book_capacity_shares = 0
     minute_kbar_capacity_shares = 0
     if status == "ready" and sizing_price is not None:
-        requested_shares = int(
-            math.floor(
-                abs(target_weight)
-                * float(spec.initial_capital_twd if sizing_nav_twd is None else sizing_nav_twd)
-                / sizing_price
-                / int(spec.lot_size)
-            )
-        ) * int(spec.lot_size)
+        requested_shares = whole_lot_target_shares(
+            target_weight,
+            float(spec.initial_capital_twd if sizing_nav_twd is None else sizing_nav_twd),
+            sizing_price,
+            spec.lot_size,
+        )
         if requested_shares_override is not None:
             requested_shares = int(requested_shares_override)
             if requested_shares < 0 or (requested_shares % spec.lot_size and not (
@@ -3920,9 +3937,8 @@ class TwDayTradeSimulationEngine:
         # and restart. The initial capital remains the reporting denominator.
         sizing_date = observed.date().isoformat()
         if mode.get("sizing_session_date") != sizing_date:
-            sizing_nav = (float(mode["initial_capital_twd"])
-                          + float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
-                          + float(mode.get("cumulative_corporate_action_net_twd") or 0.0))
+            # Carry costs are deducted below, after any new opening accrual.
+            sizing_nav = realized_account_nav(mode, deduct_carry_cost=False)
             if margin_rebalance:
                 # Only observed opening prices, not the completed 09:01 fill,
                 # may value the pre-decision inventory used for target sizing.
@@ -3983,14 +3999,9 @@ class TwDayTradeSimulationEngine:
                 or sizing_price is None
             ):
                 continue
-            requested_shares = int(
-                math.floor(
-                    abs(weight)
-                    * sizing_nav
-                    / sizing_price
-                    / int(spec.lot_size)
-                )
-            ) * int(spec.lot_size)
+            requested_shares = whole_lot_target_shares(
+                weight, sizing_nav, sizing_price, spec.lot_size
+            )
             if requested_shares > 0:
                 actionable_symbols.append(symbol)
         later_quote_found = any(
@@ -7281,6 +7292,7 @@ class TwDayTradeSimulationEngine:
         open_net = 0.0
         stale_count = 0
         open_count = 0
+        indicative_count = 0
         total_notional = 0.0
         fresh_notional = 0.0
         missing_count = 0
@@ -7296,6 +7308,17 @@ class TwDayTradeSimulationEngine:
             liquidation = _finite(quote.get("bid" if side == "long" else "ask"))
             if mode.get("historical_minute_valuation") and quote.get("historical_minute_valuation"):
                 liquidation = _finite(quote.get("valuation_price_0901"))
+            indicative = False
+            valuation_at = _parse_timestamp(quote.get("valuation_quote_at"))
+            if (liquidation is None and valuation_at is not None
+                    and valuation_at.date() == now.date()
+                    and 0 <= (now - valuation_at).total_seconds() <= 10.0
+                    and quote.get("valuation_simtrade") is not True
+                    and quote.get("simtrade") is not True
+                    and quote.get("valuation_evidence") == "indicative_snapshot_book_only_not_execution_evidence_v1"):
+                liquidation = _finite(quote.get("valuation_bid" if side == "long" else "valuation_ask"))
+                indicative = liquidation is not None
+                indicative_count += int(indicative)
             mark_price = liquidation or _finite(position.get("last_mark_price"))
             if mark_price is not None:
                 total_notional += abs(signed) * mark_price
@@ -7317,6 +7340,14 @@ class TwDayTradeSimulationEngine:
             net_pnl = position_net_liquidation_pnl(position, liquidation)
             position["last_mark_at"] = now.isoformat(timespec="seconds")
             position["last_quote_at"] = quote.get("quote_at")
+            if indicative:
+                position["last_quote_at"] = quote.get("valuation_quote_at")
+            position["last_mark_quote_source"] = (
+                quote.get("valuation_quote_source") if indicative else quote.get("source")
+            )
+            position["last_mark_evidence"] = (
+                quote.get("valuation_evidence") if indicative else "observed_execution_or_historical_quote"
+            )
             position["last_mark_price"] = liquidation
             position["last_complete_net_pnl_twd"] = net_pnl
             position["total_net_pnl_twd"] = (
@@ -7347,6 +7378,7 @@ class TwDayTradeSimulationEngine:
             {
                 "open_position_count": open_count,
                 "stale_position_count": stale_count,
+                "indicative_valuation_position_count": indicative_count,
                 "open_net_liquidation_pnl_twd": open_net,
                 "total_equity_twd": total_equity,
                 "last_mark_at": now.isoformat(timespec="seconds"),
@@ -7430,6 +7462,7 @@ class TwDayTradeSimulationEngine:
                 "total_equity_twd": total_equity,
                 "open_position_count": open_count,
                 "stale_position_count": stale_count,
+                "indicative_valuation_position_count": indicative_count,
                 "valuation_stale": stale_count > 0,
                 **({
                     "historical_minute_replay": True,
@@ -7702,6 +7735,7 @@ class TwDayTradeSimulationEngine:
                             "open_net_liquidation_pnl_twd",
                             "open_position_count",
                             "stale_position_count",
+                            "indicative_valuation_position_count",
                             "force_exit_failures",
                             "terminal_flatten_count",
                             "terminal_flatten_degraded_count",

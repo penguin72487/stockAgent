@@ -1,0 +1,33 @@
+[Unit]
+Description=StockAgent automatic serial TEJ Smart Wizard acquisition
+After=local-fs.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_tej_history.sh"
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=30s
+# SIGTERM asks the supervisor to finish its bounded query. Never kill and
+# blindly replay a Preview. Windows/TEJ session must already be authenticated.
+KillMode=mixed
+TimeoutStopSec=1900s
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryAccounting=true
+MemoryHigh=768M
+MemoryMax=1536M
+TasksMax=64
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

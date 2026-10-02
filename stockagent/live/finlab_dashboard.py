@@ -13,7 +13,7 @@ import statistics
 from typing import Any, Mapping
 
 from scripts.finlab_release_gate import catalog_readiness
-from scripts.download_finlab_history import safe_stem
+from stockagent.data.finlab_acquisition_contract import UPSTREAM_CHECK_MODES, safe_stem
 from scripts.snapshot_finlab_quota import load_quota_history
 
 
@@ -23,8 +23,8 @@ STAGE_DATASET = "tw-public-research-finlab-2014-v4"
 def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
     """Project only workload counters; no cache paths, raw frames or SDK calls."""
     raw = _read_json(root / "artifacts/live/finlab/workload_latest.json", {})
-    if not isinstance(raw, Mapping) or raw.get("contract_version") != 1:
-        return {"contract_version": 1, "state": "unavailable"}
+    if not isinstance(raw, Mapping) or raw.get("contract_version") != 3:
+        return {"contract_version": 3, "state": "unavailable"}
 
     def fields(value, names):
         if not isinstance(value, Mapping):
@@ -37,7 +37,8 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
                     "catalog_keys scope cycle_started_at_utc refresh_days general_keys refresh_pending "
                     "unknown_transfer_keys unknown_record_keys stored_parquet_bytes eta_basis "
                     "all_data_finish_at_utc all_data_finish_reason daily_budget_bytes "
-                    "overhead_seconds_per_key_estimate overhead_samples")
+                    "quota_policy_version incremental_quota_policy incremental_daily_capacity_bytes "
+                    "overhead_seconds_per_key_estimate overhead_samples expected_pending_payload_bytes")
     known = {row["key"] for row in datasets}
     result["blocked_keys"] = [key for key in raw.get("blocked_keys", []) if isinstance(key, str) and key in known]
     result["validation_waiting_keys"] = [key for key in raw.get("validation_waiting_keys", []) if isinstance(key, str) and key in known]
@@ -51,11 +52,28 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
     result["scenarios"] = {name: fields(raw.get("scenarios", {}).get(name),
                                        "state finish_at_utc remaining_seconds processing_seconds quota_opening_wait_seconds "
                                        "queue_wait_seconds total_wait_seconds "
-                                       "quota_resets quota_share duration_factor") for name in ("fast", "reference", "slow")}
+                                       "quota_resets quota_share duration_factor newly_due_checks simulated_checks") for name in ("fast", "reference", "slow")}
+    result["stages"] = []
+    for stage in raw.get("stages", []):
+        if not isinstance(stage, Mapping) or stage.get("id") not in {
+                "priority_updates", "history", "updates", "metadata", "source_issues", "tick"}:
+            continue
+        public = fields(stage, "id label state total_keys pending_keys blocked_keys completed_keys "
+                        "remaining_bytes_estimate unknown_transfer_keys remaining_work_seconds_estimate "
+                        "unknown_time_keys next_check_at_utc reason source_weight_total_bytes "
+                        "source_weight_completed_bytes progress_ratio promoted_keys incremental_quota_exempt_keys")
+        public["records"] = [fields(row, "unit count") for row in stage.get("records", [])
+                             if isinstance(row, Mapping) and row.get("unit") in {
+                                 "wide_values", "event_rows", "metadata_values"}]
+        public["scenarios"] = {name: fields(stage.get("scenarios", {}).get(name),
+                                            "state start_at_utc finish_at_utc")
+                               for name in ("fast", "reference", "slow")}
+        result["stages"].append(public)
     rows = raw.get("datasets", [])
     result["datasets"] = [fields(row, "key downloaded needs_refresh blocked_reason queue_role scheduled "
                                   "transfer_bytes transfer_basis fetch_seconds time_basis record_count record_unit "
-                                  "stored_rows estimated_finish_at_utc")
+                                  "stored_rows estimated_finish_at_utc next_source_check_at_utc expected_payload_bytes payload_basis "
+                                  "incremental_quota_exempt")
                           for row in rows if isinstance(row, Mapping) and row.get("key") in known]
     age = _age_seconds(raw.get("generated_at_utc"), now)
     result["age_seconds"] = age
@@ -71,6 +89,10 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
         for measure in result["records"]:
             measure["ratio"] = None
         result["scenarios"] = {}
+        for stage in result["stages"]:
+            stage["scenarios"] = {}
+            stage["state"] = "stale"
+            stage["progress_ratio"] = None
         for row in result["datasets"]:
             row["estimated_finish_at_utc"] = None
     return result
@@ -176,7 +198,7 @@ def _per_key_estimates(root: Path, datasets: list[dict[str, Any]],
         if row.get("state") == "partial_windowed":
             row["local_bytes"] = row.get("partition_bytes")
         row["latest_check_within_24h"] = bool(
-            receipt.get("source_check_mode") == "upstream_forced"
+            receipt.get("source_check_mode") in UPSTREAM_CHECK_MODES
             and checked and timedelta(0) <= now - checked <= timedelta(hours=24)
         )
         row["observed_last_fetch_seconds"] = round(own, 1) if own is not None else None

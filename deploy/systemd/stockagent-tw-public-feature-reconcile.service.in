@@ -1,5 +1,5 @@
 [Unit]
-Description=Reconcile Taiwan public training features against exact source bytes
+Description=Reconcile service-required Taiwan public projection against exact source bytes
 After=local-fs.target
 # Wake the independent cold publisher only after this oneshot releases the
 # canonical source lock.  The publisher still audits every receipt and its
@@ -13,7 +13,8 @@ Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python scripts/reconcile_tw_public_training_features.py --defer-market-hours --research-output-path data_tw_public/features/tw_public_research_wide_2014_v1.parquet --research-taifex-output-path artifacts/research_features/tw_public_research_wide_2014_taifex_v2.parquet --research-all-output-path artifacts/research_features/tw_public_research_all_2014_v3.parquet'
+# Source/service hosts do not routinely build experiment-only research copies.
+ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python scripts/reconcile_tw_public_training_features.py --defer-market-hours'
 Nice=15
 CPUWeight=10
 IOWeight=10

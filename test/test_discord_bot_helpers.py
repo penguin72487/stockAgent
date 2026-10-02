@@ -958,6 +958,8 @@ def test_event_driven_postclose_service_never_runs_formal_history(
 ) -> None:
     from scripts import run_discord_artifact_maintenance as runner
 
+    runner._load_discord_bot()
+
     calls: list[object] = []
     monkeypatch.setattr(runner.discord_bot, "_rotate_error_log_if_needed", lambda: None)
     monkeypatch.setattr(
@@ -995,6 +997,8 @@ def test_artifact_maintenance_waits_through_transient_public_writer(
 ) -> None:
     from scripts import run_discord_artifact_maintenance as runner
 
+    runner._load_discord_bot()
+
     states = iter((True, True, False))
     clocks = iter((0.0, 0.0, 0.1))
     sleeps: list[float] = []
@@ -1029,6 +1033,8 @@ def test_artifact_maintenance_rechecks_public_writer_between_markets(
     from types import SimpleNamespace
 
     from scripts import run_discord_artifact_maintenance as runner
+
+    runner._load_discord_bot()
 
     events: list[tuple[str, str | None]] = []
     waits = iter((True, False))

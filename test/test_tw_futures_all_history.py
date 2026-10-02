@@ -14,7 +14,8 @@ from stockagent.data.tw_futures_margin_preparation import (
     physical_lifetime_calendar, margin_table_candidates, margin_grid_candidates,
     position_grid_candidates, corporate_grid_candidates, corporate_text_candidates,
     margin_legacy_word_levels, position_legacy_word_candidates,
-    corporate_native_table_candidates,
+    corporate_native_table_candidates,corporate_legacy_word_candidates,
+    corporate_position_legacy_word_candidates,
     corporate_deliverable_components,
     corporate_terms_intervals, margin_candidate_intervals, stock_futures_cash_reform_intervals,
     corporate_position_table_candidates,position_prose_candidates,position_candidate_intervals,
@@ -22,6 +23,196 @@ from stockagent.data.tw_futures_margin_preparation import (
 from stockagent.data.tw_futures_portfolio_daily import (
     _fixed_fee_contract_metadata, _validate_fixed_contract_units,
 )
+
+
+NATIVE_WORD_ADJUSTMENT = '''發文日期：中華民國99年7月21日。
+|調整生效日|99年8月4日|
+|調整契約月份|99年8月、9月、12月、100年3月及6月到期契約|
+|調整契約代號|CKO調整為CKA|
+| |CKF調整為CK1|
+|調整約定標的物|調整為2,100股標的證券|
+|契約乘數|CK1契約乘數調整為2,100|
+| |CKA履約價格乘數不調整，仍為2,000|
+
+推出標準契約：
+|上市日|99年8月4日|
+|契約代號|國泰金期貨CKF|
+|約定標的物|2,000股標的證券|
+|到期月份|99年8月到期契約|
+'''
+
+
+def _native_two_code_group_case():
+    pages=[dict(page=2,native_text='',tables=[dict(caption='加掛標準契約',cells=[
+        ['上市日','104年7月13日'],['契約代號','KPF'],['約定標的物','2,000股標的證券']])]),
+        dict(page=3,native_text='部位限制：KPF與KP1部位合併計算。',tables=[])]
+    facts=[dict(from_product='KPF',product='KP1',effective_date='2015-07-13',
+        contract_months=['201507','201508'],contract_multiplier=2000.,
+        deliverable_security_quantity=2000.,issue_date_bound=True)]
+    return pages,facts
+
+
+def test_native_two_code_group_uses_own_standard_grid_and_bound_physical_identity():
+    from stockagent.data.tw_futures_margin_preparation import unchanged_corporate_position_groups
+    pages,facts=_native_two_code_group_case()
+    rows=unchanged_corporate_position_groups(pages[1]['native_text'],facts,pages=pages)
+    row,=rows
+    assert row['product']=='KP1' and row['combined_position_base_product']=='KPF'
+    assert row['combined_position_ratio']=='1/1' and row['effective_date']=='2015-07-13'
+    assert row['natural_person_limit'] is None
+    evidence=json.loads(row['position_group_unit_evidence'])
+    assert evidence['standard_table']==[2,0] and evidence['standard_columns']=={'KPF':2000}
+    assert corporate_position_table_candidates(pages,corporate=facts)==rows
+
+
+@pytest.mark.parametrize('problem',['missing_units','wrong_standard_code','missing_listing_day',
+    'changed_adjusted_units','wrong_origin','unbound_publication','missing_physical_months',
+    'conflicting_standard_tables','option_group','numeric_cap'])
+def test_native_two_code_group_rejects_unproven_ownership_and_cap_borrowing(problem):
+    from copy import deepcopy
+    from stockagent.data.tw_futures_margin_preparation import unchanged_corporate_position_groups
+    pages,facts=_native_two_code_group_case()
+    cells=pages[0]['tables'][0]['cells']
+    if problem=='missing_units':cells.pop()
+    if problem=='wrong_standard_code':cells[1][1]='CPF'
+    if problem=='missing_listing_day':cells.pop(0)
+    if problem=='changed_adjusted_units':facts[0].update(contract_multiplier=2100,deliverable_security_quantity=2100)
+    if problem=='wrong_origin':facts[0]['from_product']='KP2'
+    if problem=='unbound_publication':facts[0]['issue_date_bound']=False
+    if problem=='missing_physical_months':facts[0]['contract_months']=[]
+    if problem=='conflicting_standard_tables':
+        table=deepcopy(pages[0]['tables'][0]);table['cells'][0][1]='104年7月14日';pages[0]['tables'].append(table)
+    if problem=='option_group':pages[1]['native_text']='部位限制：KPO與KPA部位合併計算。'
+    if problem=='numeric_cap':pages[1]['native_text']+='部位限制數：自然人4,000,000股。'
+    assert unchanged_corporate_position_groups(pages[1]['native_text'],facts,pages=pages)==[]
+
+
+def test_native_word_financial_continuations_preserve_futures_and_option_identity():
+    fact,=corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT)
+    assert fact['product']=='CK1' and fact['from_product']=='CKF'
+    assert fact['effective_date']=='2010-08-04'
+    assert fact['contract_months']==['201008','201009','201012','201103','201106']
+    assert fact['contract_multiplier']==fact['deliverable_security_quantity']==2100
+    assert fact['deliverable_cash_twd']==0 and fact['deliverable_components_resolved']
+    assert not fact['has_equity_credit_fields']
+    assert fact['equity_credit_long_per_contract'] is None
+    assert fact['extraction_method']=='native_legacy_word_scoped_financial_cells'
+    assert fact['native_line_start']==1 and fact['native_line_end_exclusive']==8
+
+
+@pytest.mark.parametrize('problem',['date_outside','months_outside','options_only',
+    'orphan_continuation','three_columns','conflicting_code','conflicting_multiplier'])
+def test_native_word_financial_table_rejects_other_table_or_ambiguous_fields(problem):
+    text=NATIVE_WORD_ADJUSTMENT
+    if problem=='date_outside':text=text.replace('|調整生效日|99年8月4日|','調整生效日：99年8月4日。')
+    if problem=='months_outside':text=text.replace('|調整契約月份|','調整契約月份：')
+    if problem=='options_only':text=text.replace('| |CKF調整為CK1|','| |CKO調整為CKA|')
+    if problem=='orphan_continuation':text=text.replace('|調整生效日|','| |')
+    if problem=='three_columns':text=text.replace('|調整約定標的物|','|調整約定標的物|其他商品|')
+    if problem=='conflicting_code':text=text.replace('\n\n推出標準契約', '\n|調整契約代號|ABF調整為AB1|\n\n推出標準契約')
+    if problem=='conflicting_multiplier':text=text.replace('\n\n推出標準契約', '\n|契約乘數|CK1契約乘數調整為2,200|\n\n推出標準契約')
+    assert corporate_legacy_word_candidates(text)==[]
+
+
+def test_native_word_financial_missing_cash_and_corrupt_quantity_remain_unresolved():
+    text=NATIVE_WORD_ADJUSTMENT.replace('\n\n推出標準契約',
+        '\n|買方權益數加項|新臺幣1,000元|\n|賣方權益數減項|新臺幣999元|\n\n推出標準契約')
+    fact,=corporate_legacy_word_candidates(text)
+    assert fact['has_equity_credit_fields'] and not fact['cash_equity_pair_agrees']
+    assert fact['equity_credit_long_per_contract'] is None
+    changed,=corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT.replace('調整為2,100股','調整為2,200股'))
+    assert not changed['deliverable_components_resolved']
+    corrupt,=corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT.replace('99年8月4日','99年8月35日'))
+    assert corrupt['effective_date'] is None
+
+
+NATIVE_WORD_POSITION = '''4. 部位限制：
+|持有部位|CKO|CKA|CKF|CK1|
+|每口折算股數|2,000|2,100|2,000|2,100|
+
+部位合併計算：CKA與CKO同方向選擇權部位合併計算；CK1與CKF部位合併計算。
+部位限制數：
+適用期間：自99年8月4日起至99年9月15日（99年9月契約到期日）止。
+| |自然人|法人機構|造市者|
+|部位限制數|7,875,000股|23,625,000股|59,010,000股|
+
+適用期間：自99年9月16日起至CKA、CK1契約均到期或撤銷掛牌之日止。
+| |自然人|法人機構|造市者|
+|部位限制數|7,500,000股|22,500,000股|56,200,000股|
+'''
+
+
+def test_native_word_position_preserves_mixed_columns_periods_and_own_units():
+    corporate=[dict(f,issue_date_bound=True) for f in corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT)]
+    rows=corporate_position_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT+NATIVE_WORD_POSITION,corporate)
+    assert len(rows)==4 and {r['product'] for r in rows}=={'CKF','CK1'}
+    for row in rows:
+        assert row['position_unit']==(2000 if row['product']=='CKF' else 2100)
+        assert row['combined_products']==['CK1','CKF'] and row['unit']=='shares'
+        assert not row['limit_follows_applicable_grade']
+        assert row['extraction_method']=='native_legacy_word_scoped_position_cells'
+        if row['effective_date']=='2010-08-04':
+            assert row['natural_person_limit']==7875000
+            assert row['valid_until_date_inclusive']=='2010-09-15'
+            assert not row['requires_delisting_clock']
+        else:
+            assert row['effective_date']=='2010-09-16'
+            assert row['natural_person_limit']==7500000
+            assert row['end_rule']=='all_contracts_expiry_or_delisting_inclusive'
+            assert row['requires_delisting_clock']
+
+
+@pytest.mark.parametrize('problem',['missing_section','missing_units','wrong_adjusted_unit',
+    'missing_combination','unbound_identity','multiple_adjustments'])
+def test_native_word_position_rejects_unproven_group_identity_and_conversion(problem):
+    corporate=[dict(f,issue_date_bound=True) for f in corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT)]
+    text=NATIVE_WORD_ADJUSTMENT+NATIVE_WORD_POSITION
+    if problem=='missing_section':text=text.replace('4. 部位限制：','其他事項：')
+    if problem=='missing_units':text=text.replace('|每口折算股數|','|參考數字|')
+    if problem=='wrong_adjusted_unit':text=text.replace('|2,000|2,100|2,000|2,100|','|2,000|2,100|2,000|2,000|')
+    if problem=='missing_combination':text=text.replace('CK1與CKF部位合併計算。','')
+    if problem=='unbound_identity':corporate[0]['issue_date_bound']=False
+    if problem=='multiple_adjustments':corporate.append(dict(corporate[0],product='CK2'))
+    assert corporate_position_legacy_word_candidates(text,corporate)==[]
+
+
+def test_native_word_position_cannot_borrow_another_tables_period_or_person_column():
+    corporate=[dict(f,issue_date_bound=True) for f in corporate_legacy_word_candidates(NATIVE_WORD_ADJUSTMENT)]
+    text=NATIVE_WORD_ADJUSTMENT+NATIVE_WORD_POSITION.replace(
+        '適用期間：自99年8月4日起至99年9月15日（99年9月契約到期日）止。','')
+    rows=corporate_position_legacy_word_candidates(text,corporate)
+    assert len(rows)==2 and all(r['effective_date']=='2010-09-16' for r in rows)
+    text=NATIVE_WORD_ADJUSTMENT+NATIVE_WORD_POSITION.replace(
+        '| |自然人|法人機構|造市者|','| |法人機構|自然人|造市者|')
+    rows=corporate_position_legacy_word_candidates(text,corporate)
+    assert {r['natural_person_limit'] for r in rows}=={23625000,22500000}
+
+
+@pytest.mark.parametrize('suffix', ['csv', 'parquet'])
+def test_scoped_source_read_verifies_unselected_rows_and_filters_before_projection(tmp_path, suffix):
+    from downloader.artifact_io import sha256_file
+    from stockagent.data.tw_futures_margin_release import read_bound_output
+    path = tmp_path / ('source.' + suffix)
+    frame = pl.DataFrame({'product': ['AAF', 'BBF'], 'value': [1., 2.]})
+    if suffix == 'csv':
+        frame.write_csv(path)
+    else:
+        frame.write_parquet(path)
+    manifest = {'outputs': {path.name: {'sha256': sha256_file(path)}},
+        'requested_products': ['AAF', 'BBF']}
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+    selected, proof = read_bound_output(path, columns=['value'], predicate=pl.col('product') == 'AAF')
+    assert selected.columns == ['value'] and selected.height == 1
+    assert float(selected.item()) == 1. and proof == manifest
+    # The unchanged selected row cannot conceal altered unselected evidence.
+    damaged = frame.with_columns(pl.when(pl.col('product') == 'BBF').then(9.)
+        .otherwise(pl.col('value')).alias('value'))
+    if suffix == 'csv':
+        damaged.write_csv(path)
+    else:
+        damaged.write_parquet(path)
+    with pytest.raises(ValueError, match='input SHA mismatch'):
+        read_bound_output(path, columns=['value'], predicate=pl.col('product') == 'AAF')
 
 
 def test_ocr_label_normalization_does_not_repair_numbers_or_contract_codes():
@@ -32,6 +223,35 @@ def test_ocr_label_normalization_does_not_repair_numbers_or_contract_codes():
               ['調整生效日','104年8月28日']]
     simplified=[[s.translate(str.maketrans('約數為標證調','约数为标证调')) for s in row] for row in original]
     assert corporate_grid_candidates(original)==corporate_grid_candidates(simplified)
+
+
+@pytest.mark.parametrize('product_noun',['','期貨'])
+def test_cross_issuer_merger_position_grid_uses_its_single_adjustment_date(product_noun):
+    cells=[['調整生效日','103年12月24日'],['調整契約月份','104年1月、3月、6月及9月到期契約'],
+           ['契約代號','IWF調整為DU1'],
+           ['約定標的物','調整為555.093股晶元光電股份有限公司普通股股票'],
+           ['契約乘數','DU1契約乘數調整為555.093']]
+    page=dict(page=2,native_text=f'調整生效日：103年12月24日。部位限制：DU1與DUF{product_noun}部位合併計算。',
+        tables=[dict(cells=cells),
+            dict(cells=[['持有部位','DUF','DU1'],['每口折算股數','2,000','555.093']]),
+            dict(caption='部位限制數',cells=[['自然人','法人機構','造市者'],
+                                         ['4,000,000股','12,000,000股','30,000,000股']])])
+    facts=corporate_position_table_candidates([page])
+    assert {f['product'] for f in facts}=={'DUF','DU1'}
+    assert {f['effective_date'] for f in facts}=={'2014-12-24'}
+    assert {f['natural_person_limit'] for f in facts}=={4000000.}
+    assert all(f['end_rule']=='until_superseding_rule' for f in facts)
+    assert all(f['combined_products']==['DU1','DUF'] for f in facts)
+    terms=corporate_native_table_candidates([page])
+    assert len(terms)==1 and terms[0]['from_product']=='IWF'
+    assert terms[0]['deliverable_components_resolved']
+    assert terms[0]['contract_months']==['201501','201503','201506','201509']
+    # An explicit period elsewhere prevents treating a missing header as a
+    # constant table. Multiple effective dates cannot own a single cap either.
+    assert not corporate_position_table_candidates([dict(page,
+        native_text=page['native_text']+'適用期間：')])
+    assert not corporate_position_table_candidates([page],corporate=[*terms,
+        dict(terms[0],effective_date='2014-12-25')])
 
 
 @pytest.mark.parametrize('row_label',['保證金','比例'])
@@ -347,6 +567,25 @@ def test_adjusted_position_caps_use_explicit_shares_and_preserve_delisting_clock
     assert not corporate_position_table_candidates(pages)
 
 
+def test_continued_single_period_cap_requires_one_source_period_and_futures_members():
+    pages=[dict(page=1,native_text='部位限制：自108年9月30日起至CU1契約終止掛牌前一營業日止。'
+        'CU1與CUF部位合併計算。',tables=[
+        dict(cells=[['契約代號','CUF調整為CU1'],['約定標的物','調整為1,342.84股標的證券'],
+                    ['契約乘數','CU1契約乘數調整為1,342.84']],caption=''),
+        dict(cells=[['持有部位','CU1','CUF'],['每口折算股數','1,342.84','2,000']],caption='')]),
+        dict(page=2,native_text='部位限制數',tables=[dict(cells=[
+            ['自然人','法人機構','造市者'],['8,000,000股','24,000,000股','60,000,000股']],caption='')])]
+    rows=corporate_position_table_candidates(pages)
+    assert len(rows)==2 and {r['product'] for r in rows}=={'CU1','CUF'}
+    assert all(r['effective_date']=='2019-09-30' and r['natural_person_limit']==8000000.
+               and r['requires_delisting_clock'] for r in rows)
+    assert all(r['page']==2 for r in rows)
+    pages[0]['native_text']+='另自108年10月1日起至CU1契約終止掛牌前一營業日止。'
+    assert not corporate_position_table_candidates(pages)
+    pages[0]['native_text']='部位限制：CU1與CUF部位合併計算。'
+    assert not corporate_position_table_candidates(pages)
+
+
 def test_margin_chain_disagreement_invalidates_prior_interval_without_backdating_new_level():
     first=dict(product='TX',margin_kind='fixed_twd',after=[100000,77000,74000],before=None,
         effective_date='2024-04-01',effective_phase='after_product_regular_close',
@@ -511,6 +750,61 @@ def test_corporate_repeated_label_in_explicit_equity_formula():
     # Separate repeated amount rows are still ambiguous, not last-value wins.
     bad=text.replace('二、加掛','買方權益數加項 新臺幣900元 二、加掛')
     assert corporate_text_candidates(bad)[0]['equity_credit_long_per_contract'] is None
+
+
+def test_corporate_reversed_rows_preserve_literal_dates_months_and_cash():
+    text='''一、契約調整：107年8月3日 調整生效日
+    調整契約月份 107年8月、9月、12月、108年3月及6月到期契約
+    契約代號 HYF調整為HY1 約定標的物 調整為2,120股標的證券
+    契約乘數 HY1契約乘數調整為2,120
+    每口買方未沖銷部位調整買方權益數加項新台幣 買方權益數加項1,600元
+    每口賣方未沖銷部位調整賣方權益數減項新台幣 賣方權益數減項1,600元
+    二、加掛標準契約：上市日107年8月3日 契約代號HYF
+    約定標的物2,000股標的證券'''
+    fact,=corporate_text_candidates(text)
+    assert fact['from_product']=='HYF' and fact['product']=='HY1'
+    assert fact['effective_date']=='2018-08-03'
+    assert fact['contract_months']==['201808','201809','201812','201903','201906']
+    assert fact['contract_multiplier']==fact['deliverable_security_quantity']==2120
+    assert fact['deliverable_components_resolved'] and fact['cash_equity_pair_agrees']
+    assert fact['equity_credit_long_per_contract']==fact['equity_debit_short_per_contract']==1600
+    # A malformed four-letter OCR token cannot become a different suffix code.
+    assert not corporate_text_candidates(text.replace('HYF調整為HY1','HYEF調整為HY1'))
+    assert not corporate_text_candidates(text.replace('HYF調整為HY1','HYF調整為HY12'))
+    ambiguous=text.replace('107年8月3日 調整生效日',
+                           '107年8月3日 調整生效日 調整生效日：107年8月4日')
+    assert not corporate_text_candidates(ambiguous)
+    # Genuine decimals remain decimals and disagree with a 2,120 multiplier.
+    decimal=text.replace('調整為2,120股','調整為2.120股')
+    changed,=corporate_text_candidates(decimal)
+    assert changed['deliverable_security_quantity']==2.12
+    assert not changed['deliverable_components_resolved']
+    # Absence of the named local adjustment section cannot lend an issue date.
+    unrelated=text.replace('一、契約調整：107年8月3日 調整生效日',
+                           '發文日期：107年8月3日 調整生效日')
+    unknown,=corporate_text_candidates(unrelated)
+    assert unknown['effective_date'] is None
+
+
+def test_corporate_repeated_cash_headers_keep_conflicts_and_options_separate():
+    text='''一、契約調整：調整生效日：105年8月5日
+    調整契約月份：105年8月、9月、12月、106年3月及6月到期契約
+    契約代號 DPF調整為DP1 約定標的物 調整為2,090股標的證券
+    契約乘數 DP1契約乘數調整為2,090
+    每口買方未沖銷部位調整買方權益數加項新臺幣1,900元
+    每口賣方未沖銷部位調整賣方權益數減項新臺幣1,900元
+    買方權益數加項 賣方權益數減項
+    選擇權調整：契約代號DPO調整為DPA 買方權益數加項新臺幣9,999元'''
+    fact,=corporate_text_candidates(text)
+    assert fact['cash_equity_pair_agrees'] and fact['equity_credit_long_per_contract']==1900
+    for side in ('買方權益數加項','賣方權益數減項'):
+        conflicted=text.replace('選擇權調整：',side+'新臺幣2,900元 選擇權調整：')
+        bad,=corporate_text_candidates(conflicted)
+        assert bad['has_equity_credit_fields'] and not bad['cash_equity_pair_agrees']
+    both=text.replace('選擇權調整：',
+                      '買方權益數加項新臺幣2,900元 賣方權益數減項新臺幣2,900元 選擇權調整：')
+    bad,=corporate_text_candidates(both)
+    assert bad['has_equity_credit_fields'] and not bad['cash_equity_pair_agrees']
 
 
 def test_margin_footer_and_legacy_currency_blocks():
@@ -849,6 +1143,170 @@ def test_legacy_shared_corporate_table_binds_old_months_new_units_and_option_sco
     # Removing the futures clause cannot silently borrow the option's 2,000.
     cells[-1][1] = 'DLA履約價格乘數不調整，仍為2,000。'
     assert corporate_grid_candidates(cells) == []
+
+
+def test_legacy_parenthesized_origins_bind_only_their_destination_cash_leg():
+    cells = [
+        ['調整生效日', '99 年8 月31 日'],
+        ['調整契約月份', 'CN1：99 年9 月及100 年3 月到期契約。\n'
+         'CNO 及 CNF：99 年9 月、10 月、12 月、100 年3 月及6 月到期契約。'],
+        ['調整契約代號', 'CNO 調整為 CNA\nCN1 調整為 CN2\nCNF 調整為 CN1'],
+        ['調整約定標的物', 'CN2（原 CN1）約定標的物調整為2,128股標的證券及現金新臺幣1,280元\n'
+         'CNA（原 CNO）及 CN1（原 CNF）約定標的物調整為2,128股標的證券'],
+        ['契約乘數', 'CN2 及 CN1 契約乘數調整為2,128。\n'
+         'CNA 履約價格乘數不調整，仍為2,000。'],
+    ]
+    facts = corporate_grid_candidates(cells)
+    assert [(r['from_product'], r['product']) for r in facts] == [('CN1', 'CN2'), ('CNF', 'CN1')]
+    assert [r['contract_months'] for r in facts] == [
+        ['201009', '201103'], ['201009', '201010', '201012', '201103', '201106']]
+    assert [r['deliverable_cash_twd'] for r in facts] == [1280., 0.]
+    assert all(r['contract_multiplier'] == r['deliverable_security_quantity'] == 2128. for r in facts)
+    assert all(r['equity_credit_long_per_contract'] is None
+               and r['equity_debit_short_per_contract'] is None
+               and not r['has_equity_credit_fields'] for r in facts)
+    # A contradictory old-code annotation invalidates that destination only.
+    cells[3][1] = cells[3][1].replace('CN2（原 CN1）', 'CN2（原 CNF）')
+    remaining = corporate_grid_candidates(cells)
+    assert len(remaining) == 1 and remaining[0]['product'] == 'CN1'
+    assert remaining[0]['deliverable_cash_twd'] == 0.
+    # Repeating a destination is ambiguous even if both copies have the same origin.
+    cells[3][1] = cells[3][1].replace('CN1（原 CNF）', 'CN1（原 CNF）及 CN1（原 CNF）')
+    assert corporate_grid_candidates(cells) == []
+
+
+def test_native_shared_header_continuation_keeps_physical_months_cash_and_rights():
+    from copy import deepcopy
+    from stockagent.data.tw_futures_margin_preparation import corporate_native_table_candidates
+    first=[['調整生效日','99年11月26日'],
+        ['調整契約月份','DFO及DFF：99年12月、100年1月、3月、6月及9月到期契約。DF1：100年3月到期契約。'],
+        ['調整契約代號','DFO調整為DFA DFF調整為DF1 DF1調整為DF2']]
+    second=[['調整約定標的物',
+        'DF1及DFA約定標的物為2,000股標的證券及其可獲優先參與現金增資之相當價值。'
+        'DF2約定標的物為2,000股標的證券及其可獲優先參與現金增資之相當價值及現金新臺幣3,600元。'],
+        ['優先參與現金增資相當價值計算方式','以繳款截止日標的證券收盤價格與現金增資認購價之差額計算。'],
+        ['契約乘數','DFA履約價格乘數不調整，仍為2,000。DF1及DF2契約乘數不調整，仍為2,000。']]
+    pages=[dict(page=1,native_text='原生公告',tables=[dict(cells=first,caption='')]),
+           dict(page=2,native_text='原生續表',tables=[dict(cells=second,caption='')])]
+    facts=corporate_native_table_candidates(pages)
+    assert [r['product'] for r in facts]==['DF1','DF2']
+    assert [r['deliverable_cash_twd'] for r in facts]==[0.,3600.]
+    assert all(r['subscription_rights_at_final_settlement'] for r in facts)
+    assert facts[0]['contract_months']==['201012','201101','201103','201106','201109']
+    assert facts[1]['contract_months']==['201103']
+    assert all(r['table_segments']==[[1,0],[2,0]] for r in facts)
+    for problem in ('page','caption','destination','intervening'):
+        bad=deepcopy(pages)
+        if problem=='page':bad[1]['page']=3
+        elif problem=='caption':bad[1]['tables'][0]['caption']='二、推出標準契約'
+        elif problem=='destination':bad[1]['tables'][0]['cells'][-1][1]='DF1及DF3契約乘數不調整，仍為2,000。'
+        else:bad[1]['tables'].insert(0,dict(cells=[['不同表','2,000股']],caption=''))
+        assert not corporate_native_table_candidates(bad)
+
+
+@pytest.mark.parametrize('problem',[None,'page','caption','destination','intervening',
+    'missing_debit','unknown_label','duplicate_label','wrong_months','width'])
+def test_native_mini_cash_rights_continuation_uses_only_its_own_head(problem):
+    head=[['調整契約月份','111年7月、8月、9月、12月及112年3月到期契約'],
+        ['契約代號','QMF調整為QM1'],
+        ['約定標的物','QM1約定標的物為100股標的證券及其可獲優先參與現金增資之相當價值。']]
+    tail=[['優先參與現金增資相當價值計算方式註1','以繳款截止日實際收盤與認購價差計算。'],
+        ['契約乘數','QM1契約乘數不調整（仍為100）'],
+        ['買方權益數加項','每口買方未沖銷部位調整買方權益數加項新臺幣450元'],
+        ['賣方權益數減項','每口賣方未沖銷部位調整賣方權益數減項新臺幣450元']]
+    pages=[dict(page=3,native_text='調整生效日：111年7月12日',tables=[
+        dict(caption='2.小型期貨契約',cells=head)]),
+        dict(page=4,native_text='原生續表',tables=[dict(caption='',cells=tail)])]
+    if problem=='page':pages[1]['page']=5
+    if problem=='caption':pages[1]['tables'][0]['caption']='二、加掛標準契約'
+    if problem=='destination':tail[1][1]='FF1契約乘數不調整（仍為2000）'
+    if problem=='intervening':pages[1]['tables'].insert(0,dict(caption='',cells=[['別的表','100']]))
+    if problem=='missing_debit':tail.pop()
+    if problem=='unknown_label':tail.append(['選擇權條款','4,500'])
+    if problem=='duplicate_label':tail.append(tail[-1][:])
+    if problem=='wrong_months':head[0][1]='月份另行公告'
+    if problem=='width':tail[0].append('另一欄')
+    result=corporate_native_table_candidates(pages)
+    if problem=='wrong_months':
+        assert result and all(not r['contract_months'] for r in result)
+    elif problem:
+        assert not result
+    else:
+        row,=result
+        assert row['product']=='QM1' and row['from_product']=='QMF'
+        assert row['contract_months']==['202207','202208','202209','202212','202303']
+        assert row['effective_date']=='2022-07-12'
+        assert row['contract_multiplier']==row['deliverable_security_quantity']==100
+        assert row['equity_credit_long_per_contract']==row['equity_debit_short_per_contract']==450
+        assert row['deliverable_cash_twd']==0 and row['subscription_rights_at_final_settlement']
+        assert row['table_segments']==[[3,0],[4,0]]
+
+
+@pytest.mark.parametrize('problem',[None,'no_geometry','changed_multiplier','extra_member',
+    'wrong_origin','duplicate_code','conflicting_units','listing_date','numeric_cap'])
+def test_mixed_standard_group_uses_each_native_column_and_own_unchanged_origin(problem):
+    from copy import deepcopy
+    from stockagent.data.tw_futures_margin_preparation import unchanged_corporate_position_groups
+    text=('二、加掛標準契約：契約代號FFFQMF約定標的物2,000股標的證券100股標的證券'
+          '三、部位限制：FF1、FFF、QM1與QMF部位合併計算。')
+    standard=[['上市日','111年7月12日',None],['契約代號','FFF','QMF'],
+        ['約定標的物','2,000股標的證券','100股標的證券']]
+    pages=[dict(page=4,native_text=text,tables=[dict(caption='二、加掛標準契約',cells=standard)])]
+    common=dict(effective_date='2022-07-12',issue_date_bound=True,contract_months=['202207'])
+    facts=[dict(common,from_product='FFF',product='FF1',contract_multiplier=2000.,deliverable_security_quantity=2000.),
+        dict(common,from_product='QMF',product='QM1',contract_multiplier=100.,deliverable_security_quantity=100.)]
+    if problem=='no_geometry':pages=None
+    if problem=='changed_multiplier':facts[1].update(contract_multiplier=103.,deliverable_security_quantity=103.)
+    if problem=='extra_member':text=text.replace('QM1與QMF','QM1、QM2與QMF')
+    if problem=='wrong_origin':facts[1]['from_product']='FFF'
+    if problem=='duplicate_code':standard[1][2]='FFF'
+    if problem=='conflicting_units':
+        other=deepcopy(pages[0]['tables'][0]);other['cells'][2][1]='2,100股標的證券'
+        pages[0]['tables'].append(other)
+    if problem=='listing_date':standard[0][1]='111年7月13日'
+    if problem=='numeric_cap':text+='部位限制數：自然人4,000,000股。'
+    result=unchanged_corporate_position_groups(text,facts,pages=pages)
+    if problem:assert not result
+    else:
+        assert {(r['product'],r['combined_position_base_product'],r['combined_position_ratio']) for r in result}=={
+            ('FF1','FFF','1/1'),('QM1','QMF','1/1')}
+        assert all(r['natural_person_limit'] is None for r in result)
+        assert all(json.loads(r['position_group_unit_evidence'])['standard_columns']=={'FFF':2000.,'QMF':100.}
+            for r in result)
+        from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+        assert corporate_position_table_candidates(pages,corporate=facts)==result
+        unbound=[dict(r,issue_date_bound=False) for r in facts]
+        assert not corporate_position_table_candidates(pages,corporate=unbound)
+
+
+def test_unchanged_multi_code_group_checks_every_destination_quantity():
+    from stockagent.data.tw_futures_margin_preparation import unchanged_corporate_position_groups
+    text=('二、推出標準契約：契約代號甲期貨：AAF約定標的物2,000股標的證券'
+          '三、部位限制：AAF、AA1與AA2部位合併計算。')
+    common=dict(effective_date='2020-01-02',issue_date_bound=True,contract_multiplier=2000.)
+    facts=[dict(common,from_product='AAF',product='AA1'),dict(common,from_product='AA1',product='AA2')]
+    result=unchanged_corporate_position_groups(text,facts)
+    assert {r['product'] for r in result}=={'AA1','AA2'}
+    assert all(r['combined_position_ratio']=='1/1' for r in result)
+    changed=[facts[0],dict(facts[1],contract_multiplier=2100.)]
+    assert [r['product'] for r in unchanged_corporate_position_groups(text,changed)]==['AA1']
+    outside=[facts[0],dict(facts[1],from_product='AB1')]
+    assert [r['product'] for r in unchanged_corporate_position_groups(text,outside)]==['AA1']
+
+
+def test_native_group_does_not_use_unscoped_ocr_or_discard_real_unit_conflicts():
+    from stockagent.data.tw_futures_margin_preparation import unchanged_corporate_position_groups
+    text=('二、加掛標準契約：契約代號甲期貨：AAF約定標的物2,000股標的證券'
+          '三、部位限制：AAF、AA1與AA2部位合併計算。')
+    common=dict(effective_date='2020-01-02',issue_date_bound=True,contract_months=['202003'])
+    first=dict(common,from_product='AAF',product='AA1',contract_multiplier=2000.,deliverable_security_quantity=2000.)
+    second=dict(common,from_product='AA1',product='AA2',contract_multiplier=2100.,deliverable_security_quantity=2100.)
+    partial=dict(first,contract_months=[],contract_multiplier=2.)
+    mismatch=dict(first,contract_multiplier=2.)
+    assert [r['product'] for r in unchanged_corporate_position_groups(text,[first,second,partial,mismatch])]==['AA1']
+    assert unchanged_corporate_position_groups(text,[second,partial,mismatch])==[]
+    real_conflict=dict(first,contract_multiplier=2100.,deliverable_security_quantity=2100.)
+    assert unchanged_corporate_position_groups(text,[first,second,real_conflict])==[]
 
 
 def test_corporate_text_does_not_borrow_new_standard_or_repeated_multiplier():

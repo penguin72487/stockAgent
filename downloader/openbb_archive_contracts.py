@@ -73,6 +73,21 @@ FMP_MANIFEST_PAGINATED_ENDPOINTS = frozenset(
     }
 )
 
+# Successful catalog parents whose retained source rows define child scopes.
+# Discovery, restart reconciliation and final auditing must use the same set.
+CATALOG_FOLLOWUP_ENDPOINTS = (
+    "cftc.cot_search",
+    "currency.search",
+    "economy.available_indicators",
+    "economy.fred_search",
+    "economy.survey.bls_search",
+    "equity.fundamental.filings",
+    "index.available",
+    "regulators.sec.cik_map",
+    "uscongress.amendments",
+    "uscongress.bills",
+)
+
 # Manifest tasks whose provider fetcher has a non-pageable fixed cap.  A plan
 # partition is only complete when its realized row count is strictly below the
 # cap; the monitor enforces this runtime proof before declaring completion.

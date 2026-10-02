@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import uuid
@@ -142,11 +143,36 @@ def _filesystem_space(path: Path = REPO_ROOT) -> dict[str, int] | None:
     if device_before != device_after:
         return None
     block_size = usage.f_frsize or usage.f_bsize
+    total = usage.f_blocks * block_size
+    available = usage.f_bavail * block_size
+    free = usage.f_bfree * block_size
     return {
         "device_id": device_before,
-        "total_bytes": usage.f_blocks * block_size,
-        "available_bytes": usage.f_bavail * block_size,
+        "total_bytes": total,
+        "available_bytes": available,
+        "free_bytes_including_reserved": free,
+        "used_bytes": total - free,
+        "reserved_or_unavailable_free_bytes": free - available,
     }
+
+
+def _filesystem_counter_delta(
+    old: Any, current: Any, key: str,
+) -> int | None:
+    """A volume net change, not bytes written or reserved-space permission."""
+    if not isinstance(old, Mapping) or not isinstance(current, Mapping):
+        return None
+    for geometry in ("device_id", "total_bytes"):
+        before, after = old.get(geometry), current.get(geometry)
+        if type(before) is not int or type(after) is not int or before < 0 or before != after:
+            return None
+    total = current["total_bytes"]
+    if total <= 0:
+        return None
+    before, after = old.get(key), current.get(key)
+    if type(before) is not int or type(after) is not int or not (0 <= before <= total and 0 <= after <= total):
+        return None
+    return after - before
 
 
 def _counter_delta(
@@ -162,6 +188,36 @@ def _counter_delta(
     ):
         return None
     return after - before
+
+
+def _process_epoch_continuity(
+    previous: Mapping[str, Any], current: Mapping[str, Any],
+    *, boot_id: str | None, same_boot: bool,
+) -> tuple[bool, str, str | None]:
+    """Never compare unmanaged PID counters on an unproven host epoch.
+
+    ProcSubset=pid can hide boot_id. An unchanged live systemd invocation is
+    then an epoch witness; both its real UUID and main PID must still match.
+    No anchor (or a changed boot) yields null process deltas, not false zeros.
+    """
+
+    if not same_boot:
+        return False, "unproven", None
+    if boot_id is not None and boot_id == previous.get("boot_id"):
+        return True, "kernel_boot_id", None
+    old_units = previous.get("sample", {}).get("units", {})
+    for unit, props in sorted(current["units"].items()):
+        old = old_units.get(unit, {})
+        invocation, pid = props.get("InvocationID"), props.get("MainPID")
+        if (
+            props.get("ActiveState") == "active" and old.get("ActiveState") == "active"
+            and isinstance(invocation, str) and re.fullmatch(r"[0-9a-f]{32}", invocation)
+            and isinstance(pid, str) and pid.isdecimal() and int(pid) > 0
+            and old.get("InvocationID") == invocation and old.get("MainPID") == pid
+            and old.get("NRestarts") == props.get("NRestarts")
+        ):
+            return True, "systemd_invocation_anchor", unit
+    return False, "unproven", None
 
 
 def _recurring_timer_health(current: Mapping[str, Any]) -> dict[str, Any]:
@@ -235,6 +291,7 @@ def sample_service_runtime(
     from scripts.benchmark_dashboard_latency import service_snapshot
     from scripts.audit_service_latency_coverage import (
         _business_receipt, _journal_last_completed_process,
+        repository_process_io_deltas, repository_process_snapshot,
     )
 
     current = service_snapshot()
@@ -246,21 +303,33 @@ def sample_service_runtime(
         same_boot = False
         baseline_state = "reset_clock_rollback"
     recurring_timers = _recurring_timer_health(current)
+    try:
+        repository_processes = repository_process_snapshot()
+    except (OSError, UnicodeError, ValueError) as exc:
+        # Optional process visibility must not poison the all-unit baseline or
+        # the authoritative public-status publication using this worker.
+        repository_processes = {
+            "inspection_state": "unavailable", "error_type": type(exc).__name__,
+            "monotonic": time.monotonic(), "processes": [],
+        }
+    process_epoch, process_epoch_source, process_epoch_anchor = _process_epoch_continuity(
+        previous, current, boot_id=boot_id, same_boot=same_boot,
+    )
+    old_processes = previous.get("repository_processes")
+    process_io = repository_process_io_deltas(
+        old_processes if isinstance(old_processes, dict) else None,
+        repository_processes, same_host_epoch=process_epoch,
+    )
+    process_io["epoch_continuity_source"] = process_epoch_source
+    process_io["epoch_continuity_anchor_unit"] = process_epoch_anchor
     filesystem = _filesystem_space()
-    old_filesystem = previous.get("filesystem") if same_boot else None
-    filesystem_available_delta = None
-    if (
-        isinstance(filesystem, Mapping)
-        and isinstance(old_filesystem, Mapping)
-        and filesystem.get("device_id") == old_filesystem.get("device_id")
-        and type(filesystem.get("available_bytes")) is int
-        and type(old_filesystem.get("available_bytes")) is int
-        and filesystem["available_bytes"] >= 0
-        and old_filesystem["available_bytes"] >= 0
-    ):
-        filesystem_available_delta = (
-            filesystem["available_bytes"] - old_filesystem["available_bytes"]
-        )
+    old_filesystem = previous.get("filesystem") if process_epoch else None
+    filesystem_available_delta = _filesystem_counter_delta(
+        old_filesystem, filesystem, "available_bytes",
+    )
+    filesystem_free_delta = _filesystem_counter_delta(
+        old_filesystem, filesystem, "free_bytes_including_reserved",
+    )
     old_units = (
         previous_sample.get("units", {})
         if same_boot and isinstance(previous_sample, Mapping) else {}
@@ -355,6 +424,7 @@ def sample_service_runtime(
         "boot_id": boot_id,
         "sample": current,
         "filesystem": filesystem,
+        "repository_processes": repository_processes,
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
@@ -376,9 +446,12 @@ def sample_service_runtime(
         "service_count": len(rows),
         "baseline_state": baseline_state,
         "recurring_timers": recurring_timers,
+        "repository_process_io": process_io,
         "filesystem": {
             **(filesystem or {}),
             "available_delta_bytes": filesystem_available_delta,
+            "free_delta_bytes_including_reserved": filesystem_free_delta,
+            "used_delta_bytes": -filesystem_free_delta if filesystem_free_delta is not None else None,
         } if filesystem is not None else None,
         "boundary": (
             "CPU and I/O are same-invocation counter deltas over the observed interval; "
@@ -389,7 +462,13 @@ def sample_service_runtime(
             "invocation ID), not request latency "
             "or data-health evidence. Filesystem available-byte change is the "
             "whole StockAgent volume, not attributable to one service or equal "
-            "to any cgroup I/O counter. A restart or boot change yields null deltas."
+            "to any cgroup I/O counter. Free bytes including reserved blocks and "
+            "the corresponding used-byte change remain observable after ordinary "
+            "available bytes reach zero; reserved blocks are not an acquisition budget "
+            "and do not change admission floors. A restart or boot change yields null deltas."
+            " Repository process I/O separately includes unmanaged context candidates, "
+            "requires paired PID/starttime and epoch proof, includes waited-for "
+            "children, and must not be summed with unit or other process counters."
         ),
         "services": rows,
     }

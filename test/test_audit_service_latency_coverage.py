@@ -241,6 +241,121 @@ def test_repository_process_inventory_finds_unmanaged_without_exposing_argv(
     assert "secret" not in json.dumps(result)
 
 
+def test_repository_process_snapshot_fences_identity_and_io(tmp_path, monkeypatch):
+    repo, proc = tmp_path / "stockAgent", tmp_path / "proc"
+    repo.mkdir()
+    directory = proc / "101"
+    directory.mkdir(parents=True)
+    (directory / "cwd").symlink_to(repo, target_is_directory=True)
+    (directory / "status").write_text("PPid:\t1\n")
+    (directory / "comm").write_text("python\n")
+    (directory / "cgroup").write_text("0::/init.scope\n")
+    (directory / "statm").write_text("100 5\n")
+    # Field 22 follows 19 earlier fields after comm, whose name has nested ')'.
+    (directory / "stat").write_text("101 (a (b) c)) S " + "0 " * 18 + "700 0\n")
+    (directory / "io").write_text(
+        "read_bytes: 10\nwrite_bytes: 30\ncancelled_write_bytes: 2\nwchar: 500\n"
+    )
+    row = audit.repository_process_snapshot(repo, proc, exclude_pids=set())["processes"][0]
+    assert row["start_time_ticks"] == 700
+    assert row["io_counters"] == {"read_bytes": 10, "write_bytes": 30, "cancelled_write_bytes": 2}
+    assert "wchar" not in row["io_counters"]
+    identity_reads = iter([700, 701])
+    monkeypatch.setattr(audit, "_proc_start_ticks", lambda _: next(identity_reads))
+    raced = audit.repository_process_snapshot(repo, proc, exclude_pids=set())["processes"][0]
+    assert raced["start_time_ticks"] is None
+    assert set(raced["io_counters"].values()) == {None}
+
+
+def test_repository_process_visibility_counts_do_not_imply_full_host_inventory(tmp_path):
+    repo, proc = tmp_path / "stockAgent", tmp_path / "proc"
+    repo.mkdir()
+    unreadable = proc / "101"
+    unreadable.mkdir(parents=True)
+    # Missing context can mean exit or permissions; do not invent an owner.
+    result = audit.repository_process_snapshot(repo, proc, exclude_pids=set())
+    assert result["inspected_proc_count"] == 1
+    assert result["matched_count"] == 0
+    assert result["visibility"]["cwd_read_failures"] == 1
+    assert result["visibility"]["argv_read_failures"] == 1
+    assert "not a fully readable" in result["scope"]
+
+
+def test_process_counter_permissions_and_malformed_values_do_not_fake_zero(tmp_path):
+    entry = tmp_path / "42"
+    entry.mkdir()
+    assert audit._proc_start_ticks(entry) is None
+    assert set(audit._proc_io_counters(entry).values()) == {None}
+    for content in ["42 missing-parens " + "1 " * 25, "42 (test) S 1\n"]:
+        (entry / "stat").write_text(content)
+        assert audit._proc_start_ticks(entry) is None
+    (entry / "io").write_text("read_bytes: -1\nwrite_bytes: bad\ncancelled_write_bytes: 7\n")
+    assert audit._proc_io_counters(entry) == {
+        "read_bytes": None, "write_bytes": None, "cancelled_write_bytes": 7,
+    }
+    assert audit.repository_process_snapshot(tmp_path, tmp_path / "absent", exclude_pids=set())["inspection_state"] == "unavailable"
+
+
+def _process_io_row(pid=42, *, start=700, write=10, unit=None):
+    return {"pid": pid, "ppid": 1, "comm": "python", "start_time_ticks": start,
+            "stockagent_unit": unit,
+            "io_counters": {"read_bytes": 0, "write_bytes": write, "cancelled_write_bytes": 0}}
+
+
+def test_process_io_deltas_keep_unmanaged_and_reaped_parent_counters_non_additive():
+    before = {"monotonic": 100, "processes": [_process_io_row(), _process_io_row(43)]}
+    after = {"monotonic": 102, "processes": [_process_io_row(write=110), _process_io_row(43, write=210)]}
+    result = audit.repository_process_io_deltas(before, after, same_host_epoch=True)
+    assert result["sample_seconds"] == 2
+    assert [row["write_bytes_delta"] for row in result["processes"]] == [100, 200]
+    assert all(row["measurement_state"] == "measured" for row in result["processes"])
+    assert "not additive" in result["scope"]
+    assert "total_write_bytes" not in result
+
+
+@pytest.mark.parametrize("change,state", [
+    ({"start_time_ticks": 701}, "pid_reused"),
+    ({"start_time_ticks": None}, "process_identity_unavailable"),
+    ({"start_time_ticks": True}, "process_identity_unavailable"),
+    ({"start_time_ticks": -1}, "process_identity_unavailable"),
+    ({"stockagent_unit": "stockagent-other.service"}, "unit_context_changed"),
+    ({"io_counters": {"write_bytes": 9}}, "counter_decreased"),
+    ({"io_counters": None}, "counters_unavailable"),
+])
+def test_process_io_deltas_reject_identity_counter_and_context_breaks(change, state):
+    before = {"monotonic": 100, "processes": [_process_io_row()]}
+    after = {"monotonic": 102, "processes": [{**_process_io_row(write=110), **change}]}
+    row = audit.repository_process_io_deltas(before, after, same_host_epoch=True)["processes"][0]
+    assert row["measurement_state"] == state
+    assert row["write_bytes_delta"] is None
+
+
+@pytest.mark.parametrize("clock", [100, 99, float("nan"), True, None, 10**1000])
+def test_process_io_invalid_clock_has_no_counter_delta(clock):
+    before = {"monotonic": 100, "processes": [_process_io_row()]}
+    after = {"monotonic": clock, "processes": [_process_io_row(write=110)]}
+    result = audit.repository_process_io_deltas(before, after, same_host_epoch=True)
+    assert result["sample_seconds"] is None
+    assert result["processes"][0]["measurement_state"] == "sampling_clock_invalid"
+
+
+def test_process_io_epochs_missing_processes_and_unavailable_snapshots_are_explicit():
+    before = {"monotonic": 100, "processes": [_process_io_row(), _process_io_row(43)]}
+    after = {"monotonic": 102, "processes": [_process_io_row(write=110), _process_io_row(44)]}
+    result = audit.repository_process_io_deltas(before, after, same_host_epoch=False)
+    assert [row["measurement_state"] for row in result["processes"]] == [
+        "host_epoch_unproven", "left_observed_context", "entered_observed_context",
+    ]
+    assert all(row["write_bytes_delta"] is None for row in result["processes"])
+    unavailable = {"monotonic": 102, "processes": [], "inspection_state": "unavailable"}
+    result = audit.repository_process_io_deltas(before, unavailable, same_host_epoch=True)
+    assert result["snapshots_available"] is False
+    assert all(row["measurement_state"] == "snapshot_unavailable" for row in result["processes"])
+    assert audit.repository_process_io_deltas(
+        {"processes": None}, {"processes": "malformed"}, same_host_epoch=False,
+    )["processes"] == []
+
+
 def test_auxiliary_schedules_find_cron_and_user_units_without_commands(
     tmp_path: Path,
 ) -> None:

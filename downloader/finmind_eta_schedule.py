@@ -28,25 +28,36 @@ def release_aware_finish(start, requests, rate, events, *, day_is_protected):
     remaining = float(requests)
     refresh = 0
     pause = 0.0
+    calendar = {}
+    midnight = cursor
+
+    def protected_day(day):
+        if day not in calendar:
+            calendar[day] = day_is_protected(day)
+        return calendar[day]
+
     while remaining > 1e-8:
         if cursor > horizon:
             raise ValueError('timed_projection_horizon')
         while heap and heap[0][0] <= cursor:
             stamp, index = heapq.heappop(heap)
             row = events[index]
-            if not row['session_only'] or day_is_protected(stamp.astimezone(TAIPEI).date()):
+            if not row['session_only'] or protected_day(stamp.astimezone(TAIPEI).date()):
                 remaining += row['requests']
                 refresh += row['requests']
             period = row['interval_seconds']
             if period:
                 heapq.heappush(heap, (stamp + timedelta(seconds=period), index))
-        local = cursor.astimezone(TAIPEI)
-        day = local.date()
-        protected = day_is_protected(day)
-        opening = datetime.combine(day, time(8, 20), TAIPEI).astimezone(UTC)
-        resume = datetime.combine(day, time(9, 10), TAIPEI).astimezone(UTC)
+        # Many release events share a session. Its immutable calendar decision
+        # and UTC boundaries cost O(days), not O(release events). Event order,
+        # capacity arithmetic and refresh counts stay exactly unchanged.
+        if cursor >= midnight:
+            day = cursor.astimezone(TAIPEI).date()
+            protected = protected_day(day)
+            opening = datetime.combine(day, time(8, 20), TAIPEI).astimezone(UTC)
+            resume = datetime.combine(day, time(9, 10), TAIPEI).astimezone(UTC)
+            midnight = datetime.combine(day + timedelta(days=1), time(), TAIPEI).astimezone(UTC)
         paused = protected and opening <= cursor < resume
-        midnight = datetime.combine(day + timedelta(days=1), time(), TAIPEI).astimezone(UTC)
         boundary = resume if paused else opening if protected and cursor < opening else midnight
         if heap:
             boundary = min(boundary, heap[0][0])

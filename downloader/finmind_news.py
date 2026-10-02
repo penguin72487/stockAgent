@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from downloader.finmind_scheduling import TAIPEI
 
 DATASET = "TaiwanStockNews"
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2  # Sparse article metadata is quality evidence, not a failed day.
 SEARCH_FLOOR = date(1900, 1, 1)
 RESEARCH_START = date(2014, 1, 1)
 DOCUMENTATION_URL = "https://finmind.github.io/tutor/TaiwanMarket/Others/"
@@ -59,6 +59,7 @@ def validate_response(partition: str, rows: list[dict]) -> dict:
     expected = date.fromisoformat(partition)
     seen = set()
     duplicates = 0
+    missing_identity = dict.fromkeys(('stock_id', 'link'), 0)
     for row in rows:
         try:
             stamp = datetime.fromisoformat(str(row['date']))
@@ -66,9 +67,16 @@ def validate_response(partition: str, rows: list[dict]) -> dict:
             raise ValueError('news_invalid_timestamp') from None
         if stamp.date() != expected:
             raise ValueError('news_response_outside_day')
-        if not all(isinstance(row.get(key), str) and row[key].strip() for key in ('stock_id', 'link')):
-            raise ValueError('news_missing_identity_or_content')
-        if urlsplit(row['link']).scheme not in {'http', 'https'}:
+        for field in missing_identity:
+            value = row.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError('news_identity_type_mismatch')
+            missing_identity[field] += int(value is None or not value.strip())
+        # A missing URL or stock association does not invalidate the other
+        # articles, timestamps or text returned for this day. Keep the exact
+        # sparse source value; never invent a link or a stock mapping.
+        link = row.get('link')
+        if link and link.strip() and urlsplit(link).scheme not in {'http', 'https'}:
             raise ValueError('news_invalid_link')
         key = json.dumps(row, sort_keys=True, ensure_ascii=False)
         duplicates += int(key in seen)
@@ -76,6 +84,8 @@ def validate_response(partition: str, rows: list[dict]) -> dict:
     # Preserve the response verbatim; an article can legitimately tag many IDs.
     return {'exact_duplicate_rows': duplicates, 'duplicate_policy': 'raw_preserved',
             'grain': 'article_stock_association', 'rows_validated': len(rows),
+            'missing_identity_fields': missing_identity,
+            'quality_policy': 'sparse_metadata_preserved_not_whole_day_rejected',
             'missing_optional_fields': {key: sum(not row.get(key) for row in rows)
                                        for key in ('title', 'source', 'description')}}
 

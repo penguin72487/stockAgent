@@ -8,6 +8,7 @@ features and are never published to the packed cold store automatically.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import UTC, date, datetime, time as wall_time, timedelta
 import errno
 import fcntl
@@ -50,6 +51,7 @@ HISTORY_START = date(2005, 1, 1)
 SCHEMA_VERSION = 1
 SESSION_GRID_CONTRACT_VERSION = 2
 SESSION_GRAINS = frozenset({"1m", "15s", "10s", "5s"})
+TRAFFIC_BUSY_TIMEOUT_SECONDS = 5.0
 
 
 class ProviderError(RuntimeError):
@@ -177,23 +179,35 @@ def _record_request_start(root: Path, dataset: str) -> None:
     """Durably count only this worker's outbound requests, never account usage.
 
     The claim is written before the network call, so transport failures also
-    consume a request slot. The worker holds its one-process lock; SQLite makes
-    the read-only dashboard's concurrent snapshots safe.
+    consume a request slot. All worker lanes share this ledger. WAL keeps local
+    read-only quota/ETA snapshots from blocking the short write transaction;
+    FULL synchronization retains the pre-request durability boundary. A failed
+    claim is recoverable local work, never permission for an uncounted request.
     """
     path = root / "request_traffic.sqlite3"
-    with sqlite3.connect(path, timeout=2.0) as connection:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS requests ("
-            "started_at_utc TEXT NOT NULL, dataset TEXT NOT NULL)"
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_finmind_requests_started "
-            "ON requests(started_at_utc)"
-        )
-        connection.execute(
-            "INSERT INTO requests (started_at_utc, dataset) VALUES (?, ?)",
-            (_iso(_utc_now()), dataset),
-        )
+    try:
+        with closing(sqlite3.connect(path, timeout=TRAFFIC_BUSY_TIMEOUT_SECONDS)) as connection:
+            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if mode != 'wal':
+                raise ProviderError('local_traffic_unavailable', retry_after=60)
+            connection.execute("PRAGMA synchronous=FULL")
+            with connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS requests ("
+                    "started_at_utc TEXT NOT NULL, dataset TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_finmind_requests_started "
+                    "ON requests(started_at_utc)"
+                )
+                connection.execute(
+                    "INSERT INTO requests (started_at_utc, dataset) VALUES (?, ?)",
+                    (_iso(_utc_now()), dataset),
+                )
+    except sqlite3.Error as error:
+        busy = getattr(error, 'sqlite_errorcode', 0) & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        raise ProviderError('local_traffic_busy' if busy else 'local_traffic_unavailable',
+                            retry_after=15 if busy else 60) from None
 
 
 def _calendar_dates(rows: list[dict[str, Any]]) -> list[date]:
@@ -350,7 +364,9 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
         "series": {
             dataset: {"total": len(eligible), "complete": 0, "deferred": 0, "rows": 0,
                       "bytes": 0, "first_complete_date": None, "last_complete_date": None,
-                      "last_receipt_at_utc": None, "observed_grains": {}}
+                      "last_receipt_at_utc": None, "observed_grains": {},
+                      "retry_tasks": 0, "earliest_retry_at_utc": None,
+                      "latest_retry_at_utc": None}
             for dataset in SESSION_DATASETS
         },
     }
@@ -376,6 +392,14 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
                 if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
                 continue
+            if receipt.get('status') in {'failed', 'partial', 'observed_empty'}:
+                item = counts['series'][dataset]
+                item['retry_tasks'] += 1
+                retry = _retry_at(receipt)
+                if retry is not None:
+                    stamp = _iso(retry)
+                    item['earliest_retry_at_utc'] = min(item['earliest_retry_at_utc'] or stamp, stamp)
+                    item['latest_retry_at_utc'] = max(item['latest_retry_at_utc'] or stamp, stamp)
             if receipt.get("status") != "complete" and _receipt_usable(receipt, root, now=now):
                 counts["deferred"] += 1
                 counts["series"][dataset]["deferred"] += 1
@@ -963,8 +987,9 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task,
                           active={"dataset": dataset, "date": day.isoformat(), "started_at_utc": _iso(_utc_now())})
             try:
+                previous_receipt = _read_json(root / 'receipts' / dataset / f'{day}.json')
                 correction = free_correction_due(root, dataset, day,
-                    _read_json(root / 'receipts' / dataset / f'{day}.json'), _utc_now())
+                    previous_receipt, _utc_now())
                 rows = _request(session, limiter, dataset, start_date=day, token=token, traffic_root=root)
                 used += 1
                 result = _record_session(root, dataset, day, rows, now=_utc_now(),
@@ -991,6 +1016,17 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                 grain = result.get("observed_grain")
                 if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
+            item = counts['series'][dataset]
+            was_retry = previous_receipt.get('status') in {'failed', 'partial', 'observed_empty'}
+            is_retry = result.get('status') in {'failed', 'partial', 'observed_empty'}
+            item['retry_tasks'] = max(0, item.get('retry_tasks', 0) + int(is_retry) - int(was_retry))
+            retry = _retry_at(result) if is_retry else None
+            if retry is not None:
+                stamp = _iso(retry)
+                item['earliest_retry_at_utc'] = min(item.get('earliest_retry_at_utc') or stamp, stamp)
+                item['latest_retry_at_utc'] = max(item.get('latest_retry_at_utc') or stamp, stamp)
+            if not item['retry_tasks']:
+                item['earliest_retry_at_utc'] = item['latest_retry_at_utc'] = None
             last_task = {"dataset": dataset, "date": day.isoformat(), "status": result["status"], "rows": result.get("rows")}
             _write_status(root, state="running", counts=counts, requests_used=used, quota=quota, token=bool(token), last=last_task)
         state = (

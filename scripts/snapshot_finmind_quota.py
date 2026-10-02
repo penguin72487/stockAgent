@@ -2,12 +2,54 @@
 
 from pathlib import Path
 import argparse
+from datetime import UTC, datetime
 import os
+import time
 
 import requests
 
 from downloader.common import load_env_file
+from downloader.artifact_io import atomic_write_json
 from downloader.finmind_account import verified_account
+from downloader.finmind_eta import snapshot_finmind_estimate
+
+
+ETA_ERROR_CODES = frozenset({
+    'priority_override_query_grain_unverified',
+    'priority_override_must_be_subset_of_required_history',
+    'stage_request_counts_do_not_reconcile',
+})
+
+
+def sample_local_eta(root: Path) -> dict | None:
+    """Publish an ETA only after a full snapshot; keep refresh health separate.
+
+    A successful quota observation does not imply a successful estimate. The
+    short local health receipt explains failures without publishing exception
+    text, overwriting old estimate evidence, or calling the provider again.
+    """
+    started, clock = datetime.now(UTC), time.monotonic()
+    try:
+        estimate = snapshot_finmind_estimate(root)
+    except Exception as error:
+        code = str(error) if isinstance(error, ValueError) and str(error) in ETA_ERROR_CODES else 'eta_snapshot_failed'
+        health = {'schema_version': 1, 'state': 'failed', 'error_code': code,
+                  'exception_type': type(error).__name__}
+        estimate = None
+        print(f"FinMind ETA sample failed: {health['exception_type']} ({code}); previous estimate expires normally")
+    else:
+        health = {'schema_version': 1, 'state': 'ok', 'error_code': None,
+                  'estimate_observed_at_utc': estimate.get('observed_at_utc'),
+                  'estimate_state': estimate['state']}
+        print(f"FinMind completion scenarios: {estimate['state']}")
+    health.update(attempt_started_at_utc=started.isoformat(),
+                  finished_at_utc=datetime.now(UTC).isoformat(),
+                  elapsed_seconds=round(time.monotonic() - clock, 3))
+    try:
+        atomic_write_json(root / 'eta_refresh_status.json', health)
+    except OSError:
+        print('FinMind ETA refresh health receipt unavailable')
+    return estimate
 
 
 def main() -> int:
@@ -16,10 +58,7 @@ def main() -> int:
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     if args.eta_only:
-        from downloader.finmind_eta import snapshot_finmind_estimate
-        estimate = snapshot_finmind_estimate(repo_root / 'data_finmind')
-        print(f"FinMind completion scenarios: {estimate['state']}")
-        return 0
+        return 0 if sample_local_eta(repo_root / 'data_finmind') is not None else 1
     load_env_file(repo_root / ".env", allowed_names=("FINMIND_TOKEN",))
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     if not token:
@@ -30,16 +69,9 @@ def main() -> int:
           f"{account['official_requests_per_hour']} requests in provider hour")
     # One bounded local snapshot per existing quota observation, not per browser
     # refresh. Estimation cannot trigger a market-data API or alter a queue.
-    if (repo_root / 'data_finmind' / 'eta_status.json').is_file():
-        try:
-            from downloader.finmind_eta import snapshot_finmind_estimate
-            estimate = snapshot_finmind_estimate(repo_root / 'data_finmind')
-        except Exception as error:
-            # Preserve the last evidence (it expires after five minutes). An
-            # estimator failure must not invalidate a successful quota sample.
-            print(f"FinMind ETA sample failed: {type(error).__name__}; previous estimate expires normally")
-        else:
-            print(f"FinMind completion scenarios: {estimate['state']}")
+    # Bootstrap missing estimates too; a removed/never-created ETA file must
+    # not permanently disable every following minute's refresh.
+    sample_local_eta(repo_root / 'data_finmind')
     return 0
 
 

@@ -242,6 +242,41 @@ def _self_ancestors(proc_root: Path) -> set[int]:
     return ancestors
 
 
+_PROC_IO_KEYS = ("read_bytes", "write_bytes", "cancelled_write_bytes")
+
+
+def _proc_start_ticks(entry: Path) -> int | None:
+    """Fence PID reuse without publishing /proc/stat's command text."""
+
+    try:
+        # comm can contain whitespace and parentheses. The fields following
+        # its final ')' start at field 3; starttime is field 22.
+        prefix, separator, tail = (entry / "stat").read_text().rpartition(")")
+        if not separator or not prefix.startswith(f"{entry.name} ("):
+            return None
+        value = int(tail.split()[19])
+        return value if value >= 0 else None
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return None
+
+
+def _proc_io_counters(entry: Path) -> dict[str, int | None]:
+    counters: dict[str, int | None] = dict.fromkeys(_PROC_IO_KEYS)
+    try:
+        for line in (entry / "io").read_text().splitlines():
+            key, _, text = line.partition(":")
+            if key not in counters:
+                continue
+            try:
+                value = int(text.strip())
+                counters[key] = value if value >= 0 else None
+            except ValueError:
+                counters[key] = None
+    except (OSError, UnicodeError):
+        pass
+    return counters
+
+
 def repository_process_snapshot(
     repo_root: Path = REPO_ROOT, proc_root: Path = Path("/proc"),
     *, exclude_pids: set[int] | None = None,
@@ -253,22 +288,36 @@ def repository_process_snapshot(
     relative-path process launched from another directory.
     """
 
+    capture_started = time.perf_counter()
     repo = str(repo_root.resolve())
     repo_bytes = repo.encode()
     excluded = _self_ancestors(proc_root) if exclude_pids is None else exclude_pids
     rows: list[dict[str, object]] = []
     inspected = 0
-    for entry in proc_root.iterdir():
+    visibility = {
+        "cwd_read_failures": 0, "argv_read_failures": 0,
+        "process_detail_read_failures": 0, "identity_unavailable_count": 0,
+        "io_unavailable_count": 0,
+    }
+    try:
+        entries = list(proc_root.iterdir())
+        inspection_state = "observed"
+    except OSError:
+        entries = []
+        inspection_state = "unavailable"
+    for entry in entries:
         if not entry.name.isdecimal():
             continue
         inspected += 1
         pid = int(entry.name)
         if pid in excluded:
             continue
+        start_ticks = _proc_start_ticks(entry)
         try:
             cwd = os.readlink(entry / "cwd")
         except OSError:
             cwd = ""
+            visibility["cwd_read_failures"] += 1
         cwd_match = cwd == repo or cwd.startswith(repo + "/")
         argv_match = False
         if not cwd_match:
@@ -276,7 +325,7 @@ def repository_process_snapshot(
                 with (entry / "cmdline").open("rb") as stream:
                     argv_match = repo_bytes in stream.read(65_536)
             except OSError:
-                pass
+                visibility["argv_read_failures"] += 1
         if not cwd_match and not argv_match:
             continue
         try:
@@ -285,7 +334,17 @@ def repository_process_snapshot(
             cgroup = (entry / "cgroup").read_text()
             statm = (entry / "statm").read_text().split()
         except (OSError, UnicodeError):
+            visibility["process_detail_read_failures"] += 1
             continue
+        io_counters = _proc_io_counters(entry)
+        if start_ticks is None or _proc_start_ticks(entry) != start_ticks:
+            # Keep reachability/context inventory even when identity or I/O
+            # permissions are unavailable, but never grant a counter delta.
+            start_ticks = None
+            io_counters = dict.fromkeys(_PROC_IO_KEYS)
+            visibility["identity_unavailable_count"] += 1
+        if all(value is None for value in io_counters.values()):
+            visibility["io_unavailable_count"] += 1
         unit_match = _STOCKAGENT_UNIT_IN_CGROUP.search(cgroup)
         try:
             rss_bytes = int(statm[1]) * os.sysconf("SC_PAGE_SIZE")
@@ -298,23 +357,150 @@ def repository_process_snapshot(
             "match_basis": "cwd" if cwd_match else "argv_path",
             "stockagent_unit": unit_match.group(1) if unit_match else None,
             "rss_bytes": rss_bytes,
+            "start_time_ticks": start_ticks,
+            "io_counters": io_counters,
         })
     rows.sort(key=lambda row: int(row["pid"]))
     unmanaged = [row for row in rows if row["stockagent_unit"] is None]
     return {
         "observed_at_utc": datetime.now(UTC).isoformat(),
+        "monotonic": time.monotonic(),
+        "capture_ms": round((time.perf_counter() - capture_started) * 1000, 3),
+        "inspection_state": inspection_state,
         "scope": (
             "Current local /proc processes with cwd under the repository or its "
             "absolute path in the first 64 KiB of argv; excludes this audit's "
             "own process ancestry. Unmanaged candidates include interactive "
             "tools and are not necessarily background services. No argv text, "
-            "open-fd search, remote host, or Windows process inventory."
+            "open-fd search, remote host, or Windows process inventory. Hardened "
+            "proc/ptrace permissions can hide process context and counters; "
+            "inspected count is not a fully readable host-process census."
         ),
         "inspected_proc_count": inspected,
         "matched_count": len(rows),
         "managed_unit_process_count": len(rows) - len(unmanaged),
         "unmanaged_candidate_count": len(unmanaged),
+        "visibility": visibility,
         "processes": rows,
+    }
+
+
+def repository_process_io_deltas(
+    before: dict[str, object] | None, after: dict[str, object],
+    *, same_host_epoch: bool,
+) -> dict[str, object]:
+    """Non-additive, paired process I/O; never infer volume growth from it."""
+
+    previous = before or {}
+    started, ended = previous.get("monotonic"), after.get("monotonic")
+
+    def valid_clock(value: object) -> bool:
+        # Bound before math.isfinite: an optional persisted JSON integer may
+        # exceed float range even when the main service baseline is valid.
+        return (
+            type(value) in (int, float) and 0 <= value <= 2**63 and math.isfinite(value)
+        )
+
+    elapsed = (
+        ended - started
+        if valid_clock(started) and valid_clock(ended) and ended > started
+        else None
+    )
+    def process_rows(snapshot: dict[str, object]) -> dict[int, dict[str, object]]:
+        candidates = snapshot.get("processes")
+        if not isinstance(candidates, list):
+            return {}
+        return {
+            row["pid"]: row for row in candidates
+            if isinstance(row, dict) and type(row.get("pid")) is int and row["pid"] > 0
+        }
+
+    old_rows, new_rows = process_rows(previous), process_rows(after)
+    snapshots_available = (
+        previous.get("inspection_state", "observed") == "observed"
+        and after.get("inspection_state", "observed") == "observed"
+    )
+    rows: list[dict[str, object]] = []
+    for pid in sorted(old_rows.keys() | new_rows.keys()):
+        old, current = old_rows.get(pid), new_rows.get(pid)
+        row = current or old
+        assert row is not None
+        delta: dict[str, int | None] = dict.fromkeys(_PROC_IO_KEYS)
+        if before is None:
+            state = "baseline_unavailable"
+        elif not snapshots_available:
+            state = "snapshot_unavailable"
+        elif old is None:
+            state = "entered_observed_context"
+        elif current is None:
+            state = "left_observed_context"
+        elif not same_host_epoch:
+            state = "host_epoch_unproven"
+        elif elapsed is None:
+            state = "sampling_clock_invalid"
+        elif (
+            type(old.get("start_time_ticks")) is not int
+            or type(current.get("start_time_ticks")) is not int
+            or old["start_time_ticks"] < 0 or current["start_time_ticks"] < 0
+        ):
+            state = "process_identity_unavailable"
+        elif old["start_time_ticks"] != current["start_time_ticks"]:
+            state = "pid_reused"
+        elif old.get("stockagent_unit") != current.get("stockagent_unit"):
+            state = "unit_context_changed"
+        else:
+            old_io, current_io = old.get("io_counters"), current.get("io_counters")
+            old_io = old_io if isinstance(old_io, dict) else {}
+            current_io = current_io if isinstance(current_io, dict) else {}
+            reset = any(
+                type(old_io.get(key)) is int and type(current_io.get(key)) is int
+                and current_io[key] < old_io[key] for key in _PROC_IO_KEYS
+            )
+            if reset:
+                state = "counter_decreased"
+            else:
+                for key in _PROC_IO_KEYS:
+                    start, end = old_io.get(key), current_io.get(key)
+                    if type(start) is int and type(end) is int and 0 <= start <= end:
+                        delta[key] = end - start
+                observed = sum(value is not None for value in delta.values())
+                state = (
+                    "measured" if observed == len(_PROC_IO_KEYS)
+                    else "partially_measured" if observed else "counters_unavailable"
+                )
+        rows.append({
+            "pid": pid,
+            "ppid": row.get("ppid"),
+            "comm": row.get("comm"),
+            "stockagent_unit": row.get("stockagent_unit"),
+            "start_time_ticks": row.get("start_time_ticks"),
+            "measurement_state": state,
+            "read_bytes_delta": delta["read_bytes"],
+            "write_bytes_delta": delta["write_bytes"],
+            "cancelled_write_bytes_delta": delta["cancelled_write_bytes"],
+        })
+    return {
+        "sample_seconds": elapsed,
+        "same_host_epoch": same_host_epoch,
+        "snapshots_available": snapshots_available,
+        "before_count": len(old_rows),
+        "after_count": len(new_rows),
+        "before_visibility": previous.get("visibility"),
+        "after_visibility": after.get("visibility"),
+        "before_capture_ms": previous.get("capture_ms"),
+        "after_capture_ms": after.get("capture_ms"),
+        "processes": rows,
+        "scope": (
+            "Two sequential local repository-context process snapshots. PID and "
+            "starttime must match in a proven continuous host epoch. Processes "
+            "born and exited entirely between observations can be missed. "
+            "Appearing/disappearing rows can reflect startup, exit, permissions "
+            "or context changes, not proven lifecycle events. "
+            "/proc/PID/io includes waited-for children: rows are not additive "
+            "and do not equal cgroup counters or filesystem net growth. I/O can "
+            "target any filesystem, not only the repository volume. No argv, "
+            "file contents, open-fd search, or remote-process inventory."
+        ),
     }
 
 
@@ -2213,9 +2399,10 @@ def build_report(*, sample_seconds: float) -> dict[str, object]:
     auxiliary_schedules = auxiliary_schedule_snapshot()
     startup = startup_snapshot()
     product_probes = product_probe_snapshot()
-    repository_processes = repository_process_snapshot()
     before = service_snapshot()
+    process_before = repository_process_snapshot()
     time.sleep(sample_seconds)
+    repository_processes = repository_process_snapshot()
     after = service_snapshot()
     host_pressure = pressure_snapshot()
     resources = service_deltas(before, after)
@@ -2344,6 +2531,9 @@ def build_report(*, sample_seconds: float) -> dict[str, object]:
         "startup": startup,
         "product_probes": product_probes,
         "repository_processes": repository_processes,
+        "repository_process_io": repository_process_io_deltas(
+            process_before, repository_processes, same_host_epoch=True,
+        ),
         "host_pressure": host_pressure,
     }
 

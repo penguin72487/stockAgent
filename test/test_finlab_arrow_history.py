@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -158,6 +158,31 @@ def test_raw_object_reuse_checks_bytes_not_filename(tmp_path):
     data = path.read_bytes()
     path.write_bytes(b"X" + data[1:])
     assert arrow._verified_raw(tmp_path, receipt, key) is None
+
+
+def test_raw_reuse_is_expiry_bound_not_whole_quota_day(tmp_path, monkeypatch):
+    import finlab.auth
+    from finlab.data import auth
+    raw = ipc_file(tmp_path / "temporary.feather", pa.table({
+        "date": [datetime(2020, 1, 2)], "2330": ["上市"],
+    }))
+    (tmp_path / "raw").mkdir()
+    key = "after_market_fixed_price:資料來源"
+    stem = history.safe_stem(key)
+    evidence = arrow._commit_raw(raw, tmp_path, stem, key, "upstream_forced", "test")
+    evidence["provider_expiry_at_utc"] = (datetime.now(UTC)+timedelta(hours=1)).isoformat()
+    arrow._atomic_json(tmp_path / "raw_receipts" / f"{stem}.json", evidence)
+    monkeypatch.setattr(finlab.auth, "get_data_status", lambda: {"limit_size": 5000, "quota": 0})
+    def source_reached(*args, **kwargs):
+        raise RuntimeError("source reached after expiry")
+    monkeypatch.setattr(auth, "fetch_metadata_batch", source_reached)
+    _, reused = arrow.acquire_raw(key, tmp_path, stem, refresh=True)
+    assert reused["raw_sha256"] == evidence["raw_sha256"]
+    evidence["source_checked_at_utc"] = (datetime.now(UTC)-timedelta(hours=2)).isoformat()
+    evidence["provider_expiry_at_utc"] = (datetime.now(UTC)-timedelta(hours=1)).isoformat()
+    arrow._atomic_json(tmp_path / "raw_receipts" / f"{stem}.json", evidence)
+    with pytest.raises(RuntimeError, match="source reached after expiry"):
+        arrow.acquire_raw(key, tmp_path, stem, refresh=True)
 
 
 @pytest.mark.parametrize("quota", [4900, float("nan"), float("inf")])

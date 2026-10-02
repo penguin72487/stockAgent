@@ -405,6 +405,14 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         source_url="https://www.okx.com/docs-v5/en/",
         note="GET /api/v5/market/history-index-candles",
     ),
+    "okx_index_candles": ProviderRateLimit(
+        provider="okx_index_candles",
+        requests=20,
+        seconds=2,
+        basis="official endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/market/index-candles; latest 1,440 entries, not all history.",
+    ),
     "okx_funding_rate_history": ProviderRateLimit(
         provider="okx_funding_rate_history",
         requests=10,

@@ -1,8 +1,8 @@
 [Unit]
-Description=Daily verified retirement of explicitly enrolled cold artifacts
+Description=Hourly verified retirement of explicitly enrolled cold artifacts
 
 [Timer]
-OnCalendar=*-*-* 04:45:00
+OnCalendar=hourly
 RandomizedDelaySec=5m
 Persistent=true
 Unit=stockagent-enrolled-artifact-retirement.service

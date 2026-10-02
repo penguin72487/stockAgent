@@ -45,6 +45,7 @@ SESSION_OPEN = datetime_time(9, 0)
 STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
+MINUTE_SESSION_POINTS = 270
 LAST_TRADE_SETTLEMENT_CONTRACT = (
     "user_authorized_last_traded_price_paper_settlement_v1"
 )
@@ -72,6 +73,57 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload
+
+
+def minute_curve_scope_failures(
+    receipt: Mapping[str, Any],
+    *,
+    completed_session_dates: list[str],
+    expected_markets: set[str],
+) -> list[str]:
+    """Share exact scope checks between the writer and publication acceptance.
+
+    This metadata gate is not a substitute for source, NAV, or output-hash
+    validation. It prevents an internally complete but wrongly scoped curve
+    from being written to the live ledger in the first place.
+    """
+    failures: list[str] = []
+    strategy = receipt.get("strategy")
+    strategy = strategy if isinstance(strategy, Mapping) else {}
+    if sorted(str(value) for value in strategy.get("session_dates") or ()) != completed_session_dates:
+        failures.append("minute curve session dates do not match completed replay sessions")
+    actual_markets = [str(value) for value in strategy.get("markets") or ()]
+    if set(actual_markets) != expected_markets or len(actual_markets) != len(expected_markets):
+        failures.append("minute curve markets do not match the promoted mode set")
+    expected_rows = len(completed_session_dates) * len(expected_markets) * MINUTE_SESSION_POINTS
+    if type(strategy.get("generated_rows")) is not int or strategy["generated_rows"] != expected_rows:
+        failures.append(f"minute curve generated row count does not equal {MINUTE_SESSION_POINTS} points per completed session and mode")
+    if not completed_session_dates or str(receipt.get("start_date") or "") != completed_session_dates[0]:
+        failures.append("minute curve start date does not match the replay start")
+    if not completed_session_dates or str(receipt.get("end_date") or "") != completed_session_dates[-1]:
+        failures.append("minute curve end date does not match the latest completed replay")
+    return failures
+
+
+def _expected_minute_scope(
+    args: argparse.Namespace, *, start: date, end: date,
+) -> tuple[list[str], set[str]] | None:
+    sessions = getattr(args, "expected_session_date", None)
+    markets = getattr(args, "expected_market", None)
+    if sessions is None and markets is None:
+        return None
+    if not sessions or not markets:
+        raise ValueError("expected session dates and markets must be supplied together")
+    canonical_sessions = sorted({date.fromisoformat(value).isoformat() for value in sessions})
+    if (len(canonical_sessions) != len(sessions)
+            or set(canonical_sessions) != set(sessions)
+            or canonical_sessions[0] != start.isoformat()
+            or canonical_sessions[-1] != end.isoformat()):
+        raise ValueError("expected session dates must be unique ISO dates spanning start/end")
+    if (len(set(markets)) != len(markets)
+            or any(not isinstance(market, str) or not market.strip() for market in markets)):
+        raise ValueError("expected markets must be unique nonempty strings")
+    return canonical_sessions, set(markets)
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -1970,6 +2022,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument(
+        "--expected-session-date", action="append",
+        help="Exact completed session set from the maintenance owner; repeatable with --expected-market.",
+    )
+    parser.add_argument(
+        "--expected-market", action="append",
+        help="Exact active mode set; reject a differently scoped reconstruction before publication.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--fetch-missing-kbars",
@@ -2256,6 +2316,9 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("start date must not be after end date")
+    expected_scope = _expected_minute_scope(args, start=start, end=end)
+    if expected_scope is not None and getattr(args, "repair_terminal_only", False):
+        raise ValueError("full minute scope cannot be validated by terminal-only repair")
     source_hashes = {name: _sha256(args.state_dir / name) for name in
                      ("marks.jsonl", "fills.jsonl", "orders.jsonl", "benchmark_history.json")
                      if (args.state_dir / name).exists()}
@@ -2611,6 +2674,14 @@ def main() -> None:
         },
     }
     receipt_path = args.output_dir / "minute_curve_receipt.json"
+    if expected_scope is not None:
+        scope_failures = minute_curve_scope_failures(
+            receipt,
+            completed_session_dates=expected_scope[0],
+            expected_markets=expected_scope[1],
+        )
+        if scope_failures:
+            raise RuntimeError("minute curve scope mismatch; publication refused: " + "; ".join(scope_failures))
     store.assert_sources_unchanged()
     _atomic_json(receipt_path, receipt)
     if args.publish:

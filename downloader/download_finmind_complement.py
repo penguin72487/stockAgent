@@ -33,7 +33,7 @@ from downloader.artifact_io import (atomic_write_bytes, atomic_write_json, atomi
                                     durable_replace, table_from_records)
 from downloader.finmind_parent_recovery import repair_content_addressed_collision
 from downloader.common import SharedRateLimiter, load_env_file
-from downloader.download_finmind_free import API_URL, TAIPEI, _record_request_start
+from downloader.download_finmind_free import API_URL, TAIPEI, ProviderError, _record_request_start
 from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import RangeBatch
 from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, fixed_incremental_demand, next_release_check
@@ -45,114 +45,35 @@ from downloader.finmind_history_refresh import (
 from downloader.finmind_updates import received_rows, retain_observation, record_success, set_next_check, record_failure
 from downloader import finmind_supplemental as supplemental
 from downloader import finmind_news as news
+from downloader.finmind_catalog import (
+    ALL_DATASETS as ALL_DATASETS,
+    BULK_GLOBAL_HISTORY,
+    CURRENCIES,
+    DERIVATIVE_HISTORY,
+    DERIVATIVE_SNAPSHOTS,
+    FIXED_ID_HISTORY,
+    GLOBAL_EQUITY_HISTORY,
+    GLOBAL_HISTORY,
+    GLOBAL_RELEASE_HOUR_TAIPEI,
+    GLOBAL_START_YEAR,
+    INSTITUTIONAL_NAMES,
+    LIVE_SNAPSHOT_ENDPOINTS,
+    LONG_INSTITUTIONAL,
+    PER_ID_REQUIRED,
+    SNAPSHOTS,
+    TW_SYMBOL_HISTORY,
+    WIDE_INSTITUTIONAL,
+)
 
 
 SOURCE_CATALOG = "https://github.com/FinMind/FinMind-MCP/blob/master/knowledge/datasets.md"
 MIN_FREE_BYTES = 25 * 1024**3
-SNAPSHOTS = (
-    "TaiwanStockInfo", "TaiwanSecuritiesTraderInfo", "TaiwanStockActiveETFInfo",
-    "TaiwanFutOptDailyInfo", "USStockInfo", "UKStockInfo", "EuropeStockInfo",
-    "JapanStockInfo",
-    "TaiwanFutOptTickInfo", "taiwan_stock_tick_snapshot",
-    "taiwan_futures_snapshot", "taiwan_options_snapshot",
-)
-GLOBAL_HISTORY = (
-    "TaiwanStockTotalMarginPurchaseShortSale",
-    "TaiwanStockTotalInstitutionalInvestors",
-    "TaiwanStockCapitalReductionReferencePrice", "TaiwanStockDelisting",
-    "TaiwanStockSplitPrice", "TaiwanStockParValueChange",
-    "TaiwanFuturesDealerTradingVolumeDaily", "TaiwanOptionDealerTradingVolumeDaily",
-    "TaiwanExchangeRate", "GoldPrice",
-)
-# The official Free tier requires data_id for these four datasets. A date-only
-# whole-market query is a different (paid) entitlement, even though the catalog
-# labels the dataset itself Free.
-PER_ID_REQUIRED = {
-    "TaiwanStockCapitalReductionReferencePrice": "stock",
-    "TaiwanFuturesDealerTradingVolumeDaily": "futures",
-    "TaiwanOptionDealerTradingVolumeDaily": "options",
-    "TaiwanExchangeRate": "currency",
-}
-CURRENCIES = (
-    "USD", "EUR", "JPY", "GBP", "CNY", "HKD", "AUD", "CAD", "CHF", "IDR",
-    "KRW", "MYR", "NZD", "PHP", "SEK", "SGD", "THB", "VND", "ZAR",
-)
-GLOBAL_START_YEAR = {
-    "TaiwanStockTotalMarginPurchaseShortSale": 2001,
-    "TaiwanStockTotalInstitutionalInvestors": 2004,
-    "TaiwanStockDelisting": 2001,
-    "TaiwanStockSplitPrice": 1900,  # The provider does not document a first year.
-    # Docs say 2020, but a verified local API receipt contains 2019-09-09.
-    # This sparse whole-market query is cheap enough to search further back.
-    "TaiwanStockParValueChange": 1900,
-    "GoldPrice": 1900,  # The provider does not document a first year.
-}
-# These whole-market series are small enough to request once for historical
-# backfill, then persist the response in the existing annual receipt layout.
-BULK_GLOBAL_HISTORY = frozenset(GLOBAL_START_YEAR)
 BULK_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 BULK_MAX_RESPONSE_ROWS = 1_000_000
 GOLD_TIMESTAMP_CONTRACT_VERSION = 1
 # One shared-quota probe plus hash-verified local replay establishes the upper
 # bound at inclusive midnight, not at the end of that calendar day.
 GOLD_RANGE_PROOF = "artifacts/data_quality/finmind_gold_range_20260927T030804094218Z.json"
-GLOBAL_RELEASE_HOUR_TAIPEI = {
-    "TaiwanStockTotalMarginPurchaseShortSale": 21,
-    "TaiwanStockTotalInstitutionalInvestors": 15,
-    # The official docs give no intraday publish time for these event tables.
-    # One daily check after the TW close is a request budget, not a PIT claim.
-    "TaiwanStockDelisting": 23,
-    "TaiwanStockSplitPrice": 18,
-    "TaiwanStockParValueChange": 14,
-}
-TW_SYMBOL_HISTORY = (
-    "TaiwanStockPrice", "TaiwanStockPriceAdj", "TaiwanStockPER",
-    "TaiwanStockDayTrading", "TaiwanStockPriceLimit",
-    "TaiwanStockMarginPurchaseShortSale",
-    "TaiwanStockInstitutionalInvestorsBuySell",
-    "TaiwanStockShareholding",
-    "TaiwanStockSecuritiesLending", "TaiwanStockMarginShortSaleSuspension",
-    "TaiwanDailyShortSaleBalances", "TaiwanStockFinancialStatements",
-    "TaiwanStockBalanceSheet", "TaiwanStockCashFlowsStatement",
-    "TaiwanStockDividend", "TaiwanStockDividendResult", "TaiwanStockMonthRevenue",
-)
-LONG_INSTITUTIONAL = "TaiwanStockInstitutionalInvestorsBuySell"
-WIDE_INSTITUTIONAL = "TaiwanStockInstitutionalInvestorsBuySellWide"
-INSTITUTIONAL_NAMES = (
-    "Foreign_Investor", "Foreign_Dealer_Self", "Investment_Trust",
-    "Dealer", "Dealer_self", "Dealer_Hedging",
-)
-DERIVATIVE_HISTORY = (
-    "TaiwanFuturesDaily", "TaiwanOptionDaily",
-    "TaiwanFuturesInstitutionalInvestors", "TaiwanOptionInstitutionalInvestors",
-    *PRODUCT_HISTORY_STARTS,
-)
-GLOBAL_EQUITY_HISTORY = {
-    "USStockPrice": "USStockInfo",
-    "UKStockPrice": "UKStockInfo",
-    "EuropeStockPrice": "EuropeStockInfo",
-    "JapanStockPrice": "JapanStockInfo",
-}
-LIVE_SNAPSHOT_ENDPOINTS = frozenset({'taiwan_stock_tick_snapshot', 'taiwan_futures_snapshot', 'taiwan_options_snapshot'})
-DERIVATIVE_SNAPSHOTS = frozenset({'taiwan_futures_snapshot', 'taiwan_options_snapshot'})
-FIXED_ID_HISTORY = {
-    "TaiwanStockTotalReturnIndex": ("TAIEX", "TPEx"),
-    "InterestRate": ("FED", "ECB", "BOJ", "BOE", "RBA", "PBOC", "BOC", "RBNZ", "RBI", "CBR", "BCB", "SNB"),
-    "CrudeOilPrices": ("WTI", "Brent"),
-    "GovernmentBondsYield": tuple(
-        f"United States {term}" for term in
-        ("1-Month", "3-Month", "6-Month", "1-Year", "2-Year", "3-Year",
-         "5-Year", "7-Year", "10-Year", "20-Year", "30-Year")
-    ),
-}
-ALL_DATASETS = (
-    *SNAPSHOTS[:4], *GLOBAL_HISTORY[:8], *TW_SYMBOL_HISTORY, WIDE_INSTITUTIONAL,
-    *DERIVATIVE_HISTORY, "TaiwanStockTotalReturnIndex",
-    *SNAPSHOTS[4:], *GLOBAL_EQUITY_HISTORY,
-    *GLOBAL_HISTORY[8:], "InterestRate", "CrudeOilPrices", "GovernmentBondsYield",
-    *supplemental.SOURCES, news.DATASET,
-)
-assert len(ALL_DATASETS) == len(set(ALL_DATASETS)) == 69
 
 
 @dataclass(frozen=True)
@@ -467,7 +388,25 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                incremental_only: bool = False,
                background_only: bool = False,
                datasets: tuple[str, ...] | None = None,
-               advance_cursor: bool = False) -> Task | None:
+               advance_cursor: bool = False,
+               required_keys: tuple[tuple[str, str, str], ...] | None = None) -> Task | None:
+    if required_keys is not None:
+        # Bounded accounting repairs use this same owner, storage and quota
+        # lane. Completed/empty, inflight, blocked and cooling keys are not
+        # reset or replaced, and there is no fallback to unrelated history.
+        for dataset, data_id, partition in required_keys:
+            if dataset in delegated or (datasets is not None and dataset not in datasets):
+                continue
+            row = connection.execute(
+                'SELECT dataset,data_id,partition,kind,priority,state FROM tasks '
+                'WHERE dataset=? AND data_id=? AND partition=? '
+                "AND state IN ('pending','failed') "
+                'AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)',
+                (dataset, data_id, partition, _iso(now))).fetchone()
+            if row and (not incremental_only or row[4] == 0 or row[3] == 'derived') \
+                    and (not background_only or row[4] > 0):
+                return Task(*row)
+        return None
     # A finite, operator-requested backfill shares this worker and its quota.
     # Never bypass the caller's incremental-only reserve or terminal failures.
     if not incremental_only and datasets is None and connection.execute(
@@ -520,7 +459,10 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
         "ORDER BY priority, CASE WHEN priority=0 AND dataset>? THEN 0 WHEN priority=0 THEN 1 ELSE 0 END, "
         "CASE WHEN priority=0 THEN dataset ELSE '' END, "
         "CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, "
-        "CASE WHEN state='pending' THEN 0 ELSE 1 END, "
+        # Within the same lane, an eligible repair must not wait behind an
+        # unbounded stream of never-queried dates. Keep release priorities,
+        # dataset rotation and existing retry cooldowns ahead of this choice.
+        "CASE WHEN state='failed' THEN 0 WHEN state='pending' THEN 1 ELSE 2 END, "
         "COALESCE(next_attempt_at_utc,''), dataset, data_id LIMIT 1",
         (_iso(now), *sorted(delegated), *selected, WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL, cursor),
     ).fetchone()
@@ -887,7 +829,12 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
     ):
         raise ValueError("max_response_bytes must be a positive integer")
     limiter.wait()
-    _record_request_start(root, dataset)
+    try:
+        _record_request_start(root, dataset)
+    except ProviderError as error:
+        # Preserve the queue retry path for local accounting failures. Sponsor
+        # uses this same request function; neither lane may bypass the ledger.
+        raise SourceError(error.code, retry_after=int(error.retry_after)) from None
     started = datetime.now(UTC)
     try:
         response = session.get(endpoint, params=params, headers={"Authorization": f"Bearer {token}"},
@@ -1474,7 +1421,13 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
 
 
 def run_once(root: Path, *, max_requests: int = 0,
-             datasets: tuple[str, ...] | None = None) -> dict[str, Any]:
+             datasets: tuple[str, ...] | None = None,
+             required_keys: tuple[tuple[str, str, str], ...] | None = None) -> dict[str, Any]:
+    if required_keys is not None:
+        required_keys = tuple(dict.fromkeys(required_keys))
+        if (not 0 < len(required_keys) <= 64
+                or any(len(k) != 3 or k[0] not in ALL_DATASETS for k in required_keys)):
+            raise ValueError('required_keys must select 1 to 64 registered finite task keys')
     if datasets is not None:
         datasets = tuple(dict.fromkeys(datasets))
         unknown = set(datasets) - set(ALL_DATASETS)
@@ -1496,11 +1449,12 @@ def run_once(root: Path, *, max_requests: int = 0,
             limiter = rate_limiter(account)
         from downloader.finmind_corrections import apply_worker_corrections, correction_context, reconcile_worker_corrections
 
-        _populate(connection, root, today=_now().astimezone(TAIPEI).date())
+        if required_keys is None:
+            _populate(connection, root, today=_now().astimezone(TAIPEI).date())
         from downloader.finmind_integrity import audit_completed_batch
         from downloader.finmind_scheduling import protected_stock_opening
 
-        if not protected_stock_opening(_now()):
+        if required_keys is None and not protected_stock_opening(_now()):
             audit_completed_batch(connection, root)
         reconcile_worker_corrections(connection, root, 'complement', _now())
         correction_summary = apply_worker_corrections(connection, root, 'complement', _now())
@@ -1525,7 +1479,8 @@ def run_once(root: Path, *, max_requests: int = 0,
             if budget.get('remaining', 1) <= 0:
                 return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
             task = _next_task(connection, now, delegated=delegated,
-                              incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True)
+                              incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True,
+                              required_keys=required_keys)
             if task is None:
                 if budget['allowed'] and datasets is None and any(
                     item.get('unseeded_partition_candidates', 0) for item in supplemental.frontier_status(connection).values()
@@ -1541,7 +1496,10 @@ def run_once(root: Path, *, max_requests: int = 0,
                 last_status_at = time.monotonic()
             bulk = None
             try:
-                bulk = _claim_bulk_years(connection, task, now, allow_history=budget["allowed"])
+                # Exact-key repair must not claim neighbouring year tasks or
+                # expand its provider query into an unrelated history batch.
+                bulk = (_claim_bulk_years(connection, task, now, allow_history=budget["allowed"])
+                        if required_keys is None else None)
                 if bulk is not None:
                     rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, bulk.params(),
                                        max_response_bytes=BULK_MAX_RESPONSE_BYTES)
@@ -1636,7 +1594,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 if bulk is not None:
                     last["request_batch"] = bulk.metadata()
                     last["request_batch"].update({"response_rows": len(rows), "stored_rows": stored_rows})
-                if task.kind == "snapshot" and rows:
+                if task.kind == "snapshot" and rows and required_keys is None:
                     _populate(connection, root, today=local.date())
                 reconcile_worker_corrections(connection, root, 'complement', _now())
                 connection.commit()
@@ -1650,7 +1608,16 @@ def run_once(root: Path, *, max_requests: int = 0,
                 if error.code in {"rate_limited", "invalid_token", "ip_banned"}:
                     return _status(connection, root, state=error.code, last=last, delegated=delegated)
             except (OSError, ValueError, pa.ArrowException) as exc:
-                error = SourceError("storage_or_schema_error", retry_after=900)
+                # Only allowlisted parser codes are persisted; arbitrary
+                # exception text can contain credentials or source content.
+                validation_codes = {
+                    'news_invalid_timestamp', 'news_response_outside_day',
+                    'news_identity_type_mismatch', 'news_invalid_link',
+                    'history_response_outside_range', 'history_wrong_data_id',
+                    'history_duplicate_date', 'unexpected_empty_after_nonempty',
+                }
+                code = str(exc) if isinstance(exc, ValueError) and str(exc) in validation_codes else 'storage_or_schema_error'
+                error = SourceError(code, retry_after=900)
                 if bulk is not None:
                     _fail_bulk_years(connection, bulk, error, _now())
                 else:
@@ -1685,12 +1652,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-requests", type=int, default=120)
     parser.add_argument("--dataset", action="append", choices=sorted(ALL_DATASETS),
                         help="Dispatch only this existing dataset; repeat to select more than one")
+    parser.add_argument("--task-key", nargs=3, action="append",
+                        metavar=("DATASET", "DATA_ID", "PARTITION"),
+                        help="Dispatch only these existing finite keys under the worker lock; repeat up to 64 times")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--retry-blocked", action="store_true",
                         help="after correcting token/parameters, explicitly requeue blocked per-ID tasks")
     args = parser.parse_args(argv)
     if args.max_requests < 0:
         parser.error("--max-requests must be nonnegative")
+    required_keys = tuple(dict.fromkeys(tuple(key) for key in args.task_key)) if args.task_key else None
+    if required_keys is not None:
+        if len(required_keys) > 64 or any(key[0] not in ALL_DATASETS for key in required_keys):
+            parser.error("--task-key requires 1 to 64 keys from registered datasets")
+        if args.loop or args.retry_blocked or args.dataset:
+            parser.error("--task-key is a finite run and cannot be combined with --loop, --retry-blocked or --dataset")
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     with (root / "worker.lock").open("a+") as handle:
@@ -1704,7 +1680,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"requeued_blocked_tasks": _retry_blocked(root)}), flush=True)
             while True:
                 result = run_once(root, max_requests=args.max_requests,
-                                  datasets=tuple(args.dataset) if args.dataset is not None else None)
+                                  datasets=tuple(args.dataset) if args.dataset is not None else None,
+                                  required_keys=required_keys)
                 print(json.dumps({"state": result["state"], "last_task": result.get("last_task")},
                                  ensure_ascii=False), flush=True)
                 if not args.loop:

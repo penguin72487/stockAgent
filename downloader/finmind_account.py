@@ -6,6 +6,7 @@ name hard-coded in a worker.  This file never persists credentials or PII.
 
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import fcntl
 import hashlib
@@ -177,7 +178,7 @@ def backfill_budget(
     ledger = traffic_root / "request_traffic.sqlite3"
     if ledger.is_file():
         try:
-            with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=2.0) as connection:
+            with closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)) as connection:
                 since_observation = int(connection.execute(
                     "SELECT count(*) FROM requests WHERE started_at_utc>? AND started_at_utc<=?",
                     (observed.isoformat(), current.isoformat()),

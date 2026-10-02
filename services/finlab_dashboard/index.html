@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>FinLab API 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=4">
+  <link rel="stylesheet" href="styles.css?v=5">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
 </head>
@@ -47,7 +47,7 @@
     <section id="workload" class="section-block" aria-labelledby="workload-title">
       <header class="section-heading"><span>00</span><div><h2 id="workload-title">下載工作量與預估完成時間</h2><p id="workload-freshness">正在讀取本機工作量快照；不會額外呼叫 FinLab。</p></div></header>
       <div class="progress-card">
-        <div class="finlab-volume-heading"><span>一般歷史追新 · 按來源檔傳輸量加權</span><strong id="volume-progress-label">待量測</strong></div>
+        <div class="finlab-volume-heading"><span>一般歷史追新 · 按完整來源大小加權</span><strong id="volume-progress-label">待量測</strong></div>
         <progress id="volume-progress" class="progress-track" max="1" aria-label="可估一般歷史追新的流量加權進度"></progress>
         <div class="finlab-volume-values"><span>已查新工作量 <strong id="volume-downloaded">—</strong></span><span>預估仍需下載 <strong id="volume-remaining">—</strong></span><span>這輪工作總量 <strong id="volume-total">—</strong></span></div>
         <p id="volume-basis" class="fleet-progress-detail">原始傳輸量與壓縮後落地容量分開計算。</p>
@@ -55,7 +55,7 @@
         <div id="workload-records" class="workload-records" aria-label="按筆數口徑分開的追新進度"></div>
       </div>
       <div class="kpi-grid workload-eta">
-        <article class="kpi featured"><span>可排程待辦清完 · 參考情境</span><strong id="download-global-eta">待估算</strong><p id="workload-time-left">—</p></article>
+        <article class="kpi featured"><span>本次觀測待辦清完 · 參考情境</span><strong id="download-global-eta">待估算</strong><p id="workload-time-left">—</p></article>
         <article class="kpi"><span>實際下載加處理 · 估計工作時間</span><strong id="workload-processing">—</strong><p>不含等待配額、排程和開盤保護</p></article>
         <article class="kpi"><span>等待配額／排程／開盤保護</span><strong id="workload-wait">—</strong><p id="workload-reset-count">—</p></article>
       </div>
@@ -63,6 +63,9 @@
       <p id="workload-eta-basis" class="data-note">估時僅涵蓋有來源大小與耗時樣本的固定待辦。時間均為台北時間。</p>
       <p id="workload-budget" class="data-note">—</p>
       <p id="workload-blockers" class="data-note">來源空值、未知歷史及最低優先級 Tick 另列，不會假算完成。</p>
+      <h3 class="finlab-stage-title">分階段完成時間 · 逾期工作自動提升優先序</h3>
+      <p class="data-note">各階段包含前面工作、配額重置與開盤保護的等待；不是把每一階段的耗時各自相加。已查核不等於逐股歷史完整。</p>
+      <div id="workload-stages" class="finlab-stage-grid" aria-live="polite" aria-label="FinLab 分階段工作量與完成預估"></div>
     </section>
 
     <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
@@ -88,7 +91,7 @@
       <div class="kpi-grid">
         <article class="kpi featured"><span>已使用</span><strong id="quota-used">—</strong><p id="quota-percent">尚無觀測</p></article>
         <article class="kpi"><span>FinLab 原始剩餘</span><strong id="quota-remaining">—</strong><p>帳號上限扣除已使用量</p></article>
-        <article class="kpi"><span>保留額度後可用</span><strong id="quota-safe-remaining">—</strong><p id="quota-reserve-basis">依下載器預設保留 50 MB</p></article>
+        <article class="kpi"><span>歷史／整表保留後可用</span><strong id="quota-safe-remaining">—</strong><p id="quota-reserve-basis">本機回補保留量預設 50 MB；追新與帳號觀測另列</p></article>
         <article class="kpi"><span>重置規則</span><strong id="quota-reset">—</strong><p id="quota-reset-basis">官方 08:00 台北時間；日期依規則推算</p></article>
       </div>
       <div class="quota-track"><div class="quota-track-header"><span>帳號已用比例</span><strong id="quota-ratio">—</strong></div><progress id="quota-progress" max="1" aria-label="FinLab 帳號每日資料流量使用比例"></progress><small id="quota-observed">尚未取得獨立帳號觀測</small></div>
@@ -160,7 +163,7 @@
       <p class="limitation">流量進度以既有原始 Feather 物件大小為整表下載基準，不是壓縮後 Parquet，也不是帳號累計用量。分子是本輪已查新來源的大小，分母再加目前可估待辦；未知大小、來源全空與全市場 Tick 不會被假補成零。筆數依寬表非空資料格、明細列、來源標籤分開，不把一個交易日當成一筆全市場資料，也不混加不同口徑。估時使用上次強制下載及轉存耗時、逐表配額容納、日額度重置與交易日開盤保護；未來新增、重新到期工作及來源失敗不在固定待辦情境內。每分鐘只更新本機量測，瀏覽器不查 FinLab。新私有包仍須既有全目錄來源與雜湊守門；上述進度不保證逐股歷史完整或 PIT。遠端研究限定私人、非商業用途。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=10" defer></script>
-  <script src="app.js?v=13" defer></script>
+  <script src="../dashboard-core.js?v=11" defer></script>
+  <script src="app.js?v=15" defer></script>
 </body>
 </html>

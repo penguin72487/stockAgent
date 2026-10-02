@@ -1092,6 +1092,26 @@ def test_cold_publish_rejects_stale_training_receipt(
         cold_publication._check_training_receipts(tmp_path)
 
 
+def test_cold_publish_records_exact_failed_checks_without_weakening_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = type("Finding", (), {"severity": "critical", "code": "stale_feature_build_receipt"})()
+    monkeypatch.setattr(
+        public_audit, "audit_official_symbol_build",
+        lambda *a: ({"checks": {"source_receipts": False, "symbol_count": True}}, []),
+    )
+    monkeypatch.setattr(
+        public_audit, "audit_feature_build_receipt",
+        lambda *a: ({"checks": {"source_bytes": False, "output_bytes": True}}, [finding]),
+    )
+    with pytest.raises(cold_publication.StaleDerivedReceipts) as error:
+        cold_publication._check_training_receipts(tmp_path)
+    assert error.value.codes == ["stale_feature_build_receipt"]
+    assert error.value.failed_checks == {
+        "official_symbols": ["source_receipts"], "public_features": ["source_bytes"]
+    }
+
+
 @pytest.mark.parametrize("defer,expected_status", [(False, "failed"), (True, "deferred")])
 def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defer: bool, expected_status: str,
@@ -1112,7 +1132,8 @@ def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
 
     def stale(*args: object) -> None:
         raise cold_publication.StaleDerivedReceipts(
-            ["stale_feature_build_receipt", "stale_official_symbol_build_receipt"]
+            ["stale_feature_build_receipt", "stale_official_symbol_build_receipt"],
+            failed_checks={"public_features": ["source_bytes"]},
         )
 
     monkeypatch.setattr(cold_publication, "_publish_while_source_stable", stale)
@@ -1120,6 +1141,10 @@ def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == expected_status
     assert receipt["release"] is None
+    assert receipt["blocking_checks"] == {"public_features": ["source_bytes"]}
+    assert receipt["blocking_findings"] == [
+        "stale_feature_build_receipt", "stale_official_symbol_build_receipt"
+    ]
     if defer:
         assert receipt["reason"] == "stale_derived_receipts"
         assert receipt["blocking_findings"] == [

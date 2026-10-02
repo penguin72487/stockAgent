@@ -32,16 +32,16 @@ from stockagent.live.tw_public_acquisition_progress import (
     ADDED_DATASETS,
     build_tw_public_acquisition_progress,
 )
-from scripts.download_finlab_history import (
+from stockagent.data.finlab_acquisition_contract import (
     AUTOMATICALLY_DEFERRED_REASONS,
     attempt_retry_at,
 )
-from downloader.download_finmind_complement import (
+from downloader.finmind_catalog import (
     ALL_DATASETS as FINMIND_COMPLEMENT_DATASETS,
     SNAPSHOTS as FINMIND_COMPLEMENT_SNAPSHOTS,
     WIDE_INSTITUTIONAL as FINMIND_DERIVED_WIDE,
 )
-from downloader.download_finmind_sponsor import (
+from downloader.finmind_scheduling import (
     SOURCES as FINMIND_SPONSOR_SOURCES,
     SESSION_DAY_DATASETS as FINMIND_SESSION_DAY_DATASETS,
 )
@@ -108,6 +108,7 @@ _GROUP_MARKET_CATEGORY: Final[dict[str, str]] = {
     "tw-public": "taiwan_public",
     "finlab-research": "taiwan_public",
     "finmind-free": "taiwan_public",
+    "tej-research": "taiwan_public",
     "yahoo-market": "cross_market",
     "openbb-compact": "cross_market",
     "openbb-task-shards-local": "cross_market",
@@ -126,6 +127,11 @@ OPENBB_L1_TIMER_JITTER_SECONDS: Final[int] = 2 * 60
 OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 40 * 60
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
+    "tej-research": {
+        "title": "TEJ 帳號目錄與本機查詢格點匯出",
+        "provider": "TEJ", "cadence": "有限桌面持有者；新增候選 → 歷史缺口 → 校驗候選",
+        "owner": "TEJ Smart Wizard 下載器", "window": 48 * 3600,
+    },
     "keyed-public-catalogs": {
         "title": "公共 API 目錄與氣象／環境目前快照",
         "provider": "NOAA / BEA / Census / Finnhub / FIRMS / CWA / MOENV",
@@ -3961,6 +3967,39 @@ def _finlab_receipt_file_exists(finlab_root: Path, data_path: str) -> bool:
     return resolved.is_relative_to(finlab_root) and resolved.is_file()
 
 
+def _tej_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
+    from stockagent.live.tej_dashboard import build_tej_public_status, METHOD
+    status = build_tej_public_status(root, now=now)
+    output = []
+    for table in status.get("tables", []):
+        state = table.get("state")
+        category = table.get("category")
+        market = ("taiwan_derivatives" if category in {"futures", "options"} else
+                  "forex" if category == "fx" else "macro" if category == "macro_banking" else
+                  "cross_market" if category in {"global_indices", "funds_bonds"} else "taiwan_public")
+        output.append({
+            "id": f"tej:{table['table_id']}", "parent_id": "group:tej-research",
+            "scope": "source_registry", "provider": "TEJ", "title": table["name"],
+            "market_category": market, "update_owner": "TEJ Smart Wizard 下載器",
+            "cadence": f"{table['frequency']} 查詢格點；原生頻率與發布規律待核對",
+            "status": "degraded" if state in {"needs_review", "stalled_requires_recovery", "empty_field_menu", "empty_query_axis_unverified"} else "updating" if state == "running" else "waiting",
+            "status_label": "查詢範圍完成；含來源空回，原生歷史與追新尚未驗證" if state == "query_scope_checked" else "查詢格點匯出完成；原生歷史與追新尚未驗證" if state == "query_grid_exported" else state,
+            "rows": table.get("exported_rows"), "latest_at_utc": None,
+            "data_through": None, "publishable": False, "automation_eligible": False,
+            "acquisition_enabled": True, "registry_alias": False,
+            "record_stats": {"state": "receipt_profile_not_native_observations",
+                             "count": table.get("exported_rows"), "first": table.get("first_query_period"),
+                             "last": table.get("last_query_period"), "basis": METHOD},
+            "coverage": _coverage(table.get("exported_rows"), table.get("grid_rows"), unit="查詢格點", label="查詢格點匯出率，不是原生歷史完整率"),
+            "eta": _unknown_eta("blocked" if state == "needs_review" else "warming_up" if state == "running" else "waiting_schedule", table.get("eta_basis") or METHOD),
+            "freshness": {"state": "unknown", "age_seconds": None},
+            "detail": f"{table['smart_id']} · {table['fields']} 欄 · {table['phase']}；{METHOD}",
+            "warnings": ["桌面限額與原生歷史發布時點未核實；原始授權值不對外提供。"],
+            "detail_link": f"/tej/#features",
+        })
+    return output
+
+
 def _finlab_candidate_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     """Expose every discovered key without treating catalog membership as data."""
 
@@ -7467,6 +7506,7 @@ def build_data_monitor_public_status(
         + finmind_sources
         + ([finlab_catalog_endpoint] if finlab_catalog_endpoint is not None else [])
         + finlab_sources
+        + _tej_sources(root, now=observed)
         + _yahoo_inventory_rows()
         + history_logical
     )

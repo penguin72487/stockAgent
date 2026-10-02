@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+import fcntl
 import json
 from pathlib import Path
 
@@ -9,6 +10,40 @@ import pyarrow.parquet as pq
 import pytest
 
 from downloader import download_finmind_complement as complement
+
+
+def test_exact_key_cli_holds_shared_worker_lock(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+
+    def run(root, **kwargs):
+        with (root / "worker.lock").open("a+") as competing:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(competing.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        calls.append(kwargs)
+        return {"state": "current_queue"}
+
+    monkeypatch.setattr(complement, "run_once", run)
+    assert complement.main(["--root", str(tmp_path), "--max-requests", "2", "--task-key",
+                            "TaiwanFuturesKBar", "CR1", "2012-08-22"]) == 0
+    assert calls == [{"max_requests": 2, "datasets": None,
+                      "required_keys": (("TaiwanFuturesKBar", "CR1", "2012-08-22"),)}]
+
+
+def test_exact_key_cli_rejects_competing_owner_before_provider_call(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(complement, "run_once", lambda *a, **k: pytest.fail("competing provider call"))
+    with (tmp_path / "worker.lock").open("a+") as active:
+        fcntl.flock(active.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert complement.main(["--root", str(tmp_path), "--task-key", "TaiwanFuturesKBar",
+                                "CJ1", "2015-08-13"]) == 2
+
+
+@pytest.mark.parametrize("extra", [["--loop"], ["--retry-blocked"], ["--dataset", "TaiwanFuturesKBar"]])
+def test_exact_key_cli_cannot_expand_finite_scope(tmp_path: Path, monkeypatch, extra) -> None:
+    monkeypatch.setattr(complement, "run_once", lambda *a, **k: pytest.fail("invalid finite scope"))
+    with pytest.raises(SystemExit) as error:
+        complement.main(["--root", str(tmp_path), "--task-key", "TaiwanFuturesKBar", "CR1",
+                         "2012-08-22", *extra])
+    assert error.value.code == 2
 
 
 def test_complement_catalog_includes_all_sponsor_per_id_sources_and_news() -> None:
@@ -88,6 +123,64 @@ def test_background_reserve_keeps_incremental_and_zero_api_derivation(tmp_path: 
         assert complement._next_task(connection, now, incremental_only=True).kind == "derived"
 
 
+def test_due_repair_precedes_pending_in_same_lane_without_bypassing_cooldown(tmp_path: Path) -> None:
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    with complement._db(tmp_path / "queue.sqlite3") as connection:
+        complement._add_tasks(connection, [
+            ("TaiwanStockNews", "", "1900-01-01", "market_day", 6),
+            ("TaiwanStockNews", "", "2013-05-03", "market_day", 6),
+            ("TaiwanStockNews", "", "2026-10-02", "market_day", 0),
+        ])
+        connection.execute(
+            "UPDATE tasks SET state='failed',next_attempt_at_utc=? WHERE partition='2013-05-03'",
+            ((now + timedelta(minutes=15)).isoformat(),),
+        )
+        assert complement._next_task(connection, now).partition == "2026-10-02"
+        assert complement._next_task(connection, now, background_only=True).partition == "1900-01-01"
+        eligible = now + timedelta(minutes=16)
+        assert complement._next_task(connection, eligible).partition == "2026-10-02"
+        assert complement._next_task(connection, eligible, background_only=True).partition == "2013-05-03"
+        assert complement._next_task(connection, eligible, incremental_only=True).partition == "2026-10-02"
+        assert complement._next_task(connection, eligible,
+                                     delegated=frozenset({"TaiwanStockNews"})) is None
+        connection.execute("UPDATE tasks SET state='not_entitled' WHERE partition='2013-05-03'")
+        assert complement._next_task(connection, eligible, background_only=True).partition == "1900-01-01"
+
+
+@pytest.mark.parametrize('state',['complete','observed_empty','inflight','blocked','unsupported'])
+def test_finite_accounting_keys_never_reopen_terminal_or_running_tasks(tmp_path,state):
+    now=datetime(2026,10,1,tzinfo=UTC)
+    key=('TaiwanFuturesKBar','CR1','2012-08-22')
+    with complement._db(tmp_path/'queue.sqlite3') as connection:
+        complement._add_tasks(connection,[(*key,'day',8),
+            ('TaiwanFuturesKBar','TX','2026-09-30','day',8)])
+        connection.execute('UPDATE tasks SET state=? WHERE data_id=?',(state,'CR1'))
+        before=list(connection.execute('SELECT * FROM tasks ORDER BY data_id'))
+        assert complement._next_task(connection,now,required_keys=(key,)) is None
+        assert list(connection.execute('SELECT * FROM tasks ORDER BY data_id'))==before
+
+
+def test_finite_accounting_keys_keep_quota_cooldown_and_owner_boundaries(tmp_path):
+    now=datetime(2026,10,1,tzinfo=UTC)
+    key=('TaiwanFuturesKBar','CR1','2012-08-22')
+    with complement._db(tmp_path/'queue.sqlite3') as connection:
+        complement._add_tasks(connection,[(*key,'day',8)])
+        assert complement._next_task(connection,now,required_keys=(key,)).data_id=='CR1'
+        assert complement._next_task(connection,now,required_keys=(key,),incremental_only=True) is None
+        assert complement._next_task(connection,now,required_keys=(key,),delegated=frozenset({key[0]})) is None
+        connection.execute('UPDATE tasks SET state=?,next_attempt_at_utc=?',
+            ('failed',(now+timedelta(hours=1)).isoformat()))
+        assert complement._next_task(connection,now,required_keys=(key,)) is None
+        assert complement._next_task(connection,now+timedelta(hours=2),required_keys=(key,)) is not None
+
+
+def test_finite_accounting_keys_validate_scope_before_loading_credentials(tmp_path):
+    for keys in [(),(('not-a-provider-dataset','CR1','2012-08-22'),),
+                 tuple(('TaiwanFuturesKBar',str(i),'2012-08-22') for i in range(65))]:
+        with pytest.raises(ValueError,match='registered finite task keys'):
+            complement.run_once(tmp_path,required_keys=keys)
+
+
 def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace
 
@@ -107,6 +200,38 @@ def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_pat
     result = complement.run_once(tmp_path, max_requests=1)
     assert result["state"] == "batch_complete"
     assert result["series"]["TaiwanStockInfo"]["complete"] == 1
+
+
+def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from downloader import finmind_integrity
+
+    now=datetime(2026,9,27,8,tzinfo=UTC)
+    monkeypatch.setenv('FINMIND_TOKEN','test-only')
+    monkeypatch.setattr(complement,'load_env_file',lambda *_a,**_k:None)
+    monkeypatch.setattr(complement,'_now',lambda:now)
+    monkeypatch.setattr(complement,'verified_account',lambda *_a:{'tier':'Free','official_requests_per_hour':600})
+    monkeypatch.setattr(complement,'rate_limiter',lambda *_a:object())
+    monkeypatch.setattr(complement,'backfill_budget',lambda *_a,**_k:{'allowed':True,'remaining':2})
+    monkeypatch.setattr(complement,'fixed_incremental_demand',lambda *_a:0)
+    monkeypatch.setattr(complement.shutil,'disk_usage',lambda *_a:SimpleNamespace(free=10**12))
+    monkeypatch.setattr(complement,'_populate',lambda *_a,**_k:pytest.fail('unrelated queue population'))
+    monkeypatch.setattr(complement,'_claim_bulk_years',lambda *_a,**_k:pytest.fail('widened year claim'))
+    monkeypatch.setattr(finmind_integrity,'audit_completed_batch',lambda *_a,**_k:pytest.fail('unrelated receipt audit'))
+    key=('TaiwanStockDelisting','','2025')
+    with complement._db(tmp_path/'queue.sqlite3') as connection:
+        complement._add_tasks(connection,[(*key,'year',4),('TaiwanStockDelisting','','2024','year',4)])
+    requested=[]
+    def request(_session,_limiter,_root,task,_token,**kwargs):
+        requested.append((task.dataset,task.data_id,task.partition))
+        assert not kwargs.get('full_history',False)
+        return [{'date':'2025-07-01','stock_id':'1234'}]
+    monkeypatch.setattr(complement,'_request',request)
+    result=complement.run_once(tmp_path,max_requests=1,required_keys=(key,))
+    assert result['state']=='batch_complete' and requested==[key]
+    with complement._db(tmp_path/'queue.sqlite3') as connection:
+        assert connection.execute("SELECT state FROM tasks WHERE partition='2025'").fetchone()[0]=='complete'
+        assert connection.execute("SELECT state FROM tasks WHERE partition='2024'").fetchone()[0]=='pending'
 
 
 def test_master_snapshot_expands_free_per_symbol_jobs(tmp_path: Path) -> None:

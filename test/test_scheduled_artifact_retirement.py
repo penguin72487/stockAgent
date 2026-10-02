@@ -11,6 +11,19 @@ import pytest
 from scripts import retire_enrolled_artifacts as scheduled
 from stockagent.data_sync.cold_artifacts import ColdArtifactSpec
 from stockagent.data_sync.desync_snapshots import SnapshotError
+from stockagent.data_sync.packed_retention import RetentionConfig
+
+
+def _retention_config(tmp_path: Path) -> RetentionConfig:
+    return RetentionConfig(
+        sync_root=tmp_path / "sync",
+        archive_root=tmp_path / "archive",
+        materialized_root=tmp_path / "materialized",
+        backup_config=tmp_path / "backup.json",
+        state_dir=tmp_path / "retention",
+        folder_id="packed",
+        required_peer_names=("old-cold-object-peer",),
+    )
 
 
 def _write_config(tmp_path: Path, *, relative_root: str, maximum_file_bytes=None):
@@ -164,17 +177,16 @@ def test_scheduled_active_leases_avoid_expensive_cold_checks(
     monkeypatch.setattr(
         scheduled.RetentionConfig,
         "load",
-        lambda *args, **kwargs: SimpleNamespace(
-            authority_node_id="penguin",
-            sync_root=tmp_path / "sync",
-            materialized_root=tmp_path / "materialized",
-            backup_config=tmp_path / "backup.json",
-        ),
+        lambda *args, **kwargs: _retention_config(tmp_path),
     )
     monkeypatch.setattr(scheduled, "scheduled_specs", lambda *args: [artifact])
     monkeypatch.setattr(scheduled, "scheduled_legacy_specs", lambda *args: [legacy])
     monkeypatch.setattr(scheduled, "load_retirement_peer_names", lambda *args, **kwargs: ())
-    monkeypatch.setattr(scheduled, "_syncthing", lambda *args: {"ok": True})
+    def local_syncthing(cfg):
+        assert cfg.required_peer_names == ()
+        return {"ok": True}
+
+    monkeypatch.setattr(scheduled, "_syncthing", local_syncthing)
     monkeypatch.setattr(
         scheduled,
         "plan_artifact_retirement",
@@ -239,12 +251,7 @@ def test_apply_preserves_lease_and_renews_live_references(
     monkeypatch.setattr(
         scheduled.RetentionConfig,
         "load",
-        lambda *args, **kwargs: SimpleNamespace(
-            authority_node_id="penguin",
-            sync_root=tmp_path / "sync",
-            materialized_root=tmp_path / "materialized",
-            backup_config=tmp_path / "backup.json",
-        ),
+        lambda *args, **kwargs: _retention_config(tmp_path),
     )
     monkeypatch.setattr(scheduled, "scheduled_specs", lambda *args: [spec])
     monkeypatch.setattr(scheduled, "load_retirement_peer_names", lambda *args, **kwargs: ())
@@ -280,3 +287,78 @@ def test_apply_preserves_lease_and_renews_live_references(
     )
     assert scheduled.main() == 0
     assert json.loads(capsys.readouterr().out)["rows"][0]["action"] == expected_action
+
+
+def test_one_legacy_proof_failure_does_not_hide_other_dataset_plans(tmp_path, monkeypatch, capsys):
+    specs = [SimpleNamespace(dataset=name, relative_root=f"markets/{name}")
+             for name in ("mismatch", "valid")]
+    legacy_state = tmp_path / "legacy-state"
+    for spec in specs:
+        path = legacy_state / "retirements" / f"{spec.dataset}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 1, "state": "hot-enrolled",
+                                    "dataset": spec.dataset, "relative_root": spec.relative_root,
+                                    "last_used_ns": time.time_ns() - 8 * 86_400_000_000_000}))
+    monkeypatch.setattr(scheduled.RetentionConfig, "load", lambda *a, **kw: _retention_config(tmp_path))
+    monkeypatch.setattr(scheduled, "scheduled_specs", lambda *a: [])
+    monkeypatch.setattr(scheduled, "scheduled_legacy_specs", lambda *a: specs)
+    monkeypatch.setattr(scheduled, "load_retirement_peer_names", lambda *a, **kw: ())
+    monkeypatch.setattr(scheduled, "_syncthing", lambda *a: {"ok": True})
+    monkeypatch.setattr(scheduled, "_bridge_inactive", lambda *a: True)
+
+    def plan(spec, **options):
+        if spec.dataset == "mismatch":
+            raise SnapshotError("unique hot mirror differs")
+        return {"apply_ready": False, "blockers": ["artifact-release-is-pinned"],
+                "lease_expires_at": "expired", "snapshot_id": "valid-release"}
+
+    monkeypatch.setattr(scheduled, "plan_legacy_retirement", plan)
+    monkeypatch.setattr(scheduled, "apply_legacy_retirement",
+                        lambda *a, **kw: pytest.fail("neither plan authorizes deletion"))
+    monkeypatch.setattr(sys, "argv", ["retire_enrolled_artifacts.py", "--apply",
+                                     "--legacy-state-root", str(legacy_state)])
+    assert scheduled.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "partial_deferred"
+    assert [row["dataset"] for row in result["rows"]] == ["mismatch", "valid"]
+    assert result["rows"][0]["deleted"] is False
+    assert result["rows"][1]["blockers"] == ["artifact-release-is-pinned"]
+
+
+def test_manual_batch_bypasses_only_age_and_records_selected_result(tmp_path, monkeypatch, capsys):
+    specs = [SimpleNamespace(dataset=name, relative_root=f"markets/{name}") for name in ("keep", "retire")]
+    root = tmp_path / "state"
+    for spec in specs:
+        path = root / "retirements" / f"{spec.dataset}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 1, "state": "hot-enrolled",
+                                   "dataset": spec.dataset, "relative_root": spec.relative_root,
+                                   "last_used_ns": time.time_ns()}))
+    monkeypatch.setattr(scheduled.RetentionConfig, "load", lambda *a, **kw: _retention_config(tmp_path))
+    monkeypatch.setattr(scheduled, "scheduled_specs", lambda *a: [])
+    monkeypatch.setattr(scheduled, "scheduled_legacy_specs", lambda *a: specs)
+    monkeypatch.setattr(scheduled, "load_retirement_peer_names", lambda *a, **kw: ())
+    monkeypatch.setattr(scheduled, "_syncthing", lambda *a: {"ok": True})
+    monkeypatch.setattr(scheduled, "_wait_for_convergence", lambda cfg, timeout: {"ok": True})
+    monkeypatch.setattr(scheduled, "_bridge_inactive", lambda *a: True)
+
+    def plan(spec, **options):
+        assert spec.dataset == "retire" and options["manual_immediate"] is True
+        return {"apply_ready": True, "blockers": [], "lease_expires_at": "still-active",
+                "snapshot_id": "exact-release", "plan_fingerprint": "manual-fingerprint"}
+
+    def apply(spec, *, expected_fingerprint, **options):
+        assert options["manual_immediate"] is True and expected_fingerprint == "manual-fingerprint"
+        assert (tmp_path / "receipts/retire.plan.json").is_file()
+        return {"action": "retired", "deleted": True, "reclaimed_allocated_file_bytes": 4096}
+
+    monkeypatch.setattr(scheduled, "plan_legacy_retirement", plan)
+    monkeypatch.setattr(scheduled, "apply_legacy_retirement", apply)
+    monkeypatch.setattr(sys, "argv", ["retire_enrolled_artifacts.py", "--apply", "--manual-immediate",
+                                     "--dataset", "retire", "--legacy-state-root", str(root),
+                                     "--receipt-dir", str(tmp_path / "receipts")])
+    assert scheduled.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["reclaimed_allocated_file_bytes"] == 4096
+    assert len(result["rows"]) == 1 and result["manual_immediate"] is True
+    assert json.loads((tmp_path / "receipts/summary.json").read_text()) == result

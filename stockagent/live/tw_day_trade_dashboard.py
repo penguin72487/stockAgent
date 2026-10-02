@@ -7399,6 +7399,7 @@ def build_dashboard_snapshot(
                 ),
                 "open_position_count": mode.get("open_position_count", 0),
                 "stale_position_count": mode.get("stale_position_count", 0),
+                "indicative_valuation_position_count": mode.get("indicative_valuation_position_count", 0),
                 "entry_completed_at": mode.get("entry_completed_at"),
                 "exit_limit_submitted_at": mode.get("exit_limit_submitted_at"),
                 "force_exit_started_at": mode.get("force_exit_started_at"),
@@ -7822,6 +7823,7 @@ def build_dashboard_snapshot(
                     "open_net_liquidation_pnl_twd",
                     "open_position_count",
                     "stale_position_count",
+                    "indicative_valuation_position_count",
                 ):
                     mode[key] = last_mark.get(key)
                 mode["return_fraction"] = last_mark.get("return_fraction")

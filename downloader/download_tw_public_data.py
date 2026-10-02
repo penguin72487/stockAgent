@@ -70,6 +70,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 stockAgent/1.0"
 )
 DATE_COLUMN = "date"
+RESOURCE_JSON_TABLE_PARSER_CONTRACT_VERSION = 1
 ROC_DATE_PATTERN = re.compile(r"^\d{2,3}/\d{1,2}/\d{1,2}$")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 HTML_ROW_START_PATTERN = re.compile(r"<tr\b[^>]*>", re.IGNORECASE)
@@ -4519,7 +4520,7 @@ def _records_from_fields_data(
     *,
     fields: list[Any],
     data: list[Any],
-    iso_date: str,
+    iso_date: str | None,
     table_title: str,
     table_index: int,
 ) -> list[dict[str, Any]]:
@@ -4535,7 +4536,8 @@ def _records_from_fields_data(
             }
         else:
             continue
-        record[DATE_COLUMN] = iso_date
+        if iso_date is not None:
+            record[DATE_COLUMN] = iso_date
         record["_table_title"] = table_title
         record["_table_index"] = table_index
         record["_row_index"] = row_index
@@ -4550,6 +4552,24 @@ def _parse_json_bytes(raw: bytes) -> pl.DataFrame:
         return _frame_from_records([row for row in payload if isinstance(row, dict)])
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), list):
+            data = payload["data"]
+            if any(isinstance(row, list) for row in data):
+                fields = payload.get("fields")
+                if (not isinstance(fields, list) or not fields
+                        or any(not isinstance(field, str) or not field.strip() for field in fields)
+                        or any(not isinstance(row, list) or len(row) != len(fields) for row in data)):
+                    raise ValueError("JSON row arrays require complete column fields and matching widths")
+                records = _records_from_fields_data(
+                    fields=fields, data=data, iso_date=None,
+                    table_title=str(payload.get("title", "")), table_index=0,
+                )
+                # A retrospective table carries its original episode fields.
+                # Capture/admission dates are attached by the downloader, never
+                # guessed from the first date inside its title or row.
+                return _frame_from_records(records).with_columns(
+                    pl.lit(RESOURCE_JSON_TABLE_PARSER_CONTRACT_VERSION)
+                    .alias("_resource_table_parser_version")
+                )
             return _frame_from_records(
                 [row for row in payload["data"] if isinstance(row, dict)]
             )

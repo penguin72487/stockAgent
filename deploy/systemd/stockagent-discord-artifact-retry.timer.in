@@ -1,0 +1,14 @@
+[Unit]
+Description=Recover due and interrupted Discord artifact jobs without daytime polling
+
+[Timer]
+# A receipt-only probe; no Torch imports, inference or receipt writes when idle.
+OnCalendar=Mon..Fri *-*-* 00..06:*:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 13..23:*:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-discord-artifact-retry.service
+
+[Install]
+WantedBy=timers.target

@@ -45,7 +45,7 @@ def test_news_keeps_multi_symbol_articles_and_flags_raw_duplicates():
 
 
 @pytest.mark.parametrize('patch', [{'date':'2026-09-30 01:00:00'}, {'date':'bad'},
-                                  {'stock_id':''}, {'link':'javascript:alert(1)'}])
+                                  {'stock_id':2330}, {'link':'javascript:alert(1)'}])
 def test_news_rejects_wrong_day_and_broken_fields(patch):
     with pytest.raises(ValueError):
         news.validate_response('2026-09-29', [{**article(), **patch}])
@@ -54,6 +54,30 @@ def test_news_rejects_wrong_day_and_broken_fields(patch):
 def test_sparse_provider_content_is_preserved_not_a_whole_day_failure():
     result = news.validate_response('2026-09-29', [{**article(), 'title': None, 'source': ''}])
     assert result['missing_optional_fields'] == {'title':1, 'source':1, 'description':1}
+
+
+@pytest.mark.parametrize('missing', [None, '', '  '])
+def test_missing_link_or_stock_mapping_is_raw_quality_not_a_failed_day(missing):
+    rows = [article(), {**article(), 'link': missing, 'stock_id': missing}]
+    before = json.dumps(rows, ensure_ascii=False)
+    result = news.validate_response('2026-09-29', rows)
+    assert result['rows_validated'] == 2
+    assert result['missing_identity_fields'] == {'stock_id': 1, 'link': 1}
+    assert result['quality_policy'] == 'sparse_metadata_preserved_not_whole_day_rejected'
+    assert json.dumps(rows, ensure_ascii=False) == before
+
+
+def test_receipt_stores_sparse_link_without_fabricating_a_url(tmp_path):
+    now = datetime(2026, 9, 29, 15, tzinfo=UTC)
+    task = worker.Task(news.DATASET, '', '2026-09-29', 'market_day', 0, 'pending')
+    rows = [article(), {**article(), 'link': None}]
+    _, metadata = news.request_contract(task.partition)
+    metadata['validation'] = news.validate_response(task.partition, rows)
+    receipt = worker._store(tmp_path, task, rows, now, request_metadata=metadata)
+    assert receipt['rows'] == 2
+    assert receipt['field_non_null_counts']['link'] == 1
+    assert receipt['request']['news_contract_version'] == 2
+    assert receipt['request']['validation']['missing_identity_fields']['link'] == 1
 
 
 def test_news_incremental_clock_uses_calendar_overlap_even_empty():

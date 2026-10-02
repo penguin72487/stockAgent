@@ -36,13 +36,61 @@ coordinated code, config, test, and documentation change.
   deterministic fixed hash buckets plus large-file blobs.  Do not replace this
   with raw small-file Syncthing or a single giant archive whose smallest change
   retransmits the entire dataset.
+- Immutable TAIFEX rule evidence may share SHA-256-addressed, read-only local
+  objects through `artifact_dedup.link_immutable_source`. Copy the producer once
+  into `.rule-source-objects` beside the preparation bundles; never hard-link
+  a mutable official source. Keep each bundle's logical `sources/` paths and
+  manifest hashes unchanged. These local objects are not cold publications or
+  training/readiness proofs, and must never be modified in place.
 - "Real-time synchronization" means that the Syncthing watcher starts copying
   an atomic release immediately after all publication gates pass.  It never
   means syncing half-written downloader output.  Scheduled and continuous
   downloaders must use the canonical publish wrapper after each successful,
   auditable batch.
 
-### Layer ownership
+### Penguin source host and remote training ownership
+
+The user's current operating standard (2026-10-01) makes penguin a **data and
+service host, not a training/preparation host**. This supersedes the assumption
+that every trainable view should be routinely generated and kept on penguin.
+
+- Retain cleaned, deduplicated authoritative source observations, their original
+  values/units, observation and availability clocks, historical revisions,
+  licenses, hashes, download state and recovery receipts. Normalization may
+  compact paths and encode typed Parquet; it must not silently discard unique
+  observations or provenance. A current provider response cannot recover a
+  historical revision or a short-retention Tick/BidAsk capture.
+- Generate experiment-specific features, labels, panels, tensors, folds,
+  execution tapes, training splits and compiler caches **on the remote training
+  node on demand**. Reuse the existing builders and training lifecycle. Record
+  exact source release IDs/hashes, Git/config/feature ABI and environment; never
+  follow a moving `latest` during a run. Remote derived caches are expendable
+  only after a verified rebuild path exists. Do not automatically hydrate or
+  build them merely because a cold release arrives.
+- A source table and a training cache can share a file. In particular, current
+  OKX/Binance `*_features.parquet` files contain original market fields as well
+  as calculated fields. Neither the name `features` nor `cache` licenses removal
+  of the whole file. A lean source projection needs explicit column/clock/unit
+  coverage, a versioned compatible consumer migration and exact cold recovery.
+- Keep bounded projections/caches and deployed model assets that current
+  collection, website, Discord or paper-execution services actually require.
+  Treat them as named service dependencies, not permission for every training
+  version to remain hot. `tw_public_stock_daily.parquet` currently has this
+  service-compatibility exception. Preserve its existing publication gates.
+- FinLab/FinMind and any `publish: false` or licensed source remain restricted
+  by the catalog; a remote-training preference does not grant redistribution
+  rights. Do not replace an unavailable authorized input with fabricated data.
+- Existing derived views, unique training results and D cold history remain
+  protected until inventory, exact recovery/rebuild, consumer/process, pin/lease
+  and applicable synchronization gates pass. This role policy is **not** proof
+  that today's remote rebuild works, that cold heads are current, or that an
+  unmanaged local cache has a seven-day automatic GC.
+
+Inventory and operational implications are recorded in
+`docs/penguin_source_only_storage_2026-10-01.md`; the reproducible read-only entry
+point is `scripts/audit_training_source_inventory.py`.
+
+### Physical layer ownership
 
 | Layer | Current authority | Mutable | Syncthing |
 |---|---|---:|---:|
@@ -202,11 +250,38 @@ coordinated code, config, test, and documentation change.
   size, signature and SHA-256, verify the encoded payload and exact decode, and
   mark `deployable=false` / `completion_claim=not_checked`. Never use such an
   archive as a model selection, promotion, or service-readiness proof. Hot-source
-  retirement still requires an exact source and old hard-link mirror audit,
-  direct D-primary cold verification, current fleet convergence, no active
-  service or process references, and an observed seven-day lease. Enabled US
+  use leases may be enrolled before a slow cold publication with the explicit
+  `enroll` command: this records observation time only, never backdates a lease,
+  asserts cold validity, or deletes bytes. All retirement gates remain mandatory.
+  Retirement still requires an exact source and old hard-link mirror audit,
+  direct D-primary cold verification, local Syncthing health and the peers in
+  `artifact_retirement.json`, no pins or active service/process references,
+  and an observed seven-day lease. Enabled US
   Discord service output is protected; do not retire that root merely because
   its bytes have been archived. Recovery is an explicit restore into a new path.
+  Both full-run and legacy retirement resolve configured and selected models,
+  candidate roots/configs, experiment input/initialization paths, runtime Discord
+  enablement and independently configured overnight consumers through the shared
+  artifact-consumer gate. Missing referenced configuration fails closed. Other
+  collector/preparation dependencies still require a separate dependency and
+  process audit; a clean Discord gate alone does not prove inactivity.
+- An explicit user request to retire hot artifacts **without waiting seven
+  days** authorizes a one-shot `--manual-immediate` age bypass in the canonical
+  full-run/legacy retirement tools. Bind this mode into the dry-run fingerprint
+  and record it in the retirement receipt; never backdate a lease or lower the
+  automatic retention policy. All exact D cold/source/mirror recovery, source
+  stability, pin, service/process, stopped-bridge, quarantine and current local/
+  applicable-peer transport gates remain mandatory. The hourly timer never
+  passes this flag. Batch manual retirement is restricted to the existing
+  enrolled allowlist and must persist each plan and result independently.
+- Legacy recovery compares original bytes, paths, sizes, mtime and permissions
+  with the archived content. Historical inode/device/ctime are observation
+  provenance, not recoverable file content: unlinking a different verified hard
+  link legitimately changes ctime. Record that drift and require the **current**
+  full source signature to remain unchanged before/after hashing and between
+  dry run/apply. Do not remove the SHA-256, exact decode or mutation-race gates,
+  rewrite an immutable archive manifest, or count blocks still held by another
+  hard link as recovered space.
 - Automatic completed-artifact maintenance must keep discovery, publication,
   peer convergence, and source eviction as separate gates.  Publish at most one
   new wave at a time; deletion requires a later exact cold/source verification,
@@ -226,6 +301,9 @@ coordinated code, config, test, and documentation change.
   Install a node-local directory tombstone
   before unlinking either hot name. Partial cold releases cannot retire a
   whole run. A failed/interrupted retirement remains in quarantine for audit.
+  The explicitly allowlisted enrolled-artifact timer checks hourly; an active
+  seven-day lease is a cheap negative gate, not a cold recovery verification.
+  On expiry, it must repeat all exact-content, pin, usage and transport gates.
 - On-demand artifact use must resolve one exact retired release through the
   managed materialized cache, expose only an immutable symlink at its original
   artifact path, and renew the same seven-day lease. A deployed or intermittently
@@ -267,6 +345,15 @@ coordinated code, config, test, and documentation change.
   while training, torchrun, distributed launch, or compiler worker processes
   are active; only an explicit manual force may bypass that process-level gate.
   Keep its audit receipt and low-I/O scheduling.
+- An abandoned packed fetch staging tree is not an ordinary leased hot version.
+  Audit one explicit canonical `.<release-id>.partial.<uuid>` with
+  `stockagent-data prune-partial`; it is not automatic GC and cannot target a
+  complete version or a producer source. Require the fetch/cache writer locks,
+  seven-day age, no pin/process reference, complete cold SHA-256/ZIP checks and
+  independent decoded SHA-256 for every selected file. Unlink only unchanged
+  files that exactly match that release inventory; retain unknown, mismatched,
+  young and shared-inode evidence. A missing cold object blocks cleanup. Keep
+  the dry-run and apply receipts; never remove cold objects or clear a pin.
 - Windows `%LOCALAPPDATA%\Temp` is not a disposable tree.  Never blanket-delete
   it from WSL or Windows.  Orphaned WSL swap recovery must use
   `scripts/cleanup_windows_wsl_temp_swap.ps1`: only a top-level GUID directory
@@ -303,4 +390,3 @@ coordinated code, config, test, and documentation change.
 - After an approved cleanup, report exactly what was removed, bytes recovered,
   what remains authoritative, whether recovery is possible, and fresh
   post-cleanup Syncthing plus release-verification evidence.
-

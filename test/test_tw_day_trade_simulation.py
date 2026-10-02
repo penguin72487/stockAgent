@@ -1406,6 +1406,60 @@ def _quote(
     }
 
 
+@pytest.mark.parametrize("weight,side,price", [(0.1, "bid", 900.0), (-0.1, "ask", 1100.0)])
+def test_snapshot_valuation_is_not_an_execution_quote(tmp_path, weight, side, price):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    assert engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row(weight)],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1, 6),
+    ) == "registered"
+    fill_bytes = engine.fills_path.read_bytes()
+    quote = {
+        "valuation_" + side: price,
+        "valuation_quote_at": _now(9, 3).isoformat(),
+        "valuation_quote_source": "shioaji:stock_snapshot",
+        "valuation_simtrade": None,
+        "valuation_evidence": "indicative_snapshot_book_only_not_execution_evidence_v1",
+    }
+    engine.process_quotes(quotes={"2330": quote}, now=_now(9, 3))
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert abs(position["signed_shares"]) == 1000
+    assert position["last_mark_price"] == price
+    assert position["last_mark_quote_source"] == "shioaji:stock_snapshot"
+    assert mode["indicative_valuation_position_count"] == 1
+    assert mode["stale_position_count"] == 0
+    assert engine.fills_path.read_bytes() == fill_bytes  # No stop/take-profit fill.
+    assert not {"bid", "ask", "last", "minute_volume_lots", "simtrade"} & quote.keys()
+
+
+@pytest.mark.parametrize("extra", [
+    {"valuation_simtrade": True}, {"simtrade": True},
+    {"valuation_quote_at": _now(9, 2, 49).isoformat()},
+    {"valuation_quote_at": _now(9, 3, 1).isoformat()},
+    {"valuation_quote_at": _now(9, 3).replace(day=12).isoformat()},
+])
+def test_stale_future_wrong_session_and_trial_snapshots_cannot_refresh_marks(tmp_path, extra):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    assert engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row()],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1, 6),
+    ) == "registered"
+    quote = {
+        "valuation_bid": 900.0, "valuation_quote_at": _now(9, 3).isoformat(),
+        "valuation_evidence": "indicative_snapshot_book_only_not_execution_evidence_v1",
+        **extra,
+    }
+    engine.process_quotes(quotes={"2330": quote}, now=_now(9, 3))
+    mode = engine.state["modes"][spec.market]
+    assert mode["indicative_valuation_position_count"] == 0
+    assert mode["stale_position_count"] == 1
+
+
 def test_entry_waits_for_quote_strictly_after_signal(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")

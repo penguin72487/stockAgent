@@ -91,6 +91,137 @@ def test_rate_margin_and_carry_keep_different_account_instants():
         validate(rules)
 
 
+@pytest.mark.parametrize('expiry_time', ['13:30:00', '13:45:00', '14:00:00'])
+@pytest.mark.parametrize('post_close_missing', [False, True])
+def test_cash_expiry_does_not_move_the_regular_margin_boundary(expiry_time, post_close_missing):
+    kwargs = inputs()
+    last = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == last).alias('cash_settlement'),
+        pl.lit(last).alias('official_expiry'))
+    kwargs['specifications'] = pl.DataFrame([specification(expiry_time=expiry_time)], schema=SPEC_FIELDS)
+    old = kwargs['margin_intervals'].row(0, named=True)
+    old['effective_phase'] = 1
+    new = dict(old, effective_date=str(last), initial=.2, maintenance=.16,
+        source_content_sha256s=['d' * 64], known_at=f'{DAYS[-2]}T23:59:59+08:00')
+    kwargs['margin_intervals'] = pl.DataFrame([old, new])
+    target = pl.col('date') == last
+    kwargs['margins'] = kwargs['margins'].with_columns(
+        pl.when(target).then(pl.lit(None if post_close_missing else 1, dtype=pl.UInt32))
+          .otherwise(pl.col('settlement_margin_interval_id')).alias('settlement_margin_interval_id'),
+        pl.when(target).then(pl.lit('missing_numeric_rule' if post_close_missing else 'bound_prior_publication'))
+          .otherwise(pl.col('settlement_binding_status')).alias('settlement_binding_status'),
+        pl.when(target).then(pl.lit(None if post_close_missing else .2, dtype=pl.Float64))
+          .otherwise(pl.col('settlement_initial')).alias('settlement_initial'),
+        pl.when(target).then(pl.lit(None if post_close_missing else .16, dtype=pl.Float64))
+          .otherwise(pl.col('settlement_maintenance')).alias('settlement_maintenance'))
+    rules, flags = compile_execution_terms(**kwargs)
+    row = rules.filter(pl.col('date') == last).row(0, named=True)
+    blocked = flags.filter(pl.col('date') == last).row(0, named=True)
+    assert row['settlement_time'] == expiry_time
+    assert row['initial'] == .1
+    if expiry_time < '13:45:00':
+        assert row['settlement_initial'] == .1
+        assert row['settlement_effective_at'] == '2025-12-02T13:45:00+08:00'
+        assert not blocked['missing_settlement_margin']
+    elif post_close_missing:
+        assert blocked['missing_settlement_margin']
+    else:
+        assert row['settlement_initial'] == .2
+        assert row['settlement_effective_at'] == f'{last}T13:45:00+08:00'
+        assert not blocked['missing_settlement_margin']
+
+
+def test_early_cash_event_cannot_admit_a_late_opening_rule_or_unknown_specification():
+    kwargs = inputs()
+    last = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == last).alias('cash_settlement'), pl.lit(last).alias('official_expiry'))
+    kwargs['margin_intervals'] = kwargs['margin_intervals'].with_columns(
+        pl.lit(str(last)).alias('effective_date'),
+        pl.lit(f'{last}T13:40:00+08:00').alias('known_at'))
+    kwargs['margins'] = kwargs['margins'].with_columns(
+        *[pl.lit('same_day_clock_review').alias(p + 'binding_status')
+          for p in ['opening_', 'settlement_']],
+        *[pl.lit(None, dtype=pl.Float64).alias(p + c)
+          for p in ['opening_', 'settlement_'] for c in ['initial', 'maintenance']])
+    _, flags = compile_execution_terms(**kwargs)
+    blocked = flags.filter(pl.col('date') == last).row(0, named=True)
+    assert blocked['missing_opening_margin'] and blocked['missing_settlement_margin']
+    kwargs = inputs()
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == last).alias('cash_settlement'), pl.lit(last).alias('official_expiry'))
+    kwargs['specifications'] = kwargs['specifications'].with_columns(pl.lit(last).alias('valid_until_exclusive'))
+    _, flags = compile_execution_terms(**kwargs)
+    assert flags.filter(pl.col('date') == last)['missing_product_specification'].all()
+
+
+def test_independent_contract_and_combined_shares_use_existing_two_ledger_slots():
+    kwargs=inputs()
+    kwargs['positions']=kwargs['positions'].with_columns(
+        pl.lit(2000.).alias('position_unit'),pl.lit(2500000.).alias('position_limit'),
+        pl.lit(None,dtype=pl.Float64).alias('monthly_position_limit'),
+        pl.lit(350.).alias('independent_contract_limit'))
+    rules,blockers=compile_execution_terms(**kwargs)
+    assert not blockers.filter(~pl.col('is_warmup'))['has_blocker'].any()
+    assert rules['position_group'].unique().to_list()==['ABC']
+    assert rules['position_limit'].unique().to_list()==[2500000.]
+    assert rules['second_position_group'].unique().to_list()==['POSITION_SINGLE:ABC']
+    assert rules['second_position_unit'].unique().to_list()==[1.]
+    assert rules['second_position_limit'].unique().to_list()==[350.]
+    validate_margin_second_position_limit(rules)
+    # Each printed obligation excludes a different otherwise feasible order.
+    row=rules.row(0,named=True)
+    feasible=lambda standard,adjusted: (standard*row['position_unit']+adjusted*2200<=row['position_limit']
+                                       and standard*row['second_position_unit']<=row['second_position_limit'])
+    assert not feasible(351,0) and not feasible(0,1137)
+    assert feasible(350,0) and feasible(0,1136) and feasible(300,800)
+    # A monthly constraint would be a third obligation, not a value to lose.
+    kwargs['positions']=kwargs['positions'].with_columns(pl.lit(100.).alias('monthly_position_limit'))
+    _,rejected=compile_execution_terms(**kwargs)
+    assert rejected.filter(~pl.col('is_warmup'))['missing_position_limit'].all()
+
+
+@pytest.mark.parametrize('cap',[0.,-1.,float('nan'),float('inf')])
+def test_invalid_independent_contract_cap_remains_blocked(cap):
+    kwargs=inputs()
+    kwargs['positions']=kwargs['positions'].with_columns(
+        pl.lit(None,dtype=pl.Float64).alias('monthly_position_limit'),
+        pl.lit(cap).alias('independent_contract_limit'))
+    _,blocked=compile_execution_terms(**kwargs)
+    assert blocked.filter(~pl.col('is_warmup'))['missing_position_limit'].all()
+
+
+@pytest.mark.parametrize('conflict',['cap','unit','monthly','none','unresolved_peer','equivalent'])
+def test_combined_group_cannot_admit_conflicting_limits_or_measurement_units(conflict):
+    kwargs=inputs()
+    for name in ['frame','margins','positions','specifications']:
+        extra=kwargs[name].with_columns(pl.lit('DEF').alias('product'))
+        if name=='frame':
+            extra=extra.with_columns(pl.lit('DEF:202603#g0').alias('physical_contract'))
+        if name=='positions':
+            extra=extra.with_columns(pl.lit(1000. if conflict=='equivalent' else
+                20. if conflict=='cap' else 10.).alias('position_limit'),
+                pl.lit(700. if conflict=='equivalent' else 4. if conflict=='monthly' else 7.).alias('monthly_position_limit'),
+                pl.lit(100. if conflict=='equivalent' else 1.).alias('position_unit'),
+                pl.lit('shares' if conflict in ['unit','equivalent'] else 'contracts').alias('unit'),
+                pl.lit(conflict!='unresolved_peer').alias('position_numeric_inputs_resolved'))
+            kwargs[name]=kwargs[name].with_columns(pl.lit('contracts').alias('unit'))
+        kwargs[name]=pl.concat([kwargs[name],extra])
+    rules,blocked=compile_execution_terms(**kwargs)
+    active=blocked.filter(~pl.col('is_warmup'))
+    if conflict in ['cap','unit','monthly']:
+        assert active['missing_position_limit'].all()
+    else:
+        assert not active.filter(pl.col('product')=='ABC')['missing_position_limit'].any()
+        assert active.filter(pl.col('product')=='DEF')['missing_position_limit'].all()==(conflict=='unresolved_peer')
+        if conflict=='equivalent':
+            assert rules['position_unit'].to_list()==[100.]*rules.height
+            assert rules['position_limit'].to_list()==[1000.]*rules.height
+            assert rules['second_position_limit'].to_list()==[700.]*rules.height
+            validate_margin_second_position_limit(rules)
+
+
 def test_future_price_does_not_change_known_features_or_prior_rule_rows():
     kwargs = inputs()
     first, _ = compile_execution_terms(**kwargs)

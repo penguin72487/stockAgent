@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import sys
 from pathlib import Path
@@ -27,9 +28,11 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
 )
 from stockagent.data_sync.legacy_artifact_retirement import (  # noqa: E402
     apply_legacy_retirement,
+    enroll_legacy_lease,
     plan_legacy_retirement,
     renew_legacy_lease,
 )
+from stockagent.data_sync.artifact_retirement import load_retirement_peer_names  # noqa: E402
 from stockagent.data_sync.packed_retention import RetentionConfig  # noqa: E402
 from scripts.manage_cold_artifacts import _bridge_inactive  # noqa: E402
 from scripts.manage_packed_retention import _syncthing  # noqa: E402
@@ -39,7 +42,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("plan", "prepare", "publish", "verify", "restore", "renew", "retire-plan", "retire-apply"),
+        choices=("plan", "prepare", "publish", "verify", "restore", "enroll", "renew", "retire-plan", "retire-apply"),
     )
     parser.add_argument("dataset")
     parser.add_argument(
@@ -50,20 +53,34 @@ def main() -> int:
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--plan-fingerprint")
     parser.add_argument(
+        "--manual-immediate", action="store_true",
+        help="one-shot user-authorized lease-age bypass for retire-plan/retire-apply only",
+    )
+    parser.add_argument(
         "--retention-config", type=Path, default=REPO_ROOT / "configs/data_sync/packed_retention.json"
+    )
+    parser.add_argument(
+        "--retirement-policy", type=Path, default=REPO_ROOT / "configs/data_sync/artifact_retirement.json"
     )
     parser.add_argument(
         "--retirement-state-root", type=Path, default=Path("/var/lib/stockagent-legacy-artifacts")
     )
     parser.add_argument(
-        "--restore-cache", type=Path, default=Path("/mnt/d/stockagent-legacy-archive-restore")
+        "--restore-cache", type=Path,
+        default=Path("/srv/stockagent-d-volume/stockagent-legacy-archive-restore")
     )
     args = parser.parse_args()
     try:
+        if args.manual_immediate and args.command not in {"retire-plan", "retire-apply"}:
+            raise SnapshotError("--manual-immediate requires retire-plan or retire-apply")
         specs = load_legacy_specs(args.catalog)
         if args.dataset not in specs:
             raise SnapshotError(f"legacy dataset is not allowlisted: {args.dataset}")
         spec = specs[args.dataset]
+        if spec.stage_root.is_relative_to(Path("/srv/stockagent-d-volume")):
+            from stockagent.data_sync.cold_primary import _check_d_primary_mount
+
+            _check_d_primary_mount(args.sync_root)
         source = args.artifact_root.resolve() / spec.relative_root
         archive = spec.stage_root / spec.dataset / "archive"
         if args.command == "plan":
@@ -107,6 +124,10 @@ def main() -> int:
                 raise SnapshotError("cold release does not match the allowlisted legacy archive")
             verify_packed_snapshot(args.sync_root, resolved, materialized_path=archive)
             result.update(snapshot_id=resolved.manifest["snapshot_id"], cold_verified=True)
+        elif args.command == "enroll":
+            result = enroll_legacy_lease(
+                spec, artifact_root=args.artifact_root, state_root=args.retirement_state_root
+            )
         elif args.command == "renew":
             result = renew_legacy_lease(
                 spec,
@@ -119,17 +140,22 @@ def main() -> int:
             cfg = RetentionConfig.load(args.retention_config, repo_root=REPO_ROOT)
             if cfg.sync_root.resolve() != args.sync_root.resolve():
                 raise SnapshotError("retirement C root differs from configured cold authority")
+            cfg = replace(cfg, required_peer_names=load_retirement_peer_names(
+                args.retirement_policy, authority_node_id=cfg.authority_node_id
+            ))
             options = {
                 "repo_root": REPO_ROOT,
                 "artifact_root": args.artifact_root,
                 "hot_root": Path("/srv/stockagent-artifacts-hot"),
                 "sync_root": args.sync_root,
+                "materialized_root": cfg.materialized_root,
                 "state_root": args.retirement_state_root,
                 "activation_root": Path("/var/lib/stockagent-cold-artifacts/activations"),
                 "backup_config": cfg.backup_config,
                 "peer_proof": _syncthing(cfg),
                 "peer_probe": lambda: _syncthing(cfg),
                 "bridge_inactive": _bridge_inactive(Path("/srv/stockagent-artifacts-hot")),
+                "manual_immediate": args.manual_immediate,
             }
             result = (
                 apply_legacy_retirement(

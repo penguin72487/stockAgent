@@ -114,6 +114,35 @@ def test_known_cooldown_is_not_ignored():
     assert all(row['remaining_seconds'] > 10000 for row in result['scenarios'].values())
 
 
+def test_failed_debt_never_gets_a_finish_from_other_datasets_dispatch_rate(tmp_path):
+    work, telemetry = evidence()
+    work['summary'].update(current_plan_requests=100, unbatched_requests=100, retry_tasks=100,
+                           max_retry_wait_seconds=900)
+    result = estimate(work, telemetry)
+    assert result['state'] == 'waiting_retry'
+    assert result['retry_wait_seconds'] == 900
+    assert all(row['active_work_seconds'] > 0 for row in result['scenarios'].values())
+    assert all(row['estimated_complete_at_utc'] is None for row in result['scenarios'].values())
+    assert result['workload']['retry_tasks'] == 100
+    write_snapshot(tmp_path, result)
+    public = public_completion_estimate(tmp_path, NOW)
+    assert public['state'] == 'waiting_retry'
+    assert public['workload']['retry_tasks'] == 100
+    assert public['blockers'][-1]['code'] == 'retry_tasks'
+
+
+def test_fresh_snapshot_past_deadline_is_overdue_not_one_minute_or_complete(tmp_path):
+    payload = estimate()
+    payload['scenarios']['central'].update(remaining_seconds=60,
+        estimated_complete_at_utc=(NOW + timedelta(seconds=60)).isoformat())
+    write_snapshot(tmp_path, payload)
+    result = public_completion_estimate(tmp_path, NOW + timedelta(seconds=120))
+    assert result['state'] != 'stale'
+    assert result['scenarios']['central']['state'] == 'overdue'
+    assert result['scenarios']['central']['remaining_seconds'] is None
+    assert result['scenarios']['central']['estimated_complete_at_utc'] is None
+
+
 def test_opening_break_and_official_holiday():
     start = datetime(2026, 9, 28, 0, tzinfo=UTC)  # Taipei 08:00
     finish, pause = scheduled_finish(start, 3600, day_is_protected=lambda _: True)

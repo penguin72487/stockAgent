@@ -97,6 +97,30 @@ def test_expired_snapshot_is_not_presented_as_a_current_countdown() -> None:
     assert "2026/09/27 12:00" in " ".join(view["observed"].split())
 
 
+def test_deadline_passes_before_snapshot_expiry_and_stops_one_minute_display():
+    payload = _estimate()
+    payload['scenarios']['fastest'].update(remaining_seconds=60,
+        estimated_complete_at_utc='2026-09-27T04:01:00+00:00')
+    view = _view(payload, now='2026-09-27T04:02:00+00:00')
+    assert view['scenarios'][0]['value'] == '已超過估計，尚未完成'
+    assert view['scenarios'][0]['complete'] == '完成日期尚無法估算'
+    assert '估計期限不是成功收據' in view['scenarios'][0]['detail']
+
+
+def test_retry_does_not_render_short_active_service_time_as_completion_countdown():
+    payload = _estimate()
+    payload['state'] = 'waiting_retry'
+    payload['workload']['retry_tasks'] = 159
+    for row in payload['scenarios'].values():
+        row['active_work_seconds'] = 60
+    view = _view(payload)
+    assert view['stateLabel'] == '尚未完成：等待成功重試'
+    assert all(row['value'] == '待重試，完成時間未定' for row in view['scenarios'])
+    assert all(row['complete'] == '完成日期尚無法估算' for row in view['scenarios'])
+    assert all('159 個' in row['detail'] and '不是倒數' in row['detail'] for row in view['scenarios'])
+    assert '不是成功完成數' in view['rateBridge']
+
+
 def test_estimate_does_not_decrease_without_a_new_measurement() -> None:
     first = _view(_estimate())
     later = _view(_estimate(), now="2026-09-27T04:04:00+00:00")
@@ -301,6 +325,10 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
         browser = runtime.chromium.launch(**browser_profile_launch_options("cpu-2d"), timeout=5000)
         try:
             page = browser.new_page(viewport={"width": width, "height": 1000})
+            # The fixture is intentionally dated; test against its own clock,
+            # not a later wall clock that should correctly mark it overdue.
+            from datetime import datetime
+            page.clock.set_fixed_time(datetime.fromisoformat(NOW))
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.route("**/*", respond)

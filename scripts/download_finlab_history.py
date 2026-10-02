@@ -8,6 +8,8 @@ Outputs preserve the provider's index labels and remain unapproved for PIT train
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 import hashlib
@@ -31,38 +33,103 @@ from scripts.finlab_wide_volume_units import volume_unit_contract  # noqa: E402
 from scripts.finlab_arrow_history import (  # noqa: E402
     STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow,
 )
+from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
+    ATTEMPT_RETRY_SECONDS as ATTEMPT_RETRY_SECONDS,
+    AUTOMATICALLY_DEFERRED_REASONS,
+    QUOTA_POLICY_VERSION,
+    attempt_retry_at,
+    incremental_quota_exempt,
+    next_source_check,
+    proven_source_empty,
+    queue_stage,
+    queue_priority,
+    quota_cycle_start,
+    safe_stem,
+    source_check_due,
+)
 
 
 DEFAULT_CATALOG = ROOT / "configs/finlab_history_candidates.json"
 DEFAULT_OUTPUT = ROOT / "data_finlab"
 TAIPEI = ZoneInfo("Asia/Taipei")
 PERIOD_LABEL = re.compile(r"^\d{4}-(?:M\d{2}|Q[1-4])$")
-# Oversized general keys use the bounded Arrow adapter. Only intrinsically
-# windowed keys stay excluded from this whole-table scheduler.
-AUTOMATICALLY_DEFERRED_REASONS = {
-    # These are dated partitions, not whole-table matrix keys. Calling
-    # data.get(key) without both dates always fails, regardless of entitlement.
-    "tw_minute:2330": "requires_date_window",
-    "tw_tick:2330": "requires_date_window",
-}
 AUTOMATICALLY_DEFERRED_KEYS = frozenset(AUTOMATICALLY_DEFERRED_REASONS)
-# A first acquisition can still extend the official archive's early history.
-# Once present locally, repeated whole-matrix price refreshes are independent
-# validation work and must not consume quota ahead of missing feature fields.
-SECONDARY_VALIDATION_REFRESH_KEYS = frozenset({"price:收盤價"})
+# A current close is necessary market data, not optional overlap validation.
+# Actual cross-provider comparisons retain their independent admission gate.
+SECONDARY_VALIDATION_REFRESH_KEYS = frozenset()
 NON_NUMERIC_DEFERRED_KEYS = frozenset({
     "after_market_fixed_price:資料來源", "after_market_fixed_price:市場別",
 })
-# Short, bounded backoff avoids both a multi-day blind spot and a tight loop
-# against a deterministic provider failure. The timer supplies the retry clock.
-ATTEMPT_RETRY_SECONDS = {
-    "vip_only": (30 * 60, 4 * 60 * 60),
-    "provider_error": (5 * 60, 60 * 60),
-    "provider_empty": (30 * 60, 2 * 60 * 60),
-    "normalization_error": (5 * 60, 60 * 60),
-    "timed_out": (30 * 60, 2 * 60 * 60),
-    "resource_deferred": (60 * 60, 2 * 60 * 60),
-}
+_PLAN_READS = ContextVar("finlab_plan_reads", default=None)
+
+
+@contextmanager
+def local_plan_reads():
+    """One ephemeral snapshot per selection; never persist freshness decisions."""
+    if _PLAN_READS.get() is not None:
+        yield
+        return
+    token = _PLAN_READS.set({})
+    try:
+        yield
+    finally:
+        _PLAN_READS.reset(token)
+
+
+def read_key_state(key: str, output_root: Path, kind: str = "receipts") -> dict:
+    path = output_root / kind / f"{safe_stem(key)}.json"
+    cache = _PLAN_READS.get()
+    if cache is not None and path in cache:
+        return cache[path]
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value = value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        value = {}
+    if cache is not None:
+        cache[path] = value
+    return value
+
+
+def verified_source_empty(key: str, output_root: Path, attempt: dict) -> bool:
+    """An error label alone must never release lower-priority quota admission."""
+    if not proven_source_empty(key, attempt):
+        return False
+    cache = _PLAN_READS.get()
+    binding = ("source_empty", output_root, key)
+    if cache is not None and binding in cache:
+        return cache[binding]
+    valid = False
+    try:
+        rel = Path(str(attempt["empty_evidence_path"]))
+        root = output_root.resolve()
+        proof = (root / rel).resolve()
+        if (rel.is_absolute() or ".." in rel.parts or rel.parts[:1] != ("empty_evidence",)
+                or not proof.is_relative_to(root) or proof.stat().st_size > 32768):
+            return False
+        report = json.loads(proof.read_text(encoding="utf-8"))
+        raw_rel = Path(str(report.get("raw_path") or ""))
+        raw = (root / raw_rel).resolve()
+        expected = report.get("raw_sha256")
+        if (report.get("dataset") == key and report.get("status") == "source_all_null"
+                and report.get("usable_observations") is False
+                and type(report.get("raw_non_null_values")) is int and report["raw_non_null_values"] == 0
+                and not raw_rel.is_absolute() and ".." not in raw_rel.parts
+                and raw_rel.parts[:1] == ("empty_evidence",) and raw.is_relative_to(root)
+                and isinstance(expected, str) and len(expected) == 64):
+            before = raw.stat()
+            if 0 < before.st_size <= 8 * 1024**2:
+                with raw.open("rb") as handle:
+                    actual = hashlib.file_digest(handle, "sha256").hexdigest()
+                after = raw.stat()
+                valid = (actual == expected and (before.st_dev, before.st_ino, before.st_size,
+                         before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino,
+                         after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if cache is not None:
+        cache[binding] = valid
+    return valid
 
 
 class EmptyProviderFrame(ValueError):
@@ -81,12 +148,6 @@ def load_catalog(path: Path = DEFAULT_CATALOG) -> dict:
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate FinLab candidate key")
     return payload
-
-
-def safe_stem(key: str) -> str:
-    """Stable filenames, without allowing provider names to become paths."""
-    readable = re.sub(r"[^A-Za-z0-9_-]+", "_", key.split(":", 1)[0])[:56]
-    return f"{readable}-{hashlib.sha256(key.encode()).hexdigest()[:12]}"
 
 
 @lru_cache(maxsize=8)
@@ -109,10 +170,7 @@ def has_local_download(key: str, output_root: Path) -> bool:
     receipt_path = output_root / "receipts" / f"{stem}.json"
     if not receipt_path.is_file():
         return False
-    try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+    receipt = read_key_state(key, output_root)
     if not isinstance(receipt, dict):
         return False
     relative = Path(str(receipt.get("parquet_path") or ""))
@@ -131,17 +189,13 @@ def unavailable_attempt(key: str, output_root: Path) -> bool:
     path = output_root / "attempts" / f"{safe_stem(key)}.json"
     if not path.is_file():
         return False
-    try:
-        attempt = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+    attempt = read_key_state(key, output_root, "attempts")
     return attempt.get("dataset") == key and attempt.get("status") == "vip_only"
 
 
 def vip_retry_due(key: str, output_root: Path, *, now: datetime) -> bool:
-    path = output_root / "attempts" / f"{safe_stem(key)}.json"
     try:
-        attempt = json.loads(path.read_text(encoding="utf-8"))
+        attempt = read_key_state(key, output_root, "attempts")
         attempted = datetime.fromisoformat(attempt["attempted_at_utc"])
         if attempted.tzinfo and attempted.astimezone(UTC) < quota_cycle_start(now):
             return True
@@ -151,34 +205,6 @@ def vip_retry_due(key: str, output_root: Path, *, now: datetime) -> bool:
         return True
 
 
-def attempt_retry_at(attempt: dict, *, downloaded: bool = False) -> datetime | None:
-    """Only per-key failures get a cooldown; account-wide failures do not."""
-    policy = ATTEMPT_RETRY_SECONDS.get(attempt.get("status"))
-    if policy is None:
-        return None
-    base, maximum = policy
-    if downloaded and attempt.get("status") == "timed_out":
-        base, maximum = 15 * 60, 60 * 60
-    streak = attempt.get("failure_streak", 1)
-    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 1:
-        streak = 1
-    delay = timedelta(seconds=min(maximum, base * (2 ** min(streak - 1, 10))))
-    try:
-        attempted = datetime.fromisoformat(attempt["attempted_at_utc"])
-        return attempted.astimezone(UTC) + delay if attempted.tzinfo else None
-    except (ValueError, KeyError, TypeError):
-        return None
-
-
-def quota_cycle_start(now: datetime) -> datetime:
-    """FinLab daily quota day begins at 08:00 Asia/Taipei, including holidays."""
-    local = now.astimezone(TAIPEI)
-    reset = local.replace(hour=8, minute=0, second=0, microsecond=0)
-    if local < reset:
-        reset -= timedelta(days=1)
-    return reset.astimezone(UTC)
-
-
 def recent_attempt(key: str, output_root: Path, *, now: datetime,
                    downloaded: bool = False) -> bool:
     """Skip only the key's measured failure window, not every error for 7 days."""
@@ -186,14 +212,14 @@ def recent_attempt(key: str, output_root: Path, *, now: datetime,
     if not path.is_file():
         return False
     try:
-        attempt = json.loads(path.read_text(encoding="utf-8"))
+        attempt = read_key_state(key, output_root, "attempts")
         if attempt.get("dataset") != key:
             return False
         attempted = datetime.fromisoformat(attempt["attempted_at_utc"])
         if attempted.tzinfo and attempted.astimezone(UTC) < quota_cycle_start(now):
             return False
         if downloaded:
-            receipt = json.loads((output_root / "receipts" / f"{safe_stem(key)}.json").read_text())
+            receipt = read_key_state(key, output_root)
             checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
             if checked.tzinfo and attempted.tzinfo and checked >= attempted:
                 return False
@@ -206,22 +232,7 @@ def recent_attempt(key: str, output_root: Path, *, now: datetime,
 def refresh_due(key: str, output_root: Path, *, now: datetime, days: int) -> bool:
     if not has_local_download(key, output_root):
         return False
-    try:
-        receipt = json.loads((output_root / "receipts" / f"{safe_stem(key)}.json").read_text())
-        if receipt.get("source_check_mode") == "sdk_cache_allowed":
-            return True
-        checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
-        # A concurrent writer can finish after this plan's as-of time. Such a
-        # receipt is not current *as of now*: keep it pending until the next
-        # plan, rather than excluding a key the progress snapshot still owes.
-        # Naive timestamps also cannot establish a UTC freshness boundary.
-        if checked.tzinfo is None or checked.astimezone(UTC) > now:
-            return True
-        if days == 1:
-            return checked.astimezone(UTC) < quota_cycle_start(now)
-        return now - checked.astimezone(UTC) >= timedelta(days=days)
-    except (OSError, ValueError, KeyError, TypeError):
-        return True
+    return source_check_due(read_key_state(key, output_root), now=now, days=days)
 
 
 def last_source_check(key: str, output_root: Path) -> datetime:
@@ -231,9 +242,7 @@ def last_source_check(key: str, output_root: Path) -> datetime:
     only a scheduling key; ``refresh_due`` still owns the freshness decision.
     """
     try:
-        receipt = json.loads(
-            (output_root / "receipts" / f"{safe_stem(key)}.json").read_text()
-        )
+        receipt = read_key_state(key, output_root)
         checked = datetime.fromisoformat(
             receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"]
         )
@@ -458,13 +467,15 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
     return passed, failed
 
 
-def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
+def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
+              incremental: bool = False) -> dict:
     from downloader.artifact_io import durable_replace
     from downloader.parquet_integrity import parquet_receipt_error
 
     started = time.monotonic()
     stem = safe_stem(key)
     receipt_path = output_root / "receipts" / f"{stem}.json"
+    previous = read_key_state(key, output_root)
     datasets_root = output_root / "datasets"
     datasets_root.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -477,8 +488,30 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
         else:
             from finlab import data
 
-            frame = data.get(key, force_download=refresh, progress="silent")
+            evidence = {}
+            if incremental:
+                from scripts.finlab_incremental_refresh import checked_get
+                frame, evidence = checked_get(key, sdk=data)
+                # SDK proof binds the source revision; local integrity binds
+                # our normalized immutable Parquet. Only their conjunction
+                # permits skipping conversion/hashing, never a cache-only read.
+                if (evidence.get("provider_content_hash")
+                        and evidence.get("provider_content_hash") == previous.get("provider_content_hash")
+                        and previous.get("provider_hash_basis") == "sdk_validated_publication_v1"
+                        and previous.get("incremental_adapter_version") == evidence.get("incremental_adapter_version")
+                        and previous.get("finlab_sdk_version") == evidence.get("finlab_sdk_version")
+                        and previous.get("normalization_contract_version") == evidence.get("normalization_contract_version")
+                        and previous.get("volume_units") == volume_unit_contract(key)
+                        and has_local_download(key, output_root)):
+                    previous.update(evidence)
+                    previous["last_check_result"] = "unchanged"
+                    previous["last_fetch_elapsed_seconds"] = round(time.monotonic() - started, 3)
+                    _atomic_json(receipt_path, previous)
+                    return previous
+            else:
+                frame = data.get(key, force_download=refresh, progress="silent")
             table, stats = serialize_provider_frame(frame)
+            stats.update(evidence)
             if not stats["rows_with_values"]:
                 evidence = capture_empty_evidence(key, output_root, stem)
                 raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"], evidence=evidence)
@@ -498,12 +531,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False) -> dict:
             raise ValueError(f"FinLab staged parquet failed validation: {validation}")
         checked_at = stats.get("source_checked_at_utc", datetime.now(UTC).isoformat())
         check_mode = stats.get("source_check_mode", "upstream_forced" if refresh else "sdk_cache_allowed")
-        previous: dict = {}
         if receipt_path.is_file():
-            try:
-                previous = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                previous = {}
             if previous.get("dataset") == key and previous.get("sha256") == content_hash:
                 old_relative = Path(str(previous.get("parquet_path") or ""))
                 if (not old_relative.is_absolute() and ".." not in old_relative.parts
@@ -593,6 +621,13 @@ def _sync_work_plan(
     available: list[str], curated: dict[str, dict], output_root: Path,
     *, now: datetime, refresh_days: int, retry_unavailable: bool,
 ) -> dict:
+    with local_plan_reads():
+        return _build_sync_work_plan(available, curated, output_root, now=now,
+                                    refresh_days=refresh_days, retry_unavailable=retry_unavailable)
+
+
+def _build_sync_work_plan(available, curated, output_root, *, now, refresh_days,
+                          retry_unavailable):
     """Separate acquisition debt from actionable work and optional validation.
 
     A cooldown or resource defer is not completion.  Neither can release the
@@ -606,11 +641,13 @@ def _sync_work_plan(
     missing_extra: list[str] = []
     refresh_extra: list[str] = []
     required_outstanding: list[str] = []
+    downloaded_by_key = {}
     for key in [*curated_keys, *extra_keys]:
         if key not in available_set or _windowed_dataset(key):
             continue
         downloaded = has_local_download(key, output_root)
-        due = not downloaded or refresh_due(key, output_root, now=now, days=refresh_days)
+        downloaded_by_key[key] = downloaded
+        due = not downloaded or source_check_due(read_key_state(key, output_root), now=now, days=refresh_days)
         secondary = downloaded and key in SECONDARY_VALIDATION_REFRESH_KEYS
         if due and not secondary and key not in NON_NUMERIC_DEFERRED_KEYS:
             required_outstanding.append(key)
@@ -639,10 +676,23 @@ def _sync_work_plan(
     primary = [*eligible_curated, *missing_extra, *refresh_extra]
     # Source-label metadata must not spend the whole-table budget before
     # missing numeric financial fields, but it is no longer permanently stuck.
-    primary.sort(key=lambda key: key in NON_NUMERIC_DEFERRED_KEYS)
+    def priority(key):
+        downloaded = downloaded_by_key[key]
+        stage = queue_stage(key, downloaded=downloaded,
+                            metadata=key in NON_NUMERIC_DEFERRED_KEYS,
+                            source_empty=verified_source_empty(key, output_root, read_key_state(key, output_root, "attempts")))
+        checked = last_source_check(key, output_root)
+        return (queue_priority(stage, checked=checked, now=now), checked, key)
+    # Stable sorting retains curated/missing insertion order where evidence
+    # ages tie; older due receipts still outrank repeatedly checked prefixes.
+    def stable_priority(key):
+        stage_priority, age, _ = priority(key)
+        return stage_priority, age
+    primary.sort(key=stable_priority)
     return {"primary": primary, "validation": validation_refresh,
             "required_outstanding": required_outstanding,
-            "required_blocked": sorted(set(required_outstanding) - set(primary))}
+            "required_blocked": sorted(set(required_outstanding) - set(primary)),
+            "local_downloads": downloaded_by_key}
 
 
 def sync_selection(
@@ -664,6 +714,11 @@ def general_work_status(
     discovery: dict, curated: dict[str, dict], output_root: Path,
     *, now: datetime, refresh_days: int,
 ) -> dict:
+    with local_plan_reads():
+        return _general_work_status(discovery, curated, output_root, now=now, refresh_days=refresh_days)
+
+
+def _general_work_status(discovery, curated, output_root, *, now, refresh_days):
     """Read-only gate for lower-priority Tick work; no provider API calls.
 
     ``idle`` means no required catalog acquisition/recheck debt. It is not
@@ -690,7 +745,23 @@ def general_work_status(
     pending = plan["primary"]
     general_keys = [key for key in available if not _windowed_dataset(key)]
     missing_general = {key for key in general_keys
-                       if not has_local_download(key, output_root)}
+                       if not plan["local_downloads"].get(key)}
+    empty_proofs = {key for key in plan["required_outstanding"]
+                    if verified_source_empty(key, output_root, read_key_state(key, output_root, "attempts"))}
+    supplemental_allowed = not (set(plan["required_outstanding"]) - empty_proofs) and not (
+        set(pending) - empty_proofs)
+    next_reset = quota_cycle_start(now) + timedelta(days=1)
+    future_reserve_bytes = 0
+    unknown_reserve_keys = 0
+    for key in general_keys:
+        receipt = read_key_state(key, output_root)
+        due = next_source_check(receipt, days=refresh_days)
+        if plan["local_downloads"].get(key) and due and now < due < next_reset:
+            estimate = receipt.get("last_full_source_bytes")
+            if isinstance(estimate, int) and not isinstance(estimate, bool) and estimate > 0:
+                future_reserve_bytes += estimate
+            else:
+                unknown_reserve_keys += 1
     return {
         "state": ("general_work_pending" if pending else
                   "general_work_blocked" if plan["required_outstanding"] else
@@ -701,11 +772,16 @@ def general_work_status(
         "required_blocked": len(plan["required_blocked"]),
         "required_blocked_keys": plan["required_blocked"],
         "secondary_validation_pending": len(plan["validation"]),
-        "supplemental_allowed": not plan["required_outstanding"],
+        "supplemental_allowed": supplemental_allowed,
+        "unresolved_source_empty_keys": sorted(empty_proofs),
+        "scheduled_reserve_mb": max(50.0, future_reserve_bytes / 1024**2 + 50.0,
+                                    500.0 if unknown_reserve_keys else 0.0),
+        "scheduled_reserve_unknown_keys": unknown_reserve_keys,
         "catalog_keys": len(available),
         "deferred_keys": sum(key in AUTOMATICALLY_DEFERRED_KEYS or _windowed_dataset(key)
                              for key in available),
-        "missing_receipts": sum(not has_local_download(key, output_root) for key in available),
+        "missing_receipts": len(missing_general) + sum(not has_local_download(key, output_root)
+                                                       for key in available if _windowed_dataset(key)),
         "general_catalog_keys": len(general_keys),
         "general_missing_receipts": len(missing_general),
         "general_missing_not_actionable_now": len(missing_general - set(pending)),
@@ -853,24 +929,36 @@ def sync_catalog(
         "unchanged": 0, "vip_only": 0, "provider_errors": 0,
         "state": "running", "quota_remaining_mb": None,
         "quota_limit_mb": None, "quota_reserve_mb": min_quota_remaining_mb,
+        "quota_policy_version": QUOTA_POLICY_VERSION,
+        "incremental_quota_policy": "provider_enforced_no_local_reserve",
+        "incremental_quota_exempt_attempted": 0, "quota_managed_deferred": 0,
         "attempt_id": attempt_id,
     }
+    quota_deferred_state = None
     try:
-        for key in pending[:limit]:
-            room = quota_room_mb()
-            if room is None:
-                summary["state"] = "quota_unknown"
+        for key in pending:
+            # Limit actual attempts, not scanned keys: a quota-blocked history
+            # prefix must not starve SDK refreshes later in the same plan.
+            if summary["attempted"] >= limit:
                 break
-            remaining, total = room
-            summary["quota_remaining_mb"] = round(remaining, 2)
-            summary["quota_limit_mb"] = round(total, 2)
-            # The caller owns the account reserve.  An implicit 10% floor
-            # stranded 450 MB/day on a 5 GB account despite the CLI's 50 MB
-            # default; FinLab enforces the authoritative limit on requests.
-            if remaining <= min_quota_remaining_mb:
-                summary["state"] = "quota_margin_reached"
-                break
+            exempt = incremental_quota_exempt(key, downloaded=has_local_download(key, output_root))
+            if not exempt:
+                room = quota_room_mb()
+                if room is None:
+                    quota_deferred_state = "quota_unknown"
+                    summary["quota_managed_deferred"] += 1
+                    continue
+                remaining, total = room
+                summary["quota_remaining_mb"] = round(remaining, 2)
+                summary["quota_limit_mb"] = round(total, 2)
+                if remaining <= min_quota_remaining_mb:
+                    quota_deferred_state = quota_deferred_state or "quota_margin_reached"
+                    summary["quota_managed_deferred"] += 1
+                    continue
+            # An exempt refresh still goes through the authenticated SDK. Its
+            # authoritative quota/auth errors below stop this account sweep.
             summary["attempted"] += 1
+            summary["incremental_quota_exempt_attempted"] += int(exempt)
             summary["active_key"] = key
             summary["active_started_at_utc"] = datetime.now(UTC).isoformat()
             _atomic_json(output_root / "runs" / "latest.json", summary)
@@ -878,7 +966,7 @@ def sync_catalog(
             try:
                 # A successful SDK cache read is not evidence that the provider
                 # was checked for current revisions. Sync must query upstream.
-                receipt = fetch_one(key, output_root, refresh=True)
+                receipt = fetch_one(key, output_root, refresh=True, incremental=True)
                 result = receipt.get("last_check_result", "downloaded")
                 summary[result] += 1
                 print(f"[finlab] {key}: {result}; rows={receipt['rows_with_values']}", flush=True)
@@ -896,7 +984,9 @@ def sync_catalog(
                     summary["state"] = reason
                     break
         if summary["state"] == "running":
-            summary["state"] = "partial" if len(pending) > summary["attempted"] else "pass_complete"
+            scanned = summary["attempted"] + summary["quota_managed_deferred"]
+            summary["state"] = ("partial" if len(pending) > scanned else
+                                quota_deferred_state or "pass_complete")
     finally:
         summary["finished_at_utc"] = datetime.now(UTC).isoformat()
         summary.pop("active_key", None)
@@ -916,10 +1006,14 @@ def sync_catalog(
         summary["required_complete"] = core["required_complete"]
         summary["required_pending"] = core["required_pending"]
         summary["required_blocked"] = core["required_blocked"]
-        room = quota_room_mb()
-        if room is not None:
-            summary["quota_remaining_mb"] = round(room[0], 2)
-            summary["quota_limit_mb"] = round(room[1], 2)
+        # Pure SDK refresh/idle sweeps do not need an extra account-status
+        # request. The canonical minute worker still measures official usage.
+        if (summary["attempted"] > summary["incremental_quota_exempt_attempted"]
+                or summary["quota_managed_deferred"]):
+            room = quota_room_mb()
+            if room is not None:
+                summary["quota_remaining_mb"] = round(room[0], 2)
+                summary["quota_limit_mb"] = round(room[1], 2)
         _atomic_json(output_root / "runs" / "latest.json", summary)
     return summary
 
@@ -934,7 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="Limit selected fetches for a trial")
     parser.add_argument("--refresh", action="store_true", help="Bypass FinLab's SDK cache")
     parser.add_argument("--refresh-days", type=int, default=30, help="Minimum days between source checks for downloaded datasets in sync mode")
-    parser.add_argument("--min-quota-remaining-mb", type=float, default=50.0, help="Stop sync before this much of the provider's daily quota remains")
+    parser.add_argument("--min-quota-remaining-mb", type=float, default=50.0,
+                        help="Reserve for history/whole-table work; verified SDK incremental checks are exempt")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--attempt-id", default=None)
     parser.add_argument("--timeout-seconds", type=int, default=0)

@@ -20,7 +20,7 @@ from downloader.parquet_integrity import parquet_receipt_error
 
 
 DAILY_EQUITY = frozenset({"USStockPrice", "UKStockPrice", "EuropeStockPrice", "JapanStockPrice"})
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2  # An empty tail is not an empty replacement of all history.
 FULL_RECHECK_DAYS = 7
 OVERLAP_DAYS = 7
 
@@ -122,7 +122,14 @@ def merge_response(old: list[dict], rows: list[dict], identifier: str, plan: dic
     start, end = (date.fromisoformat(plan[key]) for key in ("request_start_date", "request_end_date"))
     validate_rows(rows, identifier, start, end)
     if old and not rows:
-        raise ValueError("unexpected_empty_after_nonempty")
+        if plan['query_shape'] != 'per_id_incremental_overlap':
+            raise ValueError("unexpected_empty_after_nonempty")
+        # A no-new-rows observation cannot prove deletion of historical rows.
+        # Retain the verified baseline verbatim, with its original date range;
+        # a later nonempty overlap/full response still applies real corrections.
+        validate_rows(old, identifier, date(1900, 1, 1), date.max)
+        plan['empty_response_policy'] = 'retain_verified_baseline_no_new_observation'
+        return sorted(old, key=lambda row: row['date'])
     if plan["query_shape"] == "per_id_full_history":
         return sorted(rows, key=lambda row: row["date"])
     # The overlap is replaced, not appended; corrections/deletions can propagate.

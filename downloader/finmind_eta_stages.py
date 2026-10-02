@@ -28,6 +28,39 @@ STAGES = (
 SCENARIOS = ('fastest', 'central', 'slowest')
 
 
+def _cumulative_milestone(stages: list[dict[str, Any]], index: int, label: str) -> dict[str, Any]:
+    """A milestone owns every predecessor, not just its last (possibly empty) stage."""
+    prefix = stages[:index + 1]
+    item = deepcopy(prefix[-1])
+    item['scope_label'] = label
+    item['workload'] = {field: sum(stage['workload'][field] or 0 for stage in prefix)
+                        for field in item['workload']}
+    blockers = {}
+    for stage in prefix:
+        for blocker in stage['blockers']:
+            entry = blockers.setdefault(blocker['code'], {**blocker, 'count': 0})
+            entry['count'] += blocker['count'] or 0
+    item['blockers'] = list(blockers.values())
+    for name, scenario in item['scenarios'].items():
+        base = sum(stage['scenarios'][name]['base_request_count'] or 0 for stage in prefix)
+        requests = scenario['cumulative_request_count']
+        duration = scenario['cumulative_active_work_seconds']
+        scenario.update(request_count=requests, active_work_seconds=duration, base_request_count=base,
+                        stage_start_at_utc=None, stage_duration_seconds=None,
+                        forecast_arrival_requests=requests - base if requests is not None else None,
+                        effective_requests_per_hour=requests * 3600 / duration if duration and requests is not None else None)
+        if any('forecast_refresh_requests' in stage['scenarios'][name] for stage in prefix):
+            scenario['forecast_refresh_requests'] = sum(stage['scenarios'][name].get('forecast_refresh_requests', 0)
+                                                      for stage in prefix)
+    states = {stage['state'] for stage in prefix}
+    item['state'] = next((state for state in ('unavailable', 'waiting_quota', 'waiting_admission', 'waiting_retry', 'warming_up')
+                          if state in states),
+                         'conditional' if item['workload']['planned_requests'] or item['blockers'] else 'current')
+    item['rate_evidence'].update(overall_rate_basis='stage_weighted', stage_label=label,
+                                effective_requests_per_hour=item['scenarios']['central']['effective_requests_per_hour'])
+    return item
+
+
 def _summary() -> dict[str, Any]:
     return dict.fromkeys((*COUNT_FIELDS, 'unknown_datasets', 'unscheduled_datasets', 'max_retry_wait_seconds'), 0)
 
@@ -42,14 +75,21 @@ def stage_workloads(workload: dict[str, Any]) -> list[dict[str, Any]]:
         values.update(unknown_datasets=int(row['state'] == 'unknown'),
                       unscheduled_datasets=int(row['state'] == 'unscheduled'),
                       max_retry_wait_seconds=row.get('max_retry_wait_seconds', 0))
+        retry_classes = row.get('retry_tasks_by_class', {})
+        retry_waits = row.get('retry_wait_seconds_by_class', {})
+        values['max_retry_wait_seconds'] = retry_waits.get('backfill', values['max_retry_wait_seconds'])
         validation = values['validation_requests']
         # Secondary tasks are never eligible for range batching (priority >=8).
         for field in ('validation_requests', 'current_plan_requests', 'unbatched_requests', 'fastest_requests'):
             values[field] -= validation
             buckets['validation'][field] += validation
         if validation:
+            retry_count = retry_classes.get('validation', 0)
+            values['retry_tasks'] -= retry_count
+            buckets['validation']['retry_tasks'] += retry_count
             buckets['validation']['max_retry_wait_seconds'] = max(
-                buckets['validation']['max_retry_wait_seconds'], values['max_retry_wait_seconds'])
+                buckets['validation']['max_retry_wait_seconds'],
+                retry_waits.get('validation', values['max_retry_wait_seconds']))
         incremental = values['incremental_requests']
         unbatched_incremental = row.get('unbatched_incremental_requests', incremental)
         fastest_incremental = row.get('fastest_incremental_requests', incremental)
@@ -61,8 +101,12 @@ def stage_workloads(workload: dict[str, Any]) -> list[dict[str, Any]]:
             values[field] -= moved
             buckets['priority'][field] += moved
         if incremental:
+            retry_count = retry_classes.get('incremental', 0)
+            values['retry_tasks'] -= retry_count
+            buckets['priority']['retry_tasks'] += retry_count
             buckets['priority']['max_retry_wait_seconds'] = max(
-                buckets['priority']['max_retry_wait_seconds'], values['max_retry_wait_seconds'])
+                buckets['priority']['max_retry_wait_seconds'],
+                retry_waits.get('incremental', values['max_retry_wait_seconds']))
         override = row.get('priority_override', {})
         requests = override.get('requests', 0)
         if override.get('unsupported_tasks', 0):
@@ -76,7 +120,7 @@ def stage_workloads(workload: dict[str, Any]) -> list[dict[str, Any]]:
                 buckets['priority'][field] += requests
             buckets['priority']['max_retry_wait_seconds'] = max(
                 buckets['priority']['max_retry_wait_seconds'], override.get('max_retry_wait_seconds', 0))
-        for field in ('inflight_tasks', 'blocked_tasks'):
+        for field in ('inflight_tasks', 'blocked_tasks', 'retry_tasks'):
             moved = override.get(field, 0)
             values[field] -= moved
             buckets['priority'][field] += moved
@@ -92,6 +136,11 @@ def stage_workloads(workload: dict[str, Any]) -> list[dict[str, Any]]:
     for key, label in STAGES:
         summary = buckets[key]
         cumulative += summary['current_plan_requests']
+        if key == 'priority' and not any(
+            any(row.get('priority_override', {}).get(field, 0) for field in ('requests', 'inflight_tasks', 'blocked_tasks'))
+            for row in workload['datasets']
+        ):
+            label = '到期追新（指定優先回補目前無待發）'
         result.append({'key': key, 'label': label, 'summary': summary,
                        'cumulative_planned_requests': cumulative,
                        'state': 'partial' if summary['unknown_datasets'] else 'observed'})
@@ -165,7 +214,7 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
                                          and scenario['request_count'] is not None else None)
             scenario['cumulative_active_work_seconds'] = cumulative_work[name]
             scenario['cumulative_request_count'] = cumulative_requests[name]
-            waiting = scenario['state'] in {'waiting_admission', 'waiting_quota'}
+            waiting = scenario['state'] in {'waiting_admission', 'waiting_quota', 'waiting_retry'}
             scenario.update(state=scenario['state'] if waiting else 'unknown',
                             remaining_seconds=None, estimated_complete_at_utc=None)
             if cursor is not None and duration is not None and not waiting:
@@ -234,15 +283,17 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
     overall['rate_evidence'] = {**current['rate_evidence'], 'stage_key': current['key'],
                                 'stage_label': current['scope_label'], 'overall_rate_basis': 'stage_weighted'}
     # Preserve the old API keys, now with actual predecessor time included.
-    overall['milestones'] = {key: deepcopy(stages[index]) for key, index in (('core', 1), ('non_tick', 2), ('all', 4))}
-    overall['milestones']['core']['scope_label'] = '累計：指定優先回補＋主要歷史／新聞'
-    overall['milestones']['non_tick']['scope_label'] = '累計：全部非 tick 資料'
-    overall['milestones']['all']['scope_label'] = '累計：全部已知工作（含校驗）'
+    overall['milestones'] = {key: _cumulative_milestone(stages, index, label) for key, index, label in (
+        ('core', 1, '累計：指定優先回補＋主要歷史／新聞'),
+        ('non_tick', 2, '累計：全部非 tick 資料'),
+        ('all', 4, '累計：全部已知工作（含校驗）'))}
     if overall['state'] != 'unavailable':
         if any(item['state'] == 'waiting_quota' for item in stages):
             overall['state'] = 'waiting_quota'
         elif any(item['state'] == 'waiting_admission' for item in stages):
             overall['state'] = 'waiting_admission'
+        elif any(item['state'] == 'waiting_retry' for item in stages):
+            overall['state'] = 'waiting_retry'
         elif any(value['active_work_seconds'] is None for value in overall['scenarios'].values()):
             overall['state'] = 'warming_up'
         else:

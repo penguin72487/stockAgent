@@ -340,7 +340,15 @@ def _path_is_under(value: str, target: Path) -> bool:
 def process_references(target: Path, *, limit: int = 20) -> list[str]:
     """Return bounded evidence that a running process still uses ``target``."""
 
-    target = target.resolve()
+    return process_references_many((target,), limit=limit)
+
+
+def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list[str]:
+    """Scan /proc once for exact selected roots, excluding unrelated siblings."""
+
+    targets = tuple(sorted({target.resolve() for target in targets}))
+    if not targets:
+        return []
     references: list[str] = []
     own_pid = os.getpid()
     for process in sorted(Path("/proc").glob("[0-9]*")):
@@ -355,7 +363,7 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
                 value = os.readlink(process / name)
             except OSError:
                 continue
-            if _path_is_under(value, target):
+            if any(_path_is_under(value, target) for target in targets):
                 references.append(f"pid={pid}:{name}:{value}")
                 if len(references) >= limit:
                     return references
@@ -368,7 +376,7 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
                 value = os.readlink(descriptor)
             except OSError:
                 continue
-            if _path_is_under(value, target):
+            if any(_path_is_under(value, target) for target in targets):
                 references.append(f"pid={pid}:fd={descriptor.name}:{value}")
                 if len(references) >= limit:
                     return references
@@ -378,14 +386,197 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
             )
         except OSError:
             maps = ""
-        target_text = str(target)
-        if f" {target_text}/" in maps or any(
-            line.endswith(f" {target_text}") for line in maps.splitlines()
-        ):
-            references.append(f"pid={pid}:maps:{target_text}")
-            if len(references) >= limit:
-                return references
+        map_lines = maps.splitlines()
+        for target in targets:
+            target_text = str(target)
+            if f" {target_text}/" in maps or any(
+                line.endswith(f" {target_text}") for line in map_lines
+            ):
+                references.append(f"pid={pid}:maps:{target_text}")
+                if len(references) >= limit:
+                    return references
     return references
+
+
+def prune_partial_materialization(
+    sync_root: Path,
+    materialized_root: Path,
+    dataset: str,
+    snapshot_id: str,
+    partial_name: str,
+    *,
+    receipt_dir: Path,
+    apply: bool = False,
+    min_age_days: float = 7.0,
+) -> dict[str, Any]:
+    """Manually prune proven redundant files in one abandoned fetch staging tree.
+
+    Unlike lease GC this never discovers targets automatically. Unknown,
+    changed, young and mismatched files stay. The entire cold release is checked,
+    then every selected ZIP member/blob is independently decoded and hashed.
+    No source, pin, complete materialization or cold object may be removed.
+    """
+    import fcntl
+    import stat
+    from contextlib import ExitStack
+
+    from stockagent.data_sync.desync_snapshots import sha256_file
+    from stockagent.data_sync.packed_snapshots import _load_inventory
+
+    dataset = validate_slug(dataset, "dataset")
+    snapshot_id = validate_slug(snapshot_id, "snapshot_id")
+    prefix = f".{snapshot_id}.partial."
+    suffix = partial_name.removeprefix(prefix)
+    if (
+        not partial_name.startswith(prefix)
+        or len(suffix) != 32
+        or any(c not in "0123456789abcdef" for c in suffix)
+    ):
+        raise SnapshotError("not a canonical fetch staging name")
+    if not math.isfinite(min_age_days) or min_age_days < 7:
+        raise SnapshotError("partial cleanup requires at least seven days")
+    sync_root = sync_root.absolute()
+    materialized_root = materialized_root.absolute()
+    target = materialized_root / dataset / partial_name
+    if (
+        _paths_overlap(sync_root.resolve(), materialized_root.resolve())
+        or materialized_root.resolve() != materialized_root
+        or target.resolve() != target
+        or not target.is_dir()
+    ):
+        raise SnapshotError("unsafe or redirected fetch staging target")
+    if snapshot_id in _pinned_snapshot_ids(materialized_root):
+        raise SnapshotError("staging release is pinned")
+    if process_references(target):
+        raise SnapshotError("staging tree is currently in use")
+    cutoff = time.time_ns() - int(min_age_days * 86400 * 1e9)
+    with ExitStack() as stack:
+        lock_paths = (
+            _lock_path(materialized_root, dataset),
+            materialized_root / ".locks" / f"fetch-{dataset}-{snapshot_id}.lock",
+        )
+        for lock_path in lock_paths:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = stack.enter_context(lock_path.open("a+b"))
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        resolved = resolve_packed_snapshot_id(sync_root, dataset, snapshot_id)
+        entries = _load_inventory(sync_root, resolved.manifest)
+        by_path = {row["path"]: row for row in entries}
+        selected, kept = [], []
+
+        def signature(info):
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        for directory, dirs, files in os.walk(target, followlinks=False):
+            dirs[:] = sorted(
+                name for name in dirs if not (Path(directory) / name).is_symlink()
+            )
+            for name in sorted(files):
+                path = Path(directory) / name
+                relative = path.relative_to(target).as_posix()
+                info = path.lstat()
+                row = by_path.get(relative)
+                reason = None
+                if not stat.S_ISREG(info.st_mode) or not row or row["kind"] != "file":
+                    reason = "unknown-or-non-regular-preserve"
+                elif info.st_nlink != 1:
+                    reason = "shared-inode-preserve"
+                elif info.st_mtime_ns > cutoff:
+                    reason = "younger-than-seven-days"
+                elif info.st_size != int(row["size"]):
+                    reason = "size-mismatch-preserve"
+                elif sha256_file(path) != row["sha256"]:
+                    reason = "hash-mismatch-preserve"
+                elif signature(path.lstat()) != signature(info):
+                    reason = "changed-during-audit"
+                if reason:
+                    kept.append({"path": relative, "reason": reason})
+                else:
+                    selected.append(
+                        {
+                            "path": relative,
+                            "sha256": row["sha256"],
+                            "size": info.st_size,
+                            "allocated_bytes": info.st_blocks * 512,
+                            "signature": signature(info),
+                        }
+                    )
+        # Mandatory even for the dry run: payload availability/manifest presence
+        # alone isn't recoverability. This verifies SHA-256 and ZIP decoding.
+        cold_proof = verify_packed_snapshot(
+            sync_root, resolved, reconstruct_paths=[item["path"] for item in selected]
+        )
+        decoded_files = cold_proof["independently_reconstructed_files"]
+        observed = time.time_ns()
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = receipt_dir / f"partial-audit-{observed}.json"
+        result = {
+            "schema_version": 1,
+            "target": str(target),
+            "dataset": dataset,
+            "snapshot_id": snapshot_id,
+            "apply": apply,
+            "checked_at": _utc_iso_from_ns(observed),
+            "manifest_sha256": resolved.manifest_sha256,
+            "cold_proof": cold_proof,
+            "independently_decoded_files": decoded_files,
+            "selected": selected,
+            "kept": kept,
+            "would_free_allocated_bytes": sum(
+                row["allocated_bytes"] for row in selected
+            ),
+            "deleted_files": 0,
+            "deleted_allocated_bytes": 0,
+            "cold_files_removed": 0,
+            "source_files_removed": 0,
+        }
+        atomic_write_json(audit_path, {**result, "apply": False})
+        if apply:
+            if process_references(target) or snapshot_id in _pinned_snapshot_ids(
+                materialized_root
+            ):
+                raise SnapshotError("staging tree became referenced or pinned")
+            if sha256_file(resolved.manifest_path) != resolved.manifest_sha256:
+                raise SnapshotError("cold manifest changed")
+            for item in selected:
+                path = target / item["path"]
+                if (
+                    path.resolve() != path
+                    or signature(path.lstat()) != tuple(item["signature"])
+                    or sha256_file(path) != item["sha256"]
+                ):
+                    result["kept"].append(
+                        {"path": item["path"], "reason": "changed-before-unlink"}
+                    )
+                    continue
+                # No broad recursive delete: unlink only exact audited files.
+                path.unlink()
+                result["deleted_files"] += 1
+                result["deleted_allocated_bytes"] += item["allocated_bytes"]
+            for directory, dirs, files in os.walk(
+                target, topdown=False, followlinks=False
+            ):
+                directory_path = Path(directory)
+                relative = directory_path.relative_to(target).as_posix()
+                if directory_path != target and by_path.get(relative, {}).get("kind") != "directory":
+                    continue  # Keep even empty unknown evidence directories.
+                try:
+                    directory_path.rmdir()
+                except OSError:
+                    pass  # Nonempty/unknown evidence remains.
+        result["audit_receipt"] = str(audit_path)
+        result_path = (
+            receipt_dir / f"partial-{'apply' if apply else 'result'}-{observed}.json"
+        )
+        result["receipt"] = str(result_path)
+        atomic_write_json(result_path, result)
+        return result
 
 
 def _validated_lease_identity(

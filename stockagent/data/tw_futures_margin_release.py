@@ -77,19 +77,31 @@ def select_complete_standard_stock_lives(frame: pl.DataFrame, rules: pl.DataFram
 
 
 def read_bound_output(path: Path, *, output_key: str | None = None,
-                      columns: list[str] | None = None) -> tuple[pl.DataFrame, dict]:
+                      columns: list[str] | None = None,
+                      predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, dict]:
+    """Verify the whole source, then read the requested repair coordinates.
+
+    The returned manifest still describes the complete immutable source.
+    Filtering cannot hide corruption outside the selected repair rows.
+    """
     manifest = json.loads(path.with_name("manifest.json").read_text())
     expected = manifest.get("outputs", {}).get(output_key or path.name, {}).get("sha256")
     if expected != sha256_file(path):
         raise ValueError(f"materialization input SHA mismatch: {path}")
     if path.suffix == ".csv":
-        return pl.read_csv(path, infer_schema=False, columns=columns), manifest
-    return pl.read_parquet(path, columns=columns), manifest
+        frame = pl.scan_csv(path, infer_schema=False)
+    else:
+        frame = pl.scan_parquet(path)
+    if predicate is not None:
+        frame = frame.filter(predicate)
+    if columns is not None:
+        frame = frame.select(columns)
+    return frame.collect(), manifest
 
 
 def materialize_margin_market_rows(
     physical: pl.DataFrame, observations: pl.DataFrame, universe: pl.DataFrame,
-    *, slot_count: int = 2816,
+    *, slot_count: int = 2816, market_dates: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Preserve identities and marks without inventing executable prices/rules.
 
@@ -117,7 +129,11 @@ def materialize_margin_market_rows(
         raise ValueError("duplicate observed general-session contract-day")
     if raw.select(KEYS).join(physical.select(KEYS), on=KEYS, how="anti").height:
         raise ValueError("physical history drops requested observed contract-days")
-    calendar = physical.select("date").unique().sort("date").with_columns(
+    calendar_source = physical.select("date").unique() if market_dates is None else market_dates.select("date")
+    if (calendar_source['date'].null_count() or calendar_source['date'].is_duplicated().any()
+            or physical.select('date').unique().join(calendar_source,on='date',how='anti').height):
+        raise ValueError('repair calendar must uniquely cover every physical date')
+    calendar = calendar_source.sort("date").with_columns(
         pl.col("date").shift(1).alias("previous_market_date"),
         pl.col("date").shift(-1).alias("next_market_date"),
     )
@@ -305,7 +321,7 @@ def build_all_twd_execution_terms(*, materialization: Path, margin_inputs: Path,
     """
     from stockagent.data.tw_futures_execution_terms import (
         EXECUTION_TERMS_COMPILER_VERSION, SPEC_FIELDS, compile_execution_terms,
-        MARGIN_INPUT_FIELDS, POSITION_INPUT_FIELDS,
+        MARGIN_INPUT_FIELDS, POSITION_INPUT_FIELDS, POSITION_INPUT_EXTENSIONS,
     )
     from stockagent.data.tw_futures_margin import (
         validate_margin_carry_rules, validate_margin_value_bases,
@@ -331,7 +347,8 @@ def build_all_twd_execution_terms(*, materialization: Path, margin_inputs: Path,
     paths += [rule_candidates / (name + ".parquet") for name in (
         "margin_level_intervals", "corporate_terms_intervals")]
     projections = [["date", "product", *MARGIN_INPUT_FIELDS],
-                   [*KEYS, *POSITION_INPUT_FIELDS],
+                   [*KEYS, *POSITION_INPUT_FIELDS, *[c for c in POSITION_INPUT_EXTENSIONS
+                       if c in pl.read_parquet_schema(paths[1])]],
                    [*KEYS, "terminal_value_input_twd"], None, None]
     inputs = [read_bound_output(p, columns=columns)[0] for p, columns in zip(paths, projections)]
     margin_manifest = json.loads((margin_inputs / "manifest.json").read_text())

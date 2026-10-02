@@ -34,7 +34,7 @@ COUNT_FIELDS = ("required_requests", "incremental_requests", "backfill_requests"
                 "unbatched_requests", "fastest_requests", "current_plan_requests", "batch_savings",
                 "completed_tasks", "pending_tasks", "blocked_tasks", "cooling_tasks", "inflight_tasks",
                 "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests",
-                "calendar_wait_tasks")
+                "calendar_wait_tasks", "retry_tasks")
 
 
 def _registry() -> dict[str, dict[str, Any]]:
@@ -111,7 +111,8 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                     raise ValueError("invalid_queue_retry_timestamp")
                 item = aggregate.setdefault(dataset, {"classes": Counter(), "range_classes": Counter(),
                                                       "states": Counter(), "derived": 0, "cooling": 0,
-                                                      "inflight_network": 0, "retry_first": None, "retry_last": None})
+                                                      "inflight_network": 0, "retry_first": None, "retry_last": None,
+                                                      "retries_by_class": Counter(), "wait_by_class": {}})
                 item["states"][state] += count
                 work = _work_class(state, priority, bool(due))
                 if work == 'validation' and owner == 'complement':
@@ -119,6 +120,8 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                     if dataset in SUPPLEMENTAL_SOURCES:
                         work = 'backfill'  # Low-priority tick is acquisition, not duplicate validation.
                 if work in {"incremental", "backfill", "validation"}:
+                    if state == 'failed':
+                        item['retries_by_class'][work] += count
                     if kind == "derived":
                         item["derived"] += count
                     else:
@@ -131,6 +134,8 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                             item["retry_first"] = min(item["retry_first"] or first, first)
                         if _stamp(last):
                             item["retry_last"] = max(item["retry_last"] or last, last)
+                            item['wait_by_class'][work] = max(item['wait_by_class'].get(work, 0),
+                                                              (_stamp(last) - now).total_seconds())
                 elif work == "inflight" and kind != "derived":
                     item["inflight_network"] += count
             tables = {value[0] for value in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -138,17 +143,26 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                 # The worker's finite, user-selected priority override precedes
                 # normal background work. Count it in the SAME queue snapshot,
                 # not as extra work or a whole-dataset priority promotion.
-                for dataset, kind, state, count, last in conn.execute('''
-                    SELECT t.dataset,t.kind,t.state,count(*),max(t.next_attempt_at_utc)
-                    FROM tasks t WHERE EXISTS (SELECT 1 FROM finmind_priority_tasks p
+                for dataset, kind, state, count, last, has_id in conn.execute('''
+                    SELECT t.dataset,t.kind,t.state,count(*),max(t.next_attempt_at_utc),t.data_id!=''
+                    FROM tasks t WHERE t.priority!=0 AND EXISTS (SELECT 1 FROM finmind_priority_tasks p
                         WHERE p.dataset=t.dataset AND p.data_id=t.data_id AND p.partition=t.partition)
-                    GROUP BY t.dataset,t.kind,t.state'''):
+                    GROUP BY t.dataset,t.kind,t.state,6'''):
                     item = aggregate[dataset].setdefault('priority_override', {
                         'requests': 0, 'inflight_tasks': 0, 'blocked_tasks': 0,
-                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 0})
+                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 0, 'retry_tasks': 0})
                     if state in PENDING_STATES:
-                        if kind == 'id_day':
-                            item['requests'] += count  # Proven one day/ID per request.
+                        from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL_SOURCES
+                        source = SUPPLEMENTAL_SOURCES.get(dataset)
+                        # The worker dispatches supplemental queries by the
+                        # source contract, not the old queue's kind spelling.
+                        # Both legacy `day` and current `id_day` cost one
+                        # per-ID/day call. Priority zero was already counted
+                        # as incremental work and must not move a second time.
+                        if (source and source.grain == 'day' and kind in {'day', 'id_day'}
+                                and bool(has_id) == (source.universe != 'market')):
+                            item['requests'] += count
+                            item['retry_tasks'] += count if state == 'failed' else 0
                             retry = _stamp(last)
                             item['max_retry_wait_seconds'] = max(item['max_retry_wait_seconds'],
                                                                  (retry - now).total_seconds() if retry else 0)
@@ -268,6 +282,9 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
                calendar_wait_tasks=states['calendar_wait'],
                inflight_tasks=states["inflight"], inflight_requests=item["inflight_network"],
                local_derived_tasks=item["derived"], cooling_tasks=item["cooling"],
+               retry_tasks=sum(item['retries_by_class'].values()),
+               retry_tasks_by_class=dict(item['retries_by_class']),
+               retry_wait_seconds_by_class=item['wait_by_class'],
                earliest_retry_at_utc=item["retry_first"], state_counts=dict(states))
     if item.get('frontier'):
         row['historical_frontier'] = item['frontier']
@@ -308,6 +325,16 @@ def _free_rows(root: Path, now: datetime, catalog: dict[str, dict[str, Any]]) ->
                        fastest_requests=pending, unbatched_requests=pending, completed_tasks=complete,
                        pending_tasks=pending, cooling_tasks=deferred, inflight_requests=inflight,
                        inflight_tasks=inflight, basis="fresh_worker_status_not_receipt_rescan")
+            # The worker already visited these receipt heads. Reuse its small
+            # projection instead of rescanning every historical file for ETA.
+            retries = item.get('retry_tasks')
+            if type(retries) is int and 0 <= retries <= pending + inflight:
+                row['retry_tasks'] = retries
+                row['retry_tasks_by_class'] = {'backfill': retries}
+            earliest, latest = (_stamp(item.get(key)) for key in ('earliest_retry_at_utc', 'latest_retry_at_utc'))
+            row['earliest_retry_at_utc'] = earliest.isoformat() if earliest else None
+            row['max_retry_wait_seconds'] = max(0, (latest - now).total_seconds()) if latest else 0
+            row['retry_wait_seconds_by_class'] = {'backfill': row['max_retry_wait_seconds']}
             result[dataset] = row
         local = now.astimezone(TAIPEI)
         for dataset in (CALENDAR_DATASET, MASTER_DATASET):

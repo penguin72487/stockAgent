@@ -18,6 +18,7 @@ from stockagent.data_sync.materialized_cache import (  # noqa: E402
     DEFAULT_CACHE_TTL_DAYS,
     evict_materialized_snapshots,
     materialized_cache_status,
+    prune_partial_materialization,
     use_materialized_snapshot,
 )
 
@@ -90,6 +91,19 @@ def build_parser() -> argparse.ArgumentParser:
     evict.add_argument("dataset")
     evict.add_argument("--snapshot-id")
     evict.add_argument("--dry-run", action="store_true")
+    partial = subparsers.add_parser(
+        "prune-partial",
+        help="audit/prune one abandoned fetch staging tree; not automatic GC",
+    )
+    partial.add_argument("dataset")
+    partial.add_argument("--snapshot-id", required=True)
+    partial.add_argument("--partial-name", required=True)
+    partial.add_argument("--apply", action="store_true")
+    partial.add_argument(
+        "--receipt-dir",
+        type=Path,
+        default=REPO_ROOT / "artifacts/operations/partial-cache-cleanup",
+    )
     return parser
 
 
@@ -146,6 +160,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     edge_mode = edge_state.is_file()
     try:
+        if args.command == "prune-partial":
+            result = prune_partial_materialization(
+                args.sync_root,
+                args.materialized_root,
+                args.dataset,
+                args.snapshot_id,
+                args.partial_name,
+                receipt_dir=args.receipt_dir,
+                apply=args.apply,
+            )
+            _print(
+                {
+                    key: value
+                    for key, value in result.items()
+                    if key not in {"selected", "kept"}
+                }
+            )
+            return 0
         if args.command == "status":
             status = materialized_cache_status(
                 args.sync_root,

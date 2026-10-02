@@ -104,6 +104,15 @@ function renderOpenbb(data) {
     $("openbb-progress").textContent = `${Number(data.completion_percent || 0).toFixed(2)}% · ${Number(data.accepted_tasks || 0).toLocaleString("zh-TW")}/${Number(data.total_tasks || 0).toLocaleString("zh-TW")}`;
 }
 
+function renderTej(data) {
+    setHealth("tej",data.state === "running" ? "updating" : data.state === "needs_review" ? "degraded" : "waiting",
+        data.state === "running" ? "桌面回補中" : data.state === "needs_review" ? "下載需檢查" : "等待桌面工作");
+    $("tej-catalog").textContent = data.tables != null && data.fields != null
+        ? `${Number(data.tables).toLocaleString("zh-TW")} 表／${Number(data.fields).toLocaleString("zh-TW")} 欄` : "未核實";
+    $("tej-progress").textContent = data.exported_rows != null
+        ? `${Number(data.exported_rows).toLocaleString("zh-TW")} 查詢格點 · 非原生歷史完整率` : "尚無驗收匯出";
+}
+
 function renderDataMonitor(data) {
     const label = data.health === "active" ? "全部正常" : data.health === "updating" ? "回補進行中" : "有來源需處理";
     setHealth("data", data.health, label);
@@ -121,7 +130,7 @@ function renderTraffic(data) {
 }
 
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "overnight", "shioaji", "finlab", "finmind", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "overnight", "shioaji", "finlab", "finmind", "tej", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
   $("overnight-freshness").textContent = "無法取得";
@@ -134,6 +143,8 @@ function renderUnavailable() {
   $("finlab-progress").textContent = "進入面板查看";
   $("finmind-quota").textContent = "無法取得";
   $("finmind-progress").textContent = "進入面板查看";
+  $("tej-catalog").textContent = "無法取得";
+  $("tej-progress").textContent = "進入面板查看";
   $("openbb-freshness").textContent = "無法取得";
   $("openbb-progress").textContent = "進入面板查看";
   $("data-registered").textContent = "無法取得";
@@ -153,6 +164,7 @@ async function refresh() {
     renderShioaji(data.shioaji || {});
     renderFinlab(data.finlab || {});
     renderFinmind(data.finmind || {});
+    renderTej(data.tej || {});
     renderOpenbb(data.openbb || {});
     renderDataMonitor(data.data_monitor || {});
     renderTraffic(data.traffic || {});

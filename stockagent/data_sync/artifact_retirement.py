@@ -1,7 +1,7 @@
 """Fail-closed transition of one complete artifact run from hot to cold-only.
 
 The packed release and independent backup are never modified here.  A run is
-retired only after an explicit seven-day lease, exact source/mirror comparison,
+retired only after an explicit seven-day lease (or a one-shot manual age bypass), exact source/mirror comparison,
 independent D verification, and the configured local/peer transport proof.
 Dataset materialization is handled separately by
 the existing seven-day materialized-cache controller.
@@ -18,9 +18,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
+from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.cold_artifacts import (
     COLD_ACTIVATION_SCHEMA_VERSION,
     ColdArtifactSpec,
@@ -142,6 +143,73 @@ def _hot_mirror(
     }
 
 
+def _reclaimable_file_bytes(*trees: Path) -> int:
+    """Count allocated file blocks only when all inode names will be removed.
+
+    Source and the old transport often share inodes. External hard links must
+    not be counted as recovered space; later retirement of their last name may
+    count those blocks instead. Directory blocks and filesystem overhead are
+    deliberately excluded.
+    """
+
+    inodes: dict[tuple[int, int], list[int]] = {}
+    for tree in trees:
+        if not tree.exists():
+            continue
+        for directory, _dirnames, filenames in os.walk(tree, followlinks=False):
+            for name in filenames:
+                info = (Path(directory) / name).lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise SnapshotError("retirement space audit found a non-regular file")
+                key = (info.st_dev, info.st_ino)
+                record = inodes.setdefault(key, [info.st_nlink, info.st_blocks * 512, 0])
+                if record[:2] != [info.st_nlink, info.st_blocks * 512]:
+                    raise SnapshotError("retirement inode changed during space audit")
+                record[2] += 1
+    return sum(allocated for links, allocated, removed in inodes.values() if links == removed)
+
+
+def _assert_unlink_gates(plan: Mapping[str, Any], quarantine: Path, **options: Any) -> dict[str, Any]:
+    """Refresh usage and transport after the potentially long rename audit.
+
+    Failure leaves the exact hot bytes in quarantine for review, never unlinks
+    them or an immutable cold object. Original service paths are checked even
+    though the verified files now live under quarantine.
+    """
+
+    source = Path(plan["source"])
+    artifact_root = Path(options["artifact_root"])
+    refs = artifact_process_references(source, artifact_root / "markets")
+    for path in (Path(plan["hot_tree"]), quarantine):
+        refs.extend(process_references(path))
+    if refs:
+        raise SnapshotError("retirement post-rename process references; quarantine retained")
+    services = artifact_service_references((source,), options.get("repo_root", artifact_root.parent))
+    if services[str(source)]:
+        raise SnapshotError("retirement post-rename service reference; quarantine retained")
+    if str(plan["snapshot_id"]) in _pinned_snapshot_ids(Path(options["materialized_root"])):
+        raise SnapshotError("retirement post-rename release pinned; quarantine retained")
+    if not options["bridge_inactive"] or _running_hot_bridge(Path(options["hot_root"])):
+        raise SnapshotError("retirement post-rename hot bridge active; quarantine retained")
+    probe = options.get("peer_probe")
+    proof = probe() if probe is not None else options["peer_proof"]
+    peers = {row.get("name"): row for row in proof.get("peers", []) if isinstance(row, Mapping)}
+    if proof.get("ok") is not True or any(
+        peers.get(name, {}).get("ok") is not True for name in options.get("required_peer_names", ())
+    ):
+        raise SnapshotError("retirement post-rename transport not converged; quarantine retained")
+    try:
+        checked = datetime.fromisoformat(str(proof["checked_at"]))
+        if checked.tzinfo is None:
+            raise ValueError("missing timezone")
+        age = (datetime.now(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds()
+        if not -5 <= age <= 300:
+            raise ValueError("stale transport proof")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SnapshotError("retirement post-rename transport proof stale; quarantine retained") from exc
+    return dict(proof)
+
+
 def plan_artifact_retirement(
     spec: ColdArtifactSpec,
     *,
@@ -155,6 +223,8 @@ def plan_artifact_retirement(
     required_peer_names: tuple[str, ...],
     bridge_inactive: bool,
     retention_days: float = 7.0,
+    manual_immediate: bool = False,
+    peer_probe: Callable[[], Mapping[str, Any]] | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
     """Return a read-only, fingerprinted plan for one registered *full* run."""
@@ -163,6 +233,8 @@ def plan_artifact_retirement(
         raise SnapshotError("partial cold artifact releases cannot retire a whole run")
     if retention_days <= 0:
         raise SnapshotError("artifact retirement lease must be positive")
+    if type(manual_immediate) is not bool:
+        raise SnapshotError("manual immediate retirement must be an explicit boolean")
     _validate_roots(artifact_root, hot_root, sync_root)
     artifact_root = artifact_root.resolve()
     hot_root = hot_root.resolve()
@@ -211,31 +283,38 @@ def plan_artifact_retirement(
         retention_days * 86_400 * 1_000_000_000
     )
     references = artifact_process_references(source, artifact_root / relative.parts[0])
+    service_references = artifact_service_references((source,), artifact_root.parent)[str(source)]
     if hot_tree.is_dir():
         references.extend(process_references(hot_tree))
     blockers: list[str] = []
     if state is None:
-        blockers.append("seven-day-use-lease-not-enrolled")
+        if not manual_immediate:
+            blockers.append("seven-day-use-lease-not-enrolled")
     elif state.get("state") == "retiring":
         blockers.append("unfinished-retirement-state-requires-audit")
-    elif current_ns < expiry_ns:
+    elif state.get("state") != "hot-enrolled":
+        blockers.append("retirement-state-is-not-hot-enrolled")
+    elif current_ns < expiry_ns and not manual_immediate:
         blockers.append("seven-day-use-lease-active")
     if references:
         blockers.append("artifact-has-process-references")
+    if service_references:
+        blockers.append("enabled-service-references-artifact")
     if str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(materialized_root):
         blockers.append("artifact-release-is-pinned")
+    current_peer_proof = peer_probe() if peer_probe is not None else peer_proof
     observed_peers = {
         str(row.get("name")): row
-        for row in peer_proof.get("peers", [])
+        for row in current_peer_proof.get("peers", [])
         if isinstance(row, Mapping)
     }
-    if peer_proof.get("ok") is not True or any(
+    if current_peer_proof.get("ok") is not True or any(
         observed_peers.get(name, {}).get("ok") is not True
         for name in required_peer_names
     ):
         blockers.append("intended-cold-peers-not-converged")
     try:
-        checked = datetime.fromisoformat(str(peer_proof["checked_at"]))
+        checked = datetime.fromisoformat(str(current_peer_proof["checked_at"]))
         if checked.tzinfo is None:
             raise ValueError("peer proof timestamp has no timezone")
         age = (datetime.now(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds()
@@ -258,6 +337,8 @@ def plan_artifact_retirement(
         "source_stability_sha256": source_tree["stability_fingerprint_sha256"],
         "hot_fingerprint": mirror["fingerprint"],
         "last_used_ns": last_used_ns,
+        "manual_immediate": manual_immediate,
+        "retention_days": retention_days,
     }
     fingerprint = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
@@ -271,8 +352,9 @@ def plan_artifact_retirement(
         "hot_mirror": mirror,
         "lease_expires_at": _utc_iso_from_ns(expiry_ns),
         "process_references": references,
+        "service_references": service_references,
         **cold_proof,
-        "peer_proof": dict(peer_proof),
+        "peer_proof": dict(current_peer_proof),
         "blockers": blockers,
         "apply_ready": not blockers,
     }
@@ -306,7 +388,7 @@ def apply_artifact_retirement(
             }
             atomic_write_json(state_path, state)
             return {**plan, "action": "enrolled", "deleted": False}
-        if plan["process_references"]:
+        if plan["process_references"] and not plan["manual_immediate"]:
             state = _read_state(state_path)
             assert state is not None
             now_ns = int(plan_options.get("now_ns") or time.time_ns())
@@ -315,6 +397,24 @@ def apply_artifact_retirement(
             return {**plan, "action": "renewed-in-use", "deleted": False}
         if plan["blockers"]:
             raise SnapshotError("artifact retirement blocked: " + ", ".join(plan["blockers"]))
+
+        # A manual age bypass never fabricates an expired lease. Preserve an
+        # existing lease or record the actual enrollment time for the audit.
+        state = _read_state(state_path)
+        if state is None:
+            now_ns = int(plan_options.get("now_ns") or time.time_ns())
+            state = {
+                "schema_version": RETIREMENT_SCHEMA_VERSION,
+                "dataset": spec.dataset,
+                "artifact_relative_root": spec.relative_root,
+                "state": "hot-enrolled",
+                "last_used_ns": now_ns,
+                "last_used_at": _utc_iso_from_ns(now_ns),
+                "enrolled_at": _utc_iso_from_ns(now_ns),
+            }
+        state.update(manual_immediate=plan["manual_immediate"],
+                     plan_fingerprint=plan["plan_fingerprint"])
+        atomic_write_json(state_path, state)
 
         # The directory-level tombstone is local to this node. Syncthing's
         # (?d)/path ignores the directory and descendants; the hot bridge uses
@@ -369,6 +469,10 @@ def apply_artifact_retirement(
                 quarantine / "hot",
                 _load_inventory(Path(plan_options["sync_root"]), resolved.manifest),
             )
+        verify_cold_resilience(Path(plan_options["sync_root"]), resolved, Path(plan_options["backup_config"]))
+        unlink_peer_proof = _assert_unlink_gates(plan, quarantine, **plan_options)
+        reclaimed_bytes = _reclaimable_file_bytes(quarantine / "source", quarantine / "hot")
+        if (quarantine / "hot").exists():
             shutil.rmtree(quarantine / "hot")
         shutil.rmtree(quarantine / "source")
         quarantine.rmdir()
@@ -377,7 +481,9 @@ def apply_artifact_retirement(
             snapshot_id=plan["snapshot_id"],
             manifest_sha256=plan["manifest_sha256"],
             retired_at=_utc_iso_from_ns(time.time_ns()),
+            reclaimed_allocated_file_bytes=reclaimed_bytes,
         )
         state.pop("quarantine", None)
         atomic_write_json(state_path, state)
-        return {**plan, "action": "retired", "deleted": True}
+        return {**plan, "action": "retired", "deleted": True,
+                "reclaimed_allocated_file_bytes": reclaimed_bytes, "unlink_peer_proof": unlink_peer_proof}

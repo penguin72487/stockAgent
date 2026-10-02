@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 import os
 from typing import Any, Callable
 import warnings
@@ -452,6 +452,73 @@ class PreparedDayTradeCarryBatch:
         return tuple(result)
 
 
+def _project_carry_session(
+    session: DayTradeCarrySession, indices: list[int],
+) -> DayTradeCarrySession:
+    """Project dense fields and CSR event identities through the same stock axis."""
+    index = torch.tensor(indices, device=session.official_open.device, dtype=torch.long)
+    sparse = session.uses_sparse_events
+    event_fields = {"exit_prices", "exit_capacity", "exit_symbol_indices", "exit_sides"}
+    values = {
+        field.name: getattr(session, field.name).index_select(0, index)
+        for field in fields(session)
+        if isinstance(getattr(session, field.name), torch.Tensor)
+        and not (sparse and field.name in event_fields)
+    }
+    if sparse:
+        starts = session.symbol_event_starts.index_select(0, index)
+        ends = session.symbol_event_ends.index_select(0, index)
+        counts = ends - starts
+        event_index = torch.cat([
+            torch.arange(int(start), int(end), device=index.device)
+            for start, end in zip(starts, ends, strict=True)
+        ])
+        values["symbol_event_ends"] = counts.cumsum(0)
+        values["symbol_event_starts"] = values["symbol_event_ends"] - counts
+        if event_index.numel():
+            for name in ("exit_prices", "exit_capacity", "exit_sides"):
+                values[name] = getattr(session, name).index_select(0, event_index)
+            values["exit_symbol_indices"] = torch.repeat_interleave(
+                torch.arange(len(indices), device=index.device), counts
+            )
+        else:
+            # The canonical sparse ABI retains one non-executable padding slot.
+            values["exit_prices"] = session.exit_prices.new_full((1,), float("nan"))
+            values["exit_capacity"] = session.exit_capacity.new_zeros((1,))
+            values["exit_sides"] = index.new_zeros((1,))
+            values["exit_symbol_indices"] = index.new_full((1,), len(indices) - 1)
+    return replace(session, **values)
+
+
+def _project_packed_carry_session(
+    session: PackedDayTradeCarrySession, indices: list[int],
+) -> PackedDayTradeCarrySession:
+    """Reindex lossless transport without allocating the dense 270 x 2 exit tape."""
+    session.validate()
+    index = torch.tensor(indices, device=session.official_open.device, dtype=torch.long)
+    remap = index.new_full((session.official_open.numel(),), -1)
+    remap[index] = torch.arange(len(indices), device=index.device)
+    event_symbols = torch.div(session.exit_flat, 540, rounding_mode="floor")
+    mapped = remap[event_symbols]
+    kept = torch.nonzero(mapped >= 0, as_tuple=False).flatten()
+    flat = mapped[kept] * 540 + session.exit_flat[kept].remainder(540)
+    order = torch.argsort(flat, stable=True)
+    kept = kept[order]
+    event_fields = {"exit_flat", "exit_price", "exit_capacity"}
+    values = {
+        field.name: getattr(session, field.name).index_select(0, index)
+        for field in fields(session)
+        if isinstance(getattr(session, field.name), torch.Tensor)
+        and field.name not in event_fields
+    }
+    values.update(
+        exit_flat=flat[order],
+        exit_price=session.exit_price[kept],
+        exit_capacity=session.exit_capacity[kept],
+    )
+    return replace(session, **values)
+
+
 @dataclass(frozen=True)
 class PreparedDayTradeCarrySource:
     sessions: tuple[DayTradeCarrySession, ...]
@@ -462,6 +529,7 @@ class PreparedDayTradeCarrySource:
     compact_session_loader: Callable[[int], DayTradeCarrySession] | None = None
     packed_session_loader: Callable[[int], PackedDayTradeCarrySession] | None = None
     audit_receipt: dict[str, Any] | None = None
+    runtime_cache_info: Callable[[], dict[str, Any]] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _validate_checkpoint_identity(self.universe, self.release_id, len(self.universe))
@@ -490,6 +558,55 @@ class PreparedDayTradeCarrySource:
 
     def day_at(self, row: int) -> int:
         return self.session_days[int(row)]
+
+    def project_universe(self, symbols: tuple[str, ...]) -> PreparedDayTradeCarrySource:
+        """Retain the receipt-bound release while lazily projecting every executor field.
+
+        Checkpoint-only masked feature slots do not establish physical prices,
+        liquidity or corporate-action evidence. Reject unknown source symbols
+        instead of silently reverting to the legacy proportional ledger.
+        """
+        _validate_checkpoint_identity(symbols, self.release_id, len(symbols))
+        if symbols == self.universe:
+            return self
+        index_by_symbol = {symbol: index for index, symbol in enumerate(self.universe)}
+        missing = [symbol for symbol in symbols if symbol not in index_by_symbol]
+        if missing:
+            raise ValueError(
+                "physical source projection is missing verified symbols: "
+                + ", ".join(missing[:10])
+            )
+        indices = [index_by_symbol[symbol] for symbol in symbols]
+
+        def load_session(row: int) -> DayTradeCarrySession:
+            return _project_carry_session(self.session_at(row), indices)
+
+        def load_compact(row: int) -> DayTradeCarrySession:
+            return _project_carry_session(self.compact_session_at(row), indices)
+
+        def load_packed(row: int) -> PackedDayTradeCarrySession:
+            if row < 0 or row >= len(self):
+                raise IndexError("physical source row is outside its pinned calendar")
+            packed = self.packed_session_loader(row)  # type: ignore[misc]
+            if packed.day != self.session_days[row]:
+                raise ValueError("packed physical session differs from its pinned calendar")
+            return _project_packed_carry_session(packed, indices)
+
+        audit = dict(self.audit_receipt or {})
+        audit["projected_from_universe"] = list(self.universe)
+        audit["projected_symbol_indices"] = indices
+        return PreparedDayTradeCarrySource(
+            sessions=(), universe=symbols, release_id=self.release_id,
+            session_days=self.session_days, session_loader=load_session,
+            compact_session_loader=(
+                load_compact if self.compact_session_loader is not None else None
+            ),
+            packed_session_loader=(
+                load_packed if self.packed_session_loader is not None else None
+            ),
+            audit_receipt=audit,
+            runtime_cache_info=self.runtime_cache_info,
+        )
 
     def session_at(self, row: int) -> DayTradeCarrySession:
         index = int(row)
@@ -546,21 +663,12 @@ class PreparedDayTradeCarrySource:
         result = []
         for row in row_indices:
             session = self.session_at(row)
+            selected = session if identity else _project_carry_session(session, symbol_indices)
             values = {}
-            index_by_device = {}
             for field in fields(session):
-                value = getattr(session, field.name)
+                value = getattr(selected, field.name)
                 if isinstance(value, torch.Tensor):
-                    if identity:
-                        selected = value
-                    else:
-                        index = index_by_device.get(value.device)
-                        if index is None:
-                            index = index_by_device[value.device] = torch.tensor(
-                                symbol_indices, device=value.device
-                            )
-                        selected = value.index_select(0, index)
-                    values[field.name] = selected.to(device=device, dtype=torch.float64)
+                    values[field.name] = value.to(device=device)
             result.append(replace(session, **values))
         return tuple(result)
 

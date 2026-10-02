@@ -8,13 +8,12 @@ import io
 import json
 import os
 import re
-import shutil
 import stat
 import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from stockagent.data_sync.desync_snapshots import (
     DEFAULT_MAX_CLOCK_SKEW_SECONDS,
@@ -1333,6 +1332,7 @@ def verify_packed_snapshot(
     resolved: ResolvedSnapshot,
     *,
     materialized_path: Path | None = None,
+    reconstruct_paths: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     sync_root = sync_root.resolve()
     manifest = resolved.manifest
@@ -1344,6 +1344,20 @@ def verify_packed_snapshot(
     _validate_object_presence(sync_root, manifest)
     entries = _load_inventory(sync_root, manifest)
     inventory_result = _validate_inventory(manifest, entries)
+    selected_paths = set(reconstruct_paths) if reconstruct_paths is not None else None
+    file_rows = (
+        {row["path"]: row for row in entries if row["kind"] == "file"}
+        if selected_paths is not None else {}
+    )
+    if selected_paths is not None and not selected_paths.issubset(file_rows):
+        raise SnapshotError(
+            "reconstruction request contains a non-file or unknown inventory path"
+        )
+    selected_by_object: dict[str, list[dict[str, Any]]] = {}
+    for relative in sorted(selected_paths or ()):
+        row = file_rows[relative]
+        selected_by_object.setdefault(row["storage"]["object_sha256"], []).append(row)
+    reconstructed_files = 0
     verified_bytes = 0
     for item in manifest["archive"]["objects"]:
         path = _path_under(sync_root, str(item["relpath"]), "object relpath")
@@ -1372,7 +1386,26 @@ def verify_packed_snapshot(
                 with zipfile.ZipFile(source, mode="r") as archive:
                     names = archive.namelist()
                     bad_member = archive.testzip()
-            except (OSError, zipfile.BadZipFile) as exc:
+                    # Reuse these already-hashed immutable pack bytes, rather
+                    # than reopen a DrvFs/HDD pack per small cached file.
+                    for row in selected_by_object.get(str(item["sha256"]), ()):
+                        digest = hashlib.sha256()
+                        decoded_size = 0
+                        with archive.open(
+                            str(row["storage"]["member"]), mode="r"
+                        ) as stream:
+                            while chunk := stream.read(8 * 1024 * 1024):
+                                decoded_size += len(chunk)
+                                digest.update(chunk)
+                        if (
+                            decoded_size != int(row["size"])
+                            or digest.hexdigest() != row["sha256"]
+                        ):
+                            raise SnapshotError(
+                                f"exact cold reconstruction failed: {row['path']}"
+                            )
+                        reconstructed_files += 1
+            except (OSError, KeyError, zipfile.BadZipFile) as exc:
                 raise SnapshotError(f"invalid ZIP pack {path}: {exc}") from exc
             if item.get("member_selection") == "subset":
                 if not _is_ordered_subset(expected_names, names):
@@ -1383,6 +1416,13 @@ def verify_packed_snapshot(
                 raise SnapshotError(f"ZIP member list differs from inventory: {path}")
             if bad_member is not None:
                 raise SnapshotError(f"ZIP CRC check failed for {bad_member} in {path}")
+        else:
+            for row in selected_by_object.get(str(item["sha256"]), ()):
+                if actual != row["sha256"] or int(item["bytes"]) != int(row["size"]):
+                    raise SnapshotError(
+                        f"exact cold blob reconstruction failed: {row['path']}"
+                    )
+                reconstructed_files += 1
     result: dict[str, Any] = {
         "snapshot_id": manifest["snapshot_id"],
         "manifest_sha256": resolved.manifest_sha256,
@@ -1391,6 +1431,10 @@ def verify_packed_snapshot(
         "verified_object_bytes": verified_bytes,
         "materialized_verified": False,
     }
+    if selected_paths is not None:
+        if reconstructed_files != len(selected_paths):
+            raise SnapshotError("not every requested file was reconstructed")
+        result["independently_reconstructed_files"] = reconstructed_files
     if materialized_path is not None:
         _verify_materialized(materialized_path, manifest, entries)
         result["materialized_verified"] = True

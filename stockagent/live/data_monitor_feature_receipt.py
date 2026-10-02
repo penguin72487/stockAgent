@@ -32,6 +32,23 @@ def feature_reuse_checksum(signature: list[int], digest: str, fields: int) -> st
     return hashlib.sha256(encoded).hexdigest()
 
 
+def feature_observation_binding(signature: list[int], digest: str, fields: int, root: str) -> str | None:
+    """Additive producer coherence proof; never changes the public v1 snapshot."""
+    if (
+        not isinstance(signature, list) or len(signature) != 5
+        or any(type(value) is not int or value < 0 for value in signature)
+        or not isinstance(digest, str) or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+        or type(fields) is not int or not 0 <= fields <= 10_000_000
+        or not isinstance(root, str) or len(root) != 32
+        or any(char not in "0123456789abcdef" for char in root)
+    ):
+        return None
+    return hashlib.sha256(json.dumps(
+        ["source-observation-v1", signature, digest, fields, root], separators=(",", ":"),
+    ).encode("ascii")).hexdigest()
+
+
 def feature_revision_binding(
     signature: list[int], source_digest: str, fields: int,
     revision: str | None, source_metadata_sha256: str | None,

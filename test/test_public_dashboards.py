@@ -620,13 +620,14 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=10"' in html
-    assert 'src="public.js?v=12"' in html
+    assert 'src="dashboard-core.js?v=11"' in html
+    assert 'src="public.js?v=13"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
     assert 'id="finlab-health"' in html
     assert 'id="finmind-health"' in html
+    assert 'id="tej-health"' in html
     assert 'id="openbb-health"' in html
     assert 'id="data-health"' in html
     assert 'id="traffic-health"' in html
@@ -639,6 +640,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert "renderOpenbb(data.openbb || {})" in javascript
     assert "renderFinlab(data.finlab || {})" in javascript
     assert "renderFinmind(data.finmind || {})" in javascript
+    assert "renderTej(data.tej || {})" in javascript
     assert "renderDataMonitor(data.data_monitor || {})" in javascript
     assert "renderTraffic(data.traffic || {})" in javascript
     assert "textContent" in javascript
@@ -937,6 +939,7 @@ def test_public_pages_share_visual_tokens() -> None:
         "shioaji_api_dashboard/index.html": "shioaji",
         "finlab_dashboard/index.html": "finlab",
         "finmind_dashboard/index.html": "finmind",
+        "tej_dashboard/index.html": "tej",
         "openbb_archive_dashboard/index.html": "openbb",
         "data_monitor_dashboard/index.html": "data-monitor",
         "traffic_dashboard/index.html": "traffic",
@@ -946,8 +949,8 @@ def test_public_pages_share_visual_tokens() -> None:
         assert "dashboard-core.css?v=6" in html
         assert "dashboard-responsive.css?v=9" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=10" defer' in html
-        assert html.index("dashboard-core.js?v=10") < html.index(
+        assert 'dashboard-core.js?v=11" defer' in html
+        assert html.index("dashboard-core.js?v=11") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -1245,7 +1248,7 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=13' in page
+        assert b'app.js?v=15' in page
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
     finally:

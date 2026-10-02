@@ -24,8 +24,11 @@ from typing import Any
 from uuid import uuid4
 
 
+# Footer/cache row semantics remain v10 for already-running read-only readers.
+# The new, independently versioned membership proof is an additive extension.
 INVENTORY_VERSION = 10
-FAST_INDEX_VERSION = 2
+DATASET_MEMBERSHIP_VERSION = 1
+FAST_INDEX_VERSION = 4
 FAST_INDEX_PREFLIGHT_HINTS = 512
 DEFAULT_REFRESH_FILES = 4_096
 DEFAULT_IDENTITY_REFRESH_FILES = 1_024
@@ -54,10 +57,49 @@ class InventorySnapshot:
     root: Path
     payload: Mapping[str, Any] | None = None
     selected: dict[str, list[Path]] | None = None
+    previous_cache_signature: list[int] | None = None
+    cache_signature: list[int] | None = None
+    changed_dataset_ids: frozenset[str] | None = None
 
     def check_root(self, root: Path) -> None:
         if self.root.resolve() != root.resolve():
             raise ValueError("inventory snapshot belongs to another repository")
+
+
+class _SourceObservation:
+    """Actual stat/absence witnessed by one existing projection scan, not PIT."""
+
+    def __init__(self) -> None:
+        self.datasets: dict[str, Any] = {}
+        self.matches_cache = True
+
+    def start(self, dataset: str) -> None:
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(b"D" + dataset.encode("utf-8") + b"\0")
+        self.datasets[dataset] = digest
+
+    def observe(self, dataset: str, path: Path, source_stat: os.stat_result | None, *,
+                entry: Mapping[str, Any] | None) -> None:
+        digest = self.datasets[dataset]
+        digest.update(b"F" + os.fsencode(path) + b"\0")
+        if source_stat is None:
+            digest.update(b"?")
+            self.matches_cache = False
+        else:
+            identity = _file_identity(source_stat)
+            digest.update(b"I" + struct.pack("<QQQQQ", *identity))
+            if not isinstance(entry, Mapping) or entry.get("file_identity") != identity:
+                self.matches_cache = False
+
+    def root(self) -> str:
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(b"source-observation-v1\0")
+        for dataset, observed in sorted(self.datasets.items()):
+            digest.update(b"D" + dataset.encode("utf-8") + b"\0" + observed.digest())
+        return digest.hexdigest()
+
+    def dataset_root(self, dataset: str) -> str:
+        return self.datasets[dataset].hexdigest()
 
 
 def _sorted_paths(paths) -> list[Path]:
@@ -209,15 +251,113 @@ def _selection_fingerprint(
     return digest.hexdigest()
 
 
-def _membership_fingerprint(selected: Mapping[str, list[Path]]) -> str:
-    """Track dataset assignment even when two files have identical aggregates."""
+def _dataset_memberships(selected: Mapping[str, list[Path]]) -> dict[str, str]:
+    """Order-sensitive membership of each dataset, including empty datasets."""
 
-    digest = hashlib.blake2b(digest_size=16)
-    for dataset, paths in sorted(selected.items()):
+    memberships = {}
+    for dataset, paths in selected.items():
+        digest = hashlib.blake2b(digest_size=16)
         digest.update(b"D" + dataset.encode("utf-8") + b"\0")
         for path in paths:
             digest.update(b"F" + os.fsencode(path) + b"\0")
+        memberships[dataset] = digest.hexdigest()
+    return memberships
+
+
+def _membership_root(memberships: Mapping[str, str]) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(b"dataset-membership-v1\0")
+    for dataset, fingerprint in sorted(memberships.items()):
+        digest.update(b"D" + dataset.encode("utf-8") + b"\0")
+        digest.update(b"M" + fingerprint.encode("ascii") + b"\0")
     return digest.hexdigest()
+
+
+def _membership_fingerprint(selected: Mapping[str, list[Path]]) -> str:
+    """Bind the per-dataset tree, not only the union of physical file paths."""
+
+    return _membership_root(_dataset_memberships(selected))
+
+
+def _bound_dataset_memberships(payload: Mapping[str, Any]) -> Mapping[str, str] | None:
+    members = payload.get("dataset_memberships")
+    version = payload.get("dataset_membership_version")
+    if (
+        type(version) is not int or version != DATASET_MEMBERSHIP_VERSION
+        or not isinstance(members, Mapping)
+        or any(not isinstance(key, str) or not isinstance(value, str)
+               or re.fullmatch(r"[0-9a-f]{32}", value) is None
+               for key, value in members.items())
+    ):
+        return None
+    return members if _membership_root(members) == payload.get("selection_membership") else None
+
+
+def inventory_dataset_delta(
+    before: Mapping[str, Any], after: Mapping[str, Any],
+    selected: Mapping[str, list[Path]],
+    *, memberships: Mapping[str, str] | None = None,
+) -> set[str] | None:
+    """Find affected and retired datasets; this is NOT a freshness exemption.
+
+    Versioned membership trees let additions/removals and reassignment be
+    narrowed without guessing the old owner from today's paths. Missing or
+    corrupt bindings require full reconstruction. Callers must still recheck
+    source identities and validate their output generation before row reuse.
+    """
+
+    if any(type(payload.get("version")) is not int
+           or payload.get("version") != INVENTORY_VERSION for payload in (before, after)):
+        return None
+    states = []
+    for payload in (before, after):
+        members = _bound_dataset_memberships(payload)
+        files, schemas, datasets = (payload.get(name) for name in ("files", "schemas", "datasets"))
+        if (
+            members is None
+            or not isinstance(files, Mapping) or not isinstance(schemas, Mapping)
+            or not isinstance(datasets, Mapping)
+            or any(not isinstance(key, str) for key in files)
+            or any(not isinstance(value, Mapping) for value in files.values())
+            or any(not isinstance(datasets.get(key), Mapping) for key in members)
+        ):
+            return None
+        states.append((members, files, schemas, datasets))
+    old_members, old_files, old_schemas, old_datasets = states[0]
+    new_members, new_files, new_schemas, new_datasets = states[1]
+    observed_members = memberships if memberships is not None else _dataset_memberships(selected)
+    if new_members != observed_members:
+        return None
+    changed_schemas = {
+        key for key in old_schemas.keys() | new_schemas.keys()
+        if old_schemas.get(key) != new_schemas.get(key)
+    }
+    changed_paths = set()
+    for key in old_files.keys() | new_files.keys():
+        old, new = old_files.get(key, {}), new_files.get(key, {})
+        if (old.get("stats"), old.get("error"), old.get("file_identity")) != (
+            new.get("stats"), new.get("error"), new.get("file_identity"),
+        ):
+            changed_paths.add(key)
+        for entry in (old, new):
+            info = entry.get("stats")
+            if isinstance(info, Mapping):
+                schema_id = info.get("schema_id")
+                if not isinstance(schema_id, str):
+                    return None
+                if schema_id in changed_schemas:
+                    changed_paths.add(key)
+    changed = set(old_members.keys() - new_members.keys())
+    # datasets also contains non-owning rollups (group:* and yahoo:equities).
+    # Only physical selected datasets own feature rows; never double-count them.
+    for dataset, paths in selected.items():
+        if (
+            old_members.get(dataset) != new_members[dataset]
+            or old_datasets.get(dataset) != new_datasets[dataset]
+            or any(str(path) in changed_paths for path in paths)
+        ):
+            changed.add(dataset)
+    return changed
 
 
 def _quick_index_path(cache_path: Path) -> Path:
@@ -236,7 +376,11 @@ def _quick_index_checksum(payload: Mapping[str, Any]) -> str:
 def _read_quick_index(
     root: Path, cache_path: Path, *, snapshot: InventorySnapshot | None,
     discovered_on_miss: list[dict[str, list[Path]]] | None = None,
+    observation: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    probe = observation if observation is not None else {}
+    probe.update({"schema_version": 1, "policy": "unknown", "hints_checked": 0,
+                  "full_signature_probe": False, "outcome": "index_unavailable"})
     index_path = _quick_index_path(cache_path)
     index_signature = _cache_signature(index_path, trusted_index=True)
     cache_signature = _cache_signature(cache_path)
@@ -257,18 +401,30 @@ def _read_quick_index(
         or not isinstance(payload.get("feature_revision"), str)
         or len(payload["feature_revision"]) != 32
         or not isinstance(payload.get("selection_fingerprint"), str)
+        or not isinstance(payload.get("source_observation_root"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", payload["source_observation_root"]) is None
+        or payload.get("source_observation_matches_cache") is not True
         or not isinstance(payload.get("checksum"), str)
     ):
+        probe["outcome"] = "index_contract_invalid"
         return None
+    policy = payload.get("preflight_policy")
+    probe["policy"] = (
+        policy if policy == "refreshed-priority-uniform-v1" or policy == "recent-ctime-desc-v1"
+        else "unspecified_legacy" if policy is None else "unknown"
+    )
     try:
         if payload["checksum"] != _quick_index_checksum(payload):
+            probe["outcome"] = "index_checksum_invalid"
             return None
     except (TypeError, ValueError):
+        probe["outcome"] = "index_checksum_invalid"
         return None
     # A changed hint can only force the already-existing complete slow path.
     # Passing hints never replaces the full membership/file-identity scan.
     preflight_hints = payload.get("preflight_file_hints", [])
     if not isinstance(preflight_hints, list) or len(preflight_hints) > FAST_INDEX_PREFLIGHT_HINTS:
+        probe["outcome"] = "hint_contract_invalid"
         return None
     for hint in preflight_hints:
         if (
@@ -277,31 +433,45 @@ def _read_quick_index(
             or not isinstance(hint[1], list) or len(hint[1]) != 5
             or any(type(value) is not int for value in hint[1])
         ):
+            probe["outcome"] = "hint_contract_invalid"
             return None
+        probe["hints_checked"] += 1
         try:
             if _file_identity(Path(hint[0]).stat()) != hint[1]:
+                probe["outcome"] = "source_hint_changed"
                 return None
         except (OSError, ValueError):
+            probe["outcome"] = "source_hint_unavailable"
             return None
     stage_started = time.perf_counter()
     selected = _selected_files(root)
     discover_ms = round((time.perf_counter() - stage_started) * 1_000, 3)
     stage_started = time.perf_counter()
+    probe["full_signature_probe"] = True
     fingerprint = _selection_fingerprint(selected)
     signature_scan_ms = round((time.perf_counter() - stage_started) * 1_000, 3)
-    if fingerprint is None or _cache_signature(cache_path) != cache_signature:
+    if fingerprint is None:
+        probe["outcome"] = "full_probe_source_unavailable"
+        return None
+    if _cache_signature(cache_path) != cache_signature:
+        probe["outcome"] = "cache_moved_during_probe"
         return None
     if fingerprint != payload["selection_fingerprint"]:
+        probe["outcome"] = "full_signature_changed"
         # A source changed, but the directory membership was just discovered
         # under a validated index/cache pair. The slow path will re-stat every
         # selected file and re-read changed footers; it need not glob again.
         if discovered_on_miss is not None:
             discovered_on_miss.append(selected)
         return None
+    probe["outcome"] = "unchanged_full_probe"
     if snapshot is not None:
         snapshot.check_root(root)
         snapshot.payload = None
         snapshot.selected = selected
+        snapshot.previous_cache_signature = cache_signature
+        snapshot.cache_signature = cache_signature
+        snapshot.changed_dataset_ids = frozenset()
     return {
         "datasets": dict(payload["datasets"]),
         "refreshed_files": 0,
@@ -309,6 +479,8 @@ def _read_quick_index(
         "cached_files": payload["cached_files"],
         "identity_unbound_files": 0,
         "feature_revision": payload["feature_revision"],
+        "source_observation_root": payload["source_observation_root"],
+        "source_observation_matches_cache": True,
         "fast_index_hit": True,
         "changed_dataset_ids": [],
         "timing_ms": {
@@ -320,11 +492,35 @@ def _read_quick_index(
     }
 
 
+def _preflight_keys(cache: Mapping[str, Any], *, recently_refreshed=(), seed: str = "") -> list[str]:
+    """Hint from real refreshes, not cross-filesystem ctime; never proves freshness.
+
+    Reserve one quarter of hints for the remaining namespace. Every passing
+    hint set still takes the complete canonical source-identity probe.
+    """
+    limit = min(FAST_INDEX_PREFLIGHT_HINTS, len(cache))
+    if not limit:
+        return []
+    keys = sorted(cache)
+    recent = sorted({key for key in recently_refreshed if isinstance(key, str) and key in cache})
+    generator = random.Random(seed)
+    priority = generator.sample(recent, min(len(recent), max(1, limit * 3 // 4)))
+    chosen = set(priority)
+    priority.extend(generator.sample([key for key in keys if key not in chosen], limit - len(priority)))
+    return priority
+
+
 def _write_quick_index(
     cache_path: Path, selected: Mapping[str, list[Path]],
     cache: Mapping[str, Any], datasets: Mapping[str, Any],
-    feature_revision: str,
+    feature_revision: str, source_observation_root: str,
+    *, source_observation_matches_cache: bool, recently_refreshed: list[str],
 ) -> None:
+    # Aggregation can witness a transient disappearance or replacement after
+    # the footer pass. Its partial rows must not be paired with a fingerprint
+    # of the old cached identities, even if those files immediately reappear.
+    if not source_observation_matches_cache:
+        return
     if len(cache) != len({str(path) for paths in selected.values() for path in paths}):
         return
     fingerprint = _selection_fingerprint(selected, cache=cache)
@@ -342,11 +538,12 @@ def _write_quick_index(
         "cached_files": len(cache),
         "identity_unbound_files": 0,
         "feature_revision": feature_revision,
+        "source_observation_root": source_observation_root,
+        "source_observation_matches_cache": True,
+        "preflight_policy": "refreshed-priority-uniform-v1",
         "preflight_file_hints": [
             [key, cache[key]["file_identity"]]
-            for key in random.Random(feature_revision).sample(
-                tuple(cache), min(FAST_INDEX_PREFLIGHT_HINTS, len(cache)),
-            )
+            for key in _preflight_keys(cache, recently_refreshed=recently_refreshed, seed=feature_revision)
         ],
     }
     try:
@@ -540,7 +737,8 @@ def _selected_files(root: Path) -> dict[str, list[Path]]:
     return selected
 
 
-def _aggregate(paths: list[Path], cache: Mapping[str, Any]) -> dict[str, Any]:
+def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
+               observation: _SourceObservation | None = None, dataset: str = "") -> dict[str, Any]:
     total = len(paths)
     inspected = 0
     invalid = 0
@@ -552,11 +750,17 @@ def _aggregate(paths: list[Path], cache: Mapping[str, Any]) -> dict[str, Any]:
     for path in paths:
         entry = cache.get(str(path))
         if not isinstance(entry, Mapping):
+            if observation is not None:
+                observation.observe(dataset, path, None, entry=None)
             continue
         try:
             stat = path.stat()
         except OSError:
+            if observation is not None:
+                observation.observe(dataset, path, None, entry=entry)
             continue
+        if observation is not None:
+            observation.observe(dataset, path, stat, entry=entry)
         if not _entry_matches_stat(entry, stat):
             continue
         if entry.get("error") == "invalid_parquet":
@@ -640,11 +844,17 @@ def _build_record_inventory_unlocked(
     stage_start = time.perf_counter()
     if snapshot is not None:
         snapshot.check_root(root)
+    previous_cache_signature = _cache_signature(cache_path)
     payload = _read_json(cache_path)
+    if _cache_signature(cache_path) != previous_cache_signature:
+        previous_cache_signature = None
     cache_decode_ms = round((time.perf_counter() - stage_start) * 1_000, 3)
     if snapshot is not None:
         snapshot.payload = payload
         snapshot.selected = None
+        snapshot.previous_cache_signature = previous_cache_signature
+        snapshot.cache_signature = previous_cache_signature
+        snapshot.changed_dataset_ids = None
     if not refresh and isinstance(payload, Mapping) and payload.get("version") == INVENTORY_VERSION:
         datasets = payload.get("datasets")
         files = payload.get("files")
@@ -660,32 +870,37 @@ def _build_record_inventory_unlocked(
                 "cached_files": len(files),
                 "identity_unbound_files": _identity_unbound_count(files),
                 "feature_revision": payload.get("feature_revision"),
+                "source_observation_root": payload.get("source_observation_root"),
+                "source_observation_matches_cache": payload.get("source_observation_matches_cache") is True,
                 "fast_index_hit": False,
                 "changed_dataset_ids": None,
                 "timing_ms": {"cache_decode": cache_decode_ms},
             }
     cache: dict[str, Any] = (
         dict(payload.get("files", {}))
-        if isinstance(payload, Mapping) and payload.get("version") in {7, INVENTORY_VERSION}
+        # Retain identical footer semantics from the short-lived outer-v11
+        # migration; restoring reader-compatible v10 must not drop observations.
+        if isinstance(payload, Mapping) and payload.get("version") in {7, 11, INVENTORY_VERSION}
         and isinstance(payload.get("files"), Mapping)
         else {}
     )
     schemas: dict[str, Any] = (
         dict(payload.get("schemas", {}))
-        if isinstance(payload, Mapping) and payload.get("version") == INVENTORY_VERSION
+        if isinstance(payload, Mapping) and payload.get("version") in {11, INVENTORY_VERSION}
         and isinstance(payload.get("schemas"), Mapping) else {}
     )
     stage_start = time.perf_counter()
     selected = preselected if preselected is not None else _selected_files(root)
-    membership_fingerprint = _membership_fingerprint(selected)
+    dataset_memberships = _dataset_memberships(selected)
+    membership_fingerprint = _membership_root(dataset_memberships)
     if snapshot is not None:
         snapshot.selected = selected
     all_paths = {str(path): path for paths in selected.values() for path in paths}
     discover_ms = round((time.perf_counter() - stage_start) * 1_000, 3)
     stage_start = time.perf_counter()
     refreshed = 0
+    recently_refreshed: list[str] = []
     identity_rechecked = 0
-    changed_file_keys: set[str] = set()
     unavailable_during_refresh = False
     all_entries_unchanged = True
     previous_files = payload.get("files", {}) if isinstance(payload, Mapping) else {}
@@ -739,7 +954,6 @@ def _build_record_inventory_unlocked(
                 unavailable_during_refresh = True
                 cache.pop(key, None)
                 feature_inputs_changed = True
-                changed_file_keys.add(key)
                 continue
             if _file_identity(stat) != _file_identity(after_stat):
                 # The footer may belong to an old inode or an in-flight write.
@@ -747,11 +961,13 @@ def _build_record_inventory_unlocked(
                 unavailable_during_refresh = True
                 cache.pop(key, None)
                 feature_inputs_changed = True
-                changed_file_keys.add(key)
                 continue
             if stats is not None:
                 fields = stats.pop("fields")
-                schemas[stats["schema_id"]] = fields
+                # JSON decodes pairs as lists. Keep the in-memory writer in
+                # that same canonical representation: tuple/list inequality
+                # must not invalidate every other owner of an unchanged schema.
+                schemas[stats["schema_id"]] = [list(field) for field in fields]
                 updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                            "file_identity": _file_identity(stat), "stats": stats}
             else:
@@ -761,8 +977,9 @@ def _build_record_inventory_unlocked(
                 entry.get("stats"), entry.get("error")
             ) != (updated.get("stats"), updated.get("error")):
                 feature_inputs_changed = True
-                changed_file_keys.add(key)
             cache[key] = updated
+            if not identity_only:
+                recently_refreshed.append(key)
         # Only reuse cached aggregates if every selected path checked so far
         # had an unchanged signature, no path was unavailable, and membership
         # is identical. A changed file can exhaust a zero footer budget and
@@ -779,8 +996,14 @@ def _build_record_inventory_unlocked(
             and isinstance(payload.get("feature_revision"), str)
             and len(payload["feature_revision"]) == 32
             and payload.get("selection_membership") == membership_fingerprint
+            and _bound_dataset_memberships(payload) == dataset_memberships
+            and isinstance(payload.get("source_observation_root"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", payload["source_observation_root"]) is not None
+            and payload.get("source_observation_matches_cache") is True
             and (not fast_index_miss or _identity_unbound_count(cache) > 0)
         ):
+            if snapshot is not None:
+                snapshot.changed_dataset_ids = frozenset()
             return {
                 "datasets": dict(payload["datasets"]),
                 "refreshed_files": 0,
@@ -788,6 +1011,8 @@ def _build_record_inventory_unlocked(
                 "cached_files": len(cache),
                 "identity_unbound_files": _identity_unbound_count(cache),
                 "feature_revision": payload.get("feature_revision"),
+                "source_observation_root": payload.get("source_observation_root"),
+                "source_observation_matches_cache": True,
                 "fast_index_hit": False,
                 "changed_dataset_ids": [],
                 "timing_ms": {
@@ -806,7 +1031,16 @@ def _build_record_inventory_unlocked(
         schemas = {key: value for key, value in schemas.items() if key in referenced_schemas}
     signature_scan_ms = round((time.perf_counter() - stage_start) * 1_000, 3)
     stage_start = time.perf_counter()
-    output = {name: _aggregate(paths, cache) for name, paths in selected.items()}
+    observation = _SourceObservation()
+    output = {}
+    for name, paths in selected.items():
+        observation.start(name)
+        output[name] = _aggregate(paths, cache, observation=observation, dataset=name)
+    source_observation_root = observation.root()
+    if not recently_refreshed and isinstance(payload, Mapping):
+        previous_recent = payload.get("recently_refreshed_files")
+        if isinstance(previous_recent, list):
+            recently_refreshed = [key for key in previous_recent if isinstance(key, str) and key in cache]
     tw_parts = [value for key, value in output.items()
                 if key.startswith("tw-public:") and key != "tw-public:mops_xbrl_quarterly"]
     output["group:tw-public"] = _combine(tw_parts)
@@ -831,24 +1065,22 @@ def _build_record_inventory_unlocked(
         )
     if not isinstance(payload, Mapping) or output != payload.get("datasets"):
         feature_inputs_changed = True
-    previous_datasets = payload.get("datasets") if isinstance(payload, Mapping) else None
-    # This is diagnostic scope, not permission to skip the full source scan.
-    # With a changed membership or old cache, the former owner of a removed
-    # path cannot be reconstructed from the newly selected paths alone.
-    changed_dataset_ids = (
-        sorted(
-            dataset for dataset, paths in selected.items()
-            if output[dataset] != previous_datasets.get(dataset)
-            or any(str(path) in changed_file_keys for path in paths)
-        )
-        if isinstance(payload, Mapping)
-        and payload.get("version") == INVENTORY_VERSION
-        and isinstance(previous_datasets, Mapping)
-        and isinstance(previous_files, Mapping)
-        and previous_files.keys() == all_paths.keys()
-        and payload.get("selection_membership") == membership_fingerprint
-        else None
+    if not isinstance(payload, Mapping) or source_observation_root != payload.get("source_observation_root"):
+        feature_inputs_changed = True
+    current_payload = {
+        "version": INVENTORY_VERSION, "files": cache, "schemas": schemas,
+        "datasets": output, "selection_membership": membership_fingerprint,
+        "dataset_membership_version": DATASET_MEMBERSHIP_VERSION,
+        "dataset_memberships": dataset_memberships,
+        "source_observation_root": source_observation_root,
+        "source_observation_matches_cache": observation.matches_cache,
+        "recently_refreshed_files": recently_refreshed,
+    }
+    delta = (
+        inventory_dataset_delta(payload, current_payload, selected, memberships=dataset_memberships)
+        if isinstance(payload, Mapping) else None
     )
+    changed_dataset_ids = sorted(delta) if delta is not None else None
     previous_revision = payload.get("feature_revision") if isinstance(payload, Mapping) else None
     feature_revision = (
         previous_revision
@@ -860,25 +1092,29 @@ def _build_record_inventory_unlocked(
         # A revision can also change because of an invalid prior revision or
         # cache contract. Do not advertise an empty safe delta in that case.
         changed_dataset_ids = None
+    current_payload["feature_revision"] = feature_revision
     if refresh:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
         try:
             temporary.write_text(
-                json.dumps({"version": INVENTORY_VERSION, "files": cache, "schemas": schemas,
-                            "datasets": output, "feature_revision": feature_revision,
-                            "selection_membership": membership_fingerprint}, separators=(",", ":")),
+                json.dumps(current_payload, separators=(",", ":")),
                 encoding="utf-8",
             )
             os.replace(temporary, cache_path)
         finally:
             temporary.unlink(missing_ok=True)
-        _write_quick_index(cache_path, selected, cache, output, feature_revision)
+        _write_quick_index(
+            cache_path, selected, cache, output, feature_revision, source_observation_root,
+            source_observation_matches_cache=observation.matches_cache,
+            recently_refreshed=recently_refreshed,
+        )
     if snapshot is not None:
-        snapshot.payload = {"version": INVENTORY_VERSION, "files": cache,
-                            "schemas": schemas, "datasets": output,
-                            "feature_revision": feature_revision,
-                            "selection_membership": membership_fingerprint}
+        snapshot.payload = current_payload
+        snapshot.cache_signature = _cache_signature(cache_path) if refresh else None
+        snapshot.changed_dataset_ids = (
+            frozenset(changed_dataset_ids) if changed_dataset_ids is not None else None
+        )
     return {
         "datasets": output,
         "refreshed_files": refreshed,
@@ -886,6 +1122,8 @@ def _build_record_inventory_unlocked(
         "cached_files": len(cache),
         "identity_unbound_files": _identity_unbound_count(cache),
         "feature_revision": feature_revision,
+        "source_observation_root": source_observation_root,
+        "source_observation_matches_cache": observation.matches_cache,
         "fast_index_hit": False,
         "changed_dataset_ids": changed_dataset_ids,
         "timing_ms": {
@@ -912,86 +1150,48 @@ def build_record_inventory(
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             discovered_on_miss: list[dict[str, list[Path]]] = []
+            preflight_observation: dict[str, Any] = {}
             probe_started = time.perf_counter()
             quick = _read_quick_index(
                 Path(repo_root),
                 Path(repo_root) / "artifacts/live/data_monitor/record_inventory_cache.json",
                 snapshot=snapshot,
                 discovered_on_miss=discovered_on_miss,
+                observation=preflight_observation,
             )
+            preflight_observation["wall_ms"] = round((time.perf_counter() - probe_started) * 1_000, 3)
             if quick is not None:
+                quick["preflight_observation"] = preflight_observation
                 return quick
-            return _build_record_inventory_unlocked(
+            result = _build_record_inventory_unlocked(
                 repo_root, refresh=True, max_refresh_files=max_refresh_files,
                 snapshot=snapshot, fast_index_miss=True,
                 preselected=discovered_on_miss[0] if discovered_on_miss else None,
-                quick_index_probe_ms=round((time.perf_counter() - probe_started) * 1_000, 3),
+                quick_index_probe_ms=preflight_observation["wall_ms"],
             )
+            result["preflight_observation"] = preflight_observation
+            return result
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def build_feature_inventory(
-    repo_root: Path, *, snapshot: InventorySnapshot | None = None,
-    timing_ms: dict[str, float] | None = None,
-) -> dict[str, Any]:
-    """List every observed Parquet field once per physical dataset, from cached footers.
+@dataclass(frozen=True)
+class FeatureDataset:
+    """Verified inputs for one owner; aggregation is lazy, never a stat exemption."""
 
-    Non-null counts are exact only if every selected file has complete row-group
-    null statistics.  Dataset time bounds are *not* field-validity bounds.
-    """
+    dataset_id: str
+    files_total: int
+    valid_files: int
+    source_observation_root: str
+    by_schema: Mapping[str, list[Mapping[str, Any]]]
+    schemas: Mapping[str, Any]
+    dataset_info: Mapping[str, Any]
 
-    started = time.perf_counter()
-    root = Path(repo_root)
-    if snapshot is not None:
-        snapshot.check_root(root)
-    payload = (snapshot.payload if snapshot is not None and snapshot.payload is not None
-               else _read_json(root / "artifacts/live/data_monitor/record_inventory_cache.json"))
-    if not isinstance(payload, Mapping) or payload.get("version") != INVENTORY_VERSION:
-        return {"version": 1, "rows": [], "datasets_total": 0,
-                "datasets_with_schema": 0, "state": "waiting_inventory"}
-    cache = payload.get("files", {})
-    schemas = payload.get("schemas", {})
-    datasets = payload.get("datasets", {})
-    if not isinstance(cache, Mapping) or not isinstance(schemas, Mapping):
-        return {"version": 1, "rows": [], "datasets_total": 0,
-                "datasets_with_schema": 0, "state": "invalid_inventory"}
-    selected = (snapshot.selected if snapshot is not None and snapshot.selected is not None
-                else _selected_files(root))
-    prepared = time.perf_counter()
-    rows: list[dict[str, Any]] = []
-    datasets_with_schema = 0
-    files_with_schema = 0
-    verify_seconds = 0.0
-    aggregate_seconds = 0.0
-    emit_seconds = 0.0
-    for dataset, paths in selected.items():
-        dataset_started = time.perf_counter()
+    def rows(self, *, timing_ms: dict[str, float] | None = None) -> list[dict[str, Any]]:
+        started = time.perf_counter()
         by_field: dict[str, dict[str, Any]] = {}
-        by_schema: dict[str, list[Mapping[str, Any]]] = {}
-        valid_files = 0
-        for path in paths:
-            entry = cache.get(str(path))
-            if not isinstance(entry, Mapping):
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if not _entry_matches_stat(entry, stat):
-                continue
-            info = entry.get("stats")
-            if not isinstance(info, Mapping):
-                continue
-            fields = schemas.get(info.get("schema_id"))
-            non_null = info.get("non_null")
-            if not isinstance(fields, list) or not isinstance(non_null, list) or len(fields) != len(non_null):
-                continue
-            valid_files += 1
-            files_with_schema += 1
-            by_schema.setdefault(info["schema_id"], []).append(info)
-        verified_at = time.perf_counter()
-        verify_seconds += verified_at - dataset_started
+        by_schema = self.by_schema
+        schemas = self.schemas
         for schema_id, members in by_schema.items():
             # A schema's field names/types and row totals are shared by all
             # members. Sum Python integers by column (no float/uint overflow).
@@ -1025,51 +1225,159 @@ def build_feature_inventory(
                     field["non_null_known_files"] += len(known)
                     field["verified_non_null"] += sum(known)
         aggregated_at = time.perf_counter()
-        aggregate_seconds += aggregated_at - verified_at
-        if not by_field:
-            continue
-        datasets_with_schema += 1
-        dataset_info = datasets.get(dataset, {}) if isinstance(datasets, Mapping) else {}
-        if not isinstance(dataset_info, Mapping):
-            dataset_info = {}
+        rows: list[dict[str, Any]] = []
         for name, field in by_field.items():
-            complete = valid_files == len(paths) and field["non_null_known_files"] == field["files_with_field"]
+            complete = self.valid_files == self.files_total and field["non_null_known_files"] == field["files_with_field"]
             rows.append({
-                "dataset_id": dataset,
+                "dataset_id": self.dataset_id,
                 "field": name,
                 "types": sorted(field["types"]),
                 "files_with_field": field["files_with_field"],
-                "files_total": len(paths),
-                "rows_with_field": field["rows_with_field"] if valid_files == len(paths) else None,
+                "files_total": self.files_total,
+                "rows_with_field": field["rows_with_field"] if self.valid_files == self.files_total else None,
                 "verified_partial_rows_with_field": field["rows_with_field"],
                 "non_null_count": field["verified_non_null"] if complete else None,
                 "verified_partial_non_null": field["verified_non_null"] if field["non_null_known_files"] else None,
                 "non_null_known_files": field["non_null_known_files"],
-                "schema_state": "verified" if valid_files == len(paths) else "partial",
-                "dataset_first": dataset_info.get("first"),
-                "dataset_last": dataset_info.get("last"),
-                "dataset_bounds_state": dataset_info.get("bounds_state", "unavailable"),
+                "schema_state": "verified" if self.valid_files == self.files_total else "partial",
+                "dataset_first": self.dataset_info.get("first"),
+                "dataset_last": self.dataset_info.get("last"),
+                "dataset_bounds_state": self.dataset_info.get("bounds_state", "unavailable"),
             })
-        emit_seconds += time.perf_counter() - aggregated_at
-    files_total = sum(len(paths) for paths in selected.values())
+        if timing_ms is not None:
+            timing_ms["aggregate_fields"] = timing_ms.get("aggregate_fields", 0.0) + (aggregated_at - started) * 1_000
+            timing_ms["emit_rows"] = timing_ms.get("emit_rows", 0.0) + (time.perf_counter() - aggregated_at) * 1_000
+        return rows
+
+
+class FeatureInventoryScan:
+    """One complete canonical identity scan with independently lazy owner rows.
+
+    Both full and incremental publishers consume this same verification and
+    integer/null accounting. A cache hit may skip ``FeatureDataset.rows``;
+    it must never skip iterating the selected files.
+    """
+
+    def __init__(self, repo_root: Path, *, snapshot: InventorySnapshot | None = None,
+                 timing_ms: dict[str, float] | None = None) -> None:
+        started = time.perf_counter()
+        root = Path(repo_root)
+        if snapshot is not None:
+            snapshot.check_root(root)
+        if snapshot is not None and snapshot.payload is not None:
+            payload = snapshot.payload
+        else:
+            cache_path = root / "artifacts/live/data_monitor/record_inventory_cache.json"
+            signature = _cache_signature(cache_path)
+            payload = _read_json(cache_path)
+            if snapshot is not None and (
+                signature != snapshot.cache_signature
+                or signature != _cache_signature(cache_path)
+            ):
+                # A quick-index frame may advance before the footer JSON is
+                # decoded. Its empty delta does not cover this new generation.
+                snapshot.previous_cache_signature = None
+                snapshot.cache_signature = None
+                snapshot.changed_dataset_ids = None
+        if not isinstance(payload, Mapping) or payload.get("version") != INVENTORY_VERSION:
+            raise ValueError("waiting_inventory")
+        self.cache = payload.get("files", {})
+        self.schemas = payload.get("schemas", {})
+        self.datasets = payload.get("datasets", {})
+        if not isinstance(self.cache, Mapping) or not isinstance(self.schemas, Mapping):
+            raise ValueError("invalid_inventory")
+        self.selected = (snapshot.selected if snapshot is not None and snapshot.selected is not None
+                         else _selected_files(root))
+        self.observation = _SourceObservation()
+        self.files_with_schema = 0
+        self.finished = False
+        self._iterated = False
+        self.timing_ms = timing_ms if timing_ms is not None else {}
+        self.timing_ms.update({"prepare": (time.perf_counter() - started) * 1_000,
+                              "verify_file_signatures": 0.0, "aggregate_fields": 0.0,
+                              "emit_rows": 0.0})
+
+    def __iter__(self):
+        if self._iterated:
+            raise ValueError("feature inventory scan is single-use")
+        self._iterated = True
+        for dataset, paths in self.selected.items():
+            self.observation.start(dataset)
+            started = time.perf_counter()
+            by_schema: dict[str, list[Mapping[str, Any]]] = {}
+            valid_files = 0
+            for path in paths:
+                entry = self.cache.get(str(path))
+                if not isinstance(entry, Mapping):
+                    self.observation.observe(dataset, path, None, entry=None)
+                    continue
+                try:
+                    source_stat = path.stat()
+                except OSError:
+                    self.observation.observe(dataset, path, None, entry=entry)
+                    continue
+                self.observation.observe(dataset, path, source_stat, entry=entry)
+                if not _entry_matches_stat(entry, source_stat):
+                    continue
+                info = entry.get("stats")
+                if not isinstance(info, Mapping):
+                    continue
+                fields = self.schemas.get(info.get("schema_id"))
+                non_null = info.get("non_null")
+                if not isinstance(fields, list) or not isinstance(non_null, list) or len(fields) != len(non_null):
+                    continue
+                valid_files += 1
+                self.files_with_schema += 1
+                by_schema.setdefault(info["schema_id"], []).append(info)
+            self.timing_ms["verify_file_signatures"] += (time.perf_counter() - started) * 1_000
+            dataset_info = self.datasets.get(dataset, {}) if isinstance(self.datasets, Mapping) else {}
+            yield FeatureDataset(
+                dataset, len(paths), valid_files, self.observation.dataset_root(dataset),
+                by_schema, self.schemas, dataset_info if isinstance(dataset_info, Mapping) else {},
+            )
+        self.finished = True
+
+    def summary(self, *, datasets_with_schema: int) -> dict[str, Any]:
+        if not self.finished:
+            raise ValueError("cannot publish an incomplete feature inventory scan")
+        files_total = sum(len(paths) for paths in self.selected.values())
+        return {
+            "version": 1,
+            "datasets_total": sum(bool(paths) for paths in self.selected.values()),
+            "datasets_with_schema": datasets_with_schema,
+            "files_total": files_total,
+            "files_with_schema": self.files_with_schema,
+            "source_observation_root": self.observation.root(),
+            "state": "complete" if files_total and self.files_with_schema == files_total else "empty" if not files_total else "partial",
+            "basis": "Parquet schema 與 row-group null_count；不代表歷史完整、發布時間或訓練可用性。",
+        }
+
+
+def build_feature_inventory(
+    repo_root: Path, *, snapshot: InventorySnapshot | None = None,
+    timing_ms: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """List every observed field using the shared canonical scan and reductions."""
+
+    try:
+        scan = FeatureInventoryScan(repo_root, snapshot=snapshot, timing_ms=timing_ms)
+    except ValueError as exc:
+        if str(exc) not in {"waiting_inventory", "invalid_inventory"}:
+            raise
+        return {"version": 1, "rows": [], "datasets_total": 0,
+                "datasets_with_schema": 0, "state": str(exc)}
+    started = time.perf_counter()
+    rows: list[dict[str, Any]] = []
+    datasets_with_schema = 0
+    for dataset in scan:
+        owner_rows = dataset.rows(timing_ms=scan.timing_ms)
+        datasets_with_schema += bool(owner_rows)
+        rows.extend(owner_rows)
     if timing_ms is not None:
-        timing_ms.update({
-            "prepare": round((prepared - started) * 1_000, 3),
-            "verify_and_aggregate": round((time.perf_counter() - prepared) * 1_000, 3),
-            "verify_file_signatures": round(verify_seconds * 1_000, 3),
-            "aggregate_fields": round(aggregate_seconds * 1_000, 3),
-            "emit_rows": round(emit_seconds * 1_000, 3),
-        })
-    return {
-        "version": 1,
-        "rows": rows,
-        "datasets_total": sum(bool(paths) for paths in selected.values()),
-        "datasets_with_schema": datasets_with_schema,
-        "files_total": files_total,
-        "files_with_schema": files_with_schema,
-        "state": "complete" if files_total and files_with_schema == files_total else "empty" if not files_total else "partial",
-        "basis": "Parquet schema 與 row-group null_count；不代表歷史完整、發布時間或訓練可用性。",
-    }
+        timing_ms["verify_and_aggregate"] = (time.perf_counter() - started) * 1_000
+        for key in timing_ms:
+            timing_ms[key] = round(timing_ms[key], 3)
+    return {"rows": rows, **scan.summary(datasets_with_schema=datasets_with_schema)}
 
 
-__all__ = ["InventorySnapshot", "PHYSICAL_FAMILIES", "build_feature_inventory", "build_record_inventory", "parquet_footer_stats"]
+__all__ = ["FeatureDataset", "FeatureInventoryScan", "InventorySnapshot", "PHYSICAL_FAMILIES", "build_feature_inventory", "build_record_inventory", "inventory_dataset_delta", "parquet_footer_stats"]

@@ -43,6 +43,24 @@ def test_stages_are_disjoint_and_override_precedes_core():
     assert sum(x['summary']['unbatched_requests'] for x in stages) == 26200
 
 
+def test_retry_work_and_cooldowns_follow_their_actual_stage_not_whole_dataset():
+    work, telemetry = inputs()
+    work['datasets'][0].update(incremental_requests=20, backfill_requests=5480,
+        retry_tasks=30, retry_tasks_by_class={'incremental': 20, 'backfill': 10},
+        retry_wait_seconds_by_class={'incremental': 60, 'backfill': 900}, max_retry_wait_seconds=900)
+    work['datasets'][1].update(retry_tasks=2, retry_tasks_by_class={'backfill': 2})
+    work['datasets'][1]['priority_override'].update(retry_tasks=1)
+    work['summary']['retry_tasks'] = 32
+    stages = stage_workloads(work)
+    assert [s['summary']['retry_tasks'] for s in stages] == [21, 10, 1, 0, 0]
+    assert stages[0]['summary']['max_retry_wait_seconds'] == 60
+    assert stages[1]['summary']['max_retry_wait_seconds'] == 900
+    result = run(work, telemetry)
+    assert result['state'] == 'waiting_retry'
+    assert result['milestones']['core']['state'] == 'waiting_retry'
+    assert all(x['estimated_complete_at_utc'] is None for x in result['scenarios'].values())
+
+
 def test_timed_release_never_subtracts_tomorrows_burst_from_early_stage(tmp_path):
     work, telemetry = inputs()
     forecast = telemetry['quota']['recurring_forecast']
@@ -152,6 +170,49 @@ def test_empty_stages_take_no_extra_capacity_or_service_time():
     result = run(work, telemetry)
     assert result['scenarios']['central']['remaining_seconds'] == 3600
     assert result['stages'][0]['scenarios']['central']['remaining_seconds'] == 0
+
+
+def test_empty_final_stage_is_not_a_completed_cumulative_milestone(tmp_path):
+    work, telemetry = inputs()
+    work['datasets'] = work['datasets'][:1]
+    work['summary'].update(current_plan_requests=5500, unbatched_requests=5500,
+                           required_requests=5500, validation_requests=0)
+    telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_phase'] = {}
+    result = run(work, telemetry)
+    assert result['stages'][-1]['state'] == 'current'
+    for key in ('core', 'non_tick', 'all'):
+        milestone = result['milestones'][key]
+        assert milestone['state'] == 'conditional'
+        assert milestone['workload']['planned_requests'] == 5500
+        assert milestone['scenarios']['central']['request_count'] == 5500
+        assert milestone['scenarios']['central']['active_work_seconds'] == 3600
+    (tmp_path / 'eta_status.json').write_text(json.dumps({'schema_version': 1, 'estimate': result}))
+    public = public_completion_estimate(tmp_path, NOW)
+    assert public['milestones']['all']['state'] == 'conditional'
+    assert public['milestones']['all']['workload']['planned_requests'] == 5500
+
+
+def test_milestone_counts_and_work_are_cumulative_not_last_stage_only():
+    result = run()
+    for key, index in (('core', 1), ('non_tick', 2), ('all', 4)):
+        milestone = result['milestones'][key]
+        prefix = result['stages'][:index + 1]
+        assert milestone['workload']['planned_requests'] == sum(s['workload']['planned_requests'] for s in prefix)
+        for name, scenario in milestone['scenarios'].items():
+            assert scenario['request_count'] == sum(s['scenarios'][name]['request_count'] for s in prefix)
+            assert scenario['active_work_seconds'] == sum(s['scenarios'][name]['active_work_seconds'] for s in prefix)
+
+
+def test_empty_milestone_remains_current_and_unknown_predecessor_remains_waiting():
+    work, telemetry = inputs()
+    work['datasets'] = []
+    work['summary'].update(current_plan_requests=0, unbatched_requests=0,
+                           required_requests=0, validation_requests=0)
+    telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_phase'] = {}
+    assert all(item['state'] == 'current' for item in run(work, telemetry)['milestones'].values())
+    work, telemetry = inputs()
+    telemetry['quota']['current_budget'] = {'allowed': False}
+    assert all(item['state'] == 'waiting_quota' for item in run(work, telemetry)['milestones'].values())
 
 
 def test_invalid_priority_grain_fails_without_fabricating_request_counts():

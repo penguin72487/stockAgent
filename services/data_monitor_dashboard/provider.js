@@ -16,6 +16,7 @@ const OPERATION_LABEL = {catching_up: "正在抓／未最新", streaming: "正�
   control: "設定閘門", reference: "清冊參照"};
 const DEDICATED = {FinLab: ["/finlab/", "/finlab/api/status"],
   FinMind: ["/finmind/", "/finmind/api/status"],
+  TEJ: ["/tej/", "/tej/api/status"],
   "永豐 Shioaji": ["/shioaji/", "/shioaji/api/status"],
   OpenBB: ["/openbb/", null]};
 const state = {provider: null, rows: [], matched: 0, nextOffset: 0, snapshotAt: null,

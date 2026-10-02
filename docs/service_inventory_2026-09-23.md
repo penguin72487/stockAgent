@@ -1,5 +1,684 @@
 # StockAgent 服務完整清單（2026-09-23 起逐次更新）
 
+## 2026-10-02 21:22：依使用者要求再次暫停
+
+使用者正在整理／刪除資料，停止後續優化與新測試、測速、來源掃描、下載、重建及
+發布作業。[最新暫停交接](SERVICE_OPTIMIZATION_PAUSE_2026-10-01.md)記錄保留的修改、
+證據、未完成項目與恢復起點。協作清單只有 root，已知 data-monitor benchmark、
+coverage audit／pytest 沒有存活程序；沒有停止／重啟既有正式服務或干預其他 actor。
+所有 dirty changes 保留，目標改為 **paused**，不是完成；等使用者明確要求繼續。
+下方 20:52 的數量、狀態及耗時是歷史觀察，不作為資料整理後的現況證明。
+
+## 2026-10-02 20:52：恢復目標、正式增量欄位發布與故障恢復
+
+使用者控制的 goal 已恢復為 **active**，10/1 暫停紀錄保留為歷史。
+沿用 `user-working-preferences` 的完整輸出、canonical 共用與證據邊界：先重查
+Git／資料位置／容量及全服務清單，不沿用整理前的來源數量或健康。
+大量 TEJ、FinLab／FinMind、儲存及其他 actor 的變更均保留，沒有提交或回退。
+
+[20:19 起始清單](../artifacts/benchmarks/service-coverage-20261002-resumed-baseline.json)及
+[20:52:21 全清單](../artifacts/benchmarks/service-coverage-20261002-shards-final.json)
+均為 **66 installed services、50 timers、3 paths**；timer findings 0。
+TEJ 新服務已納入，而不是沿用昨天的 65。起始 root 可用約 **164 GB**，
+`data_tw_public` 仍指向 `/srv/stockagent-live/data_tw_public`；容量是觀察，
+不是所有 acquisition／cold publication 的容量或完成證明。
+
+### 修掉不必要重建的根因，再沿用同一份精確計算
+
+新 footer 的 schema pairs 原為 tuple，JSON cache 解碼則為 list；內容相同仍被
+視為 schema 改變，造成共用 schema 的其他 owner 也重建。Writer 現在統一為
+JSON-native list pairs，真正 schema 改變仍影響全部相關 owner。
+Cache 外層維持 v10／membership v1／fast-index v4，沒有另建 legacy 分支。
+初次新測試的 **2 failed／114 passed** 已保留於
+[初次語意回歸](../artifacts/benchmarks/data-monitor-shards-semantic-20261002-initial.log)，
+修正後重新驗證，不把先前失敗改寫為通過。
+
+`FeatureInventoryScan`／`FeatureDataset.rows` 成為全量與增量共用入口：完整逐檔
+身分／缺項核對保留，只有已證明不變的 owner 可以省略欄位聚合與 JSON 編碼。
+Python native integer、NULL 下界、partial、欄位角色、公開排序及完整 rows 不變。
+來源移動、schema／公開標籤變更、cache base 不符、未知 delta 或 ABI 變更均重建。
+
+### 正式 per-dataset shards 已接入既有 producer
+
+`data_monitor_feature_shards.py` 的 content-addressed rows／preview objects 是
+**可重建的私有網站投影**，不是來源、訓練資料或 cold publication。
+預設藏在完整 JSON 同目錄的 `.feature_inventory.json.projection-cache`；
+objects 上限 **256 MiB**，current／previous manifest 各有 **2 MiB** 上限。
+保留兩個 head，僅在 writer lock 下核對 marker、明列 digest、regular file、
+單一 inode link、身分及 SHA256 後回收自己產生的 orphan objects；不遞迴刪除，
+不碰未知檔名、來源、receipt、packed／materialized 或其他 actor 資料。
+
+完整舊格式 JSON 仍是公開 authority。全部 shards 核對完才 durable atomic rename，
+再發布原 v3 receipt／完整來源頁；不是把部分 rows 當完整資料。
+已知 object 遺失／損壞會重新做 canonical cold build；容量／權限或其他 cache
+問題則走原完整 publisher，保留 fallback event。這不是冷來源重建或主機冷啟動驗收。
+同 output 的 JSON＋receipt 發布共用 kernel lock，避免兩個 local publisher 的
+rename／digest 競態；程序死亡釋放鎖。**不是網站全域 rate limit 或訪客併發上限**。
+
+### 同完整資料 ABBA，首次成本另列
+
+[最終 publisher ABBA](../artifacts/benchmarks/data-monitor-shards-pipeline-abba-20261002-final.json)
+釘住兩個真實 cache 世代與當時 stat／absence，四次均核對 **59,974** 個 source
+references，保留 **88,740** 欄位及完全相同的 JSON bytes。
+該次 delta 為 OKX hot tail；**全量中位數 2,656.915 ms、sharded 547.734 ms**。
+首次 seed 的全部分片建置為 **2,841.804／3,461.921 ms**，不能當熱路徑或零成本。
+另保留[較早三 owner delta 的 ABBA](../artifacts/benchmarks/data-monitor-shards-pipeline-abba-20261002.json)。
+
+範圍是完整欄位核對／聚合、公開 JSON、原子檔案與 receipt；source stat 用捕獲的
+真實觀察做固定重播。Imports、cache decode、discovery、record refresh、真實冷 I/O、
+provider、公網與 browser-paint **不包含**。零 production source writes／broker calls，
+不以這個數字宣稱整個 producer 或所有服務的端到端加速率。
+
+[自然 timer journal](../artifacts/benchmarks/data-monitor-shards-natural-cycles-20261002.jsonl)
+已看到正式 cache `published`，例如 20:54:59 重用 **236**、重建 **1** owner，
+完整 feature stage **1,149.233 ms**；20:55:29 重用 **234**、重建 **3**，
+feature stage **1,093.333 ms**。這兩次 record／feature roots 相符，完整 workflow
+仍約 **8 秒**，record decode／掃描／寫入與 public status 仍待優化。
+其他持續寫入輪次有 roots 不符及 partial；沒有強改成正常，也不把不同負載當 A/B。
+
+[首次自然世代 shadow](../artifacts/benchmarks/data-monitor-shards-natural-delta-20261002.json)
+是 `inconclusive_initial_generation`：取樣時 cache／feature／receipt 未對齊。
+該收據保留，不宣稱正式環境兩個完整世代的 shadow 已通過。
+
+### 驗收與仍未完成的全服務範圍
+
+- [最終共用回歸](../artifacts/benchmarks/data-monitor-shards-final-shared-regression-20261002.log)：
+  **1,185 passed／53.95 秒**，涵蓋 data-monitor／FinLab／FinMind／imports／benchmarks。
+- [最終針對性回歸](../artifacts/benchmarks/data-monitor-shards-final-publication-lock-20261002.log)：
+  **126 passed／3.14 秒**，包括 native integer、來源消失／恢復、quick frame 跨世代、
+  標籤／ABI、壞 object、容量不足、rename 中斷、receipt／fallback、同 output 鎖及
+  symlink 拒絕。與上一項有重疊，不加總。
+- [Gateway／paging／updates／imports 回歸](../artifacts/benchmarks/data-monitor-shards-gateway-regression-20261002.log)：
+  **160 passed／31.10 秒**；在最後 publisher lock 修改前完成，該修改另由上述兩項
+  驗證。沒有執行全 repository、browser、多裝置或 reboot。
+- 實際 localhost `/data-monitor/api/features/page?offset=0&limit=80` 回應 200／80 rows，
+  完整 summary **88,740 fields、59,974 files**，取樣時 **59,467** 通過 schema，仍為
+  **partial**；未驗證的檔案沒有被宣稱完整。
+
+20:52 六個 localhost status GET 全 200，但 TAIFEX **blocked**、當沖／隔日沖／
+Shioaji／data monitor **degraded**、OpenBB **stopped**。Daily 收據保留 Yahoo **212**
+gaps（13 failed／199 lagging_skip）；OKX feature step 仍 failed，crypto training
+`deferred_raw_writer`、TW cold `deferred`。OpenBB archive 與 legacy US cold unit 的
+失敗亦未由本輪修復，不能用 HTTP 200 或 systemd oneshot completed 掩蓋。
+
+本輪 gateway／day-trade／Discord PID **3988904／1551092／898** 與起始相同 invocations；
+gateway 已由其他工作在前一天之後更新，不冒稱是本輪部署。沒有重啟核心、登入券商、
+送單、改帳本／模型、刪來源、清 OS cache、全量 acquisition 或 cold publication。
+新增 producer 由原自然 timer 載入，不另開輪詢 daemon。
+
+下一步仍按完整服務清冊：record cache 的解碼／聚合／寫入、public status 各來源成本，
+以及 OpenBB／TAIFEX／OKX／Yahoo 真實資料健康與可靠性；自然完整世代、全庫、
+browser／公網 IPv6、Windows-WSL 冷恢復尚未全部驗收。**目標維持 active，未完成全系統。**
+
+可重測（不登入、不改來源；output 必須是新檔，固定觀察重播不是冷 I/O）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_data_monitor_projection_pipeline.py --output artifacts/benchmarks/data-monitor-pipeline-rerun.json
+run_fintech_python scripts/benchmark_data_monitor_feature_delta.py --wait-seconds 50 --output artifacts/benchmarks/data-monitor-natural-delta-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-rerun.json
+```
+
+## 2026-10-01 16:28：依使用者要求再次暫停
+
+使用者正在整理／刪除資料，先停止優化工作並保留所有既有修改。
+[最新暫停交接](SERVICE_OPTIMIZATION_PAUSE_2026-10-01.md)記錄已驗收的來源一致性修正、
+尚未實作的正式分片 publisher，以及恢復時需重新核對的資料位置／身分與 runtime。
+本次沒有啟動新測試、測速、來源掃描、下載、重建或發布，也沒有停止／重啟正式服務
+或干預其他 actor。協作清單只有 root，已知 data-monitor benchmark／pytest 沒有存活程序。
+先前的 active、資料數量、健康及耗時均是有時間標籤的歷史證據，不是整理後現況。
+目標改為 **paused**，不是完成；等使用者明確要求繼續後才續接。
+
+## 2026-10-01 16:02：來源觀察一致性、暫時缺項恢復與真實增量驗證
+
+使用者控制的目標已恢復為 **active**；不把上次暫停當作整個系統完成。
+依 `user-working-preferences`，先補共享根因／正確性證據，再測速，不靠少讀來源、
+少列欄位或把 partial 改成正常。[本輪驗收與 SHA256 綁定](../artifacts/benchmarks/data-monitor-source-coherence-validation-20261001.json)
+保留測試、原始自然 journal、全服務清單與測速邊界。沒有重啟核心、登入券商、
+送單、換帳本／模型、刪來源、清 OS cache、cold publication 或回退其他 actor 的工作。
+
+### 修復會把缺項留住的共享競態
+
+原本清單統計與欄位投影分兩階段核對檔案；相同 footer revision 不代表兩階段
+看見同一份檔案或缺項狀態。新增 `source-observation-v1` 根指紋，沿用原來逐檔
+stat，綁定 dev／ino／size／mtime／ctime 與已觀察的缺項，不增加另一輪來源掃描。
+Cache 外層維持 **v10**、membership v1；fast index **v4** 加上來源／cache 一致性。
+
+新增測試先[重現失敗](../artifacts/benchmarks/data-monitor-transient-source-red-20261001.log)：
+資料夾在彙總時短暫移走又放回，child inode 不變，舊程式仍寫出可重用的 partial
+索引。現在彙總觀察不符 cached identities 時不寫該索引，下一輪重算後恢復真實
+計數。同 footer 的檔案替換也更換觀察根／revision；不能用數值看似相同跳過身分。
+
+Producer receipt 另綁定實際欄位投影的觀察根；缺少、損壞或不同根時重建。
+有要求來源綁定時，只把 JSON 再 parse 一次不能補成已驗證來源。自然 journal 的
+`feature_source_observation` 區分 record／feature 是否相符、record 是否符合 cache；
+不一致仍保留 partial，之後重新投影。這不是官方發布時鐘、PIT 或券商成交證據。
+
+### 測速機制與沒有被消除的成本
+
+將 ctime 全域排序提示換成 **`refreshed-priority-uniform-v1`**：上一輪實際 footer
+刷新鍵優先，其他來源仍抽樣；提示通過後仍核對全清單與五部分身分，未抽到的
+變動仍走完整處理。沒有新增網站全域限流或併發上限。
+
+[完整 frozen-metadata ABBA](../artifacts/benchmarks/data-monitor-refreshed-hint-full-namespace-20261001.json)
+有 **59,028** 條 cache paths、上一輪實際刷新 pool **703**、提示 **512**，12 trials
+包含 unchanged、指定 refreshed-path 變動與 unhinted 變動。刻意選「新提示命中而
+原 uniform 沒抽到」的控制情境，metadata calls **59,540 → 1**，中位數
+**314.79 → 4.73 ms**。Unchanged／unhinted 仍完整核對；這是記憶體中身分重播，
+**不是實際冷 I/O 或完整 producer 的加速率**，不拿它宣稱網站已達極限。
+
+[自然排程 journal](../artifacts/benchmarks/data-monitor-refreshed-policy-natural-cycles-20261001.jsonl)
+新提示命中時 preflight **23.92／9.78／3.99 ms**；一次未命中仍全核對 **2,860.07 ms**。
+來源變動完整 workflow 分別 **27.29／21.45／21.05／8.84 秒**，來源量與其他程序負載
+不同，不能直接算 A/B 改善。較早來源一致性 journal 還有 **36.34 秒**的輪次；
+完整 cache 解碼／彙總／寫入與欄位全量建置仍是下一階段重點。沒有減少欄位來換速度。
+
+### 終於取得兩個自然世代的一致性證據，尚非正式增量發布
+
+第一個新 shadow 視窗為[no_new_generation](../artifacts/benchmarks/data-monitor-source-coherence-natural-delta-20261001.json)，
+不是通過，也沒有把正常的外部無變動當故障。確認另有新 revision 後再測，
+[07:55:42 → 07:57:43 UTC 兩個完成世代](../artifacts/benchmarks/data-monitor-source-coherence-natural-delta-20261001-new-revision.json)
+全 **88,706** rows 重組與完整新版相同；**7** 個受影響資料集、**179** rows 的局部
+footer 重建也相同，`moved_paths=0`、`cache_identity_mismatch_paths=0`。
+重組 **71.82 ms**、局部 footer **22.24 ms**；完整世代讀取／discovery／綁定另列，
+不能相加後冒稱已部署的端到端 latency。這次完成的是增量基礎驗證，
+**正式 immutable per-dataset shards／atomic publisher 尚未啟用**。
+
+此前 same-revision mismatch 與現場身分不符的 inconclusive artifacts 都保留。
+15:55 的公開 schema summary 仍為 **partial**：59,029 files 中 59,010 通過欄位
+驗證，沒有把尚未驗證的 19 個檔案改成完整。
+
+### 回歸與全服務狀態
+
+- [共用回歸](../artifacts/benchmarks/data-monitor-source-coherence-shared-regression-20261001.log)：
+  **1,076 passed／90.59 秒**，涵蓋 FinLab、FinMind、data-monitor、import contract
+  及相關 feature／hint benchmarks。
+- [公開 gateway／updates／feature pages 回歸](../artifacts/benchmarks/data-monitor-source-coherence-gateway-regression-20261001.log)：
+  **160 passed／34.16 秒**，與上項有重疊，**不加總**。Ruff／py_compile／diff
+  whitespace 通過；未執行全庫、browser、多裝置或重開機驗收。
+- 最初 [106 passed／3 failed](../artifacts/benchmarks/data-monitor-source-observation-resumed-initial-20261001.log)
+  及暫停前不存在 test filename 的 no-tests log 保留，不改寫成 pass。
+
+[16:02:13 全清單](../artifacts/benchmarks/service-coverage-20261001-source-coherence-final.json)：
+**65 installed services／0 transient、50 timers、3 paths**，schedule findings 0。
+六個 localhost GET 都 200，但 TAIFEX **blocked**、當沖／隔日沖／Shioaji／全資料
+**degraded**、OpenBB **stopped**。OpenBB archive 與 registered daily unit failed；
+既有 Yahoo **210** gaps、crypto deferred_raw_writer、TW cold deferred 保留。
+OpenBB L1 精確 matched invocation `ee9e97f813724de4a3f4e16a370524ba` 的 stage samples
+有 **7,143 memory-high events／0 OOM**，是該次歷史壓力，不是當下記憶體占用。
+
+Gateway、當沖引擎、Discord 的 PID／invocation 均保持 **1526156／1551092／898**
+及前次相同 invocation，沒有為了取樣或 cache 遷移重啟。常駐 gateway 不宣稱
+已載入所有新版程式；短命 producer 已由自然 timer 載入並記錄新契約。
+公網 IPv6、Windows／WSL cold recovery、資料健康根因與其他全服務優化仍未完成，
+**目標維持 active，不宣稱系統全部修好**。
+
+重測（沿用現有環境；output 使用新檔，不清 cache／不觸發 provider／帳本）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_data_monitor_hint_policy.py --output artifacts/benchmarks/data-monitor-hint-policy-rerun.json
+run_fintech_python scripts/benchmark_data_monitor_feature_delta.py --wait-seconds 50 --output artifacts/benchmarks/data-monitor-generation-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-generation-rerun.json
+```
+
+## 2026-10-01 11:01：唯讀監控依賴解耦、載入耗時與自然排程證據
+
+全服務目標維持 **active**。沿用 `user-working-preferences` 的完整流程／現場量測與有界驗收：先查 recurring producer，而非把快速 HTTP projection 說成整個資料流程已快。本輪沒有登入券商、送單、修改帳本／價格／模型、刪來源、清 OS cache 或重啟服務。[本輪交接](../artifacts/benchmarks/public-reader-reliability-validation-20261001.json)綁定程式、測試與原始觀測；本節不替代其他服務的驗收。
+
+### 減少依賴，而不是減少資料
+
+原監控只需讀分類／重試規則，卻因 import 下載器而連帶載入 pandas、requests 和收集工作。將 FinLab `safe_stem`、date-window 排除與 per-key retry 原樣移入 `stockagent/data/finlab_acquisition_contract.py`；FinMind Complement 的全部目錄規則移入 `downloader/finmind_catalog.py`。收集器與唯讀讀者共用同一組物件，不維護第二份清單；Sponsor 時鐘／source specs 直接沿用既有 `finmind_scheduling`。
+
+沒有變更 69 項 Complement 目錄的順序／成員、查詢粒度、授權、release 時鐘、retry deadline、receipt 檔名或資料健康。缺 SDK／收集器依賴不再阻止唯讀模組載入；缺選用 PyArrow 時可載入，不代表仍能驗證新 footer 或宣稱資料正常。新增 fresh-process import guard，避免後續又把 worker／SDK／pandas／requests 拉回讀取路徑。
+
+### 完整原版／新版載入對照，不是完整工作加速率
+
+[最後 ABBA](../artifacts/benchmarks/public-monitor-imports-abba-20261001-instrumented.json)使用[修改前五支模組的實際 frozen source](../artifacts/benchmarks/public-monitor-imports-baseline-20261001.json)，兩側使用相同 source loader；每個 target 各 8 次 fresh interpreter，共 **24 次**。比對完整有限目錄與命名／重試案例 SHA，結果一致；新讀者均未載入 worker、pandas、requests 或券商 SDK。中位數如下：
+
+| 載入邊界 | 原版 → 新版 wall | 程序 peak RSS 原版 → 新版 |
+| --- | --- | --- |
+| 30 秒監控 producer 的模組載入 | 1,129.76 → 448.82 ms | 140.46 → 83.24 MiB |
+| 全資料監控模組 | 1,111.08 → 455.51 ms | 140.28 → 83.01 MiB |
+| FinLab 面板模組 | 732.04 → 23.18 ms | 126.69 → 29.79 MiB |
+
+這是**載入邊界**，不含完整建置、provider、HTTP、browser paint 或 Windows/WSL 冷開機；OS cache 未控制。不同試跑受負載影響，保留所有 receipts，不把前一輪較慢值與最後新版值拼成更大的加速率。既有常駐 gateway 沒重啟，不宣稱它已載入新版或當下 RSS 減少上述幅度。
+
+### 自然排程與仍然昂貴的來源變動
+
+producer 已增加可持續記錄的 `dependency_import_observation`（nested schema v1）：shared import wall、範圍與 completion 時是否載入三支 worker。它不包含 interpreter／stdlib 啟動；既有 `total_ms` 仍是 main workflow，不改舊計時意義，也不把兩者相加冒充 systemd 完整 wall。
+
+[自然排程原始 journal](../artifacts/benchmarks/public-monitor-natural-cycles-instrumented-20261001.jsonl)中，10:54:07–10:56:08 五個不同 invocation 的 shared import **198.37–284.87 ms**，三支 worker flags 全 false；來源 **1,888**、欄位 **88,703**。各輪仍逐檔核對並更新 footer，未減少來源範圍／公開欄位。不能由欄位數推論歷史或 PIT 完整。
+
+**剩餘主要成本仍在**：即使 10:55 輪僅變動 1 個檔案，main workflow 仍 **9.65 秒**；其他變動輪 **9.36–14.40 秒**，[稍早 journal](../artifacts/benchmarks/public-monitor-natural-cycles-20261001.jsonl)亦有 **16.51 秒**。新增檔案／身份／schema／non-null count 變動會使整份特徵投影與持久 cache 重建，不能拿 unchanged fast-index hit 和 changed-source rebuild 直接算加速率。稍早一輪因來源動態觀測只有 88,670 欄，下一輪回到 88,703；沒有把動態缺項改寫成完整。下一階段優先 canonical per-dataset 增量投影／原子 manifest，保留完整身分核對、未驗證／缺項狀態及冷重建 fallback，而不是用 directory mtime 跳過原地改寫。
+
+### 驗收與部署邊界
+
+[最終相關回歸](../artifacts/benchmarks/public-monitor-contract-regression-20261001-accepted.log)：**979 passed／48.47 秒**，涵蓋全部 `test_finlab_*`、`test_finmind_*`、`test_data_monitor_*` 與 import contract；Ruff、py_compile、diff whitespace 通過。早期錯誤 test filename 的 no-tests 試跑保留，但不算成通過，也不把重疊的 165 項 telemetry 試跑加總。沒有執行全 repository suite。
+
+[10:52:18 全服務觀測](../artifacts/benchmarks/service-coverage-20261001-public-reader-contract.json)為 **66 services＝65 installed＋1 transient、50 timers、3 paths**，schedule／當次 pressure findings 0。六個 localhost GET 為 200，但 TAIFEX blocked、當沖／隔日沖／Shioaji degraded、OpenBB stopped、全資料 degraded；HTTP 成功不代表 source／execution 已修好。Discord maintenance、OpenBB、registered daily／features 的 failed unit 狀態保留。
+
+公開 gateway 仍 PID **1526156**、09:55:55 invocation `c12a00583bc844fc9060d8a808a2384a`；本輪短命 producer 自然載入，常駐讀者部署仍待安全窗口。引擎目前 PID **1551092**、10:14:35 invocation `ab27422100a04db99c6bfef872f9c863`，與前次記錄不同，本輪沒有做該重啟。沒有驗證新開盤、外部 IPv6、browser 或 Windows/WSL 重開機，也未宣稱所有服務已修好／達效能極限。
+
+可重測（只讀／新程序，不清 cache、不執行下載／帳本；output 用新檔）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_public_monitor_imports.py --baseline artifacts/benchmarks/public-monitor-imports-baseline-20261001.json --output artifacts/benchmarks/public-monitor-imports-rerun.json --rounds 2
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-public-reader-rerun.json
+```
+
+## 2026-10-01：Shioaji 查詢／回補可量測性、排程公平性與官方視窗修正
+
+全服務目標仍 **active**；沿用 `user-working-preferences` 的現場證據與有界驗收，以及 Shioaji skill 的單一既有連線／callback／local-first 流程。先審查並保留工作樹中其他 actor 的背景回補候選，再做共用修正；本輪沒有另開券商登入、送訂單、換帳本／模型、刪來源或重啟核心。[本輪交接](../artifacts/benchmarks/service-reliability-shioaji-timing-validation-20261001.json)綁定最終程式、測試與測速 SHA256。
+
+### 先把真正成本與未量測部分分開
+
+今天 09:01 回補的 retained receipt 有 **820** 個已解析價格，09:16 才完成；舊 traffic ledger 同 consumer 的 **820** 個 query event，`duration_ms` 加總約 **279.89 秒**，不能解釋整段約 15 分鐘。舊計時不包含 before-usage 與 ledger 寫入，成功／失敗的 after-usage 邊界也不同。這只證明存在未量測成本，不能推論全部時間都花在某個 RPC 或 fsync。
+
+- Canonical `shioaji_query` 現在保存 before-usage、request body、after-usage、pre-record 分段；可選的 caller-owned timing 另取得 ledger 寫入與完整 context，再由既有 remote-fetch receipt 聚合。沒有新增 network／usage calls，也沒有為了量自身寫入而再寫第二筆 event。
+- 舊 `duration_ms` 的相容邊界保留；新量測／row-count contract 是 **`query-phases-v1-column-rows-v1`**。Request body 包含 context 內處理／callback 等待，不冒稱純券商傳輸。Ledger 失敗僅標記 `ledger_record_failed`，不能改動有效行情或原查詢例外；無法量測的 wrapper 保留 unmeasured／null，不補造 0 ms。
+- Native Ticks／KBars 的 `len()` 可能回傳欄位數；現在先以 `ts`／`close` column 數計 observations，list-of-rows 仍照列數。820 個舊 event 的 rows 加總 **6,560** 不能解讀為 6,560 個 ticks；舊原始 ledger 不重寫。Summary 可能混合不同觀測契約，不能拿舊 rows 宣稱歷史完整。
+- Remote fetch receipt 分出 API acquisition、配額 guard、contract／鎖等待、歷史 admission、query phases、resolved callback 與剩餘處理。Resolved callback 的每檔原子收據寫入包含在 fetch 中，另列其成本；外部 local scan、最後 outer receipt、NAV 與完整復原工作不包含。不能把 last-batch timing 當整個 820 檔回補時間。
+
+### 修正會造成停止服務或無謂等待的排程
+
+[永豐目前官方限制](https://sinotrade.github.io/zh/tutor/limit/)為行情總查詢 **50 次／10 秒**，不是舊版 50／5 秒。候選 background gate 的 40／5 秒與另一 entry-book 的 50／5 秒都有過快風險；改讀 canonical `downloader.common` 的相同 profile。09:01 ticks／KBar fallback、historical entry books、current-minute KBars 共用這個**程序內歷史視窗**，維持原候選 20% reserve，即目前歷史最多 **40／10 秒**，不再各函式／各 batch 重設或維護三套迴圈。這不是網站全域限流，沒有新增 32 concurrency cap。
+
+另外修正高優先失敗標的的 retry starvation：先讓尚未查詢的標的前進，組內仍保留 mode priority；還有 fresh work 時不受其他標的的 5 秒 retry cooldown 拖累。只有純 retry／source-settling 才等 5 秒，quota stop 仍等 60 秒。沒有增加曝險、減少原訊號／分鐘點或改價格契約。
+
+**這是局部防護，尚非全部券商規範驗收**：官方另列盤中 ticks 10 次／KBars 270 次及少量必要查詢／使用推播的要求；跨程序、snapshots、其他 clients 的總配額／盤中限制仍需追查，不能把程序內 40／10 秒當全帳戶保證。沒有實際重查今天 820 檔、放寬 provider ceiling 或用追加登入規避。
+
+### 最終同資料、隔離 ABBA 與回歸
+
+[最終 fixture-only ABBA](../artifacts/benchmarks/shioaji-recovery-fixture-abba-20261001-final.json)：相同 8 個標的、固定 native／usage replies、每 variant 2 次；canonical ledger fsync／atomic receipts／dispatch 是實作，broker latency 是替身。同步 main-call 最大值的中位數 **144.33 ms**，背景為 **0.42 ms**；完整回補 **144.33 → 148.28 ms**，**整批沒有更快**。改善是主迴圈可回應，而非宣稱 provider／今天開盤訊號已加速。四次完整價格 SHA 相同；32 個 events／64 observations／31,668 bytes journal，零 live broker requests／正式 source writes、promotion=false。Native callback 替身正確回送結果，不把 timeout=0 placeholder 當有效資料。Imports、OS cache control、完整 live job、browser／公網均未量測；8-symbol probe 未觸及 40-call 視窗，不用這個數字替代 admission 壓力測試。
+
+[最終 15 模組回歸](../artifacts/benchmarks/service-shioaji-timing-regression-20261001-final.log)：**774 passed／12.99 秒**；Ruff、py_compile、diff whitespace 通過。涵蓋成功／失敗／interrupt timing、無額外 usage calls、ledger／reporting sink 失敗隔離、native column rows、callback 收據耗時、價格／張股與 09:01 邊界、原子分批恢復、fresh-work 公平性、官方 profile／跨 batch 視窗、當沖／隔日沖、Shioaji collector／panel／schedule、全服務 audit。先前的 callback fixture 與 module-cache 隔離試跑失敗已修正並重跑；保留失敗 log，不加總成更多通過測試，也未跑全 repository suite。
+
+### 現場、版次與剩餘風險
+
+[10:11:29 全清單](../artifacts/benchmarks/service-coverage-20261001-shioaji-timing-final.json)：**65 services／50 timers／3 paths**，schedule findings 0；比前一份清單多了其他工作流程安裝的 legacy-US cold-publication service／timer，尚未執行不算資料發布完成。六個 localhost GET 全為 200，但 TAIFEX **blocked**、當沖／隔日沖／Shioaji **degraded**、OpenBB **stopped**、data monitor **degraded**。當沖 status GET **5.08 ms** 是 projection transfer，不是開盤、券商、冷來源、browser-paint 或完整回補速度。
+
+現場 Discord PID **898**、同 invocation；當沖引擎／公開面板由其他工作流程先後於 **09:37／09:55** 重新啟動，最新 PID **1526022／1526156**，invocations 已不同。本輪沒有重啟；`NRestarts=0` 不能證明沒有手動重啟。10:11 engine active、四 mode session_date 均為 10/1，仍不等於全行情或券商成交完成。10:13 的現場 stock snapshot 已看到新 query contract：before-usage **18.28 ms**、body **79.36 ms**、after-usage **30.05 ms**、pre-record **127.71 ms**；這證明早前共用量測有載入，**不證明 09:55 後的正確視窗／公平性／callback 計時等最終版本全已部署**。
+
+本輪末次 root statvfs 一般 available **59,925,037,056 bytes**、含 reserved free **169,892,970,496 bytes**，與先前 available=0 是不同時間的觀察；本輪沒有刪除或搬移，不能由差值推論誰回收了哪些來源，亦不代表每一工作容量／publication preflight 都通過。重型 cold reconstruction 仍維持盤中保護。
+
+後續需在安全部署窗口驗收最終版、下一次真實開盤與全工作 timing；追查跨服務 native account budget／intraday 查詢、仍存在的 source gaps／Discord maintenance／TAIFEX／OpenBB 健康、全庫、公網 IPv6／browser、Windows-WSL cold boot。**不宣稱所有服務已修好或效能達到極限，目標維持 active**。
+
+可重測（固定 fixtures，不登入／不改 source；output 必須是新檔）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_shioaji_recovery_responsiveness.py --output artifacts/benchmarks/shioaji-recovery-fixture-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-shioaji-rerun.json
+```
+
+## 2026-10-01 09:18：Yahoo 匯率重修與退出碼修正，開盤等待風險仍在
+
+沿用 `user-working-preferences` 的現場證據與有界驗收流程，並以資料品質 skill 作為工程檢查的 companion：先確認來源身分、交易日／查詢邊界、code 粒度與本次／累積報告，再改共用契約，不將未解決來源問題改成正常。[本輪交接](../artifacts/benchmarks/service-reliability-yahoo-validation-20261001.json)保存程式／回歸／測速／來源報告 hashes 與現場邊界。沒有重新啟動核心、修改帳本／模型、下單、全量下載、刪來源、force GC 或放寬容量 floor。
+
+### Yahoo FX：消除 producer／precheck 自相矛盾
+
+58 個 canonical Yahoo 匯率檔案都有有效 `source=yahoo`、`asset_class=forex`、requested-start 與 checked-through metadata；現場最後價格為 9/30，查詢邊界為 10/1。Writer 原本會移除全零／null 的無實際意義成交量，precheck 卻把 `Trading_Volume` 設為所有資產的必填欄，每天判定全部 58 檔 `schema_mismatch`，觸發從 2000 年開始重抓與重寫。這不是行情缺漏，也不應補造 volume=0 來掩蓋。
+
+- Canonical repair 現在按 asset 驗證欄位：forex volume 可省略，有實際數值仍保留；台／美股與 crypto volume 仍必填。缺 OHLC／adjclose、來源錯誤、日期或 asset metadata 錯誤仍不通過；真正 stale 仍安排 overlap 增量 merge，沒有跳過更新。
+- Acquisition contract **v2**，FX fingerprint **`da9beafa7f8333cdea9fc53014f14a15272b422a3df72b11a09a41406ab0afe8`**。價格 schema／grain 維持 **v1／daily**；後續新檔／新 source summary 記錄 contract，不回寫舊來源 metadata、冒稱已有正式 v2 run 或改 training ABI。
+- 同一 daily runner 的 `run_yahoo_incremental_assets` 用 `if ! ...; then rc=$?`，取得的是邏輯反轉後的 0，而不是原失敗碼。改成成功／失敗分支擷取原退出碼，且兩種結果都恢復 asset scope；0／1／7／42／124 均有 regression。保留原 source-gap gate，不把有 productive rows 的 exit=0 解讀為無缺口。
+
+[58 檔、13,754,753 bytes 唯讀 ABBA 驗收](../artifacts/benchmarks/yahoo-forex-readonly-precheck-20261001-validated.json)：相同檔案／10/1 查詢邊界，legacy 安排 **58** 次全歷史 schema rebuild，candidate 為 **0**、58 current；四次 trial 的每檔 SHA256 與 repair-report hash 前後相同，**零 network／source writes、promotion=false**。Precheck 中位數 legacy **17.13 ms**、candidate **21.17 ms**，新版本身沒有更快；改善是避免錯誤觸發的 provider fetch／全歷史重寫。不能把前次正式 **16.666 秒**與這個唯讀 planning 的 **21.17 ms**當整批下載 A/B，imports／discovery／subprocess precheck timeout／provider／cold-start／全工作未包含；OS cache 未控制。
+
+[最終 12 模組回歸](../artifacts/benchmarks/service-yahoo-regression-20261001-validated.log)：**642 passed／9.14 秒**；Ruff、py_compile、bash syntax、diff whitespace 通過。涵蓋 forex volume／incremental／source identity、台美股與 crypto 必填 volume、report preservation／leading-zero code、真實失敗退出碼、source run binding、shared transport／locks／limiter、public economic／monitor／service audit。沒有執行或宣稱全 repository suite。
+
+### US 的 210 筆 source gaps 仍未解決，報告不能混算
+
+精確正式 run **`registered-daily-20260930T223000400818411Z`**：US source **1,223.664 秒**、step 1,225 秒；**12 failed＋198 lagging_skip**，matched source summary 與 step receipt 的 unresolved=210。12 個 metadata-invalid code 都對到本次 failed；其中 CWAN 來源為 CBOE、WSR 缺 requested-start、其餘 10 缺來源／日期證據，沒有補 metadata 假冒 Yahoo，也沒有為了綠燈取消 lag 門檻。
+
+`repair_report.csv` 是 **16,427 個唯一 code 的本次 precheck**；`download_report.csv` 是保留舊結果的 **12,046 個唯一 code 累積 report**，其中 14 failed 有 **RZAI／THRMV** 兩筆不在本次 metadata-invalid cohort。因此本次不能報成 14 failed，也不能把累積 99 history-extension-unavailable／47 retry 說成今天的新錯誤。歷史退市股／來源缺口仍保留，未做全 US 重抓或清理。下一個 eligible 正式 source run 才可驗收新版端到端。
+
+### 開盤與全服務：可連線不等於完成執行
+
+[09:12:39 全清單](../artifacts/benchmarks/service-coverage-20261001-yahoo.json)：**64 services／49 timers／3 paths**、timer findings 0。六個 localhost GET 皆 200，但 TAIFEX blocked、當沖 stale、隔日沖／Shioaji degraded、OpenBB stopped、data monitor degraded；舊 Frankfurter failed、Yahoo 210 gaps、OKX feature failed、crypto-training deferred_raw_writer 仍未清除。HTTP timings只包含 localhost response transfer，不代表公網／browser／uncached／成交延遲。
+
+今天四模式 `opening_signal_latency.jsonl` 的 immutable-ready 延遲 **15.29／15.67／16.11／16.48 秒**；第一模式 realtime prepare 約 2.65 秒、quote fetch **12.06 秒**，不是 138 ms model inference 佔主因。四筆 signal-ready receipt 不等於 simulation fills。09:15 引擎 `status.json` 仍為 **09:01:01／waiting**、各 mode session_date 仍 9/30；journal 顯示當日 09:01 VWAP 回補持續進展到 **500／820**。應追查長時間同步資料取得與 control-loop／status 更新的串接，不能縮短價格證據窗口、插值或回填假成交來解決。此次未重啟正在回補的引擎。
+
+**09:20:25 再查**：引擎更新至當下、health 為 **active**，四 mode session_date 均切到 **10/1**，沒有重啟。這不消除剛才的長時間等待，也不證明券商成交／全行情完整；09:20 stock-stream 記錄 requested **366**、subscribed **200**、available **193**、capacity_limited **166**，數值是各自的覆蓋／容量定義，不能簡單相加。交接保留此恢復後狀態，前面的全清單與 09:15 snapshot 是有時間標籤的恢復前證據。
+
+[09:21:26 全清單再查](../artifacts/benchmarks/service-coverage-20261001-yahoo-post-opening.json)：仍為 **64／49／3**；公開當沖投影由 stale 回到 **degraded**，不是全正常。TAIFEX blocked、隔日沖／Shioaji degraded、OpenBB stopped、data monitor degraded；全部 localhost GET 仍 200。引擎 active、畫面已更新與資料／執行健康分開呈現。
+
+三核心 PID **898／606482／715544**、原 invocation 與 NRestarts 0 未變。09:15 root 一般 available **0**、含保留區 free **72,459,042,816 bytes**；reserved 不是 acquisition budget。容量值有波動，不用兩次 sampling 推算是哪個 PID 的 volume 寫入或精確滿盤時間。正式大型歷史／source 重建、cold publication、全庫、公網 IPv6／browser／Windows-WSL cold boot 仍未驗收；**不宣稱所有服務正常或最佳化完成，goal 仍 active**。
+
+可重跑（不修改 source；output 必須是未存在的新檔）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_yahoo_forex_precheck.py --end-date 2026-10-01 --output artifacts/benchmarks/yahoo-forex-precheck-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-yahoo-rerun.json
+```
+
+## 2026-10-01 08:40：Frankfurter 歷史前段誤判修正，目標仍 active
+
+沿用使用者工作偏好的「現場失敗 → 共用機制 → 同源驗證 → 明確驗收邊界」。[本輪交接](../artifacts/benchmarks/service-reliability-frankfurter-validation-20261001.json)包含 13 份程式／測試／正式失敗報告／實測 receipts 的 SHA256；沒有新增服務或下載框架、重啟核心、換模型／帳本、送訂單、刪來源、force GC、解除 pins、降低容量 floor 或終止其他 actor 的工作。
+
+### 真正原因：沒有發布的前段，不能冒充檔案損壞或補造價格
+
+Registered daily `registered-daily-20260930T223000400818411Z` 的 Frankfurter 不是整批未取得：**754 updated_incremental、116 failed_existing_read**。116 筆全部是 BRL／CNY／ILS／INR，各 29 pairs；皆在查詢 `1999-01-04..2000-01-12` 時收到 404，因而阻斷後續 tail，不是 Parquet 讀壞。本機四個 USD pairs 的第一筆是 **2000-01-13**，最後一筆仍 **2026-09-25**。
+
+核對相同窗口的 **native EUR／ECB v1**：267 個發布日皆無這四種 base 的觀測；另行只讀查詢 2000-01-13 時四種幣別才出現。V2 的 currency metadata 起始日混合多個來源，不能拿來充當 ECB 的發布起點；[Frankfurter 官方文件](https://frankfurter.dev/)亦說明 v2 預設 blended、指定 provider 才是單一來源。本輪保留[既有 v1 ECB 契約](https://frankfurter.dev/v1/)，不切換成 blended feed。
+
+- 只對 **404** 尋求 absence 證據：必須有完整、非空、amount=1、base=EUR、日期範圍完全一致、日期／幣別／數值有效的原生回應，且全窗口沒有該 base。若其實有 base 觀測、窗口偏移、壞資料、native EUR 自己 404，或其他 HTTP／認證／伺服器錯誤，仍保留失敗，不標正常。
+- 每個窗口只保存一份共享 `.head_sources` parsed provider response；head proof 綁定來源 SHA256、實際 first date、查詢範圍與 acquisition **v2**。缺少／改變／損壞的證據不能沿用；先前只查短窗口的 proof 也不能覆蓋較長的 end。未發布日期保持沒有價格，**沒有計算 EUR cross-rate、補零、內插、造價或捏造 broker fill**。
+- 真正 head source 錯誤改成 `failed_head_source`，保留可讀原檔的實際 row count；真正檔案錯誤仍是 `failed_existing_read`。源資料或交易問題不改成正常。
+
+### 效率、復用與併行穩定性
+
+移除 `.app` legacy 跳轉，直接使用同一個 `.dev/v1`；保留既有原生 shared limiter／有界重試與 base/date singleflight，不新增全域 32 concurrency／任意 throughput cap。手寫、只含 PID 的 temporary writers 改用既有 `artifact_io` 原子發布，保留 Snappy／schema／price dtype；主 collector 沿用 canonical `.download.lock`、finite nonnegative `--lock-timeout-seconds`，覆蓋來源讀取、所有寫入、summary 與 optional v2 子工作，例外後也釋放鎖。不另建 cache／fetch framework。
+
+Acquisition v2 fingerprint **`897d988772250aff77ea335bae479d0b6bfb56150d753394f3483803bcb2c1e5`**；price ABI 仍 **v1**。下一次正常 collector invocation 才會寫新正式契約；沒有改寫舊正式 receipt 來宣稱已部署／已完整取得。
+
+[固定已完成窗口的最新 ABBA 實測](../artifacts/benchmarks/frankfurter-head-isolated-native-20261001-validated.json)：每 variant 2 samples，舊 alias 中位數 **352.18 ms**、native v1 **59.92 ms**，減少 **82.99%**；四份完整 JSON payload 的 normalized SHA256 全相同。前兩次測量也保存為獨立 receipts，時間不同，不選最快當常數。這只是 GET＋JSON 的單端點比較，provider／OS cache 未控制、redirect HTTP legs 未逐個計數；**不是全 870 pairs、完整 daily job、首次 process cold start、browser 或 opening signal 的改善幅度**。
+
+### 隔離驗收，不替換正式來源
+
+同一可重跑工具只複製 **BRLUSD／CNYUSD／ILSUSD／INRUSD** 到有界 temporary workspace，沿用 canonical `_download_pair`，實際查到 9/30；三個原有 6,834 rows 成為 6,837，ILS 6,833 成為 6,836。**全部原有 observations／dtype 完整保留**，未發布前段仍空缺，四個正式來源 SHA256 前後不變。這不證明 2000～2026 全部 interior history 無缺。
+
+第一個 evidence＋tail pass 約 **2.79／1.22／1.25／1.18 秒**；下一次無變更再檢查 **1.44／1.01／1.21／1.01 ms**、網路 calls **0**，不是把熱路徑當冷啟動。共享 source response 只有一份。工具的 **14 logical GET calls** 有 admission budget，benchmark 自己 max_retries=0，不改正式 retry policy。Parsed provider response、觀測時間、query、exact serialized-source SHA256 與每個 head proof 都保留於 benchmark receipt，temporary copies 清除但正式 source/report 沒有修改，**promotion=false**。
+
+[9 個模組最終回歸](../artifacts/benchmarks/service-frankfurter-regression-20261001-validated.log)：**270 passed／4.53 秒**，包含共享前段、實際 tail 保留、壞／缺／改 source proof、各 HTTP 失敗、短窗口、源／檔錯誤分離、writer-lock 例外與 timeout、benchmark admission／不 promotion、public economic／keyed receipts、native limiter 與 data-monitor inventory。Ruff／py_compile／diff whitespace 通過；前面的 collection error 已修正 import 並完整重跑，不把試跑次數加總，不宣稱全 repository。
+
+### 現場仍未完成的項目
+
+[08:27:47 完整清單再查](../artifacts/benchmarks/service-coverage-20261001-frankfurter-final.json)：**64 services／49 timers／3 paths**、timer findings 0。六個 localhost GET 均 200，但 TAIFEX **blocked**、當沖 **degraded**、隔日沖／Shioaji **waiting**、OpenBB **stopped**、data monitor **degraded**。Registered daily 舊 Frankfurter failed／Yahoo **12 failed＋198 lagging_skip**、舊 OKX feature failure、crypto-training deferred_raw_writer 與 TW cold 未接受的 source-only release 都沒有清除；availability 不等於 source／execution acceptance。
+
+08:40 核對三核心 PID **898／606482／715544**、原 invocation、NRestarts 0，沒有重啟或破壞開盤保護。Root 一般 available **0**、含保留區 free **83,602,890,752 bytes**；D available **2,529,952,428,032 bytes**。保留區不是 acquisition budget、D 空間不是搬移授權，沒有啟動正式全量來源／歷史重建。容量仍在消耗，是持續風險；**不宣稱系統正常、全服務已優化到極限或本輪 source promotion 完成**。
+
+下一輪繼續安全容量／writer 現場、Yahoo 精確失敗、data-monitor 重掃／projection 與其他服務；正式 870-pair run／完整 source-history、全庫、公網 IPv6／browser、Windows／WSL cold boot 仍需各自驗收。目標維持 active。
+
+可重測（只寫新 benchmark receipt，已有 output 會拒絕覆寫）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_frankfurter_head_repair.py --output artifacts/benchmarks/frankfurter-head-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-frankfurter-rerun.json
+```
+
+## 2026-10-01 07:43：OKX 原生端點分流與保留區容量監測，目標仍 active
+
+依使用者工作偏好的「現場證據 → 共用實作 → 同資料測速 → 逐項驗收」流程；本輪沒有新增下載框架／daemon、重啟核心服務、換模型／帳本、送出訂單、刪除來源、解除 pins 或降低容量 floor。完整 source hashes、回歸與現場邊界見[本輪交接](../artifacts/benchmarks/service-reliability-okx-reserve-validation-20261001.json)。
+
+### OKX：減少端點配額等待，不刪分鐘或改資料語義
+
+9/30 的 registered-feature run 不是整批未下載：481 個 feature 標的有 480 updated、1 partial；**WLD-USDT-SWAP 的 mark_price 因 RemoteDisconnected 失敗**。現行 transport 已有有界斷線重試，沒有再實作同一修正／增加 retry budget。當次 index history **7,218 grants、0.2 秒 interval**，aggregate worker seconds 含共用 limiter 等待，不能相加成全流程 wall。
+
+[OKX 官方文件](https://app.okx.com/docs-v5/en/#public-data-rest-api-get-index-candlesticks)說明近期 index candles 保留最新 1,440 筆、20 requests／2 秒；歷史端點 10 requests／2 秒；**兩者每頁最多都是 100**，不是提高 page limit 到 300。
+
+- 在 canonical historical-feature reader 中，只有整頁位於近期保留區內、再扣一頁安全 margin 時，才使用 recent endpoint；更舊區間仍走 history。空頁、短頁、非連續／未完成頁或 recent error 從**同一 cursor**退回 history，不提交不完整 recent page，也不反覆切回失效 recent endpoint。history 仍失敗就保留 failed／partial 與已有價格。
+- 在原共用 native limiter 加入 recent endpoint 的獨立官方 profile，保留使用者較慢的 explicit interval；沒有全域速率／32 concurrency 限制。每個標的的 CSV 多記錄 index acquisition fingerprint、logical page calls 與 fallback reason；transport grant telemetry 仍包含實際 retries，兩種計數不混用。
+- Array、funding object、Rubik 三種 history pager 共用 typed row／timestamp／cursor 驗證；重複頁或壞回應不再被靜默當成「歷史結束」。合法稀疏資料仍維持缺值，不補造或內插。
+- Acquisition contract **v2／SHA256 `45b41fda489d0dcf529d374e8816d07f5e453e0dd46f9f5fd6be991557b53218`**；feature ABI 仍 v1、completed 1m／native 5m／causal funding 語義與欄位不變，保留相容 `data_okx/1m` root。Catalog／summary 記錄新 acquisition contract，不改原有 price files／receipts 來冒稱新正式 run 已完成。
+
+| 固定已完成區間 | ABBA samples／variant | history-only median | hybrid median | 延遲減少 | 完整資料／dtype parity |
+| --- | --- | --- | --- | --- | --- |
+| [BTC-USDT，1,440 分鐘](../artifacts/benchmarks/okx-index-routing-btc-1440-abba-20261001.json) | 4 | 2.993924 秒 | 1.591330 秒 | 46.85% | 全部相同、全部 1,440 點 |
+| [ETH-USDT，2,880 分鐘](../artifacts/benchmarks/okx-index-routing-eth-2880-abba-20261001.json) | 2 | 5.755572 秒 | 4.383307 秒 | 23.84% | 全部相同、全部 2,880 點 |
+
+實際 anonymous public GETs，原生 shared buckets；BTC 每 variant 都是 15 頁，hybrid 改為 recent 13／history 2，**沒有少抓或減少總 HTTP 頁數**。只測 fetch＋normalize，排除 imports、其他七項 features、全市場、檔案冷啟動、browser／成交延遲；provider／OS cache 未控制。兩份 receipts 的程式 hashes 均再次與本輪最後程式核對。正式全市場下一次 eligible run 尚未驗收，因此 **舊 OKX failed receipt 未清除，也不推稱整批已快一倍／已修好**。
+
+### 保留區：一般可用量降到 0，不能因此停止觀測容量變化
+
+本輪開始一般 available 約 11.5 GB；07:23 核對已是 **0**，但含 reserved 的 `f_bfree` 約 **107.5 GB**，不是宣稱檔案系統完全沒有 free blocks。07:43:15 再查一般 available **0**、含保留區 free **102,555,701,248 bytes**；D 槽 **2,529,952,428,032 bytes**。保留區不是 acquisition budget，D 空間不是搬移授權；沒有削減保留量／floor、force GC 或終止另一項工作。
+
+原 trend 只扣 available，在 available=0 後會漏掉繼續佔用的保留區。現在沿用**同一次 statvfs**，增加 free-including-reserved、used、reserved-or-unavailable-free 及配對 delta；仍每五分鐘一次、同個 bounded baseline／rotated journal，沒有 walk 或更多輪詢。未知 epoch、counter、geometry／clock 異常與舊 baseline 缺欄位均維持 null，不把缺值當 0。
+
+既有 hardened worker **自然載入**新計量，未重啟／加權限。07:32／07:37 兩次 **64 services** 的事件，各四個 journal frames 已以 `journalctl --all -o json` 完整取回／重組／核對 SHA256。第一個 sample 對舊 baseline 的新增 counter delta 是 null；第二個 sample 以相同真實 systemd invocation anchor 證明 epoch，available delta **0**，含保留區 free delta **-406,310,912 bytes**、used delta **+406,310,912 bytes**；capture **27.059／17.770 ms**。這是 volume net used change，**不能歸因某個服務、當成檔案 growth 或與 parent／child／cgroup I/O 相加**。
+
+### 回歸與剩餘服務狀態
+
+[17 個模組最終回歸](../artifacts/benchmarks/service-okx-reserve-regression-20261001.log)：**964 passed／43.43 秒**。包含 recent／history 跨保留區、同 cursor fallback、壞頁／重複頁、完整八階段 synthetic enrichment＋實際 Parquet write/read 的全部 feature／缺值模式／coverage parity、原生配額、重試、有界測速、來源 run／report／receipt 串接、public dashboards、data inventory、storage-pressure 與新保留區 delta；早先 119／86／10 項試跑有重疊，不加總。Ruff／py_compile／diff whitespace 通過，不是全 repository／正式歷史／真實成交或冷開機驗收。
+
+[07:32:06 的完整服務觀測](../artifacts/benchmarks/service-coverage-20261001-okx-reserve-final.json)：**64 services／49 timers／3 paths**，timer findings 0，六個 localhost GET 均 200；TAIFEX **blocked**、當沖 **degraded**、隔日沖／Shioaji **waiting**、OpenBB **stopped**、全資料監控 **degraded**，不改寫為正常。Registered daily 又有 Frankfurter failed，以及 Yahoo **12 failed／198 lagging_skip**；crypto-training-refresh deferred_raw_writer。TW cold 最新 source-only attempt 仍 deferred stale_derived_receipts（feature source_bytes／official lifecycle＋source receipts），沒有 release；不以 unmatched receipt 作驗收。OpenBB L1 matched invocation `2499b43ae877431b86ef754b65505a01` completed，但 memory-high delta **8,242**、OOM／kill 0；不能說已解決其重掃與 resource pressure。
+
+07:43 三核心單元 PID **898／606482／715544**、原 invocation、NRestarts 0；HTTP／active 只證明可達與監督。下一輪優先安全容量／actual volume use、Frankfurter／Yahoo 精確來源失敗、OpenBB 重掃與 recurring data-monitor projection 成本，再在容量及 opening admission gates 下做正式來源／FIFO history 驗收。全市場 job 性能、全服務資料健康、全庫測試、公網 IPv6／browser 與 Windows／WSL cold boot 都仍未全部完成，**目標保持 active**。
+
+**07:52:22 容量再查**：一般 available 仍 **0**，含保留區 free 已降至 **98,182,283,264 bytes**。沒有因為一般 available delta 為 0 而宣稱容量穩定；繼續保留大型作業 admission／opening 保護，不把保留區改算成可用額度。
+
+可重測（public read-only probe 只寫新 benchmark receipt；已有 output 會拒絕覆寫）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_okx_index_routing.py --inst-id BTC-USDT --minutes 1440 --lag-minutes 30 --repetitions 2 --budget-seconds 60 --output artifacts/benchmarks/okx-index-routing-btc-rerun.json
+run_fintech_python scripts/benchmark_okx_index_routing.py --inst-id ETH-USDT --minutes 2880 --lag-minutes 30 --repetitions 1 --budget-seconds 60 --output artifacts/benchmarks/okx-index-routing-eth-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 2 --output artifacts/benchmarks/service-coverage-okx-reserve-rerun.json
+```
+
+## 2026-10-01 06:45：程序寫入與容量風險監測，目標仍 active
+
+沿用使用者工作偏好的「清單 → 現場量測 → 共用修正 → 驗收」流程。沒有新增常駐服務、放寬公開服務權限、重啟核心服務、刪除資料或啟動正式全歷史推論。
+
+### 修正與實際運轉
+
+- 原 all-service audit 只有一次 repo-context 程序清單，寫入計量主要來自 systemd cgroup，因此會漏掉獨立執行的修復工作。現在在既有取樣區間前後收集 PID／starttime／unit 與 `/proc/PID/io`，以啟動時間防 PID 重用；缺少權限、counter rollback、unit context 改變、時鐘／host epoch 無法證明均保留 null 與原因。出現／消失只代表進出可觀察範圍，不冒稱確定啟動／退出。
+- 與既有每五分鐘的 runtime tracker 共用相同實作；一般每 30 秒狀態發布在未到期時不讀 `/proc`，不新增 polling daemon 或不受控歷史。單一 baseline 仍限 4 MiB，歷史交由既有 journald rotation 與有 checksum 的分段事件。程序權限或 optional baseline clock 異常不會抹掉 64 個 unit 的監測或阻止公開狀態發布。
+- Hardened status worker 的 `ProcSubset=pid` 會隱藏 boot ID：只有真實 32-hex systemd invocation UUID／MainPID／restart count 及 active 狀態相符才可作 host epoch witness。沒有見證即不扣除 unmanaged process 或 filesystem counter；磁碟容量變更也不當成寫入成長。PID I/O 包含 waited-for children，**不可把 parent／child／cgroup 相加或當成容量淨增長**，依 [Linux man-pages 的 counter 定義](https://man7.org/linux/man-pages/man5/proc_pid_io.5.html)。
+- 對 `/proc` 的可見性亦保留 failure counts，未增加 ptrace／公開服務權限。06:44:30 的 root CLI 觀察到 57 個 repo-context 程序（40 managed／17 unmanaged candidate），兩次 capture **29.027／39.011 ms**；06:44:55 的既有 hardened worker 只觀察到 19 個（18／1），capture **22.514 ms**，119 個 cwd read failures、17 個 matched process I/O unavailable。這是當次 metadata capture 耗時，不是全站延遲或全主機工作覆蓋率。
+- 既有排程已自然載入新程式：06:34、06:39 的兩份五分鐘事件已由 journal chunk 完整重組並校驗 SHA256；06:39 以 Discord invocation 作 epoch anchor，程序間隔 **303.407 秒**。後續 06:44 baseline 已包含最終 capture timing／visibility。這證明監測執行，不證明任何 source／成交成功。
+
+### 容量與尚未解決風險
+
+本輪系統盤 available 從 06:13 的 **30,270,435,328 bytes** 降至最後核對的 **11,543,511,040 bytes**（約 11.5 GB；`df` rounded 100%）。D 槽仍 **2,529,952,428,032 bytes**，guarded cold bind `--check` 通過；D 是本機冷主副本，不冒稱獨立備份。
+
+20.984 秒 read-only sample 的 volume available **-291,250,176 bytes**；主要 observed writers 是 unmanaged Python **291,012,608 bytes** 及其 bash parent **339,058,688 bytes**，parent 開啟 `artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/rebuild_v36.log`。這是另一項期貨修復工作的重要線索，**不是把 parent＋child 加總、不是證明全部容量下降都由它造成**。06:39 既有容量監測另外記錄五分鐘 **-4,857,126,912 bytes**。
+
+06:44:47 重新執行 canonical `stockagent-data gc --dry-run`：只核對目前四個 managed registrations，全部 pinned，would_evict／would_renew／實際 evicted 均 **0**。沒有 apply／force、解除 pin、刪除 minute source／模型／帳本／cold object 或清掉使用中 caches。不能用這四項的結果聲稱全部 node-local derived caches 已驗收；亦不能把 D 槽容量當成搬移授權。已向使用者請求協調另一項修復工作之暫停／D 槽寫入路徑，本輪不擅自終止它；安全容量確定前不追加大型驗證／回補。
+
+### 回歸與服務驗收邊界
+
+[六模組最終回歸](../artifacts/benchmarks/service-process-io-regression-final-20261001.log) **666 passed／28.62 秒**；包含 PID reuse、same-capture race、hidden boot ID／有效 anchor、null counters、partial visibility、counter／clock rollback、巨大 optional clock、volume resize、journal framing、snapshot publication 與 public dashboard／data inventory／storage-pressure 整合。先前 414／662 項試跑是重疊集合，不加總。Ruff、py_compile、diff whitespace 通過；不是全庫、正式全歷史、Windows 冷啟動或公網 browser 驗收。
+
+[06:44:30 最終現場 audit](../artifacts/benchmarks/service-coverage-20261001-process-io-final.json)仍 **64 services／49 timers／3 paths**，timer findings 0；六個 localhost GET 全 200，但 TAIFEX **blocked**、當沖 **degraded**、隔日沖 **waiting**、Shioaji **waiting**、OpenBB **stopped**、全資料監控 **degraded**。Crypto training refresh deferred raw writer、registered features 的 OKX step failed、TW cold publication failed 均保留，不以 HTTP 200 消除。
+
+OpenBB L1 最新 matched invocation `8f0f3bb24c984d7ab799d077517eb964` completed，但 derivative footer scan **132.911 秒**、memory-high delta **4,941**、OOM／kill 0；約 2.55 GB file cache／0.116 GB anon 的 stage sample 顯示主要是讀取 cache 壓力，不能誤稱 Python heap 洩漏或宣稱已解決。正式 Discord history attempt 6 仍 failed，沒有解除 opening runway／backoff 或替換產物。三個 core unit PID／invocation 未變、NRestarts 0。
+
+完整證據與後續安全邊界：[本輪交接](../artifacts/benchmarks/service-reliability-process-io-validation-20261001.json)。重測仍走既有路徑：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 10 --output artifacts/benchmarks/service-coverage-process-io-rerun.json
+run_fintech_python -m pytest -q -s test/test_audit_service_latency_coverage.py test/test_track_service_runtime_trends.py test/test_data_monitor_inventory.py test/test_public_dashboards.py test/test_data_monitor_dashboard.py test/test_storage_pressure.py
+stockagent-data gc --dry-run
+```
+
+## 2026-10-01 06:00 起：共享實體分鐘快取容量／解碼修復，目標仍 active
+
+依共用訓練及使用者工作偏好流程，修正相同問題的 dense／packed／compact 三條來源路徑，沒有新增下載器、重啟核心服務、替換模型／帳本或改財務公式。這是本機程式碼與小型端到端驗證，**不是正式全歷史或全服務 ready**。
+
+### 根因、修正與監測
+
+- 舊程式只有 dense 依整份資料估算值決定是否保留；packed／compact 的 dictionary 無條件保留，包含明確設定 `STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB=0` 時也保留。三種表示各自解碼同一份 NPZ，還可能保留重複 mark plane。這是原始碼與反例證明的風險，不冒稱它造成 attempt 6 的失敗；attempt 6 的已證明根因仍是上一節的 checkpoint 投影遺失來源。
+- 改為來源模組內一個 byte-bounded LRU，三種表示共用 budget；按實際 CPU tensor backing-storage identity／bytes 計算，同一 storage／view 不重複計入。dense／compact 從同一 packed loader 取得資料，不再各設無界 dictionary。相同 key 的併發 miss 共用結果或原始錯誤，失敗可重試；不同日期的 I/O 不在全域鎖內，保留平行解碼。淘汰只放掉 cache 引用，已交給 batch 的 tensor／views 與 immutable source 檔均保留。
+- 延用既有 GIB 設定；零值現在確實關閉所有表示的保留，拒絕 NaN／infinity／負值。`auto` 在原 host reserve／world-size 分配前，亦讀取可取得的 cgroup v2 ancestor `memory.high`／`memory.max` 減 `memory.current` 餘裕；沒有提高 systemd 限制。實際 formal owner 的 high **48 GiB**、max **64 GiB**，不能把整機 MemAvailable 當該 worker 的可用容量。Linux 文件區分 [high 的節流與 max 的 OOM 邊界](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-interface-files)；storage 計數依 [PyTorch storage API](https://docs.pytorch.org/docs/2.14/storage.html)，不只計算 view 的 logical cells。
+- 每個表示保留 hits／loads／coalesced／errors／evictions／bypasses、load／wait 秒數及 resident／peak tensor bytes。prepared source 的獨立 runtime callback 跨 universe projection 共用，不混入 immutable audit、release ID、optimizer／checkpoint fingerprints。所有 canonical fold writer 呼叫端接上原本的 atomic JSON writer，輸出 `physical_source_cache.json`；標為 **rank-local shared-source lifetime，fold reporting 前 snapshot**，不是某一 fold／epoch 的獨占量測。`load_s` 含 nested load，不可相加假裝總 wall time；snapshot 附時間。
+- budget 限制的是 **cache 保留的 tensor storages**，不含完整 source arrays、Python metadata、in-flight decode、consumer-held／projected batch、GPU workspace。啟動時 headroom 不是日後可用 RAM 的保證；cgroup v1／無法讀取的 limits 不在新 v2 headroom 證據內。因此未宣稱整個 worker 不會 OOM，亦未宣稱全域 replay 已做 bounded streaming。
+
+### 驗證與可重測結果
+
+[最終回歸](../artifacts/benchmarks/day-trade-source-cache-regression-final-20261001.log)：**496 passed、3 skipped／49.56 秒**，共 14 個選定模組；包括 source builder 三種 budget、storage/view byte 計數、跨格式 LRU、consumer 引用、同 key／nested 表示併發共用與錯誤後恢復、獨立日期平行、v2 ancestor reserve／DDP 分配，以及原 checkpoint／FIFO／270 點／fees／artifact／stitched deployment／訓練 lifecycle 回歸。實際小型 neural inference 仍產生全部要求的 NPZ、audit、報表／圖與新 cache diagnostic，checkpoint SHA 不變。Ruff、py_compile、`git diff --check` 通過；不是全庫測試、正式行情或冷開機驗收。
+
+[最終 ABBA receipt](../artifacts/benchmarks/day-trade-source-cache-abba-accepted-20261001.json)及[原始 log](../artifacts/benchmarks/day-trade-source-cache-abba-accepted-20261001.log)固定 Git baseline `862fc3e08b156a411d1b64f54e925faed44247cc`，每 budget／variant 4 samples、每 sample 2 次 ordered access；資料為 receipt-backed **synthetic 2 sessions／3 symbols**，CPU eager。各表示完整 tensor／session digest、全部 FIFO state 與 **270 點／session**完全一致，panel input fingerprint、原始來源與 session NPZ hashes 不變。
+
+| budget | 舊／新保留 tensor bytes | minute NPZ 讀取次數（兩次存取） | 舊／新首輪 accessor 合計 | 舊／新兩輪 accessor 合計 |
+| --- | --- | --- | --- | --- |
+| 1 GiB，足夠放整個小型資料 | 93,888／66,720 | 3／1 | 15.038／12.923 ms | 24.103／24.491 ms |
+| 約 10 KiB，byte 上限 10,737 | 28,464／7,488 | 4／2 | 19.695／11.538 ms | 34.662／22.500 ms |
+| 0，關閉保留 | 28,464／0 | 4／6 | 13.300／9.023 ms | 18.358／25.987 ms |
+
+容量足夠時確認少一次以上解碼、少保留 **28.94%** 的 storage；但是最終這次兩輪合計沒有加速（約 +1.6%），不能挑先前較快試跑當結論。零容量的舊版違反關閉設定，新版確實少保留，但重複讀取變慢是誠實的取捨。獨立記錄完整兩-session FIFO replay（含取得 dense source），1 GiB 的 median **46.964／47.642 ms**，也沒有證明整段 workflow 更快。輸入建置、digest 驗證、replay 各自計時；accessor samples **不含 imports、source preparation、parity digest、模型、report／plots、CUDA 或 cold filesystem**。CLI 整個 process peak RSS **965,070,848 bytes**含 imports，不是各 variant 或正式全市場的 RSS 比較。前輪 1,036.813 秒真正來源建置量測未被改寫。
+
+最後另固定測速器的預設 baseline commit，避免未來 commit 後 `HEAD` 自己變成新版、讓測速器回歸錯誤；[這項 CLI 修正的測試](../artifacts/benchmarks/day-trade-source-cache-benchmark-pinned-default-20261001.log) **5 passed／8.81 秒**，與上述 496 個測試有重疊，不加總成額外 coverage。[固定預設後的同指令重測](../artifacts/benchmarks/day-trade-source-cache-abba-pinned-20261001.json)仍有相同解碼／bytes／exact parity，但 1 GiB 兩輪 median 變成 **23.110／20.810 ms**、完整 FIFO **31.177／29.719 ms**；相鄰量測的 wall time 有明顯變動，因此沒有選其中一次宣稱穩態或正式全市場延遲改善。最新測速程式的 code hash 見這份重測，不以舊 receipt 的 CLI hash 冒稱最新版。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python test/benchmark_day_trade_source_cache.py --baseline-commit 862fc3e08b156a411d1b64f54e925faed44247cc --output artifacts/benchmarks/day-trade-source-cache-rerun.json
+```
+
+### 服務／容量與後續優先序
+
+[05:53:15 Taipei 的服務觀測](../artifacts/benchmarks/service-coverage-20261001T0600-source-cache.json)仍 **64 services／49 timers／3 paths**；六個 localhost GET 200。TAIFEX **blocked**、當沖 **degraded**、隔日沖 **waiting**、Shioaji **waiting**、OpenBB **stopped**、全資料監控 **degraded**，不把 HTTP／systemd active 當成交證據或資料完整。Discord／gateway／當沖仍原 PID **898／606482／715544**、原 invocation、NRestarts 0，無核心 restart。新 source cache 程式需由下一個讀入新程式的 worker 執行，未宣稱現有常駐進程已熱載入。
+
+timer findings 0；**resource findings 不為 0**。新獨立 OpenBB L1 invocation `cabf292c76404aff882d571dce89edd4` 在 05:39～05:41 completed、new segments 0，但 memory-high delta **4,459**、OOM／kill 0；matched step 的 stale-contract audit **123.771 秒**、whole unit **163.581 秒**。root 沒有手動觸發該輪、修改該 compactor 或把節流消成 green。
+
+正式 job attempt 6 仍 `failed`、completed **04:17:44**、next retry **10:17:44**；沒有消除錯誤／重設 backoff，也沒有覆寫 fold10 archive。123 分鐘 runway／06:17～13:40 admission fence 保持。**06:00:16** filesystem available **35,774,357,504 bytes**（約 35.8 GB、99% 使用），較 05:29 的 44.9 GB 繼續下降，有其他活動，不憑差額判定 writer。OpenBB 仍低於原 100 GiB floor 保護停止；沒有降低 floor、實際 GC、刪除來源／checkpoints 或啟動正式全歷史 rebuild。
+
+下一輪優先釐清持續磁碟成長與安全容量，再處理 L1 已量測的重掃／memory-high，以及正確來源的正式歷史驗收與跨 universe 全域 replay peak。全服務資料健康、公網 IPv6／browser、Windows／WSL cold boot、完整 repository suite 仍未全部驗收。此輪有實作、496 項 regression 與可重測 evidence，屬於實際進展，**目標保持 active，不標完成或 blocked**。
+
+**06:09:16** 再查 filesystem available 為 **30,763,302,912 bytes**；持續下降，後續不能只把剛更新的 source cache 當成容量問題已解。完整 code／runtime／safety 與剩餘項目見[本輪交接](../artifacts/benchmarks/service-reliability-source-cache-validation-20261001.json)。
+
+## 2026-10-01 05:03 起：正式推論來源遺失根因修復，目標仍 active
+
+本輪使用共用訓練及使用者工作偏好流程，先確認實際來源／checkpoint／產物範圍，再修共享實作；沒有以放寬 FIFO 驗證消除錯誤。05:03:41 的[完整服務觀測](../artifacts/benchmarks/service-coverage-20261001T0510-fifo-inference.json)仍是 **64 services／49 timers／3 paths**。Discord、公開 gateway、當沖引擎的 PID／invocation 與前輪相同、NRestarts 0，沒有重啟、送出訂單、換模型或改紙上帳本。
+
+### 根因與實作
+
+- **更正前輪「legacy archive 相容性」的定位。** [20 份 NPZ 成員清冊](../artifacts/benchmarks/day-trade-inference-archive-census-20261001.json)證明 fold01～09 的 test／deployment 都是 schema 8、currency、270 點曲線與 FIFO 狀態；只有 attempt 6 新生成的 fold10 兩份是 schema 7、nav_ratio、沒有 minute_nav／carry fields。不是把舊檔強改標籤可以解決。原共用 `_subset_panel_symbols` 在 2,757→2,754 checkpoint 對齊時，漏帶 `day_trade_carry_source` 與 executor minute tape；原始 panel 保留物理來源、aligned panel 卻掉回舊帳務路徑，最後嚴格 stitched reader 正確拒絕。
+- **共用標的投影不再遺失執行證據。** 為 prepared source 新增 lazy universe projection；投影前核對完整 ordered universe／calendar，保持 release ID 與源收據。dense／CSR／packed transport 各保留正確軸、整數 event identities 與 chronological minute tape，packed 投影不先製造 dense exit cells。缺少已驗證實體來源的 checkpoint-only 標的仍明確失敗，不用 masked feature 假裝有價格，也不回退舊帳務。原 source 不被改寫。
+- **移除兩份重複推論報表流程。** neural／tree inference 改走既有 `_save_fold_output_artifacts`，重新接上 test symbol sidecar、settlement audit、schema/context 驗證、`save_timing.json`／`plot_timing.json`／`mode_artifact_contract.json`。推論不重寫 model／checkpoint。Taiwan surrogate／integer audit 的 metrics 仍區分；沒有移除圖、縮短日期或少算分鐘。
+- **只移除已證明重複的完整前綴重播。** 完整 owned interval 有相同 split rows、來源最後日與真實 FIFO endpoint 時，複製已記錄結果與狀態；不再重讀每一天與重跑 270 opportunities。部分前綴或具 initial state 的續接仍走 canonical replay。合法 checkpoint 子集合／重排是 fresh deployment cache miss，轉標準全域 replay；壞或重複 sidecar 不會被吞成成功。
+
+### 回歸、測速與邊界
+
+[11 個模組的最終回歸](../artifacts/benchmarks/day-trade-inference-contract-regression-final-20261001.log) **464 passed、3 skipped／35.37 秒**；另[測速器回歸](../artifacts/benchmarks/day-trade-full-prefix-benchmark-regression-20261001.log) **5 passed／7.40 秒**，不重複加總之前試跑。新增反例包含來源／minute tape 遺失、calendar／universe 不符、缺少實體證據、zero eager decode、dense／CSR／packed exact projection、integer event dtype、full endpoint 不重算，以及真實小型 neural infer→schema 8→270 點曲線→報表／全部圖→checkpoint subset 擴展→同一 stitched account。source/context、checkpoint SHA 與新標的零 request／零 holdings 都核對；測試資料明確是 synthetic，不是官方交易證據。[端到端 log](../artifacts/benchmarks/day-trade-inference-e2e-20261001.log)。Ruff、py_compile、diff whitespace 另驗證；不是全庫、正式全部歷史或 Windows 冷啟動驗收。
+
+[同一已評估物理帳戶、Git baseline 的 ABBA 測速](../artifacts/benchmarks/day-trade-full-prefix-abba-final-20261001.json)，每 variant 4 samples、10 個 synthetic sessions／2 symbols／270 點，每個財務陣列、canonical compact FIFO state、完整 input fingerprint 均相符；完整前綴處理 median **152.753→0.385 ms**。這是 CPU eager synthetic prefix-only 比較；**不包含 imports、source preparation、模型、NPZ／報表／圖、全域 stitched replay、provider、cold filesystem 或 CUDA**，不能拿它取代正式 inference 或 09:00-to-signal 延遲。完整來源第一次建置前輪仍 1,036.813 秒，這輪沒有改寫該量測。
+
+### 現場與下一輪
+
+正式 attempt 6 仍 `failed`，completed 04:17:44、next retry **10:17:44**；沒有手動清掉錯誤／6h backoff，也沒有把新測試標成正式資料 ready。既有 123 分鐘 runway／08:20 fence／13:40 保護保持不變；修正後正式歷史仍需在安全容量及排程條件下走隔離驗收。原 fold10 schema 7 檔未覆寫或刪除。filesystem available 從本輪較早的 **50,441,269,248 bytes**，到 **05:26:18 的 44,935,598,080 bytes**（約 44.9 GB），有其他 ongoing work，不能單憑差額歸因。OpenBB 仍低於 100 GiB floor 保護停止；沒有 GC/apply、刪除來源或降低 floor。
+
+05:03 的六個 localhost public projections 都 200；TAIFEX **blocked**、當沖 **degraded**、隔日沖 **waiting**、Shioaji **waiting**、OpenBB **stopped**、全資料監控 **degraded**。這與 TCP／HTTP 可達分開。timer findings 0。獨立 OpenBB L1 matched invocation `7af189d767024961acf6dfe3da41399d` 的 memory-high delta **1,713**、OOM／kill 0，沒有因此聲稱記憶體無壓力。
+
+下一輪需處理安全容量、正式最新完整來源／產物驗收，以及 physical source dense／packed／compact session cache 的目前無界保留與跨 universe replay 成本。後者是程式碼風險，這輪尚未量測修正後正式 peak RSS；不能先宣稱更快或更省記憶體。全服務資料健康、全庫測試、公網 IPv6／browser 及 Windows／WSL 冷開機仍未全部驗收。完整證據見[本輪交接](../artifacts/benchmarks/service-reliability-fifo-inference-validation-20261001.json)。
+
+可重測（明確 synthetic microbenchmark，不碰正式產物或訂單）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python test/benchmark_day_trade_full_prefix.py --baseline-commit 862fc3e08b156a411d1b64f54e925faed44247cc --output artifacts/benchmarks/day-trade-full-prefix-rerun.json
+run_fintech_python -m pytest -q -s test/test_day_trade_inference_source.py test/test_benchmark_day_trade_full_prefix.py
+```
+
+## 2026-10-01 03:58：輕量盤後重試已部署，全服務目標仍 active
+
+本輪依使用者工作偏好，以完整服務清冊及真實收據為準，不把程序存活當資料健康。[新清單](../artifacts/benchmarks/service-coverage-20261001T0400-discord-retry.json)實際觀測 **03:58:00、64 services／49 timers／3 paths**；增加的只有 Discord artifact retry controller 與 timer。沒有重啟 Discord Gateway、公開 gateway 或當沖引擎，也沒有改模型、真實訂單或帳本。完整交接見[本輪收據](../artifacts/benchmarks/service-reliability-retry-validation-20261001.json)。
+
+### 實作與實際驗證
+
+- **補上 retry deadline 到固定排程之間的空窗。** 第 5 次失敗的 `next_retry_at=02:08:36` 原本僅代表最早允許時間，不會自行啟動 worker。新 controller 每分鐘只查最新／啟用／已排程工作的收據；由 systemd 喚醒原本 `stockagent-discord-artifact-maintenance.service`，沿用既有模型、來源驗收、backoff、2h budget 與 kernel lock，不複製推論或資料下載邏輯。週末不輪詢；現場 owner `TimeoutStartSec=2h`、stop grace 90 秒，所以最後版派送前再次核對 **123 分鐘 runway**，06:17～13:40 不派送。沒有只用 start budget 擠到 08:20 fence；原 owner budget 沒有改動。
+- **沒有工作就不載入模型。** 把 Discord／Torch import 移到真正 worker 路徑。只接受有時區 deadline；缺檔不建立空成功收據，壞 JSON／過大內容明確失敗。`running` 必須配合實際 kernel lock 判讀，不拿過期 PID 或時間戳當 owner。
+- **來源未變時合併重複喚醒。** 相同 due jobs 與 canonical close receipt/config event hints，300 秒內不重複派送；新 source event、job attempt 或 config 可立即喚醒。stat 只是排程提示，不是資料驗收。獨立、原子寫入的 `/var/lib/stockagent-discord-artifact-retry/latest.json` 僅證明 systemd 接受派送，不能證明產物成功；未接受／狀態寫入失敗分別保留。時鐘倒退不會無限 suppress。控制器 `ProtectSystem=strict`、僅 AF_UNIX，只有自己的 StateDirectory 可寫。
+- **同份真實 snapshot、fresh-process ABBA。** [最新碼可重測收據](../artifacts/benchmarks/discord-artifact-retry-probe-accepted-final-20261001.json)每 variant 4 samples、決策一致、原 receipt bytes 不變、沒有 dispatch／inference。whole process wall median **8.756124→0.187056 秒**；worker peak RSS **770,125,824→24,346,624 bytes**。baseline 包含原本 eager Discord／Torch imports；輕量 probe 沒有 Torch。這次背景 worker 正在推論，不能跨輪對比：[較早一輪](../artifacts/benchmarks/discord-artifact-retry-probe-abba-20261001.json)是 3.840153→0.100596 秒。本測速不是 full-history、provider、公網、p95 或 cold filesystem speed；OS cache 未控制。只比較最新內部 `probe_seconds` 則沒有加速（66.212→90.508ms），真正省掉的是不必要的 import。
+- **自然 timer 已接通，但正式歷史第 6 次仍失敗。** 03:58:00 controller 無 Torch、probe 84.126ms、dispatch persisted；原 worker invocation `ffe5a5e962894aefb80c613ef044a10c`，03:58:06 最新 v8 job 進入 attempt 6，target 9/30。03:59 下一輪 kernel-lock fast path 76.226µs，`requested=false`，沒有第二個模型 worker。資料建置 1,036.813 秒後進入 CUDA 推論；04:17:40 stitched deployment 讀取 backtest archive 時拒絕 **`physical FIFO source context/state cannot use a legacy archive schema`**，04:17:47 unit `failed/exit 1`、MainPID 0。canonical job 保存 attempt 6／failed、worker degraded、next retry **10:17:44**（6h backoff）；04:25 timer 正確 `no_due_retry`、無 Torch、沒有再派送。錯誤在 archive 相容性，沒有把它放寬或改寫為 ready；10:17 位於保護區，最早仍需 13:40 的正常 gates。這不代表 Discord Gateway／當沖引擎中斷。[runtime log](../artifacts/benchmarks/discord-artifact-retry-runtime-20261001.log)。
+
+本輪六個 canonical test 模組 **247 passed／6.83 秒**，包含 malformed/future/obsolete/disabled jobs、orphan recovery、kernel lock、時區邊界、大小寫一致的 market scope、runway/stop-grace recheck、重複派送合併、來源變動、時鐘倒退、dispatch／持久化失敗、CLI 無 Torch，以及 benchmark parity／budget／market-window guards。[最終 log](../artifacts/benchmarks/discord-artifact-retry-regression-runway-final-20261001.log)；沒有重複加總前幾輪，也不是全庫或冷開機驗收。Ruff、py_compile、shell syntax、systemd unit verify 與 calendar parse 均另行檢查。
+
+### 容量與仍未解決的項目
+
+完成低優先度 read-only [workspace](../artifacts/benchmarks/workspace-disk-inventory-20261001T0300.tsv)及 [artifacts](../artifacts/benchmarks/artifacts-disk-inventory-20261001T0330.tsv)清冊：不同時間樣本的 artifacts 約 948.5／955.2 GB；這不是精確增長量。markets 約 477.9 GB、replays 139.8 GB、live 117.6 GB、cache 62.2 GB。名稱、大小或 mtime 不能當刪除授權；正式來源、receipts、pins、leases 與可恢復契約保持不變。canonical compiler-cache [dry-run](../artifacts/benchmarks/storage-pressure-20261001/storage-pressure-audit-20260930T185728.049011Z.json) **eligible 0／selected 0／deleted 0**，未 force／apply。沒有取消 pins、降低 OpenBB 100 GiB floor 或刪正式資料。
+
+03:58 的六個 localhost GET 200，產品仍是 TAIFEX blocked、當沖 degraded、隔日沖 waiting、Shioaji degraded、OpenBB stopped、全資料監控 degraded。timer findings 0；獨立 OpenBB L1 compaction matched invocation `5d2ddc3003434f2da3cbaff098a3811b` 有 memory-high delta 1,958、OOM/kill 0，不能改寫成整個系統無壓力。04:01 live filesystem available **88,636,489,728 bytes**，OpenBB 仍保護性停止；沒有只從磁碟變化歸因於本輪 worker。
+
+待辦仍包括安全容量處理、OpenBB L1／全檔驗收、TW source/derived/cold publication、Discord legacy archive 相容性修復與正式歷史驗收、TAIFEX/Shioaji/隔日沖資料健康，以及全庫測試、公網 IPv6/browser 和 Windows/WSL 冷開機。目標保持 active，不宣稱所有服務正常或優化到極限。
+
+可重測：
+
+```bash
+source scripts/runtime_env.sh
+# 若需與正式 worker 相同的 market scope，先載入既有 .env；不要輸出其內容。
+run_fintech_python scripts/benchmark_discord_artifact_retry_probe.py --output artifacts/benchmarks/discord-artifact-retry-probe-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 1 --output artifacts/benchmarks/service-coverage-rerun.json
+```
+
+## 2026-10-01：目標恢復 active、OpenBB 有界修復與真實測速
+
+**目標已恢復 `active`**：全服務延遲／吞吐／資源效率，以及健壯性、穩定性；不是全部完成。依使用者偏好先盤點、維持服務與來源契約，再逐項量測／修正／驗收。[02:28:49 現場清單](../artifacts/benchmarks/service-coverage-20261001T0230-openbb-recovery.json)是 **63 services／48 timers／3 paths**，沒有把歷次清單相加；本節不把局部測試稱為全庫驗收。完整變更、失敗與驗收邊界見[本輪交接收據](../artifacts/benchmarks/service-reliability-validation-20261001.json)。
+
+### 實作與現場證據
+
+1. **消除每批近 900 萬筆的重掃。** 新增目錄子工作修復初版把 `active/plan_token` 和 `task_id IN` 放在同一 SQL；現場 SQLite 選了 scheduling covering index，每批掃大量 active tasks。已安全中止本輪自己啟動的 `--plan-only` 工作（PID 884286，精確 stdout log 核對，exit 130），保留 log 與已提交進度；改成主鍵查詢，再在 Python 套用完全相同的 active／plan 條件，不新增索引或修改正式 DB 的 durability。[同 snapshot 的真實 512 筆 ABBA](../artifacts/benchmarks/openbb-catalog-membership-abba-20261001.json)每 variant 2 samples，median **1.806468 秒→0.004512 秒**、結果相同、query-only、連線 total_changes 0。這只證明該查詢，不是整個 archive／公網／p95 的速度。
+2. **接回缺漏的 catalog children，保持原資料。** 使用 canonical `discover_followup_tasks` 和 Manifest upsert，驗證本機成功 parent 的 footer／列數／metadata 後才建立缺漏工作；不重抓 parents、不重置 active accepted children，也不延伸固定 archive end date **2026-07-18**。coverage 的合法 `deferred` 動態端點現在與 `included` 一起保留；excluded／unavailable／not_enumerable 仍不接受。現場 SDK 是帶點名稱；新增無點相容查詢只是防禦，**不是現場缺漏成因**。
+3. **成功修復與獨立驗收分開。** [修復收據](../data_openBB/_state/catalog_followup_repair_latest.json)version 2，**13,148 parents、1,133,281 per-parent children、743 restored、140.929 秒**，固定 plan `56e52165c96966261d74547b`。第二次同一 canonical `--plan-only` 成功退出，版本 marker 避免再做整輪修復，accepted child 不變。[獨立 canonical read-only followup audit](../artifacts/benchmarks/openbb-catalog-followup-audit-20261001.json)重建 **1,126,953 unique required scopes**，missing **743→0**、parent read failure 0、32.390 秒。兩種 child 數字的 grain 不同：前者逐 parent，後者跨 parents 去重。這些證據是「工作存在」，**不是新增 743 份資料已下載或 archive 全完成**。
+4. **ownership audit 不再保留全量 Path set。** 在資料 filesystem 的私有 SQLite scratch index 串流 512 筆，每檔都掃，最多保留 50 個問題樣本；不放在 tmpfs、不改正式 Manifest 的同步設定。Manifest inactive-success 檔另列 retained；unknown／pending／failed／foreign-active outputs 仍拒絕，所有 active-success 的原 footer／wrapper／metadata 驗證保留。原 147,186 個被列 non-success 的檔，只查核了 50／50 樣本為 inactive-success；**不能推論全數都已合格**。retained 是所有權分類，不是重新驗證 inactive 檔內容。
+5. **實際 source copies 的 ownership benchmark。** [100,000 真實檔案 ABBA](../artifacts/benchmarks/openbb-ownership-abba-accepted-20261001.json)使用複製檔，不是 hardlinks；來源 stat identity 與 SHA 前後相同。worker VmHWM median **182.25→91.77 MB（−49.64%）**。wall median 9.708→8.935 秒，但 samples 重疊且波動，**不宣稱穩定 latency／全服務加速或原 47.56 GB peak 已根除**。沒有裁掉來源檔案／分鐘或拿熱快取冒充來源重建。scratch index 本身也需要磁碟空間。
+6. **冷發布明確指出阻擋項，但不放寬 gate。** `publish_tw_public_cold_release.py` 保留 exit 75，新增 `blocking_checks`／原始 findings 到失敗或 deferred 收據。現場 canonical audit 的失敗是 official symbols `source_receipts/lifecycle_source_receipts`、features `source_bytes`：官方 symbols build 到 9/30，整體 download summary 仍到 9/29，TPEx company 與多份公開來源在 derived build 後已變動。這是來源／衍生層一致性問題，不能只改日期或網站狀態；本輪沒有發布新的 cold release 或重寫 runtime pin。新診斷接線尚未經下一個自然 publish run 驗收。
+
+### 反例、故障與回歸
+
+保留首輪修復回傳 0 但只認 `included` 的失敗驗收（13,148 parents／1,062 expected／0 restored）；不能把它算成功。也保留後續錯誤 SQL 工作的 interrupt log。初次 ownership benchmark fixture 的 import 衝突，以及新增 lookup benchmark 原子 writer 參數順序錯誤（1 failed／1 passed），均在正式現場 benchmark 前修正，沒有把失敗 sample 混入 accepted timings。
+
+本輪 canonical **10 模組 457 passed／8.90 秒**，涵蓋既有 downloader／contracts／supervisor／watchdog／dashboard、ownership 全 batches、外計畫與 pending 拒絕、read-only、scratch connect／insert 空間不足清理、成功資料不變、deferred scope、壞 parent 不標完成，以及首批已 durable 後中斷再續跑。Ruff、py_compile、scoped diff check 通過。這不是全 repository 或冷開機驗收；沒有加總各輪重複測試。[最終 log](../artifacts/benchmarks/service-reliability-regression-final-faults-20261001.log)。
+
+可重測入口：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_openbb_catalog_lookup.py --output artifacts/benchmarks/openbb-catalog-membership-rerun.json
+run_fintech_python scripts/benchmark_openbb_file_audit.py --sample-files 100000 --output artifacts/benchmarks/openbb-ownership-rerun.json
+run_fintech_python scripts/audit_service_latency_coverage.py --sample-seconds 1 --output artifacts/benchmarks/service-coverage-rerun.json
+```
+
+### 正式服務與未解風險
+
+已於 **02:22:47**沿原 systemd unit 恢復 OpenBB archive：invocation `c57d2961521e4140a79ee26afbb52569`、原 PID 923909、NRestarts 0，原 supervisor lock、100 GiB 磁碟 floor、開盤 resource gate、provider policy 全保留。02:41:28 的 canonical monitor 記錄 success **7,319,562→7,320,556**，不是 full acceptance，也不能由總數判定每個新 child 都完成。隨後 **02:44:36** 因 free **106,900,807,680 bytes < 107,374,182,400 bytes floor**，supervisor 保護性停止，unit `failed/exit 2`、MainPID 0；**不再是 running**。新 full source／catalog／compaction acceptance 仍未完成，沒有放寬 floor、reset-failed 或刪正式資料。
+
+[02:48:09 停止後清單](../artifacts/benchmarks/service-coverage-20261001T0250-disk-guard.json)仍 63／48／3，六個 localhost GET 200，OpenBB 回到 **stopped**，其餘產品健康仍與下列 02:28 樣本相同；timer／resource findings 此樣本皆 0，不抹掉先前 matched compaction 的壓力證據。已執行 canonical [GC dry-run](../artifacts/benchmarks/storage-gc-dry-run-20261001.log)，**would_evict 0／would_renew 0**，既有重要資料被 pin 保護；沒有實際 GC。資料盤空間不足仍待安全儲存盤點或容量處理，不能用取消 pin／降低 floor 冒充已修好。
+
+Discord／gateway／當沖仍是 PID **898／606482／715544**及原 invocation、NRestarts 0；本輪沒有重啟它們，沒有改真實訂單、模型／checkpoint 或當沖帳本，也沒有碰其他 actor 的 futures margin dirty work。
+
+02:28:49 六個 localhost GET 都 200，但 TAIFEX **blocked**、當沖 **degraded**、隔日沖 **waiting**、Shioaji **degraded**、OpenBB **active**、data-monitor **degraded**。當沖單次 GET 3.505ms 只含 localhost projection／傳輸，不是開盤訊號、browser paint、公網或 uncached source latency。
+
+timer findings 為 0；**resource findings 不為 0**：獨立 L1 compaction 02:01:24～02:03:10 雖完成、沒有新增 segments，該 matched run 記錄 memory-high counter 增加 2,019，OOM／kill 0，stale derivative metadata scan 82.745 秒。這是該次收據，不等於此刻仍有記憶體事故；root 本輪沒有觸發或重啟該 compaction，也沒有宣稱已修復這項瓶頸。
+
+待辦維持可分別驗收：OpenBB 新下載及全檔 audit／L1 pressure；registered OKX 原 transport 失敗的自然輪；crypto-training source lease budget；TW 正確來源完成後 derived 重建與 cold publish；Discord formal-history 第 5 次失敗仍保留，02:08:36 是最早允許 retry，不是保證 worker 自動啟動，夜間觸發空窗仍需處理；TAIFEX／Shioaji／隔日沖實際資料健康；公網 IPv6／瀏覽器、Windows／WSL 整機冷啟動與全庫測試。不能因本節局部進展宣告全服務都正常或已到極限。
+
+## 2026-09-30：來源恢復、分鐘曲線驗收與有界可靠性修正
+
+本輪是全服務目標的局部進度，**不是全系統完成或全部服務加速到極限**。9/30 當輪結束的目標紀錄是 `blocked`，不是 `complete`；10/1 已依使用者要求恢復 `active`，見上節。本輪仍完成下列可安全驗證的工程修復，未改投資模型／checkpoint、真實券商訂單、全域 rate limit 或服務資源上限。完整命令、來源 SHA、失敗與驗收邊界見[驗證收據](../artifacts/benchmarks/service-reliability-validation-20260930.json)。
+
+### 已修復與現場驗收
+
+1. **還原被清掉的指定分鐘來源並保護部署。** 透過 canonical `stockagent-data use … --verify` 從既有 cold objects 還原指定 `tw-minute-train-20260910…09bedd96`，full verification 成功：3,189 檔、13,817,707,306 logical bytes；另外加入部署 pin，防止間歇消費者沒有持有程序 lease 時再次被自動回收。來源分割日期到 9/10，不能據此宣稱 9/30 價格或模型完整。
+2. **修復模擬進場重試的事件種類。** 兩種 canonical paper entry 路徑，首次成交仍標 `entry`，追加成交改標 `entry_completion`；保持股數、價格、費用與雙帳本提交／復原契約。歷史 reader 僅在明確 paper contract、既有同一 position、嚴格 retry order ID 與無重複 order ID 下，把 36 筆舊 retry 用追加進場的數學估值。查核 203,690 筆 fills；**沒有修改原始 fills、orders、signals 或 replay receipt**。不把這些事件認成券商成交，不按券商 order ID 去重實際 fills。
+3. **恢復完整分鐘曲線並消除漏日。** Reader 改從現有 canonical `replay_entry_books` 讀取檔案，但仍逐檔核對原始 receipt SHA、日期、schema／數值，拒絕外部 symlink；原 receipt 的舊絕對路徑只作 provenance。維護程式漏認 `unlimited_close_paper_settlement`，導致 9/29 完整資料被排除；現在只接受精確 assumption contract、整數剩餘數 0、正整數已清倉數的事件，仍保留所有模式端點驗證。
+4. **發布前驗 scope、發布後錯誤留當輪證據。** Writer 與 promotion 共用日期／模式／270 點 scope validator；維護 owner 把精確日期與模式傳給 child，錯誤 scope 在寫正式帳本前拒絕。來源、NAV、價格來源、checksum、帳本未變與鎖檢查仍各自保留，不以 metadata gate 冒充完整驗收。Post-publication validation 若失敗會寫當輪 `failed_stage`、錯誤及耗時，不再殘留前一次錯誤。
+5. **修復已下載尾段未接上歷史公司行動目錄。** Baseline 只到 9/17，但 `execution_actions` 尾段已通過 9/30 來源驗收。用既有 merger 先 dry-run、備份舊 table／receipt，再核對 12 個重疊事件與 58 份 raw response，合併 602→605 筆、coverage 2014/1/1～9/30，重疊 accounting revisions 為 0。沒有新抓 provider、編造條款或只改 receipt 日期。既有 margin-actions 排程已接上同一 merger；已有完整 catalog 時只驗證，沒有 accepted baseline／合併失敗則另留 `waiting_baseline`／`blocked`，不掩蓋錯誤也不阻斷已合格的當日 action receipt。新接線的完整自然排程尚待驗收。
+6. **Crypto 資料下載修正與有界 transport 重試。** 將已測過的 shared reconciliation planner 接到 OKX／Bybit；以實際 timestamps 規劃缺頭／內部缺段／revision tail，不用 first/last 假裝連續；原 atomic merge、舊非 null feature 與 malformed fallback 保留。共用 transport 補進 truncated-body／disconnect 等可重試例外，保留既有 retry 次數、HTTP 永久錯誤與 JSON 格式失敗邊界。TW 分鐘來源 metadata 缺失先在建置大 panel 前拒絕；不把 metadata presence 當內容完整。
+7. **Discord backoff 不再假完成。** 未證實 artifact current 的 retry-deferred 工作，保留其 market failure／attempt／deadline，worker 顯示 `waiting_source`；成功 reconcile 的路徑仍可 complete。沒有手動清掉 failure 或略過 backoff。
+
+正式 minute-curves service 於 **23:22:57～23:23:07**，invocation `1fc5eb623f9c461283faf52804221a10`，以 `no_op_already_complete` 驗收 **148 交易日 × 4 模式 × 270 分鐘 = 159,840 點**，2/25～9/30，unverified interior rows 為 0。這約 10 秒是完整現有輸出的驗收，**不是完整歷史重建加速成 10 秒**。先前 child 成功寫出 148 日、舊 parent 卻只期待 147 日的失敗紀錄仍保留。
+
+確認四模式空倉、無 pending entry 後，23:28:17 只重啟當沖服務，啟用 producer 修正：PID 132→715544、invocation `24576b9466794213b6b9157ba5ac45df`，`active/running`、`Result=success`、NRestarts 0，索引 ready／2,984.567ms；重啟後再查一次上述 159,840 點驗收仍成功，帳本執行來源 SHA 不變。這不是 Windows／WSL 整機重開測試。Discord PID 898 未變；gateway 由另一個 actor 於 21:57:33 換成 PID 606482，本輪 root 沒有重啟 gateway，不歸因於本 patch。
+
+### 可重測效能與回歸
+
+[OKX ABBA 收據](../artifacts/benchmarks/okx-reconcile-abba-20260930.json)每 scenario／variant 10 samples，mocked HTTP 分頁、真實私有 Parquet read／merge／atomic write，暖 OS／imports，輸出 bytes 相同；受測與 installed `_download_symbol_1m` AST SHA 相同。
+
+| 同份 candle 工作 | HTTP calls 舊→新 | wall median 舊→新 |
+| --- | --- | --- |
+| 缺頭 | 28→2 | 104.791→42.395ms |
+| 內部缺段 | 28→3 | 74.882→40.456ms |
+| 普通尾段 control | 1→1 | 29.351→32.617ms |
+| 明確 full refresh | 28→27 | 81.331→81.961ms |
+
+尾段與 full refresh 沒有加速證據；不是 live provider／p95／公網數值。沒有為了 speed 刪分鐘、放寬驗收或把 cache hit 當來源重建。
+
+最新 canonical **40 模組 1,141 passed／59.72 秒**，包含兩類 producer recovery、legacy long／short 完整 270 點 NAV parity、source paths、scope-before-write、post-validation failure、真實 merger 子程序、source receipts、crypto source／projection 鎖及 bounded retry。Ruff、py_compile、scoped diff check 通過。保留 pre-fix 6 個 producer／consumer 反例 fail、998-pass 中間輪，以及新增 test fixture 匯入衝突的一次 1 failed／1,140 passed；修正匯入後重新跑全部 40 模組，不隱藏前輪失敗、不重複加總，也**不宣稱全 repository 測試完成**。
+
+### 全服務現況與未解決項目
+
+[23:34:09 coverage](../artifacts/benchmarks/service-coverage-20260930T2340-after-reliability.json)實際觀測 63 個 installed services／48 timers／3 paths（檔名 2340 不是觀測時鐘）；timer findings 與該樣本 resource-pressure findings 為 0。六個 localhost GET 都 200，但產品仍分別是 TAIFEX blocked、當沖 degraded、隔日沖 degraded、Shioaji degraded、OpenBB stopped、data-monitor degraded，不能從網頁可連線推論交易或資料正常。
+
+仍 failed 的 units：OpenBB archive、registered data features（OKX WLD mark-price transport 的 14:00 原失敗）。Discord 23:00 oneshot 雖正常退出，實際 worker 是 `waiting_source`／`artifact_retry_deferred`；最新 formal-history 第 5 次失敗在 22:08:36，下一允許 retry **10/1 02:08:36**。歷史 share catalog 已修復，但完整模型 panel／inference／artifact publication 尚未重新驗收，不把小型 physical-source horizon probe 成功改寫成正式產物完成。
+
+接續優先驗收修復後的 Discord formal artifact 與 action 排程、OKX 真實失敗 window，再處理 OpenBB upstream／L1 memory pressure、TAIFEX／Shioaji／隔日沖實際資料健康；crypto source continuity、最新分鐘來源／PIT、全庫測試、公網 IPv6／瀏覽器與 Windows 冷啟動仍各需自己的 current receipt。其他 actor 的 TW futures margin preparation dirty work 未改動、未納入本輪驗收。
+
 ## 2026-09-27 06:31 起：歷史日線重建契約與來源互斥
 
 **本輪 progress，原目標保持 active。** 沿57服務清單檢查長時間weekly backfill，沒有因journal暫無輸出就重啟。此輪修兩個production檔、新增三個測試檔；沒有手動訪provider、重啟服務、改排程／資源上限或寫正式來源、帳本、cold store。完整hash、命令與邊界見[驗證交接](../artifacts/benchmarks/daily-materializer-validation-20260927.json)。

@@ -90,6 +90,25 @@ def test_okx_client_keeps_independent_official_endpoint_buckets() -> None:
     assert candles is not mark
 
 
+def test_okx_recent_and_historical_index_use_native_separate_buckets() -> None:
+    client = OkxClient(request_interval=0.0, max_retries=0, retry_base=0.1)
+    recent = client._limiter_for_request("/api/v5/market/index-candles")
+    history = client._limiter_for_request("/api/v5/market/history-index-candles")
+    assert recent.name == "okx_index_candles"
+    assert history.name == "okx_history_index_candles"
+    assert recent.interval_seconds == pytest.approx(0.1)
+    assert history.interval_seconds == pytest.approx(0.2)
+    assert recent is not history
+    assert client._limiter_for_request("/api/v5/market/index-candles", {"instId": "ETH-USDT"}) is recent
+    assert set(client.limiter_activity()) == {"okx_index_candles", "okx_history_index_candles"}
+
+
+def test_okx_index_routing_preserves_explicit_slower_requested_interval() -> None:
+    client = OkxClient(request_interval=0.5, max_retries=0, retry_base=0.1)
+    for path in ("/api/v5/market/index-candles", "/api/v5/market/history-index-candles"):
+        assert client._limiter_for_request(path).interval_seconds == 0.5
+
+
 def test_persistent_progress_publishes_measured_eta_atomically(tmp_path) -> None:
     path = tmp_path / "progress.json"
     progress = PersistentProgress(

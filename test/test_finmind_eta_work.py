@@ -168,9 +168,46 @@ def test_finite_priority_override_is_a_subset_not_an_extra_dataset(tmp_path, mon
     result, rows = _result(tmp_path, monkeypatch, [_spec(dataset, 'complement', 'per_futures_day')])
     priority = rows[dataset]['priority_override']
     assert priority == {'requests': 2, 'inflight_tasks': 1, 'blocked_tasks': 1,
-                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 3600}
+                        'unsupported_tasks': 0, 'max_retry_wait_seconds': 3600, 'retry_tasks': 1}
     assert result['summary']['current_plan_requests'] == 3
     assert result['state'] == 'observed'
+
+
+def test_legacy_day_priority_uses_worker_contract_and_incremental_is_not_counted_twice(tmp_path, monkeypatch):
+    from downloader.finmind_eta_stages import stage_workloads
+
+    dataset = 'TaiwanFuturesKBar'
+    path = _database(tmp_path, 'complement', [
+        (dataset, 'CR1', '2012-08-22', 'day', 8, 'pending', None),
+        (dataset, 'CJ1', '2015-08-13', 'day', 8, 'failed', NOW.isoformat()),
+        (dataset, 'TX', '2026-09-26', 'id_day', 0, 'pending', None),
+    ])
+    with sqlite3.connect(path) as connection:
+        connection.execute('CREATE TABLE finmind_priority_tasks(dataset TEXT,data_id TEXT,partition TEXT)')
+        connection.execute('INSERT INTO finmind_priority_tasks SELECT dataset,data_id,partition FROM tasks')
+    result, rows = _result(tmp_path, monkeypatch, [_spec(dataset, 'complement', 'per_futures_day')])
+    override = rows[dataset]['priority_override']
+    assert override['requests'] == 2
+    assert override['unsupported_tasks'] == 0
+    assert rows[dataset]['incremental_requests'] == 1
+    stages = stage_workloads(result)
+    assert stages[0]['summary']['current_plan_requests'] == 3
+    assert sum(item['summary']['current_plan_requests'] for item in stages) == 3
+    assert all(item['summary']['current_plan_requests'] == 0 for item in stages[1:])
+
+
+def test_unknown_priority_query_cannot_be_assumed_one_per_day(tmp_path, monkeypatch):
+    from downloader.finmind_eta_stages import stage_workloads
+
+    dataset = 'TaiwanFuturesKBar'
+    path = _database(tmp_path, 'complement', [(dataset, '', '2012-08-22', 'day', 8, 'pending', None)])
+    with sqlite3.connect(path) as connection:
+        connection.execute('CREATE TABLE finmind_priority_tasks(dataset TEXT,data_id TEXT,partition TEXT)')
+        connection.execute('INSERT INTO finmind_priority_tasks SELECT dataset,data_id,partition FROM tasks')
+    result, rows = _result(tmp_path, monkeypatch, [_spec(dataset, 'complement', 'per_futures_day')])
+    assert rows[dataset]['priority_override']['unsupported_tasks'] == 1
+    with pytest.raises(ValueError, match='query_grain_unverified'):
+        stage_workloads(result)
 
 
 def test_unreadable_queue_unknown_and_no_database_created(tmp_path, monkeypatch):
@@ -211,6 +248,19 @@ def test_free_fresh_status_includes_deferred_once(tmp_path, monkeypatch):
     assert result['summary']['required_requests'] == 4
     assert result['summary']['cooling_tasks'] == 2
     assert result['sources']['free']['state'] == 'observed'
+
+
+def test_free_eta_uses_worker_retry_heads_not_a_zero_second_guess(tmp_path, monkeypatch):
+    specs = _free_fixture(tmp_path)
+    path = tmp_path / 'status.json'
+    payload = json.loads(path.read_text())
+    for item in payload['series'].values():
+        item.update(retry_tasks=1, earliest_retry_at_utc=(NOW + timedelta(minutes=1)).isoformat(),
+                    latest_retry_at_utc=(NOW + timedelta(minutes=15)).isoformat())
+    path.write_text(json.dumps(payload))
+    result, rows = _result(tmp_path, monkeypatch, specs)
+    assert result['summary']['retry_tasks'] == 2
+    assert result['summary']['max_retry_wait_seconds'] == 900
 
 
 def test_stale_free_status_is_unknown_not_finished(tmp_path, monkeypatch):

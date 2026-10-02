@@ -294,6 +294,16 @@
       "note": "FinLab account-scoped source data and receipts. Private cross-host copying scope remains unconfirmed; cold publication stays disabled. Local research use and publication-time safety require per-field verification."
     },
     {
+      "dataset": "tej-research",
+      "source": "data_tej",
+      "role": "local-licensed-query-grid-research-not-native-pit-validated",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": ["downloader.download_tej_history", "tej_smart_wizard_bridge.ps1"],
+      "note": "TEJ Smart Wizard account-visible catalog, scoped desktop exports and receipts. Requested query dates may carry the latest report and are not proven native observations or release timestamps. Do not publish licensed raw values, settings, account identity or the desktop session. Keep cold publication and automatic training injection disabled."
+    },
+    {
       "dataset": "free-public-context",
       "source": "data_free_public",
       "role": "analytics-and-audit",

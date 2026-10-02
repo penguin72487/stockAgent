@@ -59,7 +59,7 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
                  and observed <= expiry <= observed + timedelta(minutes=5) and now <= expiry)
     state = payload.get('state')
     if state not in {'estimated', 'conditional', 'current', 'warming_up', 'unavailable', 'stale',
-                     'waiting_admission', 'waiting_quota'}:
+                     'waiting_admission', 'waiting_quota', 'waiting_retry'}:
         state = 'unavailable'
     if payload and not fresh:
         state = 'stale'
@@ -78,18 +78,24 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         result['workload'] = {key: _number(work.get(key)) for key in (
             'required_requests', 'validation_requests', 'planned_requests', 'unbatched_requests',
             'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-            'batch_savings', 'calendar_wait_tasks')}
+            'batch_savings', 'calendar_wait_tasks', 'retry_tasks')}
+    result['retry_wait_seconds'] = _number(payload.get('retry_wait_seconds')) if usable else None
     scenarios = payload.get('scenarios')
     for key in ('fastest', 'central', 'slowest'):
         raw = scenarios.get(key) if isinstance(scenarios, dict) else None
         raw = raw if isinstance(raw, dict) else {}
         finish, seconds = _stamp(raw.get('estimated_complete_at_utc')), _number(raw.get('remaining_seconds'))
-        waiting = usable and state in {'waiting_admission', 'waiting_quota'}
+        waiting = usable and state in {'waiting_admission', 'waiting_quota', 'waiting_retry'}
         valid = bool(usable and not waiting and raw.get('state') == 'estimated' and seconds is not None
                      and finish and observed and finish >= observed
                      and abs((finish-observed).total_seconds() - seconds) <= 2)
+        # A deadline passing is not an accepted receipt. In particular a fresh
+        # one-minute forecast must not stay "one minute" until its 5m expiry.
+        overdue = bool(valid and finish < now and seconds > 0)
+        if overdue:
+            valid = False
         result['scenarios'][key] = {
-            'state': 'estimated' if valid else state if waiting else 'unknown',
+            'state': 'estimated' if valid else 'overdue' if overdue else state if waiting else 'unknown',
             'remaining_seconds': seconds if valid else None,
             'estimated_complete_at_utc': finish.isoformat() if valid else None,
             'active_work_seconds': _number(raw.get('active_work_seconds')) if usable else None,
@@ -131,5 +137,5 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             {'code': item['code'], 'count': _number(item.get('count')), 'reason': item['reason'][:400]}
             for item in blockers[:10] if isinstance(item, dict) and isinstance(item.get('reason'), str)
             and item.get('code') in {'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets',
-                                     'secondary_admission', 'unmeasured_tail', 'quota_pause'}]
+                                     'secondary_admission', 'unmeasured_tail', 'quota_pause', 'retry_tasks'}]
     return result

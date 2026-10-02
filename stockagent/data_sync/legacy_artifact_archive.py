@@ -115,6 +115,10 @@ def _paths(spec: LegacyArchiveSpec, artifact_root: Path) -> tuple[Path, Path, Pa
     source = artifact_root / spec.relative_root
     stage = spec.stage_root / spec.dataset
     archive = stage / "archive"
+    if spec.stage_root.is_relative_to(Path("/srv/stockagent-d-volume")):
+        from stockagent.data_sync.cold_primary import _check_d_primary_mount
+
+        _check_d_primary_mount(Path("/srv/stockagent-packed"))
     if source.resolve() != source or stage.resolve(strict=False) != stage:
         raise SnapshotError("legacy archive root is redirected by a symlink")
     if source == archive or source in archive.parents or archive in source.parents:
@@ -252,6 +256,7 @@ def verify_archive_directory(
         raise SnapshotError("legacy archive has no file inventory")
     expected_encoded = {"legacy_archive_manifest.json"}
     expected_original: set[str] = set()
+    source_metadata_drift: list[dict[str, Any]] = []
     total = 0
     for row in rows:
         relative = _safe_relative_path(row["path"], "legacy archived path").as_posix()
@@ -276,8 +281,21 @@ def verify_archive_directory(
             original = source.joinpath(*PurePosixPath(relative).parts)
             if original.is_symlink() or not original.is_file():
                 raise SnapshotError(f"legacy source file missing: {relative}")
-            if _source_signature(original.lstat()) != row["source"] or sha256_file(original) != digest:
+            # An inode's ctime also changes when another verified hard-link
+            # name is removed. Historical inode/ctime are observations, not
+            # recoverable content. Require exact portable metadata + bytes,
+            # and compare the *current* complete signature before/after hashing
+            # to retain the mutation/race gate without rejecting alias cleanup.
+            before = _source_signature(original.lstat())
+            original_digest = sha256_file(original)
+            after = _source_signature(original.lstat())
+            if (before != after or original_digest != digest
+                or any(before[key] != row["source"][key] for key in ("size", "mtime_ns", "mode"))):
                 raise SnapshotError(f"legacy source differs: {relative}")
+            changed = [key for key in ("device", "inode", "ctime_ns") if before[key] != row["source"][key]]
+            if changed:
+                source_metadata_drift.append({"path": relative, "changed_observations": changed,
+                                              "current_signature": before, "exact_sha256": original_digest})
         total += size
     observed = {p.relative_to(archive).as_posix() for p in archive.rglob("*") if p.is_file()}
     if observed != expected_encoded:
@@ -289,7 +307,8 @@ def verify_archive_directory(
         observed_source = {row["path"] for row in source_plan(source, source_spec)}
         if observed_source != expected_original:
             raise SnapshotError("legacy source has extra or missing files")
-    return {"dataset": manifest["dataset"], "files": len(rows), "original_bytes": total, "manifest": manifest}
+    return {"dataset": manifest["dataset"], "files": len(rows), "original_bytes": total, "manifest": manifest,
+            "source_metadata_drift": source_metadata_drift}
 
 
 def publish_archive(spec: LegacyArchiveSpec, artifact_root: Path, sync_root: Path, *, repo_root: Path):

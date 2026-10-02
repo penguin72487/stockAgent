@@ -8,7 +8,7 @@
       "minimum_stable_days": 7,
       "archive_only": true,
       "compression": "gzip-1-csv-over-8m",
-      "stage_root": "/mnt/d/stockagent-legacy-archive-stage"
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
     },
     {
       "dataset": "legacy-artifact-markets-us",
@@ -16,7 +16,191 @@
       "minimum_stable_days": 7,
       "archive_only": true,
       "compression": "gzip-1-csv-over-8m",
-      "stage_root": "/mnt/d/stockagent-legacy-archive-stage"
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw-a9efa1519fc9",
+      "relative_root": "markets/tw",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_boost-c1ce61281a06",
+      "relative_root": "markets/tw_boost",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_day_trade_10m_free_mix_projection_l-afbe1b024743",
+      "relative_root": "markets/tw_day_trade_10m_free_mix_projection_l1_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_day_trade_10m_free_mix_raw_l1_v1-ef30bd4930a3",
+      "relative_root": "markets/tw_day_trade_10m_free_mix_raw_l1_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_day_trade_daily_multi_basis_raw_ohl-e188d70b5f3c",
+      "relative_root": "markets/tw_day_trade_daily_multi_basis_raw_ohlcv_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_index_futures_day-e99c9e311151",
+      "relative_root": "markets/tw_index_futures_day",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_minute-1f4190c194e8",
+      "relative_root": "markets/tw_minute",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_overnight_1320_close_fallback_next_-d027ca5af80a",
+      "relative_root": "markets/tw_overnight_1320_close_fallback_next_open_multi_basis_22_projection_l1_capital10m_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_candles_full_gross_naive_dua-ffe1e72d98a8",
+      "relative_root": "markets/tw_public_candles_full_gross_naive_dual5090_all_folds",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_candles_multi_basis_lookback-4c5fbfca5044",
+      "relative_root": "markets/tw_public_candles_multi_basis_lookback32_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_candles_snapshot_safe99_open-5440d1ee26a2",
+      "relative_root": "markets/tw_public_candles_snapshot_safe99_open_aware_gross_tw_day_trade_2014plus",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_lanten_market_candles_tw_cas-23fb39efe7fa",
+      "relative_root": "markets/tw_public_lanten_market_candles_tw_cash_all_available",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_lanten_market_candles_tw_cas-42ee0e37ca24",
+      "relative_root": "markets/tw_public_lanten_market_candles_tw_cash_gradfix_v2",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_lanten_market_token_all_avai-96caaab6722e",
+      "relative_root": "markets/tw_public_lanten_market_token_all_available",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_official_2005_all_available_-f367fd7f4707",
+      "relative_root": "markets/tw_public_official_2005_all_available_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_all_observed_researc-4faa09b68fd7",
+      "relative_root": "markets/tw_public_preopen_all_observed_research_2014_v3",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_pit-b235fbdcd669",
+      "relative_root": "markets/tw_public_preopen_pit",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_pit_pinned_20260916-f6211f50fbfd",
+      "relative_root": "markets/tw_public_preopen_pit_pinned_20260916",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_raw_2014_v1-b4e8af22fd18",
+      "relative_root": "markets/tw_public_preopen_raw_2014_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_raw_long_history_v1-a5cc6f58d6d2",
+      "relative_root": "markets/tw_public_preopen_raw_long_history_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_raw_v1-cfb476f16459",
+      "relative_root": "markets/tw_public_preopen_raw_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_wide_research_2014_v-7ea847d41e04",
+      "relative_root": "markets/tw_public_preopen_wide_research_2014_v1",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw_public_preopen_wide_research_taifex-2854893718ee",
+      "relative_root": "markets/tw_public_preopen_wide_research_taifex_2014_v2",
+      "minimum_stable_days": 7,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage"
     }
   ]
 }

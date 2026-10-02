@@ -14,7 +14,7 @@ from scripts import run_discord_artifact_maintenance as runner
 def isolated_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     status_path = tmp_path / "artifact_backfill_status.json"
     emissions: list[dict] = []
-    bot = runner.discord_bot
+    bot = runner._load_discord_bot()
     monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH", str(status_path))
     monkeypatch.setattr(bot, "_rotate_error_log_if_needed", lambda: None)
     monkeypatch.setattr(bot, "_opening_critical_work_pending", lambda: False)

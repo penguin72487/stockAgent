@@ -14,8 +14,9 @@ import os
 from pathlib import Path
 import select
 import sys
+import threading
 import time as time_module
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -63,7 +64,9 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     load_live_eligibility,
     load_symbol_metadata,
     quote_map_from_snapshot,
+    realized_account_nav,
     resolve_day_trade_rule_data_dir,
+    whole_lot_target_shares,
 )
 
 
@@ -237,7 +240,8 @@ def _persist_missed_opening_prices(
     path = _missed_opening_receipt_path(state_dir, observed)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "query_contract": "bounded_incremental_per_mode_source_queries_v3",
         "session_date": observed.date().isoformat(),
         "simulation_only": True,
         "production_order_possible": False,
@@ -277,6 +281,10 @@ def _resolve_missed_opening_prices(
     state_dir: Path,
     observed: datetime,
     symbols: set[str],
+    *,
+    max_remote_symbols: int | None = None,
+    symbol_priority: tuple[str, ...] = (),
+    on_progress: Callable[[dict[str, dict[str, Any]], dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Resume and durably receipt one quota-bounded 09:01 price query."""
 
@@ -284,16 +292,21 @@ def _resolve_missed_opening_prices(
     missing = sorted(set(symbols) - set(cached))
     wall_time = observed.timetz().replace(tzinfo=None)
     source_is_settling = wall_time < MISSED_OPENING_SOURCE_SETTLE_DEADLINE
-    prior_complete = bool(
-        prior_receipt
-        and not prior_receipt.get("error_counts")
-        and not int(prior_receipt.get("unqueried_symbols") or 0)
-        and not bool(prior_receipt.get("stopped_for_traffic"))
-    )
     attempted = set(prior_receipt.get("attempted_symbols") or cached)
+    retry_symbols = set(prior_receipt.get("retry_symbols") or ())
+    if "retry_symbols" not in prior_receipt and (
+        prior_receipt.get("error_counts")
+        or prior_receipt.get("unqueried_symbols")
+        or prior_receipt.get("stopped_for_traffic")
+    ):
+        # Incomplete legacy receipts marked even unqueried symbols attempted.
+        retry_symbols.update(set(missing) & attempted)
     unseen = sorted(set(missing) - attempted)
-    if missing and (not prior_complete or source_is_settling or unseen):
-        query_symbols = missing if not prior_complete or source_is_settling else unseen
+    query_symbols = list(dict.fromkeys(
+        unseen + sorted(set(missing) & retry_symbols)
+        + (missing if source_is_settling else [])
+    ))
+    if query_symbols:
         local, local_receipt = load_local_stock_0901_vwaps(
             _missed_opening_minute_roots(),
             query_symbols,
@@ -301,16 +314,61 @@ def _resolve_missed_opening_prices(
         )
         cached.update({symbol: dict(row) for symbol, row in local.items()})
         remote_symbols = sorted(set(query_symbols) - set(local))
+        fetched: dict[str, dict[str, Any]] = {}
+        priority = {symbol: index for index, symbol in enumerate(symbol_priority)}
+        # A failed high-priority symbol must not monopolize every batch while
+        # unrelated symbols have never been queried. Retain mode priority
+        # within each group, and retry only after the fresh work has progressed.
+        remote_symbols.sort(key=lambda symbol: (
+            symbol in attempted, priority.get(symbol, len(priority)), symbol,
+        ))
+        if max_remote_symbols is not None:
+            if max_remote_symbols < 1:
+                raise ValueError("max_remote_symbols must be positive")
+            remote_symbols = remote_symbols[:max_remote_symbols]
+        def publish_partial():
+            # Each resolved symbol is committed before another network wait.
+            local_progress = {
+                **prior_receipt,
+                "source": "local_first_then_shioaji_0901_minute_price",
+                "local": local_receipt,
+                "remote": {"in_progress": True},
+                "attempted_symbols": sorted(attempted),
+                "retry_symbols": sorted(retry_symbols),
+                "unqueried_symbols": len(set(symbols) - attempted - set(cached)),
+                "requested_union_symbols": len(symbols),
+                "resolved_union_symbols": len(set(symbols) & set(cached)),
+                "unresolved_union_symbols": len(set(symbols) - set(cached)),
+                "source_settling": bool(source_is_settling and set(symbols) - set(cached)),
+            }
+            _persist_missed_opening_prices(
+                state_dir, observed, prices=cached, query_receipt=local_progress,
+            )
+            if on_progress is not None:
+                on_progress(cached, local_progress)
+
+        if local and remote_symbols:
+            # Local evidence must not wait behind another mode's network I/O.
+            attempted.update(local)
+            retry_symbols.difference_update(local)
+            publish_partial()
+
+        def publish_remote(symbol, row):
+            cached[symbol] = dict(row)
+            attempted.add(symbol)
+            retry_symbols.discard(symbol)
+            publish_partial()
         if remote_symbols:
             fetched, remote_receipt = fetch_shioaji_historical_stock_0901_vwaps(
                 remote_symbols,
                 trading_date=observed.date(),
                 max_traffic_fraction=0.90,
                 progress_callback=lambda index, total, queried, resolved: notify_systemd(
-                    "WATCHDOG=1\n"
                     "STATUS=missed-opening 09:01 recovery "
                     f"{index}/{total}; queried={queried}; resolved={resolved}"
                 ),
+                **({"nonblocking": True, "resolved_callback": publish_remote}
+                   if max_remote_symbols is not None else {}),
             )
             cached.update({symbol: dict(row) for symbol, row in fetched.items()})
         else:
@@ -323,6 +381,20 @@ def _resolve_missed_opening_prices(
                 "error_counts": {},
                 "stopped_for_traffic": False,
             }
+        remote_attempted = set(remote_receipt.get("attempted_symbols") or ())
+        remote_attempted.update(remote_receipt.get("contract_missing_symbol_codes") or ())
+        if "attempted_symbols" not in remote_receipt:
+            # Compatibility with a complete older provider receipt only.
+            if not remote_receipt.get("error_counts") and not int(remote_receipt.get("unqueried_symbols") or 0):
+                remote_attempted.update(remote_symbols)
+        remote_attempted.update(fetched)
+        completed = set(local) | remote_attempted
+        attempted.update(completed)
+        retry_symbols.difference_update(completed | set(cached))
+        retry_symbols.update(remote_receipt.get("failed_symbols") or ())
+        retry_symbols.update(remote_receipt.get("retry_symbols") or ())
+        if remote_receipt.get("error_counts") and "failed_symbols" not in remote_receipt:
+            retry_symbols.update(set(remote_symbols) - set(cached))
         receipt = {
             "source": "local_first_then_shioaji_0901_minute_price",
             "local": local_receipt,
@@ -330,10 +402,12 @@ def _resolve_missed_opening_prices(
             "requested_symbols": len(query_symbols),
             "queried_symbols": int(remote_receipt.get("queried_symbols") or 0),
             "resolved_symbols": len(set(query_symbols) & set(cached)),
-            "unqueried_symbols": int(remote_receipt.get("unqueried_symbols") or 0),
+            "unqueried_symbols": len(set(symbols) - attempted - set(cached)),
             "error_counts": dict(remote_receipt.get("error_counts") or {}),
             "stopped_for_traffic": bool(remote_receipt.get("stopped_for_traffic")),
-            "attempted_symbols": sorted(attempted | set(query_symbols)),
+            "attempted_symbols": sorted(attempted),
+            "retry_symbols": sorted(retry_symbols),
+            "batch_remote_symbols": len(remote_symbols),
             "requested_union_symbols": len(symbols),
             "resolved_union_symbols": len(set(symbols) & set(cached)),
             "unresolved_union_symbols": len(set(symbols) - set(cached)),
@@ -368,6 +442,96 @@ def _resolve_missed_opening_prices(
         )
         return cached, finalized_receipt
     return cached, prior_receipt
+
+
+def _missed_opening_query_pending(
+    prices: Mapping[str, Any], receipt: Mapping[str, Any],
+    symbols: set[str], observed: datetime,
+) -> bool:
+    """A mode waits for its own unresolved requests, never another mode's."""
+
+    missing = symbols - set(prices)
+    if not missing:
+        return False
+    if not receipt:
+        return True
+    if missing - set(receipt.get("attempted_symbols") or ()):
+        return True
+    if missing & set(receipt.get("retry_symbols") or ()):
+        return True
+    if "retry_symbols" not in receipt and receipt.get("error_counts"):
+        return True
+    return observed.timetz().replace(tzinfo=None) < MISSED_OPENING_SOURCE_SETTLE_DEADLINE
+
+
+class _MissedOpeningPriceRecovery:
+    """One bounded worker shares the existing quote client; only main writes NAV.
+
+    Every completed batch is atomically receipted before the next batch. The
+    event loop never waits on historical network I/O, and a restart resumes
+    from the retained source prices rather than repeating the entire universe.
+    """
+
+    def __init__(self, state_dir: Path, *, batch_size: int = 8):
+        self.state_dir = state_dir
+        self.batch_size = batch_size
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._session_date = None
+        self._prices: dict[str, dict[str, Any]] = {}
+        self._receipt: dict[str, Any] = {}
+        self._retry_after = 0.0
+
+    def poll(self, observed: datetime, symbols: set[str], *, symbol_priority: tuple[str, ...] = ()):
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            if self._session_date != observed.date():
+                if running:
+                    return {}, {}  # Never mix a previous session's prices.
+                self._session_date = observed.date()
+                self._prices, self._receipt = _load_missed_opening_prices(self.state_dir, observed)
+                self._retry_after = 0.0
+            prices, receipt = dict(self._prices), dict(self._receipt)
+            settling_finalization = bool(
+                receipt.get("source_settling")
+                and observed.timetz().replace(tzinfo=None) >= MISSED_OPENING_SOURCE_SETTLE_DEADLINE
+            )
+            if (symbols and observed.timetz().replace(tzinfo=None) >= MISSED_OPENING_REPLAY_AT
+                    and not running and time_module.monotonic() >= self._retry_after
+                    and (_missed_opening_query_pending(prices, receipt, symbols, observed)
+                         or settling_finalization)):
+                self._thread = threading.Thread(
+                    target=self._run, args=(observed, set(symbols), symbol_priority),
+                    name="tw-missed-opening-prices", daemon=True,
+                )
+                self._thread.start()
+            return prices, receipt
+
+    def _run(self, observed: datetime, symbols: set[str], priority: tuple[str, ...]):
+        try:
+            prices, receipt = _resolve_missed_opening_prices(
+                self.state_dir, observed, symbols,
+                max_remote_symbols=self.batch_size, symbol_priority=priority,
+                on_progress=self._publish_progress,
+            )
+        except Exception as exc:
+            print(f"[tw-day-trade-sim] missed_opening_0901_price_error={type(exc).__name__}: {exc}", flush=True)
+            with self._lock:
+                self._retry_after = time_module.monotonic() + 5.0
+            return
+        with self._lock:
+            self._prices, self._receipt = prices, receipt
+            delay = 60.0 if receipt.get("stopped_for_traffic") else (
+                5.0 if not receipt.get("unqueried_symbols") and (
+                    receipt.get("retry_symbols") or receipt.get("source_settling")
+                ) else 0.0
+            )
+            self._retry_after = time_module.monotonic() + delay
+
+
+    def _publish_progress(self, prices, receipt):
+        with self._lock:
+            self._prices, self._receipt = dict(prices), dict(receipt)
 
 
 def _acquire_engine_lock(state_dir: Path):
@@ -713,6 +877,40 @@ def _entry_and_carry_quote_symbols(*, spec, rows, eligibility, mode):
     return symbols, fallback
 
 
+def _missed_opening_quote_symbols(*, spec, rows, eligibility, mode, observed):
+    """Exclude only provably zero replay orders, using the real account NAV.
+
+    Carried inventory, unsettled corporate-action accounting, unknown opening
+    prices or invalid NAV retain the broad discovery scope. Live best-quote
+    execution does not use this retrospective 09:00 sizing optimization.
+    """
+
+    symbols, fallback = _entry_and_carry_quote_symbols(
+        spec=spec, rows=rows, eligibility=eligibility, mode=mode
+    )
+    if (any(int(p.get("signed_shares") or 0) for p in (mode.get("positions") or {}).values())
+            or mode.get("corporate_action_ledger")
+            or mode.get("initial_capital_twd") is None):
+        return symbols, fallback
+    nav = (
+        float(mode.get("session_sizing_nav_twd") or 0.0)
+        if mode.get("sizing_session_date") == observed.date().isoformat()
+        else realized_account_nav(mode)
+    )
+    if not np.isfinite(nav) or nav <= 0.0:
+        return symbols, fallback
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        price = float(row.get("open_price") or 0.0)
+        weight = float(row.get("target_weight") or 0.0)
+        if (symbol in symbols and np.isfinite(price) and price > 0.0
+                and np.isfinite(weight)
+                and whole_lot_target_shares(weight, nav, price, spec.lot_size) == 0):
+            symbols.remove(symbol)
+            fallback.pop(symbol, None)
+    return symbols, fallback
+
+
 def _replay_sizing_open_price(signal_open, quote):
     # A zero-target row can omit open_price. The broker's observed session open
     # remains a source price; current/last/09:01 execution price never replaces it.
@@ -781,6 +979,58 @@ def _fetch_quotes(
         snapshot,
         trading_date=trading_date.date(),
     )
+
+
+def _attach_snapshot_valuation_quotes(quotes, *, engine, observed):
+    """Refresh missing held-side marks without adding any execution evidence.
+
+    A fresh Snapshot read can value a paper position even when it does not
+    expose simtrade. Such a mark is explicitly indicative. It must not supply
+    bid/ask, last, minute volume or non-trial flags to the order/fill engine.
+    """
+
+    held: dict[str, set[str]] = {}
+    fallback: dict[str, float] = {}
+    for mode in engine.state.get("modes", {}).values():
+        for position in (mode.get("positions") or {}).values():
+            if not int(position.get("signed_shares") or 0):
+                continue
+            symbol = str(position["symbol"])
+            held.setdefault(symbol, set()).add("bid" if position.get("side") == "long" else "ask")
+            fallback[symbol] = float(position.get("last_mark_price") or position.get("entry_price") or 1.0)
+    missing = sorted(
+        symbol for symbol, sides in held.items()
+        if any(not (np.isfinite(float((quotes.get(symbol) or {}).get(side) or 0.0))
+                    and float((quotes.get(symbol) or {}).get(side) or 0.0) > 0.0)
+               for side in sides)
+    )
+    if not missing:
+        return
+    snapshot = fetch_shioaji_stock_snapshots(
+        missing, np.asarray([fallback[s] for s in missing], dtype=np.float64),
+        cache_ttl_seconds=0.0,
+    )
+    rows = quote_map_from_snapshot(missing, snapshot, trading_date=observed.date())
+    available = snapshot.available_mask
+    for index, symbol in enumerate(missing):
+        if available is None or not bool(available[index]):
+            continue
+        row = rows[symbol]
+        # Prior-session books, explicit trial observations and carried fallback
+        # prices cannot become fresh marks. Unknown simtrade stays unknown.
+        if (row.get("simtrade") is True
+                or (quotes.get(symbol) or {}).get("simtrade") is True
+                or not str(row.get("exchange_quote_at") or "").startswith(observed.date().isoformat())):
+            continue
+        target = quotes.setdefault(symbol, {})
+        target.update({
+            "valuation_bid": row.get("bid"),
+            "valuation_ask": row.get("ask"),
+            "valuation_quote_at": row.get("quote_at"),
+            "valuation_quote_source": row.get("source"),
+            "valuation_simtrade": row.get("simtrade"),
+            "valuation_evidence": "indicative_snapshot_book_only_not_execution_evidence_v1",
+        })
 
 
 def _attach_terminal_official_close_context(quotes, *, engine, specs, configs, observed):
@@ -1283,6 +1533,13 @@ def _flat_mark_markets_due(engine, *, observed: datetime, last_mark_minute: str 
     return due
 
 
+def _stream_rotation_interval_seconds(reconciliation_pending: bool) -> float:
+    # A 200-name subscription target takes up to eight 25-name batches.
+    # At 1 Hz, replacement + 5 s dwell outlives the 10 s causal quote TTL.
+    # Reconcile at 10 Hz only until the target is subscribed, then idle at 1 Hz.
+    return 0.1 if reconciliation_pending else 1.0
+
+
 def _loop_sleep_seconds(
     observed: datetime,
     *,
@@ -1654,6 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
     last_quote_minute: str | None = None
     last_causal_pending_quote_at = 0.0
     last_stream_rotation_at = 0.0
+    stream_reconciliation_pending = False
     last_stream_coverage_minute: str | None = None
     last_pending_entry_shares: int | None = None
     entry_fast_until = 0.0
@@ -1664,6 +1922,7 @@ def main(argv: list[str] | None = None) -> int:
     quote_client_prewarm_retry_after = 0.0
     eligibility_prewarmed_session: str | None = None
     signal_watcher = _SignalPointerWatcher()
+    missed_opening_prices = _MissedOpeningPriceRecovery(engine.state_dir)
     last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
     non_session_invalidation_attempts: set[tuple[str, str]] = set()
     ready_notified = False
@@ -2035,6 +2294,7 @@ def main(argv: list[str] | None = None) -> int:
         ] = []
         pending_symbols: set[str] = set()
         recovery_symbols: set[str] = set()
+        recovery_groups: list[set[str]] = []
         pending_fallback: dict[str, float] = {}
         minute_key = observed.replace(second=0, microsecond=0).isoformat(
             timespec="minutes"
@@ -2088,16 +2348,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 pending_retry_after[spec.market] = time_module.monotonic() + 0.5
                 continue
-            candidate_symbols, candidate_fallback = _entry_and_carry_quote_symbols(
+            missed_opening_recovery = _missed_opening_recovery_required(detected_at)
+            candidate_symbols, candidate_fallback = (
+                _missed_opening_quote_symbols(
+                    spec=spec, rows=rows, eligibility=eligibility, mode=mode, observed=observed
+                ) if missed_opening_recovery else _entry_and_carry_quote_symbols(
                 spec=spec,
                 rows=rows,
                 eligibility=eligibility,
                 mode=mode,
+                )
             )
             eligibility_ms = (time_module.perf_counter() - eligibility_started) * 1000.0
-            missed_opening_recovery = _missed_opening_recovery_required(
-                detected_at
-            )
             pending.append(
                 (
                     spec,
@@ -2122,6 +2384,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if missed_opening_recovery:
                 recovery_symbols.update(candidate_symbols)
+                recovery_groups.append(candidate_symbols)
             else:
                 pending_symbols.update(candidate_symbols)
             pending_fallback.update(candidate_fallback)
@@ -2234,6 +2497,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if use_execution_stream:
                     last_stream_rotation_at = monotonic_now
+                    stream_reconciliation_pending = any(
+                        q.get("stream_reconciliation_pending") for q in quotes.values()
+                    )
                 if benchmark_due:
                     _attach_benchmark_previous_close_context(
                         quotes,
@@ -2263,20 +2529,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if quote_due:
+            if wall_time > MISSED_OPENING_COMMIT_DEADLINE:
+                try:
+                    _attach_snapshot_valuation_quotes(quotes, engine=engine, observed=observed)
+                except Exception as exc:
+                    print(f"[tw-day-trade-sim] snapshot_valuation_error={type(exc).__name__}: {exc}", flush=True)
             _attach_terminal_official_close_context(
                 quotes, engine=engine, specs=specs, configs=live_configs, observed=observed
             )
 
         if (use_execution_stream and active_symbols and not quote_due
                 and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)
-                and monotonic_now - last_stream_rotation_at >= 1.0):
+                and monotonic_now - last_stream_rotation_at >=
+                    _stream_rotation_interval_seconds(stream_reconciliation_pending)):
             # Subscription rotation is not a ledger valuation. Keep the
             # >200-symbol universe subscribed over time without re-marking or
             # fsyncing the 9 MB paper state every second.
             last_stream_rotation_at = monotonic_now
             try:
-                fetch_shioaji_stock_live_quotes(
+                stream_quotes = fetch_shioaji_stock_live_quotes(
                     active_symbols, trading_date=observed.date()
+                )
+                stream_reconciliation_pending = any(
+                    q.get("stream_reconciliation_pending") for q in stream_quotes.values()
                 )
             except Exception as exc:
                 print(
@@ -2290,10 +2565,12 @@ def main(argv: list[str] | None = None) -> int:
         if recovery_symbols and wall_time >= MISSED_OPENING_REPLAY_AT:
             try:
                 recovery_prices, recovery_price_receipt = (
-                    _resolve_missed_opening_prices(
-                        engine.state_dir,
-                        observed,
-                        recovery_symbols,
+                    missed_opening_prices.poll(
+                        observed, recovery_symbols,
+                        symbol_priority=tuple(dict.fromkeys(
+                            symbol for group in sorted(recovery_groups, key=len)
+                            for symbol in sorted(group)
+                        )),
                     )
                 )
             except Exception as exc:
@@ -2366,23 +2643,16 @@ def main(argv: list[str] | None = None) -> int:
                 register_observed = datetime.now(TAIPEI)
                 counterfactual_open_replay = False
                 if missed_opening_recovery:
-                    query_incomplete = bool(
-                        recovery_price_receipt.get("error_counts")
-                        or int(
-                            recovery_price_receipt.get("unqueried_symbols") or 0
-                        )
-                        or recovery_price_receipt.get("stopped_for_traffic")
-                        or recovery_price_receipt.get("source_settling")
-                    )
-                    candidate_symbols, _candidate_fallback = _entry_and_carry_quote_symbols(
+                    candidate_symbols, _candidate_fallback = _missed_opening_quote_symbols(
                         spec=spec,
                         rows=rows,
                         eligibility=eligibility,
                         mode=mode,
+                        observed=observed,
                     )
                     missing_recovery = candidate_symbols - set(recovery_prices)
-                    if missing_recovery and (
-                        not recovery_price_receipt or query_incomplete
+                    if _missed_opening_query_pending(
+                        recovery_prices, recovery_price_receipt, candidate_symbols, observed
                     ):
                         pending_retry_after[spec.market] = (
                             time_module.monotonic() + 5.0
@@ -2605,7 +2875,7 @@ def main(argv: list[str] | None = None) -> int:
             _loop_sleep_seconds(
                 datetime.now(TAIPEI),
                 fast_seconds=float(args.poll_seconds),
-                has_pending_signal=bool(pending) or (
+                has_pending_signal=stream_reconciliation_pending or bool(pending) or (
                     causal_pending_entry and time_module.monotonic() < entry_fast_until
                 ),
                 has_open_position=bool(active_symbols),

@@ -24,15 +24,18 @@ if str(REPO_ROOT) not in sys.path:
 from stockagent.live.dashboard_updates import metadata_signature  # noqa: E402
 from stockagent.live.data_monitor_dashboard import _MARKET_CATEGORY_LABELS  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
+    feature_observation_binding,
     feature_revision_binding,
     feature_reuse_receipt_path,
     trusted_feature_snapshot,
 )
 from stockagent.live.data_monitor_inventory import (  # noqa: E402
     InventorySnapshot,
+    _bound_dataset_memberships,
     _membership_fingerprint,
     _selected_files,
     build_feature_inventory,
+    inventory_dataset_delta as changed_dataset_ids,
 )
 
 
@@ -57,10 +60,18 @@ def _reject_nonfinite(value: str) -> None:
 
 
 def _read_generation(root: Path) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Pin a completed generation, not the producer's moving filename head.
+
+    _stable_bytes fences each opened file while reading. The feature digest,
+    revision and receipt must then agree. A newer cache may legitimately be
+    published while these already-frozen bytes are decoded; it does not erase
+    this completed generation. This is a shadow parity observation, NEVER a
+    permission for production readers to skip a current-source freshness gate.
+    """
     directory = root / "artifacts/live/data_monitor"
     cache_path = directory / "record_inventory_cache.json"
     feature_path = directory / "feature_inventory.json"
-    cache_body, cache_stat = _stable_bytes(cache_path)
+    cache_body, _ = _stable_bytes(cache_path)
     feature_body, feature_stat = _stable_bytes(feature_path)
     if not trusted_feature_snapshot(feature_path, source_stat=feature_stat, body=feature_body):
         raise ValueError("feature producer receipt does not validate source bytes")
@@ -84,6 +95,11 @@ def _read_generation(root: Path) -> tuple[dict[str, Any], dict[str, Any], str]:
         ))
         else None
     )
+    source_root = cache.get("source_observation_root") if isinstance(cache, Mapping) else None
+    observation_binding = (
+        feature_observation_binding(signature, receipt.get("source_sha256"), receipt.get("fields"), source_root)
+        if isinstance(receipt, Mapping) else None
+    )
     if (
         not isinstance(cache, dict)
         or not isinstance(cache.get("files"), dict)
@@ -99,68 +115,13 @@ def _read_generation(root: Path) -> tuple[dict[str, Any], dict[str, Any], str]:
         or receipt.get("fields") != len(feature["rows"])
         or receipt.get("source_sha256") != hashlib.sha256(feature_body).hexdigest()
         or revision_binding is None
-        or metadata_signature(cache_stat) != metadata_signature(cache_path.stat())
+        or cache.get("source_observation_matches_cache") is not True
+        or observation_binding is None
+        or receipt.get("source_observation_root") != source_root
+        or receipt.get("source_observation_sha256") != observation_binding
     ):
         raise ValueError("cache, feature, and receipt are not one completed generation")
     return cache, feature, revision
-
-
-def changed_dataset_ids(
-    before: Mapping[str, Any], after: Mapping[str, Any],
-    selected: Mapping[str, list[Path]],
-) -> set[str] | None:
-    """Return None when a generation cannot be narrowed without guessing."""
-
-    old_files = before.get("files")
-    new_files = after.get("files")
-    old_datasets = before.get("datasets")
-    new_datasets = after.get("datasets")
-    if (
-        before.get("version") != after.get("version")
-        or before.get("selection_membership") != after.get("selection_membership")
-        or not isinstance(old_files, Mapping)
-        or not isinstance(new_files, Mapping)
-        or old_files.keys() != new_files.keys()
-        or not all(isinstance(value, Mapping) for value in old_files.values())
-        or not all(isinstance(value, Mapping) for value in new_files.values())
-        or not isinstance(old_datasets, Mapping)
-        or not isinstance(new_datasets, Mapping)
-    ):
-        return None
-    old_schemas = before.get("schemas")
-    new_schemas = after.get("schemas")
-    if not isinstance(old_schemas, Mapping) or not isinstance(new_schemas, Mapping):
-        return None
-    changed_schema_ids = {
-        key for key in old_schemas.keys() | new_schemas.keys()
-        if old_schemas.get(key) != new_schemas.get(key)
-    }
-    changed_paths = {
-        key for key in new_files
-        if (
-            (old_files[key] or {}).get("stats"),
-            (old_files[key] or {}).get("error"),
-        ) != (
-            (new_files[key] or {}).get("stats"),
-            (new_files[key] or {}).get("error"),
-        )
-    }
-    if changed_schema_ids:
-        def schema_id(entry: Mapping[str, Any]) -> Any:
-            stats = entry.get("stats")
-            return stats.get("schema_id") if isinstance(stats, Mapping) else None
-
-        changed_paths.update(
-            key for key in new_files
-            if schema_id(old_files[key]) in changed_schema_ids
-            or schema_id(new_files[key]) in changed_schema_ids
-        )
-    changed = {
-        dataset for dataset, paths in selected.items()
-        if old_datasets.get(dataset) != new_datasets.get(dataset)
-        or any(str(path) in changed_paths for path in paths)
-    }
-    return changed
 
 
 def project_rows(
@@ -190,8 +151,66 @@ def _path_signatures(paths: list[Path]) -> dict[str, tuple[int, ...] | None]:
     return signatures
 
 
+def _generation_selection(
+    cache: Mapping[str, Any], observed: Mapping[str, list[Path]],
+) -> tuple[dict[str, list[Path]], str] | None:
+    """Select a CLOSED generation, not a mutable current directory listing.
+
+    New partitions may appear immediately after the producer publishes. Remove
+    only those absent from its file map, and require the entire per-owner tree
+    to match its bound root. Missing paths or reassignment cannot be guessed.
+    This proves membership only; source identities still fence restricted rows.
+    """
+
+    members = _bound_dataset_memberships(cache)
+    files = cache.get("files")
+    if members is None or not isinstance(files, Mapping):
+        return None
+    if cache.get("selection_membership") == _membership_fingerprint(observed):
+        return dict(observed), "current_selection_matches_completed_generation"
+    candidate = {
+        dataset: [path for path in observed.get(dataset, []) if str(path) in files]
+        for dataset in members
+    }
+    if cache.get("selection_membership") != _membership_fingerprint(candidate):
+        return None
+    return candidate, "completed_generation_bound_membership"
+
+
+def _different_generation(old_cache_revision: str, old_feature: Mapping[str, Any],
+                          new_cache_revision: str, new_feature: Mapping[str, Any]) -> bool:
+    # Labels/code can require republishing without changing raw footer inputs.
+    # Do not silently discard that real public generation; parity may expose
+    # missing public-metadata invalidation. Separately report raw-input changes.
+    old_at, new_at = old_feature.get("generated_at_utc"), new_feature.get("generated_at_utc")
+    return old_cache_revision != new_cache_revision or (
+        isinstance(old_at, str) and isinstance(new_at, str) and old_at != new_at
+    )
+
+
+def _row_value_changes(old_rows: list[dict], new_rows: list[dict]) -> dict[str, dict[str, int]]:
+    """Diagnose all changed columns by owner, without logging source values."""
+
+    old = {(row["dataset_id"], row["field"]): row for row in old_rows}
+    new = {(row["dataset_id"], row["field"]): row for row in new_rows}
+    changes: dict[str, dict[str, int]] = {}
+    missing = object()
+    for identity in old.keys() | new.keys():
+        before, after = old.get(identity, {}), new.get(identity, {})
+        columns = [key for key in before.keys() | after.keys()
+                   if before.get(key, missing) != after.get(key, missing)]
+        if columns:
+            counts = changes.setdefault(identity[0], {})
+            for key in columns:
+                counts[key] = counts.get(key, 0) + 1
+    return changes
+
+
 def run(root: Path, *, wait_seconds: float) -> dict[str, Any]:
-    initial_deadline = time.monotonic() + min(wait_seconds, 3.0)
+    # Decoding a real completed generation already takes around two seconds.
+    # Permit bounded retries across cache -> feature -> receipt publication;
+    # never mistake a torn generation for a parity success or a service outage.
+    initial_deadline = time.monotonic() + min(wait_seconds, 10.0)
     while True:
         try:
             read_started = time.perf_counter()
@@ -200,7 +219,8 @@ def run(root: Path, *, wait_seconds: float) -> dict[str, Any]:
             break
         except (OSError, ValueError, UnicodeError) as exc:
             if time.monotonic() >= initial_deadline:
-                return {"state": "inconclusive_initial_generation", "error_type": type(exc).__name__}
+                return {"state": "inconclusive_initial_generation", "error_type": type(exc).__name__,
+                        "last_error": str(exc)}
             time.sleep(0.2)
     directory = root / "artifacts/live/data_monitor"
     feature_path = directory / "feature_inventory.json"
@@ -225,17 +245,21 @@ def run(root: Path, *, wait_seconds: float) -> dict[str, Any]:
                 # A mid-publication read is not a parity failure.
                 time.sleep(0.2)
                 continue
-            if new_revision != old_revision:
+            if _different_generation(old_revision, old_feature, new_revision, new_feature):
                 break
         time.sleep(0.5)
     else:
         return {"state": "no_new_generation", "old_revision": old_revision}
 
     selected_started = time.perf_counter()
-    selected = _selected_files(root)
+    observed_selected = _selected_files(root)
     selected_discovery_ms = round((time.perf_counter() - selected_started) * 1_000, 3)
-    if new_cache.get("selection_membership") != _membership_fingerprint(selected):
+    binding_started = time.perf_counter()
+    generation_selection = _generation_selection(new_cache, observed_selected)
+    generation_membership_binding_ms = round((time.perf_counter() - binding_started) * 1_000, 3)
+    if generation_selection is None:
         return {"state": "inconclusive_membership_moved"}
+    selected, membership_source = generation_selection
     changed = changed_dataset_ids(old_cache, new_cache, selected)
     if changed is None:
         return {"state": "full_rebuild_required", "old_revision": old_revision,
@@ -250,13 +274,13 @@ def run(root: Path, *, wait_seconds: float) -> dict[str, Any]:
     compose_ms = round((time.perf_counter() - started) * 1_000, 3)
     candidate_equal = candidate == new_rows
 
-    changed_paths = [path for dataset in sorted(changed) for path in selected[dataset]]
+    changed_paths = [path for dataset in sorted(changed) for path in selected.get(dataset, [])]
     signatures_started = time.perf_counter()
     before_signatures = _path_signatures(changed_paths)
     started = time.perf_counter()
     snapshot = InventorySnapshot(
         root, payload=new_cache,
-        selected={dataset: selected[dataset] for dataset in changed},
+        selected={dataset: selected.get(dataset, []) for dataset in changed},
     )
     restricted = build_feature_inventory(root, snapshot=snapshot)
     restricted_ms = round((time.perf_counter() - started) * 1_000, 3)
@@ -298,10 +322,16 @@ def run(root: Path, *, wait_seconds: float) -> dict[str, Any]:
         "state": "inconclusive_source_signature" if source_moved else "verified" if candidate_equal and restricted_equal else "mismatch",
         "old_revision": old_revision,
         "new_revision": new_revision,
+        "raw_feature_revision_changed": new_revision != old_revision,
+        "old_feature_generated_at_utc": old_feature.get("generated_at_utc"),
+        "new_feature_generated_at_utc": new_feature.get("generated_at_utc"),
         "full_rows": len(new_rows),
         "affected_datasets": sorted(changed),
         "affected_rows": len(expected),
+        "membership_source": membership_source,
+        "generation_membership_binding_ms": generation_membership_binding_ms,
         "candidate_matches_full_rows": candidate_equal,
+        "changed_row_values_by_dataset": _row_value_changes(old_rows, new_rows),
         "restricted_footer_matches_full_rows": restricted_equal,
         "moved_paths": len(moved_paths),
         "cache_identity_mismatch_paths": len(cache_mismatch),
