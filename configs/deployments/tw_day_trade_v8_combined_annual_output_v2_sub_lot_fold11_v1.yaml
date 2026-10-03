@@ -1,0 +1,24 @@
+# Single formal Fold-11 training run selected after the learning-mechanism audit.
+# It combines the capital-domain correction, zero-score output derivative and
+# one-lot ledger surrogate.  The exact physical forward/account remains intact.
+base_config: tw_day_trade_v8_ofat_resume_corrected_control.yaml
+experiment_name: tw-day-trade-v8-combined-annual-output-v2-sub-lot-fold11-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_output_v2_sub_lot_fold11_v1
+  start_fold: 11
+  resume: true
+  post_train_infer: false
+
+training:
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  # Keep the formal scheduler horizon fixed even for diagnostic CLI overrides.
+  lr_scheduler_t_max: 1000
+  day_trade_training_annual_episodes: true
+  day_trade_sub_lot_recovery: true
+  # Calendar-year episodes have variable lengths.
+  backtest_compile_dynamic: true
+  financial_transformer:
+    portfolio_output_mode: score_entmax_cash_v2
+    center_long_short_logits: false

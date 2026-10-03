@@ -487,3 +487,23 @@ def test_new_training_config_uses_canonical_daily_trainer() -> None:
     assert config.trading.tw_futures_portfolio_fee_stock_twd == 40.0
     assert config.trading.tw_futures_portfolio_fee_micro_twd == 16.0
     assert "taifex_portfolio_daily_v4" in config.trading.tw_futures_portfolio_data_path
+
+
+def test_reissued_product_month_keeps_separate_quarantined_instance_slots():
+    dates=[date(2024,1,1)+timedelta(days=i) for i in range(12)]
+    meta=pl.DataFrame([
+        dict(product='CN1',contract='202406',physical_instance='CN1:202406@old',
+            first_observed_date=dates[0],last_observed_date=dates[4]),
+        dict(product='CN1',contract='202406',physical_instance='CN1:202406@new',
+            first_observed_date=dates[5],last_observed_date=dates[10]),
+    ])
+    mapping=_fixed_portfolio_slot_map(meta,dates,fixed_slot_count=2816,cooldown_sessions=3)
+    assert mapping['portfolio_slot'].n_unique()==2
+    assert mapping['physical_instance'].n_unique()==2
+    assert set(mapping['contract'])=={'202406'}  # Preserve the exchange lookup key.
+    assert mapping.equals(_fixed_portfolio_slot_map(meta.reverse(),dates,
+        fixed_slot_count=2816,cooldown_sessions=3))
+    with pytest.raises(ValueError,match='reused codes require physical_instance'):
+        _fixed_portfolio_slot_map(meta.drop('physical_instance'),dates)
+    with pytest.raises(ValueError,match='duplicate futures lifetime identity'):
+        _fixed_portfolio_slot_map(pl.concat([meta,meta.head(1)]),dates)

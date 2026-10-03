@@ -17,13 +17,14 @@ import warnings
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from stockagent.backtest.tw_day_trade_inventory import (
     CohortField, DayTradeInventoryState, InventoryPathReduction,
     InventoryReduction, _require, accrue_inventory_interest,
     apply_inventory_action, convert_inventory_to_margin, inventory_nav,
     inventory_intraday_nav_lower_bound_from_extrema, inventory_path_nav,
-    rebalance_inventory_at_open, reduce_inventory_fifo_sparse_liquidity,
+    rebalance_inventory_at_open, reduce_inventory_fifo, reduce_inventory_fifo_sparse_liquidity,
     reduce_inventory_fifo_path, release_inventory_stock_deliveries,
     settle_inventory_claims,
     validate_inventory_state,
@@ -37,6 +38,7 @@ class DayTradeCarryEventCompressionFallback(RuntimeError):
 
 _COMPILED_PATHS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_SESSIONS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
+_COMPILED_SWEEP_STEPS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_PATH_LOCK = threading.Lock()
 _CARRY_COMPILE_STATS = {
     "compile_constructors": 0,
@@ -44,6 +46,12 @@ _CARRY_COMPILE_STATS = {
     "compiled_path_calls": 0,
     "compiled_session_calls": 0,
     "eager_path_calls": 0,
+    "checkpointed_sweep_session_calls": 0,
+    "eager_sweep_session_calls": 0,
+    "compiled_sweep_step_calls": 0,
+    "sweep_step_compile_constructors": 0,
+    "certified_sweep_suffix_calls": 0,
+    "certified_sweep_minutes_avoided": 0,
     "compile_failures": 0,
     "eager_fallback_calls": 0,
     "padded_session_calls": 0,
@@ -104,6 +112,7 @@ def reset_day_trade_carry_compile_stats(*, clear_cache: bool = False) -> None:
         if clear_cache:
             _COMPILED_PATHS.clear()
             _COMPILED_SESSIONS.clear()
+            _COMPILED_SWEEP_STEPS.clear()
 
 
 def invalidate_day_trade_carry_compiled_caches() -> tuple[int, int]:
@@ -118,6 +127,7 @@ def invalidate_day_trade_carry_compiled_caches() -> tuple[int, int]:
         counts = (len(_COMPILED_PATHS), len(_COMPILED_SESSIONS))
         _COMPILED_PATHS.clear()
         _COMPILED_SESSIONS.clear()
+        _COMPILED_SWEEP_STEPS.clear()
     return counts
 
 
@@ -182,6 +192,7 @@ def _compiled_inventory_path(
         else torch.cuda.current_device()
     )
     training_graph = bool(torch.is_grad_enabled() and state.cohorts.requires_grad)
+    compile_options = _carry_compile_options()
     key: tuple[object, ...] = (
         int(device_index),
         str(state.cohorts.dtype),
@@ -189,7 +200,7 @@ def _compiled_inventory_path(
         int(state.cohorts.shape[1]),
         float(initial_capital),
         training_graph,
-        (("triton.cudagraphs", False),),
+        tuple(sorted(compile_options.items())),
     )
     with _COMPILED_PATH_LOCK:
         compiled = _COMPILED_PATHS.get(key)
@@ -254,7 +265,7 @@ def _compiled_inventory_path(
                 tensor_core,
                 fullgraph=True,
                 dynamic=False,
-                options={"triton.cudagraphs": False},
+                options=compile_options,
             )
             _COMPILED_PATHS[key] = compiled
             _CARRY_COMPILE_STATS["compile_constructors"] += 1
@@ -1005,6 +1016,10 @@ class DayTradeCarrySession:
     # close and ignores market-volume capacity.  None preserves historical
     # residual-to-margin behavior and old artifacts exactly.
     terminal_liquidation_price: Tensor | None = None
+    # Opt-in daily frozen-order execution, including missing first-minute fills.
+    # [S,270,(VWAP,volume_shares)] and fresh long/short stop observations.
+    entry_path: Tensor | None = None
+    stop_hits: Tensor | None = None
 
     @property
     def uses_sparse_events(self) -> bool:
@@ -1026,6 +1041,10 @@ class DayTradeCarrySession:
         return all(value is not None for value in sparse)
 
     def validate_shape(self, symbols: int, device: torch.device) -> None:
+        if (self.entry_path is None) != (self.stop_hits is None):
+            raise ValueError("minute entry continuation requires prices, volume and stop observations")
+        if self.entry_path is not None and (self.uses_sparse_events or self.terminal_liquidation_price is not None):
+            raise ValueError("minute entry continuation requires dense capacity-limited carry")
         if not isinstance(self.day, int) or isinstance(self.day, bool) or not 0 < self.day <= 3652059:
             raise ValueError("carry session requires an exact Gregorian day ordinal")
         actions = (
@@ -1052,7 +1071,7 @@ class DayTradeCarrySession:
             elif sparse_events and field.name == "marks":
                 shape = (symbols, 1)
             else:
-                shape = ((symbols, 270, 2) if field.name in {"exit_prices", "exit_capacity"}
+                shape = ((symbols, 270, 2) if field.name in {"exit_prices", "exit_capacity", "entry_path", "stop_hits"}
                          else (symbols, 270) if field.name == "marks" else (symbols,))
             if not isinstance(value, Tensor) or value.shape != shape or value.device != device:
                 raise ValueError(f"carry session {field.name} differs from pinned universe/device")
@@ -1104,6 +1123,8 @@ def compact_day_trade_carry_session(
     session: DayTradeCarrySession,
 ) -> DayTradeCarrySession:
     """Losslessly replace the dense minute source by exact event sufficient statistics."""
+    if session.entry_path is not None:
+        raise ValueError("frozen target entry sweeps cannot discard the chronological minute tape")
     if session.uses_sparse_events:
         return session
     symbols, minutes, sides = session.exit_prices.shape
@@ -1278,6 +1299,292 @@ def _choose_inventory(condition: Tensor, new: DayTradeInventoryState,
     return DayTradeInventoryState(**values)
 
 
+_INVENTORY_FIELDS = tuple(f.name for f in fields(DayTradeInventoryState))
+
+
+def _sweep_checkpoint_enabled(weights: Tensor) -> bool:
+    return (weights.device.type == "cuda" and torch.is_grad_enabled()
+            and _env_truthy("STOCKAGENT_DAY_TRADE_SWEEP_CHECKPOINT", "1"))
+
+
+def _frozen_target_minute(
+    inventory: DayTradeInventoryState, weights: Tensor, target: Tensor,
+    sizing_nav: Tensor, stopped: Tensor, cancelled: Tensor, solvent: Tensor, *,
+    minute_fields: tuple[Tensor, ...], entry_phase: bool, common: dict,
+    initial_capital: float,
+) -> tuple[Tensor, ...]:
+    from stockagent.backtest.tw_day_trade_minute import _capacity
+
+    short = inventory.shares < 0
+    held = inventory.shares != 0
+    new_quantity = inventory.cohorts[-1, :, CohortField.SHARES].abs()
+    prices, capacities, entry, hits, mark = minute_fields
+    price = torch.where(short, prices[:, 1], prices[:, 0])
+    capacity = torch.where(short, capacities[:, 1], capacities[:, 0])
+    quote, volume = entry.unbind(-1)
+    if entry_phase:
+        hit = torch.where(short, hits[:, 1], hits[:, 0]).bool()
+        stopped = stopped | (held & hit)
+        quote_ok = torch.isfinite(quote) & (quote > 0)
+        observed_capacity = torch.where(quote_ok, _capacity(volume), 0)
+        price = torch.where(stopped & held & quote_ok, quote, price)
+        capacity = torch.where(stopped & held & quote_ok, observed_capacity, capacity)
+    reduction = reduce_inventory_fifo(inventory,
+        requested_shares=inventory.tradable_shares.abs(), price=price,
+        capacity_shares=torch.where(solvent, capacity, 0))
+    inventory = reduction.state
+    notional = (reduction.filled_shares * torch.nan_to_num(price, nan=0)).sum()
+    if entry_phase:
+        # A stop on yesterday's opposite-side cohort must not cancel today's
+        # still-unopened order. Paper owns exit latches per acquisition cohort.
+        new_reduced = new_quantity > inventory.cohorts[-1, :, CohortField.SHARES].abs()
+        cancelled = cancelled | ((new_quantity > 0) & stopped) | new_reduced
+        stopped = stopped & (inventory.shares != 0)
+        continuation_target = torch.where(cancelled, inventory.shares, target)
+        remaining_capacity = (observed_capacity - reduction.filled_shares).clamp_min(0)
+        continuation = rebalance_inventory_at_open(inventory, weights=weights, entry_price=quote,
+            entry_volume_shares=torch.where(solvent, remaining_capacity * 2, 0),
+            frozen_target_shares=continuation_target, frozen_sizing_nav=sizing_nav, **common)
+        inventory = continuation.state
+        # A completed order does not reopen after a later bracket exit. This
+        # also covers a carried target already fully held before today's open.
+        cancelled = cancelled | (inventory.shares == target)
+        notional = notional + ((continuation.reduction.filled_shares + continuation.addition_shares.abs())
+                               * torch.nan_to_num(quote, nan=0)).sum()
+    nav = inventory_nav(inventory, initial_capital=initial_capital, marks=mark)
+    solvent = solvent & torch.isfinite(nav) & (nav > 0)
+    return (*(getattr(inventory, name) for name in _INVENTORY_FIELDS),
+            stopped, cancelled, solvent, nav, notional)
+
+
+def _flat_sweep_step(state_values, action_values, minute_fields, common, *, initial_capital, entry_phase):
+    return _frozen_target_minute(DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, state_values))),
+        *action_values, minute_fields=minute_fields, common=common,
+        initial_capital=initial_capital, entry_phase=entry_phase)
+
+
+def _sweep_step_function(weights: Tensor, inventory: DayTradeInventoryState, *, initial_capital: float, entry_phase: bool):
+    def core(state_values, action_values, minute_fields, common):
+        return _flat_sweep_step(state_values, action_values, minute_fields, common,
+                               initial_capital=initial_capital, entry_phase=entry_phase)
+    if not (_carry_path_compile_enabled(weights) and _env_truthy("STOCKAGENT_DAY_TRADE_SWEEP_COMPILE", "1")):
+        return core
+    # Corporate events append a claim row daily, even when the account owns
+    # no affected stock. That logical row count is not a new minute algorithm.
+    # Pad ONLY this compiler boundary; the returned ledger keeps its exact
+    # original rows/dates. Powers of two bound graph variants without changing
+    # claim settlement, masking a balance, or inventing paid cash.
+    claim_rows = max(32, 1 << max(0, int(inventory.claims.shape[0] - 1).bit_length()))
+    key = (weights.device.index, weights.dtype, torch.is_grad_enabled(), initial_capital, entry_phase,
+           tuple(((claim_rows, *inventory.claims.shape[1:]) if name == "claims"
+                  else tuple(getattr(inventory, name).shape), getattr(inventory, name).requires_grad)
+                 for name in _INVENTORY_FIELDS))
+    with _COMPILED_PATH_LOCK:
+        if key not in _COMPILED_SWEEP_STEPS:
+            isolated = _compile_isolated_code_object(core, name=f"fifo_sweep_step_{len(_COMPILED_SWEEP_STEPS)}")
+            _COMPILED_SWEEP_STEPS[key] = torch.compile(isolated, fullgraph=True, dynamic=False,
+                                                     options=_carry_compile_options())
+            _CARRY_COMPILE_STATS["sweep_step_compile_constructors"] += 1
+    compiled = _COMPILED_SWEEP_STEPS[key]
+    def checked(state_values, action_values, minute_fields, common):
+        claim_index = _INVENTORY_FIELDS.index("claims")
+        claims = state_values[claim_index]
+        logical_rows = int(claims.shape[0])
+        padded_values = list(state_values)
+        if logical_rows < claim_rows:
+            padded_values[claim_index] = torch.cat((claims, claims.new_zeros(
+                (claim_rows - logical_rows, *claims.shape[1:]))), dim=0)
+        try:
+            # Same narrow PyTorch tracing warning filter as the established
+            # full-session compiler. No financial/data warning is suppressed.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning,
+                    message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*")
+                result = compiled(tuple(padded_values), action_values, minute_fields, common)
+        except Exception:
+            _CARRY_COMPILE_STATS["compile_failures"] += 1
+            raise
+        _CARRY_COMPILE_STATS["compiled_sweep_step_calls"] += 1
+        result = list(result)
+        result[claim_index] = result[claim_index][:logical_rows]
+        return tuple(result)
+    return checked
+
+
+def _checkpointed_frozen_target_minutes(funded, session, *, weights, **kwargs):
+    # Flatten state tensors: a dataclass passed as a non-Tensor checkpoint
+    # argument would hold its intermediate cohorts alive and defeat the bound.
+    def core(*values):
+        state = DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[:-1])))
+        before, after, marks, notional = _run_frozen_target_minutes(
+            state, session, weights=values[-1], **kwargs)
+        return (*(getattr(before, name) for name in _INVENTORY_FIELDS),
+                *(getattr(after, name) for name in _INVENTORY_FIELDS), marks, notional)
+
+    values = checkpoint(core, *(getattr(funded, name) for name in _INVENTORY_FIELDS), weights,
+                        use_reentrant=False, preserve_rng_state=False)
+    n = len(_INVENTORY_FIELDS)
+    return (DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[:n]))),
+            DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[n:2*n]))),
+            values[-2], values[-1])
+
+
+def _certified_sweep_exit_suffix(inventory, session, *, target, stopped, cancelled,
+                                 start: int, initial_capital: float):
+    """Reuse dense FIFO integration only if no remaining order can execute.
+
+    The certificate changes neither source nor order semantics. Every one of
+    the 270 marks remains present. A potentially executable target difference
+    or an inconclusive solvency proof returns to the chronological oracle.
+    """
+    if not _env_truthy("STOCKAGENT_DAY_TRADE_SWEEP_SUFFIX_FASTPATH", "1"):
+        return None
+    from stockagent.backtest.tw_day_trade_minute import _capacity
+
+    quotes, volumes = session.entry_path.unbind(-1)
+    possible = (torch.isfinite(quotes[:, start:259])
+                & (quotes[:, start:259] > 0)
+                & (volumes[:, start:259] >= 2000)).any(-1)
+    pending = ~cancelled & (inventory.shares != target)
+    if bool((pending & possible).any().detach().cpu()):
+        return None
+    short = (inventory.shares < 0)[:, None]
+    prices = torch.where(short, session.exit_prices[..., 1], session.exit_prices[..., 0])
+    capacity = torch.where(short, session.exit_capacity[..., 1], session.exit_capacity[..., 0])
+    minutes = torch.arange(270, device=quotes.device)[None, :]
+    remaining = minutes >= start
+    hits = torch.where(short, session.stop_hits[..., 1], session.stop_hits[..., 0]).bool()
+    latched = ((hits & remaining).to(torch.int64).cumsum(-1) > 0) | stopped[:, None]
+    quote_ok = torch.isfinite(quotes) & (quotes > 0)
+    override = latched & (minutes < 259) & quote_ok
+    prices = torch.where(override, quotes, prices)
+    capacity = torch.where(override, _capacity(volumes), capacity)
+    # Keep the existing fixed 270-column kernel ABI. Pre-suffix slots are
+    # zero-capacity padding, never fills or published reconstructed marks.
+    prices = torch.where(remaining, prices, float('nan'))
+    capacity = torch.where(remaining, capacity, 0)
+    marks = torch.where(remaining, session.marks, session.marks[:, start-1:start])
+    path, nav = _run_inventory_path(inventory, prices=prices,
+        capacity_shares=capacity, marks=marks, initial_capital=initial_capital)
+    nav = nav[start:]
+    if not bool((torch.isfinite(nav) & (nav > 0)).all().detach().cpu()):
+        return None
+    _CARRY_COMPILE_STATS['certified_sweep_suffix_calls'] += 1
+    _CARRY_COMPILE_STATS['certified_sweep_minutes_avoided'] += 270 - start
+    notional = (path.minute_filled_shares * torch.nan_to_num(prices, nan=0)).sum()
+    return path.reduction.state, nav, notional
+
+
+def _run_frozen_target_minutes(
+    funded: DayTradeInventoryState, session: DayTradeCarrySession, *,
+    weights: Tensor, can_enter: Tensor, buy_fee_rate: Tensor,
+    day_sell_fee_rate: Tensor, normal_sell_fee_rate: Tensor, rebate_rate: Tensor,
+    initial_capital: float,
+) -> tuple[DayTradeInventoryState, DayTradeInventoryState, Tensor, Tensor]:
+    """Chronological oracle for a single frozen daily order and its remainders.
+
+    Brackets have priority, then old-inventory reductions, then new entries.
+    All three consume ONE symbol/minute budget. Only the first call sizes the
+    target; a later price or NAV cannot change the original order. The source
+    records fresh stop touches; a stop cannot latch before a position exists.
+    """
+    assert session.entry_path is not None and session.stop_hits is not None
+    trace = _env_truthy("STOCKAGENT_DAY_TRADE_SWEEP_TRACE", "0")
+    fee_args = dict(buy_fee_rate=buy_fee_rate, day_sell_fee_rate=day_sell_fee_rate,
+                    normal_sell_fee_rate=normal_sell_fee_rate, rebate_rate=rebate_rate)
+    common = dict(official_open=session.official_open, opening_marks=session.opening_marks,
+                  lower_limit=session.lower_limit, upper_limit=session.upper_limit,
+                  can_enter=can_enter, initial_capital=initial_capital, day=session.day,
+                  halted=session.halted, daily_proxy_mask=session.daily_proxy_mask,
+                  state_already_advanced=True, **fee_args)
+    opening = rebalance_inventory_at_open(
+        funded, weights=weights, entry_price=session.entry_price,
+        entry_volume_shares=session.entry_volume, **common)
+    inventory = opening.state
+    target = opening.target_shares
+    sizing_nav = opening.sizing_nav
+    notional = ((opening.reduction.filled_shares + opening.addition_shares.abs())
+                * torch.nan_to_num(session.entry_price, nan=0)).sum()
+    # Approved daily proxies have NO later-minute observations. Keep their
+    # two-event algebra instead of scanning 258 empty continuation slots.
+    # This branch depends only on the source, never future model outcomes.
+    if not torch.compiler.is_compiling() and not bool(
+        torch.isfinite(session.entry_path[..., 0]).any().detach().cpu()
+    ):
+        short = (inventory.shares < 0)[:, None]
+        prices = torch.where(short, session.exit_prices[..., 1], session.exit_prices[..., 0])
+        capacity = torch.where(short, session.exit_capacity[..., 1], session.exit_capacity[..., 0])
+        path, marks = _run_inventory_path(inventory, prices=prices,
+                                          capacity_shares=capacity, marks=session.marks,
+                                          initial_capital=initial_capital)
+        notional = notional + (path.minute_filled_shares * torch.nan_to_num(prices, nan=0)).sum()
+        inventory = path.reduction.state
+        return inventory, convert_inventory_to_margin(inventory, day=session.day), marks, notional
+    marks = [inventory_nav(inventory, initial_capital=initial_capital,
+                           marks=session.marks[:, 0])]
+    stopped = torch.zeros_like(weights, dtype=torch.bool)
+    cancelled = inventory.shares == target
+    solvent = torch.isfinite(marks[0]) & (marks[0] > 0)
+    # The date is data, not a graph specialization. Keep the validated ordinal
+    # as an FP64 scalar, preserving every calendar check without 2,000 graphs.
+    step_common = common | {"day": inventory.observed_day}
+    for minute in range(1, 270):
+        if trace and minute in {1, 129, 259}:
+            print(f"[fifo sweep] day={session.day} minute={minute+1} "
+                  f"cohorts={inventory.cohorts.shape[0]} claims={inventory.claims.shape[0]} "
+                  f"step_graphs={len(_COMPILED_SWEEP_STEPS)}", flush=True)
+        if minute in {1, 3, 9, 33, 65, 129, 259}:
+            suffix = _certified_sweep_exit_suffix(inventory, session, target=target,
+                stopped=stopped, cancelled=cancelled, start=minute,
+                initial_capital=initial_capital)
+            if suffix is not None:
+                inventory, suffix_marks, suffix_notional = suffix
+                return (inventory, convert_inventory_to_margin(inventory, day=session.day),
+                        torch.cat((torch.stack(marks), suffix_marks)), notional + suffix_notional)
+        function = _sweep_step_function(weights, inventory, initial_capital=initial_capital, entry_phase=minute < 259)
+        minute_fields = (session.exit_prices[:, minute], session.exit_capacity[:, minute],
+                         session.entry_path[:, minute], session.stop_hits[:, minute], session.marks[:, minute])
+        # Bind source slices and the callable by value for backward replay.
+        def step(*values, function=function, minute_fields=minute_fields):
+            n = len(_INVENTORY_FIELDS)
+            return function(values[:n], values[n:], minute_fields, step_common)
+        inputs = (*(getattr(inventory, name) for name in _INVENTORY_FIELDS),
+                  weights, target, sizing_nav, stopped, cancelled, solvent)
+        values = (checkpoint(step, *inputs, use_reentrant=False, preserve_rng_state=False)
+                  if _sweep_checkpoint_enabled(weights) else step(*inputs))
+        inventory = DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[:len(_INVENTORY_FIELDS)])))
+        stopped, cancelled, solvent, nav, traded = values[-5:]
+        notional = notional + traded
+        marks.append(nav)
+    return inventory, convert_inventory_to_margin(inventory, day=session.day), torch.stack(marks), notional
+
+
+def _failed_session_cpu_diagnostic(state, session, **kwargs) -> str:
+    """Failure-only, one-session CPU oracle; never alter the accepted ledger.
+
+    CUDA validity flags deliberately avoid poisoning DDP with device asserts.
+    Replaying only the first rejected session exposes the actual failed
+    invariant, instead of blaming source gaps when all source checks passed.
+    """
+    cpu_session = replace(session, **{
+        field.name: value.detach().cpu()
+        for field in fields(session)
+        if isinstance(value := getattr(session, field.name), Tensor)
+    })
+    cpu_args = {key: value.detach().cpu() if isinstance(value, Tensor) else value
+                for key, value in kwargs.items()}
+    try:
+        with torch.no_grad():
+            checked, _, _ = execute_carry_session(
+                state.detached(device="cpu"), cpu_session,
+                event_compression=False, **cpu_args)
+        if bool(checked.inventory.failed):
+            return "cpu_oracle_returned_failed_inventory"
+        return "cpu_oracle_passed_rejected_gpu_session"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 def execute_carry_session(
     state: DayTradeCarryState, session: DayTradeCarrySession, *, weights: Tensor,
     can_enter: Tensor, buy_fee_rate: Tensor, day_sell_fee_rate: Tensor,
@@ -1370,7 +1677,17 @@ def execute_carry_session(
     funded_fields["observed_day"] = working.observed_day
     funded = DayTradeInventoryState(**funded_fields)
     target_weights = torch.where(trade_alive, weights, 0)
-    if _carry_full_session_compile_enabled(funded.cohorts):
+    if session.entry_path is not None:
+        rematerialize = _sweep_checkpoint_enabled(target_weights)
+        _CARRY_COMPILE_STATS["checkpointed_sweep_session_calls" if rematerialize
+                            else "eager_sweep_session_calls"] += 1
+        sweep = _checkpointed_frozen_target_minutes if rematerialize else _run_frozen_target_minutes
+        path_inventory, converted, marks, notional = sweep(
+            funded, session, weights=target_weights, can_enter=can_enter,
+            buy_fee_rate=buy_fee_rate, day_sell_fee_rate=day_sell_fee_rate,
+            normal_sell_fee_rate=normal_sell_fee_rate, rebate_rate=rebate_rate,
+            initial_capital=initial_capital)
+    elif _carry_full_session_compile_enabled(funded.cohorts):
         path_inventory, converted, marks, notional = _compiled_session_execution(
             funded,
             session,
@@ -1660,6 +1977,7 @@ def run_day_trade_carry_sessions(
             state.alive,
             state.inventory,
         )
+        prior_state = state
         state, curve, notional = execute_carry_session(state, session,
             weights=weights[i], can_enter=can_enter[i], buy_fee_rate=buy_fee_rate,
             day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
@@ -1729,6 +2047,10 @@ def run_day_trade_carry_sessions(
                 else torch.nonzero(session.action_mask != 0)
                 .flatten().detach().cpu().tolist()
             )
+            diagnosis = _failed_session_cpu_diagnostic(prior_state, session,
+                weights=weights[i], can_enter=can_enter[i], buy_fee_rate=buy_fee_rate,
+                day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
+                rebate_rate=rebate_rate, initial_capital=initial_capital)
             raise FloatingPointError(
                 "physical source integrity failed at first bad contract-day: "
                 f"date={date.fromordinal(session.day).isoformat()} "
@@ -1745,7 +2067,7 @@ def run_day_trade_carry_sessions(
                 f"requested_missing_path_indices={requested_missing_path[:32]} "
                 f"requested_missing_path_count={len(requested_missing_path)} "
                 f"action_indices={action_indices[:32]} "
-                f"action_count={len(action_indices)}"
+                f"action_count={len(action_indices)} invariant_diagnosis={diagnosis}"
             )
         # Reuse the canonical return/ruin-floor math, while retaining invalid
         # source NaNs (the generic helper's legacy NaN sanitization is unsafe

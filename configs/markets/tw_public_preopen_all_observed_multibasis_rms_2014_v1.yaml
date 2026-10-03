@@ -1,0 +1,27 @@
+# Research-only control: one shared 428-column ABI, train-only RMS, and a
+# fixed two-family temporal basis. Do not resume the earlier basis-free v3 run.
+base_config: tw_public_preopen_all_observed_research_2014_v3.yaml
+experiment_name: tw-public-all-observed-multibasis-rms-2014-v1
+
+runner:
+  output_dir: artifacts/ablations/tw_public_preopen_all_observed_multibasis_2014_v1/rms
+  resume: false
+
+training:
+  # Keep this budget identical in every preprocessing arm. A full run should
+  # first pass a real device/memory smoke at the selected batch size.
+  batch_size_train: 8
+  batch_size_eval: 8
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  transformer_base_portfolio:
+    temporal_basis_input: input_features
+    temporal_basis_families: [haar, dct]
+    temporal_basis_components: 2
+  financial_transformer:
+    temporal_basis_input: input_features
+    temporal_basis_families: [haar, dct]
+    temporal_basis_components: 2
+    causal_feature_rms_normalization: true
+    causal_feature_compression: none
+    causal_feature_compression_patterns: []

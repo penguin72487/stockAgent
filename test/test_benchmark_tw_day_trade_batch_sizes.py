@@ -103,6 +103,41 @@ def test_source_contract_accepts_only_strict_minute_executable_pairing() -> None
         benchmark._validate_source_contract(config)
 
 
+def test_source_contract_accepts_explicit_naive_projection_l1() -> None:
+    config = {
+        "data": {},
+        "trading": {"execution_mode": "naive", "frequency": "daily"},
+        "training": {
+            "model_name": "financial_transformer",
+            "loss_type": "log_utility",
+            "financial_transformer": {"portfolio_output_mode": "projection_l1"},
+        },
+    }
+    contract = benchmark._validate_source_contract(
+        config, expected_execution_mode="naive"
+    )
+    assert contract["training.portfolio_output_mode"] == "projection_l1"
+
+
+def test_futures_benchmark_keeps_exact_account_contract() -> None:
+    config = {
+        "data": {},
+        "trading": {"execution_mode": "tw_stock_context_futures_portfolio", "frequency": "daily",
+                    "tw_futures_portfolio_integer_contracts": True,
+                    "tw_futures_portfolio_capital_basis": "initial_margin"},
+        "training": {"model_name": "financial_transformer", "loss_type": "log_utility",
+                     "futures_portfolio_training_surrogate_only": False,
+                     "futures_portfolio_optimizer_step_per_trajectory": True},
+    }
+    contract = benchmark._validate_source_contract(
+        config, expected_execution_mode="tw_stock_context_futures_portfolio")
+    assert contract["capital_basis"] == "initial_margin"
+    assert contract["optimizer_step_per_trajectory"] is True
+    config["training"]["futures_portfolio_training_surrogate_only"] = True
+    with pytest.raises(ValueError, match="exact training-forward"):
+        benchmark._validate_source_contract(config, expected_execution_mode="tw_stock_context_futures_portfolio")
+
+
 def test_score_curve_uses_real_rows_and_complete_epoch_median() -> None:
     rows = [
         _epoch(1, wall=99.0, train=90.0),
@@ -152,6 +187,60 @@ def test_score_curve_rejects_invalid_training(mutate, reason: str) -> None:
     )
     assert score["ok"] is False
     assert any(reason in item for item in score["reasons"])
+
+
+def test_naive_score_allows_canonical_eager_eval_but_rejects_runtime_fallback() -> None:
+    rows = [
+        _epoch(3, wall=4.0, train=3.0),
+        _epoch(4, wall=4.0, train=3.0),
+        _epoch(5, wall=4.0, train=3.0),
+    ]
+    for row in rows:
+        row["bt_eager_runner_calls"] = 1
+        row["bt_prep_compile_nonhit"] = 1
+    score = benchmark._score_curve(
+        rows,
+        skip_epochs=2,
+        minimum_steady_epochs=3,
+        train_rows=289,
+        global_batch_size=128,
+        memory=_memory(),
+        max_peak_fraction=0.9,
+        min_headroom_gib=3.0,
+        strict_compiled_backtest=False,
+    )
+    assert score["ok"] is True
+    rows[0]["bt_runtime_fallback_calls"] = 1
+    rejected = benchmark._score_curve(
+        rows,
+        skip_epochs=2,
+        minimum_steady_epochs=3,
+        train_rows=289,
+        global_batch_size=128,
+        memory=_memory(),
+        max_peak_fraction=0.9,
+        min_headroom_gib=3.0,
+        strict_compiled_backtest=False,
+    )
+    assert rejected["ok"] is False
+
+
+def test_score_uses_slowest_rank_and_rejects_incomplete_rank_timing() -> None:
+    rows = [_epoch(i, wall=4.0, train=3.0) for i in (3, 4, 5)]
+    for row in rows:
+        row.update(epoch_wall_s_max_rank=5.0, train_total_s_max_rank=3.5)
+    kwargs = dict(
+        skip_epochs=2, minimum_steady_epochs=3, train_rows=289,
+        global_batch_size=128, memory=_memory(), max_peak_fraction=0.9,
+        min_headroom_gib=3.0,
+    )
+    score = benchmark._score_curve(rows, **kwargs)
+    assert score["ok"]
+    assert score["timing_scope"] == "maximum_rank"
+    assert score["complete_epoch_real_rows_per_s"] == pytest.approx(289 / 5)
+    assert score["median_train_wall_s"] == 3.5
+    del rows[1]["train_total_s_max_rank"]
+    assert not benchmark._score_curve(rows, **kwargs)["ok"]
 
 
 def test_score_curve_rejects_unsafe_vram_and_winner_uses_complete_epoch_rate() -> None:

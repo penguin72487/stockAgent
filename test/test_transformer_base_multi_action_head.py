@@ -66,6 +66,21 @@ def _make_model(
     ).to(device=device)
 
 
+@pytest.mark.parametrize(
+    "output_mode", [
+        "score_entmax_global_cash", "score_entmax_cash_v2",
+        "score_entmax_bounded_cash",
+        "score_entmax_log_cash",
+        "score_entmax_scale_separated_cash",
+    ]
+)
+def test_new_cash_output_modes_reject_unvalidated_multi_phase_action_abi(
+    output_mode: str,
+) -> None:
+    with pytest.raises(ValueError, match="single target channel"):
+        _make_model(execution_mode="tw_cash", portfolio_output_mode=output_mode)
+
+
 @pytest.mark.parametrize("device", _devices())
 def test_legacy_single_target_head_keeps_strict_state_and_output_contract(
     device: str,

@@ -18,7 +18,11 @@ import numpy as np
 import torch
 
 from stockagent.backtest.simulator import CANONICAL_BACKTEST_CONTRACT_VERSION
-from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+from stockagent.backtest.crypto_perpetual import (
+    CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
+)
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     TW_STOCK_EXECUTION_MODES,
@@ -214,15 +218,26 @@ def _project_temporal_basis_model_config(
         projected.pop("feature_bottleneck_dim", None)
     if not bool(projected.get("causal_feature_rms_normalization", False)):
         # The disabled branch is the exact historical forward: no scale or
-        # active-mask buffers are consulted.  The threshold and epsilon are
-        # consequently unreachable configuration, so adding their defaults to
-        # the dataclass must not invalidate older inference checkpoints.
+        # active-mask buffers are consulted. Keep the shared threshold/epsilon
+        # when the futures normalizer still consumes them; otherwise omit these
+        # defaults to preserve older inference checkpoints.
         projected.pop("causal_feature_rms_normalization", None)
-        projected.pop("causal_feature_min_active_dates", None)
-        projected.pop("causal_feature_scale_epsilon", None)
+        if not bool(projected.get("futures_feature_rms_normalization", False)):
+            projected.pop("causal_feature_min_active_dates", None)
+            projected.pop("causal_feature_scale_epsilon", None)
+    if str(projected.get("causal_feature_compression", "none")) == "none":
+        # A disabled compression is the exact historical feature path.
+        projected.pop("causal_feature_compression", None)
+        projected.pop("causal_feature_compression_patterns", None)
+    if not bool(projected.get("causal_feature_window_rms_normalization", False)):
+        projected.pop("causal_feature_window_rms_normalization", None)
     for field_name in (
         "futures_denomination_aware_output",
         "futures_current_open_feature",
+        "futures_feature_rms_normalization",
+        "futures_flat_action_initialization",
+        "futures_notional_score_coordinates",
+        "futures_margin_amount_context",
     ):
         if not bool(projected.get(field_name, False)):
             # These futures-only branches were added after the cash-equity
@@ -273,6 +288,10 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if config.data.tw_futures_denomination_context_basis == "current_open":
+        snapshot["data"].pop("tw_futures_denomination_context_basis", None)
+    if not config.data.tw_futures_require_prior_capacity:
+        snapshot["data"].pop("tw_futures_require_prior_capacity", None)
     if config.data.overnight_decision_time == "13:25":
         snapshot["data"].pop("overnight_decision_time", None)
     if config.data.overnight_1325_missing_price_policy == "reject":
@@ -282,6 +301,9 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     if not config.data.overnight_1325_root:
         snapshot["data"].pop("overnight_1325_root", None)
     trading = snapshot.get("trading")
+    if isinstance(trading, dict) and not trading.get("crypto_announced_exit_unlimited_volume", False):
+        # Keep every existing experiment's disabled-branch fingerprint intact.
+        trading.pop("crypto_announced_exit_unlimited_volume", None)
     if isinstance(trading, dict) and trading.get("tw_stock_futures_day_trade_daily_proxy_before") is None:
         trading.pop("tw_stock_futures_day_trade_daily_proxy_before", None)
     if isinstance(trading, dict) and not trading.get('tw_stock_futures_day_trade_quarantine_dates'):
@@ -362,13 +384,16 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
             CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION,
+            CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION,
         )
 
         return {
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_all_futures",
             "contract_version": int(
-                CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION
+                CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION
+                if config.training.transformer_base_portfolio.futures_feature_rms_normalization
+                else CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION
                 if (
                     config.training.transformer_base_portfolio
                     .futures_current_open_feature
@@ -512,6 +537,8 @@ def _active_scheduler_checkpoint_contract(config: ExperimentConfig) -> dict[str,
                 "gamma": float(training.lr_scheduler_gamma),
                 "patience": max(1, int(training.lr_scheduler_patience)),
                 "threshold": float(training.lr_scheduler_threshold),
+                "threshold_mode": "abs",
+                "min_lr": max(0.0, float(training.lr_scheduler_eta_min)),
             }
         )
     return contract
@@ -688,6 +715,12 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         fold_continuation_contract[
             "pretrained_initialization_require_improvement_over_flat_cash"
         ] = True
+    if training.day_trade_sub_lot_recovery:
+        fold_continuation_contract["day_trade_sub_lot_recovery"] = "one_lot_fifo_utility_v1"
+    if training.day_trade_training_annual_episodes:
+        fold_continuation_contract["day_trade_training_annual_episodes"] = (
+            "calendar_year_first_session_fresh_capital_v2"
+        )
     contract: dict[str, Any] = {
         "seed": int(training.seed),
         "objective": objective,
@@ -729,6 +762,42 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         },
     }
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    if training.futures_training_max_drawdown is not None:
+        contract["exact_policy_step"] = {
+            "version": (5 if (training.futures_training_risk_tangent
+                              and not training.futures_training_stop_on_rejected_step)
+                        else 4 if training.futures_training_max_drawdown == "benchmark"
+                        else 3 if training.futures_training_risk_interior
+                        else 2 if training.futures_training_risk_tangent else 1),
+            "training_max_drawdown": ("benchmark" if training.futures_training_max_drawdown == "benchmark"
+                                      else float(training.futures_training_max_drawdown)),
+            "max_backtracks": 8,
+            "acceptance": "full_training_exact_log_utility_nonincrease_and_solvency",
+        }
+        if training.futures_training_risk_tangent:
+            contract["exact_policy_step"]["direction"] = "adam_then_training_drawdown_tangent"
+        if training.futures_training_risk_interior:
+            contract["exact_policy_step"]["direction"] += "_with_normal_reflection_candidate"
+        if (training.futures_training_risk_tangent
+                and not training.futures_training_stop_on_rejected_step):
+            # Preserve historical fingerprints unless the effective stopping
+            # policy changes. Account replay and candidate acceptance do not.
+            contract["exact_policy_step"]["stop_on_rejected_step"] = False
+    if (execution_mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_capital_basis == "initial_margin"):
+        from stockagent.data.tw_futures_margin import MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION
+        # Inference still uses the same exact account; old Adam state must not
+        # resume with corrected opening funding / expiry / permission tangents.
+        contract["futures_margin_backward_contract_version"] = (
+            MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION
+        )
+    if execution_mode == "crypto_perpetual":
+        # Forward account values are unchanged; the exact signed-cap derivative
+        # at a zero rebalance is not the historical sign/abs derivative. Keep
+        # inference replay possible but never reuse the old Adam trajectory.
+        contract["crypto_backward_contract_version"] = (
+            CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION
+        )
     if execution_mode == "tw_index_futures_day":
         contract["integer_gradient_contract_version"] = int(
             TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
@@ -801,7 +870,13 @@ def _training_checkpoint_contract_schema_3(
     contract.pop("cache_train_features_in_amp_dtype", None)
     contract.pop("compile_eval_model", None)
     contract.pop("day_trade_optimizer_step_per_trajectory", None)
+    contract.pop("day_trade_sub_lot_recovery", None)
+    contract.pop("day_trade_training_annual_episodes", None)
     contract.pop("crypto_optimizer_step_per_trajectory", None)
+    contract.pop("futures_training_max_drawdown", None)
+    contract.pop("futures_training_risk_tangent", None)
+    contract.pop("futures_training_risk_interior", None)
+    contract.pop("futures_training_stop_on_rejected_step", None)
     # This decoupling control did not exist in schema 3; historical runs always
     # used trading.min_trade_weight in the loss.
     contract.pop("loss_min_trade_weight", None)
@@ -979,6 +1054,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "stateful_proximal_allocator": bool(trading.crypto_stateful_proximal_allocator),
             "proximal_cost_multiplier": float(trading.crypto_proximal_cost_multiplier),
         }
+        if trading.crypto_announced_exit_unlimited_volume:
+            # This is an authorized strategy fill approximation, not the
+            # exchange's later index-price settlement. Omit the disabled branch
+            # entirely so v7 and older constrained-exit replay stay unchanged.
+            contract["crypto_perpetual"].update(
+                backtest_contract_version=CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+                announced_exit_unlimited_volume=True,
+                announced_exit_policy="dated_zero_target_volume_exempt_side_and_turnover_constrained",
+                announced_exit_price="existing_source_backed_execution_price",
+                announced_exit_fees="ordinary_executed_buy_sell_fees",
+                announced_exit_assumption="user_authorized_research_fill_not_exchange_settlement",
+            )
     if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         contract["taiwan_index_futures_day"] = {
             "backtest_contract_version": int(
@@ -1049,6 +1136,40 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "accounting": "continuous_notional_research_surrogate",
         }
     if execution_mode == "tw_stock_context_futures_portfolio":
+        if trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross":
+            contract["futures_benchmark_contract"] = {
+                "version": 1,
+                "mode": "tx_front_rolling_1x_gross",
+                "source_path": str(trading.tw_futures_portfolio_benchmark_data_path or trading.tw_futures_portfolio_data_path),
+                "source_sha256": trading.tw_futures_portfolio_benchmark_sha256,
+                "product": "TX",
+                "clock": "front_contract_own_previous_session_close_to_current_close",
+                "roll": "switch_at_preceding_session_close_no_calendar_spread_gap",
+                "costs": "gross_no_fees_or_tax",
+                "coverage": "verified_source_sessions_only",
+            }
+        if trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            from stockagent.data.tw_futures_margin import MARGIN_ACCOUNTING_CONTRACT_VERSION
+            contract["futures_margin_contract"] = {
+                "version": MARGIN_ACCOUNTING_CONTRACT_VERSION,
+                "capital_basis": "signed_initial_margin_budget",
+                "rules_path": trading.tw_futures_portfolio_margin_rules_path,
+                "broker_multiplier": trading.tw_futures_portfolio_broker_margin_multiplier,
+                "liquidation_ratio": trading.tw_futures_portfolio_margin_liquidation_ratio,
+                "marking": "official_settlement_then_next_open_gap",
+                "margin_call_policy": "next_open_flat_no_external_capital",
+                "position_limit_policy": "absolute_group_units_reduce_excess_only",
+                "surrogate": "grouped_margin_cash_solvency_recovery_v2",
+                "risk_clock": "daily_open_and_settlement_only",
+            }
+        if (config.training.model_name == "financial_transformer"
+                or trading.tw_futures_portfolio_holding_policy == "intraday"):
+            contract["futures_holding_policy"] = {
+                "policy": trading.tw_futures_portfolio_holding_policy,
+                "minute_data_path": trading.tw_futures_portfolio_minute_data_path,
+                "intraday_adapter_version": 1,
+                "financial_encoder_futures_adapter_version": 1,
+            }
         from stockagent.data.tw_futures_portfolio_daily import (
             FUTURES_MODEL_FEATURE_COLUMNS,
             TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
@@ -1067,11 +1188,19 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION,
         )
 
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
         contract["taiwan_stock_context_futures_portfolio"] = {
             "cross_domain_contract_version": int(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION
+                if config.data.tw_futures_require_prior_capacity
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
                 if config.data.tw_futures_expiry_settlement_valuation
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
                 if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
@@ -1081,9 +1210,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 if trading.tw_futures_portfolio_integer_contracts
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION
             ),
-            "data_contract_version": int(
-                TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
-            ),
+            "data_contract_version": futures_slot_layout_version(config.data.tw_futures_portfolio_slot_count),
             "feature_contract_version": int(
                 TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION
             ),
@@ -1094,17 +1221,21 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "input_universe": "full_ordered_cash_stock_feature_panel",
             "action_universe": "fixed_all_taifex_futures_slots",
             "fixed_model_output_slots": int(
-                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+                config.data.tw_futures_portfolio_slot_count
             ),
             "candidate_feature_columns": list(
-                TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+                TW_STOCK_CONTEXT_FUTURES_PRIOR_DENOMINATION_MODEL_FEATURE_COLUMNS
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
                 if config.data.tw_futures_current_open_feature
                 else TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
                 if trading.tw_futures_portfolio_integer_contracts
                 else TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
             ),
             "candidate_clock": (
-                "market_features_t_minus_1_plus_session_t_08:45_futures_open"
+                "completed_futures_session_t_minus_1_and_prior_settlement_denomination"
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else "market_features_t_minus_1_plus_session_t_08:45_futures_open"
                 if config.data.tw_futures_current_open_feature
                 else "market_features_t_minus_1_plus_09:00_known_denomination_metadata"
                 if trading.tw_futures_portfolio_integer_contracts
@@ -1124,7 +1255,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "configured_daily_futures_execution_proxy"
             ),
             "policy_mask": (
-                "prior_slot_context_same_physical_contract_valid_current_open_"
+                "prior_slot_context_same_physical_contract_and_positive_prior_volume_capacity"
+                if config.data.tw_futures_require_prior_capacity
+                else "prior_slot_context_same_physical_contract_valid_current_open_"
                 "and_physical_contract_carry_valuation_integrity"
                 if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
                 else "prior_slot_context_same_physical_contract_and_valid_current_open"
@@ -1214,7 +1347,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "model_fixed_reference_capital_then_exact_integer_executor"
             ),
             "denomination_clock": (
-                "08:45_same_print_group_tier_and_open_notional_research_proxy"
+                "prior_settlement_dated_multiplier_and_known_fees_executor_open_only"
+                if config.data.tw_futures_denomination_context_basis == "prior_settlement"
+                else "08:45_same_print_group_tier_and_open_notional_research_proxy"
                 if config.data.tw_futures_current_open_feature
                 else "09:00_known_group_tier_and_observed_08:45_open_notional"
                 if trading.tw_futures_portfolio_integer_contracts
@@ -1230,6 +1365,31 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 else "disabled"
             ),
         }
+        if trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            from stockagent.data.tw_futures_margin import (
+                MARGIN_FEATURE_COLUMNS, MARGIN_AMOUNT_FEATURE_COLUMNS,
+                MARGIN_ACCOUNTING_CONTRACT_VERSION, MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION,
+            )
+            margin_features = (
+                MARGIN_AMOUNT_FEATURE_COLUMNS
+                if config.training.financial_transformer.futures_margin_amount_context
+                else MARGIN_FEATURE_COLUMNS
+            )
+            contract["taiwan_stock_context_futures_portfolio"].update({
+                "candidate_feature_columns": list(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS + margin_features),
+                "candidate_clock": "prior_completed_prices_and_rules_known_before_0845",
+                "accounting": "integer_initial_margin_budget_with_causal_corporate_inventory_v2",
+                "accounting_contract_version": MARGIN_ACCOUNTING_CONTRACT_VERSION,
+                "training_gradient_contract_version": MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION,
+                "integer_training_surrogate": "physical_executed_inventory_anchored_backward_terminal_obligation_scope_v12",
+                "integer_training_forward": "exact_integer_margin_account_v7_unfilled_risk_carry",
+                "unfilled_risk_liquidation_policy": "retain_whole_contracts_mark_pnl_retry_if_margin_requires_no_extra_penalty",
+                "corporate_carry_contract": "one_to_one_prior_slot_rational_quantity_signed_cash_once",
+                "position_constraint_policy": "intersect_dated_caps_share_close_capacity_preserve_permitted_existing_excess_without_additions",
+                "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
+                "denomination_clock": "prior_settlement_margin_ratios_model_current_open_executor_only",
+                "unfilled_notional": "unused_margin_budget_no_cross_group_redistribution",
+            })
     if execution_mode in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
@@ -1613,6 +1773,10 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "corporate_action_mode": str(trading.tw_corporate_action_mode),
         }
+        if trading.tw_day_trade_entry_remainder_policy != "first_minute_only":
+            contract["taiwan_execution"]["entry_remainder_policy"] = (
+                trading.tw_day_trade_entry_remainder_policy
+            )
         if bool(trading.tw_day_trade_terminal_liquidation_unlimited_capacity):
             contract["taiwan_execution"][
                 "day_trade_terminal_liquidation_unlimited_capacity"
@@ -1766,7 +1930,9 @@ def _effective_model_portfolio_mode(
         raw_mode = str(values["portfolio_mode"] or "").strip().lower().replace("-", "_")
         if raw_mode in {"", "auto"}:
             raw_mode = "long_only" if config.trading.long_only else "long_short"
-        return normalize_portfolio_mode(raw_mode)
+        return normalize_portfolio_mode(raw_mode, allow_short_only=config_name in {
+            "financial_transformer", "transformer_base_portfolio",
+        })
     if config_name == "bottleneck_portfolio_autoencoder":
         is_long_short = bool(values.get("long_short", False)) and not bool(
             config.trading.long_only
@@ -1819,6 +1985,16 @@ def _transformer_base_checkpoint_model_values(
         contract["portfolio_output_contract"] = (
             "contextual_cash_gate_signed_direction_v1"
         )
+    elif output_mode == "score_entmax_global_cash":
+        contract["portfolio_output_contract"] = "score_entmax_global_cash_v1"
+    elif output_mode == "score_entmax_bounded_cash":
+        contract["portfolio_output_contract"] = "score_entmax_bounded_cash_v1"
+    elif output_mode == "score_entmax_log_cash":
+        contract["portfolio_output_contract"] = "score_entmax_log_cash_v1"
+    elif output_mode == "score_entmax_scale_separated_cash":
+        contract["portfolio_output_contract"] = "score_entmax_scale_separated_cash_v1"
+    elif output_mode == "score_entmax_cash_v2":
+        contract["portfolio_output_contract"] = "score_entmax_cash_zero_gradient_v2"
     if not bool(values.get("sanitize_inputs", True)):
         contract["sanitize_inputs"] = False
     if bool(values.get("amp_native_position_add", False)):
@@ -1924,12 +2100,18 @@ def _checkpoint_model_values(
 ) -> dict[str, Any]:
     config_name = str(active_model["config_name"])
     values = dict(active_model["values"])
+    action_layout = {}
+    if (normalize_execution_mode(config.trading.execution_mode)=="tw_stock_context_futures_portfolio"
+            and config.data.tw_futures_portfolio_slot_count!=1936):
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        action_layout=dict(futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+            futures_slot_layout_version=futures_slot_layout_version(config.data.tw_futures_portfolio_slot_count))
     if config_name == "transformer_base_portfolio":
-        return _transformer_base_checkpoint_model_values(
+        return {**_transformer_base_checkpoint_model_values(
             config,
             values,
             feature_names,
-        )
+        ),**action_layout}
 
     contract = {
         name: value
@@ -1949,10 +2131,21 @@ def _checkpoint_model_values(
             contract["portfolio_output_contract"] = (
                 "contextual_cash_gate_signed_direction_v1"
             )
+        elif output_mode == "score_entmax_global_cash":
+            contract["portfolio_output_contract"] = "score_entmax_global_cash_v1"
+        elif output_mode == "score_entmax_bounded_cash":
+            contract["portfolio_output_contract"] = "score_entmax_bounded_cash_v1"
+        elif output_mode == "score_entmax_log_cash":
+            contract["portfolio_output_contract"] = "score_entmax_log_cash_v1"
+        elif output_mode == "score_entmax_scale_separated_cash":
+            contract["portfolio_output_contract"] = "score_entmax_scale_separated_cash_v1"
+        elif output_mode == "score_entmax_cash_v2":
+            contract["portfolio_output_contract"] = "score_entmax_cash_zero_gradient_v2"
     if output_mode in {None, "activation_l1"}:
         contract["portfolio_activation"] = normalize_portfolio_activation(
             config.trading.portfolio_activation
         )
+    contract.update(action_layout)
     return contract
 
 
@@ -2197,6 +2390,10 @@ def _checkpoint_manifest(
                     "stock-context futures checkpoint manifest requires its "
                     "causal sidecar"
                 )
+            if daily.intraday_session_mask is not None:
+                panel_arrays["stock_context_futures_intraday_session_mask"] = _array_content_fingerprint(daily.intraday_session_mask)
+            if daily.margin_session_mask is not None:
+                panel_arrays["stock_context_futures_margin_session_mask"] = _array_content_fingerprint(daily.margin_session_mask)
             panel_arrays.update(
                 {
                     "stock_context_futures_symbols": _array_content_fingerprint(
@@ -2230,6 +2427,10 @@ def _checkpoint_manifest(
             if daily.integer_execution is not None:
                 panel_arrays["stock_context_futures_integer_execution"] = (
                     _array_content_fingerprint(daily.integer_execution)
+                )
+            if daily.intraday_execution is not None:
+                panel_arrays["stock_context_futures_intraday_execution"] = (
+                    _array_content_fingerprint(daily.intraday_execution)
                 )
             if daily.carry_valuation_quarantine_mask is not None:
                 panel_arrays["stock_context_futures_carry_valuation_quarantine"] = (
@@ -2366,6 +2567,15 @@ def _checkpoint_manifest(
         "feature_include": list(config.data.feature_include),
         "feature_exclude": list(config.data.feature_exclude),
     }
+    if config.data.crypto_exchange_scope:
+        # Opt-in only: pin venue identity without changing legacy fingerprints.
+        preprocessing_contract["crypto_exchange_scope"] = str(
+            config.data.crypto_exchange_scope
+        )
+        if config.data.crypto_information_scope != "venue_only":
+            preprocessing_contract["crypto_information_scope"] = str(
+                config.data.crypto_information_scope
+            )
     if not bool(config.data.day_trade_minute_execution_allow_daily_proxy):
         # True is the historical hybrid-loader behavior and remains omitted for
         # checkpoint compatibility.  Strict no-proxy mode changes the label
@@ -2912,7 +3122,17 @@ def _validate_checkpoint_manifest(
         raise ValueError(f"Unknown checkpoint validation scope: {scope!r}")
 
     actual = checkpoint.get("experiment_manifest")
+    continuation = expected.get("contracts", {}).get("training", {}).get("fold_continuation", {})
+    new_day_trade_training = any(continuation.get(name) for name in (
+        "day_trade_training_annual_episodes", "day_trade_sub_lot_recovery",
+    ))
     if actual is None:
+        if normalized_scope in {"resume", "artifact"} and new_day_trade_training:
+            raise RuntimeError(
+                "Legacy checkpoint cannot resume the new day-trade training contract; "
+                "annual accounts and sub-lot gradients require a fresh training run: "
+                f"{checkpoint_path}. Model-weight transfer remains available."
+            )
         expected_execution_mode = normalize_execution_mode(
             expected.get("contracts", {})
             .get("trading", {})
@@ -2963,6 +3183,12 @@ def _validate_checkpoint_manifest(
             "use a runtime that understands the saved schema instead of guessing compatibility."
         )
     if actual_schema < 4 and normalized_scope in {"resume", "artifact"}:
+        if new_day_trade_training:
+            raise RuntimeError(
+                f"Schema {actual_schema} checkpoint predates the new day-trade training "
+                "contract; annual accounts and sub-lot gradients require a fresh "
+                f"training run: {checkpoint_path}. Model-weight transfer remains available."
+            )
         schema_constraints = expected.get("compatibility_constraints", {}).get(
             f"schema_{actual_schema}",
             {},

@@ -25,13 +25,42 @@ def contract_sources_digest(contracts: list[dict]) -> str:
     return hashlib.sha256(json.dumps(contracts, sort_keys=True).encode()).hexdigest()
 
 
-def validate_kbar_completion(item: dict) -> None:
+def validate_kbar_completion(item: dict, *, product: str | None = None,
+                             asset_class: str = "stock_future") -> None:
     start, end = date.fromisoformat(item["start"]), date.fromisoformat(item["end"])
     finished = datetime.fromisoformat(item["finished_at_utc"].replace("Z", "+00:00"))
     if start > end or finished.tzinfo is None:
         raise ValueError("invalid KBar query interval or completion timezone")
-    if finished.astimezone(ZoneInfo("Asia/Taipei")) < datetime.combine(end, time(13, 45), ZoneInfo("Asia/Taipei")):
+    end_minute = 825
+    if product is not None:
+        from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+        _, end_minute = taifex_futures_day_session_minutes(
+            end, product_code=product, asset_class=asset_class,
+        )
+    close = time(*divmod(end_minute, 60))
+    if finished.astimezone(ZoneInfo("Asia/Taipei")) < datetime.combine(end, close, ZoneInfo("Asia/Taipei")):
         raise ValueError("KBar query finished before the completed day session")
+
+
+def kbar_day_session_proof(day: date, *, product: str, asset_class: str) -> dict:
+    """Bind an all-futures observed day to its dated product/session contract."""
+    from stockagent.data.tw_price_rules import (
+        TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION, taifex_futures_day_session_minutes,
+    )
+    start, end = taifex_futures_day_session_minutes(day, product_code=product, asset_class=asset_class)
+    return {"contract_version": TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION,
+            "date": str(day), "start_minute": start, "end_minute": end}
+
+
+def validate_kbar_product_session(item: dict, *, day: date) -> None:
+    """Old stock receipts remain valid; all-futures receipts need explicit proof."""
+    product, asset_class = item.get("product"), item.get("asset_class")
+    if (not isinstance(product, str) or not isinstance(asset_class, str)
+            or item.get("physical_contract", "").split(":", 1)[0] != product):
+        raise ValueError("all-futures KBar receipt lacks its physical product/session identity")
+    if item.get("day_session") != kbar_day_session_proof(day, product=product, asset_class=asset_class):
+        raise ValueError("all-futures KBar dated session proof differs from the product rules")
+    validate_kbar_completion(item, product=product, asset_class=asset_class)
 
 
 def empty_minute_bars() -> pl.DataFrame:
@@ -44,7 +73,8 @@ def empty_minute_bars() -> pl.DataFrame:
 
 def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
                            physical_contract: str, source_sha256: str,
-                           full_session: bool = False) -> pl.DataFrame:
+                           full_session: bool = False, product: str | None = None,
+                           asset_class: str = "stock_future") -> pl.DataFrame:
     required = {"ts", "trading_date", "query_contract", "security_type",
                 "Open", "High", "Low", "Close", "Volume", "Amount"}
     if not required <= set(frame.columns):
@@ -70,6 +100,14 @@ def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
     frame = frame.filter(pl.col("Volume") > 0).with_columns(
         (pl.col("Amount") / pl.col("Volume")).alias("vwap"),
     )
+    if product is not None and frame.height:
+        from stockagent.data.tw_price_rules import price_on_taifex_futures_tick_grid_numpy
+        for field in ("Open", "High", "Low", "Close"):
+            if not price_on_taifex_futures_tick_grid_numpy(
+                frame[field].to_numpy(), frame["trading_date"].to_numpy(),
+                product_codes=product, asset_classes=asset_class,
+            ).all():
+                raise ValueError(f"off-grid dated futures KBar {field}: {code}")
     if frame.filter(
         (pl.col("Low") <= 0) | (pl.col("High") < pl.col("Low"))
         | ~pl.col("Open").is_between(pl.col("Low"), pl.col("High"))
@@ -77,13 +115,23 @@ def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
         | ~pl.col("vwap").is_between(pl.col("Low") - 1e-8, pl.col("High") + 1e-8)
     ).height:
         raise ValueError(f"KBar OHLC or Amount/Volume price scale mismatch: {code}")
+    full_session_filter = pl.col("minute").is_between(526, 825)
+    if product is not None and full_session:
+        from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+        limits = []
+        for day in frame["trading_date"].unique().to_list():
+            start, end = taifex_futures_day_session_minutes(day, product_code=product, asset_class=asset_class)
+            limits.append({"trading_date": day, "_session_start": start + 1, "_session_end": end})
+        if limits:
+            frame = frame.join(pl.DataFrame(limits), on="trading_date", how="left", validate="m:1")
+            full_session_filter = pl.col("minute").is_between(pl.col("_session_start"), pl.col("_session_end"))
     return (
         frame.with_columns(
             (pl.col("bar_end").dt.hour().cast(pl.Int32) * 60
              + pl.col("bar_end").dt.minute()).alias("minute"),
         )
         .filter((pl.col("bar_end").dt.date() == pl.col("trading_date"))
-                & (pl.col("minute").is_between(526, 825) if full_session else pl.col("minute").is_in(EVENT_MINUTES)))
+                & (full_session_filter if full_session else pl.col("minute").is_in(EVENT_MINUTES)))
         .select(
             pl.col("trading_date").alias("date"),
             pl.lit(physical_contract).alias("physical_contract"), "minute", "vwap",
@@ -95,7 +143,8 @@ def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
 
 
 def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
-                             expected_dates: list[date]) -> tuple[pl.DataFrame, list[dict], list[dict]]:
+                             expected_dates: list[date], *,
+                             all_futures: bool = False) -> tuple[pl.DataFrame, list[dict], list[dict]]:
     """Use the existing collector's inventory/chunks; missing != zero volume."""
     from downloader.download_shioaji_historical_market_data import load_inventory, _valid_receipt
 
@@ -103,6 +152,12 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
     wanted_by_contract = defaultdict(set)
     for d, contract in needed:
         wanted_by_contract[contract].add(d)
+    physical_by_alias = defaultdict(set)
+    if all_futures:
+        for item in needed.values():
+            month = item["physical_contract"].rsplit(":", 1)[-1]
+            for alias in {item["product"], *str(item.get("shioaji_roots") or item["product"]).split(",")}:
+                physical_by_alias[(alias.strip(), month)].add(item["physical_contract"])
     covered: dict[tuple[str, str], dict] = {}
     observed_days: dict[tuple[str, str], pl.DataFrame] = {}
     frames = []
@@ -119,6 +174,13 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
             if row.code.endswith(("R1", "R2")) or not re.fullmatch(r"\d{6}", row.delivery_month):
                 continue
             physical = f"{row.root}:{row.delivery_month}"
+            if all_futures:
+                matches = physical_by_alias.get((row.root, row.delivery_month), set())
+                if len(matches) > 1:
+                    raise ValueError(f"ambiguous dated physical KBar root: {row.root}:{row.delivery_month}")
+                if not matches:
+                    continue
+                physical = next(iter(matches))
             wanted = wanted_by_contract[physical]
             if not wanted:
                 continue
@@ -135,14 +197,23 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                 if not dates:
                     continue
                 # A completed API request during the session is still partial history.
-                validate_kbar_completion(receipt)
+                metadata = needed[(dates[0], physical)]
+                validate_kbar_completion(
+                    receipt, product=metadata["product"] if all_futures else None,
+                    asset_class=metadata.get("asset_class", "stock_future"),
+                )
                 receipt_sha = sha256_file(receipt_path)
                 chunk_sha = receipt.get("sha256") if receipt["status"] == "complete" else receipt_sha
                 raw = pl.read_parquet(data_path) if receipt["status"] == "complete" else pl.DataFrame()
                 if raw.height != receipt.get("rows"):
                     raise ValueError(f"KBar receipt row count mismatch: {receipt_path}")
                 if raw.height:
-                    bars = normalize_futures_kbars(raw, code=row.code, physical_contract=physical, source_sha256=chunk_sha)
+                    bars = normalize_futures_kbars(
+                        (raw.filter(pl.col("trading_date").cast(pl.String).is_in(dates)) if all_futures else raw),
+                        code=row.code, physical_contract=physical, source_sha256=chunk_sha,
+                        product=metadata["product"] if all_futures else None,
+                        asset_class=metadata.get("asset_class", "stock_future"),
+                    )
                     raw_dates = set(map(str, raw["trading_date"].unique()))
                     if raw_dates != set(receipt["observed_trading_dates"]):
                         raise ValueError(f"KBar chunk dates disagree with receipt: {receipt_path}")
@@ -150,8 +221,21 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                     # Only same-date completed day-session bars establish coverage here.
                     bar_end = pl.col("ts").cast(pl.Datetime("ns"))
                     minute = bar_end.dt.hour().cast(pl.Int32) * 60 + bar_end.dt.minute()
-                    day_volume = (raw.filter((bar_end.dt.date() == pl.col("trading_date"))
-                                            & minute.is_between(526, 825))
+                    if all_futures:
+                        from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+                        limits = []
+                        for wanted_date in dates:
+                            start_minute, end_minute = taifex_futures_day_session_minutes(
+                                date.fromisoformat(wanted_date), product_code=metadata["product"],
+                                asset_class=metadata["asset_class"],
+                            )
+                            limits.append({"trading_date": date.fromisoformat(wanted_date),
+                                           "_session_start": start_minute + 1, "_session_end": end_minute})
+                        volume_source = raw.join(pl.DataFrame(limits), on="trading_date", how="inner")
+                        session_minutes = minute.is_between(pl.col("_session_start"), pl.col("_session_end"))
+                    else:
+                        volume_source, session_minutes = raw, minute.is_between(526, 825)
+                    day_volume = (volume_source.filter((bar_end.dt.date() == pl.col("trading_date")) & session_minutes)
                                   .group_by("trading_date").agg(pl.col("Volume").sum()))
                     volumes = {str(d): v for d, v in day_volume.iter_rows()}
                     if sha256_file(data_path) != chunk_sha:
@@ -163,16 +247,21 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                 if sha256_file(receipt_path) != receipt_sha:
                     raise ValueError(f"KBar receipt changed during read: {receipt_path}")
                 for d in dates:
+                    if all_futures and volumes.get(d, 0) <= 0:
+                        # An empty provider day alone is not a verified absence
+                        # of trades. The history/official-evidence path handles
+                        # independent no-trade proofs for these contract-days.
+                        continue
                     if needed[(d, physical)]["volume"] > 0 and volumes.get(d, 0) <= 0:
                         continue  # Missing provider history is not a no-trade day.
                     # Incremental collector queries can overlap when the final
                     # chunk grows. Compare the completed day's actual trades,
                     # not whole-chunk hashes or receipt timestamps. Zero-volume
                     # carried prices are not execution observations.
-                    day_observed = (raw.filter(
+                    day_observed = (volume_source.filter(
                         (pl.col("trading_date").cast(pl.String) == d)
                         & (bar_end.dt.date() == pl.col("trading_date"))
-                        & minute.is_between(526, 825) & (pl.col("Volume") > 0)
+                        & session_minutes & (pl.col("Volume") > 0)
                     ).select("ts", "Open", "High", "Low", "Close", "Volume", "Amount")
                         .sort("ts")) if raw.height else pl.DataFrame()
                     if (d, physical) in covered:
@@ -190,6 +279,12 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                         "path": str(data_path), "receipt_path": str(receipt_path),
                         "receipt_sha256": receipt_sha, "status": receipt["status"],
                         "start": str(start), "end": str(end), "finished_at_utc": receipt["finished_at_utc"],
+                        "observed_day_volume": int(volumes.get(d, 0)),
+                        **({"product": metadata["product"], "asset_class": metadata["asset_class"],
+                            "day_session": kbar_day_session_proof(
+                                date.fromisoformat(d), product=metadata["product"],
+                                asset_class=metadata["asset_class"],
+                            )} if all_futures else {}),
                     }
         if sha256_file(inventory) != digest:
             raise ValueError("KBar contract inventory changed during read")

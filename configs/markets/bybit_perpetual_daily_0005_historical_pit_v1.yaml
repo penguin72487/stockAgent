@@ -1,0 +1,60 @@
+# Fresh venue-only input contract. No checkpoints were created with this root
+# before the scope correction; the older mixed-exchange inventory is archival.
+base_config: bybit_perpetual_daily_multi_basis_projection_l1.yaml
+
+experiment_name: bybit-perpetual-daily-0005-venue-only-v1
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_venue_only_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  parquet_root: data_bybit/perpetual_daily
+  crypto_exchange_scope: bybit
+  external_feature_path: data_bybit/public_features/bybit_venue_daily.parquet
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_0005_venue_only_v1
+  panel_start_date: "2020-03-27"
+  # Only prior completed Bybit OHLCV and Bybit funding; no Binance, OKX,
+  # Hyperliquid, macro, ETF, or other shared public inputs.
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - crypto_bybit_funding_rate_sum_1d
+    - crypto_bybit_funding_realized_annualized
+    - crypto_bybit_funding_cashflow_coefficient_1d
+    - crypto_bybit_funding_last_rate
+    - crypto_bybit_funding_age_hours
+    - crypto_bybit_funding_event_count_1d
+    - crypto_bybit_funding_available
+  feature_exclude: []
+  # Keep a distinct mask for each sparse value; an observed zero is not a
+  # missing value, especially for fees, rates and event counts.
+  feature_availability_indicators:
+    - crypto_bybit_funding_rate_sum_1d
+    - crypto_bybit_funding_realized_annualized
+    - crypto_bybit_funding_cashflow_coefficient_1d
+    - crypto_bybit_funding_last_rate
+    - crypto_bybit_funding_age_hours
+    - crypto_bybit_funding_event_count_1d
+    - crypto_bybit_funding_available
+  # The inherited historical control zeroed *every* external channel. This
+  # new artifact root deliberately uses observed values; NaNs remain missing
+  # until panel assembly, with the source-family availability channels kept.
+  feature_zero_fill: []
+
+trading:
+  crypto_execution_minute_utc: 5

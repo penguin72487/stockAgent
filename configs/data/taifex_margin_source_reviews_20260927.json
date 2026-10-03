@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "purpose": "Bounded visual transcription of image-only clock clauses; numeric tables still require independent CSV/PDF equality.",
+  "reviews": [
+    {
+      "url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20230130保證金調整公告.pdf",
+      "content_sha256": "a7f234b0fcb270cc3aea1e2073aed578dc3f64874ab430497beebe4e89198905",
+      "pdf_pages_one_based": [1, 2],
+      "method": "Visual inspection of the original embedded page images extracted by pypdf; no inferred date.",
+      "reviewed_at": "2026-09-27",
+      "clock_text": "發文日期：中華民國112年1月30日。發文字號：台期結字第11203001201號。並自112年1月31日一般交易時段結束後實施，請查照。"
+    }
+  ]
+}

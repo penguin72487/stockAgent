@@ -1,0 +1,4 @@
+# Compatibility entry point after merging long_only and short_only into v8 OFAT.
+# Inherit the complete 14-experiment suite so old commands also preserve its
+# combined summaries. Completed requested folds are skipped by the runner.
+base_spec: tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat.yaml

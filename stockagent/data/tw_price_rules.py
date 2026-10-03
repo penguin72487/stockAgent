@@ -54,6 +54,50 @@ TW_LIMIT_10_PERCENT_EFFECTIVE_ORDINAL = int(
 )
 TW_CURRENT_RULE_ORDINAL = int(np.iinfo(np.int64).max)
 
+# A bounded historical registry for the selected all-futures intraday archive.
+# This is deliberately not a latest-specification fallback for arbitrary dates.
+# Sources, product identity and limits: docs/tw_futures_price_grid_evidence_2026-09-27.md.
+TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 2
+TAIFEX_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2020-03-23", "D")
+TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH = np.datetime64("2026-09-27", "D")
+# product: (tick, first verified date, exclusive end or None).  For products
+# already trading in 2020 the lower bound is this archive's scope, not listing.
+_TAIFEX_INDEX_HISTORY = {
+    "TX": (1.0, "2011-01-03", None),
+    "MTX": (1.0, "2011-01-03", None),
+    "TE": (0.05, "2020-03-23", None),
+    "TF": (0.2, "2020-03-23", None),
+    "T5F": (1.0, "2020-03-23", "2022-09-22"),
+    "GTF": (0.05, "2020-03-23", None),
+    "XIF": (1.0, "2020-03-23", None),
+    "TJF": (0.25, "2020-03-23", None),
+    "UDF": (1.0, "2020-03-23", None),
+    "SPF": (0.25, "2020-03-23", None),
+    "UNF": (1.0, "2020-03-23", None),
+    "G2F": (1.0, "2020-03-23", None),
+    "E4F": (1.0, "2020-06-08", None),
+    "BTF": (1.0, "2020-06-08", None),
+    "F1F": (1.0, "2020-11-23", None),
+    "ZEF": (0.05, "2021-06-28", None),
+    "ZFF": (0.2, "2021-12-06", None),
+    "SOF": (1.0, "2022-06-27", None),
+    "SHF": (0.05, "2022-06-27", None),
+    "SXF": (0.5, "2023-12-18", None),
+    "TMF": (1.0, "2024-07-29", None),
+    "M1F": (1.0, "2024-12-09", None),
+}
+# The common ETF numerical rule predates the archive.  Product listing,
+# adjustment and expiry eligibility still come from the dated contract master.
+# The split below is by underlying constituents, not the listing exchange.
+_TAIFEX_DOMESTIC_ETF_PRODUCTS = frozenset({
+    "NYF", "PFF", "RIF", "RYF", "SMF", "SNF", "SRF", "SSF", "SUF", "VHF",
+})
+_TAIFEX_FOREIGN_ETF_PRODUCTS = frozenset({
+    "NZF", "OAF", "OBF", "OCF", "OJF", "OKF", "OOF", "RXF", "RZF",
+    "SGF", "SIF", "SQF", "UJF", "UKF", "URF", "USF",
+})
+_TAIFEX_ETF_PRODUCTS = _TAIFEX_DOMESTIC_ETF_PRODUCTS | _TAIFEX_FOREIGN_ETF_PRODUCTS
+
 
 def trade_date_ordinals(values: Any | None, shape: tuple[int, ...]) -> np.ndarray:
     """Return broadcast execution-date ordinals, using current rules if absent."""
@@ -213,6 +257,119 @@ def taifex_index_future_tick_size_numpy(
         unknown = sorted(set(products[np.isfinite(values) & (values > 0.0) & ~supported]))
         raise ValueError(f"unsupported TAIFEX index future products: {unknown[:8]}")
     return np.where(np.isfinite(values) & (values > 0.0) & supported, 1.0, np.nan)
+
+
+def _taifex_futures_history_metadata(
+    shape: tuple[int, ...], dates: Any, product_codes: Any, asset_classes: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve only the reviewed historical scope; never infer a product class."""
+
+    ordinals = trade_date_ordinals(dates, shape)
+    if dates is None or np.any(ordinals == TW_CURRENT_RULE_ORDINAL):
+        raise ValueError("historical TAIFEX futures price requires a trading date")
+    products = np.char.upper(np.char.strip(
+        np.broadcast_to(np.asarray(product_codes).astype(str), shape)
+    ))
+    # Only TX/MTX received the earlier-source review. Do not accidentally extend
+    # the remaining index, stock or ETF contracts when expanding this registry.
+    first = np.where(np.isin(products, ["TX", "MTX"]),
+                     int(np.datetime64("2011-01-03", "D").astype(np.int64)),
+                     int(TAIFEX_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)))
+    if np.any((ordinals < first) | (ordinals > int(TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)))):
+        raise ValueError("TAIFEX futures date outside verified historical window (TX/MTX 2011+, other products 2020+)")
+    kinds = np.broadcast_to(np.asarray(asset_classes).astype(str), shape)
+    if not np.all(np.isin(kinds, ["stock_future", "etf_future", "index_future"])):
+        raise ValueError("unsupported TAIFEX futures asset class")
+    if np.any(np.isin(products, ["", "NONE", "NAN"])):
+        raise ValueError("historical TAIFEX futures product code is required")
+    index_product = np.isin(products, list(_TAIFEX_INDEX_HISTORY))
+    etf_product = np.isin(products, list(_TAIFEX_ETF_PRODUCTS))
+    if np.any(index_product & (kinds != "index_future")) or np.any(
+        etf_product & (kinds != "etf_future")
+    ):
+        raise ValueError("TAIFEX futures product and asset class disagree")
+    unknown = ((kinds == "index_future") & ~index_product) | (
+        (kinds == "etf_future") & ~etf_product
+    )
+    if np.any(unknown):
+        raise ValueError(f"unsupported historical TAIFEX futures products: {np.unique(products[unknown]).tolist()[:8]}")
+    for product in np.unique(products[kinds == "index_future"]):
+        _, start, end = _TAIFEX_INDEX_HISTORY[str(product)]
+        selected = products == product
+        outside = ordinals < int(np.datetime64(start, "D").astype(np.int64))
+        if end is not None:
+            outside |= ordinals >= int(np.datetime64(end, "D").astype(np.int64))
+        if np.any(selected & outside):
+            raise ValueError(f"{product} date outside verified product window {start}..{end or '2026-09-27 inclusive'}")
+    return ordinals, products, kinds
+
+
+def taifex_futures_tick_size_numpy(
+    price: np.ndarray, dates: Any, *, product_codes: Any, asset_classes: Any,
+) -> np.ndarray:
+    """Dated ordinary outright ticks: TX/MTX 2011+, other products 2020+.
+
+    Index grids are product-specific. Stock and ETF grids reuse ``tick_size_numpy``
+    including the stock-futures 2026-07-06 amendment. The dated contract master,
+    not this numeric validator, proves listing, physical month and adjustment.
+    Settlement, averages, spreads, blocks and adjusted prices are not raw prints.
+    Unknown index/ETF products, missing dates and unreviewed periods fail closed.
+    """
+
+    values = np.asarray(price, dtype=np.float64)
+    ordinals, products, kinds = _taifex_futures_history_metadata(
+        values.shape, dates, product_codes, asset_classes,
+    )
+    ticks = np.full(values.shape, np.nan, dtype=np.float64)
+    equities = kinds != "index_future"
+    if np.any(equities):
+        ticks[equities] = tick_size_numpy(
+            values[equities], ordinals[equities].astype("datetime64[D]"),
+            security_types=kinds[equities],
+        )
+    valid = np.isfinite(values) & (values > 0.0)
+    for product in np.unique(products[kinds == "index_future"]):
+        ticks[(products == product) & valid] = _TAIFEX_INDEX_HISTORY[str(product)][0]
+    return ticks
+
+
+def price_on_taifex_futures_tick_grid_numpy(
+    price: np.ndarray, dates: Any, *, product_codes: Any, asset_classes: Any,
+) -> np.ndarray:
+    """Validate raw outright prints without modifying prices or rounding VWAP."""
+
+    ticks = taifex_futures_tick_size_numpy(
+        price, dates, product_codes=product_codes, asset_classes=asset_classes,
+    )
+    return price_on_explicit_tick_grid_numpy(price, ticks)
+
+
+def taifex_futures_day_session_minutes(
+    day: Any, *, product_code: str, asset_class: str,
+    is_last_trading_day: bool = False,
+) -> tuple[int, int]:
+    """Taipei regular day-session envelope, including the closing minute.
+
+    This is for source identity/OHLC validation, not strategy execution times.
+    A dated physical-contract master may set ``is_last_trading_day``; do not
+    guess expiry from weekday alone (holidays and exceptional closures exist).
+    Without it the full regular envelope includes shortened expiry sessions,
+    but does not fabricate any trades. Night sessions are always excluded.
+    """
+
+    _, products, _ = _taifex_futures_history_metadata(
+        (), day, product_code, asset_class,
+    )
+    product = str(products.item())
+    if product == "TJF":
+        return 480, 975
+    # The reviewed US/UK specifications keep the full day envelope on expiry;
+    # changes to their final night-session cutoff do not alter this day rule.
+    if product in {"UDF", "SPF", "UNF", "SXF", "F1F"}:
+        return 525, 825
+    if is_last_trading_day:
+        return 525, 810
+    return 525, (975 if product in _TAIFEX_FOREIGN_ETF_PRODUCTS else 825)
 
 
 def taifex_option_tick_size_numpy(

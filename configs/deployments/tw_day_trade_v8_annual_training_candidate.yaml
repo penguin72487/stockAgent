@@ -1,0 +1,12 @@
+# Capital-domain correction, one factor relative to the frozen v8 control.
+# Eleven independent annual accounts, all training dates, one update per epoch.
+# Validation/test retain their existing exact accounts and checkpoint selection.
+base_config: tw_day_trade_v8_ofat_resume_corrected_control.yaml
+experiment_name: tw-day-trade-v8-annual-training-capital-candidate
+runner:
+  output_dir: artifacts/ablations/tw_day_trade_v8_annual_training_20260923
+  resume: false
+training:
+  day_trade_training_annual_episodes: true
+  # Calendar boundaries produce variable-length batches; reuse dynamic prep.
+  backtest_compile_dynamic: true

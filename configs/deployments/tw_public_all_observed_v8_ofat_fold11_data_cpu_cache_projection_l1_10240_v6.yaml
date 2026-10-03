@@ -1,0 +1,15 @@
+# Historical fold-11 projection-L1 run. Despite the name, the effective
+# ceiling below is 1,024 epochs, with ceil(1,024 * 0.1) = 103 consecutive
+# validation checks of early-stop patience. Preserve this for artifact replay.
+# Keep the v5 data, exact FIFO execution, CPU cache, and two-GPU batch contract.
+# Keep the distinct artifact root and its original checkpoint history; the
+# epoch ceiling and warmup-cosine schedule did not actually change from v5.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_projection_l1_v5.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-projection-l1-10240-v6
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_projection_l1_10240_v6
+
+training:
+  epochs: 1024
+  early_stopping_no_improve_ratio: 0.1

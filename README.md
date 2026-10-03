@@ -136,6 +136,21 @@ run_fintech_python scripts/check_environment.py --require-cuda --strict
 若環境位置特殊，使用 `FINTECH_ENV_PATH=/path/to/fintech` 或
 `PYTHON_BIN=/path/to/python`，不要把某台機器的 Conda 絕對路徑寫進腳本。
 
+使用跨資產圖分析的 cuGraph 後端時，先確認 NVIDIA 驅動支援所選 CUDA
+主版本。驅動 575 應使用 CUDA 12 套件組；
+[`requirements-cugraph-cu12.txt`](requirements-cugraph-cu12.txt) 記錄已測試的
+cuGraph、cuDF、CuPy、`numba-cuda` 與 CUDA Python 版本。請在**新的**環境中安裝
+這組依賴；不要把它疊裝到含 CUDA 13 RAPIDS 的環境，也不要在訓練程序運行時
+更換共用環境套件。在已安裝本專案基本依賴的全新環境中，維持 pytest 原有的
+嚴格警告設定執行：
+
+```bash
+export FINTECH_ENV_PATH=/path/to/fintech-cu12
+source scripts/runtime_env.sh
+run_fintech_python -m pip install -r requirements-cugraph-cu12.txt
+run_fintech_python -m pytest -q test/test_explainability_cross_asset.py
+```
+
 查看冷庫與同步狀態；預設不解封：
 
 ```bash
@@ -973,11 +988,14 @@ run_fintech_python downloader/download_binance_perp_1m.py --help
 不要從其他 provider 猜相同旗標。
 
 Bybit 日頻策略固定每日 00:00 UTC 決策／零延遲研究執行，可跨日留倉。
-資料已備妥時不要重新下載或建立 snapshot；新版訓練設定為
-`configs/markets/bybit_perpetual_daily_0000_trajectory.yaml`，輸出在
-`artifacts/markets/bybit_perpetual_daily_0000_trajectory_v1`。
-帳本修正、績效診斷與使用者自行執行的命令見
-[Bybit 日頻策略](docs/bybit_perpetual_daily_strategy.md#績效診斷與待驗證修正)。
+資料已備妥時不要重新下載或建立 snapshot；目前研究候選為
+`configs/markets/bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v8.yaml`，
+使用者批准公告生效日全額減倉、僅公告退出豁免成交量上限；正常交易依最新更正，
+上限為前一個已完成日成交額的 50%（`max_volume_participation: 0.5`）。
+直接重用 v7 固定本地派生資料與 panel cache；新輸出在獨立 `artifacts/markets` 根，
+保留 v7 與舊 00:05 v6，不能接續它們的 optimizer。沒有保證所有 fold 報酬提升。
+規則、驗證及使用者自行執行命令見 [Bybit v8 公告退出](docs/bybit_v8_announced_exit.md)；
+歷史全折診斷與時鐘／funding 假設見 [Bybit v6 診斷](docs/bybit_v6_training_audit.md)。
 
 ### 一分鐘與衍生品資料
 
@@ -1011,6 +1029,14 @@ run_fintech_python train.py --config configs/markets/tw_public.yaml
 
 市場、資料範圍、execution mode、模型、loss、checkpoint 與 output root 都以該次 YAML
 為準，不要只看 README 的範例推測實驗契約。
+
+v8 台股當沖 OFAT 原 12 組 fold-11 比較、RMS 續跑修正與新對照指令見
+[消融分析與續跑一致性](docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md)。
+後續的資金規模、整張梯度與「只能做多／只能做空」實驗，見
+[訓練機制診斷與執行指令](docs/tw_day_trade_v8_training_mechanisms_2026-09-23.md)。
+只多與只空已併入原 `tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat`
+目錄及主消融設定，現在共 14 組，各自保留 checkpoint。年度本金與梯度候選仍使用
+獨立 artifact root。全部保留 1,000 epochs 上限；目前尚未證明新方法改善策略報酬。
 
 ### 08:45 個股期貨當沖
 

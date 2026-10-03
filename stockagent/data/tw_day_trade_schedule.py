@@ -30,6 +30,7 @@ class PaperMinuteOpportunities:
     capacity_shares: np.ndarray  # same shape; one shared budget, NOT per cohort
     marks: np.ndarray  # source Close, with explicitly indexed last-trade carry
     mark_source_index: np.ndarray  # [S,270], 0-based source minute; -1 = unavailable
+    stop_hits: np.ndarray  # fresh stop observations, NOT a position-dependent latch
 
 
 def paper_minute_opportunities(
@@ -40,6 +41,7 @@ def paper_minute_opportunities(
     upper_limit: np.ndarray,
     security_types: np.ndarray,
     halted: np.ndarray | None = None,
+    latch_stops: bool = True,
 ) -> PaperMinuteOpportunities:
     """Match canonical paper replay on OHLC/VWAP/volume, not live bid/ask.
 
@@ -128,6 +130,7 @@ def paper_minute_opportunities(
         * BOARD_LOT_SHARES
     )
     out = np.full((s, 270, 2), np.nan, dtype=np.float64)
+    stop_hits = np.zeros((s, 270, 2), dtype=bool)
     inner_low = move_price_ticks_numpy(lower, 1, day, security_types=kinds)
     inner_high = move_price_ticks_numpy(upper, -1, day, security_types=kinds)
     for direction, long in enumerate((True, False)):
@@ -141,7 +144,9 @@ def paper_minute_opportunities(
             if long
             else (high[:, intraday] >= stop[:, None])
         )
-        latched = np.logical_or.accumulate(stop_hit & seen, axis=1)
+        stop_hits[:, intraday, direction] = stop_hit & seen
+        latched = (np.logical_or.accumulate(stop_hit & seen, axis=1)
+                   if latch_stops else stop_hit & seen)
         tp_hit = (
             (high[:, intraday] > tp[:, None])
             if long
@@ -200,4 +205,4 @@ def paper_minute_opportunities(
         np.where(observed, np.arange(270)[None, :], -1), axis=1)
     marks = np.take_along_axis(close, np.maximum(source_index, 0), axis=1)
     marks = np.where(source_index >= 0, marks, np.nan)
-    return PaperMinuteOpportunities(out, capacities, marks, source_index)
+    return PaperMinuteOpportunities(out, capacities, marks, source_index, stop_hits)

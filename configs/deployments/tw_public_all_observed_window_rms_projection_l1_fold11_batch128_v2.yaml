@@ -1,0 +1,11 @@
+# Independent fold-11 experiment: user's selected global batch 128.
+# Preserve the completed batch-124 artifacts and its optimizer trajectory.
+base_config: tw_public_all_observed_window_rms_projection_l1_fold11_v1.yaml
+experiment_name: tw-public-all-observed-window-rms-projection-l1-fold11-batch128-v2
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_window_rms_projection_l1_fold11_batch128_v2
+  resume: true
+
+training:
+  batch_size_train: 128

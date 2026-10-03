@@ -1,0 +1,15 @@
+# RMS-only control: keep the 100M v7 ledger and all trainable parameters.
+# Fit the 17 prior-session futures channels on training decisions only.
+base_config: tw_futures_v8_general_tradable_capital100m_funding.yaml
+experiment_name: tw-futures-v8-general-prior-capacity-capital100m-rms
+
+training:
+  financial_transformer:
+    futures_feature_rms_normalization: true
+  transformer_base_portfolio:
+    futures_feature_rms_normalization: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_tradable_capital100m_rms_fold10
+  start_fold: 10
+  resume: true

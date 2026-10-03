@@ -1,0 +1,28 @@
+# Prospective candidate after the v6 audit. Never resume v6 optimizer state.
+# User contract: 00:00 UTC decision and idealized zero-latency 00:00 execution.
+# Reuses the same immutable raw release/public inputs, but must rebuild the
+# execution clock and funding ownership through prepare_bybit_midnight.py.
+base_config: bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v6.yaml
+
+experiment_name: bybit-perpetual-daily-0000-historical-public-pit-score-cash-trajectory-v7
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v7
+
+data:
+  parquet_root: artifacts/cache/bybit_perpetual_daily_0000_repaired/perpetual_daily
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_0000_repaired/panel
+
+trading:
+  crypto_execution_minute_utc: 0
+
+training:
+  financial_transformer:
+    # Reuse the existing FP32 signed softsign-conviction/entmax head. Unlike
+    # signed unit-L1 learned_cash, one active coin retains a directional
+    # derivative. Zero score is exactly cash with a nonzero entry derivative.
+    portfolio_output_mode: score_entmax_cash_v2
+
+  # Keep LR, optimizer cadence, early stopping, 1000-epoch cap and model size
+  # unchanged; nonzero gradients do not establish OOS improvement. No test-year
+  # tuning, fixed exposure quotas, or incompatible pretrained transfer.

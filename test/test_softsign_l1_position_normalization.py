@@ -9,6 +9,10 @@ from stockagent.models.normalization import (
     dual_branch_softmax,
     masked_activation_l1_weights,
     masked_cash_entmax15_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_log_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
     masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -79,6 +83,20 @@ def test_signed_action_softmax_allocates_long_short_and_cash_actions() -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
     assert weights[0, 0] > 0.0
     assert weights[0, 2] < 0.0
+
+
+def test_signed_action_reports_explicit_cash_separately_from_long_short_cancellation() -> None:
+    scores = torch.zeros(1, 10)
+    weights, parts = masked_signed_action_weights(
+        scores, None, transform="softmax", return_parts=True
+    )
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    torch.testing.assert_close(parts["implicit_cash_weight"], torch.ones(1))
+    torch.testing.assert_close(parts["action_cash_alloc"], torch.tensor([1.0 / 21.0]))
+    torch.testing.assert_close(
+        parts["action_cancellation_cash"] + parts["action_cash_alloc"],
+        parts["implicit_cash_weight"],
+    )
 
 
 def test_signed_action_entmax_can_return_sparse_actions() -> None:
@@ -186,6 +204,303 @@ def test_cash_entmax_zero_evidence_is_cash_and_candidate_count_is_invariant() ->
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_score_entmax_cash_v2_preserves_forward_allocation_and_repairs_zero_gradient() -> None:
+    scores = torch.tensor([[1.25, -0.5, 0.0, 9.0]])
+    mask = torch.tensor([[True, True, True, False]])
+    legacy = masked_cash_entmax15_weights(
+        scores, mask, preserve_fp32_output=True
+    )
+    revised = masked_cash_entmax15_weights(
+        scores, mask, preserve_fp32_output=True,
+        preserve_zero_score_gradient=True,
+    )
+    torch.testing.assert_close(revised, legacy, atol=1e-7, rtol=1e-6)
+
+    flat = torch.zeros(1, 3, requires_grad=True)
+    weights = masked_cash_entmax15_weights(
+        flat, torch.ones_like(flat, dtype=torch.bool),
+        preserve_fp32_output=True,
+        preserve_zero_score_gradient=True,
+    )
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    (weights * torch.tensor([[0.3, -0.2, 0.1]])).sum().backward()
+    assert flat.grad is not None
+    torch.testing.assert_close(flat.grad, torch.tensor([[0.1, -0.2 / 3.0, 0.1 / 3.0]]))
+
+
+def test_score_entmax_global_cash_has_one_shared_risk_budget_and_sparse_legs() -> None:
+    scores = torch.tensor([[8.0, -3.0, 0.0, 99.0]])
+    mask = torch.tensor([[True, True, True, False]])
+    weights, parts = masked_score_entmax_global_cash_weights(
+        scores, mask, return_parts=True
+    )
+
+    relative = parts["score_entmax_global_relative_alloc"]
+    legal_scores = scores.masked_fill(~mask, 0.0)
+    evidence = (relative * legal_scores.abs()).sum(dim=1, keepdim=True)
+    expected = relative * legal_scores / (1.0 + evidence)
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        parts["score_entmax_global_cash_fraction"] + weights.abs().sum(dim=1),
+        torch.ones(1),
+    )
+    assert weights[0, 0] > 0.0
+    assert weights[0, 1] == 0.0  # Entmax excludes the weak leg.
+    assert weights[0, 3] == 0.0  # The masked score cannot buy risk.
+
+
+def test_score_entmax_global_cash_zero_scores_are_cash_but_trainable() -> None:
+    scores = torch.zeros(1, 4, requires_grad=True)
+    mask = torch.tensor([[True, True, False, True]])
+    weights, parts = masked_score_entmax_global_cash_weights(
+        scores, mask, return_parts=True
+    )
+
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    torch.testing.assert_close(
+        parts["score_entmax_global_cash_fraction"], torch.ones(1)
+    )
+    (weights * torch.tensor([[0.3, -0.2, 9.0, 0.1]])).sum().backward()
+    assert scores.grad is not None
+    torch.testing.assert_close(
+        scores.grad, torch.tensor([[0.1, -0.2 / 3.0, 0.0, 0.1 / 3.0]])
+    )
+
+
+def test_score_entmax_global_cash_respects_short_mask_and_wide_sparse_universe() -> None:
+    small = torch.tensor([[8.0, 0.0]])
+    wide = torch.zeros(1, 4_102)
+    wide[0, 0] = 8.0
+    for scores in (small, wide):
+        weights = masked_score_entmax_global_cash_weights(scores, None)
+        torch.testing.assert_close(
+            weights.abs().sum(dim=1), torch.tensor([8.0 / 9.0]), atol=1e-6, rtol=1e-6
+        )
+        assert torch.count_nonzero(weights).item() == 1
+
+    scores = torch.tensor([[-3.0, 2.0, -2.5]])
+    weights = masked_score_entmax_global_cash_weights(
+        scores, torch.ones_like(scores, dtype=torch.bool),
+        short_mask=torch.tensor([[False, False, True]]),
+    )
+    assert weights[0, 0] == 0.0
+    assert weights[0, 1] > 0.0
+    assert weights[0, 2] < 0.0
+
+
+def test_score_entmax_global_cash_extreme_finite_scores_stay_inside_l1_ball() -> None:
+    scores = torch.tensor([[3.0e38, 0.0, -3.0e38]], requires_grad=True)
+    weights = masked_score_entmax_global_cash_weights(scores, None)
+    assert torch.isfinite(weights).all()
+    assert weights.abs().sum().item() <= 1.0 + 1e-6
+    (weights * torch.tensor([[0.3, -0.2, 0.1]])).sum().backward()
+    assert scores.grad is not None
+    assert torch.isfinite(scores.grad).all()
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_score_entmax_global_cash_keeps_fp32_weights_under_amp(input_dtype: torch.dtype) -> None:
+    scores = torch.tensor([[2.0, -1.0, 0.0]], dtype=input_dtype, requires_grad=True)
+    weights = masked_score_entmax_global_cash_weights(scores, None)
+    assert weights.dtype == torch.float32
+    weights.sum().backward()
+    assert scores.grad is not None
+    assert torch.isfinite(scores.grad).all()
+
+
+def test_score_entmax_bounded_cash_limits_outlier_selector_concentration() -> None:
+    scores = torch.zeros(1, 2_754)
+    scores[0, 0] = 5.0
+    bounded, parts = masked_score_entmax_bounded_cash_weights(
+        scores, None, return_parts=True
+    )
+    historical = masked_cash_entmax15_weights(
+        scores,
+        None,
+        preserve_fp32_output=True,
+        preserve_zero_score_gradient=True,
+    )
+
+    assert historical[0, 0] > 0.8
+    assert 0.0 < bounded[0, 0] < 0.2
+    assert parts["score_entmax_bounded_relative_alloc"][0, 0] < 0.2
+    torch.testing.assert_close(
+        bounded.abs().sum(dim=1)
+        + parts["score_entmax_bounded_cash_fraction"],
+        torch.ones(1),
+    )
+
+
+def test_score_entmax_bounded_cash_zero_scores_are_cash_but_trainable() -> None:
+    scores = torch.zeros(1, 4, requires_grad=True)
+    mask = torch.tensor([[True, True, False, True]])
+    weights = masked_score_entmax_bounded_cash_weights(scores, mask)
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+
+    (weights * torch.tensor([[0.3, -0.2, 9.0, 0.1]])).sum().backward()
+    assert scores.grad is not None
+    torch.testing.assert_close(
+        scores.grad, torch.tensor([[0.1, -0.2 / 3.0, 0.0, 0.1 / 3.0]])
+    )
+
+
+def test_score_entmax_bounded_cash_masks_extremes_and_amp_precision() -> None:
+    scores = torch.tensor(
+        [[3.0e38, -3.0e38, 2.0, 0.0]], requires_grad=True
+    )
+    mask = torch.tensor([[True, True, False, True]])
+    short_mask = torch.tensor([[True, False, False, False]])
+    weights = masked_score_entmax_bounded_cash_weights(
+        scores, mask, short_mask=short_mask
+    )
+    assert weights.dtype == torch.float32
+    assert torch.isfinite(weights).all()
+    assert weights[0, 1] == 0.0
+    assert weights[0, 2] == 0.0
+    assert weights.abs().sum() <= 1.0
+    weights.sum().backward()
+    assert scores.grad is not None
+    assert torch.isfinite(scores.grad).all()
+
+    amp_scores = torch.tensor([[2.0, -1.0]], dtype=torch.bfloat16)
+    assert masked_score_entmax_bounded_cash_weights(amp_scores, None).dtype == torch.float32
+
+
+def test_score_entmax_log_cash_bridges_bounded_and_raw_selector_geometry() -> None:
+    scores = torch.zeros(1, 2_754)
+    scores[0, 0] = 3.0
+    bounded = masked_score_entmax_bounded_cash_weights(scores, None)
+    logarithmic, parts = masked_score_entmax_log_cash_weights(
+        scores, None, return_parts=True
+    )
+    raw = masked_cash_entmax15_weights(
+        scores,
+        None,
+        preserve_fp32_output=True,
+        preserve_zero_score_gradient=True,
+    )
+
+    assert bounded[0, 0] < logarithmic[0, 0] < raw[0, 0]
+    assert parts["score_entmax_log_relative_alloc"][0, 0] > 0.0
+    torch.testing.assert_close(
+        logarithmic.abs().sum(dim=1)
+        + parts["score_entmax_log_cash_fraction"],
+        torch.ones(1),
+    )
+
+
+def test_score_entmax_log_cash_zero_scores_are_cash_but_trainable() -> None:
+    scores = torch.zeros(1, 4, requires_grad=True)
+    mask = torch.tensor([[True, True, False, True]])
+    weights = masked_score_entmax_log_cash_weights(scores, mask)
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+
+    (weights * torch.tensor([[0.3, -0.2, 9.0, 0.1]])).sum().backward()
+    assert scores.grad is not None
+    torch.testing.assert_close(
+        scores.grad, torch.tensor([[0.1, -0.2 / 3.0, 0.0, 0.1 / 3.0]])
+    )
+
+
+def test_score_entmax_log_cash_masks_extremes_and_keeps_fp32() -> None:
+    scores = torch.tensor(
+        [[3.0e38, -3.0e38, 2.0, 0.0]], requires_grad=True
+    )
+    mask = torch.tensor([[True, True, False, True]])
+    short_mask = torch.tensor([[True, False, False, False]])
+    weights = masked_score_entmax_log_cash_weights(
+        scores, mask, short_mask=short_mask
+    )
+    assert weights.dtype == torch.float32
+    assert torch.isfinite(weights).all()
+    assert weights[0, 1] == 0.0
+    assert weights[0, 2] == 0.0
+    assert weights.abs().sum() <= 1.0
+    weights.sum().backward()
+    assert scores.grad is not None
+    assert torch.isfinite(scores.grad).all()
+
+    amp_scores = torch.tensor([[2.0, -1.0]], dtype=torch.bfloat16)
+    assert masked_score_entmax_log_cash_weights(amp_scores, None).dtype == torch.float32
+
+
+def test_scale_separated_cash_changes_budget_without_changing_stock_selection() -> None:
+    scores = torch.tensor([[0.4, -0.2, 0.08, 0.0]])
+    base, base_parts = masked_score_entmax_scale_separated_cash_weights(
+        scores, None, return_parts=True
+    )
+    scaled, scaled_parts = masked_score_entmax_scale_separated_cash_weights(
+        scores * 4.0, None, return_parts=True
+    )
+    torch.testing.assert_close(
+        base_parts["score_entmax_scale_separated_relative_alloc"],
+        scaled_parts["score_entmax_scale_separated_relative_alloc"],
+        atol=1e-6, rtol=1e-6,
+    )
+    assert scaled.abs().sum() > base.abs().sum()
+    assert scaled_parts["score_entmax_scale_separated_cash_fraction"] < base_parts[
+        "score_entmax_scale_separated_cash_fraction"
+    ]
+    torch.testing.assert_close(
+        base.abs().sum(dim=1) + base_parts["implicit_cash_weight"],
+        torch.ones(1), atol=1e-6, rtol=1e-6,
+    )
+
+
+def test_scale_separated_cash_small_signal_remains_executable_in_wide_universe() -> None:
+    scores = torch.zeros(1, 2_755)
+    scores[0, 0] = 0.1
+    proposed = masked_score_entmax_scale_separated_cash_weights(scores, None)
+    old = masked_score_entmax_global_cash_weights(scores, None)
+    # With TWD 10M and a TWD 50 board lot, 0.005 is the nominal one-lot
+    # target weight. The experiment only checks the output mapping, not fills.
+    assert proposed[0, 0] > 0.005
+    assert old[0, 0] < 0.005
+    assert torch.count_nonzero(proposed).item() == 1
+    torch.testing.assert_close(proposed.abs().sum(dim=1), torch.tensor([0.1 / 1.1]))
+
+
+def test_scale_separated_cash_zero_scores_are_flat_with_finite_nonzero_gradient() -> None:
+    scores = torch.zeros(1, 4, requires_grad=True)
+    weights, parts = masked_score_entmax_scale_separated_cash_weights(
+        scores, None, return_parts=True
+    )
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    torch.testing.assert_close(
+        parts["score_entmax_scale_separated_shape_rms"], torch.zeros(1)
+    )
+    (weights * torch.tensor([[0.3, -0.2, 0.1, 2.0]])).sum().backward()
+    torch.testing.assert_close(scores.grad, torch.tensor([[0.075, -0.05, 0.025, 0.5]]))
+
+
+def test_scale_separated_cash_masks_and_extreme_scores_stay_finite() -> None:
+    scores = torch.tensor(
+        [[3.0e38, -3.0e38, 99.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        requires_grad=True,
+    )
+    mask = torch.tensor([[True, True, False, True], [False, False, False, False]])
+    short_mask = torch.tensor([[True, False, False, False], [False, False, False, False]])
+    weights = masked_score_entmax_scale_separated_cash_weights(
+        scores, mask, short_mask=short_mask
+    )
+    assert torch.isfinite(weights).all()
+    assert weights[0, 1] == 0.0
+    assert weights[0, 2] == 0.0
+    assert torch.count_nonzero(weights[1]).item() == 0
+    assert weights.abs().sum(dim=1).max() <= 1.0
+    weights.sum().backward()
+    assert torch.isfinite(scores.grad).all()
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_scale_separated_cash_keeps_fp32_allocation_under_amp(input_dtype: torch.dtype) -> None:
+    scores = torch.tensor([[0.1, -0.05, 0.0]], dtype=input_dtype, requires_grad=True)
+    weights = masked_score_entmax_scale_separated_cash_weights(scores, None)
+    assert weights.dtype == torch.float32
+    weights.sum().backward()
+    assert torch.isfinite(scores.grad).all()
 
 
 def test_learned_cash_is_free_gross_and_candidate_count_invariant() -> None:
@@ -485,6 +800,11 @@ def test_portfolio_mode_contract_normalizes_shared_aliases() -> None:
     assert normalize_portfolio_output_mode("free_gross") == "learned_cash"
     assert normalize_portfolio_output_mode("differentiable_projection") == "projection_l1"
     assert normalize_portfolio_output_mode("signed_action_entmax15") == "signed_entmax15"
+    assert normalize_portfolio_output_mode("score-entmax-global-cash") == "score_entmax_global_cash"
+    assert normalize_portfolio_output_mode("score-entmax-bounded-cash") == "score_entmax_bounded_cash"
+    assert normalize_portfolio_output_mode("score-entmax-log-cash") == "score_entmax_log_cash"
+    assert normalize_portfolio_output_mode("score-entmax-scale-separated-cash") == "score_entmax_scale_separated_cash"
+    assert normalize_portfolio_output_mode("score-entmax-cash-v2") == "score_entmax_cash_v2"
 
 
 def test_tensor_backtest_portfolio_activation_switch_changes_target_normalizer() -> None:

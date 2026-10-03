@@ -419,6 +419,7 @@ def build_model(
             }
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
             else {
+                "futures_slot_count": config.data.tw_futures_portfolio_slot_count,
                 "futures_denomination_aware_output": (
                     tbp_cfg.futures_denomination_aware_output
                 ),
@@ -427,6 +428,9 @@ def build_model(
                 ),
                 "futures_current_open_feature": (
                     tbp_cfg.futures_current_open_feature
+                ),
+                "futures_feature_rms_normalization": (
+                    tbp_cfg.futures_feature_rms_normalization
                 ),
                 "futures_denomination_reference_capital": (
                     config.trading.tw_futures_portfolio_integer_initial_capital
@@ -532,6 +536,11 @@ def build_model(
             model_type = CrossSectionalIndexDerivativesDayModel
         elif executable_policy:
             model_type = ExecutablePortfolioTransformerModel
+        elif config.trading.execution_mode == "tw_stock_context_futures_portfolio":
+            from stockagent.models.financial_transformer_futures import (
+                FinancialTransformerFuturesModel,
+            )
+            model_type = FinancialTransformerFuturesModel
         else:
             model_type = FinancialTransformerModel
         derivative_kwargs = (
@@ -590,6 +599,41 @@ def build_model(
             if executable_policy
             else {}
         )
+        window_observation_pairs: list[tuple[int, int]] = []
+        window_passthrough_indices: list[int] = []
+        if fin_cfg.causal_feature_window_rms_normalization:
+            if not feature_names or len(feature_names) != num_features:
+                raise ValueError("window RMS requires the exact ordered feature names")
+            ordered_names = [str(name) for name in feature_names]
+            name_to_index = {name: index for index, name in enumerate(ordered_names)}
+            if len(name_to_index) != len(ordered_names):
+                raise ValueError("window RMS requires unique feature names")
+            window_passthrough_indices = [
+                index for index, name in enumerate(ordered_names)
+                if name.endswith("__available")
+            ]
+            window_observation_pairs = [
+                (index, name_to_index[f"{name}__available"])
+                for index, name in enumerate(ordered_names)
+                if f"{name}__available" in name_to_index
+            ]
+        if config.trading.execution_mode == "tw_stock_context_futures_portfolio":
+            derivative_kwargs.update(
+                futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+                futures_margin_budget_output=(
+                    config.trading.tw_futures_portfolio_capital_basis == "initial_margin"
+                ),
+                futures_denomination_aware_output=fin_cfg.futures_denomination_aware_output,
+                futures_denomination_hard_projection=fin_cfg.futures_denomination_hard_projection,
+                futures_current_open_feature=fin_cfg.futures_current_open_feature,
+                futures_feature_rms_normalization=fin_cfg.futures_feature_rms_normalization,
+                futures_flat_action_initialization=fin_cfg.futures_flat_action_initialization,
+                futures_notional_score_coordinates=fin_cfg.futures_notional_score_coordinates,
+                futures_margin_amount_context=fin_cfg.futures_margin_amount_context,
+                futures_denomination_reference_capital=(
+                    config.trading.tw_futures_portfolio_integer_initial_capital
+                ),
+            )
         return model_type(
             lookback=lookback,
             num_features=num_features,
@@ -667,6 +711,19 @@ def build_model(
             candle_dropout=fin_cfg.candle_dropout,
             causal_feature_rms_normalization=(
                 fin_cfg.causal_feature_rms_normalization
+            ),
+            causal_feature_window_rms_normalization=(
+                fin_cfg.causal_feature_window_rms_normalization
+            ),
+            window_rms_observation_pairs=window_observation_pairs,
+            window_rms_passthrough_indices=window_passthrough_indices,
+            window_rms_epsilon=fin_cfg.causal_feature_scale_epsilon,
+            causal_feature_compression=fin_cfg.causal_feature_compression,
+            causal_feature_compression_indices=(
+                _feature_indices_from_patterns(
+                    feature_names,
+                    fin_cfg.causal_feature_compression_patterns,
+                )
             ),
             feature_bottleneck_dim=fin_cfg.feature_bottleneck_dim,
             temporal_basis_algebraic_contraction=(

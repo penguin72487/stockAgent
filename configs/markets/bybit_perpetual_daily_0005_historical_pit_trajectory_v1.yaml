@@ -1,0 +1,21 @@
+# Single-variable successor to the venue-only 00:05 UTC Bybit control.
+#
+# The policy is evaluated as one chronological account trajectory, so all
+# training chunks in an epoch see the same parameter vector. Gradients are
+# accumulated with valid-date weighting and the optimizer steps once after the
+# complete trajectory. This changes learning semantics and therefore owns a
+# fresh artifact/cache root; it must never resume the batch-cadence control.
+base_config: bybit_perpetual_daily_0005_historical_pit_v1.yaml
+
+experiment_name: bybit-perpetual-daily-0005-venue-only-trajectory-v1
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_venue_only_trajectory_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_0005_venue_only_trajectory_v1
+
+training:
+  crypto_optimizer_step_per_trajectory: true

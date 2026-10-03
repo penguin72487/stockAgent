@@ -39,9 +39,16 @@ from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
 from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.backtest.futures_data_validity import FuturesCarryDataError
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 
-from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+from stockagent.backtest.crypto_perpetual import (
+    CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
+    CryptoPerpetualDataError,
+)
 from stockagent.backtest.report import (
+    reporting_weight_history,
     compute_metrics,
     generate_annual_report,
     plot_annual_performance,
@@ -1130,10 +1137,15 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
     output_mode = normalize_portfolio_output_mode(
         str(getattr(raw_model, "portfolio_output_mode", ""))
     )
-    # score_entmax_cash multiplies its relative allocation by
-    # abs(score) / (1 + abs(score)); a zero final score is therefore exactly
-    # flat even when entmax assigns nonzero relative allocation.
-    if output_mode not in {"projection_l1", "learned_cash", "score_entmax_cash"}:
+    # The score-entmax cash modes all emit zero requested weights at exactly
+    # zero stock scores, even when entmax assigns nonzero relative allocation.
+    if output_mode not in {
+        "projection_l1", "learned_cash", "score_entmax_cash",
+        "score_entmax_cash_v2", "score_entmax_global_cash",
+        "score_entmax_bounded_cash",
+        "score_entmax_log_cash",
+        "score_entmax_scale_separated_cash",
+    }:
         raise RuntimeError(
             "pretrained exact-account stock fallback requires a proven "
             "zero-score output mode"
@@ -1169,6 +1181,11 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
         "projection_l1": (1, "zero_score_head_final_linear_flat_projection_l1_v1"),
         "learned_cash": (2, "zero_score_head_final_linear_flat_learned_cash_v2"),
         "score_entmax_cash": (3, "zero_score_head_final_linear_flat_score_entmax_cash_v3"),
+        "score_entmax_cash_v2": (4, "zero_score_head_final_linear_flat_score_entmax_cash_zero_grad_v4"),
+        "score_entmax_global_cash": (5, "zero_score_head_final_linear_flat_score_entmax_global_cash_v5"),
+        "score_entmax_scale_separated_cash": (6, "zero_score_head_final_linear_flat_score_entmax_scale_separated_cash_v6"),
+        "score_entmax_bounded_cash": (7, "zero_score_head_final_linear_flat_score_entmax_bounded_cash_v7"),
+        "score_entmax_log_cash": (8, "zero_score_head_final_linear_flat_score_entmax_log_cash_v8"),
     }
     schema_version, method = fallback_versions[output_mode]
     return {
@@ -1318,6 +1335,51 @@ def _checkpoint_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _normalize_pretrained_initialization_fold_policy(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {
+        "matching_train_and_validation_years",
+        "matching_train_val_years",
+    }:
+        return "matching_train_and_validation_years"
+    if normalized == "matching_validation_and_causal_train_superset":
+        return normalized
+    raise ValueError(
+        "pretrained_initialization_fold_policy must be "
+        "'matching_train_and_validation_years' or "
+        "'matching_validation_and_causal_train_superset'"
+    )
+
+
+def _pretrained_fold_years_match(
+    *,
+    policy: str,
+    source_train_years: Sequence[int],
+    source_val_years: Sequence[int],
+    target_train_years: Sequence[int],
+    target_val_years: Sequence[int],
+) -> bool:
+    source_train = [int(value) for value in source_train_years]
+    source_val = [int(value) for value in source_val_years]
+    target_train = [int(value) for value in target_train_years]
+    target_val = [int(value) for value in target_val_years]
+    if source_val != target_val:
+        return False
+    if policy == "matching_train_and_validation_years":
+        return source_train == target_train
+    if policy != "matching_validation_and_causal_train_superset":
+        raise ValueError(f"unsupported pretrained fold policy: {policy!r}")
+    if not target_train or len(source_train) <= len(target_train):
+        return False
+    prefix_count = len(source_train) - len(target_train)
+    prefix = source_train[:prefix_count]
+    return (
+        source_train[prefix_count:] == target_train
+        and bool(prefix)
+        and all(year < target_train[0] for year in prefix)
+    )
+
+
 def _resolve_pretrained_initialization(
     config: ExperimentConfig,
     group_folds: Sequence[WalkForwardFold],
@@ -1325,10 +1387,11 @@ def _resolve_pretrained_initialization(
     """Resolve one causally matching source fold for a fresh train group.
 
     The source may have a different execution objective, so this is never a
-    resume and never imports optimizer state.  Exact train/validation-year
-    matching prevents a later source fold from leaking into an earlier target
-    fold and gives the target's epoch-zero validation guard the same temporal
-    information boundary as the source checkpoint selection.
+    resume and never imports optimizer state. Exact matching is the default.
+    The explicit causal-superset policy additionally permits only earlier
+    source training years while requiring the target train years to be an exact
+    suffix and validation years to match. A later source fold can therefore
+    never initialize an earlier target fold.
     """
 
     raw_root = config.training.pretrained_initialization_root
@@ -1347,20 +1410,9 @@ def _resolve_pretrained_initialization(
     if not group_folds:
         raise ValueError("pretrained initialization requires at least one fold")
 
-    policy = (
-        str(config.training.pretrained_initialization_fold_policy)
-        .strip()
-        .lower()
-        .replace("-", "_")
+    policy = _normalize_pretrained_initialization_fold_policy(
+        config.training.pretrained_initialization_fold_policy
     )
-    if policy not in {
-        "matching_train_and_validation_years",
-        "matching_train_val_years",
-    }:
-        raise ValueError(
-            "pretrained_initialization_fold_policy must be "
-            "'matching_train_and_validation_years'"
-        )
 
     reference = group_folds[0]
     target_train_years = [int(value) for value in reference.train_years]
@@ -1479,15 +1531,18 @@ def _resolve_pretrained_initialization(
         row
         for row in source_summary
         if isinstance(row, Mapping)
-        and [int(value) for value in row.get("train_years", [])]
-        == target_train_years
-        and [int(value) for value in row.get("val_years", [])]
-        == target_val_years
+        and _pretrained_fold_years_match(
+            policy=policy,
+            source_train_years=row.get("train_years", []),
+            source_val_years=row.get("val_years", []),
+            target_train_years=target_train_years,
+            target_val_years=target_val_years,
+        )
     ]
     if len(matching_rows) != 1:
         raise RuntimeError(
             "pretrained initialization requires exactly one source checkpoint "
-            "with identical train/validation years; "
+            f"under fold_policy={policy!r}; "
             f"train={target_train_years} val={target_val_years} "
             f"matches={len(matching_rows)} "
             f"root={source_root}"
@@ -1502,11 +1557,18 @@ def _resolve_pretrained_initialization(
             f"pretrained source checkpoint is unreadable: {checkpoint_path}: "
             f"{read_error}"
         )
-    if (
-        [int(value) for value in checkpoint.get("train_years", [])]
-        != target_train_years
-        or [int(value) for value in checkpoint.get("val_years", [])]
-        != target_val_years
+    source_train_years = [
+        int(value) for value in checkpoint.get("train_years", [])
+    ]
+    source_val_years = [
+        int(value) for value in checkpoint.get("val_years", [])
+    ]
+    if not _pretrained_fold_years_match(
+        policy=policy,
+        source_train_years=source_train_years,
+        source_val_years=source_val_years,
+        target_train_years=target_train_years,
+        target_val_years=target_val_years,
     ):
         raise RuntimeError(
             "pretrained summary/checkpoint year mismatch: "
@@ -1535,7 +1597,12 @@ def _resolve_pretrained_initialization(
         "target_fold_ids": [int(fold.fold_id) for fold in group_folds],
         "target_train_years": target_train_years,
         "target_validation_years": target_val_years,
-        "fold_policy": "matching_train_and_validation_years",
+        "source_train_years": source_train_years,
+        "source_validation_years": source_val_years,
+        "source_causal_prefix_train_years": source_train_years[
+            : len(source_train_years) - len(target_train_years)
+        ],
+        "fold_policy": policy,
         "optimizer_state_imported": False,
         "source_test_metrics_used": False,
     }
@@ -1690,7 +1757,23 @@ def _pretrained_temporal_basis_matches_target(
 
     model_config = _temporal_basis_runtime_config(config)
     if model_config is None:
-        return True
+        # A target with no temporal basis cannot reuse a source PCA/KLT bank
+        # (or its feature encoder).  The source may itself have no basis, in
+        # which case ordinary pretrained weights remain ABI-compatible.
+        source_state = initialization.checkpoint["model_state_dict"]
+        if any(
+            str(name).startswith("temporal_basis_feature_encoder.")
+            or str(name).endswith("pca_klt_basis")
+            for name in source_state
+        ):
+            return False
+        source_metadata = initialization.checkpoint.get(
+            "temporal_basis_selection"
+        )
+        return not (
+            isinstance(source_metadata, Mapping)
+            and bool(source_metadata.get("families"))
+        )
     metadata = initialization.checkpoint.get("temporal_basis_selection")
     if not isinstance(metadata, Mapping):
         return False
@@ -1759,6 +1842,24 @@ def _pretrained_temporal_basis_matches_target(
     )
 
 
+def _expand_pretrained_margin_amount_column(key, source, target, model):
+    """Preserve the old policy when adding one explicitly named observation.
+
+    The old encoder's columns are margin/notional and maintenance/initial.
+    The new last encoder column is known initial margin/reference capital;
+    zero initialization preserves the old function, while allowing it to learn.
+    Every other incompatible shape must still fail the exact-backbone check.
+    """
+    if (key == "futures_margin_encoder.weight"
+            and bool(getattr(model, "futures_margin_amount_context", False))
+            and torch.is_tensor(source) and source.ndim == target.ndim == 2
+            and source.shape == (target.shape[0], 2) and target.shape[1] == 3):
+        expanded = target.detach().new_zeros(target.shape)
+        expanded[:, :2] = source.detach().to(device=target.device, dtype=target.dtype)
+        return expanded
+    return source
+
+
 def _transfer_pretrained_feature_identity(
     model: nn.Module,
     initialization: _PretrainedInitialization,
@@ -1824,6 +1925,7 @@ def _transfer_pretrained_feature_identity(
         copied_keys: list[str] = []
         for key, target_value in target_state.items():
             source_value = source_state.get(key)
+            source_value = _expand_pretrained_margin_amount_column(key, source_value, target_value, raw_model)
             if not torch.is_tensor(source_value):
                 mismatches.append(f"{key}:missing")
                 continue
@@ -1892,6 +1994,10 @@ def _transfer_pretrained_feature_identity(
                 "trainable_parameters": int(trainable_parameters),
                 "total_parameters": int(total_parameters),
                 "epoch_zero_validation_guard": True,
+                "margin_amount_column_zero_initialized": bool(
+                    getattr(raw_model, "futures_margin_amount_context", False)
+                    and source_state.get("futures_margin_encoder.weight", torch.empty(0, 0)).shape[-1] == 2
+                ),
             }
         )
         setattr(
@@ -1922,6 +2028,8 @@ def _transfer_pretrained_feature_identity(
     copied_keys: list[str] = []
     for key, source_value in source_state.items():
         target_value = target_state.get(key)
+        if target_value is not None:
+            source_value = _expand_pretrained_margin_amount_column(key, source_value, target_value, raw_model)
         if not torch.is_tensor(source_value) or target_value is None:
             mismatches.append(f"{key}:missing")
             continue
@@ -2293,6 +2401,7 @@ class _ExecutionRuntime:
     settlement_lag_sessions: int
     crypto_stateful_proximal_allocator: bool = False
     crypto_proximal_cost_multiplier: float = 1.0
+    crypto_announced_exit_unlimited_volume: bool = False
     normal_sell_fee_rates: torch.Tensor | None = None
     day_trade_unlimited_margin_conversion: bool = False
     day_trade_margin_financing_ratio: float = 0.60
@@ -2327,6 +2436,10 @@ class _ExecutionRuntime:
     option_day_cost_schedule: OptionDayCostSchedule | None = None
     derivatives_maximum_capital_fraction: float = 0.98
     day_trade_carry_source: PreparedDayTradeCarrySource | None = None
+    day_trade_training_annual_episodes: bool = False
+    # CPU identity references only; resolved exclusively after a crypto error.
+    diagnostic_panel_dates: np.ndarray | None = None
+    diagnostic_panel_symbols: Sequence[str] | None = None
 
 
 def _is_stateful_security_carry(
@@ -2357,7 +2470,7 @@ def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
 
     mode = normalize_execution_mode(str(getattr(split, "execution_mode", "naive")))
     if (
-        mode == "tw_index_futures_day"
+        mode in {"tw_index_futures_day", "crypto_perpetual"}
         or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     ):
         return True
@@ -2365,8 +2478,8 @@ def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
     shape = getattr(execution, "shape", ())
     return bool(
         mode == "tw_stock_context_futures_portfolio"
-        and len(shape) == 3
-        and int(shape[-1]) == 11
+        and ((len(shape) == 3 and int(shape[-1]) in {11, *MARGIN_EXECUTION_WIDTHS})
+             or (len(shape) == 4 and int(shape[-1]) == 63))
     )
 
 
@@ -2462,6 +2575,12 @@ def _build_execution_runtime(
             crypto_proximal_cost_multiplier=float(
                 config.trading.crypto_proximal_cost_multiplier
             ),
+            crypto_announced_exit_unlimited_volume=(
+                bool(config.trading.crypto_announced_exit_unlimited_volume)
+                if mode == "crypto_perpetual" else False
+            ),
+            diagnostic_panel_dates=panel.dates if mode == "crypto_perpetual" else None,
+            diagnostic_panel_symbols=panel.symbols if mode == "crypto_perpetual" else None,
         )
     if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         market = getattr(panel, "index_futures_day_session", None)
@@ -2734,6 +2853,7 @@ def _build_execution_runtime(
             and config.trading.tw_day_trade_unlimited_margin_conversion
             else None
         ),
+        day_trade_training_annual_episodes=bool(config.training.day_trade_training_annual_episodes),
     )
 
 
@@ -3014,6 +3134,61 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    if (mode == "tw_stock_context_futures_portfolio"
+            and getattr(config.trading, "tw_futures_portfolio_capital_basis", "notional") == "initial_margin"):
+        from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS, MARGIN_ACCOUNTING_CONTRACT_VERSION
+        payload.update(
+            decision_clock="08:45_prior_completed_features_and_effective_margin_rules",
+            execution_clock="daily_open_trade_proxy_official_settlement_mark",
+            recurrent_state_scope="whole_contracts_and_settled_equity",
+            terminal_policy="expiry_cash_settlement_or_capacity_limited_close_proxy",
+            weight_snapshot_contract="signed_entry_contract_quantities",
+            benchmark_contract=(
+                "tx_front_month_rolling_buy_hold_1x_gross_same_contract_close_v1"
+                if config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"
+                else "flat_cash_nominal_twd_no_interest"
+            ),
+            mode_details={"capital_basis": "learned_signed_initial_margin_budget",
+                          **_benchmark_reporting_details(config),
+                          "settlement_ledger_unit": "contract_quantity",
+                          "allocation_report_source": "requested_weights_history",
+                          "allocation_report_unit": "requested_initial_margin_budget_over_equity",
+                          "margin_contract_version": MARGIN_ACCOUNTING_CONTRACT_VERSION,
+                          "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
+                          "risk_clock": "daily_open_and_settlement_not_intraday_broker_replay",
+                          "margin_call_policy": "next_open_flat_no_external_topups",
+                          "margin_audit_columns": list(MARGIN_AUDIT_COLUMNS)},
+        )
+        return payload
+    if (mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
+        payload.update(
+            frequency="daily_policy_exact_minute_execution",
+            decision_clock="08:45_completed_prior_session_features",
+            execution_clock="08:46_minute_vwap_entry_1320_limit_1324_market_until_1330",
+            terminal_policy="mandatory_1330_flat_or_absorbing_unfilled_exit_failure",
+            recurrent_state_scope="account_equity_only_no_overnight_positions",
+            benchmark_contract="flat_cash_nominal_twd_no_interest",
+            weight_snapshot_contract="signed_entry_contract_quantities",
+            mode_details={"holding_policy": "intraday", "contract_version": 1,
+                          **_benchmark_reporting_details(config),
+                          "settlement_ledger_unit": "contract_quantity",
+                          "allocation_report_source": "requested_weights_history",
+                          "allocation_report_unit": "requested_notional_exposure_over_equity",
+                          "capacity": f"floor_{config.trading.max_volume_participation * 100:g}pct_observed_minute_contracts",
+                          "price_contract": "minute_trade_price_research_not_bidask_fill"},
+        )
+        return payload
+    if mode == "tw_stock_context_futures_portfolio":
+        payload["mode_details"] = _benchmark_reporting_details(config)
+        if bool(getattr(config.trading, "tw_futures_portfolio_integer_contracts", False)):
+            payload["weight_snapshot_contract"] = "signed_entry_contract_quantities"
+            payload["mode_details"].update(
+                settlement_ledger_unit="contract_quantity",
+                allocation_report_source="requested_weights_history",
+                allocation_report_unit="requested_notional_exposure_over_equity",
+            )
+        return payload
     # Artifact-only callers may provide a minimal compatibility namespace.
     # A missing overnight flag means that the legacy/non-overnight contract
     # applies; it must not make artifact serialization fail.
@@ -3119,13 +3294,28 @@ def _mode_artifact_contract_for_config(
                 ),
                 "mode_details": {
                     "crypto_backtest_contract_version": CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+                    "crypto_backward_contract_version": CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
                     "crypto_execution_minute_utc": execution_minute,
                     "funding_boundary_order": (
                         "boundary_funding_settles_before_new_target"
                     ),
+                    "volume_capacity_denominator": "live_nav_over_reference_capital",
+                    "missing_held_valuation": "raise_data_error_no_retrospective_exit",
+                    "announced_exit_policy": "zero_target_request_obeys_side_capacity_turnover_not_exchange_settlement",
+                    "gross_breach_policy": "capacity_and_permission_constrained_reduction_no_new_expansion",
+                    "cross_fold_inventory_transfer": "not_implemented_independent_fold_accounts",
                 },
             }
         )
+        if bool(getattr(config.trading, "crypto_announced_exit_unlimited_volume", False)):
+            payload["mode_details"].update(
+                crypto_backtest_contract_version=CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+                crypto_announced_exit_unlimited_volume=True,
+                announced_exit_policy=(
+                    "user_authorized_volume_unlimited_announced_reduction_only_"
+                    "side_permissions_turnover_prices_fees_unchanged_not_exchange_settlement"
+                ),
+            )
         return payload
     if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
         return payload
@@ -3133,12 +3323,15 @@ def _mode_artifact_contract_for_config(
     terminal_unlimited = bool(
         config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
     )
+    entry_remainder_policy = config.trading.tw_day_trade_entry_remainder_policy
     payload.update(
         {
             "frequency": "daily_policy_exact_minute_execution",
             "decision_clock": "observed_session_open",
             "execution_clock": (
-                "official_open_sizing_then_0901_minute_price_entry_1320_limit_"
+                ("official_open_sizing_then_0901_to_1319_frozen_target_entries_1320_limit_"
+                 if entry_remainder_policy == "frozen_target_until_1320" else
+                 "official_open_sizing_then_0901_minute_price_entry_1320_limit_") +
                 "1324_market_1330_auction"
             ),
             "recurrent_state_scope": (
@@ -3157,6 +3350,8 @@ def _mode_artifact_contract_for_config(
             "weight_snapshot_contract": "exact_filled_entry_notional_over_nav",
             "turnover_contract": "sum_exact_minute_fill_notional_over_nav",
             "mode_details": {
+                **({"entry_remainder_policy": entry_remainder_policy}
+                   if entry_remainder_policy != "first_minute_only" else {}),
                 "execution_variant": (
                     "exact_board_lot_minute_physical_fifo_v1"
                     if physical_fifo
@@ -3566,6 +3761,28 @@ class TimingBreakdown:
     cuda_events: list[tuple[str, torch.device, torch.cuda.Event, torch.cuda.Event]] = field(
         default_factory=list
     )
+
+
+def _max_rank_epoch_timing(
+    *, epoch_wall_s: float, train_total_s: float, device: torch.device
+) -> dict[str, float | int]:
+    """Report the slowest worker, without averaging away a DDP bottleneck.
+
+    Every rank must call this after the epoch's CUDA work has synchronized.
+    Keep local stage timings intact; their maxima need not belong to one rank
+    and must not be summed into a fictitious critical path.
+    """
+    values = [float(epoch_wall_s), float(train_total_s)]
+    world_size = _distributed_world_size() if _distributed_is_initialized() else 1
+    if world_size > 1:
+        payload = torch.tensor(values, dtype=torch.float64, device=device)
+        dist.all_reduce(payload, op=dist.ReduceOp.MAX)
+        values = payload.cpu().tolist()
+    return {
+        "epoch_wall_s_max_rank": values[0],
+        "train_total_s_max_rank": values[1],
+        "timing_rank_count": world_size,
+    }
 
 
 def _broadcast_epoch_eval_tensor(
@@ -4548,6 +4765,9 @@ def _evaluated_backtest_loss(
         crypto_proximal_cost_multiplier=(
             config.trading.crypto_proximal_cost_multiplier
         ),
+        crypto_announced_exit_unlimited_volume=(
+            config.trading.crypto_announced_exit_unlimited_volume
+        ),
         gross_leverage=1.0,
         min_trade_weight=config.trading.min_trade_weight,
         portfolio_activation=config.trading.portfolio_activation,
@@ -5020,6 +5240,10 @@ def _evaluate_windowed_aux_objective_loss(
         sell_fee_rate=sell_fee_rate,
         max_turnover_ratio=max_turnover_ratio,
         volume_limit_weights=volume_limit_weights,
+        crypto_announced_exit_unlimited_volume=(
+            False if execution_runtime is None
+            else execution_runtime.crypto_announced_exit_unlimited_volume
+        ),
         short_capacity_weights=_short_capacity_weights_from_notional(
             short_capacity_notional,
             volume_participation_equity=volume_participation_equity,
@@ -5139,6 +5363,14 @@ def _evaluate_windowed_aux_objective_loss(
     mean_loss = float(loss_t.detach().float().cpu())
     rank_scores = _resolve_rank_scores(weights_all, aux_all)
     sample_all = torch.cat(sample_chunks, dim=0).to(dtype=torch.bool)
+    if (execution_mode == "tw_stock_context_futures_portfolio"
+            and overnight_returns_all.ndim == 4):
+        # No stock-return IC is defined for the different futures action axis.
+        # Scheduled, size-dependent minute executions have no scalar label IC.
+        timing.metrics_s += time.perf_counter() - reduce_start
+        timing.total_s = time.perf_counter() - overall_start
+        timing.batches = int(expected_chunks)
+        return mean_loss, None, timing
     if execution_mode == "tw_stock_context_futures_portfolio":
         futures_holding_log_returns = overnight_returns_all[..., 0]
         rank_targets = torch.expm1(
@@ -5482,9 +5714,19 @@ def _training_transform_cache_key(
     train_ds: CrossSectionalDataset,
     contract: Mapping[str, Any],
     include_alive_mask: bool,
+    feature_values: np.ndarray | None = None,
+    alive_mask_values: np.ndarray | None = None,
 ) -> dict[str, Any]:
     indices = np.asarray(train_ds.valid_indices, dtype="<i8").reshape(-1)
-    if panel is None:
+    if feature_values is not None:
+        features = np.asarray(feature_values)
+        feature_fingerprint = {
+            "present": True,
+            "shape": [int(size) for size in features.shape],
+            "dtype": str(features.dtype),
+            "sha256": _array_sha256(features),
+        }
+    elif panel is None:
         features = train_ds.features_t.detach().to(device="cpu").numpy()
         feature_fingerprint = {
             "present": True,
@@ -5507,11 +5749,20 @@ def _training_transform_cache_key(
         "contract": dict(contract),
     }
     if include_alive_mask:
-        if panel is None:
+        if alive_mask_values is not None:
+            alive = np.asarray(alive_mask_values)
+            payload["alive_mask"] = {
+                "present": True,
+                "shape": [int(size) for size in alive.shape],
+                "dtype": str(alive.dtype),
+                "sha256": _array_sha256(alive),
+            }
+        elif panel is None:
             raise ValueError("alive-mask training transform cache requires PanelData")
-        payload["alive_mask"] = _panel_training_transform_fingerprint(
-            panel, "alive_mask", panel.alive_mask
-        )
+        else:
+            payload["alive_mask"] = _panel_training_transform_fingerprint(
+                panel, "alive_mask", panel.alive_mask
+            )
     return payload
 
 
@@ -5611,7 +5862,48 @@ def _fit_group_temporal_basis(
 
     model_config = _temporal_basis_runtime_config(config)
     if model_config is None:
-        return {}, None
+        active_name = str(_active_model_config(config)["config_name"])
+        active_config = getattr(config.training, active_name, None)
+        if active_config is None or not hasattr(
+            active_config, "temporal_basis_families"
+        ):
+            return {}, None
+        # Record the disabled basis explicitly.  A failed pretrained attempt
+        # may already have written its source selection into this artifact;
+        # leaving that file in place would misdescribe a successful rerun.
+        metadata = build_temporal_basis_metadata(
+            (),
+            lookback=int(config.training.lookback),
+            components=int(active_config.temporal_basis_components),
+            components_by_family=(
+                active_config.temporal_basis_components_by_family
+            ),
+            novelty_threshold=float(
+                active_config.temporal_basis_novelty_threshold
+            ),
+        )
+        metadata.update(
+            {
+                "train_years": [int(year) for year in train_years],
+                "fold_ids": [int(fold.fold_id) for fold in group_folds],
+                "pca_klt_training_only": False,
+            }
+        )
+        metadata["selection_fingerprint"] = _stable_fingerprint(metadata)
+        if _distributed_should_write():
+            _write_temporal_basis_metadata(
+                _group_dir(output_path, list(train_years))
+                / "temporal_basis_selection.json",
+                metadata,
+            )
+            for fold in group_folds:
+                _write_temporal_basis_metadata(
+                    _fold_dir(output_path, fold.fold_id)
+                    / "temporal_basis_selection.json",
+                    metadata,
+                    fold_id=fold.fold_id,
+                )
+        return {}, metadata
     families = list(getattr(model_config, "temporal_basis_families"))
     components = int(getattr(model_config, "temporal_basis_components"))
     components_by_family = dict(
@@ -5766,6 +6058,48 @@ def _fit_group_temporal_basis(
     return overrides, metadata
 
 
+def _fit_masked_training_feature_rms(
+    features: np.ndarray,
+    mask: np.ndarray,
+    row_indices: np.ndarray,
+    *,
+    epsilon: float,
+    minimum_dates: int,
+    window_rms: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Shared zero-preserving FP64 RMS reducer over explicitly owned train rows."""
+    feature_count = int(features.shape[-1])
+    squared_sum = None if window_rms else np.zeros(feature_count, dtype=np.float64)
+    active_date_count = np.zeros(feature_count, dtype=np.int64)
+    alive_cell_count = 0
+    for start in range(0, len(row_indices), 32):
+        selected = row_indices[start:start + 32]
+        values = np.nan_to_num(
+            np.asarray(features[selected], dtype=np.float32),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        alive = np.asarray(mask[selected], dtype=np.bool_)
+        alive_cell_count += int(alive.sum(dtype=np.int64))
+        if squared_sum is not None:
+            squared_sum += np.einsum(
+                "tsf,tsf,ts->f", values, values, alive,
+                dtype=np.float64, optimize=True,
+            )
+        observed = (np.abs(values) > epsilon) & alive[..., None]
+        active_date_count += np.any(observed, axis=1).sum(axis=0, dtype=np.int64)
+    if alive_cell_count <= 0:
+        raise ValueError("causal feature RMS normalization found no alive training cells")
+    if squared_sum is None:
+        active = active_date_count >= minimum_dates
+        scale = np.ones(feature_count, dtype=np.float32)
+    else:
+        rms = np.sqrt(squared_sum / float(alive_cell_count))
+        active = (np.isfinite(rms) & (rms >= epsilon)
+                  & (active_date_count >= minimum_dates))
+        scale = np.where(active, rms, 1.0).astype(np.float32)
+    return scale, active, active_date_count, alive_cell_count
+
+
 def _fit_group_causal_feature_rms(
     *,
     config: ExperimentConfig,
@@ -5811,6 +6145,7 @@ def _fit_group_causal_feature_rms(
 
     epsilon = float(model_config.causal_feature_scale_epsilon)
     minimum_dates = int(model_config.causal_feature_min_active_dates)
+    window_rms = bool(model_config.causal_feature_window_rms_normalization)
     valid_indices = np.asarray(train_ds.valid_indices, dtype=np.int64).reshape(-1)
     if valid_indices.size == 0:
         raise ValueError("causal feature RMS normalization requires training rows")
@@ -5829,7 +6164,8 @@ def _fit_group_causal_feature_rms(
         panel=panel,
         train_ds=train_ds,
         contract={
-            "schema_version": 1,
+            "schema_version": 2 if window_rms else 1,
+            **({"window_rms": True} if window_rms else {}),
             "feature_row_start": int(row_start),
             "feature_row_end_inclusive": int(row_end),
             "feature_lag": int(feature_lag),
@@ -5858,44 +6194,11 @@ def _fit_group_causal_feature_rms(
             cache_status = "hit"
             return
         started = time.perf_counter()
-        squared_sum = np.zeros(feature_count, dtype=np.float64)
-        active_date_count = np.zeros(feature_count, dtype=np.int64)
-        alive_cell_count = 0
-        chunk_rows = 32
-        for start in range(row_start, row_end + 1, chunk_rows):
-            end = min(row_end + 1, start + chunk_rows)
-            values = np.nan_to_num(
-                np.asarray(panel.features[start:end], dtype=np.float32),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            alive = np.asarray(panel.alive_mask[start:end], dtype=np.bool_)
-            alive_cell_count += int(alive.sum(dtype=np.int64))
-            squared_sum += np.einsum(
-                "tsf,tsf,ts->f",
-                values,
-                values,
-                alive,
-                dtype=np.float64,
-                optimize=True,
-            )
-            observed = (np.abs(values) > epsilon) & alive[..., None]
-            active_date_count += np.any(observed, axis=1).sum(
-                axis=0,
-                dtype=np.int64,
-            )
-        if alive_cell_count <= 0:
-            raise ValueError(
-                "causal feature RMS normalization found no alive training cells"
-            )
-        rms = np.sqrt(squared_sum / float(alive_cell_count))
-        active = (
-            np.isfinite(rms)
-            & (rms >= epsilon)
-            & (active_date_count >= minimum_dates)
+        scale, active, active_date_count, alive_cell_count = _fit_masked_training_feature_rms(
+            panel.features, panel.alive_mask,
+            np.arange(row_start, row_end + 1, dtype=np.int64),
+            epsilon=epsilon, minimum_dates=minimum_dates, window_rms=window_rms,
         )
-        scale = np.where(active, rms, 1.0).astype(np.float32)
         categorical_names = {
             str(name) for name in model_config.categorical_feature_names
         }
@@ -5918,8 +6221,11 @@ def _fit_group_causal_feature_rms(
             scale[categorical_indices] = 1.0
             active[categorical_indices] = True
         metadata = {
-            "schema_version": 1,
-            "normalization": "training_only_zero_preserving_rms",
+            "schema_version": 2 if window_rms else 1,
+            "normalization": (
+                "training_only_active_mask_plus_observed_window_rms"
+                if window_rms else "training_only_zero_preserving_rms"
+            ),
             "train_years": [int(year) for year in train_years],
             "fold_ids": [int(fold.fold_id) for fold in group_folds],
             "feature_row_start": int(row_start),
@@ -6016,6 +6322,165 @@ def _apply_causal_feature_rms_to_model(
     setattr(model, "causal_feature_rms_metadata", deepcopy(metadata))
 
 
+def _fit_group_futures_feature_rms(
+    *,
+    config: ExperimentConfig,
+    panel: PanelData,
+    train_ds: CrossSectionalDataset,
+    train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold],
+    output_path: Path,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None:
+    """Fit already-lagged futures channels on causal training decisions only."""
+    model_config = getattr(config.training, str(_active_model_config(config)["config_name"]))
+    if not bool(getattr(model_config, "futures_feature_rms_normalization", False)):
+        return None
+    if config.trading.execution_mode != "tw_stock_context_futures_portfolio":
+        raise ValueError("futures feature RMS requires the stock-context futures mode")
+    daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+    if daily is None:
+        raise ValueError("futures feature RMS requires the causal futures sidecar")
+    from stockagent.data.tw_futures_portfolio_daily import FUTURES_MODEL_FEATURE_COLUMNS
+
+    features = np.asarray(daily.candidate_features)[..., 1:18]
+    mask = np.asarray(daily.candidate_mask, dtype=np.bool_)
+    indices = np.asarray(train_ds.valid_indices, dtype=np.int64).reshape(-1)
+    names = tuple(FUTURES_MODEL_FEATURE_COLUMNS[1:18])
+    if (features.ndim != 3 or features.shape[-1] != 17 or len(names) != 17
+            or mask.shape != features.shape[:2]
+            or indices.size == 0 or indices.min() < 0
+            or indices.max() >= features.shape[0]
+            or np.any(indices[1:] <= indices[:-1])):
+        raise ValueError("futures feature RMS requires ordered nonempty train rows and 17 aligned channels")
+    epsilon = float(getattr(model_config, "causal_feature_scale_epsilon", 1e-6))
+    minimum_dates = int(getattr(model_config, "causal_feature_min_active_dates", 1))
+    kind = "futures_feature_rms"
+    cache_key = _training_transform_cache_key(
+        kind=kind, panel=panel, train_ds=train_ds, include_alive_mask=True,
+        feature_values=features, alive_mask_values=mask,
+        contract={
+            "schema_version": 1,
+            "feature_names": list(names),
+            "feature_clock": "already_shifted_prior_completed_session",
+            "row_selection": "exact_train_dataset_valid_indices_no_extra_lag",
+            "train_years": [int(year) for year in train_years],
+            "fold_ids": [int(fold.fold_id) for fold in group_folds],
+            "minimum_active_dates": minimum_dates,
+            "scale_epsilon": epsilon,
+        },
+    )
+    payload: dict[str, Any] | None = None
+
+    def fit_on_rank0() -> None:
+        nonlocal payload
+        payload = _load_training_transform_cache(output_path, kind=kind, cache_key=cache_key)
+        if payload is not None:
+            return
+        scale, active, counts, cells = _fit_masked_training_feature_rms(
+            features, mask, indices, epsilon=epsilon, minimum_dates=minimum_dates,
+        )
+        metadata = {
+            **dict(cache_key["contract"]),
+            "normalization": "training_only_zero_preserving_rms",
+            "train_row_count": int(indices.size),
+            "train_indices_sha256": _array_sha256(indices),
+            "feature_date_start": str(np.asarray(daily.dates[indices[0]], dtype="datetime64[D]")),
+            "feature_date_end": str(np.asarray(daily.dates[indices[-1]], dtype="datetime64[D]")),
+            "candidate_cell_count": cells,
+            "active_feature_count": int(active.sum()),
+            "features": [
+                {"name": name, "rms_scale": float(scale[i]),
+                 "active": bool(active[i]), "active_dates": int(counts[i])}
+                for i, name in enumerate(names)
+            ],
+        }
+        metadata["normalizer_fingerprint"] = _stable_fingerprint(metadata)
+        payload = {"scale": scale.tolist(), "active": active.tolist(), "metadata": metadata}
+        _store_training_transform_cache(output_path, kind=kind, cache_key=cache_key, payload=payload)
+
+    _run_rank0_store_synchronized_phase("futures_feature_rms_fit", fit_on_rank0)
+    if _distributed_is_initialized() and _distributed_world_size() > 1:
+        objects: list[dict[str, Any] | None] = [payload]
+        dist.broadcast_object_list(objects, src=0)
+        payload = objects[0]
+    if payload is None:
+        raise RuntimeError("futures feature RMS fit produced no distributed payload")
+    scale = torch.tensor(payload["scale"], dtype=torch.float32)
+    active = torch.tensor(payload["active"], dtype=torch.bool)
+    metadata = dict(payload["metadata"])
+    if _distributed_should_write():
+        for directory in [_group_dir(output_path, list(train_years)),
+                          *[_fold_dir(output_path, fold.fold_id) for fold in group_folds]]:
+            _write_temporal_basis_metadata(directory / "futures_feature_rms_normalization.json", metadata)
+    print(f"[Train {list(train_years)}] futures feature RMS active={int(active.sum())}/17 "
+          f"training_dates={metadata['feature_date_start']}..{metadata['feature_date_end']}")
+    return scale, active, metadata
+
+
+def _apply_futures_feature_rms_to_model(
+    model: nn.Module,
+    fitted: tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None,
+) -> None:
+    if fitted is None:
+        return
+    scale, active, metadata = fitted
+    setter = getattr(model, "set_futures_feature_rms_normalizer", None)
+    if not callable(setter):
+        raise TypeError("futures feature RMS normalization requires a compatible model")
+    setter(scale, active)
+    setattr(model, "futures_feature_rms_metadata", deepcopy(metadata))
+
+
+def _restore_resume_model_state(
+    model: nn.Module,
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """Restore the learned function, including its persistent input buffers.
+
+    Same-feature pretrained transfer can intentionally import the source RMS
+    along with its learned projection. Reapplying the target fold's fitted RMS
+    here changes that function without transforming the weights or Adam state.
+    Fitting belongs to fresh initialization; an exact resume owns all buffers.
+    """
+    _load_state_dict(model, checkpoint["model_state_dict"])
+    provenance = checkpoint.get("pretrained_initialization")
+    if isinstance(provenance, Mapping):
+        setattr(
+            _unwrap_model(model),
+            "pretrained_initialization_provenance",
+            deepcopy(dict(provenance)),
+        )
+
+
+def _effective_causal_feature_rms_report(
+    model: nn.Module,
+    fitted: tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Distinguish fitted target statistics from the buffers actually used."""
+    if fitted is None:
+        return None
+    encoder = getattr(_unwrap_model(model), "candle_encoder", None)
+    scale = getattr(encoder, "causal_feature_rms_scale", None)
+    active = getattr(encoder, "causal_feature_active_mask", None)
+    if not torch.is_tensor(scale) or not torch.is_tensor(active):
+        raise TypeError("causal RMS report requires model normalization buffers")
+    scale = scale.detach().cpu()
+    active = active.detach().cpu()
+    fitted_scale, fitted_active, metadata = fitted
+    fitted_scale = fitted_scale.detach().cpu().to(scale.dtype)
+    fitted_active = fitted_active.detach().cpu().to(active.dtype)
+    return {
+        "schema_version": 1,
+        "authority": "model_state_dict",
+        "fitted_normalizer_fingerprint": metadata.get("normalizer_fingerprint"),
+        "matches_fitted_scale": bool(torch.equal(scale, fitted_scale)),
+        "matches_fitted_active_mask": bool(torch.equal(active, fitted_active)),
+        "max_abs_scale_difference": float((scale - fitted_scale).abs().max()),
+        "effective_scale": scale.tolist(),
+        "effective_active_mask": active.tolist(),
+    }
+
+
 def _write_loss_contract_metadata(
     path: Path,
     *,
@@ -6024,6 +6489,8 @@ def _write_loss_contract_metadata(
     direction_weight: float,
     volatility_regime_weight: float,
     factor_aug_kwargs: Mapping[str, float] | None,
+    day_trade_training_annual_episodes: bool = False,
+    day_trade_sub_lot_recovery: bool = False,
 ) -> None:
     """Persist which loss components are shared with evaluation versus train-only."""
     if not _distributed_should_write():
@@ -6046,6 +6513,24 @@ def _write_loss_contract_metadata(
             "parameters": dict(factor_aug_kwargs or {}),
         },
     }
+    if day_trade_training_annual_episodes or day_trade_sub_lot_recovery:
+        payload["day_trade_training_contract"] = {
+            "annual_independent_accounts": bool(day_trade_training_annual_episodes),
+            "annual_episode_boundary": (
+                "calendar_year_first_session_fresh_capital_v2"
+                if day_trade_training_annual_episodes
+                else None
+            ),
+            "lookback_role": (
+                "causal_feature_context_only"
+                if day_trade_training_annual_episodes
+                else None
+            ),
+            "sub_lot_backward_only": bool(day_trade_sub_lot_recovery),
+            "validation_test_unchanged": True,
+            "optimizer_steps_per_complete_epoch": 1,
+            "training_loss_comparable_to_continuous_account": not day_trade_training_annual_episodes,
+        }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -6493,6 +6978,8 @@ def _timing_curve_payload(
     train_backtest_runtime_stats: dict[str, float] | None = None,
     loss_runtime_stats: dict[str, float] | None = None,
 ) -> dict[str, float | int]:
+    from stockagent.backtest.futures_cuda_graph import get_futures_cuda_graph_stats
+
     _flush_cuda_timing_events(train_timing)
     if val_timing is not None:
         _flush_cuda_timing_events(val_timing)
@@ -6796,6 +7283,8 @@ def _timing_curve_payload(
         "tw_dual_cuda_graph_fallback_calls": int(
             tw_dual_session_compile_stats.get("cuda_graph_fallback_calls", 0)
         ),
+        **{f"futures_cuda_graph_{key}": value
+           for key, value in get_futures_cuda_graph_stats().items()},
         "bt_runtime_calls": int(backtest_runtime_stats.get("calls", 0.0)),
         "bt_runtime_ms_per_call": _bt_avg_ms("total_s"),
         "bt_runtime_cuda_ms_per_call": _bt_avg_ms("total_cuda_s"),
@@ -6935,6 +7424,19 @@ def _write_fold_complete_marker(
     if not _distributed_should_write():
         return
 
+    required_artifacts = {
+        "metrics": _metrics_path(fold_dir),
+        "backtest": _backtest_path(fold_dir),
+    }
+    if str(source) != "artifact_scope_v2_migration":
+        required_artifacts["model"] = _model_path(fold_dir)
+    missing = [name for name, path in required_artifacts.items() if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "refusing to mark fold complete before required artifacts exist: "
+            + ", ".join(missing)
+        )
+
     def _date_coverage(path: Path) -> dict[str, int | str | None]:
         if not path.exists():
             return {"rows": 0, "date_start": None, "date_end": None}
@@ -6958,7 +7460,9 @@ def _write_fold_complete_marker(
         "val_years": [int(year) for year in fold_result.val_years],
         "test_years": [int(year) for year in fold_result.test_years],
         "metrics_json": _metrics_path(fold_dir).name,
-        "model_path": _model_path(fold_dir).name,
+        "model_path": (
+            _model_path(fold_dir).name if _model_path(fold_dir).is_file() else None
+        ),
         "checkpoint_path": (
             _best_checkpoint_path(fold_dir).name
             if _best_checkpoint_path(fold_dir).exists()
@@ -7123,6 +7627,52 @@ def _trajectory_valid_row_count(split: WindowedSplitTensors) -> int:
     return int(mask.detach().to(device="cpu", dtype=torch.int64).sum().item())
 
 
+def _enrich_crypto_data_error(
+    exc: CryptoPerpetualDataError,
+    *,
+    scope: str,
+    row_offset: int,
+    panel_row_indices=None,
+    symbol_indices=None,
+    execution_runtime: _ExecutionRuntime | None = None,
+    chunk_end: int | None = None,
+    progress_label: str | None = None,
+) -> CryptoPerpetualDataError:
+    """Resolve existing CPU identities only on failure, never in model inputs."""
+    evidence = dict(exc.evidence)
+    evidence.update(scope=scope, chunk_start=int(row_offset))
+    if chunk_end is not None:
+        evidence["chunk_end"] = int(chunk_end)
+    if progress_label is not None:
+        evidence["progress_label"] = progress_label
+    if "row" in evidence:
+        split_row = int(row_offset) + int(evidence["row"])
+        evidence["split_row"] = split_row
+        if panel_row_indices is not None and 0 <= split_row < len(panel_row_indices):
+            panel_row = int(panel_row_indices[split_row])
+            evidence["panel_row"] = panel_row
+            dates = getattr(execution_runtime, "diagnostic_panel_dates", None)
+            if dates is not None and 0 <= panel_row < len(dates):
+                evidence["date"] = str(np.datetime64(dates[panel_row], "D"))
+    if "symbol_index" in evidence:
+        symbol_index = int(evidence["symbol_index"])
+        global_index = symbol_index
+        if symbol_indices is not None:
+            global_index = (
+                int(symbol_indices[symbol_index])
+                if 0 <= symbol_index < len(symbol_indices) else -1
+            )
+        evidence["global_symbol_index"] = global_index
+        symbols = getattr(execution_runtime, "diagnostic_panel_symbols", None)
+        if symbols is not None and 0 <= global_index < len(symbols):
+            evidence["symbol"] = str(symbols[global_index])
+    prefix = (
+        f"train chunk starting at split row {row_offset}: "
+        if scope == "train" else f"evaluation chunk rows=[{row_offset},{chunk_end}): "
+    )
+    return CryptoPerpetualDataError(prefix + exc.message, evidence=evidence)
+
+
 @contextmanager
 def _capture_carry_data_error(errors):
     """Defer only a data error until independent eval ranks can rendezvous."""
@@ -7130,6 +7680,16 @@ def _capture_carry_data_error(errors):
         yield
     except FuturesCarryDataError as exc:
         errors.append(exc.evidence)
+    except CryptoPerpetualDataError as exc:
+        errors.append({"data_error_type": "crypto_perpetual", "message": exc.message,
+                       "evidence": exc.evidence})
+
+
+def _raise_carry_data_error(error):
+    """Restore the product-specific failure after a shared rank rendezvous."""
+    if error.get("data_error_type") == "crypto_perpetual":
+        raise CryptoPerpetualDataError(error["message"], evidence=error.get("evidence"))
+    raise FuturesCarryDataError(error)
 
 
 def _synchronize_carry_data_error(error, device, *, distributed):
@@ -7147,7 +7707,8 @@ def _synchronize_carry_data_error(error, device, *, distributed):
 
 
 @contextmanager
-def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=False):
+def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=False,
+                           execution_runtime=None):
     """Reject the complete trajectory on all ranks before backward/AdamW.
 
     The ledger cannot own a collective: validation can run on one rank only.
@@ -7158,7 +7719,7 @@ def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=
     carrying = (split.execution_mode == "tw_stock_futures_day_trade_0845_minute"
                 and tape is not None and tape.ndim == 4
                 and tape.shape[-1] in CARRY_SUPPORTED_TAPE_FIELDS)
-    if not carrying:
+    if not carrying and split.execution_mode != "crypto_perpetual":
         yield
         return
     from stockagent.backtest.futures_data_validity import FuturesCarryDataError
@@ -7172,10 +7733,19 @@ def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=
         evidence.update(scope='train', split_row=row,
                         panel_row=int(split._valid_indices_cpu[row]))
         error = evidence
+    except CryptoPerpetualDataError as exc:
+        enriched = _enrich_crypto_data_error(
+            exc, scope="train", row_offset=row_offset,
+            panel_row_indices=getattr(split, "_valid_indices_cpu", None),
+            symbol_indices=getattr(split, "symbol_indices", None),
+            execution_runtime=execution_runtime,
+        )
+        error = {"data_error_type": "crypto_perpetual",
+                 "message": enriched.message, "evidence": enriched.evidence}
     error = _synchronize_carry_data_error(error, device, distributed=distributed)
     if error is not None:
         optimizer.zero_grad(set_to_none=True)
-        raise FuturesCarryDataError(error)
+        _raise_carry_data_error(error)
 
 
 def _finalize_trajectory_optimizer_step(
@@ -8535,6 +9105,10 @@ def _create_lr_scheduler(
             factor=float(config.training.lr_scheduler_gamma),
             patience=max(1, int(config.training.lr_scheduler_patience)),
             threshold=float(config.training.lr_scheduler_threshold),
+            # Log-utility losses may be negative: relative thresholds can
+            # incorrectly count a worsening negative loss as an improvement.
+            threshold_mode="abs",
+            min_lr=max(0.0, float(config.training.lr_scheduler_eta_min)),
         )
         return scheduler, "plateau", True, "epoch"
 
@@ -8561,8 +9135,40 @@ def _step_batch_lr_scheduler(
     return time.perf_counter() - start
 
 
+def _validate_futures_margin_audit(result: BacktestResult, rows: int, symbols: int) -> None:
+    if result.futures_margin_audit is None:
+        return
+    from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
+    audit = np.asarray(result.futures_margin_audit)
+    if (result.execution_mode != "tw_stock_context_futures_portfolio"
+            or audit.shape != (rows, len(MARGIN_AUDIT_COLUMNS))
+            or not np.isfinite(audit).all()):
+        raise ValueError("invalid futures margin equity/requirement audit")
+    if result.weights_history.shape[0] == 0:
+        return
+    for name in ("futures_contract_quantities_history", "futures_residual_contract_quantities_history"):
+        value = getattr(result, name)
+        if value is None or np.asarray(value).shape != (rows, symbols) or not np.issubdtype(np.asarray(value).dtype, np.integer):
+            raise ValueError(f"margin artifact requires integer {name} [T,S]")
+    if result.default_reason_history is None or result.settlement_default is None:
+        raise ValueError("margin artifact requires failure reason history")
+    # An unfilled risk-reduction order is a surviving physical position, not
+    # automatic insolvency. Reports must retain it even on solvent rows.
+    unfilled = audit[:, 10]
+    residual = np.abs(np.asarray(result.futures_residual_contract_quantities_history)).sum(axis=1)
+    if np.any((unfilled < 0) | (unfilled != np.floor(unfilled)) | (unfilled > residual)):
+        raise ValueError("unfilled margin liquidation must be backed by retained whole contracts")
+
+
 def _validate_futures_minute_audit(result: BacktestResult, rows: int, symbols: int) -> None:
-    if result.execution_mode != "tw_stock_futures_day_trade_0845_minute":
+    stock_context_minute = (
+        result.execution_mode == "tw_stock_context_futures_portfolio"
+        and any(value is not None and np.asarray(value).ndim == 3 for value in (
+            result.futures_contract_quantities_history,
+            result.futures_residual_contract_quantities_history,
+        ))
+    )
+    if result.execution_mode != "tw_stock_futures_day_trade_0845_minute" and not stock_context_minute:
         return
     if result.weights_history.shape[0] == 0:
         return
@@ -8676,6 +9282,7 @@ def _save_backtest_artifact(
         )
     symbol_count = int(weights_history.shape[1])
     _validate_futures_minute_audit(result, rows, symbol_count)
+    _validate_futures_margin_audit(result, rows, symbol_count)
     mode = normalize_execution_mode(result.execution_mode)
     short_sale_collateral_history = result.short_sale_collateral_history
     short_margin_collateral_history = result.short_margin_collateral_history
@@ -9114,6 +9721,7 @@ def _save_backtest_artifact(
     has_equity_scale_contract = (
         ledger_unit == "nav_ratio"
         or ledger_unit == "contract_quantity"
+        or (mode == "crypto_perpetual" and result.equity_scale_history is not None)
         or mode == "tw_index_futures_day"
         or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
@@ -9390,6 +9998,10 @@ def _save_backtest_artifact(
     add_optional("final_futures_carry_state", result.final_futures_carry_state)
     add_optional("futures_carry_state_history", result.futures_carry_state_history)
     add_optional("default_reason_history", result.default_reason_history)
+    add_optional("futures_margin_audit", result.futures_margin_audit)
+    if result.futures_margin_audit is not None:
+        from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
+        payload["futures_margin_audit_columns"] = np.asarray(MARGIN_AUDIT_COLUMNS)
     add_optional("open_weights_history", result.open_weights_history)
     add_optional("close_weights_history", result.close_weights_history)
     add_optional("event_turnovers", result.event_turnovers)
@@ -9568,10 +10180,38 @@ def _realized_leverage_backtest(
     )
 
 
-def _benchmark_plot_label(config: object) -> str:
+def _benchmark_reporting_details(config: object) -> dict[str, str]:
+    """Describe the execution adapter's comparator independently of stock inputs."""
+    trading = getattr(config, "trading", None)
+    mode = str(getattr(trading, "execution_mode", "")).strip().lower()
+    if mode == "tw_stock_context_futures_portfolio":
+        if getattr(trading, "tw_futures_portfolio_benchmark_mode", "legacy_front_holding_return") == "tx_front_rolling_1x_gross":
+            return {
+                "benchmark_name": "TX front-month rolling buy-and-hold, 1x gross",
+                "benchmark_cost_treatment": "gross_no_fees_or_tax",
+                "benchmark_exposure": "continuous_1x_long_not_integer_account",
+                "benchmark_return_clock": "same_contract_close_to_close_roll_at_prior_close",
+            }
+        if (getattr(trading, "tw_futures_portfolio_holding_policy", "carry") == "intraday"
+                or getattr(trading, "tw_futures_portfolio_capital_basis", "notional") == "initial_margin"):
+            return {
+                "benchmark_name": "TWD cash, 0% interest",
+                "benchmark_cost_treatment": "no_positions_no_trading_costs",
+            }
+        return {
+            "benchmark_name": "TX front-month, 1x gross, no fees/tax",
+            "benchmark_cost_treatment": "gross_no_fees_or_tax",
+            "benchmark_exposure": "continuous_1x_long_not_integer_account",
+            "benchmark_return_clock": "same_contract_open_to_next_open_or_own_terminal_mark",
+        }
     benchmark_name = str(
         getattr(getattr(config, "data", None), "benchmark_name", "")
     ).strip()
+    return {"benchmark_name": benchmark_name}
+
+
+def _benchmark_plot_label(config: object) -> str:
+    benchmark_name = _benchmark_reporting_details(config)["benchmark_name"]
     return f"Benchmark ({benchmark_name})" if benchmark_name else "Benchmark"
 
 
@@ -9662,13 +10302,21 @@ def _save_best_val_backtest_snapshot(
         num_symbols = int(val_backtest.weights_history.size(1)) if val_backtest.weights_history.dim() == 2 else 0
         weights_history = np.empty((0, num_symbols), dtype=np.float32)
 
-    def sliced_optional_float32(value: torch.Tensor | None) -> np.ndarray | None:
+    equity_scale_dtype = (
+        torch.float64
+        if normalize_execution_mode(val_backtest.execution_mode) == "crypto_perpetual"
+        else torch.float32
+    )
+
+    def sliced_optional_float32(
+        value: torch.Tensor | None, *, dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray | None:
         if value is None:
             return None
         if value.dim() == 0 or int(value.size(0)) < row_end:
             raise ValueError("best-val settlement history is shorter than its core returns")
         return value[row_start:row_end].detach().to(
-            device="cpu", dtype=torch.float32
+            device="cpu", dtype=dtype
         ).numpy()
 
     def sliced_optional_bool(value: torch.Tensor | None) -> np.ndarray | None:
@@ -9682,10 +10330,12 @@ def _save_best_val_backtest_snapshot(
 
     preserves_terminal_state = row_end == int(val_backtest.strategy_returns.size(0))
 
-    def terminal_optional_float32(value: torch.Tensor | None) -> np.ndarray | None:
+    def terminal_optional_float32(
+        value: torch.Tensor | None, *, dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray | None:
         if value is None or not preserves_terminal_state:
             return None
-        return value.detach().to(device="cpu", dtype=torch.float32).numpy()
+        return value.detach().to(device="cpu", dtype=dtype).numpy()
 
     def terminal_optional_bool(value: torch.Tensor | None) -> np.ndarray | None:
         if value is None or not preserves_terminal_state:
@@ -9716,6 +10366,7 @@ def _save_best_val_backtest_snapshot(
         futures_residual_contract_quantities_history=(None if val_backtest.futures_residual_contract_quantities_history is None else val_backtest.futures_residual_contract_quantities_history[row_start:row_end].detach().cpu().numpy().copy()),
         futures_carry_state_history=(None if val_backtest.futures_carry_state_history is None else val_backtest.futures_carry_state_history[row_start:row_end].detach().cpu().numpy().copy()),
         default_reason_history=(None if val_backtest.default_reason_history is None else val_backtest.default_reason_history[row_start:row_end].detach().cpu().numpy().copy()),
+        futures_margin_audit=(None if val_backtest.futures_margin_audit is None else val_backtest.futures_margin_audit[row_start:row_end].detach().cpu().numpy().copy()),
         final_futures_carry_state=(None if val_backtest.futures_carry_state_history is None else val_backtest.futures_carry_state_history[row_end-1].detach().cpu().numpy().copy()),
         executed_buy_weights=sliced_optional_float32(
             val_backtest.executed_buy_weights
@@ -9757,7 +10408,7 @@ def _save_best_val_backtest_snapshot(
         ),
         settlement_default=sliced_optional_bool(val_backtest.settlement_default),
         equity_scale_history=sliced_optional_float32(
-            val_backtest.equity_scale_history
+            val_backtest.equity_scale_history, dtype=equity_scale_dtype,
         ),
         short_sale_collateral_history=sliced_optional_float32(
             val_backtest.short_sale_collateral_history
@@ -9793,7 +10444,7 @@ def _save_best_val_backtest_snapshot(
         ),
         final_alive=terminal_optional_bool(val_backtest.final_alive),
         final_equity_scale=terminal_optional_float32(
-            val_backtest.final_equity_scale
+            val_backtest.final_equity_scale, dtype=equity_scale_dtype,
         ),
         final_short_sale_collateral=terminal_optional_float32(
             val_backtest.final_short_sale_collateral
@@ -10026,6 +10677,44 @@ def _save_tw_index_futures_benchmark_audit(
     )
 
 
+def _save_stock_context_tx_rolling_benchmark_audit(
+    output_path: Path,
+    *,
+    dates: np.ndarray,
+    benchmark_returns: np.ndarray,
+    config: ExperimentConfig,
+) -> None:
+    """Prove that the reported comparator matches the verified TX roll path."""
+
+    from stockagent.data.tw_futures_benchmark import (
+        load_tx_front_rolling_benchmark, resolve_tx_benchmark_path,
+    )
+
+    payload = load_tx_front_rolling_benchmark(
+        resolve_tx_benchmark_path(config.trading),
+        np.asarray(dates, dtype="datetime64[D]"),
+    )
+    if not bool(payload["source_covered"].all()):
+        raise ValueError("reported TX benchmark includes dates before verified TX inception")
+    expected = np.asarray(payload["benchmark_log_returns"], dtype=np.float64)
+    reported = np.asarray(benchmark_returns, dtype=np.float64)
+    if expected.shape != reported.shape or not np.allclose(expected, reported, rtol=1e-6, atol=1e-8):
+        raise ValueError("reported TX benchmark differs from verified front-month roll path")
+    np.savez_compressed(
+        output_path,
+        artifact_schema_version=np.asarray(1, dtype=np.int64),
+        benchmark_name=np.asarray("TX front-month rolling buy-and-hold", dtype="U64"),
+        benchmark_contract=np.asarray(
+            "1x_long_front_month_gross_roll_at_preceding_close_v1", dtype="U96"
+        ),
+        roll_gap_treatment=np.asarray("same_contract_close_to_close", dtype="U64"),
+        cost_treatment=np.asarray("gross_no_fees_or_tax", dtype="U32"),
+        reference_product=np.asarray("TX", dtype="U8"),
+        **payload,
+        benchmark_simple_returns=np.expm1(expected),
+    )
+
+
 def _save_fold_output_artifacts(
     *,
     fold_dir: Path,
@@ -10236,6 +10925,18 @@ def _save_fold_output_artifacts(
     if requested_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         benchmark_audit_start = time.perf_counter()
         _save_tw_index_futures_benchmark_audit(
+            fold_dir / "futures_benchmark_audit.npz",
+            dates=test_dates,
+            benchmark_returns=test_backtest.benchmark_returns,
+            config=config,
+        )
+        save_timing["futures_benchmark_audit_s"] = float(
+            time.perf_counter() - benchmark_audit_start
+        )
+    elif (requested_mode == "tw_stock_context_futures_portfolio"
+          and config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"):
+        benchmark_audit_start = time.perf_counter()
+        _save_stock_context_tx_rolling_benchmark_audit(
             fold_dir / "futures_benchmark_audit.npz",
             dates=test_dates,
             benchmark_returns=test_backtest.benchmark_returns,
@@ -11110,7 +11811,15 @@ def _reporting_weight_table_payload(
             for tenor in range(TAIFEX_INDEX_FUTURES_TENOR_SLOTS)
         ]
         return action_symbols, actions
-    return symbols, np.asarray(result.weights_history)
+    if str(result.settlement_ledger_unit).strip().lower() != "contract_quantity":
+        return symbols, np.asarray(result.weights_history)
+    weights, label = reporting_weight_history(result)
+    if label != "Weight":
+        if weights.shape[1] != len(symbols):
+            raise ValueError("requested allocation width differs from reporting symbols")
+        prefix = label.lower().replace(" ", "_")
+        return [f"{prefix}:{symbol}" for symbol in symbols], weights
+    return symbols, weights
 
 
 def _maybe_save_daily_weights_table(
@@ -11517,6 +12226,7 @@ def _load_backtest_artifact(
             final_futures_carry_state=optional("final_futures_carry_state", None),
             futures_carry_state_history=optional("futures_carry_state_history", None),
             default_reason_history=optional("default_reason_history", None),
+            futures_margin_audit=optional("futures_margin_audit", None),
             open_weights_history=optional("open_weights_history"),
             close_weights_history=optional("close_weights_history"),
             event_turnovers=optional("event_turnovers"),
@@ -11597,6 +12307,7 @@ def _load_backtest_artifact(
                 f"backtest artifact {name} must have shape ({rows},)"
             )
     _validate_futures_minute_audit(result, rows, result.weights_history.shape[1] if result.weights_history.ndim == 2 else 0)
+    _validate_futures_margin_audit(result, rows, result.weights_history.shape[1] if result.weights_history.ndim == 2 else 0)
     if result.weights_history.ndim != 2 or int(result.weights_history.shape[0]) not in {
         0,
         rows,
@@ -12127,6 +12838,7 @@ def _load_backtest_artifact(
     has_equity_scale_contract = (
         ledger_unit == "nav_ratio"
         or ledger_unit == "contract_quantity"
+        or (execution_mode == "crypto_perpetual" and result.equity_scale_history is not None)
         or execution_mode == "tw_index_futures_day"
         or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
@@ -12596,6 +13308,91 @@ def _split_valid_indices(
     return valid_indices
 
 
+def _validate_annual_day_trade_training_boundaries(
+    panel: PanelData,
+    folds: Sequence[WalkForwardFold],
+    config: ExperimentConfig,
+) -> dict[str, Any] | None:
+    """Prove that lookback is context and never shifts an annual account.
+
+    The annual objective claims one fresh-capital account for every complete
+    target calendar year. Its authoritative rows are therefore the fold's
+    owned training sessions, while the rolling window may read older panel
+    rows. Comparing the two index sets catches both a delayed first decision
+    and an accidental spill into the following year before optimizer state is
+    created.
+    """
+
+    if not bool(config.training.day_trade_training_annual_episodes):
+        return None
+    if normalize_execution_mode(config.trading.execution_mode) != "tw_day_trade":
+        raise ValueError("annual day-trade boundary validation requires tw_day_trade")
+
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    panel_years = panel_dates.astype("datetime64[Y]").astype(np.int64) + 1970
+    groups: list[dict[str, Any]] = []
+    seen: set[tuple[int, ...]] = set()
+    for fold in folds:
+        train_years = tuple(int(year) for year in fold.train_years)
+        if train_years in seen:
+            continue
+        seen.add(train_years)
+        owned = np.sort(np.asarray(fold.train_indices, dtype=np.int64))
+        decisions = _split_valid_indices(
+            panel,
+            owned,
+            int(config.training.lookback),
+            config.trading.execution_mode,
+            config.walk_forward.lookback_context,
+        )
+        year_reports: list[dict[str, Any]] = []
+        for year in train_years:
+            expected = owned[panel_years[owned] == year]
+            actual = decisions[panel_years[decisions] == year]
+            if expected.size == 0:
+                raise ValueError(f"annual training year {year} owns no panel sessions")
+            if not np.array_equal(actual, expected):
+                actual_start = "none" if actual.size == 0 else str(panel_dates[actual[0]])
+                actual_end = "none" if actual.size == 0 else str(panel_dates[actual[-1]])
+                raise ValueError(
+                    "annual training episode must cover every owned session from "
+                    "the calendar year's first trading day through its last: "
+                    f"year={year} expected={panel_dates[expected[0]]}.."
+                    f"{panel_dates[expected[-1]]} ({expected.size} rows), "
+                    f"actual={actual_start}..{actual_end} ({actual.size} rows). "
+                    "Use causal rows before the first target year as panel_history "
+                    "lookback context, or extend the validated panel; do not shift "
+                    "the account by lookback rows."
+                )
+            year_reports.append(
+                {
+                    "year": int(year),
+                    "first_session": str(panel_dates[actual[0]]),
+                    "last_session": str(panel_dates[actual[-1]]),
+                    "sessions": int(actual.size),
+                }
+            )
+        groups.append(
+            {
+                "fold_ids": [
+                    int(candidate.fold_id)
+                    for candidate in folds
+                    if tuple(int(year) for year in candidate.train_years) == train_years
+                ],
+                "train_years": list(train_years),
+                "years": year_reports,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "contract": "calendar_year_first_session_fresh_capital_v2",
+        "lookback": int(config.training.lookback),
+        "lookback_context": str(config.walk_forward.lookback_context),
+        "lookback_role": "causal_feature_context_only",
+        "groups": groups,
+    }
+
+
 def _next_fold_by_id(folds: Iterable[WalkForwardFold]) -> dict[int, WalkForwardFold | None]:
     """Return the next strictly later test-window owner for each fold.
 
@@ -12849,6 +13646,7 @@ def _prefix_backtest_result(
         futures_residual_contract_quantities_history=(None if result.futures_residual_contract_quantities_history is None else np.asarray(result.futures_residual_contract_quantities_history[:rows]).copy()),
         futures_carry_state_history=(None if result.futures_carry_state_history is None else np.asarray(result.futures_carry_state_history[:rows]).copy()),
         default_reason_history=(None if result.default_reason_history is None else np.asarray(result.default_reason_history[:rows]).copy()),
+        futures_margin_audit=(None if result.futures_margin_audit is None else np.asarray(result.futures_margin_audit[:rows]).copy()),
         final_futures_carry_state=(None if result.futures_carry_state_history is None else np.asarray(result.futures_carry_state_history[rows-1]).copy()),
         benchmark_returns=np.asarray(result.benchmark_returns[:rows]).copy(),
         turnovers=np.asarray(result.turnovers[:rows]).copy(),
@@ -13059,6 +13857,26 @@ def _physical_carry_artifact_context(
     )
 
 
+@contextmanager
+def _physical_carry_cpu_replay_threads():
+    """Bound intra-op dispatch for the serial, CPU-only artifact oracle.
+
+    These two replay callers run outside training and do not launch concurrent
+    model work in this process. A large training thread pool makes their many
+    small FIFO operations slower. Restore it even when source validation fails;
+    other DDP processes and subsequent GPU work retain their original settings.
+    """
+    previous = torch.get_num_threads()
+    if previous != 1:
+        torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        if previous != 1:
+            torch.set_num_threads(previous)
+
+
+@_physical_carry_cpu_replay_threads()
 def _replay_physical_carry_split_prefix(
     result: BacktestResult,
     split: WindowedSplitTensors,
@@ -13166,6 +13984,7 @@ def _replay_physical_carry_split_prefix(
     return replay.to_numpy()
 
 
+@_physical_carry_cpu_replay_threads()
 def _replay_physical_carry_panel_segment(
     requests: np.ndarray,
     panel_rows: np.ndarray,
@@ -14935,11 +15754,16 @@ def _run_eval_backtest_from_weight_buffers(
             raise ValueError("physical evaluation requires its exact owned rows without implicit account resets")
     elif physical_previous is not None:
         raise ValueError("physical eval state requires its prepared source")
-    integer_stock_context_execution = bool(
+    stock_context_minute_execution = bool(
+        execution_mode == "tw_stock_context_futures_portfolio"
+        and overnight_log_returns_all is not None
+        and overnight_log_returns_all.dim() == 4
+    )
+    integer_stock_context_execution = stock_context_minute_execution or bool(
         execution_mode == "tw_stock_context_futures_portfolio"
         and overnight_log_returns_all is not None
         and overnight_log_returns_all.dim() == 3
-        and int(overnight_log_returns_all.size(-1)) == 11
+        and int(overnight_log_returns_all.size(-1)) in {11, *MARGIN_EXECUTION_WIDTHS}
     )
     num_symbols = int(
         future_log_returns_all.size(-1)
@@ -14986,6 +15810,10 @@ def _run_eval_backtest_from_weight_buffers(
     receivables_history_out: torch.Tensor | None = None
     settlement_default_out: torch.Tensor | None = None
     default_reason_history_out: torch.Tensor | None = None
+    margin_audit_out = None
+    if integer_stock_context_execution and int(overnight_log_returns_all.size(-1)) in MARGIN_EXECUTION_WIDTHS:
+        from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
+        margin_audit_out = torch.empty((total_rows, len(MARGIN_AUDIT_COLUMNS)), device=device)
     equity_scale_history_out: torch.Tensor | None = None
     short_sale_collateral_history_out: torch.Tensor | None = None
     short_margin_collateral_history_out: torch.Tensor | None = None
@@ -15002,6 +15830,9 @@ def _run_eval_backtest_from_weight_buffers(
     due_weights_history_out: torch.Tensor | None = None
     futures_quantities_out: torch.Tensor | None = None
     futures_residuals_out: torch.Tensor | None = None
+    if margin_audit_out is not None and return_weights_history:
+        futures_quantities_out = torch.empty((total_rows, num_symbols), device=device, dtype=torch.int64)
+        futures_residuals_out = torch.empty_like(futures_quantities_out)
     futures_carry_states_out: torch.Tensor | None = None
     commission_rebate_accrued_history_out: torch.Tensor | None = None
     commission_rebate_paid_history_out: torch.Tensor | None = None
@@ -15031,6 +15862,7 @@ def _run_eval_backtest_from_weight_buffers(
                        if physical_source is not None else None)
     equity_scaled_execution = bool(
         execution_mode in TW_STOCK_EXECUTION_MODES
+        or execution_mode == "crypto_perpetual"
         or execution_mode == "tw_index_futures_day"
         or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
         or integer_stock_context_execution
@@ -15041,9 +15873,10 @@ def _run_eval_backtest_from_weight_buffers(
     )
     if equity_scaled_execution:
         equity_scale_history_out = torch.empty(
-            (total_rows,), device=device, dtype=output_dtype
+            (total_rows,), device=device,
+            dtype=torch.float64 if execution_mode == "crypto_perpetual" else output_dtype,
         )
-    if execution_mode == "tw_stock_futures_day_trade_0845_minute":
+    if execution_mode == "tw_stock_futures_day_trade_0845_minute" or stock_context_minute_execution:
         settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
         default_reason_history_out = torch.empty((total_rows,), device=device, dtype=torch.int64)
         if return_weights_history:
@@ -15519,6 +16352,13 @@ def _run_eval_backtest_from_weight_buffers(
                         source=physical_source, split=physical_split, start=start, end=end,
                         device=device, previous=physical_previous,
                         event_compression=compact_physical_eval))
+                # Binding the physical source decodes, pads, stacks and moves
+                # the minute tape. Attribute that work to preparation, not to
+                # the canonical account kernel (it can dominate CPU wall time).
+                _maybe_sync_cuda(device, profile_timing)
+                prepared_at = time.perf_counter()
+                timing.backtest_prepare_s += prepared_at - backtest_runner_start
+                backtest_runner_start = prepared_at
                 backtest_chunk = backtest_runner(
                     weights_chunk,
                     returns_chunk,
@@ -15537,6 +16377,10 @@ def _run_eval_backtest_from_weight_buffers(
                         1.0
                         if execution_runtime is None
                         else execution_runtime.crypto_proximal_cost_multiplier
+                    ),
+                    crypto_announced_exit_unlimited_volume=(
+                        False if execution_runtime is None
+                        else execution_runtime.crypto_announced_exit_unlimited_volume
                     ),
                     gross_leverage=gross_leverage,
                     min_trade_weight=min_trade_weight,
@@ -15675,6 +16519,12 @@ def _run_eval_backtest_from_weight_buffers(
             if panel_row_indices is not None:
                 evidence['panel_row'] = int(panel_row_indices[split_row])
             raise FuturesCarryDataError(evidence) from exc
+        except CryptoPerpetualDataError as exc:
+            raise _enrich_crypto_data_error(
+                exc, scope="evaluation", row_offset=start, chunk_end=end,
+                panel_row_indices=panel_row_indices, symbol_indices=symbol_indices,
+                execution_runtime=execution_runtime, progress_label=progress_label,
+            ) from exc
         except RuntimeError as exc:
             raise RuntimeError(
                 f"evaluation backtest chunk rows=[{start},{end}) failed: {exc}"
@@ -15862,6 +16712,10 @@ def _run_eval_backtest_from_weight_buffers(
             default_reason_history_out[start:end].copy_(
                 backtest_chunk.default_reason_history[:valid_rows]
             )
+            if margin_audit_out is not None:
+                if backtest_chunk.futures_margin_audit is None:
+                    raise ValueError("margin execution lost its risk audit")
+                margin_audit_out[start:end].copy_(backtest_chunk.futures_margin_audit[:valid_rows])
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
         timing.backtest_s += time.perf_counter() - backtest_start
@@ -15917,6 +16771,7 @@ def _run_eval_backtest_from_weight_buffers(
         receivables_history=receivables_history_out,
         settlement_default=settlement_default_out,
         default_reason_history=default_reason_history_out,
+        futures_margin_audit=margin_audit_out,
         equity_scale_history=equity_scale_history_out,
         final_cash=prev_cash,
         final_payables=prev_payables,
@@ -16432,9 +17287,9 @@ def _split_recurrent_symbol_count(split: WindowedSplitTensors) -> int:
 
     if split.execution_mode == "tw_stock_context_futures_portfolio":
         execution = split.overnight_log_returns
-        if execution is None or execution.dim() != 3:
+        if execution is None or execution.dim() not in {3, 4}:
             raise ValueError(
-                "stock-context futures split requires packed execution [T,1936,4]"
+                "stock-context futures split requires daily or minute execution"
             )
         return int(execution.size(1))
     return int(split.num_symbols)
@@ -17281,6 +18136,7 @@ def _slice_backtest_rows(
         futures_residual_contract_quantities_history=rows(result.futures_residual_contract_quantities_history),
         futures_carry_state_history=rows(result.futures_carry_state_history),
         default_reason_history=rows(result.default_reason_history),
+        futures_margin_audit=rows(result.futures_margin_audit),
         final_futures_carry_state=(None if result.futures_carry_state_history is None else rows(result.futures_carry_state_history)[-1]),
         open_weights_history=rows(result.open_weights_history),
         close_weights_history=rows(result.close_weights_history),
@@ -17836,6 +18692,9 @@ def _replay_taiwan_stitched_deployment(
                 crypto_proximal_cost_multiplier=(
                     config.trading.crypto_proximal_cost_multiplier
                 ),
+                crypto_announced_exit_unlimited_volume=(
+                    config.trading.crypto_announced_exit_unlimited_volume
+                ),
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
@@ -18135,6 +18994,7 @@ def _refresh_walkforward_artifacts(
     all_first_year_baseline_log: list[np.ndarray] = []
     all_first_year_turnovers: list[np.ndarray] = []
     all_first_year_weights: list[np.ndarray] = []
+    first_year_weight_labels: set[str] = set()
     seen_first_test_years: set[int] = set()
     experimental_fold_ids: set[int] = set()
     all_deployment_fold_ids: list[int] = []
@@ -18143,6 +19003,7 @@ def _refresh_walkforward_artifacts(
     all_deployment_baseline_log: list[np.ndarray] = []
     all_deployment_turnovers: list[np.ndarray] = []
     all_deployment_weights: list[np.ndarray] = []
+    deployment_weight_labels: set[str] = set()
     physical_source = (
         panel.day_trade_carry_source
         if panel is not None
@@ -18197,17 +19058,8 @@ def _refresh_walkforward_artifacts(
             all_first_year_strategy_log.append(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).astype(np.float64))
             all_first_year_baseline_log.append(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).astype(np.float64))
             all_first_year_turnovers.append(np.nan_to_num(fold_backtest.turnovers[mask], nan=0.0).astype(np.float64))
-            concentration_weights = fold_backtest.weights_history
-            if (
-                normalize_execution_mode(fold_backtest.execution_mode)
-                in {"tw_index_futures_day", "tw_index_derivatives_day"}
-                and fold_backtest.requested_weights_history is not None
-            ):
-                # Derivative strategies finish each day flat, so their carried
-                # stock-axis weights_history is intentionally all zeros.  The
-                # economically meaningful concentration lives on the direct
-                # futures/options request axis.
-                concentration_weights = fold_backtest.requested_weights_history
+            concentration_weights, weight_label = reporting_weight_history(fold_backtest)
+            first_year_weight_labels.add(weight_label)
             all_first_year_weights.append(
                 np.nan_to_num(
                     np.asarray(concentration_weights)[mask],
@@ -18258,15 +19110,8 @@ def _refresh_walkforward_artifacts(
                         deployment_backtest.turnovers, nan=0.0
                     ).astype(np.float64)
                 )
-                deployment_weights = deployment_backtest.weights_history
-                if (
-                    normalize_execution_mode(deployment_backtest.execution_mode)
-                    in {"tw_index_futures_day", "tw_index_derivatives_day"}
-                    and deployment_backtest.requested_weights_history is not None
-                ):
-                    deployment_weights = (
-                        deployment_backtest.requested_weights_history
-                    )
+                deployment_weights, weight_label = reporting_weight_history(deployment_backtest)
+                deployment_weight_labels.add(weight_label)
                 all_deployment_weights.append(
                     np.nan_to_num(
                         deployment_weights, nan=0.0
@@ -18275,6 +19120,8 @@ def _refresh_walkforward_artifacts(
 
     if not all_dates:
         return
+    if len(first_year_weight_labels) > 1 or len(deployment_weight_labels) > 1:
+        raise ValueError("walk-forward concentration cannot mix allocation units")
 
     if all_first_year_dates:
         benchmark_label = (
@@ -18314,6 +19161,7 @@ def _refresh_walkforward_artifacts(
             output_path / "walkforward_first_year_turnover_concentration.png",
             scope_label="Fold Test First Year (Reset State)",
             experimental_fold_ids=experimental_fold_ids,
+            weight_label=next(iter(first_year_weight_labels), "Weight"),
         )
     if all_deployment_fold_ids:
         benchmark_label = (
@@ -18353,6 +19201,7 @@ def _refresh_walkforward_artifacts(
             output_path
             / "walkforward_stitched_deployment_turnover_concentration.png",
             scope_label="Owned Stitched Deployment Segment",
+            weight_label=next(iter(deployment_weight_labels), "Weight"),
         )
 
 
@@ -19196,6 +20045,7 @@ def _probe_compiled_loss_forward_backward(
                 end=int(batch_size),
                 device=device,
                 previous=None,
+                reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = probed_loss_fn(
@@ -19890,6 +20740,7 @@ def _train_epoch_windowed_tensor(
     settlement_lag_sessions: int = 2,
     execution_runtime: _ExecutionRuntime | None = None,
     optimizer_step_per_trajectory: bool = False,
+    log_return_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     if panel_slab_model is not None:
@@ -20028,7 +20879,11 @@ def _train_epoch_windowed_tensor(
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=start, end=end,
             device=device, previous=physical_previous,
+            reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             prepared_batch=prepared_physical_batch))
+        if log_return_weights is not None:
+            from stockagent.training.exact_policy_step import bind_return_weighted_loss
+            batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, start, end - start)
         if progress_label:
             _progress(f"{progress_label}: batch {step_idx}/{num_batches} gather rows=[{start},{end})")
         _maybe_sync_cuda(device, profile_timing)
@@ -20298,7 +21153,7 @@ def _train_epoch_windowed_tensor(
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 loss_context = profile_range("train.forward.loss") if PROFILE_RANGES_ENABLED else nullcontext()
                 with loss_context, _carry_loss_data_guard(
-                    split, optimizer, device, start
+                    split, optimizer, device, start, execution_runtime=execution_runtime
                 ):
                     loss = batch_loss_fn(
                         weights,
@@ -20761,6 +21616,7 @@ def _train_epoch_windowed_tensor_ddp(
     symbol_sharded_ledger: bool = False,
     replicated_ledger_local_metadata: bool = False,
     optimizer_step_per_trajectory: bool = False,
+    log_return_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -20935,7 +21791,11 @@ def _train_epoch_windowed_tensor_ddp(
             loss_fn, source=physical_source, split=split, start=global_start,
             end=global_start + int(batch_size), device=device,
             previous=physical_previous,
+            reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             prepared_batch=prepared_physical_batch))
+        if log_return_weights is not None:
+            from stockagent.training.exact_policy_step import bind_return_weighted_loss
+            batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, global_start, int(batch_size))
         if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} "
@@ -21145,7 +22005,8 @@ def _train_epoch_windowed_tensor_ddp(
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing), \
-                    _carry_loss_data_guard(split, optimizer, device, global_start, distributed=True):
+                    _carry_loss_data_guard(split, optimizer, device, global_start, distributed=True,
+                                           execution_runtime=execution_runtime):
                 aux_outputs: dict[str, torch.Tensor] | None = None
                 aux_outputs = {
                     "initial_weights": portfolio_prev_weights,
@@ -22932,11 +23793,32 @@ def _run_inference_tree_models(
         )
         results_by_fold[fold.fold_id] = fold_result
 
+        # Pure inference must persist the same pinned physical-source contract
+        # as the formal training finalizer.  The exact FIFO result contains
+        # currency NAV and minute inventory histories; writing it without the
+        # ordered universe, immutable release id, and reset-segment NAV would
+        # either make the artifact unreplayable or (correctly) trip the legacy
+        # writer guard.
+        day_trade_carry_context = _physical_carry_artifact_context(
+            runtime=execution_runtime,
+            symbols=test_symbols,
+            config=config,
+            initial_nav=float(config.trading.volume_participation_equity),
+        )
+
         with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
             json.dump(asdict(fold_result), f, indent=2)
 
+        _test_symbols_path(fold_dir).write_text(
+            json.dumps([str(symbol) for symbol in test_symbols], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
         _save_backtest_artifact(
-            _backtest_path(fold_dir), canonical_test_bt, test_dates
+            _backtest_path(fold_dir),
+            canonical_test_bt,
+            test_dates,
+            day_trade_carry_context=day_trade_carry_context,
         )
         if (
             execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
@@ -22975,6 +23857,7 @@ def _run_inference_tree_models(
             backtest_artifact_compression=str(
                 getattr(config.training, "backtest_artifact_compression", "none")
             ),
+            day_trade_carry_context=day_trade_carry_context,
         )
 
         benchmark_label = _benchmark_plot_label(config)
@@ -23616,93 +24499,37 @@ def _run_inference_neural_models(
         )
         results_by_fold[fold.fold_id] = fold_result
 
-        with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
-            json.dump(asdict(fold_result), f, indent=2)
-
-        _save_backtest_artifact(
-            _backtest_path(fold_dir), canonical_test_bt, test_dates
-        )
-        if (
-            fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
-            and not canonical_tensor_exact
-        ):
-            _save_backtest_artifact(
-                fold_dir / "test_backtest_continuous_surrogate.npz",
-                test_bt,
-                test_dates,
-            )
-        table_output_format = str(getattr(config.training, "table_output_format", "csv"))
-        _save_daily_portfolio_returns_table(
-            fold_dir / "daily_portfolio_returns",
-            test_dates,
-            canonical_test_bt.strategy_returns,
-            canonical_test_bt.benchmark_returns,
-            canonical_test_bt.turnovers,
-            table_output_format=table_output_format,
-        )
-        _maybe_save_daily_weights_table(
-            fold_dir / "daily_weights.csv",
-            test_dates,
-            fold_panel.symbols,
-            canonical_test_bt.weights_history,
-            enabled=bool(config.training.save_daily_weights_table),
-            table_output_format=table_output_format,
-        )
-        report = generate_annual_report(canonical_test_bt, test_dates)
-        with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
-            f.write(report)
-        _save_deployment_test_artifacts(
-            fold_dir,
-            deployment_test_bt,
-            deployment_test_dates,
+        # Match the training finalizer's exact FIFO artifact contract.  Pure
+        # inference starts the test segment from configured capital as well,
+        # so both the full test and its deployment prefix share this context.
+        day_trade_carry_context = _physical_carry_artifact_context(
+            runtime=fold_execution_runtime,
             symbols=test_symbols,
-            backtest_artifact_compression=str(
-                getattr(config.training, "backtest_artifact_compression", "none")
-            ),
+            config=config,
+            initial_nav=float(config.trading.volume_participation_equity),
         )
 
-        benchmark_label = _benchmark_plot_label(config)
-        test_scope_label = "Full-Horizon Fold Test (Reset State)"
-        plot_equity_curve(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "equity_curve.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
+        # Reuse the formal training finalizer so pure inference cannot publish
+        # a completion marker while omitting model, settlement, mode-contract,
+        # timing, source-context, or ordered-symbol artifacts.
+        _save_fold_output_artifacts(
+            fold_dir=fold_dir,
+            fold_result=fold_result,
+            model=model,
+            test_backtest=test_bt,
+            test_dates=test_dates,
+            symbols=test_symbols,
+            config=config,
+            test_future_returns=test_returns,
+            test_integer_backtest=test_integer_bt,
+            holdings_records=holdings_records,
+            deployment_backtest=deployment_test_bt,
+            deployment_dates=deployment_test_dates,
+            print_report=False,
+            write_plots=True,
+            mark_complete=True,
+            day_trade_carry_context=day_trade_carry_context,
         )
-        plot_equity_curve_log(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "equity_curve_log.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
-        )
-        plot_annual_performance(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "annual_performance.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
-        )
-        _write_reporting_leverage_artifacts(
-            canonical_test_bt,
-            test_returns,
-            test_dates,
-            fold_dir,
-            config,
-        )
-        if test_integer_bt is not None:
-            _save_integer_share_audit_artifacts(
-                fold_dir,
-                test_integer_bt,
-                test_dates,
-                fold_panel.symbols,
-                holdings_records,
-                write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
-                write_holdings_table=write_integer_holdings_table,
-                table_output_format=table_output_format,
-            )
-        _write_fold_complete_marker(fold_dir, fold_result, source="neural_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(
@@ -23935,6 +24762,7 @@ def _run_training_impl(
     loss_portfolio_activation = _training_loss_portfolio_activation(config)
     loss_min_trade_weight = _training_loss_min_trade_weight(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
+    risk_loss_kwargs["day_trade_sub_lot_recovery"] = bool(config.training.day_trade_sub_lot_recovery)
     risk_loss_kwargs["min_trade_weight"] = loss_min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
     risk_loss_kwargs["day_trade_execution_initial_capital"] = float(
@@ -24106,6 +24934,9 @@ def _run_training_impl(
             "crypto_proximal_cost_multiplier": (
                 execution_runtime.crypto_proximal_cost_multiplier
             ),
+            "crypto_announced_exit_unlimited_volume": (
+                execution_runtime.crypto_announced_exit_unlimited_volume
+            ),
         }
     )
     deterministic_algorithms = bool(
@@ -24178,6 +25009,12 @@ def _run_training_impl(
         "device_precision_and_compile_runtime_setup",
         device=str(device),
         amp_dtype=str(amp_dtype),
+        torch_threads=int(torch.get_num_threads()),
+        torch_interop_threads=int(torch.get_num_interop_threads()),
+        cpu_affinity=(
+            sorted(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity") else None
+        ),
     )
 
     output_path = Path(output_dir)
@@ -24201,6 +25038,24 @@ def _run_training_impl(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
+    annual_boundary_report = _validate_annual_day_trade_training_boundaries(
+        panel,
+        fold_list,
+        config,
+    )
+    if annual_boundary_report is not None and _distributed_should_write():
+        boundary_path = output_path / "annual_episode_boundaries.json"
+        boundary_path.parent.mkdir(parents=True, exist_ok=True)
+        with boundary_path.open("w", encoding="utf-8") as handle:
+            json.dump(annual_boundary_report, handle, indent=2, sort_keys=True)
+        covered_years = sum(
+            len(group["years"])
+            for group in annual_boundary_report["groups"]
+        )
+        print(
+            "[annual episodes] verified first-session through last-session "
+            f"coverage for {covered_years} calendar-year account(s)"
+        )
     deployment_fold_list = (
         fold_list if deployment_folds is None else list(deployment_folds)
     )
@@ -24388,6 +25243,8 @@ def _run_training_impl(
                     direction_weight=config.training.multitask_loss.direction_weight,
                     volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    day_trade_training_annual_episodes=config.training.day_trade_training_annual_episodes,
+                    day_trade_sub_lot_recovery=config.training.day_trade_sub_lot_recovery,
                 )
         except BaseException as exc:
             loss_contract_error = exc
@@ -24478,6 +25335,10 @@ def _run_training_impl(
             train_years=train_years,
             group_folds=group_folds,
             output_path=output_path,
+        )
+        futures_feature_rms = _fit_group_futures_feature_rms(
+            config=config, panel=panel, train_ds=train_ds,
+            train_years=train_years, group_folds=group_folds, output_path=output_path,
         )
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
@@ -24867,6 +25728,9 @@ def _run_training_impl(
                 f"{pretrained_initialization_report['trainable_parameters']}/"
                 f"{pretrained_initialization_report['total_parameters']}"
             )
+        # A pretrained source may contain another fold's normalizer buffers.
+        # The current training decisions own this scale before any validation.
+        _apply_futures_feature_rms_to_model(model, futures_feature_rms)
         batch_coupled_modules = _batch_coupled_training_module_names(model)
         if _model_supports_panel_slab_forward(model):
             filtered_train_rows = len(train_windowed)
@@ -24931,6 +25795,7 @@ def _run_training_impl(
                         model,
                         causal_feature_rms,
                     )
+                    _apply_futures_feature_rms_to_model(model, futures_feature_rms)
                     print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
@@ -25022,6 +25887,7 @@ def _run_training_impl(
         resume_no_improve_epochs = 0
         resume_no_improve_source: str | None = None
         resume_rng_state: Mapping[str, Any] | None = None
+        resumed_model_state = False
         resume_checkpoint_path = group_checkpoint_path
         if (
             resume
@@ -25057,11 +25923,8 @@ def _run_training_impl(
                     checkpoint_path=resume_checkpoint_path,
                 )
                 if list(checkpoint.get("train_years", [])) == train_years:
-                    _load_state_dict(model, checkpoint["model_state_dict"])
-                    _apply_causal_feature_rms_to_model(
-                        model,
-                        causal_feature_rms,
-                    )
+                    _restore_resume_model_state(model, checkpoint)
+                    resumed_model_state = True
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                     scaler_state = checkpoint.get("scaler_state_dict")
                     if scaler_state:
@@ -25086,6 +25949,18 @@ def _run_training_impl(
                     )
 
         will_train_epochs = start_epoch <= config.training.epochs
+        effective_rms_report = _effective_causal_feature_rms_report(
+            model, causal_feature_rms
+        )
+        if effective_rms_report is not None and _distributed_should_write():
+            effective_rms_report["start_epoch"] = int(start_epoch)
+            effective_rms_report["resumed"] = resumed_model_state
+            effective_rms_path = (
+                _group_dir(output_path, train_years)
+                / "effective_causal_feature_rms_normalization.json"
+            )
+            with effective_rms_path.open("w", encoding="utf-8") as handle:
+                json.dump(effective_rms_report, handle, indent=2, sort_keys=True)
         if not will_train_epochs:
             print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
 
@@ -25128,6 +26003,17 @@ def _run_training_impl(
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
             if not record_epoch_curve:
                 return 0.0
+            if profile_timing:
+                elapsed = torch.tensor(
+                    [float(payload.get("epoch_total_s", 0.0)),
+                     float(payload.get("train_total_s", 0.0))],
+                    dtype=torch.float64, device=device,
+                )
+                if _distributed_is_initialized():
+                    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+                max_epoch, max_train = elapsed.cpu().tolist()
+                payload["epoch_max_rank_s"] = max_epoch
+                payload["train_max_rank_s"] = max_train
             start_t = time.perf_counter()
             curve_error: BaseException | None = None
             try:
@@ -25357,6 +26243,7 @@ def _run_training_impl(
         # Recovery is a backward-only training mechanism. Validation/test have
         # gradients disabled and always report the exact absorbing account.
         eval_risk_loss_kwargs["futures_portfolio_recoverable_backward"] = False
+        eval_risk_loss_kwargs["day_trade_sub_lot_recovery"] = False
         eval_risk_loss_kwargs["futures_minute_saturation_recovery"] = False
         eval_risk_loss_kwargs["futures_minute_recovery_objective"] = "residual_notional"
         if factor_aug_kwargs:
@@ -26782,14 +27669,18 @@ def _run_training_impl(
                 epoch_zero_error,
             )
 
-        def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
+        def _run_one_train_epoch(train_model: nn.Module, *, log_return_weights=None) -> tuple[torch.Tensor, TimingBreakdown]:
+            # The risk VJP traverses the same account and DDP batches with a
+            # zero-step stateless optimizer. It never updates Adam or its clock.
+            active_optimizer = optimizer if log_return_weights is None else torch.optim.SGD(model.parameters(), lr=0.)
+            active_scheduler = scheduler if log_return_weights is None else None
             if train_windowed is not None:
                 if ddp_enabled:
                     return _train_epoch_windowed_tensor_ddp(
                         train_model,
                         compiled_loss_fn,
                         train_windowed,
-                        optimizer,
+                        active_optimizer,
                         scaler,
                         batch_size=train_batch_size,
                         device=device,
@@ -26825,7 +27716,7 @@ def _run_training_impl(
                         concentration_weight=config.training.multitask_loss.concentration_weight,
                         regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                         regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
-                        lr_scheduler=scheduler,
+                        lr_scheduler=active_scheduler,
                         lr_scheduler_interval=scheduler_step_interval,
                         profile_timing=profile_timing,
                         debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
@@ -26841,13 +27732,17 @@ def _run_training_impl(
                             config.training.distributed_replicated_ledger_local_metadata
                         ),
                         optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+                        log_return_weights=log_return_weights,
+                        progress_label=(
+                            f"[Train {train_years}]" if profile_timing else None
+                        ),
                     )
                 return _train_epoch_windowed_tensor(
                     train_model,
                     panel_slab_model,
                     compiled_loss_fn,
                     train_windowed,
-                    optimizer,
+                    active_optimizer,
                     scaler,
                     batch_size=train_batch_size,
                     device=device,
@@ -26884,7 +27779,7 @@ def _run_training_impl(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
-                    lr_scheduler=scheduler,
+                    lr_scheduler=active_scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                     debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
@@ -26893,6 +27788,7 @@ def _run_training_impl(
                     settlement_lag_sessions=execution_runtime.settlement_lag_sessions,
                     execution_runtime=execution_runtime,
                     optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+                    log_return_weights=log_return_weights,
                 )
 
         def _save_best_val_complete_fold_artifacts(
@@ -27190,6 +28086,63 @@ def _run_training_impl(
         deferred_val_loss_tensors: torch.Tensor | None = None
         deferred_test_loss_tensors: torch.Tensor | None = None
         train_loss_t: torch.Tensor | None = None
+        policy_step_baseline = None
+
+        def _evaluate_training_policy_step():
+            from stockagent.training.exact_policy_step import PolicyEvaluation, maximum_drawdown_span
+            measured = None
+            error = None
+            if _distributed_is_rank0():
+                try:
+                    with torch.inference_mode():
+                        bt, _, metrics = _evaluate_windowed_tensor_batch(
+                            eval_model, eval_panel_slab_model, train_windowed,
+                            device, amp_dtype, non_blocking,
+                            config.trading.long_only, config.trading.buy_fee_rate,
+                            config.trading.sell_fee_rate, config.trading.max_turnover_ratio, 1.0,
+                            min_trade_weight=config.trading.min_trade_weight,
+                            chunk_rows=eval_chunk_rows,
+                            backtest_chunk_rows=eval_backtest_chunk_rows,
+                            portfolio_activation=config.trading.portfolio_activation,
+                            compute_ic=False, compute_metrics_summary=True,
+                            return_weights_history=False,
+                            max_volume_participation=config.trading.max_volume_participation,
+                            volume_participation_equity=config.trading.volume_participation_equity,
+                            execution_runtime=execution_runtime,
+                        )
+                    if bt.settlement_default is None:
+                        raise RuntimeError("exact policy step requires authoritative default history")
+                    defaulted = bool(bt.settlement_default.any().item())
+                    span = maximum_drawdown_span(bt.strategy_returns) if not defaulted else (0, 0)
+                    benchmark_span = maximum_drawdown_span(bt.benchmark_returns)
+                    benchmark_drawdown = float(torch.expm1(
+                        bt.benchmark_returns.double()[benchmark_span[0]:benchmark_span[1]].sum()).item())
+                    measured = PolicyEvaluation(
+                        loss=float(-bt.strategy_returns.double().mean().item()
+                                   * config.evaluation.eval_log_utility_periods_per_year
+                                   * config.evaluation.gamma_sharpe),
+                        max_drawdown=float(metrics["max_drawdown"]),
+                        defaulted=defaulted, drawdown_start=span[0], drawdown_end=span[1],
+                        benchmark_max_drawdown=benchmark_drawdown,
+                    )
+                except BaseException as exc:
+                    error = exc
+            _raise_if_distributed_phase_failed("exact_training_policy_step", error)
+            if ddp_enabled:
+                payload = [measured]
+                dist.broadcast_object_list(payload, src=0)
+                measured = payload[0]
+            if measured is None:
+                raise RuntimeError("missing exact training policy evaluation")
+            return measured
+
+        def _training_drawdown_gradient(baseline):
+            row_weights = torch.zeros(len(train_windowed), device=device, dtype=torch.float32)
+            row_weights[baseline.drawdown_start:baseline.drawdown_end] = 1.
+            _run_one_train_epoch(compiled_train_model, log_return_weights=row_weights)
+            return [torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
+                    for p in model.parameters() if p.requires_grad]
+
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             epoch_compile_before = _dynamo_compile_counter_snapshot()
@@ -27212,9 +28165,48 @@ def _run_training_impl(
             get_backtest_prep_compile_stats(reset=True)
             get_backtest_runtime_stats(reset=True)
             get_loss_runtime_stats(reset=True)
+            policy_step = None
+            policy_step_payload = {}
+            policy_step_started = time.perf_counter()
+            if config.training.futures_training_max_drawdown is not None:
+                from stockagent.training.exact_policy_step import ExactPolicyStep, resolve_training_drawdown_budget
+                if policy_step_baseline is None:
+                    policy_step_baseline = _evaluate_training_policy_step()
+                policy_step = ExactPolicyStep(
+                    model, optimizer, scheduler, policy_step_baseline,
+                    resolve_training_drawdown_budget(config.training.futures_training_max_drawdown, policy_step_baseline),
+                )
+            policy_step_prepare_s = time.perf_counter() - policy_step_started
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
             train_bt_runtime_after = get_backtest_runtime_stats()
             train_loss_runtime_after = get_loss_runtime_stats()
+            if policy_step is not None:
+                policy_step_started = time.perf_counter()
+                before_loss = policy_step_baseline.loss
+                policy_step_baseline, decision = policy_step.resolve(
+                    _evaluate_training_policy_step,
+                    _training_drawdown_gradient if config.training.futures_training_risk_tangent else None,
+                    risk_interior=config.training.futures_training_risk_interior,
+                )
+                if not decision["accepted"]:
+                    train_timing.optimizer_steps = 0
+                policy_step_payload = {
+                    "train_policy_loss_before": before_loss,
+                    "train_policy_loss_after": policy_step_baseline.loss,
+                    "train_policy_max_drawdown": policy_step_baseline.max_drawdown,
+                    "train_policy_drawdown_budget": policy_step.budget,
+                    "train_benchmark_max_drawdown": policy_step_baseline.benchmark_max_drawdown,
+                    "train_policy_update_accepted": decision["accepted"],
+                    "train_policy_step_fraction": decision["fraction"],
+                    "train_policy_direction": decision["direction"],
+                    "train_policy_candidate_evaluations": len(decision["trials"]),
+                    "train_policy_step_s": policy_step_prepare_s + time.perf_counter() - policy_step_started,
+                }
+                if _distributed_should_write():
+                    receipt = {"epoch": int(epoch), **policy_step_payload, "trials": decision["trials"]}
+                    with (_group_dir(output_path, train_years) / "policy_step_trials.jsonl").open("a") as handle:
+                        handle.write(json.dumps(receipt, allow_nan=False) + "\n")
+                del policy_step
 
             should_validate = (
                 epoch == start_epoch
@@ -27301,6 +28293,11 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **_max_rank_epoch_timing(
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            train_total_s=train_timing.total_s,
+                            device=device,
+                        ),
                         "train_loss": float(train_loss),
                         "val_mean": None,
                         "test_mean": test_mean_best_by_val,
@@ -27310,6 +28307,10 @@ def _run_training_impl(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "best_val_loss": min((c.best_val_loss for c in fold_contexts.values()
+                                              if math.isfinite(c.best_val_loss)), default=None),
+                        "improved": None,
+                        **policy_step_payload,
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -27676,14 +28677,15 @@ def _run_training_impl(
                         test_loss_total = time.perf_counter() - test_loss_start
                     curve_test_total = time.perf_counter() - curve_test_start
 
-            if config.trading.tw_stock_futures_day_trade_residual_policy == 'carry':
+            if (config.trading.tw_stock_futures_day_trade_residual_policy == 'carry'
+                    or execution_runtime.mode == "crypto_perpetual"):
                 carry_eval_error = _synchronize_carry_data_error(
                     carry_eval_errors[0] if carry_eval_errors else None, device,
                     distributed=parallel_ddp_epoch_eval)
                 if carry_eval_error is not None:
-                    raise FuturesCarryDataError(carry_eval_error)
+                    _raise_carry_data_error(carry_eval_error)
             elif carry_eval_errors:
-                raise FuturesCarryDataError(carry_eval_errors[0])
+                _raise_carry_data_error(carry_eval_errors[0])
 
             parallel_eval_overlap_s = 0.0
             if parallel_ddp_epoch_eval:
@@ -27948,6 +28950,11 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **_max_rank_epoch_timing(
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            train_total_s=train_timing.total_s,
+                            device=device,
+                        ),
                         "train_loss": float(train_loss),
                         "val_mean": val_mean_loss,
                         "test_mean": test_mean_best_by_val,
@@ -27957,6 +28964,10 @@ def _run_training_impl(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "best_val_loss": min((c.best_val_loss for c in fold_contexts.values()
+                                              if math.isfinite(c.best_val_loss)), default=None),
+                        "improved": bool(any_fold_improved),
+                        **policy_step_payload,
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -28033,6 +29044,19 @@ def _run_training_impl(
                         f"{no_improve_epochs} validation check(s) "
                         f"(patience={early_stop_patience})"
                     )
+                    break
+                if (config.training.futures_training_stop_on_rejected_step
+                        and config.training.futures_training_risk_tangent
+                        and policy_step_payload and not policy_step_payload["train_policy_update_accepted"]):
+                    # Optional historical stop. With it disabled, rejection
+                    # still restores model/Adam/scheduler; validation patience
+                    # and the epoch cap alone govern normal completion.
+                    print(f"[Train {train_years}] optimizer stop at epoch {epoch}: "
+                          "Adam and risk-tangent directions exhausted exact feasible step search")
+                    if _distributed_should_write():
+                        (_group_dir(output_path, train_years) / "optimizer_stop.json").write_text(
+                            json.dumps({"epoch": int(epoch), "reason": "no_feasible_policy_step",
+                                        "training_only": True, **policy_step_payload}, allow_nan=False, indent=2))
                     break
 
         _distributed_barrier()

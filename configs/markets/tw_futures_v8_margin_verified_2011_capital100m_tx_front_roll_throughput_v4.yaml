@@ -1,0 +1,19 @@
+# Fold-14 measured on dual RTX 5090; see the throughput report for evidence.
+# Batch 128 changes truncated-BPTT boundaries: use this fresh artifact root.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_gradient_v3.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-throughput-v4
+
+training:
+  batch_size_train: 128
+  batch_size_eval: 16
+  eval_model_chunk_rows: 16
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  cache_train_features_in_amp_dtype: false
+  distributed_replicated_ledger_local_metadata: true
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_throughput_v4
+  start_fold: 1

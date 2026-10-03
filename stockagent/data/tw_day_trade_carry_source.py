@@ -1515,8 +1515,14 @@ def build_prepared_day_trade_carry_source(
     cache_dir: str | Path, allow_daily_proxy: bool,
     daily_proxy_price_policy: str, corporate_action_mode: str,
     terminal_liquidation_unlimited_capacity: bool = False,
+    entry_remainder_policy: str = "first_minute_only",
     sparse_event_slots: int | None = None,
 ) -> PreparedDayTradeCarrySource:
+    sweep_entries = entry_remainder_policy == "frozen_target_until_1320"
+    if entry_remainder_policy not in {"first_minute_only", "frozen_target_until_1320"}:
+        raise ValueError("unsupported physical entry remainder policy")
+    if sweep_entries and (terminal_liquidation_unlimited_capacity or sparse_event_slots is not None):
+        raise ValueError("entry sweeps require dense capacity-limited physical carry")
     if corporate_action_mode != "avoid":
         raise ValueError(
             "physical carry source supports the requested avoid action policy only"
@@ -1667,6 +1673,9 @@ def build_prepared_day_trade_carry_source(
         resume_compatible_release_ids.append(
             f"tw-day-trade-carry:{predecessor_digest}"
         )
+    if sweep_entries:
+        digest = hashlib.sha256((digest + ":frozen_target_until_1320_v1").encode()).hexdigest()
+        resume_compatible_release_ids = []
     cache_root = Path(cache_dir).resolve() / f"physical-{digest}"
     manifest_path = cache_root / "manifest.json"
     ready_path = cache_root / "READY.json"
@@ -1918,11 +1927,15 @@ def build_prepared_day_trade_carry_source(
                 entry_array = np.full((len(symbols), 3), np.nan, dtype=np.float64)
                 entry_array[:, 1] = 0.0
                 entry_array[:, 2] = 0.0
+                entry_path = np.zeros((len(symbols), 270, 2), dtype=np.float64)
+                entry_path[..., 0] = np.nan
+                stop_hits = np.zeros_like(entry_path)
                 if good.any():
                     opportunities = paper_minute_opportunities(
                         dense[good], trading_date=day,
                         lower_limit=lower[row, good], upper_limit=upper[row, good],
                         security_types=security_types[good],
+                        latch_stops=not sweep_entries,
                     )
                     path_array[good, :, :2] = opportunities.prices
                     path_array[good, :, 2:4] = opportunities.capacity_shares
@@ -1932,6 +1945,9 @@ def build_prepared_day_trade_carry_source(
                     path_array[good, :, 4] = marks
                     entry_array[good, 0] = dense[good, 0, 4]
                     entry_array[good, 1] = dense[good, 0, 5]
+                    if sweep_entries:
+                        entry_path[good] = dense[good, :, 4:6]
+                        stop_hits[good] = opportunities.stop_hits
                 if proxy.any():
                     path_array[proxy, :, 4] = opens[row, proxy, None]
                     path_array[proxy, -1, 4] = closes[row, proxy]
@@ -1979,6 +1995,7 @@ def build_prepared_day_trade_carry_source(
                     mark_flat=mark_flat,
                     mark=mark_view[mark_flat].astype(np.float64, copy=False),
                     entry=entry_array,
+                    **({"entry_path": entry_path, "stop_hits": stop_hits} if sweep_entries else {}),
                 )
                 files[output.name] = {
                     "bytes": output.stat().st_size, "sha256": _sha256(output)
@@ -2054,6 +2071,7 @@ def build_prepared_day_trade_carry_source(
                 "date_start": str(dates[0]), "date_end": str(dates[-1]),
                 "first_minute_date": str(first_minute),
                 "daily_proxy": "official_open_close_without_adverse_tick",
+                "entry_remainder_policy": entry_remainder_policy,
                 "daily_proxy_capacity": "floor(daily_volume/271*0.5/1000)*1000",
                 "daily_proxy_intraday_marks": "official_open_carried_to_official_close_not_observed_minutes",
                 "daily_proxy_source_precision": {
@@ -2227,7 +2245,7 @@ def build_prepared_day_trade_carry_source(
     # chronological LRU caching would thrash from opposite ends each epoch.
     vector_fields = 15
     estimated_session_bytes = int(
-        len(symbols) * (vector_fields + 5 * 270) * np.dtype(np.float64).itemsize
+        len(symbols) * (vector_fields + (9 if sweep_entries else 5) * 270) * np.dtype(np.float64).itemsize
     )
     estimated_cache_bytes = estimated_session_bytes * len(dates)
     cache_setting = os.environ.get(
@@ -2276,6 +2294,13 @@ def build_prepared_day_trade_carry_source(
         flush=True,
     )
 
+    # Source-only, read-only-by-contract transport shared by all daily proxies.
+    # It contains no synthetic minute liquidity and needs only one host copy.
+    empty_entry_path = np.zeros((len(symbols), 270, 2), dtype=np.float64) if sweep_entries else None
+    empty_stop_hits = np.zeros_like(empty_entry_path) if sweep_entries else None
+    if sweep_entries:
+        empty_entry_path[..., 0] = np.nan
+
     def _load_packed_session_uncached(row: int) -> PackedDayTradeCarrySession:
         day = dates[row]
         day_text = np.datetime_as_string(day, unit="D")
@@ -2304,6 +2329,8 @@ def build_prepared_day_trade_carry_source(
             stock_delivery_day[event_columns] = action_delivery[
                 event_start:event_stop
             ]
+        entry_path = empty_entry_path
+        stop_hits = empty_stop_hits
         if day < first_minute:
             marks = np.full((len(symbols), 270), np.nan, dtype=np.float64)
             executable = (
@@ -2339,10 +2366,11 @@ def build_prepared_day_trade_carry_source(
             with np.load(
                 cache_root / f"session-{day_text}.npz", allow_pickle=False
             ) as packed:
-                if set(packed.files) != {
+                expected_fields = {
                     "exit_flat", "exit_price", "exit_capacity", "mark_flat",
                     "mark", "entry",
-                }:
+                } | ({"entry_path", "stop_hits"} if sweep_entries else set())
+                if set(packed.files) != expected_fields:
                     raise RuntimeError(f"invalid physical session fields: {day_text}")
                 exit_flat = np.array(packed["exit_flat"], copy=True)
                 exit_value = np.array(packed["exit_price"], copy=True)
@@ -2350,6 +2378,9 @@ def build_prepared_day_trade_carry_source(
                 mark_flat = np.array(packed["mark_flat"], copy=True)
                 mark_value = np.array(packed["mark"], copy=True)
                 entry = np.array(packed["entry"], copy=True)
+                if sweep_entries:
+                    entry_path = np.array(packed["entry_path"], copy=True)
+                    stop_hits = np.array(packed["stop_hits"], copy=True)
             exit_size = len(symbols) * 270 * 2
             mark_size = len(symbols) * 270
             if (
@@ -2414,6 +2445,8 @@ def build_prepared_day_trade_carry_source(
             unresolved_action_gap_mask=tensor(unresolved_gap),
             daily_proxy_mask=tensor(daily_proxy_mask),
             terminal_liquidation_price=terminal_liquidation_price,
+            entry_path=tensor(entry_path) if sweep_entries else None,
+            stop_hits=tensor(stop_hits) if sweep_entries else None,
         )
         packed_session.validate()
         return packed_session
@@ -2449,6 +2482,8 @@ def build_prepared_day_trade_carry_source(
             unresolved_action_gap_mask=packed.unresolved_action_gap_mask,
             daily_proxy_mask=packed.daily_proxy_mask,
             terminal_liquidation_price=packed.terminal_liquidation_price,
+            entry_path=packed.entry_path,
+            stop_hits=packed.stop_hits,
         )
 
     def _load_session_uncached(row: int) -> DayTradeCarrySession:
@@ -2536,6 +2571,7 @@ def build_prepared_day_trade_carry_source(
                 if terminal_liquidation_unlimited_capacity
                 else "source_minute_capacity_then_physical_margin_carry"
             ),
+            "entry_remainder_policy": entry_remainder_policy,
         },
     )
 

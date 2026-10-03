@@ -1,0 +1,102 @@
+# Factorial continuation of the 2026-09-23 learning-mechanism audit.
+# Each row owns a fresh artifact root.  The 2025 validation year and 2026 test
+# year have already been inspected, so every result from this matrix remains
+# exploratory rather than a new blind strategy claim.
+base_config: configs/deployments/tw_day_trade_v8_ofat_resume_corrected_control.yaml
+output_root: artifacts/ablations/tw_day_trade_v8_learning_mechanisms_factorial_20260924
+baseline_artifact_root: artifacts/ablations/tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat/baseline
+expected_fold_count: 11
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  dimensions:
+    # Engineering control: dynamic compilation without changing account resets.
+    - name: compile_control
+      enabled: true
+      variants:
+        - name: dynamic
+          experiment_name: continuous_dynamic_compile_control
+          description: Continuous account with dynamic compile; isolates compile mode from annual resets.
+          overrides:
+            training:
+              backtest_compile_dynamic: true
+
+    # B isolates the output-map zero-score derivative. Forward actions are
+    # exactly equal to the historical score_entmax_cash mode.
+    - name: output_gradient
+      enabled: true
+      variants:
+        - name: v2
+          experiment_name: output_v2_only
+          description: Forward-identical score-entmax output with a nonzero exact-zero derivative.
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: score_entmax_cash_v2
+
+    # C with B=0 checks whether the ledger surrogate matters away from the
+    # output's exact-zero dead point. C with B=1 is the original bundled
+    # candidate and gives the clean C contrast against output_v2_only.
+    - name: sub_lot_gradient
+      enabled: true
+      variants:
+        - name: v1
+          experiment_name: sub_lot_only_v1
+          description: One-lot ledger surrogate with the historical output derivative.
+          overrides:
+            training:
+              day_trade_sub_lot_recovery: true
+        - name: v2
+          experiment_name: output_v2_sub_lot
+          description: V2 output derivative plus the one-lot ledger surrogate.
+          overrides:
+            training:
+              day_trade_sub_lot_recovery: true
+              financial_transformer:
+                portfolio_output_mode: score_entmax_cash_v2
+
+    # A changes the capital-domain training objective. All annual rows use
+    # dynamic compile because calendar boundary segments have variable lengths.
+    - name: annual_accounts
+      enabled: true
+      variants:
+        - name: v1
+          experiment_name: annual_only_v1
+          description: Independent annual TWD 10M accounts with the historical output derivative.
+          overrides:
+            training:
+              day_trade_training_annual_episodes: true
+              backtest_compile_dynamic: true
+        - name: v2
+          experiment_name: annual_output_v2
+          description: Annual accounts plus the forward-identical V2 output derivative.
+          overrides:
+            training:
+              day_trade_training_annual_episodes: true
+              backtest_compile_dynamic: true
+              financial_transformer:
+                portfolio_output_mode: score_entmax_cash_v2
+        - name: sub_lot_v1
+          experiment_name: annual_sub_lot_v1
+          description: Annual accounts plus sub-lot recovery under the historical output derivative.
+          overrides:
+            training:
+              day_trade_training_annual_episodes: true
+              day_trade_sub_lot_recovery: true
+              backtest_compile_dynamic: true
+        - name: sub_lot_v2
+          experiment_name: annual_output_v2_sub_lot
+          description: Full A+B+C interaction candidate; not a new baseline without held-out evidence.
+          overrides:
+            training:
+              day_trade_training_annual_episodes: true
+              day_trade_sub_lot_recovery: true
+              backtest_compile_dynamic: true
+              financial_transformer:
+                portfolio_output_mode: score_entmax_cash_v2

@@ -10,6 +10,9 @@ from functools import lru_cache, partial
 import torch
 
 from stockagent.data.tw_stock_futures_minute import BAR_FIELDS, EVENT_MINUTES, TAPE_FIELDS, HYBRID_TAPE_FIELDS
+from stockagent.backtest.futures_cuda_graph import (
+    futures_cuda_graph_enabled, run_futures_cuda_graph,
+)
 
 
 @dataclass(slots=True)
@@ -564,7 +567,7 @@ def _compiled_scheduled_recovery_gradient(
     )
 
 
-def run_tw_stock_futures_day_trade_integer_torch(
+def _run_tw_stock_futures_day_trade_integer_torch_impl(
     target_weights: torch.Tensor,
     candidate_execution: torch.Tensor,
     *,
@@ -639,7 +642,7 @@ def run_tw_stock_futures_day_trade_integer_torch(
         if initial_equity_scale is None
         else initial_equity_scale.to(device=weights.device, dtype=weights.dtype).reshape(())
     )
-    equity = weights.new_tensor(capital) * starting_scale
+    equity = weights.new_full((), capital) * starting_scale
 
     compile_requested = (
         os.environ.get("STOCKAGENT_BACKTEST_COMPILE", "0").lower() in {"1", "true", "yes", "on"}
@@ -686,7 +689,7 @@ def run_tw_stock_futures_day_trade_integer_torch(
                 # A failed exact account stays failed. Counterfactual daily
                 # gradients can still teach all remaining dates to be feasible.
                 # Reset only the backward reference cash, never exact state.
-                reference_equity = torch.where(alive & (equity > 0), equity.detach(), weights.new_tensor(capital))
+                reference_equity = torch.where(alive & (equity > 0), equity.detach(), weights.new_full((), capital))
                 shadow_delta = recovery_gradient(weights[row], execution[row], reference_equity)
                 reported_log = reported_log.detach() + torch.where(advance[row], shadow_delta, torch.zeros_like(shadow_delta))
             return_rows.append(reported_log)
@@ -803,6 +806,39 @@ def run_tw_stock_futures_day_trade_integer_torch(
         residual_contract_quantities_history=(torch.stack(residual_rows) if residual_rows else None),
         default_history=(torch.stack(default_rows) if default_rows else None),
     )
+
+
+def run_tw_stock_futures_day_trade_integer_torch(
+    target_weights: torch.Tensor,
+    candidate_execution: torch.Tensor,
+    *,
+    initial_capital: float,
+    state_advance_mask: torch.Tensor | None = None,
+    initial_equity_scale: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+    return_weights_history: bool = True,
+    scheduled_events: bool = False,
+    use_compile: bool | None = None,
+    recoverable_backward: bool = False,
+    saturation_recovery: bool = False,
+    recovery_objective: str = "residual_notional",
+) -> StockFuturesDayTradeTensorResult:
+    options = dict(
+        initial_capital=initial_capital, state_advance_mask=state_advance_mask,
+        initial_equity_scale=initial_equity_scale, initial_alive=initial_alive,
+        return_weights_history=return_weights_history, scheduled_events=scheduled_events,
+        use_compile=use_compile, recoverable_backward=recoverable_backward,
+        saturation_recovery=saturation_recovery, recovery_objective=recovery_objective,
+    )
+    if futures_cuda_graph_enabled(target_weights):
+        # Capture the same eager minute equations; compilation is an independent
+        # mechanism whose floating-point transformations require separate proof.
+        options["use_compile"] = False
+        return run_futures_cuda_graph(
+            _run_tw_stock_futures_day_trade_integer_torch_impl,
+            target_weights, candidate_execution, **options)
+    return _run_tw_stock_futures_day_trade_integer_torch_impl(
+        target_weights, candidate_execution, **options)
 
 
 __all__ = [

@@ -84,12 +84,16 @@ def _check_price_bounds(bars: pl.DataFrame, fact: dict, evidence: dict) -> pl.Da
     return bars
 
 
-def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path) -> pl.DataFrame:
+def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path, *,
+                          allow_unreported_volume: bool = False) -> pl.DataFrame:
     needed = {(str(d), c) for d, c in keys.select('date', 'physical_contract').iter_rows()}
     wanted_dates = {d for d, _ in needed}
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
     records, spreads, days = {}, {}, {}
+    # Official files repeat the same date across thousands of contracts. Parse
+    # each exact source token once without changing accepted date semantics.
+    parsed_dates = {}
     sources = []
     for item in manifest['receipts']:
         path = Path(item['path'])
@@ -102,13 +106,19 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
         for stream, name, _ in _decoded_csv_stream(path):
             reader = csv.DictReader(stream)
             reader.fieldnames = [str(s).lstrip('\ufeff').strip() for s in reader.fieldnames]
-            if not {'交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段'} <= set(reader.fieldnames):
-                raise ValueError(f'incomplete modern official daily schema: {name}')
+            if not {'交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價'} <= set(reader.fieldnames):
+                raise ValueError(f'incomplete official daily schema: {name}')
+            has_session = '交易時段' in reader.fieldnames
             for raw in reader:
-                day = str(_parse_trading_date(raw.get('交易日期')))
+                date_token = raw.get('交易日期')
+                if date_token not in parsed_dates:
+                    parsed_dates[date_token] = str(_parse_trading_date(date_token))
+                day = parsed_dates[date_token]
                 if day not in wanted_dates:
                     continue
-                session, _ = _taifex_futures_session(raw.get('交易時段'), source_has_session=True, source_name=name)
+                if not has_session and day >= '2017-05-15':
+                    raise ValueError(f'official session missing after night-session launch: {name} {day}')
+                session, _ = _taifex_futures_session(raw.get('交易時段'), source_has_session=has_session, source_name=name)
                 if session != '一般':
                     continue
                 product, month = raw['契約'].strip().upper(), raw['到期月份(週別)'].strip()
@@ -121,9 +131,10 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
                     # infer zero outright capacity when known legs already
                     # account for every reported contract lot.
                     continue
-                if not volume_text.isdigit():
+                unreported = allow_unreported_volume and volume_text in ('', '-')
+                if not volume_text.isdigit() and not unreported:
                     raise ValueError(f'invalid official volume: {name} {day} {product} {month}')
-                volume = int(volume_text)
+                volume = None if unreported else int(volume_text)
                 if '/' in month:
                     legs = month.split('/')
                     if len(legs) != 2 or any(len(v) != 6 or not v.isdigit() for v in legs):
@@ -154,9 +165,11 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
             reason = 'absent_from_complete_day' if days.get(day) and not spread else 'missing_official_day'
             outright = 0 if reason == 'absent_from_complete_day' else None
         else:
-            outright = row['official_volume'] - spread
-            reason = 'zero_total_volume' if row['official_volume'] == 0 else ('spread_legs_only' if outright == 0 else 'outright_volume')
-            if outright < 0:
+            outright = None if row['official_volume'] is None else row['official_volume'] - spread
+            reason = ('unreported_volume' if outright is None else
+                'zero_total_volume' if row['official_volume'] == 0 else
+                'spread_legs_only' if outright == 0 else 'outright_volume')
+            if outright is not None and outright < 0:
                 raise ValueError(f'spread legs exceed total volume: {day} {physical}')
         rows.append(dict(date=date.fromisoformat(day), physical_contract=physical, **row,
                          spread_leg_volume=spread, outright_volume=outright, official_reason=reason,
@@ -168,12 +181,13 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path)
         source='taifex_complete_daily_and_spread_legs_v1', rows=frame.height,
         sha256=sha256_file(output/'official_evidence.parquet'), sources=sources,
         input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        unreported_volume_policy='preserve_unknown_never_zero' if allow_unreported_volume else 'reject',
         rule_reference='https://www.taifex.com.tw/cht/3/futDailyMarketReport'))
     return frame
 
 
 class ExactMinuteRecovery:
-    def __init__(self, root: Path, official: pl.DataFrame, *, participation: float | None = None,
+    def __init__(self, root: Path | None, official: pl.DataFrame, *, participation: float | None = None,
                  capacity_rounding: str = "floor"):
         if capacity_rounding not in {"floor", "ceil"}:
             raise ValueError('futures minute capacity rounding must be floor or ceil')
@@ -181,12 +195,12 @@ class ExactMinuteRecovery:
         self.participation = participation
         self.capacity_rounding = capacity_rounding
         self.official = {(r['date'], r['physical_contract']): r for r in official.to_dicts()}
-        plan = json.loads((root/'repair_plan.json').read_text())
+        plan = json.loads((root/'repair_plan.json').read_text()) if root is not None else {"tasks": []}
         self.chunks = {}
         for task in plan['tasks']:
             self.chunks.setdefault(task['physical_contract'], []).append(task)
-        tick_plan = root/'repair_tick_plan.json'
-        self.tick_tasks = json.loads(tick_plan.read_text())['tasks'] if tick_plan.exists() else []
+        tick_plan = root/'repair_tick_plan.json' if root is not None else None
+        self.tick_tasks = json.loads(tick_plan.read_text())['tasks'] if tick_plan is not None and tick_plan.exists() else []
 
     def recover(self, row: dict, bars: pl.DataFrame, evidence: dict):
         from downloader.download_shioaji_historical_market_data import _valid_receipt
@@ -195,6 +209,21 @@ class ExactMinuteRecovery:
         if fact is None:
             return bars, evidence
         evidence.update(official_reason=fact['official_reason'], outright_volume=fact['outright_volume'])
+        # Independent complete-day evidence can prove no possible integer fill
+        # without pretending a missing provider response is a minute observation.
+        if fact.get('official_day_sources') not in (None, '', '[]'):
+            if fact['outright_volume'] == 0 and fact['official_reason'] in {
+                'zero_total_volume', 'spread_legs_only', 'spread_and_block_legs_only', 'absent_from_complete_day',
+            }:
+                evidence.update(status=NO_TRADE, detail='independent_complete_official_day_zero_outright',
+                                tick_volume=0, tick_rows=0)
+                return pl.DataFrame(schema=bars.schema), evidence
+            if (self.capacity_rounding == 'floor' and self.participation is not None
+                    and fact['outright_volume'] is not None
+                    and 0 < fact['outright_volume'] * self.participation < 1):
+                evidence.update(status=NO_CAPACITY, detail='independent_official_volume_upper_bound_zero_integer_capacity',
+                                tick_volume=0, tick_rows=0)
+                return pl.DataFrame(schema=bars.schema), evidence
         for task in self.chunks.get(physical, []):
             if not task['start'] <= str(day) <= task['end']:
                 continue
@@ -204,7 +233,11 @@ class ExactMinuteRecovery:
             if not receipt:
                 continue
             try:
-                validate_kbar_completion(receipt)
+                validate_kbar_completion(
+                    receipt,
+                    product=row['product'] if row.get('_source_scope') == 'all_futures_intraday' else None,
+                    asset_class=row.get('asset_class', 'stock_future'),
+                )
                 receipt_sha = sha256_file(receipt_path)
                 raw = pl.read_parquet(path) if receipt['status'] == 'complete' else pl.DataFrame()
                 if raw.height != receipt['rows']:
@@ -214,11 +247,21 @@ class ExactMinuteRecovery:
                 if raw.height:
                     end = pl.col('ts').cast(pl.Datetime('ns'))
                     minute = end.dt.hour().cast(pl.Int32)*60+end.dt.minute().cast(pl.Int32)
-                    raw = raw.filter((end.dt.date() == day) & minute.is_between(526,825) & (pl.col('Volume') > 0))
+                    start_minute, end_minute = 525, 825
+                    if row.get('_source_scope') == 'all_futures_intraday':
+                        from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+                        start_minute, end_minute = taifex_futures_day_session_minutes(
+                            day, product_code=row['product'], asset_class=row['asset_class'])
+                    raw = raw.filter((end.dt.date() == day) & minute.is_between(start_minute + 1,end_minute) & (pl.col('Volume') > 0))
                 source_sha = receipt.get('sha256', '')
                 if raw.height:
                     recovered = normalize_futures_kbars(raw, code=task['code'], physical_contract=physical,
-                                                       source_sha256=source_sha, full_session=True)
+                                                       source_sha256=source_sha, full_session=True,
+                                                       product=row['product'] if row.get('_source_scope') == 'all_futures_intraday' else None,
+                                                       asset_class=row.get('asset_class', 'stock_future'))
+                    if (row.get('_source_scope') == 'all_futures_intraday'
+                            and recovered['volume'].sum() > min(row['volume'], fact['outright_volume'] if fact['outright_volume'] is not None else row['volume'])):
+                        raise ValueError('exact KBar observed volume exceeds official volume bound')
                     recovered = _check_price_bounds(recovered, fact, evidence)
                     # Exact-month identity needs no OHLC equality heuristic.
                     # Retain observed quantities just as with ticks; absent
@@ -257,12 +300,24 @@ class ExactMinuteRecovery:
                 continue
             try:
                 from stockagent.data.tw_stock_futures_history import normalize_continuous_ticks
-                validate_kbar_completion(dict(receipt, start=str(day), end=str(day)))
+                validate_kbar_completion(
+                    dict(receipt, start=str(day), end=str(day)),
+                    product=row['product'] if row.get('_source_scope') == 'all_futures_intraday' else None,
+                    asset_class=row.get('asset_class', 'stock_future'),
+                )
                 receipt_sha = sha256_file(receipt_path)
                 raw = pl.read_parquet(path)
                 if raw.height != receipt['rows']:
                     raise ValueError('exact tick receipt row count mismatch')
-                recovered, stats = normalize_continuous_ticks(raw, day=day, alias=task['code'], physical=physical, digest=receipt['sha256'])
+                recovered, stats = normalize_continuous_ticks(
+                    raw, day=day, alias=task['code'], physical=physical, digest=receipt['sha256'],
+                    product=(row['product'] if row.get('_source_scope') == 'all_futures_intraday'
+                             or row.get('asset_class') in {'etf_future', 'index_future'} else None),
+                    asset_class=row.get('asset_class', 'stock_future'),
+                )
+                if (row.get('_source_scope') == 'all_futures_intraday'
+                        and stats['tick_volume'] > min(row['volume'], fact['outright_volume'] if fact['outright_volume'] is not None else row['volume'])):
+                    raise ValueError('exact tick observed volume exceeds official volume bound')
                 recovered = _check_price_bounds(recovered, fact, evidence)
                 if sha256_file(path) != receipt['sha256'] or sha256_file(receipt_path) != receipt_sha:
                     raise ValueError('exact ticks changed during read')

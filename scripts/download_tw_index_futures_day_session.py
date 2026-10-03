@@ -231,16 +231,24 @@ def _select_rebuild_receipts(raw_dir: Path) -> list[Path]:
     return selected
 
 
-def _all_futures_quality(path: Path) -> dict[str, object]:
+def _all_futures_quality(path: Path, *, include_valuation_rows: bool = False,
+                         include_reference_evidence: bool = False) -> dict[str, object]:
     import pyarrow.parquet as pq
 
     parquet = pq.ParquetFile(path)
     metadata = parquet.schema_arrow.metadata or {}
-    expected_contract = str(TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION).encode(
+    if include_reference_evidence and not include_valuation_rows:
+        raise ValueError('reference evidence requires reported valuation rows')
+    expected_contract = str(3 if include_reference_evidence else
+                            (2 if include_valuation_rows else TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION)).encode(
         "ascii"
     )
     if metadata.get(b"stockagent.contract_version") != expected_contract:
         raise ValueError(f"{path} has unsupported all-futures contract metadata")
+    if include_reference_evidence:
+        for name in ('reported_price_change','reported_price_change_percent'):
+            if name not in parquet.schema_arrow.names or str(parquet.schema_arrow.field(name).type) != 'string':
+                raise ValueError('reference evidence must preserve source text columns')
     products: set[str] = set()
     sessions: Counter[str] = Counter()
     series: Counter[str] = Counter()

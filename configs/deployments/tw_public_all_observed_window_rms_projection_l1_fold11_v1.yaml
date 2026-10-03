@@ -1,0 +1,29 @@
+# Completed historical fold-11 run: naive execution, projection_l1, Haar/DCT.
+# For the v8 OFAT baseline training contract with the newer v3 dataset, use
+# tw_public_all_observed_v8_ofat_fold11_data_v1.yaml and its separate artifact.
+# Both input releases here were verified and materialized before launch.
+base_config: ../markets/tw_public_preopen_all_observed_multibasis_window_rms_2014_v1.yaml
+experiment_name: tw-public-all-observed-window-rms-projection-l1-fold11-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_window_rms_projection_l1_fold11_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-public/tw-public-20260921T040006535230961Z-l0-penguin-4ab6cb1612e4862c/stocks
+  tw_public_feature_path: /srv/stockagent-packed-materialized/tw-public-research-all-observed-2014-v3/tw-public-research-all-observed-2014-v3-20260921T041303541818804Z-l0-penguin-af32bae76010f47e/features/tw_public_research_all_2014_v3.parquet
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_public_all_observed_window_rms_projection_l1_v1
+
+training:
+  # vastai1T: two-GPU DDP, global batch 124 (local 62). Eight complete
+  # fold-11 epochs gave 333 real rows/s after warmup with >=3 GiB free/GPU.
+  batch_size_train: 124
+  batch_size_eval: 16
+  eval_model_chunk_rows: 16
+  financial_transformer:
+    portfolio_output_mode: projection_l1
+    # Preserve projection_l1 while giving each raw score an average-position
+    # meaning. Without this, O(1) logits across thousands of stocks force the
+    # projection onto a tiny sparse support and the training gradient collapses.
+    projection_l1_scale_by_active_count: true

@@ -1,0 +1,106 @@
+# Separate research ABI accepting current revisions, theoretical release dates,
+# and later-only observed values. This cannot establish historical PIT or fills.
+base_config: tw_public_preopen_wide_research_taifex_2014_v2.yaml
+experiment_name: tw-public-preopen-all-observed-research-2014-v3
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_all_observed_research_2014_v3
+  resume: false
+  post_train_infer: false
+
+data:
+  tw_public_feature_path: artifacts/research_features/tw_public_research_all_2014_v3.parquet
+  panel_start_date: "2014-01-01"
+  feature_include:
+    - body_ratio
+    - close_logret_1d
+    - close_raw
+    - clv
+    - clv_centered
+    - delta_body_ratio
+    - delta_clv
+    - high_raw
+    - low_raw
+    - lower_shadow
+    - max_logret_1d
+    - min_logret_1d
+    - open_logret_1d
+    - open_raw
+    - shadow_imbalance
+    - signed_body_ratio
+    - signed_vol
+    - trading_volume_logret_1d
+    - trading_volume_raw
+    - upper_shadow
+    - twpub_*
+  # Every absent or later-starting value has its own observed-value channel.
+  # The panel converts unknown numeric values to zero only after generating it.
+  feature_availability_indicators:
+    - twpub_*
+  feature_shift_next_session:
+    - body_ratio
+    - close_logret_1d
+    - close_raw
+    - clv
+    - clv_centered
+    - delta_body_ratio
+    - delta_clv
+    - high_raw
+    - low_raw
+    - lower_shadow
+    - max_logret_1d
+    - min_logret_1d
+    - open_logret_1d
+    - open_raw
+    - shadow_imbalance
+    - signed_body_ratio
+    - signed_vol
+    - trading_volume_logret_1d
+    - trading_volume_raw
+    - upper_shadow
+    - twpub_official_*
+    - twpub_twse_taiex_*
+    - twpub_pe_*
+    - twpub_pb_*
+    - twpub_dividend_yield*
+    - twpub_dividend_per_share_*
+    - twpub_attention_*
+    - twpub_disposal_*
+    # Current snapshot families have no proven intraday publication clock.
+    # Their recorded capture session is the earliest source date; expose only
+    # on the next exchange session in this 09:00 research mode.
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_short_sale_available_*
+    - twpub_tdcc_*
+    - twpub_company_*
+    - twpub_material_*
+    - twpub_dividend_board_approved
+    - twpub_dividend_cash_per_share
+    - twpub_dividend_confirmed
+    - twpub_dividend_stock_per_share
+    - twpub_dividend_total_*
+    - twpub_exdiv_*
+    # The ten new official TAIFEX fields are already mapped to a verified
+    # next session; only legacy same-session/snapshot fields need this shift.
+    - twpub_taifex_dealer_*
+    - twpub_taifex_foreign_*
+    - twpub_taifex_trust_*
+    - twpub_taifex_tx_final_settlement_logret
+    - twpub_taifex_tx_large_oi_log
+    - twpub_taifex_tx_open_interest_log
+    - twpub_taifex_tx_settlement_logret_1d
+    - twpub_taifex_tx_volume_log
+    - twpub_taifex_tx_top5_long_ratio
+    - twpub_taifex_tx_top10_long_ratio
+    - twpub_taifex_txo_call_*
+    - twpub_taifex_txo_put_oi_log
+    - twpub_taifex_txo_put_volume_log
+    - twpub_taifex_txo_put_call_*
+
+walk_forward:
+  expected_first_year: 2014

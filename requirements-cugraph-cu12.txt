@@ -1,0 +1,11 @@
+# Optional cross-asset cuGraph backend for a CUDA 12 environment.
+# Install into a clean environment; do not mix with CUDA 13 RAPIDS packages.
+--extra-index-url https://pypi.nvidia.com
+cugraph-cu12==26.8.0
+cudf-cu12==26.8.1
+cupy-cuda12x==14.2.0
+numba-cuda[cu12]==0.30.4
+cuda-core[cu12]==0.7.0
+cuda-bindings==12.9.4
+cuda-pathfinder==1.8.2
+pandas==3.0.3

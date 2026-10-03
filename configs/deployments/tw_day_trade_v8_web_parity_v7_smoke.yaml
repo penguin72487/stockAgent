@@ -1,0 +1,8 @@
+# Full fold lifecycle with a bounded epoch count; never a formal checkpoint.
+base_config: tw_day_trade_v8_web_parity_v7.yaml
+experiment_name: tw-day-trade-v8-web-parity-v7-smoke
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_web_parity_v7_smoke
+training:
+  epochs: 3
+  early_stopping_no_improve_ratio: 0

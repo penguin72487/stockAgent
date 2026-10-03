@@ -187,6 +187,12 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_TW_DUAL_SESSION_CUDA_GRAPH"] = (
         "1" if bool(training.tw_dual_session_cuda_graph) else "0"
     )
+    os.environ["STOCKAGENT_FUTURES_CUDA_GRAPH"] = (
+        "1" if bool(training.futures_cuda_graph) else "0"
+    )
+    os.environ["STOCKAGENT_FUTURES_FUNDING_COMPILE"] = (
+        "1" if bool(training.futures_funding_compile) else "0"
+    )
     os.environ["STOCKAGENT_SYMBOL_SHARDED_PACK_METADATA"] = (
         "1" if bool(training.distributed_symbol_sharded_pack_metadata) else "0"
     )

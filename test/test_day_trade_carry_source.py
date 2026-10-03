@@ -620,6 +620,24 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
         (tmp_path / "cache").glob("physical-price-limits-*/READY.json")
     )
     assert len(price_limit_caches) == 1
+    swept = build_prepared_day_trade_carry_source(
+        panel=panel, minute_root=minute,
+        public_feature_path=public / "features/tw_public_stock_daily.parquet",
+        cache_dir=tmp_path / "sweep-cache", allow_daily_proxy=True,
+        daily_proxy_price_policy="official_open_close", corporate_action_mode="avoid",
+        entry_remainder_policy="frozen_target_until_1320",
+    )
+    assert swept.release_id != source.release_id
+    assert swept.audit_receipt["entry_remainder_policy"] == "frozen_target_until_1320"
+    packed_rows = tuple(swept.packed_session_loader(row) for row in (0, 1))
+    rebuilt_rows = PreparedDayTradeCarryBatch.from_packed_sessions(
+        packed_rows, 2, event_compression=True).sessions(torch.device("cpu"))
+    for row, rebuilt in enumerate(rebuilt_rows):
+        expected = swept.session_at(row)
+        expected.validate_shape(3, torch.device("cpu"))
+        for name in ("entry_path", "stop_hits"):
+            torch.testing.assert_close(getattr(rebuilt, name), getattr(expected, name),
+                                       rtol=0, atol=0, equal_nan=True)
 
 
 def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(tmp_path):

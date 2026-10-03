@@ -1,0 +1,11 @@
+# Experimental backward contract; never resume old optimizer state into it.
+# v2 retains v8 forward allocation and restores its zero-score derivative.
+base_config: tw_day_trade_v8_ofat_resume_corrected_control.yaml
+experiment_name: tw-day-trade-v8-one-lot-gradient-candidate
+runner:
+  output_dir: artifacts/ablations/tw_day_trade_v8_lot_recovery_20260923
+  resume: false
+training:
+  day_trade_sub_lot_recovery: true
+  financial_transformer:
+    portfolio_output_mode: score_entmax_cash_v2

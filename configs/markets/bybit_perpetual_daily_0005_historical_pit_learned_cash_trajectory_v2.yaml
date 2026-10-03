@@ -1,0 +1,24 @@
+# First-principles action successor to the venue-only trajectory control.
+#
+# projection_l1 forces requested risky gross to one whenever any score is
+# non-zero. That makes cash an execution accident (liquidity, capacity or a
+# failed fill), not a model action. The independent learned cash gate below
+# lets the policy choose risky gross and cash while the signed stock head still
+# chooses long/short direction. Fees, funding, availability and volume capacity
+# remain market mechanics in the executor rather than hand-authored signals.
+base_config: bybit_perpetual_daily_0005_historical_pit_trajectory_v1.yaml
+
+experiment_name: bybit-perpetual-daily-0005-venue-only-learned-cash-trajectory-v2
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_venue_only_learned_cash_trajectory_v2
+  resume: true
+  post_train_infer: false
+
+training:
+  financial_transformer:
+    portfolio_output_mode: learned_cash
+  # This model is not active in the experiment. Pin its inherited ABI so the
+  # candidate changes only the selected Financial Transformer policy.
+  executable_portfolio_transformer:
+    portfolio_output_mode: projection_l1

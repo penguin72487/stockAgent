@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 import os
 import threading
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -14,9 +16,20 @@ from stockagent.backtest.portfolio_allocator import (
 )
 
 
-# v2 makes non-advancing rows an exact identity transition, including finite
-# duplicated tail labels and carried gross exposure above the cap.
-CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION = 2
+# v4 carries live NAV for absolute capacity, never bypasses execution constraints
+# to enforce gross, and rejects unknown held valuations instead of fabricating
+# either a pre-gap liquidation (v3) or an economic default.
+# v5 interprets a crypto force-exit flag as a dated, persistent zero-target
+# request: side permissions and capacity still own every fill. It is not an
+# exchange cash-settlement event or permission to erase residual inventory.
+CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION = 5
+# Opt-in research contract: only a dated announcement's zero-target reduction
+# may ignore the volume cap. Source side permissions, turnover and fees remain.
+CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION = 6
+# Backward v1 preserves the exact continuous capacity map at a zero trade.
+# This is a derivative correction, not a straight-through execution surrogate;
+# optimizer/checkpoint fingerprints must distinguish the earlier sign/abs map.
+CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION = 1
 _MIN_WEALTH_FACTOR = 1.0e-6
 _DAY_KERNEL_CACHE: dict[
     tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]
@@ -31,12 +44,55 @@ class CryptoPerpetualTensorResult:
     executed_weights: torch.Tensor
     final_weights: torch.Tensor
     final_alive: torch.Tensor
+    equity_scale_history: torch.Tensor
+    final_equity_scale: torch.Tensor
+
+
+class CryptoPerpetualDataError(RuntimeError):
+    """A held contract cannot be valued; this is not an economic loss."""
+
+    def __init__(self, message: str, *, evidence: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.message = message
+        self.evidence = dict(evidence or {})
+
+    def __str__(self) -> str:
+        if not self.evidence:
+            return self.message
+        return f"{self.message}; evidence={json.dumps(self.evidence, sort_keys=True)}"
+
+
+def _capacity_clamp(
+    delta: torch.Tensor,
+    capacity: torch.Tensor,
+    can_increase: torch.Tensor,
+    can_decrease: torch.Tensor,
+) -> torch.Tensor:
+    """Clip an already side-legal order without losing the derivative at zero."""
+
+    # sign(delta) * min(abs(delta), capacity) has the same values as a
+    # signed clamp, but its autograd derivative incorrectly vanishes at
+    # delta == 0 even inside a positive-capacity interval. Explicit signed
+    # bounds retain the true local derivative, including a usable entry
+    # gradient from cash. At a one-sided boundary the map is nonsmooth;
+    # clamp chooses the permitted-side derivative (a valid subgradient).
+    lower = torch.where(can_decrease, -capacity, 0.0)
+    upper = torch.where(can_increase, capacity, 0.0)
+    return torch.where(
+        lower < upper,
+        torch.clamp(delta, min=lower, max=upper) + 0.0,
+        # A collapsed interval is constant, not clamp's boundary slope 1.
+        # Preserve the earlier map's signed zero for a capped nonzero order.
+        delta.sign() * torch.zeros_like(delta),
+    )
 
 
 def _gross_cap(
     previous: torch.Tensor,
     proposed: torch.Tensor,
     maximum_gross: float,
+    *,
+    enforce_reduction: bool = True,
 ) -> torch.Tensor:
     """Apply reductions first, then fit only expansions into the gross budget.
 
@@ -74,7 +130,11 @@ def _gross_cap(
     # the next decision.  Requested reductions run first, but if their endpoint
     # is still over budget the cap is a hard risk constraint: deleverage the
     # reduced book and admit no expansion on that row.
-    return torch.where(cap_breached_after_reductions, reduced_at_cap, normal)
+    if enforce_reduction:
+        return torch.where(cap_breached_after_reductions, reduced_at_cap, normal)
+    # After legality/capacity checks, the retained book cannot be sold again
+    # without a fill. A blocked breach permits reductions but no expansion.
+    return normal
 
 
 def _day_kernel_factory(
@@ -86,10 +146,12 @@ def _day_kernel_factory(
     max_turnover_ratio: float,
     stateful_proximal_allocator: bool,
     proximal_cost_multiplier: float,
+    announced_exit_unlimited_volume: bool = False,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     def day(
         previous: torch.Tensor,
         alive: torch.Tensor,
+        equity_scale: torch.Tensor,
         target: torch.Tensor,
         effective_simple: torch.Tensor,
         price_simple: torch.Tensor,
@@ -105,11 +167,10 @@ def _day_kernel_factory(
     ) -> tuple[torch.Tensor, ...]:
         incoming_previous = previous
         previous = torch.where(alive, previous, torch.zeros_like(previous))
-        forced = force_exit & row_advances
-        forced_delta = torch.where(forced, -previous, torch.zeros_like(previous))
-        base = torch.where(forced, torch.zeros_like(previous), previous)
+        exit_requested = force_exit & row_advances & alive
+        base = previous
         requested = torch.where(
-            alive & row_advances & tradable & ~forced,
+            alive & row_advances & tradable,
             target,
             base,
         )
@@ -124,6 +185,13 @@ def _day_kernel_factory(
                 cost_multiplier=proximal_cost_multiplier,
                 long_only=long_only,
             )
+        # A known announcement requests flat even after policy eligibility is
+        # disabled. Do not let the optional proximal dead-zone retain a small
+        # position forever, but keep this request upstream of every fill gate.
+        requested = torch.where(exit_requested, torch.zeros_like(requested), requested)
+        # Risk reductions are orders too: apply the desired gross endpoint
+        # before side permissions and volume, never fabricate fills afterwards.
+        requested = _gross_cap(base, requested, maximum_gross)
         delta = requested - base
         constrained = torch.where((delta > 0.0) & ~can_buy, base, requested)
         down = constrained < base
@@ -139,7 +207,25 @@ def _day_kernel_factory(
         increase_short = down & (base <= 0.0) & (constrained < base) & ~can_short
         constrained = torch.where(increase_short, base, constrained)
         delta = constrained - base
-        delta = delta.sign() * torch.minimum(delta.abs(), volume)
+        unlimited_volume = torch.isposinf(volume)
+        if announced_exit_unlimited_volume:
+            # exit_requested already requires alive + an advancing row and
+            # already replaced the model target with zero. It cannot expand
+            # or reverse inventory; side gates above and turnover below stay.
+            unlimited_volume = unlimited_volume | exit_requested
+        finite_volume = torch.where(unlimited_volume, 0.0, volume)
+        live_volume = (
+            finite_volume.to(equity_scale.dtype)
+            / equity_scale.clamp_min(torch.finfo(equity_scale.dtype).tiny)
+        ).to(delta.dtype)
+        # Do not divide infinity through the recurrent graph (0 * inf in its
+        # inactive backward branch can poison gradients). No configured cap
+        # remains genuinely unlimited even after large NAV growth.
+        live_volume = torch.where(unlimited_volume, float("inf"), live_volume)
+        can_decrease = torch.where(
+            base > 0.0, can_sell, can_short & (not long_only)
+        )
+        delta = _capacity_clamp(delta, live_volume, can_buy, can_decrease)
         if max_turnover_ratio > 0.0:
             turnover_before_cap = delta.abs().sum()
             scale = torch.minimum(
@@ -152,15 +238,13 @@ def _day_kernel_factory(
                 / turnover_before_cap.clamp_min(1.0e-12),
             )
             delta = delta * scale
-        executed = _gross_cap(base, base + delta, maximum_gross)
+        executed = _gross_cap(base, base + delta, maximum_gross, enforce_reduction=False)
         delta = executed - base
 
-        buy_turnover = delta.clamp_min(0.0).sum() + forced_delta.clamp_min(0.0).sum()
-        sell_turnover = (-delta).clamp_min(0.0).sum() + (-forced_delta).clamp_min(
-            0.0
-        ).sum()
-        active = row_advances & (executed.abs() > 1.0e-10)
-        valuation_complete = (~active | (effective_finite & price_finite)).all()
+        buy_turnover = delta.clamp_min(0.0).sum()
+        sell_turnover = (-delta).clamp_min(0.0).sum()
+        active = alive & row_advances & (executed != 0.0)
+        invalid_valuation = active & ~(effective_finite & price_finite)
         effective_pnl = (executed * effective_simple).sum()
         net_simple = (
             effective_pnl
@@ -168,8 +252,7 @@ def _day_kernel_factory(
             - float(sell_fee_rate) * sell_turnover
         )
         survived_on_advance = (
-            valuation_complete
-            & torch.isfinite(net_simple)
+            torch.isfinite(net_simple)
             & (1.0 + net_simple > _MIN_WEALTH_FACTOR)
         )
         survived = torch.where(
@@ -207,7 +290,8 @@ def _day_kernel_factory(
         net_simple = torch.where(row_advances, net_simple, torch.zeros_like(net_simple))
         turnover = torch.where(row_advances, turnover, torch.zeros_like(turnover))
         executed = torch.where(row_advances, executed, incoming_previous)
-        return next_previous, next_alive, net_simple, turnover, executed
+        next_equity_scale = equity_scale * (1.0 + net_simple.to(equity_scale.dtype))
+        return next_previous, next_alive, next_equity_scale, net_simple, turnover, executed, invalid_valuation
 
     return day
 
@@ -219,6 +303,7 @@ def _block_kernel_factory(
     def block(
         previous: torch.Tensor,
         alive: torch.Tensor,
+        equity_scale: torch.Tensor,
         target: torch.Tensor,
         effective_simple: torch.Tensor,
         price_simple: torch.Tensor,
@@ -235,10 +320,13 @@ def _block_kernel_factory(
         returns: list[torch.Tensor] = []
         turnovers: list[torch.Tensor] = []
         weights: list[torch.Tensor] = []
+        scales: list[torch.Tensor] = []
+        invalid_rows: list[torch.Tensor] = []
         for row in range(block_rows):
-            previous, alive, net, turnover, executed = day_kernel(
+            previous, alive, equity_scale, net, turnover, executed, invalid = day_kernel(
                 previous,
                 alive,
+                equity_scale,
                 target[row],
                 effective_simple[row],
                 price_simple[row],
@@ -255,12 +343,17 @@ def _block_kernel_factory(
             returns.append(net)
             turnovers.append(turnover)
             weights.append(executed)
+            scales.append(equity_scale)
+            invalid_rows.append(invalid)
         return (
             previous,
             alive,
+            equity_scale,
             torch.stack(returns),
             torch.stack(turnovers),
             torch.stack(weights),
+            torch.stack(scales),
+            torch.stack(invalid_rows),
         )
 
     return block
@@ -277,6 +370,7 @@ def _resolve_block_kernel(
     max_turnover_ratio: float,
     stateful_proximal_allocator: bool,
     proximal_cost_multiplier: float,
+    announced_exit_unlimited_volume: bool = False,
 ) -> tuple[
     Callable[..., tuple[torch.Tensor, ...]],
     Callable[..., tuple[torch.Tensor, ...]],
@@ -289,6 +383,7 @@ def _resolve_block_kernel(
         max_turnover_ratio=max_turnover_ratio,
         stateful_proximal_allocator=stateful_proximal_allocator,
         proximal_cost_multiplier=proximal_cost_multiplier,
+        announced_exit_unlimited_volume=announced_exit_unlimited_volume,
     )
     eager_block = _block_kernel_factory(eager_day, block_rows)
     compiler = getattr(torch, "compiler", None)
@@ -307,6 +402,9 @@ def _resolve_block_kernel(
     ):
         return eager_block, eager_day
     key = (
+        (CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION
+         if announced_exit_unlimited_volume else CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION),
+        CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
         "block",
         int(block_rows),
         str(example.device),
@@ -319,6 +417,7 @@ def _resolve_block_kernel(
         float(max_turnover_ratio),
         bool(stateful_proximal_allocator),
         float(proximal_cost_multiplier),
+        bool(announced_exit_unlimited_volume),
     )
     with _DAY_KERNEL_LOCK:
         cached = _DAY_KERNEL_CACHE.get(key)
@@ -350,10 +449,12 @@ def run_crypto_perpetual_torch(
     max_turnover_ratio: float = 0.0,
     stateful_proximal_allocator: bool = False,
     proximal_cost_multiplier: float = 1.0,
+    announced_exit_unlimited_volume: bool = False,
     volume_limit_weights: torch.Tensor | None = None,
     state_advance_mask: torch.Tensor | None = None,
     initial_weights: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
+    initial_equity_scale: torch.Tensor | None = None,
     return_weights_history: bool = True,
 ) -> CryptoPerpetualTensorResult:
     """Run a recurrent USDT-linear perpetual account.
@@ -361,7 +462,14 @@ def run_crypto_perpetual_torch(
     The funding-adjusted return controls NAV PnL, while the raw price return
     controls end-of-period risky notional.  Keeping those paths separate is the
     essential accounting identity: funding is a cash transfer, not a change in
-    contract quantity or mark price.
+    contract quantity or mark price. ``volume_limit_weights`` is denominated
+    in initial reference capital; it is divided by recurrent live NAV here.
+    ``force_exit_mask`` requests a zero target for an already-known dated
+    lifecycle event, subject to the original source-backed side permissions,
+    volume and turnover limits. Keep it set on later rows to retry a residual;
+    it never manufactures a fill, skips valuation, or encodes future missingness.
+    The explicit ``announced_exit_unlimited_volume`` research option exempts
+    only that reduction from volume limits, not side permissions or turnover.
     """
 
     if target_weights.dim() != 2:
@@ -386,6 +494,8 @@ def run_crypto_perpetual_torch(
         not isinstance(stateful_proximal_allocator, bool)
     ):
         raise TypeError("stateful_proximal_allocator must be bool")
+    if not torch.compiler.is_compiling() and not isinstance(announced_exit_unlimited_volume, bool):
+        raise TypeError("announced_exit_unlimited_volume must be bool")
 
     target = torch.nan_to_num(
         target_weights.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0
@@ -401,11 +511,18 @@ def run_crypto_perpetual_torch(
     price_simple = torch.expm1(
         torch.where(price_finite, price_log, torch.zeros_like(price_log))
     )
+    effective_finite = effective_finite & torch.isfinite(effective_simple)
+    price_finite = price_finite & torch.isfinite(price_simple)
+    effective_simple = torch.where(effective_finite, effective_simple, 0.0)
+    price_simple = torch.where(price_finite, price_simple, 0.0)
     tradable = tradable_mask.to(device=device, dtype=torch.bool)
-    can_buy = can_buy_mask.to(device=device, dtype=torch.bool) & tradable
-    can_sell = can_sell_mask.to(device=device, dtype=torch.bool) & tradable
-    can_short = can_short_open_mask.to(device=device, dtype=torch.bool) & can_sell
     force_exit = force_exit_mask.to(device=device, dtype=torch.bool)
+    # Only an explicit reduction request may use executable source side masks
+    # outside the model's eligible universe. False side evidence stays false.
+    order_eligible = tradable | force_exit
+    can_buy = can_buy_mask.to(device=device, dtype=torch.bool) & order_eligible
+    can_sell = can_sell_mask.to(device=device, dtype=torch.bool) & order_eligible
+    can_short = can_short_open_mask.to(device=device, dtype=torch.bool) & can_sell
     advance = (
         torch.ones((shape[0],), device=device, dtype=torch.bool)
         if state_advance_mask is None
@@ -423,7 +540,7 @@ def run_crypto_perpetual_torch(
     volume = torch.nan_to_num(
         volume,
         nan=0.0,
-        posinf=torch.finfo(torch.float32).max,
+        posinf=float("inf"),
         neginf=0.0,
     ).clamp_min(0.0)
 
@@ -442,9 +559,18 @@ def run_crypto_perpetual_torch(
         if initial_alive is None
         else initial_alive.to(device=device, dtype=torch.bool).reshape(())
     )
+    equity_scale = (
+        torch.ones((), device=device, dtype=torch.float64)
+        if initial_equity_scale is None
+        else initial_equity_scale.to(device=device, dtype=torch.float64).reshape(())
+    )
+    if not bool(torch.isfinite(equity_scale) & (equity_scale > 0.0)):
+        raise ValueError("crypto initial_equity_scale must be finite and positive")
     weights_rows: list[torch.Tensor] = []
     returns_rows: list[torch.Tensor] = []
     turnover_rows: list[torch.Tensor] = []
+    equity_rows: list[torch.Tensor] = []
+    invalid_rows: list[torch.Tensor] = []
     block_rows = 4
     block_kernel, eager_day_kernel = _resolve_block_kernel(
         previous,
@@ -456,14 +582,16 @@ def run_crypto_perpetual_torch(
         max_turnover_ratio=max_turnover_ratio,
         stateful_proximal_allocator=stateful_proximal_allocator,
         proximal_cost_multiplier=proximal_cost_multiplier,
+        announced_exit_unlimited_volume=announced_exit_unlimited_volume,
     )
 
     for start in range(0, shape[0], block_rows):
         end = min(start + block_rows, shape[0])
         if end - start == block_rows:
-            previous, alive, net_block, turnover_block, executed_block = block_kernel(
+            previous, alive, equity_scale, net_block, turnover_block, executed_block, scales, invalid = block_kernel(
                 previous,
                 alive,
+                equity_scale,
                 target[start:end],
                 effective_simple[start:end],
                 price_simple[start:end],
@@ -479,13 +607,16 @@ def run_crypto_perpetual_torch(
             )
             returns_rows.extend(net_block.unbind(0))
             turnover_rows.extend(turnover_block.unbind(0))
+            equity_rows.extend(scales.unbind(0))
+            invalid_rows.extend(invalid.unbind(0))
             if return_weights_history:
                 weights_rows.extend(executed_block.unbind(0))
             continue
         for row in range(start, end):
-            previous, alive, net_simple, turnover, executed = eager_day_kernel(
+            previous, alive, equity_scale, net_simple, turnover, executed, invalid = eager_day_kernel(
                 previous,
                 alive,
+                equity_scale,
                 target[row],
                 effective_simple[row],
                 price_simple[row],
@@ -503,6 +634,67 @@ def run_crypto_perpetual_torch(
                 weights_rows.append(executed)
             returns_rows.append(net_simple)
             turnover_rows.append(turnover)
+            equity_rows.append(equity_scale)
+            invalid_rows.append(invalid)
+
+    # Host-side boundary check, outside compiled kernels and before loss or
+    # backward. Never poison a CUDA context with a device assertion, or turn
+    # absent observations into a profitable exit / a ruin-clamped loss.
+    if invalid_rows:
+        invalid = torch.stack(invalid_rows)
+        if bool(invalid.any()):
+            row, symbol = invalid.nonzero()[0].tolist()
+            # Failure-only scalar transfers. Do not retain extra portfolio
+            # histories or synchronize successful rows for diagnostics.
+            incoming_scale = (
+                equity_rows[row - 1] if row > 0
+                else initial_equity_scale if initial_equity_scale is not None
+                else target.new_tensor(1.0, dtype=torch.float64)
+            ).detach().reshape(()).to(device=target.device, dtype=torch.float64)
+            capacity_reference = volume[row, symbol].detach()
+            capacity_live = (
+                capacity_reference.to(dtype=torch.float64)
+                / incoming_scale.clamp_min(torch.finfo(torch.float64).tiny)
+            ).to(dtype=torch.float32)
+            reference_value, live_value, scale_value = (
+                float(capacity_reference), float(capacity_live), float(incoming_scale)
+            )
+            evidence = {
+                "row": row,
+                "symbol_index": symbol,
+                "price_valuation_available": bool(price_finite[row, symbol]),
+                "funding_adjusted_valuation_available": bool(effective_finite[row, symbol]),
+                "valuation_availability_note": "funding-adjusted label combines price and funding; raw funding availability is not passed to this ledger",
+                "tradable": bool(tradable[row, symbol]),
+                "force_exit": bool(force_exit[row, symbol]),
+                "announced_exit_volume_exempt": bool(
+                    announced_exit_unlimited_volume and force_exit[row, symbol] and advance[row]
+                ),
+                "can_buy_source": bool(can_buy_mask[row, symbol]),
+                "can_sell_source": bool(can_sell_mask[row, symbol]),
+                "can_short_open_source": bool(can_short_open_mask[row, symbol]),
+                "can_buy_effective": bool(can_buy[row, symbol]),
+                "can_sell_effective": bool(can_sell[row, symbol]),
+                "can_short_open_effective": bool(can_short[row, symbol]),
+                "target_weight": float(target[row, symbol].detach()),
+                "volume_capacity_weight_reference": reference_value if math.isfinite(reference_value) else None,
+                "volume_capacity_weight_live": live_value if math.isfinite(live_value) else None,
+                "volume_capacity_unlimited": math.isinf(reference_value) and reference_value > 0.0,
+                "incoming_equity_scale": scale_value if math.isfinite(scale_value) else None,
+                "remaining_executed_weight": (
+                    float(weights_rows[row][symbol].detach())
+                    if return_weights_history else None
+                ),
+                "remaining_executed_weight_status": (
+                    "retained_execution_history" if return_weights_history else "history_not_requested"
+                ),
+            }
+            raise CryptoPerpetualDataError(
+                f"crypto held valuation unavailable: row={row}, symbol_index={symbol}; "
+                "repair price/funding or provide dated settlement evidence; "
+                "missing future data does not authorize a prior-mark liquidation",
+                evidence=evidence,
+            )
 
     empty_scalar = target.new_empty((0,))
     strategy = torch.stack(returns_rows) if returns_rows else empty_scalar
@@ -516,7 +708,9 @@ def run_crypto_perpetual_torch(
         executed_weights=history,
         final_weights=previous,
         final_alive=alive,
+        equity_scale_history=(torch.stack(equity_rows) if equity_rows else equity_scale.new_empty((0,))),
+        final_equity_scale=equity_scale,
     )
 
 
-__all__ = ["CryptoPerpetualTensorResult", "run_crypto_perpetual_torch"]
+__all__ = ["CryptoPerpetualDataError", "CryptoPerpetualTensorResult", "run_crypto_perpetual_torch"]

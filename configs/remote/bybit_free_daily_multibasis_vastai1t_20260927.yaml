@@ -1,0 +1,20 @@
+# Remote-only configuration; intentionally outside producer-local deployments.
+# Inherits the existing Vast v7, including its receipt-backed
+# 00:00 daily repair view. v7 is newer than this producer's local trainer.
+# Newly captured research-only histories
+# are intentionally not backprojected into the historical-public PIT feature ABI.
+base_config: ../markets/bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v7.yaml
+
+experiment_name: bybit-free-daily-multibasis-pinned-20260927
+
+runner:
+  output_dir: artifacts/markets/bybit_free_daily_multibasis_pinned_20260927
+  resume: true
+
+data:
+  external_feature_path: /srv/stockagent-packed-materialized/bybit/bybit-20260926T051004983477667Z-l0-penguin-857d2f9a99f1b88f/public_features/bybit_crypto_public_daily.parquet
+  panel_cache_root: artifacts/cache/bybit_free_daily_multibasis_pinned_20260927
+
+environment:
+  cpu_threads: 16
+  torch_compile_threads: 8

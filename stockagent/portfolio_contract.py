@@ -4,14 +4,19 @@ from __future__ import annotations
 DEFAULT_PORTFOLIO_ACTIVATION = "identity"
 
 
-def normalize_portfolio_mode(portfolio_mode: str | None) -> str:
+def normalize_portfolio_mode(
+    portfolio_mode: str | None, *, allow_short_only: bool = False,
+) -> str:
     """Normalize the shared model portfolio-direction name."""
     normalized = str(portfolio_mode or "").strip().lower().replace("-", "_")
     if normalized in {"long", "long_only", "longonly"}:
         return "long_only"
+    if allow_short_only and normalized in {"short_only", "shortonly"}:
+        return "short_only"
     if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
         return "long_short"
-    raise ValueError("portfolio_mode must be 'long_only' or 'long_short'")
+    choices = "'long_only', 'long_short', or 'short_only'" if allow_short_only else "'long_only' or 'long_short'"
+    raise ValueError(f"portfolio_mode must be {choices}")
 
 
 def normalize_portfolio_output_mode(mode: str | None) -> str:
@@ -56,6 +61,16 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         "score_entmax_cash_fp32",
     }:
         return "score_entmax_cash"
+    if normalized == "score_entmax_cash_v2":
+        return "score_entmax_cash_v2"
+    if normalized == "score_entmax_global_cash":
+        return "score_entmax_global_cash"
+    if normalized == "score_entmax_bounded_cash":
+        return "score_entmax_bounded_cash"
+    if normalized == "score_entmax_log_cash":
+        return "score_entmax_log_cash"
+    if normalized == "score_entmax_scale_separated_cash":
+        return "score_entmax_scale_separated_cash"
     if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
         return "logits"
     if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
@@ -88,7 +103,11 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         "portfolio_output_mode must be 'activation_l1', 'l1', 'cash_l1', "
         "'learned_cash', 'logits', "
         "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', "
-        "'cash_entmax15', 'score_entmax_cash', or 'projection_l1'"
+        "'cash_entmax15', 'score_entmax_cash', 'score_entmax_cash_v2', "
+        "'score_entmax_global_cash', 'score_entmax_bounded_cash', "
+        "'score_entmax_log_cash', "
+        "'score_entmax_scale_separated_cash', "
+        "or 'projection_l1'"
     )
 
 
