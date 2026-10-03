@@ -1,0 +1,20 @@
+# User-authorized research fill assumption: at the first daily decision after
+# a dated delisting announcement, close the existing position without the
+# normal 50% volume ceiling. This is NOT the later exchange settlement event.
+# Reuse v7 data/public inputs and panel cache in place; never resume its optimizer.
+base_config: bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v7.yaml
+
+experiment_name: bybit-perpetual-daily-0000-historical-public-pit-score-cash-trajectory-v8
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v8
+
+trading:
+  max_volume_participation: 0.5
+  crypto_announced_exit_unlimited_volume: true
+
+# Ordinary participation is 50% of prior completed daily turnover, as corrected
+# by the user; it is not 50% of a future day's or the execution minute's volume.
+# Keep 00:00 UTC zero-latency decisions/execution, real side permissions,
+# 0.055% fees, carry, output head, optimizer settings and 1000
+# epochs unchanged. Missing held valuation still raises if an exit is blocked.

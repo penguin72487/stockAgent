@@ -1,0 +1,15 @@
+# The v1 data-only experiment failed before epoch 1: its 99-feature pretrained
+# checkpoint cannot be transferred into this 428-feature preopen ABI through
+# the baseline's learned 24-dimensional bottleneck. The absent source feature
+# is next_session_open_gap_logret. Preserve v1's failure and use a new artifact
+# root for this causally valid fresh initialization.
+# All model, execution, optimizer, objective, basis, batch and fold settings
+# continue to inherit the completed OFAT v8 baseline through data_v1.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_v1.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-fresh-v2
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_fresh_v2
+
+training:
+  pretrained_initialization_root: null

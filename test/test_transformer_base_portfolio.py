@@ -2,6 +2,7 @@
 """Smoke tests for the scalable Transformer-base portfolio model."""
 
 import copy
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,10 @@ from stockagent.models.normalization import (
     masked_activation_l1_weights,
     masked_cash_asset_l1_weights,
     masked_cash_entmax15_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_log_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
     masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -2391,6 +2396,196 @@ def test_portfolio_output_mode_cash_entmax_matches_cash_helper() -> None:
     )
     assert torch.all(weights.abs().sum(dim=1) < 1.0)
     assert weights[1, 10:].abs().max().item() == 0.0
+
+
+def test_score_entmax_global_cash_model_uses_existing_score_head_and_cash_budget() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="score_entmax_global_cash",
+        center_long_short_logits=False,
+    ).eval()
+    control = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="projection_l1",
+        center_long_short_logits=False,
+    ).eval()
+    assert set(model.state_dict()) == set(control.state_dict())
+    assert sum(p.numel() for p in model.parameters()) == sum(p.numel() for p in control.parameters())
+    assert model.cash_asset_token is None
+    assert model.learned_cash_score_head is None
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+    expected, expected_parts = masked_score_entmax_global_cash_weights(
+        aux["centered_score_logits"], mask, return_parts=True
+    )
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["score_entmax_global_cash_fraction"],
+        expected_parts["score_entmax_global_cash_fraction"],
+    )
+    assert weights.dtype == torch.float32
+    assert torch.all(weights.abs().sum(dim=1) < 1.0)
+
+
+def test_scale_separated_cash_model_uses_existing_parameters_and_audits_cash() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="score_entmax_scale_separated_cash",
+        center_long_short_logits=False,
+    ).eval()
+    control = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="projection_l1",
+        center_long_short_logits=False,
+    ).eval()
+    assert set(model.state_dict()) == set(control.state_dict())
+    assert sum(p.numel() for p in model.parameters()) == sum(p.numel() for p in control.parameters())
+    assert model.cash_asset_token is None
+    assert model.learned_cash_score_head is None
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+    expected, expected_parts = masked_score_entmax_scale_separated_cash_weights(
+        aux["centered_score_logits"], mask, return_parts=True
+    )
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["score_entmax_scale_separated_cash_fraction"],
+        expected_parts["score_entmax_scale_separated_cash_fraction"],
+    )
+    assert weights.dtype == torch.float32
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0)
+
+
+def test_bounded_cash_model_uses_existing_parameters_and_audits_cash() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="score_entmax_bounded_cash",
+        center_long_short_logits=False,
+    ).eval()
+    control = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="projection_l1",
+        center_long_short_logits=False,
+    ).eval()
+    assert set(model.state_dict()) == set(control.state_dict())
+    assert sum(p.numel() for p in model.parameters()) == sum(
+        p.numel() for p in control.parameters()
+    )
+    assert model.cash_asset_token is None
+    assert model.learned_cash_score_head is None
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+    expected, expected_parts = masked_score_entmax_bounded_cash_weights(
+        aux["centered_score_logits"], mask, return_parts=True
+    )
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["score_entmax_bounded_cash_fraction"],
+        expected_parts["score_entmax_bounded_cash_fraction"],
+    )
+    assert weights.dtype == torch.float32
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0)
+
+
+def test_log_cash_model_uses_existing_parameters_and_audits_cash() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="score_entmax_log_cash",
+        center_long_short_logits=False,
+    ).eval()
+    control = _make_model(
+        attention_mode="market_token",
+        portfolio_output_mode="projection_l1",
+        center_long_short_logits=False,
+    ).eval()
+    assert set(model.state_dict()) == set(control.state_dict())
+    assert sum(p.numel() for p in model.parameters()) == sum(
+        p.numel() for p in control.parameters()
+    )
+    assert model.cash_asset_token is None
+    assert model.learned_cash_score_head is None
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+    expected, expected_parts = masked_score_entmax_log_cash_weights(
+        aux["centered_score_logits"], mask, return_parts=True
+    )
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["score_entmax_log_cash_fraction"],
+        expected_parts["score_entmax_log_cash_fraction"],
+    )
+    assert weights.dtype == torch.float32
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "output_mode"),
+    [
+        (
+            "tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_global_cash_10240_v7.yaml",
+            "score_entmax_global_cash",
+        ),
+        (
+            "tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_cash_v2_10240_v8.yaml",
+            "score_entmax_cash_v2",
+        ),
+        (
+            "tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_scale_separated_cash_10240_v9.yaml",
+            "score_entmax_scale_separated_cash",
+        ),
+    ],
+)
+def test_historical_cash_output_fold11_configs_resolve_effective_epoch_contract(
+    config_name: str, output_mode: str,
+) -> None:
+    cfg = load_config(Path("configs/deployments") / config_name)
+    assert cfg.training.model_name == "financial_transformer"
+    assert cfg.training.financial_transformer.portfolio_output_mode == output_mode
+    assert cfg.training.transformer_base_portfolio.portfolio_output_mode == output_mode
+    # The historical file names say 10240, but their v6 base explicitly pins
+    # the effective lifecycle to 1,024 epochs. Keep the test on resolved YAML.
+    assert cfg.training.epochs == 1024
+    assert cfg.training.early_stopping_no_improve_ratio == 0.1
+
+
+def test_scale_separated_fold11_config_changes_only_output_contract_and_run_identity() -> None:
+    root = Path("configs/deployments")
+    baseline = asdict(load_config(
+        root / "tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_global_cash_10240_v7.yaml"
+    ))
+    candidate = asdict(load_config(
+        root / "tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_scale_separated_cash_10240_v9.yaml"
+    ))
+    baseline["experiment_name"] = candidate["experiment_name"]
+    baseline["runner"]["output_dir"] = candidate["runner"]["output_dir"]
+    for model_name in (
+        "transformer_base_portfolio", "financial_transformer",
+        "executable_portfolio_transformer",
+    ):
+        baseline["training"][model_name]["portfolio_output_mode"] = (
+            "score_entmax_scale_separated_cash"
+        )
+    assert baseline == candidate
 
 
 def test_factory_builds_transformer_base_portfolio_model() -> None:

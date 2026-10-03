@@ -1,0 +1,15 @@
+# Same v5-derived intraday model and canonical trainer; complete private minute
+# bundle and the user's TWD 100M account. Fold 5 is train 2020-2024 / val 2025 /
+# test 2026, matching the validation year of the original v5 fold 10.
+base_config: tw_futures_v8_intraday.yaml
+experiment_name: tw-futures-v8-intraday-capital100m
+
+trading:
+  tw_futures_portfolio_integer_initial_capital: 100000000.0
+  volume_participation_equity: 100000000.0
+  tw_futures_portfolio_minute_data_path: artifacts/data_preparation/all_futures_intraday_v8_20260927_v4/minutes.parquet
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_intraday_capital100m_fold5
+  start_fold: 5
+  resume: true

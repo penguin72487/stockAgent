@@ -9,6 +9,10 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_activation_l1_weights,
     masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
     masked_cross_sectional_mean,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -595,8 +599,35 @@ class GradientBoostedPortfolioTransformer(nn.Module):
                 weights, output_aux = action_output
             else:
                 weights = action_output
-        elif self.portfolio_output_mode == "cash_entmax15":
+        elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash_v2"}:
             cash_output = masked_cash_entmax15_weights(
+                target_logits,
+                mask_bool,
+                short_mask=(
+                    torch.zeros_like(mask_bool) if long_only else mask_bool
+                ),
+                return_parts=include_aux,
+                preserve_fp32_output=(self.portfolio_output_mode != "cash_entmax15"),
+                preserve_zero_score_gradient=(self.portfolio_output_mode == "score_entmax_cash_v2"),
+            )
+            if include_aux:
+                weights, output_aux = cash_output
+            else:
+                weights = cash_output
+        elif self.portfolio_output_mode in {
+            "score_entmax_global_cash", "score_entmax_bounded_cash",
+            "score_entmax_log_cash",
+            "score_entmax_scale_separated_cash",
+        }:
+            allocator = {
+                "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+                "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+                "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+                "score_entmax_scale_separated_cash": (
+                    masked_score_entmax_scale_separated_cash_weights
+                ),
+            }[self.portfolio_output_mode]
+            cash_output = allocator(
                 target_logits,
                 mask_bool,
                 short_mask=(

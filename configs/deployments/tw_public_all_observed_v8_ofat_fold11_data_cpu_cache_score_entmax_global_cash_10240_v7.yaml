@@ -1,0 +1,17 @@
+# No-additional-trainable-parameter cash-budget OFAT against v6 projection-L1.
+# Preserve v6's pinned observed dataset, architecture, physical FIFO ledger,
+# two-GPU compute shapes, effective 1,024-epoch ceiling, and early stopping.
+# The historical 10,240 name does not override v6's training.epochs: 1024. The output
+# transform changes requested weights and the checkpoint contract, so this run
+# owns a fresh artifact root and must not resume the projection-L1 optimizer.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_projection_l1_10240_v6.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-score-entmax-global-cash-10240-v7
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_global_cash_10240_v7
+
+training:
+  transformer_base_portfolio:
+    portfolio_output_mode: score_entmax_global_cash
+  financial_transformer:
+    portfolio_output_mode: score_entmax_global_cash

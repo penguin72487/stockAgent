@@ -1254,6 +1254,7 @@ def risk_aware_loss(
     gamma_turnover_budget: float = 0.0,
     objective: str = "sharpe",
     log_utility_periods_per_year: float = 252.0,
+    log_return_weights: Tensor | None = None,
     aux_outputs: dict[str, Tensor] | None = None,
     rank_ic_weight: float = 1.0,
     return_rank_ic_weight: float = 0.0,
@@ -1289,8 +1290,11 @@ def risk_aware_loss(
     futures_portfolio_recoverable_backward: bool = False,
     day_trade_carry_sessions: tuple[DayTradeCarrySession, ...] | None = None,
     day_trade_carry_event_compression: bool = False,
+    day_trade_sub_lot_recovery: bool = False,
+    day_trade_sub_lot_recovery_labels: tuple[object, ...] | None = None,
     futures_minute_saturation_recovery: bool = False,
     futures_minute_recovery_objective: str = "residual_notional",
+    crypto_announced_exit_unlimited_volume: bool = False,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1299,6 +1303,8 @@ def risk_aware_loss(
 
     prepare_start = _loss_timer_start()
     mode = normalize_execution_mode(execution_mode)
+    if crypto_announced_exit_unlimited_volume and mode != "crypto_perpetual":
+        raise ValueError("crypto_announced_exit_unlimited_volume requires crypto_perpetual")
     execution_returns, returns = _execution_and_safe_returns(
         future_log_returns,
         reference=weights,
@@ -1306,6 +1312,11 @@ def risk_aware_loss(
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if log_return_weights is not None and (
+        objective_norm != "log_utility" or mode != "tw_stock_context_futures_portfolio"
+        or log_return_weights.ndim != 1 or log_return_weights.shape[0] != weights.shape[0]
+    ):
+        raise ValueError("return VJP weights require aligned futures log_utility rows")
     if day_trade_carry_sessions is not None and objective_norm not in {
         "log_utility", "log_util", "kelly", "growth", "mean_log_return",
     }:
@@ -1378,11 +1389,14 @@ def risk_aware_loss(
                 f"{mode} requires integer candidate execution tensor [T,S,2,{candidate_fields}]"
             )
     if mode == "tw_stock_context_futures_portfolio":
-        if weights.dim() != 2 or int(weights.size(1)) != 1936:
+        if weights.dim() != 2:
             raise ValueError(
                 "tw_stock_context_futures_portfolio requires direct model "
-                f"actions [T,1936], got {tuple(weights.shape)}"
+                f"actions [T,S], got {tuple(weights.shape)}"
             )
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        slots = int(weights.size(1))
+        futures_slot_layout_version(slots)
         if objective_norm not in {
             "log_utility",
             "log_util",
@@ -1394,16 +1408,19 @@ def risk_aware_loss(
                 "tw_stock_context_futures_portfolio supports only canonical "
                 "log utility"
             )
+        from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
         valid_execution_shapes = {
-            (int(weights.size(0)), 1936, 4),
-            (int(weights.size(0)), 1936, 11),
+            (int(weights.size(0)), slots, 4),
+            (int(weights.size(0)), slots, 11),
+            *((int(weights.size(0)), slots, width) for width in MARGIN_EXECUTION_WIDTHS),
+            (int(weights.size(0)), slots, 2, TAPE_FIELDS),
         }
         if overnight_log_returns is None or tuple(
             overnight_log_returns.shape
         ) not in valid_execution_shapes:
             raise ValueError(
                 "tw_stock_context_futures_portfolio requires packed execution "
-                "tensor [T,1936,4] or exact-integer [T,1936,11]"
+                f"tensor [T,{slots},C] matching the declared execution ABI"
             )
     if mode in TW_CARRYING_EXECUTION_MODES:
         phase_actions = mode == "tw_overnight" or weights.dim() == 3
@@ -1773,6 +1790,7 @@ def risk_aware_loss(
             crypto_stateful_proximal_allocator
         ),
         crypto_proximal_cost_multiplier=crypto_proximal_cost_multiplier,
+        crypto_announced_exit_unlimited_volume=crypto_announced_exit_unlimited_volume,
         volume_limit_weights=volume_limit_weights,
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
@@ -1879,6 +1897,10 @@ def risk_aware_loss(
             mode == "tw_stock_context_futures_portfolio"
             and float(gamma_turnover) == 0.0
         ),
+        # This reporting-only margin table is not used by any loss or carried
+        # state. The exact funding/default checks above remain mandatory;
+        # validation, inference and exports retain the simulator's default.
+        return_futures_margin_audit=False,
     )
     _loss_timer_stop("backtest", backtest_start)
 
@@ -1996,6 +2018,38 @@ def risk_aware_loss(
         valid_f = valid_mask.to(dtype=clean_returns.dtype)
         valid_count = valid_f.sum()
         masked_returns = clean_returns * valid_f
+        if log_return_weights is not None:
+            # A separate gradient-only probe uses these weights to differentiate
+            # a peak-to-trough log loss. Do not change sample_mask, state advance,
+            # positions or the actual returns of any date outside that interval.
+            masked_returns = masked_returns * log_return_weights.to(clean_returns)
+        if day_trade_sub_lot_recovery and torch.is_grad_enabled() and weights.requires_grad:
+            if day_trade_carry_sessions is None or portfolio_activation != "pre_normalized":
+                raise ValueError("sub-lot recovery requires physical FIFO pre_normalized actions")
+            from stockagent.training.day_trade_lot_recovery import sub_lot_recovery_delta
+            initial_physical = (aux_outputs or {}).get("initial_day_trade_carry_state")
+            if initial_physical is not None and bool((initial_physical.inventory.shares != 0).any()):
+                raise ValueError("sub-lot recovery cannot approximate carried inventory")
+            def recovery_rate(values, default):
+                if values is None:
+                    return weights.new_full((weights.shape[1],), default, dtype=torch.float64)
+                if symbol_indices is not None:
+                    values = values.index_select(0, symbol_indices.to(values.device, dtype=torch.long))
+                return values.to(device=weights.device, dtype=torch.float64)
+            allowed = tradable & day_trade_eligible_mask.bool()
+            shadow = sub_lot_recovery_delta(
+                weights, day_trade_carry_sessions, backtest,
+                can_long=allowed & day_trade_can_buy_open_mask.bool(),
+                can_short=(torch.zeros_like(allowed) if long_only else
+                           allowed & day_trade_can_sell_open_mask.bool() & can_short_open_mask.bool()),
+                buy=recovery_rate(buy_fee_rates, buy_fee_rate),
+                sell=recovery_rate(sell_fee_rates, sell_fee_rate),
+                normal=recovery_rate(normal_sell_fee_rates, sell_fee_rate),
+                rebate=recovery_rate(commission_rebate_rates, 0.),
+                initial_nav=(day_trade_execution_initial_capital if initial_physical is None else initial_physical.last_nav),
+                labels=day_trade_sub_lot_recovery_labels,
+            )
+            masked_returns = masked_returns + shadow * valid_f
         _loss_timer_stop("mask_apply", mask_start)
 
         reduce_start = _loss_timer_start()

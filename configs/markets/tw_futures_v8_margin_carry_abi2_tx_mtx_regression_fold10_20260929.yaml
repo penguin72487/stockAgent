@@ -1,0 +1,11 @@
+# Engineering regression for the new carry ABI. This is TX/MTX source evidence
+# only, and does not constitute all-TWD product admission or a performance run.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_scratch_all_folds_v17.yaml
+experiment_name: tw-futures-v8-margin-carry-abi2-tx-mtx-regression-fold10-20260929
+
+trading:
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/carry_abi2_real_index_regression_v2_20260929/rules.parquet
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_carry_abi2_tx_mtx_regression_fold10_smoke3_20260929
+  start_fold: 10

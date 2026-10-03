@@ -15,8 +15,62 @@ from scripts.run_ablation_experiments import (
     _fold_status,
     _format_fold_status,
     _per_job_thread_budget,
+    _postprocess_plot_specs,
+    _render_postprocess_plots,
     _resolve_pinned_panel_cache_env,
 )
+
+
+def test_v8_day_trade_ofat_refreshes_all_three_plot_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs/ablations/"
+        "tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat.yaml"
+    )
+    spec, _ = _experiment_rows(spec_path)
+    plots = _postprocess_plot_specs(spec)
+    assert [(plot["split"], plot["prefix"]) for plot in plots] == [
+        ("val", "val"),
+        ("deployment", "test"),
+        ("test", "full_horizon_integer_audit"),
+    ]
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        ablation_module.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+    _render_postprocess_plots(tmp_path, plots, baseline_root=None)
+    assert len(commands) == 3
+    assert commands[2][commands[2].index("--prefix") + 1] == (
+        "full_horizon_integer_audit"
+    )
+    assert all("--output-dir" in command for command in commands)
+
+
+def test_postprocess_plot_spec_rejects_duplicate_prefixes() -> None:
+    with pytest.raises(ValueError, match="prefixes must be unique"):
+        _postprocess_plot_specs(
+            {
+                "postprocess_plots": [
+                    {"split": "test", "prefix": "duplicate"},
+                    {"split": "val", "prefix": "duplicate"},
+                ]
+            }
+        )
+
+
+def test_temporal_basis_configuration_failure_is_not_a_distributed_retry() -> None:
+    assert _failure_kind(
+        1,
+        "[rank0]: ValueError: Temporal basis overrides are not enabled "
+        "in the configured families: ['pca_klt']\n"
+        "torch.distributed.elastic.multiprocessing.errors.ChildFailedError",
+    ) == "temporal_basis_configuration_failure"
 
 
 def test_deep_merge_preserves_unmodified_nested_values() -> None:

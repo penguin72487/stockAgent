@@ -15,6 +15,7 @@ from stockagent.backtest.tw_execution import (
     normalize_execution_mode,
 )
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
     TAIFEX_OPTION_CANDIDATE_CAPACITY,
@@ -94,6 +95,12 @@ class WindowedSplitTensors:
                 f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"
             )
         expected_symbol_shape = tuple(self.future_log_returns.shape)
+        futures_slots=TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+        if (self.execution_mode=="tw_stock_context_futures_portfolio"
+                and self.overnight_log_returns is not None and self.overnight_log_returns.ndim>=2):
+            from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+            futures_slots=int(self.overnight_log_returns.size(1))
+            futures_slot_layout_version(futures_slots)
         if self.overnight_log_returns is None:
             self.overnight_log_returns = torch.zeros_like(
                 self.future_log_returns
@@ -167,19 +174,28 @@ class WindowedSplitTensors:
             not in {
                 (
                     int(self.features.size(0)),
-                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    futures_slots,
                     4,
                 ),
                 (
                     int(self.features.size(0)),
-                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    futures_slots,
                     11,
+                ),
+                *((int(self.features.size(0)), futures_slots, width)
+                  for width in MARGIN_EXECUTION_WIDTHS),
+                (
+                    int(self.features.size(0)),
+                    futures_slots,
+                    2,
+                    TAPE_FIELDS,
                 ),
             }
         ):
             raise ValueError(
                 "tw_stock_context_futures_portfolio execution tensor must have "
-                "shape [T,1936,4] or exact-integer [T,1936,11]"
+                f"shape [T,versioned slots,C] with C in {(4, 11, *MARGIN_EXECUTION_WIDTHS)}, "
+                "or intraday [T,versioned slots,2,63]"
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
@@ -245,15 +261,24 @@ class WindowedSplitTensors:
                 dtype=torch.bool
             )
         elif self.execution_mode == "tw_stock_context_futures_portfolio":
+            from stockagent.data.tw_futures_margin import (
+                MARGIN_FEATURE_COLUMNS,
+                MARGIN_AMOUNT_FEATURE_COLUMNS,
+            )
+
             expected_rows = int(self.features.size(0))
             expected_context_prefix = (
                 expected_rows,
-                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                futures_slots,
             )
             valid_context_widths = {
                 len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS),
                 len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS),
                 len(TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS),
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_FEATURE_COLUMNS),
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_AMOUNT_FEATURE_COLUMNS),
             }
             if (
                 self.derivative_candidate_features is None
@@ -265,7 +290,7 @@ class WindowedSplitTensors:
             ):
                 raise ValueError(
                     "tw_stock_context_futures_portfolio model context must have "
-                    f"shape [T,{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT},F] "
+                    f"shape [T,{futures_slots},F] "
                     f"where F is one of {sorted(valid_context_widths)}"
                 )
             if self.derivative_candidate_mask is None or tuple(
@@ -273,7 +298,7 @@ class WindowedSplitTensors:
             ) != expected_context_prefix:
                 raise ValueError(
                     "tw_stock_context_futures_portfolio context mask must match "
-                    "[T,1936]"
+                    "[T,versioned slots]"
                 )
             self.derivative_candidate_mask = self.derivative_candidate_mask.to(
                 dtype=torch.bool

@@ -1,0 +1,30 @@
+base_config: tw_futures_v8_general.yaml
+experiment_name: tw-futures-v8-intraday
+
+data:
+  panel_start_date: '2020-03-23'
+  tw_futures_expiry_settlement_valuation: false
+  panel_cache_root: artifacts/cache/tw_futures_v8_intraday
+
+trading:
+  tw_futures_portfolio_holding_policy: intraday
+  tw_futures_portfolio_capital_basis: notional
+  tw_futures_portfolio_minute_data_path: artifacts/data_preparation/futures_minutes_capacity_ceil_quarantine_v2_20260909/minutes.parquet
+
+training:
+  # The minute ledger uses the shared CUDA graph; no daily funding selector.
+  futures_funding_compile: false
+  # Full-history minute coverage and VRAM acceptance are still pending.
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  pretrained_initialization_fold_policy: matching_validation_and_causal_train_superset
+  futures_minute_recovery_objective: execution_utility
+
+walk_forward:
+  expected_first_year: 2020
+  split_start_year: 2020
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_intraday
+  # This horizon has five folds; do not inherit a general-mode fold-10 override.
+  start_fold: 1

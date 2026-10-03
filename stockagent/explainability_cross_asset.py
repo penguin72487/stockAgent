@@ -21,6 +21,10 @@ from stockagent.models.normalization import (
     masked_cash_asset_l1_weights,
     masked_cross_sectional_mean,
     masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
     masked_learned_cash_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -517,12 +521,29 @@ def _portfolio_weights_from_scores(
             return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=True).masked_fill(~mask, 0.0)
         if output_mode == "signed_entmax15":
             return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=True).masked_fill(~mask, 0.0)
-        if output_mode in {"cash_entmax15", "score_entmax_cash"}:
+        if output_mode in {"cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2"}:
             return masked_cash_entmax15_weights(
                 target_logits,
                 mask,
                 short_mask=torch.zeros_like(mask),
-                preserve_fp32_output=(output_mode == "score_entmax_cash"),
+                preserve_fp32_output=(output_mode != "cash_entmax15"),
+                preserve_zero_score_gradient=(output_mode == "score_entmax_cash_v2"),
+            ).masked_fill(~mask, 0.0)
+        if output_mode in {
+            "score_entmax_global_cash", "score_entmax_bounded_cash",
+            "score_entmax_log_cash",
+            "score_entmax_scale_separated_cash",
+        }:
+            allocator = {
+                "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+                "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+                "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+                "score_entmax_scale_separated_cash": (
+                    masked_score_entmax_scale_separated_cash_weights
+                ),
+            }[output_mode]
+            return allocator(
+                target_logits, mask, short_mask=torch.zeros_like(mask)
             ).masked_fill(~mask, 0.0)
         if output_mode == "projection_l1":
             return masked_l1_projection_weights(
@@ -565,12 +586,29 @@ def _portfolio_weights_from_scores(
         return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=False).masked_fill(~mask, 0.0)
     if output_mode == "signed_entmax15":
         return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=False).masked_fill(~mask, 0.0)
-    if output_mode in {"cash_entmax15", "score_entmax_cash"}:
+    if output_mode in {"cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2"}:
         return masked_cash_entmax15_weights(
             target_logits,
             mask,
             short_mask=mask,
-            preserve_fp32_output=(output_mode == "score_entmax_cash"),
+            preserve_fp32_output=(output_mode != "cash_entmax15"),
+            preserve_zero_score_gradient=(output_mode == "score_entmax_cash_v2"),
+        ).masked_fill(~mask, 0.0)
+    if output_mode in {
+        "score_entmax_global_cash", "score_entmax_bounded_cash",
+        "score_entmax_log_cash",
+        "score_entmax_scale_separated_cash",
+    }:
+        allocator = {
+            "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+            "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+            "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+            "score_entmax_scale_separated_cash": (
+                masked_score_entmax_scale_separated_cash_weights
+            ),
+        }[output_mode]
+        return allocator(
+            target_logits, mask, short_mask=mask
         ).masked_fill(~mask, 0.0)
     if output_mode == "projection_l1":
         return masked_l1_projection_weights(

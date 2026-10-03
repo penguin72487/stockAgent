@@ -1,0 +1,13 @@
+# Same v13 feasible backward and normal nonzero policy initialization.
+# Change account capital to TWD 10M; preserve the TWD 100M artifacts and
+# start with a fresh optimizer under the new capital fingerprint.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_feasible_gradient_v13.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital10m-tx-front-roll-feasible-gradient-v14
+
+trading:
+  tw_futures_portfolio_integer_initial_capital: 10000000.0
+  volume_participation_equity: 10000000.0
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_feasible_gradient_v14
+  start_fold: 14

@@ -1,0 +1,14 @@
+# Learn exposure from an exactly flat initial policy, using the existing head.
+# The existing futures RMS fitter uses 2011..2024 only for Fold 14.
+# Initialization and input transforms change training: never resume v5 Adam.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_physical_gradient_v5.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-cash-init-v6
+
+training:
+  financial_transformer:
+    futures_flat_action_initialization: true
+    futures_feature_rms_normalization: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_cash_init_v6
+  start_fold: 14

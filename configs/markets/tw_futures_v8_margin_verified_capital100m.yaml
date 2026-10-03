@@ -1,0 +1,31 @@
+# Same v5-derived architecture and canonical margin account, verified TX/MTX
+# monthly scope. No future fold checkpoint is borrowed to lengthen history.
+base_config: tw_futures_v8_margin.yaml
+experiment_name: tw-futures-v8-margin-verified-capital100m
+
+data:
+  panel_start_date: '2021-05-20'
+  panel_cache_root: artifacts/cache/tw_futures_v8_margin_verified_capital100m
+
+trading:
+  tw_futures_portfolio_integer_initial_capital: 100000000.0
+  volume_participation_equity: 100000000.0
+  tw_futures_portfolio_data_path: artifacts/markets/tw_futures_v8_margin_preparation/verified_scope_20260927_v3/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/verified_scope_20260927_v3/rules/rules.parquet
+
+training:
+  pretrained_initialization_root: null
+
+walk_forward:
+  expected_first_year: 2021
+  split_start_year: 2021
+  min_train_years: 1
+  val_years: 1
+  lookback_context: panel_history
+  require_contiguous_years: true
+  require_future_test_year: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_capital100m_fold4
+  start_fold: 4
+  resume: true

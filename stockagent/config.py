@@ -33,6 +33,7 @@ from stockagent.data.tw_day_trade_execution import (
     normalize_day_trade_daily_proxy_price_policy,
 )
 from stockagent.data.walkforward import normalize_lookback_context
+from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     normalize_portfolio_activation,
@@ -152,10 +153,16 @@ def _validate_crypto_perpetual_mode_contract(
     proximal_cost_multiplier: object,
     execution_minute_utc: object,
     optimizer_step_per_trajectory: object = False,
+    announced_exit_unlimited_volume: object = False,
 ) -> None:
     """Keep the daily Bybit carrying account on one explicit contract."""
 
     if execution_mode != "crypto_perpetual":
+        if bool(announced_exit_unlimited_volume):
+            raise ValueError(
+                "trading.crypto_announced_exit_unlimited_volume requires "
+                "trading.execution_mode='crypto_perpetual'"
+            )
         if bool(optimizer_step_per_trajectory):
             raise ValueError(
                 "crypto_optimizer_step_per_trajectory requires "
@@ -188,6 +195,7 @@ def _validate_crypto_perpetual_mode_contract(
         "l1",
         "cash_l1",
         "learned_cash",
+        "score_entmax_cash_v2",
         "projection_l1",
     }:
         raise ValueError(
@@ -706,6 +714,7 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     futures_denomination_hard_projection: object,
     futures_current_open_feature: object,
     data_futures_current_open_feature: object,
+    denomination_context_basis: str,
     carry_valuation_max_abs_simple_return: object,
     expiry_settlement_valuation: object,
     final_settlement_path: object,
@@ -726,7 +735,17 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
 ) -> None:
     if execution_mode != "tw_stock_context_futures_portfolio":
         return
-    if _normalized_contract_name(model_name) not in (
+    financial_futures = _normalized_contract_name(model_name) == "financial_transformer"
+    if financial_futures and (
+        (bool(day_trade_open_feature)
+         and DAY_TRADE_OPEN_GAP_FEATURE not in tuple(feature_shift_next_session))
+        or bool(futures_current_open_feature)
+        or (bool(futures_denomination_aware_output)
+            and denomination_context_basis != "prior_settlement")
+        or futures_denomination_hard_projection is not False
+    ):
+        raise ValueError("financial futures require prior-session features and executor-only denomination rounding")
+    if not financial_futures and _normalized_contract_name(model_name) not in (
         _TW_STOCK_CONTEXT_ALL_FUTURES_MODEL_NAMES
     ):
         raise ValueError(
@@ -739,15 +758,14 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
             "training.train_symbol_compaction=false; the input stock axis and "
             "fixed futures action axis have different identities"
         )
-    if normalize_portfolio_output_mode(str(model_portfolio_output_mode)) != (
-        "projection_l1"
-    ):
+    allowed_outputs = {"score_entmax_log_cash"} if financial_futures else {"projection_l1"}
+    if normalize_portfolio_output_mode(str(model_portfolio_output_mode)) not in allowed_outputs:
         raise ValueError(
             "tw_stock_context_futures_portfolio requires model "
             "portfolio_output_mode='projection_l1'"
         )
     if bool(integer_contracts):
-        if not bool(futures_denomination_aware_output):
+        if not financial_futures and not bool(futures_denomination_aware_output):
             raise ValueError(
                 "integer tw_stock_context_futures_portfolio requires "
                 "futures_denomination_aware_output=true"
@@ -1398,6 +1416,33 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     return items
 
 
+def _normalize_causal_feature_compression(
+    model_config: dict[str, Any], *, section: str
+) -> None:
+    method = str(model_config["causal_feature_compression"]).strip().lower()
+    if method not in {"none", "signed_log1p", "asinh"}:
+        raise ValueError(
+            f"{section}.causal_feature_compression must be "
+            "none, signed_log1p, or asinh"
+        )
+    patterns = _normalize_string_list(
+        model_config["causal_feature_compression_patterns"],
+        field_name=f"{section}.causal_feature_compression_patterns",
+    )
+    if method != "none" and (
+        not model_config["causal_feature_rms_normalization"] or not patterns
+    ):
+        raise ValueError(
+            f"{section} feature compression requires train-only RMS and feature patterns"
+        )
+    if method == "none" and patterns:
+        raise ValueError(
+            f"{section} feature compression patterns require an enabled method"
+        )
+    model_config["causal_feature_compression"] = method
+    model_config["causal_feature_compression_patterns"] = patterns
+
+
 def _normalize_temporal_basis_component_map(
     value: Any,
     *,
@@ -1460,6 +1505,15 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
+    # Opt-in, checkpoint-affecting execution-universe boundary. The traded
+    # instruments and valuation rows must remain on this venue even when an
+    # explicitly registered public information scope is enabled below.
+    crypto_exchange_scope: str = ""
+    # ``venue_only`` admits only the execution venue's own information.
+    # ``historical_public_pit`` additionally admits the registered, explicit
+    # cross-venue/FRED/SEC columns whose publication clocks are historically
+    # reproducible. Prospective snapshots remain unavailable to old dates.
+    crypto_information_scope: str = "venue_only"
     # Inclusive lower bound for the model panel.  Source archives may retain
     # older rows for provenance even when that interval cannot support an
     # unbiased training universe.
@@ -1507,6 +1561,12 @@ class DataConfig:
     # exposed as current information and used by the execution proxy, while
     # the cash-stock panel remains complete only through session t-1.
     tw_futures_current_open_feature: bool = False
+    # Must match the immutable futures release and model action layout.
+    tw_futures_portfolio_slot_count: int = 1936
+    # Optional causal sizing context; the executor still uses observed OPEN.
+    tw_futures_denomination_context_basis: str = "current_open"
+    # Exclude known zero-capacity orders from policy actions, never valuation.
+    tw_futures_require_prior_capacity: bool = False
     # Optional data-integrity guard for stock/ETF futures whose physical
     # contract cannot be valued consistently across adjacent daily OPENs.
     # Zero preserves historical contracts. A positive threshold fails the
@@ -1656,6 +1716,10 @@ class TradingConfig:
     # 5 preserves the v6 lagged contract; 0 selects the v7 zero-latency
     # counterfactual and must be paired with matching materialized daily data.
     crypto_execution_minute_utc: int = 5
+    # Explicit research assumption: dated announced reductions bypass only
+    # volume capacity; side permissions, turnover, prices and fees still apply.
+    # False preserves the existing v5 carrying-account contract.
+    crypto_announced_exit_unlimited_volume: bool = False
     max_volume_participation: float = 0.0
     volume_participation_equity: float = 1_000_000.0
     # Reporting/post-processing multiplier only. Canonical train/eval exposure is 1.0.
@@ -1688,6 +1752,7 @@ class TradingConfig:
     # ceiling.  This is an explicit semantic/checkpoint boundary, not an
     # observed auction-liquidity claim.
     tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
+    tw_day_trade_entry_remainder_policy: str = "first_minute_only"
     tw_day_trade_margin_financing_ratio: float = 0.60
     tw_day_trade_margin_financing_annual_rate: float = 0.16
     tw_day_trade_margin_short_handling_fee_rate: float = 0.001
@@ -1792,6 +1857,17 @@ class TradingConfig:
     tw_futures_portfolio_integer_contracts: bool = False
     tw_futures_portfolio_integer_initial_capital: float = 10_000_000.0
     tw_futures_portfolio_integer_fee_per_contract_per_side_twd: float = 40.0
+    # Explicit account policy; intraday uses receipt-backed 08:46..13:30 bars.
+    tw_futures_portfolio_holding_policy: str = "carry"
+    tw_futures_portfolio_minute_data_path: str | None = None
+    tw_futures_portfolio_capital_basis: str = "notional"
+    # Explicit comparator ABI; the historical default preserves old runs.
+    tw_futures_portfolio_benchmark_mode: str = "legacy_front_holding_return"
+    tw_futures_portfolio_benchmark_data_path: str | None = None
+    tw_futures_portfolio_benchmark_sha256: str | None = None
+    tw_futures_portfolio_margin_rules_path: str | None = None
+    tw_futures_portfolio_broker_margin_multiplier: float = 1.0
+    tw_futures_portfolio_margin_liquidation_ratio: float = 0.25
     # Full cash-stock feature universe, but only causally known nearby
     # single-stock futures may receive a target. The aligned source owns
     # physical contract selection, multiplier, prices, and statutory tax.
@@ -2091,6 +2167,18 @@ class TransformerBasePortfolioModelConfig:
     # denomination.  Hard whole-unit values own forward; identity STE owns
     # backward.  This is disabled for legacy checkpoint compatibility.
     futures_denomination_aware_output: bool = False
+    # Train-window-only RMS for the 17 continuous futures candidate features.
+    futures_feature_rms_normalization: bool = False
+    # Start the dated-margin policy from cash by zeroing its existing final
+    # linear action head. No new parameters or permanent exposure cap.
+    futures_flat_action_initialization: bool = False
+    # Express raw action scores in prior-notional coordinates before the
+    # existing margin-budget output. Uses dated input metadata, no new weights
+    # or exposure ceiling; disabled models retain their historical contract.
+    futures_notional_score_coordinates: bool = False
+    # Observe the dated, pre-open one-contract initial margin relative to the
+    # experiment's initial capital. This is information, never a size rule.
+    futures_margin_amount_context: bool = False
     # Historical models quantized group actions against one fixed reference
     # capital before the recurrent integer executor quantized them again against
     # live equity. New exact-account experiments may retain denomination context
@@ -2133,6 +2221,14 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     causal_feature_rms_normalization: bool = False
     causal_feature_min_active_dates: int = 1
     causal_feature_scale_epsilon: float = 1e-6
+    # Opt-in exact per-decision trailing-window RMS. The training group still
+    # supplies an active-feature mask; its fitted global scale is not used.
+    causal_feature_window_rms_normalization: bool = False
+    # Optional zero-preserving compression after train-only RMS scaling and
+    # before temporal-basis decomposition. Patterns select source features;
+    # availability flags and categorical IDs should remain untouched.
+    causal_feature_compression: str = "none"
+    causal_feature_compression_patterns: list[str] = field(default_factory=list)
     # Disabled by default so historical checkpoints retain their original AMP
     # operation order. New experiments may opt into the algebraically
     # equivalent rank-lookback contraction explicitly.
@@ -2329,6 +2425,10 @@ class TrainingConfig:
     # all-futures mode uses a shadow account. The 08:45 minute mode uses adjacent
     # executable basket slopes and counterfactual days, with the same deadline.
     futures_portfolio_recoverable_backward: bool = False
+    # Replay unchanged futures tensor operations to reduce CUDA launch overhead.
+    # Runtime-only acceleration; the accounting and optimizer ABI is unchanged.
+    futures_cuda_graph: bool = False
+    futures_funding_compile: bool = False
     # Minute-only opt-in: retain the feasible inward basket secant when entry
     # capacity is saturated. False preserves the v3-v5 optimization contract.
     futures_minute_saturation_recovery: bool = False
@@ -2339,12 +2439,26 @@ class TrainingConfig:
     # account trajectory. Batches remain bounded truncated-BPTT chunks, while
     # AdamW and the step scheduler advance exactly once after the full epoch.
     futures_portfolio_optimizer_step_per_trajectory: bool = False
+    # Optional training-only exact step acceptance. Replays the full account
+    # and backtracks Adam proposals against this maximum drawdown magnitude.
+    futures_training_max_drawdown: float | str | None = None
+    futures_training_risk_tangent: bool = False
+    futures_training_risk_interior: bool = False
+    # Rejected proposals always roll back. This controls only whether an
+    # exhausted tangent search also ends training before validation patience.
+    futures_training_stop_on_rejected_step: bool = True
     # The physical Taiwan day-trade account is recurrent whenever an unfilled
     # position becomes margin inventory.  Keep one policy parameter vector for
     # the complete chronological epoch so every bounded FIFO chunk belongs to
     # the same policy that validation replays.  This is deliberately opt-in so
     # historical batch-cadence artifacts remain reproducible.
     day_trade_optimizer_step_per_trajectory: bool = False
+    # Backward-only one-lot utility for actions rejected by board-lot sizing.
+    # Forward execution, validation and checkpoint selection stay exact.
+    day_trade_sub_lot_recovery: bool = False
+    # Match annual fresh-capital validation with independent calendar-year
+    # training accounts. Never use this to reset a carrying/live account.
+    day_trade_training_annual_episodes: bool = False
     # Daily crypto shares the bounded recurrent executor. Keep one policy for
     # all training dates and weight each chunk by its valid-date count before
     # one optimizer update; this is an opt-in optimization-semantic change.
@@ -3297,6 +3411,20 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["causal_feature_rms_normalization"] = bool(
         financial_transformer["causal_feature_rms_normalization"]
     )
+    financial_transformer["causal_feature_window_rms_normalization"] = bool(
+        financial_transformer["causal_feature_window_rms_normalization"]
+    )
+    if financial_transformer["causal_feature_window_rms_normalization"] and (
+        not financial_transformer["causal_feature_rms_normalization"]
+        or financial_transformer["temporal_basis_input"] != "input_features"
+        or not financial_transformer["temporal_basis_families"]
+        or int(financial_transformer["daily_context_layers"]) > 0
+    ):
+        raise ValueError(
+            "training.financial_transformer.causal_feature_window_rms_normalization "
+            "requires train-only active mask, input_features temporal basis, "
+            "and no daily context encoder"
+        )
     financial_transformer["causal_feature_min_active_dates"] = max(
         1, int(financial_transformer["causal_feature_min_active_dates"])
     )
@@ -3313,6 +3441,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     financial_transformer["causal_feature_scale_epsilon"] = (
         causal_feature_scale_epsilon
+    )
+    _normalize_causal_feature_compression(
+        financial_transformer, section="training.financial_transformer"
     )
     financial_transformer["feature_bottleneck_dim"] = max(
         0, int(financial_transformer["feature_bottleneck_dim"])
@@ -3350,6 +3481,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         deepcopy(financial_transformer),
         executable_portfolio_transformer_overrides,
     )
+    # The executable model has a distinct forward path. Do not inherit the
+    # Financial Transformer-only window transform implicitly.
+    if "causal_feature_window_rms_normalization" not in executable_portfolio_transformer_overrides:
+        executable_portfolio_transformer["causal_feature_window_rms_normalization"] = False
     training["executable_portfolio_transformer"] = (
         executable_portfolio_transformer
     )
@@ -3441,6 +3576,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     executable_portfolio_transformer["causal_feature_rms_normalization"] = bool(
         executable_portfolio_transformer["causal_feature_rms_normalization"]
     )
+    executable_portfolio_transformer["causal_feature_window_rms_normalization"] = bool(
+        executable_portfolio_transformer["causal_feature_window_rms_normalization"]
+    )
+    if executable_portfolio_transformer["causal_feature_window_rms_normalization"]:
+        raise ValueError(
+            "training.executable_portfolio_transformer does not support "
+            "per-window RMS for its execution-context path"
+        )
     executable_portfolio_transformer["causal_feature_min_active_dates"] = max(
         1,
         int(
@@ -3462,6 +3605,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     executable_portfolio_transformer["causal_feature_scale_epsilon"] = (
         executable_causal_epsilon
+    )
+    _normalize_causal_feature_compression(
+        executable_portfolio_transformer,
+        section="training.executable_portfolio_transformer",
     )
     executable_portfolio_transformer["feature_bottleneck_dim"] = max(
         0, int(executable_portfolio_transformer["feature_bottleneck_dim"])
@@ -3790,6 +3937,20 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["tw_futures_current_open_feature"] = bool(
         data["tw_futures_current_open_feature"]
     )
+    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+    futures_slot_layout_version(data["tw_futures_portfolio_slot_count"])
+    data["tw_futures_portfolio_slot_count"] = int(data["tw_futures_portfolio_slot_count"])
+    data["tw_futures_denomination_context_basis"] = str(
+        data["tw_futures_denomination_context_basis"]
+    ).strip().lower()
+    data["tw_futures_require_prior_capacity"] = bool(data["tw_futures_require_prior_capacity"])
+    if data["tw_futures_denomination_context_basis"] not in {
+        "current_open", "prior_settlement",
+    }:
+        raise ValueError("futures denomination context must be current_open or prior_settlement")
+    if (data["tw_futures_denomination_context_basis"] == "prior_settlement"
+            and data["tw_futures_current_open_feature"]):
+        raise ValueError("prior-settlement denomination cannot expose current futures OPEN")
     data["tw_futures_expiry_settlement_valuation"] = bool(
         data["tw_futures_expiry_settlement_valuation"]
     )
@@ -3833,6 +3994,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["feature_shift_next_session"] = _normalize_string_list(
         data["feature_shift_next_session"],
         field_name="data.feature_shift_next_session",
+    )
+    data["crypto_exchange_scope"] = str(
+        data["crypto_exchange_scope"] or ""
+    ).strip().lower()
+    data["crypto_information_scope"] = str(
+        data["crypto_information_scope"] or "venue_only"
+    ).strip().lower()
+    validate_crypto_exchange_scope(
+        data, repo_root=Path(__file__).resolve().parents[1]
     )
     data["tw_public_feature_cutoff"] = str(
         data["tw_public_feature_cutoff"]
@@ -4025,6 +4195,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         phase_model_config = training["financial_transformer"]
     else:
         phase_model_config = training["transformer_base_portfolio"]
+    direction = str(phase_model_config.get("portfolio_mode", "auto")).lower().replace("-", "_")
+    if direction in {"short_only", "shortonly"}:
+        if trading["long_only"]:
+            raise ValueError("short_only portfolio_mode conflicts with trading.long_only=true")
+        if trading["execution_mode"] != "tw_day_trade" or normalized_phase_model not in _TW_PHASE_HEAD_MODEL_NAMES:
+            raise ValueError("short_only currently requires a TW day-trade transformer policy")
+        if phase_model_config["portfolio_output_mode"] not in {
+            "cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2",
+        }:
+            raise ValueError("short_only requires a score_entmax_cash family output")
     _validate_executable_portfolio_transformer_contract(
         model_name=training["model_name"],
         execution_mode=trading["execution_mode"],
@@ -4118,6 +4298,114 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
+    holding_policy = trading["tw_futures_portfolio_holding_policy"]
+    if training["futures_funding_compile"] and (
+        not training["futures_cuda_graph"] or training["backtest_compile"]
+    ):
+        raise ValueError("futures funding fusion requires futures_cuda_graph and an eager outer ledger")
+    capital_basis = trading["tw_futures_portfolio_capital_basis"]
+    if capital_basis not in {"notional", "initial_margin"}:
+        raise ValueError("futures capital basis must be notional or initial_margin")
+    benchmark_mode = trading["tw_futures_portfolio_benchmark_mode"]
+    if benchmark_mode not in {"legacy_front_holding_return", "tx_front_rolling_1x_gross"}:
+        raise ValueError("unsupported futures portfolio benchmark mode")
+    if benchmark_mode == "tx_front_rolling_1x_gross" and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or holding_policy != "carry"
+    ):
+        raise ValueError("TX rolling benchmark requires stock-context futures carry")
+    benchmark_path = trading["tw_futures_portfolio_benchmark_data_path"]
+    benchmark_sha = trading["tw_futures_portfolio_benchmark_sha256"]
+    if benchmark_path is not None and (not str(benchmark_path).strip()
+            or benchmark_mode != "tx_front_rolling_1x_gross" or benchmark_sha is None):
+        raise ValueError("external TX benchmark requires rolling mode and a SHA-256 pin")
+    if benchmark_sha is not None and (not isinstance(benchmark_sha, str) or len(benchmark_sha) != 64
+            or any(c not in "0123456789abcdef" for c in benchmark_sha)):
+        raise ValueError("invalid TX benchmark SHA-256 pin")
+    if (data["tw_futures_denomination_context_basis"] == "prior_settlement"
+            or data["tw_futures_require_prior_capacity"]) and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or not trading["tw_futures_portfolio_integer_contracts"]
+        or holding_policy != "carry"
+        or capital_basis != "notional"
+    ):
+        raise ValueError("prior-settlement denomination/prior capacity currently requires integer notional futures carry")
+    if phase_model_config["futures_feature_rms_normalization"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+    ):
+        raise ValueError("futures feature RMS requires the all-futures candidate sidecar")
+    if phase_model_config["futures_flat_action_initialization"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or capital_basis != "initial_margin"
+        or training["model_name"] != "financial_transformer"
+        or phase_model_config["portfolio_output_mode"] != "score_entmax_log_cash"
+    ):
+        raise ValueError("flat futures initialization requires the margin score_entmax_log_cash policy")
+    if phase_model_config["futures_notional_score_coordinates"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or capital_basis != "initial_margin"
+        or training["model_name"] != "financial_transformer"
+        or phase_model_config["portfolio_output_mode"] != "score_entmax_log_cash"
+        or phase_model_config["center_long_short_logits"]
+    ):
+        raise ValueError("notional score coordinates require the uncentered margin score_entmax_log_cash policy")
+    if phase_model_config["futures_margin_amount_context"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or capital_basis != "initial_margin"
+        or training["model_name"] != "financial_transformer"
+    ):
+        raise ValueError("margin amount context requires the financial-transformer dated-margin policy")
+    step_drawdown = training["futures_training_max_drawdown"]
+    if not isinstance(training["futures_training_stop_on_rejected_step"], bool):
+        raise ValueError("futures_training_stop_on_rejected_step must be a boolean")
+    if training["futures_training_risk_tangent"] and step_drawdown is None:
+        raise ValueError("risk tangent requires futures_training_max_drawdown")
+    if training["futures_training_risk_interior"] and not training["futures_training_risk_tangent"]:
+        raise ValueError("risk interior requires the drawdown tangent")
+    if step_drawdown is not None:
+        if step_drawdown != "benchmark" and (
+                not isinstance(step_drawdown, (float, int)) or isinstance(step_drawdown, bool)
+                or not math.isfinite(step_drawdown) or not 0 < step_drawdown < 1):
+            raise ValueError("futures_training_max_drawdown must be a fraction in (0,1) or benchmark")
+        if (capital_basis != "initial_margin"
+                or trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+                or not training["futures_portfolio_optimizer_step_per_trajectory"]
+                or training["loss_type"] != "log_utility"
+                or training["lr_scheduler"] != "warmup_cosine"
+                or evaluation["gamma_turnover"] != 0
+                or any(training["multitask_loss"][name] != 0 for name in
+                       ("rank_ic_weight", "return_rank_ic_weight", "direction_weight", "volatility_regime_weight", "concentration_weight"))
+                or any(phase_model_config[name] != 0 for name in ("dropout", "input_dropout", "candle_dropout"))):
+            raise ValueError("exact policy step requires deterministic margin trajectory log_utility without auxiliary penalties and with a step scheduler")
+    if capital_basis == "initial_margin":
+        if (trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+                or holding_policy != "carry"
+                or not trading["tw_futures_portfolio_integer_contracts"]
+                or not trading["tw_futures_portfolio_margin_rules_path"]
+                or training["model_name"] != "financial_transformer"
+                or training["futures_portfolio_training_surrogate_only"]
+                or training["backtest_compile"] or training["eval_backtest_compile"]
+                or training["compile_loss"]
+                or data["tw_futures_current_open_feature"]
+                or training["financial_transformer"]["futures_denomination_aware_output"]
+                or training["financial_transformer"]["portfolio_output_mode"] not in {"learned_cash", "score_entmax_log_cash"}
+                or not data["tw_futures_expiry_settlement_valuation"]):
+            raise ValueError("margin requires dated rules, FinancialTransformer, exact carry and eager ledger")
+        multiplier = float(trading["tw_futures_portfolio_broker_margin_multiplier"])
+        ratio = float(trading["tw_futures_portfolio_margin_liquidation_ratio"])
+        if not math.isfinite(multiplier) or multiplier < 1:
+            raise ValueError("broker margin multiplier must be finite and >= 1")
+        if not math.isfinite(ratio) or not 0.25 <= ratio <= 1:
+            raise ValueError("margin liquidation ratio must be in [0.25,1]")
+    if holding_policy not in {"carry", "intraday"}:
+        raise ValueError("tw_futures_portfolio_holding_policy must be carry or intraday")
+    if holding_policy == "intraday" and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or not trading["tw_futures_portfolio_integer_contracts"]
+        or not trading["tw_futures_portfolio_minute_data_path"]
+        or data["tw_futures_expiry_settlement_valuation"]
+    ):
+        raise ValueError("intraday requires exact all-futures minute data and cannot use expiry valuation")
     _validate_tw_futures_portfolio_mode_contract(
         execution_mode=trading["execution_mode"],
         frequency=trading["frequency"],
@@ -4151,6 +4439,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         data_futures_current_open_feature=data[
             "tw_futures_current_open_feature"
         ],
+        denomination_context_basis=data["tw_futures_denomination_context_basis"],
         carry_valuation_max_abs_simple_return=data[
             "tw_futures_carry_valuation_max_abs_simple_return"
         ],
@@ -4240,7 +4529,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if recovery_objective not in {"residual_notional", "execution_utility"}:
         raise ValueError("futures minute recovery objective must be residual_notional or execution_utility")
     if recovery_objective != "residual_notional" and (
-        trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+        (trading["execution_mode"] != "tw_stock_futures_day_trade_0845_minute"
+         and not (trading["execution_mode"] == "tw_stock_context_futures_portfolio"
+                  and holding_policy == "intraday"))
         or not training["futures_portfolio_recoverable_backward"]
     ):
         raise ValueError("execution utility recovery requires minute recoverable backward")
@@ -4455,6 +4746,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    remainder_policy = str(trading["tw_day_trade_entry_remainder_policy"])
+    if remainder_policy not in {"first_minute_only", "frozen_target_until_1320"}:
+        raise ValueError("unsupported tw_day_trade_entry_remainder_policy")
+    if remainder_policy == "frozen_target_until_1320":
+        if (trading["execution_mode"] != "tw_day_trade"
+                or float(trading["max_volume_participation"]) != 0.5
+                or not trading["tw_day_trade_unlimited_margin_conversion"]
+                or data["day_trade_minute_execution_root"] is None
+                or trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]
+                or training["day_trade_sparse_events"]
+                or training.get("day_trade_training_annual_episodes", False)):
+            raise ValueError("frozen target entry sweep requires dense continuous physical "
+                             "carry without unlimited close or annual account resets")
     if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
         if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
             raise ValueError(
@@ -4473,6 +4777,26 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "unlimited terminal day-trade liquidation requires the "
                 "scheduled 50%-minute execution policy"
             )
+    if bool(training["day_trade_sub_lot_recovery"]):
+        if (trading["execution_mode"] != "tw_day_trade"
+                or str(trading["tw_corporate_action_mode"]).lower() != "avoid"
+                or not trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]
+                or not trading["tw_day_trade_unlimited_margin_conversion"]
+                or not data["day_trade_minute_execution_root"]
+                or training["compile_loss"] is not False
+                or training["loss_type"] != "log_utility"
+                or not training["day_trade_optimizer_step_per_trajectory"]
+                or phase_model_config["portfolio_mode"] not in {"auto", "long_short"}):
+            raise ValueError("day_trade_sub_lot_recovery requires an exact flat-terminal long_short physical log-utility trajectory with compile_loss=false")
+    if bool(training["day_trade_training_annual_episodes"]):
+        if (trading["execution_mode"] != "tw_day_trade"
+                or str(trading["tw_corporate_action_mode"]).lower() != "avoid"
+                or not trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]
+                or not trading["tw_day_trade_unlimited_margin_conversion"]
+                or not data["day_trade_minute_execution_root"]
+                or training["loss_type"] != "log_utility"
+                or not training["day_trade_optimizer_step_per_trajectory"]):
+            raise ValueError("annual training episodes require a flat-terminal physical log-utility trajectory")
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -4981,6 +5305,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["crypto_execution_minute_utc"] = int(
         trading["crypto_execution_minute_utc"]
     )
+    trading["crypto_announced_exit_unlimited_volume"] = bool(
+        trading["crypto_announced_exit_unlimited_volume"]
+    )
     if (
         not math.isfinite(trading["crypto_proximal_cost_multiplier"])
         or trading["crypto_proximal_cost_multiplier"] < 0.0
@@ -5006,6 +5333,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "crypto_proximal_cost_multiplier"
         ],
         execution_minute_utc=trading["crypto_execution_minute_utc"],
+        announced_exit_unlimited_volume=trading["crypto_announced_exit_unlimited_volume"],
         optimizer_step_per_trajectory=training[
             "crypto_optimizer_step_per_trajectory"
         ],
@@ -5076,14 +5404,24 @@ def load_config(path: str | Path) -> ExperimentConfig:
             futures_portfolio_recoverable_backward=training_raw[
                 "futures_portfolio_recoverable_backward"
             ],
+            futures_cuda_graph=training_raw["futures_cuda_graph"],
+            futures_funding_compile=training_raw["futures_funding_compile"],
             futures_minute_saturation_recovery=training_raw["futures_minute_saturation_recovery"],
             futures_minute_recovery_objective=training_raw["futures_minute_recovery_objective"],
             futures_portfolio_optimizer_step_per_trajectory=training_raw[
                 "futures_portfolio_optimizer_step_per_trajectory"
             ],
+            futures_training_max_drawdown=training_raw["futures_training_max_drawdown"],
+            futures_training_risk_tangent=training_raw["futures_training_risk_tangent"],
+            futures_training_risk_interior=training_raw["futures_training_risk_interior"],
+            futures_training_stop_on_rejected_step=training_raw[
+                "futures_training_stop_on_rejected_step"
+            ],
             day_trade_optimizer_step_per_trajectory=training_raw[
                 "day_trade_optimizer_step_per_trajectory"
             ],
+            day_trade_sub_lot_recovery=training_raw["day_trade_sub_lot_recovery"],
+            day_trade_training_annual_episodes=training_raw["day_trade_training_annual_episodes"],
             crypto_optimizer_step_per_trajectory=training_raw[
                 "crypto_optimizer_step_per_trajectory"
             ],

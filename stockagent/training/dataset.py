@@ -35,6 +35,26 @@ def execution_feature_lag(execution_mode: str) -> int:
     return 0 if mode in {"naive", "crypto_perpetual"} else 1
 
 
+def _crypto_lifecycle_force_exit_mask(
+    alive_mask: np.ndarray,
+    finite_forward_return: np.ndarray,
+) -> np.ndarray:
+    """Missing forward labels never establish a causal liquidation event.
+
+    Keep this shape-validated helper for callers, but do not infer an exit from
+    future coverage. A genuine dated settlement belongs to the explicit panel
+    force-exit contract. An unvalued held interval must fail in the ledger.
+    """
+
+    alive = np.asarray(alive_mask, dtype=bool)
+    finite = np.asarray(finite_forward_return, dtype=bool)
+    if alive.shape != finite.shape or alive.ndim != 2:
+        raise ValueError(
+            "crypto lifecycle masks must be matching two-dimensional [T,S] arrays"
+        )
+    return np.zeros_like(alive, dtype=bool)
+
+
 def _dual_session_return_components(
     panel: PanelData,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -517,18 +537,22 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 stock_context_futures_daily.must_liquidate_mask,
                 dtype=bool,
             ).copy()
+            from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+            slots = len(stock_context_futures_daily.symbols)
+            if futures_slot_layout_version(slots) != stock_context_futures_daily.futures_data_contract_version:
+                raise ValueError("stock-context futures sidecar slot layout/version mismatch")
             if (
                 derivative_candidate_features.ndim != 3
                 or derivative_candidate_features.shape[:2]
                 != derivative_candidate_mask.shape
                 or derivative_candidate_features.shape[0] != panel.num_dates
-                or derivative_candidate_mask.shape[1] != 1936
+                or derivative_candidate_mask.shape[1] != slots
                 or stock_context_futures_liquidation.shape
                 != derivative_candidate_mask.shape
             ):
                 raise ValueError(
-                    "stock-context futures sidecar requires context [T,1936,F], "
-                    "mask [T,1936], and liquidation [T,1936]"
+                    f"stock-context futures sidecar requires context [T,{slots},F], "
+                    f"mask [T,{slots}], and liquidation [T,{slots}]"
                 )
             # Stock returns remain a shape-compatible placeholder for generic
             # dataset/report plumbing. The dedicated executor consumes only
@@ -802,6 +826,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             force_exit = np.zeros_like(tradable, dtype=bool)
         elif stock_futures_day_trade_execution:
             force_exit = np.zeros_like(tradable, dtype=bool)
+        elif self.execution_mode == "crypto_perpetual":
+            force_exit = np.asarray(force_exit, dtype=bool).copy()
+            force_exit |= _crypto_lifecycle_force_exit_mask(
+                panel.alive_mask,
+                finite_target,
+            )
         if self.date_indices.size == 0:
             valid_indices = self.date_indices
             if not allow_empty:
@@ -864,6 +894,15 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 executable_or_terminal = futures_executable[valid_indices].any(
                     axis=1
                 ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
+                intraday_sessions = getattr(stock_context_futures_daily, "intraday_session_mask", None)
+                if intraday_sessions is not None:
+                    # Calendar/source admission owns row selection. A future
+                    # minute with no fill must still contribute a cash day.
+                    executable_or_terminal = np.asarray(intraday_sessions, dtype=bool)[valid_indices]
+                margin_sessions = getattr(stock_context_futures_daily, "margin_session_mask", None)
+                if margin_sessions is not None:
+                    # No-fill days still settle and can generate margin calls.
+                    executable_or_terminal = np.asarray(margin_sessions, dtype=bool)[valid_indices]
                 valid_indices = valid_indices[executable_or_terminal]
             elif (valid_indices.size > 0 and stock_futures_day_trade_execution
                   and self.execution_mode != MINUTE_MODE):
@@ -899,10 +938,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if stock_context_futures_portfolio_execution:
             assert stock_context_futures_daily is not None
             assert stock_context_futures_liquidation is not None
-            # A research fold cannot retain an unreported terminal liability.
-            # This extra close is independent of the source-owned expiry rows;
-            # stitched deployment later replays folds without these resets.
-            if self.valid_indices.size > 0:
+            # A margin account reports official settlement NAV and residual
+            # whole contracts at a sample boundary. That boundary is not a
+            # broker liquidation order: a failed synthetic exit must not turn
+            # a solvent marked account into absorbing default. Preserve the
+            # historical forced-close convention for notional experiments.
+            if (self.valid_indices.size > 0
+                    and not getattr(stock_context_futures_daily, "margin_contract_version", 0)):
                 stock_context_futures_liquidation[
                     int(self.valid_indices[-1]), :
                 ] = True

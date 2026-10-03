@@ -37,6 +37,21 @@ _ACTIVE_CHILD_PROCESS: subprocess.Popen[object] | None = None
 _ACTIVE_CHILD_SHUTTING_DOWN = False
 _TERMINATION_SIGNAL: int | None = None
 _ACTIVE_OUTPUT_DIR: Path | None = None
+_MATERIALIZED_DATASET_HOLDS: dict[Path, int] = {}
+
+
+def _release_materialized_dataset_holds() -> None:
+    """Release persistent cache references owned by this launcher."""
+
+    for target, descriptor in list(_MATERIALIZED_DATASET_HOLDS.items()):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        _MATERIALIZED_DATASET_HOLDS.pop(target, None)
+
+
+atexit.register(_release_materialized_dataset_holds)
 
 
 def _child_shutdown_timeout(name: str, default: float) -> float:
@@ -398,6 +413,10 @@ def _resolve_multi_gpu_strategy(value: object) -> str:
 
 
 def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
+    # One inference account replay and artifact publisher, regardless of training DDP.
+    mode = getattr(args, "mode", None) or getattr(config.runner, "mode", "train")
+    if mode == "infer":
+        return
     strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     if args.multi_gpu_strategy is not None:
         strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
@@ -657,6 +676,18 @@ def _configure_cpu_parallelism(
     os.environ["POLARS_MAX_THREADS"] = str(resolved_polars_threads)
     os.environ["RAYON_NUM_THREADS"] = str(resolved_polars_threads)
 
+    # Numba's first OpenMP launch initializes the shared runtime to its own
+    # host-wide default and can overwrite PyTorch's intra-op thread count.
+    # Initialize/mask it before restoring this rank's resolved Torch budget.
+    # Respect an explicitly smaller NUMBA_NUM_THREADS maximum as well.
+    try:
+        import numba
+    except ImportError:
+        pass
+    else:
+        numba.set_num_threads(
+            min(resolved_cpu_threads, int(numba.config.NUMBA_NUM_THREADS))
+        )
     torch.set_num_threads(resolved_cpu_threads)
     try:
         torch.set_num_interop_threads(resolved_cpu_threads)
@@ -786,6 +817,14 @@ def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
 
 
 def _build_panel_kwargs(config) -> dict:
+    if config.data.crypto_exchange_scope:
+        from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
+
+        validate_crypto_exchange_scope(
+            config.data,
+            repo_root=Path(__file__).resolve().parent,
+            check_schema=True,
+        )
     return {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
@@ -917,6 +956,157 @@ def _set_rank_local_seed(base_seed: int, active_strategy: str) -> int:
 _FOLD_ISOLATION_CHILD_ENV = "STOCKAGENT_FOLD_ISOLATION_CHILD"
 
 
+def _iter_config_string_values(value: object):
+    """Yield strings from a loaded config without assuming one schema shape."""
+
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_config_string_values(child)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for child in value:
+            yield from _iter_config_string_values(child)
+        return
+    fields = getattr(value, "__dataclass_fields__", None)
+    if fields is not None:
+        for name in fields:
+            yield from _iter_config_string_values(getattr(value, name))
+
+
+def _configured_materialized_snapshots(
+    config: object,
+) -> tuple[tuple[Path, str, str, Path], ...]:
+    """Find exact packed releases referenced by absolute config paths."""
+
+    materialized_root = Path(
+        os.environ.get(
+            "STOCKAGENT_MATERIALIZED_ROOT",
+            "/srv/stockagent-packed-materialized",
+        )
+    ).expanduser()
+    if not materialized_root.is_absolute():
+        materialized_root = Path.cwd() / materialized_root
+    materialized_root = materialized_root.resolve(strict=False)
+    found: dict[tuple[str, str], Path] = {}
+    for raw in _iter_config_string_values(config):
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            continue
+        candidate = candidate.resolve(strict=False)
+        try:
+            relative = candidate.relative_to(materialized_root)
+        except ValueError:
+            continue
+        if len(relative.parts) < 2:
+            continue
+        dataset, snapshot_id = relative.parts[:2]
+        # The mutable ``current`` symlink is intentionally not accepted here:
+        # reproducible training must name one immutable release.
+        if dataset in {"current", ".cache-state", "pins"}:
+            continue
+        if not snapshot_id.startswith(f"{dataset}-"):
+            continue
+        found[(dataset, snapshot_id)] = (
+            materialized_root / dataset / snapshot_id
+        )
+    return tuple(
+        (materialized_root, dataset, snapshot_id, found[(dataset, snapshot_id)])
+        for dataset, snapshot_id in sorted(found)
+    )
+
+
+def _materialized_snapshot_ready_path(
+    materialized_root: Path,
+    dataset: str,
+    snapshot_id: str,
+) -> Path:
+    return materialized_root / dataset / f".{snapshot_id}.READY.json"
+
+
+def _restore_materialized_snapshot(
+    *,
+    dataset: str,
+    snapshot_id: str,
+) -> None:
+    script = Path(__file__).resolve().parent / "scripts" / "run_data_cache.sh"
+    command = [
+        "bash",
+        str(script),
+        "use",
+        dataset,
+        "--snapshot-id",
+        snapshot_id,
+        "--ttl-days",
+        "7",
+    ]
+    print(
+        "[data-cache] restoring exact materialized release before training: "
+        f"dataset={dataset} snapshot={snapshot_id}",
+        flush=True,
+    )
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parent,
+        env=os.environ.copy(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return
+    detail = (completed.stderr or completed.stdout or "").strip()
+    if len(detail) > 4000:
+        detail = detail[-4000:]
+    raise RuntimeError(
+        "failed to restore exact materialized training release: "
+        f"dataset={dataset} snapshot={snapshot_id} "
+        f"returncode={completed.returncode}; {detail}"
+    )
+
+
+def _hold_configured_materialized_snapshots(config: object) -> None:
+    """Keep exact input releases visible to lease GC for the whole run.
+
+    Training often serves epochs from derived panel/minute caches and therefore
+    may not otherwise retain an open file below its immutable source release.
+    A directory descriptor expresses that real dependency to the existing
+    ``/proc`` lease monitor, including while isolated fold children run.
+    """
+
+    for materialized_root, dataset, snapshot_id, target in (
+        _configured_materialized_snapshots(config)
+    ):
+        if target in _MATERIALIZED_DATASET_HOLDS:
+            continue
+        ready = _materialized_snapshot_ready_path(
+            materialized_root, dataset, snapshot_id
+        )
+        if not target.is_dir() or target.is_symlink() or not ready.is_file():
+            _restore_materialized_snapshot(
+                dataset=dataset,
+                snapshot_id=snapshot_id,
+            )
+        if not target.is_dir() or target.is_symlink() or not ready.is_file():
+            raise RuntimeError(
+                "exact materialized training release is unavailable after restore: "
+                f"target={target} ready={ready}"
+            )
+        descriptor = os.open(
+            target,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        _MATERIALIZED_DATASET_HOLDS[target] = descriptor
+        print(
+            "[data-cache] holding exact release for active training lifecycle: "
+            f"dataset={dataset} snapshot={snapshot_id}",
+            flush=True,
+        )
+
+
 def _isolated_fold_command(
     argv: Sequence[str],
     *,
@@ -946,6 +1136,8 @@ def _isolated_inference_command(argv: Sequence[str]) -> list[str]:
         *argv,
         "--mode",
         "infer",
+        "--multi-gpu-strategy",
+        "none",
         "--no-post-train-infer",
         "--no-isolate-train-folds",
     ]
@@ -980,14 +1172,69 @@ def _run_isolated_train_fold_processes(
         )
         if completed.returncode != 0:
             details = _isolated_futures_failure_detail(output_dir, failure_before)
-            raise RuntimeError(
+            message = (
                 "isolated train.py child failed: "
                 f"fold={fold_id} returncode={completed.returncode}{details}"
             )
+            _mark_isolated_fold_failed(
+                output_dir,
+                fold_id=fold_id,
+                returncode=int(completed.returncode),
+                message=message,
+            )
+            raise RuntimeError(message)
         print(
             f"[runner] isolated train fold complete: fold={fold_id}",
             flush=True,
         )
+
+
+def _mark_isolated_fold_failed(
+    output_dir: str | Path | None,
+    *,
+    fold_id: int,
+    returncode: int,
+    message: str,
+) -> None:
+    """Replace a stale running receipt after an isolated child failure."""
+
+    if output_dir is None:
+        return
+    path = Path(output_dir) / "progress.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            payload = {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    payload.update(
+        {
+            "state": "failed",
+            "phase": "failed",
+            "message": "isolated fold failed; completed folds are safe to resume",
+            "fold_id": int(fold_id),
+            "failure": {
+                "type": "IsolatedFoldChildError",
+                "message": str(message),
+                "returncode": int(returncode),
+            },
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.fold-failure-{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _isolated_futures_failure_receipts(output_dir):
@@ -1394,6 +1641,27 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
+        from stockagent.data.tw_futures_margin import validate_margin_rule_source
+        try:
+            validate_margin_rule_source(
+                config.trading.tw_futures_portfolio_margin_rules_path,
+                config.trading.tw_futures_portfolio_data_path,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"[futures-margin preflight] {exc}") from exc
+    if (config.trading.execution_mode == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
+        from stockagent.data.tw_all_futures_intraday import validate_all_futures_intraday_data
+        try:
+            validate_all_futures_intraday_data(
+                config.trading.tw_futures_portfolio_data_path,
+                config.trading.tw_futures_portfolio_minute_data_path,
+                participation=config.trading.max_volume_participation,
+                start_date=config.data.panel_start_date,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"[futures-minute preflight] {exc}") from exc
     configured_output_dir = getattr(config.runner, "output_dir", None)
     _ACTIVE_OUTPUT_DIR = (
         None
@@ -1404,6 +1672,10 @@ def main() -> None:
     # the torchrun supervisor.  Rank processes install the same handler after
     # relaunch and unwind their own DDP/Inductor resources through atexit.
     _install_graceful_termination_handlers()
+    # Only the launcher owns durable cache references. Under torchrun, the
+    # supervising parent already holds them while every rank is alive.
+    if int(os.environ.get("WORLD_SIZE", "1")) == 1:
+        _hold_configured_materialized_snapshots(config)
     if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute":
         from stockagent.data.tw_stock_futures_minute import (
             preflight_futures_minute_training, validate_futures_minute_data,
@@ -1457,6 +1729,17 @@ def main() -> None:
             raise SystemExit(str(exc)) from exc
     if not args.check_data_only:
         _maybe_relaunch_for_ddp(config, args)
+    # Opt-in in-process diagnostics work in containers without ptrace/perf.
+    # Trace only the canonical worker, never the waiting torchrun supervisor.
+    trace_interval = os.environ.get("STOCKAGENT_TRAINING_STACK_INTERVAL_SECONDS")
+    if trace_interval:
+        import faulthandler
+
+        interval = float(trace_interval)
+        if not np.isfinite(interval) or interval < 1.0:
+            raise ValueError("training stack interval must be finite and >= 1 second")
+        faulthandler.dump_traceback_later(interval, repeat=True)
+        atexit.register(faulthandler.cancel_dump_traceback_later)
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = "none" if args.check_data_only else (cli_strategy or config_strategy)
@@ -1485,6 +1768,7 @@ def main() -> None:
         _load_checkpoint,
         _load_completed_fold_result,
         _refresh_walkforward_artifacts,
+        _validate_annual_day_trade_training_boundaries,
         run_inference,
         run_training,
     )
@@ -1702,6 +1986,17 @@ def main() -> None:
         return
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
+    if (str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio"
+            and config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"):
+        from stockagent.data.panel import slice_panel_end
+        from stockagent.data.tw_futures_benchmark import (
+            tx_front_benchmark_source_end, resolve_tx_benchmark_path,
+        )
+
+        panel = slice_panel_end(
+            panel,
+            tx_front_benchmark_source_end(resolve_tx_benchmark_path(config.trading)),
+        )
     if str(config.trading.execution_mode) == "tw_futures_portfolio_day":
         from stockagent.data.tw_futures_portfolio_daily import (
             attach_futures_portfolio_daily,
@@ -1737,6 +2032,11 @@ def main() -> None:
             current_open_feature=bool(
                 config.data.tw_futures_current_open_feature
             ),
+            denomination_context_basis=config.data.tw_futures_denomination_context_basis,
+            futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+            margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
+                               if config.trading.tw_futures_portfolio_capital_basis == "initial_margin" else None),
+            require_prior_capacity=config.data.tw_futures_require_prior_capacity,
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return
             ),
@@ -1752,7 +2052,25 @@ def main() -> None:
             max_volume_participation=float(
                 config.trading.max_volume_participation
             ),
+            benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
+            benchmark_data_path=config.trading.tw_futures_portfolio_benchmark_data_path,
         )
+        if config.trading.tw_futures_portfolio_holding_policy == "intraday":
+            from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
+            panel = attach_all_futures_intraday(
+                panel, config.trading.tw_futures_portfolio_minute_data_path,
+                participation=config.trading.max_volume_participation,
+            )
+        if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
+            from stockagent.data.tw_futures_margin import attach_futures_margin_rules
+            panel = attach_futures_margin_rules(
+                panel, config.trading.tw_futures_portfolio_margin_rules_path,
+                broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
+                liquidation_ratio=config.trading.tw_futures_portfolio_margin_liquidation_ratio,
+                participation=config.trading.max_volume_participation,
+                benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
+                include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
+            )
         if (
             _distributed_rank() == 0
             and config.data.tw_futures_expiry_settlement_valuation
@@ -1903,6 +2221,7 @@ def main() -> None:
                         config.data.day_trade_minute_execution_daily_proxy_price_policy
                     ),
                     corporate_action_mode=config.trading.tw_corporate_action_mode,
+                    entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
                     terminal_liquidation_unlimited_capacity=(
                         config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
                     ),
@@ -2251,6 +2570,21 @@ def main() -> None:
         mode=str(mode),
         resume=bool(resume),
     )
+    annual_boundary_report = (
+        _validate_annual_day_trade_training_boundaries(panel, folds, config)
+        if str(mode).strip().lower() == "train"
+        else None
+    )
+    if annual_boundary_report is not None:
+        covered_years = sum(
+            len(group["years"])
+            for group in annual_boundary_report["groups"]
+        )
+        print(
+            "[annual episodes] preflight verified lookback as context only; "
+            f"complete_calendar_year_accounts={covered_years}",
+            flush=True,
+        )
     if args.check_data_only:
         source = getattr(panel, "day_trade_carry_source", None)
         source_payload = (

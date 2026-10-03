@@ -534,6 +534,27 @@ def test_eval_segment_handoff_preserves_account_not_rebased_capital():
             initial_day_trade_carry_state=first_result.day_trade_carry_state.detached(), **options)
 
 
+def test_cpu_artifact_replay_restores_threads_after_source_failure(monkeypatch):
+    split, runtime, _ = fixture()
+
+    def fail_source(*args, **kwargs):
+        assert torch.get_num_threads() == 1
+        raise RuntimeError("source failure")
+
+    monkeypatch.setattr(PreparedDayTradeCarrySource, "batch", fail_source)
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(4)
+        with pytest.raises(RuntimeError, match="source failure"):
+            trainer._replay_physical_carry_split_prefix(
+                SimpleNamespace(requested_weights_history=np.zeros((1, 2))),
+                split, 1, runtime=runtime, config=None,
+            )
+        assert torch.get_num_threads() == 4
+    finally:
+        torch.set_num_threads(previous)
+
+
 def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_account():
     split, runtime, _ = fixture()
     model = Policy()

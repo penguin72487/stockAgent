@@ -1,0 +1,13 @@
+# Same capacity-eligible general futures policy; change account capital only.
+# A fresh output preserves the TWD 10M experiment and its optimizer contract.
+base_config: tw_futures_v8_general_tradable.yaml
+experiment_name: tw-futures-v8-general-prior-capacity-capital100m
+
+trading:
+  tw_futures_portfolio_integer_initial_capital: 100000000.0
+  volume_participation_equity: 100000000.0
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_tradable_capital100m_fold10
+  start_fold: 10
+  resume: true

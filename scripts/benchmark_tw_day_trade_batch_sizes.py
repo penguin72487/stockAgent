@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the production TW daily day-trade batch-size frontier.
+"""Measure the production TW daily day-trade or exact futures batch frontier.
 
 The sweep intentionally changes only the global training batch size (plus the
 number of epochs/early-stopping guard needed to obtain repeated measurements).
@@ -59,6 +59,12 @@ _FALLBACK_KEYS = (
     "bt_eager_runner_calls",
     "bt_prep_compile_nonhit",
     "bt_compile_nonhit",
+)
+_GENERIC_FAILURE_KEYS = (
+    "bt_compile_failures",
+    "bt_prep_compile_failures",
+    "bt_runtime_fallback_calls",
+    "futures_cuda_graph_busy_eager_calls",
 )
 
 
@@ -207,6 +213,7 @@ def _score_curve(
     memory: dict[str, Any],
     max_peak_fraction: float,
     min_headroom_gib: float,
+    strict_compiled_backtest: bool = True,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -216,12 +223,15 @@ def _score_curve(
             f"found {len(steady)}"
         )
 
-    required_finite = ("epoch_wall_s", "train_total_s", "train_loss", "val_mean", "test_mean")
+    max_rank = any("epoch_wall_s_max_rank" in row for row in steady)
+    epoch_wall_key = "epoch_wall_s_max_rank" if max_rank else "epoch_wall_s"
+    train_wall_key = "train_total_s_max_rank" if max_rank else "train_total_s"
+    required_finite = (epoch_wall_key, train_wall_key, "train_loss", "val_mean", "test_mean")
     for row in steady:
         epoch = int(row.get("epoch", 0) or 0)
         for key in required_finite:
             value = _finite_float(row.get(key))
-            if value is None or (key.endswith("_s") and value <= 0):
+            if value is None or (key in (epoch_wall_key, train_wall_key) and value <= 0):
                 reasons.append(f"epoch {epoch} has invalid {key}={row.get(key)!r}")
         if int(row.get("train_zero_grad_batches", 0) or 0) != 0:
             reasons.append(f"epoch {epoch} contains zero-gradient optimizer batches")
@@ -230,9 +240,15 @@ def _score_curve(
             reasons.append(f"epoch {epoch} has non-positive/non-finite gradient norm")
         if int(row.get("dynamo_unique_graphs_epoch_delta", 0) or 0) != 0:
             reasons.append(f"epoch {epoch} compiled a new Dynamo graph after warmup")
-        for key in _FALLBACK_KEYS:
+        failure_keys = _FALLBACK_KEYS if strict_compiled_backtest else _GENERIC_FAILURE_KEYS
+        for key in failure_keys:
             if int(row.get(key, 0) or 0) != 0:
                 reasons.append(f"epoch {epoch} has {key}={row.get(key)!r}")
+
+    for key in ("futures_cuda_graph_constructors", "futures_cuda_graph_evictions"):
+        observed = [int(row[key]) for row in steady if key in row]
+        if observed and len(set(observed)) > 1:
+            reasons.append(f"{key} changed after warmup: {observed}")
 
     if not memory.get("ok"):
         reasons.append(str(memory.get("reason", "GPU memory sampling failed")))
@@ -256,8 +272,8 @@ def _score_curve(
             "memory": memory,
         }
 
-    epoch_wall = [float(row["epoch_wall_s"]) for row in steady]
-    train_wall = [float(row["train_total_s"]) for row in steady]
+    epoch_wall = [float(row[epoch_wall_key]) for row in steady]
+    train_wall = [float(row[train_wall_key]) for row in steady]
     train_batches = [int(row.get("train_batches", 0) or 0) for row in steady]
     expected_batches = math.ceil(train_rows / global_batch_size)
     if any(value != expected_batches for value in train_batches):
@@ -284,6 +300,7 @@ def _score_curve(
         "padded_slots": padded_slots,
         "padding_fraction": (padded_slots - train_rows) / padded_slots,
         "median_epoch_wall_s": median_epoch_wall,
+        "timing_scope": "maximum_rank" if max_rank else "legacy_reporting_rank",
         "epoch_wall_mad_s": _median_absolute_deviation(epoch_wall),
         "median_train_wall_s": median_train_wall,
         "train_wall_mad_s": _median_absolute_deviation(train_wall),
@@ -405,6 +422,7 @@ def _write_candidate_config(
     path: Path,
     output_dir: Path,
     batch_size: int,
+    batch_size_eval: int,
     epochs: int,
     start_fold: int,
 ) -> None:
@@ -423,6 +441,12 @@ def _write_candidate_config(
     training.update(
         {
             "batch_size_train": batch_size,
+            # Keep the model-forward evaluation chunk inside the measured
+            # evaluation batch boundary. A larger inherited manual chunk can
+            # OOM after an otherwise valid training epoch and misclassify the
+            # training batch frontier.
+            "batch_size_eval": batch_size_eval,
+            "eval_model_chunk_rows": batch_size_eval,
             "auto_batch_size": False,
             "epochs": epochs,
             # The short measurement must not stop before enough steady epochs
@@ -445,7 +469,9 @@ def _plain_config_value(value: Any) -> Any:
     return value
 
 
-def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
+def _validate_source_contract(
+    config: dict[str, Any], *, expected_execution_mode: str = "tw_day_trade"
+) -> dict[str, Any]:
     training = config.get("training")
     trading = config.get("trading")
     data = config.get("data")
@@ -458,7 +484,7 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
             "source config must contain data, training, and trading mappings"
         )
     expected = {
-        "trading.execution_mode": "tw_day_trade",
+        "trading.execution_mode": expected_execution_mode,
         "trading.frequency": "daily",
         "training.loss_type": "log_utility",
     }
@@ -484,6 +510,29 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
             f"executable_portfolio_transformer, got {model_name!r}"
         )
     actual["training.model_name"] = model_name
+    if expected_execution_mode == "tw_stock_context_futures_portfolio":
+        if model_name != "financial_transformer" or not trading.get("tw_futures_portfolio_integer_contracts"):
+            raise ValueError("futures benchmark requires the financial encoder and exact integer account")
+        if training.get("futures_portfolio_training_surrogate_only"):
+            raise ValueError("futures benchmark must retain exact training-forward accounting")
+        actual["capital_basis"] = trading.get("tw_futures_portfolio_capital_basis")
+        actual["optimizer_step_per_trajectory"] = training.get("futures_portfolio_optimizer_step_per_trajectory")
+    if expected_execution_mode == "naive":
+        if model_name != "financial_transformer":
+            raise ValueError(
+                "naive batch benchmark requires financial_transformer, "
+                f"got {model_name!r}"
+            )
+        financial = training.get("financial_transformer")
+        if not isinstance(financial, dict):
+            raise ValueError("naive batch benchmark requires financial_transformer settings")
+        output_mode = str(financial.get("portfolio_output_mode", ""))
+        if output_mode != "projection_l1":
+            raise ValueError(
+                "naive batch benchmark requires the requested projection_l1 ABI, "
+                f"got {output_mode!r}"
+            )
+        actual["training.portfolio_output_mode"] = output_mode
     if model_name == "executable_portfolio_transformer":
         minute_execution = bool(data.get("day_trade_minute_execution_root"))
         actual["objective"] = (
@@ -554,11 +603,20 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         path=config_path,
         output_dir=run_dir,
         batch_size=batch_size,
+        batch_size_eval=args.batch_size_eval,
         epochs=args.epochs,
         start_fold=args.start_fold,
     )
 
     env = os.environ.copy()
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # Fitted transforms are already keyed by source content, training rows,
+    # masks and fit contract. Share that canonical cache across candidates;
+    # never refit the same causal basis just because the artifact root differs.
+    env.setdefault(
+        "STOCKAGENT_TRAINING_TRANSFORM_CACHE_DIR",
+        str(Path(args.output_root).resolve() / ".training_transform_cache_v1"),
+    )
     env.update(
         {
             "PYTHONUNBUFFERED": "1",
@@ -570,7 +628,6 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
             "RAYON_NUM_THREADS": str(args.polars_threads),
             "STOCKAGENT_BACKTEST_COMPILE_PREP": "1",
             "STOCKAGENT_STRICT_NO_FALLBACK": "1",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         }
     )
@@ -601,6 +658,8 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         "--torch-compile-threads",
         str(args.compile_threads),
     ]
+    if getattr(args, "profile_timing", False):
+        cmd.append("--profile-timing")
     print(
         f"[batch-benchmark] start strategy={args.multi_gpu_strategy} "
         f"global_batch={batch_size} local_batch={batch_size // args.world_size}",
@@ -652,6 +711,16 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
     result["failure_patterns"] = [pattern for pattern in _FAILURE_PATTERNS if pattern in log_text]
     if return_code == 0 and status == "ok":
         try:
+            from stockagent.training.lifecycle import validate_completed_training_artifacts
+            manifest = json.loads((run_dir / "run_manifest.json").read_text())
+            summary = json.loads((run_dir / "summary.json").read_text())
+            conformance = validate_completed_training_artifacts(
+                run_dir, fold_ids=manifest["selected_fold_ids"],
+                group_names=["train_" + "-".join(map(str, row["train_years"])) for row in summary],
+            )
+            if not conformance.ok:
+                raise ValueError(f"incomplete fold lifecycle: {conformance.missing}, {conformance.invalid}")
+            result["lifecycle_ok"] = True
             curve_path = _single_epoch_curve(run_dir)
             rows = _read_jsonl(curve_path)
             train_rows = _parse_train_rows(log_path)
@@ -665,6 +734,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 memory=memory,
                 max_peak_fraction=args.max_peak_vram_fraction,
                 min_headroom_gib=args.min_vram_headroom_gib,
+                strict_compiled_backtest=(
+                    args.expected_execution_mode == "tw_day_trade"
+                ),
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)
@@ -723,6 +795,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--batch-size-eval", type=int, default=128)
+    parser.add_argument(
+        "--expected-execution-mode",
+        choices=("tw_day_trade", "naive", "tw_stock_context_futures_portfolio"),
+        default="tw_day_trade",
+        help="fail closed unless the resolved config has this execution mode",
+    )
     parser.add_argument("--start-fold", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--skip-epochs", type=int, default=2)
@@ -737,6 +815,8 @@ def main() -> None:
     parser.add_argument("--python", type=Path, default=Path(sys.executable).resolve())
     parser.add_argument("--cpu-threads", type=int, default=112)
     parser.add_argument("--compile-threads", type=int, default=16)
+    parser.add_argument("--profile-timing", action="store_true",
+                        help="synchronize CUDA stage timing; use equally for every compared candidate")
     parser.add_argument("--polars-threads", type=int, default=1)
     parser.add_argument("--timeout-s", type=float, default=1800.0)
     parser.add_argument("--gpu-sample-interval-s", type=float, default=0.25)
@@ -797,7 +877,9 @@ def main() -> None:
         base = _plain_config_value(asdict(load_config(args.config)))
         if not isinstance(base, dict):
             raise ValueError(f"resolved config root must be a mapping: {args.config}")
-        source_contract = _validate_source_contract(base)
+        source_contract = _validate_source_contract(
+            base, expected_execution_mode=args.expected_execution_mode
+        )
         _run_environment_preflight(
             args.python,
             output_path=args.output_root / "environment_preflight.log",
@@ -809,6 +891,7 @@ def main() -> None:
         "schema_version": 1,
         "source_config": str(args.config),
         "source_contract": source_contract,
+        "expected_execution_mode": args.expected_execution_mode,
         "output_root": str(args.output_root),
         "batch_sizes": batch_sizes,
         "world_size": args.world_size,

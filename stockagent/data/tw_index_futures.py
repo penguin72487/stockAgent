@@ -1141,6 +1141,8 @@ def build_taifex_all_futures_daily_sessions(
     output_path: str | Path,
     *,
     batch_rows: int = 100_000,
+    include_valuation_rows: bool = False,
+    include_reference_evidence: bool = False,
 ) -> Path:
     """Build all official TAIFEX futures trade bars without Shioaji traffic.
 
@@ -1152,11 +1154,16 @@ def build_taifex_all_futures_daily_sessions(
     hours field and silently combining the two would change the trading-date
     clock.  Pre-2017 rows are explicitly marked ``session_reported=False`` and
     treated as day-session observations, matching the source schema available
-    at that time.
+    at that time. With ``include_valuation_rows``, retain official no-print
+    rows and their nullable OHLC/volume separately from execution eligibility.
+    This versioned source format is needed for carry margin accounting; a
+    settlement is an observed valuation, never a fabricated transaction bar.
     """
 
     if batch_rows < 1:
         raise ValueError("batch_rows must be positive")
+    if include_reference_evidence and not include_valuation_rows:
+        raise ValueError("reference evidence requires all reported valuation rows")
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -1169,11 +1176,11 @@ def build_taifex_all_futures_daily_sessions(
             pa.field("series_type", pa.string(), nullable=False),
             pa.field("session", pa.string(), nullable=False),
             pa.field("session_reported", pa.bool_(), nullable=False),
-            pa.field("open", pa.float64(), nullable=False),
-            pa.field("high", pa.float64(), nullable=False),
-            pa.field("low", pa.float64(), nullable=False),
-            pa.field("close", pa.float64(), nullable=False),
-            pa.field("volume", pa.int64(), nullable=False),
+            pa.field("open", pa.float64(), nullable=include_valuation_rows),
+            pa.field("high", pa.float64(), nullable=include_valuation_rows),
+            pa.field("low", pa.float64(), nullable=include_valuation_rows),
+            pa.field("close", pa.float64(), nullable=include_valuation_rows),
+            pa.field("volume", pa.int64(), nullable=include_valuation_rows),
             pa.field("settlement", pa.float64()),
             pa.field("open_interest", pa.int64()),
             pa.field("last_bid", pa.float64()),
@@ -1184,15 +1191,18 @@ def build_taifex_all_futures_daily_sessions(
             pa.field("spread_order_volume", pa.int64()),
             pa.field("source_file", pa.string(), nullable=False),
             pa.field("source_sha256", pa.string(), nullable=False),
-        ],
+        ] + ([pa.field("reported_price_change", pa.string()),
+              pa.field("reported_price_change_percent", pa.string())]
+             if include_reference_evidence else []),
         metadata={
             b"stockagent.dataset": b"taifex_all_futures_daily_sessions",
             b"stockagent.contract_version": str(
-                TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION
+                3 if include_reference_evidence else (2 if include_valuation_rows else TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION)
             ).encode("ascii"),
             b"stockagent.session_policy": b"source_sessions_separate",
             b"stockagent.legacy_session_policy": b"day_only_unreported",
             b"stockagent.instrument_scope": b"outright_no_calendar_spreads",
+            b"stockagent.row_policy": (b"all_reported_outrights" if include_valuation_rows else b"positive_volume_ohlc_trade_bars"),
         },
     )
     target = Path(output_path).expanduser().resolve()
@@ -1264,22 +1274,16 @@ def build_taifex_all_futures_daily_sessions(
                         for column in ("開盤價", "最高價", "最低價", "收盤價")
                     )
                     volume = _parse_optional_nonnegative_count(raw.get("成交量"))
-                    if any(value is None for value in prices) or not volume:
+                    complete_bar = all(value is not None and value > 0 for value in prices)
+                    if not include_valuation_rows and (not complete_bar or not volume):
                         continue
-                    open_price, high_price, low_price, close_price = (
-                        float(value) for value in prices if value is not None
-                    )
-                    if not all(
-                        value > 0.0
-                        for value in (open_price, high_price, low_price, close_price)
-                    ):
-                        continue
-                    if high_price < max(open_price, close_price, low_price):
+                    open_price, high_price, low_price, close_price = prices
+                    if complete_bar and high_price < max(open_price, close_price, low_price):
                         raise ValueError(
                             f"{source_name} has invalid high for "
                             f"{date_value}/{product}/{contract}/{session}"
                         )
-                    if low_price > min(open_price, close_price, high_price):
+                    if complete_bar and low_price > min(open_price, close_price, high_price):
                         raise ValueError(
                             f"{source_name} has invalid low for "
                             f"{date_value}/{product}/{contract}/{session}"
@@ -1306,7 +1310,7 @@ def build_taifex_all_futures_daily_sessions(
                             "high": high_price,
                             "low": low_price,
                             "close": close_price,
-                            "volume": int(volume),
+                            "volume": int(volume) if volume is not None else None,
                             "settlement": _parse_optional_finite_number(
                                 raw.get("結算價")
                             ),
@@ -1333,6 +1337,9 @@ def build_taifex_all_futures_daily_sessions(
                             ),
                             "source_file": source_name,
                             "source_sha256": source_sha256,
+                            **({"reported_price_change": str(raw.get("漲跌價") or "").strip() or None,
+                                "reported_price_change_percent": str(raw.get("漲跌%") or "").strip() or None}
+                               if include_reference_evidence else {}),
                         }
                     )
                     if len(pending) >= batch_rows:

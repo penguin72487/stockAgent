@@ -1,0 +1,19 @@
+# Corrected annual-account successor to v3. The validated panel begins in
+# 2014, so 2014 supplies causal feature history and is not mislabeled as a
+# complete annual account after losing its first 32 lookback rows. Every
+# trained account now spans the first through last owned trading session of
+# 2015--2024. Validation remains 2025 and the inspected test period remains
+# 2026. The fresh root prevents continuation from the incompatible v1
+# annual-boundary optimizer state.
+base_config: tw_day_trade_v8_combined_annual_log_cash_sub_lot_fold11_v3.yaml
+experiment_name: tw-day-trade-v8-combined-annual-log-cash-sub-lot-first-session-fold10-v4
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_fold10_v4
+  start_fold: 10
+  resume: true
+
+walk_forward:
+  # Keep 2014 in the panel for causal rolling windows, but begin target-year
+  # ownership only after enough earlier validated sessions exist.
+  split_start_year: 2015

@@ -1067,6 +1067,22 @@ Rules:
   ordered symbols are authoritative; `symbol_position` is only a capacity hint
   and `daily_weights` is a legacy fallback. A model/data symbol-contract
   disagreement must fail closed.
+- An exact optimizer resume must restore persistent input-normalization buffers
+  from the checkpoint together with model weights. Same-feature pretrained
+  transfer may intentionally retain source RMS scales; never overwrite those
+  buffers with a newly fitted target RMS during resume. Record fitted and
+  effective scales separately. A historical resumed ablation with changed RMS
+  is a confounded trajectory, not a clean architecture-only comparison. See
+  `docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md`.
+- `day_trade_training_annual_episodes` and `day_trade_sub_lot_recovery` are
+  opt-in research training contracts, each requiring a new artifact root and
+  checkpoint fingerprint. Annual accounts may reset only at a calendar-year
+  boundary with no held inventory or unpaid claims; validation/test retain
+  their original account lifecycle. Sub-lot recovery changes backward only
+  and must reuse source-backed FIFO opportunity/fee math, preserve all exact
+  forward values, and remain disabled during evaluation. Never silently add
+  either mechanism to an existing directional or architecture ablation. See
+  `docs/tw_day_trade_v8_training_mechanisms_2026-09-23.md`.
 - Neural training has one lazy `WindowedSplitTensors` executor per process. The
   single-device and torchrun DDP variants share the same canonical model, loss,
   side masks, fees, and stateful backtest semantics.
@@ -1141,6 +1157,21 @@ Rules:
 
 - Use `epoch_curve.jsonl` when optimizing epoch-level speed.
 - Break down "other" time before optimizing blindly.
+- Initialize/mask Numba's parallel pool before setting the resolved per-rank
+  Torch thread count. On a shared OpenMP runtime, Numba's first parallel panel
+  operation can overwrite Torch's budget with the host-wide maximum. Preserve
+  a smaller explicit Numba maximum, and verify actual trainer counts after
+  panel loading rather than relying on the launcher's earlier thread message.
+- Attribute physical-source decoding, padding, stacking, and device transfer to
+  backtest preparation separately from the account runner. Large CPU thread
+  budgets can make per-session tensor padding much slower than one batched
+  allocation/copy. For immutable FP64/int64 CPU transport, preserve source bytes
+  (including NaNs and signed zero), padding, ownership, and CUDA reconstruction;
+  keep the tensor/autograd path for other inputs. Limit CPU-only final replay
+  threads within its own scope and restore the previous count on exceptions.
+  Validate exact metrics/checkpoint states and complete artifacts; report any
+  control restart or changed reporting runtime explicitly. See
+  `docs/no_qk_norm_cpu_staging_2026-09-22.md`.
 - For long-year runs, re-check the latest artifact before optimizing. The run under
   `artifacts/train_2000-2001-...-2024/epoch_curve.jsonl` showed train time
   dominating epoch wall time, with CPU-to-GPU train tensor transfer larger than
@@ -1157,6 +1188,15 @@ Rules:
   listings and delistings remain runtime data. An arbitrary very large upper
   bound makes Inductor constraint analysis and cold compilation much more
   expensive and can violate flattened-index guards.
+- A temporal-basis OFAT with an empty target family list is an incompatible
+  basis ABI when its pretrained source has any basis encoder, PCA/KLT bank, or
+  nonempty family metadata. Do not reuse source basis overrides merely because
+  the target has no fitting work. Fit/record the empty target selection and
+  allow only explicitly reported compatible pretrained tensors to transfer;
+  an epoch-zero account guard still decides whether that initialization is
+  acceptable. A failed attempt may have left source-basis metadata in the
+  target artifact, so the corrected run must overwrite it with an empty-basis
+  receipt. Treat deterministic basis-configuration exceptions as non-retryable.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead. For `tw_minute`, compute that audit-only loss over the first calendar year of the current fold's test interval, record its year/row scope in `epoch_curve.jsonl`, and never use it for checkpoint selection, early stopping, or the scheduler.
 - Keep curve plotting async where possible.
@@ -1288,6 +1328,53 @@ Compile/runtime rules:
   - preserve `prev_weights` continuation across backtest chunks and reset only at fold/segment boundaries
 
 ## Crypto Downloader Baseline
+
+- Crypto ledger contract v5 denominates volume limits in initial reference
+  capital and divides by carried live NAV. Preserve FP64 equity scale across
+  train/eval chunks, tensor-to-NumPy conversion and all backtest artifacts.
+  Gross-risk reduction orders remain subject to side permissions and capacity;
+  a blocked carried breach cannot manufacture a fill or admit new expansion.
+- A missing future price/funding label is not a dated delisting event. Never
+  use it to force an exit at the preceding mark. Unknown nonzero held valuation
+  raises `CryptoPerpetualDataError` before loss/backward, coordinated across
+  DDP ranks; only economic insolvency is an absorbing account default.
+  New crypto accounting requires a fresh optimizer root. Preserve old artifacts
+  and distinguish overlapping latest-year experiments from held-out folds.
+  In crypto contract v5, `force_exit_mask` means a dated announcement's zero-
+  target request, not unlimited exchange settlement. Preserve the current
+  inventory until real side permissions/capacity permit a fill; missing held
+  valuations still fail closed. Date-only announcements become policy-known
+  no earlier than the following UTC day.
+  See `docs/bybit_v4_training_audit.md` for measured v4 evidence and
+  `docs/bybit_source_repairs.md` for the ICX funding repair, HFT/VINE announced
+  exit policy, hash-verified local derived view, and fresh v6 training root.
+  This view reuses unchanged source files and is not a publisher or producer.
+- Crypto continuous capacity must retain the true local signed-clamp derivative
+  at zero order delta when capacity and permissions allow trading. A collapsed
+  zero-capacity/forbidden interval has zero derivative; do not use sign/abs
+  clipping that kills a valid cash-entry gradient. Backward contract 1 is a
+  training-only fingerprint change, while forward account contract remains 5.
+  Single-active-name learned_cash unit-L1 direction has zero score derivative;
+  preserve it for replay and use an explicitly separate output-mode candidate
+  when changing this behavior. See `docs/bybit_v6_training_audit.md` for the
+  all-fold audit and the user-requested 00:00 zero-latency v7 research contract.
+  Clock changes require actual 1m/funding rematerialization, not relabeling a
+  00:05 table; source/public data and prior artifacts remain untouched.
+- The user's v8 Bybit follow-up authorizes
+  `trading.crypto_announced_exit_unlimited_volume: true`. Only a dated
+  announcement's zero-target reduction may waive the ordinary volume cap;
+  side permissions, real execution-price evidence, turnover limits, ordinary
+  buy/sell fees, padding/default state and missing-held-valuation failures stay
+  unchanged. It cannot open or reverse inventory or use future NaNs as events.
+  This is a research fill assumption, not exchange delisting settlement.
+  Opt-in crypto forward contract 6 uses a fresh optimizer/artifact root and
+  reuses v7's source and panel cache without duplication; disabled configs keep
+  contract 5 and their old fingerprints. See `docs/bybit_v8_announced_exit.md`.
+  The user's subsequent correction sets ordinary v8 participation to
+  `max_volume_participation: 0.5` of prior completed daily USDT turnover, not
+  the legacy 1%. Keep this explicit in v8; preserve v7's replay contract and
+  reject optimizer resumes across participation values. Announcement exits
+  remain the only volume-exempt reductions.
 
 The active crypto downloader baseline is one-minute bars.
 

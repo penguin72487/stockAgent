@@ -1,0 +1,29 @@
+state_dir: /root/stockAgent/artifacts/gpu_jobs/tw_futures_margin_components_20261003
+jobs:
+  - name: futures-margin-components-smoke
+    enabled: true
+    config: /root/stockAgent/configs/markets/tw_futures_v8_margin_components_capital100m_20261003.yaml
+    gpus: [0, 1]
+    fold_range: [10, 10]
+    output_dir: /root/stockAgent/artifacts/markets/tw_futures_v8_margin_components_smoke_fold10_20261003
+    extra_args:
+      - --epochs
+      - '4'
+      - --resume
+      - --early-stopping-no-improve-ratio
+      - '0'
+      - --multi-gpu-strategy
+      - distributed_data_parallel
+      - --cpu-threads
+      - '2'
+      - --torch-compile-threads
+      - '16'
+      - --no-post-train-infer
+      - --profile-timing
+      - --no-isolate-train-folds
+      - --retrain-completed-folds
+    env:
+      STOCKAGENT_CODE_RELEASE_RECEIPT: /root/stockAgent/artifacts/runtime/tw_futures_margin/code-release/release.json
+      PYTHONUNBUFFERED: '1'
+      POLARS_MAX_THREADS: '16'
+      MPLBACKEND: Agg

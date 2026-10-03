@@ -1,0 +1,15 @@
+# Exploratory continuation of the completed v4 score_entmax_cash fold.
+# The 2026 test period has already been inspected and is no longer blind.
+# Preserve its exact data, physical FIFO execution, architecture, batch shape,
+# and parameter-free output map. The separate root prevents checkpoint mixing.
+# A 10,240-epoch ceiling with 0.01 no-improvement ratio gives 103 validation
+# checks of patience; v9's inherited 1,024 ceiling gave the same 103 checks.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_v4.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-score-entmax-cash-10240-v10
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_cash_10240_v10
+
+training:
+  epochs: 10240
+  early_stopping_no_improve_ratio: 0.01

@@ -390,6 +390,37 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     }
 
 
+def reporting_weight_history(result: BacktestResult) -> tuple[np.ndarray, str]:
+    """Return an explicitly labelled allocation surface, never contracts as weights.
+
+    Exact futures retain signed whole contracts in ``weights_history`` for
+    recurrent-account replay.  Their saved requests can explain the policy's
+    allocation, but cannot establish realised notional exposure without prices,
+    multipliers and the opening account equity.
+    """
+    mode = str(result.execution_mode).strip().lower()
+    unit = str(result.settlement_ledger_unit).strip().lower()
+    use_requests = unit == "contract_quantity" or mode in {
+        "tw_index_futures_day", "tw_index_derivatives_day",
+    }
+    if not use_requests:
+        return np.asarray(result.weights_history), "Weight"
+    if result.requested_weights_history is None:
+        raise ValueError(
+            f"{mode} {unit} allocation reporting requires requested weight history; "
+            "contract quantities cannot be reported as exposure weights"
+        )
+    requested = np.asarray(result.requested_weights_history)
+    if requested.ndim != 2 or requested.shape[0] != len(result.strategy_returns):
+        raise ValueError("requested allocation history must be row-aligned [T,S]")
+    label = (
+        "Requested Initial Margin Budget"
+        if result.futures_margin_audit is not None
+        else "Requested Notional Exposure"
+    )
+    return requested, label
+
+
 def _aligned_dated_backtest_rows(
     result: BacktestResult,
     dates: np.ndarray,
@@ -737,6 +768,11 @@ def plot_leverage_curve(
 
     Gross leverage is defined as sum(abs(weights)) each day.
     """
+    if str(result.settlement_ledger_unit).strip().lower() == "contract_quantity":
+        raise ValueError(
+            "realised futures leverage requires marked contract notionals and "
+            "opening equity; signed contract counts are not leverage"
+        )
     weights = np.asarray(result.weights_history, dtype=np.float64)
     if weights.ndim != 2 or weights.size == 0:
         return
@@ -1146,6 +1182,7 @@ def plot_first_year_turnover_concentration(
     *,
     scope_label: str = "First Test Year",
     experimental_fold_ids: set[int] | None = None,
+    weight_label: str = "Weight",
 ) -> None:
     """Plot first-test-year turnover and concentration by fold."""
     if not fold_ids:
@@ -1182,11 +1219,11 @@ def plot_first_year_turnover_concentration(
     axes[0].set_ylabel("Turnover")
 
     axes[1].bar(x, _finite_values(mean_max_abs_weight), color="tab:purple")
-    axes[1].set_title(f"{scope_label} Mean Max Absolute Single-Name Weight")
-    axes[1].set_ylabel("Weight")
+    axes[1].set_title(f"{scope_label} Mean Max Absolute Single-Name {weight_label}")
+    axes[1].set_ylabel(weight_label)
 
     axes[2].bar(x, _finite_values(mean_hhi), color="tab:brown")
-    axes[2].set_title(f"{scope_label} Mean Weight HHI")
+    axes[2].set_title(f"{scope_label} Mean {weight_label} HHI")
     axes[2].set_ylabel("HHI")
     axes[2].set_xticks(x)
     axes[2].set_xticklabels(labels, rotation=45, ha="right")

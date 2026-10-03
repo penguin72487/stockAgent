@@ -32,10 +32,11 @@ CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION = 2
 CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION = 3
 CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION = 4
 CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION = 5
+CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION = 6
 
 
 class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
-    """Read all stock histories and emit a fixed 1,936-slot futures action.
+    """Read all stock histories and emit a versioned fixed futures action axis.
 
     Every stock/ETF futures token first receives a learned gated residual from
     its own cash-underlying embedding. Four learned market queries then read
@@ -49,14 +50,23 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self,
         *args: Any,
         futures_product_capacity: int = 1024,
+        futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
         futures_joint_market_tokens: int = 4,
         futures_denomination_aware_output: bool = False,
         futures_denomination_hard_projection: bool | None = None,
         futures_current_open_feature: bool = False,
+        futures_margin_budget_output: bool = False,
+        futures_feature_rms_normalization: bool = False,
+        futures_flat_action_initialization: bool = False,
+        futures_notional_score_coordinates: bool = False,
+        futures_margin_amount_context: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
+        futures_slot_layout_version(futures_slot_count)
+        self.futures_slot_count = int(futures_slot_count)
         if int(futures_product_capacity) < 2:
             raise ValueError("futures_product_capacity must be at least two")
         if int(futures_joint_market_tokens) < 1:
@@ -67,6 +77,18 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         del self.score_head
 
         feature_dim = len(FUTURES_MODEL_FEATURE_COLUMNS)
+        self.futures_feature_rms_normalization = bool(
+            futures_feature_rms_normalization
+        )
+        if self.futures_feature_rms_normalization:
+            self.register_buffer(
+                "futures_feature_rms_scale",
+                torch.ones(feature_dim - 1, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "futures_feature_active_mask",
+                torch.ones(feature_dim - 1, dtype=torch.bool),
+            )
         self.futures_product_capacity = int(futures_product_capacity)
         self.futures_denomination_aware_output = bool(
             futures_denomination_aware_output
@@ -84,6 +106,25 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 "futures denomination hard projection requires denomination context"
             )
         self.futures_current_open_feature = bool(futures_current_open_feature)
+        self.futures_margin_budget_output = bool(futures_margin_budget_output)
+        self.futures_margin_amount_context = bool(futures_margin_amount_context)
+        if self.futures_margin_amount_context and not self.futures_margin_budget_output:
+            raise ValueError("margin amount context requires a dated-margin policy")
+        self.futures_notional_score_coordinates = bool(futures_notional_score_coordinates)
+        if self.futures_notional_score_coordinates and (
+            not self.futures_margin_budget_output
+            or self.portfolio_output_mode != "score_entmax_log_cash"
+            or self.center_long_short_logits
+        ):
+            raise ValueError("notional score coordinates require the uncentered margin score_entmax_log_cash policy")
+        if self.futures_margin_budget_output and (
+            self.futures_current_open_feature or self.futures_denomination_aware_output
+        ):
+            raise ValueError("margin budgeting uses only its prior-observable margin context")
+        self.futures_margin_encoder = (
+            nn.Linear(2 + int(self.futures_margin_amount_context), self.d_model, bias=False)
+            if self.futures_margin_budget_output else None
+        )
         if (
             self.futures_current_open_feature
             and not self.futures_denomination_aware_output
@@ -102,7 +143,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             self.d_model,
         )
         self.futures_slot_embedding = nn.Embedding(
-            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+            self.futures_slot_count,
             self.d_model,
         )
         self.futures_underlying_norm = PortfolioRMSNorm(self.d_model)
@@ -144,6 +185,15 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             nn.Linear(self.d_model * 2, self.d_model),
         )
         self.futures_action_head = nn.Linear(self.d_model, 1)
+        if futures_flat_action_initialization:
+            if not self.futures_margin_budget_output or self.portfolio_output_mode != "score_entmax_log_cash":
+                raise ValueError("flat futures initialization requires the margin score_entmax_log_cash policy")
+            # Zero scores map to cash with a nonzero action derivative. Only
+            # this last affine map is zeroed: its random upstream features
+            # break symmetry, and the backbone receives gradients after the
+            # first head update. Checkpoint loads still restore trained values.
+            nn.init.zeros_(self.futures_action_head.weight)
+            nn.init.zeros_(self.futures_action_head.bias)
         if self.futures_denomination_aware_output:
             self.futures_denomination_encoder = nn.Sequential(
                 nn.Linear(2, self.d_model),
@@ -162,9 +212,53 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             self.futures_current_open_encoder = None
         self.register_buffer(
             "futures_slot_indices",
-            torch.arange(TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT),
+            torch.arange(self.futures_slot_count),
             persistent=False,
         )
+
+    def set_futures_feature_rms_normalizer(
+        self,
+        scale: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> None:
+        """Install the canonical train-fitted scale for continuous futures fields.
+
+        Product IDs, linked-stock indices and denomination metadata are not
+        part of this 17-column normalization ABI. Persistent buffers preserve
+        exactly the same transform during checkpoint inference and resume.
+        """
+
+        if not self.futures_feature_rms_normalization:
+            raise RuntimeError("futures feature RMS normalization is disabled")
+        normalized_scale = torch.as_tensor(
+            scale, dtype=torch.float32, device=self.futures_feature_rms_scale.device
+        ).reshape(-1)
+        normalized_active = torch.as_tensor(
+            active_mask, dtype=torch.bool,
+            device=self.futures_feature_active_mask.device,
+        ).reshape(-1)
+        width = len(FUTURES_MODEL_FEATURE_COLUMNS) - 1
+        if normalized_scale.numel() != width or normalized_active.numel() != width:
+            raise ValueError("futures RMS scale/mask must match continuous feature width")
+        if not bool(torch.isfinite(normalized_scale).all().item()) or bool(
+            (normalized_scale <= 0).any().item()
+        ):
+            raise ValueError("futures RMS scales must be finite and positive")
+        with torch.no_grad():
+            self.futures_feature_rms_scale.copy_(normalized_scale)
+            self.futures_feature_active_mask.copy_(normalized_active)
+
+    def _normalize_futures_continuous_features(
+        self, features: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.futures_feature_rms_normalization:
+            return features
+        # Normalize before AMP casts, and preserve the missing/unseen zero
+        # sentinel. In particular, future-only source launches cannot activate
+        # randomly initialized feature columns in a completed earlier fold.
+        clean = torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        scaled = clean / self.futures_feature_rms_scale
+        return scaled.masked_fill(~self.futures_feature_active_mask, 0.0)
 
     def _require_futures_context(
         self,
@@ -181,6 +275,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         current_open_features = len(
             TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
         )
+        margin_features = expected_features + 2 + int(self.futures_margin_amount_context)
         if features is None or mask is None:
             raise ValueError(
                 "all-futures candidate_features and candidate_mask must be paired"
@@ -188,26 +283,29 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         if (
             features.ndim != 3
             or tuple(features.shape[:2])
-            != (batch_size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
+            != (batch_size, self.futures_slot_count)
             or int(features.size(-1))
             not in {
                 base_features,
                 prior_features,
                 expected_features,
                 current_open_features,
+                margin_features,
             }
         ):
             raise ValueError(
                 "all-futures candidate_features must have shape "
-                f"[B,{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT},"
-                f"{base_features}, {prior_features}, {expected_features}, or "
-                f"{current_open_features}], "
+                f"[B,{self.futures_slot_count},"
+                f"{base_features}, {prior_features}, {expected_features}, "
+                f"{current_open_features}, or {margin_features}], "
                 f"got {tuple(features.shape)}"
             )
         if tuple(mask.shape) != tuple(features.shape[:2]):
-            raise ValueError("all-futures candidate_mask must match [B,1936]")
+            raise ValueError(f"all-futures candidate_mask must match [B,{self.futures_slot_count}]")
         features = features.to(device=device)
         feature_width = int(features.size(-1))
+        if self.futures_margin_budget_output != (feature_width == margin_features):
+            raise ValueError("margin action/context contract mismatch")
         if self.futures_current_open_feature and feature_width != current_open_features:
             raise ValueError(
                 "current futures OPEN model requires its current OPEN gap context"
@@ -370,13 +468,24 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         ).round().to(dtype=torch.long)
         product_ids = product_ids.clamp(0, self.futures_product_capacity - 1)
         futures_tokens = self.futures_continuous_encoder(
-            base_candidate_features[..., 1:].to(dtype=z_stock.dtype)
+            self._normalize_futures_continuous_features(
+                base_candidate_features[..., 1:]
+            ).to(dtype=z_stock.dtype)
         )
         futures_tokens = (
             futures_tokens
             + self.futures_product_embedding(product_ids)
             + self.futures_slot_embedding(self.futures_slot_indices)[None, :, :]
         )
+        if self.futures_margin_encoder is not None:
+            margin_context = candidate_features[..., -2:].float()
+            if self.futures_margin_amount_context:
+                amount_fraction = candidate_features[..., -3:-2].float() / self.futures_denomination_reference_capital
+                margin_context = torch.cat((margin_context, amount_fraction), dim=-1)
+            margin_context = torch.log(margin_context.clamp_min(1.0e-8)).clamp(-18.0, 4.0)
+            futures_tokens = futures_tokens + self.futures_margin_encoder(
+                margin_context.to(dtype=z_stock.dtype)
+            ).masked_fill(~candidate_mask.unsqueeze(-1), 0.0)
         denomination_features = (
             candidate_features[
                 ...,
@@ -517,6 +626,16 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         target_logits = (centered_scores / temp).masked_fill(
             ~candidate_mask, 0.0
         )
+        if self.futures_notional_score_coordinates:
+            # q*=w*E/IM amplifies an unscaled score's local derivative by N/IM.
+            # r=known_IM/prior_notional makes that derivative proportional to
+            # E/prior_notional near zero. r>0 is invertible, so reachable margin
+            # budgets remain unchanged. Current OPEN and future returns never
+            # enter this coordinate transform; masked slots contribute zero.
+            margin_to_notional = candidate_features[..., -2].float().masked_fill(
+                ~candidate_mask, 0.0
+            )
+            target_logits = target_logits * margin_to_notional
         action_aux: dict[str, torch.Tensor] = {}
         if self.portfolio_output_mode == "logits":
             weights = target_logits
@@ -598,5 +717,6 @@ __all__ = [
     "CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION",
     "CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION",
     "CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION",
+    "CROSS_SECTIONAL_ALL_FUTURES_RMS_MODEL_CONTRACT_VERSION",
     "CrossSectionalAllFuturesModel",
 ]

@@ -1,0 +1,16 @@
+# Fold-11 OFAT: change only the score-to-portfolio output map relative to v7.
+# Keep the pinned observed dataset, exact FIFO account, CPU tensor cache,
+# two-GPU batch, effective 1,024-epoch ceiling, and validation early stopping.
+# The historical 10,240 name did not override v6's training.epochs: 1024.
+# A distinct output map owns a distinct checkpoint/artifact root.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_global_cash_10240_v7.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-score-entmax-scale-separated-cash-10240-v9
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_scale_separated_cash_10240_v9
+
+training:
+  transformer_base_portfolio:
+    portfolio_output_mode: score_entmax_scale_separated_cash
+  financial_transformer:
+    portfolio_output_mode: score_entmax_scale_separated_cash

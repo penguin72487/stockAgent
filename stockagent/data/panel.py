@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 import fnmatch
 from pathlib import Path
@@ -43,6 +43,7 @@ from stockagent.data.us_universe import (
     normalize_us_symbol_key,
     us_broker_untradable_reason,
 )
+from stockagent.data.crypto_lifecycle import ANNOUNCEMENT_COLUMNS, announced_exit_mask
 
 try:
     from stockagent.data import panel_numba as _panel_numba
@@ -512,6 +513,38 @@ def slice_panel_start(
     )
 
 
+def slice_panel_end(panel: PanelData, panel_end_date: str | date | np.datetime64) -> PanelData:
+    """Keep sessions through an inclusive verified source boundary."""
+
+    end_date = _normalize_panel_start_date(panel_end_date)
+    assert end_date is not None
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    stop = int(np.searchsorted(panel_dates, end_date, side="right"))
+    if stop == 0:
+        raise ValueError(f"panel_end_date={end_date} precedes every panel session")
+    if stop == len(panel_dates):
+        return panel
+    row_fields = (
+        "dates", "features", "returns_1d", "tradable_mask", "alive_mask",
+        "benchmark_returns", "close_prices", "daily_volumes", "can_buy_mask",
+        "can_sell_mask", "can_short_open_mask", "can_short_open_open_mask",
+        "force_short_cover_mask", "force_exit_mask", "short_capacity_shares",
+        "short_margin_rate", "open_prices", "intraday_returns",
+        "day_trade_eligible_mask", "day_trade_can_short_open_mask",
+        "day_trade_can_buy_open_mask", "day_trade_can_sell_open_mask",
+        "raw_close_returns_1d", "corporate_action_avoidance_mask",
+        "unresolved_corporate_action_mask", "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions", "overnight_1325_available",
+        "overnight_1325_close_fallback_mask", "overnight_decision_prices",
+    )
+    updates = {
+        name: (None if (value := getattr(panel, name)) is None else value[:stop])
+        for name in row_fields
+    }
+    print(f"[panel] applied inclusive verified panel_end_date={end_date}; kept {stop}/{len(panel_dates)} dates")
+    return replace(panel, **updates)
+
+
 @dataclass(slots=True)
 class _SymbolPanelArrays:
     symbol: str
@@ -535,6 +568,7 @@ class _SymbolPanelArrays:
     day_trade_can_sell_open_mask: np.ndarray
     alive_mask: np.ndarray
     day_trade_eligible_mask: np.ndarray | None = None
+    crypto_announced_exit_mask: np.ndarray | None = None
 
 
 def _slice_symbol_arrays_start(
@@ -582,6 +616,7 @@ def _slice_symbol_arrays_start(
         day_trade_can_sell_open_mask=arrays.day_trade_can_sell_open_mask[slc],
         alive_mask=arrays.alive_mask[slc],
         day_trade_eligible_mask=sliced(arrays.day_trade_eligible_mask),
+        crypto_announced_exit_mask=sliced(arrays.crypto_announced_exit_mask),
     )
 
 
@@ -2545,6 +2580,11 @@ def _symbol_arrays_from_arrow_table(
     dates = _coerce_arrow_datetime_ns_column(table, "date", rows)
     order = np.argsort(dates)
     dates = dates[order]
+    crypto_exit = announced_exit_mask(dates, {
+        name: table[name].to_pylist()
+        for name in (*ANNOUNCEMENT_COLUMNS, "bybit_perpetual_contract_version")
+        if name in table.column_names
+    })
 
     def col(name: str) -> np.ndarray:
         return _coerce_arrow_numeric_column(table, name, rows)[order]
@@ -2718,6 +2758,8 @@ def _symbol_arrays_from_arrow_table(
         capacity_volume = capacity_volume[valid_dates]
         tradable = tradable[valid_dates]
         execution_available = execution_available[valid_dates]
+        if crypto_exit is not None:
+            crypto_exit = crypto_exit[valid_dates]
         close_notna = close_notna[valid_dates]
         if day_trade_eligible is not None:
             day_trade_eligible = day_trade_eligible[valid_dates]
@@ -2763,7 +2805,8 @@ def _symbol_arrays_from_arrow_table(
         open_prices=open_px.astype(np.float32, copy=False),
         intraday_returns=intraday_return_co.astype(np.float32, copy=False),
         daily_volumes=capacity_volume.astype(np.float32, copy=False),
-        tradable_mask=tradable,
+        tradable_mask=tradable if crypto_exit is None else tradable & ~crypto_exit,
+        crypto_announced_exit_mask=crypto_exit,
         return_valuation_mask=(
             execution_available.copy()
             if raw_execution_available is not None
@@ -3027,6 +3070,11 @@ def _load_symbol_arrays_polars_lazy(
     execution_available = out["execution_available"].to_numpy().astype(
         bool, copy=False
     )
+    crypto_exit = announced_exit_mask(dates, {
+        name: frame[name].to_list()
+        for name in (*ANNOUNCEMENT_COLUMNS, "bybit_perpetual_contract_version")
+        if name in schema_names
+    })
     features = np.column_stack(
         [
             out[name].to_numpy().astype(np.float64, copy=False)
@@ -3049,6 +3097,8 @@ def _load_symbol_arrays_polars_lazy(
         daily_volume = daily_volume[valid_dates]
         tradable = tradable[valid_dates]
         execution_available = execution_available[valid_dates]
+        if crypto_exit is not None:
+            crypto_exit = crypto_exit[valid_dates]
         close_notna = close_notna[valid_dates]
         if day_trade_eligible is not None:
             day_trade_eligible = day_trade_eligible[valid_dates]
@@ -3094,7 +3144,8 @@ def _load_symbol_arrays_polars_lazy(
         open_prices=open_px.astype(np.float32, copy=False),
         intraday_returns=intraday_return_co.astype(np.float32, copy=False),
         daily_volumes=daily_volume.astype(np.float32, copy=False),
-        tradable_mask=np.asarray(tradable, dtype=bool),
+        tradable_mask=np.asarray(tradable if crypto_exit is None else tradable & ~crypto_exit, dtype=bool),
+        crypto_announced_exit_mask=crypto_exit,
         return_valuation_mask=np.asarray(
             execution_available
             if "execution_available" in schema_names
@@ -3241,6 +3292,7 @@ def _build_panel_from_symbol_arrays(
     day_trade_can_buy_open_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     day_trade_can_sell_open_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    crypto_announced_exit = np.zeros((num_dates, num_symbols), dtype=bool)
     has_day_trade_eligibility = any(
         item.day_trade_eligible_mask is not None for item in symbol_arrays
     )
@@ -3367,6 +3419,10 @@ def _build_panel_from_symbol_arrays(
             else item.day_trade_can_sell_open_mask[valid]
         )
         alive_mask[row_idx, sym_idx] = item.alive_mask if all_valid else item.alive_mask[valid]
+        if item.crypto_announced_exit_mask is not None:
+            crypto_announced_exit[row_idx, sym_idx] = (
+                item.crypto_announced_exit_mask if all_valid else item.crypto_announced_exit_mask[valid]
+            )
         if day_trade_eligible_mask is not None and item.day_trade_eligible_mask is not None:
             day_trade_eligible_mask[row_idx, sym_idx] = (
                 item.day_trade_eligible_mask
@@ -3415,7 +3471,7 @@ def _build_panel_from_symbol_arrays(
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_sell_mask.copy(),
         force_short_cover_mask=np.zeros_like(tradable_mask, dtype=bool),
-        force_exit_mask=np.zeros_like(tradable_mask, dtype=bool),
+        force_exit_mask=crypto_announced_exit,
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
@@ -5921,6 +5977,7 @@ def build_panel(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
     )
+    build_started = time_module.perf_counter()
     polars_collect_engine = "streaming" if selected_backend == "polars_streaming" else "auto"
 
     def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
@@ -5951,6 +6008,7 @@ def build_panel(
             loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
     else:
         loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+    symbol_load_seconds = time_module.perf_counter() - build_started
 
     valid_arrays: list[_SymbolPanelArrays] = []
     for path, arrays, exc in loaded_arrays:
@@ -5992,6 +6050,7 @@ def build_panel(
         selected_external_feature_names = tuple(
             external_names[index] for index in selected_external_indices
         )
+    external_started = time_module.perf_counter()
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,
@@ -6003,6 +6062,8 @@ def build_panel(
         if external_feature_path is not None
         else None
     )
+    external_load_seconds = time_module.perf_counter() - external_started
+    assemble_started = time_module.perf_counter()
     panel = _build_panel_from_symbol_arrays(
         valid_arrays,
         benchmark_name=benchmark_name,
@@ -6028,7 +6089,19 @@ def build_panel(
     )
     if panel.unresolved_corporate_action_mask is not None:
         panel = _attach_raw_close_forward_returns(panel)
+    assemble_seconds = time_module.perf_counter() - assemble_started
+    cache_started = time_module.perf_counter()
     _save_panel_cache(cache_root, panel, source_hash, backend_key)
+    cache_save_seconds = time_module.perf_counter() - cache_started
+    print(
+        "[panel] cold build stages "
+        f"symbols={symbol_load_seconds:.3f}s "
+        f"external={external_load_seconds:.3f}s "
+        f"assemble_rules={assemble_seconds:.3f}s "
+        f"cache_save={cache_save_seconds:.3f}s "
+        f"total={time_module.perf_counter() - build_started:.3f}s",
+        flush=True,
+    )
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(cache_root)}")
     if include_day_trade_open_gap:
         panel = _append_configured_day_trade_open_gap_feature(

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -20,6 +21,25 @@ from stockagent.training.trainer import (
     _save_fold_output_artifacts,
     _write_reporting_leverage_artifacts,
 )
+
+
+def test_fold_complete_marker_refuses_missing_required_artifacts(tmp_path: Path) -> None:
+    result = FoldResult(
+        fold_id=1,
+        train_years=[2024],
+        val_years=[2025],
+        test_years=[2026],
+        best_val_loss=-1.0,
+        val_ic={},
+        val_metrics={},
+        test_ic={},
+        test_metrics={},
+    )
+    with pytest.raises(RuntimeError, match="required artifacts"):
+        trainer_module._write_fold_complete_marker(
+            tmp_path, result, source="incomplete_test"
+        )
+    assert not (tmp_path / "fold_complete.json").exists()
 
 
 def test_save_best_val_backtest_snapshot_writes_compressed_npz_and_metadata(tmp_path: Path) -> None:

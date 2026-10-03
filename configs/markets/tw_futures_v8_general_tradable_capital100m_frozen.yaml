@@ -1,0 +1,12 @@
+# One-factor transfer-learning control: preserve the pretrained stock backbone.
+# Reuse the canonical trainable-prefix contract; learn all futures modules.
+base_config: tw_futures_v8_general_tradable_capital100m_funding.yaml
+experiment_name: tw-futures-v8-general-prior-capacity-capital100m-frozen
+
+training:
+  pretrained_initialization_trainable_parameter_prefixes: [futures_]
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_general_tradable_capital100m_frozen_fold10
+  start_fold: 10
+  resume: true

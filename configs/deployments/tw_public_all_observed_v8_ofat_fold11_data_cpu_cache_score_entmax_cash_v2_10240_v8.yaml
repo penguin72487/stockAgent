@@ -1,0 +1,15 @@
+# Matched parameter-free control for the global-cash v7 experiment. Keep the
+# same pinned data, exact FIFO ledger, effective 1,024-epoch ceiling, and early stop.
+# This mode retains v4's per-stock forward allocation but fixes its exact-zero
+# score gradient; the changed training ABI requires its own artifact root.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_global_cash_10240_v7.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-score-entmax-cash-v2-10240-v8
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_score_entmax_cash_v2_10240_v8
+
+training:
+  transformer_base_portfolio:
+    portfolio_output_mode: score_entmax_cash_v2
+  financial_transformer:
+    portfolio_output_mode: score_entmax_cash_v2
