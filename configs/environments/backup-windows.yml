@@ -1,0 +1,6 @@
+name: stockagent-backup-windows
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - restic=0.19.1

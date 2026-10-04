@@ -22,6 +22,7 @@ escape_replacement() {
 }
 
 units=(
+  stockagent.slice
   stockagent-heavy-data.slice
   stockagent-finmind-free.service
   stockagent-finmind-complement.service
@@ -59,7 +60,9 @@ units=(
   stockagent-openbb-public-priority.service
   stockagent-openbb-public-priority.timer
 )
-if [[ "${1:-}" == "features-only" ]]; then
+if [[ "${1:-}" == "resource-slices-only" ]]; then
+  units=(stockagent.slice stockagent-heavy-data.slice)
+elif [[ "${1:-}" == "features-only" ]]; then
   # A targeted deployment must not reinstall unrelated dirty service templates
   # or start the large daily/backfill jobs during a live market window.
   units=(
@@ -98,7 +101,7 @@ elif [[ "${1:-}" == "public-economic-only" ]]; then
   units=(stockagent-public-economic-history.service stockagent-public-economic-history.timer
          stockagent-openbb-public-priority.service stockagent-openbb-public-priority.timer)
 elif [[ $# -gt 0 ]]; then
-  echo "usage: $0 [features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only|finmind-announcements-only|taifex-rules-only|keyed-public-catalogs-only|public-economic-only]" >&2
+  echo "usage: $0 [resource-slices-only|features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only|finmind-announcements-only|taifex-rules-only|keyed-public-catalogs-only|public-economic-only]" >&2
   exit 2
 fi
 temporary_dir="$(mktemp -d)"
@@ -128,7 +131,7 @@ if [[ "${1:-}" == "finmind-only" || $# -eq 0 ]]; then
 fi
 systemd-analyze verify "${verify_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
-if [[ "${1:-}" != "intraday-timer-only" && "${1:-}" != "finmind-announcements-only" && "${1:-}" != "taifex-rules-only" && "${1:-}" != "keyed-public-catalogs-only" && "${1:-}" != "public-economic-only" ]]; then
+if [[ "${1:-}" != "resource-slices-only" && "${1:-}" != "intraday-timer-only" && "${1:-}" != "finmind-announcements-only" && "${1:-}" != "taifex-rules-only" && "${1:-}" != "keyed-public-catalogs-only" && "${1:-}" != "public-economic-only" ]]; then
   chmod 0755 \
     "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
     "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
@@ -141,6 +144,10 @@ if [[ "${1:-}" != "intraday-timer-only" && "${1:-}" != "finmind-announcements-on
     "$repo_root/scripts/run_taifex_public_history.sh"
 fi
 systemctl daemon-reload
+if [[ "${1:-}" == "resource-slices-only" ]]; then
+  echo "[registered-data] parent/data scheduling weights installed; existing memory limits retained"
+  exit 0
+fi
 if [[ "${1:-}" == "public-economic-only" ]]; then
   systemctl enable --now stockagent-public-economic-history.timer stockagent-openbb-public-priority.timer
   echo "[registered-data] economic history and canonical OpenBB planner timers enabled; trading services untouched"

@@ -32,6 +32,7 @@ def test_two_phase_cold_start_repairs_then_executes_all_modes(
     original_specs = cold_test._enabled_specs
     monkeypatch.setattr(cold_test, "_enabled_specs", lambda sandbox: [
         replace(spec, residual_margin_conversion=margin_enabled,
+                terminal_liquidation_unlimited_capacity=False,
                 odd_lot_execution_policy=(spec.odd_lot_execution_policy if margin_enabled else "reject"))
         for spec in original_specs(sandbox)
     ])
@@ -96,8 +97,15 @@ def test_two_phase_cold_start_separates_live_best_quote_from_0901_replay(
     assert modes["tw_day_trade_multi_basis"]["entry_price"] == 998.0
     assert modes["tw_day_trade_multi_basis_22"]["side"] == "long"
     assert modes["tw_day_trade_multi_basis_22"]["entry_price"] == 1_000.0
-    assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["side"] == "long"
-    assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["entry_price"] == 1_000.0
+    for market, evidence in modes.items():
+        if market != "tw_day_trade_multi_basis":
+            assert evidence["side"] == "long"
+            assert evidence["entry_price"] == 1_000.0
+    close = report["phases"]["intraday_postclose"]
+    assert close["unlimited_close_enabled"] is True
+    assert close["residual_status"] == "waiting_valid_terminal_close_source"
+    assert close["terminal_ledger_fill_count"] == 0
+    assert close["residual_contract_valid"] is True
     assert all(row["filled_shares"] == 1_000 for row in modes.values())
     assert all(row["requested_shares"] == 1_000 for row in modes.values())
     assert all(row["entry_unfilled_shares"] == 0 for row in modes.values())

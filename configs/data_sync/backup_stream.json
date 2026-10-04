@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "producer_device_id": "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW",
+  "receiver_device_id": "TLOI2HH-6EZOSBC-H6YMGVW-APQOGFW-P2A7FZT-EKX6IUP-2HMRKS6-LBDHOQM",
+  "repository_id": "c717a3d315e20a5a3314c595e66607fcb7d6646cb73ad4412cc2cccb22abb798",
+  "cold_root": "/srv/stockagent-packed",
+  "include_unreferenced_cold_objects": true,
+  "history_disposition": "/root/stockAgent/configs/data_sync/backup_history_disposition_20261004.json",
+  "key_custody_confirmation": "/root/stockAgent/configs/data_sync/backup_key_custody_20261004.json",
+  "nas_recovery_plan": "/root/stockAgent/configs/data_sync/lab203_nas_recovery_plan_20261004.json",
+  "automatic_recovery": {
+    "enabled": true,
+    "minimum_free_bytes": 68719476736,
+    "maximum_restore_bytes": 4294967296
+  },
+  "publication_catalog": "/root/stockAgent/configs/data_sync/packed_datasets.json",
+  "transport_root": "/srv/stockagent-backup-ingress-lab203",
+  "syncthing_folder_id": "stockagent-backup-ingress-lab203",
+  "scan_timeout_seconds": 900,
+  "receipt_root": "/srv/stockagent-backup-receipts-lab203",
+  "state_root": "/var/lib/stockagent/backup-stream",
+  "maximum_batch_bytes": 8589934592,
+  "maximum_batch_files": 512,
+  "maximum_pending_bytes": 17179869184,
+  "maximum_staging_bytes": 17179869184,
+  "maximum_pending_deliveries": 1,
+  "maximum_retained_transport_bytes": 1099511627776,
+  "reserve_bytes": 68719476736,
+  "readiness_max_age_seconds": 900,
+  "auxiliary": {
+    "repository_root": "/root/stockAgent",
+    "control_receipt": "/var/lib/stockagent/control-plane/backups/latest.json",
+    "interval_seconds": 3600,
+    "maximum_bytes": 536870912,
+    "include_documentation": true,
+    "include_configs": true
+  },
+  "require_transport_mount": true,
+  "required_mounts": {
+    "/srv/stockagent-packed": "D:",
+    "/srv/stockagent-backup-ingress-lab203": "D:"
+  },
+  "automatic_pruning": false,
+  "automatic_batch_deletion": true,
+  "cold_transport_cache": {
+    "enabled": true,
+    "scope": "machine_acknowledged_reconstructible_cold_transport",
+    "user_instruction": "2026-10-04：請幫我全部分析整理同步到 lab203；冷資料傳輸暫存以 NAS 還原收據及保留來源核對後回收，以符合 lab203 容量。"
+  },
+  "source_cleanup_authorized": false
+}

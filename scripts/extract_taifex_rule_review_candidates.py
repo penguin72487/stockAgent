@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from functools import cache
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -44,6 +45,7 @@ from stockagent.ocr.rapidocr import rapidocr_runtime, rapidocr_engine
 
 PROFILE = 'pdf_review_pymupdf_1.27.2.2_tesseract_chi_tra_eng_psm3_200dpi_process_v2'
 TABLE_PROFILE = 'pdf_native_tables_pymupdf_1.27.2.2_v1'
+OCR_TABLE_PROFILE = 'source_ruled_ocr_cell_grid_v5'
 
 
 @cache
@@ -231,6 +233,217 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
     return receipt
 
 
+def refine_position_ocr_cells(table, tokens):
+    """Restore position-row ownership from already retained glyph polygons.
+
+    A scanned rule may merge two rows or miss a label cell. Only literal
+    labels and complete, uniquely aligned amount tokens can repair ownership.
+    Original cells and token identities remain in the candidate's evidence.
+    """
+    from copy import deepcopy
+    import math
+    normal=lambda s:re.sub(r'\s+','',str(s or '')).translate(
+        str.maketrans('数约标证终业计准营','數約標證終業計準營'))
+    original=table['cells']
+    if 'position_cell_refinement' in table:return table
+    if (not original or not original[0] or len({len(r) for r in original})!=1
+            or len(original[0])<2):return table
+    unit_table=normal(original[0][0])=='持有部位'
+    cap_table=normal(original[0][0]).startswith('適用期間')
+    if not (unit_table or cap_table):return table
+    evidence={(e['row'],e['column']):e for e in table.get('cell_evidence',[])}
+    if len(evidence)!=len(table.get('cell_evidence',[])):return table
+    def box(i):
+        polygon=tokens[i]['box']
+        if len(polygon)!=4 or any(len(p)!=2 or not all(math.isfinite(v) for v in p) for p in polygon):
+            raise ValueError('invalid retained OCR polygon')
+        return [min(p[0] for p in polygon),min(p[1] for p in polygon),
+                max(p[0] for p in polygon),max(p[1] for p in polygon)]
+    def aligned(a,b):
+        return max(0,min(a[3],b[3])-max(a[1],b[1]))>=.7*min(a[3]-a[1],b[3]-b[1])>0
+    def indices(r,c):
+        item=evidence.get((r,c))
+        if item is None:return []
+        ids=item.get('token_indices',[])
+        if len(ids)!=len(set(ids)) or any(i<0 or i>=len(tokens) for i in ids):
+            raise ValueError('invalid retained OCR token identity')
+        if '\n'.join(tokens[i]['txt'] for i in ids)!=(original[r][c] or ''):
+            raise ValueError('retained OCR cell differs from its tokens')
+        x0,y0,x1,y1=item['bbox'];pad=min(8.,.12*min(x1-x0,y1-y0))
+        for i in ids:
+            b=box(i)
+            if not (x0-pad<=b[0] and b[2]<=x1+pad and y0-pad<=b[1] and b[3]<=y1+pad):
+                return []
+        return ids
+    rows=deepcopy(original);changes=[]
+    categories={'自然人','法人機構','造市者'}
+    amount=r'[\d,]+(?:\.\d+)?(?:股|受益權單位)'
+    for r in range(1,len(rows)):
+        labels=(original[r][0] or '').splitlines()
+        if len(labels)<2 or not all(normal(s) in categories for s in labels):continue
+        label_ids=indices(r,0)
+        if len(label_ids)!=len(labels) or len(set(map(normal,labels)))!=len(labels):continue
+        label_boxes=[box(i) for i in label_ids]
+        if any(a[3]>=b[1] for a,b in zip(label_boxes,label_boxes[1:])):continue
+        columns=[]
+        for c in range(1,len(rows[r])):
+            ids=indices(r,c)
+            if len(ids)!=len(label_ids) or not all(re.fullmatch(amount,normal(tokens[i]['txt'])) for i in ids):break
+            matches=[[i for i in ids if aligned(label,box(i))] for label in label_boxes]
+            if any(len(m)!=1 for m in matches) or len({m[0] for m in matches})!=len(ids):break
+            columns.append([m[0] for m in matches])
+        if len(columns)!=len(rows[r])-1:continue
+        replacement=[[tokens[i]['txt'],*[tokens[ids[n]]['txt'] for ids in columns]]
+                     for n,i in enumerate(label_ids)]
+        changes.append(dict(kind='uniquely_aligned_category_rows',row=r,
+            label_token_indices=label_ids,amount_token_indices=columns,replacement=replacement))
+    # Missing labels can be retained in a spanning header cell. Numeric row
+    # borders independently own the target row; a caption or neighbouring
+    # label outside that row/column cannot supply it.
+    if not changes:
+        left=[e['bbox'] for (r,c),e in evidence.items() if c==0]
+        if left:
+            x0=max(b[0] for b in left);x1=min(b[2] for b in left)
+            excluded=set(table.get('excluded_boundary_tokens',[]))
+            for r in range(1,len(rows)):
+                if normal(rows[r][0]):continue
+                numeric=[evidence.get((r,c)) for c in range(1,len(rows[r]))]
+                if any(e is None for e in numeric):continue
+                y0=max(e['bbox'][1] for e in numeric);y1=min(e['bbox'][3] for e in numeric)
+                if x0>=x1 or y0>=y1:continue
+                expected={'每口折算股數','每口折算單位數'} if unit_table else categories
+                found=[]
+                for i,t in enumerate(tokens):
+                    if i in excluded or normal(t['txt']) not in expected:continue
+                    b=box(i);pad=min(8.,.12*min(x1-x0,y1-y0))
+                    if x0-pad<=b[0] and b[2]<=x1+pad and y0-pad<=b[1] and b[3]<=y1+pad:
+                        found.append(i)
+                if len(found)!=1:continue
+                i=found[0];owners=[(rr,c) for (rr,c),e in evidence.items() if i in e.get('token_indices',[])]
+                if len(owners)>1 or any(c!=0 for rr,c in owners):continue
+                if owners:
+                    rr,c=owners[0];ids=indices(rr,c)
+                    lines=(rows[rr][c] or '').splitlines()
+                    if len(lines)!=len(ids) or rr==r:continue
+                    rows[rr][c]='\n'.join(line for line,j in zip(lines,ids) if j!=i)
+                rows[r][0]=tokens[i]['txt']
+                changes.append(dict(kind='unique_label_in_numeric_row_bounds',row=r,
+                    token_index=i,previous_cell=owners,own_row_bbox=[x0,y0,x1,y1]))
+    if not changes:return table
+    if any(c['kind']=='uniquely_aligned_category_rows' for c in changes):
+        replacements={c['row']:c['replacement'] for c in changes}
+        rows=[row for r,old in enumerate(rows) for row in replacements.get(r,[old])]
+    result=dict(table,cells=rows,position_cell_refinement=dict(
+        contract='retained_polygons_unique_position_rows_v1',original_cells=original,changes=changes))
+    return result
+
+
+def position_polygon_tables(tokens):
+    """Recover two complete position tables from unique retained text axes.
+
+    This narrow fallback handles missing scan rules, not missing glyphs. All
+    member/quantity cells, three person rows and both period headers must be
+    observed. Ambiguous rows or columns produce no additional candidates.
+    """
+    records=[]
+    for i,token in enumerate(tokens):
+        try:
+            points=token['box']
+            xs=[float(p[0]) for p in points];ys=[float(p[1]) for p in points]
+            if len(points)!=4 or not all(math.isfinite(v) for v in xs+ys):return []
+            box=[min(xs),min(ys),max(xs),max(ys)]
+            if box[2]<=box[0] or box[3]<=box[1]:return []
+            value=''.join(token['txt'].split()).translate(str.maketrans('数约','數約'))
+        except (KeyError,TypeError,ValueError):return []
+        records.append(dict(index=i,box=box,value=value,x=(box[0]+box[2])/2,
+                            y=(box[1]+box[3])/2,h=box[3]-box[1]))
+    labels=('持有部位','每口折算股數','適用期間','自然人','法人機構','造市者')
+    matches={label:[r for r in records if r['value']==label] for label in labels}
+    if any(len(matches[label])!=1 for label in labels):return []
+    label={key:value[0] for key,value in matches.items()}
+    if not all(label[a]['y']<label[b]['y'] for a,b in zip(labels,labels[1:])):return []
+    number=r'\d[\d,]*(?:\.\d+)?'
+    def same_row(anchor):
+        return [r for r in records if r['x']>anchor['box'][2]
+                and abs(r['y']-anchor['y'])<.45*(r['h']+anchor['h'])]
+    codes=sorted(same_row(label['持有部位']),key=lambda r:r['x'])
+    quantities=sorted(same_row(label['每口折算股數']),key=lambda r:r['x'])
+    if (not 2<=len(codes)<=6 or len(quantities)!=len(codes)
+            or len({r['value'] for r in codes})!=len(codes)
+            or any(not re.fullmatch(r'[A-Z]{2}[A-Z0-9]',r['value']) for r in codes)
+            or any(not re.fullmatch(number,r['value'])
+                   or float(r['value'].replace(',',''))<=0 for r in quantities)):return []
+    for code,quantity in zip(codes,quantities):
+        # The numeric polygon must align with exactly this observed code.
+        aligned=[c for c in codes if min(c['box'][2],quantity['box'][2])>
+                                      max(c['box'][0],quantity['box'][0])]
+        if aligned!=[code]:return []
+    persons=[label[key] for key in labels[3:]]
+    amounts=[]
+    for row,person in enumerate(persons):
+        values=sorted(same_row(person),key=lambda r:r['x'])
+        if (len(values)!=2 or any(not re.fullmatch(number+'股',r['value'])
+                or float(r['value'][:-1].replace(',',''))<=0 for r in values)):return []
+        # Scanned rows may slope across a wide page. Every numeric polygon
+        # must match exactly one observed person baseline and be no taller
+        # than an ordinary single-row token; no synthetic horizontal rule.
+        if any(r['h']>1.5*person['h'] or [p for p in persons
+                if abs(r['y']-p['y'])<.45*(r['h']+p['h'])]!=[person] for r in values):return []
+        amounts.append(values)
+    header_low=label['適用期間']['box'][1]
+    header_high=min(r['box'][1] for r in [persons[0],*amounts[0]])
+    starts=sorted([r for r in records if re.match(r'自\d',r['value'])
+                   and header_low<=r['y']<header_high],key=lambda r:r['x'])
+    if len(starts)!=2:return []
+    # All observed left/right numbers and start phrases leave one common
+    # empty horizontal gap. It supplies a separator without choosing dates.
+    left=max(starts[0]['box'][2],*(row[0]['box'][2] for row in amounts))
+    right=min(starts[1]['box'][0],*(row[1]['box'][0] for row in amounts))
+    if left>=right:return []
+    split=(left+right)/2
+    label_right=max(r['box'][2] for r in [label['適用期間'],*persons])
+    if any(row[0]['box'][0]<=label_right for row in amounts):return []
+    headers=[[],[]]
+    for r in records:
+        if not header_low<=r['y']<header_high or r['x']<=label_right:continue
+        column=int(r['x']>split)
+        pad=min(8.,.12*(r['box'][2]-r['box'][0]))
+        if (column==0 and r['box'][2]>split+pad
+                or column==1 and r['box'][0]<split-pad):return []
+        headers[column].append(r)
+    if any(not h or len([r for r in h if re.match(r'自\d',r['value'])])!=1
+           for h in headers):return []
+    for row in amounts:
+        if row[0]['box'][2]>split or row[1]['box'][0]<split:return []
+    def table(rows,kind):
+        evidence=[];cells=[];used=[]
+        for ri,row in enumerate(rows):
+            values=[]
+            for ci,parts in enumerate(row):
+                parts=sorted(parts,key=lambda r:(r['y'],r['x']))
+                box=[min(r['box'][0] for r in parts),min(r['box'][1] for r in parts),
+                     max(r['box'][2] for r in parts),max(r['box'][3] for r in parts)]
+                values.append('\n'.join(tokens[r['index']]['txt'] for r in parts))
+                evidence.append(dict(row=ri,column=ci,bbox=box,
+                    token_indices=[r['index'] for r in parts]))
+                used.extend(r['index'] for r in parts)
+            cells.append(values)
+        if len(set(used))!=len(used):raise ValueError('position polygon table assigns a token twice')
+        return dict(cells=cells,caption='',bbox=[min(e['bbox'][0] for e in evidence),
+            min(e['bbox'][1] for e in evidence),max(e['bbox'][2] for e in evidence),
+            max(e['bbox'][3] for e in evidence)],cell_evidence=evidence,
+            position_polygon_structure=dict(contract='complete_position_token_axes_v1',kind=kind,
+                token_indices=sorted(used),column_separator=split,
+                original_tokens=[dict(index=i,**tokens[i]) for i in sorted(used)]),
+            extraction_method='source_position_polygon_alignment',candidate_only=True)
+    unit=table([[[label[labels[0]]],*[[r] for r in codes]],
+                [[label[labels[1]]],*[[r] for r in quantities]]],'own_units')
+    cap=table([[[label[labels[2]]],*headers],
+               *[[[person],*[ [r] for r in row]] for person,row in zip(persons,amounts)]],
+              'two_period_three_person_caps')
+    return [unit,cap]
+
+
 def ruled_ocr_tables(pixels, tokens):
     """Recover source cells with a bounded five-pixel scan-gap repair.
 
@@ -256,7 +469,8 @@ def ruled_ocr_tables(pixels, tokens):
     grid=cv2.morphologyEx(cv2.bitwise_or(horizontal,vertical),cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)))
     contours,hierarchy=cv2.findContours(grid,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE)
-    if hierarchy is None:return []
+    fallback=position_polygon_tables(tokens)
+    if hierarchy is None:return fallback
     groups={}
     for i,contour in enumerate(contours):
         parent=int(hierarchy[0,i,3])
@@ -312,7 +526,13 @@ def ruled_ocr_tables(pixels, tokens):
             token_whitespace_padding_max_pixels=8,
             token_whitespace_padding_cell_fraction=.12,
             extraction_method='source_ruled_ocr_cell_grid',candidate_only=True))
-    return sorted(tables,key=lambda t:(t['bbox'][1],t['bbox'][0]))
+    refined=[refine_position_ocr_cells(t,tokens) for t in tables]
+    normalized=lambda cells:[[''.join(str(v or '').split()).translate(str.maketrans('数约','數約'))
+                              for v in row] for row in cells]
+    for candidate in fallback:
+        if not any(normalized(t['cells'])==normalized(candidate['cells']) for t in refined):
+            refined.append(candidate)
+    return sorted(refined,key=lambda t:(t['bbox'][1],t['bbox'][0]))
 
 
 def extract_ocr_tables(root: Path, out: Path, item: dict, max_pages: int, *, review_root: Path,
@@ -351,7 +571,7 @@ def extract_ocr_tables(root: Path, out: Path, item: dict, max_pages: int, *, rev
     dest=out/'documents'/source['content_sha256'];dest.mkdir(parents=True,exist_ok=True)
     if (dest/'receipt.json').exists():raise FileExistsError('OCR grid receipts are immutable')
     atomic_write_json(dest/'tables.json',dict(pages=pages,candidate_only=True))
-    result=dict(profile='source_ruled_ocr_cell_grid_v3',url=source['url'],
+    result=dict(profile=OCR_TABLE_PROFILE,url=source['url'],
         content_sha256=source['content_sha256'],source_raw_sha256=source['raw_sha256'],
         status='complete',document_pages=len(pages),extracted_pages=len(pages),
         candidate_only=True,point_in_time_verified=False,table_count=sum(len(p['tables']) for p in pages),
@@ -461,7 +681,7 @@ def main():
             raise ValueError('selected source hashes are outside the captured category: '+str(sorted(selected-set(items))))
         items={k:v for k,v in items.items() if k in selected}
     args.output_dir.mkdir(parents=True,exist_ok=True)
-    profile = ('source_ruled_ocr_cell_grid_v3' if args.ocr_tables_from else TABLE_PROFILE if args.native_tables_only else
+    profile = (OCR_TABLE_PROFILE if args.ocr_tables_from else TABLE_PROFILE if args.native_tables_only else
         rapidocr_review_profile(args.rapidocr_config, args.ocr_dpi, args.force_ocr)
         if args.rapidocr_config else extraction_profile(
             args.ocr_dpi,args.ocr_psm,args.ocr_languages,args.tessdata_dir,args.force_ocr))

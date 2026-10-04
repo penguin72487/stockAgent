@@ -9,9 +9,10 @@
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
   <link rel="stylesheet" href="styles.css?v=5">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="finlab">
   <a class="skip-link" href="#main">跳到主要內容</a>
   <header class="site-header">
     <a class="brand" href="../">STOCKAGENT</a>
@@ -163,7 +164,8 @@
       <p class="limitation">流量進度以既有原始 Feather 物件大小為整表下載基準，不是壓縮後 Parquet，也不是帳號累計用量。分子是本輪已查新來源的大小，分母再加目前可估待辦；未知大小、來源全空與全市場 Tick 不會被假補成零。筆數依寬表非空資料格、明細列、來源標籤分開，不把一個交易日當成一筆全市場資料，也不混加不同口徑。估時使用上次強制下載及轉存耗時、逐表配額容納、日額度重置與交易日開盤保護；未來新增、重新到期工作及來源失敗不在固定待辦情境內。每分鐘只更新本機量測，瀏覽器不查 FinLab。新私有包仍須既有全目錄來源與雜湊守門；上述進度不保證逐股歷史完整或 PIT。遠端研究限定私人、非商業用途。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=11" defer></script>
-  <script src="app.js?v=15" defer></script>
+  <script src="../dashboard-core.js?v=14" defer></script>
+  <script src="../dashboard-acquisition.js?v=3" defer></script>
+  <script src="app.js?v=17" defer></script>
 </body>
 </html>

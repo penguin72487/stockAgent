@@ -1157,12 +1157,15 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 "rules_path": trading.tw_futures_portfolio_margin_rules_path,
                 "broker_multiplier": trading.tw_futures_portfolio_broker_margin_multiplier,
                 "liquidation_ratio": trading.tw_futures_portfolio_margin_liquidation_ratio,
-                "marking": "official_settlement_then_next_open_gap",
+                "marking": (trading.tw_futures_portfolio_valuation_research_contract
+                    or "official_settlement_then_next_open_gap"),
                 "margin_call_policy": "next_open_flat_no_external_capital",
                 "position_limit_policy": "absolute_group_units_reduce_excess_only",
                 "surrogate": "grouped_margin_cash_solvency_recovery_v2",
                 "risk_clock": "daily_open_and_settlement_only",
             }
+            if trading.tw_futures_portfolio_valuation_research_contract is not None:
+                contract["futures_margin_contract"]["valuation_research_contract"] = trading.tw_futures_portfolio_valuation_research_contract
         if (config.training.model_name == "financial_transformer"
                 or trading.tw_futures_portfolio_holding_policy == "intraday"):
             contract["futures_holding_policy"] = {

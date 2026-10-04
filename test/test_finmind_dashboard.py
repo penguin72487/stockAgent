@@ -71,9 +71,9 @@ def test_finmind_page_uses_receipts_and_worker_only_quota(tmp_path: Path, monkey
     assert result["quota"]["official_requests_per_hour"] == 300
     assert result["quota"]["observed_requests_60m"] == 1
     assert result["quota"]["worker_headroom_60m"] == 299
-    assert result["datasets"][0]["rows"] == 542
-    assert result["datasets"][2]["rows"] == 2
-    assert result["datasets"][3]["rows"] == 200976
+    assert next(row for row in result["datasets"] if row['id'] == worker.SESSION_DATASETS[0])["rows"] == 542
+    assert next(row for row in result["datasets"] if row['id'] == worker.CALENDAR_DATASET)["rows"] == 2
+    assert next(row for row in result["datasets"] if row['id'] == worker.MASTER_DATASET)["rows"] == 200976
     assert "TaiwanStockNews" not in result["scope"]["excluded"]
     assert result['acquisition']['news'] == 'enabled_whole_market_calendar_day'
     assert "TaiwanStockPriceTick" in result["scope"]["scheduled_datasets"]
@@ -94,7 +94,7 @@ def test_finmind_page_rejects_partial_master_and_missing_status(tmp_path: Path) 
     })
     result = build_finmind_public_status(tmp_path, now=datetime(2026, 9, 25, 8, tzinfo=UTC))
     assert result["health"] == "unavailable"
-    assert result["datasets"][3]["state"] == "pending"
+    assert next(row for row in result["datasets"] if row['id'] == worker.MASTER_DATASET)["state"] == "pending"
     assert result["quota"]["state"] == "not_started"
     assert result["acquisition"]["total_session_day_tasks"] is None
 
@@ -219,7 +219,7 @@ def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
     assert "分割數不等於請求數" in javascript + html
     assert 'unbatched_task_projection' not in javascript
     assert 'id="download-global-eta-basis"' in html
-    assert 'app.js?v=13' in html
+    assert 'app.js?v=21' in html
 
 
 def test_finmind_ui_legacy_numeric_values_still_render_unknown() -> None:

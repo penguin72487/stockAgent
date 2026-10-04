@@ -25,6 +25,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid  # noqa: E402
+from downloader.stock_volume_units import (  # noqa: E402
+    STOCK_MINUTE_READER_CONTRACT, scan_stock_minute_sources,
+)
 from scripts.audit_shioaji_tw_minute_dataset import audit_frame  # noqa: E402
 from scripts.build_shioaji_tw_minute_dataset import (  # noqa: E402
     EXECUTOR_ONLY_COLUMNS,
@@ -161,6 +164,7 @@ def _day_summary(day: pl.DataFrame, trade_date: date,
     return {
         "schema_version": SCHEMA_VERSION,
         "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
+        "source_reader_contract": STOCK_MINUTE_READER_CONTRACT,
         "status": "ok", "source": "shioaji_kbars_1m",
         "trade_date": trade_date.isoformat(),
         "input_chunk_start": source_summary.get("input_chunk_start"),
@@ -211,7 +215,7 @@ def reconcile(input_root: Path, output_root: Path, trade_date: date,
     if not paths:
         raise RuntimeError("no verified source chunks for selected session")
     try:
-        source = (pl.scan_parquet([str(p) for p in paths])
+        source = (scan_stock_minute_sources(paths)
                   .filter(pl.col("date") == trade_date)
                   .select(RAW_COLUMNS).collect(engine="streaming"))
     except (OSError, pl.exceptions.PolarsError) as exc:

@@ -49,8 +49,14 @@ for (const profile of profiles) {
   if (fs.existsSync(reportPath)) rows = JSON.parse(fs.readFileSync(reportPath, "utf8"));
   const gates = {
     auditErrors: rows.filter((row) => row.auditError).length,
+    currentPageLinkErrors: rows.filter(row => !row.auditError && row.currentPageLinkCount !== 1).length,
+    duplicateIds: rows.reduce((sum, row) => sum + Number(row.duplicateIds?.length || 0), 0),
+    unlabeledFields: rows.reduce((sum, row) => sum + Number(row.unlabeledFields?.length || 0), 0),
+    unnamedControls: rows.reduce((sum, row) => sum + Number(row.unnamedTargets?.length || 0), 0),
+    inaccessibleTables: rows.reduce((sum, row) => sum + Number(row.inaccessibleTableRegions?.length || 0), 0),
     documentOverflow: rows.filter((row) => row.horizontalOverflow > 0).length,
     navigationOverflow: rows.filter((row) => row.navigationOverflow?.length).length,
+    navigationRouteErrors: rows.filter((row) => row.navigationRouteErrors?.length).length,
     laptopTableOverflow: rows.filter((row) => row.laptopTableOverflow?.length).length,
     smallTargets: rows.reduce((sum, row) => sum + Number(row.smallTargets?.length || 0), 0),
     mobileTouchTargetRisks: profile.mobile
@@ -61,10 +67,14 @@ for (const profile of profiles) {
     consoleErrors: rows.reduce((sum, row) => sum + Number(row.consoleErrors?.length || 0), 0),
     failedApis: rows.reduce((sum, row) => sum + Number(row.failedApi?.length || 0), 0),
     timingErrors: rows.reduce((sum, row) => sum + Number(row.apiTimingErrors?.length || 0), 0),
+    interactionErrors: rows.filter(row => row.interactionLatency?.error || row.interactionLatency?.fullHistory?.error
+      || row.interactionLatency?.eventActivation?.error).length,
+    representativeActionErrors: rows.filter(row => row.representativeAction?.error).length,
   };
-  const status = child.status ?? 1;
+  const childExitCode = child.status ?? 1;
+  const status = childExitCode === 0 && !Object.values(gates).some(Boolean) ? 0 : 1;
   if (status !== 0) failed = true;
-  results.push({...profile, status, reportPath, pages: rows.length, gates});
+  results.push({...profile, status, childExitCode, reportPath, pages: rows.length, gates});
   process.stdout.write(`${profile.id} ${profile.width}x${profile.height}@${profile.dpr} status=${status}\n`);
   if (status !== 0 && child.stderr) process.stderr.write(child.stderr.slice(-4000));
 }

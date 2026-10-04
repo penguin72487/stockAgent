@@ -150,10 +150,44 @@ point is `scripts/audit_training_source_inventory.py`.
   penguin may subsequently publish through the registered cold-artifact path.
   Do not change Vast's index-only role, sync raw artifacts, create release heads
   in the ingress folder, auto-activate models, or delete either source copy.
-- Each enrolled machine owns one permanent release node ID and one unique
-  Syncthing identity, currently `penguin` and `vastai1T`. `lab203` is a retired
-  historical producer: retain its existing cold heads, manifests, and objects,
-  but do not pair it again, accept its invitations, or receive later releases.
+- Each enrolled producer owns one permanent release node ID and one unique
+  Syncthing identity, currently `penguin` and `vastai1T`. `lab203` remains a
+  retired historical **producer**: retain its existing cold heads, manifests,
+  and objects. The user's 2026-10-03 instruction permits re-enrollment only as
+  a backup receiver/relay in the bounded `stockagent-backup-ingress-lab203`
+  transport after checking its local identity and configuration. The bounded
+  `stockagent-backup-receipts-lab203` return namespace is lab203 Send Only and
+  penguin Receive Only; it carries only allowlisted NAS acceptance/readiness,
+  never keys or private config. Reuse the current lab203 backup owner; the
+  return channel grants no release publishing authority. Fixed file backup,
+  canonical source reconstruction and database restore remain separate proofs.
+  See [continuous NAS backup](../continuous_nas_backup_2026-10-04.md).
+  For unattended semantic recovery, source-pinned data-only requests may be
+  consumed by fixed locally installed code in the existing backup service's
+  post hook, under that same owner lock. Never interpret synced commands or
+  execute moving synced code. Preserve separate file ACK and semantic proofs,
+  bounded scratch/physical WSL capacity, retry status and exact scratch cleanup
+  evidence; see [automatic backup](../lab203_automatic_backup_2026-10-04.md).
+  Source-owned rolling transport retirement is limited to machine-ACKed,
+  reconstructible `incremental_cold_objects` batches: unchanged canonical
+  source/full-SHA file signatures, fixed NAS independent-restore ACK, exact
+  inventory, no links/unknown files/process references, paired idle/error-free
+  Syncthing convergence, retained dry-run/owner intent and explicit deletion
+  scan. Preserve code/SQL, relayed pilots, failed staging, source objects and
+  NAS snapshots; lab203's worker is not a second deletion owner. Recovery
+  indexes retain the fixed NAS snapshots after transport removal.
+  It does not
+  restore publishing/training, the retired hot folders, auto-acceptance, or
+  later lab203-produced releases. Its Windows-side deployment is handled
+  locally by the user's Codex; SSH access is not a prerequisite. The user's
+  latest instruction explicitly authorizes discarding and permanently deleting
+  lab203's old StockAgent data and retiring its unused project services, without
+  backup, migration, waiting periods, or exact recovery proof. This exception
+  applies only to those local project files, not penguin, Vast, NAS, Windows,
+  or other users' data. Identify the exact local roots and detach their old
+  Syncthing shares before deletion so it cannot propagate to authoritative
+  peers. Preserve the local Syncthing identity and use fresh backup directories.
+  See [backup handoff](../lab203_backup_handoff_2026-10-03.md).
   Never copy Syncthing certificates, keys, device IDs, databases, or
   `.local-state/node-id` between machines.  `.local-state` remains ignored by
   Syncthing.
@@ -211,6 +245,15 @@ point is `scripts/audit_training_source_inventory.py`.
   Missing D, disk pressure, conflict files, checksum mismatch or incomplete
   current release is degraded/blocked. WSL must be running for publication and
   synchronization; Windows cold-boot recovery remains a separate acceptance.
+  The user's 2026-10-04 instruction abandons recovery only for the 25 pinned,
+  non-current historical releases and 114 already-unavailable objects in
+  `configs/data_sync/backup_history_disposition_20261004.json`. Recheck head,
+  manifest and unavailable-object identity each capture; preserve existing
+  bytes, metadata, pins and quarantine. This does not waive future/current
+  damage or claim full-history recovery. Existing unreferenced immutable cold
+  objects may be backed as unique evidence with no release/deletion claim;
+  restricted-manifest objects must not be reclassified to bypass publication.
+  See [full backup rollout](../lab203_complete_backup_rollout_2026-10-04.md).
   See `docs/d_cold_store_migration_2026-09-25.md` for migration receipts.
 
 ### Multi-writer publication and conflict resolution
@@ -274,6 +317,36 @@ point is `scripts/audit_training_source_inventory.py`.
   applicable-peer transport gates remain mandatory. The hourly timer never
   passes this flag. Batch manual retirement is restricted to the existing
   enrolled allowlist and must persist each plan and result independently.
+- A user-authorized, one-shot legacy preservation may additionally select
+  `--manual-capture`, but only for a source with an explicit
+  `manual_capture_min_stable_hours` entry in the legacy catalog (at least 12
+  hours). This is a distinct exact-capture contract, not an implicit extension
+  of `--manual-immediate`. Automatic publication and retirement retain their
+  seven-day source-stability and use-lease policies. Manual capture requires
+  inactive process/service consumers, complete source signatures before and
+  after encoding and verification, original and encoded SHA-256, independent
+  decode, and a manifest-bound capture-plan digest. Reverify the source after
+  cold commit. Retirement requires both flags, binds both into the dry-run
+  fingerprint, and repeats all ordinary D/cold/mirror/pin/usage/transport and
+  quarantine gates. The archive remains non-deployable; restore into a new
+  path preserves original bytes, mode and mtime. No timer selects this mode.
+- Archive encoding scratch is not a cold authority. The four manual legacy
+  roots enrolled on 2026-10-03 may use the bounded
+  `/var/lib/stockagent-legacy-archive-stage` C-side work area to avoid DrvFs
+  per-small-file I/O. Require the D guard even before preparing this scratch,
+  budget the full source size plus a 32 GiB C reserve, and publish only to the
+  canonical D store. Preserve all interrupted D staging as audit evidence until
+  separately verified redundant. After exact hot retirement, the explicit
+  `prune-stage-plan` / `prune-stage-apply` transaction may remove only that
+  dataset's C scratch: require its matching cold-only state, all original and
+  encoded hashes, every cold member's independent reconstruction, exact control
+  receipts, no unknown/symlink files, pin/process gates and unchanged dry-run
+  signatures; rename to private quarantine and repeat the D/recovery/signature
+  gates immediately before unlink. Never use this tool for D staging or objects.
+  `verify --cold-only` without a retained scratch uses a bounded, private
+  canonical fetch for verification only; remove it after successful original
+  decode plus cold verification, and retain any failure for diagnosis. It must
+  not activate/hydrate an artifact path or create a persistent C cold replica.
 - Legacy recovery compares original bytes, paths, sizes, mtime and permissions
   with the archived content. Historical inode/device/ctime are observation
   provenance, not recoverable file content: unlinking a different verified hard

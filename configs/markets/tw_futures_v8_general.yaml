@@ -1,5 +1,5 @@
 # Inherit the exact requested v5 artifact snapshot; override futures semantics only.
-base_config: ../deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml
+base_config: ../historical/tw_futures_v17_20261003/deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml
 experiment_name: tw-futures-v8-general
 
 environment:

@@ -126,6 +126,16 @@ def setup_root(root):
     return keys
 
 
+def test_active_sample_overrun_cannot_slide_a_fake_finish_forward(tmp_path):
+    setup_root(tmp_path)
+    write(tmp_path / "data_finlab/runs/latest.json", {
+        "state": "running", "active_key": "price:b", "active_started_at_utc": (NOW-timedelta(minutes=10)).isoformat()})
+    result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path / "sdk", now=NOW,
+                               quota=quota(5000), footer_budget_seconds=10)
+    assert result["scenarios"]["reference"]["state"] == "insufficient_samples"
+    assert next(r for r in result["datasets"] if r["key"] == "price:b")["estimated_finish_at_utc"] is None
+
+
 def test_snapshot_weights_bytes_includes_refresh_not_just_missing_keys(tmp_path):
     setup_root(tmp_path)
     result, cache = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
@@ -161,7 +171,7 @@ def test_live_incremental_quota_policy_and_v2_footer_cache_are_shared_with_proje
     cache["contract_version"] = 2
     result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
                                quota=quota(.001), cache=cache, footer_budget_seconds=0)
-    assert result["contract_version"] == 3 and result["quota_policy_version"] == 1
+    assert result["contract_version"] == 4 and result["quota_policy_version"] == 1
     assert result["measurement"]["footer_reads"] == 0
     row = next(r for r in result["datasets"] if r["key"] == "price:b")
     assert row["incremental_quota_exempt"] is True and row["record_count"] == 1

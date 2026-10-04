@@ -8,9 +8,10 @@
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=1">
   <link rel="stylesheet" href="performance.css?v=4">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="traffic">
   <a class="skip-link" href="#main">跳到主要內容</a>
   <header class="public-nav">
     <a class="public-brand" href="../">STOCKAGENT</a>
@@ -39,6 +40,7 @@
       <article class="kpi"><span>延遲 p95</span><strong id="kpi-p95">—</strong><small>histogram 上界</small></article>
       <article class="kpi"><span>延遲 p99</span><strong id="kpi-p99">—</strong><small>histogram 上界</small></article>
       <article class="kpi"><span>目前／峰值併發</span><strong id="kpi-concurrency">—</strong><small>不設應用層硬上限</small></article>
+      <article class="kpi"><span>最近 1 分鐘錯誤率</span><strong id="kpi-errors">—</strong><small>本站已完成請求；不是供應商失敗率</small></article>
     </section>
 
     <div class="section-intro"><div><span>01</span><h2>最近一小時</h2></div><p>每分鐘請求率與 p95 延遲</p></div>
@@ -64,7 +66,7 @@
     </section>
 
     <div class="section-intro"><div><span>03</span><h2>各頁功能反應測速</h2></div><p>這台瀏覽器最近 256 筆；每一功能最多保留 32 筆</p></div>
-    <section class="panel browser-performance-panel" aria-labelledby="browser-performance-title">
+    <section id="browser-performance" class="panel browser-performance-panel" aria-labelledby="browser-performance-title">
       <div class="panel-head browser-performance-head">
         <div>
           <h2 id="browser-performance-title">跨頁互動與請求</h2>
@@ -92,7 +94,7 @@
     </section>
 
     <div class="section-intro"><div><span>04</span><h2>長期真實測速</h2></div><p>背景按分鐘保存 90 天；服務中斷保留為未觀測</p></div>
-    <section class="panel history-panel" aria-labelledby="history-title">
+    <section id="traffic-history" class="panel history-panel" aria-labelledby="history-title">
       <div class="panel-head history-head">
         <div>
           <h2 id="history-title">閘道延遲、步驟與路由趨勢</h2>
@@ -136,7 +138,7 @@
 
     <div class="section-intro"><div><span>05</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
     <section class="grid-two">
-      <article class="panel">
+      <article id="traffic-windows" class="panel">
         <div class="panel-head"><div><h2>時間窗比較</h2><p>1 分鐘、5 分鐘與 1 小時</p></div></div>
         <div class="table-wrap" tabindex="0" role="region" aria-label="各時間窗流量與延遲比較，可水平捲動">
           <table><thead><tr><th>時間窗</th><th>請求</th><th>RPS</th><th>p50</th><th>p95</th><th>p99</th><th>body</th><th>錯誤率</th></tr></thead><tbody id="window-rows"></tbody></table>
@@ -157,7 +159,7 @@
       </article>
     </section>
 
-    <section class="panel route-panel">
+    <section id="traffic-routes" class="panel route-panel">
       <div class="panel-head"><div><h2>最近一小時路由明細</h2><p>未知路徑與靜態資源會聚合，避免任意 URL 造成無界 cardinality</p></div><span id="route-count" class="count">—</span></div>
       <div class="table-wrap" tabindex="0" role="region" aria-label="最近一小時路由流量明細，可水平捲動">
         <table><thead><tr><th>路由</th><th>請求</th><th>占比</th><th>平均</th><th>p95</th><th>最大</th><th>body</th><th>錯誤率</th></tr></thead><tbody id="route-rows"></tbody></table>
@@ -169,7 +171,8 @@
       <dl id="definition-list"></dl>
     </details>
   </main>
-  <script src="../dashboard-core.js?v=11" defer></script>
-  <script src="app.js?v=10" defer></script>
+  <script src="../dashboard-core.js?v=14" defer></script>
+  <script src="../dashboard-acquisition.js?v=3" defer></script>
+  <script src="app.js?v=12" defer></script>
 </body>
 </html>

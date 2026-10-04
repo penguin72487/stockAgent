@@ -7,10 +7,11 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=20">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="styles.css?v=21">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="data-monitor">
   <a class="skip-link" href="#source-list">跳到資料來源</a>
   <header class="site-header topbar">
     <a class="brand" href="../">STOCKAGENT</a>
@@ -157,7 +158,7 @@
       </div>
       <p class="feature-boundary">清冊範圍是已註冊的實體 Parquet 主表與獨立衍生表；未去重的原始分片、非 Parquet 檔仍在上方來源清冊，不冒充已逐欄核實。非空值筆數只採完整的 row-group null 統計；首末時間屬於整個資料集，不是該欄位的首末有效值，也不是發布／訓練可用時間。原始表、衍生表不相加。</p>
       <form id="feature-filters" class="feature-filters" role="search">
-        <label>搜尋欄位／資料來源<input id="feature-search" type="search" placeholder="例如 twpub_、成交量、Binance" autocomplete="off"></label>
+        <label>搜尋欄位／資料來源<input id="feature-search" type="search" maxlength="120" placeholder="例如 twpub_、成交量、Binance" autocomplete="off"></label>
         <label>市場分類<select id="feature-category"><option value="all">全部分類</option></select></label>
         <label>資料來源<select id="feature-source"><option value="all">全部來源</option></select></label>
       </form>
@@ -263,7 +264,10 @@
   </main>
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
-  <script src="../dashboard-core.js?v=11" defer></script>
-  <script src="app.js?v=46" defer></script>
+  <script src="../dashboard-core.js?v=14" defer></script>
+  <script src="../dashboard-acquisition.js?v=3" defer></script>
+  <script src="../feature-page-constraints.js?v=1" defer></script>
+  <script src="../feature-page-contract.js?v=1" defer></script>
+  <script src="app.js?v=50" defer></script>
 </body>
 </html>

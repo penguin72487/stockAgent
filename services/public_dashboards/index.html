@@ -8,9 +8,10 @@
   <title>StockAgent 即時資料面板</title>
   <link rel="stylesheet" href="public.css?v=3">
   <link rel="stylesheet" href="dashboard-core.css?v=6">
-  <link rel="stylesheet" href="dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="overview">
   <a class="skip-link" href="#dashboards">跳到即時面板</a>
   <header class="site-header">
     <a class="brand" href="./" aria-label="StockAgent 公開面板首頁">STOCKAGENT</a>
@@ -20,11 +21,11 @@
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">全來源面板，<br>一個可信的即時視角</h1>
-      <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
+      <h1 id="page-title">資料與抓取總覽</h1>
+      <p class="lead">查看所有來源的抓取狀態、進度與配額；策略模擬另列於下方。公開唯讀，不呼叫供應商 API。</p>
       <div class="trust-row" aria-label="面板資料原則">
-        <span>只讀模擬</span>
-        <span>Bid / Ask 可成交價</span>
+        <span>只讀觀測</span>
+        <span>來源證據分開呈現</span>
         <span>缺值不虛構</span>
       </div>
     </section>
@@ -191,7 +192,8 @@
     </aside>
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
-  <script src="dashboard-core.js?v=11" defer></script>
-  <script src="public.js?v=13" defer></script>
+  <script src="dashboard-core.js?v=14" defer></script>
+  <script src="dashboard-acquisition.js?v=3" defer></script>
+  <script src="public.js?v=15" defer></script>
 </body>
 </html>

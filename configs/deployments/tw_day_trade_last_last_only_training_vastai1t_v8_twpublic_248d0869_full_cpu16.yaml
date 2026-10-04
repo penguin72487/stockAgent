@@ -1,0 +1,10 @@
+# Runtime profile accepted on two RTX 5090s, fold11, formal global batch32.
+# Exact checkpoint, optimizer/RNG, metrics and 70 NPZ arrays match the 112-thread
+# control. Numerical model/data/execution settings remain inherited.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full.yaml
+
+environment:
+  cpu_threads: 16
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_twpublic_248d0869_full_cpu16

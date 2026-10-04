@@ -14,7 +14,7 @@ from stockagent.data.tw_price_rules import tick_size_numpy
 from stockagent.research.taifex_transaction_tax import futures_transaction_tax_rate
 
 
-EXECUTION_TERMS_COMPILER_VERSION = 6
+EXECUTION_TERMS_COMPILER_VERSION = 8
 KEYS = ["date", "physical_contract"]
 QUOTE_KEYS = ["date", "product", "contract"]
 POSITION_INPUT_FIELDS = ["position_unit", "position_limit", "monthly_position_limit", "position_root_product",
@@ -56,6 +56,63 @@ def _clock(day, clock):
 
 def _utc(value):
     return value.str.to_datetime(time_zone="UTC", strict=False)
+
+
+def inventory_entry_reachability(frame: pl.DataFrame, rules: pl.DataFrame) -> pl.DataFrame:
+    """Bound possible inventory from causal entry capacity and declared carry edges.
+
+    This is an upper bound, independent of model actions. Never retire a possible
+    position because open interest is zero or a later observation is missing.
+    Unknown entry capacity/origins remain reachable. Only account rows enter the
+    graph; the account starts empty and source warmup rows cannot place orders.
+    """
+    if rules.select(KEYS).is_duplicated().any() or frame.select(KEYS).is_duplicated().any():
+        raise ValueError("duplicate physical day in inventory reachability")
+    required={"executable", "volume"}
+    proof_fields={"carry_from_date", "carry_from_physical_contract", "inventory_origin_unresolved"}
+    if not required<=set(frame.columns) or not proof_fields<=set(rules.columns):
+        return rules.select(KEYS).with_columns(pl.lit(True).alias("inventory_entry_reachable"))
+    data=rules.select(*KEYS,*sorted(proof_fields)).join(
+        frame.select(*KEYS,"executable","volume"),on=KEYS,how="left",validate="1:1")
+    if rules.join(frame.select(KEYS),on=KEYS,how="anti").height:
+        raise ValueError("inventory reachability lacks a source physical day")
+    incoming=data.filter(pl.col("carry_from_physical_contract")!="")
+    if incoming.filter(pl.col("carry_from_date").is_null()
+                       |(pl.col("carry_from_date")>=pl.col("date"))).height:
+        raise ValueError("inventory reachability requires strictly earlier carry dates")
+    data=data.sort(KEYS).with_columns(
+        (pl.col("inventory_origin_unresolved").fill_null(True)
+         |pl.col("executable").fill_null(True)&(
+             pl.col("volume").is_null()|~pl.col("volume").is_finite()|(pl.col("volume")>0)))
+        .alias("_entry_seed"))
+    def prefix(rows):
+        return rows.sort(KEYS).with_columns(pl.col("_entry_seed").cast(pl.Int64).cum_sum()
+            .over("physical_contract").gt(0).alias("inventory_entry_reachable"))
+    data=prefix(data)
+    cross=incoming.filter(pl.col("carry_from_physical_contract")!=pl.col("physical_contract"))
+    missing_same=incoming.filter(pl.col("carry_from_physical_contract")==pl.col("physical_contract")).join(
+        data.select(pl.col("date").alias("carry_from_date"),
+                    pl.col("physical_contract").alias("carry_from_physical_contract")),
+        on=["carry_from_date","carry_from_physical_contract"],how="anti")
+    cross=pl.concat([cross,missing_same],how="vertical")
+    # Same-identity carry is already bounded by the causal prefix. Cross-identity
+    # events seed only their destination date, then propagate forward. Iteration
+    # handles multi-step conversions without letting future nodes seed the past.
+    for _ in range(cross.height+1):
+        sources=data.select(pl.col("date").alias("carry_from_date"),
+            pl.col("physical_contract").alias("carry_from_physical_contract"),
+            pl.col("inventory_entry_reachable").alias("_source_reachable"))
+        targets=cross.join(sources,on=["carry_from_date","carry_from_physical_contract"],
+            how="left",validate="m:1").join(data.select(*KEYS,"inventory_entry_reachable"),
+            on=KEYS,validate="1:1").filter(
+                pl.col("_source_reachable").fill_null(True)&~pl.col("inventory_entry_reachable"))
+        if targets.is_empty():
+            return data.select(*KEYS,"inventory_entry_reachable").sort(KEYS)
+        data=prefix(data.join(targets.select(KEYS).with_columns(pl.lit(True).alias("_incoming_seed")),
+            on=KEYS,how="left",validate="1:1").with_columns(
+                (pl.col("_entry_seed")|pl.col("_incoming_seed").fill_null(False)).alias("_entry_seed"))
+            .drop("_incoming_seed"))
+    raise ValueError("inventory reachability did not converge")
 
 
 def bind_product_specifications(days: pl.DataFrame, specifications: pl.DataFrame) -> pl.DataFrame:
@@ -124,10 +181,43 @@ def bind_product_specifications(days: pl.DataFrame, specifications: pl.DataFrame
           for c in [*SPEC_FIELDS, *SPEC_EXTENSIONS] if c != "product"])
 
 
+def position_constraint_columns() -> list[pl.Expr]:
+    """Canonical mapping from bound position inputs to the two account axes."""
+    return [pl.col("pos_position_unit").alias("position_unit"),
+        pl.col("pos_position_limit").alias("position_limit"),
+        pl.col("pos_position_root_product").alias("position_group"),
+        pl.when(pl.col("pos_independent_contract_limit").is_not_null())
+          .then(pl.lit("POSITION_SINGLE:")+pl.col("product"))
+          .when(pl.col("pos_monthly_position_limit").is_not_null())
+          .then(pl.col("pos_position_root_product")+":"+pl.col("contract"))
+          .otherwise(pl.col("pos_position_root_product")).alias("second_position_group"),
+        pl.when(pl.col("pos_independent_contract_limit").is_not_null()).then(1.)
+          .otherwise(pl.col("pos_position_unit")).alias("second_position_unit"),
+        pl.coalesce("pos_independent_contract_limit","pos_monthly_position_limit","pos_position_limit")
+          .alias("second_position_limit")]
+
+
+def position_constraint_errors() -> tuple[pl.Expr, pl.Expr]:
+    """Shared dated group/second-axis consistency gates, without valuation."""
+    group_fields=["date","pos_position_root_product"]
+    conflict=pl.any_horizontal([
+        pl.when(pl.col("pos_position_numeric_inputs_resolved")).then(pl.col(c))
+          .otherwise(None).drop_nulls().n_unique().over(group_fields)>1
+        for c in ("pos_position_limit","pos_unit")])
+    conflict=conflict | (pl.when(pl.col("pos_position_numeric_inputs_resolved"))
+        .then(pl.col("second_position_limit")).otherwise(None).drop_nulls().n_unique()
+        .over(["date","second_position_group"])>1)
+    extra=pl.col("pos_independent_contract_limit").is_not_null()
+    unsupported=extra & (~_positive("pos_independent_contract_limit")
+        | pl.col("pos_monthly_position_limit").is_not_null())
+    return conflict,unsupported
+
+
 def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         positions: pl.DataFrame, corporate_terms: pl.DataFrame,
         margin_intervals: pl.DataFrame, specifications: pl.DataFrame,
-        terminal_values: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+        terminal_values: pl.DataFrame, *,
+        position_research_policy: dict | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Vectorized all-product compiler; return rules and explicit row blockers.
 
     Specification intervals establish historical units, clocks and price/tax
@@ -328,20 +418,24 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
           for p in ("opening", "terminal", "known")],
         pl.col("opening_margin_kind").alias("margin_kind"),
         pl.col("opening_initial").alias("initial"), pl.col("opening_maintenance").alias("maintenance"),
-        pl.col("pos_position_unit").alias("position_unit"),
-        pl.col("pos_position_limit").alias("position_limit"),
-        pl.col("pos_position_root_product").alias("position_group"),
-        pl.when(pl.col("pos_independent_contract_limit").is_not_null())
-          .then(pl.lit("POSITION_SINGLE:")+pl.col("product"))
-          .when(pl.col("pos_monthly_position_limit").is_not_null())
-          .then(pl.col("pos_position_root_product") + ":" + pl.col("contract"))
-          .otherwise(pl.col("pos_position_root_product")).alias("second_position_group"),
-        pl.when(pl.col("pos_independent_contract_limit").is_not_null()).then(1.)
-          .otherwise(pl.col("pos_position_unit")).alias("second_position_unit"),
-        pl.coalesce("pos_independent_contract_limit", "pos_monthly_position_limit", "pos_position_limit")
-          .alias("second_position_limit"),
+        *position_constraint_columns(),
         *[pl.col("spec_" + c).alias(c) for c in ("position_grandfather_existing", "second_position_grandfather_existing")],
     )
+    if position_research_policy is not None:
+        from stockagent.data.tw_futures_position_research import apply_research_position_capacity
+        conflict, unsupported = position_constraint_errors()
+        pos_effective = _utc(pl.col("pos_effective_date") + "T"
+            + pl.when(pl.col("pos_effective_phase") == 0).then(pl.col("opening_time"))
+              .otherwise(pl.col("settlement_time")) + "+08:00")
+        cutoff = _utc(_clock("date", "opening_time"))
+        failed = (~pl.col("pos_position_numeric_inputs_resolved") | conflict | unsupported
+            | ~_positive("pos_position_unit") | ~_positive("pos_position_limit")
+            | pl.col("pos_position_root_product").is_null()
+            | (_utc(pl.col("pos_known_at")) > cutoff)
+            | _utc(pl.col("pos_known_at")).is_null() | pos_effective.is_null()
+            | (pos_effective > cutoff)).fill_null(True)
+        f = apply_research_position_capacity(f, position_research_policy, failed)
+        f = f.with_columns(*position_constraint_columns())
     for prefix, clock in (("opening_", "opening_time"), ("settlement_", "settlement_time")):
         f = f.with_columns((pl.col(prefix + "rule_effective_date") + "T"
             + pl.when(pl.col(prefix + "rule_effective_phase") == 0).then(pl.col("opening_time"))
@@ -396,25 +490,20 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         pl.when(incoming).then(pl.col("carry_quantity_numerator")).otherwise(1).alias("carry_quantity_numerator"),
         pl.when(incoming).then(pl.col("carry_quantity_denominator")).otherwise(1).alias("carry_quantity_denominator"),
     )
+    f=f.with_columns((~pl.col("is_warmup")&pl.col("_source_identity").is_null())
+        .alias("inventory_origin_unresolved"))
+    reachability=inventory_entry_reachability(f,f.filter(~pl.col("is_warmup")))
+    f=f.join(reachability,on=KEYS,how="left",validate="1:1")
     owners = f.filter((pl.col("carry_from_physical_contract") != "") & ~pl.col("is_warmup")).group_by(
         "carry_from_date", "carry_from_physical_contract").agg(
             pl.len().alias("_next_owners"), pl.col("date").min().alias("_next_owner_date"))
     f = f.join(owners, left_on=KEYS, right_on=["carry_from_date", "carry_from_physical_contract"],
                how="left", validate="1:1")
-    needs_owner = (~pl.col("is_warmup") & (pl.col("terminal_event") == "mark_only")
+    needs_owner = (~pl.col("is_warmup") & pl.col("inventory_entry_reachable").fill_null(True)
+                   & (pl.col("terminal_event") == "mark_only")
                    & pl.col("next_market_date").is_not_null())
     admitted_margin = ["bound_prior_publication", "bound_same_security_rate", "bound_same_day_clock"]
-    group_fields=["date","pos_position_root_product"]
-    group_conflict=pl.any_horizontal([
-        pl.when(pl.col("pos_position_numeric_inputs_resolved")).then(pl.col(c))
-          .otherwise(None).drop_nulls().n_unique().over(group_fields)>1
-        for c in ("pos_position_limit","pos_unit")])
-    group_conflict=group_conflict | (pl.when(pl.col("pos_position_numeric_inputs_resolved"))
-        .then(pl.col("second_position_limit")).otherwise(None).drop_nulls().n_unique()
-        .over(["date","second_position_group"])>1)
-    extra_cap=pl.col("pos_independent_contract_limit").is_not_null()
-    unsupported_extra=extra_cap & (~_positive("pos_independent_contract_limit")
-        | pl.col("pos_monthly_position_limit").is_not_null())
+    group_conflict,unsupported_extra=position_constraint_errors()
     reasons = {
         "missing_product_specification": ~pl.col("specification_bound"),
         "missing_opening_margin": ~pl.col("opening_binding_status").is_in(admitted_margin),
@@ -466,4 +555,8 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         "carry_from_date", "carry_from_physical_contract", "carry_quantity_numerator", "carry_quantity_denominator",
         "carry_cash_twd", "carry_known_at", "carry_effective_at", "carry_previous_value_twd",
         "carry_previous_initial_twd", "carry_previous_maintenance_twd"]
+    columns.extend(["inventory_origin_unresolved","inventory_entry_reachable"])
+    if position_research_policy is not None:
+        from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
+        columns.extend(POSITION_RESEARCH_COLUMNS)
     return f.filter(~pl.col("is_warmup")).select(columns).sort(KEYS), blockers.sort(KEYS)

@@ -1,0 +1,11 @@
+{
+  "contract": "stock_futures_previous_capacity_research_v1",
+  "research_only": true,
+  "fallback_standard_contracts": 1250,
+  "standard_shares_per_contract": 2000,
+  "fallback_known_at": "2010-01-15T23:59:59+08:00",
+  "fallback_effective_date": "2010-01-25",
+  "fallback_source_content_sha256": "ede98ec9781faa346fa8eba024344a5ffec5cfa8fb518ebf2efb49707b447d47",
+  "fallback_source_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/09900006380稿轉函(35檔期貨及其他事項).doc",
+  "interpretation": "Operator research risk capacity; never a verified historical legal limit. Current known group capacity, then previous known capacity, then the documented initial ordinary grade. Floor conflicting capacities in shares."
+}

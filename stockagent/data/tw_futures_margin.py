@@ -18,9 +18,12 @@ MARGIN_MULTI_LIMIT_CONTRACT_VERSION = 3
 MARGIN_VALUE_BASE_CONTRACT_VERSION = 4
 MARGIN_GRANDFATHER_CONTRACT_VERSION = 5
 MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION = 6
+MARGIN_POSITION_RESEARCH_CONTRACT_VERSION = 7
+MARGIN_VALUATION_RESEARCH_CONTRACT_VERSION = 8
 MARGIN_RULE_VERSIONS = (MARGIN_CONTRACT_VERSION, MARGIN_CORPORATE_CONTRACT_VERSION,
                         MARGIN_MULTI_LIMIT_CONTRACT_VERSION, MARGIN_VALUE_BASE_CONTRACT_VERSION,
-                        MARGIN_GRANDFATHER_CONTRACT_VERSION, MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION)
+                        MARGIN_GRANDFATHER_CONTRACT_VERSION, MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION,
+                        MARGIN_POSITION_RESEARCH_CONTRACT_VERSION, MARGIN_VALUATION_RESEARCH_CONTRACT_VERSION)
 # Executor policy version is independent of the immutable source-tape schema.
 MARGIN_ACCOUNTING_CONTRACT_VERSION = 7
 # Training-only: exact quantities, marks, fees and forward returns are unchanged.
@@ -67,10 +70,18 @@ def validate_margin_rule_source(path: str | Path, daily_path: str | Path):
             "current TAIFEX tables cannot be backfilled as historical rules"
         )
     manifest = json.loads(path.with_name("manifest.json").read_text())
+    valuation_research = manifest.get("schema_version") == MARGIN_VALUATION_RESEARCH_CONTRACT_VERSION
+    research = manifest.get("schema_version") in (MARGIN_POSITION_RESEARCH_CONTRACT_VERSION, MARGIN_VALUATION_RESEARCH_CONTRACT_VERSION)
+    if valuation_research:
+        from stockagent.data.tw_futures_valuation_research import validate_valuation_research_manifest
+        valuation_policy = validate_valuation_research_manifest(manifest, path.parent)
+    elif research:
+        from stockagent.data.tw_futures_position_research import validate_position_research_manifest
+        validate_position_research_manifest(manifest, path.parent)
     if (manifest.get("dataset") != "taifex_futures_margin_rules"
             or manifest.get("schema_version") not in MARGIN_RULE_VERSIONS
             or manifest.get("status") != "complete"
-            or manifest.get("point_in_time_verified") is not True):
+            or (not research and manifest.get("point_in_time_verified") is not True)):
         raise ValueError("futures margin rule release must be PIT-verified and complete")
     if manifest.get("source_daily_sha256") != sha256_file(Path(daily_path)):
         raise ValueError("futures margin rules belong to a different daily release")
@@ -88,6 +99,37 @@ def validate_margin_rule_source(path: str | Path, daily_path: str | Path):
     if manifest['schema_version'] >= MARGIN_TERMINAL_COMPONENT_CONTRACT_VERSION:
         load_margin_terminal_components(path, manifest)
     rules = pl.read_parquet(path)
+    if valuation_research:
+        from stockagent.data.tw_futures_valuation_research import validate_research_valuation_rows
+        validate_research_valuation_rows(rules)
+        if (not valuation_policy['terminal_cash_conversion_authorized']
+                and rules.filter(pl.col('terminal_event') == 'research_cash_conversion').height):
+            raise ValueError('research terminal cash conversion lacks operator authorization')
+    elif (any(c.startswith("valuation_research_") for c in rules.columns)
+            or 'terminal_event' in rules.columns and rules.filter(pl.col('terminal_event') == 'research_cash_conversion').height):
+        raise ValueError("estimated financial values require the separate schema-8 research release")
+    if "position_research_applied" in rules.columns:
+        if not research:
+            raise ValueError("research position columns require the separate schema-7 or schema-8 release")
+        from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
+        if set(POSITION_RESEARCH_COLUMNS) - set(rules.columns) or rules["position_research_applied"].null_count():
+            raise ValueError("incomplete research position assumptions")
+        assumed = rules.filter(pl.col("position_research_applied"))
+        assumption_clock = (pl.col("date").cast(pl.String) + "T" + pl.col("opening_time")
+            + "+08:00").str.to_datetime(time_zone="UTC", strict=False)
+        bad_assumption = (pl.col("position_research_seed_date").is_null()
+                | (pl.col("position_research_seed_date") > pl.col("date"))
+                | pl.col("position_research_source_known_at").is_null()
+                | (pl.col("position_research_source_known_at").str.to_datetime(time_zone="UTC", strict=False)
+                    > assumption_clock)
+                | ~pl.col("position_group").str.starts_with("RESEARCH:")
+                | ~pl.col("position_research_method").is_in([
+                    "initial_ordinary_grade_assumption", "known_group_minimum_shares",
+                    "previous_known_group_capacity"]))
+        if assumed.filter(bad_assumption.fill_null(True)).height:
+            raise ValueError("invalid research position assumption provenance")
+    elif research:
+        raise ValueError("research position release lacks per-row assumption provenance")
     required = {
         "date", "physical_contract", "margin_kind", "initial", "maintenance",
         "settlement_initial", "settlement_maintenance", "known_at", "effective_at",
@@ -192,7 +234,7 @@ def validate_margin_carry_rules(rules: pl.DataFrame) -> None:
     if missing:
         raise ValueError(f"missing corporate margin rules: {sorted(missing)}")
     if rules.filter(pl.col("terminal_event").is_null() | ~pl.col("terminal_event").is_in(
-            ["mark_only", "cash_settlement", "market_close_required"])).height:
+            ["mark_only", "cash_settlement", "market_close_required", "research_cash_conversion"])).height:
         raise ValueError("explicit product-specific terminal event is required")
     if rules.filter(pl.col("carry_from_physical_contract").is_null()).height:
         raise ValueError("carry origin must be explicit; empty means no incoming inventory")
@@ -453,7 +495,7 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         # GBF cannot retire a bond obligation using a fictitious cash fill.
         # A pre-delivery close is a capacity-constrained research trade; an
         # unfilled close remains an explicit executor failure.
-        expiry = np.asarray(frame["terminal_event"] == "cash_settlement")
+        expiry = np.asarray(frame["terminal_event"].is_in(["cash_settlement", "research_cash_conversion"]))
         required_close = np.asarray(frame["terminal_event"] == "market_close_required")
         if frame.filter((pl.col("liquidation_reason") == "last_trade_date")
                         & (pl.col("terminal_event") == "mark_only")).height:

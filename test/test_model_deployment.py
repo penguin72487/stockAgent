@@ -148,7 +148,6 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
         "tw_day_trade_multi_basis_22",
-        "tw_day_trade_multi_basis_projection_l1_gelu",
     }.issubset(configs)
     naive = configs["tw"]
     assert naive.market_type == "tw"
@@ -179,21 +178,8 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert multi_basis.checkpoint_path == (
         f"{multi_basis_root}/fold_11/checkpoint_best.pt"
     )
-    projection = configs["tw_day_trade_multi_basis_projection_l1_gelu"]
-    assert projection.fold_id == 11
-    assert projection.initial_capital == 10_000_000.0
-    assert projection.config_path == (
-        "configs/deployments/tw_day_trade_hybrid_minute_v12_layernorm_fold11.yaml"
-    )
-    projection_root = (
-        "artifacts/ablations/"
-        "tw_day_trade_hybrid_minute_v12_reference_architecture_checkpoint_"
-        "finetune_ofat_v2/layernorm"
-    )
-    assert projection.output_dir == projection_root
-    assert projection.checkpoint_path == (
-        f"{projection_root}/fold_11/checkpoint_best.pt"
-    )
+    assert "tw_day_trade_multi_basis_projection_l1_gelu" not in configs
+    assert "tw_day_trade_attention_layernorm" not in configs
     multi_basis_22 = configs["tw_day_trade_multi_basis_22"]
     multi_basis_22_root = (
         "artifacts/markets/"
@@ -213,7 +199,6 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         multi_basis.live_output_dir
         == day_trade_100m.live_output_dir
         == multi_basis_22.live_output_dir
-        == projection.live_output_dir
         == "artifacts/live_signals"
     )
     shared_refresh = (
@@ -224,12 +209,10 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert multi_basis.pre_signal_command == shared_refresh
     assert day_trade_100m.pre_signal_command == shared_refresh
     assert multi_basis_22.pre_signal_command == shared_refresh
-    assert projection.pre_signal_command == shared_refresh
     completed_close = ("scripts/finalize_tw_public_completed_session.py",)
     assert multi_basis.completed_session_command == completed_close
     assert day_trade_100m.completed_session_command == completed_close
     assert multi_basis_22.completed_session_command == completed_close
-    assert projection.completed_session_command == completed_close
 
 
 def test_repo_multi_basis_22_fold11_deployment_keeps_effective_rank_contract() -> None:

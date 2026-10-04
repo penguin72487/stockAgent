@@ -27,7 +27,9 @@ def _account(root, **changes):
 
 @pytest.fixture(autouse=True)
 def _fixed_demand(monkeypatch):
-    monkeypatch.setattr(telemetry, "fixed_incremental_demand", lambda root, now: 10)
+    monkeypatch.setattr(telemetry, "incremental_reservation", lambda root, now: {
+        'reserve_requests': 10, 'ready_requests': 0, 'queue_errors': [],
+        'observed_at_utc': now.isoformat()})
 
 
 def test_complete_active_bins_keep_low_rates_and_report_idle(tmp_path):
@@ -81,18 +83,40 @@ def test_recurring_model_separates_worker_priorities_and_new_daily_arrivals(tmp_
         ('TaiwanFuturesTick', 'TX', '2020-01-02', 'id_day', 10, 'observed_empty', NOW.isoformat()),
     ])
     with sqlite3.connect(path) as conn:
-        conn.execute('CREATE TABLE finmind_source_frontiers(dataset TEXT)')
-        conn.executemany('INSERT INTO finmind_source_frontiers VALUES (?)',
-                         [('TaiwanFuturesKBar',), ('TaiwanFuturesKBar',), ('TaiwanFuturesTick',), ('Delegated',)])
+        conn.execute('CREATE TABLE finmind_source_frontiers(dataset TEXT,data_id TEXT)')
+        conn.executemany('INSERT INTO finmind_source_frontiers VALUES (?,?)',
+                         [('TaiwanFuturesKBar', 'TX'), ('TaiwanFuturesKBar', 'MTX'),
+                          ('TaiwanFuturesTick', 'TX'), ('Delegated', 'TX')])
     before = path.read_bytes()
     model = telemetry.recurring_forecast(tmp_path)
     assert model['state'] == 'modeled'
     parts = model['requests_per_hour_by_phase']
     assert parts['incremental'] == pytest.approx(3 + 5 / 24)
-    assert parts['core'] == 0
-    assert parts['detail'] == pytest.approx(2 / 24 + 1 / (365 * 24))
-    assert parts['tick'] == pytest.approx(1 / 24 + 1 / (90 * 24))
+    assert parts['core'] == pytest.approx(1 / (365 * 24) + 1 / (90 * 24))
+    assert parts['detail'] == pytest.approx(2 / 24)
+    assert parts['tick'] == pytest.approx(1 / 24)
+    assert model['requests_per_hour_by_stage']['validation'] == parts['core']
     assert model['new_partition_requests_per_hour_by_phase'] == {'core': 0, 'detail': 2 / 24, 'tick': 1 / 24}
+    assert path.read_bytes() == before
+
+
+def test_recurring_market_day_ignores_archived_per_id_frontiers(tmp_path, monkeypatch):
+    from scripts import audit_finmind_query_ranges
+    from test_finmind_eta_work import _database
+
+    dataset = 'TaiwanFuturesSpreadTick'
+    monkeypatch.setattr(audit_finmind_query_ranges, 'registry', lambda: {
+        dataset: {'primary_owner': 'complement', 'query_shape': 'whole_market_day'}})
+    _database(tmp_path, 'sponsor', [])
+    path = _database(tmp_path, 'complement', [])
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE finmind_source_frontiers(dataset TEXT,data_id TEXT)')
+        conn.executemany('INSERT INTO finmind_source_frontiers VALUES (?,?)',
+                         [(dataset, identifier) for identifier in ('', 'TX', 'MTX', 'CAF')])
+    before = path.read_bytes()
+    model = telemetry.recurring_forecast(tmp_path)
+    assert model['new_partition_requests_per_hour_by_phase']['tick'] == 1 / 24
+    assert model['requests_per_hour_by_phase']['tick'] == 1 / 24
     assert path.read_bytes() == before
 
 

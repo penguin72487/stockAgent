@@ -95,6 +95,12 @@ def test_verified_tw_stock_session_fails_closed_and_uses_official_provenance(
     assert "ordinary weekday session" in open_reason
     assert holiday is False
     assert "中華民國開國紀念日" in holiday_reason
+    weekend, weekend_reason = verified_tw_stock_session_day(
+        datetime(2026, 8, 15).date(), parquet_root=public_root
+    )
+    assert not weekend
+    assert 'official TWSE schedule as-of 2026-08-14' in weekend_reason
+    assert 'weekend' in weekend_reason
 
 
 def test_calendar_decision_distinguishes_closure_open_and_unknown(tmp_path) -> None:

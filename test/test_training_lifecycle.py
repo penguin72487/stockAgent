@@ -80,11 +80,7 @@ def _write_minimal_completed_artifacts(
     )
     (layout.fold_dir(fold_id) / "mode_artifact_contract.json").write_text(
         json.dumps(
-            {
-                "schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
-                "artifact_layout_version": TRAINING_ARTIFACT_LAYOUT_VERSION,
-                "execution_mode": execution_mode,
-            }
+            canonical_mode_artifact_contract(execution_mode)
         )
     )
     layout.fold_complete_path(fold_id).write_text(
@@ -355,6 +351,17 @@ def test_completed_artifact_conformance_reports_exact_missing_path(
     )
     assert valid.ok
     assert not valid.missing
+
+    contract_path = layout.fold_dir(1) / "mode_artifact_contract.json"
+    current_contract = contract_path.read_text()
+    stale_contract = json.loads(current_contract)
+    stale_contract["metrics_contract_version"] = 1
+    contract_path.write_text(json.dumps(stale_contract))
+    stale = validate_completed_training_artifacts(
+        tmp_path, fold_ids=[1], group_names=[group_name],
+    )
+    assert any("metrics contract disagrees" in issue for issue in stale.invalid)
+    contract_path.write_text(current_contract)
 
     model_path = layout.fold_dir(1) / "model.pt"
     model_path.write_bytes(b"")

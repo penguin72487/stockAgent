@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timezone, timedelta
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -27,6 +28,7 @@ from stockagent.data_sync.artifact_dedup import link_immutable_source
 TAIPEI = timezone(timedelta(hours=8))
 PRODUCTS = ("TX", "MTX")
 ROC_DATE = r"(\d{2,3})年(\d{1,2})月(\d{1,2})日"
+CORPORATE_TERMS_DERIVATION_VERSION = 2
 
 
 def align_product_margin_intervals(days: pl.DataFrame, intervals: pl.DataFrame) -> pl.DataFrame:
@@ -464,12 +466,22 @@ def bind_dated_position_combinations(days: pl.DataFrame, intervals: pl.DataFrame
         parents=result.select('date',pl.col('product').alias('combined_position_base_product'),
             *[pl.col(c).alias('_base_'+c) for c in ('position_limit','monthly_position_limit',
                 'position_unit','unit','position_root_product','position_interval_id','known_at',
-                'source_content_sha256s','requires_delisting_clock','_resolved')])
+                'source_content_sha256s','requires_delisting_clock','combined_products','_resolved')])
         result=result.join(parents,on=['date','combined_position_base_product'],how='left',validate='m:1')
         usable=((pl.col('position_binding_status')=='bound_prior_publication')
             & pl.col('requires_base_limit_join') & ~pl.col('_resolved')
             & pl.col('_base__resolved').fill_null(False)
             & (pl.col('conversion_numerator')>0) & (pl.col('conversion_denominator')>0))
+        # A renamed, nonstandard-size incumbent can join an existing share
+        # pool. The notice supplies units and members, never a new allowance.
+        # A plain contract cap cannot establish the temporarily adjusted pool.
+        securities_formula=pl.col('event_type').eq('combined_securities_position_formula').fill_null(False)
+        origin=pl.col('combined_products').list.set_difference(
+            pl.concat_list('product','combined_position_base_product')).list.first()
+        pool_proved=(pl.col('_base_unit').eq('shares') & pl.col('_base_position_unit').eq(2000.)
+            & pl.col('_base_combined_products').list.contains(pl.col('combined_position_base_product'))
+            & pl.col('_base_combined_products').list.contains(origin)).fill_null(False)
+        usable=usable & (~securities_formula | pool_proved)
         count=result.select(usable.sum()).item()
         if not count:
             result=result.drop([c for c in result.columns if c.startswith('_base_')]);break
@@ -550,6 +562,119 @@ def _inherit_dated_same_security_positions(frame: pl.DataFrame, position_columns
     return frame
 
 
+def _bind_named_securities_position_groups(direct: pl.DataFrame,
+        universe: pl.DataFrame, family_rules: list[dict], terms: pl.DataFrame) -> pl.DataFrame:
+    """Keep a dated, explicit corporate group on its announced share axis.
+
+    Article 16's general grade has an express exception; Article 31 changes
+    the named same-security group to total shares until its announced end.
+    A later standalone grade row cannot turn only the standard member back
+    into contracts. The numeric allowance still comes solely from an active
+    original corporate interval, never grade times standard contract size.
+    """
+    keys=['date','product']
+    named=direct.filter((pl.col('event_type')=='corporate_securities_unit_limit')
+        & pl.col('position_numeric_inputs_resolved')
+        & pl.col('unit').is_in(['shares','beneficial_units'])
+        & pl.col('product').str.contains(r'\d$')
+        & (pl.col('combined_products').list.len()>1)
+        & (pl.col('combined_products').list.eval(
+            pl.element().str.contains(r'^[A-Z]{2}F$')).list.sum()==1))
+    if named.is_empty():return direct
+    # A lifecycle-relative end is usable on a day with this original's own
+    # physical units. The same code/size in a later generation is insufficient.
+    # A source-bound finite end also works without a peer trading observation.
+    proof_columns={'known_at','contract_multiplier','source_content_sha256s','terms_binding_status'}
+    if proof_columns<=set(terms.columns):
+        current=terms.filter(pl.col('terms_binding_status')=='bound_prior_publication').select(
+            *keys,pl.col('contract_multiplier').alias('_own_units'),
+            pl.col('source_content_sha256s').alias('_own_sources'),pl.col('known_at').alias('_own_known'))
+        matching=named.select(*keys,'position_unit','source_content_sha256s').join(current,on=keys,how='inner')
+        matching=matching.filter((pl.col('position_unit')==pl.col('_own_units'))
+            & (pl.col('source_content_sha256s').list.set_intersection(pl.col('_own_sources')).list.len()>0)
+            & (pl.col('_own_known').str.to_datetime(time_zone='UTC')
+                .dt.convert_time_zone('Asia/Taipei').dt.date()<pl.col('date'))).select(keys).unique()
+        named=named.join(matching.with_columns(pl.lit(True).alias('_own_original_active')),
+            on=keys,how='left',validate='1:1')
+        queried=terms.select(keys).unique().with_columns(pl.lit(True).alias('_own_units_queried'))
+        named=named.join(queried,on=keys,how='left',validate='1:1')
+        named=named.filter(pl.col('_own_original_active').fill_null(False)
+            | (pl.col('valid_until_date_exclusive').is_not_null()
+               & ~pl.col('_own_units_queried').fill_null(False))).drop(
+                   '_own_original_active','_own_units_queried')
+    else:named=named.filter(pl.col('valid_until_date_exclusive').is_not_null())
+    if named.is_empty():return direct
+    named=named.with_columns(pl.col('combined_products').list.eval(
+        pl.element().filter(pl.element().str.contains(r'^[A-Z]{2}F$')))
+        .list.first().alias('_group_root'))
+    # Conflicting active originals remain conflicts. Choosing the newest or
+    # smallest number would hide missing applicability evidence.
+    signatures=['unit','position_limit','monthly_position_limit','combined_products']
+    named=named.with_columns(pl.struct(signatures).n_unique()
+        .over(['date','_group_root']).alias('_group_versions')).filter(pl.col('_group_versions')==1)
+    if named.is_empty():return direct
+    fields=[c for c in direct.columns if c not in keys]
+    grouped=named.group_by('date','_group_root').agg(
+        *[pl.col(c).first().alias('_named_'+c) for c in fields
+          if c not in ['known_at','source_content_sha256s','source_urls',
+                       'effective_date','valid_until_date_exclusive']],
+        pl.col('known_at').max().alias('_named_known_at'),
+        pl.col('effective_date').max().alias('_named_effective_date'),
+        pl.col('valid_until_date_exclusive').min().alias('_named_valid_until_date_exclusive'),
+        *[pl.col(c).explode(empty_as_null=True, keep_nulls=True).drop_nulls().unique().sort().alias('_named_'+c)
+          for c in ['source_content_sha256s','source_urls']])
+    frame=direct.join(grouped,left_on=keys,right_on=['date','_group_root'],how='left',validate='1:1')
+    frame=frame.join(universe.select('product','asset_class'),on='product',how='left',validate='m:1')
+    for law in family_rules:
+        if law.get('rule')!='same_security_same_direction; unchanged_units_or_explicit_securities_cap_only':continue
+        known=datetime.fromisoformat(law['known_at'])
+        digest=law['source_content_sha256']
+        if known.tzinfo is None or not re.fullmatch(r'[a-f0-9]{64}',digest):
+            raise ValueError('named position group requires a dated source-bound law')
+        eligible=((pl.col('asset_class')==law['asset_class'])
+            & (pl.col('date')>=date.fromisoformat(law['effective_date']))
+            & (pl.col('date')>known.astimezone(TAIPEI).date())
+            & (pl.col('event_type')=='absolute_level') & (pl.col('unit')=='contracts')
+            & pl.col('position_numeric_inputs_resolved')
+            & pl.col('limit_follows_applicable_grade').eq(False)
+            & pl.col('_named_position_limit').is_not_null()
+            & pl.col('independent_contract_limit').is_null()
+            & pl.col('monthly_position_limit').is_null()
+            & pl.col('_named_monthly_position_limit').is_null()
+            # A notice that follows the latest grade needs the current
+            # grade's already verified composition. Its old literal number
+            # alone cannot override a newer standalone grade. The source
+            # composer retains that dated grade among the donor's identities.
+            & (pl.col('_named_limit_follows_applicable_grade').eq(False)
+               | (pl.col('_named_limit_follows_applicable_grade').eq(True)
+                  & (pl.col('_named_source_content_sha256s').list.set_intersection(
+                      pl.col('source_content_sha256s')).list.len()>0)))).fill_null(False)
+        copied=[c for c in fields if c not in ['position_interval_id','position_base_interval_id',
+            'position_binding_status','position_unit','known_at','effective_date','source_content_sha256s',
+            'source_urls','valid_until_date_exclusive','independent_contract_limit']]
+        frame=frame.with_columns(
+            *[pl.when(eligible).then(pl.col('_named_'+c)).otherwise(pl.col(c)).alias(c) for c in copied],
+            pl.when(eligible).then(float(law['standard_units'])).otherwise(pl.col('position_unit')).alias('position_unit'),
+            *[pl.when(eligible).then(None).otherwise(pl.col(c)).alias(c)
+              for c in ['position_interval_id','position_base_interval_id']],
+            pl.when(eligible).then(pl.lit('bound_named_securities_position'))
+              .otherwise(pl.col('position_binding_status')).alias('position_binding_status'),
+            pl.when(eligible).then(pl.max_horizontal(pl.col('known_at').str.to_datetime(time_zone='UTC'),
+                pl.col('_named_known_at').str.to_datetime(time_zone='UTC'),pl.lit(known).cast(pl.Datetime('us','UTC')))
+                .dt.to_string('%Y-%m-%dT%H:%M:%S%:z')).otherwise(pl.col('known_at')).alias('known_at'),
+            pl.when(eligible).then(pl.max_horizontal('effective_date','_named_effective_date',
+                pl.lit(law['effective_date']))).otherwise(pl.col('effective_date')).alias('effective_date'),
+            pl.when(eligible).then(pl.min_horizontal('valid_until_date_exclusive',
+                '_named_valid_until_date_exclusive')).otherwise(pl.col('valid_until_date_exclusive'))
+                .alias('valid_until_date_exclusive'),
+            pl.when(eligible).then(pl.concat_list('source_content_sha256s','_named_source_content_sha256s',
+                pl.lit([digest])).list.unique().list.sort()).otherwise(pl.col('source_content_sha256s'))
+                .alias('source_content_sha256s'),
+            pl.when(eligible).then(pl.concat_list('source_urls','_named_source_urls').list.unique().list.sort())
+                .otherwise(pl.col('source_urls')).alias('source_urls'))
+    return frame.select(direct.columns)
+
+
 def bind_equity_position_families(days: pl.DataFrame, intervals: pl.DataFrame,
         universe: pl.DataFrame, terms: pl.DataFrame, family_rules: list[dict]) -> pl.DataFrame:
     """Apply dated same-security grouping laws without inventing a cap.
@@ -563,7 +688,16 @@ def bind_equity_position_families(days: pl.DataFrame, intervals: pl.DataFrame,
         families,on='product',how='left',validate='m:1')
     query=pl.concat([wanted.select(keys),wanted.select('date',
         pl.col('standard_product').alias('product'))]).unique()
+    # A named group member need not trade that day. Bind its dated interval
+    # for legal grouping only; this does not borrow its prices or own units.
+    named_edges=intervals.filter(pl.col('event_type')=='corporate_securities_unit_limit').select(
+        pl.col('product').alias('_member'),pl.col('combined_products').cast(pl.List(pl.String)).alias('product'))
+    named_edges=named_edges.explode('product', empty_as_null=True, keep_nulls=True).drop_nulls().unique()
+    if not named_edges.is_empty():
+        peers=query.join(named_edges,on='product',how='inner').select('date',pl.col('_member').alias('product'))
+        query=pl.concat([query,peers]).unique()
     direct=bind_dated_position_combinations(query,intervals)
+    direct=_bind_named_securities_position_groups(direct,universe,family_rules,terms)
     parent=direct.rename({c:'_base_'+c for c in direct.columns if c!='date'}).rename(
         {'_base_product':'standard_product'})
     original=direct.join(wanted.select(keys),on=keys,how='semi')
@@ -593,7 +727,8 @@ def bind_equity_position_families(days: pl.DataFrame, intervals: pl.DataFrame,
     relevant=(pl.col('family_relation').is_in(['adjusted','adjusted_mini'])
         & pl.col('position_numeric_inputs_resolved')
         & (pl.col('unit').is_in(['shares','beneficial_units'])
-           | (pl.col('event_type')=='combined_position_formula'))).fill_null(False)
+           | pl.col('event_type').is_in(['combined_position_formula',
+                                         'combined_securities_position_formula']))).fill_null(False)
     valid_units=pl.lit(False)
     for law in sorted(family_rules,key=lambda r:r['effective_date']):
         known=datetime.fromisoformat(law['known_at']).astimezone(TAIPEI).date()
@@ -689,10 +824,113 @@ def load_unchanged_position_member_scopes(path: Path) -> tuple[pl.DataFrame, dic
     return frame,sources
 
 
+def reviewed_incumbent_position_member_scopes(facts: list[dict], units: pl.DataFrame) -> pl.DataFrame:
+    """Bind a printed incumbent's cap to its own previously declared months.
+
+    Facts must have been reparsed by the canonical source-bound review reader.
+    Naming a member does not create a financial event or authorize subsequent
+    generations with the same ticker and share quantity.
+    """
+    schema={'product':pl.String,'contract':pl.String,'standard_product':pl.String,
+        'position_source_sha256':pl.String,'unit_source_sha256':pl.String,
+        'visual_review_sha256':pl.String,'effective_date':pl.String,
+        'known_at':pl.String,'unit_effective_date':pl.String,'unit_known_at':pl.String,
+        'valid_until_date_exclusive':pl.String,'contract_multiplier':pl.Float64}
+    rows=[]
+    for fact in facts:
+        if fact.get('position_unit_review_scope')!='all_named_members_in_inspected_grid':continue
+        product=fact['product']
+        if not re.fullmatch(r'[A-Z]{2}[1-9]',product):continue
+        base=product[:2]+'F'
+        if (fact.get('extraction')!='source_bound_visual_corporate_cells'
+                or fact.get('event_type')!='corporate_securities_unit_limit'
+                or fact.get('unit')!='shares' or not fact.get('issue_date_bound')
+                or not {product,base}<=set(fact.get('combined_products') or [])
+                or not math.isfinite(fact.get('position_unit') or 0)
+                or (fact.get('position_unit') or 0)<=0
+                or not math.isfinite(fact.get('natural_person_limit') or 0)
+                or (fact.get('natural_person_limit') or 0)<=0):
+            raise ValueError('incumbent member requires a complete source-verified numeric grid')
+        for key in ('source_content_sha256','visual_review_sha256'):
+            if not re.fullmatch(r'[a-f0-9]{64}',fact.get(key) or ''):
+                raise ValueError('incumbent member requires original and review identities')
+        # A later grade may contribute to known_at. It cannot retroactively
+        # make a later financial generation an incumbent in the original grid.
+        published=date.fromisoformat(fact['published_date'])
+        original_clock=datetime.combine(published,datetime.max.time(),tzinfo=TAIPEI)
+        known=datetime.fromisoformat(fact['known_at'])
+        beginning=date.fromisoformat(fact['effective_date'])
+        if known.tzinfo is None or known<original_clock.replace(microsecond=0) or beginning<=published:
+            raise ValueError('incumbent member lacks a prior original publication clock')
+        own=units.filter((pl.col('product')==product)
+            & (pl.col('contract_multiplier')==fact['position_unit']))
+        for unit in own.iter_rows(named=True):
+            unit_clock=datetime.fromisoformat(unit['known_at'])
+            unit_begin=date.fromisoformat(unit['effective_date'])
+            hashes=unit.get('source_content_sha256s') or []
+            if (unit_clock.tzinfo is None or not hashes
+                    or any(not re.fullmatch(r'[a-f0-9]{64}',s) for s in hashes)):
+                raise ValueError('incumbent member lacks its own dated monthly source')
+            if (unit_clock.astimezone(TAIPEI).date()>=published or unit_begin>=published
+                    or fact['source_content_sha256'] in hashes):continue
+            if not re.fullmatch(r'\d{6}',unit['contract']):
+                raise ValueError('incumbent member has an invalid physical month')
+            endings=[]
+            if unit.get('valid_until_exclusive'):
+                endings.append(date.fromisoformat(unit['valid_until_exclusive']))
+            if fact.get('valid_until_date_inclusive'):
+                endings.append(date.fromisoformat(fact['valid_until_date_inclusive'])+timedelta(days=1))
+            until=min(endings) if endings else None
+            if until is not None and until<=beginning:continue
+            for digest in hashes:
+                rows.append(dict(product=product,contract=unit['contract'],standard_product=base,
+                    position_source_sha256=fact['source_content_sha256'],unit_source_sha256=digest,
+                    visual_review_sha256=fact['visual_review_sha256'],effective_date=str(beginning),
+                    known_at=fact['known_at'],unit_effective_date=str(unit_begin),unit_known_at=unit['known_at'],
+                    valid_until_date_exclusive=str(until) if until else None,
+                    contract_multiplier=float(fact['position_unit'])))
+    return pl.DataFrame(rows,schema=schema).unique().sort('product','contract','effective_date','unit_source_sha256')
+
+
+def load_reviewed_incumbent_position_member_scopes(path: Path) -> tuple[pl.DataFrame, dict[str,str]]:
+    """Recheck the portable original/review/month proof without refetching."""
+    from stockagent.data.tw_futures_margin_release import read_bound_output
+    frame,manifest=read_bound_output(path)
+    if (manifest.get('schema_version')!=1
+            or manifest.get('status')!='source_verified_incumbent_physical_member_scopes'
+            or manifest.get('numeric_position_caps_added')!=0
+            or manifest.get('financial_events_added')!=0):
+        raise ValueError('unsupported incumbent member proof bundle')
+    sources={str(path):sha256_file(path),str(path.with_name('manifest.json')):sha256_file(path.with_name('manifest.json'))}
+    retained=set();originals=set()
+    for source in manifest['sources']:
+        item=path.parent/source['path']
+        if not item.resolve().is_relative_to(path.parent.resolve()) or sha256_file(item)!=source['sha256']:
+            raise ValueError('incumbent member retained source SHA/path mismatch')
+        sources[str(item)]=source['sha256'];retained.add(source['sha256'])
+        if source['kind']=='raw_gzip':
+            originals.add(hashlib.sha256(gzip.decompress(item.read_bytes())).hexdigest())
+    fact_path=path.parent/'reparsed_incumbent_position_facts.json'
+    if sha256_file(fact_path)!=manifest['outputs'][fact_path.name]['sha256']:
+        raise ValueError('incumbent member facts SHA mismatch')
+    facts=json.loads(fact_path.read_text())
+    if any(f['visual_review_sha256'] not in retained or f['source_content_sha256'] not in originals for f in facts):
+        raise ValueError('incumbent member lacks its retained original/review')
+    unit_path=path.parent/'source_bound_unit_intervals.parquet'
+    units,_=read_bound_output(unit_path)
+    if any(s not in originals for group in units['source_content_sha256s'] for s in group):
+        raise ValueError('incumbent member monthly units lack their own retained original')
+    if not frame.equals(reviewed_incumbent_position_member_scopes(facts,units)):
+        raise ValueError('incumbent member scopes differ from their reviewed grid/months')
+    sources[str(fact_path)]=sha256_file(fact_path);sources[str(unit_path)]=sha256_file(unit_path)
+    return frame,sources
+
+
 def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
         units: pl.DataFrame, universe: pl.DataFrame, family_rules: list[dict], *,
         corporate_unit_intervals: pl.DataFrame | None = None,
-        unchanged_member_scopes: pl.DataFrame | None = None) -> pl.DataFrame:
+        unchanged_member_scopes: pl.DataFrame | None = None,
+        reviewed_incumbent_member_scopes: pl.DataFrame | None = None) -> pl.DataFrame:
     """Check every physical month's units independently against a dated cap.
 
     One missing month's terms cannot disable a fully observed peer or acquire
@@ -700,7 +938,7 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
     grouping and full account admission are still separate.
     """
     keys=['date','product','contract']
-    if unchanged_member_scopes is not None and corporate_unit_intervals is None:
+    if (unchanged_member_scopes is not None or reviewed_incumbent_member_scopes is not None) and corporate_unit_intervals is None:
         raise ValueError('unchanged member proof requires physical corporate declarations')
     if units.select(keys).is_duplicated().any() or positions.select('date','product').is_duplicated().any():
         raise ValueError('duplicate position-unit input identity')
@@ -712,7 +950,8 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
         universe.select('product','asset_class'),on='product',how='left',validate='m:1')
     adjusted=pl.col('product').str.contains(r'\d$') & pl.col('asset_class').is_in(['stock_future','etf_future'])
     relevant=(adjusted & (pl.col('unit').is_in(['shares','beneficial_units'])
-                         | (pl.col('event_type')=='combined_position_formula'))).fill_null(False)
+                         | pl.col('event_type').is_in(['combined_position_formula',
+                                                       'combined_securities_position_formula']))).fill_null(False)
     valid=pl.lit(False)
     for law in family_rules:
         known=datetime.fromisoformat(law['known_at']).astimezone(TAIPEI).date()
@@ -738,6 +977,52 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
         direct=(adjusted & (pl.col('event_type')=='corporate_securities_unit_limit')
                 & pl.col('position_base_interval_id').is_null()).fill_null(False)
         scope_bound=(~direct | pl.col('_corporate_month_declared').fill_null(False))
+        securities_formula=pl.col('event_type').eq('combined_securities_position_formula').fill_null(False)
+        if frame.select(securities_formula.any()).item():
+            if 'position_member_source_sha256' not in frame.columns:
+                raise ValueError('securities member formula lacks its own source identity')
+            own=frame.select(*keys,'_term_sources','position_member_source_sha256').explode(
+                '_term_sources', empty_as_null=True, keep_nulls=True)
+            matches=own.filter(pl.col('_term_sources')==pl.col('position_member_source_sha256')).join(
+                declared.rename({'source_content_sha256s':'_term_sources'}),
+                on=['product','contract','_term_sources'],how='semi').select(keys).unique().with_columns(
+                    pl.lit(True).alias('_securities_own_month_declared'))
+            frame=frame.join(matches,on=keys,how='left',validate='1:1')
+            scope_bound=scope_bound & (~securities_formula | pl.col('_securities_own_month_declared').fill_null(False))
+        if reviewed_incumbent_member_scopes is not None:
+            proof=reviewed_incumbent_member_scopes
+            required={'product','contract','standard_product','position_source_sha256','unit_source_sha256',
+                'visual_review_sha256','effective_date','known_at','unit_effective_date','unit_known_at',
+                'valid_until_date_exclusive','contract_multiplier'}
+            if not required<=set(proof.columns):raise ValueError('incomplete incumbent member proof')
+            if proof.select(pl.any_horizontal(
+                    ~pl.col(c).str.contains(r'^[a-f0-9]{64}$').fill_null(False)
+                    for c in ('position_source_sha256','unit_source_sha256','visual_review_sha256')).any()).item():
+                raise ValueError('incumbent member proof has invalid source identities')
+            for row in proof.iter_rows(named=True):
+                cap_clock=datetime.fromisoformat(row['known_at']);unit_clock=datetime.fromisoformat(row['unit_known_at'])
+                if (cap_clock.tzinfo is None or unit_clock.tzinfo is None or unit_clock>=cap_clock
+                        or row['unit_effective_date']>=row['effective_date']):
+                    raise ValueError('incumbent member proof requires previously known monthly terms')
+            joined=frame.select(*keys,'_term_sources','_units','_unit_known_at','source_content_sha256s','combined_products').explode(
+                '_term_sources', empty_as_null=True, keep_nulls=True).join(proof.rename({'unit_source_sha256':'_term_sources'}),
+                    on=['product','contract','_term_sources'],how='inner')
+            matched=joined.filter(
+                (pl.col('standard_product')==pl.col('product').str.slice(0,2)+pl.lit('F'))
+                & (pl.col('_units')==pl.col('contract_multiplier'))
+                & (pl.col('_unit_known_at').str.to_datetime(time_zone='UTC')
+                    ==pl.col('unit_known_at').str.to_datetime(time_zone='UTC'))
+                & pl.col('source_content_sha256s').list.contains(pl.col('position_source_sha256'))
+                & pl.col('combined_products').list.contains(pl.col('product'))
+                & pl.col('combined_products').list.contains(pl.col('standard_product'))
+                & (pl.col('date')>=pl.col('effective_date').str.to_date())
+                & (pl.col('valid_until_date_exclusive').is_null()
+                   | (pl.col('date')<pl.col('valid_until_date_exclusive').str.to_date()))
+                & (pl.col('date')>pl.col('known_at').str.to_datetime(time_zone='UTC')
+                    .dt.convert_time_zone('Asia/Taipei').dt.date())
+            ).select(keys).unique().with_columns(pl.lit(True).alias('_incumbent_month_declared'))
+            frame=frame.join(matched,on=keys,how='left',validate='1:1')
+            scope_bound=scope_bound | (direct & pl.col('_incumbent_month_declared').fill_null(False))
         # A historical notice that does not declare this physical month has
         # no authority over a later generation. An unchanged-size successor
         # can still use the admitted dated grouping law and an independently
@@ -826,14 +1111,38 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
           if corporate_unit_intervals is not None else [])).sort(keys)
 
 
+def corporate_identity_views(facts: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Exclude a wrong flattened origin only when the same bytes prove it."""
+    from collections import defaultdict
+    grids = defaultdict(set)
+    for fact in facts:
+        if (fact.get('extraction_method') in ('native_cell_grid', 'source_ruled_ocr_cell_grid')
+                and fact.get('deliverable_components_resolved')
+                and fact.get('deliverable_security_quantity') == fact.get('contract_multiplier')
+                and all(fact.get(k) for k in ('source_content_sha256', 'product', 'effective_date'))):
+            grids[(fact['source_content_sha256'], fact['product'], fact['effective_date'])].add(fact.get('from_product'))
+    kept, issues = [], []
+    for fact in facts:
+        own = grids[(fact.get('source_content_sha256'), fact.get('product'), fact.get('effective_date'))]
+        if (fact.get('extraction_method') == 'explicit_text_fields_requires_source_review'
+                and len(own) == 1 and fact.get('from_product') not in own):
+            issues.append(dict(product=fact['product'], source_content_sha256=fact['source_content_sha256'],
+                source_url=fact['source_url'], effective_date=fact.get('effective_date'),
+                reasons='text_identity_outside_same_source_structured_grid'))
+        else:
+            kept.append(fact)
+    return kept, issues
+
+
 def corporate_identity_boundaries(facts: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Locate code transfers, independently of unresolved cash/share amounts.
 
     These boundaries organize evidence only. They do not admit a conversion,
     resolve a cash amount, or create a fill. Conflicting destinations fail here.
     """
+    selected, _ = corporate_identity_views(facts.to_dicts())
     rows=[]
-    for fact in facts.iter_rows(named=True):
+    for fact in selected:
         origin=fact.get('from_product');target=fact.get('product');day=fact.get('effective_date')
         if not origin or origin==target or not day or not fact.get('contract_months'):continue
         try:day=date.fromisoformat(day)
@@ -846,7 +1155,7 @@ def corporate_identity_boundaries(facts: pl.DataFrame) -> tuple[pl.DataFrame, pl
                 corporate_transfer_target=target,source_content_sha256=fact['source_content_sha256']))
     if not rows:
         if any(f.get('from_product') and f.get('from_product') != f.get('product')
-                for f in facts.iter_rows(named=True)):
+                for f in selected):
             raise ValueError('no source-bound corporate identity transfers')
         # A normal-only scope has no code transfer. Same-code dividend events
         # retain their separate financial accounting and require no fake edge.
@@ -971,6 +1280,218 @@ def load_adjusted_zero_oi_rule(path: Path) -> dict:
     if clause not in body:
         raise ValueError('adjusted zero-open-interest delisting clause missing')
     return rule
+
+
+def load_loss_reduction_halt_review(path: Path) -> dict:
+    """Verify a portable loss-reduction episode and its original value rule.
+
+    This supplies a legal accounting value, never an observed quote. The
+    corporate record, complete text, original bytes, commencement and dated
+    replacement are independently bound. Other reductions remain unsupported.
+    """
+    from decimal import Decimal
+    from stockagent.data.tw_futures_margin_release import read_bound_output
+    review=json.loads(path.read_text())
+    if review.get('review_kind')!='source_bound_loss_reduction_halt_value_v2':
+        raise ValueError('unsupported loss-reduction halt review')
+    raw={};parsed={};texts={};text_hashes={};receipts={}
+    for source in review['sources']:
+        file=path.parent/source['path']
+        if not file.resolve().is_relative_to(path.parent.resolve()) or sha256_file(file)!=source['sha256']:
+            raise ValueError('halt value source SHA/path mismatch')
+        url=source['url'];kind=source['kind']
+        if kind=='raw_gzip':raw[url]=hashlib.sha256(gzip.decompress(file.read_bytes())).hexdigest()
+        elif kind=='parsed_native':parsed[url]=json.loads(file.read_text())
+        elif kind=='review_pages_including_ocr':
+            texts[url]=file.read_text();text_hashes[url]=source['sha256']
+        elif kind=='page_extraction_receipt':receipts[url]=json.loads(file.read_text())
+    law=parsed[review['law_source_url']]
+    if raw.get(review['law_source_url'])!=law['content_sha256']:
+        raise ValueError('halt value rule lacks original bytes')
+    body=compact(law['text'])
+    for clause in ('四、消除累積虧損之減資','期貨契約價值(平常日遇停止交易)',
+                   '契約停止交易前一營業日之期貨價格(每日結算價)÷減資換發新股比例×減資後約定標的證券股數'):
+        if clause not in body:raise ValueError('loss-reduction halt value rule clause missing')
+    dates={r['date_iso'] for r in temporal_mentions(law['text']) if r['role']=='publication'}
+    if dates!={review['law_known_at'][:10]}:
+        raise ValueError('halt value rule publication mismatch')
+    commencement=path.parent/review['commencement_review']['path']
+    if not commencement.resolve().is_relative_to(path.parent.resolve()) or sha256_file(commencement)!=review['commencement_review']['sha256']:
+        raise ValueError('halt value commencement SHA/path mismatch')
+    rule=load_same_security_final_fixing_rule(commencement)
+    # The 2010 formula notice was explicitly replaced on 2011-05-03.
+    # Identical algebra in the replacement does not extend the old law's life.
+    regime_url=review['law_regime_source_url'];regime=parsed[regime_url]
+    if raw.get(regime_url)!=regime['content_sha256']:
+        raise ValueError('halt value regime lacks original bytes')
+    regime_text=compact(regime['text'])
+    retirement='本公司99年1月14日台期交字第09900006290號公告自100年5月3日起不再適用'
+    if (retirement not in regime_text or '發文字號:台期交字第10002003020號' not in regime_text
+            or '公告股票期貨契約遇契約調整契約價值及約定標的物價值計算方式如附件2' not in regime_text):
+        raise ValueError('halt value regime lacks its exact replacement clause')
+    regime_dates={r['date_iso'] for r in temporal_mentions(regime['text']) if r['role']=='publication'}
+    if regime_dates!={review['law_regime_known_at'][:10]}:
+        raise ValueError('halt value regime publication mismatch')
+    replacement=date(2011,5,3)
+    if law['content_sha256']==regime['content_sha256']:
+        legal_beginning=replacement;legal_end=None
+        if review['law_known_at']!=review['law_regime_known_at']:
+            raise ValueError('replacement halt value publication clocks differ')
+    elif '發文字號:台期交字第09900006290號' in body:
+        legal_beginning=rule['law_effective_date'];legal_end=replacement
+    else:
+        raise ValueError('halt value formula has no verified dated regime')
+    episode=review['episode'];url=episode['source_url'];text=compact(texts[url])
+    receipt=receipts[url]
+    if (raw.get(url)!=episode['source_content_sha256'] or receipt.get('status')!='complete'
+            or receipt.get('content_sha256')!=raw[url]
+            or not receipt.get('document_pages') or receipt.get('extracted_pages')!=receipt['document_pages']
+            or text_hashes[url] not in {f['sha256'] for f in receipt.get('files',[])
+                                       if f['path']=='candidate.txt'}):
+        raise ValueError('halt episode requires complete original/page evidence')
+    if not any(phrase in text for phrase in ('減資以彌補虧損', '減資彌補虧損')):
+        raise ValueError('halt episode is not pure loss reduction')
+    start=date.fromisoformat(episode['halt_start_date']);end=date.fromisoformat(episode['halt_end_date'])
+    resume=date.fromisoformat(episode['resumption_date'])
+    if start<legal_beginning or (legal_end is not None and end>=legal_end):
+        raise ValueError('halt episode is outside its formula law effective regime')
+    roc=lambda d:f'{d.year-1911}年{d.month}月{d.day}日'
+    halt_literals=(f'停止交易期間:{roc(start)}至{roc(end)}',
+                   f'停止交易期間:{roc(start)}至{end.month}月{end.day}日',
+                   f'停止交易期間:{roc(start)}至{end.day}日')
+    if (not start<=end<resume or not any(s in text for s in halt_literals)
+            or f'恢復交易日:{roc(resume)}' not in text):
+        raise ValueError('halt episode dates are not source-owned')
+    ratio=Decimal(episode['new_shares_per_thousand'])/Decimal(1000)
+    before=Decimal(episode['before_units']);after=Decimal(episode['after_units'])
+    if not 0<ratio<1 or before!=2000 or before*ratio!=after:
+        raise ValueError('unsupported/inconsistent loss-reduction share identity')
+    if f'每千股換發新股票{episode["new_shares_per_thousand"]}股' not in text:
+        raise ValueError('halt share ratio is not source-owned')
+    product=episode['product']
+    if not re.fullmatch(r'[A-Z]{2}F',product):
+        raise ValueError('halt review currently requires an unadjusted stock future')
+    cf_info=review['corporate_input'];cf_file=path.parent/cf_info['path']
+    if not cf_file.resolve().is_relative_to(path.parent.resolve()) or sha256_file(cf_file)!=cf_info['sha256']:
+        raise ValueError('halt corporate input SHA/path mismatch')
+    cf,_=read_bound_output(cf_file)
+    own=cf.filter((pl.col('source_content_sha256')==raw[url])&(pl.col('from_product')==product)
+                  &(pl.col('effective_date')==str(resume)))
+    if own.height!=1:raise ValueError('halt requires one source-owned corporate event')
+    event=own.to_dicts()[0]
+    if (Decimal(str(event['contract_multiplier']))!=after
+            or event['deliverable_cash_twd']!=0 or event['requires_rights_valuation']
+            or not event['deliverable_components_resolved'] or event['known_at']!=episode['known_at']):
+        raise ValueError('halt corporate quantities/components/clock mismatch')
+    months=set(event['contract_months'])
+    for expiry in episode.get('expiring_contracts',[]):
+        final=date.fromisoformat(expiry['final_date']);month=expiry['contract']
+        literal=f'{final.year-1911}年{int(month[4:])}月契約({product})到期日為{roc(final)}'
+        if month!=final.strftime('%Y%m') or not start<=final<=end or literal not in text:
+            raise ValueError('halt expiry month is not source-owned')
+        months.add(month)
+    known=max(review['law_known_at'],episode['known_at'])
+    clock=datetime.fromisoformat(known)
+    if clock.tzinfo is None or clock.astimezone(TAIPEI).date()>=start or start<rule['law_effective_date']:
+        raise ValueError('halt rule/episode was not available before the halt')
+    return dict(episode,contract_months=sorted(months),ratio=str(ratio),
+        rule_known_at=known,law_effective_date=legal_beginning,
+        law_valid_until_date_exclusive=legal_end,
+        legal_halt_value_contract='source_bound_loss_reduction_halt_value_v2',
+        law_regime_source_sha256=regime['content_sha256'],
+        law_source_sha256=law['content_sha256'],review_sha256=sha256_file(path))
+
+
+def apply_loss_reduction_halt_values(physical: pl.DataFrame, market_dates: pl.DataFrame,
+                                    episode: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Add missing nonexpiry legal values from each instance's own prior mark.
+
+    Source OHLC, daily_mark, volume, cash settlement and lifetimes remain
+    untouched. Missing own-month/prior-session evidence leaves the value NULL.
+    No latest available mark search or generic forward filling is permitted.
+    """
+    from decimal import Decimal, InvalidOperation
+    keys=['date','product','contract'];identity='physical_instance'
+    required={*keys,identity,'valuation_price','daily_mark','cash_settlement',
+              'official_source_sha256','official_settlement','outright_volume',
+              'official_open','official_close'}
+    if required-set(physical.columns) or physical.select(keys).is_duplicated().any():
+        raise ValueError('halt values require unique source-bound physical marks')
+    start=date.fromisoformat(episode['halt_start_date']);end=date.fromisoformat(episode['halt_end_date'])
+    ratio=Decimal(episode['ratio']);before=Decimal(episode['before_units']);after=Decimal(episode['after_units'])
+    known=datetime.fromisoformat(episode['rule_known_at'])
+    law_end=episode.get('law_valid_until_date_exclusive')
+    if (episode.get('legal_halt_value_contract')!='source_bound_loss_reduction_halt_value_v2'
+            or not start<=end<date.fromisoformat(episode['resumption_date']) or not 0<ratio<1
+            or before!=2000 or before*ratio!=after or known.tzinfo is None
+            or known.astimezone(TAIPEI).date()>=start or start<episode['law_effective_date']
+            or (law_end is not None and end>=law_end)
+            or not all(re.fullmatch('[a-f0-9]{64}',episode[c]) for c in
+                       ('law_source_sha256','law_regime_source_sha256','source_content_sha256','review_sha256'))):
+        raise ValueError('invalid/unavailable loss-reduction halt value contract')
+    dates=market_dates['date'].cast(pl.Date)
+    if dates.null_count() or dates.is_duplicated().any():raise ValueError('halt market calendar is not unique')
+    previous=dates.filter(dates<start).max()
+    if previous is None:raise ValueError('halt lacks a prior market session')
+    target=physical.filter((pl.col('product')==episode['product'])
+        &pl.col('contract').is_in(episode['contract_months'])&pl.col('date').is_between(start,end))
+    printed=target.select(pl.col('outright_volume').fill_null(0)>0,
+        *[pl.col(c).cast(pl.Float64,strict=False).fill_null(0)>0 for c in ('official_open','official_close')])
+    if printed.select(pl.any_horizontal(pl.all()).any()).item():
+        raise ValueError('observed executable prices contradict the full-day halt')
+    pending=target.filter(pl.col('valuation_price').is_null()&~pl.col('cash_settlement'))
+    prior=physical.filter(pl.col('date')==previous).select(identity,'daily_mark',
+        pl.col('official_settlement').alias('_prior_literal'),
+        pl.col('official_source_sha256').alias('_prior_source'))
+    joined=pending.join(prior,on=identity,suffix='_prior',how='left',validate='m:1')
+    rows=[]
+    for row in joined.iter_rows(named=True):
+        price=row['daily_mark_prior'];digest=row['_prior_source']
+        if (price is None or not np.isfinite(price) or price<=0 or not digest
+                or not re.fullmatch('[a-f0-9]{64}',digest)):continue
+        try:literal=Decimal(row['_prior_literal'].replace(',',''))
+        except (TypeError,AttributeError,InvalidOperation):continue
+        if not literal.is_finite() or literal<=0 or float(literal)!=price:continue
+        value=literal/ratio*after
+        rows.append({**{k:row[k] for k in keys},identity:row[identity],
+            'legal_halt_valuation_price':float(value/before),
+            'legal_halt_contract_value_twd':float(value),'legal_halt_prior_date':previous,
+            'legal_halt_prior_settlement':price,'legal_halt_prior_source_sha256':digest,
+            'legal_halt_rule_known_at':episode['rule_known_at'],
+            # A published rule does not reveal a future settlement operand.
+            # Keep the conservative completed prior-session availability bound
+            # distinct from the rule/episode's publication clock.
+            'legal_halt_known_at':max(episode['rule_known_at'],timestamp(previous,'23:59:59')),
+            'legal_halt_source_sha256s':sorted({episode['law_source_sha256'],episode['source_content_sha256'],
+                episode['law_regime_source_sha256']}),
+            'legal_halt_review_sha256':episode['review_sha256']})
+    schema={**{k:physical.schema[k] for k in [*keys,identity]},'legal_halt_valuation_price':pl.Float64,
+        'legal_halt_contract_value_twd':pl.Float64,'legal_halt_prior_date':pl.Date,
+        'legal_halt_prior_settlement':pl.Float64,'legal_halt_prior_source_sha256':pl.String,
+        'legal_halt_rule_known_at':pl.String,'legal_halt_known_at':pl.String,
+        'legal_halt_source_sha256s':pl.List(pl.String),
+        'legal_halt_review_sha256':pl.String}
+    values=pl.DataFrame(rows,schema=schema)
+    metadata=[c for c in schema if c not in {*keys,identity}]
+    present=set(metadata)&set(physical.columns)
+    if present and present!=set(metadata):
+        raise ValueError('incomplete prior legal halt provenance')
+    if present:
+        overlap=target.filter(pl.col('legal_halt_review_sha256').is_not_null()
+            &(pl.col('legal_halt_review_sha256')!=episode['review_sha256']))
+        if not overlap.is_empty():
+            raise ValueError('overlapping distinct legal halt reviews')
+        # Preserve each earlier episode and its operands when applying a
+        # second, disjoint episode. Reapplying the same review is idempotent.
+        additions=values.rename({c:'_halt_'+c for c in metadata})
+        result=physical.join(additions,on=[*keys,identity],how='left',validate='1:1').with_columns(
+            *[pl.coalesce(c,'_halt_'+c).alias(c) for c in metadata]).drop(
+                *['_halt_'+c for c in metadata])
+    else:
+        result=physical.join(values,on=[*keys,identity],how='left',validate='1:1')
+    result=result.with_columns(
+        pl.coalesce('valuation_price','legal_halt_valuation_price').alias('valuation_price'))
+    return result,values
 
 
 def physical_lifetime_calendar(observed: pl.DataFrame, final: pl.DataFrame,
@@ -1959,14 +2480,18 @@ def corporate_deliverable_components(text: str, multiplier: float) -> dict:
     """
     from decimal import Decimal
     dense=compact(text)
-    number=r'([\d,]+(?:\.\d+)?)'
+    number=r'(?<![\d.,])([\d][\d.,]*)(?![\d.,])'
     # A legacy field may name the issuer directly ("股台積電股票"). Its
     # table already binds the product. Do not treat a second securities leg
     # as the first; a separately named OLD rights base is not a deliverable.
     quantity_text=re.sub(r'及(?:原)?'+number+r'股標的證[券劵](?:可獲|所獲|可得)優先參與現金增資.*','',dense)
     shares=re.findall(number+r'(?:股(?:標的證[券劵]|[\u4e00-\u9fffA-Za-z-]{1,40}(?:普通股|股票))|(?:單位)?受益權單位標的證券|單位標的證券)',quantity_text)
     errors=[]
-    quantity=Decimal(shares[0].replace(',','')) if len(shares)==1 else None
+    quantity = None
+    if len(shares) == 1:
+        literal = shares[0]
+        if re.fullmatch(r'(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?', literal):
+            quantity = Decimal(literal.replace(',', ''))
     if quantity is None or quantity!=Decimal(str(multiplier)):
         errors.append('deliverable_quantity_missing_or_disagrees_with_multiplier')
     rights='現金增資' in dense or '優先參與' in dense
@@ -2030,14 +2555,23 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
     those financial fields, so it cannot pass as a complete deliverable.
     """
     from collections import defaultdict
-    grouped=defaultdict(list);issues=[];outgoing=defaultdict(set)
+    facts, issues = corporate_identity_views(facts)
+    grouped=defaultdict(list);outgoing=defaultdict(set)
+    late_barriers=defaultdict(set)
     month_views=defaultdict(list)
+    cash_key_fields = ('source_content_sha256', 'product', 'from_product', 'effective_date',
+                       'contract_multiplier', 'deliverable_cash_twd',
+                       'subscription_rights_at_final_settlement')
+    cash_peer_amounts = defaultdict(set)
     def month_key(fact):
         return tuple(fact.get(key) for key in
             ('source_content_sha256','from_product','product','effective_date'))
     for fact in facts:
         if fact.get('contract_months') and all(month_key(fact)):
             month_views[month_key(fact)].append(fact)
+        if fact.get('cash_equity_pair_agrees'):
+            cash_peer_amounts[tuple(fact.get(k) for k in cash_key_fields)].add(
+                fact.get('equity_credit_long_per_contract'))
     for original in facts:
         fact=dict(original)
         # OCR can lose an entire cell while another view of the exact same
@@ -2052,6 +2586,16 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
                 fact['month_scope_provenance']=sorted({json.dumps({key:peer.get(key) for key in
                     ('source_content_sha256','extraction_method','page','table_index','contract_months_origin')},
                     ensure_ascii=False,sort_keys=True) for peer in peers})
+        # Missing cash cells can be supplied by an agreeing independent view
+        # of this exact event. A stated different amount is never overwritten.
+        if (not unit_only and fact.get('has_equity_credit_fields')
+                and fact.get('equity_credit_long_per_contract') is None
+                and fact.get('equity_debit_short_per_contract') is None):
+            amounts = cash_peer_amounts[tuple(fact.get(k) for k in cash_key_fields)]
+            if len(amounts) == 1 and None not in amounts:
+                amount = next(iter(amounts))
+                fact.update(cash_equity_pair_agrees=True,
+                    equity_credit_long_per_contract=amount, equity_debit_short_per_contract=amount)
         reasons=[]
         if not fact.get('effective_date') or not fact.get('contract_months'):
             reasons.append('date_or_month_scope_missing')
@@ -2083,6 +2627,16 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
                 source_url=fact['source_url'],effective_date=fact.get('effective_date'),
                 reasons=';'.join(reasons)))
         if not fact.get('effective_date') or not fact.get('contract_months'):continue
+        if ('not_known_before_effective_day' in reasons
+                and known.astimezone(TAIPEI).date() > date.fromisoformat(fact['effective_date'])):
+            # A later amendment cannot invalidate an earlier, independently
+            # known observation before the amendment was published. Preserve
+            # the old state up to the next day, then keep an unresolved barrier;
+            # this does NOT invent a revised amount or reapply a conversion.
+            barrier = str(known.astimezone(TAIPEI).date() + timedelta(days=1))
+            for month in fact['contract_months']:
+                late_barriers[(fact['product'], month)].add(barrier)
+            continue
         for month in fact['contract_months']:
             grouped[(fact['product'],month,fact['effective_date'])].append((fact,reasons))
             origin=fact.get('from_product')
@@ -2152,6 +2706,9 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
     for key,days in outgoing.items():
         existing={day for day,state in identities[key]}
         identities[key].extend((day,None) for day in days-existing)
+    for key, days in late_barriers.items():
+        existing = {day for day, state in identities[key]}
+        identities[key].extend((day, None) for day in days - existing)
     intervals=[]
     for key,boundaries in identities.items():
         boundaries.sort(key=lambda x:x[0])
@@ -2211,6 +2768,83 @@ def stock_futures_cash_reform_intervals(intervals: list[dict], reform: dict,
             source_urls=sorted(set(row['source_urls'])|set(reform['source_urls'])))
         output.append(changed)
     return sorted(output,key=lambda r:(r['product'],r['contract'],r['effective_date'])),issues
+
+
+_CORPORATE_MONTH_SCOPE_PATTERN = (
+    r'(?:調整(?:契約)?|契約調整|契約)月份'
+    r'(?:(?:註\d*|\d+)?[:：]|(?:註\d*)?(?=\d{2,3}年))'
+    r'((?:[\d年月、及與]|到期契約)+)'
+)
+
+
+def corporate_retained_view_candidates(views: list[tuple[str, str]]) -> list[dict]:
+    """Join labelled cells retained in different views of ONE original.
+
+    Callers verify the original and every extraction receipt. A view can lose
+    a row label without losing the same row in another view. Only a single
+    explicit code conversion and adjustment section can share fields. Literal
+    numeric alternatives remain alternatives; no OCR characters are repaired.
+    """
+    from collections import defaultdict
+    from itertools import product
+
+    code = r'[A-Z]{2}[F1-9]'
+    conversion = r'(?<![A-Z0-9])(' + code + r')調整為(' + code + r')(?![A-Z0-9])'
+    scopes = []
+    identities = set()
+    for text, provenance in views:
+        dense = compact(text)
+        # Native/new standard-contract and position tables cannot lend fields.
+        sections = re.split(r'(?:^|[一二三]、)契約調整[:：]', dense)
+        scope = sections[-1] if len(sections) == 2 else dense
+        scope = re.split(r'[二三]、部位限制|選擇權調整|(?:加掛|推出)(?:新|標準(?:型)?)', scope)[0]
+        pairs = set(re.findall(conversion, scope))
+        if len(pairs) > 1 or len(sections) > 2:
+            return []
+        identities.update(pairs)
+        scopes.append((scope, provenance))
+    if len(identities) != 1:
+        return []
+    before, after = next(iter(identities))
+    values = defaultdict(lambda: defaultdict(set))
+
+    def retain(label, literal, provenance):
+        if literal:
+            values[label][literal].add(provenance)
+
+    for scope, provenance in scopes:
+        for match in re.finditer(r'調整生效日(?:及恢復交易日)?[:：]?(' + ROC_DATE + r')', scope):
+            retain('調整生效日', match[1], provenance)
+        for literal in re.findall(_CORPORATE_MONTH_SCOPE_PATTERN, scope):
+            retain('調整契約月份', literal, provenance)
+        for match in re.finditer(re.escape(after) + r'契約乘數(?:調整為[\d,]+(?:\.\d+)?|'
+                                 r'不調整\(仍為[\d,]+(?:\.\d+)?\))(?![\d.,])', scope):
+            retain('契約乘數', match[0], provenance)
+        for match in re.finditer(r'約定標的物[|:：]?(.+?)(?=契約乘數|買方權益數加項|'
+                                 r'賣方權益數減項|$)', scope):
+            retain('約定標的物', match[1], provenance)
+        for label, other in (('買方權益數加項', '賣方權益數減項'),
+                             ('賣方權益數減項', '買方權益數加項')):
+            for match in re.finditer(re.escape(label) + r'(.{0,90}?)(?=' + re.escape(other) + r'|$)', scope):
+                for amount in re.findall(r'新[臺台]幣([\d,]+)元', match[1]):
+                    retain(label, '新臺幣' + amount + '元', provenance)
+    required = ('調整生效日', '調整契約月份', '契約乘數', '約定標的物')
+    if any(not values[k] for k in required):
+        return []
+    labels = [*required, *[k for k in ('買方權益數加項', '賣方權益數減項') if values[k]]]
+    count = 1
+    for label in labels:
+        count *= len(values[label])
+    if count > 64:
+        return []
+    result = []
+    for alternatives in product(*(sorted(values[k]) for k in labels)):
+        cells = [['契約代號', before + '調整為' + after], *map(list, zip(labels, alternatives))]
+        for candidate in corporate_grid_candidates(cells, '\n'.join(text for text, _ in views)):
+            candidate.update(extraction_method='same_source_retained_label_fields',
+                retained_field_views={k: sorted(values[k][v]) for k, v in zip(labels, alternatives)})
+            result.append(candidate)
+    return result
 
 
 def corporate_grid_candidates(cells: list[list], source_text: str = '', caption: str = '',
@@ -2278,9 +2912,7 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
     months_origin = 'table_cell'
     # Restrict the value to the date-list alphabet. A missing 到期契約 suffix
     # must not consume prices, footnote dates or the next contract's table.
-    scope_pattern=(r'(?:調整(?:契約)?|契約調整|契約)月份'
-                   r'(?:(?:註\d*|\d+)?[:：]|(?:註\d*)?(?=\d{2,3}年))'
-                   r'((?:[\d年月、及與]|到期契約)+)')
+    scope_pattern = _CORPORATE_MONTH_SCOPE_PATTERN
     if not months and not month_fields:
         # The month list often sits immediately above this exact table. Never
         # borrow a different product's list from the whole document.
@@ -2293,6 +2925,17 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
             if len(page_scopes)==1:
                 months=page_scopes.pop()
                 months_origin='same_page_single_scope'
+            elif not page_scopes:
+                # Older ruled tables omit their caption, while retained text
+                # contains one explicitly identified futures adjustment. Only
+                # that unique own-code scope may provide the missing months.
+                dense_source = compact(source_text)
+                changes = set(re.findall(r'(?<![A-Z0-9])([A-Z]{2}[F1-9])調整為'
+                                         r'([A-Z]{2}[F1-9])(?![A-Z0-9])', dense_source))
+                scopes = set(re.findall(scope_pattern, dense_source))
+                if changes == {(before, after)} and len(scopes) == 1:
+                    months = scopes.pop()
+                    months_origin = 'same_source_single_adjustment_scope'
     explicit_months = []; year = None; months_error = None
     for item in re.finditer(r'(?:(\d{2,3})年)?(\d{1,2})月', months):
         if item[1]: year = int(item[1]) + 1911
@@ -2520,6 +3163,17 @@ def corporate_position_table_candidates(pages: list[dict], *, corporate: list[di
     for page in pages:
         for ti,table in enumerate(page['tables']):
             cells=[[normal(v) for v in row] for row in table['cells']]
+            empty_edges=[]
+            if (len(cells)>=2 and len({len(row) for row in cells})==1
+                    and cells[0] and any(value=='持有部位' or value.startswith('適用期間')
+                                          for value in cells[0])):
+                # Native PDF grids sometimes include an entirely empty edge
+                # column. Drop only that empty furniture, never an interior
+                # cell or a partially observed category/member column.
+                while len(cells[0])>1 and all(not row[0] for row in cells):
+                    empty_edges.append('left');cells=[row[1:] for row in cells]
+                while len(cells[0])>1 and all(not row[-1] for row in cells):
+                    empty_edges.append('right');cells=[row[:-1] for row in cells]
             if (len(cells)==5 and all(cells) and cells[0][0]=='持有部位'
                     and cells[1][0]=='每口折算股數'
                     and len(cells[0])==len(cells[1])
@@ -2651,6 +3305,24 @@ def corporate_position_table_candidates(pages: list[dict], *, corporate: list[di
             for header,amount in cap_cells:
                 number=re.fullmatch(r'([\d,]+(?:\.\d+)?)(股|受益權單位|單位)',amount)
                 dates=list(re.finditer(r'(?<!\d)(\d{2,3})(?:[./]|年)(\d{1,2})(?:[./]|月)(\d{1,2})(?:日)?',header))
+                # Some originals print the start as 100.0729 / 102.0827.
+                # Four digits state MMDD unambiguously; a three-digit value
+                # or an expected date never supplies a missing separator.
+                # Admit this local notation only when the same original's
+                # independent adjustment date agrees. General notice clocks
+                # and the literal source period remain unchanged.
+                compact_start=list(re.finditer(r'(?<=自)(\d{2,3})\.(\d{2})(\d{2})(?![\d.])',header))
+                compact_proof=None
+                if compact_start:
+                    if len(compact_start)!=1:continue
+                    match=compact_start[0]
+                    try:compact_day=str(date(int(match[1])+1911,int(match[2]),int(match[3])))
+                    except ValueError:continue
+                    own_days={r.get('effective_date') for r in identities}
+                    if own_days!={compact_day}:continue
+                    dates=sorted([*dates,match],key=lambda m:m.start())
+                    compact_proof=json.dumps(dict(notation='ROC_year.MMDD',
+                        literal_start=match[0],same_original_adjustment_date=compact_day),sort_keys=True)
                 if not number or not dates or not header.startswith('自'):continue
                 try:days=[str(date(int(m[1])+1911,int(m[2]),int(m[3]))) for m in dates]
                 except ValueError:continue
@@ -2669,6 +3341,9 @@ def corporate_position_table_candidates(pages: list[dict], *, corporate: list[di
                     end_rule=end_rule,natural_person_limit=float(number[1].replace(',','')),
                     unit='shares' if number[2]=='股' else 'beneficial_units',
                     source_period_text=header,page=page['page'],table_index=ti,
+                    position_compact_date_evidence=compact_proof,
+                    **({'position_empty_edge_columns':json.dumps(dict(removed=empty_edges,
+                        original_cells=table['cells']),ensure_ascii=False)} if empty_edges else {}),
                     extraction_method=table.get('extraction_method','native_cell_grid')))
     result=[];code=r'[A-Z]{2}[F1-9]'
     group_scope=text
@@ -2738,8 +3413,21 @@ def _owned_two_period_natural_caps(source_text: str) -> tuple[float, float] | No
     space=r'[^\S\r\n]*'
     rows=list(re.finditer(r'自然人'+space+'('+number+')'+space+'股'+space+
                          '('+number+')'+space+'股',text))
-    if len(rows)!=1:return None
-    return tuple(float(rows[0][i].replace(',','')) for i in (1,2))
+    if len(rows)==1:return tuple(float(rows[0][i].replace(',','')) for i in (1,2))
+    if rows:return None
+    # A complete row-major text export may put each amount on its own line.
+    # Require all three uniquely named rows and exactly two atomic share
+    # amounts per row. A category-first or incomplete export cannot prove
+    # ownership and remains rejected.
+    labels=('自然人','法人機構','造市者')
+    if any(len(re.findall(r'(?m)^[^\S\r\n]*'+label+r'[^\S\r\n]*$',text))!=1
+           for label in labels):return None
+    row=lambda label:(r'[^\S\r\n]*'+label+r'[^\S\r\n]*\r?\n\s*'
+        r'('+number+r')'+space+r'股\s+('+number+r')'+space+r'股[^\S\r\n]*')
+    owned=re.findall(r'(?m)^'+row(labels[0])+r'\r?\n\s*'+row(labels[1])+
+                     r'\r?\n\s*'+row(labels[2])+r'$',text)
+    if len(owned)!=1:return None
+    return tuple(float(value.replace(',','')) for value in owned[0][:2])
 
 
 def corporate_position_flat_table_candidates(source_text: str, corporate: list[dict]) -> list[dict]:
@@ -2986,6 +3674,100 @@ def unchanged_corporate_position_groups(text: str, corporate: list[dict], *, pag
     return result
 
 
+def unchanged_quantity_securities_position_groups(text: str, corporate: list[dict],
+        *, reviewed_standard_groups: tuple[dict, ...] = ()) -> list[dict]:
+    """Read a cash-rights rename into an existing, separately verified share pool.
+
+    The three-member notice must also declare a standard-size one-for-one
+    member and explicitly say that the other member's multiplier is unchanged.
+    Own monthly financial declarations retain its code, units and source.
+    The canonical archive reader may supply freshly revalidated standard
+    cells from the same original when flattened text lost that declaration.
+    This emits only a weight. The dated binder must supply a securities cap.
+    """
+    from fractions import Fraction
+    text=compact(text);rows=[]
+    standard=unchanged_corporate_position_groups(text,corporate)
+    provenance=('source_content_sha256','source_url','published_date','known_at')
+    for reviewed in reviewed_standard_groups:
+        if (reviewed.get('extraction_method')!='source_bound_visual_corporate_position_group'
+                or reviewed.get('event_type')!='combined_position_formula'
+                or reviewed.get('combined_position_ratio')!='1/1' or reviewed.get('unit')!='contracts'
+                or not reviewed.get('issue_date_bound')
+                or not re.fullmatch(r'[a-f0-9]{64}',reviewed.get('visual_review_sha256') or '')):
+            continue
+        base=reviewed.get('combined_position_base_product');origin=reviewed.get('product')
+        own=[f for f in corporate if f.get('from_product')==base and f.get('product')==origin
+            and f.get('effective_date')==reviewed.get('effective_date')
+            and f.get('contract_months') and f.get('issue_date_bound')
+            and all(f.get(k) is not None and f.get(k)==reviewed.get(k) for k in provenance)]
+        if not own or any(f.get('contract_multiplier')!=2000.
+                or f.get('deliverable_security_quantity')!=2000. for f in own):continue
+        # A legible contrary standard declaration is a conflict, not a reason
+        # to prioritize the review. Do not fix punctuation in damaged text.
+        declarations={Fraction(m[1].replace(',',''))
+            for section in re.findall(r'(?:加掛|推出)標準(?:型)?契約(.*?)部位限制',text)
+            for m in re.finditer(r'約定標的物([\d,]+)(?:股|單位)標的證券',section)}
+        if declarations and declarations!={Fraction(2000)}:continue
+        standard.append(reviewed)
+    emitted=set()
+    for first in standard:
+        base=first['combined_position_base_product'];origin=first['product']
+        groups={tuple(sorted(set(re.findall(r'[A-Z]{2}[F1-9]',m[1]))))
+            for m in re.finditer(r'([A-Z]{2}[F1-9](?:(?:、|與|及|暨)[A-Z]{2}[F1-9])+)(?:期貨)?部位合併計算',
+                                 first['combined_position_evidence'])}
+        if len(groups)!=1:continue
+        members=next(iter(groups))
+        if (len(members)!=3 or base not in members or origin not in members
+                or any(p[:2]!=base[:2] for p in members)):
+            continue
+        literal_groups={tuple(sorted(set(re.findall(r'[A-Z]{2}[F1-9]',m[1]))))
+            for m in re.finditer(r'([A-Z]{2}[F1-9](?:(?:、|與|及|暨)[A-Z]{2}[F1-9])+)(?:期貨)?部位合併計算',text)}
+        if literal_groups!={members}:continue
+        target=next(p for p in members if p not in (base,origin))
+        if not re.fullmatch(r'[A-Z]{2}[1-9]',target):continue
+        candidates=[f for f in corporate if f.get('issue_date_bound') and f.get('contract_months')
+            and f.get('from_product')==origin and f.get('product')==target
+            and f.get('effective_date')==first['effective_date']
+            and f.get('subscription_rights_at_final_settlement') is True
+            and f.get('deliverable_security_quantity')==f.get('contract_multiplier')]
+        if first in reviewed_standard_groups:
+            candidates=[f for f in candidates if all(f.get(k) is not None
+                and f.get(k)==first.get(k) for k in provenance)]
+        identities={(f['effective_date'],f['contract_multiplier']) for f in candidates}
+        if len(identities)!=1:continue
+        _,units=next(iter(identities))
+        if not isinstance(units,(int,float)) or isinstance(units,bool) or not math.isfinite(units) or units<=2000:
+            continue
+        clauses=list(re.finditer(re.escape(target)+r'契約乘數不調整\(仍為([\d,]+(?:\.\d+)?)\)',text))
+        if not clauses or {Fraction(m[1].replace(',','')) for m in clauses}!={Fraction(str(units))}:
+            continue
+        weight=Fraction(str(units))/2000
+        months=sorted({month for f in candidates for month in f['contract_months']})
+        if any(re.fullmatch(r'\d{6}',month) is None for month in months):continue
+        identity=(target,first['effective_date'],tuple(months),units)
+        if identity in emitted:continue
+        emitted.add(identity)
+        details=dict(combined_products=list(members),standard_product=base,
+            standard_units=2000,transfer_origin=origin,transfer_target=target,
+            unchanged_multiplier=units,contract_months=months,
+            unchanged_multiplier_clauses=sorted({m[0] for m in clauses}))
+        if first in reviewed_standard_groups:
+            details.update(standard_cells_review_sha256=first['visual_review_sha256'],
+                standard_cells_source_sha256=first['source_content_sha256'])
+        evidence=json.dumps(details,sort_keys=True,ensure_ascii=False)
+        rows.append(dict(product=target,effective_date=first['effective_date'],
+            effective_phase='product_regular_open',unit='shares',
+            event_type='combined_securities_position_formula',natural_person_limit=None,
+            combined_products=list(members),combined_position_base_product=base,
+            combined_position_ratio=f'{weight.numerator}/{weight.denominator}',
+            combined_position_evidence=first['combined_position_evidence'],
+            position_group_unit_evidence=evidence,
+            extraction_method='explicit_unchanged_quantity_securities_combination',
+            candidate_only=True,requires_adjusted_contract_and_mini_group_review=True))
+    return rows
+
+
 def corporate_position_text_candidates(source_text: str, corporate: list[dict]) -> list[dict]:
     """Read explicit old notice caps using already source-bound identities.
 
@@ -2998,6 +3780,7 @@ def corporate_position_text_candidates(source_text: str, corporate: list[dict]) 
     if flat:return flat
     text=compact(source_text).replace('|','').replace('標准','標準').replace('计','計').replace('营','營')
     unchanged = unchanged_corporate_position_groups(text, corporate)
+    unchanged += unchanged_quantity_securities_position_groups(text,corporate)
     if unchanged: return unchanged
     identities={(f.get('from_product'),f.get('product'),f.get('effective_date'),
                  f.get('contract_multiplier')) for f in corporate
@@ -3737,7 +4520,7 @@ def position_candidate_intervals(facts: list[dict]) -> tuple[list[dict], list[di
         kind=fact.get('event_type') or 'absolute_level';unit=fact.get('unit')
         amount=fact.get('natural_person_limit');monthly=fact.get('natural_person_monthly_limit')
         position_unit=1.;members=None;base=None;ratio=None
-        if kind=='combined_position_formula':
+        if kind in ('combined_position_formula','combined_securities_position_formula'):
             base=fact.get('combined_position_base_product')
             if not base:reasons.append('dated_base_product_identity_unresolved')
             try:
@@ -3751,7 +4534,17 @@ def position_candidate_intervals(facts: list[dict]) -> tuple[list[dict], list[di
                             or reviewed_unchanged)
                            and re.fullmatch(r'[A-Z]{2}[1-9]',product)
                            and base==product[:-1]+'F')
-                if not (0<ratio<1 or (ratio==1 and unchanged)):raise ValueError('conversion ratio')
+                securities=(kind=='combined_securities_position_formula'
+                    and fact.get('extraction_method')=='explicit_unchanged_quantity_securities_combination'
+                    and re.fullmatch(r'[A-Z]{2}[1-9]',product)
+                    and base==product[:2]+'F' and fact.get('unit')=='shares')
+                if securities:
+                    members=sorted(set(fact.get('combined_products') or []))
+                    if (ratio<=1 or len(members)!=3 or product not in members or base not in members
+                            or any(not re.fullmatch(product[:2]+r'[F1-9]',p) for p in members)):
+                        raise ValueError('securities combination member or weight')
+                elif not (kind=='combined_position_formula' and (0<ratio<1 or (ratio==1 and unchanged))):
+                    raise ValueError('conversion ratio')
             except (ValueError,ZeroDivisionError):reasons.append('dated_position_conversion_invalid')
             if amount is not None or monthly is not None:reasons.append('formula_has_independent_amount')
         elif kind in ('absolute_level','corporate_securities_unit_limit'):
@@ -3793,12 +4586,14 @@ def position_candidate_intervals(facts: list[dict]) -> tuple[list[dict], list[di
             combined_position_base_product=base,
             conversion_numerator=ratio.numerator if ratio and not reasons else None,
             conversion_denominator=ratio.denominator if ratio and not reasons else None,
-            requires_base_limit_join=kind=='combined_position_formula',
+            requires_base_limit_join=kind in ('combined_position_formula','combined_securities_position_formula'),
             requires_delisting_clock=bool(fact.get('requires_delisting_clock')),
             explicit_end=end,end_rule=fact.get('end_rule'),
             notice_revoked_effective_date=revoked,
             notice_revocation_source_sha256=fact.get('notice_revocation_source_sha256'),
             point_in_time_verified=False,requires_dated_group_and_lifecycle_admission=True)
+        if kind=='combined_securities_position_formula':
+            state['position_member_source_sha256']=fact.get('source_content_sha256')
         grouped[(product,day)].append((fact,state,reasons))
     products=defaultdict(list)
     for (product,day),views in grouped.items():

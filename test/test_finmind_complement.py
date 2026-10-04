@@ -80,10 +80,17 @@ def test_queue_has_all_reference_and_historical_ranges(tmp_path: Path) -> None:
     with complement._db(tmp_path / "queue.sqlite3") as connection:
         complement._populate(connection, tmp_path, today=date(2026, 9, 25))
         count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        # Newly proven market-wide SpreadTick does not require a master ID,
+        # and is still a bounded day queue, not one full-history request.
+        market_tick_days = connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanFuturesSpreadTick' AND data_id=''"
+        ).fetchone()[0]
+        assert 0 < market_tick_days <= complement.supplemental.WORKING_SET
         news_days = (date(2026, 9, 25) - complement.news.SEARCH_FLOOR).days + 1
         assert count == (news_days + len(complement.SNAPSHOTS) - len(complement.DERIVATIVE_SNAPSHOTS) + sum(2026 - first + 1 for first in complement.GLOBAL_START_YEAR.values())
                          + sum(len(ids) for ids in complement.FIXED_ID_HISTORY.values())
-                         + len(complement.CURRENCIES) + len(complement.supplemental.MARKET_HISTORY_DATASETS))
+                         + len(complement.CURRENCIES) + len(complement.supplemental.MARKET_HISTORY_DATASETS)
+                         + market_tick_days)
         assert connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset='TaiwanStockNews'").fetchone()[0] == news_days
         assert connection.execute("SELECT priority FROM tasks WHERE dataset='GoldPrice' AND partition='1900'").fetchone()[0] == 3
         assert connection.execute("SELECT priority FROM tasks WHERE dataset='GoldPrice' AND partition='2014'").fetchone()[0] == 1
@@ -191,7 +198,7 @@ def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_pat
     monkeypatch.setattr(complement, "verified_account", lambda *_a: {"tier": "Free", "official_requests_per_hour": 600})
     monkeypatch.setattr(complement, "rate_limiter", lambda *_a: object())
     monkeypatch.setattr(complement, "backfill_budget", lambda *_a, **_kw: {"allowed": True})
-    monkeypatch.setattr(complement, "fixed_incremental_demand", lambda *_a: 0)
+    monkeypatch.setattr(complement, "incremental_reservation", lambda *_a: {'reserve_requests': 0})
     monkeypatch.setattr(complement.shutil, "disk_usage", lambda *_a: SimpleNamespace(free=10**12))
     monkeypatch.setattr(complement, "_populate", lambda conn, *_a, **_kw: complement._add_tasks(
         conn, [("TaiwanStockInfo", "", "latest", "snapshot", 0)],
@@ -213,7 +220,7 @@ def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_p
     monkeypatch.setattr(complement,'verified_account',lambda *_a:{'tier':'Free','official_requests_per_hour':600})
     monkeypatch.setattr(complement,'rate_limiter',lambda *_a:object())
     monkeypatch.setattr(complement,'backfill_budget',lambda *_a,**_k:{'allowed':True,'remaining':2})
-    monkeypatch.setattr(complement,'fixed_incremental_demand',lambda *_a:0)
+    monkeypatch.setattr(complement,'incremental_reservation',lambda *_a:{'reserve_requests':0})
     monkeypatch.setattr(complement.shutil,'disk_usage',lambda *_a:SimpleNamespace(free=10**12))
     monkeypatch.setattr(complement,'_populate',lambda *_a,**_k:pytest.fail('unrelated queue population'))
     monkeypatch.setattr(complement,'_claim_bulk_years',lambda *_a,**_k:pytest.fail('widened year claim'))

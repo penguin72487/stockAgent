@@ -4,6 +4,8 @@
     {
       "dataset": "tw-public",
       "source": "/srv/stockagent-live/data_tw_public",
+      "source_coordination_lock": ".locks/tw-public-refresh.lock",
+      "source_coordination_lock_scope": "source_parent",
       "role": "training-and-audit",
       "publish": true,
       "pack_buckets": 64,
@@ -503,7 +505,10 @@
       "loose_threshold_mib": 8,
       "excluded_subtrees": [
         "taifex_stock_futures_minute_history_v2",
-        "shioaji_gap_repair"
+        "shioaji_gap_repair",
+        "margin_sources",
+        ".margin-sources-pending",
+        ".margin-sources-previous"
       ],
       "active_process_substrings": [
         "download_shioaji_tx_futures_ticks",
@@ -514,6 +519,16 @@
         "build_tw_stock_futures_0900_entries.py"
       ],
       "note": "Shioaji/TAIFEX futures data, including historical+current stock/ETF/domestic+foreign-index delivery-month-slot daily training data. Historical minute v2 remains local until its coverage audit is complete; remove that exclusion only with an audited release and pinned training inputs."
+    },
+    {
+      "dataset": "tw-futures-margin-sources",
+      "source": "data_tw_futures/margin_sources",
+      "role": "official-source-and-rule-evidence",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_futures_margin_sources.py"],
+      "note": "SHA-audited TAIFEX originals, observations and reviewed rule evidence for a pinned remote rebuild. source_manifest.json declares remaining financial gaps and source-only status; publication does not assert training readiness. No licensed TEJ/FinLab source, execution ledger, panel or training cache. The maintained rule editing authority remains all_products_rule_facts."
     },
     {
       "dataset": "forex-frankfurter",

@@ -92,12 +92,14 @@ def corporate_final_value_diagnostics(terms: pl.DataFrame, final: pl.DataFrame) 
         raise ValueError('duplicate official settlement event')
     dated=terms.with_columns(pl.col('effective_date').cast(pl.Date),
                             pl.col('valid_until_exclusive').cast(pl.Date))
+    dated=dated.with_columns((pl.col('fixed_subscription_rights_twd').fill_null(0.)
+        if 'fixed_subscription_rights_twd' in dated.columns else pl.lit(0.)).alias('fixed_subscription_rights_twd'))
     selected=final.filter(pl.col('product').str.contains(r'\d$'))
     joined=selected.sort('settlement_date').join_asof(dated.sort('effective_date'),
         left_on='settlement_date',right_on='effective_date',by=keys,
         strategy='backward',check_sortedness=False)
     joined=joined.with_columns((pl.col('final_settlement_price')*pl.col('contract_multiplier')+
-        pl.col('deliverable_cash_twd')).alias('candidate_formula_value_twd'))
+        pl.col('deliverable_cash_twd')+pl.col('fixed_subscription_rights_twd')).alias('candidate_formula_value_twd'))
     joined=joined.with_columns((pl.col('final_settlement_value')-pl.col('candidate_formula_value_twd'))
         .alias('official_minus_candidate_twd'))
     return joined.with_columns(
@@ -421,6 +423,91 @@ def document_inventory(root: Path, products: set[str], reviews: Path | None = No
     return documents, mentions, unresolved, counts
 
 
+def audit_numeric_rules(root: Path, output: Path) -> int:
+    """Check numeric semantics without building any contract-day account.
+
+    Thresholds nominate source review; they do not overwrite or approve facts.
+    Candidate errors and a suspicious number in an interval are separate counts.
+    """
+    import math
+    from scripts.repair_tw_futures_margin_source_intervals import read_bound_output
+    from scripts.build_tw_futures_margin_event_candidates import corporate_numeric_anomalies,reviewed_small_corporate_units
+    names=('corporate_event_candidates','position_event_candidates','margin_event_candidates',
+           'corporate_unit_intervals','corporate_terms_intervals','position_level_intervals','margin_level_intervals')
+    frames={name:read_bound_output(root/(name+'.parquet'))[0] for name in names}
+    inputs={name:sha256_file(root/(name+'.parquet')) for name in names}
+    corporate=frames['corporate_event_candidates'].to_dicts()
+    # A matching native/inspected multiplier AND deliverable supports a true
+    # small unit. A same-value pair of old OCR readings alone does not.
+    small_native=reviewed_small_corporate_units(corporate)
+    diagnostics=[]
+    for row in corporate_numeric_anomalies(corporate):
+        key=(row['product'],row['effective_date'],row['contract_multiplier'],row['source_content_sha256'])
+        supported=key in small_native and row['contract_multiplier']==row['deliverable_security_quantity']
+        diagnostics.append(dict(row,table='corporate_event_candidates',field='contract_multiplier_or_deliverable',
+            value=row['contract_multiplier'],in_interval=False,
+            review_status='small_native_or_inspected_unit' if supported else 'source_review_required'))
+    def check(name,row,field,reason):
+        amount=row.get(field)
+        if amount is None:return
+        digests=row.get('source_content_sha256s') or [row.get('source_content_sha256')]
+        supported=(field in ('contract_multiplier','position_unit') and any((row.get('product'),row.get('effective_date'),amount,d)
+                    in small_native for d in digests))
+        diagnostics.append(dict(table=name,product=row.get('product'),effective_date=row.get('effective_date'),
+            contract_months=[row['contract']] if row.get('contract') else None,
+            source_url=row.get('source_url'),source_content_sha256=digests[0] if digests else None,
+            field=field,value=amount,unit=row.get('unit') or row.get('margin_kind'),reasons=[reason],
+            in_interval=name.endswith('intervals'),
+            review_status='small_native_or_inspected_unit' if supported else 'source_review_required'))
+    def suspicious(v):return isinstance(v,(int,float)) and (not math.isfinite(v) or v<=0 or v<100)
+    for name in ('corporate_unit_intervals','corporate_terms_intervals'):
+        for row in frames[name].iter_rows(named=True):
+            if suspicious(row.get('contract_multiplier')):check(name,row,'contract_multiplier','small_or_invalid_contract_unit')
+    for name in ('position_event_candidates','position_level_intervals'):
+        fields=('natural_person_limit','natural_person_monthly_limit','contract_multiplier') if name.endswith('candidates') else ('position_limit','monthly_position_limit','independent_contract_limit')
+        for row in frames[name].iter_rows(named=True):
+            for field in fields:
+                if suspicious(row.get(field)):check(name,row,field,'small_or_invalid_position_count_or_security_cap')
+            if (row.get('event_type')=='corporate_securities_unit_limit'
+                    and suspicious(row.get('position_unit'))):
+                check(name,row,'position_unit','small_or_invalid_actual_security_conversion_unit')
+    for name in ('margin_event_candidates','margin_level_intervals'):
+        for row in frames[name].iter_rows(named=True):
+            kind=row.get('margin_kind')
+            if name.endswith('candidates'):
+                vectors=[(side,row.get(side)) for side in ('before','after') if row.get(side)]
+            else:vectors=[('level',[row.get(k) for k in ('initial','maintenance','clearing')])]
+            for side,values in vectors:
+                valid=all(isinstance(v,(int,float)) and math.isfinite(v) and v>0 for v in values)
+                ordered=valid and len(values)==3 and values[0]>=values[1]>=values[2]
+                for i,value in enumerate(values):
+                    invalid=(not valid or not ordered or (kind=='notional_rate' and value>1)
+                             or (kind in ('fixed_twd','fixed_usd') and value<100))
+                    if invalid:check(name,dict(row,**{side+'_'+str(i):value}),side+'_'+str(i),'margin_amount_unit_or_order_review')
+    unresolved=[r for r in diagnostics if r['review_status']=='source_review_required']
+    interval=[r for r in unresolved if r['in_interval']]
+    output.mkdir(parents=True,exist_ok=True)
+    atomic_write_json(output/'numeric_rule_diagnostics.json',dict(
+        diagnostics=diagnostics,threshold_is_diagnostic_only=True,financial_values_inferred=False))
+    if diagnostics:
+        atomic_write_parquet(output/'numeric_rule_diagnostics.parquet',pl.from_dicts(diagnostics,infer_schema_length=None))
+    manifest=dict(schema_version=1,contract='source_bound_numeric_rule_audit_v1',
+        status='numeric_intervals_source_review_required' if interval else 'numeric_intervals_checked_candidates_preserved',
+        input_manifest_sha256=sha256_file(root/'manifest.json'),inputs=inputs,
+        input_rows={name:frame.height for name,frame in frames.items()},
+        diagnostic_rows=len(diagnostics),source_review_candidate_rows=len(unresolved)-len(interval),
+        source_review_interval_rows=len(interval),supported_small_value_rows=len(diagnostics)-len(unresolved),
+        threshold_is_diagnostic_only=True,new_ocr_jobs=0,new_accounting_builds=0,
+        training_release_approved=False,builder_sha256=sha256_file(Path(__file__)),
+        outputs={p.name:dict(sha256=sha256_file(p)) for p in output.iterdir() if p.name.startswith('numeric_rule_diagnostics.')})
+    if inputs!={name:sha256_file(root/(name+'.parquet')) for name in names}:
+        raise ValueError('numeric audit input changed during reading')
+    atomic_write_json(output/'manifest.json',manifest)
+    print(json.dumps({k:manifest[k] for k in ('status','diagnostic_rows','source_review_candidate_rows',
+        'source_review_interval_rows','supported_small_value_rows')},ensure_ascii=False))
+    return 2 if interval else 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--daily", type=Path)
@@ -434,9 +521,12 @@ def main() -> int:
     p.add_argument('--raw-universe',type=Path,help='SHA-bound complete raw product inventory, including excluded model codes')
     p.add_argument('--candidate-events',type=Path)
     p.add_argument('--reviews',type=Path)
+    p.add_argument('--numeric-rules',type=Path,help='Audit bound candidate/interval numeric values without an accounting rebuild')
     a = p.parse_args()
     if (a.output_dir / "manifest.json").exists():
         raise FileExistsError("use a new immutable audit output directory")
+    if a.numeric_rules:
+        return audit_numeric_rules(a.numeric_rules,a.output_dir)
     if a.physical_history:
         return audit_prepared_scope(a)
     if not all((a.daily,a.rules,a.verified_daily,a.final_settlement)):

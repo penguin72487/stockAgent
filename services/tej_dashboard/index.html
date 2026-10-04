@@ -6,11 +6,12 @@
   <title>TEJ 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
   <link rel="stylesheet" href="../finlab/styles.css?v=3">
-  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="stylesheet" href="styles.css?v=7">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="tej">
   <a class="skip-link" href="#main">跳到主要內容</a>
   <header class="site-header"><a class="brand" href="../">STOCKAGENT</a><nav data-dashboard-nav="tej" aria-label="公開面板導覽"></nav></header>
   <main id="main">
@@ -18,8 +19,19 @@
       <div><p class="eyebrow">TEJ · READ-ONLY DATA MONITOR</p><h1 id="page-title">TEJ Smart Wizard<br>資料管線</h1><p class="lead">完整目錄、逐欄覆蓋與桌面匯出收據。沿用 FinLab／FinMind 面板架構；頁面只讀本機中繼資料，不操作 Excel、不呼叫 TEJ。</p></div>
       <div class="health-panel"><span>管線狀態</span><strong id="tej-health" class="status loading" role="status" aria-live="polite">讀取中</strong><p id="tej-freshness">取得最新本機觀測…</p><p id="tej-automation">核對自動排程…</p><small>公開唯讀 · 帳號、金鑰、原始值及工作簿永不傳到瀏覽器</small></div>
     </section>
-    <nav class="jump-nav" aria-label="頁內導覽"><a href="#overview">完整清冊</a><a href="#progress">資料量與估時</a><a href="#quota">限額與用量</a><a href="#tables">資料表</a><a href="#features">個別欄位</a><a href="#method">口徑</a></nav>
+    <nav class="jump-nav" aria-label="頁內導覽"><a href="#activity">下載現況</a><a href="#overview">完整清冊</a><a href="#progress">資料量與估時</a><a href="#quota">限額與用量</a><a href="#tables">資料表</a><a href="#features">個別欄位</a><a href="#method">口徑</a></nav>
     <section id="page-alert" class="alert" hidden role="status"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+    <section id="activity" class="section-block" aria-labelledby="activity-title">
+      <header class="section-heading"><span>LIVE</span><div><h2 id="activity-title">下載器即時進度</h2><p id="activity-sync">每 5 秒原位更新；切回此頁立即同步。</p></div><button id="refresh-now" type="button">立即同步</button></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>目前處理資料表</span><strong id="active-table">核對中</strong><p id="active-task">等待下載器收據</p></article>
+        <article class="kpi"><span>目前步驟／已耗時</span><strong id="active-stage">核對中</strong><p id="active-elapsed">—</p></article>
+        <article class="kpi"><span>累計成功下載工作</span><strong id="completed-downloads">—</strong><p id="completed-discoveries">不是這次服務啟動的計數；包含明確來源空回</p></article>
+        <article class="kpi"><span>最後成功入庫 · 臺北</span><strong id="last-success">—</strong><p id="last-success-detail">尚無成功下載收據</p></article>
+      </div>
+      <div id="active-readback-card" class="progress-card" hidden><p id="active-readback-label">尚無來源讀回數</p><progress id="active-readback" class="progress-track" max="1" aria-label="目前資料格讀回進度；尚未驗證入庫"></progress></div>
+      <details id="activity-blockers" class="tej-eta-details" hidden><summary id="blocker-summary">等待原因</summary><ul id="blocker-list"></ul></details>
+    </section>
     <section id="overview" class="section-block" aria-labelledby="overview-title">
       <header class="section-heading"><span>01</span><div><h2 id="overview-title">帳號可見完整清冊</h2><p>目錄可見不等於每張表已成功查詢；同名欄位在不同表、頻率、合併／個體版本中保留獨立身份。</p></div></header>
       <div class="kpi-grid overview-kpis">
@@ -48,6 +60,10 @@
         <article class="kpi"><span>預估本機總容量／分片列</span><strong id="forecast-total-bytes">未知</strong><p><span id="forecast-total-rows">未知</span> 列；非網路流量、非原生觀測數</p></article>
       </div>
       <div class="progress-card"><p id="forecast-progress-label">預估查詢工作分母未知</p><progress id="forecast-progress" class="progress-track" max="1" aria-label="TEJ 預估查詢工作進度，不是已驗證歷史完整率"></progress></div>
+      <div class="tej-volume-progress">
+        <div class="progress-card"><p id="result-row-progress-label">已入庫列數／預估總列數待觀測</p><progress id="result-row-progress" class="progress-track" max="1" aria-label="已入庫分片列／情境預估總列，不是歷史完整率"></progress></div>
+        <div class="progress-card"><p id="byte-progress-label">收據容量／預估本機總容量待觀測</p><progress id="byte-progress" class="progress-track" max="1" aria-label="收據容量／情境預估本機總容量，不是官方網路流量"></progress></div>
+      </div>
       <p id="forecast-storage" class="data-note">本機容量餘裕待觀測。</p>
       <div class="table-scroll tej-stage-scroll" role="region" aria-label="分階段工作量與完成時間" tabindex="0"><table><thead><tr><th>階段／範圍</th><th>欄位／下載依賴</th><th>新增剩餘查詢</th><th>已匯出／預估總列</th><th>實際／預估總容量</th><th>完成依賴的剩餘工時</th><th>若現在連續執行的完成日 · 臺北</th><th>未解條件</th></tr></thead><tbody id="phase-rows"></tbody></table></div>
       <details class="tej-eta-details"><summary>估算依據與限制</summary><p id="forecast-assumptions">等待本機中繼資料。</p></details>
@@ -61,6 +77,7 @@
         <article class="kpi"><span>桌面每日請求上限</span><strong id="quota-day-calls">未知</strong><p>官方帳號實際已用量也未取得</p></article>
         <article class="kpi"><span>桌面每日列數上限</span><strong id="quota-day-rows">未知</strong><p id="quota-reset">重置時間與時區尚未確認</p></article>
       </div>
+      <p id="local-capacity" class="data-note">本機批次容量待讀取；不是官方帳號流量上限。</p>
       <p class="data-note">官方 <a href="https://api.tej.com.tw/document_python.html" target="_blank" rel="noopener noreferrer">TEJ API 文件</a>提供帳號每日請求、每日／每月筆數與用量；需要獨立 API key，不能由桌面登入推定。桌面限額未查證不表示無限制；遇到來源配額或權限視窗立即停止，不自動關閉或繞過。</p>
     </section>
     <section id="tables" class="section-block" aria-labelledby="tables-title">
@@ -80,5 +97,7 @@
       <p class="limitation">1900 年只是往前搜尋起點，不宣稱資料自該年開始。v4 先驗證公司／日期介面可用、來源通知已完成且沒有錯誤視窗，再保存完整資料格的顯示字串，避開故障的 Excel ActiveX 匯出。因 TEJ 記憶體錯誤而可能沿用的舊選單範圍保留、撤回重驗，不當成歷史完整證明。尚未逐表證明底層數值精度。另建的十進位數值欄只解析明確數字，不猜地區格式。原始值不做 log、補零、插值或任意捨入；來源自身的 log 衍生欄位仍保存，但標為不得作原始值訓練輸入。已明示「千股」的欄位另建股數換算，原值與單位保留。失敗及未知操作結果不當成完成；明確空回只計入查詢範圍，不計入資料筆數。查詢格點可能帶出最近一期，不能把其日期當發布日。本機授權資料不自動公開、同步冷庫或注入模型。下載順序候選不是已證明同義或已完成多源一致性校驗。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=11" defer></script><script src="app.js?v=14" defer></script>
+  <script src="../dashboard-core.js?v=14" defer></script>
+  <script src="../dashboard-acquisition.js?v=3" defer></script>
+  <script src="app.js?v=19" defer></script>
 </body></html>

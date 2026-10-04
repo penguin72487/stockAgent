@@ -1,0 +1,18 @@
+# Immutable reproduction config for the completed LayerNorm/raw-feature-basis
+# v4 artifact.  It intentionally retains batch-cadence optimization and the
+# partial v12 transfer so the historical result remains auditable.
+base_config: tw_day_trade_attention_training_vastai1t.yaml
+
+experiment_name: tw-day-trade-last-last-only-layernorm-minute-paper-parity-v4
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_last_last_only_layernorm_minute50_margin_carry_capital10m_batch32_share_replacement_v4
+
+environment:
+  cpu_threads: 112
+
+training:
+  day_trade_optimizer_step_per_trajectory: false
+  financial_transformer:
+    temporal_pooling: last
+    temporal_query_mode: last_only

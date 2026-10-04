@@ -273,6 +273,17 @@ def empty_export():
             "capture_method": "owned_vendor_empty_dialog", "source_message": "ERROR1:No data !!(wbk22)"}
 
 
+@pytest.mark.parametrize('ownership',['exact_owned_modal_v1','unique_same_thread_ownerless_modal_v1'])
+def test_versioned_normal_empty_modal_contract_preserves_zero_source_values(ownership):
+    from downloader.tej_history import validate_download_evidence
+    doc={**empty_export(),'empty_dialog_ownership_contract':ownership,
+         'empty_acknowledgement_contract':'normal_ok_control_notification_no_foreground_v1'}
+    _,rows,profile=validate_download_evidence(request(),doc)
+    assert rows==[] and profile['omitted_query_grid_rows']==4
+    doc['empty_acknowledgement_contract']='dismiss_any_error'
+    with pytest.raises(ValueError):validate_download_evidence(request(),doc)
+
+
 def test_explicit_empty_response_resolves_scope_not_data_and_recovers_once(registry):
     repo, root, _, _ = registry
     run_one(root, FakeBridge())
@@ -574,7 +585,7 @@ def test_bridge_safe_retry_requires_exact_private_prequery_proof(registry,monkey
         elif mutation in {'task_id','table','provider','action','error_code'}:proof[mutation] = 'wrong'
         if mutation != 'absent':atomic_write_json(output.with_suffix('.json.outcome.json'),proof)
         return SimpleNamespace(returncode=1,stderr=b'SECRET private diagnostic',stdout=b'')
-    monkeypatch.setattr(collector.subprocess,'run',fail)
+    monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',fail)
     expected = BeforeDataQueryError if mutation is None else RuntimeError
     with pytest.raises(expected) as caught:
         DesktopBridge(root,session).execute(root,task)
@@ -645,7 +656,7 @@ def test_bridge_timeout_never_exposes_command_or_retries(registry,monkeypatch):
     monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(lambda path:str(path)))
     def timeout(*args,**kwargs):
         raise subprocess.TimeoutExpired('SECRET command',900,stderr=b'private vendor path')
-    monkeypatch.setattr(collector.subprocess,'run',timeout)
+    monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',timeout)
     session = dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='Book2',ExpectedExcelWindow=3)
     with pytest.raises(RuntimeError,match='requires_recovery') as caught:
         DesktopBridge(root,session).execute(root,task)
@@ -1150,6 +1161,107 @@ def test_actual_worker_short_wait_does_not_flap_queued_or_claim_active_query(reg
     assert status['worker']['state'] == ('waiting_local_retry' if local_retry else 'between_tasks')
     assert status['workload']['running_tasks'] == 0
     assert 'owner_pid' not in json.dumps(status)
+
+
+def _live_readback(registry):
+    """A registered task with a real local owner, but fixture-only source data."""
+    from datetime import UTC, datetime, timedelta
+    import os
+    repo, root, _, _ = registry
+    assert run_one(root, FakeBridge()) == 'completed_task'
+    now = datetime.now(UTC)
+    started = now-timedelta(seconds=5)
+    with closing(connect(root)) as con, con:
+        task = dict(con.execute("SELECT * FROM tasks WHERE kind='download' AND state='pending' LIMIT 1").fetchone())
+        attempt = task['task_id']+'-'+'a'*32
+        con.execute("UPDATE tasks SET state='running',attempted_at_utc=?,active_attempt_id=? WHERE task_id=?",
+                    (started.isoformat(), attempt, task['task_id']))
+    worker = {'state': 'running', 'task_id': task['task_id'], 'kind': 'download',
+              'owner_pid': os.getpid(), 'owner_start_ticks': Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ',1)[1].split()[19],
+              'observed_at_utc': started.isoformat(), 'deadline_at_utc': (started+timedelta(seconds=900)).isoformat(),
+              'bridge_attempt_id': attempt}
+    atomic_write_json(root/'worker_status.json', worker)
+    progress = {'contract': 'tej_native_readback_progress_v1', 'task_id': task['task_id'],
+                'attempt_id': attempt, 'stage': 'reading_preview', 'observed_at_utc': now.isoformat(),
+                'scanned_row_slots': 2, 'total_row_slots': 4, 'private_exception': 'SECRET'}
+    path = root/'progress'/(attempt+'.json.progress.json')
+    atomic_write_json(path, progress)
+    return repo, root, now, task, worker, progress, path
+
+
+def test_real_readback_does_not_count_as_committed_data_or_renew_deadline(registry):
+    repo, root, now, _, worker, _, _ = _live_readback(registry)
+    status = build_tej_public_status(repo, now=now)
+    current = status['activity']['current_task']
+    assert current['stage'] == 'reading_preview' and current['readback_ratio'] == .5
+    assert current['elapsed_seconds'] == 5 and current['adopted'] is False
+    assert status['activity']['completed_download_tasks'] == 0
+    assert status['workload']['exported_rows'] == 0
+    assert 'SECRET' not in json.dumps(status) and 'bridge_attempt_id' not in json.dumps(status)
+    assert json.loads((root/'worker_status.json').read_text()) == worker
+
+
+@pytest.mark.parametrize('mutation', ['expired_owner', 'pid_reused', 'wrong_attempt', 'old_attempt',
+    'wrong_task', 'invalid_stage', 'future_clock', 'oversized', 'symlink', 'invalid_slots', 'bool_slots'])
+def test_readback_requires_exact_attempt_bounded_time_and_safe_metadata(registry, mutation):
+    from datetime import timedelta
+    repo, root, now, _, worker, progress, path = _live_readback(registry)
+    if mutation == 'expired_owner': worker['deadline_at_utc'] = (now-timedelta(seconds=1)).isoformat()
+    if mutation == 'pid_reused': worker['owner_start_ticks'] = 'different'
+    if mutation == 'wrong_attempt': worker['bridge_attempt_id'] = '../../private'
+    if mutation == 'old_attempt': progress['attempt_id'] = progress['task_id']+'-'+'b'*32
+    if mutation == 'wrong_task': progress['task_id'] = 'b'*24
+    if mutation == 'invalid_stage': progress['stage'] = 'SECRET'
+    if mutation == 'future_clock': progress['observed_at_utc'] = (now+timedelta(seconds=6)).isoformat()
+    if mutation == 'invalid_slots': progress['scanned_row_slots'] = 5
+    if mutation == 'bool_slots': progress['scanned_row_slots'] = True
+    if mutation == 'oversized': progress['private_exception'] = 'SECRET'+'x'*65536
+    atomic_write_json(root/'worker_status.json', worker)
+    atomic_write_json(path, progress)
+    if mutation == 'symlink':
+        target = repo/'private.json'
+        target.write_bytes(path.read_bytes()); path.unlink(); path.symlink_to(target)
+    public = build_tej_public_status(repo, now=now)
+    current = public['activity']['current_task']
+    if mutation in {'expired_owner', 'pid_reused'}: assert current is None
+    else:
+        assert current['readback_ratio'] is None
+        if mutation not in {'invalid_slots', 'bool_slots'}: assert current['stage'] == 'awaiting_progress'
+    assert 'SECRET' not in json.dumps(public)
+
+
+def test_last_success_and_cumulative_totals_survive_scheduler_restart(registry):
+    from datetime import UTC, datetime, timedelta
+    import os
+    repo, root, _, _ = registry
+    run_one(root, FakeBridge()); run_one(root, FakeBridge())
+    before = build_tej_public_status(repo)['activity']
+    assert before['completed_download_tasks'] == before['completed_discovery_tasks'] == 1
+    assert before['last_successful_download']['actual_rows'] == 4
+    now = datetime.now(UTC)
+    atomic_write_json(root/'scheduler_status.json', {
+        'contract': 'persistent_serial_evidence_preserving_supervision_v1', 'continuous': True,
+        'state': 'waiting_queue', 'observed_at_utc': now.isoformat(),
+        'deadline_at_utc': (now+timedelta(seconds=60)).isoformat(),
+        'owner_pid': os.getpid(), 'owner_start_ticks': Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ',1)[1].split()[19],
+        'completed_tasks': 0, 'last_completed_at_utc': None})
+    after = build_tej_public_status(repo, now=now)
+    assert after['scheduler']['completed_tasks'] == 0
+    assert after['activity']['last_successful_download'] == before['last_successful_download']
+    assert after['activity']['completion_revision'] == before['completion_revision']
+    assert after['activity']['current_task'] is None
+
+
+def test_failed_source_is_visible_but_never_counts_as_a_success(registry):
+    repo, root, _, _ = registry
+    class Invalid:
+        def execute(self, *args): raise ValueError('SECRET')
+    assert run_one(root, Invalid()) == 'source_validation_failed'
+    public = build_tej_public_status(repo)
+    assert public['activity']['completed_download_tasks'] == 0
+    assert public['activity']['last_successful_download'] is None
+    assert public['activity']['blocked_tasks'][0]['last_error_code'] == 'source_validation_failed'
+    assert 'SECRET' not in json.dumps(public)
 
 
 def test_recovered_result_current_scale_is_not_original_query_unit_proof(registry):

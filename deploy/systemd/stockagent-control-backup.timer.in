@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily backup of StockAgent engineering work receipts
+
+[Timer]
+OnActiveSec=30m
+OnCalendar=*-*-* 03:05:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=stockagent-control-backup.service
+
+[Install]
+WantedBy=timers.target

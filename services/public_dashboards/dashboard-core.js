@@ -66,6 +66,8 @@
   }
 
   function metricNumber(value, maximum = 600000) {
+    if (value == null || !["number", "string"].includes(typeof value)
+        || (typeof value === "string" && !value.trim())) return null;
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed < 0) return null;
     return Math.round(Math.min(parsed, maximum) * 1000) / 1000;
@@ -98,7 +100,9 @@
       "prepareMs", "drawMs", "pointCount", "seriesCount",
     ];
     for (const field of numericFields) {
-      const parsed = metricNumber(row[field]);
+      const maximum = field === "pointCount" || field === "seriesCount"
+        ? Number.MAX_SAFE_INTEGER : 600000;
+      const parsed = metricNumber(row[field], maximum);
       if (parsed != null) metric[field] = parsed;
     }
     const status = Number(row.status);
@@ -303,6 +307,9 @@
   function installInteractionMeasurements() {
     if (!global.document?.addEventListener) return;
     global.document.addEventListener("click", (event) => beginInteractionMeasurement(event), true);
+    global.document.addEventListener("keydown", (event) => {
+      if (["Enter", " ", "Escape"].includes(event.key)) beginInteractionMeasurement(event);
+    }, true);
     global.document.addEventListener("change", (event) => {
       const prior = pendingInputMeasurements.get(event.target);
       if (prior) {
@@ -657,6 +664,82 @@
     });
   }
 
+  // Visibility is a rendering boundary, not a different data/progress model.
+  // Share event handling; closed disclosures must not count as visible merely
+  // because IntersectionObserver still has an old intersection entry.
+  const visibilityChecks = new Set();
+  let visibilityEventsInstalled = false;
+  let visibilityCheckQueued = false;
+
+  function isElementVisible(target, {marginPx = 0} = {}) {
+    const node = typeof target === "string" ? byId(target) : target;
+    if (!node || global.document?.hidden || global.document?.readyState === "loading"
+        || node.closest?.("details:not([open]), [hidden]")
+        || !node.getClientRects?.().length) return false;
+    const rect = node.getBoundingClientRect();
+    const height = global.innerHeight || global.document?.documentElement?.clientHeight || 0;
+    const width = global.innerWidth || global.document?.documentElement?.clientWidth || 0;
+    return rect.bottom > -marginPx && rect.top < height + marginPx
+      && rect.right > -marginPx && rect.left < width + marginPx;
+  }
+
+  function queueVisibilityChecks() {
+    if (visibilityCheckQueued) return;
+    visibilityCheckQueued = true;
+    const check = () => {
+      visibilityCheckQueued = false;
+      for (const update of visibilityChecks) {
+        try { update(); }
+        catch { global.console?.error?.("Dashboard visibility callback failed"); }
+      }
+    };
+    if (global.requestAnimationFrame) global.requestAnimationFrame(check);
+    else Promise.resolve().then(check);
+  }
+
+  function observeVisibility(target, onChange, {marginPx = 0} = {}) {
+    const node = typeof target === "string" ? byId(target) : target;
+    if (!node || typeof onChange !== "function") throw new TypeError("Invalid visibility observer");
+    let visible = null;
+    const update = () => {
+      const next = isElementVisible(node, {marginPx});
+      if (next !== visible) { visible = next; onChange(next); }
+    };
+    visibilityChecks.add(update);
+    if (!visibilityEventsInstalled) {
+      visibilityEventsInstalled = true;
+      for (const name of ["toggle", "acquisition:reveal", "visibilitychange", "DOMContentLoaded"]) {
+        global.document?.addEventListener(name, queueVisibilityChecks, true);
+      }
+      global.addEventListener?.("resize", queueVisibilityChecks, {passive: true});
+      // IntersectionObserver does not track a display:none ancestor in some
+      // browsers. The cheap, frame-coalesced fallback also covers no-IO clients.
+      global.addEventListener?.("scroll", queueVisibilityChecks, {passive: true});
+    }
+    const observer = typeof global.IntersectionObserver === "function"
+      ? new global.IntersectionObserver(update, {rootMargin: `${marginPx}px`}) : null;
+    observer?.observe(node);
+    update();
+    return Object.freeze({
+      isVisible: () => isElementVisible(node, {marginPx}),
+      dispose() { visibilityChecks.delete(update); observer?.disconnect(); },
+    });
+  }
+
+  function createDeferredRenderer(target, render) {
+    let pending = null;
+    const flush = () => {
+      if (!pending || !isElementVisible(target)) return;
+      const args = pending;
+      pending = null;
+      render(...args);
+    };
+    const observer = observeVisibility(target, (visible) => { if (visible) flush(); });
+    const deferred = (...args) => { pending = args; flush(); };
+    deferred.dispose = () => { pending = null; observer.dispose(); };
+    return deferred;
+  }
+
   function svgElement(name, attributes = {}) {
     if (!global.document) return null;
     const node = global.document.createElementNS("http://www.w3.org/2000/svg", String(name));
@@ -666,10 +749,8 @@
     return node;
   }
 
-  function dashboardHref(item, current) {
-    if (current === "overview") return item.id === "overview" ? "./" : `${item.slug}/`;
-    if (item.id === "overview") return "../";
-    return item.id === current ? "./" : `../${item.slug}/`;
+  function dashboardHref(item) {
+    return item.slug ? `/${item.slug}/` : "/";
   }
 
   function mountNavigation(target) {
@@ -683,7 +764,7 @@
     const fragment = global.document.createDocumentFragment();
     for (const item of NAV_ITEMS) {
       const link = global.document.createElement("a");
-      link.href = dashboardHref(item, current);
+      link.href = dashboardHref(item);
       link.textContent = item.label;
       if (item.id === current) link.setAttribute("aria-current", "page");
       fragment.append(link);
@@ -717,8 +798,8 @@
         target.addEventListener("click", (event) => {
           if (event.target?.closest?.("a")) setExpanded(false);
         });
-        target.addEventListener("keydown", (event) => {
-          if (event.key !== "Escape") return;
+        header.addEventListener("keydown", (event) => {
+          if (event.key !== "Escape" || target.dataset.expanded !== "true") return;
           setExpanded(false);
           toggle.focus();
         });
@@ -744,16 +825,21 @@
     return Boolean(table.closest(".table-scroll,.table-wrap"));
   }
 
-  function enhanceResponsiveTable(table) {
+  function enhanceResponsiveTable(table, affectedRows = null) {
     if (!responsiveTableEligible(table)) return false;
     const headers = [...table.querySelectorAll("thead th")]
       .map((cell) => String(cell.textContent || "").trim());
     if (!headers.length) return false;
-    table.classList.add("dashboard-responsive-table");
-    for (const row of table.querySelectorAll("tbody tr")) {
+    if (!table.classList.contains("dashboard-responsive-table")) {
+      table.classList.add("dashboard-responsive-table");
+    }
+    for (const row of affectedRows ?? table.querySelectorAll("tbody tr")) {
       const cells = [...row.children].filter((cell) => cell.tagName === "TD");
       if (cells.length !== headers.length) continue;
-      cells.forEach((cell, index) => cell.setAttribute("data-label", headers[index] || `欄位 ${index + 1}`));
+      cells.forEach((cell, index) => {
+        const label = headers[index] || `欄位 ${index + 1}`;
+        if (cell.getAttribute("data-label") !== label) cell.setAttribute("data-label", label);
+      });
     }
     return true;
   }
@@ -767,21 +853,41 @@
   function observeResponsiveTables() {
     if (!global.MutationObserver || !global.document?.body) return null;
     const observer = new global.MutationObserver((records) => {
-      const tables = new Set();
+      const tables = new Map();
+      const queue = (table, row = null) => {
+        if (!table || row?.closest?.("thead,tfoot")) return;
+        if (!row) tables.set(table, null);
+        else if (!tables.has(table)) tables.set(table, new Set([row]));
+        else tables.get(table)?.add(row);
+      };
       for (const record of records) {
-        const owner = record.target?.closest?.("table");
-        if (owner) tables.add(owner);
+        const target = record.target?.nodeType === 3 ? record.target.parentElement : record.target;
+        const owner = target?.closest?.("table");
+        if (owner) {
+          if (target === owner || target.closest?.("thead")) queue(owner);
+          else {
+            const row = target.closest?.("tr");
+            if (row) queue(owner, row);
+          }
+        }
         for (const node of record.addedNodes || []) {
           if (node.nodeType !== 1) continue;
-          if (node.matches?.("table")) tables.add(node);
+          if (node.matches?.("table")) queue(node);
           const closest = node.closest?.("table");
-          if (closest) tables.add(closest);
-          for (const table of node.querySelectorAll?.("table") || []) tables.add(table);
+          if (closest) {
+            if (node.closest?.("thead")) queue(closest);
+            else {
+              const row = node.closest?.("tr");
+              if (row) queue(closest, row);
+              else for (const addedRow of node.querySelectorAll?.("tr") || []) queue(closest, addedRow);
+            }
+          }
+          for (const table of node.querySelectorAll?.("table") || []) queue(table);
         }
       }
-      tables.forEach(enhanceResponsiveTable);
+      tables.forEach((rows, table) => enhanceResponsiveTable(table, rows));
     });
-    observer.observe(global.document.body, {childList: true, subtree: true});
+    observer.observe(global.document.body, {childList: true, characterData: true, subtree: true});
     return observer;
   }
 
@@ -791,13 +897,29 @@
     if (intervalMs == null || intervalMs < 250) {
       throw new RangeError("intervalMs must be at least 250 milliseconds");
     }
-    let disposed = false;
+    let disposed = false, pending = null, inFlight = false, visibleRefreshQueued = false;
     const run = () => {
       if (disposed || (options.pauseWhenHidden !== false && global.document?.hidden)) return;
-      Promise.resolve(callback()).catch((error) => options.onError?.(error));
+      if (inFlight) return pending;
+      inFlight = true;
+      let result;
+      try { result = callback(); }
+      catch (error) { result = Promise.reject(error); }
+      pending = Promise.resolve(result).catch((error) => options.onError?.(error)).finally(() => {
+        inFlight = false;
+        pending = null;
+        if (visibleRefreshQueued) {
+          visibleRefreshQueued = false;
+          run();
+        }
+      });
+      return pending;
     };
     const visibilityHandler = () => {
-      if (!global.document.hidden && options.refreshOnVisible !== false) run();
+      if (!global.document.hidden && options.refreshOnVisible !== false) {
+        if (inFlight) visibleRefreshQueued = true;
+        else run();
+      }
     };
     const timer = global.setInterval(run, intervalMs);
     global.document?.addEventListener("visibilitychange", visibilityHandler);
@@ -807,6 +929,7 @@
       dispose() {
         if (disposed) return;
         disposed = true;
+        visibleRefreshQueued = false;
         global.clearInterval(timer);
         global.document?.removeEventListener("visibilitychange", visibilityHandler);
       },
@@ -880,7 +1003,7 @@
   });
 
   const api = Object.freeze({
-    version: 4,
+    version: 5,
     DEFAULT_TIMEOUT_MS,
     PERFORMANCE_SCHEMA_VERSION,
     PERFORMANCE_HISTORY_LIMIT,
@@ -906,6 +1029,9 @@
     createFetch,
     createJsonFetcher,
     createLatestRequest,
+    isElementVisible,
+    observeVisibility,
+    createDeferredRenderer,
     svgElement,
     mountNavigation,
     mountNavigations,

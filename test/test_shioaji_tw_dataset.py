@@ -291,9 +291,11 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@pytest.mark.parametrize("local_only", [False, True])
 def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    local_only: bool,
 ) -> None:
     base_root = tmp_path / "data_tw_public" / "stocks"
     shioaji_root = tmp_path / "data_tw_public" / "shioaji"
@@ -401,6 +403,47 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
         ),
         encoding="utf-8",
     )
+    if local_only:
+        from downloader.shioaji_daily_calendar import DAILY_CALENDAR_CONTRACT, session_dates_sha256
+        from scripts import audit_tw_shioaji_dataset as auditor
+        from scripts import build_tw_shioaji_dataset as builder
+
+        sessions = {date(2020, 3, day) for day in (2, 3, 4)}
+        calendar = {
+            "contract": DAILY_CALENDAR_CONTRACT, "root": str(base_root.parent),
+            "sha256": "c" * 64, "start_date": "2020-03-02", "end_date": "2020-03-04",
+            "session_dates_sha256": session_dates_sha256(sessions, date(2020, 3, 2), date(2020, 3, 4)),
+        }
+        monkeypatch.setattr(builder, "load_daily_calendar", lambda *_args: (sessions, calendar))
+        monkeypatch.setattr(auditor, "load_daily_calendar", lambda *_args: (sessions, calendar))
+        minute_summary_path = tmp_path / "minute-summary.json"
+        minute_summary_path.write_text('{"source":"sealed minute fixture"}')
+        minute_manifest_path = tmp_path / "minute-manifest.json"
+        minute_manifest_path.write_text('{"symbol":"2330"}')
+        summary_path = daily_path.with_suffix(".summary.json")
+        summary = json.loads(summary_path.read_text())
+        summary.update({
+            "materialization_mode": "verified_local_minute", "official_calendar": calendar,
+            "quarantined_non_session_source_rows": {}, "source_minute_chunks_verified": 1,
+            "source_minute_rows": int(_shioaji_frame()["shioaji_minute_bars"].sum()),
+            "minute_manifest_receipt": {
+                "path": str(minute_manifest_path), "size": minute_manifest_path.stat().st_size,
+                "sha256": _file_sha256(minute_manifest_path),
+            },
+        })
+        summary_path.write_text(json.dumps(summary))
+        download_path = shioaji_root / "download_summary.json"
+        download = json.loads(download_path.read_text())
+        download.update({
+            "start_date": "2020-03-02", "materialization_mode": "verified_local_minute",
+            "api_requests_started": 0, "daily_calendar_contract": DAILY_CALENDAR_CONTRACT,
+            "official_calendar": calendar, "quarantined_non_session_source_rows": 0,
+            "source_minute_summary_receipt": {
+                "path": str(minute_summary_path), "size": minute_summary_path.stat().st_size,
+                "sha256": _file_sha256(minute_summary_path),
+            },
+        })
+        download_path.write_text(json.dumps(download))
     monkeypatch.setattr(
         sys,
         "argv",
@@ -446,8 +489,24 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     assert audit["status"] == "ok"
     assert audit["symbols"] == 2
     assert audit["public_only_contract_unavailable_symbols"] == 1
-    assert audit["daily_chunk_receipts"] == 1
+    assert audit["daily_chunk_receipts"] == (0 if local_only else 1)
     assert audit["storage_frequency"] == "daily"
+    if local_only:
+        assert audit["non_session_admission_verified"] is True
+        assert audit["source_minute_chunk_receipts"] == 1
+        assert audit["quarantined_non_session_source_rows"] == 0
+        output_path = output_root / "2330_features.parquet"
+        good_output = pl.read_parquet(output_path)
+        pl.concat([
+            good_output,
+            good_output.tail(1).with_columns(pl.lit(date(2020, 3, 8)).alias("date")),
+        ]).write_parquet(output_path)
+        with pytest.raises(RuntimeError, match="hybrid contains non-session Shioaji dates"):
+            auditor.audit(
+                base_stock_root=base_root, shioaji_root=shioaji_root,
+                dataset_root=output_root, verify_chunk_checksums=True,
+            )
+        good_output.write_parquet(output_path)
     (base_root / "official_symbol_build_summary.json").write_text(
         '{"build":"updated"}', encoding="utf-8"
     )

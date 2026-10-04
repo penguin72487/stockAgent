@@ -5,6 +5,11 @@
 `artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5/run_manifest.json`
 中的 `configuration` 完全一致。
 
+2026-10-03 保存註記：上述 v5 frozen YAML 原檔已連同 SHA 與完整繼承鏈移至
+[歷史 bundle](../configs/historical/tw_futures_v17_20261003/manifest.json)。
+現行一般模式的 base reference 同步指向該原檔，未改 numerical settings；
+歷史鏈不因可解析便視為相容目前 strict config ABI。以下保留當日實驗紀錄。
+
 | 模式 | 設定 | 正式產物位置 |
 |---|---|---|
 | 當沖 | `configs/markets/tw_futures_v8_intraday.yaml` | `artifacts/markets/tw_futures_v8_intraday/` |

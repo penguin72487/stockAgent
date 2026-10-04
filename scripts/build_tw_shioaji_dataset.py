@@ -15,6 +15,12 @@ from typing import Any
 import polars as pl
 import pyarrow.parquet as pq
 
+from downloader.shioaji_daily_calendar import (
+    DAILY_CALENDAR_CONTRACT,
+    calendar_prefix_matches,
+    load_daily_calendar,
+)
+
 
 SOURCE_NAME = "tw_public_before_shioaji_after"
 SHIOAJI_SOURCE_NAME = "shioaji_kbars_1m"
@@ -56,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("data_tw_public/shioaji/stocks")
     )
+    parser.add_argument("--calendar-root", type=Path, default=Path("data_tw_public"))
     parser.add_argument("--cutover-date", default=DEFAULT_CUTOVER.isoformat())
     parser.add_argument(
         "--allow-incomplete",
@@ -479,6 +486,21 @@ def main() -> None:
     download_summary = _validate_download_summary(
         args.shioaji_root, allow_incomplete=bool(args.allow_incomplete)
     )
+    download_summary_receipt = _receipt(args.shioaji_root / "download_summary.json")
+    local_materialization = download_summary.get("materialization_mode") == "verified_local_minute"
+    official_calendar = None
+    official_sessions: set[date] = set()
+    if local_materialization:
+        start = date.fromisoformat(str(download_summary["start_date"]))
+        end = date.fromisoformat(str(download_summary["end_date"]))
+        official_sessions, official_calendar = load_daily_calendar(args.calendar_root, start, end)
+        if not (
+            download_summary.get("daily_calendar_contract") == DAILY_CALENDAR_CONTRACT
+            and calendar_prefix_matches(
+                download_summary.get("official_calendar"), official_sessions, official_calendar, end
+            )
+        ):
+            raise RuntimeError("local daily summary lacks verified calendar admission")
     download_report = _load_report(args.shioaji_root)
     if not args.allow_incomplete:
         unaccounted = sorted(set(target_symbols) - set(download_report))
@@ -539,6 +561,13 @@ def main() -> None:
             daily_summary = _validate_daily_receipt(daily_path)
             base = pl.read_parquet(base_path)
             shioaji = pl.read_parquet(daily_path)
+            if local_materialization and not (
+                calendar_prefix_matches(
+                    daily_summary.get("official_calendar"), official_sessions, official_calendar, end
+                )
+                and set(shioaji["date"]) <= official_sessions
+            ):
+                raise RuntimeError(f"{symbol}: local daily calendar admission is invalid")
             declared_source_gap_dates = {
                 date.fromisoformat(str(value))
                 for value in daily_summary.get("declared_source_gap_dates", [])
@@ -588,6 +617,8 @@ def main() -> None:
         )
     if base_build_receipt != _receipt(base_build_path):
         raise RuntimeError("official symbol build changed during Shioaji hybrid materialization")
+    if download_summary_receipt != _receipt(args.shioaji_root / "download_summary.json"):
+        raise RuntimeError("Shioaji download summary changed during hybrid materialization")
     shutil.copy2(symbols_path, args.output_dir / "symbols.csv")
     provenance = {
         "schema_version": 1,
@@ -612,8 +643,13 @@ def main() -> None:
     }
     _atomic_write_json(args.output_dir / "return_price_provenance.json", provenance)
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": SOURCE_NAME,
+        "daily_calendar_contract": DAILY_CALENDAR_CONTRACT if local_materialization else None,
+        "official_calendar": official_calendar,
+        "quarantined_non_session_source_rows": int(
+            download_summary.get("quarantined_non_session_source_rows", 0)
+        ),
         "cutover_date": cutover.isoformat(),
         "quote_contract": (
             "For each covered symbol, public rows precede its first Shioaji daily "
@@ -647,11 +683,7 @@ def main() -> None:
         "public_source_gap_fallback_rows": sum(
             item.public_source_gap_fallback_rows for item in results
         ),
-        "download_summary_receipt": {
-            "path": str(args.shioaji_root / "download_summary.json"),
-            "size": int((args.shioaji_root / "download_summary.json").stat().st_size),
-            "sha256": _sha256(args.shioaji_root / "download_summary.json"),
-        },
+        "download_summary_receipt": download_summary_receipt,
         "base_symbol_build_receipt": base_build_receipt,
         "download_end_date": download_summary.get("end_date"),
         "report_path": str(report_path),

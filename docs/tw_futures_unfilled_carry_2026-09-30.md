@@ -37,7 +37,10 @@
 到期證據已齊全。這個 adapter 的全面准入目前仍未完成。
 
 修正後的遠端控制設定：
-[`tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml`](../configs/markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml)。
+[`tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml`](../configs/historical/tw_futures_v17_20261003/markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml)。
+此歷史工程設定在 2026-10-03 連同原始繼承鏈與 SHA-256 歸檔；它依賴舊版程式
+ABI，目前程式會拒絕執行。完整範圍見
+[archive manifest](../configs/historical/tw_futures_v17_20261003/manifest.json)。
 
 遠端兩張 RTX 5090 已完成 fold 10 的三個 epoch、validation／test、推論、曲線、
 checkpoint 與帳戶驗收，合計 286.95 秒。實際訓練決策日期為

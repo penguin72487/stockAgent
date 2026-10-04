@@ -8,11 +8,12 @@
   <title>FinMind 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
   <link rel="stylesheet" href="../finlab/styles.css?v=3">
-  <link rel="stylesheet" href="styles.css?v=7">
+  <link rel="stylesheet" href="styles.css?v=10">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="finmind">
   <a class="skip-link" href="#main">跳到主要內容</a>
   <header class="site-header">
     <a class="brand" href="../">STOCKAGENT</a>
@@ -91,19 +92,21 @@
     </section>
 
     <section id="backfill" class="section-block" aria-labelledby="downloads-title">
-      <header class="section-heading"><span>04</span><div><h2 id="downloads-title">逐資料集歷史進度</h2><p>分母為目前已清點的查詢任務；逐檔主檔尚未載入時分母會增加。來源空回算已查驗，但不算有數值；失敗與未知歷史不算完成。</p></div></header>
+      <header class="section-heading"><span>04</span><div><h2 id="downloads-title">逐資料集歷史進度</h2><p>已建待辦與未建歷史搜尋候選分開清點；已依官方證據排除台股現貨休市日，上市存續期間及其他市場未知日曆仍待查。候選不是確定缺漏筆數；來源空回算已查驗，但不算有數值，失敗與未知歷史不算完成。</p></div></header>
       <div class="progress-card">
-        <div class="progress-copy"><div><span>已查驗／目前已建立任務</span><strong id="download-progress-label">—</strong></div><div class="fleet-eta"><span>全域剩餘工作估算 · FinMind</span><strong id="download-global-eta">讀取估算中</strong><p id="download-global-eta-basis">目前已排程工作；未知與未排程範圍另列。</p></div></div>
-        <progress id="download-progress" class="progress-track" max="1" aria-label="FinMind 目前已建立任務的查驗率"></progress>
+        <div class="progress-copy"><div><span>候選搜尋進度（非資料完整率）</span><strong id="download-progress-label">—</strong><p id="download-progress-detail" class="progress-scope">已建任務與未建歷史搜尋候選分開顯示。</p></div><div class="fleet-eta"><span>全域剩餘工作估算 · FinMind</span><strong id="download-global-eta">讀取估算中</strong><p id="download-global-eta-basis">實際待辦與未建候選分開顯示；未知與未排程範圍另列。</p></div></div>
+        <progress id="download-progress" class="progress-track" max="1" aria-label="FinMind 已查驗任務占已建及未建搜尋候選目標的比率，非資料完整率"></progress>
         <div class="completion-estimates" role="group" aria-label="FinMind 全域剩餘時間三情境估算">
           <article class="completion-estimate"><h3>最快 <span>樂觀情境</span></h3><strong id="download-eta-fastest">—</strong><p id="download-eta-fastest-complete">完成日期待估算</p><small id="download-eta-fastest-detail">工作量與速度待核實</small><small id="download-eta-fastest-basis">—</small></article>
           <article class="completion-estimate completion-estimate-central"><h3>中間 <span>中間情境</span></h3><strong id="download-eta-central">—</strong><p id="download-eta-central-complete">完成日期待估算</p><small id="download-eta-central-detail">工作量與速度待核實</small><small id="download-eta-central-basis">—</small></article>
           <article class="completion-estimate"><h3>最慢 <span>保守情境</span></h3><strong id="download-eta-slowest">—</strong><p id="download-eta-slowest-complete">完成日期待估算</p><small id="download-eta-slowest-detail">工作量與速度待核實</small><small id="download-eta-slowest-basis">—</small></article>
         </div>
         <p class="estimate-caveat">三個數字是條件式情境，不是保證完成期限或統計信賴區間。「最慢」不是硬上界；持續故障或權限未解決時，實際完成時間可能無限延後。</p>
-        <p class="estimate-exclusions">時間是取樣時的工作量預估，不是成功倒數。失敗／部分回應仍待重試時，先顯示待重試，不用其他資料的請求速度推定它會成功。分鐘／tick 含尚未扣除上市前與休市日的日曆候選；持續追新沒有永久完工日。</p>
+        <p class="estimate-exclusions">時間是取樣時的工作量預估，不是成功倒數。失敗／部分回應仍待重試時，保留待重試狀態，另列「下次重試成功」的條件試算。台股現貨已證實的休市日不送查詢；未知上市期間及其他市場日曆仍列為候選。持續追新沒有永久完工日。</p>
         <div class="estimate-rate-bridge"><h3>流量與估時對帳</h3><p id="download-eta-rate-bridge">等待同一取樣窗的流量與追新模型。</p><small id="download-eta-rate-window">流量窗待核實。</small><small>當下預留配額是排程守門；未來追新模型是長期負載，兩者不重複扣除。上方全程速度按階段加權；下表順序共用一個帳號，不是各自獨占額度。</small></div>
-        <h3 class="estimate-stage-heading">依現行優先順序 · 階段與累計完成時間</h3>
+        <h3 class="estimate-stage-heading">依指定九類順序 · 候選進度與累計完成時間</h3>
+        <p id="history-sequence" class="fleet-progress-detail">讀取下載器的歷史順序；到期追新仍優先。</p>
+        <p class="data-note">最佳五檔由<a href="../shioaji/">永豐即時行情管線</a>另行保存（股票既有 Top-200 與期貨／選擇權選定合約，非完整全市場歷史）；FinMind 新版快照的單檔買賣價量不等於五檔，也不能由 tick／K 線反推委託簿。</p>
         <div class="table-scroll estimate-stage-table" role="region" aria-label="依資料優先級估算完成時間" tabindex="0"><table><thead><tr><th>階段／已知剩餘請求</th><th>最快 · 累計完成</th><th>中間 · 累計完成</th><th>保守 · 累計完成</th></tr></thead><tbody id="download-eta-milestones"></tbody></table></div>
         <p id="download-eta-observed" class="fleet-progress-detail">估算觀測尚未取得。</p>
         <p id="download-eta-workload" class="fleet-progress-detail">工作量待核實。</p>
@@ -112,12 +115,12 @@
         <details class="estimate-method"><summary>估算依據與條件</summary><p id="download-eta-method">分割數不等於請求數；尚待合批與速度觀測。</p><ul id="download-eta-assumptions"></ul></details>
       </div>
       <div class="kpi-grid">
-        <article class="kpi featured"><span>已查驗／已建任務</span><strong id="download-count">—</strong><p>空回另列，不代表歷史完整</p></article>
+        <article class="kpi featured"><span>已查驗／候選查詢目標</span><strong id="download-count">—</strong><p>含未建歷史搜尋候選，非缺漏筆數或資料完整率</p></article>
         <article class="kpi"><span>待補</span><strong id="download-pending">—</strong><p>空回另列、不冒充完成</p></article>
         <article class="kpi"><span>失敗短期重試</span><strong id="download-deferred">—</strong><p>與未清點代號分開</p></article>
         <article class="kpi"><span>最新工作</span><strong id="download-last">—</strong><p id="download-last-detail">—</p></article>
       </div>
-      <div class="finlab-table-scroll table-scroll" role="region" aria-label="FinMind 各資料集歷史進度" tabindex="0"><table><thead><tr><th>資料集</th><th>狀態</th><th>已查驗／已建目標</th><th>最早資料</th><th>最新資料</th><th>總筆數</th><th>本機容量</th><th>空回／失敗</th><th>完成時間估算</th><th>追新檢查／更新觀測</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="10">讀取中…</td></tr></tbody></table></div>
+      <div class="finlab-table-scroll table-scroll" role="region" aria-label="FinMind 各資料集歷史進度" tabindex="0"><table><thead><tr><th>資料集</th><th>狀態</th><th>已查驗／候選目標</th><th>最早資料</th><th>最新資料</th><th>總筆數</th><th>本機容量</th><th>空回／失敗</th><th>完成時間估算</th><th>追新檢查／更新觀測</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="10">讀取中…</td></tr></tbody></table></div>
     </section>
 
     <section id="capture" class="section-block" aria-labelledby="capture-title">
@@ -127,10 +130,11 @@
 
     <section id="method" class="section-block method" aria-labelledby="method-title">
       <header class="section-heading"><span>06</span><div><h2 id="method-title">數字口徑</h2><p>完成、容量、流量與訓練可用性是不同證據。</p></div></header>
-      <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。非空回應與查詢空回都不證明供應商歷史完整。法人寬表與分點彙總由驗證過的父資料在本機衍生，不另外呼叫 API。未知歷史代號仍待查。新聞採全市場逐日查詢，包含休市日；1900 年為向前搜尋起點，不代表來源從該年就有資料。保留來源時間字串，不宣稱為已驗證發布時點。三情境估時針對固定截止日的已知工作，扣除未來週期性增量；大範圍候選含未剔除的上市前／休市日，並非錯誤缺失筆數。超過一年的日曆僅按平日投影。本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
+      <p class="limitation">兩種盤中逐日資料只有回應格點完整且來源檔與收據仍在才算完成；早期來源可能是一分鐘，而非五秒。非空回應與查詢空回都不證明供應商歷史完整。法人寬表與分點彙總由驗證過的父資料在本機衍生，不另外呼叫 API。未知歷史代號仍待查。新聞採全市場逐日查詢，包含休市日；1900 年為向前搜尋起點，不代表來源從該年就有資料。保留來源時間字串，不宣稱為已驗證發布時點。三情境估時依目前已知工作、共用配額、發布事件與未來新增分區模型計算；台股現貨僅排除已證實休市日，未知上市期間及其他市場日曆仍列候選，不是確定缺失筆數。遠期開盤保護採平日投影，不等同未來精確日曆。本機原始值不是 point-in-time 安全訓練特徵，也沒有自動同步冷庫。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=11" defer></script>
-  <script src="app.js?v=13" defer></script>
+  <script src="../dashboard-core.js?v=14" defer></script>
+  <script src="../dashboard-acquisition.js?v=3" defer></script>
+  <script src="app.js?v=21" defer></script>
 </body>
 </html>

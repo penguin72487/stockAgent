@@ -3,6 +3,61 @@
   "authority_node_id": "penguin",
   "archives": [
     {
+      "dataset": "legacy-tw-futures-rule-parser",
+      "durable_staging": false,
+      "relative_root": "markets/tw_futures_v8_margin_preparation/.rule-parser-retired",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-tw-futures-rule-parser-sources",
+      "relative_root": "markets/tw_futures_v8_margin_preparation/.rule-parser-source-supplement",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-tw-public-lantent",
+      "relative_root": "markets/tw_public_lantent",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-forex",
+      "relative_root": "markets/forex",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-online-lookback32-v2",
+      "relative_root": "markets/tw_public_candles_multi_basis_online_complete_lookback32_v2",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
+      "dataset": "legacy-markets-feature-input-lookback32-v4-full",
+      "relative_root": "markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v4",
+      "minimum_stable_days": 7,
+      "manual_capture_min_stable_hours": 12,
+      "archive_only": true,
+      "compression": "gzip-1-csv-over-8m",
+      "stage_root": "/var/lib/stockagent-legacy-archive-stage"
+    },
+    {
       "dataset": "legacy-artifact-markets-crypto",
       "relative_root": "markets/crypto",
       "minimum_stable_days": 7,

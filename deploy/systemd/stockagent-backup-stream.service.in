@@ -1,0 +1,18 @@
+[Unit]
+Description=Bounded incremental packed deliveries and NAS receipt reconciliation
+Requires=stockagent-backup-transport-mount.service
+After=stockagent-backup-transport-mount.service syncthing@root.service
+ConditionPathExists=__BACKUP_ENV_FILE__
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment="STOCKAGENT_BACKUP_STREAM_ENV_FILE=__BACKUP_ENV_FILE__"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_backup_stream.sh cycle
+UMask=0077
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryHigh=512M
+MemoryMax=1G
+TimeoutStartSec=28800

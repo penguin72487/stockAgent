@@ -15,6 +15,84 @@ from scripts.download_finlab_market_intraday import (
     annotate_daily_close_coverage, load_universe, session_days, sync_market,
 )
 from scripts.download_finlab_history import safe_stem
+from scripts.download_finlab_intraday import _partition_paths
+from stockagent.data.finlab_acquisition_contract import intraday_progress
+
+
+def test_cached_and_ineligible_candidates_never_call_account_quota(tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    for symbol, day in (("2330", date(2026, 8, 19)), ("2330", date(2026, 9, 24)),
+                        ("2867", date(2026, 8, 19))):
+        receipt_path, _ = _partition_paths(output, f"tw_tick:{symbol}", day)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"dataset": f"tw_tick:{symbol}", "trade_date": day.isoformat(),
+                                            "source_checked_at_utc": datetime.now(UTC).isoformat(),
+                                            "status": "verified_no_trade", "rows": 0}))
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday.quota_room_mb",
+        side_effect=AssertionError("local replay/absent lifecycle must not query account"),
+    ) as quota:
+        summary = sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+                              limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC))
+    assert summary["attempted_this_run"] == 0
+    assert summary["by_kind"]["tw_tick"]["receipted_partitions"] == 3
+    assert quota.call_count == 0
+
+
+def test_inflight_progress_and_interruption_preserve_uncommitted_frontier(tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    calls = []
+
+    def interrupted(root, key, day, *, now):
+        calls.append((key, day))
+        live = intraday_progress(root, now=datetime.now(UTC))
+        assert live["state"] == "running" and live["owner_alive"]
+        assert live["active_key"] == key
+        assert json.loads((root / "intraday/market_cursor.json").read_text())["recent_queue"][0]["next"] == 0
+        raise SystemExit(143)
+
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday.quota_room_mb", return_value=(1000, 5000)), patch(
+        "scripts.download_finlab_market_intraday.derive_partition", return_value={
+            "status": "derived_unverified_for_pit", "rows": 1, "parquet_size_bytes": 10}):
+        with pytest.raises(SystemExit):
+            sync_market(output, public, start=date(2026, 9, 24), end=date(2026, 9, 24),
+                        limit=1, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), fetch=interrupted)
+        assert json.loads((output / "intraday/market_status.json").read_text())["state"] == "interrupted"
+        assert json.loads((output / "intraday/active_run.json").read_text())["state"] == "interrupted"
+
+        def resumed(root, key, day, *, now):
+            calls.append((key, day))
+            return {"status": "downloaded_unverified_for_pit", "rows": 2, "parquet_size_bytes": 100}
+
+        summary = sync_market(output, public, start=date(2026, 9, 24), end=date(2026, 9, 24),
+                              limit=1, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), fetch=resumed)
+    assert calls[0] == calls[1]
+    assert summary["successes_this_run"] == 1
+
+
+def test_wall_clock_budget_exits_before_request_and_keeps_candidate(tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
+        "scripts.download_finlab_market_intraday.quota_room_mb",
+        side_effect=AssertionError("no API after batch wall-clock budget")):
+        summary = sync_market(output, public, start=date(2026, 9, 24), end=date(2026, 9, 24),
+                              limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC),
+                              max_run_seconds=180)
+    assert summary["state"] == "run_time_budget_reached" and summary["attempted_this_run"] == 0
+    assert json.loads((output / "intraday/market_cursor.json").read_text())["recent_queue"][0]["next"] == 0
 
 
 @pytest.fixture(autouse=True)

@@ -2,7 +2,227 @@
 
 日期：2026-10-02（Asia/Taipei）。這份是現行取得／維運文件；
 [10 月 1 日清單](tej_smart_wizard_inventory_2026-10-01.md)保留為不完整目錄的歷史快照。
-**最新維運版本是下方「常駐自動下載」；前面的有限批次／停機紀錄是各自時間點的歷史證據。**
+**最新吞吐量／並行分析與部署接受見
+[2026-10-04 TEJ 實測](tej_throughput_2026-10-04.md)。下方「2026-10-03 晚間：
+不明查詢與無回應外掛恢復」及其他有限批次、常駐啟動／停機紀錄是各自時間點的
+歷史證據，不是永久運行狀態。**
+
+## 2026-10-04：本機缺口優先、依資料價值派工
+
+API 與 Smart Wizard 現在共用
+[`tej_local_gap_value_priority_v1`](../downloader/tej_value_priority.py)，
+策略可在 [設定檔](../configs/tej_value_priority.json)調整。
+只改排程，不改原始數值、來源鍵、原生欄位次序、公司／日期範圍、分頁 cursor、
+已完成工作、收據、授權／配額或模型 ABI。已支付的 API 分頁保留原 cursor 繼續，
+不為換排序重新取第一頁。
+
+### 完整清單與排序含義
+
+- [283 張表的下載價值排序](../artifacts/data_quality/tej_value_priority_2026-10-04/applied_v1/ranked_tables.csv)：
+  255 張 Wizard 表＋28 張 API 表，包含價值理由、優先欄位、本機缺口／校驗候選數。
+- [47,352 項欄位／科目排序](../artifacts/data_quality/tej_value_priority_2026-10-04/applied_v1/ranked_fields.csv)：
+  Wizard 45,826 欄＋API 974 原生欄＋552 財會系列定義。
+  552 項是 276 科目在累計／單季的定義，不是另已取得 552 項完整歷史。
+- [全來源本機對照證據](../artifacts/data_quality/tej_value_priority_2026-10-04/applied_v1/local_feature_evidence.csv)：
+  本次重新讀取 9,124 項來源欄位記錄，沿用 FinLab 收據、FinMind 完成任務／欄位樣本、
+  公開監控清冊；不是只查 TEJ 資料夾。另標示 Wizard 已取得的非空欄位格點。
+- [套用收據](../artifacts/data_quality/tej_value_priority_2026-10-04/applied_v1/application.json)：
+  230 個 Wizard 待執行工作及 1,078 個 API 待執行工作已換優先序。
+  同一 SQLite 寫交易核對了 Wizard 1,270 個保留狀態工作、API 1,084 個工作，
+  請求／生命週期與 API cursor／已取得筆數 SHA 在套用前後一致；沒有發送來源請求。
+
+排序為「本機沒有明確觀測、歷史／範圍缺口或尚待核對」在前，「已有對照、可做校驗」在後；
+各組內依研究價值排序，同價值表輪轉。不是依表名、表小或快照就優先。
+
+| 價值層 | 主要內容 | 排序理由 |
+| --- | --- | --- |
+| 最高 | 契約調整、交易／容量限制、除權息、停復牌與下市生命週期 | 補執行、契約及樣本存續的必要上下文 |
+| 高 | 期權結算／未平倉／隱含波動、財報與發布欄位、借券／融資／籌碼、營收 | 補商品獨有狀態及可用時鐘，而不只重複 OHLC |
+| 中 | 產業／治理／審計、總經、利率、匯率與跨市場資訊 | 輔助不同市場狀態與企業背景研究 |
+| 後 | 已有行情概念、基金／不動產輔助表、來源 log 衍生欄 | 相同概念留校驗；輔助／非原始輸入仍保留，不取消下載 |
+
+分數是可修改的**工程優先序**，不是經模型驗證的 alpha／特徵重要性。
+原生 Preview／API 一次會包含上下文及多個欄位，以該批次最有價值的缺口決定表優先序；
+不拆成每欄另呼叫，也不為排序重排已驗證 schema。純代碼、名稱、期間鍵降低獨立價值，
+仍隨數值一起取得。清楚早於主要 2014 研究視窗的舊選擇權表保留、但排後；
+其實際取得範圍仍由原有來源軸／1900 年搜尋設定決定，不裁掉較早歷史。
+
+本次分類有 47,271 項 `missing_or_gap`、81 項 `crosscheck_candidate`。
+**不能說本機真的缺 47,271 個獨立特徵**：其中包含未知同義字、表義／頻率差異、
+發布／逐欄日期未知、已有部分 TEJ 匯出但剩餘範圍未證明、以及結構欄與長表科目。
+一個 provider 的最早日與另一個 provider 的最新日不拼成完整區間；全空欄不當取得；
+已知美股／crypto 同名欄不當台股／TAIFEX 覆蓋。校驗候選也不是全部 symbol／日期完整證明。
+API 只按實際可查的試用切片比較，不因本機欠 2014 年而優先重抓 API 已有的 2025 年重複值。
+真正跳過 Wizard 格點仍只使用下節已驗證的 API 鍵／欄位／單位收據對應。
+
+### 常駐更新、實際派工與操作
+
+每 15 分鐘在既有工作邊界更新本機缺口／排序；不在每個來源 call 重掃歷史 Parquet，
+不呼叫 API 或 GUI 做排序。新清點表、新 lazy 分片與新 API seed 也繼承共用優先序。
+清冊或快取暫壞時保留已核准排序並在 15 分鐘後再查，不因此停住健康下載器，
+也不解除未知 Preview 結果、來源隔離、重試時間或官方配額的保護。
+
+01:59 套用後實際取得 `TDR Cash Dividends`，重啟後持續取得
+`Company Suspended Records`；安全重啟只換 Python supervisor，不重開 Excel 或改登入。
+API 下一個已改為 `TRAIL/TAMT`，後續依序為選擇權日交易、財報發布封面、營收、
+期貨／財務科目等；當時官方日筆數已達 50,000，所以是配額等待，沒有為優先序重排
+額外呼叫資料。配額恢復後由既有 timer 按新排序繼續；官方重置時刻尚未驗證，不承諾午夜解鎖。
+
+公開 TEJ status 會附 `planning.acquisition_priority` 和逐表 `collection_priority/rank`，
+ETA 的 P1/P2/P3 改為按實際價值排序與依賴表推算，不再假設 P1 一定先於 P2。
+它們仍是資料對照分類、連續執行情境，不是保證抓完日期；來源阻礙／未知等待仍單獨保留。
+
+02:10（臺北）[實際運行接受快照](../artifacts/data_quality/tej_value_priority_2026-10-04/applied_v1/runtime_acceptance_v1.json)：
+兩條佇列的待執行優先序錯配均為 **0**；最終 supervisor 啟動後已有 25 份下載查詢收據、
+99 列結果（包含合法空查詢；不是唯一觀測筆數），下一個可執行工作為高價值的股東會資料。
+公開唯讀端點已回傳共用排序及三個按價值依賴推算的階段 ETA，原始值不外傳。
+既有 22 個來源／中繼資料隔離工作仍保留，不能把排序修正說成來源錯誤已全修復；
+21 組非股價跨通道對應仍待核對，不因同名就取消 Wizard 取得範圍。
+較廣 TEJ／公開面板迴歸 **1,670 項通過**；最後快取防護修正後的排序／ETA／scheduler／API
+聚焦驗證 **664 項通過**。沒有重啟交易、行情擷取或 Discord 服務。
+
+重算／檢查（輸出用新目錄，舊收據不覆寫）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/rank_tej_acquisition_value.py \
+  --output artifacts/data_quality/tej_value_priority_2026-10-04/REVIEW_NEW
+# 確認價值設定後，加 --apply 套用兩條既有佇列；不呼叫資料來源。
+run_fintech_python -m pytest -q test/test_tej*.py \
+  test/test_crypto_client_transport_retry.py test/test_public_dashboards.py
+```
+
+## 2026-10-04：試用 API 清冊與 Smart Wizard 分工
+
+本次使用 `.env` 既有 `TEJ_API_KEY` 驗證實際帳號，沒有把金鑰、帳號身份或
+原始觀測值寫進公開清冊。官網公開 `TRAIL` 目錄為 25 表，帳號權限另列
+3 張不動產表，合計 **28 表／974 個表內 schema 欄位**；27 表有非空回應，
+`TALANDTR` 的本次無篩選查詢為空，不能推定為永久無資料。
+28 表的公開欄位定義均與本次授權 metadata 完整相符。
+
+| 清冊／證據 | 內容 |
+| --- | --- |
+| [全部資料表](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/tables.csv) | 分類、欄數、頻率語義、公開目錄年份／筆數與實際日期分開列示 |
+| [974 欄完整定義](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/fields.csv) | 原始欄名、中文、型別、來源單位、描述、表內最早／最新觀測；不是全欄歷史完整證明 |
+| [帳號逐表可用範圍](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/account_table_scopes.csv) | 28 表逐一驗證；授權起始年不冒充實際資料起始年，未宣告主鍵仍列為未知 |
+| [財報會計科目](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/financial_account_fields.csv) | 276 個來源會計科目、累計／單季合計 552 個系列定義；不是 552 個已補齊的歷史特徵 |
+| [API／Wizard 分工](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/source_allocation_plan.csv) | 28 表 API 工作、22 組 Wizard 表級候選對應、已核對與未核對的排除範圍 |
+| [逐表下載快照](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/download_status_snapshot.csv) | 批次列數與首末日期、巡檢取樣列數、已完成／待執行查詢分開；不是唯一觀測或全歷史完成比例 |
+| [日股價 33 欄對應](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/reviewed_daily_price_field_pairs.csv) | 32 欄通過單位檢查；市值因來源單位矛盾不排除 Wizard。僅未調整日股價 |
+| [本次接受快照](../artifacts/data_quality/tej_trial_api_inventory_2026-10-04/acceptance.json) | 實際 API 收據、配額基準、服務、測試、可排除格點及未完成事項；不是永久狀態 |
+
+### 可取得資訊與真實歷史界限
+
+- 公司／交易：基本資料 `AIND`、股東會 `TAMT`、月營收盈餘 `TASALE`、
+  融資融券 `TAGIN`、未調整日股價 `TAPRCD`、外資持股 `TAQFII`、
+  三大法人買賣超 `TATINST1`。
+- 財報：會計科目字典 `TAIACC`；累計值 `TAIM1A`、累計封面 `TAIM1AA`；
+  單季值 `TAIM1AQ`、單季封面 `TAIM1AQA`。
+  數值表是 `coid/mdate/acc_code/acc_value` 長表；會計科目是潛在特徵，
+  不能只計成四欄，也不能未核對累計／單季／幣別／單位就排除 Wizard 寬表。
+- 基金：`TAATT`、`TANAV`；境外基金 `TAOFATT`、`TAOFCAN`、`TAOFIVA`、
+  `TAOFIVP`、`TAOFMNV`、`TAOFNAV`、`TAOFSUSP`、`TAOFUNDS`，涵蓋基本資料、
+  淨值、股息、區域／產業配置、績效與暫停計價。
+- 期貨／選擇權：`TAFUTR`、`TAOPBAS`、`TAOPTION`，不宣稱包含分鐘、逐筆、
+  L2 或已確認的完整歷史部位限額。
+- 不動產：`TAAPRRENT`、`TAAPRTRAN`、`TALANDTR`。
+
+本次實查日股價、融資融券、三大法人、期貨等主要日表的首末日期為
+**2025-01-02～2025-12-31**；月表為 2025-01～12，季財報為 2025-03～12。
+公司與部分基金／選擇權基本資料快照是 2026-01-01；不動產交易目前只驗到
+2025-05-15。完整逐表差異見範圍 CSV。
+官網文字、公開目錄 `minYear` 與帳號授權 `dataStartYear` 都不是逐檔歷史覆蓋證明。
+`mdate` 是資料業務日期，不是精確發布時間；metadata 刷新時間也不作為發布時間。
+頻率欄是來源語義分類，固定發布時刻仍未驗證，不承諾試用庫追到 2026 年即時最新。
+
+### 配額、取得與失敗恢復
+
+[TEJ 官方試用限制](https://tejtw.github.io/EN-TEJAPI/)為
+每天最多 **500 次／50,000 筆**，每頁最多 **10,000 筆**，每個查詢分頁累計最多
+**50,000 筆**。本帳號回應 `multiConn=false`，API 同時只設一個 writer；
+API 與既有串行 Smart Wizard 可以同時運行，但未認定兩者授權／配額必然獨立。
+本次未取得可信每秒上限，不把 10 req/s 或任何自訂間隔冒充官方上限。
+
+使用既有共用傳輸、重試工具、dataset lock、原子收據與 Parquet 路徑，不開第二套
+Smart Wizard 框架。每個 HTTP 動作在 SQLite 先預留配額；不明網路回應保留整頁
+配額，已收到但本機轉檔失敗用原始 JSON＋精確 intent 恢復，不重新呼叫 API。
+支援 gzip、完整 Decimal 數值及 zstd Parquet；來源數值欄的空字串／符號或精度超出
+宣告型別時保留字串並在收據標記，不變成零、假觀測或有損四捨五入。
+原始張／千股、千元等來源單位仍保留；這批 native 儲存不是已正規化為股的訓練 ABI。
+
+本機 admission 保守計入 metadata／帳號等所有 HTTP 動作，官方
+`todayReqCount` 另列為有時間戳的快照，不把不同口徑稱為相同流量。
+官方每日重置時區尚未確認，暫行「日曆＋滾動 24 小時」界限；
+不能聲稱已做到官方重置瞬間追抓。429／503 有 `Retry-After` 時保存冷卻期限，
+冷卻或已知配額不足期間的排程只讀本機，不反覆呼叫來源。
+
+帳號目前有效期 **2026-10-04～2027-01-04**。公開目錄筆數合計
+11,586,826，假設數字準確且範圍不再擴大，每日 50,000 筆至少需 **232 天**；
+這是容量下界，不是實測 ETA，公開筆數已發現與實際查詢不一致。
+因此三個月試用 API 不足以承諾取得全部目錄資料，必須保留 Wizard 的補充工作。
+
+API 的 28 表都已建立工作清單；基本資料／字典及小表先取得，
+一個既有最早日股價工作另提高優先度，用於真實範圍排除接受驗證。
+按已驗到的日期、月／季週期與需要時的互斥 entity 範圍分片，不拿現存股票清單
+排除下市標的。查詢碰到 50,000 筆界限改建互斥子範圍，不重置 cursor 冒充無限分頁。
+仍可能有來源未宣告的粒度與版本問題；不宣稱每個 native 表已有唯一鍵或全歷史完成。
+
+### 精確分工而不是整表移除
+
+API 所有原始表寫到私有 `data_tej/api_trial_v1/`，不變成假的 Wizard 收據。
+只有核對過的 `TRAIL/TAPRCD` 與
+`TEJ Equity / TSE/OTC Unadjusted_Price(Daily)` 的 33 個欄位對應中，
+**32 欄**能用實際收據與逐欄單位檢查支援「標的＋日＋欄位」非空格點排除。
+市值 `mv` 的中文是「百萬元」，來源單位卻是 `NTD,T`；未做數值互校前，不推測
+哪一個才正確，也不拿它排除 Wizard 的 `Market Cap.(NTD MN)`。
+原始值保留，materialized coverage 改版為 `tej_exact_native_fact_delegation_v2`，
+重建衍生索引而不刪除來源；舊契約的 eligibility 不沿用。
+**API 尚未取得、來源空值／型別未確認、數值版本衝突、較早或較新歷史仍由 Wizard 補。**
+另外 21 組候選表還需要語義／鍵／單位核對，不整表排除；快照、月頻與第三鍵事件
+不沿用日股價格點契約。本次分工是部分已驗證部署，不是全 28 表零重複承諾。
+
+2026-10-04 **01:37（臺北）**接受快照：API 原始收據共 70 頁、49,997 列，
+其中 49,938 列為正式批次、59 列為範圍取樣；原始 JSON→Parquet 值完整核對通過。
+早期部分取樣沒有記錄原始 Parquet hash，沒有偽造舊 hash；改用保留的 raw SHA
+及逐值對照驗證當下 materialization。帳號端當天回報 **50,000 筆／73 次資料呼叫**；
+本機包括帳號與 metadata 的保守 admission 為 109 次。配額已知不足後排程不再取資料。
+日股價兩個批次各 10,000 筆、鍵互斥，已建立 20,001 個已觀測標的／日索引，
+可支援 563,777 個非空且單位通過的欄位格點；這不是 563,777 筆獨立資料列。
+市值排除 bit 為零。6 個查詢完整結束、1,078 個尚待處理，沒有 API blocked 工作；
+全部歷史仍未完成。Wizard 新程序正常取得新收據、未留下不明提交 barrier。
+目前尚未產生真實 Wizard repartition 審計；範圍扣除完整性已由 canonical queue
+fixture／不明狀態保留／全部格點測試驗證，但不能稱為已量得桌面 query 節省
+或全來源去重接受完成。
+
+Wizard 在來源提交之前，將 pending 工作精確拆成剩餘矩形，保留原始工作、
+獨立分配審計與原有收據。原工作記 `superseded_exact_api_scope_v1`，不是 completed。
+只改實際桌面工作分母；按欄位拆分可能增加 Preview 行數，不能把 API 筆數當成
+Wizard 已完成列數或把工作拆分當作已量得的整體速度提升。
+已提交、正在執行、不明結果及 blocked 的來源工作不會被此機制重新分配或重送。
+
+現場 API 分頁另驗出同一個 cursor 可回傳互斥的新資料頁，token 不變不表示
+資料卡住；以原生頁面內容雜湊判斷是否重複。初次被舊 token 旋轉假設擋下的
+第二頁已保留原始 JSON 與精確 intent，可本機重建收據，不另付一次來源流量。
+續頁保留原始 page size；未確認 server 能在 cursor 中途縮頁前，剩餘配額不足
+完整頁時不冒險送出，改讓其他可用新查詢使用剩額。
+
+維運指令（均在 repo root）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python -m downloader.download_tej_api status
+run_fintech_python -m downloader.download_tej_api run --max-pages 1
+run_fintech_python -m downloader.download_tej_api recover
+run_fintech_python -m downloader.download_tej_api reference-fields
+```
+
+`inventory` 會重新呼叫每表首末資料、消耗配額，不是唯讀狀態指令。
+完成首次 inventory／seed 後，使用
+`bash scripts/install_tej_api_trial_service.sh --start` 安裝 API oneshot 與
+`stockagent-tej-api-trial.timer`；每個完成批次後 15 分鐘檢查一次。
+只以當下有效帳號與 admission 配額抓取；大批次有界、idle／等待不是全歷史完成。
+監控目前是私有 metadata 與上述接受快照，本次沒有新增網頁 API 進度欄位或
+遠端訓練發布。現場部署與持續運行須讀新收據，不以 service active 單獨證明。
 
 ## 清點完成的是什麼
 
@@ -220,7 +440,9 @@ req/s、每日請求／列數、月列數、重置時間或已用量**，不能�
    每表先驗證介面／通知／來源，再取實際公司／系列及日期選單、分割工作；
    255 張表已註冊，但歷史軸與下載尚未全部完成。
 2. **每次有界、欄位片不重複。** 單一桌面持有者、跨程序 lock 與 Windows mutex，
-   每次最多 10,000 列／200,000 個儲存格、公司批次上限 32，完成後至少間隔 2 秒。
+   2026-10-03 顯式升級後，每次最多 10,000 列／400,000 個儲存格、公司批次上限 128，
+   兩次查詢開始至少間隔 2 秒（包含本次端到端耗時，不再固定完成後多等 2 秒）。
+   既有已完成或暫緩重排的計畫仍保留其原本的容量與範圍。
    另遵守 Preview 30 欄（含來源的一、二或三鍵）。這是本機記憶體／UI 邊界與預覽限制，不冒充官方速率。
    每欄位片填滿容許的公司／期間範圍，不逐欄重抓已完成資料。
 3. **不用錯誤的勾選讀回。** 此版本 Checkbox 是 owner-draw 按鈕；
@@ -944,6 +1166,504 @@ queue 仍約 4.4 GB，保留既有 superseded 歷史／receipt；本輪沒有以
 所有單位及 Transformation、發布／PIT、5 張來源 metadata 故障、全量容量、逐鍵多源校驗，
 以及將未來日期自動追加到完整來源計畫的增量追新仍未完成；不是全部 255 表已可用於訓練。
 沒有啟用 raw 跨主機發布或遠端訓練注入，也沒有自動修改登入／授權／Office 安全設定。
+
+## 22:54 再次檢查與容量／本機狀態恢復（runtime_capacity_v1）
+
+本輪開始時 systemd 雖為 active，最後完成卻停在 **18:35**；18:36 起為
+`waiting_recovery`。原因是 TDR Qfii Broker Trading 的第三鍵讓同公司／日期有多筆記錄，
+32 公司 × 312 日的 9,984 個查詢格點不能當作預期來源列數。Preview 已送出、回傳超過
+10,000 列／200,000 格的本機上限；既有擷取例外被歸為未知結果，因而安全停止。
+本次沒有把服務 active 當作取得成功，也沒有直接清除未知結果 barrier。
+
+修復沿用既有序列下載器、lazy plan、attempt 收據與桌面 lock，沒有另一套下載框架：
+
+- **精確已知容量超限可自動重排。** Windows bridge 有界核對同一新 Preview 的原生列下界、
+  欄數與 signature，只產生不含數值的 overflow descriptor。controller 重驗 exact attempt／
+  prepared request／stage／原計畫 fingerprint，保留原回覆及計畫，再對尚未取得的 scope
+  增加密度估計、縮小查詢片。計畫與 task identity 更新；不把超限算成完成或從未提交。
+  `auto_preview_capacity_replanning=true` 僅適用已證實的三鍵超限，並非未知查詢自動重試。
+  密度估計不是觀測筆數或容量保證；單一公司／期間仍超限則留 `source_capacity_requires_review`。
+- **SQLite contention 不遮蔽較強的回覆證據。** 新增 scope／kind／state／error covering index，
+  不讀 59 萬筆 superseded request blobs。遇到 SQLITE_BUSY／LOCKED，先保留本機 annotation，
+  五秒後檢查 exact saved response 或有時間界限的 before-Preview negative proof；
+  資料庫損毀不走 busy retry。重啟不重送未知 Preview、不重設原兩次程式錯誤預算。
+  [實際大型 queue 量測](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_capacity_v1/count_index_acceptance.json)
+  三次計數讀取交易為 **86.9／106.5／103.0 ms**，確實使用 covering index；不是外部下載加速倍數。
+- **重排保留舊空 scope。** Directors Holding(Yearly) 容量重排曾因舊 Key=2 完成 request
+  不符合新 Key=3 plan 而停在 `source_validation_failed`。現在共用既有 key-layout repair 的
+  explicit-empty 驗證，要求原始 SHA／receipt／實際零列／完整欄位與範圍一致，保留原收據，
+  只繼承 planning-only 空回範圍證明與 **3,584 個工作格點**。非空舊資料不捏造第三鍵。
+  隨後又一次實際容量超限已正常重排，密度估計由 17 修正到 42；不是來源資料已完成。
+- **桌面不可用與輸入故障分開。** 只將明確發生在任何 SendWait 之前的 exact-focus
+  availability marker 視為等待桌面，60 秒後再檢查，不消耗程式錯誤預算。
+  字元輸入未被確認仍立即停止，保留兩次有限預算，不盲目補送字元、換視窗或繞過焦點檢查。
+  面板 schema 9 另明示 `waiting_metadata`／容量需檢查，不將其顯示為完成。
+
+### 真實下載與全收據接受
+
+TDR 修復後兩次較小的真實查詢取得 **4,546＋4,607＝9,153 分片列、82,377 個非空值**，
+原始 JSON、Parquet、receipt 均已寫入；讀回既有超限 descriptor 的恢復本身沒有再送查詢，
+後續較小的新查詢仍按正常來源使用量記錄。
+
+**22:51:45（臺北）**再啟動 `stockagent-tej-history.service`，到 **22:53:40** 已連續完成
+四項工作，其中一項為來源清點，三項為新的非空資料下載：
+
+| 來源表 | 新分片列數 | 完成時間（臺北） |
+| --- | ---: | --- |
+| TSE/OTC Adjusted_Price(Yearly)-Ex_R+D | 306 | 22:52:11 |
+| Event_Daily | 312 | 22:53:05 |
+| IFRS_TEJ Parent Financial_Security(Acc)-4 | 527 | 22:53:40 |
+
+最後觀察仍為單一 canonical worker 執行下一工作，沒有 paused reason；不是只看 PID 或 HTTP 200。
+**22:56:00** 的後續觀察已連續完成八項工作，下一項為 T13-3 Fin. Structure -Bank；
+同一個服務 PID 沒有重新啟動，仍無 paused reason。這是有限觀察期的持續取得證據，
+不是長期無故障承諾；以下全收據統計仍固定在各自明示的 SQL snapshot 時間。
+**22:57:35** 再核對已連續完成十項、仍在執行下一項、無 paused reason；
+公開 HTTPS 狀態頁亦讀到 schema 9、worker alive／running，未呼叫來源補畫面。
+**22:54:39** 的
+[固定 SQL snapshot 全收據稽核](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_capacity_v1/receipt_audit_v3/audit.json)
+核對 **97 個完成下載、41,536 分片列、700,571 個非空值**；原始／Parquet 雜湊、來源 schema／鍵、
+列數與 feature 計數差異皆為零。這些列按欄位片計，不能直接當作不同公司／日期的唯一筆數；
+快照後的完成項不在本次稽核內。71 份收據有 attempt SHA 綁定，26 份保留較早真實契約。
+
+[全 255 表／45,826 欄狀態快照](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_capacity_v1/acquisition_snapshot_v3/manifest.json)
+與[桌機／手機唯讀驗收](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_capacity_v1/rendered_v2/rendered_acceptance.json)
+分別核對固定完整清冊及公開 schema 9／搜尋／分頁／篩選；不公開原始授權值、不呼叫 provider 補畫面。
+本輪 TEJ Python 回歸 **1,248 項通過（15.79 秒）**，公開 gateway 回歸另 **111 項通過
+（27.49 秒）**，Node 前端 **7 項通過**。
+
+Windows fixture **v2 的 39 項通過**，包含真實編譯 C# 的原生容量下界測試；
+[v3 失敗證據](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_capacity_v1/windows_fixture_v3.json)
+仍保留：共享桌面上第一個日期字元沒有確認，立即停止，沒有送市場查詢。
+不能將 fixture v3 說成通過，或由幾次真實下載推論 UI 永不失焦。現行輸入仍需要互動桌面，
+尚不能保證鎖屏／操作其他程式時持續 headless 下載。
+
+此快照仍有 **7 張 metadata 故障表、190 個待清點表**。被隔離的是來源選單準備／分配錯誤，
+不是已證明原始值錯誤或無權限；其他可用表繼續抓取：Bond Indicators Yield-Government、
+Delisted Option Attribute(2010~2013)、Delisted Option Attribute(2024~2025)、
+Delisted Option Attribute(before 2009)、Delisted Option(2010~2013)、Delisted Option(2022~2023)、
+Public Consolidated Long-Term Investment Detail。它們沒有算成完成。
+
+本輪沒有刪 source／receipt／舊 queue、沒有啟用冷庫或訓練注入。仍為既有截止
+**2026-10-01** 的歷史回補；未來日期追加、全歷史、全表原始數值精度／單位／發布時點、
+逐鍵多源校驗及官方桌面配額仍未完成或未核實，不能宣稱所有資料已可訓練或無限流量。
+
+## 23:23 日期輸入移除前景焦點依賴（runtime_focus_v1）
+
+**日期輸入的前景依賴已移除，整體下載狀態仍須另外檢查。** 舊 v5 用正常 SetFocus／
+全域 SendKeys／Tab 提交；即使字元前後都檢查 foreground，檢查與送鍵之間仍可能被使用者
+切換程式，且不能保證 SendKeys 的 active-window 路由不變。增加延遲、無限重搶前景
+或把失焦算完成都不能消除這個競態。
+
+本輪實作 `owned_edit_messages_acknowledged_date_model_no_foreground_v6`，沿用同一個
+collector、桌面 mutex、scratch query、prepare／stage／receipt。日期共用入口現在：
+
+1. 驗證精確 PID／thread／HWND／Date Setting 父群組、可見／可用、非 read-only、
+   WinForms EDIT 類型、沒有來源通知及真正有效的八位日期。
+2. 對這個日期控制項送一次 EM_SETSEL／WM_CLEAR，確認原遮罩真的清空；
+   不是只以 WM_SETTEXT 改外觀，也不動剪貼簿。
+3. 每個字元只向同一個 HWND 發送一次有界 WM_KEYDOWN／WM_CHAR／WM_KEYUP，
+   每步重驗 owner／群組狀態及文字或 caret 確認，最後八位日期必須完全相同。
+4. 正式日期路徑不呼叫 Activate／SetFocus／AttachThreadInput／SendKeys，不依賴 foreground，
+   不在失敗後補送另一種輸入方法。後續 Search、完整公司／日期／欄位選取、來源 binding、
+   fresh Preview 與 Parquet／receipt 驗證都保留。
+
+[Microsoft 的字元訊息定義](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-char)
+與[WinForms MaskedTextBox 官方實作](https://github.com/dotnet/winforms/blob/main/src/System.Windows.Forms/System/Windows/Forms/Controls/TextBox/MaskedTextBox.cs)
+提供訊息／遮罩事件的依據；但是否真的更新 TEJ 日期模型，以以下實機測試為準。
+`FocusDate` 仍供明確 operator 的焦點診斷，不再由正式日期輸入呼叫；
+來源錯誤對話框或 TEJ 元件自己的 MSAA default action 仍可能啟用視窗，不能承諾整個產品
+完全沒有 UI 或可跨鎖屏、休眠、桌面 session 中斷運行。
+
+### 背景輸入與真正查詢的接受證據
+
+- 自建 Windows 表單的完整驗收三次各 **46 項通過**，耗時 **0.949／0.929／0.649 秒**：
+  [第一次完整通過](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/windows_full_v6_2.json)、
+  [第二次](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/windows_full_v6_3.json)、
+  [第三次](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/windows_full_v6_4.json)。
+  包括 owner 真正在背景、起訖日期互不修改、空遮罩、途中切換焦點仍完成、前景輸入框
+  未被修改、群組途中停用則在下一字元前停止、readonly／foreign／無效日期拒絕，以及
+  單次 Preview 能力／容量界限。沒有連 TEJ 或送來源資料查詢。
+  最後與目前完整 bridge bytes 對應的
+  [最終 fixture](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/windows_full_v6_final.json)
+  另 **46 項通過（0.937 秒）**，包括最終 PowerShell 解析與 C# helper 編譯。
+- 第一輪 full fixture 尚在舊的**測試前景啟用**步驟失敗，未進入新日期輸入；
+  [失敗檔](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/windows_full_v6_1.json)
+  原樣保留。之後把測試本身也改成觀察實際背景，而非先強搶前景才測「不需前景」。
+  不是反覆嘗試舊方法直到通過，也不把先前失敗改成成功。
+- 真實 TEJ 起訖日期都觀察到「原值 → 空遮罩 → 原日期」，沒送 Preview。
+  再將查詢改到 2015 年，Search 實際回傳該來源 **201502～201512 的 11 個月格點**；
+  還原 1995-06-30～2024-02-29 後，原 **344 個月格點**恢復。
+  這驗證內部日期模型，不只是畫面相同；11 個格點仍受既有月份選單下界行為影響，
+  不冒充完整 2015 年或任何原生資料／發布日。
+- **23:19:10（臺北）**一個既有年價格 pending 分片用 v6 正式流程完成 **375 列**，
+  task `9c566aa2b60f1c91b9ec6d94` 的原始／Parquet／receipt 落在原 `data_tej`，
+  stage 明確記錄 `date_input_requires_foreground=false`、`global_keyboard_input_sent=false`。
+- 隨後同 task 的正式 `verify-input` v2 私有接受收據，SHA 綁定原 probe 回覆並驗證兩個
+  日期實際編輯、來源／欄位／axes／queue 不變；觀察為
+  `date_input_started_in_background=true`、`date_input_foreground_unchanged=true`。
+  不送新 Preview、不重設其他未知結果或採納任何新來源值。
+  私有收據位於 `data_tej/input_acceptance/9c566aa2b60f1c91b9ec6d94-82fd0d01d43941bdb409ee7cf364dfde.json`。
+
+v6 正式請求與新 stage 保存新的 input contract；v5 prepared request 加入明確 legacy
+白名單，原 request／stage／receipt SHA 及原來源值 ABI v4 均不改寫。
+operator 輸入接受報告升級 v2，缺少或矛盾的「無全域鍵盤／不需前景」證明會拒絕。
+本輪 TEJ Python 回歸 **1,251 項通過（21.83 秒）**，公開 gateway 回歸另 **111 項通過
+（26.22 秒）**。沒有 GPU／訓練／交易動作、沒有更動 Office 或登入／授權設定。
+
+### 整體服務狀態與仍存在的另一個問題
+
+23:23 已將 `stockagent-tej-history.service` 啟動到 v6。**它仍保留
+`source_validation_failed` 的恢復等待，不等於持續全速下載。** 本輪開始前 **22:58:08** 的
+Public Security Regulatory Capital Adequacy 回覆含 **2024-03** 來源月份，而該工作的
+選取範圍只到 **2024-02**，因此沒有採納，也沒有為了測焦點放寬範圍驗證、裁掉來源列、
+重送該查詢或把 task 改完成。這不是失焦，也尚不能判定 TEJ 原始資料錯誤；
+需要另外核實該表的月份／發布期間對應規則。
+
+[23:21:18 固定全收據稽核](../artifacts/data_quality/tej_smart_wizard_inventory_2026-10-02/runtime_focus_v1/receipt_audit_v1/audit.json)
+核對 **103 個完成下載、46,904 分片列、817,637 個非空值**，原始／Parquet／來源鍵驗證及
+feature 計數差異皆為零。未採納的上述回覆不算完成；七張 metadata 故障表仍隔離。
+此稽核時有限測試批次已結束，worker alive=false 是真實當時狀態，不把稍後 systemd
+active 或背景輸入成功當作全歷史完成。
+
+## 2026-10-03 下載進度與網頁連動（web_progress_v1）
+
+[TEJ 公開頁面](https://penguin72487.ddnsgeek.com/tej/) 現在每 **5 秒**同步現有
+collector 的工作狀態，不靠新增來源查詢填補畫面。原先只有批次／累計收據，缺少
+目前查詢表與讀回步驟；服務重啟後的本批完成數也不能代表全部已下載量。
+本輪沿用原 queue、attempt、receipt 與唯讀 gateway，沒有另一套下載器。
+
+### 顯示與計算契約
+
+- 公開 status schema **10**、`tej_download_activity_v1`：目前表、階段、步驟、
+  已耗秒數、累計完成下載／清點、持久化最後成功時間，以及有界的等待工作清單。
+  最新成功取已完成 queue 記錄，不取排程 heartbeat，不因重啟歸零。
+- 原生 bridge 寫 `tej_native_readback_progress_v1` 私有 sidecar，僅含精確
+  task／attempt、時間、步驟與已掃／總列槽；沒有來源儲存格、帳號或金鑰。
+  實際讀回以兩秒節流發布 metadata，不逐格寫檔，原子替換；來源查詢與日期輸入仍沿用 v6。
+  Windows UNC 實測最初的 File.Replace 未能更新，改用已驗證的
+  `MoveFileExW(REPLACE_EXISTING)`；失敗 fixture 保留，不冒充第一次就成功。
+- 網頁的「讀回來源列槽」包含可能的空列，**尚未驗證入庫**；讀回 100% 不是
+  下載完成。只有正式驗證並寫入資料／收據後，已入庫分片列、非空值及容量才增加。
+  明確來源空回可完成一項查詢，但不會增加有值資料筆數。
+- 筆數及容量進度條的分母是「已入庫實際量＋中間情境剩餘估計」，不是完成表數。
+  分片列不是跨欄位去重後的經濟觀測；容量是本機 receipt 記錄，不是 HTTP 流量。
+  未核實的分母維持未知；P1／P2／P3 的較快／中間／較慢 ETA 是條件估算，
+  不將故障等待或未核實官方配額換算成保證完成日期。
+- worker 必須仍有有效 owner／deadline、task 與 attempt 都相符才顯示活躍工作。
+  telemetry 不延長 query deadline、不驅動 retry、不改採納規則。
+  較舊步驟會標示；過期 status 或 HTTP 失敗不繼續宣稱正在下載。
+- gateway status 快取 **4 秒**，失敗不回放 stale status；頁面每 5 秒原位更新，
+  背景分頁暫停、切回立即同步。欄位細節只在完成修訂變更或 30 秒到期時刷新，
+  不阻塞 status，保留搜尋／分頁／焦點，不讀來源值檔或巨大 plan JSON。
+
+### 驗收與執行狀態
+
+- TEJ 與共用 gateway 回歸 **1,378 項通過（47.72 秒）**；包含真正
+  DesktopBridge → 公開 status → 正式 commit 的隔離流程測試，以及 telemetry
+  損壞不影響採納驗證、不觸發新增 query 的檢查。前端協調測試 **10 項通過**，
+  已含於 gateway 回歸，不另加總。
+- [Windows native fixture](../artifacts/data_quality/tej_web_progress_2026-10-03/windows_native_v3.json)
+  **52 項通過（1.046 秒）**，實際編譯 helper、原生表格讀回、UNC 原子替換、
+  無來源值曝露／額外 Preview／telemetry 搶焦點；只用自建表單，沒有連接 TEJ。
+- [第一次公開瀏覽器驗收](../artifacts/data_quality/tej_web_progress_2026-10-03/public_browser_v1/rendered_acceptance.json)
+  00:35（臺北）確認桌機 1440px／手機 390px 無 overflow／JS error，搜尋、分頁、
+  分階段估算及等待原因可讀。隔離 HTTP fixture 驗證 5 秒自動更新的
+  等回覆 → 讀回 → 入庫 → HTTP 失敗 → 恢復等待，5 次 status 僅 2 次欄位請求。
+  fixture 不改 production queue，不代表真的下載了測試列。
+- [完整 metadata 測量](../artifacts/data_quality/tej_web_progress_2026-10-03/metadata_benchmark_v1.json)
+  255 表／45,826 欄，warm p50 **0.136 秒**；沒有來源查詢、原始值檔或 plan blob
+  讀取。這不是實際下載加速、全系統 CPU 或 GPU 效能證明。
+- 00:33:53 只重啟既有 TEJ supervisor 與公開 gateway。00:35 的實際自動排程仍為
+  `waiting_recovery/source_validation_failed`，103 個完成下載、46,904 分片列、
+  817,637 非空值、38,172,138 bytes；本輪沒有為了顯示進度重送失敗查詢。
+  00:38 另觀察到既有 Future DB 有限工作，公開 status 顯示實際 preparing_scope；
+  00:38:34 明確來源空回完成後，00:39 status 已變為 **104 個完成下載**，
+  最後成功表／時間及容量 38,179,118 bytes 隨之更新，資料列與非空值不增加。
+  [00:41 第二次公開瀏覽器驗收](../artifacts/data_quality/tej_web_progress_2026-10-03/public_browser_v2/rendered_acceptance.json)
+  確認桌機／手機都呈現 104 及新的最後成功時間；同一組自動刷新隔離測試仍通過。
+  自動排程仍待來源驗證修復；有限工作不等於全程恢復或全歷史完成。
+
+## 2026-10-03：同範圍批次效率與正常空回修復
+
+工作為 `tej-acquisition-efficiency-20261003`；保留既有 serial collector、queue、
+source request／stage／receipt、桌面身分與唯讀 gateway，不另建下載器。
+
+### 實測瓶頸與修正
+
+- **批次容量未用滿。** 200,000 cells 下，30 欄的批次含 header 只能容納
+  6,665 列；提高本機 cells budget 到既有 native guard 允許的 400,000，
+  列數仍限制 10,000。公司數上限 32→128，既有矩形規劃器在上限內選擇
+  查詢數最少的 uniform company/date batch，而非一律取 128。
+- **查詢間固定空等。** 新 `minimum_query_start_interval_v1` 以開始時間限流：
+  等待 `max(0, 2 - complete_query_seconds)`，仍只有一個桌面持有者；
+  ETA 使用同樣的 `max(2, complete_query_seconds)` 成本。重試、磁碟、未知結果及
+  shared interface 的安全等待保留。舊契約仍維持完成後間隔，不靜默追改。
+- **單表結果阻擋整個 provider。** `Public Security Regulatory Capital Adequacy`
+  的 exact attempt 已完整保存 247 列，但含請求範圍外的 2024-03 鍵。
+  在 prepared／stage／active attempt、fresh/full native capture、schema/sample 及
+  finished clock 全部核對後，只隔離此表。沒有採納、不裁切或重送原資料；
+  unknown outcome、缺失 binding、shared interface 故障仍為全域阻擋。
+  normal selection、table rotation、targeted acceptance 都排除該表的其他待送分片。
+- **實際發現的 150 秒空等與假未知。** 首次放大批次仍逾時；保留失敗後，
+  只讀診斷找到 TEJ 已產生 `ERROR1:No data !!(wis4)`，但是 dialog 的 `GW_OWNER=0`，
+  舊 direct-owner 枚舉完全漏判。新候選要求同 PID、同 GUI thread、query root
+  停用、原生 `#32770`、且該 process 只有 root 與唯一 modal 兩個可見 top-level
+  視窗；再核對唯一標準 No-data 文案與唯一 enabled OK、父視窗、真實 control ID。
+  只向該 modal 送標準 OK control notification，不啟用介面、不搶焦點，不關閉
+  quota／permission／login／server error 或未知通知。
+
+無 owner 的 task-modal 與 inactive dialog 的 BM_CLICK 行為，分別可對照
+[Microsoft MessageBoxW 文件](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxw)、
+[BM_CLICK](https://learn.microsoft.com/en-us/windows/win32/controls/bm-click) 及
+[BN_CLICKED／WM_COMMAND](https://learn.microsoft.com/en-us/windows/win32/controls/bn-clicked)。
+本機 Win32 MessageBox fixture 實際讀回單一 OK button 的 control ID 為 2，
+不能由顯示文案假定為 1；僅允許已核實單一 OK 的標準 ID 1／2。
+ownerless／acknowledgement 契約保存到 raw 與 receipt，舊收據不追補。
+
+### 同範圍查詢量證據
+
+[只讀容量比較](../artifacts/data_quality/tej_efficiency_2026-10-03/capacity_before_v1.json)
+的 48 張可比較表為 976,179→775,319 次，減少 200,860（20.58%）。
+這是提案，不把它描述為全部已部署。
+
+實際容量遷移為 **44 張表、865,673→689,428 次，減少 176,245（20.36%）**。
+原計畫有 durable SHA backup，已完成 scope／工作權重／來源檔／收據保留，
+不增加已完成格點的重抓。11 張 snapshot、原生待送 scope、阻擋表或鍵值年代待
+對帳的表未被強制重排；另外兩張計畫不減少次數，所以不重寫。
+private migration audit 為
+`data_tej/planning_migrations/f5c3950730534b24a61773d81011d975/audit.json`。
+key/period 不同的表不靠丟資料降低次數，延後表的 overflow 核對其 immutable
+former plan bounds，不能錯拿新的全域上限拒絕舊請求。
+
+上面是**查詢次數下降，不是相同比例的 wall-time／bytes／CPU 加速**。
+官方 [Smart Wizard 中文操作手冊](https://www.tej.com.tw/TEJPLUS/TEJE3_TCHINESE.pdf)
+說明 Preview 30 欄；不能將它泛化成 ExportToExcel 或 REST API 的全通道上限。
+10,000 列／400,000 cells／128 公司／2 秒間距是本機設定，不是官方帳號 quota。
+目前 `.env` 沒有已設定的 TEJ API key；桌面每日／每秒配額仍未知。
+此輪不重試過往 ActiveX bulk export 故障，也不假裝已達官方整批通道理論最快。
+
+### 實際接受與恢復
+
+- [升級前 104 份收據](../artifacts/data_quality/tej_efficiency_2026-10-03/receipts_before_v1/audit.json)
+  全部通過，46,904 列／817,637 非空值。
+- [Windows modal fixture v5](../artifacts/data_quality/tej_efficiency_2026-10-03/ownerless_modal_fixture_v5.json)
+  13 項通過：包含背景確認不變更 foreground、quota 文案不確認、額外可見視窗
+  造成 ownership 歧義時不確認。只有自建 fixture，未連 TEJ／Excel 或送 provider 查詢。
+  先前 MSAA／UIA／假定 IDOK=1 的候選實際失敗，沒有套到 provider 或追改為通過。
+- 01:41:07 只恢復原逾時 attempt 的 exact saved scope 與現有正常 No-data modal；
+  `data_query_repeated=false`，完成數 104→105，數值不增加，原失敗診斷保留。
+  前面提出的一次重試確認沒有使用，亦未送 operator replay。
+- 01:43:49／01:44:38 的兩次新正式批次各為 9,984 個格點／28 個 feature 欄，
+  各取得 1,083 列、fresh end-to-end 37.126／48.789 秒。
+  合計新增 **2,166 列／60,648 非空值**，不是恢復讀回耗時冒充 acquisition 速度。
+- [升級後 107 份收據](../artifacts/data_quality/tej_efficiency_2026-10-03/receipts_after_v1/audit.json)
+  全部通過，49,070 列／878,285 非空值；raw／Parquet／receipt hashes、source keys、
+  schema 與 feature counts 都沒有失配。此為固定 SQL snapshot，不含之後新完成項目。
+- 01:46:15 啟動既有自動 service；新 config/runtime policy 生效，未知結果不因 restart
+  而重送。[公開瀏覽器 v2](../artifacts/data_quality/tej_efficiency_2026-10-03/public_browser_v2/rendered_acceptance.json)
+  在真實 1440／390px 頁核對新的本機容量、5 秒狀態、結果列／容量 bar，
+  並以同一 rendered HTTP generation 驗證，避免拿另外一次 request 的新完成數
+  誤判 UI。無 overflow／JS error／外部 provider request；隔離 polling fixture
+  不代表真實下載或修改 production queue。
+- [自動執行後固定快照的 109 份收據](../artifacts/data_quality/tej_efficiency_2026-10-03/receipts_after_auto_v2/audit.json)
+  在 01:52:34 通過本機完整性驗證：49,751 分片列／892,586 非空值，
+  `local_artifact_failures=0`、`feature_count_mismatches=0`。其中 26 份為沒有新
+  attempt SHA binding 的 legacy 收據，不能宣稱全部歷史已升級成新版 binding。
+  [同次全表／欄位快照](../artifacts/data_quality/tej_efficiency_2026-10-03/acquisition_after_auto_v1/manifest.json)
+  涵蓋 255 表／45,826 欄，沒有呼叫 provider 或公開原始值；
+  [逐表歷史狀態](../artifacts/data_quality/tej_efficiency_2026-10-03/acquisition_after_auto_v1/table_history_status.csv)
+  與 [逐欄下載狀態](../artifacts/data_quality/tej_efficiency_2026-10-03/acquisition_after_auto_v1/feature_download_status.csv)
+  是有界 metadata 快照，不是全量歷史完成證明。
+- 01:59:11 的實際唯讀 status 顯示重啟後已完成 6 個新下載，累計 113 份，
+  正在下載 `Directors Holding(Yearly)`，`paused_reason=null`；
+  `Delisted Option Attribute(2020~2021)` 與 `(from 2026)` 的 metadata 錯誤已個別
+  延後，沒有使整個 provider 再次停止。113 是後續即時完成數，**不把它冒充
+  上面已重驗的 109 份**；01:59:11 的資料量為 52,423 分片列／935,338 非空值，
+  不等於去重後的經濟觀測筆數。
+- 最終 [TEJ／gateway 回歸記錄](../artifacts/operations/agent-workflow/runs/efficiency-regression-20261002T174654-6b161047/run.log)
+  為 **1,422 項通過**，另有 10 項 Node 前端測試與上述 13 項 Windows fixture 通過。
+  這是本次受影響合約的驗證，不冒充全 repository／全 provider 或底層數值品質驗證。
+
+程式位置：[容量／分片](../downloader/tej_planning.py)、
+[完成結果隔離](../downloader/tej_source_isolation.py)、
+[開始間距](../downloader/tej_scheduler.py)、[同範圍 audit](../scripts/audit_tej_acquisition_efficiency.py)、
+[native modal fixture](../scripts/verify_tej_ownerless_modal.ps1)。
+目前仍有已隔離的來源 metadata／period-key 問題與未發現的表軸；沒有以這輪優化
+宣稱全部歷史已取得、底層數值／PIT 已完整驗證或全市場最終日期已保證。
+
+## 2026-10-03 持久化逐表重試與持續取得
+
+### 當下故障與原因
+
+08:24（臺北）巡檢時，自動 supervisor 還活著，卻停在
+`list_selection_prequery_needs_review`；不是正常持續下載，也沒有證據表示配額耗盡。
+失敗工作是 `Bond Indicators Yield-Corporate` 的一個公司／日期／欄位分片。
+三份原始 attempt 都明確保存 `market_data_query_submission_possible=false`，
+沒有 Preview stage、完整資料回覆或成功收據；不是不明成交／查詢可以任意重送。
+
+實機診斷顯示，native 清空後選一項仍只有一項，但送出來源選取事件通知後，
+又出現舊項目，變成兩項，因而在 Select／Preview 之前被拒絕。
+這是來源介面與選取事件的問題，不能當成來源數值錯誤或「沒有資料」。
+只有 native `LB_SETSEL` 不會自動發出 `LBN_SELCHANGE`；
+參見 [Microsoft 官方通知說明](https://learn.microsoft.com/en-us/windows/win32/controls/lbn-selchange)。
+這份文件解釋一般控制項事件，並不證明 TEJ 自訂事件處理程式的內部原因。
+
+六種自建 WinForms case（單選／兩種複選，各含 bound／unbound）
+在[最終 native fixture](../artifacts/data_quality/tej_resilience_2026-10-03/list_fixture_native_final_v10.json)
+通過 37 個檢查：精確名稱、先後兩次 native／managed selection、禁用拒絕、
+不送 Select、前景不變。**通用 fixture 不能重現或宣稱修好 TEJ 特定 callback。**
+清空先通知的候選雖通過 fixture，實機仍失敗；MSAA／UIA 候選也沒有通過完整 fixture。
+失敗 artifact v4～v9 保留，候選均未留在正式選取路徑，不把 native readback 合格
+當成 TEJ 模型必然一致，也不採用未驗證的 fallback。
+
+### 已部署的恢復設計
+
+沿用 canonical task、attempt、SQLite、dataset lock、Windows mutex、systemd 與唯讀 gateway；
+沒有第二套下載器或私人帳戶／工作簿搜尋。
+
+- 明確啟用 `exact_unsent_table_retry_window_v1`，沿用原本兩次短重試；
+  用盡後不再讓單張表永久卡住其他表。
+- 逐表持久化 `desktop_retry_windows`：60、120、240、480、900 秒，之後最多每
+  900 秒一個探測分片。以原 task 與最新 finished／proved-not-submitted attempt 探測，
+  同表其餘分片不得繞過等待；重新啟動也不清空退避。
+- 重試許可要求 exact prepared request、scope、active attempt、註冊路徑、SHA、
+  aware attempt clocks、明確 false 的未送出證據，且沒有 raw／Preview stage／adopted rows。
+  再做一次正常唯讀 UI 核對：新鮮、同範圍、介面穩定、selector／公司群組可用且無通知。
+  整個恢復核對 `provider_queries_sent=0`，不送資料查詢或採納來源軸。
+- 保留兩次短重試已用盡的計數、原診斷與 audit；DB committed 後即使 audit 的
+  secondary marker 寫入失敗，也不重複恢復或重置預算。只有同 task 的來源回覆
+  通過原本嚴格驗證並入庫，才清除自己的逐表窗口。
+- 正在執行／未知結果、來源 period barrier、停用介面、quota／login／permission／
+  未知通知仍保持共享安全阻擋。不能用穩健性當成重送結果未知的理由。
+
+關鍵程式：[原始 attempt 與重試證明](../downloader/tej_desktop_attempts.py)、
+[共用選取／入庫](../downloader/tej_history.py)、[常駐監督](../downloader/tej_scheduler.py)、
+[負面與重啟語義測試](../test/test_tej_prequery_recovery.py)。
+
+### 網頁與實際接受
+
+公開 [TEJ 進度頁](https://penguin72487.ddnsgeek.com/tej/) 的 schema 升至 12，
+新增逐表等待原因、退避次數、最早可重試時間，以及「已到期，等待桌面與先行工作」。
+這是 earliest eligibility，不是保證開始／完成時間；重試仍算未完成。
+有故障依賴的階段另標示等待重試數，不把 heartbeat、未驗證讀回、格點或欄位數
+混成成功資料列數。所有顯示仍只讀本機中繼資料，每 5 秒更新，不呼叫 TEJ／Excel
+填畫面，也不公開 audit 路徑、來源原始值或帳號。
+
+- [恢復前固定快照](../artifacts/data_quality/tej_resilience_2026-10-03/receipts_before_v1/audit.json)
+  的 150 份 v4 下載收據全部通過，68,402 分片列／1,293,322 非空值。
+  測試期間另有已授權工作完成 `Future DB`；不能把它算成本次 supervisor 的修復成效。
+- 08:50:55 啟動既有 `stockagent-tej-history.service`。原失敗分片被確認未送查詢後，
+  成功進入逐表等待；08:53:08 自動取得 `Fund's Turnover` **46 列**，
+  之後其他資料工作繼續，含正常來源空回。第二次 bond 分片選取仍失敗，
+  其窗口變成 120 秒，沒有再次卡住所有表，也沒有虛報修復來源選取。
+- [08:54:41 固定 SQL 快照全收據重驗](../artifacts/data_quality/tej_resilience_2026-10-03/receipts_after_v1/audit.json)
+  的 **154 份**全部通過，**68,453 分片列／1,294,357 非空值**；
+  `local_artifact_failures=0`、`feature_count_mismatches=0`。
+  後續即時完成數會繼續增加，不冒充這份固定快照已審核。
+- 09:00:28 再取得 `IFRS_TEJ Consolidated First Financial_Security(Acc)-4`
+  **2,613 列**。本次重啟後兩批非空資料合計 **2,659 列**，不含測試期間其他工作
+  取得的 `Future DB`，亦不以來源空回覆充當有數值資料。
+  [之後固定快照重驗](../artifacts/data_quality/tej_resilience_2026-10-03/receipts_after_auto_v2/audit.json)
+  包含這兩批；檢查筆數與時點以該收據為準，不混用持續增長的即時總數。
+- [全表與全部欄位快照](../artifacts/data_quality/tej_resilience_2026-10-03/acquisition_after_v1/manifest.json)
+  包含 255 表／45,826 欄；空欄仍是未知，不等於零或全歷史完成。
+- [受影響 TEJ／gateway 回歸](../artifacts/operations/agent-workflow/runs/resilience-regression-final-20261003T005249-20be6939/run.log)
+  **1,246 項通過**，另有 **11 項 Node 前端測試**與上述 Windows 37 項檢查通過。
+  早期測試 fixture 的 callback 參數錯誤已修正並重跑；原失敗 run 保留。
+- [公開頁面驗收](../artifacts/data_quality/tej_resilience_2026-10-03/public_browser_v2/rendered_acceptance.json)
+  使用真實 source-backed HTTP generation，在 1440／390px 核對資料量、逐表重試、
+  搜尋／分頁／篩選、5 秒同步及狀態切換；具體結果以該收據為準。
+  隔離 polling fixture 只驗證前端轉換，不冒充 TEJ 真實下載。
+
+**仍未完成：** bond 表來源選取本身仍待修復，既有被隔離的 metadata／source validation
+問題及尚未清點的歷史軸仍存在。這輪證明持續下載與逐表恢復，不是所有表、
+全部原生歷史、底層精度／單位或 point-in-time 的完整驗證，更不保證桌面來源永不故障。
+
+## 2026-10-03 晚間：不明查詢與無回應外掛恢復
+
+19:55 的 status 查核發現最後成功收據仍是 09:36；服務活著卻已停止取得約十小時。
+卡住的是 `Fund's Holding(Weekly)`，原 attempt 有 `prepreview_verified` stage、
+沒有完整 raw response／成功收據，並留下 `Query identity or control owner changed`。
+本次先停用 collector，確認 Windows 原生 HWND 的 PID／標題仍與原 session 相同，
+但 `IsHungAppWindow=true`；不能把它當成未送出或正常空回。
+
+### 修正及操作邊界
+
+- **無回應時仍核對原視窗。** 外掛重啟路徑使用原生 HWND owner、頂層 caption、
+  window class、程序啟動時間及 image SHA。跨程序頂層 caption 可由
+  [Microsoft GetWindowTextW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw)
+  讀取，不必等待無回應程序的 UIA 回覆。沒有重綁 Windows ghost 視窗、改 workbook
+  pin、強制啟用控制項，或對任意程序按名稱執行終止。
+- **處理此時已不存在的 connector。** 本次原程序只剩唯一原生 hung Wizard，
+  沒有 `TEJProConnector`。只在原視窗 hung、原 PID／caption／class／workbook
+  pin 與 image/start-time 均一致，且全程序沒有其他應用程式表單／對話框時，
+  接受 `sole_native_hung_query_no_other_application_windows_v1`。隱藏的其他 Wizard
+  或 `#32770` 對話框同樣會拒絕，不能以 connector 缺席略過 auth／quota 通知。
+- **操作員專用，不是自動重送。** 新增 `restart-unknown`，要求 exact task、原始
+  prepared request、restart/discard/usage 三項明確確認。無參數的既有 restart
+  仍拒絕 unresolved Preview；scheduler 的 `unknown_outcome_auto_retry` 仍為 false。
+  已有 raw／receipt、不同 active attempt、其他 running／unknown 或範圍不符，均在
+  reset 前拒絕。原始 attempt 保留 unknown，不改寫成未送出、成功或空值。
+- **三鍵資料不能把公司×日期當成原生筆數。** 原查詢是 100 基金×100 日期、
+  四欄、第三鍵為持股記錄；其實際筆數尚未取得，不能宣稱已證明容量超限。
+  本次明確使用 `operator_unknown_record_geometry_prior_v1` 的 density prior=250，
+  將每次選取矩形限制到最多 40 組公司／日期，再由既有 capacity 路徑處理真正量測
+  到的 overflow。250 是標示過的復原幾何先驗，不是觀測列數、官方上限或完整性保證。
+- **全範圍保留。** 沿用 canonical lazy planner 排列該表所有尚缺的欄位／公司／日期；
+  已完成 scope 排除、總工作量與完成工作量一致，舊 plan 有 SHA backup。
+  舊 unknown task 變成 `superseded_operator_unknown_geometry_v1`，原 error、attempt、
+  prepared/stage 和 traffic 都保留；它不是完成下載。替代分片會使用正常來源流量，
+  可能再次計入原先未保存查詢的用量。復原／重排本身沒有發送資料查詢。
+
+本次原生重啟、fresh-session 驗證與小分片重排在 20:28 成功，20:29:25 重新啟動
+既有 `stockagent-tej-history.service`。PID／HTTP 200 不作下載成功驗收，後續必須
+核對新的非空 source receipt、連續批次與 metadata-only 公開狀態。
+
+```bash
+source scripts/runtime_env.sh
+# 先確認完整 saved response／existing Preview 無法採納，並停妥原 collector。
+# TASK 與 PREPARED 必須是當下同一個 unresolved active attempt，不能照抄舊 task。
+run_fintech_python -m downloader.download_tej_history restart-unknown \
+  --task-id EXACT_TASK --evidence data_tej/requests/EXACT_ACTIVE_ATTEMPT.json \
+  --allow-restart-addin --allow-discard-query-settings --acknowledge-unknown-usage \
+  --record-density-prior 250
+```
+
+省略 density prior 時僅允許同一 scope 的明確 one-shot operator replay；重啟證據、
+原始 query SHA 與 consumed-once authorization 保留。不要對已知大三鍵矩形直接重送。
+任一 stop／open 可能已送出但無完整回覆時，保留 lifecycle barrier，不盲目重開。
+
+本次實作驗證：[836 項回歸](../artifacts/operations/agent-workflow/runs/restore-final-regression-v2-20261003T122655-0126a789/run.log)、
+[Windows native fixture](../artifacts/data_quality/tej_restore_2026-10-03/windows_fixture_v2.json)、
+[177 份恢復前完整性稽核](../artifacts/data_quality/tej_restore_2026-10-03/receipts_before_v1/audit.json)。
+fixture 只操作自己的新表單，不證明 TEJ 來源的全部值正確；恢復前稽核為
+86,712 分片列／1,699,645 非空值，artifact 與 feature count mismatch 都是零。
+
+### 恢復後的實際接受證據
+
+20:42:00（臺北）的[固定 SQL 快照／全收據重驗](../artifacts/data_quality/tej_restore_2026-10-03/receipts_final_v1/audit.json)
+是 **186 份成功下載收據、92,485 分片列、1,762,860 非空值**；
+local artifact failure 與 feature count mismatch 均為零。相對恢復前新增
+**9 份成功下載收據、5,773 分片列、63,215 非空值**。新增非空資料來自
+`Contract Adjustment of Stock Futures`（4 列）、
+`TSE/OTC Adjusted_Price(Daily)-ROI`（499 列）及
+`Qfii/Dealer/Invest. Buy/Sell`（5,270 列）；其他新成功下載包含明確來源空回，
+不把空回當成已取得數值，也不把分片列當成去重後原生觀測。
+
+[20:42 公開瀏覽器接受](../artifacts/data_quality/tej_restore_2026-10-03/public_browser_v4/rendered_acceptance.json)
+通過桌機、手機、來源-backed status 與每 5 秒原位更新；isolated fixture 額外覆蓋
+等待來源、讀回、入庫、HTTP 錯誤及等待安全恢復，且不改 production queue。
+這一輪調整的是驗收流程：實際展開共用清冊 disclosure、等待 deferred 區塊 layout
+並捲至 feature 清單，才驗證可見區域的 lazy loading；沒有為了驗收強制全頁載入，
+瀏覽器也沒有發送 TEJ provider 查詢或接收原始數值。
+
+當下新 TEJ 外掛及原 Excel 都回報 responding；Excel 啟動時間保持 10/1 原值。
+沿用既有 collector、queue、lazy planner、receipt、systemd 與唯讀公開 gateway，
+沒有建立第二套下載管線。**仍有 15 項來源驗證／metadata 待修及 1 項逐表 retry**，
+已隔離並在網頁保留，不阻擋其他可正常處理的表。基金 density prior 重排已接受，
+但此快照尚未驗證其新分片的實際列密度／非空收據；不得宣稱該表修復完成、全部歷史
+下載完或 UI 的條件式年級工時是保證完成日。
 
 ## 驗證與已知未完成
 

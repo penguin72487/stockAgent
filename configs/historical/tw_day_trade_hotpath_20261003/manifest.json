@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "purpose": "Preserved rejected 2026-09-14 hotpath experiments and exact source inheritance; not runnable with current code ABI",
+  "source": "Current repository originals observed 2026-10-03; negative full-workflow results in docs/TW_DAY_TRADE_FIFO_TRAINING_HOTPATH_OPTIMIZATION_2026-09-14.md",
+  "runnable_with_current_code": false,
+  "archived_deployment_paths": [
+    "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_cohort_only_candidate.yaml",
+    "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_prepared_cache_candidate.yaml",
+    "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_fixed_abi_candidate.yaml",
+    "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_ofat_candidate.yaml"
+  ],
+  "incompatibilities": [
+    "training.day_trade_cohort_bucket_mode",
+    "training.day_trade_prepared_batch_cache_gb",
+    "training.day_trade_source_decode_workers",
+    "training.day_trade_prefetch_depth",
+    "training.day_trade_sparse_event_bucket_mode"
+  ],
+  "files": [
+    {
+      "path": "deployments/tw_day_trade.yaml",
+      "original_path": "configs/deployments/tw_day_trade.yaml",
+      "sha256": "aef520d1e80735f626d6f1d54e399fd2ceb1b10ca549e777e39cdd09bc212d8c"
+    },
+    {
+      "path": "deployments/tw_day_trade_attention_parity_vastai1t_candidate.yaml",
+      "original_path": "configs/deployments/tw_day_trade_attention_parity_vastai1t_candidate.yaml",
+      "sha256": "45d16493eef2199a04b4627e0179ea4c2c35f8414d29da62a509c3ab163e2a36"
+    },
+    {
+      "path": "deployments/tw_day_trade_attention_training_vastai1t.yaml",
+      "original_path": "configs/deployments/tw_day_trade_attention_training_vastai1t.yaml",
+      "sha256": "b6f7cfd89f38e3a20956a22b474a5a360e78033b44813cefcf9c03851a8e3050"
+    },
+    {
+      "path": "deployments/tw_day_trade_last_last_only_training_vastai1t_cohort_only_candidate.yaml",
+      "original_path": "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_cohort_only_candidate.yaml",
+      "sha256": "511a3c42703604bdde436c6fdbf9e617933bbf3653debc4a56b6474ca70efc27"
+    },
+    {
+      "path": "deployments/tw_day_trade_last_last_only_training_vastai1t_prepared_cache_candidate.yaml",
+      "original_path": "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_prepared_cache_candidate.yaml",
+      "sha256": "bcf9075c3b13d33fd45bd6713aa6371a14079b0adb31c33053473cdaef4c6f7c"
+    },
+    {
+      "path": "deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_fixed_abi_candidate.yaml",
+      "original_path": "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_fixed_abi_candidate.yaml",
+      "sha256": "7543741627ff26a02b0d6316027a629a432889dc2238aabeed70fabb5c8393ec"
+    },
+    {
+      "path": "deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_ofat_candidate.yaml",
+      "original_path": "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_sparse_event_ofat_candidate.yaml",
+      "sha256": "d5a140d01545d036bb8f9781152c1513befd334b4ad1b3531dc02806e99bdb1d"
+    },
+    {
+      "path": "deployments/tw_day_trade_last_last_only_training_vastai1t_v4.yaml",
+      "original_path": "configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v4.yaml",
+      "sha256": "d4be8c30ff92469ea23557daf42d03d16bd2c25f76e30d6e670a6e4094918f5f"
+    },
+    {
+      "path": "markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v11.yaml",
+      "original_path": "configs/markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v11.yaml",
+      "sha256": "a01a5a1ad06e29e4f29c30035a520e0a8abc62911b64d6b430c862806bb6edc9"
+    },
+    {
+      "path": "markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml",
+      "original_path": "configs/markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml",
+      "sha256": "b26a516889607ca12626e8ce3b7268213d779cd6da6e261beb2bb92815629a64"
+    },
+    {
+      "path": "markets/tw_day_trade_1m_hybrid_v12_attention_full_then_last_layernorm.yaml",
+      "original_path": "configs/markets/tw_day_trade_1m_hybrid_v12_attention_full_then_last_layernorm.yaml",
+      "sha256": "7837cb192a0dc61e882a5eae3d5a5169e16133545e358113808958b403a06cd2"
+    },
+    {
+      "path": "markets/tw_day_trade_attention_layernorm_paper_parity_candidate.yaml",
+      "original_path": "configs/markets/tw_day_trade_attention_layernorm_paper_parity_candidate.yaml",
+      "sha256": "aade09f946d3b32b8aad400e70b9c611b69370f1957af6525acc4e558f44d8ce"
+    },
+    {
+      "path": "markets/tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_capital10m.yaml",
+      "original_path": "configs/markets/tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_capital10m.yaml",
+      "sha256": "9ace5fc97b8e33e49f2de638a9d7d53ee1607bff5d315ca35e9fc9ab540807ef"
+    },
+    {
+      "path": "markets/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml",
+      "original_path": "configs/markets/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml",
+      "sha256": "b4c66349d1c19e10ab8db964e74dc3101346baf68b46f832f39624f04cf37599"
+    },
+    {
+      "path": "markets/tw_day_trade_daily_multi_basis_tplus2_close.yaml",
+      "original_path": "configs/markets/tw_day_trade_daily_multi_basis_tplus2_close.yaml",
+      "sha256": "580e1700810ea19bafe5fdea4f4dbb5ed3a9648ec6bc4b8c0e3509c3ec45cda5"
+    },
+    {
+      "path": "markets/tw_day_trade_daily_multi_basis_tplus2_close_capital10m.yaml",
+      "original_path": "configs/markets/tw_day_trade_daily_multi_basis_tplus2_close_capital10m.yaml",
+      "sha256": "f85e87918054dbc6a3e551f6b063efbb094c03543edad42fc6a97e428b1a5520"
+    },
+    {
+      "path": "markets/tw_day_trade_daily_no_default.yaml",
+      "original_path": "configs/markets/tw_day_trade_daily_no_default.yaml",
+      "sha256": "5345152dbc0d989c7b1efc012728af509ab3933440b7a5ff2b5cb78035390112"
+    }
+  ]
+}

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from downloader import download_shioaji_tw_kbars as daily_downloader
 from downloader.download_shioaji_tw_kbars import (
@@ -18,10 +19,24 @@ from downloader.download_shioaji_tw_kbars import (
     aggregate_daily,
     normalize_kbars,
 )
+from downloader.shioaji_daily_calendar import (
+    DAILY_CALENDAR_CONTRACT, calendar_prefix_matches, session_dates_sha256,
+)
 
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _calendar(start: date, end: date, sessions: set[date] | None = None):
+    sessions = sessions if sessions is not None else {
+        start + timedelta(days=index) for index in range((end - start).days + 1)
+    }
+    return sessions, {
+        "contract": DAILY_CALENDAR_CONTRACT, "root": "/fixture/calendar", "sha256": "a" * 64,
+        "start_date": start.isoformat(), "end_date": end.isoformat(),
+        "session_dates_sha256": session_dates_sha256(sessions, start, end),
+    }
 
 
 def _minute(day: date, price: float) -> pl.DataFrame:
@@ -111,6 +126,8 @@ def test_incremental_daily_reuses_verified_prefix_and_rebuilds_changed_tail(
         minute_source_chunks=_local_minute_chunk_signatures(
             old_manifest, start=first, end=second
         ),
+        official_sessions=_calendar(first, second)[0],
+        official_calendar=_calendar(first, second)[1],
     )
     new_tail = pl.concat([_minute(second, 102), _minute(third, 103)])
     updated = [initial[0], _entry(root, second, third, new_tail)]
@@ -144,6 +161,8 @@ def test_incremental_daily_reuses_verified_prefix_and_rebuilds_changed_tail(
         prefix_daily=plan[1],
         prefix_source_minute_rows=plan[2],
         reused_source_chunks=plan[3],
+        official_sessions=_calendar(first, third)[0],
+        official_calendar=_calendar(first, third)[1],
     )
     expected = aggregate_daily(
         pl.concat([_minute(first, 100), new_tail]).sort("ts"), name="台積電"
@@ -192,6 +211,8 @@ def test_incremental_daily_fails_closed_on_historical_change_or_corrupt_output(
         minute_source_chunks=_local_minute_chunk_signatures(
             manifest, start=first, end=second
         ),
+        official_sessions=_calendar(first, second)[0],
+        official_calendar=_calendar(first, second)[1],
     )
     changed = [
         _entry(root, first, first, _minute(first, 99)),
@@ -282,6 +303,9 @@ def test_local_only_job_uses_incremental_daily_without_broker(
     monkeypatch.setattr(
         daily_downloader, "record_avoided_query", lambda **_kwargs: None
     )
+    monkeypatch.setattr(
+        daily_downloader, "load_daily_calendar", lambda _root, start, end: _calendar(start, end)
+    )
     source_summary(second)
     daily_downloader._run_local_materialization(
         args, start=first, end=second, universe=[row], selected=[row]
@@ -312,3 +336,118 @@ def test_local_only_job_uses_incremental_daily_without_broker(
     run_summary = json.loads((output / "download_summary.json").read_text())
     assert run_summary["complete_symbols"] == 1
     assert run_summary["api_requests_started"] == 0
+
+
+def test_daily_calendar_quarantines_closed_day_and_preserves_raw_source(tmp_path):
+    first, closed, last = date(2020, 3, 6), date(2020, 3, 8), date(2020, 3, 9)
+    root, output = tmp_path / "minute", tmp_path / "daily"
+    frame = pl.concat([_minute(first, 100), _minute(closed, 900), _minute(last, 101)])
+    entry = _entry(root, first, last, frame)
+    manifest = _manifest(root, [entry], last)
+    raw_sha = _sha(Path(str(entry["data_path"])))
+    sessions, calendar = _calendar(first, last, {first, last})
+    row = UniverseRow("2330", "台積電", "twse", "stock", tmp_path / "base.parquet")
+    receipt_path = root / "symbols" / "2330.manifest.json"
+    result = _materialize_local_daily_symbol(
+        output, row, requested_start=first, requested_end=last, chunks=[(first, last)],
+        minute=frame, minute_manifest_receipt={"path": str(receipt_path), "sha256": _sha(receipt_path)},
+        source_gap_dates=[], verified_source_chunks=1,
+        minute_source_chunks=_local_minute_chunk_signatures(manifest, start=first, end=last),
+        official_sessions=sessions, official_calendar=calendar,
+    )
+    daily = pl.read_parquet(result.output_path)
+    assert daily["date"].to_list() == [first, last]
+    assert daily["close"].to_list() == [100, 101]
+    assert daily["Trading_Volume"].to_list() == [1000, 1000]
+    assert result.source_minute_rows == 3
+    assert result.quarantined_non_session_source_rows == 1
+    summary = json.loads(Path(result.output_path).with_suffix(".summary.json").read_text())
+    assert summary["quarantined_non_session_source_rows"] == {closed.isoformat(): 1}
+    assert _sha(Path(str(entry["data_path"]))) == raw_sha
+
+
+@pytest.mark.parametrize("failure", ["changed_source", "changed_output", "changed_calendar"])
+def test_calendar_upgrade_rejects_changed_identity(tmp_path, failure):
+    first, closed, last = date(2020, 3, 6), date(2020, 3, 8), date(2020, 3, 9)
+    root, output = tmp_path / "minute", tmp_path / "daily"
+    raw = pl.concat([_minute(first, 100), _minute(closed, 900), _minute(last, 101)])
+    manifest = _manifest(root, [_entry(root, first, last, raw)], last)
+    row = UniverseRow("2330", "台積電", "twse", "stock", tmp_path / "base.parquet")
+    path = root / "symbols" / "2330.manifest.json"
+    signatures = _local_minute_chunk_signatures(manifest, start=first, end=last)
+    all_sessions, legacy_calendar = _calendar(first, last)
+    result = _materialize_local_daily_symbol(
+        output, row, requested_start=first, requested_end=last, chunks=[(first, last)],
+        minute=raw, minute_manifest_receipt={"path": str(path), "sha256": _sha(path)},
+        source_gap_dates=[], verified_source_chunks=1, minute_source_chunks=signatures,
+        official_sessions=all_sessions, official_calendar=legacy_calendar,
+    )
+    summary_path = Path(result.output_path).with_suffix(".summary.json")
+    summary = json.loads(summary_path.read_text())
+    if failure != "changed_calendar":
+        summary.pop("official_calendar")
+    summary_path.write_text(json.dumps(summary))
+    sessions, calendar = _calendar(first, last, {first, last})
+    if failure == "changed_source":
+        signatures[0] = dict(signatures[0], data_sha256="b" * 64)
+    elif failure == "changed_output":
+        Path(result.output_path).write_bytes(b"bad bytes")
+    before = Path(result.output_path).read_bytes()
+    assert daily_downloader._upgrade_local_daily_calendar(
+        output, row, start=first, end=last, chunks=[(first, last)], manifest=manifest,
+        manifest_sha256=_sha(path), source_chunks=signatures,
+        official_sessions=sessions, official_calendar=calendar,
+    ) is None
+    assert Path(result.output_path).read_bytes() == before
+
+
+def test_legacy_calendar_upgrade_is_equivalent_to_full_materialization(tmp_path):
+    first, closed, last = date(2020, 3, 6), date(2020, 3, 8), date(2020, 3, 9)
+    root, output = tmp_path / "minute", tmp_path / "daily"
+    raw = pl.concat([_minute(first, 100), _minute(closed, 900), _minute(last, 101)])
+    manifest = _manifest(root, [_entry(root, first, last, raw)], last)
+    row = UniverseRow("2330", "台積電", "twse", "stock", tmp_path / "base.parquet")
+    path = root / "symbols" / "2330.manifest.json"
+    signatures = _local_minute_chunk_signatures(manifest, start=first, end=last)
+    all_sessions, old_calendar = _calendar(first, last)
+    kwargs = dict(
+        requested_start=first, requested_end=last, chunks=[(first, last)], minute=raw,
+        minute_manifest_receipt={"path": str(path), "sha256": _sha(path)},
+        source_gap_dates=[], verified_source_chunks=1, minute_source_chunks=signatures,
+    )
+    old = _materialize_local_daily_symbol(
+        output, row, **kwargs, official_sessions=all_sessions, official_calendar=old_calendar
+    )
+    summary_path = Path(old.output_path).with_suffix(".summary.json")
+    summary = json.loads(summary_path.read_text()); summary.pop("official_calendar")
+    summary_path.write_text(json.dumps(summary))
+    sessions, calendar = _calendar(first, last, {first, last})
+    assert daily_downloader._completed_daily_result(
+        output, row, [(first, last)], requested_start=first, requested_end=last,
+        minute_manifest_sha256=_sha(path), official_sessions=sessions, official_calendar=calendar,
+    ) is None
+    upgraded = daily_downloader._upgrade_local_daily_calendar(
+        output, row, start=first, end=last, chunks=[(first, last)], manifest=manifest,
+        manifest_sha256=_sha(path), source_chunks=signatures,
+        official_sessions=sessions, official_calendar=calendar,
+    )
+    full = _materialize_local_daily_symbol(
+        tmp_path / "full", row, **kwargs, official_sessions=sessions, official_calendar=calendar
+    )
+    assert upgraded is not None
+    assert pl.read_parquet(upgraded.output_path).to_dicts() == pl.read_parquet(full.output_path).to_dicts()
+    assert upgraded.source_minute_rows == full.source_minute_rows == 3
+    assert upgraded.quarantined_non_session_source_rows == full.quarantined_non_session_source_rows == 1
+    assert daily_downloader._completed_daily_result(
+        output, row, [(first, last)], requested_start=first, requested_end=last,
+        minute_manifest_sha256=_sha(path), official_sessions=sessions, official_calendar=calendar,
+    ) is not None
+
+
+def test_calendar_prefix_allows_new_sessions_but_rejects_historical_date_change():
+    first, closed, last, next_day = (date(2020, 3, day) for day in (6, 8, 9, 10))
+    old_sessions, old = _calendar(first, last, {first, last})
+    new_sessions, new = _calendar(first, next_day, old_sessions | {next_day})
+    assert calendar_prefix_matches(old, new_sessions, new, last)
+    assert not calendar_prefix_matches(old, new_sessions | {closed}, new, last)
+    assert not calendar_prefix_matches(dict(old, contract="unknown"), new_sessions, new, last)

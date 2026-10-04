@@ -1,6 +1,6 @@
 # 全臺幣期貨保證金模式準備狀態
 
-更新：2026-10-02。最新逐座標修復與測試見
+更新：2026-10-03。最新逐座標修復與測試見
 [會計缺口修復計畫](tw_futures_accounting_gap_plan_2026-09-30.md)；下方保留 9 月 30 日
 的歷史交付與驗收結果，不能當成今天新版本的遠端驗收。
 **全 765 個商品仍未完成；本次使用者已授權先排除 54 個非股票代碼，
@@ -10,12 +10,31 @@
 
 目前依使用者最新指示，優先使用歷史 JSON／CSV／HTML、原生文字及既有
 FinMind 運算元，只有必要欄位無等價來源時才用公告圖像。只驗收受影響商品的
-增量，全部修復完成後再做一次完整帳本檢查。截至 v811 的局部快取含
-**253 個代碼、1,939,507 列來源、1,918,308 列會計日、23,657 列受阻**，
+增量，全部修復完成後再做一次完整帳本檢查。截至 v1410 的局部快取含
+**257 個代碼、1,939,851 列來源、1,918,652 列會計日、4,873 列受阻**，
 不是全 711 個代碼的最新總數。以 v205 快取及後續新增代碼在原始 v47 的
-對應列比較，相同有效座標解除 9,975 列、新揭露 1,452 列。新增代碼皆有
+對應列比較，相同有效座標解除 27,681 列、新揭露 90 列。新增代碼皆有
 凍結原始來源的座標證明；121／142 列暖身與會計身分轉換另列，既有座標
 零遺失，不加總重疊批次的改善。
+
+最新補接 FH／FP／GP 六代碼家族，解除 310 列、零新增受阻；只重放
+19,241 個來源座標，19.28 秒完成。來源、金融、行情及編譯器逐列核對，
+共用程式 SHA 與 917 passed、0 skipped 的回歸相同，沒有重跑相同全套。
+[最新逐列驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/held_successor_family_acceptance_v1391.json)、
+[最新端點及成本](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v1410.json)。
+
+FYF 的有限 TEJ 匯出完成，第一停牌日五個格點均被省略；一筆停牌前結算價
+另與官方每日年檔不一致，恰與八天後最後結算值相同，未作每日估值准入。
+task 原優先序恢復讀回；只有來源診斷與成本更新，没有重算帳本。部位時鐘
+2,168 個座標已合併為 52 組候選原件，但未知公開時分仍未放行。全 711 的
+來源整合、快取外 CPF 早期規則鏈及遠端 smoke 仍是未完成項目。
+
+本輪依[修改前計畫](tw_futures_remaining_gap_execution_plan_2026-10-03.md)修復
+具名股數群組、當期級數證明及同原件文字接合，先解除 11,213 列；再從
+留存文字座標恢復四份原件的標籤／自然人列，解除 488 列。兩批都沒有新增
+受阻或改變暖身角色。後一批金融、行情、座標及共用編譯器全部欄位逐列核對，
+八模組回歸 **723 passed、0 skipped**，沒有新 OCR、轉圖或 provider 查詢。
+[本輪總收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v992.json)。
 
 已修跨頁原生表格、Word 財務／部位續列、同代碼月份／世代的部位來源綁定、
 全型／小型契約各自的單位換算及兩代碼合併規則。潤泰新新增四個有實際
@@ -51,8 +70,45 @@ HS1 缺歷史上限適用範圍的原型已撤回，其改善數未計入。
 **486 列、零新增受阻**，保留其他股數與原公告上限；大成鋼舊快取另接回
 先前已驗收的 13:30 現金到期時鐘修正，沒有替換來源保證金。
 [原件與逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/unchanged_member_replay_acceptance_v808.json)。
-本批十個受影響模組的共用回歸 **636 passed、2 skipped**；本輪來源修復
+該批十個受影響模組的共用回歸 **636 passed、2 skipped**；本輪來源修復
 沒有新增 OCR、影像轉檔、全部帳本重建或遠端訓練。
+
+最新再修華南金 2011 原件的期貨／選擇權跨欄部位表與具名終止恢復條件。
+原載自然人 250 萬股，CJ2 自身 201112 的正式到期及完整未平倉量紀錄
+驗證至 2011-12-21，2011-12-22 才恢復獨立原公告的 1,250 口及 CJ1 合併
+規則。只重算三個代碼、22,428 個座標，15.07 秒完成；與實際快取比較解除
+**284 列、零新增受阻**，財務原件、行情、保證金、單位來源、持倉接續及
+暖身身分不變，後續級數仍依自身當期來源。該批六模組回歸 **537 passed、
+0 skipped**，無新增 OCR 或供應商查詢。
+[原件及逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/cj2011_position_acceptance_v823.json)。
+具名終止證據已接回共用來源命令 `--position-termination-context`，重新
+組合的期間與證據相同，沒有再重算帳本；該批六模組回歸 **543 passed、
+0 skipped**。
+[共用入口及最新測試驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/fast_position_workflow_acceptance_v830.json)。
+
+本輪 v825→v894 共解除 **2,322 列、零新增受阻**。接入 DY／KT 第二期間、
+DN／DD 期間起點的已知級數、DC／IA／LO 名義月份時鐘，再修 CM／LV／NE
+原件 `民國年.MMDD` 與來源包覆蓋範圍；最後補入舊驗讀漏收的 PSF 上市行，
+及 IP1 自身股數表。只重算受影響及法律相依代碼，各批驗收後合併快取，
+沒有全部帳本重建。新增 DD2 的 43 個原始座標完整保留，暖身身分不變。
+財務、行情、交易允許、保證金與單位來源逐欄驗證；舊 13:30 到期計算
+依已驗收編譯器 v6 核對，不把後來的保證金提前套用。最新共用六模組回歸
+**670 passed、2 skipped**；跳過的是缺 optional cv2 的兩項 OCR 格線測試。
+必要原頁共重建 **6 頁、約 0.66 秒**，每頁雜湊與舊收據相同，新增 OCR／
+資料供應商查詢均為零。
+[CM／LV／NE 驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/scoped_literal_position_acceptance_v879.json)、
+[PS／IP 驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/ps_ip_position_acceptance_v889.json)、
+[最新來源冪等驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/literal_source_parity_v891.json)。
+v896 時早期 HY／LO 的 1,158 列群組衝突尚未准入；後續 v943 已依原載
+股數、明示群組與當期法律修正接合。欠最新級數證明的其他供體仍保留受阻。
+
+部位限制自股票期貨 2010-01-25 上市生效即存在，契約數與調整後總股數
+各有法律及原公告範圍。現在仍有 **6,695 列部位／時鐘、1,032 列持倉接續、
+1,623 列估值等受阻**；已將部位列整理成 **221 組來源／接合工作**，刷新
+修復過的部位 metadata 並逐座標確認每列只屬一組，不再把每列當成一次
+原件查詢。來源優先用既有原生文字、完整表格及原件證明。
+[法律來源、較快取得順序與實作計畫](tw_futures_accounting_gap_plan_2026-09-30.md)、
+[來源工作表](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v989/position_repair_jobs.json)。
 
 QM1／CJ1 的單日分鐘回應已完成，但沒有出現所需的持倉月份，尚未用於
 會計准入。CR1 已驗證 29 列分鐘資料及自身四個月份，仍缺 201306，首根
@@ -61,16 +117,27 @@ QM1／CJ1 的單日分鐘回應已完成，但沒有出現所需的持倉月份�
 TEJ 公告時點、欄位單位及全歷史完整性仍未證明，未用於會計准入。
 新的 HW 查詢註冊前遇到既有未知結果鎖，沒有重送或清除其他工作者的狀態。
 後續 TEJ 原生調整表再取得五列並與原件核對；這個帳號可見的六張期貨相關
-表未找到歷史保證金／部位上限欄位。最新佇列證據顯示舊未知任務已完成；
+表未找到歷史保證金／部位上限欄位。較早佇列證據顯示當時的舊未知任務已完成；
 三個精確日期範圍已註冊。CN2 先因前景不可用、後因精確來源選項缺失，
 三次都在 Preview 前停止；不將本機選取失敗視為供應商缺資料。KI1 的三個
 指定遠月已收到供應商明示空回覆；CJ1 的有限嘗試受共用佇列防護阻擋，
-最新唯讀快照確認另一張 TDR 表的下載結果未知，原始回應檔未留存；保留
+當時唯讀快照確認另一張 TDR 表的下載結果未知，原始回應檔未留存；保留
 `unknown_outcome_no_auto_retry`，沒有重送或清除狀態。三筆優先序均為 100，
 沒有新行情准入，不重複已完成的空查詢。
 [TEJ 選取障礙及 KI1 空回覆](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_transfer_gap_runtime_boundary_v712.json)、
 [CJ1 優先序恢復](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_cj_far_month_finite_priority_v748.json)、
-[最新 TEJ 障礙快照](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_remaining_scope_runtime_boundary_v796.json)。
+[當時 TEJ 障礙快照](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_remaining_scope_runtime_boundary_v812.json)。
+2026-10-03 00:16（臺北）只重讀三個精確 task ID：KI1 明示零列完成，
+CN2 等待且保留本機選取失敗，CJ1 等待，沒有新行情准入；舊 TDR 快照
+不當作今天的服務阻塞證據。沒有操作 GUI、改排程或重查已完成的空回應。
+[本次有限 TEJ 狀態證據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_exact_futures_runtime_boundary_v892.json)。
+後續一次有限 CJ1 精確查詢收到 `ERROR1:No data !!(wfutr)`，已恢復原優先序，
+零行情准入；CN2 的本機選取失敗仍與供應商空資料區分。
+[有限 CJ1 查詢收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_cj_exact_priority_attempt_v897.json)。
+另已驗證現有 TEJ 留存目錄 255 表、45,826 個欄位，未找到期貨部位上限
+欄位；不是 TEJ 全部方案均無此資料的證明。沒有新增付費／GUI 查詢，
+未重查已明示空的遠月，也沒有清除其他任務的未知結果。
+[TEJ 目錄及網路來源查找](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_position_source_search_v815.json)。
 FinMind 三筆有限分鐘查詢已插隊完成，優先序及服務已恢復；只回應近月，
 沒有補到缺失遠月，未用於會計准入。
 
@@ -78,8 +145,8 @@ FinMind 三筆有限分鐘查詢已插隊完成，優先序及服務已恢復；
 法律／時鐘、月份股數與真實承接行情，以及 CPF 的早期法律與保證金變更鏈。
 局部測試通過不能當成全商品訓練完成。
 [完整修復計畫及根因](tw_futures_accounting_gap_plan_2026-09-30.md)、
-[最新總收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v811.json)、
-[逐商品缺口](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v810/products.csv)。
+[最新總收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v992.json)、
+[逐商品缺口](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v989/products.csv)。
 
 ## 2026-09-30 修復：規格 v5、來源 v79、會計條款 v18
 

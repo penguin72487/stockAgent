@@ -66,7 +66,7 @@ def _pool(target: dict, records: list[dict], *, axis: str | None = None) -> tupl
     return records, "cross_table_fallback"
 
 
-def _metrics(samples: list[dict], overhead: float) -> dict | None:
+def _metrics(samples: list[dict], overhead: float, *, start_interval: bool = False) -> dict | None:
     # Repeated small exports from one table must not dominate all other tables.
     grouped = defaultdict(list)
     for sample in samples:
@@ -76,7 +76,8 @@ def _metrics(samples: list[dict], overhead: float) -> dict | None:
             grouped[sample["table_id"]].append(sample)
     if not grouped:
         return None
-    durations = {scenario: quantile([quantile([s['seconds'] for s in members], q) + overhead
+    durations = {scenario: quantile([(max(quantile([s['seconds'] for s in members], q),overhead)
+                                      if start_interval else quantile([s['seconds'] for s in members], q) + overhead)
                                     for members in grouped.values()], q)
                  for scenario, q in zip(SCENARIOS, QUANTILES)}
     density, byte_cost = [], []
@@ -98,7 +99,8 @@ def _sum(rows: list[dict], key: str, scenario: str) -> float | None:
     return None if any(v is None for v in values) else sum(values)
 
 
-def _milestone(needed: list[dict], all_work: list[dict], barrier: str, scenario: str) -> float | None:
+def _milestone(needed: list[dict], all_work: list[dict], barrier: str | int, scenario: str,
+               *, ordering_key: str = 'phase') -> float | None:
     """Round-robin table milestone under the canonical single-owner scheduler.
 
     Earlier owner phases drain first. In the final owner phase, each table
@@ -108,21 +110,24 @@ def _milestone(needed: list[dict], all_work: list[dict], barrier: str, scenario:
     """
     if not needed:
         return 0
-    final = [r for r in needed if r['phase'] == barrier]
+    if ordering_key == 'collection_priority' and all(
+            r['remaining_queries'][scenario] == 0 and r['discovery_seconds'][scenario] == 0 for r in needed):
+        return 0
+    final = [r for r in needed if r[ordering_key] == barrier]
     rounds = [r['remaining_queries'][scenario] for r in final]
     if any(n is None for n in rounds):
         return None
     horizon = max(rounds, default=0)
     seconds = 0
     for row in all_work:
-        if row['phase'] > barrier:
+        if row[ordering_key] > barrier:
             continue
         queries = row['remaining_queries'][scenario]
         discovery = row['discovery_seconds'][scenario]
         if discovery is None:
             return None
         seconds += discovery
-        if row['phase'] < barrier:
+        if row[ordering_key] < barrier:
             service = row['download_seconds'][scenario]
         elif horizon == 0:
             service = 0
@@ -141,12 +146,16 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                      interface_blocked: bool = False) -> dict:
     """Project query workloads and stage dependency barriers, without mutation."""
     overhead = config.get("minimum_export_interval_seconds", 0)
+    interval_contract = config.get('query_interval_contract','minimum_completion_gap_v1')
+    if interval_contract not in ('minimum_completion_gap_v1','minimum_query_start_interval_v1'):
+        raise ValueError('Unreviewed TEJ query interval contract')
+    start_interval = interval_contract == 'minimum_query_start_interval_v1'
     samples = [s for s in samples if s.get('timing_basis') == 'fresh_end_to_end'
                and isinstance(s.get('seconds'), (int, float)) and math.isfinite(s['seconds']) and s['seconds'] > 0]
     downloads = [s for s in samples if s.get("kind") == "download"]
     discoveries = [s for s in samples if s.get("kind") == "discover"]
-    global_download = _metrics(downloads, overhead)
-    global_discovery = _metrics(discoveries, overhead)
+    global_download = _metrics(downloads, overhead, start_interval=start_interval)
+    global_discovery = _metrics(discoveries, overhead, start_interval=start_interval)
     per_table_samples = defaultdict(list)
     for sample in downloads:
         per_table_samples[sample['table_id']].append(sample)
@@ -194,12 +203,12 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                             if magnitude is not None else (0, math.inf))
             matched = [s for s in downloads if lower <= (s.get('expected_rows') or 0) <= upper]
             pool, basis = _pool(table, matched or downloads)
-            frequency_models[key] = (_metrics(pool, overhead) or global_download,
+            frequency_models[key] = (_metrics(pool, overhead, start_interval=start_interval) or global_download,
                                      basis + ('/similar_scope' if matched else '/scope_unverified'), lower, upper)
         model, timing_basis, lower, upper = frequency_models[key]
         matched_own = [s for s in own if lower <= (s.get('expected_rows') or 0) <= upper]
         if len(matched_own) >= 2:
-            model, timing_basis = _metrics(matched_own, overhead), 'same_table/similar_scope'
+            model, timing_basis = _metrics(matched_own, overhead, start_interval=start_interval), 'same_table/similar_scope'
         discovery_count = table.get("remaining_discovery_tasks", 0)
         seconds, result_rows, result_bytes, download_times, discovery_times = {}, {}, {}, {}, {}
         for scenario in SCENARIOS:
@@ -218,6 +227,7 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
             result_bytes[scenario] = (0 if queries == 0 else queries * byte_cost
                                       if queries is not None and byte_cost is not None else None)
         table_forecasts.append({"table_id": table["table_id"], "phase": table["phase"],
+            "collection_priority": table.get('collection_priority'),
             "field_phase_counts": table["field_phase_counts"], "axis_verified": table.get("grid_rows") is not None,
             "remaining_queries": remaining_queries, "remaining_work_rows": remaining_rows,
             "remaining_seconds": seconds, "remaining_export_rows": result_rows, "remaining_local_bytes": result_bytes,
@@ -225,6 +235,7 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
             "geometry_basis": geometry_basis, "timing_basis": timing_basis,
             "timing_samples": model["samples"] if model else 0,
             "discovery_tasks": discovery_count, "blocked_tasks": table.get("blocked_tasks", 0),
+            "deferred_tasks": table.get('deferred_tasks',0),
             "resolved_grid_rows": table["resolved_grid_rows"], "exported_rows": table["exported_rows"],
             "recorded_bytes": table["recorded_bytes"]})
     scenarios = {scenario: {"remaining_seconds": _sum(table_forecasts, "remaining_seconds", scenario),
@@ -234,15 +245,18 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                             "remaining_local_bytes": _sum(table_forecasts, "remaining_local_bytes", scenario)}
                  for scenario in SCENARIOS}
     phases = []
+    value_order = bool(table_forecasts) and all(type(r['collection_priority']) is int for r in table_forecasts)
     for phase in PHASES:
         own = [r for r in table_forecasts if r["phase"] == phase]
         needed = [r for r in table_forecasts if r["field_phase_counts"].get(phase, 0) > 0]
         # Scheduler completes earlier phases first. Bundled fields depend on
         # their owner phase, not a second download or zero-time completion.
         barrier = max((r["phase"] for r in needed), default=phase)
+        priority_barrier = max((r['collection_priority'] for r in needed), default=0) if value_order else None
         phase_scenarios = {}
         for scenario in SCENARIOS:
-            remaining = _milestone(needed, table_forecasts, barrier, scenario)
+            remaining = _milestone(needed, table_forecasts, priority_barrier if value_order else barrier, scenario,
+                                   ordering_key='collection_priority' if value_order else 'phase')
             phase_scenarios[scenario] = {
                 "additional_queries": _sum(own, "remaining_queries", scenario),
                 "additional_seconds": _sum(own, "remaining_seconds", scenario),
@@ -254,10 +268,13 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                 "dependency_remaining_export_rows": _sum(needed, "remaining_export_rows", scenario),
             }
         phases.append({"phase": phase, "candidate_fields": sum(r["field_phase_counts"].get(phase, 0) for r in needed),
+            "milestone_order_basis": "local_gap_value_priority" if value_order else "legacy_phase_priority",
+            "priority_dependency_barrier": priority_barrier,
             "owner_tables": len(own), "dependency_tables": len(needed), "parent_phase_barrier": barrier,
             "bundled_into_earlier_tables": sum(r["phase"] < phase for r in needed),
             "undiscovered_dependency_tables": sum(not r["axis_verified"] for r in needed),
             "blocked_dependency_tasks": sum(r["blocked_tasks"] for r in needed),
+            "deferred_dependency_tasks": sum(r['deferred_tasks'] for r in needed),
             "dependency_resolved_grid_rows": sum(r['resolved_grid_rows'] for r in needed),
             "dependency_exported_rows": sum(r['exported_rows'] for r in needed),
             "dependency_recorded_bytes": sum(r['recorded_bytes'] for r in needed),
@@ -270,6 +287,7 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                   "bounds": {k: config.get(k) for k in ("max_rows_per_export", "max_cells_per_export",
                               "max_companies_per_export", "minimum_export_interval_seconds")}}
     provenance['bounds']['query_tiling_contract'] = config.get('query_tiling_contract')
+    provenance['bounds']['query_interval_contract'] = interval_contract
     fingerprint = hashlib.sha256(json.dumps(provenance, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()).hexdigest()
     return {"contract": CONTRACT, "as_of_utc": observed.isoformat(), "history_cutoff": cutoff,
             "input_sha256": fingerprint, "execution_state": "finite_batch_running" if alive else "not_running",
@@ -290,7 +308,8 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
             "assumptions": ["單一桌面持有者，若從現在連續 24 小時執行；有限批次並非持續排程",
                 "較快／中間／較慢是同表或相近表實測情境，不是保證或統計信賴區間",
                 "未清點歷史軸以同 universe／頻率推估；缺同類證據則跨表外推，Key 暫假設 2",
-                "依既有階段順序與逐表輪轉推算最後依賴表完成；清點工時前置計入，實際仍交錯執行",
+                ("依本機缺口與資料價值優先序、同價值逐表輪轉推算；P1/P2/P3是覆蓋分類而非執行先後，清點工時前置計入" if value_order else
+                 "依既有階段順序與逐表輪轉推算最後依賴表完成；清點工時前置計入，實際仍交錯執行"),
                 "含完整查詢、驗證、保存、收據與工作間隔；不把恢復舊結果當下載速度",
                 "假設來源故障已修復；官方配額、桌面空檔與外部修復等待未知，未計入",
                 "筆數與容量是稀疏樣本外推，本機含原始匯出＋Parquet，不是網路流量",

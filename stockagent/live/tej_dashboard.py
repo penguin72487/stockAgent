@@ -6,18 +6,25 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 from statistics import median
 from typing import Any
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 12
+STATUS_CACHE_SECONDS = 4.0
+STATUS_REFRESH_SECONDS = 5
+PROGRESS_CONTRACT = 'tej_native_readback_progress_v1'
+PROGRESS_STAGES = frozenset({'preparing_scope', 'awaiting_preview', 'reading_preview',
+                            'response_saved', 'validating_and_saving'})
 SCHEDULER_STATES = frozenset({'starting', 'executing', 'between_tasks', 'waiting_local_retry', 'waiting_desktop',
-    'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_recovery', 'stopped'})
+    'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_metadata', 'waiting_recovery', 'stopped'})
 SCHEDULER_REASONS = frozenset({'desktop_interface_recovery_required', 'inflight_requires_recovery',
     'unknown_outcome_no_auto_retry', 'source_validation_failed', 'local_storage_failed',
     'source_key_layout_replan_required', 'date_input_prequery_needs_review',
     'source_period_replan_required',
+    'source_capacity_requires_review',
     'list_selection_prequery_needs_review', 'query_activation_prequery_needs_review'})
 METHOD = "Smart Wizard 查詢可能沿用最近一期。v4 另驗證公司／日期介面可用及無錯誤視窗；保存的是來源顯示字串，不是 Excel 底層精度、原生歷史或發布時點證明。舊範圍需重新驗證。"
 TABLE_COLUMNS = ("table_id", "smart_id", "name", "category", "phase", "frequency", "state",
@@ -106,6 +113,45 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
             'query_deadline_renewed_by_heartbeat': False, 'unknown_outcome_auto_retry': False}
 
 
+def _current_task_public(root: Path, task: dict | None, worker: dict, alive: bool,
+                         observed: datetime) -> dict | None:
+    """Progress is display-only: never a receipt, retry proof or owner heartbeat."""
+    if not task or not alive or worker.get('state') != 'running':
+        return None
+    started = _stamp(task.get('attempted_at_utc'))
+    value = {'task_id': task['task_id'], 'table_id': task['table_id'],
+             'table_name': task['table_name'], 'kind': task['kind'], 'phase': task['phase'],
+             'started_at_utc': started.isoformat() if started else None,
+             'elapsed_seconds': max(0, (observed-started).total_seconds()) if started else None,
+             'query_work_rows': task['work_rows'], 'stage': 'awaiting_progress',
+             'progress_observed_at_utc': None, 'readback_scanned_row_slots': None,
+             'readback_total_row_slots': None, 'readback_ratio': None,
+             'adopted': False, 'progress_stale': False}
+    attempt = worker.get('bridge_attempt_id')
+    if (not isinstance(attempt, str) or
+            not re.fullmatch(re.escape(task['task_id']) + r'-[0-9a-f]{32}', attempt) or
+            task.get('active_attempt_id') and task['active_attempt_id'] != attempt):
+        return value
+    path = root / 'progress' / (attempt + '.json.progress.json')
+    # Derive one exact attempt path; no glob, source file read or symlink escape.
+    if path.resolve().parent != (root / 'progress').resolve():
+        return value
+    progress = _json(path)
+    clock = _stamp(progress.get('observed_at_utc'))
+    if (progress.get('contract') != PROGRESS_CONTRACT or progress.get('task_id') != task['task_id']
+            or progress.get('attempt_id') != attempt or progress.get('stage') not in PROGRESS_STAGES
+            or not clock or not started or not started <= clock <= observed + timedelta(seconds=5)):
+        return value
+    value.update(stage=progress['stage'], progress_observed_at_utc=clock.isoformat(),
+                 progress_stale=(observed-clock).total_seconds() > 30)
+    scanned, total = progress.get('scanned_row_slots'), progress.get('total_row_slots')
+    if (type(scanned) is int and type(total) is int and 0 <= scanned <= total <= 10001
+            and progress['stage'] in {'reading_preview', 'response_saved', 'validating_and_saving'}):
+        value.update(readback_scanned_row_slots=scanned, readback_total_row_slots=total,
+                     readback_ratio=scanned/total if total else None)
+    return value
+
+
 def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> dict:
     observed = (now or datetime.now(UTC)).astimezone(UTC)
     root = repo_root / "data_tej"
@@ -113,6 +159,7 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
             "read_only": True, "raw_values_exposed": False, "method": METHOD,
             "native_observation_completeness_verified": False, "publication_verified": False,
             "raw_source_publish": False, "tables": []}
+    worker = _json(root / 'worker_status.json')
     if not (root / "queue.sqlite3").is_file():
         return {**base, "state": "not_registered", "catalog": {"tables": None, "fields": None}}
     try:
@@ -131,6 +178,9 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
             per_table = {r["table_id"]: dict(r) for r in con.execute("SELECT table_id,COUNT(*) AS fields,SUM(exported_non_null_cells) AS exported_non_null_cells,MIN(first_query_period) AS first_query_period,MAX(last_query_period) AS last_query_period,SUM(phase='P1') AS p1_fields,SUM(phase='P2') AS p2_fields,SUM(phase='P3') AS p3_fields FROM features GROUP BY table_id")}
             tasks = [dict(r) for r in con.execute("SELECT table_id,kind,state,COUNT(*) AS tasks,SUM("+work_rows+") AS target_rows,SUM(actual_rows) AS exported_rows,SUM(actual_bytes) AS recorded_bytes,SUM(CASE WHEN kind='download' AND state='complete' AND actual_rows=0 THEN 1 ELSE 0 END) AS empty_tasks FROM tasks WHERE state IN ('pending','running','complete','blocked')"+current_scope+" GROUP BY table_id,kind,state")]
             plans={r['table_id']:dict(r) for r in con.execute('SELECT table_id,total_queries,next_query FROM download_plans')} if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_plans'").fetchone() else {}
+            value_priorities = {r['table_id']: dict(r) for r in con.execute(
+                'SELECT table_id,priority,rank,value_score,missing_fields,crosscheck_fields,reason FROM acquisition_value_priorities')
+                } if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='acquisition_value_priorities'").fetchone() else {}
             # A bounded timing sample, never a scan of source Parquet files.
             samples = []
             for kind in ("download", "discover"):
@@ -142,6 +192,37 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
             features_obtained = con.execute("SELECT COUNT(*) FROM features WHERE exported_non_null_cells>0").fetchone()[0]
             minute = observed.replace(second=0, microsecond=0)
             traffic = con.execute("SELECT COUNT(*) FROM traffic WHERE started_at_utc>? AND started_at_utc<=?", ((minute - timedelta(hours=1)).isoformat(), minute.isoformat())).fetchone()[0]
+            # Indexed current/success records; never decode giant lazy plans or
+            # read licensed values just to display download activity.
+            active_column = 'k.active_attempt_id' if 'active_attempt_id' in task_columns else 'NULL AS active_attempt_id'
+            active_work_rows = ('COALESCE(k.work_expected_rows,k.expected_rows)' if
+                                'work_expected_rows' in task_columns else 'k.expected_rows')
+            current_row = con.execute("SELECT k.task_id,k.table_id,t.name AS table_name,k.kind,k.phase,"
+                "k.attempted_at_utc," + active_column + "," + active_work_rows
+                + " AS work_rows FROM tasks k JOIN tables t ON t.table_id=k.table_id "
+                "WHERE k.task_id=? AND k.state='running'" + current_scope,
+                (worker.get('task_id') if isinstance(worker.get('task_id'), str) else '',)).fetchone()
+            current = dict(current_row) if current_row else None
+            latest_row = con.execute("SELECT k.task_id,k.table_id,t.name AS table_name,k.completed_at_utc,"
+                "k.actual_rows,k.actual_bytes FROM tasks k JOIN tables t ON t.table_id=k.table_id "
+                "WHERE k.state='complete' AND k.kind='download'" + current_scope
+                + " ORDER BY k.completed_at_utc DESC LIMIT 1").fetchone()
+            latest = dict(latest_row) if latest_row else None
+            blocked = [dict(r) for r in con.execute("SELECT k.task_id,k.table_id,t.name AS table_name,"
+                "k.kind,k.last_error_code,k.attempted_at_utc FROM tasks k JOIN tables t ON t.table_id=k.table_id "
+                "WHERE k.state='blocked'" + current_scope + " ORDER BY k.priority,k.task_id LIMIT 20")]
+            retry_windows = {}
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='desktop_retry_windows'").fetchone():
+                for row in con.execute("SELECT r.table_id,r.task_id,t.name AS table_name,r.consecutive_failures,"
+                        "r.next_attempt_at_utc,r.error_code,k.state AS task_state FROM desktop_retry_windows r "
+                        "JOIN tasks k ON k.task_id=r.task_id JOIN tables t ON t.table_id=r.table_id "
+                        "WHERE k.state IN ('pending','running') ORDER BY r.next_attempt_at_utc,r.table_id"):
+                    record=dict(row)
+                    if record['error_code'] not in SCHEDULER_REASONS:
+                        record['error_code']='unclassified_requires_review'
+                    due=_stamp(record['next_attempt_at_utc'])
+                    record['retry_after_seconds']=max(0,(due-observed).total_seconds()) if due else None
+                    retry_windows[record['table_id']]=record
     except (sqlite3.Error, OSError, ValueError):
         return {**base, "state": "metadata_unavailable", "catalog": {"tables": None, "fields": None}}
     grouped: dict[str, list[dict]] = {}
@@ -151,7 +232,6 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         legacy = json.loads(meta.get('legacy_unverified_exports','{}'))
     except (TypeError, ValueError):
         return {**base, "state": "metadata_unavailable", "catalog": {"tables": None, "fields": None}}
-    worker = _json(root / "worker_status.json")
     alive = _worker_alive(worker, observed)
     scheduler = _scheduler_public(root, observed)
     for task in tasks:
@@ -165,6 +245,12 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
               "known_grid_rows": 0, "discovered_tables": 0, "blocked_tasks": 0, "running_tasks": 0}
     for table in tables:
         identifier = table["table_id"]
+        ranking = value_priorities.get(identifier)
+        if ranking:
+            table.update(collection_priority=ranking['priority'], collection_rank=ranking['rank'],
+                         acquisition_value_score=ranking['value_score'], acquisition_value_basis=ranking['reason'],
+                         local_gap_candidate_fields=ranking['missing_fields'],
+                         local_crosscheck_candidate_fields=ranking['crosscheck_fields'])
         # One company/date pair may have several disjoint field batches.
         # Keep the unique menu grid separately; progress measures query work.
         table['company_period_grid_rows']=table['grid_rows']
@@ -183,6 +269,9 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         table["remaining_discovery_tasks"] = sum(w["tasks"] for w in work if w['kind'] == 'discover' and w['state'] != 'complete')
         table["blocked_tasks"] = sum(w["tasks"] for w in work if w["state"] == "blocked")
         table["running_tasks"] = sum(w["tasks"] for w in work if w["state"] == "running")
+        table['local_retry_window']=retry_windows.get(identifier)
+        table['deferred_tasks']=int(bool(table['local_retry_window'] and
+                                       table['local_retry_window']['task_state']=='pending'))
         table["active_work_kind"] = next((w['kind'] for w in work if w['state']=='running'),None)
         table["exported_rows"] = sum(w["exported_rows"] or 0 for w in downloads if w["state"] == "complete")
         table["resolved_grid_rows"] = sum(w["target_rows"] or 0 for w in downloads if w["state"] == "complete")
@@ -194,6 +283,7 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         checked = bool(table["grid_rows"] and downloads and not unfinished and table["resolved_grid_rows"] == table["grid_rows"])
         table["state"] = ("needs_review" if table["blocked_tasks"] else "running" if table["running_tasks"] and alive else
                           "stalled_requires_recovery" if table["running_tasks"] else
+                          "waiting_local_retry" if table['deferred_tasks'] else
                           "query_grid_exported" if checked and table["exported_rows"] == table["grid_rows"] else
                           "query_scope_checked" if checked else table["state"])
         measured = table_samples.get(identifier, [])
@@ -210,7 +300,7 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         table["estimated_total_export_rows"] = (table["exported_rows"] if checked else
                                                 table["exported_rows"] + round(density * remaining) if density is not None and table["grid_rows"] else None)
         table["remaining_seconds"] = (0 if checked else
-                                      remaining / rate if rate and not table["blocked_tasks"] and table["grid_rows"] is not None else None)
+                                      remaining / rate if rate and not table["blocked_tasks"] and not table['local_retry_window'] and table["grid_rows"] is not None else None)
         table["eta_basis"] = "同表近期完整工作之格點處理速度／稀疏密度；條件式，不含未核實配額、其他表優先工作及桌面等待" if rate else "至少兩次同表完整工作後估算；恢復讀回不當抓取速度，欄位數不當流量／原生筆數"
         for key in ("exported_rows", "resolved_grid_rows", "source_empty_tasks", "recorded_bytes", "blocked_tasks", "running_tasks"):
             totals[key] += table[key]
@@ -270,7 +360,23 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         table.pop('query_type', None)
     automatic_wait = ('needs_review' if scheduler['state'] == 'waiting_recovery' else
                       'paused_for_storage' if scheduler['state'] == 'waiting_storage' else 'automatic_waiting')
+    for task in blocked:
+        if task['last_error_code'] not in SCHEDULER_REASONS | {'vendor_metadata_allocation_failed_deferred',
+                'metadata_preparation_failed_deferred','source_validation_failed_deferred'}:
+            task['last_error_code'] = 'unclassified_requires_review'
+    completed_downloads = sum(w['tasks'] for w in tasks if w['kind'] == 'download' and w['state'] == 'complete')
+    completed_discoveries = sum(w['tasks'] for w in tasks if w['kind'] == 'discover' and w['state'] == 'complete')
     return {**base, "state": "running" if alive else automatic_wait if scheduler['alive'] else "needs_review" if totals["blocked_tasks"] or totals["running_tasks"] else "paused_for_storage" if worker.get("state") == "local_disk_headroom_low" else completed_state if all_known_exported else "queued",
+            "activity": {'contract': 'tej_download_activity_v1', 'refresh_seconds': STATUS_REFRESH_SECONDS,
+                         'completed_download_tasks': completed_downloads,
+                         'completed_discovery_tasks': completed_discoveries,
+                         'last_successful_download': latest,
+                         'current_task': _current_task_public(root, current, worker, alive, observed),
+                         'blocked_tasks': blocked, 'blocked_tasks_total': totals['blocked_tasks'],
+                         'deferred_tasks': [r for r in retry_windows.values() if r['task_state']=='pending'][:20],
+                         'deferred_tasks_total': sum(r['task_state']=='pending' for r in retry_windows.values()),
+                         'completion_revision': f"{latest['task_id'] if latest else ''}:{completed_downloads}:"
+                             f"{completed_discoveries}:{totals['exported_non_null_cells']}:{total_features}"},
             "catalog": {"tables": len(tables), "fields": total_features, "types_scanned": len(catalog_proof.get("types_verified_complete", [])) or None,
                         "catalog_scan_complete": catalog_proof.get("catalog_scan_complete") is True, "empty_field_menus": states["empty_field_menu"],
                         "fields_with_non_null_exports": features_obtained,
@@ -280,7 +386,14 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
                          "global_query_scope_ratio": totals["resolved_grid_rows"] / totals["known_grid_rows"] if axes_complete and totals["known_grid_rows"] else None,
                          "scope": "已發現公司／日期／欄位分片工作格點，不等於原生歷史；未發現的表不填零"},
             "planning": {"contract":meta.get('preview_planning_contract'),
+                         "acquisition_priority":json.loads(meta.get('acquisition_value_priority','null')),
                          "query_tiling_contract":meta.get('query_tiling_contract'),
+                         "query_capacity_contract":meta.get('query_capacity_contract'),
+                         "local_max_rows":config.get('max_rows_per_export'),
+                         "local_max_cells":config.get('max_cells_per_export'),
+                         "local_max_companies":config.get('max_companies_per_export'),
+                         "query_interval_contract":config.get('query_interval_contract','minimum_completion_gap_v1'),
+                         "minimum_query_interval_seconds":config.get('minimum_export_interval_seconds'),
                          "preview_max_columns":30 if meta.get('preview_planning_contract')=='preview_30_columns_lazy_fields_v1' else None,
                          "buffered_download_tasks":sum(w['tasks'] for w in tasks if w['kind']=='download' and w['state'] in {'pending','running'}),
                          "unmaterialized_queries":sum(p['total_queries']-p['next_query'] for p in plans.values()) if plans else None},

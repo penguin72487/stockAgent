@@ -1,0 +1,12 @@
+# User-selected TWD 100M account. Preserve the TWD 10M research and checkpoints.
+# Model-only, fold-matched initialization; ordinary unconstrained optimization.
+base_config: tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_warm_policy_v16.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-warm-policy-v16
+
+trading:
+  tw_futures_portfolio_integer_initial_capital: 100000000.0
+  volume_participation_equity: 100000000.0
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_warm_policy_v16
+  start_fold: 14

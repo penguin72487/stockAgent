@@ -8,6 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from downloader.stock_volume_units import STOCK_MINUTE_READER_CONTRACT
+
 
 def _json_object(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -138,6 +140,7 @@ def may_reuse_materialization(
             and source_rows_after == source_rows_before
             and _source_fingerprint(source_root, report_rows) == source_fingerprint_before
             and manifest.get("research_ready") is True
+            and manifest.get("source_reader_contract") == STOCK_MINUTE_READER_CONTRACT
             and manifest.get("download_start_date") == "2020-03-02"
             and manifest.get("download_end_date") == target_date
             and manifest.get("source_fingerprint_sha256") == source_fingerprint_before

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import fcntl
@@ -39,11 +40,12 @@ from downloader.finmind_batching import (
     coalesce_pending_tasks, split_batch_rows,
 )
 from downloader.finmind_parent_recovery import recover_failed_long_parent
-from downloader.finmind_runtime import wait_for_next_cycle
+from downloader.finmind_runtime import wait_for_next_cycle, retryable_queue_error
 from downloader.finmind_updates import retain_observation, empty_retry, set_next_check, record_failure
+from downloader import finmind_retry_policy as retry_policy
 from downloader.finmind_scheduling import (
     SOURCES, SPECS, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS, Source, _s,
-    fixed_incremental_demand, protected_stock_opening,
+    fixed_incremental_demand, incremental_reservation, protected_stock_opening,
     next_release_check,
     reconcile_release_deadlines,
 )
@@ -505,8 +507,8 @@ def _ready_after_wait(root: Path, now: datetime, *, secondary_admission: Callabl
     """A primary retry becoming due must wake even while validation is vetoed."""
     try:
         due, values = _due_query(now, datasets=datasets)
-        with sqlite3.connect((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro', uri=True,
-                             timeout=0.2) as conn:
+        with closing(sqlite3.connect((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro', uri=True,
+                                    timeout=0.2)) as conn:
             first = conn.execute(f'SELECT priority FROM tasks WHERE {due} ORDER BY priority LIMIT 1',
                                  values).fetchone()
             if first is None:
@@ -896,6 +898,7 @@ def _finish(conn: sqlite3.Connection, root: Path, task: Task,
         next_at = next_period_refresh(task.dataset, task.partition, now)
     elif not rows and not context.get('allow_empty') and task.kind in {'day', 'derived'} and _late_daily_retry(task.dataset, task.partition, now):
         next_at = now + timedelta(hours=4)
+    retry_policy.record_success(conn, task, now)
     conn.execute(
         "UPDATE tasks SET state=?,next_attempt_at_utc=?,last_attempt_at_utc=?,"
         "rows=?,bytes=?,first_data_date=?,last_data_date=?,receipt_path=?,error_code=NULL "
@@ -928,6 +931,7 @@ def _fail(conn: sqlite3.Connection, task: Task, error: SourceError, now: datetim
          None if terminal else (now + timedelta(seconds=max(60, error.retry_after))).isoformat(),
          task.dataset, task.partition),
     )
+    retry_policy.record_failure(conn, task, error.code, now)
     conn.commit()
 
 
@@ -937,7 +941,8 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
             session_policy: dict[str, Any] | None = None) -> dict[str, Any]:
     from downloader.acquisition_policy import finmind_secondary_mode
     series = {spec.dataset: {"target": 0, "complete": 0, "observed_empty": 0,
-                             "failed": 0, "blocked": 0, "non_session": 0,
+                             "failed": 0, "retry_exhausted": 0, "retained_rows": 0, "retained_bytes": 0,
+                             "blocked": 0, "non_session": 0,
                              "not_observation_date": 0,
                              "calendar_wait": 0,
                              "deprecated_query_shape": 0,
@@ -960,6 +965,9 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
             item["target"] += count
         if task_state in item:
             item[task_state] += count
+        if task_state in {'failed', 'retry_exhausted'}:
+            item['retained_rows'] += row_count or 0
+            item['retained_bytes'] += size or 0
         if attempted and (item["last_attempt_at_utc"] is None or attempted > item["last_attempt_at_utc"]):
             item["last_attempt_at_utc"] = attempted
         if (task_state in {"complete", "observed_empty"} and partition
@@ -978,6 +986,7 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
         "state": state, "tier": account.get("tier") if account else None,
         "official_requests_per_hour": account.get("official_requests_per_hour") if account else None,
         "series": series, "unscheduled": UNSCHEDULED,
+        "retry_policy": retry_policy.summary(conn),
         "session_policy": session_policy or {"state": "calendar_unverified"},
         "active_tasks": [{"dataset": task.dataset, "partition": task.partition} for task in active or []],
         "last_task": last, "catalog_source": CATALOG_URL,
@@ -1018,17 +1027,17 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
         try:
             account = verified_account(session, token, root.parent)
         except (requests.RequestException, RuntimeError, ValueError) as exc:
-            with _db(root / "queue.sqlite3") as conn:
+            with closing(_db(root / "queue.sqlite3")) as conn, conn:
                 return _status(conn, root, "account_unverified", last={"error_type": type(exc).__name__})
     if account["tier"] not in {"Sponsor", "SponsorPro"}:
-        with _db(root / "queue.sqlite3") as conn:
+        with closing(_db(root / "queue.sqlite3")) as conn, conn:
             return _status(conn, root, "not_entitled", account=account)
     limiter = rate_limiter(account)
     if secondary_admission is None:
         from downloader.acquisition_policy import evaluate_finmind_secondary_admission
 
         secondary_admission = lambda: evaluate_finmind_secondary_admission(root=root.parent)
-    with _db(root / "queue.sqlite3") as conn:
+    with closing(_db(root / "queue.sqlite3")) as conn, conn:
         from downloader.finmind_corrections import apply_worker_corrections, reconcile_worker_corrections
 
         session_policy = _seed(
@@ -1068,10 +1077,12 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                 while not halt and len(in_flight) < workers and (not max_requests or sent < max_requests):
                     dispatch_now = datetime.now(UTC)
                     account = refresh_dispatch_account(account, token, root.parent, dispatch_now)
+                    reservation = incremental_reservation(root.parent, dispatch_now)
                     budget = backfill_budget(
                         account, root.parent,
-                        fixed_incremental_requests=_fixed_incremental_demand(root.parent, dispatch_now),
+                        fixed_incremental_requests=reservation['reserve_requests'],
                         in_flight=len(in_flight), now=dispatch_now, prioritize_due=True,
+                        reservation_plan=reservation,
                     )
                     if budget.get('remaining', len(in_flight) + 1) <= len(in_flight):
                         halt = True
@@ -1191,8 +1202,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset", action="append", choices=sorted(spec.dataset for spec in SOURCES),
                         help="Dispatch only this existing dataset; repeat to select more than one")
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument('--reopen-exhausted', action='store_true',
+                        help='Explicitly reopen exhausted --dataset scopes, then exit without an API call')
     args = parser.parse_args(argv)
+    if args.reopen_exhausted and (not args.dataset or args.loop):
+        parser.error('--reopen-exhausted requires --dataset and cannot combine with --loop')
     root = args.root.resolve()
+    if args.reopen_exhausted and not (root / 'queue.sqlite3').is_file():
+        parser.error('--reopen-exhausted requires an existing owner queue')
     root.mkdir(parents=True, exist_ok=True)
     with (root / "worker.lock").open("a+") as handle:
         try:
@@ -1201,9 +1218,19 @@ def main(argv: list[str] | None = None) -> int:
             print("FinMind Sponsor worker already running", file=sys.stderr)
             return 2
         try:
+            if args.reopen_exhausted:
+                with closing(_db(root / 'queue.sqlite3')) as conn, conn:
+                    changed = retry_policy.reopen(conn, tuple(args.dataset), datetime.now(UTC))
+                print(json.dumps({'reopened_exhausted_tasks': changed, 'provider_calls': 0}), flush=True)
+                return 0
             while True:
-                result = run_once(root, max_requests=args.max_requests, workers=args.workers,
-                                  datasets=tuple(args.dataset) if args.dataset is not None else None)
+                try:
+                    result = run_once(root, max_requests=args.max_requests, workers=args.workers,
+                                      datasets=tuple(args.dataset) if args.dataset is not None else None)
+                except sqlite3.OperationalError as error:
+                    if not args.loop or not retryable_queue_error(error):
+                        raise
+                    result = {'state': 'queue_busy', 'error_code': 'sqlite_busy'}
                 print(json.dumps({"state": result["state"], "last_task": result.get("last_task")},
                                  ensure_ascii=False), flush=True)
                 if not args.loop or result["state"] in {"account_unverified", "not_entitled", "invalid_token"}:
@@ -1211,7 +1238,8 @@ def main(argv: list[str] | None = None) -> int:
                 delay = (1800 if result["state"] in {"rate_limited", "ip_banned"} else
                          600 if result["state"] in {"current_queue", "protected_opening", "disk_guard",
                                                      "waiting_necessary_acquisition"} else
-                         60 if result["state"] == "incremental_reserve" else 2)
+                         60 if result["state"] == "incremental_reserve" else
+                         5 if result['state'] == 'queue_busy' else 2)
                 from downloader.acquisition_policy import evaluate_finmind_secondary_admission
                 wake_if = (lambda: _ready_after_wait(
                     root, datetime.now(UTC),

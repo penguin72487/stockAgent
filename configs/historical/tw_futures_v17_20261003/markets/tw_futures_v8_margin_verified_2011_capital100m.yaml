@@ -1,0 +1,23 @@
+# Same futures-only v5-derived architecture, with the expanded verified release.
+# Fold 14 retains validation=2025/test=2026 and learns from 2011..2024.
+base_config: tw_futures_v8_margin_verified_capital100m.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m
+
+data:
+  # Context only: keep 32 prior completed stock sessions for the first 2011
+  # decision. Split ownership and verified futures rules still begin in 2011.
+  panel_start_date: '2010-11-01'
+  panel_cache_root: artifacts/cache/tw_futures_v8_margin_verified_2011_capital100m_context2010
+
+trading:
+  tw_futures_portfolio_data_path: artifacts/markets/tw_futures_v8_margin_preparation/verified_scope_2011_20260928/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/verified_scope_2011_20260928/rules/rules.parquet
+  tw_futures_portfolio_final_settlement_path: artifacts/markets/tw_futures_v8_margin_preparation/official_final_settlement_index_1998_20260928/futures_final_settlement_history.parquet
+
+walk_forward:
+  expected_first_year: 2010
+  split_start_year: 2011
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_fold14
+  start_fold: 14

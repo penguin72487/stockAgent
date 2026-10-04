@@ -1,0 +1,6 @@
+[Service]
+Slice=stockagent-control.slice
+CPUWeight=20
+MemoryHigh=384M
+MemoryMax=512M
+Nice=10

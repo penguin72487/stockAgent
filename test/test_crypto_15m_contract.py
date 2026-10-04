@@ -63,13 +63,20 @@ def test_discord_tw_day_trade_multi_basis_uses_its_point_in_time_data_contract()
     ).pre_signal_command
 
 
-def test_projection_l1_day_trade_uses_shared_live_opening_data_contract() -> None:
-    cfg = load_market_config(
-        "services/discord_bot/markets/tw_day_trade_multi_basis_projection_l1_gelu.yaml"
-    )
-    assert cfg.pre_signal_command == load_market_config(
-        "services/discord_bot/markets/tw_day_trade_100m.yaml"
-    ).pre_signal_command
+def test_enabled_day_trade_modes_share_live_opening_data_contract() -> None:
+    from stockagent.live.market_config import load_market_configs
+
+    configs = load_market_configs("services/discord_bot/markets")
+    active = [cfg for cfg in configs.values()
+              if cfg.enabled and cfg.day_trade_simulation_enabled]
+    assert len(active) >= 3
+    for cfg in active:
+        assert cfg.pre_signal_command == (
+            "scripts/activate_tw_public_opening_data.py", "--link", "data_tw_public",
+        )
+        assert cfg.completed_session_command == (
+            "scripts/finalize_tw_public_completed_session.py",
+        )
 
 
 def test_daily_downloader_keeps_tw_out_of_legacy_yahoo_tree() -> None:

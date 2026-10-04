@@ -1,5 +1,12 @@
 # OpenBB 2000+ 歷史資料下載器
 
+下載／manifest／provider 邏輯仍由 `download_openbb_archive.py` 管理。
+`openbb_archive_types.py` 管理工作型別，`openbb_archive_serialization.py` 保持
+既有 JSON ABI，`openbb_request_checkpoints.py` 管理原子 request 續傳／損壞隔離。
+原入口保留相容 import aliases；SQLite task identity、provider outcomes、費用
+觀測與完成判定沒有因拆分另建一套。實測見
+[目標架構驗收](target_architecture_execution_2026-10-03.md)。
+
 ## 範圍
 
 預設從 `2000-01-01` 下載至執行當日，股票清單取自本機 US 與 TW universe。

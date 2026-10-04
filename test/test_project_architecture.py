@@ -1,5 +1,7 @@
 """Keep clean-checkout configuration and read-only inventory contracts."""
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -41,3 +43,51 @@ def test_unit_inventory_retains_repeated_calendars_without_environment(
         encoding="utf-8",
     )
     assert _unit_fields(path) == {"OnCalendar": ["Mon 09:00", "Tue 10:00"]}
+
+
+def test_historical_configs_preserve_exact_sources_and_closed_current_abi():
+    bundle = ROOT / "configs/historical/tw_futures_v17_20261003"
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["runnable_with_current_code"] is False
+    for entry in manifest["files"]:
+        path = bundle / entry["path"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]
+        config_module._load_raw_config(path)
+    for original in manifest["archived_market_paths"]:
+        assert not (ROOT / original).exists()
+        archived = bundle / "markets" / Path(original).name
+        with pytest.raises(ValueError, match="Unknown or removed config key"):
+            load_config(archived)
+
+
+def test_deployment_configuration_loads_without_retired_experiments():
+    for path in sorted((ROOT / "configs/deployments").glob("*.yaml")):
+        load_config(path)
+
+
+def test_cpu16_runtime_profile_preserves_complete_experiment_contract():
+    from dataclasses import asdict
+
+    name = "tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full"
+    base = asdict(load_config(ROOT / f"configs/deployments/{name}.yaml"))
+    selected = asdict(load_config(ROOT / f"configs/deployments/{name}_cpu16.yaml"))
+    assert selected["environment"]["cpu_threads"] == 16
+    assert selected["runner"]["output_dir"] != base["runner"]["output_dir"]
+    selected["environment"]["cpu_threads"] = base["environment"]["cpu_threads"]
+    selected["runner"]["output_dir"] = base["runner"]["output_dir"]
+    assert selected == base
+
+
+def test_rejected_hotpath_experiments_keep_exact_inheritance_and_source_bytes():
+    bundle = ROOT / "configs/historical/tw_day_trade_hotpath_20261003"
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["runnable_with_current_code"] is False
+    for entry in manifest["files"]:
+        path = bundle / entry["path"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]
+        config_module._load_raw_config(path)
+    for original in manifest["archived_deployment_paths"]:
+        assert not (ROOT / original).exists()
+        archived = bundle / "deployments" / Path(original).name
+        with pytest.raises(ValueError, match="Unknown or removed config key"):
+            load_config(archived)
