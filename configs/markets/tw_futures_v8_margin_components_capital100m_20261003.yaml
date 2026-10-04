@@ -227,7 +227,7 @@ trading:
   tw_day_trade_terminal_liquidation_unlimited_capacity: false
   tw_day_trade_unlimited_margin_conversion: false
   tw_etf_sell_tax: 0.001
-  tw_futures_portfolio_data_path: /root/stockAgent/artifacts/markets/tw_futures_v8_margin_preparation/margin_components_20261003/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_data_path: /root/stockAgent/artifacts/markets/tw_futures_v8_margin_preparation/margin_components_current/release/daily/continuous_daily.parquet
   tw_futures_portfolio_fee_large_twd: 60
   tw_futures_portfolio_fee_micro_twd: 16
   tw_futures_portfolio_fee_standard_twd: 24
@@ -322,7 +322,8 @@ trading:
   volume_participation_equity: 100000000.0
   tw_futures_portfolio_holding_policy: carry
   tw_futures_portfolio_capital_basis: initial_margin
-  tw_futures_portfolio_margin_rules_path: /root/stockAgent/artifacts/markets/tw_futures_v8_margin_preparation/margin_components_20261003/release/rules/rules.parquet
+  tw_futures_portfolio_margin_rules_path: /root/stockAgent/artifacts/markets/tw_futures_v8_margin_preparation/margin_components_current/release/rules/rules.parquet
+  tw_futures_portfolio_valuation_research_contract: frozen_contract_value_research_v1
   tw_futures_portfolio_broker_margin_multiplier: 1.0
   tw_futures_portfolio_margin_liquidation_ratio: 0.25
 training:

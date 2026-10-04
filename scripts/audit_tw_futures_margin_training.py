@@ -13,6 +13,7 @@ from scripts.audit_crypto_training import _Sources, analyze_epoch_curve
 from stockagent.backtest.report import compute_metrics
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS
+from stockagent.data.walkforward import normalize_year_boundary_mode, period_labels_from_contract
 from stockagent.training.lifecycle import validate_completed_training_artifacts
 
 
@@ -101,8 +102,19 @@ def audit_root(root: Path):
         with np.load(io.BytesIO(sources.read(relative)), allow_pickle=False) as saved:
             return {key: saved[key] for key in saved.files}
 
+    period_contract = None
+    if normalize_year_boundary_mode(config['walk_forward'].get('year_boundary_mode', 'calendar')) == 'lookback_shifted':
+        period_contract = sources.json('walkforward_period_boundaries.json')
+        if period_contract['offset_sessions'] != config['training']['lookback']:
+            raise ValueError('annual period proof differs from the configured lookback')
+
+    def period_years(dates):
+        if period_contract is not None:
+            return period_labels_from_contract(dates, period_contract)
+        return dates.astype('datetime64[Y]').astype(int) + 1970
+
     stitched = read_npz('walkforward_deployment_backtest.npz')
-    years = stitched['dates'].astype('datetime64[Y]').astype(int) + 1970
+    years = period_years(stitched['dates'])
     full = summarize_path(stitched)
     yearly = {str(y): summarize_path(stitched, years == y) for y in np.unique(years)}
     folds = []
@@ -110,7 +122,7 @@ def audit_root(root: Path):
         fold_id = entry['fold_id']
         saved = read_npz(f'fold_{fold_id:02d}/test_backtest.npz')
         owned = read_npz(f'fold_{fold_id:02d}/deployment_test_backtest.npz')
-        test_years = saved['dates'].astype('datetime64[Y]').astype(int) + 1970
+        test_years = period_years(saved['dates'])
         epoch_rows = [json.loads(line) for line in sources.read(f'{group}/epoch_curve.jsonl').splitlines() if line]
         folds.append({
             'fold_id': fold_id,
@@ -129,6 +141,7 @@ def audit_root(root: Path):
         'loss_type': config['training']['loss_type'],
         'benchmark_contract': manifest['benchmark_contract'],
         'stitched_continuous_account': full, 'stitched_by_year': yearly, 'folds': folds,
+        'annual_period_contract': period_contract,
         'source_sha256': sources.digests,
         'limitations': [
             'Standalone fold tests reset capital and overlap; they are not a continuous deployment.',

@@ -1,0 +1,21 @@
+# Preserves v3's shifted annual ownership; fixes optional DDP cache residency.
+# Use artifacts/runtime/tw_futures_margin_ddp_cache_v4/source/train.py and its receipt.
+base_config: tw_futures_v8_margin_components_repaired_year_shift32_capital100m_fold14_v3.yaml
+experiment_name: tw-futures-margin-components-year-shift32-ddp-cache-capital100m-all-folds-v4
+
+training:
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  lookback: 32
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  cache_train_features_in_amp_dtype: false
+
+walk_forward:
+  year_boundary_mode: lookback_shifted
+  lookback_context: panel_history
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_components_year_shift32_ddp_cache_capital100m_all_folds_v4
+  start_fold: 1
+  resume: false
