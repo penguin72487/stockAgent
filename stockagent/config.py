@@ -34,7 +34,7 @@ from stockagent.data.tw_day_trade_execution import (
     normalize_day_trade_minute_execution_policy,
     normalize_day_trade_daily_proxy_price_policy,
 )
-from stockagent.data.walkforward import normalize_lookback_context
+from stockagent.data.walkforward import normalize_lookback_context, normalize_year_boundary_mode
 from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
@@ -1698,6 +1698,9 @@ class WalkForwardConfig:
     # Optional first year that owns train/validation/test targets. Older panel
     # years remain available only as lookback context when requested above.
     split_start_year: int | None = None
+    # Opt-in target ownership [year first session + lookback, next year + lookback).
+    # Input lookback remains panel_history and is not applied a second time.
+    year_boundary_mode: str = "calendar"
 
 
 @dataclass(slots=True)
@@ -2835,6 +2838,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward["lookback_context"] = normalize_lookback_context(
         walk_forward["lookback_context"]
     )
+    walk_forward['year_boundary_mode'] = normalize_year_boundary_mode(walk_forward['year_boundary_mode'])
+    if walk_forward['year_boundary_mode'] == 'lookback_shifted' and walk_forward['lookback_context'] != 'panel_history':
+        raise ValueError('lookback_shifted requires panel_history; split_only would discard the warmup twice')
     if walk_forward["split_start_year"] is not None:
         walk_forward["split_start_year"] = int(walk_forward["split_start_year"])
 

@@ -1770,6 +1770,7 @@ def main() -> None:
         build_checkpoint_inference_fold,
         build_expanding_year_folds,
         validate_walk_forward_year_contract,
+        year_boundary_offset_sessions, year_period_contract,
     )
     from stockagent.training.trainer import (
         _checkpoint_manifest,
@@ -2520,7 +2521,18 @@ def main() -> None:
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
         split_start_year=config.walk_forward.split_start_year,
+        year_boundary_offset_sessions=year_boundary_offset_sessions(config),
     )
+    if year_boundary_offset_sessions(config) and _distributed_rank() == 0:
+        from downloader.artifact_io import atomic_write_json
+        boundary_proof = year_period_contract(panel.dates, year_boundary_offset_sessions(config))
+        atomic_write_json(Path(output_dir) / 'walkforward_period_boundaries.json', boundary_proof)
+        for boundary_fold in all_folds:
+            if start_fold is None or boundary_fold.fold_id >= int(start_fold):
+                print(f"[annual boundary] fold={boundary_fold.fold_id} offset_sessions={boundary_proof['offset_sessions']} "
+                      f"train={panel.dates[boundary_fold.train_indices[0]]}..{panel.dates[boundary_fold.train_indices[-1]]} "
+                      f"val={panel.dates[boundary_fold.val_indices[0]]}..{panel.dates[boundary_fold.val_indices[-1]]} "
+                      f"test={panel.dates[boundary_fold.test_indices[0]]}..{panel.dates[boundary_fold.test_indices[-1]]}", flush=True)
     if mode == "infer" and start_fold is not None:
         checkpoint_path = (
             Path(output_dir)
@@ -2532,6 +2544,7 @@ def main() -> None:
             checkpoint_fold = build_checkpoint_inference_fold(
                 panel.dates,
                 checkpoint,
+                year_boundary_offset_sessions=year_boundary_offset_sessions(config),
             )
             if checkpoint_fold.fold_id != int(start_fold):
                 raise ValueError(

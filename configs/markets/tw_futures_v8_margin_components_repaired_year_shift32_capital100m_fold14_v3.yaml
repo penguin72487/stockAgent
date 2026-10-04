@@ -1,0 +1,16 @@
+# Annual target ownership is [first session of Y + 32, first session of Y+1 + 32).
+# Run with the independent tw_futures_margin_year_shift_v3 runtime receipt/source.
+base_config: tw_futures_v8_margin_components_repaired_capital100m_fold14_v2.yaml
+experiment_name: tw-futures-margin-components-repaired-year-shift32-capital100m-fold14-v3
+
+training:
+  lookback: 32
+
+walk_forward:
+  year_boundary_mode: lookback_shifted
+  lookback_context: panel_history
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_components_repaired_year_shift32_capital100m_fold14_v3
+  start_fold: 14
+  resume: false

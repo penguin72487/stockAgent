@@ -2812,6 +2812,10 @@ def _checkpoint_manifest(
         "feature_names": feature_names,
     }
     walk_forward_contract = asdict(config.walk_forward)
+    boundary_mode = walk_forward_contract.pop('year_boundary_mode', 'calendar')
+    if boundary_mode != 'calendar':
+        walk_forward_contract['year_boundary_mode'] = boundary_mode
+        walk_forward_contract['year_boundary_offset_sessions'] = int(config.training.lookback)
     pre_lookback_context_walk_forward_contract = dict(walk_forward_contract)
     # Checkpoint schemas 1-4 existed before cross-split feature context was a
     # configurable contract. Their only honest interpretation is today's
