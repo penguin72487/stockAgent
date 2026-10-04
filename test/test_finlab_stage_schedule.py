@@ -12,12 +12,34 @@ import pytest
 from scripts.download_finlab_history import fetch_one, general_work_status, local_plan_reads, read_key_state
 from scripts.download_finlab_history import sync_selection
 from scripts.finlab_incremental_refresh import checked_get
-from scripts.finlab_stage_schedule import MIB, forecast, stage_summary
+from scripts.finlab_stage_schedule import MIB, forecast, stage_summary, next_release_waves
 from stockagent.data.finlab_acquisition_contract import (
     next_source_check, proven_source_empty, safe_stem, source_check_due,
 )
 
 NOW = datetime(2026, 10, 1, 10, tzinfo=UTC)
+
+
+def test_future_wave_cannot_start_before_its_observed_expiry():
+    due = NOW + timedelta(hours=1)
+    rows = [job("price:a", size=1, stage="priority_updates", pending=False, next_check=due.isoformat())]
+    wave = next_release_waves(rows, now=NOW, quota=account(1000), reserve_mb=50, next_run=NOW,
+                              dispatch_interval_seconds=0)["priority_updates"]
+    assert wave["keys"] == 1 and wave["check_at_utc"] == due.isoformat()
+    assert wave["scenarios"]["reference"]["start_at_utc"] == due.isoformat()
+    assert wave["scenarios"]["reference"]["finish_at_utc"] == (due + timedelta(seconds=10)).isoformat()
+    assert forecast(rows, now=NOW, quota=account(1000), reserve_mb=50, next_run=NOW)["state"] == "complete"
+
+
+def test_stage_retains_retry_clock_without_promising_source_recovery():
+    retry = NOW + timedelta(minutes=15)
+    rows = [{**job("empty", stage="source_issues"), "blocked_reason": "provider_empty", "fetch_seconds": None,
+             "retry_at_utc": retry.isoformat()}]
+    stage = next(s for s in stage_summary(rows, {"reference": {"state": "blocked"}}, now=NOW, tick={})
+                 if s["id"] == "source_issues")
+    assert stage["next_retry_at_utc"] == retry.isoformat() and stage["cooldown_keys"] == 1
+    assert stage["remaining_work_seconds_estimate"] is None
+    assert stage["scenarios"]["reference"]["finish_at_utc"] is None
 
 
 def account(remaining=0, limit=5000):

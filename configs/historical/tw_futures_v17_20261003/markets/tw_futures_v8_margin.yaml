@@ -1,0 +1,19 @@
+# The same v5 model and training lifecycle; actions allocate margin, not notional.
+base_config: tw_futures_v8_general.yaml
+experiment_name: tw-futures-v8-margin
+
+trading:
+  tw_futures_portfolio_capital_basis: initial_margin
+  tw_futures_portfolio_holding_policy: carry
+  tw_futures_portfolio_margin_rules_path: data_tw_futures/margin_rules_v1/rules.parquet
+  tw_futures_portfolio_broker_margin_multiplier: 1.0
+  tw_futures_portfolio_margin_liquidation_ratio: 0.25
+
+training:
+  # Shared graph/funding acceleration passes exact synthetic account tests.
+  # Defer panel residency until historical margin rules permit a real fold.
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin

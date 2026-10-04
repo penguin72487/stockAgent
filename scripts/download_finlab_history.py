@@ -260,7 +260,11 @@ def quota_room_mb() -> tuple[float, float] | None:
     except Exception:
         return None
     try:
-        return float(status["limit_size"]) - float(status["quota"]), float(status["limit_size"])
+        import math
+        used, limit = float(status["quota"]), float(status["limit_size"])
+        if not math.isfinite(used) or not math.isfinite(limit) or used < 0 or limit <= 0:
+            return None
+        return max(0.0, limit - used), limit
     except (KeyError, TypeError, ValueError):
         return None
 

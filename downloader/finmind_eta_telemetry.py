@@ -18,7 +18,8 @@ import sqlite3
 from typing import Any, Iterator
 
 from downloader.finmind_account import backfill_budget
-from downloader.finmind_scheduling import fixed_incremental_demand, incremental_reservation
+from downloader.finmind_scheduling import incremental_reservation
+from downloader.finmind_history_order import BY_DATASET, STAGES
 
 
 WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "7d": 604800}
@@ -251,14 +252,15 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
     """
     from collections import Counter
     from downloader.finmind_scheduling import (SOURCES, SESSION_DAY_DATASETS, PRODUCT_HISTORY_STARTS,
-                                               TAIPEI, calendar_next_check, RELEASE_CLOCKS)
+                                               TAIPEI, calendar_next_check, RELEASE_CLOCKS,
+                                               PERIODIC_RELEASE_CLOCKS, periodic_release_boundary)
     from downloader.finmind_history_refresh import DAILY_EQUITY
     from downloader.finmind_observation_dates import PERIOD_DATASETS
     from scripts.audit_finmind_query_ranges import registry
     catalog = registry()
     events = Counter()
 
-    def add(stamp, period, count=1, session_only=False):
+    def add(stamp, period, count=1, session_only=False, publishing_weekdays=()):
         if stamp is None:
             return
         if stamp <= now:
@@ -266,7 +268,7 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
                 return  # Already in the measured backlog, not a second charge.
             stamp = now + timedelta(seconds=period)
         rounded = math.ceil(stamp.timestamp() / 60) * 60
-        events[(rounded, period, session_only)] += count
+        events[(rounded, period, session_only, publishing_weekdays)] += count
 
     local = now.astimezone(TAIPEI)
     daily = set()
@@ -302,6 +304,7 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
                 if catalog.get(dataset, {}).get('primary_owner') != owner:
                     continue
                 stamp = _stamp(raw)
+                publishing_weekdays = ()
                 if owner == 'sponsor':
                     # Daily successful heads expire at the next seed; the new
                     # day's source event above already pays for that request.
@@ -315,21 +318,27 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
                     period = 86400 if state != 'observed_empty' else 7 * 86400
                 elif dataset in PRODUCT_HISTORY_STARTS:
                     period = 3 * 3600 if state != 'observed_empty' else 30 * 86400
+                    if state == 'complete':
+                        publishing_weekdays = PERIODIC_RELEASE_CLOCKS[dataset]['weekdays']
+                        if stamp is None or stamp <= now:
+                            stamp = now + timedelta(seconds=period)
+                        stamp = periodic_release_boundary(dataset, stamp)
                 else:
                     period = 86400
                 if stamp is None and state in {'pending', 'failed'} and period:
                     stamp = now + timedelta(seconds=period)
-                add(stamp, period, count)
+                add(stamp, period, count, publishing_weekdays=publishing_weekdays)
     except (OSError, sqlite3.Error):
         return {'state': 'unavailable', 'events': []}
     return {'state': 'modeled', 'basis': 'queued_release_clock_then_worker_successful_renewal',
             'resolution_seconds': 60, 'includes_current_overdue_backlog': False,
             'events': [{'first_at_utc': datetime.fromtimestamp(stamp, UTC).isoformat(),
-                        'interval_seconds': period, 'requests': count, 'session_only': session_only}
-                       for (stamp, period, session_only), count in sorted(events.items())]}
+                        'interval_seconds': period, 'requests': count, 'session_only': session_only,
+                        **({'publishing_weekdays': list(weekdays)} if weekdays else {})}
+                       for (stamp, period, session_only, weekdays), count in sorted(events.items())]}
 
 
-def recurring_forecast(root: Path) -> dict[str, Any]:
+def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any]:
     """Estimate future refresh load, never reuse the current overdue backlog.
 
     Worker renewal cadence plus one new calendar partition per frontier ID
@@ -339,19 +348,25 @@ def recurring_forecast(root: Path) -> dict[str, Any]:
     """
     from downloader.finmind_history_refresh import DAILY_EQUITY
     from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL
-    from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS
+    from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, PERIODIC_RELEASE_CLOCKS
+    from downloader.finmind_history_calendar import arrival_density, load_closures
     from scripts.audit_finmind_query_ranges import registry
 
     catalog = registry()
+    now = now or datetime.now(UTC)
+    arrival_calendars = {}
     # The worker leaves supplemental arrivals at their original priority. A
-    # future tick partition cannot consume capacity before required non-tick
-    # history. Keep phase components, rather than deducting all of them early.
+    # Each history dataset consumes capacity only after its ordered stage is
+    # reached (US minutes now follow ticks). Do not deduct all loads early.
     components = {'incremental': 3.0 + 4 / 24, 'core': 0.0, 'detail': 0.0, 'tick': 0.0}
     arrivals = dict.fromkeys(('core', 'detail', 'tick'), 0.0)
+    stage_components = dict.fromkeys(('incremental', *(key for key, _ in STAGES if key != 'priority')), 0.0)
+    stage_arrivals = dict.fromkeys((key for key, _ in STAGES), 0.0)
     components['incremental'] += sum(row['primary_owner'] == 'sponsor' and row['query_shape'] != 'derived_no_api'
                               for row in catalog.values()) / 24
     if catalog.get('TaiwanStockDayTrading', {}).get('primary_owner') == 'sponsor':
         components['incremental'] += 1 / 24  # Final volume/value phase, separate from the earlier sample.
+    stage_components['incremental'] = components['incremental']
     def phase(dataset: str) -> str:
         source = SUPPLEMENTAL.get(dataset)
         return 'tick' if source and source.priority >= 10 else 'detail' if source and source.priority >= 8 else 'core'
@@ -374,7 +389,10 @@ def recurring_forecast(root: Path) -> dict[str, Any]:
                         elif kind == 'snapshot':
                             hours = 24
                         elif dataset in PRODUCT_HISTORY_STARTS:
-                            hours = 30 * 24 if empty else 3
+                            # Average maintenance demand uses the same provider
+                            # publishing days as the worker, not cash sessions.
+                            hours = (30 * 24 if empty else
+                                     3 * 7 / len(PERIODIC_RELEASE_CLOCKS[dataset]['weekdays']))
                         elif dataset in SUPPLEMENTAL:
                             hours = ((90 if empty else 365) * 24 if kind == 'id_day'
                                      else 7 * 24 if empty else 24)
@@ -382,19 +400,38 @@ def recurring_forecast(root: Path) -> dict[str, Any]:
                             hours = 24 if priority == 0 else 90 * 24
                         else:
                             hours = (30 if empty else 14) * 24
-                        components['incremental' if priority == 0 else phase(dataset)] += count / hours
+                        # Accepted old partitions renew AFTER acquisition,
+                        # matching dispatch rather than taxing every stage.
+                        components['incremental' if priority == 0 else 'core'] += count / hours
+                        stage_components['incremental' if priority == 0 else 'validation'] += count / hours
                 if owner == 'complement' and conn.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone():
-                    for dataset, count in conn.execute('SELECT dataset,count(*) FROM finmind_source_frontiers GROUP BY dataset'):
+                    closures = load_closures(conn)
+                    for dataset, count, market_count in conn.execute(
+                            "SELECT dataset,count(*),SUM(data_id='') FROM finmind_source_frontiers GROUP BY dataset"):
                         if catalog.get(dataset, {}).get('primary_owner') == 'complement':
-                            components[phase(dataset)] += count / 24
-                            arrivals[phase(dataset)] += count / 24
-        except sqlite3.Error:
+                            source = SUPPLEMENTAL.get(dataset)
+                            if source and source.universe == 'market':
+                                # Superseded per-ID frontiers remain as evidence,
+                                # not future whole-market request multipliers.
+                                count = market_count
+                            calendar = arrival_density(closures, dataset, now)
+                            arrival_calendars[dataset] = calendar
+                            load = count * calendar['factor'] / 24
+                            components[phase(dataset)] += load
+                            arrivals[phase(dataset)] += load
+                            key = BY_DATASET[dataset].key if dataset in BY_DATASET else 'core'
+                            stage_components[key] += load
+                            stage_arrivals[key] += load
+        except (sqlite3.Error, ValueError, KeyError):
             return {'requests_per_hour': None, 'state': 'unavailable'}
     return {'requests_per_hour': math.ceil(sum(components.values())), 'state': 'modeled',
             'requests_per_hour_by_phase': components,
             'new_partition_requests_per_hour_by_phase': arrivals,
-            'phase_basis': 'worker_priority_core_then_detail_then_tick_cumulative_maintenance',
-            'basis': 'worker_renewal_cadence_plus_calendar_day_per_frontier_id_plus_news_overlap',
+            'requests_per_hour_by_stage': stage_components,
+            'new_partition_requests_per_hour_by_stage': stage_arrivals,
+            'new_partition_calendars': arrival_calendars,
+            'phase_basis': 'due_refresh_core_then_explicit_nine_history_stages_cumulative_maintenance',
+            'basis': 'release_renewals_then_verified_cash_session_density_or_calendar_day_upper_model',
             'includes_current_overdue_backlog': False,
             'limitations': 'current_known_universe_only_not_future_listings_or_future_retries'}
 
@@ -410,11 +447,11 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
     fresh = age is not None and -60 <= age <= ACCOUNT_MAX_AGE_SECONDS
     limit = account.get("official_requests_per_hour")
     limit = limit if type(limit) is int and 0 < limit <= 100_000 else None
-    demand = fixed_incremental_demand(root, now)
-    reserve = min(limit, demand + 2) if limit is not None else None
     plan = incremental_reservation(root, now)
+    demand = plan['reserve_requests']
+    reserve = min(limit, demand + 2) if limit is not None else None
     budget = backfill_budget(account, root, fixed_incremental_requests=demand, now=now,
-                             prioritize_due=True) if limit else None
+                             prioritize_due=True, reservation_plan=plan) if limit else None
     quota = {
         "official_requests_per_hour": limit,
         "account_tier": account.get("tier") if account.get("tier") in {"Free", "Backer", "Sponsor", "SponsorPro"} else None,
@@ -431,7 +468,7 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
         "reservation_plan": plan,
         "reserve_is_consumption_measurement": False,
     }
-    forecast = recurring_forecast(root)
+    forecast = recurring_forecast(root, now)
     forecast['timed_incremental'] = timed_incremental_forecast(root, now)
     if forecast['requests_per_hour'] is not None:
         quota['forecast_recurring_requests_per_hour'] = forecast['requests_per_hour']

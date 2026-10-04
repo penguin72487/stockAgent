@@ -666,7 +666,8 @@ def test_twse_month_filters_irrelevant_subject_before_fetching_detail(monkeypatc
     assert session.detail_urls == ["https://dsp.twse.com.tw/relevant"]
 
 
-def test_twse_legacy_plain_text_archive_is_parsed_and_month_checked(monkeypatch) -> None:
+@pytest.mark.parametrize("kind", ["s", "t"])
+def test_twse_legacy_plain_text_archive_is_parsed_and_month_checked(monkeypatch, kind) -> None:
     search_html = b"""
         <form id="form_category"><input name="SYNCHRONIZER_TOKEN" value="token"></form>
     """
@@ -700,17 +701,18 @@ def test_twse_legacy_plain_text_archive_is_parsed_and_month_checked(monkeypatch)
             return Response(search_html, "text/html")
 
         def post(self, *_args, **_kwargs):
+            assert _kwargs["data"]["kind"] == kind
             return Response(legacy_text, "text/plain;charset=UTF-8")
 
     monkeypatch.setattr(downloader.requests, "Session", Session)
 
-    batch = downloader._download_twse_month(2018, 1, 5)
+    batch = downloader._download_twse_legacy_month(2018, 1, 5, kind=kind)
     assert [record["symbols"] for record in batch.records] == ["1234"]
     assert batch.filtered_irrelevant == 1
     assert batch.unparseable == 0
 
     with pytest.raises(RuntimeError, match="different month"):
-        downloader._download_twse_month(2018, 2, 5)
+        downloader._download_twse_legacy_month(2018, 2, 5, kind=kind)
 
 
 def test_twse_current_month_rejects_mismatched_result_month(monkeypatch) -> None:

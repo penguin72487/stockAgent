@@ -7921,10 +7921,20 @@ def build_dashboard_snapshot(
             and str(committed_mode.get("session_date") or "") == selected_session_date
             and committed_mode.get("signal_id") == mode.get("signal_id")
         )
-        account_source = {**committed_mode, **mode} if same_session_state else mode
+        carried_account_state = bool(
+            current_view
+            and isinstance(committed_mode, Mapping)
+            and str(committed_mode.get("session_date") or "")
+            and str(committed_mode["session_date"]) < selected_session_date
+        )
+        account_source = (
+            committed_mode if carried_account_state else
+            {**committed_mode, **mode} if same_session_state else mode
+        )
         mode["account_performance"] = paper_account_performance(
             account_source,
-            revision=state.get("state_revision") if same_session_state else None,
+            revision=state.get("state_revision")
+            if same_session_state or carried_account_state else None,
         )
         mode["signal_product"] = "scheduled_execution"
     measured_opening_markets = set(opening_signal_latency.get("observed_markets") or [])

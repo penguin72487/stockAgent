@@ -35,8 +35,9 @@ PHASE_LABELS = {"P1": "候選新增特徵", "P2": "補歷史／口徑缺口", "P
 METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_v1"
 BATCH_SCHEDULER_CONTRACT = "phase_preserving_discovery_download_interleave_v1"
 PREVIEW_SUBMISSION_CONTRACT = 'owned_msaa_default_action_once_no_foreground_result_transition_v2'
-DESKTOP_INPUT_CONTRACT = 'native_acknowledged_date_model_commit_blank_mask_no_mouse_v5'
+DESKTOP_INPUT_CONTRACT = 'owned_edit_messages_acknowledged_date_model_no_foreground_v6'
 PREQUERY_FAILURES = {
+    'desktop_transport_unavailable_before_preview':'desktop_unavailable',
     'desktop_foreground_unavailable_before_preview':'desktop_unavailable',
     'desktop_context_unavailable_before_preview':'desktop_unavailable',
     'local_date_input_failed_before_preview':'date_input_prequery_needs_review',
@@ -130,6 +131,10 @@ def connect(root: Path) -> sqlite3.Connection:
       CREATE TABLE IF NOT EXISTS desktop_replays (
         authorization_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,original_attempted_at_utc TEXT,
         audit_path TEXT NOT NULL,audit_sha256 TEXT NOT NULL,consumed_at_utc TEXT,outcome TEXT);
+      CREATE TABLE IF NOT EXISTS desktop_retry_windows (
+        table_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,attempt_id TEXT NOT NULL,
+        consecutive_failures INTEGER NOT NULL,next_attempt_at_utc TEXT NOT NULL,
+        error_code TEXT NOT NULL,audit_path TEXT NOT NULL);
     """)
     if 'active_attempt_id' not in {r[1] for r in con.execute('PRAGMA table_info(tasks)')}:
         con.execute('ALTER TABLE tasks ADD COLUMN active_attempt_id TEXT')
@@ -157,9 +162,13 @@ def connect(root: Path) -> sqlite3.Connection:
     con.execute("CREATE INDEX IF NOT EXISTS tasks_timing_sample ON tasks(state,kind,timing_basis,completed_at_utc DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_metadata ON tasks(scope_contract,table_id,kind,state,expected_rows,actual_rows,actual_bytes)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_work_metadata ON tasks(scope_contract,state,table_id,kind,work_expected_rows,expected_rows,actual_rows,actual_bytes)")
+    # Inventory/audit counts must scan metadata, not 600k superseded request
+    # blobs while a DELETE-journal writer waits for the reader transaction.
+    con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_state_counts ON tasks(scope_contract,kind,state,last_error_code)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_timing ON tasks(scope_contract,state,kind,timing_basis,completed_at_utc DESC,table_id,expected_rows,actual_rows,actual_bytes,seconds)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_ready_order ON tasks(state,priority,table_id,task_id,next_attempt_at_utc)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_ready_kind_order ON tasks(state,kind,priority,table_id,task_id,next_attempt_at_utc)")
+    con.execute("CREATE INDEX IF NOT EXISTS tasks_table_error ON tasks(table_id,state,last_error_code)")
     if not con.execute("SELECT 1 FROM meta WHERE key='full_lifecycle_timing_v1'").fetchone():
         with con:
             con.execute("UPDATE tasks SET timing_basis='legacy_bridge_only' WHERE timing_basis='fresh_end_to_end'")
@@ -323,6 +332,7 @@ def revalidate_source_scopes(root: Path) -> dict:
 def register_inventory(root: Path, inventory: Path, config: dict, *, cutoff: str) -> dict:
     """Register every field, including empty tables; do not infer entitlement."""
     from scripts.build_tej_smart_wizard_inventory import table_identity
+    from downloader.tej_value_priority import installed_priority
     date.fromisoformat(cutoff)
     summary = json.loads((inventory / "summary.json").read_text())
     if not summary.get("catalog", {}).get("catalog_scan_complete"):
@@ -382,7 +392,7 @@ def register_inventory(root: Path, inventory: Path, config: dict, *, cutoff: str
                            "max_cells": config["max_cells_per_export"], "max_rows": config["max_rows_per_export"]}
                 con.execute("INSERT OR IGNORE INTO tasks(task_id,table_id,kind,phase,priority,request_json,scope_contract) VALUES(?,?,?,?,?,?,?)",
                             (stable_id([identity, "discover", cutoff, CONTRACT_VERSION]), identity, "discover", phase,
-                             int(phase[1]) * 100 + 1, json.dumps(request, ensure_ascii=False),SOURCE_SCOPE_CONTRACT))
+                             installed_priority(con,identity,int(phase[1])*100+1,kind='discover'), json.dumps(request, ensure_ascii=False),SOURCE_SCOPE_CONTRACT))
     return {"tables": len(tables), "fields": len(fields), "catalog_sha256": fingerprint}
 
 
@@ -477,6 +487,7 @@ def validate_source_scope(request: dict, payload: dict, action: str) -> None:
 def discovery_tasks(root: Path, task: dict, payload: dict, output: Path) -> int:
     """Partition the real vendor axes, never a guessed historical universe."""
     request = task_request(root, task)
+    from downloader.tej_value_priority import installed_priority
     validate_source_scope(request, payload, "plan")
     if payload.get("task_id") != task["task_id"]:
         raise ValueError("Discovery evidence belongs to another task")
@@ -552,7 +563,7 @@ def discovery_tasks(root: Path, task: dict, payload: dict, output: Path) -> int:
                                  end=min(request['end'], f"{last}-{monthrange(year, month)[1]:02d}"))
                 key = stable_id([task["table_id"], query])
                 con.execute("INSERT OR IGNORE INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract) VALUES(?,?,?,?,?,?,?,?)",
-                            (key, task["table_id"], "download", task["phase"], int(task["phase"][1]) * 100,
+                            (key, task["table_id"], "download", task["phase"], installed_priority(con,task['table_id'],int(task['phase'][1])*100),
                              json.dumps(compact_request(query, definition), ensure_ascii=False, separators=(",", ":")), len(group) * len(selection),
                              SOURCE_SCOPE_CONTRACT if request.get('contract_version') == CONTRACT_VERSION else 'legacy_scope_unverified_v3'))
                 generated += 1
@@ -763,6 +774,12 @@ def validate_download_evidence(request: dict, payload: dict) -> tuple[list[str],
             or payload.get("cells") not in (None, [])
             or not re.fullmatch(r"ERROR1:No data !!\([a-zA-Z0-9_]{1,32}\)", str(payload.get("source_message")))):
         raise ValueError("Unverified provider empty response")
+    ownership=payload.get('empty_dialog_ownership_contract')
+    acknowledgement=payload.get('empty_acknowledgement_contract')
+    if (ownership is not None or acknowledgement is not None) and (
+            ownership not in ('exact_owned_modal_v1','unique_same_thread_ownerless_modal_v1')
+            or acknowledgement!='normal_ok_control_notification_no_foreground_v1'):
+        raise ValueError('Unreviewed normal empty-response modal contract')
     # The bridge verifies the actual source/field/company/date selections before
     # acknowledging this exact normal response. Unknown notices are not empty.
     empty_headers=['CO_ID'] if keys_count==1 else ['CO_ID','Date']+(['Source_Record_Key'] if keys_count==3 else [])
@@ -861,6 +878,8 @@ def ingest_export(root: Path, task: dict, payload: dict, output: Path) -> dict:
                "parquet_sha256": hashlib.sha256(parquet.read_bytes()).hexdigest(), "parquet_bytes": parquet.stat().st_size,
                "normalization": normalized, "schema_notes": schema_notes, "source_values_retained": True,
                "source_outcome": 'explicit_empty_scope' if empty else 'exported_query_grid',
+               "empty_dialog_ownership_contract":payload.get('empty_dialog_ownership_contract'),
+               "empty_acknowledgement_contract":payload.get('empty_acknowledgement_contract'),
                "msaa_value_read_path": payload.get("msaa_value_read_path"),
                "msaa_object_fallback_cells": payload.get("msaa_object_fallback_cells"),
                "vendor_numeric_scale_selection": scale_selection,
@@ -928,6 +947,24 @@ class DesktopBridge:
         if is_preview:
             from downloader.tej_desktop_attempts import begin_attempt
             begin_attempt(root,task,name,request,output)
+        try:
+            (root/'progress').mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+        # Display-only telemetry is bound to this attempt and the already-live
+        # worker. It never renews query ownership or clears recovery barriers.
+        worker_path = root / 'worker_status.json'
+        try:
+            worker = json.loads(worker_path.read_text())
+        except (OSError, ValueError):
+            worker = {}
+        if not isinstance(worker, dict):
+            worker = {}
+        if worker.get('state') == 'running' and worker.get('task_id') == task['task_id']:
+            try:
+                atomic_write_json(worker_path, {**worker, 'bridge_attempt_id': name}, durable=False)
+            except OSError:
+                pass
         command = ("$ErrorActionPreference='Stop';$s=" + source + ";"
                    "$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('StockAgent\\TEJSmartWizard\\worker-'+[Guid]::NewGuid().ToString('N'));"
                    "[void](New-Item -ItemType Directory -Path $d);$p=Join-Path $d 'bridge.ps1';Copy-Item -LiteralPath $s -Destination $p;"
@@ -936,14 +973,28 @@ class DesktopBridge:
                    "catch{[Console]::Error.WriteLine($_.Exception.Message);[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1}")
         started = time.monotonic()
         try:
-            result = subprocess.run(["/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
-                                 "-NoProfile", "-NonInteractive", "-Command", command],
+            from downloader.tej_windows_transport import UnpermittedWindowsLaunch, run_guarded_windows
+            result = run_guarded_windows(command, request=request, windows_path=self.windows_path,
                                 # A complete bounded MSAA grid is read across
                                 # processes cell by cell. The former four-minute
                                 # deadline killed valid large readbacks after
                                 # the single Preview was already submitted.
                                 # Still finite; a timeout never resends it.
-                                capture_output=True, timeout=900)
+                                timeout=900)
+        except UnpermittedWindowsLaunch as exc:
+            from downloader.tej_windows_transport import validate_unpermitted
+            validate_unpermitted(root, request, exc.evidence)
+            if is_preview:
+                from downloader.tej_desktop_attempts import finish_attempt
+                atomic_write_json(output.with_suffix('.json.outcome.json'), {
+                    'contract_version':CONTRACT_VERSION, 'provider':'tej_smart_wizard', 'action':'download',
+                    'task_id':task['task_id'], 'observed_at_utc':datetime.now(UTC).isoformat(),
+                    **{key:wire_request[key] for key in ('type','smart_id','table')},
+                    'market_data_query_submission_possible':False,
+                    'launch_admission_path':str(exc.evidence.relative_to(root)),
+                    'error_code':'desktop_transport_unavailable_before_preview'})
+                finish_attempt(root,name,'proven_not_submitted')
+            raise BeforeDataQueryError('desktop_transport_unavailable_before_preview') from None
         except subprocess.TimeoutExpired as exc:
             if is_preview:
                 from downloader.tej_desktop_attempts import finish_attempt
@@ -997,6 +1048,19 @@ class DesktopBridge:
                     pass
             raise RuntimeError("desktop_bridge_failed_requires_scoped_diagnostic")
         payload = json.loads(output.read_text(encoding="utf-8-sig"))
+        progress_path = root/'progress'/(name+'.json.progress.json')
+        try:
+            with progress_path.open('rb') as stream:
+                body = stream.read(65537)
+            progress = json.loads(body) if len(body) <= 65536 else {}
+            if not isinstance(progress, dict):
+                progress = {}
+            if (progress.get('contract') == 'tej_native_readback_progress_v1'
+                    and progress.get('task_id') == task['task_id'] and progress.get('attempt_id') == name):
+                atomic_write_json(progress_path, {**progress, 'stage': 'validating_and_saving',
+                    'observed_at_utc': datetime.now(UTC).isoformat()}, durable=False)
+        except (OSError, ValueError):
+            pass  # Telemetry loss cannot invalidate or resubmit source evidence.
         if is_preview:
             from downloader.tej_desktop_attempts import finish_attempt
             if payload.get('query_attempt_id') != name:
@@ -1023,6 +1087,8 @@ def verify_desktop_input(root: Path, task_id: str, bridge: DesktopBridge) -> dic
             or payload.get('desktop_input_contract') != DESKTOP_INPUT_CONTRACT
             or any(payload.get(k) != request.get(k) for k in ('type', 'smart_id', 'table'))
             or payload.get('market_data_query_submitted') is not False
+            or payload.get('global_keyboard_input_sent') is not False
+            or payload.get('date_foreground_required') is not False
             or payload.get('early_noop_path_used') is not False
             or any(payload.get(k) is not True for k in ('date_text_input_sent', 'binding_matches_failed_plan',
                  'query_axes_unchanged', 'source_binding_unchanged', 'field_selection_unchanged'))):
@@ -1043,12 +1109,15 @@ def verify_desktop_input(root: Path, task_id: str, bridge: DesktopBridge) -> dic
         current = con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
     if current is None or dict(current) != task:
         raise ValueError('Queue changed during input acceptance; no recovery performed')
-    audit = {'contract_version':1, 'desktop_input_contract':DESKTOP_INPUT_CONTRACT, 'task_id':task_id,
+    audit = {'contract_version':2, 'desktop_input_contract':DESKTOP_INPUT_CONTRACT, 'task_id':task_id,
              'observed_at_utc':datetime.now(UTC).isoformat(), 'source_evidence_path':str(output.resolve()),
              'source_evidence_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),
              'seconds':seconds, 'both_date_writes_verified':True, 'intermediate_edits_observed':True,
              'source_binding_unchanged':True, 'field_selection_unchanged':True, 'query_axes_unchanged':True,
              'queue_unchanged':True, 'data_query_repeated':False, 'source_rows_adopted':False,
+             'global_keyboard_input_sent':False,'date_foreground_required':False,
+             'date_input_foreground_unchanged':payload.get('date_input_foreground_unchanged'),
+             'date_input_started_in_background':payload.get('date_input_started_in_background'),
              'state_before':task['state'], 'state_after':current['state'], 'unknown_outcome_barrier_reset':False}
     atomic_write_json(root/'input_acceptance'/(output.stem+'.json'), audit)
     return {k:audit[k] for k in ('desktop_input_contract', 'both_date_writes_verified', 'intermediate_edits_observed',
@@ -1101,6 +1170,8 @@ def commit_evidence(root: Path, task: dict, payload: dict, output: Path, seconds
         if task['kind']=='download':
             con.execute("UPDATE desktop_attempts SET state='adopted',finished_at_utc=? WHERE attempt_id="
                         "(SELECT active_attempt_id FROM tasks WHERE task_id=?)",(complete,task['task_id']))
+            con.execute('DELETE FROM desktop_retry_windows WHERE table_id=? AND task_id=?',
+                        (task['table_id'],task['task_id']))
 
 
 def recover_evidence(root: Path, task_id: str, output: Path) -> None:
@@ -1113,10 +1184,25 @@ def recover_evidence(root: Path, task_id: str, output: Path) -> None:
         if row is None:
             raise ValueError("Unknown task")
     task = dict(row)
+    # A completed local response may have failed only during metadata commit.
+    # Close its exact still-running traffic event without rewriting a recorded
+    # source failure, or calling a new request a recovery.
+    with closing(connect(root)) as con:
+        traffic = con.execute("SELECT event_id FROM traffic WHERE action=? AND started_at_utc=? AND state='running'",
+                              (task["kind"], task["attempted_at_utc"])).fetchall()
+    if len(traffic) > 1:
+        raise ValueError("Recovery traffic ownership is ambiguous")
+    event_id = traffic[0]["event_id"] if traffic else None
     payload = json.loads(output.read_text(encoding="utf-8-sig"))
     if payload.get("task_id") != task_id:
         raise ValueError("Recovery task identity mismatch")
-    commit_evidence(root, task, payload, output, None)
+    from downloader.tej_preview_capacity import OUTCOME, replan_capacity
+    if payload.get('source_outcome') == OUTCOME:
+        result = replan_capacity(root,task_id,payload,output,event_id=event_id)
+        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
+            'state':result['state'],'task_id':task_id,'observed_at_utc':datetime.now(UTC).isoformat()})
+        return
+    commit_evidence(root, task, payload, output, None, event_id=event_id)
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION,
                        "state": "evidence_recovered", "observed_at_utc": datetime.now(UTC).isoformat()})
 
@@ -1299,6 +1385,12 @@ def recover_desktop_response(root: Path, task_id: str, bridge: Any, *, response:
         return {"state": "known_excel_error_acknowledged", "data_query_repeated": False}
     # Recovery does not repeat the query, so its readback-only duration is not
     # a sample of end-to-end fresh acquisition throughput.
+    from downloader.tej_preview_capacity import OUTCOME, replan_capacity
+    if payload.get('source_outcome') == OUTCOME:
+        result = replan_capacity(root,task_id,payload,output)
+        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
+            'state':result['state'],'task_id':task_id,'observed_at_utc':datetime.now(UTC).isoformat()})
+        return result
     commit_evidence(root, task, payload, output, None)
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION,
                        "state": "evidence_recovered", "observed_at_utc": datetime.now(UTC).isoformat()})
@@ -1411,7 +1503,8 @@ def settle_preview_column_limit(root: Path, task_id: str, bridge: Any, prepared:
 
 def _mark_prequery_failure(con: sqlite3.Connection, task: dict, error_code: str='local_date_input_failed_before_preview') -> str:
     """One shared, durable two-retry budget; never change result counters."""
-    if error_code in {'desktop_foreground_unavailable_before_preview','desktop_context_unavailable_before_preview'}:
+    if error_code in {'desktop_transport_unavailable_before_preview',
+                      'desktop_foreground_unavailable_before_preview','desktop_context_unavailable_before_preview'}:
         deadline = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
         con.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=?,last_error_code=? WHERE task_id=?",
                     (deadline,error_code,task['task_id']))
@@ -1569,6 +1662,8 @@ def recover_verified_input(root: Path, task_id: str, bridge: Any, prepared_reque
 
 def configure_runtime_policy(root: Path, config: dict) -> dict:
     """Version execution policy separately from immutable source requests."""
+    from downloader.tej_scheduler import remaining_query_interval
+    remaining_query_interval(config,0.0)  # Reject an invalid limiter before any source action.
     policy = {'contract':BATCH_SCHEDULER_CONTRACT,
               'preview_submission_contract':PREVIEW_SUBMISSION_CONTRACT,
               'desktop_input_contract':DESKTOP_INPUT_CONTRACT,
@@ -1576,24 +1671,47 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'auto_key3_replanning':config.get('auto_key3_replanning',False),
               'auto_snapshot_replanning':config.get('auto_snapshot_replanning',False),
               'auto_month_period_replanning':config.get('auto_month_period_replanning',False),
+              'auto_preview_capacity_replanning':config.get('auto_preview_capacity_replanning',False),
+              'source_validation_isolation':config.get('source_validation_isolation',False),
+              'prequery_failure_isolation':config.get('prequery_failure_isolation',False),
+              'prequery_recovery_contract':config.get('prequery_recovery_contract'),
+              'prequery_retry_base_seconds':config.get('prequery_retry_base_seconds',60),
+              'prequery_retry_max_seconds':config.get('prequery_retry_max_seconds',900),
               'metadata_failure_isolation':config.get('metadata_failure_isolation',False),
               'acknowledge_known_metadata_runtime_notices':config.get('acknowledge_known_metadata_runtime_notices',False)}
     if (isinstance(policy['download_burst'],bool) or not isinstance(policy['download_burst'],int)
             or not 1 <= policy['download_burst'] <= 20
             or any(not isinstance(policy[k],bool) for k in
-                   ('metadata_failure_isolation','acknowledge_known_metadata_runtime_notices','auto_key3_replanning','auto_snapshot_replanning','auto_month_period_replanning'))):
+                   ('metadata_failure_isolation','acknowledge_known_metadata_runtime_notices','auto_key3_replanning','auto_snapshot_replanning','auto_month_period_replanning','auto_preview_capacity_replanning','source_validation_isolation','prequery_failure_isolation'))):
         raise ValueError('Unreviewed desktop runtime policy')
+    if (policy['prequery_failure_isolation'] and
+            policy['prequery_recovery_contract'] != 'exact_unsent_table_retry_window_v1'):
+        raise ValueError('Explicit proved-unsent retry contract required')
+    if (any(type(policy[k]) is not int for k in ('prequery_retry_base_seconds','prequery_retry_max_seconds'))
+            or not 5 <= policy['prequery_retry_base_seconds'] <= policy['prequery_retry_max_seconds'] <= 3600):
+        raise ValueError('Invalid bounded table retry window')
     with closing(connect(root)) as con,con:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('runtime_policy',?)",(json.dumps(policy),))
     return policy
 
 
 def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dict, table_id: str | None=None) -> sqlite3.Row | None:
-    """Interleave within the earliest phase; rotate tables without sorting blobs."""
+    """Interleave within the best priority band; rotate equal-value tables.
+
+    Legacy priorities encode phases; installed value priorities encode local
+    gap and research relevance. No lower-value download may defer a higher-
+    value discovery, and neither changes source safety/retry admission.
+    """
+    # A proved terminal response quarantines its entire table, not just one
+    # fragment. Indexed metadata lookup keeps other sources progressing.
+    isolation = (" AND NOT EXISTS (SELECT 1 FROM tasks AS blocked WHERE blocked.table_id=tasks.table_id "
+                 "AND blocked.state='blocked' AND blocked.last_error_code='source_validation_failed_deferred')"
+                 " AND NOT EXISTS (SELECT 1 FROM desktop_retry_windows AS retry WHERE retry.table_id=tasks.table_id "
+                 "AND (retry.next_attempt_at_utc>? OR retry.task_id<>tasks.task_id))")
     def candidate(selected: str):
         if table_id is not None:
-            return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?) ORDER BY priority,task_id LIMIT 1",(selected,table_id,now)).fetchone()
-        return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?) ORDER BY priority,table_id,task_id LIMIT 1",(selected,now)).fetchone()
+            return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,task_id LIMIT 1",(selected,table_id,now,now)).fetchone()
+        return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,table_id,task_id LIMIT 1",(selected,now,now)).fetchone()
     if kind is not None:
         return candidate(kind)
     discovery,download = candidate('discover'),candidate('download')
@@ -1608,7 +1726,7 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
         return None
     last_table = values.get('scheduler_last_download_table')
     if last_table and table_id is None:
-        rotated = con.execute("SELECT * FROM tasks WHERE state='pending' AND kind='download' AND priority=? AND table_id>? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?) ORDER BY table_id,task_id LIMIT 1",(download['priority'],last_table,now)).fetchone()
+        rotated = con.execute("SELECT * FROM tasks WHERE state='pending' AND kind='download' AND priority=? AND table_id>? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY table_id,task_id LIMIT 1",(download['priority'],last_table,now,now)).fetchone()
         if rotated is not None:
             return rotated
     return download
@@ -1616,6 +1734,22 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
 
 def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str | None=None,
             retry_authorization_id: str | None=None) -> str:
+    """Keep source evidence authoritative through bounded metadata contention."""
+    try:
+        return _run_one(root,bridge,kind=kind,table_id=table_id,retry_authorization_id=retry_authorization_id)
+    except sqlite3.OperationalError as exc:
+        from downloader.tej_desktop_attempts import metadata_busy
+        if not metadata_busy(exc):
+            raise
+        # A pending task stays pending; a possibly submitted task stays
+        # unresolved. Only exact durable source evidence can clear that state.
+        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
+            'state':'waiting_metadata','observed_at_utc':datetime.now(UTC).isoformat()})
+        return 'local_metadata_busy'
+
+
+def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str | None=None,
+             retry_authorization_id: str | None=None) -> str:
     if kind not in {None, "discover", "download"}:
         raise ValueError("Unknown acquisition task kind")
     if table_id is not None and (kind!='download' or not re.fullmatch(r'[0-9a-f]{24}',table_id)):
@@ -1629,6 +1763,8 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
             return 'desktop_interface_recovery_required'
         if con.execute("SELECT 1 FROM meta WHERE key='source_period_replan_required'").fetchone():
             return 'source_period_replan_required'
+        if con.execute("SELECT 1 FROM tasks WHERE state='blocked' AND last_error_code='source_capacity_requires_review' LIMIT 1").fetchone():
+            return 'source_capacity_requires_review'
         if shutil.disk_usage(root).free < config.get("minimum_free_disk_bytes", 5 * 1024 ** 3):
             atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION,
                               "state": "local_disk_headroom_low", "observed_at_utc": now})
@@ -1666,6 +1802,13 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
             row = _ready_task(con,now,kind,policy,table_id)
         if not row:
             return "idle"
+        if replay is None and row['kind']=='download':
+            from downloader.tej_api_ownership import repartition_pending
+            if repartition_pending(con, root, row):
+                # This is a source-allocation transition, not a desktop query
+                # or successful Wizard export. The next normal iteration runs
+                # only the exact remaining scope; all old receipts stay intact.
+                return 'api_scope_repartitioned'
         task = dict(row)
         if replay is not None:
             con.execute('UPDATE desktop_replays SET consumed_at_utc=? WHERE authorization_id=?', (now,retry_authorization_id))
@@ -1689,6 +1832,12 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
         # requests. The compact form belongs to the durable queue only.
         task["request_json"] = json.dumps(task_request(root, task), ensure_ascii=False)
         payload, output, seconds = bridge.execute(root, task)
+        from downloader.tej_preview_capacity import OUTCOME, replan_capacity
+        if payload.get('source_outcome') == OUTCOME:
+            result = replan_capacity(root,task['task_id'],payload,output,event_id=event)
+            atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
+                'state':result['state'],'task_id':task['task_id'],'observed_at_utc':datetime.now(UTC).isoformat()})
+            return result['state']
         commit_evidence(root, task, payload, output, seconds, event_id=event)
         total_seconds = time.monotonic() - lifecycle_started
         with closing(connect(root)) as con, con:
@@ -1717,6 +1866,15 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
             with closing(connect(root)) as con, con:
                 state = _mark_prequery_failure(con,task,exc.error_code)
                 con.execute("UPDATE traffic SET completed_at_utc=?,state='failed_before_preview' WHERE event_id=?", (datetime.now(UTC).isoformat(), event))
+            if policy.get('prequery_failure_isolation') is True:
+                from downloader.tej_desktop_attempts import EXHAUSTED_PREQUERY_ERRORS, defer_unsent_prequery
+                if state in EXHAUSTED_PREQUERY_ERRORS:
+                    try:
+                        state=defer_unsent_prequery(root,task['task_id'],bridge,
+                            base_seconds=policy['prequery_retry_base_seconds'],
+                            max_seconds=policy['prequery_retry_max_seconds'])['state']
+                    except (ValueError,OSError,RuntimeError,subprocess.SubprocessError):
+                        pass  # No proof/interface acknowledgement means the existing barrier stays.
             atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": state,
                                "observed_at_utc": datetime.now(UTC).isoformat(), "task_id": task["task_id"]})
             return state
@@ -1733,6 +1891,14 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
             con.execute("UPDATE tables SET last_error_code=?,state='needs_review' WHERE table_id=?", (code, task["table_id"]))
             con.execute("UPDATE traffic SET completed_at_utc=?,state='failed' WHERE event_id=?", (datetime.now(UTC).isoformat(), event))
         state = code
+        if code == 'source_validation_failed' and policy.get('source_validation_isolation') is True:
+            from downloader.tej_source_isolation import isolate_invalid_response
+            try:
+                state = isolate_invalid_response(root,task['task_id'])['state']
+            except (ValueError,OSError,RuntimeError):
+                # A binding, shape, transport or missing-attempt failure is
+                # not a known terminal result. Preserve the global pause.
+                state = code
         if (isinstance(exc,SourceKeyLayoutError) and
                 (exc.source_key_mode==3 and policy.get('auto_key3_replanning') is True or
                  exc.source_key_mode==1 and policy.get('auto_snapshot_replanning') is True)):

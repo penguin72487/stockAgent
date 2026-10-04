@@ -2,6 +2,7 @@ import hashlib
 import json
 
 import polars as pl
+from downloader.stock_volume_units import STOCK_MINUTE_READER_CONTRACT
 
 from scripts.shioaji_minute_backfill_state import (
     frontier_state,
@@ -52,6 +53,7 @@ def test_frontier_checks_exact_symbols_and_reuse_requires_unchanged_rows(tmp_pat
     assert len(fingerprint) == 64
     manifest_bytes = json.dumps({
         "research_ready": True,
+        "source_reader_contract": STOCK_MINUTE_READER_CONTRACT,
         "download_start_date": "2020-03-02",
         "download_end_date": "2026-09-22",
         "source_fingerprint_sha256": fingerprint,
@@ -68,6 +70,11 @@ def test_frontier_checks_exact_symbols_and_reuse_requires_unchanged_rows(tmp_pat
             source_rows_before=rows, source_fingerprint_before=fingerprint,
         )
     assert reusable()
+    legacy = json.loads(manifest_bytes)
+    legacy.pop("source_reader_contract")
+    (research / "manifest.json").write_text(json.dumps(legacy))
+    assert not reusable()  # A current source does not prove the old reader contract.
+    (research / "manifest.json").write_bytes(manifest_bytes)
     old_manifest = json.loads(manifest_bytes)
     old_manifest.pop("source_fingerprint_sha256")
     (research / "manifest.json").write_text(json.dumps(old_manifest))

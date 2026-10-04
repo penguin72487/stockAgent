@@ -1,0 +1,10 @@
+[Unit]
+Description=Batch-data parent with lower scheduling priority than core services
+
+[Slice]
+# Core paper execution, Discord and the read-only gateway remain in
+# system.slice. Weight the parent: child weights alone cannot control the
+# competition between /stockagent.slice and /system.slice.
+CPUWeight=20
+IOAccounting=true
+IOWeight=20

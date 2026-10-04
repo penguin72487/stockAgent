@@ -1,0 +1,66 @@
+# Requested successor to the completed attention/full_then_last/LayerNorm v12
+# artifact. Formal start remains fail-closed on source/cache/checkpoint gates;
+# configuration validation no longer substitutes for those runtime receipts.
+# Daily-K proxies are now user-authorized (2026-09-10 follow-up): official
+# open/close without adverse ticks, retaining volume / 271 then 50% capacity.
+# All otherwise unmentioned assumptions inherit the named v12 artifact:
+# 2014-01-06 start, annual folds, matching-fold
+# pretrained initialization, DDP, and own-run resume. Never resume an old
+# optimizer under the new physical-inventory/official-price contract.
+# Do not turn margin conversion off or remove the minute root to bypass the
+# independent annual physical-state integration guard.
+# The FIFO inventory/opening kernels, whole-session schedule, lazy source,
+# annual train/val/test archives, exact prefix endpoints and stitched reporting
+# share one physical inventory ABI. Component tests alone remain insufficient:
+# the exact remote releases and full-history cache must still pass at startup.
+base_config: tw_day_trade_1m_hybrid_v12_attention_full_then_last_layernorm.yaml
+
+experiment_name: tw-day-trade-attention-layernorm-minute-paper-parity-candidate
+
+runner:
+  mode: train
+  output_dir: artifacts/markets/tw_day_trade_attention_full_then_last_layernorm_minute50_margin_carry_capital10m_candidate_v1
+  start_fold: 1
+  post_train_infer: false
+
+data:
+  # Match the named artifact and the user's explicit daily-K fallback approval.
+  # Before the first minute partition, and for an exact later symbol/session
+  # whose minute volume contradicts the independent official daily bound or
+  # lacks receipt-backed historical ETF limits, use official OPEN/CLOSE with
+  # no adverse tick and the retained daily-volume/271 capacity approximation.
+  # The source receipt counts every downgrade; it is never labelled minute data.
+  panel_start_date: '2014-01-06'
+  panel_cache_root: null
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_attention_layernorm_paper_parity_candidate
+  day_trade_minute_execution_allow_daily_proxy: true
+  day_trade_minute_execution_daily_proxy_price_policy: official_open_close
+
+walk_forward:
+  expected_first_year: 2014
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: true
+  require_contiguous_years: true
+  lookback_context: panel_history
+
+trading:
+  volume_participation_equity: 10000000.0
+  max_volume_participation: 0.5
+  tw_commission_discount: 0.2
+  tw_commission_rebate_timing: daily_close
+  tw_day_trade_unlimited_margin_conversion: true
+  tw_short_capacity_limit_enabled: false
+
+training:
+  epochs: 1000
+  # The source release has 2,746 symbols and this pinned target is a strict
+  # 2,754-symbol superset. Both manifests disable learned symbol positions, so
+  # the shared policy is permutation invariant; epoch-zero is still revalued
+  # on the new exact account before it can seed checkpoint_best.
+  pretrained_initialization_symbol_adapter: permutation_invariant_superset
+  # Inherit the artifact's matching-train-and-validation-year initialization.
+  # Canonical validation must revalue transferred model weights on the new
+  # account; transfer is not permission to restore the source optimizer.
+  warm_start_from_previous_fold: false

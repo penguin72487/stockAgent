@@ -16,7 +16,8 @@ def test_current_child_failure_survives_elastic_footer(tmp_path, monkeypatch):
     def child(*args, **kwargs):
         receipt(tmp_path/'futures_data_failure_rank0.json')
         return SimpleNamespace(returncode=1)
-    monkeypatch.setattr(train.subprocess,'run',child)
+    monkeypatch.setattr(train,'_run_managed_subprocess',child)
+    monkeypatch.setattr(train.subprocess,'Popen',lambda *a,**kw:pytest.fail('unit test must not launch a trainer'))
     with pytest.raises(RuntimeError,match='root_cause=unresolved_corporate_contract_transition date=2023-03-10 scope=train contracts=RFF:202303') as error:
         train._run_isolated_train_fold_processes([SimpleNamespace(fold_id=4)],argv=[],output_dir=tmp_path)
     assert 'DNF:202303' not in str(error.value)
@@ -24,7 +25,8 @@ def test_current_child_failure_survives_elastic_footer(tmp_path, monkeypatch):
 
 def test_stale_failure_cannot_explain_another_child_error(tmp_path, monkeypatch):
     receipt(tmp_path/'futures_data_failure_rank0.json')
-    monkeypatch.setattr(train.subprocess,'run',lambda *a,**kw:SimpleNamespace(returncode=1))
+    monkeypatch.setattr(train,'_run_managed_subprocess',lambda *a,**kw:SimpleNamespace(returncode=1))
+    monkeypatch.setattr(train.subprocess,'Popen',lambda *a,**kw:pytest.fail('unit test must not launch a trainer'))
     with pytest.raises(RuntimeError) as error:
         train._run_isolated_train_fold_processes([SimpleNamespace(fold_id=4)],argv=[],output_dir=tmp_path)
     assert 'root_cause' not in str(error.value)

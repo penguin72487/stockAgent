@@ -125,7 +125,9 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644) -> None:
+def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644, durable: bool = True) -> None:
+    if type(durable) is not bool:
+        raise ValueError('durable must be an explicit boolean')
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / (
         f".syncthing.{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -135,16 +137,18 @@ def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644) -> None
             os.fchmod(stream.fileno(), mode)
             stream.write(content)
             stream.flush()
-            os.fsync(stream.fileno())
+            if durable:
+                os.fsync(stream.fileno())
         os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        if durable:
+            _fsync_directory(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
 
 
-def atomic_write_json(path: Path, value: Any) -> None:
-    atomic_write_bytes(path, _canonical_json_bytes(value))
+def atomic_write_json(path: Path, value: Any, *, durable: bool = True) -> None:
+    atomic_write_bytes(path, _canonical_json_bytes(value), durable=durable)
 
 
 def write_immutable_json(path: Path, value: Any) -> str:

@@ -1,0 +1,7 @@
+name: stockagent-control-recovery
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - psycopg=3.3.4
+  - postgresql=18

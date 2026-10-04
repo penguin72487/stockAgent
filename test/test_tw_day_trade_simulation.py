@@ -270,7 +270,7 @@ def test_engine_publishes_one_compact_revision_after_related_state_files(
     assert heartbeat["content_revision"] == content_revision
 
 
-def test_idle_liveness_does_not_rewrite_or_advance_paper_ledger(tmp_path: Path) -> None:
+def test_idle_liveness_does_not_rewrite_or_advance_paper_ledger(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.update_readiness([spec], now=_now(8, 59))
@@ -399,7 +399,7 @@ def test_appended_older_history_does_not_replace_latest_live_commit(
 
 
 def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
-    tmp_path: Path,
+    tmp_path: Path, verified_dashboard_calendar,
 ) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -452,7 +452,7 @@ def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
     assert compact["positions"] == []
 
 
-def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> None:
+def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.update_readiness([spec], now=_now(8, 59))
@@ -5114,7 +5114,7 @@ def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
     assert current["record_counts"]["benchmark_history_marks"] == 3
 
 
-def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -> None:
+def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.update_readiness([spec], now=_now(8, 59))
@@ -5156,7 +5156,7 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
 
 
 def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
-    tmp_path: Path,
+    tmp_path: Path, verified_dashboard_calendar,
 ) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -5422,7 +5422,7 @@ def test_dashboard_marks_post_receipt_mode_as_late_recovery_after_engine_commit(
 
 
 def test_dashboard_default_view_exposes_today_prewarm_before_first_signal(
-    tmp_path: Path,
+    tmp_path: Path, verified_dashboard_calendar,
 ) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -5699,7 +5699,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "refreshSummary" not in javascript
 
 
-def test_dashboard_counts_only_same_day_execution_events(tmp_path: Path) -> None:
+def test_dashboard_counts_only_same_day_execution_events(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.update_readiness([spec], now=_now(9, 5))
@@ -7468,8 +7468,15 @@ def test_dashboard_event_page_returns_all_selected_day_rows_safely(
         limit=10,
         maximum_scan_rows=2,
     )
-    assert bounded["scan_limit_reached"] is True
-    assert bounded["source_rows_scanned"]["orders"] == 2
+    if all(bounded["source_projection_complete"].values()):
+        # A complete indexed projection can answer the date range without
+        # a bounded JSONL fallback and must return the complete result.
+        assert bounded["scan_limit_reached"] is False
+        assert bounded["total"] == updated["total"]
+        assert bounded["rows"] == updated["rows"]
+    else:
+        assert bounded["scan_limit_reached"] is True
+        assert bounded["source_rows_scanned"]["orders"] == 2
 
 
 def test_detail_pages_hide_retired_paper_modes_after_config_change(

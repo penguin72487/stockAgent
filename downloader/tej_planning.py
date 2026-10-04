@@ -16,6 +16,9 @@ import math
 CONTRACT = 'preview_30_columns_lazy_fields_v1'
 MAX_PREVIEW_COLUMNS = 30
 TILING_CONTRACT = 'minimum_uniform_company_date_rectangles_v1'
+CAPACITY_CONTRACT = 'native_row_capacity_replanning_v1'
+OPERATOR_GEOMETRY_CONTRACT = 'operator_unknown_record_geometry_prior_v1'
+LOCAL_CAPACITY_CONTRACT = 'native_preview_full_local_capacity_v1'
 
 
 def rectangle_queries(companies: int, dates: int, rows: int, size: int, keys: int) -> int:
@@ -61,6 +64,11 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
         raise ValueError('Preview cap is exactly the reviewed 30 total columns')
     from downloader.tej_key_layout import key_count
     keys=key_count(request)
+    density=request.get('native_record_density_hint',1)
+    if (type(density) is not int or not 1 <= density <= 1000000
+            or request.get('record_capacity_contract') not in (None,CAPACITY_CONTRACT,OPERATOR_GEOMETRY_CONTRACT)
+            or density!=1 and (keys!=3 or request.get('record_capacity_contract') not in (CAPACITY_CONTRACT,OPERATOR_GEOMETRY_CONTRACT))):
+        raise ValueError('Unverified native record capacity hint')
     width=limit-keys
     if not fields or len(fields) > 2000 or len(set(companies)) != len(companies) or len(set(dates)) != len(dates):
         raise ValueError('Unverified field/company/date plan')
@@ -100,6 +108,9 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
     for begin in range(0,len(fields),width):
         stop=min(len(fields),begin+width); selected=set(fields[begin:stop]); columns=stop-begin+keys
         rows=min(request['max_rows'],request['max_cells']//columns-1)
+        # Key=3 means several native records may share a company/period.
+        # The hint bounds query geometry, not actual observation counts.
+        rows //= density
         if rows < 1:
             raise ValueError('Preview partition exceeds output bound')
         company_size=company_batch_size(len(companies),len(dates),rows,config['max_companies_per_export'],keys,
@@ -215,6 +226,10 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
         request={**request,'source_key_mode':mode,'key_layout_contract':KEY1_CONTRACT if mode==1 else KEY3_CONTRACT}
         if mode==1:
             request['frequency']='snapshot'
+    if config.get('query_capacity_contract') == LOCAL_CAPACITY_CONTRACT:
+        # Discovery captures menus, not market observations. The next data
+        # request may use the explicitly upgraded output memory budget.
+        request={**request,'max_rows':config['max_rows_per_export'],'max_cells':config['max_cells_per_export']}
     plan=build_plan(request,payload['company_labels'],payload['date_labels'],config,completed)
     weights=[]
     for done,task in zip(completed,completed_tasks):
@@ -222,9 +237,11 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
         weights.append((weight*task['expected_rows'],task['task_id']))
     if sum(weight for weight,_ in weights) != plan['completed_work_rows']:
         raise ValueError('Overlapping or unaligned completed field scopes; do not refetch silently')
+    from downloader.tej_value_priority import installed_priority
+    priority = installed_priority(con, definition['table_id'], int(definition['phase'][1])*100)
     con.execute('INSERT INTO download_plans VALUES(?,?,?,?,?,?,?)',
                 (definition['table_id'],CONTRACT,json.dumps(plan,ensure_ascii=False,separators=(',',':')),
-                 0,plan['total_queries'],definition['phase'],int(definition['phase'][1])*100))
+                 0,plan['total_queries'],definition['phase'],priority))
     con.executemany('UPDATE tasks SET work_expected_rows=? WHERE task_id=?',weights)
     # Source evidence and failed receipts remain; this is a queue encoding /
     # field-partition upgrade, not deletion or relabelling successful data.
@@ -240,6 +257,7 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
 
 def refill_ready_plans(con) -> int:
     from downloader.tej_history import SOURCE_SCOPE_CONTRACT, compact_request, stable_id
+    from downloader.tej_value_priority import installed_priority
 
     generated=0
     plans=con.execute("SELECT p.table_id,p.next_query,p.phase,p.priority FROM download_plans p WHERE p.next_query<p.total_queries AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.table_id=p.table_id AND t.kind='download' AND t.scope_contract=? AND t.state IN ('pending','running','blocked')) ORDER BY p.priority,p.table_id",(SOURCE_SCOPE_CONTRACT,)).fetchall()
@@ -250,7 +268,7 @@ def refill_ready_plans(con) -> int:
         from downloader.tej_key_layout import key_count
         key=stable_id([row['table_id'],query]); expected=len(query['company_labels'])*(1 if key_count(query)==1 else len(query['date_labels']))
         con.execute('INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,work_expected_rows) VALUES(?,?,?,?,?,?,?,?,?)',
-                    (key,row['table_id'],'download',row['phase'],row['priority'],
+                    (key,row['table_id'],'download',row['phase'],installed_priority(con,row['table_id'],row['priority']),
                      json.dumps(compact_request(query,definition),ensure_ascii=False,separators=(',',':')),
                      expected,SOURCE_SCOPE_CONTRACT,expected))
         con.execute('UPDATE download_plans SET next_query=next_query+1 WHERE table_id=?',(row['table_id'],))
@@ -258,12 +276,14 @@ def refill_ready_plans(con) -> int:
     return generated
 
 
-def upgrade_query_tiling(root, config: dict) -> dict:
+def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) -> dict:
     """Explicit, locked upgrade preserving completed scopes and original plans.
 
     Caller owns the canonical dataset lock. No GUI or provider request occurs;
     no source receipt or former queue encoding is deleted. Unknown outcomes,
-    blocked downloads, and active workers remain hard migration barriers.
+    blocked downloads, and active workers remain hard migration barriers for
+    the legacy operation. An explicit capacity upgrade defers invalid tables,
+    but still rejects every inflight/unknown source action globally.
     """
     from contextlib import closing
     from datetime import UTC, datetime
@@ -275,41 +295,76 @@ def upgrade_query_tiling(root, config: dict) -> dict:
 
     if config.get('query_tiling_contract') != TILING_CONTRACT:
         raise ValueError('Explicit reviewed company/date tiling configuration required')
+    contract = LOCAL_CAPACITY_CONTRACT if capacity_upgrade else TILING_CONTRACT
+    if capacity_upgrade and (config.get('query_capacity_contract') != LOCAL_CAPACITY_CONTRACT
+            or type(config.get('max_cells_per_export')) is not int or not 100 <= config['max_cells_per_export'] <= 400000
+            or type(config.get('max_companies_per_export')) is not int or not 1 <= config['max_companies_per_export'] <= 1024
+            or type(config.get('max_rows_per_export')) is not int or not 1 <= config['max_rows_per_export'] <= 10000):
+        raise ValueError('Explicit reviewed local Preview capacity required')
     with closing(connect(root)) as con, con:
         saved = dict(con.execute('SELECT key,value FROM meta'))
         deferred_ids = set(json.loads(saved.get('query_tiling_deferred_tables','[]')))
-        if saved.get('query_tiling_contract') == TILING_CONTRACT and not deferred_ids:
-            return {'contract':TILING_CONTRACT,'already_installed':True,'provider_queries_sent':0}
+        original_config = json.loads(saved['config'])
+        if (saved.get('query_tiling_contract') == TILING_CONTRACT and not deferred_ids
+                and (not capacity_upgrade or saved.get('query_capacity_contract') == LOCAL_CAPACITY_CONTRACT
+                     and all(config[k]==original_config[k] for k in
+                             ('max_rows_per_export','max_cells_per_export','max_companies_per_export')))):
+            return {'contract':contract,'already_installed':True,'provider_queries_sent':0}
         if saved.get('preview_planning_contract') != CONTRACT:
             raise ValueError('Upgrade the canonical Preview planner first')
-        if con.execute("SELECT 1 FROM tasks WHERE state='running' OR (kind='download' AND state='blocked') LIMIT 1").fetchone():
+        barrier_sql = ("SELECT 1 FROM tasks WHERE state='running' OR "
+                       "(state='blocked' AND last_error_code='unknown_outcome_no_auto_retry') LIMIT 1"
+                       if capacity_upgrade else
+                       "SELECT 1 FROM tasks WHERE state='running' OR (kind='download' AND state='blocked') LIMIT 1")
+        if con.execute(barrier_sql).fetchone():
             raise ValueError('Unresolved source action blocks tiling migration')
+        if capacity_upgrade and con.execute("SELECT 1 FROM meta WHERE key IN ('desktop_interface_recovery_required','source_period_replan_required')").fetchone():
+            raise ValueError('Unresolved shared source interface blocks capacity migration')
         if shutil.disk_usage(root).free < config.get('minimum_free_disk_bytes',5*1024**3)+2*(root/'queue.sqlite3').stat().st_size:
             raise OSError('Insufficient headroom for recoverable tiling upgrade')
-        original_config = json.loads(saved['config'])
         for field in ('max_rows_per_export','max_cells_per_export','max_companies_per_export'):
-            if config[field] != original_config[field]:
+            if not capacity_upgrade and config[field] != original_config[field]:
                 raise ValueError('Tiling cannot silently change source capacity bounds')
         new_config = {**original_config,'query_tiling_contract':TILING_CONTRACT}
+        if capacity_upgrade:
+            new_config.update({k:config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export',
+                                                   'query_capacity_contract')})
+            new_config['query_interval_contract'] = config.get('query_interval_contract','minimum_completion_gap_v1')
         migration = root/'planning_migrations'/uuid.uuid4().hex
-        audit = {'contract':TILING_CONTRACT,'state':'prepared','provider_queries_sent':0,
+        audit = {'contract':contract,'state':'prepared','provider_queries_sent':0,
                  'observed_at_utc':datetime.now(UTC).isoformat(),'tables':[], 'deferred_tables':[],
-                 'source_files_deleted':False,'completed_scopes_preserved':True}
+                 'source_files_deleted':False,'completed_scopes_preserved':True,
+                 'former_bounds':{k:original_config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export')},
+                 'new_bounds':{k:new_config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export')}}
         prepared = []
         for row in con.execute('SELECT * FROM download_plans ORDER BY table_id').fetchall():
-            if saved.get('query_tiling_contract') == TILING_CONTRACT and row['table_id'] not in deferred_ids:
+            if not capacity_upgrade and saved.get('query_tiling_contract') == TILING_CONTRACT and row['table_id'] not in deferred_ids:
                 continue
             previous = json.loads(row['plan_json'])
             core = {k:v for k,v in previous.items() if k!='fingerprint'}
             if hashlib.sha256(json.dumps(core,sort_keys=True,ensure_ascii=False).encode()).hexdigest() != previous['fingerprint']:
                 raise ValueError('Original plan fingerprint differs')
+            if capacity_upgrade and con.execute("SELECT 1 FROM tasks WHERE table_id=? AND kind='download' AND state='blocked' LIMIT 1",
+                                                (row['table_id'],)).fetchone():
+                audit['deferred_tables'].append({'table_id':row['table_id'],'reason':'blocked_table_scope_unchanged'})
+                continue
             from downloader.tej_key_layout import key_count
             if key_count(previous['request']) == 1:
+                if capacity_upgrade:
+                    audit['deferred_tables'].append({'table_id':row['table_id'],'reason':'snapshot_axis_scope_unchanged'})
                 continue  # Snapshot batching is already maximal; no dated migration.
             definition = dict(con.execute('SELECT * FROM tables WHERE table_id=?',(row['table_id'],)).fetchone())
             finished = [dict(r) for r in con.execute("SELECT * FROM tasks WHERE table_id=? AND kind='download' AND state='complete' AND scope_contract=?",(row['table_id'],SOURCE_SCOPE_CONTRACT))]
             completed = [expand_request(json.loads(t['request_json']),definition,row['table_id']) for t in finished]
-            plan = build_plan(previous['request'],previous['companies'],previous['dates'],new_config,completed)
+            base = {**previous['request'],'max_rows':new_config['max_rows_per_export'],
+                    'max_cells':new_config['max_cells_per_export']} if capacity_upgrade else previous['request']
+            try:
+                plan = build_plan(base,previous['companies'],previous['dates'],new_config,completed)
+            except ValueError:
+                if not capacity_upgrade:
+                    raise
+                audit['deferred_tables'].append({'table_id':row['table_id'],'reason':'completed_key_scope_requires_reconciliation'})
+                continue
             resolved = sum(t['work_expected_rows'] if t['work_expected_rows'] is not None else t['expected_rows'] for t in finished)
             if (plan['total_work_rows'] != previous['total_work_rows'] or plan['completed_work_rows'] != resolved):
                 raise ValueError('Completed scope coverage changed or overlapped; reject migration')
@@ -355,12 +410,14 @@ def upgrade_query_tiling(root, config: dict) -> dict:
             con.execute('UPDATE download_plans SET plan_json=?,next_query=0,total_queries=? WHERE table_id=?',
                         (json.dumps(plan,ensure_ascii=False,separators=(',',':')),plan['total_queries'],table_id))
         con.execute("INSERT OR REPLACE INTO meta VALUES('query_tiling_contract',?)",(TILING_CONTRACT,))
+        if capacity_upgrade:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('query_capacity_contract',?)",(LOCAL_CAPACITY_CONTRACT,))
         con.execute("INSERT OR REPLACE INTO meta VALUES('query_tiling_deferred_tables',?)",
                     (json.dumps([r['table_id'] for r in audit['deferred_tables']]),))
         con.execute("UPDATE meta SET value=? WHERE key='config'",(json.dumps(new_config),))
     audit['state']='committed'
     atomic_write_json(migration/'audit.json',audit,durable=True)
-    return {'contract':TILING_CONTRACT,'already_installed':False,'tables_optimized':len(prepared),
+    return {'contract':contract,'already_installed':False,'tables_optimized':len(prepared),
             'queries_saved':sum(r['before_remaining_queries']-r['after_remaining_queries'] for r in audit['tables']),
             'provider_queries_sent':0,'completed_scopes_preserved':True,
             'deferred_tables':audit['deferred_tables'],

@@ -93,13 +93,6 @@ def test_saved_tw_cash_artifacts_expose_forced_gross_redundant_phase_targets() -
     assert _defaulted_fold_count(day_trade_integer) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "known diagnostic gap: absorbing default is stored as -inf, but the "
-        "current tensor metric helper replaces -inf with a zero-return row"
-    ),
-)
 def test_tensor_metrics_treat_absorbing_default_as_total_loss() -> None:
     metrics = trainer_module._compute_metrics_from_tensors(
         torch.tensor([0.01, float("-inf"), 0.0], dtype=torch.float64),

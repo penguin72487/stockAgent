@@ -31,8 +31,10 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
 from stockagent.live.dashboard_updates import metadata_signature  # noqa: E402
 from stockagent.live.data_monitor_inventory import (  # noqa: E402
     InventorySnapshot,
+    SourceRevisionChanged,
     build_feature_inventory,
     build_record_inventory,
+    require_coherent_feature_source,
 )
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
     FEATURE_SOURCE_PAGES_MAX_BYTES,
@@ -251,8 +253,9 @@ def _current_feature_snapshot(
     path: Path, *, feature_revision: str | None = None,
     source_metadata_sha256: str | None = None,
     source_observation_root: str | None = None,
+    allow_stale_dependencies: bool = False,
 ) -> int | None:
-    """Reuse field count only after source and dependency proof is current."""
+    """Validate field count; retained generations require an intact prior proof."""
 
     dependencies = (
         REPO_ROOT / "artifacts/live/data_monitor/record_inventory_cache.json",
@@ -267,6 +270,8 @@ def _current_feature_snapshot(
     )
 
     def dependencies_current(snapshot_mtime: int, *, revision_bound: bool) -> bool:
+        if allow_stale_dependencies:
+            return True
         return not any(
             dependency.stat().st_mtime_ns > snapshot_mtime
             for dependency in (dependencies[1:] if revision_bound else dependencies)
@@ -334,6 +339,10 @@ def _current_feature_snapshot(
             return receipt["fields"]
     except (OSError, ValueError, UnicodeError, TypeError):
         pass
+    if allow_stale_dependencies:
+        # Deferral may retain a previously validated generation, but must not
+        # manufacture a new receipt or update its original generation time.
+        return None
     if source_metadata_sha256 is not None or source_observation_root is not None:
         # A full JSON parse proves the file contract, not that its labels were
         # projected from today's public metadata and observed source identities.
@@ -377,6 +386,7 @@ def _publish_feature_inventory_snapshot(
     root: Path, output: Path, *, snapshot: InventorySnapshot,
     public_status: dict[str, object], feature_revision: str | None,
     source_metadata_sha256: str, prefer_shards: bool = True,
+    expected_source_observation_root: str | None = None,
 ) -> dict[str, object]:
     """One canonical complete publisher, with an optional bounded shard cache.
 
@@ -392,7 +402,10 @@ def _publish_feature_inventory_snapshot(
 
         started = time.perf_counter()
         try:
-            result = publish_feature_shards(root, output, snapshot=snapshot, monitor_status=public_status)
+            result = publish_feature_shards(
+                root, output, snapshot=snapshot, monitor_status=public_status,
+                expected_source_observation_root=expected_source_observation_root,
+            )
             projection_cache = {
                 "state": "published", "schema_version": 1,
                 "reused_datasets": result.reused_datasets,
@@ -400,6 +413,8 @@ def _publish_feature_inventory_snapshot(
                 "object_recovery": "object_recovery_total" in result.timing_ms,
             }
             inventory_timing.update(result.timing_ms)
+        except SourceRevisionChanged:
+            raise
         except (OSError, ValueError, TypeError, UnicodeError) as exc:
             projection_cache = {"state": "full_fallback", "error_type": type(exc).__name__}
             print(json.dumps({"event": "feature_projection_cache_fallback", **projection_cache}), flush=True)
@@ -413,6 +428,7 @@ def _publish_feature_inventory_snapshot(
     else:
         started = time.perf_counter()
         raw = build_feature_inventory(root, snapshot=snapshot, timing_ms=inventory_timing)
+        require_coherent_feature_source(raw, expected_source_observation_root)
         source_root = raw.get("source_observation_root")
         snapshot.payload = None
         snapshot.selected = None
@@ -450,6 +466,7 @@ def publish_feature_inventory_snapshot(
     root: Path, output: Path, *, snapshot: InventorySnapshot,
     public_status: dict[str, object], feature_revision: str | None,
     source_metadata_sha256: str, prefer_shards: bool = True,
+    expected_source_observation_root: str | None = None,
 ) -> dict[str, object]:
     """Serialize source+receipt publication, not HTTP visitors or providers.
 
@@ -474,6 +491,7 @@ def publish_feature_inventory_snapshot(
                 root, output, snapshot=snapshot, public_status=public_status,
                 feature_revision=feature_revision, source_metadata_sha256=source_metadata_sha256,
                 prefer_shards=prefer_shards,
+                expected_source_observation_root=expected_source_observation_root,
             )
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -580,7 +598,10 @@ def main() -> int:
         feature_inventory_output, feature_revision=feature_revision,
         source_metadata_sha256=source_metadata_sha256,
         source_observation_root=inventory_source_root,
-    ) if isinstance(inventory_source_root, str) else None
+    ) if (
+        isinstance(inventory_source_root, str)
+        and record_inventory.get("source_observation_matches_cache") is True
+    ) else None
     feature_stages_ms = {
         "reuse_check": round((time.perf_counter() - feature_stage_started) * 1_000, 3),
     }
@@ -589,16 +610,32 @@ def main() -> int:
     feature_inventory_timing_ms: dict[str, float] = {}
     feature_projection_cache: dict[str, object] = {"state": "whole_snapshot_reused"}
     if feature_count is None:
-        publication = publish_feature_inventory_snapshot(
-            REPO_ROOT, feature_inventory_output, snapshot=inventory_snapshot,
-            public_status=public_status, feature_revision=feature_revision,
-            source_metadata_sha256=source_metadata_sha256,
-        )
-        feature_count = publication["fields"]
-        feature_source_root = publication["source_observation_root"]
-        feature_stages_ms.update(publication["stages_ms"])
-        feature_inventory_timing_ms.update(publication["inventory_timing_ms"])
-        feature_projection_cache = publication["projection_cache"]
+        try:
+            if (
+                not isinstance(inventory_source_root, str)
+                or record_inventory.get("source_observation_matches_cache") is not True
+            ):
+                raise SourceRevisionChanged("record inventory contains unrefreshed source identities")
+            publication = publish_feature_inventory_snapshot(
+                REPO_ROOT, feature_inventory_output, snapshot=inventory_snapshot,
+                public_status=public_status, feature_revision=feature_revision,
+                source_metadata_sha256=source_metadata_sha256,
+                expected_source_observation_root=inventory_source_root,
+            )
+        except SourceRevisionChanged as exc:
+            # Keep the last independently validated projection. The next
+            # supervised cycle refreshes changed footers; HTTP readers retain
+            # that projection's actual generation time rather than a new stamp.
+            feature_count = _current_feature_snapshot(
+                feature_inventory_output, allow_stale_dependencies=True,
+            )
+            feature_projection_cache = {"state": "deferred_source_revision", "reason": str(exc)}
+        else:
+            feature_count = publication["fields"]
+            feature_source_root = publication["source_observation_root"]
+            feature_stages_ms.update(publication["stages_ms"])
+            feature_inventory_timing_ms.update(publication["inventory_timing_ms"])
+            feature_projection_cache = publication["projection_cache"]
     feature_elapsed = time.perf_counter() - started - services_elapsed - public_elapsed
     # Reuse this supervised, every-30-second worker instead of installing one
     # more polling daemon. The tracker checks its durable due time before doing

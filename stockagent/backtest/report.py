@@ -10,13 +10,14 @@ import matplotlib.ticker as mticker
 from matplotlib.patches import Patch
 
 from stockagent.backtest.simulator import BacktestResult
+from stockagent.backtest.return_metrics import (
+    ZERO_NAV_LOG as _ZERO_NAV_LOG,
+    clean_log_returns as _clean_log_returns,
+)
 
 
 _PLOT_LOG_MIN = -60.0
 _PLOT_LOG_MAX = 60.0
-# A zero-NAV return is -inf, not missing data. Use a finite underflow floor
-# only for log-risk statistics; cumulative returns/drawdown still equal -100%.
-_ZERO_NAV_LOG = float(np.log(np.finfo(np.float64).tiny))
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 _MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
     r"This figure includes Axes that are not compatible with tight_layout.*"
@@ -204,19 +205,6 @@ def _safe_log10_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
 def _finite_values(values: list[float] | np.ndarray, *, nan: float = 0.0) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64)
     return np.nan_to_num(arr, nan=nan, posinf=nan, neginf=nan)
-
-
-def _clean_log_returns(values: np.ndarray) -> np.ndarray:
-    raw = np.asarray(values, dtype=np.float64)
-    clean = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=_ZERO_NAV_LOG)
-    zero_nav = np.flatnonzero(raw <= _ZERO_NAV_LOG)
-    if zero_nav.size:
-        first = int(zero_nav[0])
-        # Also recognizes float-min sentinels from historical np.nan_to_num
-        # report adapters. Capital cannot recover after an absorbing default.
-        clean[first] = _ZERO_NAV_LOG - float(clean[:first].sum())
-        clean[first + 1:] = 0.0
-    return clean
 
 
 def _finite_xy(x_values: np.ndarray, y_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

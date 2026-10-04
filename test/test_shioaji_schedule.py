@@ -23,6 +23,7 @@ from stockagent.live.shioaji_schedule import (
     latest_completed_tw_stock_session,
     previous_tw_stock_session,
 )
+import stockagent.live.shioaji_schedule as schedule_module
 from downloader import download_shioaji_tw_kbars, download_shioaji_tw_minute_kbars
 
 
@@ -32,6 +33,15 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 def _local(hour: int, minute: int, *, day: int = 17) -> datetime:
     # 2026-08-17 is Monday; 2026-08-16 is Sunday.
     return datetime(2026, 8, day, hour, minute, tzinfo=TAIPEI)
+
+
+@pytest.fixture
+def verified_august_sessions(monkeypatch):
+    sessions = {date(2026, 8, day) for day in (14, 17, 18, 21, 24)}
+    monkeypatch.setattr(
+        schedule_module, "is_trading_day",
+        lambda _market, day, **_kwargs: day in sessions,
+    )
 
 
 def test_history_queries_stop_before_observed_quota_reset() -> None:
@@ -93,10 +103,45 @@ def test_minute_frontier_uses_only_the_bounded_postclose_window() -> None:
     ) == (2, 0, 1, None)
 
 
-def test_traffic_ceiling_waits_for_next_reset_and_historical_window() -> None:
+def test_traffic_ceiling_waits_for_next_reset_and_historical_window(verified_august_sessions) -> None:
     assert next_postreset_historical_window(_local(6, 0)) == _local(14, 31)
     assert next_postreset_historical_window(_local(22, 0)) == _local(14, 31, day=18)
     assert next_postreset_historical_window(_local(22, 0, day=21)) == _local(14, 31, day=24)
+
+
+def test_traffic_ceiling_calendar_search_is_bounded_without_evidence(monkeypatch) -> None:
+    checked = []
+
+    def unavailable(_market, day, **_kwargs):
+        checked.append(day)
+        return False
+
+    monkeypatch.setattr(schedule_module, "is_trading_day", unavailable)
+    with pytest.raises(RuntimeError, match="within 32 days.*verified calendar"):
+        next_postreset_historical_window(_local(22, 0))
+    assert len(checked) == 32
+
+
+def test_traffic_ceiling_calendar_search_stops_at_datetime_limit(monkeypatch) -> None:
+    monkeypatch.setattr(schedule_module, "is_trading_day", lambda *_a, **_kw: False)
+    with pytest.raises(RuntimeError, match="date limit"):
+        next_postreset_historical_window(datetime(9999, 12, 31, 22, tzinfo=TAIPEI))
+
+
+def test_minute_quota_retry_retains_wait_when_calendar_is_unverified(monkeypatch, capsys) -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
+    function = source.split("seconds_until_next_quota_window() {", 1)[1].split("\n}\n", 1)[0]
+    program = function.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("verified calendar evidence is required")
+
+    monkeypatch.setattr(schedule_module, "next_postreset_historical_window", unavailable)
+    exec(compile(program, "minute-quota-retry", "exec"), {})
+    output = capsys.readouterr()
+    assert output.out.strip() == "3600"
+    assert "calendar_unverified" in output.err
 
 
 def test_history_runners_share_one_logged_in_batch_lock() -> None:
@@ -118,12 +163,12 @@ def test_history_runners_share_one_logged_in_batch_lock() -> None:
     assert "yield_to_waiting_exact_history" in futures_runner
 
 
-def test_previous_tw_stock_session_skips_weekend_targets() -> None:
+def test_previous_tw_stock_session_skips_weekend_targets(verified_august_sessions) -> None:
     observed = datetime(2026, 8, 23, 3, 0, tzinfo=TAIPEI)
     assert previous_tw_stock_session(observed) == date(2026, 8, 21)
 
 
-def test_latest_completed_session_advances_only_after_close() -> None:
+def test_latest_completed_session_advances_only_after_close(verified_august_sessions) -> None:
     assert latest_completed_tw_stock_session(_local(14, 30)) == date(2026, 8, 14)
     assert latest_completed_tw_stock_session(_local(14, 31)) == date(2026, 8, 17)
 

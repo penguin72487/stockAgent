@@ -16,7 +16,7 @@ MARKET_ORDER = {name: rank for rank, name in enumerate((
     "forex", "macro", "cross_market", "configuration", "crypto",
 ))}
 OPERATION_ORDER = {name: rank for rank, name in enumerate((
-    "catching_up", "streaming", "complete", "unable", "deferred", "control", "reference",
+    "catching_up", "streaming", "waiting_publication", "complete", "unable", "deferred", "control", "reference",
 ))}
 
 

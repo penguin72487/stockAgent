@@ -12,24 +12,31 @@ from datetime import UTC, datetime, timedelta
 import json
 import math
 import os
+import sqlite3
+import subprocess
+import time
 from pathlib import Path
 from threading import Event
 from typing import Callable
 
 from downloader.artifact_io import atomic_write_json
 from downloader.dataset_lock import DatasetLockTimeout, exclusive_dataset_lock
-from downloader.tej_history import connect, recover_evidence, run_one
+from downloader.tej_history import CONTRACT_VERSION, connect, recover_evidence, run_one
 
 CONTRACT = "persistent_serial_evidence_preserving_supervision_v1"
 PROGRESS_STATES = frozenset({
-    "completed_task", "source_key_layout_replanned",
+    "completed_task", "source_key_layout_replanned", "source_capacity_replanned",
     "metadata_preparation_failed_deferred", "vendor_metadata_allocation_failed_deferred",
+    "source_validation_failed_deferred",
+    "prequery_failure_deferred",
+    "api_scope_repartitioned",
 })
 SAFETY_STATES = frozenset({
     "desktop_interface_recovery_required", "inflight_requires_recovery",
     "unknown_outcome_no_auto_retry", "source_validation_failed", "local_storage_failed",
     "source_key_layout_replan_required", "date_input_prequery_needs_review",
     "source_period_replan_required",
+    "source_capacity_requires_review",
     "list_selection_prequery_needs_review", "query_activation_prequery_needs_review",
 })
 
@@ -40,6 +47,7 @@ class WatchPolicy:
     blocked_seconds: float = 60
     heartbeat_seconds: float = 30
     minimum_interval_seconds: float = 2
+    interval_contract: str = 'minimum_completion_gap_v1'
 
     @classmethod
     def from_config(cls, config: dict) -> "WatchPolicy":
@@ -56,7 +64,100 @@ class WatchPolicy:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or not 0 < value <= 300):
                 raise ValueError(f"Invalid TEJ supervision interval: {key}")
+        values['interval_contract'] = config.get('query_interval_contract','minimum_completion_gap_v1')
+        if values['interval_contract'] not in ('minimum_completion_gap_v1','minimum_query_start_interval_v1'):
+            raise ValueError('Unreviewed TEJ query interval contract')
         return cls(**values)
+
+
+def remaining_query_interval(config: dict, elapsed_seconds: float) -> float:
+    """Rate-limiter time already spent on the complete query is not idle time.
+
+    A legacy finish-gap config keeps its original semantics. No overlap or
+    parallel owner is added; retries and safety waits use their own clocks.
+    """
+    contract = config.get('query_interval_contract','minimum_completion_gap_v1')
+    interval = config.get('minimum_export_interval_seconds',2)
+    if (isinstance(interval,bool) or not isinstance(interval,(int,float))
+            or not math.isfinite(interval) or not 0 < interval <= 300):
+        raise ValueError('Invalid TEJ query interval')
+    if contract == 'minimum_completion_gap_v1':
+        return interval
+    if contract != 'minimum_query_start_interval_v1':
+        raise ValueError('Unreviewed TEJ query interval contract')
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0:
+        raise ValueError('Invalid monotonic query elapsed time')
+    return max(0.0,interval-elapsed_seconds)
+
+
+def finished_discovery_response(root: Path, task_id: str) -> Path | None:
+    """Locate the completed current metadata readback, never repeat discovery.
+
+    Discovery does not register a Preview attempt. Its prepared request, exact
+    progress identity, complete response and failure clock must therefore agree
+    before passing the response to the canonical evidence adopter.
+    """
+    import re
+    from downloader.tej_desktop_attempts import prepared_request_matches
+    from downloader.tej_history import CONTRACT_VERSION, DESKTOP_INPUT_CONTRACT, SOURCE_SCOPE_CONTRACT, task_request
+    worker_path = root / "worker_status.json"
+    if not worker_path.is_file():
+        return None
+    worker = json.loads(worker_path.read_text())
+    if not isinstance(worker, dict) or worker.get("state") != "waiting_metadata":
+        return None
+    with closing(connect(root)) as con:
+        task_row = con.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if task_row is None:
+            return None
+        task = dict(task_row)
+        if (task["kind"] != "discover" or task["state"] != "running"
+                or task["scope_contract"] != SOURCE_SCOPE_CONTRACT or task.get("active_attempt_id") is not None
+                or any(task.get(k) is not None for k in ("actual_rows", "receipt_path", "completed_at_utc"))
+                or con.execute("SELECT count(*) FROM tasks WHERE state='running'").fetchone()[0] != 1
+                or con.execute("SELECT 1 FROM desktop_attempts WHERE task_id=?", (task_id,)).fetchone()):
+            return None
+    started = datetime.fromisoformat(task["attempted_at_utc"])
+    failed = datetime.fromisoformat(worker["observed_at_utc"])
+    if (started.tzinfo is None or failed.tzinfo is None or failed > datetime.now(UTC)
+            or not 0 <= (failed - started).total_seconds() <= 900):
+        return None
+    candidates = [p for p in (root / "requests").glob(task_id + "-*.json")
+                  if started.timestamp() <= p.stat().st_mtime]
+    if len(candidates) != 1 or candidates[0].stat().st_mtime > failed.timestamp():
+        return None
+    prepared = candidates[0]
+    if not re.fullmatch(re.escape(task_id) + r"-[0-9a-f]{32}", prepared.stem):
+        return None
+    request = task_request(root, task)
+    original = json.loads(prepared.read_text())
+    if (not isinstance(original, dict) or request.get("action") != "plan" or request.get("contract_version") != CONTRACT_VERSION
+            or original.get("desktop_input_contract") != DESKTOP_INPUT_CONTRACT
+            or original.get("query_attempt_id") is not None
+            or not prepared_request_matches(original, request, task)):
+        return None
+    output = root / "raw" / prepared.name
+    progress = root / "progress" / (prepared.name + ".progress.json")
+    if any(not p.is_file() or p.stat().st_size > 64 * 1024**2 or not (
+            started.timestamp() <= p.stat().st_mtime <= failed.timestamp()) for p in (output, progress)):
+        return None
+    payload, step = json.loads(output.read_text()), json.loads(progress.read_text())
+    if (not isinstance(payload, dict) or not isinstance(step, dict)
+            or step.get("contract") != "tej_native_readback_progress_v1"
+            or step.get("task_id") != task_id or step.get("attempt_id") != prepared.stem
+            or step.get("stage") != "validating_and_saving"
+            or payload.get("task_id") != task_id or payload.get("action") != "plan"
+            or payload.get("contract_version") != CONTRACT_VERSION
+            or any(payload.get(k) != request.get(k) for k in ("type", "smart_id", "table", "fields"))
+            or payload.get("query_attempt_id") is not None):
+        return None
+    for timestamp in (payload.get("observed_at_utc"), step.get("observed_at_utc")):
+        if not isinstance(timestamp, str):
+            return None
+        observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if observed.tzinfo is None or not started <= observed <= failed:
+            return None
+    return output
 
 
 def recover_complete_local_response(root: Path) -> bool:
@@ -68,14 +169,35 @@ def recover_complete_local_response(root: Path) -> bool:
     """
     with closing(connect(root)) as con:
         rows = con.execute(
-            "SELECT task_id,active_attempt_id FROM tasks WHERE kind='download' AND "
+            "SELECT task_id,kind,active_attempt_id FROM tasks WHERE kind IN ('download','discover') AND "
             "(state='running' OR (state='blocked' AND last_error_code='unknown_outcome_no_auto_retry'))"
         ).fetchall()
     recovered = False
     for row in rows:
+        if row["kind"] == "discover":
+            try:
+                output = finished_discovery_response(root, row["task_id"])
+                if output is not None:
+                    recover_evidence(root, row["task_id"], output)
+                    recovered = True
+            except (ValueError, OSError, RuntimeError, TypeError):
+                pass  # No complete current readback means the barrier stays.
+            continue
         attempt = row["active_attempt_id"]
         if not isinstance(attempt, str) or not attempt.startswith(row["task_id"] + "-"):
+            from downloader.tej_desktop_attempts import recover_unlaunched_metadata_claim
+            try:
+                recovered = recover_unlaunched_metadata_claim(root, row['task_id']) or recovered
+            except (ValueError, OSError, RuntimeError):
+                pass  # NULL alone never proves an unsent source action.
             continue
+        from downloader.tej_desktop_attempts import recover_prequery_outcome
+        try:
+            if recover_prequery_outcome(root,row['task_id']):
+                recovered = True
+                continue
+        except (ValueError,OSError,RuntimeError):
+            continue  # Invalid/ambiguous evidence never licenses a query replay.
         output = root / "raw" / (attempt + ".json")
         if (output.resolve().parent != (root / "raw").resolve() or not output.is_file()
                 or output.stat().st_size > 64 * 1024**2):
@@ -141,6 +263,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
             "next_check_at_utc": (observed + timedelta(seconds=wait)).isoformat() if wait is not None else None,
             "unknown_outcome_auto_retry": False,
             "query_deadline_renewed_by_heartbeat": False,
+            "query_interval_contract": policy.interval_contract,
         })
 
     def wait(state: str, seconds: float) -> None:
@@ -178,11 +301,25 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                     if barrier == "inflight_requires_recovery":
                         recover_complete_local_response(root)
                         barrier = local_barrier()
+                    from downloader.tej_desktop_attempts import EXHAUSTED_PREQUERY_ERRORS, defer_unsent_prequery
+                    if barrier in EXHAUSTED_PREQUERY_ERRORS and config.get('prequery_failure_isolation') is True:
+                        with closing(connect(root)) as con:
+                            row=con.execute("SELECT task_id FROM tasks WHERE state='blocked' AND last_error_code=? "
+                                "ORDER BY priority,task_id LIMIT 1",(barrier,)).fetchone()
+                        try:
+                            defer_unsent_prequery(root,row['task_id'],bridge,
+                                base_seconds=config.get('prequery_retry_base_seconds',60),
+                                max_seconds=config.get('prequery_retry_max_seconds',900))
+                        except (ValueError,OSError,RuntimeError,subprocess.SubprocessError):
+                            pass  # Unfinished/unknown/foreign evidence never licenses a new query.
+                        barrier=local_barrier()
                     if barrier:
                         last_result = paused_reason = barrier
                         wait_state, delay = "waiting_recovery", policy.blocked_seconds
                     else:
                         paused_reason = None
+                        from downloader.tej_value_priority import refresh_if_due
+                        refresh_if_due(root)
                         if session_path is not None:
                             # Reload only explicitly pinned private identity,
                             # after reconciliation. Never discover or select a
@@ -196,7 +333,9 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                                 raise ValueError('Exact private desktop session required')
                             bridge.session = session
                         publish("executing")
+                        query_started = time.monotonic()
                         last_result = runner(root, bridge)
+                        delay = remaining_query_interval(config,time.monotonic()-query_started)
                         cycles += 1
                         emit(json.dumps({"event": "tej_automatic_task", "state": last_result, "cycle": cycles}), flush=True)
                         if last_result == "completed_task":
@@ -204,6 +343,8 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                             last_completed = datetime.now(UTC).isoformat()
                         elif last_result == "prequery_retry_scheduled":
                             wait_state, delay = "waiting_local_retry", 5
+                        elif last_result == 'local_metadata_busy':
+                            wait_state, delay = 'waiting_metadata', 5
                         elif last_result == 'desktop_unavailable':
                             wait_state, delay = 'waiting_desktop', policy.blocked_seconds
                         elif last_result == "idle":
@@ -219,6 +360,16 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
             except DatasetLockTimeout:
                 last_result = "another_writer_active"
                 wait_state, delay = "waiting_owner", 5
+            except sqlite3.OperationalError as exc:
+                from downloader.tej_desktop_attempts import metadata_busy
+                if not metadata_busy(exc):
+                    raise
+                # Release the dataset lock and wait without a source retry.
+                # Next cycle reconciles the exact response/negative proof.
+                last_result = 'local_metadata_busy'
+                wait_state, delay = 'waiting_metadata', 5
+                atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
+                    'state':'waiting_metadata','observed_at_utc':datetime.now(UTC).isoformat()})
             wait(wait_state, delay)
     finally:
         publish("stopped")

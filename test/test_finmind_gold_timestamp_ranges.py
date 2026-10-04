@@ -175,7 +175,7 @@ def test_filtered_worker_one_http_preserves_end_day_and_quota_reservation(tmp_pa
     monkeypatch.setattr(c, 'verified_account', lambda *_a: {'tier': 'Free', 'official_requests_per_hour': 600})
     monkeypatch.setattr(c, 'rate_limiter', lambda *_a: object())
     monkeypatch.setattr(c, '_populate', lambda *_a, **_kw: None)
-    monkeypatch.setattr(c, 'fixed_incremental_demand', lambda *_a: 0)
+    monkeypatch.setattr(c, 'incremental_reservation', lambda *_a: {'reserve_requests': 0})
     monkeypatch.setattr(c, 'backfill_budget', lambda *_a, **_kw: {'allowed': history_allowed})
     monkeypatch.setattr(c.shutil, 'disk_usage', lambda *_a: SimpleNamespace(free=100 * 1024**3))
     monkeypatch.setattr(c, '_status', lambda conn, root, **kw: kw)

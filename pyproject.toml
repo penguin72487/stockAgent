@@ -1,3 +1,44 @@
+[build-system]
+requires = ["setuptools>=77", "wheel>=0.45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stockagent"
+version = "0.1.0"
+description = "Versioned financial data, research and execution infrastructure"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "pyarrow>=16.0",
+  "PyYAML>=6.0",
+  "polars>=0.20",
+  "tqdm>=4.66",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+training = ["torch>=2.3", "transformers>=4.40", "matplotlib>=3.8", "scikit-learn>=1.4", "scipy>=1.12"]
+boosting = ["lightgbm>=4.3", "xgboost>=2.0"]
+services = ["discord.py>=2.4,<3", "shioaji>=1.7.0"]
+acquisition = ["yfinance>=1.0", "beautifulsoup4>=4.12", "lxml>=5.0", "pypdf>=6.18.1,<7"]
+analytics = ["duckdb>=1.1", "msgspec>=0.22,<0.23"]
+control = ["psycopg[binary]>=3.2,<4"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.9", "wheel>=0.45"]
+control = ["psycopg[binary]>=3.2,<4", "pytest>=8"]
+
+[tool.setuptools]
+include-package-data = false
+py-modules = ["train", "plot_epoch_curves"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stockagent*", "downloader*", "scripts*"]
+exclude = ["test*", "artifacts*", "data_*", "*.tests*"]
+namespaces = false
+
 [tool.pytest.ini_options]
 testpaths = ["test"]
 python_files = ["test_*.py"]

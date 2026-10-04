@@ -442,20 +442,20 @@ ctime 相同就認定內容相同，也不因 ctime 不同就把相同內容重�
 第二次執行完成 19 項回收後，在下一項唯讀驗證階段中斷，套用修正後只重查剩餘
 8 項；已完成收據保留於 `attempt-2/`，其餘結果在 `attempt-3/`，不重複加總容量。
 
-### 已回收結果與大型項目的監督執行
+### 已完成的回收與大型項目監督執行
 
-截至交接，一共 **24 個 root 已回收、3,280,912,384 allocated file bytes**（約 3.28 GB）。
-已一起移除 repository 與舊 hot transport 的已驗證名稱；D 冷物件刪除數仍為零。
-這不是 Windows VHDX 壓縮量，也不是把較早其它清理的 15.71／115 GB 重新加總。
+2026-10-03 重新查核總收據：本批於 **2026-10-02 18:53 台北時間完成**，
+一共 **27 個 root 已回收、143,124,492,288 allocated file bytes**（約 143.12 GB）。
+已一起移除 repository 與舊 hot transport 的已驗證名稱；D 冷物件刪除數為零。
+這不是 Windows VHDX 壓縮量，也沒有把較早其它清理的 15.71／115 GB 重新加總。
 
-剩餘三項是 `tw_public_lanten_market_candles_tw_cash_all_available`、crypto、US。
-大型檔案需要完整雜湊／獨立解碼，不以發布成功或舊收據直接授權刪除。
-前景工作只在下一項 **唯讀 planning** 階段中斷，沒有中斷 rename/unlink。
-後續由一次性 `stockagent-market-manual-retirement-20261002.service` 執行；只挑原
+早先交接的 24 項／3.28 GB 是中途結果。剩餘
+`tw_public_lanten_market_candles_tw_cash_all_available`、crypto、US
+已由一次性 `stockagent-market-manual-retirement-20261002.service` 完成；只挑原
 `preflight.json` 已授權且未完成的 root，走相同 canonical plan/apply。
-完成回收後會對所有已回收 release 再做一次完整冷物件／解碼檢查，最後觀察本機
-Syncthing 與容量，才寫總結 `summary.json`。`state=complete` 才是全部 27 項的驗收。
-在那之前不能把 service active 或單項成功稱為全量完成。
+最後的 `summary.json` 為 `state=complete`、`remaining_datasets=[]`，
+27 項 `post_unlink_audits` 全部確認冷物件／獨立解碼、兩個熱名稱不存在及 cold-only 狀態。
+總收據的本機 Syncthing 驗收當時亦通過；它不是今天的 peer 傳輸或全冷庫歷史驗收。
 
 ```bash
 systemctl status stockagent-market-manual-retirement-20261002.service --no-pager
@@ -466,5 +466,13 @@ run_fintech_python artifacts/operations/market_artifact_manual_retirement_202610
 
 `attempt-4/` 保存剩餘三項逐項收據，`background-job.json` 記錄 PID 與選定項目；
 最後複驗進度為 `final-audit-progress.json`，每項為 `.post-unlink.json`。
+成功的一次性 unit 已由 systemd 收集；`status` 顯示 not-found 不等於回收失敗，
+完成判斷以保留的 `summary.json` 與逐項複驗收據為準。
 一次性 unit 不啟用開機排程、不重啟既有服務、不替換七日 timer；WSL 關閉不屬於
 完成證明。任何失敗保留 blocked/quarantine 收據，不可手動清空。
+
+## 15. 2026-10-03 剩餘 markets 容量與冷覆蓋審查
+
+本次只讀清點的容量排名、歷史解析版本、服務依賴及逐檔冷覆蓋結果，見
+[markets 儲存審查](markets_storage_review_2026-10-03.md)。
+清單不是刪除許可；不能把仍在使用、來源變動或只封存小檔的目錄當成完整冷保存。

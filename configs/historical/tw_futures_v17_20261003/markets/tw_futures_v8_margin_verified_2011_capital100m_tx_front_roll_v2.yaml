@@ -1,0 +1,12 @@
+# Verified 2011 TX/MTX margin account with a gross 1x TX front-month comparator.
+# The benchmark rolls at the prior session close using the new contract's own
+# previous close. The old margin/cash experiment retains its separate root.
+base_config: tw_futures_v8_margin_verified_2011_capital100m.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-v2
+
+trading:
+  tw_futures_portfolio_benchmark_mode: tx_front_rolling_1x_gross
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_fold14_v2
+  start_fold: 14

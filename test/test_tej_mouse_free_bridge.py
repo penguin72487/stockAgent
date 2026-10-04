@@ -1,7 +1,7 @@
 """Mouse-free input contract and no-query operator acceptance boundaries.
 
 Source checks cover interop paths on Linux. The owned Windows fixture and
-private TEJ same-value input receipt separately verify actual focus/key behavior.
+private TEJ input receipts separately verify actual addressed-input behavior.
 """
 from contextlib import closing
 import json
@@ -47,13 +47,30 @@ def test_focus_is_real_owner_scoped_and_detached_even_on_failure():
     assert 'WindowFromPoint' not in focus
 
 
-def test_date_model_uses_acknowledged_real_input_not_a_native_display_text_noop():
+def test_no_input_focus_refusal_is_availability_not_an_exhaustible_keyboard_bug():
+    focus=BRIDGE.split('public static long FocusDate',1)[1].split('public static string[] WriteDateText',1)[0]
+    assert focus.count('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')==4
+    assert 'SendWait(' not in focus
+    outcomes=BRIDGE.split(".Contains('DATE_INPUT_BEFORE_QUERY:')",1)[1].split(".Contains('LOCAL_SELECTION_BEFORE_QUERY:')",1)[0]
+    assert "Contains('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')" in outcomes
+    assert "'desktop_foreground_unavailable_before_preview'" in outcomes
+    # An actual unacknowledged digit/caret remains a local-input defect, not
+    # availability or permission to carry on typing/replay a provider query.
+    digits=BRIDGE.split('public static string[] WriteDateText',1)[1].split('public static void DateText',1)[0]
+    assert 'DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:' not in digits
+
+
+def test_date_model_uses_acknowledged_owned_messages_without_foreground_or_keyboard():
     write = BRIDGE.split('public static string[] WriteDateText', 1)[1].split('public static void DateText', 1)[0]
-    assert write.index('FocusDate(') < write.index('SendWait(')
-    for proof in ('DateTime.TryParseExact', 'VerifiedDateFocus(', 'acknowledged', 'beforeCharacter', 'SendWait("{TAB}")'):
-        assert proof in write
-    for forbidden in ('WriteText(', 'WM_SETFOCUS', 'WM_KILLFOCUS', 'WriteDateControlText('):
-        assert forbidden not in write
+    assert 'return WriteDateMessages(root,edit,group,digits)' in write
+    scoped=BRIDGE.split('public static string[] WriteDateMessages',1)[1].split('public static string[] PreviewHeader',1)[0]
+    for proof in ('DateTime.TryParseExact', 'DateScope(root,edit,group)', 'acknowledged', 'previous=Text(edit)',
+                  'Message(edit,0x303,0,0)', 'Message(edit,0x102,c,1)', 'result.Replace("/","")'):
+        assert proof in scoped
+    for forbidden in ('WriteText(', 'WM_SETFOCUS', 'WM_KILLFOCUS', 'FocusDate(', 'Activate(',
+                      'SendWait(', 'AttachThreadInput(', 'SetFocus(', 'PostMessageW('):
+        assert forbidden not in scoped
+    assert 'SendKeys.SendWait(' not in BRIDGE
     production = BRIDGE.split('public static void DateText', 1)[1].split('public static string[] PreviewHeader', 1)[0]
     assert 'WriteDateText(' in production and 'return;' not in production
 
@@ -61,9 +78,9 @@ def test_date_model_uses_acknowledged_real_input_not_a_native_display_text_noop(
 def test_blank_source_mask_can_be_filled_without_accepting_an_arbitrary_empty_edit():
     production=BRIDGE.split("$dates=Find-QueryGroup 'Date Setting'",1)[1]
     assert "(\\d{4}/\\d{2}/\\d{2}|____/__/__)" in production
-    write=BRIDGE.split('public static string[] WriteDateText',1)[1].split('public static void DateText',1)[0]
-    assert 'beforeInput=="________"' in write and 'afterClear==beforeInput&&!wasEmptyMask' in write
-    assert 'VerifiedDateFocus(root,edit,group)' in write and 'Date character not acknowledged' in write
+    write=BRIDGE.split('public static string[] WriteDateMessages',1)[1].split('public static string[] PreviewHeader',1)[0]
+    assert 'before!="________"' in write and 'cleared==before&&before!=""' in write
+    assert 'DateScope(root,edit,group)' in write and 'Scoped date character not acknowledged' in write
     fixture=(REPO/'scripts/verify_tej_mouse_free_input.ps1').read_text()
     assert 'blank_mask_real_digits_and_model_commit' in fixture
 
@@ -74,6 +91,24 @@ def test_unknown_notice_is_retained_privately_without_acknowledgement_or_edit_va
     assert 'GetWindowThreadProcessId' in capture and "($Output+'.notice.json')" in capture
     for forbidden in ('Activate(', '0xF5', 'SendWait(', "'Edit'", 'ValuePattern'):
         assert forbidden not in capture
+
+
+def test_ownerless_modal_requires_exact_thread_disabled_root_and_unique_source_process_windows():
+    method=BRIDGE.split('public static bool IsUniqueOwnerlessModal',1)[1].split('public static void VerifyNormalEmptyDialog',1)[0]
+    for proof in ('rp!=dp','rt!=dt','IsWindowEnabled(r)','GetWindow(d,4)!=IntPtr.Zero',
+                  'name.ToString()!="#32770"','windows.Length==2','Array.IndexOf(windows,root)'):
+        assert proof in method
+    acknowledgement=BRIDGE.split('public static void VerifyNormalEmptyDialog',1)[1].split('public static long[] VisibleProcessWindows',1)[0]
+    assert 'ERROR1:No data' in acknowledgement and 'matching!=1' in acknowledgement
+    assert 'buttons.Length!=1' in acknowledgement and 'a.accDoDefaultAction(0)' not in acknowledgement
+    assert 'Activate(' not in acknowledgement and '0xF5' not in acknowledgement
+    production=BRIDGE.split('function Empty-Response',1)[1].split("if($requestDoc.action -in @('resolve_empty'",1)[0]
+    assert 'IsUniqueOwnerlessModal' in production and 'AcknowledgeNormalEmptyDialog' in production
+    ack=BRIDGE.split('public static void AcknowledgeNormalEmptyDialog',1)[1].split('public static long[] VisibleProcessWindows',1)[0]
+    assert 'VerifyNormalEmptyDialog(root,dialog,button)' in ack and 'Message(dialog,0x111u,id,button)' in ack
+    assert 'GetDlgCtrlID(new IntPtr(button))' in ack and '(id!=1&&id!=2)' in ack
+    assert 'Activate(' not in ack and '0xF5' not in ack
+    assert 'Activate(' not in production
 
 
 def test_query_uses_exact_pinned_workbook_not_users_active_excel_view():
@@ -111,6 +146,81 @@ def test_preview_normal_owned_action_does_not_require_foreground():
     assert 'Activate(' not in production and '$stage.preview_foreground_required=$false' in production
 
 
+def test_resolved_selection_controls_are_guarded_per_click_and_rechecked_per_batch():
+    resolved = BRIDGE.split('function Click-ResolvedButton',1)[1].split('function Select-FieldList',1)[0]
+    for proof in ('Assert-Scope $parent', 'Assert-Scope $h', 'IsChild', 'WindowsForms10.BUTTON.',
+                  'Current.Name', 'Dialogs($ExpectedWindow)', 'IsWindowEnabled', 'IsWindowVisible'):
+        assert proof in resolved
+    assert resolved.count('Message $h 0xF5') == 1
+    companies = BRIDGE.split('$companySelectButton=Company-SelectButton',1)[1].split('$dateSelectButton=',1)[0]
+    assert 'Select-Company $companySelectButton' in companies
+    assert '(Company-SelectButton) -ne $companySelectButton' in companies
+    assert 'WaitSelectedList' in companies
+    for group, variable in (('source','fieldSelectButton'),('dates','dateSelectButton')):
+        assert f"${variable}=Control ${group} 'Select' '*BUTTON*'" in BRIDGE
+        assert f"Click-ResolvedButton ${group} ${variable} 'Select'" in BRIDGE
+        assert f"(Control ${group} 'Select' '*BUTTON*') -ne ${variable}" in BRIDGE
+
+
+def test_native_scope_guard_is_fresh_per_operation_not_cached_owner_authorization():
+    native = BRIDGE.split('public static void AssertControlScope',1)[1].split('[DllImport',1)[0]
+    for proof in ('GetWindowThreadProcessId(r,out rp)', 'GetWindowThreadProcessId(c,out cp)',
+                  '!IsWindow(r)', '!IsWindow(c)', 'rp!=expectedPid', 'cp!=expectedPid', '!IsChild(r,c)',
+                  'WindowTitle(root)!=title'):
+        assert proof in native
+    powershell = BRIDGE.split('function Assert-Scope',1)[1].split("if($root.Current.Name",1)[0]
+    assert 'AssertControlScope($ExpectedWindow,$h,$TejProcessId,$ExpectedTitle)' in powershell
+    assert '$root.Current' not in powershell
+
+
+def test_current_binding_readback_reads_selected_combo_not_the_entire_menu():
+    verify=BRIDGE.split('function Verify-EditableScope',1)[1].split('function Verify-SourceSelectors',1)[0]
+    assert 'SelectedComboText($ExpectedWindow,$h)' in verify
+    assert 'Items $h $true' not in verify
+    production=BRIDGE.split('$bindingAlreadyMatches=$true',1)[1].split('$sourceKeyMode=Read-SourceKeyMode',1)[0]
+    assert 'SelectedComboText($ExpectedWindow,$h)' in production and 'Items $h $true' not in production
+    selection=BRIDGE.split('function Select-Combo',1)[1].split('function Click-Button',1)[0]
+    assert 'ExactComboIndex($ExpectedWindow,$h,$name)' in selection
+    assert selection.count('NotifyBinding(')==1 and 'Items $h $true' not in selection
+
+
+def test_native_combo_lookup_keeps_case_sensitive_unicode_and_duplicate_safety():
+    lookup=BRIDGE.split('public static int ExactComboIndex',1)[1].split('public static string Text',1)[0]
+    for proof in ('ComboScope(root,control,true)', '0x158u', 'ComboItem(control,index)==label',
+                  'duplicate exact combo label', 'index==first', 'scanned<count'):
+        assert proof in lookup
+    assert '0x14Du' not in lookup and '0x14Eu' not in lookup  # read-only find, never selection.
+    selected=BRIDGE.split('public static string SelectedComboText',1)[1].split('public static int ExactComboIndex',1)[0]
+    assert 'ComboItem(control,index)' in selected and '0x147u' in selected
+    assert 'Items(' not in selected
+    assert 'ComboScope(root,control,false)' in selected
+
+
+def test_all_axis_shortcut_still_requires_exact_source_names_before_preview():
+    company=BRIDGE.split('$companyIndices=@{}',1)[1].split('$availableDates=@()',1)[0]
+    dates=BRIDGE.split('$dateIndices=@{}',1)[1].split("if($requestDoc.action -in @('plan','recover_plan'",1)[0]
+    assert '$requestDoc.company_labels.Count -ne $availableCompanyCount' in company
+    assert '$requestDoc.date_labels.Count -ne $availableDateCount' in dates
+    assert 'ExactListIndex' in company and 'ExactListIndex' in dates
+    submission=BRIDGE.split("if($requestDoc.company_labels.Count -lt 1",1)[1].split('$querySubmissionPossible=$true',1)[0]
+    for proof in ('SameItems([string[]]$selectedCompanies,[string[]]$requestDoc.company_labels)',
+                  'SameItems([string[]]$selectedDates,[string[]]$requestDoc.date_labels)', 'Verify-EditableScope -BindingReadback'):
+        assert proof in submission
+    assert "scope_preparation_timings_contract='monotonic_complete_scope_stages_v1'" in submission
+
+
+def test_date_foreground_and_keyboard_telemetry_match_the_actual_message_contract():
+    for proof in ('$stage.date_input_requires_foreground=$false', '$stage.global_keyboard_input_sent=$false'):
+        assert proof in BRIDGE
+    scoped=BRIDGE.split('public static string[] WriteDateMessages',1)[1].split('public static string[] PreviewHeader',1)[0]
+    assert scoped.count('Message(edit,0x102,c,1)')==1
+    assert 'while(' not in scoped and 'SendKeys' not in scoped
+    fixture=(REPO/'scripts/verify_tej_mouse_free_input.ps1').read_text()
+    for proof in ('date_writes_never_activated_owner','focus_loss_does_not_interrupt_scoped_input',
+                  'focus_loss_never_typed_into_foreground_window','midwrite_disabled_group_stops_before_digits'):
+        assert proof in fixture
+
+
 def test_notice_diagnostic_distinguishes_disabled_root_from_no_direct_dialog():
     diagnostic = BRIDGE.split("if($requestDoc.action -eq 'inspect_notices')", 1)[1].split(
         "if($requestDoc.action -eq 'ack_preview_column_limit')", 1)[0]
@@ -121,7 +231,8 @@ def test_notice_diagnostic_distinguishes_disabled_root_from_no_direct_dialog():
         assert forbidden not in diagnostic
     enumerate_windows = BRIDGE.split('public static long[] VisibleProcessWindows', 1)[1].split(
         'public static string[] Items', 1)[0]
-    assert 'pid==sourcePid&&IsWindowVisible(h)' in enumerate_windows
+    assert 'return ProcessWindows(root,true)' in enumerate_windows
+    assert 'pid==sourcePid&&(!visibleOnly||IsWindowVisible(h))' in enumerate_windows
     assert 'handles.Count>32' in enumerate_windows
     assert 'GetWindowThreadProcessId(new IntPtr(root),out sourcePid)' in enumerate_windows
 
@@ -168,6 +279,7 @@ class ProbeBridge:
                    'desktop_input_contract':DESKTOP_INPUT_CONTRACT,
                    **{k:call[k] for k in ('type', 'smart_id', 'table')},
                    'market_data_query_submitted':False, 'early_noop_path_used':False,
+                   'global_keyboard_input_sent':False, 'date_foreground_required':False,
                    **{k:True for k in ('date_text_input_sent', 'binding_matches_failed_plan', 'query_axes_unchanged',
                        'source_binding_unchanged', 'field_selection_unchanged')}, 'date_input_results':[]}
         for key in ('start', 'end'):
@@ -206,10 +318,13 @@ def test_verified_input_never_resets_unknown_or_adopts_data(probe_registry):
         assert dict(con.execute('SELECT * FROM tasks').fetchone()) == before
     audit = json.loads(next((root / 'input_acceptance').glob('*.json')).read_text())
     assert audit['source_evidence_sha256'] and audit['state_before'] == audit['state_after'] == 'blocked'
+    assert audit['contract_version']==2 and audit['global_keyboard_input_sent'] is False
+    assert audit['date_foreground_required'] is False
 
 
 @pytest.mark.parametrize('mutation', ['task_id', 'action', 'table', 'provider', 'desktop_input_contract',
-    'market_data_query_submitted', 'early_noop_path_used', 'query_axes_unchanged', 'field_selection_unchanged',
+    'market_data_query_submitted', 'global_keyboard_input_sent', 'date_foreground_required',
+    'early_noop_path_used', 'query_axes_unchanged', 'field_selection_unchanged',
     'no_intermediate_edit', 'wrong_final_date', 'missing_date', 'queue_changed'])
 def test_incomplete_input_proof_is_rejected_without_recovery(probe_registry, mutation):
     root, request = probe_registry

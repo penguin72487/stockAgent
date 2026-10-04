@@ -13,7 +13,9 @@ import statistics
 from typing import Any, Mapping
 
 from scripts.finlab_release_gate import catalog_readiness
-from stockagent.data.finlab_acquisition_contract import UPSTREAM_CHECK_MODES, safe_stem
+from stockagent.data.finlab_acquisition_contract import (
+    UPSTREAM_CHECK_MODES, safe_stem, WORKLOAD_CONTRACT_VERSION, intraday_progress,
+)
 from scripts.snapshot_finlab_quota import load_quota_history
 
 
@@ -23,8 +25,8 @@ STAGE_DATASET = "tw-public-research-finlab-2014-v4"
 def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
     """Project only workload counters; no cache paths, raw frames or SDK calls."""
     raw = _read_json(root / "artifacts/live/finlab/workload_latest.json", {})
-    if not isinstance(raw, Mapping) or raw.get("contract_version") != 3:
-        return {"contract_version": 3, "state": "unavailable"}
+    if not isinstance(raw, Mapping) or raw.get("contract_version") not in {3, WORKLOAD_CONTRACT_VERSION}:
+        return {"contract_version": WORKLOAD_CONTRACT_VERSION, "state": "unavailable"}
 
     def fields(value, names):
         if not isinstance(value, Mapping):
@@ -38,6 +40,7 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
                     "unknown_transfer_keys unknown_record_keys stored_parquet_bytes eta_basis "
                     "all_data_finish_at_utc all_data_finish_reason daily_budget_bytes "
                     "quota_policy_version incremental_quota_policy incremental_daily_capacity_bytes "
+                    "actionable_complete blocked_count "
                     "overhead_seconds_per_key_estimate overhead_samples expected_pending_payload_bytes")
     known = {row["key"] for row in datasets}
     result["blocked_keys"] = [key for key in raw.get("blocked_keys", []) if isinstance(key, str) and key in known]
@@ -62,18 +65,25 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
                         "remaining_bytes_estimate unknown_transfer_keys remaining_work_seconds_estimate "
                         "unknown_time_keys next_check_at_utc reason source_weight_total_bytes "
                         "source_weight_completed_bytes progress_ratio promoted_keys incremental_quota_exempt_keys")
+        public.update(fields(stage, "next_retry_at_utc cooldown_keys"))
         public["records"] = [fields(row, "unit count") for row in stage.get("records", [])
                              if isinstance(row, Mapping) and row.get("unit") in {
                                  "wide_values", "event_rows", "metadata_values"}]
         public["scenarios"] = {name: fields(stage.get("scenarios", {}).get(name),
                                             "state start_at_utc finish_at_utc")
                                for name in ("fast", "reference", "slow")}
+        wave = stage.get("next_wave")
+        if isinstance(wave, Mapping):
+            public["next_wave"] = fields(wave, "check_at_utc keys transfer_bytes_estimate basis dispatch_interval_seconds")
+            public["next_wave"]["scenarios"] = {name: fields(wave.get("scenarios", {}).get(name),
+                                                       "state start_at_utc finish_at_utc")
+                                                   for name in ("fast", "reference", "slow")}
         result["stages"].append(public)
     rows = raw.get("datasets", [])
     result["datasets"] = [fields(row, "key downloaded needs_refresh blocked_reason queue_role scheduled "
                                   "transfer_bytes transfer_basis fetch_seconds time_basis record_count record_unit "
                                   "stored_rows estimated_finish_at_utc next_source_check_at_utc expected_payload_bytes payload_basis "
-                                  "incremental_quota_exempt")
+                                  "incremental_quota_exempt retry_at_utc source_checked_at_utc")
                           for row in rows if isinstance(row, Mapping) and row.get("key") in known]
     age = _age_seconds(raw.get("generated_at_utc"), now)
     result["age_seconds"] = age
@@ -93,6 +103,7 @@ def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
             stage["scenarios"] = {}
             stage["state"] = "stale"
             stage["progress_ratio"] = None
+            stage.pop("next_wave", None)
         for row in result["datasets"]:
             row["estimated_finish_at_utc"] = None
     return result
@@ -518,6 +529,25 @@ def build_finlab_public_status(
                 "key": active_key,
                 "started_at_utc": running_receipt.get("active_started_at_utc"),
             }
+    tick_worker = intraday_progress(root / "data_finlab", now=observed)
+    public_worker = {k: (None if isinstance(tick_worker.get(k), float)
+                        and not math.isfinite(tick_worker[k]) else tick_worker.get(k)) for k in (
+        "run_started_at_utc", "observed_at_utc", "state", "owner_alive", "age_seconds",
+        "active_key", "active_trade_date", "attempt_limit", "attempted", "successful",
+        "scanned_candidates", "cached_skips", "quota_checks", "elapsed_seconds", "sample_count",
+        "seconds_per_attempt_estimate", "remaining_batch_seconds_estimate",
+        "estimated_batch_finish_at_utc", "stop_by_at_utc", "estimate_scope", "batch_eta_state",
+    ) if k in tick_worker and (tick_worker[k] is None or isinstance(tick_worker[k], (str, int, float, bool)))}
+    tick_active = public_worker.get("owner_alive") is True and public_worker.get("state") == "running"
+    if current_fetch:
+        phase = "general"
+    elif tick_active:
+        phase = "tick"
+        current_fetch = {"key": public_worker.get("active_key"),
+                         "trade_date": public_worker.get("active_trade_date"),
+                         "started_at_utc": public_worker.get("run_started_at_utc")}
+    else:
+        phase = "transition" if acquisition.get("service_active") else "idle"
     return {
         "schema_version": 1,
         "generated_at_utc": observed.isoformat(),
@@ -540,6 +570,8 @@ def build_finlab_public_status(
         "volume_estimate": volume_estimate,
         "workload": workload,
         "current_fetch": current_fetch,
+        "execution": {"phase": phase, "tick": public_worker,
+                      "basis": "canonical_general_run_and_live_tick_owner_not_systemd_active_alone"},
         "release_gate": readiness,
         "storage": {
             "raw_current_bytes": raw_bytes,

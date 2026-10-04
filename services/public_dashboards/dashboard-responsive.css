@@ -38,6 +38,18 @@ nav[data-dashboard-nav] a {
   text-align: center;
 }
 
+/* Evidence links are controls too; their complete copy stays visible. */
+body .data-note a,
+body .provider-breadcrumb a {
+  display: inline-flex;
+  align-items: center;
+  min-inline-size: 44px;
+  min-block-size: 44px;
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+
 .dashboard-nav-toggle {
   display: none;
   min-width: 44px;
@@ -175,7 +187,7 @@ nav[data-dashboard-nav] a {
   }
 }
 
-@media (max-width: 700px) {
+@media (max-width: 1100px) {
   body > .public-nav,
   body > .site-header {
     width: calc(100% - 2 * var(--dashboard-mobile-gutter));
@@ -213,6 +225,9 @@ nav[data-dashboard-nav] a {
     border-radius: 9px;
     white-space: normal;
   }
+}
+
+@media (max-width: 700px) {
 
   .jump-nav {
     display: flex;

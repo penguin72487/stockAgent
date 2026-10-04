@@ -78,3 +78,7 @@ progress{overflow:hidden;border:0;border-radius:999px;background:#07131d;accent-
 @media(max-width:760px){.provider-grid,.provider-filters{grid-template-columns:1fr}.provider-card{min-height:145px}.provider-context-grid{grid-template-columns:1fr}.provider-toolbar>span{margin-left:0}.provider-main{padding-top:22px}}
 @media(max-width:470px){.provider-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(prefers-reduced-motion:reduce){.provider-card{transition:none}.provider-card:hover{transform:none}}
+:root .status-pill.waiting_publication {
+  background: rgba(245, 189, 79, .09);
+  color: var(--amber);
+}

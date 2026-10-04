@@ -17,7 +17,7 @@ from downloader.artifact_io import atomic_write_json
 
 TAIPEI = ZoneInfo('Asia/Taipei')
 SCOPE_LABEL = 'FinMind 已排程可執行工作（含次要校驗）'
-SNAPSHOT_CONTRACT_VERSION = 3  # Retry debt is not successful throughput or a finite completion clock.
+SNAPSHOT_CONTRACT_VERSION = 9  # Exhausted retries are unresolved data, not automatic request work.
 
 
 def _number(value: Any) -> float | None:
@@ -57,7 +57,8 @@ def scheduled_finish(now: datetime, active_seconds: float, *,
 
 def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now: datetime, *,
                         day_is_protected: Callable[[date], bool] | None = None,
-                        secondary_admission: dict[str, Any] | None = None) -> dict[str, Any]:
+                        secondary_admission: dict[str, Any] | None = None,
+                        _project_calendar: bool = True) -> dict[str, Any]:
     if now.tzinfo is None:
         raise ValueError('now must be timezone-aware')
     now = now.astimezone(UTC)
@@ -84,13 +85,14 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     slow_rate = min(central_rate, max(0.0, observed_slow - reserved)) if None not in (central_rate, observed_slow, reserved) else None
     counts = {key: summary.get(key) for key in ('required_requests', 'validation_requests', 'unbatched_requests',
               'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-              'batch_savings', 'calendar_wait_tasks', 'retry_tasks')}
+              'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests')}
     counts['planned_requests'] = int(planned) if planned is not None else None
     blockers: list[dict[str, Any]] = []
     for field, reason in (
         ('blocked_tasks', '權限、參數或端點阻塞不包含在有限工時中。'),
         ('unscheduled_datasets', '未排程來源沒有工作分母，不能聲稱全來源完工。'),
         ('unknown_datasets', '尚有未知工作範圍；預估不含未發現的商品與歷史。'),
+        ('retry_exhausted_tasks', '重試已達上限，保留資料與失敗紀錄；不再自動重試，也不算抓取完成。此估時只涵蓋可自動排程工作。'),
     ):
         count = _number(summary.get(field))
         if count:
@@ -188,6 +190,13 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
                                     basis=basis + '；僅為成功後有效工時，不含未知等待與額外重試')
                     estimate['scenarios'][name] = scenario
                     continue
+                if requests and not _project_calendar:
+                    # Ordered stages own the calendar cursor. Computing an
+                    # independent date here and throwing it away would repeat
+                    # years of date walking for every stage and retry model.
+                    scenario['state'] = 'work_ready'
+                    estimate['scenarios'][name] = scenario
+                    continue
                 try:
                     # Cooling can overlap other work; the conservative scenario
                     # waits first. No scenario can finish before the last known
@@ -220,7 +229,11 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
 
 
 def milestone_workloads(workload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Cumulative priority milestones, all using ONE account's capacity."""
+    """Logical coverage subsets, not dispatch-order completion deadlines.
+
+    The ordered ETA owns actual predecessor time (US minutes follow ticks).
+    This legacy helper remains for callers inspecting non-tick coverage only.
+    """
     from downloader.finmind_supplemental import SOURCES
     from downloader.finmind_eta_work import COUNT_FIELDS
 
@@ -267,7 +280,7 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
     admission = evaluate_finmind_secondary_admission(root=root, now=now)
     estimate = ordered_estimate(workload, telemetry, now, day_is_protected=protected,
                                 secondary_admission=admission)
-    estimate['assumptions'].append('大範圍日級候選包含尚未剔除的上市前／休市日，屬搜尋工作量上側投影；不是缺失 K 棒數。')
+    estimate['assumptions'].append('台股現貨僅排除已驗證的休市日；上市存續期間及其他市場未知日曆仍保留為搜尋工作量上側投影，不是缺失 K 棒數。')
     estimate['assumptions'].append('超過一年的未公布日曆僅按平日保護時段投影；持續新增資料另依週期負載預留。')
     estimate['calendar_states'] = calendar
     if 'unknown' in calendar.values():

@@ -7,10 +7,11 @@
   <meta name="theme-color" content="#071019">
   <title>資料來源詳情 · StockAgent 全資料監控</title>
   <link rel="stylesheet" href="/dashboard-core.css?v=6">
-  <link rel="stylesheet" href="/data-monitor/styles.css?v=19">
-  <link rel="stylesheet" href="/dashboard-responsive.css?v=9">
+  <link rel="stylesheet" href="/data-monitor/styles.css?v=21">
+  <link rel="stylesheet" href="/dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="/dashboard-acquisition.css?v=4">
 </head>
-<body>
+<body data-acquisition-page="provider">
   <a class="skip-link" href="#provider-sources">跳到資料來源</a>
   <header class="site-header topbar">
     <a class="brand" href="/">STOCKAGENT</a>
@@ -58,8 +59,8 @@
       <div class="section-heading"><div><p class="eyebrow">ENDPOINTS & EVIDENCE</p><h2 id="provider-sources-title">逐端點資料與回補狀態</h2></div>
         <p id="provider-result-count">—</p></div>
       <form id="provider-filters" class="provider-filters" role="search">
-        <label>搜尋資料集、標的或更新器<input id="provider-source-search" type="search" placeholder="輸入名稱或端點 ID" autocomplete="off"></label>
-        <label>狀態<select id="provider-status-filter"><option value="all">全部狀態</option><option value="catching_up">正在抓／未最新</option><option value="streaming">正在串流</option><option value="complete">已完成／已最新</option><option value="unable">無法完成</option><option value="deferred">延後</option><option value="control">設定</option><option value="reference">清冊參照</option></select></label>
+        <label>搜尋資料集、標的或更新器<input id="provider-source-search" type="search" maxlength="120" placeholder="輸入名稱或端點 ID" autocomplete="off"></label>
+        <label>狀態<select id="provider-status-filter"><option value="all">全部狀態</option><option value="catching_up">正在抓／未最新</option><option value="streaming">正在串流</option><option value="waiting_publication">等待發布證據</option><option value="complete">已完成／已最新</option><option value="unable">無法完成</option><option value="deferred">延後</option><option value="control">設定</option><option value="reference">清冊參照</option></select></label>
         <label>市場<select id="provider-market-filter"><option value="all">全部市場</option></select></label>
       </form>
       <div class="table-scroll provider-table-scroll" tabindex="0" role="region" aria-label="本來源逐端點明細，可水平捲動">
@@ -71,7 +72,8 @@
     <aside class="boundary-note"><span>閱讀界線</span><div><h2>來源清冊、取得、可用於訓練是三件事。</h2><p>同一資料可出現在群組與個別端點；不加總異質粒度的筆數或進度。發布時間未經證實時，僅顯示來源宣告或我方觀測；沒有速率時不捏造完成倒數。</p></div></aside>
   </main>
   <footer>StockAgent 全資料監控 · 唯讀 · 介面時間為台北時間 · 資料由既有監控快照提供</footer>
-  <script src="/dashboard-core.js?v=11" defer></script>
-  <script src="/data-monitor/provider.js?v=1" defer></script>
+  <script src="/dashboard-core.js?v=14" defer></script>
+  <script src="/dashboard-acquisition.js?v=3" defer></script>
+  <script src="/data-monitor/provider.js?v=3" defer></script>
 </body>
 </html>

@@ -154,11 +154,20 @@ def test_empty_retry_detects_early_without_unbounded_polls():
 
 @pytest.mark.parametrize('now,expected', [
     (datetime(2026, 9, 30, 4, tzinfo=UTC), datetime(2026, 9, 30, 9, 30, tzinfo=UTC)),
-    (datetime(2026, 9, 26, 4, tzinfo=UTC), datetime(2026, 9, 28, 9, 30, tzinfo=UTC)),
+    (datetime(2026, 9, 26, 4, tzinfo=UTC), datetime(2026, 9, 29, 9, 30, tzinfo=UTC)),
 ])
 def test_current_empty_before_official_release_waits_for_boundary(tmp_path, monkeypatch, now, expected):
     from downloader import download_finmind_sponsor as sponsor
     from downloader.finmind_scheduling import TAIPEI
+    from downloader.finmind_scheduling import next_release_check
+    from types import SimpleNamespace
+    # Deterministic official calendar fixture: Monday 9/28 is a holiday,
+    # not a release merely because it is a weekday. No live repo calendar.
+    def decision(day, **kwargs):
+        return SimpleNamespace(status='closed' if day.isoformat() == '2026-09-28' else 'scheduled_open',
+                               reason='official TWSE schedule fixture')
+    monkeypatch.setattr(sponsor, 'next_release_check', lambda dataset, at: next_release_check(
+        dataset, at, day_decision=decision))
     partition = now.astimezone(TAIPEI).date().isoformat()
     task = Task('TaiwanStockPrice', '', partition, 'day', 0, 'inflight')
     monkeypatch.setattr(sponsor, '_store', lambda *_args: {

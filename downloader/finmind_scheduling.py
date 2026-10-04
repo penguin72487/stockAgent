@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from stockagent.live.market_status import tw_stock_day_decision
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-RELEASE_CLOCK_VERSION = 2
+RELEASE_CLOCK_VERSION = 4  # Periodic settlement publication is Mon-Fri, not 24/7.
 # Primary tutorial pages, checked 2026-09-30. These are expected release
 # boundaries, not actual publication evidence; the observation ledger owns it.
 RELEASE_CLOCKS: dict[str, dict] = {}
@@ -64,8 +64,36 @@ _clocks('Derivative', {'TaiwanFuturesInstitutionalInvestorsAfterHours': (5, 0),
 _clocks('ConvertibleBond', {'TaiwanStockConvertibleBondPutProvision': (19, 0)})
 _clocks('ConvertibleBond', {'TaiwanStockConvertibleBondMonthlyAnalysis': (18, 0)}, saturday=True)
 
+# This is the provider's publication calendar, not a TAIFEX trading-session
+# calendar. Do not apply it to ticks, night sessions, failures or first backfills.
+PERIODIC_RELEASE_CLOCKS = {
+    name: {'interval_seconds': 3 * 3600, 'weekdays': tuple(range(5)),
+           'source_url': 'https://finmind.github.io/tutor/TaiwanMarket/Derivative/'}
+    for name in ('TaiwanFuturesFinalSettlementPrice', 'TaiwanOptionFinalSettlementPrice')
+}
+
+
+def periodic_release_boundary(dataset: str, earliest: datetime) -> datetime:
+    """Honor publishing weekdays without inventing an intraday release phase.
+
+    FinMind specifies every three hours but no fixed phase. Retain the current
+    success-based interval; if it crosses a closed publishing day, poll at the
+    very start of the next allowed day rather than delaying until its old hour.
+    """
+    clock = PERIODIC_RELEASE_CLOCKS[dataset]
+    candidate = earliest.astimezone(TAIPEI)
+    while candidate.weekday() not in clock['weekdays']:
+        candidate = (candidate + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return candidate.astimezone(UTC)
+
 
 def release_details(dataset: str) -> dict:
+    if dataset in PERIODIC_RELEASE_CLOCKS:
+        return {'contract_version': RELEASE_CLOCK_VERSION,
+                **PERIODIC_RELEASE_CLOCKS[dataset],
+                'weekdays': list(PERIODIC_RELEASE_CLOCKS[dataset]['weekdays']),
+                'label': '週一至五每 3 小時；時段相位未公告',
+                'basis': 'official_interval_weekdays_not_actual_publication', 'timezone': 'Asia/Taipei'}
     if dataset in RELEASE_CLOCKS:
         return {'contract_version': RELEASE_CLOCK_VERSION, **RELEASE_CLOCKS[dataset]}
     if dataset == 'TaiwanStockDayTrading':
@@ -81,13 +109,30 @@ def release_details(dataset: str) -> dict:
             'basis': 'polling_policy_not_publication', 'timezone': 'Asia/Taipei'}
 
 
-def next_release_check(dataset: str, now: datetime) -> datetime | None:
-    """Next release/check phase; weekdays are NOT historical exclusions."""
+def next_release_check(dataset: str, now: datetime, *, day_decision=tw_stock_day_decision,
+                       public_root: Path | None = None) -> datetime | None:
+    """Next publishing phase; skip proven cash closures, never issuer events.
+
+    The official publishing weekdays do not prove historical non-sessions.
+    Unknown calendar evidence keeps the poll; derivatives retain their clocks.
+    """
+    public_root = public_root or Path(__file__).resolve().parents[1] / 'data_tw_public'
+    if dataset in PERIODIC_RELEASE_CLOCKS:
+        interval = PERIODIC_RELEASE_CLOCKS[dataset]['interval_seconds']
+        return periodic_release_boundary(dataset, now + timedelta(seconds=interval))
+
+    def closed(day: date) -> bool:
+        if dataset not in SESSION_DAY_DATASETS:
+            return False
+        decision = day_decision(day, parquet_root=public_root, observed=now)
+        return decision.status == 'closed' and any(
+            token in decision.reason for token in ('receipt-verified', 'official TWSE'))
+
     if dataset == 'TaiwanStockDayTrading':
         local = now.astimezone(TAIPEI)
-        for offset in range(8):
+        for offset in range(370):
             day = local + timedelta(days=offset)
-            if day.weekday() >= 5:
+            if day.weekday() >= 5 or closed(day.date()):
                 continue
             for hour, minute in ((18, 0), (21, 30)):
                 candidate = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -99,9 +144,11 @@ def next_release_check(dataset: str, now: datetime) -> datetime | None:
         return None
     local = now.astimezone(TAIPEI)
     candidate = local.replace(hour=clock['hour'], minute=clock['minute'], second=0, microsecond=0)
-    while candidate <= local or candidate.weekday() not in clock['weekdays']:
+    for _ in range(370):
+        if candidate > local and candidate.weekday() in clock['weekdays'] and not closed(candidate.date()):
+            return candidate.astimezone(UTC)
         candidate += timedelta(days=1)
-    return candidate.astimezone(UTC)
+    return None
 
 
 def reconcile_release_deadlines(conn: sqlite3.Connection, now: datetime) -> None:
@@ -452,12 +499,14 @@ def incremental_reservation(root: Path, now: datetime, *,
             continue
         try:
             with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
+                from downloader.finmind_retry_cohorts import admission_clause
+                retry_filter, retry_args = admission_clause(conn, horizon)
                 rows = conn.execute(
                     "SELECT dataset,next_attempt_at_utc,count(*) FROM tasks WHERE priority=0 AND kind!='derived' AND "
                     "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
                     "OR (state IN ('complete','observed_empty','failed') "
-                    "AND next_attempt_at_utc<=?)) GROUP BY dataset,next_attempt_at_utc",
-                    (horizon.isoformat(), horizon.isoformat()),
+                    "AND next_attempt_at_utc<=?))" + retry_filter + " GROUP BY dataset,next_attempt_at_utc",
+                    (horizon.isoformat(), horizon.isoformat(), *retry_args),
                 ).fetchall()
             for dataset, raw_due, count in rows:
                 # These are the canonical ownership contracts, not additive

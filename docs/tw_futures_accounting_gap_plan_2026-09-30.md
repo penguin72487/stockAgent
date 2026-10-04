@@ -6,38 +6,79 @@
 1998-07-21～2026-09-24，初始資金一億元、保證金、多空與跨日持倉。
 已准入的 437 商品 release 不屬於本輪變更；本輪沒有重新驗證遠端程序狀態。
 
-### 2026-10-02 已驗收增量（截至 v811）
+### 2026-10-03 已驗收增量（截至 v1410）
 
 目前先修使用者保留的 711 個代碼：710 個股票期貨代碼及 CPF；暫緩的 54 個
 代碼與其原始資料仍保留。沿用既有來源與共用會計程式，只重算受影響商品及
 明示的合併部位／持倉依賴，尚未再做全 711／765 個商品的完整建置。
 
-最新局部快取包含 **253 個代碼、1,939,507 列原始座標、1,918,308 列會計日，
-其中 23,657 列受阻**。新增代碼的座標均與凍結原始來源逐列核對，不是填造行情。
+最新局部快取包含 **257 個代碼、1,939,851 列原始座標、1,918,652 列會計日，
+其中 4,873 列受阻**。新增代碼的座標均與凍結原始來源逐列核對，不是填造行情。
 以 v205 快取及後續新增代碼在原始 v47 的對應列比較，相同有效會計座標解除
-**9,975** 列、新揭露 **1,452** 列；另有 121 列會計轉為暖身、142 列暖身轉為
+**27,681** 列、新揭露 **90** 列；另有 121 列會計轉為暖身、142 列暖身轉為
 會計，原始座標零遺失。不同範圍不直接比較分母，也不累加重疊批次的改善。
 較早商品的快取仍等待最終來源整合；這些數字不能稱為全 711 個代碼的目前總數。
-[端點比較與驗收總收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v811.json)、
-[局部工作表](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v810/manifest.json)、
-[逐商品缺口](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v810/products.csv)。
+[端點比較與驗收總收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/repair_batch_progress_v1410.json)、
+[局部工作表](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v1393/manifest.json)、
+[逐商品缺口](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v1393/products.csv)。
+
+最新互斥缺口為部位／時鐘 3,088、持倉接續 224、估值等 1,561。
+DP 的日期化制度替代解除 369 列，CN1 的具名既有成員／自身月份接合解除
+53 列，兩批均零新增受阻。另修正 77 列停牌估值所綁法律版本，財務數值及
+行情未變。DN2／LO2 自身不變股數接入既有股數池再解除 155 列、零新增受阻。
+CN2 的同原件標準儲存格與明文不變股數接合再解除 21 列、零新增受阻；
+只重放五個法定相依代碼、28,309 座標，7.16 秒。
+因果持倉上界只解除可證明從未進場、且沒有跨契約持倉來源的缺接續列。
+最新依雙向持倉相依及四種原表索引布局編譯，另解除 555 列、零新增受阻；
+1,098 筆到期時鐘及 3 筆到期保證金按自己的開盤來源修正。來源、行情及
+其他財務欄位逐列核對，可能持倉的缺口仍受阻。
+共用九模組最新回歸 917 passed、0 skipped，72.76 秒。
+最新 FH／FP／GP 六代碼家族重用一頁原件及完整來源，解除 310 列，零新增
+受阻；未新增 OCR、轉圖、來源下載或共用程式修改。TEJ 三列 DTF 終止屬性
+已與完整既有官方最後結算值核對，沒有新增每日清算值或會計准入。
+FYF 五月份的有限 TEJ 匯出也已完成；第一停牌日五個格點均省略，停止同事件
+擴抓。停牌前 FYF201909 的 SETTLE 與官方年檔不一致，恰與八天後最後結算價
+相同，保持拒絕，未倒填每日清算值。原優先序已恢復讀回；v1410 只更新來源
+診斷與成本，帳本不重算，受阻數不變。時鐘工作已從按商品的 155 件整理為
+52 組候選原件，沒有推定未知開盤前時鐘。
+以下各批計數保留為當時快照；目前工作順序見
+[2026-10-03 執行計畫](tw_futures_remaining_gap_execution_plan_2026-10-03.md)。
 
 | 互斥上游原因（僅此局部快取） | 受阻會計列 |
 | --- | ---: |
 | 日期化商品規格 | 0 |
 | 公司行動及調整契約條款 | 0 |
 | 保證金 | 0 |
-| 部位限制及時鐘 | 21,025 |
-| 持倉接續 | 1,013 |
-| 估值及其他 | 1,619 |
-| 合計 | 23,657 |
+| 部位限制及時鐘 | 3,088 |
+| 持倉接續 | 224 |
+| 估值及其他 | 1,561 |
+| 合計 | 4,873 |
+
+先完成[10 月 3 日實作計畫](tw_futures_remaining_gap_execution_plan_2026-10-03.md)，
+再修正具名股數群組被季度口數覆蓋、同原件文字／表格接合、最新級數來源與
+等值級數邊界的證明保留。v894→v945 解除 **11,213 列、零新增受阻**；
+有最新級數條款卻欠當期組合證據的供體仍不准入。
+[逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/current_position_batches_acceptance_v943.json)。
+
+接著沿用既有抽取器，從已留存的文字座標修復南亞 2013、彰銀 2014、
+啟碁 2018、喬山 2015 的錯接列。新格線 ABI v4 保留原始 cells、token
+座標、原件／PNG／收據雜湊，只接受唯一的標籤及金額歸屬。四批只重算
+八個代碼，v945→v989 再解除 **488 列、零新增受阻**；金融欄位、行情、
+原始座標及暖身角色不變，與當前共用編譯器的全部規則及旗標相符。
+八模組回歸 **723 passed、0 skipped**。這四份原件沒有新 OCR、轉圖或
+provider 查詢；剩餘 31 份原件的來源檢查約 0.91 秒，不是完整帳本重建。
+[來源座標及帳本驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/polygon_position_batches_acceptance_v986.json)。
+
+本輪兩次有限官方重抓取得同一 bytes，CM 2017／DE 2015 的部位表缺頁仍在；
+一次 TEJ CJ1 精確工作明示零列，優先序已恢復。沒有重送既有空回覆。
+全 711 最新來源整合、CPF 快取外的早期鏈及遠端 smoke 尚未完成。
 
 v720→v794 的同一局部範圍再解除 **89 列、零新增受阻**，原始座標與暖身
 身分不變。先完成各批來源與時鐘計畫，再修改共用接合；沒有重建全部帳本。
-保證金歸零只適用此 253 代碼快取，CPF 的早期保證金鏈仍在快取以外待補。
+保證金歸零只適用該批 253 代碼快取，CPF 的早期保證金鏈仍在快取以外待補。
 
 v794→v810 再解除 **486 列、零新增受阻**。大成鋼、永豐金、台中銀的新
-世代原件已證明 2,000 股及合併部位，舊原件較晚排定的上限却仍在商品日
+世代原件已證明 2,000 股及合併部位，舊原件較晚排定的上限卻仍在商品日
 接合遮住新世代；相同月份也不能當成相同世代。新接合只使用重新驗證的
 原件／頁面 SHA、公開時鐘、15 個自身月份及明示群組，承接已完整解析的
 標準契約股數上限；不同股數的 FE2／DE2／HW2、獨立上限與仍適用的自身
@@ -54,6 +95,149 @@ v794→v810 再解除 **486 列、零新增受阻**。大成鋼、永豐金、�
 `--position-family-review`；新證明使用 v4 範圍契約、原件與實作指紋，不得
 繼續使用舊輸入／檢查點指紋。該參數已接回共用流程，但尚未執行全 711
 重建或遠端訓練驗收。
+
+v810→v825 再解除 **284 列、零新增受阻**。華南金 2011 原件把期貨與選擇權
+列在同一跨欄表；舊矩形表解析漏掉自然人 250 萬股及 CJ2 終止後恢復契約數
+的條件。共用解析器保留原文期貨／選擇權分組、2,000／2,000／2,120 股換算
+及原載數字，未把法人、造市者數字或選擇權部位混入。CJ2 自身只含 201112；
+正式結算及 33 個原始交易日的未平倉量證明 2011-12-21 到期，沒有提前零未平倉量。
+臨時股數上限截至當日，2011-12-22 才按原文接回獨立上市公告的 1,250 口及
+CJ1 一比一合併規則，後續級數變更沿用各自的日期化來源。正式到期證據缺失、
+後來才公開的基準上限、不同股數或不完整月份仍不能准入。重新執行組合時會
+重新驗證條件；失去證據即撤回衍生時鐘，不沿用舊的已解析標記。
+
+只重算 CJ1／CJ2／CJF，**22,428 個原始座標保留，來源接合 5.94 秒、會計
+重算 15.07 秒**；與實際已驗收快取比較由 451 列受阻降至 167 列。
+107 列恢復原載股數上限、177 列恢復契約數控管。所有原件財務數字、行情、
+交易權限、保證金、單位來源、持倉接續及暖身身分不變；綜合規則時鐘只取
+已證明新部位時鐘與既有其他時鐘的最大值，局部槽位代號由共用物化器重新配置。
+與較舊的重算程式內建基準比較的 1,381 列改善／12 列揭露未作為本批成果。
+六個受影響模組共用回歸 **537 passed、0 skipped**。沒有新增 OCR、轉圖、
+供應商查詢或完整帳本重建。
+[修改前計畫](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/cj2011_conditional_cap_plan_v813.json)、
+[來源與正式到期組合](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/cj2011_position_source_v819/manifest.json)、
+[實際快取逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/cj2011_position_acceptance_v823.json)。
+
+具名終止證據也已接回既有 `scripts/build_tw_futures_margin_event_candidates.py`
+的 `--position-termination-context`，沿用同一載入器、原件／來源 SHA、完整
+交易日及法律驗證，不另建來源流程。此原件的已驗證輸入是
+`remaining_gap_repair_v3_20260930/cj2011_inputs_v817/termination_context.json`。
+共用入口重新組合後，期間、問題清單、原文及衍生證據與 v819 完全相同；
+沒有再重算會計帳本。新入口與來源歸屬保護測試加入後，最新六模組回歸為
+**543 passed、0 skipped**。
+[共用入口等值驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/named_context_integration_v828/manifest.json)、
+[最新修復流程驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/fast_position_workflow_acceptance_v830.json)。
+
+### 本輪修復與仍不能准入的來源
+
+每批均先保存分析計畫，再使用既有 v63 來源組合器、v54 局部重算及共用會計。
+只重算有修改及法律相依的代碼；沒有全 711／765 帳本重建、遠端發布或訓練。
+v825→v863 解除 **1,752 列、零新增受阻**：
+
+- DY／KT 原件第二期間及自身群組：1,187 列。
+- DN 期間起點的已知級數：118 列；DD 2014 同類起點：237 列。
+- DC／IA／LO 2020 次近月時鐘：210 列。月份名義日曆可由明示契約承接證據
+  驗證，但不把另一世代的報價、未平倉量或部位數值當作自身觀測。
+
+DD2 另接回凍結來源已有的 43 個座標，全部無受阻；既有座標及暖身身分不變。
+級數換算必須同時有原件條款、當期基準與精確算術，不以未來級數回填。
+[第二期間驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/retained_second_period_acceptance_v837.json)、
+[DN／DD 驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/position_period_batches_acceptance_v849.json)、
+[名義月份時鐘驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/quarter2020_split_clock_acceptance_v862.json)。
+
+v863→v894 再解除 **570 列、零新增受阻**，兩批通過後只合併一次：
+
+- 修正來源包套用範圍。來源包包含某商品，不代表它是該商品目前已驗收的來源。
+  原候選最後載入的舊來源曾覆蓋 CM2 已證明的零現金，製造不相關缺口；候選未准入。
+  現在逐家族明示套用範圍，五個已驗收來源的 168 筆財務列完整保留。
+- 原件確實印有 `100.0729`、`102.0827`，不是 OCR 漏了日期標點。
+  共用解析器只在民國年.MMDD 為合法日期、且同一原件的財務生效日唯一相符時讀取；
+  原文不改、公告公開時鐘不提前。CM1／LV1／NE1 解除 320 列；NE1 的
+  4,039,733 股直接保留原載整數，不用自行重算的浮點數替換。
+- PSF 上市附件早已封存，舊驗讀只收同表 PRF 一列。補入原載 PS／3706
+  的自然人 2,000 口，生效 2020-05-04、公開 2020-04-27，解除 235 列。
+  IP1 原件自身 1,200 股、400 萬股合併上限及最新級數條款解除 15 列；
+  不全域把 OCR 的 I／l 變成 1。其餘原先同時缺持倉接續的列仍受阻。
+
+這兩批保留 **84,736 個原始座標**；逐欄核對財務、保證金、單位、行情與
+交易允許，暖身身分不變。重算各為 **7.76／7.73 秒**，來源組合各為
+**16.09／5.12 秒**，只是這兩批局部流程的實測，不能當成全 fold 訓練速度。
+舊快取的到期收盤時鐘依已驗收編譯器 v6 逐列校正；IPF 兩列現金到期
+只使用當時已生效的開盤保證金，原始保證金事件、金額及期間未改。
+[CM／LV／NE 逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/scoped_literal_position_acceptance_v879.json)、
+[PS／IP 逐欄驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/ps_ip_position_acceptance_v889.json)。
+
+本輪使用既有文字、完整格表與原始 PDF；必要時重建 **6 頁**，全部 PNG
+雜湊與舊頁面收據相同，轉圖合計約 **0.66 秒**，**新增 OCR 0 次、
+資料供應商查詢 0 次、完整帳本重建 0 次**。不是靠少檢查或刪日期降低受阻。
+最新六模組回歸 **670 passed、2 skipped**；兩項跳過是缺 optional cv2 的
+OCR 格線測試，本輪未執行 OCR。兩個最新來源包再做一次組合冪等驗收，
+沒有再算帳本，所有期間及問題清單相同。
+[原頁恢復收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/reconstructed_position_pages_v868/manifest.json)、
+[IP 原頁恢復](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/ip_retained_page_v882/manifest.json)、
+[來源冪等驗收](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/literal_source_parity_v891.json)。
+
+**本輪仍未達受阻歸零。** v896 時早期 HY／LO 的 1,158 列群組衝突尚未
+准入；後續 v943 已依原載股數、具名群組及當期法律修正適用接合。沒有取兩個
+數字的最小值，或把後來的最新級數條款套回早期。局部快取仍不宣稱已整合
+全 711 個代碼的最新來源。
+部分缺口仍是自身月份／世代的股數接合、當日公開時鐘及真實承接行情。
+官方「合併按總股數」法律本身沒有提供各日數值或證明未明示的季度換算。
+[實作前範圍與未准入原因](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/literal_position_scoped_owner_plan_v874.json)。
+
+最新部位缺口 **6,695 列完整分配至 221 組來源／接合工作**，每列一次。
+其中 21 列未找到可准入的先前區間、2,138 列公開時鐘待核、2,264 列自身
+月份範圍待核、365 列單位待核、42 列基準待核，另有 1,865 列已綁來源但
+仍有數值／群組適用問題。上方部位互斥原因的子分類不再與其他原因混加。
+[最新分組工作表](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v989/position_repair_jobs.json)。
+
+TEJ 於 **2026-10-03 00:16（臺北）**只依三個指定 task ID 重讀共用佇列：
+KI1 已完成且明示零列，CN2 等待且保留選取失敗證據，CJ1 等待；未取得新行情。
+沒有掃描全佇列 request blobs、操作桌面、重送已完成的空查詢或改動排程。
+舊 TDR 未知結果快照不能當作今天的服務障礙。TEJ 契約調整表仍只可核對
+每口股數；所查目錄沒有歷史限額欄位，未平倉量不是法律部位上限。
+[本次有限 TEJ 狀態證據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_exact_futures_runtime_boundary_v892.json)。
+
+### 部位上限的法律與較快補齊方式
+
+這是正式規定。期交所 2009-10-19 新訂股票期貨規則，第 16 條已訂同標的、
+同方向未了結部位的分級契約數；第 31 條要求特定契約調整後合併按總股數
+計算。2010-01-08 的實施公告指定 **2010-01-25** 生效；不是到 2011 年才
+開始限制。2011-02-01 公告的第 16 條修正於 2011-05-03 生效；
+2012-04-09 第 31 條修正後仍要求調整內容及恢復日期由期交所公告。
+[2009 原規則](https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/09800110800公告稿轉函.doc)、
+[2010 實施公告](https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/09900003760稿轉函_he.doc)、
+[2011 修法及生效日](https://www.selaw.com.tw/Chinese/RegulatoryInformationResult?releaseDate=2011-02-01&sysNumber=LW10850689)、
+[2012 第 31 條](https://www.selaw.com.tw/Chinese/RegulatoryInformationResult?releaseDate=2012-04-09&sysNumber=LW10850689)。
+原件發文日與本專案保守採用的可得時鐘分開保留，這次沒有提前歷史 `known_at`。
+
+第一性原理是把「需要哪一個法律事實」與「哪一列因它受阻」分開：上限、
+換算股數、合併群組、適用月份、公開／生效／恢復時鐘各自驗證。
+缺來源先找當期上市／季度級數表；已有來源先修月份與世代接合、臨時上限
+終止與恢復、合併群組衝突，不先逐列下載或 OCR。已接回既有局部工作表
+建置器，按來源與接合原因分組，刷新 v806／v820 的部位 metadata 後，
+**v894 的 18,403 個實際受阻座標完整分配到 284 組工作**；最新 v989 為
+6,695 列／221 組。每列只屬一組，保留精確座標與原始雜湊；v894 工作分組
+建置 **0.82 秒**。優先序按影響列數排序，來源
+存在不等於規則已解決；這個時間是工作表處理，不是訓練速度。
+[分析後實作計畫](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/fast_position_repair_plan_v824.json)、
+[可直接接續的來源工作表](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/affected_gap_worklist_v989/position_repair_jobs.json)。
+
+較快來源依序為既有原生 Word／HTML／CSV、可讀 PDF 表格、已驗證完整原件；
+必需且仍缺欄位時才做新 OCR。期貨商逐日 P15／PB5 結構檔可提供各類交易人
+適用的股數上限，期交所 2024-04-30 檔案手冊的 R13／R14 有格式與範例；
+但這是期貨商檔案傳輸規格，尚未建立匿名公開的歷史值檔下載路徑，不能把
+2024 手冊當成 2011 數值或規則的證據。
+[期交所檔案傳輸格式](https://www.taifex.com.tw/file/taifex/CHINESE/11/TechDocs/27/期交所檔案傳輸格式_v1.12.0.pdf)。
+
+TEJ 現有帳號留存目錄 **255 表、45,826 個欄位**已用表別身份及 schema 雜湊
+核對，再搜尋上限／規格相關欄位；未找到期貨部位上限欄位。財報的代客證券
+交割、實際未平倉量、全市場比率都不是等價的自然人上限。TEJ 調整資料可
+協助交叉核對每口股數與到期屬性；不能以未知的歷史級數補出數值。
+這個結果只適用所查帳號與目錄，沒有宣稱 TEJ 所有方案均無此資料。
+本次搜尋沒有 GUI／付費 Preview，也沒有清除另一個 TDR 任務的未知下載結果。
+FinMind 分鐘行情不能替代法律上限；仍缺真實承接行情時才用其授權插隊額度。
+[TEJ 目錄查找及網路來源收據](../artifacts/markets/tw_futures_v8_margin_preparation/remaining_gap_repair_v3_20260930/tej_position_source_search_v815.json)。
 
 - 南帝 2017 年及穩懋 2018 年的處置保證金，接回自身完整原件、原生新聞稿
   與當時股票單一交易時段規則；各解除 44／5 列。穩懋原件的兩筆未定時段

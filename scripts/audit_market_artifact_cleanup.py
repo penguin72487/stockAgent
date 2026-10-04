@@ -27,12 +27,21 @@ from stockagent.data_sync.cold_artifacts import load_cold_artifact_registry
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 
 
-def inventory(repo: Path, output: Path) -> dict:
+def inventory(repo: Path, output: Path, *, selected_roots: list[str] | None = None) -> dict:
     repo = repo.resolve()
     parent = repo / "artifacts/markets"
     if parent.resolve() != parent or not parent.is_dir():
         raise ValueError("market artifact parent must be a real directory")
-    roots = sorted(parent.iterdir())
+    if selected_roots is not None:
+        if not selected_roots or len(selected_roots) != len(set(selected_roots)):
+            raise ValueError("selected market roots must be a non-empty unique list")
+        if any(Path(name).name != name or name in {".", ".."} for name in selected_roots):
+            raise ValueError("selected market roots must be direct child names")
+        roots = sorted(parent / name for name in selected_roots)
+        if any(not os.path.lexists(root) for root in roots):
+            raise ValueError("selected market root is missing")
+    else:
+        roots = sorted(parent.iterdir())
     service_refs = artifact_service_references(roots, repo)
     cold = load_cold_artifact_registry(repo / "configs/data_sync/cold_artifacts.json")
     legacy = load_legacy_specs(repo / "configs/data_sync/legacy_artifact_archives.json")
@@ -149,6 +158,7 @@ def inventory(repo: Path, output: Path) -> dict:
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "roots": rows,
         "root_count": len(rows),
+        "selected_roots": selected_roots,
         "unique_file_allocated_bytes": total_unique,
         "eviction_authorized_by_inventory": False,
         "limitations": [
@@ -191,8 +201,9 @@ def inventory(repo: Path, output: Path) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--root", action="append", help="inventory only this direct markets child; repeatable")
     args = parser.parse_args()
-    result = inventory(REPO, args.output_dir)
+    result = inventory(REPO, args.output_dir, selected_roots=args.root)
     print(
         json.dumps(
             {

@@ -148,7 +148,7 @@ def test_frozen_v5_futures_configuration(policy):
     assert "next_session_open_gap_logret" in config.data.feature_shift_next_session
     # Inspect the historical artifact as data: its stock annual/sub-lot policy
     # need not be executable in the current, continuous-account stock runtime.
-    baseline = _load_raw_config(Path(__file__).resolve().parents[1] / "configs/deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml")
+    baseline = _load_raw_config(Path(__file__).resolve().parents[1] / "configs/historical/tw_futures_v17_20261003/deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml")
     source_training = baseline["training"]
     source_model = source_training["financial_transformer"]
     target_model = asdict(config.training.financial_transformer)

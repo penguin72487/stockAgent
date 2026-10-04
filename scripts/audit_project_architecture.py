@@ -105,6 +105,16 @@ def build_inventory(*, systemd: bool = False) -> dict:
             )
         except Exception as exc:
             errors.append({"path": relative, "error": f"{type(exc).__name__}: {exc}"})
+    deployment_configs, deployment_errors = [], []
+    for path in sorted((REPO_ROOT / "configs/deployments").glob("*.yaml")):
+        relative = str(path.relative_to(REPO_ROOT))
+        try:
+            cfg = load_config(path)
+            deployment_configs.append({"path": relative,
+                                       "execution_mode": cfg.trading.execution_mode,
+                                       "model": cfg.training.model_name})
+        except Exception as exc:
+            deployment_errors.append({"path": relative, "error": f"{type(exc).__name__}: {exc}"})
     templates = sorted((REPO_ROOT / "deploy/systemd").glob("*.in"))
     units = [
         {
@@ -151,6 +161,13 @@ def build_inventory(*, systemd: bool = False) -> dict:
         "training_modes": [asdict(spec) for spec in TRAINING_MODE_SPECS.values()],
         "market_configs": market_configs,
         "market_config_errors": errors,
+        "deployment_configs": deployment_configs,
+        "deployment_config_errors": deployment_errors,
+        "historical_config_bundles": [
+            {"manifest": str(path.relative_to(REPO_ROOT)),
+             **json.loads(path.read_text(encoding="utf-8"))}
+            for path in sorted((REPO_ROOT / "configs/historical").glob("*/manifest.json"))
+        ],
         "dataset_catalog": catalog["datasets"],
         "systemd_templates": units,
         "evidence_limits": [
@@ -183,16 +200,17 @@ def main() -> None:
                 {
                     "output": str(args.output),
                     "market_configs": len(result["market_configs"]),
+                    "deployment_configs": len(result["deployment_configs"]),
                     "training_modes": len(result["training_modes"]),
                     "systemd_templates": len(result["systemd_templates"]),
-                    "config_errors": len(result["market_config_errors"]),
+                    "config_errors": len(result["market_config_errors"]) + len(result["deployment_config_errors"]),
                 },
                 ensure_ascii=False,
             )
         )
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    if result["market_config_errors"] or result.get("local_systemd_error"):
+    if result["market_config_errors"] or result["deployment_config_errors"] or result.get("local_systemd_error"):
         raise SystemExit(1)
 
 

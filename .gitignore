@@ -234,6 +234,9 @@ data_tw_minute/*
 data_tw_index_derivatives_ticks/*
 artifacts_benchmark/*
 .build/
+/build/
+/*.egg-info/
+/node_modules/
 data_tw_futures/*
 data_fred_crypto_macro/*
 data_tw_shioaji_history/*

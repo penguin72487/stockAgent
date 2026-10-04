@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -25,6 +25,62 @@ DATE_COLUMN_CANDIDATES = (
     "published_date",
     "updated_at",
 )
+
+
+def read_daily_projection(
+    source: str | Path, *, columns: Sequence[str], symbols: Sequence[str],
+    start_date: date, end_date: date | None = None, engine: str = 'arrow',
+    duckdb_threads: int = 4, duckdb_memory_limit: str = '1GB',
+):
+    """Read actual daily observations with projection and predicate pushdown.
+
+    This is the existing offline columnar owner's bounded analysis API, not a
+    panel backend or eligibility clock. Callers select an immutable source and
+    retain its identity. Engine choice is explicit; measured query timings do
+    not change training defaults. Identifiers are quoted and values bound.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    source=Path(source).resolve(strict=True)
+    if engine not in ('arrow','polars','duckdb'):
+        raise ValueError('unknown columnar query engine')
+    if type(duckdb_threads) is not int or not 1<=duckdb_threads<=1024:
+        raise ValueError('query threads must be a positive bounded integer')
+    if type(start_date) is not date or (end_date is not None and type(end_date) is not date):
+        raise ValueError('daily query needs explicit calendar dates')
+    if end_date is not None and end_date<start_date:
+        raise ValueError('daily query date range is reversed')
+    if not columns or len(set(columns))!=len(columns) or any(not isinstance(c,str) or not c or '\x00' in c for c in columns):
+        raise ValueError('query columns must be distinct names')
+    if not symbols or any(not isinstance(s,str) or not s for s in symbols):
+        raise ValueError('symbol identity must remain non-empty strings')
+    dataset=ds.dataset(source,format='parquet',partitioning='hive')
+    schema=dataset.schema
+    if 'date' not in schema.names or not pa.types.is_date(schema.field('date').type):
+        raise ValueError('daily query cannot reinterpret a timestamp or text as an observation date')
+    for name in (*columns,'symbol'):
+        if name not in schema.names:raise ValueError('source column missing: '+name)
+    if engine=='arrow':
+        predicate=(ds.field('date')>=start_date)&ds.field('symbol').isin(symbols)
+        if end_date is not None:predicate=predicate&(ds.field('date')<=end_date)
+        result=dataset.to_table(columns=list(columns),filter=predicate)
+    elif engine=='polars':
+        path=str(source/'**/*.parquet') if source.is_dir() else str(source)
+        predicate=(pl.col('date')>=start_date)&pl.col('symbol').is_in(symbols)
+        if end_date is not None:predicate=predicate&(pl.col('date')<=end_date)
+        result=pl.scan_parquet(path).filter(predicate).select(list(columns)).collect().to_arrow()
+    else:
+        import duckdb
+        path=str(source/'**/*.parquet') if source.is_dir() else str(source)
+        names=','.join('"'+name.replace('"','""')+'"' for name in columns)
+        sql='SELECT '+names+' FROM read_parquet(?) WHERE "date" >= ? AND "symbol" IN ('+','.join('?' for _ in symbols)+')'
+        parameters=[path,start_date,*symbols]
+        if end_date is not None:sql+=' AND "date" <= ?';parameters.append(end_date)
+        with duckdb.connect() as connection:
+            connection.execute('SET threads='+str(duckdb_threads))
+            connection.execute('SET memory_limit='+_duckdb_string(duckdb_memory_limit))
+            result=connection.execute(sql,parameters).to_arrow_table()
+    return result.cast(pa.schema([schema.field(name) for name in columns]))
 
 
 @dataclass(frozen=True, slots=True)

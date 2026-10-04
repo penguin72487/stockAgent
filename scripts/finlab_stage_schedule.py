@@ -9,7 +9,9 @@ from datetime import UTC, datetime, timedelta
 import heapq
 import math
 
-from stockagent.data.finlab_acquisition_contract import STAGE_PRIORITY, queue_priority, quota_cycle_start, utc_time
+from stockagent.data.finlab_acquisition_contract import (
+    STAGE_PRIORITY, queue_priority, quota_cycle_start, utc_time, DISPATCH_INTERVAL_SECONDS,
+)
 
 MIB = 1024**2
 STAGE_LABELS = {
@@ -78,9 +80,13 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
     def arrive(key, due, *, initial=False):
         heapq.heappush(future, (due, key, initial))
 
+    def initial_slot(row):
+        return max(now, utc_time(row.get("retry_at_utc")) or now,
+                   utc_time(row.get("ready_at_utc")) or now)
+
     for key, row in by_key.items():
         if key in targets:
-            arrive(key, max(now, utc_time(row.get("retry_at_utc")) or now), initial=True)
+            arrive(key, initial_slot(row), initial=True)
         else:
             arrive(key, max(now, utc_time(row.get("next_source_check_at_utc")) or
                             quota_cycle_start(now) + timedelta(days=1)))
@@ -92,7 +98,7 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
         # Before every higher-priority key's first observed future slot has
         # passed, there can still be an earlier tail window. Do not prematurely
         # declare starvation from a catalog-size average.
-        last_first_slot = max((max(now, utc_time(r.get("retry_at_utc")) or now) if r["key"] in targets else
+        last_first_slot = max((initial_slot(r) if r["key"] in targets else
                                max(now, utc_time(r.get("next_source_check_at_utc")) or
                                    quota_cycle_start(now) + timedelta(days=1)) for r in higher), default=now)
         daily_capacity[priority] = (sum(c or 0 for c in costs) if all(c is not None for c in costs) else 0,
@@ -125,7 +131,7 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
             by_key[key].get("incremental_quota_exempt") is True
             and max(_number(by_key[key].get("transfer_bytes")) or 0,
                     _number(by_key[key].get("admission_bytes")) or 0) <= room
-            and (utc_time(by_key[key].get("retry_at_utc")) or now) <= cursor for key in targets)
+            and initial_slot(by_key[key]) <= cursor for key in targets)
         if (refresh_days == 1 and recurring_bytes and recurring_bytes + smallest_target > target_budget
                 and cursor >= last_first_slot and target_room < smallest_target and not ready_exempt_target):
             # In this conservative daily recurrence model a complete higher
@@ -253,6 +259,8 @@ def stage_summary(rows: list[dict], scenarios: dict, *, now: datetime, tick: dic
                    if any(r.get("record_unit") == unit and r.get("record_count") is not None for r in pending)]
         next_checks = [utc_time(r.get("next_source_check_at_utc")) for r in selected if not r["needs_refresh"]]
         next_checks = [t for t in next_checks if t and t > now]
+        retry_checks = [utc_time(r.get("retry_at_utc")) for r in pending]
+        retry_checks = [t for t in retry_checks if t and t > now]
         state = "blocked" if blocked else "pending" if pending else "not_required" if not selected else "awaiting_release"
         entry = {"id": stage, "label": label, "state": state, "total_keys": len(selected),
                  "incremental_quota_exempt_keys": sum(r.get("incremental_quota_exempt") is True for r in selected),
@@ -260,9 +268,14 @@ def stage_summary(rows: list[dict], scenarios: dict, *, now: datetime, tick: dic
                  "completed_keys": len(selected) - len(pending),
                  "remaining_bytes_estimate": sum(r["transfer_bytes"] for r in known) if known else (0 if not pending else None),
                  "unknown_transfer_keys": sum(r.get("transfer_bytes") is None for r in pending),
-                 "remaining_work_seconds_estimate": sum(r.get("fetch_seconds") or 0 for r in pending),
+                 "remaining_work_seconds_estimate": sum(r["fetch_seconds"] for r in pending
+                                                       if r.get("fetch_seconds") is not None)
+                    if any(r.get("fetch_seconds") is not None for r in pending) or not pending else None,
                  "unknown_time_keys": sum(r.get("fetch_seconds") is None for r in pending),
                  "next_check_at_utc": min(next_checks).isoformat() if next_checks else None,
+                 "next_retry_at_utc": min(retry_checks).isoformat() if retry_checks else None,
+                 "cooldown_keys": sum(bool(utc_time(r.get("retry_at_utc"))
+                                           and utc_time(r["retry_at_utc"]) > now) for r in pending),
                  "records": records, "scenarios": {}}
         weights = [r.get("source_weight_bytes", r.get("transfer_bytes")) for r in selected]
         total_weight = sum(w or 0 for w in weights)
@@ -297,3 +310,45 @@ def stage_summary(rows: list[dict], scenarios: dict, *, now: datetime, tick: dic
             entry["reason"] = " ".join(filter(None, (entry.get("reason"), note)))
         stages.append(entry)
     return stages
+
+
+def next_release_waves(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
+                       next_run: datetime | None, opening_policy=None, refresh_days=1,
+                       dispatch_interval_seconds=DISPATCH_INTERVAL_SECONDS) -> dict:
+    """Forecast each stage's first *observed* future expiry wave, not all future data.
+
+    This is distinct from today's completion. All other stages can still
+    preempt according to the same quota/priority rules. A small bounded horizon
+    protects the minute sampler; unknown source arrivals remain unknown.
+    """
+    result = {}
+    for stage in STAGE_PRIORITY:
+        selected = [r for r in rows if r["queue_role"] == stage and not r["needs_refresh"]
+                    and not r["blocked_reason"] and (utc_time(r.get("next_source_check_at_utc")) or now) > now]
+        if not selected:
+            continue
+        first = min(utc_time(r["next_source_check_at_utc"]) for r in selected)
+        wave = [r for r in selected if utc_time(r["next_source_check_at_utc"]) == first]
+        keys = {r["key"] for r in wave}
+        targets = [dict(r, needs_refresh=r["needs_refresh"] or r["key"] in keys,
+                        ready_at_utc=first.isoformat() if r["key"] in keys else None) for r in rows]
+        estimates = {}
+        for name, factor, share in (("fast", .75, 1), ("reference", 1, 1), ("slow", 1.5, .5)):
+            lag = 0 if name == "fast" else dispatch_interval_seconds * (.5 if name == "reference" else 1)
+            dispatched = [dict(r, ready_at_utc=(first+timedelta(seconds=lag)).isoformat())
+                          if r["key"] in keys else r for r in targets]
+            estimate = forecast(dispatched, now=now, quota=quota, reserve_mb=reserve_mb,
+                                next_run=next_run, duration_factor=factor, quota_share=share,
+                                opening_policy=opening_policy, refresh_days=refresh_days,
+                                horizon_days=14, max_jobs=4000)
+            finish = estimate.get("stage_finish_at_utc", {}).get(stage)
+            estimates[name] = {"state": "conditional" if finish else estimate["state"],
+                               "start_at_utc": estimate.get("stage_start_at_utc", {}).get(stage),
+                               "finish_at_utc": finish}
+        result[stage] = {"check_at_utc": first.isoformat(), "keys": len(wave),
+                         "dispatch_interval_seconds": dispatch_interval_seconds,
+                         "transfer_bytes_estimate": sum(r["transfer_bytes"] or 0 for r in wave)
+                            if all(r["transfer_bytes"] is not None for r in wave) else None,
+                         "scenarios": estimates,
+                         "basis": "first_observed_sdk_expiry_wave_not_publication_or_all_future_history"}
+    return result

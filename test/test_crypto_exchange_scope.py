@@ -26,6 +26,20 @@ def test_single_venue_configs_are_scoped(name: str, venue: str) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs/markets" / name)
     assert config.data.crypto_exchange_scope == venue
+    validate_crypto_exchange_scope(config.data, repo_root=root)
+
+
+@pytest.mark.parametrize("name", [
+    "bybit_perpetual_daily_0005_historical_pit_v1.yaml",
+    "bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v4.yaml",
+])
+def test_retained_external_feature_contract_matches_scoped_config(name: str) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs/markets" / name)
+    source = root / config.data.external_feature_path
+    receipt = source.with_name(f"{source.stem}_summary.json")
+    if not source.exists() and not receipt.exists():
+        pytest.skip("integration requires the retained Bybit feature table and source receipt")
     validate_crypto_exchange_scope(config.data, repo_root=root, check_schema=True)
 
 

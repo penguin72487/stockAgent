@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "folder_id": "stockagent-backup-receipts-lab203",
+  "producer_device_id": "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW",
+  "receiver_device_id": "TLOI2HH-6EZOSBC-H6YMGVW-APQOGFW-P2A7FZT-EKX6IUP-2HMRKS6-LBDHOQM",
+  "producer_root": "/srv/stockagent-backup-receipts-lab203",
+  "receiver_root": "/srv/lab203-backup/receipts",
+  "producer_type": "receiveonly",
+  "receiver_type": "sendonly",
+  "repository_id": "c717a3d315e20a5a3314c595e66607fcb7d6646cb73ad4412cc2cccb22abb798",
+  "readiness_max_age_seconds": 900
+}

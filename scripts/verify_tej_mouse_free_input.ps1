@@ -7,7 +7,8 @@ Use a new output path; does not relax Windows/Office execution policy.
 param(
     [Parameter(Mandatory=$true)][string]$BridgeScript,
     [Parameter(Mandatory=$true)][string]$CatalogScript,
-    [Parameter(Mandatory=$true)][string]$Output
+    [Parameter(Mandatory=$true)][string]$Output,
+    [switch]$ScopedDateOnly
 )
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -38,8 +39,10 @@ public static class TejInputFixture {
     public static DataGridView Grid;
     public static ListBox Labels;
     public static Form ForegroundFixture;
+    public static TextBox ForegroundInput;
     public static int PreviewClicks;
     public static bool StealFocus;
+    public static bool DisableDuringWrite;
     public static int TabChanges;
     private static Thread thread;
     private static Exception startupError;
@@ -67,7 +70,10 @@ public static class TejInputFixture {
                 Labels=new ListBox {Location=new Point(380,25),Size=new Size(190,90)};
                 Labels.Items.AddRange(new object[]{"2330 Foo","20261001","prefix","dupe","dupe"});
                 Tabs.TabPages[0].Controls.Add(Labels);
-                Start.TextChanged+=(s,e)=>{if(StealFocus){StealFocus=false;Foreign.Focus();}};
+                Start.TextChanged+=(s,e)=>{
+                    if(StealFocus){StealFocus=false;ForegroundFixture.Activate();ForegroundInput.Focus();}
+                    if(DisableDuringWrite){DisableDuringWrite=false;Dates.Enabled=false;}
+                };
                 Root.Shown+=(s,e)=>ready.Set();
                 Application.Run(Root);
             }catch(Exception e){startupError=e;ready.Set();}
@@ -80,19 +86,20 @@ public static class TejInputFixture {
         return (long)Root.Invoke(new Func<long>(()=> {
             Control c=name=="root"?(Control)Root:name=="tabs"?(Control)Tabs:name=="group"?(Control)Dates:
                       name=="start"?(Control)Start:name=="end"?(Control)End:name=="preview"?(Control)Preview:
-                      name=="grid"?(Control)Grid:name=="labels"?(Control)Labels:(Control)Foreign;
+                      name=="grid"?(Control)Grid:name=="labels"?(Control)Labels:name=="other"?(Control)ForegroundInput:(Control)Foreign;
             return c.Handle.ToInt64();
         }));
     }
     public static void SetMode(string mode) {
         Root.Invoke(new Action(()=> {
-            StealFocus=false;Dates.Enabled=true;Start.ReadOnly=false;Start.Text="2020/03/02";
+            StealFocus=false;DisableDuringWrite=false;Dates.Enabled=true;Start.ReadOnly=false;Start.Text="2020/03/02";
             Preview.Enabled=true;Preview.Visible=true;
             End.Text="2026/10/01";Foreign.Text="UNRELATED_INPUT_UNCHANGED";
             if(mode=="disabled")Dates.Enabled=false;
             if(mode=="readonly")Start.ReadOnly=true;
             if(mode=="blank")Start.Text="";
             if(mode=="steal")StealFocus=true;
+            if(mode=="disable_during_write")DisableDuringWrite=true;
             if(mode=="preview_disabled")Preview.Enabled=false;
             if(mode=="preview_hidden")Preview.Visible=false;
         }));
@@ -101,7 +108,9 @@ public static class TejInputFixture {
     public static long ShowForegroundFixture() {
         return (long)Root.Invoke(new Func<long>(()=> {
             ForegroundFixture=new Form {Text="StockAgent unrelated owned foreground fixture",Size=new Size(320,180)};
-            ForegroundFixture.Show();ForegroundFixture.Activate();return ForegroundFixture.Handle.ToInt64();
+            ForegroundInput=new TextBox {Text="FOREGROUND_INPUT_UNCHANGED",Dock=DockStyle.Top};
+            ForegroundFixture.Controls.Add(ForegroundInput);
+            ForegroundFixture.Show();ForegroundFixture.Activate();ForegroundInput.Focus();return ForegroundFixture.Handle.ToInt64();
         }));
     }
     public static void Close() {
@@ -130,6 +139,8 @@ try {
     $r=[TejInputFixture]::Handle('root');$t=[TejInputFixture]::Handle('tabs')
     $g=[TejInputFixture]::Handle('group');$s=[TejInputFixture]::Handle('start');$e=[TejInputFixture]::Handle('end')
     $f=[TejInputFixture]::Handle('foreign')
+    Check 'native_root_caption_matches_owned_fixture' ([TejBridgeNative]::WindowTitle($r) -ceq [TejInputFixture]::Root.Text)
+    Check 'native_root_class_matches_owned_fixture' ([TejBridgeNative]::WindowClass($r).StartsWith('WindowsForms10.Window.',[StringComparison]::Ordinal))
     [TejBridgeNative]::SelectTab($r,$t,3)
     Check 'preview_tab_native_readback' ([TejBridgeNative]::Message($t,0x130B,0,0) -eq 3)
     $pidOfRoot=[uint32]0;[void][TejBridgeNative]::GetWindowThreadProcessId([IntPtr]$r,[ref]$pidOfRoot)
@@ -141,12 +152,31 @@ try {
     Check 'exact_native_date_lookup' ([TejBridgeNative]::ExactListIndex($r,$list,'20261001') -eq 1)
     Expect-Rejection 'absent_exact_label_rejected' {[TejBridgeNative]::ExactListIndex($r,$list,'prefix suffix')}
     Expect-Rejection 'duplicate_exact_label_rejected' {[TejBridgeNative]::ExactListIndex($r,$list,'dupe')}
+    if($ScopedDateOnly) {
+        [void][TejInputFixture]::ShowForegroundFixture()
+        $backgroundForeground=[TejBridgeNative]::GetForegroundWindow().ToInt64()
+        Check 'scoped_date_owner_really_background' ([TejBridgeNative]::GetForegroundWindow().ToInt64() -ne $r)
+        [TejBridgeNative]::WriteDateMessages($r,$s,$g,'20210715')|Out-Null
+        Check 'background_start_model_readback' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
+        Check 'background_end_unchanged' ([TejBridgeNative]::Text($e) -ceq '2026/10/01')
+        [TejBridgeNative]::WriteDateMessages($r,$e,$g,'20260930')|Out-Null
+        Check 'background_end_model_readback' ([TejBridgeNative]::Text($e) -ceq '2026/09/30')
+        Check 'date_input_never_activated_owner' ([TejBridgeNative]::GetForegroundWindow().ToInt64() -eq $backgroundForeground)
+        Check 'date_input_never_changed_foreign_edit' ([TejBridgeNative]::Text($f) -ceq 'UNRELATED_INPUT_UNCHANGED')
+        [TejInputFixture]::SetMode('blank')
+        [TejBridgeNative]::WriteDateMessages($r,$s,$g,'20210715')|Out-Null
+        Check 'background_blank_mask_readback' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
+        Check 'background_input_no_preview' ([TejInputFixture]::PreviewClicks -eq 0)
+    } else {
+    [void][TejInputFixture]::ShowForegroundFixture()
+    $backgroundForeground=[TejBridgeNative]::GetForegroundWindow().ToInt64()
+    Check 'date_owner_really_background' ([TejBridgeNative]::GetForegroundWindow().ToInt64() -ne $r)
     [TejBridgeNative]::DateText($r,$s,$g,'20210715')
-    Check 'start_changed_date_real_keyboard_readback' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
+    Check 'start_changed_date_scoped_message_readback' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
     Check 'start_did_not_change_end' ([TejBridgeNative]::Text($e) -ceq '2026/10/01')
     [TejBridgeNative]::DateText($r,$s,$g,'20200302')
     [TejBridgeNative]::DateText($r,$e,$g,'20260930')
-    Check 'end_changed_date_real_keyboard_readback' ([TejBridgeNative]::Text($e) -ceq '2026/09/30')
+    Check 'end_changed_date_scoped_message_readback' ([TejBridgeNative]::Text($e) -ceq '2026/09/30')
     Check 'end_did_not_change_start' ([TejBridgeNative]::Text($s) -ceq '2020/03/02')
     [TejBridgeNative]::DateText($r,$e,$g,'20261001')
     [TejInputFixture]::SetMode('blank')
@@ -154,6 +184,8 @@ try {
     [TejBridgeNative]::DateText($r,$s,$g,'20210715')
     Check 'blank_mask_real_digits_and_model_commit' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
     Check 'blank_start_never_modified_end' ([TejBridgeNative]::Text($e) -ceq '2026/10/01')
+    Check 'date_writes_never_activated_owner' ([TejBridgeNative]::GetForegroundWindow().ToInt64() -eq $backgroundForeground)
+    Check 'foreground_window_input_unchanged' ([TejBridgeNative]::Text([TejInputFixture]::Handle('other')) -ceq 'FOREGROUND_INPUT_UNCHANGED')
     [TejInputFixture]::SetMode('disabled')
     Expect-Rejection 'disabled_group_no_input' {[TejBridgeNative]::WriteDateText($r,$s,$g,'20210715')}
     Check 'disabled_group_values_unchanged' ([TejBridgeNative]::Text($s) -ceq '2020/03/02')
@@ -164,10 +196,16 @@ try {
     [TejInputFixture]::SetMode('readonly')
     Expect-Rejection 'readonly_date_no_write' {[TejBridgeNative]::WriteDateText($r,$s,$g,'20210715')}
     Check 'readonly_values_unchanged' ([TejBridgeNative]::Text($s) -ceq '2020/03/02')
+    [TejInputFixture]::SetMode('disable_during_write')
+    Expect-Rejection 'midwrite_disabled_group_stops_before_digits' {[TejBridgeNative]::WriteDateText($r,$s,$g,'20210715')}
+    Check 'midwrite_disable_kept_other_date' ([TejBridgeNative]::Text($e) -ceq '2026/10/01')
+    Check 'midwrite_disable_never_changed_foreground_edit' ([TejBridgeNative]::Text([TejInputFixture]::Handle('other')) -ceq 'FOREGROUND_INPUT_UNCHANGED')
     [TejInputFixture]::SetMode('steal')
-    Expect-Rejection 'focus_loss_stops_real_input' {[TejBridgeNative]::WriteDateText($r,$s,$g,'20210715')}
+    [TejBridgeNative]::WriteDateText($r,$s,$g,'20210715')|Out-Null
+    Check 'focus_loss_does_not_interrupt_scoped_input' ([TejBridgeNative]::Text($s) -ceq '2021/07/15')
     Check 'focus_loss_never_typed_into_unrelated_edit' ([TejBridgeNative]::Text($f) -ceq 'UNRELATED_INPUT_UNCHANGED')
-    [TejInputFixture]::SetMode('normal');[TejBridgeNative]::Activate($r)
+    Check 'focus_loss_never_typed_into_foreground_window' ([TejBridgeNative]::Text([TejInputFixture]::Handle('other')) -ceq 'FOREGROUND_INPUT_UNCHANGED')
+    [TejInputFixture]::SetMode('normal')
     $b=[TejInputFixture]::Handle('preview');$grid=[TejInputFixture]::Handle('grid')
     Check 'preview_actual_msaa_press_capability' ([TejBridgeNative]::AccessibleDefaultAction($b) -ceq 'Press')
     $before=[TejBridgeNative]::PreviewSignature($grid)
@@ -181,20 +219,49 @@ try {
     [TejInputFixture]::SetMode('normal')
     Expect-Rejection 'nonbutton_preview_never_invoked' {[TejBridgeNative]::BeginPreviewDefaultAction($r,$f)}
     Check 'preview_no_calls_before_owned_action' ([TejInputFixture]::PreviewClicks -eq 0)
-    $backgroundForeground=[TejInputFixture]::ShowForegroundFixture()
-    [TejBridgeNative]::Activate($backgroundForeground)
+    $backgroundForeground=[TejBridgeNative]::GetForegroundWindow().ToInt64()
     Check 'preview_owner_really_in_background' ([TejBridgeNative]::GetForegroundWindow().ToInt64() -ne $r)
     [TejBridgeNative]::BeginPreviewDefaultAction($r,$b)
     $by=[DateTime]::UtcNow.AddSeconds(5)
     while([TejBridgeNative]::PreviewActionState() -eq 0 -and [DateTime]::UtcNow -lt $by){Start-Sleep -Milliseconds 25}
     Check 'single_owned_msaa_action_completed' ([TejBridgeNative]::PreviewActionState() -eq 1)
     Check 'single_owned_action_changed_tab' ([TejBridgeNative]::Message($t,0x130B,0,0) -eq 3)
+    Check 'capacity_metadata_counts_header_and_two_rows' ([TejBridgeNative]::PreviewRowLowerBound($grid,10) -eq 3)
+    $progressTask='aaaaaaaaaaaaaaaaaaaaaaaa';$progressAttempt=$progressTask+'-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    $progressPath=$Output+'.json.progress.json'
+    [TejBridgeNative]::WriteProgress($progressPath,$progressTask,$progressAttempt,'preparing_scope',-1,-1)
+    $progress=Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8|ConvertFrom-Json
+    Check 'progress_metadata_only_exact_attempt' ($progress.contract -ceq 'tej_native_readback_progress_v1' -and
+        $progress.task_id -ceq $progressTask -and $progress.attempt_id -ceq $progressAttempt -and
+        $null -eq $progress.scanned_row_slots)
+    $fallbackCells=0
+    $captured=[TejBridgeNative]::FullPreview($grid,10,3,[ref]$fallbackCells,$progressPath,$progressTask,$progressAttempt)
+    $progress=Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8|ConvertFrom-Json
+    Check 'progress_real_full_readback_rows' ($captured.Count -eq 3 -and $progress.scanned_row_slots -eq 2 -and
+        $progress.total_row_slots -eq 2 -and $progress.stage -ceq 'reading_preview')
+    # The preceding normal Preview action may activate its own window. Check
+    # the isolated telemetry write against its immediate foreground, not the
+    # foreground from before that separately authorized native action.
+    $progressForegroundBefore=[TejBridgeNative]::GetForegroundWindow().ToInt64()
+    [TejBridgeNative]::WriteProgress($progressPath,$progressTask,$progressAttempt,'response_saved',-1,-1)
+    $progressForegroundAfter=[TejBridgeNative]::GetForegroundWindow().ToInt64()
+    $progress=Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8|ConvertFrom-Json
+    Check 'progress_atomic_replacement_keeps_measured_slots' ($progress.stage -ceq 'response_saved' -and $progress.scanned_row_slots -eq 2)
+    Check 'progress_never_exposes_source_values' ((Get-Content -LiteralPath $progressPath -Raw) -cnotmatch '2330|CO_ID|TSMC|Volume')
+    Check 'progress_writes_never_activate_owner_or_query' ([TejInputFixture]::PreviewClicks -eq 1 -and
+        $progressForegroundAfter -eq $progressForegroundBefore)
+    [TejBridgeNative]::WriteProgress($progressPath,$progressTask,$progressAttempt,'SECRET',0,2)
+    $progress=Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8|ConvertFrom-Json
+    Check 'progress_unknown_stage_never_overwrites_metadata' ($progress.stage -ceq 'response_saved')
+    Check 'capacity_metadata_stops_at_proved_lower_bound' ([TejBridgeNative]::PreviewRowLowerBound($grid,2) -eq 2)
+    Expect-Rejection 'capacity_metadata_rejects_invalid_bound' {[TejBridgeNative]::PreviewRowLowerBound($grid,0)}
     Expect-Rejection 'second_preview_action_rejected' {[TejBridgeNative]::BeginPreviewDefaultAction($r,$b)}
     Check 'single_owned_msaa_click_exactly_once' ([TejInputFixture]::PreviewClicks -eq 1)
     # MSAA can activate its own UI as part of the normal default action.
     # Record that observed side effect; do not promise a headless desktop.
     $previewForegroundAfter=[TejBridgeNative]::GetForegroundWindow().ToInt64()
     Check 'background_preview_single_action_verified' ([TejInputFixture]::PreviewClicks -eq 1)
+    }
 } catch {$failure='owned_fixture_acceptance_failed';$fixtureDiagnostic=$_.Exception.Message} finally {
     if($opened){[TejInputFixture]::Close()}
     if($previous -gt 0 -and [TejBridgeNative]::IsWindow([IntPtr]$previous)){
@@ -209,6 +276,7 @@ $receipt=@{contract_version=1;desktop_input_contract=[TejBridgeNative]::InputCon
     source_catalog_sha256=(Get-FileHash -LiteralPath $CatalogScript).Hash.ToLowerInvariant();
     seconds=$clock.Elapsed.TotalSeconds;checks=$checks.ToArray();failure=$failure;fixture_diagnostic=$fixtureDiagnostic;
     preview_foreground_before=$backgroundForeground;preview_foreground_after=$previewForegroundAfter;
+    scoped_date_only=[bool]$ScopedDateOnly;
     passed=($null -eq $failure);fixture_closed=$true;vendor_connected=$false;market_data_query_submitted=$false}
 [IO.File]::WriteAllText($Output,($receipt|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
 if($failure){throw $failure}

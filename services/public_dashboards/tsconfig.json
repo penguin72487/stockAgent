@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"]
+  },
+  "files": ["time-axis.js", "time-axis-contracts.d.ts", "api-contracts.d.ts",
+    "feature-page-contracts.d.ts", "feature-page-constraints.js", "feature-page-contract.js"]
+}

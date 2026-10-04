@@ -1,6 +1,7 @@
 import threading
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,19 +216,53 @@ def test_atomic_write_text_replaces_complete_artifact(tmp_path) -> None:
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_named_limiters_share_host_global_schedule_and_cooldown(tmp_path) -> None:
+@pytest.mark.parametrize("defer_return_delay", [0.0, 0.1])
+def test_named_limiters_share_host_global_schedule_and_cooldown(
+    tmp_path, monkeypatch, defer_return_delay
+) -> None:
+    # Cooldown begins when it is published, rather than when defer() returns.
+    # Scheduler/storage latency may consume it before the next caller runs.
+    # Drive only the limiter's clock so both the ordinary and delayed-return
+    # cases verify exact grant timing without depending on host scheduling.
+    now = 1000.0
+    clock_lock = threading.Lock()
+
+    def monotonic():
+        with clock_lock:
+            return now
+
+    def advance(seconds):
+        nonlocal now
+        with clock_lock:
+            now += seconds
+
+    clock = SimpleNamespace(
+        monotonic=monotonic, time=monotonic, sleep=advance
+    )
+    monkeypatch.setattr(downloader_common, "time", clock)
     first = SharedRateLimiter(0.03, name="shared-test", state_dir=tmp_path)
     second = SharedRateLimiter(0.03, name="shared-test", state_dir=tmp_path)
 
     first.wait()
-    started = time.monotonic()
+    first_grant = monotonic()
     second.wait()
-    assert time.monotonic() - started >= 0.02
+    second_grant = monotonic()
+    assert second_grant - first_grant == pytest.approx(0.03)
+
+    publish_cooldown = first._defer_process_shared
+
+    def delayed_return(seconds):
+        publish_cooldown(seconds)
+        advance(defer_return_delay)
+
+    monkeypatch.setattr(first, "_defer_process_shared", delayed_return)
 
     first.defer(0.04)
-    started = time.monotonic()
+    started = monotonic()
     second.wait()
-    assert time.monotonic() - started >= 0.03
+    granted = monotonic()
+    assert granted - started == pytest.approx(max(0.04 - defer_return_delay, 0.0))
+    assert granted - second_grant == pytest.approx(max(0.04, defer_return_delay))
 
 
 def test_shared_rate_limiter_reports_granted_slots(tmp_path) -> None:

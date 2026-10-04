@@ -42,7 +42,7 @@ INDEX_PRICE_PAGE_LIMIT = 100
 # Keep one full page away from the moving recent-endpoint retention edge.
 INDEX_PRICE_RETENTION_MARGIN_ENTRIES = INDEX_PRICE_PAGE_LIMIT
 FEATURE_ACQUISITION_CONTRACT = {
-    "version": 2,
+    "version": 3,
     "feature_schema_version": FEATURE_SCHEMA_VERSION,
     "observation_contract": "completed_1m_prices_native_5m_statistics_causal_funding_v1",
     "index_price": {
@@ -55,6 +55,7 @@ FEATURE_ACQUISITION_CONTRACT = {
         "fallback": "same_cursor_history_on_recent_error_empty_short_or_noncontiguous_page",
     },
     "pagination_validation": "typed_rows_valid_timestamps_strict_cursor_progress_v1",
+    "oversized_page_policy": "one_exact_request_retry_then_reject_without_truncation_v1",
 }
 FUNDING_RATE_HISTORY_ENDPOINT = "/api/v5/public/funding-rate-history"
 MARKET_DATA_HISTORY_ENDPOINT = "/api/v5/public/market-data-history"
@@ -539,12 +540,23 @@ def _history_page(
     minimum_fields: int = 1,
 ) -> tuple[list[Any], int | None]:
     """Reject malformed/stagnant pages instead of certifying silent truncation."""
-    payload = client.get(path, params)
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise ValueError(f"{path}: invalid history data array")
-    chunk = payload["data"]
-    if len(chunk) > int(params["limit"]):
-        raise ValueError(f"{path}: history page exceeds requested limit")
+    for attempt in range(2):
+        payload = client.get(path, params)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError(f"{path}: invalid history data array")
+        chunk = payload["data"]
+        if len(chunk) <= int(params["limit"]):
+            break
+        if attempt:
+            raise ValueError(f"{path}: history page exceeds requested limit after exact request retry")
+        # The provider returned oversized OI pages for five contracts in the
+        # 2026-10-02 batch. Retry the identical request through its shared
+        # limiter once; never truncate the page, move the cursor, or certify it.
+        print(json.dumps({
+            "event": "okx_oversized_history_page_retry", "endpoint": path,
+            "rows": len(chunk), "requested_limit": int(params["limit"]),
+            "cursor_ms": cursor_ms, "attempts_allowed": 2,
+        }, separators=(",", ":")), flush=True)
     oldest: int | None = None
     for item in chunk:
         if timestamp_field is None:

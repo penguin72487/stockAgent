@@ -17,6 +17,7 @@ from typing import Final
 import numpy as np
 
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_futures_entry_capacity import whole_contract_trade_capacity
 from stockagent.data.tw_futures_portfolio_daily import (
     FUTURES_MODEL_FEATURE_COLUMNS,
     TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
@@ -215,6 +216,7 @@ def attach_stock_context_futures_portfolio_daily(
     integer_fee_per_contract_per_side_twd: float = 40.0,
     max_volume_participation: float = 0.0,
     margin_rules_path: str | Path | None = None,
+    valuation_research_contract: str | None = None,
     futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 ) -> PanelData:
     """Attach prior-session futures tokens and current execution facts.
@@ -282,11 +284,31 @@ def attach_stock_context_futures_portfolio_daily(
             f"{source_path}, {manifest_path}"
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    from stockagent.data.tw_futures_margin_release import CONTEXT_ONLY_PREFIX_CONTRACT, WHOLE_CONTRACT_PREFIX_CONTRACT
+    prefix_contract = manifest.get("context_only_prefix_contract")
+    if prefix_contract not in (None, CONTEXT_ONLY_PREFIX_CONTRACT, WHOLE_CONTRACT_PREFIX_CONTRACT):
+        raise ValueError("unsupported context-only prefix data contract")
+    if prefix_contract == WHOLE_CONTRACT_PREFIX_CONTRACT:
+        bound = manifest.get("maximum_volume_participation")
+        if (not integer_contracts or isinstance(bound, bool) or not isinstance(bound, (int, float))
+                or not np.isfinite(bound) or not 0 < bound <= 1
+                or not np.isfinite(float(max_volume_participation))
+                or not 0 < float(max_volume_participation) <= bound):
+            raise ValueError("whole-contract empty-prefix release exceeds its admitted entry capacity")
     if "materialization_version" in manifest:
+        research = manifest.get("position_research_contract") == "stock_futures_previous_capacity_research_v1"
+        from stockagent.data.tw_futures_valuation_research import VALUATION_RESEARCH_CONTRACT
+        valuation_research = manifest.get("valuation_research_contract") == VALUATION_RESEARCH_CONTRACT
+        if (valuation_research and valuation_research_contract != VALUATION_RESEARCH_CONTRACT
+                or not valuation_research and valuation_research_contract is not None):
+            raise ValueError("estimated financial values require an explicit matching research valuation opt-in")
         from stockagent.data.tw_futures_margin_release import MARGIN_MATERIALIZATION_VERSION
         if (manifest["materialization_version"] != MARGIN_MATERIALIZATION_VERSION
                 or manifest.get("status") != "complete"
-                or manifest.get("point_in_time_verified") is not True
+                or (not research and manifest.get("point_in_time_verified") is not True)
+                or (research and (manifest.get("point_in_time_verified") is not False
+                    or manifest.get("research_only") is not True
+                    or manifest.get("financial_point_in_time_verified") is not (not valuation_research)))
                 or manifest.get("all_products_execution_ready") is not True):
             raise ValueError("all-TWD market rows require complete dated accounting admission before training")
         if margin_rules_path is None:
@@ -316,6 +338,18 @@ def attach_stock_context_futures_portfolio_daily(
     if margin_rules_path is not None:
         from stockagent.data.tw_futures_margin import validate_margin_rule_source, MARGIN_CORPORATE_CONTRACT_VERSION
         dated_rules, dated_manifest = validate_margin_rule_source(margin_rules_path, source_path)
+        if (dated_manifest.get('valuation_research_contract') != manifest.get('valuation_research_contract')
+                or dated_manifest.get('valuation_research_policy_sha256') != manifest.get('valuation_research_policy_sha256')):
+            raise ValueError('daily release and research valuation policy differ')
+        if prefix_contract == WHOLE_CONTRACT_PREFIX_CONTRACT:
+            prefix = dated_manifest.get("context_only_prefix", {})
+            if (prefix.get("contract") != manifest["context_only_prefix_contract"]
+                    or prefix.get("maximum_volume_participation") != manifest["maximum_volume_participation"]):
+                raise ValueError("daily release and whole-contract prefix capacity differ")
+        if manifest.get("position_research_contract") is not None and (
+                dated_manifest.get("position_research_contract") != manifest["position_research_contract"]
+                or dated_manifest.get("position_research_policy_sha256") != manifest.get("position_research_policy_sha256")):
+            raise ValueError("daily release and research position policy differ")
         if dated_manifest['schema_version'] >= MARGIN_CORPORATE_CONTRACT_VERSION:
             if not integer_contracts or current_open_feature or carry_guard > 0:
                 raise ValueError('corporate margin requires whole contracts and prior-only candidate features')
@@ -652,7 +686,7 @@ def attach_stock_context_futures_portfolio_daily(
 
     holding_values = frame["holding_log_return"].to_numpy().astype(np.float64)
     if corporate_rules is not None:
-        ending_values = np.where(frame['_rule_terminal_event'].to_numpy() == 'cash_settlement',
+        ending_values = np.where(np.isin(frame['_rule_terminal_event'].to_numpy(), ['cash_settlement','research_cash_conversion']),
                                 frame['_rule_terminal_contract_value_twd'].to_numpy(),
                                 frame['_rule_settlement_contract_value_twd'].to_numpy())
         holding_values = np.log(ending_values / frame['_rule_opening_contract_value_twd'].to_numpy())
@@ -898,15 +932,8 @@ def attach_stock_context_futures_portfolio_daily(
             symbol_indices,
             denomination_feature_start + 2,
         ] = model_one_contract_cash.astype(np.float32, copy=False)
-        prior_volume = np.nan_to_num(
-            integer_frame["previous_volume"].to_numpy().astype(np.float64),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        maximum_trade_contracts = np.floor(
-            np.clip(prior_volume, 0.0, None) * participation
-        )
+        maximum_trade_contracts = whole_contract_trade_capacity(
+            integer_frame["previous_volume"].to_numpy(), participation)
         integer_execution = np.full(
             (*shape, len(TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS)),
             np.nan,

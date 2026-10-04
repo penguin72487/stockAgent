@@ -63,6 +63,21 @@ def test_empty_response_cost_is_service_work_not_downloaded_values():
     assert result['global_scenarios']['fast']['remaining_seconds'] < 170 < result['global_scenarios']['slow']['remaining_seconds']
 
 
+@pytest.mark.parametrize('seconds,expected',[(10,100),(.5,20)])
+def test_new_start_interval_eta_uses_same_spacing_as_actual_supervisor(seconds,expected):
+    config={**CONFIG,'query_interval_contract':'minimum_query_start_interval_v1'}
+    result=build_staged_eta([table()],[sample(seconds=seconds)],config,observed=NOW,cutoff='2026-10-01',alive=False)
+    assert result['global_scenarios']['middle']['remaining_seconds']==expected
+    legacy=forecast([table()],[sample(seconds=seconds)])
+    assert legacy['input_sha256']!=result['input_sha256']
+
+
+def test_unreviewed_eta_interval_contract_is_not_displayed():
+    with pytest.raises(ValueError):
+        build_staged_eta([table()],[sample()],{**CONFIG,'query_interval_contract':'unreviewed'},
+                         observed=NOW,cutoff='2026-10-01',alive=False)
+
+
 def test_recovery_legacy_and_nonfinite_samples_cannot_speed_up_forecast():
     records=[sample(),{**sample(seconds=.001),'timing_basis':'recovery_or_unmeasured'},sample(seconds=float('nan'))]
     result=forecast([table()],records)
@@ -110,6 +125,29 @@ def test_owned_phases_are_serial_and_cumulative_not_parallel():
     phases=result['phases']
     assert [p['scenarios']['middle']['dependency_remaining_seconds'] for p in phases]==[120,360,720]
     assert result['global_scenarios']['middle']['remaining_seconds']==720
+
+
+def test_value_order_milestones_follow_actual_priority_not_old_p1_p2_labels():
+    low = table('a', phase='P1', query_count=100)
+    low['collection_priority'] = 5500
+    high = table('b', phase='P2', query_count=10)
+    high['collection_priority'] = 0
+    result = forecast([low, high], [sample('a'), sample('b')])
+    stages = {p['phase']: p for p in result['phases']}
+    assert stages['P2']['scenarios']['middle']['dependency_remaining_seconds'] == 120
+    assert stages['P1']['scenarios']['middle']['dependency_remaining_seconds'] == 1320
+    assert stages['P2']['milestone_order_basis'] == 'local_gap_value_priority'
+    assert stages['P2']['priority_dependency_barrier'] == 0
+    assert result['global_scenarios']['middle']['remaining_seconds'] == 1320
+
+
+def test_completed_value_stage_does_not_wait_for_unrelated_high_priority_work():
+    done = table('a', phase='P2', query_count=0)
+    done['collection_priority'] = 500
+    work = table('b', phase='P1', query_count=100)
+    work['collection_priority'] = 0
+    result = forecast([done, work], [sample('a'), sample('b')])
+    assert result['phases'][1]['scenarios']['middle']['dependency_remaining_seconds'] == 0
 
 
 @pytest.mark.parametrize('alive',[False,True])

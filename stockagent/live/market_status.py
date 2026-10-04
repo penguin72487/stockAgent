@@ -605,7 +605,7 @@ def tw_stock_day_decision(
     if names:
         return TwStockDayDecision("closed", f"official TWSE schedule as-of {as_of}: {', '.join(names)}")
     if day.weekday() >= 5:
-        return TwStockDayDecision("closed", f"{day.isoformat()} is a weekend")
+        return TwStockDayDecision("closed", f"official TWSE schedule as-of {as_of}: {day.isoformat()} is a weekend")
     return TwStockDayDecision("scheduled_open", f"official TWSE schedule as-of {as_of}: ordinary weekday session")
 
 

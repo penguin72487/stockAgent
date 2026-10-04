@@ -253,6 +253,7 @@ def _publish_feature_shards(
     repo_root: Path, output: Path, *, snapshot: inventory.InventorySnapshot,
     monitor_status: Mapping[str, Any], max_cache_bytes: int = MAX_CACHE_BYTES,
     allow_reuse: bool = True,
+    expected_source_observation_root: str | None = None,
 ) -> ShardedFeaturePublication:
     """Scan every source, rebuild changed owners, atomically publish all rows.
 
@@ -319,6 +320,7 @@ def _publish_feature_shards(
         ))
         fields = sum(item["fields"] for item in ordered)
         raw_summary = scan.summary(datasets_with_schema=sum(bool(item["fields"]) for item in ordered))
+        inventory.require_coherent_feature_source(raw_summary, expected_source_observation_root)
         public = dashboard.build_data_monitor_feature_inventory(
             repo_root, monitor_status=monitor_status, inventory={"rows": [], **raw_summary},
         )
@@ -363,15 +365,18 @@ def _publish_feature_shards(
 def publish_feature_shards(
     repo_root: Path, output: Path, *, snapshot: inventory.InventorySnapshot,
     monitor_status: Mapping[str, Any], max_cache_bytes: int = MAX_CACHE_BYTES,
+    expected_source_observation_root: str | None = None,
 ) -> ShardedFeaturePublication:
     """Reconstruct a lost/corrupt private object once; never weaken source checks."""
     started = time.perf_counter()
     try:
         return _publish_feature_shards(repo_root, output, snapshot=snapshot,
-                                       monitor_status=monitor_status, max_cache_bytes=max_cache_bytes)
+                                       monitor_status=monitor_status, max_cache_bytes=max_cache_bytes,
+                                       expected_source_observation_root=expected_source_observation_root)
     except ProjectionObjectError:
         result = _publish_feature_shards(repo_root, output, snapshot=snapshot,
                                         monitor_status=monitor_status, max_cache_bytes=max_cache_bytes,
-                                        allow_reuse=False)
+                                        allow_reuse=False,
+                                        expected_source_observation_root=expected_source_observation_root)
         result.timing_ms["object_recovery_total"] = round((time.perf_counter() - started) * 1_000, 3)
         return result

@@ -5,6 +5,7 @@
   const MINUTE_MS = 60 * 1000;
   const HOUR_MS = 60 * MINUTE_MS;
   const DAY_MS = 24 * HOUR_MS;
+  /** @type {Readonly<Record<string, number>>} */
   const RANGE_MS = {
     "1h": HOUR_MS,
     "1d": DAY_MS,
@@ -41,6 +42,7 @@
     year: "numeric",
   });
 
+  /** @param {readonly unknown[]} values */
   function finiteTimes(values) {
     return values
       .map((value) => value instanceof Date ? value.getTime() : Number(value))
@@ -48,6 +50,7 @@
       .sort((left, right) => left - right);
   }
 
+  /** @param {number} timestamp @param {import('./time-axis-contracts').CalendarUnit} unit */
   function localFloor(timestamp, unit, step = 1) {
     const shifted = new Date(timestamp + TAIPEI_OFFSET_MS);
     if (unit === "month") {
@@ -72,11 +75,13 @@
       - TAIPEI_OFFSET_MS;
   }
 
+  /** @param {number} timestamp */
   function localDateKey(timestamp) {
     const shifted = new Date(timestamp + TAIPEI_OFFSET_MS);
     return `${shifted.getUTCFullYear()}-${shifted.getUTCMonth() + 1}-${shifted.getUTCDate()}`;
   }
 
+  /** @param {number} timestamp @param {import('./time-axis-contracts').CalendarUnit} unit @param {number} step */
   function addCalendar(timestamp, unit, step) {
     if (unit === "minute") return timestamp + step * MINUTE_MS;
     if (unit === "hour") return timestamp + step * HOUR_MS;
@@ -95,6 +100,7 @@
     return timestamp + step * DAY_MS;
   }
 
+  /** @param {import('./time-axis-contracts').Range} range @param {number} spanMs @returns {import('./time-axis-contracts').TickSpec} */
   function tickSpec(range, spanMs) {
     if (range === "1h") return {unit: "minute", step: 15, format: timeFormatter};
     if (range === "1d") return {unit: "hour", step: 1, format: timeFormatter, rotate: true};
@@ -109,7 +115,9 @@
     return {unit: "year", step: 1, format: yearFormatter};
   }
 
+  /** @param {number} startMs @param {number} endMs @param {import('./time-axis-contracts').TickSpec} spec */
   function regularTicks(startMs, endMs, spec) {
+    /** @type {import('./time-axis-contracts').Tick[]} */
     const ticks = [];
     let cursor = localFloor(startMs, spec.unit, spec.step);
     if (cursor < startMs) cursor = addCalendar(cursor, spec.unit, spec.step);
@@ -127,8 +135,10 @@
     return ticks;
   }
 
+  /** @param {number} startMs @param {number} endMs @param {readonly import('./time-axis-contracts').SessionMarker[]} sessions @param {Set<string>} activeDates */
   function sessionTicks(startMs, endMs, sessions, activeDates) {
     if (!sessions.length) return [];
+    /** @type {import('./time-axis-contracts').Tick[]} */
     const ticks = [];
     let day = localFloor(startMs, "day", 1);
     if (day > startMs) day -= DAY_MS;
@@ -150,6 +160,7 @@
     return ticks;
   }
 
+  /** @param {readonly number[]} times @param {number} timestamp */
   function nearestObserved(times, timestamp) {
     let low = 0;
     let high = times.length;
@@ -169,6 +180,7 @@
     return {index, timestamp: times[index], distance: Math.abs(times[index] - timestamp)};
   }
 
+  /** @param {import('./time-axis-contracts').TickSpec} spec */
   function tickToleranceMs(spec) {
     if (spec.unit === "minute") return spec.step * MINUTE_MS / 2;
     if (spec.unit === "hour") return spec.step * HOUR_MS / 2;
@@ -179,6 +191,7 @@
     return HOUR_MS / 2;
   }
 
+  /** @param {import('./time-axis-contracts').Tick[]} ticks @param {number[]} observedTimes @param {import('./time-axis-contracts').TickSpec} spec */
   function mapTicksToObserved(ticks, observedTimes, spec) {
     const tolerance = tickToleranceMs(spec);
     const seen = new Set();
@@ -200,6 +213,7 @@
     return mapped;
   }
 
+  /** @param {import('./time-axis-contracts').TimeAxisInput} input @returns {import('./time-axis-contracts').TimeAxis | null} */
   function buildTimeAxis({range, timestamps, sessions = [], collapseEmptyIntervals = false}) {
     const times = finiteTimes(timestamps);
     if (!times.length) return null;
@@ -229,11 +243,13 @@
     };
   }
 
+  /** @param {import('./time-axis-contracts').TimeAxis} axis @param {unknown} timestamp @param {number} left @param {number} right */
   function position(axis, timestamp, left, right) {
     const value = timestamp instanceof Date ? timestamp.getTime() : Number(timestamp);
     if (axis.collapseEmptyIntervals && Array.isArray(axis.observedTimes)) {
       if (axis.observedTimes.length === 1) return left + (right - left) / 2;
       const nearest = nearestObserved(axis.observedTimes, value);
+      if (nearest === null) throw new RangeError("collapsed axis has no observed timestamps");
       const ratio = nearest.index / (axis.observedTimes.length - 1);
       return left + ratio * (right - left);
     }

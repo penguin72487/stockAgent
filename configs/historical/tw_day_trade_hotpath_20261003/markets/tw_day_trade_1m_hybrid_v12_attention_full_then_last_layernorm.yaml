@@ -1,0 +1,54 @@
+base_config: tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml
+
+# Ordinary training with the reference-architecture OFAT baseline protocol,
+# combining its attention_pooling and layernorm settings in a fresh run.
+experiment_name: tw-day-trade-hybrid-minute-v12-attention-full-then-last-layernorm-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_hybrid_minute_v12_attention_full_then_last_layernorm_commission20_capital10m_all_features_v1
+  resume: true
+  post_train_infer: false
+
+environment:
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+data:
+  # Same pinned panel generation as the completed reference OFAT. The launcher
+  # verifies its identity; all derived writes stay outside materialized data.
+  panel_cache_root: artifacts/cache/tw_day_trade_hybrid_minute_v12_reference/tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba/stocks
+
+training:
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  batch_size_train: 16
+  batch_size_eval: 16
+  eval_model_chunk_rows: 16
+  eval_auto_chunk_rows_cap: 16
+  explain_after_each_fold: false
+  record_epoch_curve: true
+  epoch_test_curve: true
+
+  # Use the same source as the OFAT baseline, not a second transfer from one
+  # selected ablation. The target architecture is different: transfer model
+  # weights by matching fold/feature names and revalue epoch 0 on its exact
+  # ledger. Optimizer resume is only from this new run's own checkpoints.
+  pretrained_initialization_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: identity_by_feature_name
+  pretrained_initialization_require_exact_backbone: false
+  pretrained_initialization_validation_guard: true
+  pretrained_initialization_trainable_parameter_prefixes: []
+
+  transformer_base_portfolio:
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    norm_type: layernorm
+    # The input_features contraction requires RMSNorm. This is the compatible
+    # LayerNorm basis path used in the completed layernorm ablation.
+    temporal_basis_input: raw_features
+  financial_transformer:
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    norm_type: layernorm
+    temporal_basis_input: raw_features

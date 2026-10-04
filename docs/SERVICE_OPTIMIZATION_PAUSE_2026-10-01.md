@@ -1,9 +1,62 @@
 # 全服務優化暫停交接（2026-10-01 11:43，Asia/Taipei）
 
-**最新狀態：2026-10-02 21:22 使用者再次要求暫停；目標暫停，不是完成。
+**最新狀態：2026-10-02 22:24 使用者再次要求暫停；目標暫停，不是完成。
 下方各次 active／paused 紀錄均為歷史；等使用者明確要求繼續才恢復。**
 
-## 最新暫停交接（2026-10-02 21:22，Asia/Taipei）
+## 最新暫停交接（2026-10-02 22:24，Asia/Taipei）
+
+使用者正在整理／刪除資料，要求先收束手邊工作。21:22 暫停之後曾恢復為網站
+工程 review；此次再度停止後續修改、測試、測速、來源掃描、下載、重建與發布。
+本次只核對既有工作及證據、更新交接文件；沒有新啟動上述作業。
+正式網站、交易服務、收集器及既有排程未停止或重啟，沒有干預資料整理或其他 actor。
+這是暫停本輪優化，**不是停止所有系統寫入**，也不是整個系統已修好的宣稱。
+所有未提交修改均保留，沒有提交、回退、刪除來源或變更帳本／模型。
+
+### 網站 review 已保留的修改與證據
+
+- 共用 `dashboard-core.js` 已修正缺少測速值被當成 0、完整點數被錯誤截斷、
+  同一刷新 callback 重疊與同步例外；表格更新只處理受影響列，標籤不變就不重寫。
+  這是單一 callback 的刷新合併，不是全域訪客 rate limit／併發限制。
+- 共用導覽改為根路徑，修正 provider 巢狀頁面的連結；平板導覽、FinMind 歷史表格
+  寬度與官方／breadcrumb 連結觸控尺寸已修正。完整列與欄位保留。
+- Overview 保留未知／等待語意，不把配額觀測新鮮冒充資料正常，不猜測等待原因。
+  選單 Escape 焦點處理與非輸入內容的鍵盤反應測速已補修；不放寬 CSP。
+- 稽核沿用既有 browser／responsive scripts；新增可重測的
+  `scripts/benchmark_dashboard_responsive_updates.py`，沒有另建前端框架。
+- [最後 Node 紀錄](../artifacts/benchmarks/web-review-node-final-all-20261002.log)：
+  **68 passed／1.058 秒**，涵蓋最後的 Escape／鍵盤修改。
+  [相關 Python 紀錄](../artifacts/benchmarks/web-review-python-verified-20261002.log)：
+  **299 passed／40.41 秒**，完成於最後 Escape／鍵盤修改之前；本次沒有重跑。
+  不加總重疊試跑，不宣稱全 repository 或最新所有變更皆已驗收。
+- [最後私有 ABBA](../artifacts/benchmarks/web-review-responsive-abba-final-all-20261002.json)：
+  1,000 列 × 8 欄、50 次更新，完整輸出一致；中位數 **4.275 → 0.100 ms**。
+  只量 DOM 修改至 MutationObserver checkpoint，不含 paint、API、網路或整站延遲。
+  Baseline commit 為 `894e782dfde5e12d1f1c6a9d94393a8bc3383ba6`；
+  candidate core SHA256 為
+  `1beb4c728d62a6b229e4623bec3a069d2c522c9c9067f8000b82fce3e4a63b51`。
+- `artifacts/benchmarks/web-review-browser-accepted-20261002/` 保留六種尺寸、
+  12 個頁面／模板的 72 個已通過案例，含代表性 provider 巢狀頁；不是所有 provider
+  或所有參數組合。此輪 browser 驗收早於最後 Escape／鍵盤修改，且主要操作為
+  DOM 程式觸發，不替代一般觸控／鍵盤端到端驗收。
+- 初次失敗、錯誤 provider fixture 與後續重測均保留，不覆寫失敗證據。
+  本次協作清單只有 root；已知 browser 稽核、responsive ABBA 與自有 9271
+  debugging port 程序沒有存活者，沒有待中斷的本輪已追蹤呼叫。
+
+### 未完成工作與恢復起點
+
+1. 等使用者明確要求繼續後，先重查 Git／其他 actor 的變更、資料實際位置與身分、
+   空間、排程及最新 receipts；不沿用整理前的來源數、健康或快取有效性。
+2. 普通觸控／Escape／provider 篩選的完整端到端補驗尚未完成：兩次驗證呼叫先後
+   遇到參數 TypeError 與 CSP 阻擋字串 eval。應改用正常 DOM／response assertions，
+   不以放寬 CSP、強制點擊或略過互動當作通過；本次沒有再啟動 browser。
+3. 初次 browser 的當沖 `/api/signals` 約 15 秒 timeout 根因仍未確認；後續成功
+   不能消除這次失敗，也未證明真正來源冷建置已優化。資料／交易完整性未重新驗收。
+4. 實際欄位清冊畫面曾出現 MOPS XBRL 日期 `1911-00-07`；來源／欄位語意仍待核對。
+   沒有只改前端文字把非法日期掩蓋，也沒有修改資料來源。
+5. 完整 web review 報告、普通輸入驗收、後端端到端瓶頸、全庫、公網 IPv6、
+   Windows-WSL 冷恢復與全服務健康仍未全部完成；逐項接續，不宣稱目標完成。
+
+## 前次暫停交接（2026-10-02 21:22，Asia/Taipei）
 
 使用者正在整理／刪除資料，要求先收束手邊工作。本次僅核對工作狀態與整理交接，
 沒有新啟動程式修正、測試、測速、來源掃描、下載、重建或發布作業。

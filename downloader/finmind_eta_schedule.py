@@ -18,11 +18,38 @@ def release_aware_finish(start, requests, rate, events, *, day_is_protected):
     cursor = start.astimezone(UTC)
     horizon = cursor + timedelta(days=3660)
     heap = []
+
+    def publishing_boundary(stamp, row):
+        weekdays = row.get('publishing_weekdays')
+        if weekdays is None:
+            return stamp
+        if not weekdays or any(type(day) is not int or not 0 <= day <= 6 for day in weekdays):
+            raise ValueError('invalid_publishing_weekdays')
+        local = stamp.astimezone(TAIPEI)
+        while local.weekday() not in weekdays:
+            local = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return local.astimezone(UTC)
+
     for index, row in enumerate(events):
         first = datetime.fromisoformat(row['first_at_utc']).astimezone(UTC)
         period = row['interval_seconds']
+        first = publishing_boundary(first, row)
         if first < cursor and period:
+            # A short publishing interval resets to midnight after a closed
+            # block, exactly as the worker's next successful check does. A
+            # later stage must keep that reset phase instead of extrapolating
+            # the original Friday hour through a weekend (and shifting ETA).
+            weekdays = row.get('publishing_weekdays')
+            if weekdays is not None and period <= 86400:
+                local = cursor.astimezone(TAIPEI)
+                for offset in range(7):
+                    boundary = (local - timedelta(days=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    if (boundary.weekday() in weekdays and (boundary - timedelta(days=1)).weekday() not in weekdays
+                            and first <= boundary.astimezone(UTC) <= cursor):
+                        first = boundary.astimezone(UTC)
+                        break
             first += timedelta(seconds=math.ceil((cursor - first).total_seconds() / period) * period)
+        first = publishing_boundary(first, row)
         if first >= cursor:
             heapq.heappush(heap, (first, index))
     remaining = float(requests)
@@ -47,7 +74,7 @@ def release_aware_finish(start, requests, rate, events, *, day_is_protected):
                 refresh += row['requests']
             period = row['interval_seconds']
             if period:
-                heapq.heappush(heap, (stamp + timedelta(seconds=period), index))
+                heapq.heappush(heap, (publishing_boundary(stamp + timedelta(seconds=period), row), index))
         # Many release events share a session. Its immutable calendar decision
         # and UTC boundaries cost O(days), not O(release events). Event order,
         # capacity arithmetic and refresh counts stay exactly unchanged.

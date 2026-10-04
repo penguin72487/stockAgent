@@ -29,6 +29,11 @@ except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from downloader.artifact_io import atomic_write_parquet
 from downloader.stock_volume_units import with_stock_share_volume
+from downloader.shioaji_daily_calendar import (
+    DAILY_CALENDAR_CONTRACT,
+    calendar_prefix_matches,
+    load_daily_calendar,
+)
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -75,6 +80,7 @@ class SymbolResult:
     last_date: str | None
     output_path: str
     message: str = ""
+    quarantined_non_session_source_rows: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,6 +97,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=Path("data_tw_public/shioaji")
+    )
+    parser.add_argument(
+        "--calendar-root", type=Path, default=Path("data_tw_public"),
+        help="Receipt-backed official TAIEX calendar for local-only daily views.",
     )
     parser.add_argument(
         "--minute-cache-root",
@@ -833,6 +843,8 @@ def _completed_daily_result(
     requested_start: date,
     requested_end: date,
     minute_manifest_sha256: str | None = None,
+    official_calendar: dict[str, Any] | None = None,
+    official_sessions: set[date] | None = None,
 ) -> SymbolResult | None:
     daily_path = output_dir / "daily" / f"{row.symbol}.parquet"
     summary = _read_json(daily_path.with_suffix(".summary.json"))
@@ -843,6 +855,13 @@ def _completed_daily_result(
         summary.get("materialization_mode") == "verified_local_minute"
         and isinstance(summary.get("minute_manifest_receipt"), dict)
         and summary["minute_manifest_receipt"].get("sha256") == minute_manifest_sha256
+    )
+    calendar_ok = official_calendar is None or (
+        official_sessions is not None
+        and calendar_prefix_matches(
+            summary.get("official_calendar"), official_sessions,
+            official_calendar, requested_end,
+        )
     )
     if not (
         summary.get("source") == SOURCE_NAME
@@ -856,6 +875,7 @@ def _completed_daily_result(
         and int(output.get("size", -1)) == int(daily_path.stat().st_size)
         and str(output.get("sha256", "")) == _sha256(daily_path)
         and local_lineage_ok
+        and calendar_ok
     ):
         return None
     return SymbolResult(
@@ -870,6 +890,9 @@ def _completed_daily_result(
         ),
         last_date=(str(summary.get("last_date")) if summary.get("last_date") else None),
         output_path=str(daily_path),
+        quarantined_non_session_source_rows=sum(
+            int(value) for value in summary.get("quarantined_non_session_source_rows", {}).values()
+        ),
     )
 
 
@@ -1015,6 +1038,8 @@ def _incremental_local_daily_plan(
     requested_start: date,
     requested_end: date,
     minute_manifest: dict[str, Any],
+    official_calendar: dict[str, Any] | None = None,
+    official_sessions: set[date] | None = None,
 ) -> tuple[date, pl.DataFrame, int, int] | None:
     """Reuse a checksum-verified daily prefix when only a source suffix changed.
 
@@ -1045,6 +1070,14 @@ def _incremental_local_daily_plan(
             for value in minute_manifest.get("source_gap_dates", [])
         ]
     except (KeyError, ValueError, TypeError):
+        return None
+    if official_calendar is not None and not (
+        official_sessions is not None
+        and calendar_prefix_matches(
+            summary.get("official_calendar"), official_sessions,
+            official_calendar, old_end,
+        )
+    ):
         return None
     if not (
         minute_manifest.get("source") == SOURCE_NAME
@@ -1130,11 +1163,29 @@ def _materialize_local_daily_symbol(
     source_gap_dates: list[str],
     verified_source_chunks: int,
     minute_source_chunks: list[dict[str, Any]],
+    official_sessions: set[date],
+    official_calendar: dict[str, Any],
     prefix_daily: pl.DataFrame | None = None,
     prefix_source_minute_rows: int = 0,
     reused_source_chunks: int = 0,
+    prefix_quarantined_rows: dict[str, int] | None = None,
+    calendar_upgrade_input_receipt: dict[str, Any] | None = None,
 ) -> SymbolResult:
-    tail_daily = aggregate_daily(minute, name=row.name)
+    quarantined = dict(prefix_quarantined_rows or {})
+    admitted_minute = minute
+    if not minute.is_empty():
+        rejected = minute.filter(~pl.col("date").is_in(official_sessions))
+        for day, count in rejected.group_by("date").len().iter_rows():
+            key = day.isoformat()
+            quarantined[key] = quarantined.get(key, 0) + int(count)
+        admitted_minute = minute.filter(pl.col("date").is_in(official_sessions))
+    if prefix_daily is not None and not prefix_daily.is_empty():
+        rejected_prefix = prefix_daily.filter(~pl.col("date").is_in(official_sessions))
+        for day, count in rejected_prefix.select("date", "shioaji_minute_bars").iter_rows():
+            key = day.isoformat()
+            quarantined[key] = quarantined.get(key, 0) + int(count)
+        prefix_daily = prefix_daily.filter(pl.col("date").is_in(official_sessions))
+    tail_daily = aggregate_daily(admitted_minute, name=row.name)
     daily = (
         pl.concat([prefix_daily, tail_daily], how="vertical_relaxed").sort("date")
         if prefix_daily is not None and not tail_daily.is_empty()
@@ -1149,10 +1200,13 @@ def _materialize_local_daily_symbol(
     _atomic_write_json(
         daily_path.with_suffix(".summary.json"),
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "source": SOURCE_NAME,
             "storage_frequency": STORAGE_FREQUENCY,
             "materialization_mode": "verified_local_minute",
+            "official_calendar": official_calendar,
+            "quarantined_non_session_source_rows": dict(sorted(quarantined.items())),
+            "calendar_upgrade_input_receipt": calendar_upgrade_input_receipt,
             "symbol": row.symbol,
             "requested_start": requested_start.isoformat(),
             "requested_end": requested_end.isoformat(),
@@ -1184,6 +1238,65 @@ def _materialize_local_daily_symbol(
         message=(
             f"verified_local_minute;declared_source_gap_sessions={len(source_gap_dates)}"
         ),
+        quarantined_non_session_source_rows=sum(quarantined.values()),
+    )
+
+
+def _upgrade_local_daily_calendar(
+    output_dir: Path,
+    row: UniverseRow,
+    *,
+    start: date,
+    end: date,
+    chunks: list[tuple[date, date]],
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    source_chunks: list[dict[str, Any]],
+    official_sessions: set[date],
+    official_calendar: dict[str, Any],
+) -> SymbolResult | None:
+    """Filter a sealed legacy view only when its entire source identity is unchanged."""
+    previous = _completed_daily_result(
+        output_dir, row, chunks, requested_start=start, requested_end=end,
+        minute_manifest_sha256=manifest_sha256,
+    )
+    path = output_dir / "daily" / f"{row.symbol}.parquet"
+    summary = _read_json(path.with_suffix(".summary.json"))
+    if previous is None or not summary or summary.get("official_calendar") is not None:
+        return None
+    if not (
+        summary.get("minute_source_chunks") == source_chunks
+        and int(summary.get("source_minute_chunks_verified", -1)) == len(source_chunks)
+        and manifest.get("source") == SOURCE_NAME
+        and manifest.get("storage_frequency") == MINUTE_STORAGE_FREQUENCY
+        and manifest.get("symbol") == row.symbol
+        and date.fromisoformat(str(manifest["requested_start"])) <= start
+        and date.fromisoformat(str(manifest["requested_end"])) >= end
+    ):
+        return None
+    daily = pl.read_parquet(path)
+    if not (
+        daily.height == previous.daily_rows
+        and not daily.is_empty()
+        and int(daily["shioaji_minute_bars"].sum()) == previous.source_minute_rows
+        and daily["name"].n_unique() == 1 and daily["name"].item(0) == row.name
+        and daily["market"].n_unique() == 1 and daily["market"].item(0) == row.market
+    ):
+        return None
+    if _sha256(Path(str(summary["minute_manifest_receipt"]["path"]))) != manifest_sha256:
+        return None
+    return _materialize_local_daily_symbol(
+        output_dir, row, requested_start=start, requested_end=end, chunks=chunks,
+        minute=pl.DataFrame(), minute_manifest_receipt=summary["minute_manifest_receipt"],
+        source_gap_dates=sorted(
+            str(value) for value in manifest.get("source_gap_dates", [])
+            if start <= date.fromisoformat(str(value)) <= end
+        ),
+        verified_source_chunks=0, minute_source_chunks=source_chunks,
+        official_sessions=official_sessions, official_calendar=official_calendar,
+        prefix_daily=daily, prefix_source_minute_rows=previous.source_minute_rows,
+        reused_source_chunks=len(source_chunks),
+        calendar_upgrade_input_receipt=summary["output_receipt"],
     )
 
 
@@ -1200,12 +1313,16 @@ def _run_local_materialization(
         requested_start=start,
         requested_end=end,
     )
+    official_sessions, official_calendar = load_daily_calendar(
+        Path(getattr(args, "calendar_root", "data_tw_public")), start, end
+    )
     results: list[SymbolResult] = []
     avoided_requests = 0
     reused_source_chunks_total = 0
     incremental_symbols = 0
     full_rebuilt_symbols = 0
     unchanged_symbols = 0
+    calendar_upgraded_symbols = 0
     progress_path = args.output_dir / "progress.json"
     started = time.monotonic()
     for symbol_index, row in enumerate(selected, start=1):
@@ -1290,6 +1407,8 @@ def _run_local_materialization(
             requested_start=symbol_start,
             requested_end=end,
             minute_manifest_sha256=manifest_sha,
+            official_calendar=official_calendar,
+            official_sessions=official_sessions,
         )
         if completed is not None:
             results.append(completed)
@@ -1302,12 +1421,24 @@ def _run_local_materialization(
             source_chunks = _local_minute_chunk_signatures(
                 manifest, start=symbol_start, end=end
             )
+            upgraded = _upgrade_local_daily_calendar(
+                args.output_dir, row, start=symbol_start, end=end, chunks=chunks,
+                manifest=manifest, manifest_sha256=manifest_sha, source_chunks=source_chunks,
+                official_sessions=official_sessions, official_calendar=official_calendar,
+            )
+            if upgraded is not None:
+                results.append(upgraded)
+                calendar_upgraded_symbols += 1
+                reused_source_chunks_total += len(source_chunks)
+                continue
             incremental = _incremental_local_daily_plan(
                 args.output_dir,
                 row,
                 requested_start=symbol_start,
                 requested_end=end,
                 minute_manifest=manifest,
+                official_calendar=official_calendar,
+                official_sessions=official_sessions,
             )
             source_start = incremental[0] if incremental is not None else symbol_start
             minute, manifest_receipt, source_gaps, verified_chunks = (
@@ -1339,11 +1470,21 @@ def _run_local_materialization(
                 source_gap_dates=source_gaps,
                 verified_source_chunks=verified_chunks,
                 minute_source_chunks=source_chunks,
+                official_sessions=official_sessions,
+                official_calendar=official_calendar,
                 prefix_daily=incremental[1] if incremental is not None else None,
                 prefix_source_minute_rows=incremental[2]
                 if incremental is not None
                 else 0,
                 reused_source_chunks=incremental[3] if incremental is not None else 0,
+                prefix_quarantined_rows={
+                    day: int(count)
+                    for day, count in (
+                        (_read_json(args.output_dir / "daily" / f"{row.symbol}.summary.json") or {})
+                        .get("quarantined_non_session_source_rows", {}).items()
+                    )
+                    if date.fromisoformat(day) < source_start
+                } if incremental is not None else None,
             )
             reused_chunks = incremental[3] if incremental is not None else 0
             avoided_chunks = verified_chunks + reused_chunks
@@ -1431,7 +1572,9 @@ def _run_local_materialization(
             "full_rebuilt_symbols": full_rebuilt_symbols,
             "unchanged_symbols": unchanged_symbols,
             "reused_source_chunks": reused_source_chunks_total,
+            "calendar_upgraded_symbols": calendar_upgraded_symbols,
         },
+        official_calendar=official_calendar,
     )
     failed = [item for item in results if item.status == "failed"]
     _atomic_write_json(
@@ -1486,6 +1629,7 @@ def _write_summary(
     api_requests_started: int | None = None,
     avoided_api_requests: int = 0,
     local_materialization_performance: dict[str, Any] | None = None,
+    official_calendar: dict[str, Any] | None = None,
 ) -> None:
     report_path = output_dir / "download_report.csv"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1551,6 +1695,11 @@ def _write_summary(
         "avoided_api_requests": int(avoided_api_requests),
         "local_materialization_performance": local_materialization_performance,
         "source_minute_summary_receipt": local_minute_summary_receipt,
+        "daily_calendar_contract": DAILY_CALENDAR_CONTRACT if official_calendar else None,
+        "official_calendar": official_calendar,
+        "quarantined_non_session_source_rows": sum(
+            item.quarantined_non_session_source_rows for item in results
+        ),
         "report_path": str(report_path),
         "written_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }

@@ -4616,6 +4616,24 @@ def test_epoch_timing_subtracts_parallel_validation_test_overlap() -> None:
     assert payload["epoch_total_s"] == pytest.approx(4.0)
 
 
+def test_epoch_timing_distinguishes_inner_fifo_compile_from_outer_runner() -> None:
+    payload = _timing_curve_payload(
+        train_timing=TimingBreakdown(total_s=1.0, batches=1),
+        backtest_runtime_stats={"compiled_runner_calls": 0.0},
+        day_trade_carry_compile_stats={"compiled_session_calls": 12, "eager_fallback_calls": 2},
+        train_day_trade_carry_compile_stats={"compiled_session_calls": 9, "eager_fallback_calls": 1},
+    )
+    assert payload["bt_compiled_runner_calls"] == 0
+    assert payload["day_trade_carry_compiled_session_calls"] == 12
+    assert payload["train_loss_day_trade_carry_compiled_session_calls"] == 9
+    assert payload["day_trade_carry_eager_fallback_calls"] == 2
+    assert payload["train_loss_day_trade_carry_eager_fallback_calls"] == 1
+    assert payload["day_trade_carry_telemetry_schema_version"] == 1
+    assert payload["day_trade_carry_telemetry_process_rank"] == 0
+    unobserved = _timing_curve_payload(train_timing=TimingBreakdown())
+    assert "day_trade_carry_compiled_session_calls" not in unobserved
+
+
 def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
     panel = _make_panel(rows=14, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)

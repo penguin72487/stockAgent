@@ -21,7 +21,7 @@ from scripts.publish_data_releases import DEFAULT_CATALOG, _load_catalog, _sourc
 from stockagent.data_sync.desync_snapshots import atomic_write_json, sha256_file
 from stockagent.data_sync.packed_snapshots import (
     _SourceEntry, _load_inventory, _validate_inventory, _write_pack,
-    _copy_and_hash, _install_immutable_object, resolve_latest_packed,
+    _copy_and_hash, _install_immutable_object, resolve_latest_packed, resolve_packed_snapshot_id,
     _validate_manifest,
 )
 
@@ -66,13 +66,17 @@ def original_members(sync_root: Path, dataset: str, needed: set[str]) -> dict:
     return found
 
 
-def repair(dataset: str, sync_root: Path, *, apply: bool, receipt: Path) -> dict:
+def repair(dataset: str, sync_root: Path, *, apply: bool, receipt: Path, snapshot_id: str | None = None,
+           original_member_cache: dict | None = None) -> dict:
+    if receipt.exists():
+        raise ValueError("preserve prior exact-source recovery receipts")
     catalog = next(e for e in _load_catalog(DEFAULT_CATALOG) if e["dataset"] == dataset)
     if not catalog.get("publish") or _blockers(catalog, _running_commands()):
         raise RuntimeError("catalog excludes publication or source writer is active")
     source = _source_path(catalog).resolve()
     sync_root = sync_root.resolve()
-    resolved = resolve_latest_packed(sync_root, dataset, require_objects=False)
+    resolved = (resolve_packed_snapshot_id(sync_root, dataset, snapshot_id, require_objects=False) if snapshot_id
+                else resolve_latest_packed(sync_root, dataset, require_objects=False))
     manifest = resolved.manifest
     inventory = _load_inventory(sync_root, manifest)
     _validate_inventory(manifest, inventory)
@@ -84,7 +88,7 @@ def repair(dataset: str, sync_root: Path, *, apply: bool, receipt: Path) -> dict
               "apply": apply, "head_changed": False, "restored": [], "recoverable": [], "unresolved": []}
     needed = {o["sha256"] for o in manifest["archive"]["objects"]
               if o.get("member_selection") == "subset" and not (sync_root / o["relpath"]).exists()}
-    originals = original_members(sync_root, dataset, needed) if needed else {}
+    originals = (original_member_cache if original_member_cache is not None else original_members(sync_root, dataset, needed)) if needed else {}
     for obj in manifest["archive"]["objects"]:
         target = sync_root / obj["relpath"]
         if target.exists():
@@ -94,6 +98,10 @@ def repair(dataset: str, sync_root: Path, *, apply: bool, receipt: Path) -> dict
         original = originals.get(obj["sha256"])
         if obj.get("member_selection") == "subset":
             if original:
+                origin = Path(original["manifest_path"])
+                if (not origin.resolve().is_relative_to(sync_root / "manifests" / dataset)
+                        or sha256_file(origin) != original["manifest_sha256"]):
+                    raise ValueError("cached original pack membership manifest changed")
                 rows = original["rows"]
             else:
                 reason = "original_pack_members_not_all_in_selected_inventory"
@@ -134,6 +142,9 @@ def repair(dataset: str, sync_root: Path, *, apply: bool, receipt: Path) -> dict
             if digest != obj["sha256"] or temporary.stat().st_size != obj["bytes"]:
                 result["unresolved"].append(item | {"reason": "reconstructed_object_hash_mismatch"})
                 continue
+            if _blockers(catalog, _running_commands()):
+                result["unresolved"].append(item | {"reason": "source_writer_started_before_install"})
+                continue
             _install_immutable_object(sync_root, temporary, target, expected_sha256=digest)
             if sha256_file(target) != digest:
                 raise RuntimeError("restored immutable object failed verification")
@@ -149,8 +160,9 @@ def main() -> None:
     parser.add_argument("--sync-root", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--snapshot-id", help="fixed retained source release; default remains the current head")
     args = parser.parse_args()
-    result = repair(args.dataset, args.sync_root, apply=args.apply, receipt=args.receipt)
+    result = repair(args.dataset, args.sync_root, apply=args.apply, receipt=args.receipt, snapshot_id=args.snapshot_id)
     print(json.dumps({k: len(v) if isinstance(v, list) else v for k, v in result.items()}, ensure_ascii=False))
 
 
