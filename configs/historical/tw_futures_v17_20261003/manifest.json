@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "purpose": "Immutable historical configuration evidence; not runnable under the current code ABI",
+  "runnable_with_current_code": false,
+  "source": "Retained vast-ai 1T working tree observed 2026-10-03; original local regression configs",
+  "incompatibilities": [
+    "trading.tw_futures_portfolio_benchmark_mode",
+    "training.futures_training_max_drawdown",
+    "training.futures_training_risk_interior",
+    "training.futures_training_risk_tangent",
+    "training.futures_training_stop_on_rejected_step",
+    "financial_transformer.futures_flat_action_initialization",
+    "financial_transformer.futures_margin_amount_context",
+    "financial_transformer.futures_notional_score_coordinates"
+  ],
+  "files": [
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_scratch_all_folds_v17.yaml",
+      "sha256": "52a8bdce4269d72d06deba7c82704bd94485a02e85579b150307a1c5d6d610bd",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_scratch_all_folds_v17.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_warm_policy_v16.yaml",
+      "sha256": "8bc381fb7816301545fbc9769e8f5533fb1a9d8e3988f4774d13137f0559bb15",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_warm_policy_v16.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_warm_policy_v16.yaml",
+      "sha256": "9ea563a84c963741750c49df8436bab30556e1923f4c5cd65a9d9462bb18bcbd",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_warm_policy_v16.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_feasible_gradient_v14.yaml",
+      "sha256": "a3ca8dd017943e3823a2549f6a4876d671adee33e9350ee2936f68ad8bc3f42e",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_feasible_gradient_v14.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_feasible_gradient_v13.yaml",
+      "sha256": "7b194ff1135a80e7083fc5f8f8323d54cd478da1d9c56ce07b11aab4174231e0",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_feasible_gradient_v13.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_absorbing_gradient_v12.yaml",
+      "sha256": "feae4b6761db9e1cc2e1fb5f95bf67f0e9b7e046d21b5639f003331f9a211759",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_absorbing_gradient_v12.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_ordinary_v11.yaml",
+      "sha256": "c4cbb1a319f5325f3983e59fae69d670f5a5517899babd4274d16cc6f26e6e1c",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_ordinary_v11.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_cash_init_v6.yaml",
+      "sha256": "9e5d2371cede1d38c0a211625301c94bcb64e16f7dbe4a06a3aa143b1648e295",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_cash_init_v6.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_physical_gradient_v5.yaml",
+      "sha256": "73f8ba6983e90304ffd7c07924338ba1a5cdfd28c731f29d58977e4d885e6972",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_physical_gradient_v5.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_throughput_v4.yaml",
+      "sha256": "4e63ea197bdc222766589038f8c1e5456d18d72590651239db5898a0ff46d64c",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_throughput_v4.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_gradient_v3.yaml",
+      "sha256": "f794d4707cfdd3ba6380ae6744b4bf8fe9d987682825c1ffe96a50a303c3015c",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_gradient_v3.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_v2.yaml",
+      "sha256": "08370274cf2b33b937125e88a8f1f4fbee2ec2c90afa4ec5dcd1b1f77c4c4df8",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_v2.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_2011_capital100m.yaml",
+      "sha256": "1d070e8be44a0abb41d1fa17bb5514520948fc6175bd0e9a288dca466819a6bf",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_2011_capital100m.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_verified_capital100m.yaml",
+      "sha256": "d464458748f9f3abe58659e0fe544df598e291ccee44e9280de390b8782e946f",
+      "original_path": "configs/markets/tw_futures_v8_margin_verified_capital100m.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin.yaml",
+      "sha256": "e3967e3e07f68804d09aa8a778be9a504a068cd58d5ba9fb7627754185a8917b",
+      "original_path": "configs/markets/tw_futures_v8_margin.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_general.yaml",
+      "sha256": "a2f2eea40eb0cd781a4c26d9e17090562d0cb50c0e52d74cb22da44f0349f53d",
+      "original_path": "configs/markets/tw_futures_v8_general.yaml"
+    },
+    {
+      "path": "deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml",
+      "sha256": "2875c6da9c29d56e4cda15ba196ad59a8c5b96aa3db14e827d14247d03babba5",
+      "original_path": "configs/markets/../deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml",
+      "sha256": "8ca43c9fc23955bccec95526114bf78e766fd8181d69dccf6830e4d104316639",
+      "original_path": "configs/markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_carry_abi2_tx_mtx_regression_fold10_20260929.yaml",
+      "sha256": "df55c6218b7532cecdcefdebe1b1bdcd78ce34152ff1d474f083eaa40a62e024",
+      "original_path": "configs/markets/tw_futures_v8_margin_carry_abi2_tx_mtx_regression_fold10_20260929.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_dual_limits_tx_mtx_regression_fold10_20260929.yaml",
+      "sha256": "d339f311e2f4147788346f8498dbbad45ddd1dbecb80ea5d97e88100fbfd51b4",
+      "original_path": "configs/markets/tw_futures_v8_margin_dual_limits_tx_mtx_regression_fold10_20260929.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_rule5_slots2560_regression_fold10_20260929.yaml",
+      "sha256": "c75428099f88683b3351fa3dec3d01d23fb493cb70224c6b9588b5a69abeb3a2",
+      "original_path": "configs/markets/tw_futures_v8_margin_rule5_slots2560_regression_fold10_20260929.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_rule5_slots2816_regression_fold10_20260930.yaml",
+      "sha256": "bf69b11d2ba05a043ab183e9b78a3085205b389b8845fdd03efb6b024eafb246",
+      "original_path": "configs/markets/tw_futures_v8_margin_rule5_slots2816_regression_fold10_20260930.yaml"
+    },
+    {
+      "path": "markets/tw_futures_v8_margin_rule5_tx_mtx_regression_fold10_20260929.yaml",
+      "sha256": "3f09622ac5390daa64e2a52e6c93de7415bad03f04df2778a7010a6dcc7f9d64",
+      "original_path": "configs/markets/tw_futures_v8_margin_rule5_tx_mtx_regression_fold10_20260929.yaml"
+    }
+  ],
+  "archived_market_paths": [
+    "configs/markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_20260930.yaml",
+    "configs/markets/tw_futures_v8_margin_carry_abi2_tx_mtx_regression_fold10_20260929.yaml",
+    "configs/markets/tw_futures_v8_margin_dual_limits_tx_mtx_regression_fold10_20260929.yaml",
+    "configs/markets/tw_futures_v8_margin_rule5_slots2560_regression_fold10_20260929.yaml",
+    "configs/markets/tw_futures_v8_margin_rule5_slots2816_regression_fold10_20260930.yaml",
+    "configs/markets/tw_futures_v8_margin_rule5_tx_mtx_regression_fold10_20260929.yaml"
+  ]
+}

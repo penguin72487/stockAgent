@@ -754,7 +754,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=11"' in html
+    assert 'src="../dashboard-core.js?v=14"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript
@@ -782,8 +782,8 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "已延後／未啟用" in html
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
-    assert "styles.css?v=20" in html
-    assert "app.js?v=46" in html
+    assert "styles.css?v=21" in html
+    assert "app.js?v=50" in html
     assert 'id="tw-calendar-state"' in html
     assert "data.tw_stock_calendar" in javascript
     assert 'id="feature-rows"' in html
@@ -801,8 +801,8 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "row.record_stats?.count" in javascript
     assert "installDetailsActivation();" in javascript
     assert "installFeatureActivation();" in javascript
-    assert 'const target = $("source-list");' in javascript
-    assert "IntersectionObserver" in javascript
+    assert 'Dashboard.observeVisibility("source-list"' in javascript
+    assert 'Dashboard.observeVisibility("feature-list"' in javascript
     assert "state.detailsActivated" in javascript
     assert 'id="overall-denominator"' in html
     assert 'id="deferred-items"' in html

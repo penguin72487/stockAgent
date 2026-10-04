@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date
+import pytest
 
 import duckdb
 import polars as pl
@@ -11,7 +13,34 @@ from stockagent.data.columnar_lake import (
     SourceFileContract,
     compact_parquet_files,
     source_signature,
+    read_daily_projection,
 )
+
+
+@pytest.mark.parametrize('engine',['arrow','polars','duckdb'])
+def test_daily_projection_keeps_exact_source_values_and_string_identity(tmp_path,engine):
+    source=tmp_path/'real-shape.parquet'
+    table=pa.table({'date':[date(2026,10,1),date(2026,10,2),date(2026,10,2)],
+                    'symbol':['0050','0050','2330'],'close':[123.456789,None,float('nan')]})
+    pq.write_table(table,source)
+    actual=read_daily_projection(source,columns=['symbol','close'],symbols=['0050'],
+                                 start_date=date(2026,10,2),end_date=date(2026,10,2),engine=engine,duckdb_threads=1)
+    assert actual.to_pylist()==[{'symbol':'0050','close':None}]
+    quoted=read_daily_projection(source,columns=['symbol','close'],symbols=["0050' OR true --"],
+                                 start_date=date(2026,10,1),engine=engine,duckdb_threads=1)
+    assert quoted.num_rows==0
+    finite=read_daily_projection(source,columns=['symbol','close'],symbols=['0050'],
+                                 start_date=date(2026,10,1),end_date=date(2026,10,1),engine=engine,duckdb_threads=1)
+    assert finite['close'][0].as_py()==123.456789
+
+
+def test_daily_projection_does_not_reinterpret_timestamp_or_numeric_symbol(tmp_path):
+    source=tmp_path/'wrong-grain.parquet'
+    pq.write_table(pa.table({'date':['2026-10-01'],'symbol':['0050']}),source)
+    with pytest.raises(ValueError,match='reinterpret'):
+        read_daily_projection(source,columns=['symbol'],symbols=['0050'],start_date=date(2026,10,1))
+    with pytest.raises(ValueError,match='strings'):
+        read_daily_projection(source,columns=['symbol'],symbols=[50],start_date=date(2026,10,1))
 
 
 def test_source_signature_is_order_independent_and_contract_sensitive() -> None:

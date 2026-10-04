@@ -13,7 +13,11 @@ from typing import Any
 
 import polars as pl
 
-from downloader.stock_volume_units import stock_volume_multiplier_expr
+from downloader.stock_volume_units import (
+    STOCK_MINUTE_READER_CONTRACT,
+    scan_stock_minute_sources,
+    stock_volume_multiplier_expr,
+)
 from scripts.shioaji_minute_backfill_state import source_fingerprint
 
 
@@ -632,7 +636,7 @@ def main() -> None:
     rejected_non_session_rows: dict[str, int] = defaultdict(int)
     for (chunk_start, chunk_end), paths in groups.items():
         frame = build_research_frame(
-            pl.scan_parquet([str(path) for path in paths])
+            scan_stock_minute_sources(paths)
         ).collect(engine="streaming")
         frame, rejected = _split_official_session_rows(frame, official_sessions)
         for date_text, rows in rejected.items():
@@ -657,6 +661,7 @@ def main() -> None:
             summary = {
                 "schema_version": SCHEMA_VERSION,
                 "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
+                "source_reader_contract": STOCK_MINUTE_READER_CONTRACT,
                 "status": "ok",
                 "source": "shioaji_kbars_1m",
                 "trade_date": date_text,
@@ -691,6 +696,7 @@ def main() -> None:
         {
             "schema_version": SCHEMA_VERSION,
             "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
+            "source_reader_contract": STOCK_MINUTE_READER_CONTRACT,
             "status": "research_ready" if not requested else "research_subset",
             "research_ready": not requested,
             "source": "shioaji_kbars_1m",

@@ -10,7 +10,11 @@ import pytest
 from scripts import switch_tw_day_trade_strategy as strategy_switch
 
 
-@pytest.mark.parametrize("version,expected", [(None, False), (0, False), (True, False), ("1", False), (1, True)])
+@pytest.mark.parametrize("version,expected", [
+    (None, False), (0, False), (True, False), ("1", False),
+    (strategy_switch.TW_ORDER_PRICE_CONTRACT_VERSION - 1, False),
+    (strategy_switch.TW_ORDER_PRICE_CONTRACT_VERSION, True),
+])
 def test_current_deployment_requires_product_aware_tick_receipt(tmp_path, version, expected):
     day = date(2026, 2, 25)
     summary = tmp_path / "summary.json"

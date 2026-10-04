@@ -9,6 +9,7 @@ resumable without loading hundreds of thousands of task receipts into memory.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import fcntl
@@ -21,7 +22,7 @@ import shutil
 import sqlite3
 import sys
 import time
-from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle
+from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
 from typing import Any
 
 import pyarrow as pa
@@ -36,7 +37,10 @@ from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, ProviderError, _record_request_start
 from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import RangeBatch
-from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, fixed_incremental_demand, next_release_check
+from downloader.finmind_scheduling import (
+    PRODUCT_HISTORY_STARTS, incremental_reservation, next_release_check, _read_metadata,
+    PERIODIC_RELEASE_CLOCKS, periodic_release_boundary,
+)
 from downloader.finmind_volume_units import annotate_stock_share_units
 from downloader.finmind_history_refresh import (
     DAILY_EQUITY, canonical_us_id, migrate_us_aliases, read_baseline,
@@ -45,6 +49,9 @@ from downloader.finmind_history_refresh import (
 from downloader.finmind_updates import received_rows, retain_observation, record_success, set_next_check, record_failure
 from downloader import finmind_supplemental as supplemental
 from downloader import finmind_news as news
+from downloader import finmind_retry_cohorts as retry_cohorts
+from downloader import finmind_retry_policy as retry_policy
+from downloader.finmind_history_order import HISTORY_STAGES, first_unfinished_dataset, metadata as history_order_metadata
 from downloader.finmind_catalog import (
     ALL_DATASETS as ALL_DATASETS,
     BULK_GLOBAL_HISTORY,
@@ -70,7 +77,9 @@ SOURCE_CATALOG = "https://github.com/FinMind/FinMind-MCP/blob/master/knowledge/d
 MIN_FREE_BYTES = 25 * 1024**3
 BULK_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 BULK_MAX_RESPONSE_ROWS = 1_000_000
+STATUS_INTERVAL_SECONDS = 20
 GOLD_TIMESTAMP_CONTRACT_VERSION = 1
+DISPATCH_CONTRACT_VERSION = 7  # Bounded task failures never re-enter automatic dispatch.
 # One shared-quota probe plus hash-verified local replay establishes the upper
 # bound at inclusive midnight, not at the end of that calendar day.
 GOLD_RANGE_PROOF = "artifacts/data_quality/finmind_gold_range_20260927T030804094218Z.json"
@@ -104,31 +113,47 @@ def _iso(value: datetime) -> str:
 def _db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=10000")
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            dataset TEXT NOT NULL, data_id TEXT NOT NULL, partition TEXT NOT NULL,
-            kind TEXT NOT NULL, priority INTEGER NOT NULL, state TEXT NOT NULL,
-            next_attempt_at_utc TEXT, last_attempt_at_utc TEXT,
-            rows INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
-            first_data_date TEXT, last_data_date TEXT, receipt_path TEXT,
-            error_code TEXT,
-            PRIMARY KEY (dataset, data_id, partition)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                dataset TEXT NOT NULL, data_id TEXT NOT NULL, partition TEXT NOT NULL,
+                kind TEXT NOT NULL, priority INTEGER NOT NULL, state TEXT NOT NULL,
+                next_attempt_at_utc TEXT, last_attempt_at_utc TEXT,
+                rows INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
+                first_data_date TEXT, last_data_date TEXT, receipt_path TEXT,
+                error_code TEXT,
+                PRIMARY KEY (dataset, data_id, partition)
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_finmind_complement_queue "
+            "ON tasks(priority, next_attempt_at_utc, state)"
         )
-    """)
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_finmind_complement_queue "
-        "ON tasks(priority, next_attempt_at_utc, state)"
-    )
-    # Sponsor rotates equally ranked whole-market datasets.  The queue can
-    # contain hundreds of thousands of daily partitions; without this index,
-    # each dispatch scans and sorts the entire priority group again.
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_finmind_priority_dataset_partition "
-        "ON tasks(priority, dataset, partition DESC)"
-    )
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_dataset_state ON tasks(dataset,state)")
+        # Sponsor shares this initializer and rotates equally ranked datasets.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_finmind_priority_dataset_partition "
+            "ON tasks(priority, dataset, partition DESC)"
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_dataset_state ON tasks(dataset,state)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_outstanding_dispatch "
+                           "ON tasks(state,dataset,next_attempt_at_utc,priority) "
+                           "WHERE state IN ('pending','failed')")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_due_refresh "
+                           "ON tasks(next_attempt_at_utc,priority,dataset) "
+                           "WHERE state IN ('complete','observed_empty') AND next_attempt_at_utc IS NOT NULL")
+        retry_cohorts.ensure_schema(connection)
+        retry_policy.migrate(connection, path.parent, _now())
+        retry_cohorts.reconcile(connection, _now())
+        # Reusing this connection every normal batch also maintains evolving
+        # cardinalities. Missing statistics previously defeated deadline seeks.
+        optimize_queue(connection)
+    except BaseException:
+        # The caller's closing() context has not been entered yet. Release even
+        # interrupted/BUSY initialization; the existing retry path owns recovery.
+        connection.close()
+        raise
     return connection
 
 
@@ -235,6 +260,44 @@ def _add_missing_identifiers(connection: sqlite3.Connection, dataset: str,
                             for identifier in identifiers if identifier not in present])
 
 
+def _reconcile_periodic_publication(connection: sqlite3.Connection, now: datetime) -> int:
+    """Move legacy successful weekend renewals, keeping fetch/receipt evidence.
+
+    Backfills, empty identities and failed/corrected tasks remain executable on
+    their existing clocks. A weekday already overdue stays due: skipping a
+    publishing weekend must not suppress an unperformed weekday catch-up.
+    """
+    connection.execute('CREATE TABLE IF NOT EXISTS finmind_periodic_clock_migrations ('
+                       'id INTEGER PRIMARY KEY,version INTEGER NOT NULL,dataset TEXT NOT NULL,'
+                       'data_id TEXT NOT NULL,partition TEXT NOT NULL,prior_deadline TEXT NOT NULL,'
+                       'new_deadline TEXT NOT NULL,changed_at_utc TEXT NOT NULL)')
+    changed = 0
+    for dataset in PERIODIC_RELEASE_CLOCKS:
+        rows = connection.execute(
+            "SELECT data_id,partition,next_attempt_at_utc,last_attempt_at_utc FROM tasks "
+            "WHERE dataset=? AND kind='id_history' AND priority=0 AND state='complete' "
+            'AND rows>0 AND next_attempt_at_utc IS NOT NULL', (dataset,)).fetchall()
+        for identifier, partition, prior, attempted in rows:
+            try:
+                due, observed = datetime.fromisoformat(prior), datetime.fromisoformat(attempted)
+                if due.tzinfo is None or observed.tzinfo is None or observed > now or due < observed:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            revised = periodic_release_boundary(dataset, due)
+            if revised == due:
+                continue
+            connection.execute('INSERT INTO finmind_periodic_clock_migrations '
+                               '(version,dataset,data_id,partition,prior_deadline,new_deadline,changed_at_utc) '
+                               'VALUES (1,?,?,?,?,?,?)',
+                               (dataset, identifier, partition, prior, _iso(revised), _iso(now)))
+            connection.execute('UPDATE tasks SET next_attempt_at_utc=? '
+                               'WHERE dataset=? AND data_id=? AND partition=?',
+                               (_iso(revised), dataset, identifier, partition))
+            changed += 1
+    return changed
+
+
 def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> None:
     _recover_bulk_year_claims(connection)
     jobs: list[tuple[str, str, str, str, int]] = []
@@ -283,6 +346,7 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
         (str(today.year), str(today.year)),
     )
     _migrate_gold_timestamp_boundary(connection, root, _now())
+    _reconcile_periodic_publication(connection, _now())
     connection.commit()
     for dataset, data_id, partition, kind, task_state, last_attempt, next_attempt in connection.execute(
         "SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc "
@@ -342,6 +406,9 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
         return tw_stock_day_decision(day, parquet_root=root.parents[1] / 'data_tw_public', observed=_now())
 
     news.seed(connection, today)
+    # Reuse Sponsor's canonical receipt/byte-verified cash-session loader.
+    # Do not apply this calendar to futures/option timestamp-date partitions.
+    from downloader.download_finmind_sponsor import _official_session_calendar
     supplemental.seed(connection, {
         "stocks": stocks,
         "futures": _derivative_ids(root, "TaiwanFuturesDaily"),
@@ -349,7 +416,7 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
         "bonds": _snapshot_ids(root.parent / "sponsor", "TaiwanStockConvertibleBondInfo", "cb_id"),
         "brokers": _snapshot_ids(root, "TaiwanSecuritiesTraderInfo", "securities_trader_id"),
         "us": sorted({canonical_us_id(value) for value in _snapshot_ids(root, "USStockInfo", "stock_id")}),
-    }, _now(), day_decision=day_decision)
+    }, _now(), day_decision=day_decision, official_sessions=_official_session_calendar(), include_status=False)
     # A completed history is a renewable observation, not a one-off archive.
     # Migrate the former 30-day delay, preserving the last actual fetch clock.
     for dataset, identifier, partition, state, attempted, due, priority, latest in connection.execute(
@@ -390,6 +457,7 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                datasets: tuple[str, ...] | None = None,
                advance_cursor: bool = False,
                required_keys: tuple[tuple[str, str, str], ...] | None = None) -> Task | None:
+    retry_filter, retry_args = retry_cohorts.admission_clause(connection, now)
     if required_keys is not None:
         # Bounded accounting repairs use this same owner, storage and quota
         # lane. Completed/empty, inflight, blocked and cooling keys are not
@@ -401,8 +469,8 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                 'SELECT dataset,data_id,partition,kind,priority,state FROM tasks '
                 'WHERE dataset=? AND data_id=? AND partition=? '
                 "AND state IN ('pending','failed') "
-                'AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)',
-                (dataset, data_id, partition, _iso(now))).fetchone()
+                'AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)' + retry_filter,
+                (dataset, data_id, partition, _iso(now), *retry_args)).fetchone()
             if row and (not incremental_only or row[4] == 0 or row[3] == 'derived') \
                     and (not background_only or row[4] > 0):
                 return Task(*row)
@@ -411,19 +479,38 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
     # Never bypass the caller's incremental-only reserve or terminal failures.
     if not incremental_only and datasets is None and connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='finmind_priority_tasks'").fetchone():
+        excluded_due = (' AND dataset NOT IN (' + ','.join('?' for _ in delegated) + ')'
+                        if delegated else '')
         if background_only or not connection.execute(
                 "SELECT 1 FROM tasks WHERE priority=0 AND "
                 "((state='pending' AND next_attempt_at_utc IS NULL) OR "
                 "(state IN ('pending','complete','observed_empty','failed') "
-                "AND next_attempt_at_utc<=?)) LIMIT 1", (_iso(now),)).fetchone():
+                "AND next_attempt_at_utc<=?))" + excluded_due + retry_filter + " LIMIT 1",
+                (_iso(now), *sorted(delegated), *retry_args)).fetchone():
+            excluded_priority = (' AND t.dataset NOT IN (' + ','.join('?' for _ in delegated) + ')'
+                                 if delegated else '')
             row = connection.execute(
+                # Completed finite overrides can be much larger than today's
+                # outstanding set. Seek their dataset prefixes through the PK,
+                # then visit only outstanding tasks in those datasets. This is
+                # equivalent to the join, including multiple dataset scopes;
+                # it does not cache state or weaken release/repair admission.
+                'WITH RECURSIVE override_datasets(dataset) AS ('
+                'SELECT MIN(dataset) FROM finmind_priority_tasks UNION ALL '
+                'SELECT (SELECT MIN(dataset) FROM finmind_priority_tasks '
+                'WHERE dataset>override_datasets.dataset) FROM override_datasets '
+                'WHERE dataset IS NOT NULL) '
                 "SELECT t.dataset,t.data_id,t.partition,t.kind,t.priority,t.state "
-                "FROM finmind_priority_tasks p JOIN tasks t "
+                # Driving from the small outstanding set avoids visiting all
+                # completed operator overrides on every subsequent API call.
+                "FROM tasks t CROSS JOIN finmind_priority_tasks p "
                 "ON t.dataset=p.dataset AND t.data_id=p.data_id AND t.partition=p.partition "
-                "WHERE t.state IN ('pending','failed') AND "
+                "WHERE t.dataset IN (SELECT dataset FROM override_datasets WHERE dataset IS NOT NULL) "
+                "AND t.state IN ('pending','failed') AND "
                 "(t.next_attempt_at_utc IS NULL OR t.next_attempt_at_utc<=?) "
-                "ORDER BY p.partition DESC,p.data_id LIMIT 1", (_iso(now),)).fetchone()
-            if row and row[0] not in delegated:
+                + excluded_priority + retry_filter.replace('tasks.', 't.') + " ORDER BY p.partition DESC,p.data_id LIMIT 1",
+                (_iso(now), *sorted(delegated), *retry_args)).fetchone()
+            if row:
                 return Task(*row)
     excluded = " AND dataset NOT IN (" + ",".join("?" for _ in delegated) + ")" if delegated else ""
     selected = tuple(datasets) if datasets is not None else ()
@@ -432,42 +519,97 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
             return None
         excluded += " AND dataset IN (" + ",".join("?" for _ in selected) + ")"
     if incremental_only:
-        excluded += " AND (priority=0 OR kind='derived')"
+        excluded += " AND (tasks.priority=0 OR kind='derived')"
     if background_only:
-        excluded += ' AND priority>0'
-    # Round-robin ONLY within the highest-priority lane. A 20k-symbol overseas
-    # release must not starve hourly news or a small settlement refresh. Status
-    # previews can read this cursor but never advance it or create a table.
+        excluded += ' AND tasks.priority>0'
+    if not incremental_only:
+        first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
+        if first_history:
+            # Keep primary refresh/core work and local derivations independent.
+            # Do not let a later ready history leap past an earlier lazy cursor
+            # or cooling failure merely because its working set was drained.
+            first_rank = next(index for index, stage in enumerate(HISTORY_STAGES) if stage.dataset == first_history)
+            # Earlier completed stages may renew on their existing due clocks;
+            # their maintenance is included in the cumulative ETA capacity.
+            others = tuple(stage.dataset for stage in HISTORY_STAGES[first_rank + 1:])
+            if others:
+                excluded += " AND (tasks.priority=0 OR dataset NOT IN (" + ','.join('?' for _ in others) + '))'
+        else:
+            others = ()
+    else:
+        others = ()
+    # Seek executable datasets before UNION / sorting. Outer NOT IN filtering
+    # used to visit every later-stage pending candidate on each dispatch.
+    # Priority-zero renewals of later history still preempt background work.
+    # Walk the primary-key prefix rather than scanning all queue rows for
+    # DISTINCT dataset. Include every existing queue dataset, not just today's
+    # registry constants, so this optimization changes no selector semantics.
+    keys = selected if datasets is not None else tuple(row[0] for row in connection.execute(
+        'WITH RECURSIVE dataset_keys(dataset) AS ('
+        'SELECT MIN(dataset) FROM tasks UNION ALL '
+        'SELECT (SELECT MIN(dataset) FROM tasks WHERE dataset>dataset_keys.dataset) '
+        'FROM dataset_keys WHERE dataset IS NOT NULL) '
+        'SELECT dataset FROM dataset_keys WHERE dataset IS NOT NULL'))
+    allowed = tuple(sorted(set(keys) - set(delegated)))
+    if not allowed:
+        return None
+    early_scope = ' AND dataset IN (' + ','.join('?' for _ in allowed) + ')'
+    scope_args = list(allowed)
+    if others:
+        early_scope += ' AND (priority=0 OR dataset NOT IN (' + ','.join('?' for _ in others) + '))'
+        scope_args.extend(others)
+    early_scope += retry_filter
+    if incremental_only:
+        early_scope += " AND (priority=0 OR kind='derived')"
+    if background_only:
+        early_scope += ' AND priority>0'
+    early_args = (*scope_args, *retry_args)
+    # Round-robin remains for primary lanes. The explicit history-stage guard
+    # admits just one of the nine datasets, so fairness cannot reorder them.
+    # Status previews never advance this cursor or create a table.
     if advance_cursor:
         connection.execute('CREATE TABLE IF NOT EXISTS dispatch_cursor '
                            '(priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)')
-    previous = None
-    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='dispatch_cursor'").fetchone():
-        previous = connection.execute('SELECT last_dataset FROM dispatch_cursor WHERE priority=0').fetchone()
-    cursor = previous[0] if previous else ''
+    has_cursor = connection.execute("SELECT 1 FROM sqlite_master WHERE name='dispatch_cursor'").fetchone()
+    cursor = ("SELECT priority,last_dataset FROM dispatch_cursor" if has_cursor else
+              "SELECT -1 AS priority,'' AS last_dataset WHERE 0")
     row = connection.execute(
-        "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
-        "WHERE ((state='pending' AND next_attempt_at_utc IS NULL) "
-        "OR (state IN ('pending','complete','observed_empty','failed') "
-        "AND next_attempt_at_utc <= ?)) "
+        "WITH eligible AS ("
+        "SELECT * FROM tasks WHERE state IN ('pending','failed') AND "
+        "((state='pending' AND next_attempt_at_utc IS NULL) OR next_attempt_at_utc<=?) " + early_scope + ' ' +
+        "UNION ALL SELECT * FROM tasks WHERE state IN ('complete','observed_empty') "
+        "AND next_attempt_at_utc IS NOT NULL AND next_attempt_at_utc<=?), "
+        "cursors AS (" + cursor + ") "
+        "SELECT tasks.dataset,data_id,partition,kind,tasks.priority,state FROM eligible tasks "
+        "LEFT JOIN cursors c ON c.priority=tasks.priority WHERE 1=1 "
         + excluded + " AND (kind!='derived' OR "
         "(dataset='TaiwanStockTradingDailyReportSecIdAgg' AND EXISTS (SELECT 1 FROM tasks AS source "
         "WHERE source.dataset='TaiwanStockTradingDailyReport' AND source.data_id=tasks.data_id "
         "AND source.partition=tasks.partition AND source.state='complete')) OR (dataset=? AND EXISTS (SELECT 1 FROM tasks AS source "
         "WHERE source.dataset=? AND source.data_id=tasks.data_id "
         "AND source.partition='history' AND source.state='complete'))) "
-        "ORDER BY priority, CASE WHEN priority=0 AND dataset>? THEN 0 WHEN priority=0 THEN 1 ELSE 0 END, "
-        "CASE WHEN priority=0 THEN dataset ELSE '' END, "
+        # A due recheck of accepted historical data is maintenance, not a new
+        # missing partition. It cannot beat acquisition merely because its
+        # original source priority was numerically lower. Current renewals and
+        # correction jobs (pending/failed) retain their actual priority.
+        "ORDER BY CASE WHEN tasks.priority>0 AND state IN ('complete','observed_empty') THEN 1 ELSE 0 END, "
+        "tasks.priority, CASE WHEN tasks.priority=0 AND dataset>COALESCE(c.last_dataset,'') "
+        "THEN 0 WHEN tasks.priority=0 THEN 1 ELSE 0 END, "
+        "CASE WHEN tasks.priority=0 THEN dataset ELSE '' END, "
         "CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, "
         # Within the same lane, an eligible repair must not wait behind an
         # unbounded stream of never-queried dates. Keep release priorities,
         # dataset rotation and existing retry cooldowns ahead of this choice.
         "CASE WHEN state='failed' THEN 0 WHEN state='pending' THEN 1 ELSE 2 END, "
-        "COALESCE(next_attempt_at_utc,''), dataset, data_id LIMIT 1",
-        (_iso(now), *sorted(delegated), *selected, WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL, cursor),
+        # Fairness within a background lane, never across priorities. Repairs
+        # still precede ordinary history; tick cannot jump ahead of minute work.
+        "CASE WHEN dataset>COALESCE(c.last_dataset,'') THEN 0 ELSE 1 END, dataset, "
+        "COALESCE(next_attempt_at_utc,''), data_id, partition DESC LIMIT 1",
+        (_iso(now), *early_args, _iso(now), *sorted(delegated), *selected, *others,
+         WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL),
     ).fetchone()
-    if row and row[4] == 0 and advance_cursor:
-        connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (0,?)', (row[0],))
+    if row and advance_cursor:
+        connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (?,?)', (row[4], row[0]))
         connection.commit()
     return Task(*row) if row else None
 
@@ -1273,7 +1415,7 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
             next_check += timedelta(days=1)
         return _iso(next_check)
     if task.dataset in PRODUCT_HISTORY_STARTS and task.kind == "id_history" and not empty:
-        return _iso(now + timedelta(hours=3))
+        return _iso(next_release_check(task.dataset, now))
     if task.kind == "snapshot":
         local = now.astimezone(TAIPEI)
         hour = 17 if task.dataset in {'taiwan_futures_snapshot', 'taiwan_options_snapshot'} else 14
@@ -1309,6 +1451,11 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
 def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, Any], now: datetime) -> None:
     next_at = _next_refresh(task, now, empty=receipt['status'] == 'observed_empty',
                             latest_date=receipt.get('source_last_date'))
+    # Retained history after an empty incremental response is not evidence that
+    # the failed full-history endpoint recovered.
+    if receipt.get('request', {}).get('response_rows', receipt['rows']) > 0:
+        retry_cohorts.record_recovery(connection, task, receipt['rows'], now)
+    retry_policy.record_success(connection, task, now)
     connection.execute(
         "UPDATE tasks SET state=?, next_attempt_at_utc=?, last_attempt_at_utc=?, "
         "rows=?,bytes=?,first_data_date=?,last_data_date=?,receipt_path=?,error_code=NULL "
@@ -1346,9 +1493,19 @@ def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError
     if queue_path:
         record_failure(Path(queue_path).parent, task, error.code, now)
     if error.code == "not_entitled":
+        # A dataset denial applies to its queued retries too. Preserve the old
+        # failure evidence, rather than repeatedly sending already denied 4xx.
+        connection.execute('CREATE TABLE IF NOT EXISTS finmind_entitlement_holds ('
+                           'dataset TEXT,data_id TEXT,partition TEXT,prior_state TEXT,prior_error_code TEXT,'
+                           'prior_next_attempt_at_utc TEXT,held_at_utc TEXT,'
+                           'PRIMARY KEY(dataset,data_id,partition,held_at_utc))')
+        connection.execute('INSERT OR IGNORE INTO finmind_entitlement_holds '
+                           'SELECT dataset,data_id,partition,state,error_code,next_attempt_at_utc,? '
+                           "FROM tasks WHERE dataset=? AND state IN ('pending','failed')",
+                           (_iso(now), task.dataset))
         connection.execute(
             "UPDATE tasks SET state='not_entitled', error_code='not_entitled', "
-            "next_attempt_at_utc=NULL WHERE dataset=? AND state='pending'",
+            "next_attempt_at_utc=NULL WHERE dataset=? AND state IN ('pending','failed')",
             (task.dataset,),
         )
     permanent = error.code in {"not_entitled", "invalid_token", "provider_bad_request",
@@ -1361,14 +1518,23 @@ def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError
          _iso(now), None if permanent else _iso(now + timedelta(seconds=error.retry_after)),
          task.dataset, task.data_id, task.partition),
     )
+    retry_policy.record_failure(connection, task, error.code, now)
+    retry_cohorts.record_failure(connection, task, error.code, now)
     connection.commit()
 
 
 def _status(connection: sqlite3.Connection, root: Path, *, state: str,
             active: Task | None = None, last: dict[str, Any] | None = None,
             delegated: frozenset[str] = frozenset()) -> dict[str, Any]:
+    # Starting an idle/bounded cycle must not erase its last completed result or
+    # give that result a new timestamp.  Keep the bounded local observation.
+    if last is None:
+        previous = _read_metadata(root / "status.json").get("last_task")
+        if isinstance(previous, dict):
+            last = previous
     summary: dict[str, dict[str, Any]] = {
-        dataset: {"target": 0, "complete": 0, "observed_empty": 0, "failed": 0,
+        dataset: {"target": 0, "complete": 0, "observed_empty": 0, "failed": 0, "retry_exhausted": 0,
+                  "retained_rows": 0, "retained_bytes": 0,
                   "not_entitled": 0, "invalid_request": 0,
                   "rows": 0, "bytes": 0, "first_data_date": None,
                   "last_data_date": None, "last_attempt_at_utc": None}
@@ -1383,8 +1549,11 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
             continue
         item = summary[dataset]
         item["target"] += count
-        if task_state in {"complete", "observed_empty", "failed", "not_entitled", "invalid_request"}:
+        if task_state in {"complete", "observed_empty", "failed", "not_entitled", "invalid_request", "retry_exhausted"}:
             item[task_state] += count
+        if task_state in {'failed', 'retry_exhausted'}:
+            item['retained_rows'] += rows or 0
+            item['retained_bytes'] += size or 0
         if task_state == "complete":
             item["rows"] += rows or 0
             item["bytes"] += size or 0
@@ -1399,11 +1568,15 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
     delisted_stock_ids = _official_delisted_ids(root)
     result = {
         "schema_version": 1, "state": state, "observed_at_utc": _iso(_now()),
+        "dispatch_contract_version": DISPATCH_CONTRACT_VERSION,
+        "history_order": history_order_metadata(),
         "delegated_to_sponsor": sorted(delegated),
         "catalog_source": SOURCE_CATALOG, "scheduled_datasets": list(ALL_DATASETS),
         "news": "enabled_whole_market_calendar_day", "training": "raw_not_pit_validated",
         "series": summary,
-        "historical_frontiers": supplemental.frontier_status(connection),
+        "historical_frontiers": supplemental.frontier_status(connection, _now()),
+        "retry_cohorts": retry_cohorts.summary(connection),
+        "retry_policy": retry_policy.summary(connection),
         "candidate_universe": {
             "finmind_current_master_stock_ids": len(current_stock_ids),
             "official_delisted_stock_ids": len(delisted_stock_ids),
@@ -1440,7 +1613,7 @@ def run_once(root: Path, *, max_requests: int = 0,
         raise RuntimeError("FINMIND_TOKEN is required for the complementary all-free catalog")
     completed = 0
     last: dict[str, Any] | None = None
-    with _db(root / "queue.sqlite3") as connection, requests.Session() as session:
+    with closing(_db(root / "queue.sqlite3")) as connection, connection, requests.Session() as session:
         try:
             account = verified_account(session, token, root.parent)
             limiter = rate_limiter(account)
@@ -1472,9 +1645,10 @@ def run_once(root: Path, *, max_requests: int = 0,
                 return _status(connection, root, state="disk_guard", last=last, delegated=delegated)
             if protected_stock_opening(now):
                 return _status(connection, root, state="protected_opening", last=last, delegated=delegated)
+            reservation = incremental_reservation(root.parent, now)
             budget = backfill_budget(
-                account, root.parent, fixed_incremental_requests=fixed_incremental_demand(root.parent, now),
-                in_flight=0, now=now, prioritize_due=True,
+                account, root.parent, fixed_incremental_requests=reservation['reserve_requests'],
+                in_flight=0, now=now, prioritize_due=True, reservation_plan=reservation,
             )
             if budget.get('remaining', 1) <= 0:
                 return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
@@ -1482,8 +1656,13 @@ def run_once(root: Path, *, max_requests: int = 0,
                               incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True,
                               required_keys=required_keys)
             if task is None:
+                first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
+                if first_history and connection.execute(
+                        "SELECT 1 FROM tasks WHERE dataset=? AND state='failed' "
+                        "AND next_attempt_at_utc>? LIMIT 1", (first_history, _iso(now))).fetchone():
+                    return _status(connection, root, state='waiting_history_retry', last=last, delegated=delegated)
                 if budget['allowed'] and datasets is None and any(
-                    item.get('unseeded_partition_candidates', 0) for item in supplemental.frontier_status(connection).values()
+                    item.get('unseeded_partition_candidates', 0) for item in supplemental.frontier_status(connection, now).values()
                 ):
                     # A holiday-only working set still has an older frontier.
                     # Seed the next bounded batch instead of sleeping an hour.
@@ -1491,7 +1670,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 return _status(connection, root,
                                state="current_queue" if budget["allowed"] else "incremental_reserve",
                                last=last, delegated=delegated)
-            if time.monotonic() - last_status_at >= 55:
+            if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
                 _status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
             bulk = None
@@ -1533,9 +1712,11 @@ def run_once(root: Path, *, max_requests: int = 0,
                             baseline_error = "invalid_local_baseline_full_refetch"
                         history_metadata = request_plan(baseline, now, local.date())
                         context = correction_context(connection, task)
-                        if context:
+                        if context or retry_cohorts.full_probe_required(connection, task):
                             # Correction notices require their complete historical scope.
                             history_metadata = request_plan({}, now, local.date())
+                            if not context:
+                                history_metadata['full_refetch_reason'] = 'unexpected_empty_history_retry'
                         incoming = _fetch_rows(
                             session, limiter, root.parent, task.dataset, token,
                             {"dataset": task.dataset, "data_id": task.data_id,
@@ -1545,6 +1726,13 @@ def run_once(root: Path, *, max_requests: int = 0,
                         )
                         if len(incoming) > BULK_MAX_RESPONSE_ROWS:
                             raise SourceError("response_row_limit")
+                        if baseline_error and not incoming and connection.execute(
+                                'SELECT 1 FROM tasks WHERE dataset=? AND data_id=? AND partition=? AND rows>0',
+                                (task.dataset, task.data_id, task.partition)).fetchone():
+                            # A broken local baseline plus a blank response is
+                            # not a validated zero-history replacement. Keep its
+                            # source evidence and retry without claiming repair.
+                            raise SourceError('empty_response_without_valid_baseline', retry_after=300)
                         if history_metadata['query_shape'] == 'per_id_incremental_overlap' and adjusted_history_changed(old_rows, incoming):
                             history_metadata = request_plan({}, now, local.date())
                             incoming = _fetch_rows(session, limiter, root.parent, task.dataset, token,
@@ -1590,7 +1778,8 @@ def run_once(root: Path, *, max_requests: int = 0,
                     stored_rows = len(rows)
                 last = {"dataset": task.dataset, "data_id": task.data_id,
                         "partition": "bulk_history" if bulk else task.partition,
-                        "status": result_status, "rows": stored_rows}
+                        "status": result_status, "rows": stored_rows,
+                        "observed_at_utc": _iso(_now())}
                 if bulk is not None:
                     last["request_batch"] = bulk.metadata()
                     last["request_batch"].update({"response_rows": len(rows), "stored_rows": stored_rows})
@@ -1604,7 +1793,8 @@ def run_once(root: Path, *, max_requests: int = 0,
                 else:
                     _save_failure(connection, task, error, _now())
                 last = {"dataset": task.dataset, "data_id": task.data_id,
-                        "partition": task.partition, "status": "failed", "error_code": error.code}
+                        "partition": task.partition, "status": "failed", "error_code": error.code,
+                        "observed_at_utc": _iso(_now())}
                 if error.code in {"rate_limited", "invalid_token", "ip_banned"}:
                     return _status(connection, root, state=error.code, last=last, delegated=delegated)
             except (OSError, ValueError, pa.ArrowException) as exc:
@@ -1624,12 +1814,13 @@ def run_once(root: Path, *, max_requests: int = 0,
                     _save_failure(connection, task, error, _now())
                 last = {"dataset": task.dataset, "data_id": task.data_id,
                         "partition": task.partition, "status": "failed",
-                        "error_code": error.code, "exception_type": type(exc).__name__}
+                        "error_code": error.code, "exception_type": type(exc).__name__,
+                        "observed_at_utc": _iso(_now())}
             finally:
                 if bulk is not None:
                     _release_bulk_years(connection, bulk)
             completed += int(task.kind != "derived")
-            if time.monotonic() - last_status_at >= 55:
+            if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
                 _status(connection, root, state="running", last=last, delegated=delegated)
                 last_status_at = time.monotonic()
         return _status(connection, root, state="batch_complete", last=last, delegated=delegated)
@@ -1637,7 +1828,7 @@ def run_once(root: Path, *, max_requests: int = 0,
 
 def _retry_blocked(root: Path) -> int:
     """Explicit operator action after fixing credentials or request parameters."""
-    with _db(root / "queue.sqlite3") as connection:
+    with closing(_db(root / "queue.sqlite3")) as connection, connection:
         cursor = connection.execute(
             "UPDATE tasks SET state='pending', next_attempt_at_utc=NULL, error_code=NULL "
             "WHERE state IN ('not_entitled','invalid_request') AND kind!='year'"
@@ -1658,9 +1849,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--retry-blocked", action="store_true",
                         help="after correcting token/parameters, explicitly requeue blocked per-ID tasks")
+    parser.add_argument('--reopen-exhausted', action='store_true',
+                        help='Explicitly reopen exhausted tasks in --dataset scopes, then exit without any API call')
     args = parser.parse_args(argv)
     if args.max_requests < 0:
         parser.error("--max-requests must be nonnegative")
+    if args.reopen_exhausted and (not args.dataset or args.loop or args.task_key or args.retry_blocked):
+        parser.error('--reopen-exhausted requires --dataset and cannot combine with --loop/--task-key/--retry-blocked')
     required_keys = tuple(dict.fromkeys(tuple(key) for key in args.task_key)) if args.task_key else None
     if required_keys is not None:
         if len(required_keys) > 64 or any(key[0] not in ALL_DATASETS for key in required_keys):
@@ -1668,6 +1863,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.loop or args.retry_blocked or args.dataset:
             parser.error("--task-key is a finite run and cannot be combined with --loop, --retry-blocked or --dataset")
     root = args.root.resolve()
+    if args.reopen_exhausted and not (root / 'queue.sqlite3').is_file():
+        parser.error('--reopen-exhausted requires an existing owner queue')
     root.mkdir(parents=True, exist_ok=True)
     with (root / "worker.lock").open("a+") as handle:
         try:
@@ -1676,12 +1873,26 @@ def main(argv: list[str] | None = None) -> int:
             print("FinMind complement worker already running", file=sys.stderr)
             return 2
         try:
+            if args.reopen_exhausted:
+                with closing(_db(root / 'queue.sqlite3')) as connection, connection:
+                    changed = retry_policy.reopen(connection, tuple(args.dataset), _now())
+                    retry_cohorts.reconcile(connection, _now())
+                print(json.dumps({'reopened_exhausted_tasks': changed, 'provider_calls': 0}), flush=True)
+                return 0
             if args.retry_blocked:
                 print(json.dumps({"requeued_blocked_tasks": _retry_blocked(root)}), flush=True)
             while True:
-                result = run_once(root, max_requests=args.max_requests,
-                                  datasets=tuple(args.dataset) if args.dataset is not None else None,
-                                  required_keys=required_keys)
+                try:
+                    result = run_once(root, max_requests=args.max_requests,
+                                      datasets=tuple(args.dataset) if args.dataset is not None else None,
+                                      required_keys=required_keys)
+                except sqlite3.OperationalError as error:
+                    if not args.loop or not retryable_queue_error(error):
+                        raise
+                    # The connection context rolls back; the next ordinary
+                    # cycle recovers claims/receipts under the same owner lock.
+                    # Do not replace acquisition status with invented success.
+                    result = {'state': 'queue_busy', 'error_code': 'sqlite_busy'}
                 print(json.dumps({"state": result["state"], "last_task": result.get("last_task")},
                                  ensure_ascii=False), flush=True)
                 if not args.loop:
@@ -1691,7 +1902,8 @@ def main(argv: list[str] | None = None) -> int:
                 delay = (3600 if result["state"] in {"current_queue", "disk_guard"}
                          else 1800 if result["state"] == "ip_banned"
                          else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
-                         else 60 if result["state"] == "incremental_reserve" else 5)
+                         else 60 if result["state"] in {"incremental_reserve", "waiting_history_retry"}
+                         else 0 if result['state'] == 'batch_complete' and result.get('next_task') else 5)
                 wait_for_next_cycle(root, result, delay,
                                     sources=supplemental.SOURCES.values(), snapshot_hours=(0, 8, 14, 17))
         except KeyboardInterrupt:

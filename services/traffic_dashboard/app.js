@@ -9,6 +9,7 @@ let activeController = null;
 let requestSequence = 0;
 let historyController = null;
 let historyRequestSequence = 0;
+let lastHistoryRange = null;
 
 const integer = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 0});
 const decimal = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 2});
@@ -274,6 +275,7 @@ function render(data) {
   $("kpi-p50").textContent = milliseconds(minute.latency_p50_ms);
   $("kpi-p95").textContent = milliseconds(minute.latency_p95_ms);
   $("kpi-p99").textContent = milliseconds(minute.latency_p99_ms);
+  $("kpi-errors").textContent = ratio(minute.error_ratio);
   $("kpi-concurrency").textContent = `${count(data.connections?.in_flight)}／${count(data.connections?.peak_in_flight)}`;
   $("cache-ratio").textContent = ratio(data.cache?.hit_ratio);
   $("cache-hits").textContent = count(data.cache?.hits);
@@ -536,36 +538,47 @@ async function refresh({manual = false} = {}) {
     const renderStarted = performance.now(); render(data); const renderedAt = performance.now();
     renderLocalTiming({started, server: serverTiming(response), headers: headersAt - started, download: downloadedAt - headersAt, parse: parsedAt - parsedAtStart, render: renderedAt - renderStarted});
   } catch (error) {
-    if (error?.name === "AbortError") return;
-    $("live-dot").className = "live-dot bad"; $("live-status").textContent = `讀取失敗：${error}`;
+    if (sequence !== requestSequence || error?.name === "AbortError") return;
+    $("live-dot").className = "live-dot bad"; $("live-status").textContent = "更新失敗 · 保留上次觀測";
   } finally {
     if (activeController === controller) activeController = null;
   }
 }
 
 async function refreshHistory({manual = false} = {}) {
+  if (!Dashboard.isElementVisible("traffic-history")) return;
   if (historyController && !manual) return;
   if (historyController) historyController.abort();
   const controller = new AbortController(); historyController = controller;
   const sequence = ++historyRequestSequence;
   const range = $("history-range").value;
+  if (lastHistoryRange !== range) {
+    renderHistory({});
+    $("history-status").textContent = "正在讀取新範圍；不沿用其他範圍的曲線。";
+    lastHistoryRange = range;
+  }
   try {
     const response = await Dashboard.fetchWithTimeout(`api/history?range=${encodeURIComponent(range)}`, {
       cache: "no-store",
       signal: controller.signal,
       timeoutMs: FETCH_TIMEOUT_MS,
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== historyRequestSequence || range !== $("history-range").value) return;
     renderHistory(data);
   } catch (error) {
-    if (error?.name === "AbortError") return;
-    $("history-status").textContent = `歷史測速讀取失敗：${error}`;
+    if (sequence !== historyRequestSequence || range !== $("history-range").value || error?.name === "AbortError") return;
+    $("history-status").textContent = "歷史更新失敗；僅保留同範圍上次觀測，不代表來源沒有資料。";
   } finally {
     if (historyController === controller) historyController = null;
   }
 }
+
+renderChart = Dashboard.createDeferredRenderer("traffic-chart", renderChart);
+renderWindows = Dashboard.createDeferredRenderer("traffic-windows", renderWindows);
+renderRoutes = Dashboard.createDeferredRenderer("traffic-routes", renderRoutes);
+renderBrowserPerformance = Dashboard.createDeferredRenderer("browser-performance", renderBrowserPerformance);
+Dashboard.observeVisibility("traffic-history", (visible) => { if (visible) void refreshHistory(); });
 
 $("refresh-now").addEventListener("click", () => {
   void refresh({manual: true});

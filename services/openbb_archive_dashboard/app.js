@@ -15,6 +15,8 @@ const hiddenSeries = new Set();
 let range = "1d";
 let refreshInFlight = false;
 const historyRequest = Dashboard.createLatestRequest();
+let historyRange = null;
+let historyInFlight = false;
 
 const $ = Dashboard.byId;
 const finite = (value, fallback = 0) => Dashboard.finiteNumber(value, fallback);
@@ -47,7 +49,7 @@ function renderStatus(data) {
     : "";
   const waitReason = process.wait_reason === "provider_cooldown" ? "供應商配額冷卻" : "等待排程條件";
   const waitUntil = process.wait_until
-    ? ` · 最早重試 ${new Date(process.wait_until).toLocaleString("zh-TW", {hour12: false})}`
+    ? ` · 最早重試 ${new Date(process.wait_until).toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false})}`
     : "";
   const waitDetail = health === "waiting" ? ` · ${waitReason}${waitUntil}` : "";
   $("source-freshness").textContent = `${phaseLabel}${phaseProgress}${waitDetail} · 程序活動 ${ageLabel(process.activity_age_seconds)} · 完整稽核 ${ageLabel(data.source_age_seconds)}（${data.snapshot_state === "current" ? "新鮮" : "逾時"}）`;
@@ -69,7 +71,7 @@ function renderStatus(data) {
   const deferred = finite(archive.retry_deferred_tasks);
   const repair = finite(archive.repair_queue_tasks);
   const retryAt = archive.next_task_retry_at
-    ? new Date(archive.next_task_retry_at).toLocaleString("zh-TW", {hour12: false})
+    ? new Date(archive.next_task_retry_at).toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false})
     : "—";
   const retryDetails = [];
   if (deferred > 0) {
@@ -251,16 +253,30 @@ function renderChart(rows) {
 }
 
 async function loadHistory() {
+  if (!Dashboard.isElementVisible("trend")) return;
+  if (historyInFlight && historyRange === range) return;
   const requestedRange = range;
+  if (historyRange !== range) {
+    renderChart([]);
+    $("chart-empty").textContent = "正在讀取這個時間範圍；不沿用其他範圍的曲線。";
+  }
+  historyRange = range;
+  historyInFlight = true;
+  $("history-status").textContent = "讀取中；曲線只代表歷史完整稽核快照。";
   const request = historyRequest.begin();
   try {
     const data = await fetchJson(`api/history?range=${encodeURIComponent(requestedRange)}`, {signal: request.signal});
     if (!request.isCurrent() || requestedRange !== range) return;
-    renderChart(Array.isArray(data.history) ? data.history : []);
+    if (!Array.isArray(data.history)) throw new Error("Invalid history snapshot");
+    renderChart(data.history);
+    $("chart-empty").textContent = "這個時間範圍尚無完整稽核快照。";
+    $("history-status").textContent = "歷史快照已更新；不是所有資料已抓齊的證明。";
   } catch (error) {
-    if (!request.isCurrent() || error?.name === "AbortError") return;
-    renderChart([]);
+    if (!request.isCurrent() || requestedRange !== range || error?.name === "AbortError") return;
+    $("history-status").textContent = "歷史讀取失敗；保留同範圍上次曲線，尚無成功資料時維持空白。";
+    $("chart-empty").textContent = "此範圍暫無可顯示的成功快照；讀取失敗不等於來源沒有資料。";
   } finally {
+    if (request.isCurrent()) historyInFlight = false;
     request.finish();
   }
 }
@@ -269,7 +285,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   const statusPromise = fetchJson("api/status");
-  const historyPromise = loadHistory();
+  void loadHistory();
   try {
     renderStatus(await statusPromise);
   } catch (_error) {
@@ -278,7 +294,6 @@ async function refresh() {
     status.lastChild.textContent = "無法取得";
     $("source-freshness").textContent = "公開狀態 API 暫時不可用";
   } finally {
-    await historyPromise;
     refreshInFlight = false;
   }
 }
@@ -296,4 +311,7 @@ for (const button of document.querySelectorAll("[data-range]")) {
   });
 }
 renderLegend();
+renderCategories = Dashboard.createDeferredRenderer("categories", renderCategories);
+renderProviders = Dashboard.createDeferredRenderer("providers", renderProviders);
+Dashboard.observeVisibility("trend", (visible) => { if (visible) void loadHistory(); });
 Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS});

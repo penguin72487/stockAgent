@@ -2,6 +2,9 @@
 Description=Aggregate memory safety boundary for resumable heavy data work
 
 [Slice]
+CPUWeight=20
+IOAccounting=true
+IOWeight=20
 MemoryAccounting=true
 # The host has 94 GiB RAM.  The 08:30 audit has peaked near 59 GiB and the
 # historical backfill near 75 GiB.  Constrain their aggregate, not just each

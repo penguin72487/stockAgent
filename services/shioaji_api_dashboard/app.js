@@ -736,4 +736,13 @@ $("storage-time-range").addEventListener("click", (event) => {
 syncTimeRangeControl("traffic-time-range", trafficTimeRange);
 syncTimeRangeControl("storage-time-range", storageTimeRange);
 syncTrafficLegend();
+renderPipelines = Dashboard.createDeferredRenderer("pipelines", renderPipelines);
+renderTrafficChart = Dashboard.createDeferredRenderer("traffic-chart", renderTrafficChart);
+renderTrafficTable = Dashboard.createDeferredRenderer("traffic-body", renderTrafficTable);
+renderTrafficLedger = Dashboard.createDeferredRenderer("ledger-body", renderTrafficLedger);
+renderTrafficBreakdown = Dashboard.createDeferredRenderer("traffic-breakdown-body", renderTrafficBreakdown);
+renderStorageGrowthChart = Dashboard.createDeferredRenderer("storage-growth-chart", renderStorageGrowthChart);
+renderStorageBars = Dashboard.createDeferredRenderer("storage-bars", renderStorageBars);
+renderStorageTable = Dashboard.createDeferredRenderer("storage-body", renderStorageTable);
+renderContracts = Dashboard.createDeferredRenderer("contracts-body", renderContracts);
 Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS});

@@ -1,0 +1,22 @@
+[Unit]
+Description=StockAgent serial TEJ trial API native history acquisition
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_tej_api_trial.sh"
+UMask=0077
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryAccounting=true
+MemoryHigh=512M
+MemoryMax=1024M
+TasksMax=32
+TimeoutStartSec=6h
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

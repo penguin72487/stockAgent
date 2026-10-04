@@ -2,6 +2,36 @@
 
 Use for compile, cache, batch, throughput or hardware investigations. Measure the complete requested workflow. Timings and tuning values below are observations of the named shape, hardware and experiment; they are starting points, not requirements for unrelated configurations. For vastai1T TW day-trade acceptance use two-GPU DDP, the formal global batch, the complete fold lifecycle and steady epoch 3+ maximum-rank wall time as specified in runtime.md. Epoch 2 observations below are historical or diagnostic. No benchmark result authorizes changing accounting or silently skipping work.
 
+## Remote node selection
+
+The user's 2026-10-03 instruction requires every remote build to use that node's
+actual conditions and measured performance. Previous winners are measurement
+seeds, never evidence that a different machine/workload has the same optimum.
+Before selection observe CPU model/topology/NUMA, process affinity, accessible
+cgroup ancestors and CPU-time quota, RAM limit/headroom, source/output storage,
+current load/pressure and, for GPU work, GPU/VRAM/driver/CUDA and active owners.
+Host-visible CPU count and MemAvailable alone do not establish container capacity.
+
+Measure the complete requested build/epoch/fold, keeping source verification,
+summary, evaluation, output, curves and checkpoints. Compare feasible candidates
+under the same code/config/source/runtime, repeat finalists in balanced order,
+and select by measured total wall time when speed is the requested priority.
+Record CPU-seconds, peak memory, I/O and output parity alongside timings. CPU
+quota limits CPU time; bounded pool oversubscription is a measurable candidate,
+not a larger CPU entitlement. Report overlapping timing ranges honestly.
+
+Bind the selection to observed node limits/topology/storage, exact workload and
+artifact/runtime identities. Changed conditions require new measurements; for
+an updated workload, previous winners may seed a smaller measured comparison
+before widening it. GPU tuning still uses the canonical manager/preflight/lifecycle.
+
+The reusable CPU observation helper is `stockagent/remote_build.py`; the first
+complete source-build implementation is
+`scripts/benchmark_tw_public_remote_derivation.py`. Commands and current scope
+are in [Remote build workflow](../remote_build_workflow.md). Other workloads keep
+their canonical builders and require their own measurements and parity proof;
+the TW source result is not a universal training/installation recommendation.
+
 ## Epoch-Level Timing And Throughput
 
 The user cares about total epoch wall time, not only train step time.
@@ -71,7 +101,11 @@ Rules:
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead. For `tw_minute`, compute that audit-only loss over the first calendar year of the current fold's test interval, record its year/row scope in `epoch_curve.jsonl`, and never use it for checkpoint selection, early stopping, or the scheduler.
 - Keep curve plotting async where possible.
-- When comparing throughput after compile, chunking, or cache changes, use the second epoch or later steady-state numbers. Do not choose defaults from the first epoch, because compile/autotune/warmup can dominate it.
+- Compare throughput in the selected benchmark's steady-state acceptance
+  window. For vastai1T TW day-trade, use epoch 3+ maximum-rank wall time under
+  the [runtime contract](runtime.md); epoch 2 is diagnostic there. Keep cold
+  compile/autotune/warmup measurements separate rather than choosing defaults
+  from the first epoch.
 - For the high-throughput TW cash candles configuration, keep
   `finite_check_interval_steps: 0` and `checkpoint_finite_check: false` when the
   user opts out of scanners. Prevent non-finite states in the settlement math

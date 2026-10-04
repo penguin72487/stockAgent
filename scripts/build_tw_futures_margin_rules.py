@@ -23,6 +23,7 @@ from stockagent.data.tw_futures_margin_preparation import (
     bind_equity_position_families,
     bind_physical_position_inputs,
     load_unchanged_position_member_scopes,
+    load_reviewed_incumbent_position_member_scopes,
     bind_adjusted_terminal_values,
 )
 
@@ -39,7 +40,8 @@ def prepare_all_twd_margin_inputs(args):
     if any(getattr(args, key) is None for key in required):
         raise ValueError('all-twd requires --physical-history, --rule-candidates and --product-universe')
     member_path=getattr(args,'position_generation_proof',None)
-    if member_path and not args.position_family_review:
+    incumbent_path=getattr(args,'position_incumbent_proof',None)
+    if (member_path or incumbent_path) and not args.position_family_review:
         raise ValueError('position generation proof requires a dated position family law')
     out = args.output_dir
     if out.exists() and any(out.iterdir()):
@@ -118,6 +120,7 @@ def prepare_all_twd_margin_inputs(args):
         units=bind_dated_corporate_terms(adjusted.select('date','product','contract'),
             corporate_unit_levels,unit_only=True)
     position_intervals=pl.read_parquet(args.rule_candidates/'position_level_intervals.parquet')
+    securities_combinations=(position_intervals['event_type']=='combined_securities_position_formula').any()
     if args.position_family_review:
         import gzip,hashlib
         review=json.loads(args.position_family_review.read_text())
@@ -141,13 +144,17 @@ def prepare_all_twd_margin_inputs(args):
         position=bind_dated_position_combinations(frame.select('date','product'),position_intervals)
     physical_position=None
     member_scopes=None
+    incumbent_scopes=None
     if member_path:
         member_scopes,member_sources=load_unchanged_position_member_scopes(member_path)
         sources.update(member_sources)
+    if incumbent_path:
+        incumbent_scopes,incumbent_sources=load_reviewed_incumbent_position_member_scopes(incumbent_path)
+        sources.update(incumbent_sources)
     if args.position_family_review:
         physical_position=bind_physical_position_inputs(frame.select('date','product','contract'),
             position,units,universe,review['rules'],corporate_unit_intervals=corporate_unit_levels,
-            unchanged_member_scopes=member_scopes)
+            unchanged_member_scopes=member_scopes,reviewed_incumbent_member_scopes=incumbent_scopes)
     rights=None
     if args.terminal_subscription_values:
         receipt=json.loads(args.terminal_subscription_values.with_name('manifest.json').read_text())
@@ -229,9 +236,12 @@ def prepare_all_twd_margin_inputs(args):
     gaps.write_csv(out / 'margin_binding_gaps.csv')
     outputs = {path.name: dict(sha256=sha256_file(path), bytes=path.stat().st_size)
                for path in sorted(out.iterdir()) if path.is_file()}
-    summary = dict(dataset='taifex_all_twd_margin_inputs', schema_version=5 if member_scopes is not None else 4,
-        position_source_scope_contract='direct_corporate_securities_cap_verified_member_v4'
-            if member_scopes is not None else 'direct_corporate_securities_cap_original_month_v2',
+    summary = dict(dataset='taifex_all_twd_margin_inputs',
+        schema_version=7 if securities_combinations else (6 if incumbent_scopes is not None else (5 if member_scopes is not None else 4)),
+        position_source_scope_contract='direct_corporate_securities_cap_own_month_share_combination_v6'
+            if securities_combinations else ('direct_corporate_securities_cap_verified_incumbent_month_v5'
+            if incumbent_scopes is not None else ('direct_corporate_securities_cap_verified_member_v4'
+            if member_scopes is not None else 'direct_corporate_securities_cap_original_month_v2')),
         status='margin_inputs_bound_requires_product_accounting_admission',
         point_in_time_verified=False, all_products_training_ready=False,
         created_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -270,6 +280,8 @@ def main():
     parser.add_argument('--execution-terms', type=Path)
     parser.add_argument('--specifications', type=Path,
                         help='Source-bound dated product specifications; missing values remain explicit blockers.')
+    parser.add_argument('--position-research-policy', type=Path,
+                        help='Explicit research-only previous-capacity policy; never verifies official historical limits.')
     parser.add_argument('--slot-count', type=int, default=2816)
     parser.add_argument('--physical-history', type=Path)
     parser.add_argument('--rule-candidates', type=Path)
@@ -282,6 +294,8 @@ def main():
                         help='Dated same-security position laws; changed shares still require an explicit cap.')
     parser.add_argument('--position-generation-proof',type=Path,
                         help='Immutable source-verified physical member scopes; never supplies a numeric cap.')
+    parser.add_argument('--position-incumbent-proof',type=Path,
+                        help='Immutable printed incumbent grid plus its own prior monthly declarations; never supplies financial events.')
     parser.add_argument("--archive", type=Path, default=Path("data_taifex_public_history/rules"))
     parser.add_argument("--daily", type=Path)
     parser.add_argument("--official-evidence", type=Path)
@@ -291,6 +305,8 @@ def main():
     parser.add_argument("--start", type=date.fromisoformat)
     parser.add_argument("--end", type=date.fromisoformat)
     args = parser.parse_args()
+    if args.position_research_policy and (args.scope != 'all-twd' or args.stage != 'terms'):
+        parser.error('--position-research-policy applies to --scope all-twd --stage terms only')
     if args.scope == 'all-twd':
         if args.stage == 'inputs':
             prepare_all_twd_margin_inputs(args)
@@ -314,7 +330,8 @@ def main():
                 parser.error('full TWD terms cannot silently truncate requested history')
             result = build_all_twd_execution_terms(materialization=args.materialization,
                 margin_inputs=args.margin_inputs, rule_candidates=args.rule_candidates,
-                specifications=args.specifications, output=args.output_dir)
+                specifications=args.specifications, output=args.output_dir,
+                position_research_policy=args.position_research_policy)
             print(json.dumps({k: v for k, v in result.items() if k not in ('outputs', 'sources', 'source_sha256s', 'requested_products')}, indent=2))
             if result['status'] != 'complete':
                 raise SystemExit(2)

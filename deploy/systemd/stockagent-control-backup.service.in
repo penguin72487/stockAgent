@@ -1,0 +1,17 @@
+[Unit]
+Description=Private logical backup of StockAgent engineering control database
+After=postgresql.service
+ConditionPathExists=__CONTROL_ENV_FILE__
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment="STOCKAGENT_CONTROL_ENV_FILE=__CONTROL_ENV_FILE__"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_control_plane_backup.sh
+Slice=stockagent-control.slice
+Nice=10
+CPUWeight=20
+MemoryHigh=128M
+MemoryMax=256M
+TimeoutStartSec=240
+UMask=0077

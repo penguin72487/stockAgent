@@ -148,6 +148,7 @@ def backfill_budget(
     account: dict[str, object], traffic_root: Path, *,
     fixed_incremental_requests: int, in_flight: int = 0,
     now: datetime | None = None, prioritize_due: bool = False,
+    reservation_plan: dict | None = None,
 ) -> dict[str, int | bool | str]:
     """Admit historical work only after protecting the fixed incremental lane.
 
@@ -198,9 +199,12 @@ def backfill_budget(
     schedule_verified = True
     if prioritize_due:
         from downloader.finmind_scheduling import incremental_reservation
-        plan = incremental_reservation(traffic_root, current)
+        plan = reservation_plan if reservation_plan is not None else incremental_reservation(traffic_root, current)
         ready = plan['ready_requests']
         schedule_verified = not plan['queue_errors']
+        if reservation_plan is not None:
+            schedule_verified = bool(schedule_verified and plan.get('observed_at_utc') == current.isoformat()
+                                     and plan.get('reserve_requests') == fixed_incremental_requests)
         priority_wait = ready > 0 or not schedule_verified
     return {"allowed": remaining > reserve + in_flight and not priority_wait,
             "remaining": remaining, "reserve": reserve,

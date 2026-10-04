@@ -4,6 +4,8 @@ import json
 import pytest
 
 from downloader.finmind_eta_stages import ordered_estimate, stage_workloads
+from downloader.finmind_eta import SNAPSHOT_CONTRACT_VERSION
+from downloader.finmind_history_order import STAGES
 from stockagent.live.finmind_eta_projection import public_completion_estimate
 from test_finmind_eta import NOW, evidence
 
@@ -13,6 +15,9 @@ def inputs():
     telemetry['quota']['recurring_forecast'] = {
         'requests_per_hour_by_phase': {'core': 100, 'detail': 900, 'tick': 500},
         'new_partition_requests_per_hour_by_phase': {'core': 0, 'detail': 100, 'tick': 200},
+        'requests_per_hour_by_stage': {'incremental': 100, 'core': 0, 'tw_futures_minute': 900,
+                                       'tw_stock_tick': 500},
+        'new_partition_requests_per_hour_by_stage': {'tw_futures_minute': 100, 'tw_stock_tick': 200},
     }
     rows = []
     for dataset, count in [('TaiwanStockNews', 5500), ('TaiwanFuturesKBar', 16500),
@@ -37,8 +42,8 @@ def run(work=None, telemetry=None, admission=None):
 def test_stages_are_disjoint_and_override_precedes_core():
     work, _ = inputs()
     stages = stage_workloads(work)
-    assert [x['key'] for x in stages] == ['priority', 'core', 'detail', 'tick', 'validation']
-    assert [x['summary']['current_plan_requests'] for x in stages] == [5500, 5500, 11000, 4100, 100]
+    assert [x['key'] for x in stages] == [key for key, _ in STAGES]
+    assert [x['summary']['current_plan_requests'] for x in stages] == [5500, 5500, 0, 11000, 0, 0, 4100, 0, 0, 0, 0, 100]
     assert stages[-1]['cumulative_planned_requests'] == 26200
     assert sum(x['summary']['unbatched_requests'] for x in stages) == 26200
 
@@ -52,7 +57,7 @@ def test_retry_work_and_cooldowns_follow_their_actual_stage_not_whole_dataset():
     work['datasets'][1]['priority_override'].update(retry_tasks=1)
     work['summary']['retry_tasks'] = 32
     stages = stage_workloads(work)
-    assert [s['summary']['retry_tasks'] for s in stages] == [21, 10, 1, 0, 0]
+    assert [s['summary']['retry_tasks'] for s in stages] == [21, 10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
     assert stages[0]['summary']['max_retry_wait_seconds'] == 60
     assert stages[1]['summary']['max_retry_wait_seconds'] == 900
     result = run(work, telemetry)
@@ -65,11 +70,12 @@ def test_timed_release_never_subtracts_tomorrows_burst_from_early_stage(tmp_path
     work, telemetry = inputs()
     forecast = telemetry['quota']['recurring_forecast']
     forecast['requests_per_hour_by_phase']['incremental'] = 1000
+    forecast['requests_per_hour_by_stage']['incremental'] = 1000
     forecast['timed_incremental'] = {'state': 'modeled', 'events': [{
         'first_at_utc': (NOW + timedelta(hours=2)).isoformat(), 'interval_seconds': 86400,
         'requests': 24000, 'session_only': False}]}
     result = run(work, telemetry)
-    assert result['schema_version'] == 4
+    assert result['schema_version'] == SNAPSHOT_CONTRACT_VERSION
     first = result['stages'][0]['scenarios']['central']
     assert first['forecast_refresh_requests'] == 0
     assert first['remaining_seconds'] < 3600
@@ -78,12 +84,13 @@ def test_timed_release_never_subtracts_tomorrows_burst_from_early_stage(tmp_path
     assert sum(s['scenarios']['central'].get('forecast_refresh_requests', 0) for s in result['stages']) >= 24000
     (tmp_path / 'eta_status.json').write_text(json.dumps({'schema_version': 1, 'estimate': result}))
     public = public_completion_estimate(tmp_path, NOW)
-    assert public['schema_version'] == 4
+    assert public['schema_version'] == SNAPSHOT_CONTRACT_VERSION
 
 
 def test_phase_capacity_reconciliation_and_lower_priority_arrivals():
     result = run()
-    stages = result['stages']
+    stages = [item for item in result['stages'] if item['key'] in
+              {'priority', 'core', 'tw_futures_minute', 'tw_stock_tick', 'validation'}]
     assert [x['rate_evidence']['future_recurring_requests_per_hour'] for x in stages] == [100, 100, 1000, 1500, 1500]
     assert [x['scenarios']['central']['effective_requests_per_hour'] for x in stages] == [5500, 5500, 4600, 4100, 4100]
     central = [x['scenarios']['central'] for x in stages]
@@ -122,6 +129,7 @@ def test_conditional_own_required_admission_is_satisfied_by_predecessors_only():
 def test_finite_override_only_competes_with_priority_zero_future_refreshes():
     work, telemetry = inputs()
     telemetry['quota']['recurring_forecast']['requests_per_hour_by_phase'].update(incremental=50)
+    telemetry['quota']['recurring_forecast']['requests_per_hour_by_stage'].update(incremental=50, core=100)
     work['datasets'][0].update(incremental_requests=20, backfill_requests=5480)
     result = run(work, telemetry)
     assert result['stages'][0]['workload']['planned_requests'] == 5520
@@ -167,6 +175,7 @@ def test_empty_stages_take_no_extra_capacity_or_service_time():
     work['summary'].update(current_plan_requests=5500, unbatched_requests=5500,
                            required_requests=5500, validation_requests=0)
     telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_phase'] = {}
+    telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_stage'] = {}
     result = run(work, telemetry)
     assert result['scenarios']['central']['remaining_seconds'] == 3600
     assert result['stages'][0]['scenarios']['central']['remaining_seconds'] == 0
@@ -178,6 +187,7 @@ def test_empty_final_stage_is_not_a_completed_cumulative_milestone(tmp_path):
     work['summary'].update(current_plan_requests=5500, unbatched_requests=5500,
                            required_requests=5500, validation_requests=0)
     telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_phase'] = {}
+    telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_stage'] = {}
     result = run(work, telemetry)
     assert result['stages'][-1]['state'] == 'current'
     for key in ('core', 'non_tick', 'all'):
@@ -194,7 +204,7 @@ def test_empty_final_stage_is_not_a_completed_cumulative_milestone(tmp_path):
 
 def test_milestone_counts_and_work_are_cumulative_not_last_stage_only():
     result = run()
-    for key, index in (('core', 1), ('non_tick', 2), ('all', 4)):
+    for key, index in (('core', 1), ('non_tick', 10), ('all', 11)):
         milestone = result['milestones'][key]
         prefix = result['stages'][:index + 1]
         assert milestone['workload']['planned_requests'] == sum(s['workload']['planned_requests'] for s in prefix)
@@ -209,6 +219,7 @@ def test_empty_milestone_remains_current_and_unknown_predecessor_remains_waiting
     work['summary'].update(current_plan_requests=0, unbatched_requests=0,
                            required_requests=0, validation_requests=0)
     telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_phase'] = {}
+    telemetry['quota']['recurring_forecast']['new_partition_requests_per_hour_by_stage'] = {}
     assert all(item['state'] == 'current' for item in run(work, telemetry)['milestones'].values())
     work, telemetry = inputs()
     telemetry['quota']['current_budget'] = {'allowed': False}

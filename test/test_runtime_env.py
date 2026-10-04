@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from stockagent.runtime_env import normalize_cuda_env, normalize_python_env
 
 
@@ -128,6 +130,30 @@ printf 'runtime-ready\n'
     )
 
     assert result.stdout == "runtime-ready\n"
+
+
+@pytest.mark.parametrize('explicit_python', [False, True])
+def test_explicit_symlinked_virtual_role_keeps_its_environment(tmp_path, explicit_python):
+    repo_root = Path(__file__).resolve().parents[1]
+    role = tmp_path / 'control role'
+    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(role)], check=True)
+    assert (role / 'bin/python').is_symlink()
+    environment = {**os.environ, 'FINTECH_ENV_PATH': str(role),
+                   'CONDA_PREFIX': sys.prefix, 'CONDA_DEFAULT_ENV': 'fintech'}
+    environment.pop('PYTHON_BIN', None)
+    if explicit_python:
+        environment['PYTHON_BIN'] = str(role / 'bin/python')
+    shell = '''
+set -e
+source "$1/scripts/runtime_env.sh"
+printf '%s\\n' "$FINTECH_ENV_PATH"
+run_fintech_python -c 'import sys; print(sys.prefix); print(sys.base_prefix)'
+'''
+    result = subprocess.run(['bash', '-c', shell, 'bash', str(repo_root)], env=environment,
+                            text=True, capture_output=True, check=True)
+    selected, actual, base = result.stdout.splitlines()
+    assert selected == actual == str(role)
+    assert base != actual
 
 
 def test_cuml_umap_uses_random_init_to_avoid_spectral_fallback_warning(monkeypatch) -> None:

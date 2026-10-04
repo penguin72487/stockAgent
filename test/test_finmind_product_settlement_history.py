@@ -99,7 +99,7 @@ def test_product_query_rejects_missing_identifier_before_fetch_and_future_rows(t
         c._request(object(), object(), tmp_path, task, "placeholder", today=NOW.date())
 
 
-def test_successful_product_history_is_reserved_incremental_with_three_hour_refresh(tmp_path):
+def test_successful_product_history_refreshes_on_next_publishing_day(tmp_path):
     dataset = "TaiwanFuturesFinalSettlementPrice"
     task = c.Task(dataset, "TX", "history", "id_history", 3, "pending")
     empty = c.Task(dataset, "ZZF", "history", "id_history", 3, "pending")
@@ -109,9 +109,10 @@ def test_successful_product_history_is_reserved_incremental_with_three_hour_refr
         c._save_result(conn, task, good, NOW)
         c._save_result(conn, empty, c._store(tmp_path, empty, [], NOW), NOW)
         assert conn.execute("SELECT priority,next_attempt_at_utc FROM tasks WHERE data_id='TX'").fetchone() == (
-            0, "2026-09-27T10:00:00+00:00",
+            0, "2026-09-27T16:00:00+00:00",  # Sunday fetch -> Monday 00:00 Taipei.
         )
         assert conn.execute("SELECT priority,next_attempt_at_utc FROM tasks WHERE data_id='ZZF'").fetchone() == (
             3, "2026-10-27T07:00:00+00:00",
         )
-        assert c._next_task(conn, datetime(2026, 9, 27, 10, 1, tzinfo=UTC), incremental_only=True).data_id == "TX"
+        assert c._next_task(conn, datetime(2026, 9, 27, 10, 1, tzinfo=UTC), incremental_only=True) is None
+        assert c._next_task(conn, datetime(2026, 9, 27, 16, 0, tzinfo=UTC), incremental_only=True).data_id == "TX"

@@ -371,10 +371,35 @@ def test_acquisition_fingerprint_is_stable_separate_from_unchanged_feature_abi()
     encoded = json.dumps(acquisition["contract"], sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == acquisition["fingerprint_sha256"]
     assert catalog["acquisition"] == acquisition
-    assert acquisition["contract"]["version"] == 2
+    assert acquisition["contract"]["version"] == 3
     assert acquisition["contract"]["feature_schema_version"] == catalog["schema_version"] == 1
     acquisition["contract"]["version"] = -1
-    assert features.feature_acquisition_payload()["contract"]["version"] == 2
+    assert features.feature_acquisition_payload()["contract"]["version"] == 3
+
+
+def test_oversized_history_page_retries_exact_request_without_committing_bad_rows():
+    calls = []
+    pages = iter([[["90"], ["80"], ["70"]], [["90"], ["80"]]])
+    def get(path, params):
+        calls.append((path, dict(params)))
+        return {"data": next(pages)}
+    rows, oldest = features._history_page(
+        SimpleNamespace(get=get), features.OPEN_INTEREST_HISTORY_ENDPOINT,
+        {"limit": "2", "end": "100", "begin": "10"}, cursor_ms=100,
+    )
+    assert rows == [["90"], ["80"]]
+    assert oldest == 80
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+def test_persistent_oversized_page_still_fails_closed_after_bounded_retry():
+    calls = []
+    def get(path, params):
+        calls.append((path, dict(params)))
+        return {"data": [["90"], ["80"], ["70"]]}
+    with pytest.raises(ValueError, match="exceeds requested limit after exact request retry"):
+        features._history_page(SimpleNamespace(get=get), "/history", {"limit": "2"}, cursor_ms=100)
+    assert len(calls) == 2 and calls[0] == calls[1]
 
 
 def test_full_enrichment_preserves_existing_prices_when_index_stage_fails(tmp_path, monkeypatch):

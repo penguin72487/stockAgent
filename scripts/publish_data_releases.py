@@ -85,9 +85,13 @@ def _source_coordination_lock(
         part in {"", ".", ".."} for part in relative.parts
     ):
         raise SnapshotError(f"invalid source coordination lock: {configured!r}")
-    path = (REPO_ROOT / relative).resolve()
-    if not path.is_relative_to(REPO_ROOT.resolve()):
-        raise SnapshotError(f"source coordination lock leaves repo: {configured!r}")
+    scope = entry.get("source_coordination_lock_scope", "repo")
+    if scope not in {"repo", "source_parent"}:
+        raise SnapshotError(f"invalid source coordination lock scope: {scope!r}")
+    lock_root = REPO_ROOT if scope == "repo" else _source_path(entry).resolve().parent
+    path = (lock_root / relative).resolve()
+    if not path.is_relative_to(lock_root.resolve()):
+        raise SnapshotError(f"source coordination lock leaves {scope}: {configured!r}")
     if inherited_fd is not None:
         if type(inherited_fd) is not int or inherited_fd < 3:
             raise SnapshotError("inherited source lock fd must be an integer >= 3")
@@ -414,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node-id")
     parser.add_argument(
         "--defer-scan", action="store_true",
-        help="Commit and durably queue scans; the source-lock owner must immediately drain outside its lease.",
+        help="Commit and durably queue scans; the source-lock owner must start the canonical drain outside its lease.",
     )
     parser.add_argument(
         "--source-lock-fd", type=int,

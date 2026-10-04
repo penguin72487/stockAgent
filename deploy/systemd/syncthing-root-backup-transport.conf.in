@@ -1,0 +1,4 @@
+[Unit]
+Requires=stockagent-backup-transport-mount.service
+BindsTo=stockagent-backup-transport-mount.service
+After=stockagent-backup-transport-mount.service

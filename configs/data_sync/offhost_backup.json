@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "relay_node_id": "lab203",
+  "source_cold_root": "/srv/stockagent-packed",
+  "nas": {
+    "host": "140.127.208.143",
+    "share": "Lab203",
+    "relative_directory": "學生上傳區/錢昱名",
+    "mount_point": "/mnt/stockagent-lab-nas",
+    "credentials_file": "/etc/stockagent/nas.credentials",
+    "repository_directory": "stockagent-restic"
+  },
+  "password_file": "/etc/stockagent/offhost-restic.password",
+  "state_root": "/var/lib/stockagent/offhost-backup",
+  "reserve_bytes": 21474836480,
+  "automatic_pruning": false,
+  "cleanup_allowed_roots": []
+}

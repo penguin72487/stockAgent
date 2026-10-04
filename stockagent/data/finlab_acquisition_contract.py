@@ -9,17 +9,65 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
+import os
+from pathlib import Path
 import re
 from zoneinfo import ZoneInfo
 
 
 UPSTREAM_CHECK_MODES = frozenset({"upstream_forced", "upstream_incremental"})
 QUOTA_POLICY_VERSION = 1
+WORKLOAD_CONTRACT_VERSION = 4
+INTRADAY_PROGRESS_VERSION = 1
+DISPATCH_INTERVAL_SECONDS = 60
 # These adapters currently sign and stream whole objects, not SDK deltas.
 WHOLE_TABLE_KEYS = frozenset({
     "broker_transactions", "after_market_fixed_price:市場別", "after_market_fixed_price:資料來源",
 })
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def process_owner(pid: int | None = None) -> dict | None:
+    """Local Linux identity prevents a killed/reused PID remaining 'running'."""
+    pid = os.getpid() if pid is None else pid
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] in {"Z", "X"}:
+            return None
+        return {"pid": pid, "start_ticks": fields[19],
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+    except (OSError, IndexError):
+        return None
+
+
+def intraday_progress(source_root: Path, *, now: datetime) -> dict:
+    """Read bounded local worker evidence; never infer liveness from an old JSON."""
+    try:
+        raw = json.loads((source_root / "intraday/active_run.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("contract_version") != INTRADAY_PROGRESS_VERSION:
+        return {}
+    observed = utc_time(raw.get("observed_at_utc"))
+    if not observed or observed > now:
+        return {}
+    owner = raw.get("owner")
+    live = isinstance(owner, dict) and process_owner(owner.get("pid")) == owner
+    result = {**raw, "owner_alive": live, "age_seconds": round((now - observed).total_seconds(), 1)}
+    if raw.get("state") == "running" and not live:
+        result.update(state="interrupted", active_key=None, active_trade_date=None,
+                      estimated_batch_finish_at_utc=None)
+    estimated = utc_time(result.get("estimated_batch_finish_at_utc"))
+    deadline = utc_time(result.get("stop_by_at_utc"))
+    result["batch_eta_state"] = "conditional" if estimated else "insufficient_samples"
+    if estimated and deadline and estimated > deadline:
+        result.update(batch_eta_state="time_budget_limited", estimated_batch_finish_at_utc=None)
+    elif result["state"] == "running" and estimated and estimated <= now:
+        result.update(batch_eta_state="sample_overrun", estimated_batch_finish_at_utc=None)
+    return result
 
 
 def incremental_quota_exempt(key: str, *, downloaded: bool) -> bool:

@@ -20,8 +20,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
+import statistics
 import sys
+import time
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -40,6 +43,9 @@ from scripts.download_finlab_intraday import (  # noqa: E402
     reconcile_stored_tick_unit,
 )
 from scripts.derive_finlab_minute import derive_partition  # noqa: E402
+from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
+    INTRADAY_PROGRESS_VERSION, process_owner,
+)
 
 
 DEFAULT_PUBLIC_ROOT = REPO_ROOT / "data_tw_public"
@@ -452,7 +458,7 @@ def _summarize(db: sqlite3.Connection, universe: list[dict], days: list[date],
 
 def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 limit: int, reserve_mb: float, minimum_free_gb: float,
-                now: datetime, fetch=fetch_partition) -> dict:
+                now: datetime, fetch=fetch_partition, max_run_seconds: float | None = None) -> dict:
     if not credential_available():
         raise RuntimeError("no usable FinLab session")
     universe = load_universe(public_root, start=start)
@@ -520,9 +526,56 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     scanned = 0
     general_admission: dict = {}
     general_recheck_at = datetime.min.replace(tzinfo=UTC)
+    started_clock = time.monotonic()
+    deadline = started_clock + max_run_seconds if max_run_seconds is not None else None
+    active_key = active_day = None
+    durations: list[float] = []
+    quota_checks = cached_skips = 0
+    last_status_clock = started_clock
+    owner = process_owner()
+    _atomic_json(cursor_path, cursor)
+
+    def checkpoint(*, full=False, finished=False):
+        """Persist only committed frontiers; in-flight reads resume after a kill."""
+        nonlocal last_status_clock
+        boundary = datetime.now(UTC)
+        if active_key is None:
+            _atomic_json(cursor_path, cursor)
+        remaining = max(0, limit - attempts)
+        median = statistics.median(durations) if len(durations) >= 3 else None
+        batch_seconds = median * remaining if median is not None else None
+        progress = {
+            "contract_version": INTRADAY_PROGRESS_VERSION, "owner": owner,
+            "run_started_at_utc": started.isoformat(), "observed_at_utc": boundary.isoformat(),
+            "state": "running" if state == "batch_limit" and not finished else state,
+            "active_key": active_key, "active_trade_date": active_day,
+            "attempt_limit": limit, "attempted": attempts, "successful": successes,
+            "scanned_candidates": scanned, "cached_skips": cached_skips,
+            "quota_checks": quota_checks, "elapsed_seconds": round(time.monotonic() - started_clock, 3),
+            "sample_count": len(durations), "seconds_per_attempt_estimate": median,
+            "remaining_batch_seconds_estimate": batch_seconds,
+            "estimated_batch_finish_at_utc": (boundary + timedelta(seconds=batch_seconds)).isoformat()
+                if batch_seconds is not None and state == "batch_limit" else None,
+            "stop_by_at_utc": (started + timedelta(seconds=max_run_seconds)).isoformat()
+                if max_run_seconds is not None else None,
+            "estimate_scope": "current_attempt_batch_not_all_history",
+        }
+        _atomic_json(root / "intraday/active_run.json", progress)
+        if full or time.monotonic() - last_status_clock >= 60:
+            summary = _summarize(index, universe, days, started=started,
+                                 attempts=attempts, successes=successes, state=progress["state"],
+                                 daily_price_coverage=daily_price_coverage)
+            summary["general_acquisition_admission"] = general_admission
+            _atomic_json(root / "intraday/market_status.json", summary)
+            last_status_clock = time.monotonic()
 
     def may_acquire_tick() -> bool:
-        nonlocal general_admission, general_recheck_at, state
+        nonlocal general_admission, general_recheck_at, state, quota_checks
+        # Leave a complete SDK request's timeout runway before the outer shell
+        # watchdog. Stop normally so source/index/frontiers stay recoverable.
+        if deadline is not None and time.monotonic() + 180 >= deadline:
+            state = "run_time_budget_reached"
+            return False
         boundary = datetime.now(UTC)
         # No other regular writer can change receipts under the account lock.
         # Recheck at most once a minute, and always at the daily reset, instead
@@ -534,9 +587,47 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         if not general_admission.get("supplemental_allowed", False):
             state = "waiting_required_general_data"
             return False
+        quota_checks += 1
+        room = quota_room_mb()
+        if room is None:
+            state = "quota_unknown"
+            return False
+        if room[0] <= reserve_mb:
+            state = "quota_margin_reached"
+            return False
+        if shutil.disk_usage(root).free < minimum_free_gb * 1024**3:
+            state = "disk_reserve_reached"
+            return False
         return True
 
+    def acquire(kind: str, symbol: str, day: date, *, retry=False):
+        nonlocal attempts, successes, active_key, active_day, state
+        active_key, active_day = f"{kind}:{symbol}", day.isoformat()
+        attempts += 1
+        checkpoint()
+        attempt_clock = time.monotonic()
+        try:
+            receipt = fetch(root, active_key, day, now=datetime.now(UTC))
+            _record_tick_and_minute(index, root, symbol, day, receipt)
+            successes += 1
+            print(f"[finlab-market] {'retry ' if retry else ''}{active_key} {day}: {receipt['status']}", flush=True)
+        except Exception as exc:
+            from scripts.download_finlab_intraday import record_failed_partition
+            failure = record_failed_partition(root, active_key, day, exc)
+            _record(index, kind, symbol, day, failure)
+            print(f"[finlab-market] {'retry ' if retry else ''}{active_key} {day}: {failure}", flush=True)
+            if failure in {"quota_exhausted", "authentication_failed"}:
+                state = failure
+        # A BaseException (SIGTERM/system exit) deliberately leaves active_key
+        # and the previous committed cursor intact. The next owner reconciles
+        # any saved receipt before trying this same candidate again.
+        durations.append(time.monotonic() - attempt_clock)
+        active_key = active_day = None
+        checkpoint()
+        gc.collect()
+
     try:
+        checkpoint(full=True)
         # Recent unpublished partitions can appear later the same session;
         # older failures get a fair retry after the next account reset. Do
         # not let retries consume the entire new-symbol discovery budget.
@@ -559,52 +650,22 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             day = date.fromisoformat(day_text)
             if kind not in KINDS or symbol not in known or day not in days or not _eligible(known[symbol], day):
                 continue
-            if not may_acquire_tick():
-                break
-            room = quota_room_mb()
-            if room is None:
-                state = "quota_unknown"
-                break
-            if room[0] <= reserve_mb:
-                state = "quota_margin_reached"
-                break
-            if shutil.disk_usage(root).free < minimum_free_gb * 1024**3:
-                state = "disk_reserve_reached"
-                break
             key = f"{kind}:{symbol}"
             receipt_path, _ = _partition_paths(root, key, day)
             receipt = _stored_receipt(receipt_path, root, key, day)
             if receipt:
                 _record_tick_and_minute(index, root, symbol, day, receipt)
+                cached_skips += 1
                 continue
-            attempts += 1
-            try:
-                receipt = fetch(root, key, day, now=datetime.now(UTC))
-                _record_tick_and_minute(index, root, symbol, day, receipt)
-                successes += 1
-                print(f"[finlab-market] retry {key} {day}: {receipt['status']}", flush=True)
-            except Exception as exc:
-                from scripts.download_finlab_intraday import record_failed_partition
-                failure = record_failed_partition(root, key, day, exc)
-                _record(index, kind, symbol, day, failure)
-                print(f"[finlab-market] retry {key} {day}: {failure}", flush=True)
-                if failure in {"quota_exhausted", "authentication_failed"}:
-                    state = failure
-                    break
-            gc.collect()
-        while state == "batch_limit" and attempts < limit and scanned < max(100_000, limit * 100):
             if not may_acquire_tick():
                 break
-            room = quota_room_mb()
-            if room is None:
-                state = "quota_unknown"
+            acquire(kind, symbol, day, retry=True)
+            if state != "batch_limit":
                 break
-            if room[0] <= reserve_mb:
-                state = "quota_margin_reached"
-                break
-            if shutil.disk_usage(root).free < minimum_free_gb * 1024**3:
-                state = "disk_reserve_reached"
-                break
+        while state == "batch_limit" and attempts < limit and scanned < max(100_000, limit * 100):
+            # Save the frontier before selecting: resource/preemption refusal
+            # must not silently skip a never-requested candidate.
+            before_candidate = json.dumps(cursor)
             queue = cursor["recent_queue"]
             if attempts % 4 == 2 and int(cursor["former"]) < len(former_tasks):
                 kind, item, day = former_tasks[int(cursor["former"])]
@@ -633,6 +694,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                                              newest_first=stream == "newest")
                 cursor[stream] = flat + 1
             scanned += 1
+            if scanned % 64 == 0:
+                checkpoint()
             if not _eligible(item, day):
                 continue
             symbol = item["symbol"]
@@ -641,34 +704,33 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             receipt = _stored_receipt(receipt_path, root, key, day)
             if receipt:
                 _record_tick_and_minute(index, root, symbol, day, receipt)
+                cached_skips += 1
                 continue
             if _checked_this_cycle(attempt_path, "attempted_at_utc", now):
                 continue
-            attempts += 1
-            try:
-                receipt = fetch(root, key, day, now=datetime.now(UTC))
-                _record_tick_and_minute(index, root, symbol, day, receipt)
-                successes += 1
-                print(f"[finlab-market] {key} {day}: {receipt['status']} rows={receipt['rows']}", flush=True)
-            except Exception as exc:
-                # The canonical per-day downloader preserves a sanitized attempt.
-                from scripts.download_finlab_intraday import record_failed_partition
-                failure = record_failed_partition(root, key, day, exc)
-                _record(index, kind, symbol, day, failure)
-                print(f"[finlab-market] {key} {day}: {failure}", flush=True)
-                if failure in {"quota_exhausted", "authentication_failed"}:
-                    state = failure
-                    break
-            gc.collect()
+            if not may_acquire_tick():
+                cursor = json.loads(before_candidate)
+                break
+            # The only persistent frontier while an API call is in flight is
+            # the one before this candidate. Receipt recovery is idempotent.
+            _atomic_json(cursor_path, json.loads(before_candidate))
+            acquire(kind, symbol, day)
         _atomic_json(cursor_path, cursor)
         summary = _summarize(index, universe, days, started=started,
                              attempts=attempts, successes=successes, state=state,
                              daily_price_coverage=daily_price_coverage)
         summary["general_acquisition_admission"] = general_admission
         _atomic_json(root / "intraday/market_status.json", summary)
+        last_status_clock = time.monotonic()
         return summary
+    except BaseException:
+        state = "interrupted"
+        raise
     finally:
-        index.close()
+        try:
+            checkpoint(full=state == "interrupted", finished=True)
+        finally:
+            index.close()
 
 
 def main() -> int:
@@ -683,12 +745,15 @@ def main() -> int:
     parser.add_argument("--minimum-free-gb", type=float, default=25.0)
     parser.add_argument("--sync-lock-fd", type=int, default=None,
                         help="Existing parent .sync.lock descriptor; otherwise acquire the account lock")
+    parser.add_argument("--max-run-seconds", type=float, default=None,
+                        help="Graceful batch wall-clock budget; leave 180 seconds for an in-flight SDK request")
     parser.add_argument("--status-only", action="store_true",
                         help="rebuild local candidate/receipt inventory without calling FinLab")
     parser.add_argument("--derive-existing", action="store_true",
                         help="with --status-only, replay all stored ticks into derived minutes")
     args = parser.parse_args()
-    if args.end_date < args.start_date or args.limit < 1 or args.reserve_mb < 0 or args.minimum_free_gb < 0:
+    if (args.end_date < args.start_date or args.limit < 1 or args.reserve_mb < 0 or args.minimum_free_gb < 0
+            or args.max_run_seconds is not None and not 180 < args.max_run_seconds <= 3600):
         parser.error("invalid market range or resource guard")
     if args.derive_existing and not args.status_only:
         parser.error("--derive-existing requires --status-only")
@@ -710,16 +775,21 @@ def main() -> int:
         summary["inventory_rebuilt_without_api"] = True
         _atomic_json(args.output_root / "intraday/market_status.json", summary)
     else:
+        def terminate(signum, frame):
+            raise SystemExit(128 + signum)
+        previous_handler = signal.signal(signal.SIGTERM, terminate)
         try:
             with _account_sync_lock(args.output_root, args.sync_lock_fd):
                 summary = sync_market(args.output_root, args.public_root, start=args.start_date,
                                       end=args.end_date, limit=args.limit,
                                       reserve_mb=args.reserve_mb,
                                       minimum_free_gb=args.minimum_free_gb,
-                                      now=datetime.now(UTC))
+                                      now=datetime.now(UTC), max_run_seconds=args.max_run_seconds)
         except BlockingIOError:
             print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))
             return 0
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
     print(json.dumps({key: value for key, value in summary.items() if key != "symbols"},
                      ensure_ascii=False, sort_keys=True), flush=True)
     return 1 if summary["state"] in {"quota_unknown", "authentication_failed"} else 0

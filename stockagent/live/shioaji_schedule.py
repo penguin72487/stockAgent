@@ -144,10 +144,19 @@ def next_postreset_historical_window(
     local = _taipei_datetime(value)
     target = datetime.combine(local.date(), HISTORICAL_QUERY_RESUME, tzinfo=TAIPEI)
     if target <= local:
+        if target.date() == date.max:
+            raise RuntimeError("cannot resolve the next Taiwan stock session: date limit")
         target += timedelta(days=1)
-    while not is_trading_day("tw", target.date(), parquet_root=parquet_root):
+    for _ in range(32):
+        if is_trading_day("tw", target.date(), parquet_root=parquet_root):
+            return target
+        if target.date() == date.max:
+            break
         target += timedelta(days=1)
-    return target
+    raise RuntimeError(
+        "cannot resolve the next Taiwan stock session within 32 days; "
+        "verified calendar evidence is required"
+    )
 
 
 def historical_login_pause_seconds(

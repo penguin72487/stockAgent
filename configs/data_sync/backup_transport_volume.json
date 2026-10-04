@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "purpose": "lab203-backup-transport-only",
+  "physical_volume": "D:",
+  "independent_disaster_recovery_copy": false
+}

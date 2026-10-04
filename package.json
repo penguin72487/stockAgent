@@ -1,0 +1,11 @@
+{
+  "name": "stockagent-dashboard-contracts",
+  "private": true,
+  "scripts": {
+    "check:dashboard-types": "tsc --project services/public_dashboards/tsconfig.json",
+    "test:dashboard-contracts": "node --test test/test_time_axis.mjs test/test_feature_page_contract.mjs test/test_acquisition_requests.mjs"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

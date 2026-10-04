@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.runtime_env import normalize_runtime_env
+from stockagent.runtime_identity import runtime_identity, validate_runtime_lock
 
 
 REQUIRED = ("numpy", "pyarrow", "yaml", "torch", "polars")
@@ -31,6 +32,10 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="treat runtime consistency warnings as failures",
     )
+    parser.add_argument("--runtime-lock-output", type=Path,
+                        help="write an exact installed-runtime identity after successful validation")
+    parser.add_argument("--expected-runtime-lock", type=Path,
+                        help="fail when installed packages or the platform differ from this lock")
     return parser.parse_args()
 
 
@@ -96,6 +101,18 @@ def main() -> int:
     if args.strict and warnings:
         failures.extend(f"warning: {warning}" for warning in warnings)
 
+    identity = runtime_identity()
+    if identity.get("metadata_errors"):
+        failures.append("runtime distribution metadata observation is incomplete")
+    if args.expected_runtime_lock:
+        try:
+            expected = json.loads(args.expected_runtime_lock.read_text(encoding="utf-8"))
+            if not isinstance(expected, dict):
+                raise ValueError("runtime lock must be a JSON object")
+            failures.extend(validate_runtime_lock(expected, identity))
+        except (OSError, ValueError) as exc:
+            failures.append(f"runtime lock: {exc}")
+
     report = {
         "python": sys.executable,
         "python_version": platform.python_version(),
@@ -121,11 +138,15 @@ def main() -> int:
         },
         "warnings": warnings,
         "failures": failures,
+        "runtime_identity": identity,
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if failures:
         print("Environment check failed:\n- " + "\n- ".join(failures), file=sys.stderr)
         return 1
+    if args.runtime_lock_output:
+        from downloader.artifact_io import atomic_write_json
+        atomic_write_json(args.runtime_lock_output, identity)
     return 0
 
 

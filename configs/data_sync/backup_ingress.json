@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "folder_id": "stockagent-backup-ingress-lab203",
+  "origin": "penguin",
+  "receiver": "lab203",
+  "producer_device_id": "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW",
+  "receiver_device_id": "TLOI2HH-6EZOSBC-H6YMGVW-APQOGFW-P2A7FZT-EKX6IUP-2HMRKS6-LBDHOQM",
+  "transport_root": "/srv/stockagent-backup-ingress-lab203",
+  "receiver_root": "/srv/lab203-backup/ingress",
+  "producer_type": "sendonly",
+  "receiver_type": "receiveonly",
+  "state_root": "/var/lib/stockagent-backup-ingress",
+  "first_delivery": {
+    "relative": "batch-350a50881fdf7ae082c77e03671c6ae61bdcb0d92ea1bfa4206f64c415c0803f",
+    "source_relative": "artifacts/operations/two-node-lab-nas-backup-20261003/pilot/lab203-ready-delivery",
+    "envelope_identity_sha256": "350a50881fdf7ae082c77e03671c6ae61bdcb0d92ea1bfa4206f64c415c0803f",
+    "verified_file_bytes": 63163322,
+    "maximum_transport_bytes": 104857600
+  },
+  "source_cleanup_authorized": false,
+  "automatic_pruning": false,
+  "durable_off_host_backup_verified": false
+}

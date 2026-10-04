@@ -1033,6 +1033,35 @@ def test_feature_snapshot_preserves_contract_without_sorting_json_keys(
     assert snapshot_service._current_feature_snapshot(feature) == 1
 
 
+def test_retained_feature_generation_keeps_count_and_bytes_when_dependencies_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(snapshot_service, "REPO_ROOT", tmp_path)
+    root = tmp_path / "artifacts/live/data_monitor"
+    root.mkdir(parents=True)
+    cache = root / "record_inventory_cache.json"
+    cache.write_text("{}", encoding="utf-8")
+    feature = root / "feature_inventory.json"
+    feature.write_text(json.dumps({
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "generated_at_utc": "2026-10-01T00:00:00+00:00",
+        "rows": [{"field": "close"}],
+    }), encoding="utf-8")
+    assert snapshot_service._current_feature_snapshot(feature) == 1
+    receipt = snapshot_service._feature_reuse_receipt_path(feature)
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (feature, receipt)}
+    newer = feature.stat().st_mtime_ns + 1_000_000_000
+    os.utime(cache, ns=(newer, newer))
+    assert snapshot_service._current_feature_snapshot(feature) is None
+    assert snapshot_service._current_feature_snapshot(feature, allow_stale_dependencies=True) == 1
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before} == before
+    feature.write_text(feature.read_text().replace('"close"', '"open"'), encoding="utf-8")
+    damaged = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before}
+    assert snapshot_service._current_feature_snapshot(feature, allow_stale_dependencies=True) is None
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in damaged} == damaged
+
+
 def test_matching_inventory_revision_reuses_feature_bytes_without_touching_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

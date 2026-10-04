@@ -113,6 +113,81 @@ def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
     assert by_id.manifest["snapshot_id"] == published.manifest["snapshot_id"]
 
 
+def test_shared_blob_reuse_does_not_write_duplicate_scratch(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    copy_and_hash = packed_snapshots._copy_and_hash
+    copied = []
+
+    def record_copy(path, temporary):
+        copied.append(path)
+        return copy_and_hash(path, temporary)
+
+    monkeypatch.setattr(packed_snapshots, "_copy_and_hash", record_copy)
+    first = publish_packed_snapshot(cold, "first", source, loose_file_threshold_bytes=1024)
+    assert len(copied) == 1  # two equal source files, one physical blob write
+    copied.clear()
+    second = publish_packed_snapshot(cold, "second", source, loose_file_threshold_bytes=1024)
+    assert copied == []  # cross-dataset reuse still hashes the existing cold blob
+    assert first.manifest["archive"]["stored_bytes"] == second.manifest["archive"]["stored_bytes"]
+    assert second.manifest["archive"]["new_object_count"] == 0
+    result = verify_packed_snapshot(cold, second, reconstruct_paths=["large-a.bin", "large-b.bin"])
+    assert result["independently_reconstructed_files"] == 2
+
+
+def test_shared_corrupt_blob_is_not_overwritten_or_published(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    first = publish_packed_snapshot(cold, "first", source, loose_file_threshold_bytes=1024)
+    blob = next(item for item in first.manifest["archive"]["objects"] if item["kind"] == "blob")
+    path = cold / blob["relpath"]
+    corrupt = b"X" * path.stat().st_size
+    path.write_bytes(corrupt)
+    monkeypatch.setattr(packed_snapshots, "_copy_and_hash", lambda *_: pytest.fail("duplicate scratch write"))
+    with pytest.raises(SnapshotError, match="object is corrupt"):
+        publish_packed_snapshot(cold, "second", source, loose_file_threshold_bytes=1024)
+    assert path.read_bytes() == corrupt
+    assert not (cold / "heads/second/test-node.json").exists()
+
+
+def test_shared_blob_reuse_rechecks_source_signature(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    first = publish_packed_snapshot(cold, "first", source, loose_file_threshold_bytes=1024)
+    blob = next(item for item in first.manifest["archive"]["objects"] if item["kind"] == "blob")
+    path = cold / blob["relpath"]
+    hash_file = packed_snapshots.sha256_file
+
+    def mutate_source_during_cold_hash(target):
+        digest = hash_file(target)
+        if target == path:
+            original = source / "large-a.bin"
+            original.write_bytes(b"Y" * original.stat().st_size)
+        return digest
+
+    monkeypatch.setattr(packed_snapshots, "sha256_file", mutate_source_during_cold_hash)
+    with pytest.raises(SnapshotError, match="source file changed"):
+        publish_packed_snapshot(cold, "second", source, loose_file_threshold_bytes=1024)
+    assert not (cold / "heads/second/test-node.json").exists()
+
+
+def test_shared_blob_reuse_rejects_cold_path_redirection(tmp_path):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    first = publish_packed_snapshot(cold, "first", source, loose_file_threshold_bytes=1024)
+    blob = next(item for item in first.manifest["archive"]["objects"] if item["kind"] == "blob")
+    path = cold / blob["relpath"]
+    path.unlink()
+    path.symlink_to(source / "large-a.bin")
+    with pytest.raises(SnapshotError, match="object is redirected"):
+        publish_packed_snapshot(cold, "second", source, loose_file_threshold_bytes=1024)
+    assert not (cold / "heads/second/test-node.json").exists()
+
+
 def test_selected_reconstruction_checks_pack_and_shared_blob_paths(tmp_path):
     source = _source_tree(tmp_path)
     cold = tmp_path / "cold"

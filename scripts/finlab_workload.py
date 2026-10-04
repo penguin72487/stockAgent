@@ -29,13 +29,13 @@ from scripts.download_finlab_history import (  # noqa: E402
 )
 from scripts.check_outside_tw_opening_resource_window import evaluate  # noqa: E402
 from scripts.finlab_arrow_history import STREAMING_KEYS, whole_table_reserve_bytes  # noqa: E402
-from scripts.finlab_stage_schedule import forecast, stage_summary  # noqa: E402
+from scripts.finlab_stage_schedule import forecast, stage_summary, next_release_waves  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     QUOTA_POLICY_VERSION, UPSTREAM_CHECK_MODES, attempt_retry_at, incremental_quota_exempt,
-    next_source_check, queue_stage, source_check_due,
+    next_source_check, queue_stage, source_check_due, intraday_progress, WORKLOAD_CONTRACT_VERSION,
 )
 
-CONTRACT = 3
+CONTRACT = WORKLOAD_CONTRACT_VERSION
 MEASURE_CONTRACT = 2
 MIB = 1024**2
 GRAINS = {
@@ -226,7 +226,7 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
                 "generated_at_utc": now.isoformat()}, {}
     catalog_at = timestamp(discovery.get("observed_at_utc"))
     catalog_fresh = bool(catalog_at and timedelta(0) <= now - catalog_at <= timedelta(hours=4))
-    cache = cache if isinstance(cache, dict) and cache.get("contract_version") in {1, 2, CONTRACT} else {}
+    cache = cache if isinstance(cache, dict) and cache.get("contract_version") in {1, 2, 3, CONTRACT} else {}
     cached = cache.get("files", {})
     next_cache = {}
     core = read_json(source / "core_acquisition_status.json")
@@ -377,9 +377,25 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
             and k not in validation_waiting]
     simulation_rows = [dict(r, source_weight_bytes=r["transfer_bytes"],
                             transfer_bytes=r["expected_payload_bytes"]) for r in rows]
+    active_started = timestamp(run.get("active_started_at_utc"))
     for job in simulation_rows:
         if job["fetch_seconds"] is not None and overhead is not None:
             job["fetch_seconds"] += overhead
+        if (run.get("state") == "running" and job["key"] == run.get("active_key")
+                and active_started and active_started <= now and job["needs_refresh"]):
+            elapsed = (now - active_started).total_seconds()
+            expected = job["fetch_seconds"]
+            # An overrun is evidence against the old point estimate. Do not
+            # slide 'one more minute' indefinitely or restart a whole key's
+            # stopwatch on every snapshot.
+            job["fetch_seconds"] = expected - elapsed if expected is not None and expected > elapsed else None
+            job["time_basis"] = "active_remaining_sample" if job["fetch_seconds"] else "active_sample_overrun"
+    active_tick = intraday_progress(source, now=now)
+    next_run = now if acq.get("service_active") else timestamp(acq.get("next_run_at_utc"))
+    if active_tick.get("state") == "running" and active_tick.get("owner_alive"):
+        # The residual Tick worker yields to general debt at request boundaries
+        # with a minute-local recheck; do not promise immediate lock ownership.
+        next_run = now + timedelta(seconds=60)
     unscheduled = [r["key"] for r in pending if r["key"] not in order]
     scenarios = {}
     for name, factor, share in [("fast", .75, 1.0), ("reference", 1.0, 1.0), ("slow", 1.5, .5)]:
@@ -393,7 +409,7 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
             scenario = {"state": "blocked", "finish_at_utc": None}
         else:
             scenario = forecast(simulation_rows, now=now, quota=quota, reserve_mb=reserve,
-                                next_run=now if acq.get("service_active") else timestamp(acq.get("next_run_at_utc")),
+                                next_run=next_run,
                                 duration_factor=factor, quota_share=share,
                                 opening_policy=_opening_policy(root), refresh_days=refresh_days)
         completions = scenario.pop("key_finish_at_utc", {})
@@ -445,6 +461,16 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
                                          "elapsed_seconds": round(time.monotonic() - started, 3)},
     }
     payload["stages"] = stage_summary(simulation_rows, scenarios, now=now, tick=payload["tick"])
+    if catalog_fresh and monitor_fresh and (acq.get("service_active") or acq.get("timer_active")):
+        waves = next_release_waves(simulation_rows, now=now, quota=quota, reserve_mb=reserve,
+                                   next_run=next_run, opening_policy=_opening_policy(root),
+                                   refresh_days=refresh_days)
+        for stage in payload["stages"]:
+            if stage["id"] in waves:
+                stage["next_wave"] = waves[stage["id"]]
+    payload["actionable_complete"] = not pending
+    payload["blocked_count"] = len(blocked_keys)
+    payload["intraday_progress"] = {k: v for k, v in active_tick.items() if k != "owner"}
     for scenario in scenarios.values():
         scenario.pop("stage_finish_at_utc", None)
         scenario.pop("stage_start_at_utc", None)

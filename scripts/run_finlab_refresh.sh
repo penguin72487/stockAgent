@@ -182,6 +182,7 @@ if [[ "$finlab_state" == "pass_complete" ]]; then
           "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
             --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-256}" \
             --sync-lock-fd 9 \
+            --max-run-seconds 1140 \
             --reserve-mb "$finlab_tick_reserve_mb"; then
         echo "[finlab] residual-quota Tick pass incomplete; general history remains higher priority" >&2
       fi

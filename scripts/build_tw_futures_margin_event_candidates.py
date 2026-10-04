@@ -13,6 +13,9 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import polars as pl
 from downloader.artifact_io import atomic_write_json,atomic_write_parquet,sha256_file
 from downloader.taifex_rule_parsing import PARSER_VERSION,temporal_mentions
+from stockagent.data.tw_futures_rule_workspace import (
+    DEFAULT_CURRENT, check_rule_output_path, maintained_rule_build,
+)
 from stockagent.data.tw_futures_margin_preparation import (
     RuleArchive,check_publication,margin_effective,margin_table_candidates,margin_grid_candidates,timestamp,
     compact,roc_date,ROC_DATE,TAIPEI,position_grid_candidates,corporate_grid_candidates,
@@ -22,6 +25,7 @@ from stockagent.data.tw_futures_margin_preparation import (
     corporate_terms_intervals, margin_candidate_intervals, corporate_position_table_candidates,
     compose_margin_ratio_intervals,
     corporate_position_text_candidates,
+    unchanged_quantity_securities_position_groups,
     stock_futures_cash_reform_intervals,
     position_prose_candidates,position_candidate_intervals,
     disposal_margin_restorations,
@@ -72,7 +76,7 @@ def candidate_notice_clock(text: str, published: str) -> dict:
     if issue_bound and len(issued)==1:
         for match in re.finditer(r'(?:原(?:本公司(?:於)?)?|本公司(?:於)?)'+ROC_DATE+
                 r'(?:公告之)?[臺台]期(?:結|交)字第(\d{9,12})號函'
-                r'(?:(?:有關|公告)[^。;；,，]{1,60}之規定)?[,，]自'+ROC_DATE+
+                r'(?:(?:有關|公告)[^。;；,，]{1,60}之規定)?[,，]?自'+ROC_DATE+
                 r'[^。;；]{0,50}(?:停止適用|廢止)',dense):
             prior_day=str(roc_date(match))
             if prior_day>=next(iter(issued)) or match[4] in current_numbers:
@@ -102,6 +106,29 @@ def candidate_notice_clock(text: str, published: str) -> dict:
             r'\)?該股票期貨契約(一般)?交易時段結束後[,，]?(?:開始實施|起實施)',compact(text))
         starts.update((str(roc_date(m)), 'after_regular_session' if m[4]
                        else 'after_trading_session') for m in named_closes)
+        # The margin close and the underlying stock's suspension can share
+        # a date but have different clocks. Retain the literal margin close;
+        # a same-day, date-only stock event cannot make it ambiguous. Short
+        # operative dates require this notice's bound, unique explicit year.
+        years={int(m[1])+1911 for m in re.finditer(ROC_DATE,
+            operative_notice_year_context(text,publication_bound=issue_bound))}
+        own_starts=set()
+        for m in re.finditer(r'自(?P<day>(?:\d{2,3}年)?\d{1,2}月\d{1,2}日)'
+                r'(?:\(證券市場處置生效日次一營業日\))?'
+                r'(?:該(?:股票)?期貨契約|該(?:股票)?契約)?(?P<regular>一般)?'
+                r'交易時段結束後[,，]?(?:開始實施|起實施|起調高保證金)',compact(text)):
+            if full:=re.fullmatch(ROC_DATE,m['day']):
+                day=roc_date(full)
+            else:
+                if not issue_bound or len(years)!=1:continue
+                short=re.fullmatch(r'(\d{1,2})月(\d{1,2})日',m['day'])
+                try:day=date(next(iter(years)),int(short[1]),int(short[2]))
+                except ValueError:continue
+            own_starts.add((str(day),'after_regular_session' if m['regular'] else 'after_trading_session'))
+        if own_starts:
+            dates={d for d,_ in own_starts}
+            starts={s for s in starts if s[1]!='date_only' or s[0] not in dates}
+            starts.update(own_starts)
         listings={str(roc_date(m)) for m in re.finditer(
             r'(?:訂於|自)'+ROC_DATE+r'(?:起)?上市',compact(text))}
         listings.update(str(roc_date(m)) for m in re.finditer(
@@ -129,7 +156,7 @@ def candidate_notice_clock(text: str, published: str) -> dict:
     if effective and len(years)==1:
         year = next(iter(years))
         for m in re.finditer(r'(?<![年月\d])(\d{1,2})月(\d{1,2})日(?:該(?:股票)?契約)?'
-                             r'(一般)?交易時段結束後恢復為', dense):
+                             r'(一般)?交易時段結束後[,，]?恢復為', dense):
             day = date(year,int(m[1]),int(m[2]))
             if day <= date.fromisoformat(effective):
                 continue
@@ -139,6 +166,40 @@ def candidate_notice_clock(text: str, published: str) -> dict:
                     if year_context != dense else 'unique_explicit_roc_year_in_notice'))
             if not any(e['date_iso']==end['date_iso'] and e['boundary']==end['boundary'] for e in ends):
                 ends.append(end)
+    for m in re.finditer(ROC_DATE+r'(?:該(?:股票)?契約)?(一般)?交易時段結束後[,，]?恢復為', dense):
+        day = str(roc_date(m))
+        if effective and day > effective:
+            end = dict(date_iso=day, role='effective_end',
+                boundary='after_regular_session' if m[4] else 'after_trading_session', evidence=m[0])
+            if not any(e['date_iso']==day for e in ends):
+                ends.append(end)
+    # Older originals state the dates inside the disposition paragraph and
+    # explicitly restore at that period's close. This binds only the nominal
+    # boundary; completed cash sessions must still prove any restoration.
+    if (issue_bound and effective and not ends and re.search(
+            r'證券市場處置期間結束後[,，]?於(?:該(?:股票)?契約)?'
+            r'(一般)?交易時段結束後恢復為', dense)):
+        periods = set()
+        for m in re.finditer(r'處置期間為(?P<start>\d{2,3}年\d{1,2}月\d{1,2}日)至'
+                r'(?P<end>(?:\d{2,3}年)?\d{1,2}月\d{1,2}日)', dense):
+            start = roc_date(re.fullmatch(ROC_DATE, m['start']))
+            full = re.fullmatch(ROC_DATE, m['end'])
+            if full:
+                end = roc_date(full)
+            else:
+                short = re.fullmatch(r'(\d{1,2})月(\d{1,2})日', m['end'])
+                end = date(start.year, int(short[1]), int(short[2]))
+            if str(start) <= effective < str(end):
+                periods.add((str(start), str(end), m[0]))
+        if len({(a,b) for a,b,_ in periods}) == 1:
+            start, end, clause = next(iter(periods))
+            regular = end < '2017-05-15' or bool(re.search(
+                r'處置期間結束後[,，]?於(?:該(?:股票)?契約)?一般交易時段結束後恢復為', dense))
+            ends.append(dict(date_iso=end, role='effective_end',
+                boundary='after_regular_session' if regular else 'after_trading_session',
+                evidence=clause, derivation='own_disposition_period_and_explicit_period_close_restoration'))
+            if not regular:
+                phase = 'after_product_trading_session_unspecified'
     ends=[dict(m,boundary='after_regular_session')
           if m['boundary']=='after_trading_session' and m['date_iso']<'2017-05-15' else m
           for m in ends]
@@ -178,7 +239,16 @@ def source_review_candidates(archive, path):
                 if dependency['source_url'] not in archive.children(announcement):
                     raise ValueError('reviewed source is not the announced attachment')
                 archive.document(announcement)
-                check_publication(doc['text'],dependency['published_date'])
+                # A scanned issuing page may accompany a native numeric annex.
+                # Its inspected primary-page transcription owns this clock;
+                # it cannot supply an amendment's issuing date. Every page is
+                # SHA-checked below before any reviewed fact is returned.
+                issuing = doc['text']
+                if (dependency['source_url'] == review['source_url']
+                        and review.get('transcribed_text')
+                        and any(p.get('page') == 1 for p in review.get('pages', []))):
+                    issuing = review['transcribed_text']
+                check_publication(issuing,dependency['published_date'])
         latest=max(d['published_date'] for d in dependencies)
         if review['known_at']!=timestamp(date.fromisoformat(latest),'23:59:59') or review['effective_date']<=latest:
             raise ValueError('reviewed source clock mismatch')
@@ -224,18 +294,30 @@ def source_review_candidates(archive, path):
             provenance.update(source_review_clock_text=review['transcribed_text'],
                               visual_review_sha256=sha256_file(path))
         ends = []
+        reviewed_clocks = {}
         if review.get('temporary_end_evidence'):
             if not review.get('pages') or not review.get('transcribed_text'):
                 raise ValueError('reviewed temporary boundary requires inspected issuing pages')
             clock = candidate_notice_clock(review['transcribed_text'], review['published_date'])
-            if (not clock['issue_date_bound'] or clock['effective_date'] != review['effective_date']
-                    or clock['effective_phase'] != review['effective_phase']):
-                raise ValueError('reviewed temporary clock differs from the inspected clause')
             # Explicit named clauses can distinguish a restoration clock
             # from dates inside its earlier-rate reference. Require all
             # reviewed products' own clocks to match the declared review.
-            ends=[end for row in rows for end in json.loads(product_margin_restoration_clock(
-                review['transcribed_text'],row['product'],clock)['temporary_end_evidence'])]
+            scoped = [dict(product_margin_restoration_clock(review['transcribed_text'], row['product'], clock),
+                           product=row['product'], source_content_sha256=review['content_sha256']) for row in rows]
+            # A reviewed page can say "trading session" in the established
+            # stock single-session era. Reuse that SAME dated source proof;
+            # the transcription itself cannot assert a regular close.
+            if any(c['effective_phase'] == 'after_product_trading_session_unspecified' for c in scoped):
+                bind_retained_single_session_margin_clocks(archive, scoped)
+            if any(not c['issue_date_bound'] or c['effective_date'] != review['effective_date']
+                   or c['effective_phase'] != review['effective_phase'] for c in scoped):
+                raise ValueError('reviewed temporary clock differs from the inspected clause')
+            session_proofs = {c['single_session_rule_review_sha256'] for c in scoped
+                              if c.get('single_session_rule_review_sha256')}
+            if len(session_proofs) == 1:
+                provenance['single_session_rule_review_sha256'] = next(iter(session_proofs))
+            ends=[end for c in scoped for end in json.loads(c['temporary_end_evidence'])]
+            reviewed_clocks = {c['product']: c for c in scoped}
             expected = {(e['date_iso'], e['boundary']) for e in review['temporary_end_evidence']}
             if (not ends or {(e['date_iso'], e['boundary']) for e in ends} != expected
                     or any(e['date_iso'] <= review['effective_date'] for e in ends)):
@@ -262,8 +344,7 @@ def source_review_candidates(archive, path):
                     raise ValueError('invalid reviewed non-disposed margin reference')
             row_ends=ends
             if ends:
-                scoped=product_margin_restoration_clock(review['transcribed_text'],row['product'],clock)
-                row_ends=json.loads(scoped['temporary_end_evidence'])
+                row_ends=json.loads(reviewed_clocks[row['product']]['temporary_end_evidence'])
             facts.append(dict(provenance,product=row['product'],margin_kind=review['margin_kind'],
                 after=values,before=before,declared_non_disposed_margin=reference,requires_dated_session_rule=True,
                 requires_reversion_review=bool(row_ends) or review.get('requires_effective_date_review',False),
@@ -401,6 +482,40 @@ def prioritize_reviewed_position_facts(facts, inherited=()):
     return replace_reviewed_product_facts(facts, reviewed)
 
 
+def reviewed_corporate_code_pair_corrections(review, facts):
+    """Bind explicitly corrected OCR code pairs to the actual inspected table.
+
+    Both codes can be misread, so source/origin matching alone is insufficient.
+    This is an exact reviewed exception, never an issuer/code similarity rule.
+    """
+    corrections = review.get('corrected_ocr_code_pairs', [])
+    seen = set()
+    for item in corrections:
+        if set(item) != {'from_product', 'product', 'effective_date', 'contract_months',
+                         'corrected_from_product', 'corrected_product'}:
+            raise ValueError('corporate code correction requires an exact old/new pair and dated months')
+        for field in ('from_product', 'product', 'corrected_from_product', 'corrected_product'):
+            if not re.fullmatch(r'[A-Z]{2}[F0-9]', item[field]):
+                raise ValueError('invalid reviewed corporate code pair')
+        months = item['contract_months']
+        if (not months or len(months) != len(set(months))
+                or any(not re.fullmatch(r'\d{4}(?:0[1-9]|1[0-2])', m) for m in months)
+                or (item['from_product'], item['product']) ==
+                   (item['corrected_from_product'], item['corrected_product'])):
+            raise ValueError('corporate code correction must identify changed codes and finite unique months')
+        day = date.fromisoformat(item['effective_date']).isoformat()
+        targets = [row for row in facts
+            if row.get('from_product') == item['corrected_from_product']
+            and row.get('product') == item['corrected_product']
+            and row.get('effective_date') == day
+            and set(months) <= set(row.get('contract_months') or [])]
+        key = (item['from_product'], item['product'], day, tuple(sorted(months)))
+        if len(targets) != 1 or key in seen:
+            raise ValueError('corporate code correction lacks one exact inspected replacement')
+        seen.add(key)
+    return corrections
+
+
 def replace_reviewed_corporate_facts(existing, reviewed):
     """An inspected code cell owns its exact source, origin, date and months.
 
@@ -409,21 +524,80 @@ def replace_reviewed_corporate_facts(existing, reviewed):
     origins, dates or contract months, even if the codes look similar.
     """
     scopes = {}
+    corrected_pairs = {}
     for row in reviewed:
         key = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'effective_date'))
         if all(key) and row.get('contract_months'):
             scopes.setdefault(key, set()).update(row['contract_months'])
+        if row.get('reviewed_code_pair_corrections'):
+            if (row.get('extraction') != 'source_bound_visual_corporate_cells'
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('visual_review_sha256') or '')
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('source_content_sha256') or '')
+                    or not row.get('issue_date_bound')):
+                raise ValueError('corporate code correction requires source-bound inspected cells')
+            corrections = json.loads(row['reviewed_code_pair_corrections'])
+            own_review = [r for r in reviewed
+                if r.get('source_content_sha256') == row['source_content_sha256']]
+            reviewed_corporate_code_pair_corrections({'corrected_ocr_code_pairs': corrections}, own_review)
+            for item in corrections:
+                old = (row['source_content_sha256'], item['from_product'], item['product'], item['effective_date'])
+                corrected_pairs.setdefault(old, set()).update(item['contract_months'])
     kept = []
     for row in replace_reviewed_product_facts(existing, reviewed):
         if row in reviewed:
-            kept.append(row)
+            # A source-bound terminal formula revision is retained in its
+            # review receipt. It is not a second conversion of the security,
+            # nor a new daily share/cash observation.
+            if row.get('event_role') != 'terminal_formula_revision_only':
+                kept.append(row)
             continue
         key = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'effective_date'))
         months = set(row.get('contract_months') or [])
+        old = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'product', 'effective_date'))
+        if months and months <= corrected_pairs.get(old, set()):
+            continue
         if months and months <= scopes.get(key, set()):
             continue
         kept.append(row)
     return kept
+
+
+def classify_terminal_formula_revision(revised, earlier):
+    """Separate a referenced rights-formula amendment from unchanged units.
+
+    Called only after the review reader binds both originals and their notice
+    number reference. The old observation must already have been known before
+    conversion; no late stock/cash amount is admitted or backdated. Terminal
+    accounting still requires its own dated final-settlement evidence.
+    """
+    fields = ('product', 'from_product', 'effective_date', 'contract_multiplier',
+              'deliverable_security_quantity', 'deliverable_cash_twd',
+              'subscription_rights_at_final_settlement', 'has_equity_credit_fields',
+              'equity_credit_long_per_contract', 'equity_debit_short_per_contract',
+              'cash_equity_pair_agrees', 'fixed_subscription_rights_twd')
+    result = []
+    for row in revised:
+        known = datetime.fromisoformat(row['known_at'])
+        boundary = datetime.combine(date.fromisoformat(row['effective_date']), datetime.min.time(), TAIPEI)
+        def prior_clock(old):
+            clock = datetime.fromisoformat(old['known_at'])
+            return clock.tzinfo is not None and clock < boundary
+        originals = [old for old in earlier
+            if old.get('source_content_sha256') in row.get('supersedes_source_sha256s', [])
+            and old.get('extraction') == 'source_bound_visual_corporate_cells'
+            and all(old.get(k) == row.get(k) for k in fields)
+            and set(row['contract_months']) == set(old['contract_months'])
+            and old.get('issue_date_bound') and prior_clock(old)]
+        if (not originals or known.tzinfo is None
+                or known.astimezone(TAIPEI).date().isoformat() <= row['effective_date']
+                or not row.get('subscription_rights_at_final_settlement')
+                or row.get('fixed_subscription_rights_twd') is not None
+                or not row.get('deliverable_components_resolved')
+                or not re.fullmatch('[a-f0-9]{64}', row.get('supersession_review_sha256') or '')):
+            raise ValueError('terminal formula revision changes or lacks its earlier financial components')
+        result.append(dict(row, event_role='terminal_formula_revision_only',
+            unchanged_financial_source_sha256s=sorted({old['source_content_sha256'] for old in originals})))
+    return result
 
 
 def bind_position_generation_constraints(archive, review, parsed, corporate_facts, position_facts, path):
@@ -791,6 +965,9 @@ def apply_position_notice_amendments(archive, facts, path):
     """Retain a revoked notice, but never activate its cancelled future cap."""
     result=[dict(row) for row in facts]
     for review in json.loads(path.read_text())['reviews']:
+        if review.get('review_kind')=='source_bound_stock_futures_grade_regime_replacement_v1':
+            result=apply_stock_futures_grade_regime_review(archive,result,review,path)
+            continue
         if review.get('review_kind')!='source_bound_position_notice_revocation':
             raise ValueError('unsupported position notice amendment')
         for key in ('original','amendment'):
@@ -843,6 +1020,174 @@ def apply_position_notice_amendments(archive, facts, path):
     return result
 
 
+def apply_stock_futures_grade_regime_review(archive, facts, review, path):
+    """Retire a scheduled old-regime cap only with law and a dated full roster.
+
+    This reviewed 2013 transition is not publication-recency supersession.
+    The original numeric fact remains intact; only its future legal window is
+    closed. Named listing exceptions and already-effective old caps are not
+    inferred from the three new general grades.
+    """
+    if review.get('effective_date')!='2013-02-20':
+        raise ValueError('unsupported stock-futures grade regime date')
+    boundary=review['effective_date'];known=timestamp(date.fromisoformat(boundary),'23:59:59')
+    for name in ('original','law','replacement'):
+        proof=review[name];doc=archive.document(proof['source_url'])
+        notice=archive.conn.execute('SELECT published_date FROM announcements WHERE url=?',
+            (proof['source_url'],)).fetchone()
+        if (doc['content_sha256']!=proof['content_sha256'] or notice is None
+                or notice['published_date']!=proof['published_date']):
+            raise ValueError('position regime source/publication mismatch')
+        check_publication(proof['transcribed_text'],proof['published_date'])
+        receipt_path=path.parent/proof['complete_original_receipt']
+        if not receipt_path.resolve().is_relative_to(path.parent.resolve()):
+            raise ValueError('unsafe position regime original receipt path')
+        receipt=json.loads(receipt_path.read_text())
+        if (sha256_file(receipt_path)!=proof['complete_original_receipt_sha256']
+                or receipt['content_sha256']!=proof['content_sha256']
+                or receipt['url']!=proof['source_url'] or receipt['status']!='complete'
+                or receipt['extracted_pages']!=receipt['document_pages']
+                or {p['page'] for p in receipt['pages']}!=set(range(1,receipt['document_pages']+1))):
+            raise ValueError('position regime requires the complete original')
+        pages=proof['pages']
+        if len({p['page'] for p in pages})!=len(pages) or any(
+                p['page']<1 or p['page']>receipt['document_pages'] for p in pages):
+            raise ValueError('position regime original page scope mismatch')
+        for page in pages:
+            image_path=path.parent/page['path']
+            if not image_path.resolve().is_relative_to(path.parent.resolve()):
+                raise ValueError('unsafe position regime page path')
+            archive.copy(image_path,page['sha256'],url=proof['source_url'],kind='visual_position_regime_page')
+        archive.copy(receipt_path,proof['complete_original_receipt_sha256'],
+            url=proof['source_url'],kind='complete_position_regime_original')
+    old,law,new=(review[k] for k in ('original','law','replacement'))
+    for proof in (old,new):
+        records=[s for s in archive.sources.values() if s['kind']=='visual_position_cell_review'
+            and s['sha256']==proof['numeric_review_sha256']]
+        if not records:raise ValueError('position regime lacks the retained numeric review')
+        for record in records:
+            original_review=archive.bundle/record['path']
+            if sha256_file(original_review)!=proof['numeric_review_sha256']:
+                raise ValueError('position regime numeric review identity mismatch')
+            retained=json.loads(original_review.read_text())
+            if not any(r.get('source_url')==proof['source_url']
+                    and r.get('content_sha256')==proof['content_sha256']
+                    and r.get('published_date')==proof['published_date']
+                    for r in retained.get('reviews',[retained])):
+                raise ValueError('position regime numeric review belongs to another original')
+    if not old['published_date']<law['published_date']==new['published_date']==boundary:
+        raise ValueError('position regime publication chronology mismatch')
+    law_text=compact(law['transcribed_text']).replace('臺期交','台期交')
+    if ('台期交字第10202001810號' not in law_text
+            or '股票期貨契約交易規則' not in law_text
+            or '並自102年2月20日起實施' not in law_text
+            or '第十六條' not in law_text or '除本公司另有規定外' not in law_text
+            or law.get('old_natural_person_grade_limits')!=[5000,3750,2500,1250,350]
+            or law.get('new_natural_person_grade_limits')!=[8000,4000,2000]
+            or not {1,26,27,28,29,30}<={p['page'] for p in law['pages']}):
+        raise ValueError('position regime lacks the dated stock-futures article')
+    new_text=compact(new['transcribed_text'])
+    if ('公告放寬本公司股票期貨交易人部位限制數' not in new_text
+            or '並自102年2月20日起實施' not in new_text
+            or review.get('replacement_is_complete_futures_roster') is not True
+            or {p['page'] for p in new['pages']}!=set(range(1,6))):
+        raise ValueError('position regime requires the dated full futures roster')
+    result=[dict(row) for row in facts];selected=[]
+    for correction in review['rows']:
+        product=correction['product'];old_amount=correction['old_natural_person_limit']
+        new_amount=correction['new_natural_person_limit'];scheduled=correction['old_effective_date']
+        if (not re.fullmatch(r'[A-Z]{2}F',product) or not boundary<scheduled
+                or old_amount not in law['old_natural_person_grade_limits']
+                or old_amount in law['new_natural_person_grade_limits']
+                or new_amount not in law['new_natural_person_grade_limits']
+                or correction.get('new_effective_date')!=boundary
+                or correction.get('named_listing_exception') is not False):
+            raise ValueError('position regime scheduled cap is not a proved old-grade replacement')
+        def matches(row,proof,amount,day):
+            return (row['product']==product and row['source_content_sha256']==proof['content_sha256']
+                and row['source_url']==proof['source_url'] and row.get('effective_date')==day
+                and row.get('underlying_symbol')==correction['underlying_symbol']
+                and row.get('unit')=='contracts' and row.get('event_type')=='absolute_level'
+                and row.get('natural_person_limit')==amount and row.get('issue_date_bound')
+                and row.get('visual_review_sha256')==proof['numeric_review_sha256']
+                and row.get('known_at')==timestamp(date.fromisoformat(proof['published_date']),'23:59:59'))
+        previous=[r for r in result if matches(r,old,old_amount,scheduled)]
+        replacements=[r for r in result if matches(r,new,new_amount,boundary)]
+        if not previous or not replacements:
+            raise ValueError('position regime lacks both exact reviewed numeric facts')
+        if any(r.get('futures_eligible') is not True or r.get('named_listing_exception') for r in replacements):
+            raise ValueError('position regime cannot replace an options-only or excepted row')
+        sources=sorted({old['content_sha256'],law['content_sha256'],new['content_sha256']})
+        for row in previous:
+            row.update(notice_revoked_effective_date=boundary,
+                notice_revocation_source_sha256=law['content_sha256'],notice_revocation_known_at=known,
+                notice_revocation_review_sha256=sha256_file(path),
+                notice_revocation_reason='dated_three_grade_law_and_full_roster',
+                legal_position_regime_contract=review['review_kind'])
+        for row in replacements:
+            row.update(position_grade_source_sha256s=sorted({*sources,*(row.get('position_grade_source_sha256s') or [])}),
+                legal_position_regime_contract=review['review_kind'],legal_position_regime_review_sha256=sha256_file(path))
+        selected.append(dict(product=product,old_effective_date=scheduled,old_limit=old_amount,
+            replacement_effective_date=boundary,replacement_limit=new_amount,source_content_sha256s=sources))
+    if not selected:raise ValueError('position regime review has no exact affected product')
+    return result
+
+
+def reviewed_corporate_publication(archive, path, review, doc, text, notice):
+    """Keep an inspected issuing-date proxy distinct from an index publication."""
+    if notice is not None:
+        if notice['published_date'] != review['published_date']:
+            raise ValueError('corporate visual review publication mismatch')
+        return {}
+    if review.get('publication_basis') != 'inspected_original_issuing_date_missing_index':
+        raise ValueError('corporate visual review publication mismatch')
+    from urllib.parse import urlsplit
+    import gzip
+    import fitz
+    url = urlsplit(review['source_url'])
+    issued = {v['date_iso'] for v in temporal_mentions(text) if v['role'] == 'publication'}
+    number = review.get('issuing_notice_number', '')
+    if (url.scheme != 'https' or url.netloc != 'www.taifex.com.tw'
+            or not url.path.startswith('/file/taifex/') or not url.path.endswith('.pdf')
+            or doc.get('format') != 'pdf' or doc.get('source_url') != review['source_url']
+            or issued != {review.get('issued_date')} or review['issued_date'] != review['published_date']
+            or not re.fullmatch(r'\d{9,12}', number)
+            or not re.search(r'發文字號[:：]?[臺台]期交字第'+number+'號', compact(text))):
+        raise ValueError('corporate missing-index issuing original identity mismatch')
+    proofs = {}
+    for kind in ('canonical_capture', 'render'):
+        proof = review.get(kind+'_evidence') or {}
+        evidence = path.parent / proof.get('path', '')
+        if not evidence.is_file() or sha256_file(evidence) != proof.get('sha256'):
+            raise ValueError('corporate missing-index evidence SHA mismatch')
+        proofs[kind] = json.loads(evidence.read_text())
+        archive.copy(evidence, proof['sha256'], url=review['source_url'], kind='corporate_'+kind+'_review')
+    captured = proofs['canonical_capture']
+    record = archive.conn.execute('SELECT * FROM documents WHERE url=?', (review['source_url'],)).fetchone()
+    if (record is None or record['state'] != 'complete'
+            or captured.get('status') != 'canonical_capture_matches_inspected_original'
+            or captured.get('publication_inferred_from_current_capture') is not False
+            or any(captured.get('document', {}).get(k) != record[k]
+                   for k in ('url', 'state', 'content_sha256', 'raw_path', 'raw_sha256'))
+            or record['content_sha256'] != review['content_sha256']):
+        raise ValueError('corporate missing-index canonical capture mismatch')
+    rendered = proofs['render']
+    raw = gzip.decompress((archive.root / record['raw_path']).read_bytes())
+    with fitz.open(stream=raw, filetype='pdf') as pdf:
+        page_count = len(pdf)
+    def scope(pages):
+        return {(p['page'], p.get('image_sha256')) for p in pages}
+    if (rendered.get('source_url') != review['source_url']
+            or rendered.get('source_content_sha256') != review['content_sha256']
+            or scope(rendered.get('pages', [])) != scope(review['pages'])
+            or sorted(p['page'] for p in review['pages']) != list(range(1, page_count+1))
+            or any(not p.get('image_path') or not p.get('image_sha256') for p in review['pages'])):
+        raise ValueError('corporate missing-index review must inspect the complete original')
+    return dict(publication_basis=review['publication_basis'], index_publication_verified=False,
+        issuing_notice_number=number, canonical_capture_review_sha256=review['canonical_capture_evidence']['sha256'],
+        render_review_sha256=review['render_evidence']['sha256'])
+
+
 def corporate_source_review_candidates(archive, path, *, source_urls=None):
     """Bind a visual cell transcription to the exact original PDF and notice."""
     payload=json.loads(path.read_text());reviews=payload.get('reviews',[payload])
@@ -857,7 +1202,7 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
             raise ValueError('corporate visual review source SHA mismatch')
         notice=archive.conn.execute('SELECT * FROM announcements WHERE url=?',
                                     (review['source_url'],)).fetchone()
-        if notice is None or notice['published_date']!=review['published_date']:
+        if notice is not None and notice['published_date']!=review['published_date']:
             raise ValueError('corporate visual review publication mismatch')
         pages=review['pages'];text='\n'.join(p['native_text'] for p in pages)
         if sorted(p['page'] for p in pages)!=review['visually_reviewed_pages']:
@@ -880,6 +1225,7 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
                     raise ValueError('corporate review page image SHA mismatch')
                 archive.copy(image_path,page['image_sha256'],url=review['source_url'],
                              kind='visual_corporate_review_page')
+        publication_proof = reviewed_corporate_publication(archive, path, review, doc, text, notice)
         publication_text=text
         if proof:=review.get('publication_evidence'):
             # The issue-date page can already have a hash-bound extraction.
@@ -926,13 +1272,15 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
                     or old['published_date']>=review['published_date']
                     or not re.fullmatch(r'\d{10,11}',number)
                     or not re.search(r'發文字號[:：]?[臺台]期交字第'+number+'號',old_text)
-                    or not re.search(r'修正本公司'+ROC_DATE+r'[臺台]期交字第'+number+'號公告',compact(text))):
+                    or not re.search(r'修正本公司'+ROC_DATE+r'[臺台]期交字第'+number+'號公告',
+                                     compact(text + '\n' + publication_text))):
                 raise ValueError('visual notice amendment lacks exact original/reference binding')
             check_publication(old['first_page_text'],old['published_date'])
             superseded.append(old['content_sha256'])
         facts=reviewed_fixed_subscription_rights(corporate_native_table_candidates(pages),review)
+        terminal_revision = review.get('terminal_formula_revision_only') is True
         if not facts or any(not r['deliverable_components_resolved'] or not r['contract_months']
-                or not r['effective_date'] or r['effective_date']<=review['published_date']
+                or not r['effective_date'] or (r['effective_date']<=review['published_date'] and not terminal_revision)
                 or (r['has_equity_credit_fields'] and not r['cash_equity_pair_agrees']) for r in facts):
             raise ValueError('visual corporate review has unresolved required fields')
         provenance=dict(source_url=review['source_url'],announcement_url=review['source_url'],
@@ -942,9 +1290,15 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
             extraction='source_bound_visual_corporate_cells',visual_review_sha256=sha256_file(path),
             supersedes_source_sha256s=sorted(set(superseded)),
             supersession_review_sha256=sha256_file(path) if superseded else None)
+        provenance.update(publication_proof)
+        corrections = reviewed_corporate_code_pair_corrections(review, facts)
+        if corrections:
+            provenance['reviewed_code_pair_corrections'] = json.dumps(corrections, sort_keys=True)
         if issued is not None:
             provenance['issued_date']=issued
         bound_facts=[dict(fact,**provenance) for fact in facts]
+        if terminal_revision:
+            bound_facts = classify_terminal_formula_revision(bound_facts, corporate)
         corporate.extend(bound_facts)
         # A complete inspected position grid can explicitly name another
         # already adjusted contract without restating its financial event.
@@ -957,7 +1311,7 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
                               position_unit_review_scope=review.get('position_unit_scope')) for fact in
                          corporate_position_table_candidates(pages,corporate=bound_facts,
                              allow_table_only_members=table_only,
-                             group_text=review.get('position_group_text')))
+                             group_text=review.get('position_group_text')) if not terminal_revision)
         replaced.add(review['content_sha256'])
     archive.copy(path,sha256_file(path),url='',kind='visual_corporate_cell_review')
     return corporate,positions,replaced
@@ -1066,11 +1420,21 @@ def native_position_candidates(archive, root, *, corporate=False, margin=False, 
         doc=archive.document(notice['url'])
         table_kind='ocr_table_' if proof['profile'] in (
             'source_ruled_ocr_cell_grid_v1', 'source_ruled_ocr_cell_grid_v2',
-            'source_ruled_ocr_cell_grid_v3') else 'native_table_'
+            'source_ruled_ocr_cell_grid_v3', 'source_ruled_ocr_cell_grid_v4',
+            'source_ruled_ocr_cell_grid_v5') else 'native_table_'
         for name in ('tables.json','receipt.json'):
             archive.copy(folder/name,sha256_file(folder/name),url=notice['url'],kind=table_kind+name)
+        if corporate:
+            table_sha=sha256_file(folder/'tables.json')
+            table_source=next(s for s in archive.sources.values()
+                if s['sha256']==table_sha and s['url']==notice['url'])
         clock=clock or candidate_notice_clock(source_text,notice['published_date'])
         for row in found:
+            if corporate:
+                row['numeric_source_cells_evidence']=json.dumps(dict(
+                    source_content_sha256=doc['content_sha256'],path=table_source['path'],
+                    sha256=table_source['sha256'],page=row.get('page'),
+                    table_index=row.get('table_index')),sort_keys=True,ensure_ascii=False)
             row.update(source_url=notice['url'],announcement_url=notice['url'],
                 published_date=notice['published_date'],source_content_sha256=doc['content_sha256'],
                 known_at=timestamp(date.fromisoformat(notice['published_date']),'23:59:59'),
@@ -1080,6 +1444,22 @@ def native_position_candidates(archive, root, *, corporate=False, margin=False, 
                 row.update(extraction='canonical_native_margin_reextraction',requires_dated_session_rule=True)
             positions.append(row)
     return positions
+
+
+def margin_notice_product_aliases(text):
+    """Use only unambiguous code/name pairs printed in this same original."""
+    dense=compact(text);code=r'(?:[A-Z]{2}F|TX|MTX|TE|TF)'
+    aliases={}
+    for m in re.finditer(r'(?<![A-Z0-9])('+code+r')\(([^()]{1,24}期貨)\)',dense):
+        aliases.setdefault(m[2],set()).add(m[1])
+    # The cover also declares names as 商品為甲期貨契約(AAF)及乙期貨契約(BBF).
+    # Overlapping lookahead retains each connected name's own code instead of
+    # consuming the whole list into its first alias. Only literal source names
+    # are accepted; the later restoration subjects must repeat them exactly.
+    for m in re.finditer(r'(?=(?:商品為|本公司|及|與|暨|、|[,，])'
+            r'([\u4e00-\u9fff]{1,24}期貨)(?:契約)?\(('+code+r')\))',dense):
+        aliases.setdefault(m[1],set()).add(m[2])
+    return {name:next(iter(codes)) for name,codes in aliases.items() if len(codes)==1}
 
 
 def named_margin_restoration_clauses(text, *, publication_bound=False):
@@ -1095,17 +1475,7 @@ def named_margin_restoration_clauses(text, *, publication_bound=False):
     targets=list(re.finditer(r'恢復(?:為(?:'+reference+r')?'+prior+r'|原保證金)',dense))
     clocks=list(re.finditer(ROC_DATE+r'一般交易時段結束後',dense))
     if not targets:return None
-    aliases={}
-    for m in re.finditer(r'(?<![A-Z0-9])('+code+r')\(([^()]{1,24}期貨)\)',dense):
-        aliases.setdefault(m[2],set()).add(m[1])
-    # The cover also declares names as 商品為甲期貨契約(AAF)及乙期貨契約(BBF).
-    # Overlapping lookahead retains each connected name's own code instead of
-    # consuming the whole list into its first alias. Only literal source names
-    # are accepted; the later restoration subjects must repeat them exactly.
-    for m in re.finditer(r'(?=(?:商品為|本公司|及|與|暨|、|[,，])'
-            r'([\u4e00-\u9fff]{1,24}期貨)(?:契約)?\(('+code+r')\))',dense):
-        aliases.setdefault(m[1],set()).add(m[2])
-    aliases={name:next(iter(codes)) for name,codes in aliases.items() if len(codes)==1}
+    aliases=margin_notice_product_aliases(text)
     names=sorted(aliases,key=len,reverse=True)
     named='|'.join(re.escape(name)+r'(?:契約)?(?:\('+re.escape(aliases[name])+r'\))?' for name in names)
     literal=r'[\u4e00-\u9fff]{1,24}期貨(?:契約)?\('+code+r'\)'
@@ -1198,6 +1568,49 @@ def named_margin_restoration_clauses(text, *, publication_bound=False):
     return rows
 
 
+def numbered_margin_extension_clauses(text, product):
+    """Select an extension by its own named contract and numbered prior notice."""
+    dense = compact(text)
+    explicit = (r'本次延長保證金調整期間之商品為[^。;；()]{1,48}'
+        r'\((?P<product>[A-Z][A-Z0-9]{1,2})\)[^。;；]{0,80}?本公司'
+        r'(?P<prior_day>'+ROC_DATE+r')[臺台]期結字第(?P<number>\d{9,12})號函'
+        r'[^。;；]{0,120}?延長至(?P<end>'+ROC_DATE+r')一般交易時段結束後[,，]'
+        r'恢復為(?P<reference>'+ROC_DATE+r')調整前之保證金')
+    found = [m for m in re.finditer(explicit, dense) if m['product'] == product]
+    if found:
+        return found
+    # Some notices contain only a period amendment, with the contract code in
+    # the unchanged financial annex. Bind its full name, never another table.
+    names = set(re.findall(re.escape(product)+r'\(([^()]{1,24}期貨)\)', dense))
+    if len(names) != 1:
+        return []
+    name = re.escape(next(iter(names)))
+    clause = (r'(?:本公司|原期交所)(?P<prior_day>'+ROC_DATE+r')[臺台]期結字第'
+        r'(?P<number>\d{9,12})號函[,，]?公告(?:自[^。;；]{0,80}?)?調整'+name+
+        r'(?:之)?保證金[^。;；]{0,100}?之期間[,，]?延長至(?P<end>'+ROC_DATE+
+        r')一般交易時段結束後[,，]恢復為(?P<reference>'+ROC_DATE+r')調整前之保證金')
+    found = list(re.finditer(clause, dense))
+    if found:
+        return found
+    # The press view states the prior start/expiry before the named change,
+    # then states its own full restoration date in a separate sentence.
+    prior = list(re.finditer(r'原期交所(?P<prior_day>'+ROC_DATE+r')[臺台]期結字第'
+        r'(?P<number>\d{9,12})號函公告自(?P<start>'+ROC_DATE+r')至'
+        r'(?P<expiry>\d{1,2}月\d{1,2}日)一般交易時段止[,，]調整'+name+
+        r'保證金適用比例為[^。;；]{1,80}之期間[,，]延長至'
+        r'(?P<end>\d{1,2}月\d{1,2}日)', dense))
+    restored = list(re.finditer(r'(?P<end>'+ROC_DATE+r')一般交易時段結束後[,，]'+name+
+        r'契約\('+re.escape(product)+r'\)恢復為(?P<reference>'+ROC_DATE+
+        r')調整前之保證金', dense))
+    if len(prior) != 1 or len(restored) != 1:
+        return []
+    p, r = prior[0], restored[0]
+    if not r['end'].endswith(p['end']) or p['start'] != r['reference']:
+        return []
+    return [{0: p[0]+'。'+r[0], 'prior_day': p['prior_day'], 'number': p['number'],
+             'end': r['end'], 'reference': r['reference']}]
+
+
 def product_margin_restoration_clock(text, product, clock):
     """Bind explicitly named restoration clauses to their own products.
 
@@ -1208,7 +1621,7 @@ def product_margin_restoration_clock(text, product, clock):
     dense = compact(text)
     extensions = set(re.findall(r'本次延長保證金調整期間之商品為'
         r'[^。;；()]{1,48}\(([A-Z][A-Z0-9]{1,2})\)', dense))
-    if product in extensions:
+    if product in extensions or numbered_margin_extension_clauses(text, product):
         # A different product may have a new start in this same notice. This
         # product continues its numbered prior notice; only a source-bound
         # join to that prior start/expiry can establish the added interval.
@@ -1277,6 +1690,89 @@ def product_margin_restoration_clock(text, product, clock):
         restoration_clock_scope='explicit_product_clause')
 
 
+def bind_native_margin_period_replacement(archive, text, amendment, facts):
+    """Compose an explicitly revoked period with its unchanged raised level.
+
+    A table may repeat the named prior restoration base in its before column.
+    That is not a new transition from the base while the raised level is live.
+    Require the own contract, numbered prior notice, amounts and exact clocks.
+    """
+    if (not amendment.get('issue_date_bound') or amendment.get('margin_kind')!='notional_rate'
+            or not amendment.get('before') or amendment.get('requires_reversion_review') is not True
+            or amendment.get('extraction')=='observed_disposition_conditional_restoration'):
+        return None
+    dense=compact(text);product=amendment['product']
+    names=set(re.findall(re.escape(product)+r'\(([^()]{1,24}期貨)\)',dense))
+    if len(names)!=1:return None
+    name=next(iter(names))
+    if '延長'+name+'契約('+product+')保證金調整期間' not in dense:return None
+    try:
+        known=timestamp(date.fromisoformat(amendment['published_date']),'23:59:59')
+        own=archive.document(amendment['source_url'])
+        if (own['content_sha256']!=amendment['source_content_sha256']
+                or not re.fullmatch('[a-f0-9]{64}',amendment['source_content_sha256'])
+                or compact(own['text'])!=dense or amendment['known_at']!=known
+                or not candidate_notice_clock(text,amendment['published_date'])['issue_date_bound']
+                or amendment.get('effective_phase')!='after_product_regular_close'
+                or amendment['published_date']>=amendment['effective_date']):
+            return None
+        revocations=json.loads(amendment.get('prior_notice_revocation_evidence') or '[]')
+        revocations=[r for r in revocations if r.get('date_iso')==amendment['effective_date']
+            and r.get('boundary')=='after_regular_session'
+            and '有關'+name+'保證金之規定' in compact(r.get('clause') or '')
+            and compact(r.get('clause') or '') in dense]
+        identities={(r['prior_publication_date'],r['revoked_notice_number'],r['clause']) for r in revocations}
+        if len(identities)!=1:return None
+        prior_day,number,clause=next(iter(identities))
+        references={str(roc_date(m)) for m in re.finditer(re.escape(name)+r'恢復為'+ROC_DATE+
+            r'調整前之保證金',dense)}
+        ends={(e['date_iso'],e['boundary']) for e in json.loads(amendment['temporary_end_evidence'])}
+        if len(references)!=1 or len(ends)!=1:return None
+        reference=next(iter(references));end,boundary=next(iter(ends))
+        if boundary!='after_regular_session' or end<=amendment['effective_date']:return None
+    except (KeyError,TypeError,ValueError):
+        return None
+    bound=[]
+    for prior in facts:
+        if (prior['product']!=product or prior.get('published_date')!=prior_day
+                or prior.get('effective_date')!=reference or not prior.get('issue_date_bound')
+                or prior.get('effective_phase')!='after_product_regular_close'
+                or prior.get('margin_kind')!=amendment['margin_kind']
+                or prior.get('before')!=amendment['before'] or prior.get('after')!=amendment.get('after')
+                or not prior.get('requires_reversion_review')
+                or prior.get('extraction')=='observed_disposition_conditional_restoration'):
+            continue
+        doc=archive.document(prior['source_url'])
+        if (doc['content_sha256']!=prior.get('source_content_sha256')
+                or not re.fullmatch('[a-f0-9]{64}',prior.get('source_content_sha256') or '')
+                or not re.search(r'發文字號:[臺台]期結字第'+re.escape(number)+r'號',compact(doc['text']))
+                or prior.get('known_at')!=timestamp(date.fromisoformat(prior_day),'23:59:59')):
+            continue
+        check_publication(doc['text'],prior_day)
+        prior_ends={(e['date_iso'],e['boundary']) for e in json.loads(prior.get('temporary_end_evidence') or '[]')}
+        if len(prior_ends)!=1:continue
+        expiry,phase=next(iter(prior_ends))
+        if not prior_day<reference<amendment['published_date']<amendment['effective_date']<expiry<end:
+            continue
+        if phase=='after_regular_session':bound.append((prior,expiry))
+    if len({(p['source_content_sha256'],s) for p,s in bound})!=1:return None
+    prior,expiry=bound[0]
+    proof=dict(rule='native_numbered_period_replacement_same_level',prior_notice_number=number,
+        prior_publication_date=prior_day,prior_source_content_sha256=prior['source_content_sha256'],
+        prior_known_at=prior['known_at'],prior_effective_date=reference,prior_scheduled_expiry=expiry,
+        amendment_source_content_sha256=amendment['source_content_sha256'],amendment_known_at=known,
+        scheduled_restoration=end,clause=clause,printed_restoration_base=list(amendment['before']))
+    return dict(amendment,before=list(prior['after']),before_column_semantics='named_prior_restoration_base',
+        event_type='before_after',clock_error=None,chronological=True,
+        extension_prior_notice_join_required=False,
+        declared_non_disposed_margin=None,restoration_target=list(prior['before']),
+        restoration_rule='return_to_referenced_before',restoration_reference_evidence=json.dumps(dict(
+            source_content_sha256s=[prior['source_content_sha256']],known_at=prior['known_at'],
+            referenced_effective_date=reference),ensure_ascii=False),
+        extension_join_evidence=json.dumps(proof,ensure_ascii=False),
+        extraction='native_numbered_margin_period_extension',candidate_only=True,point_in_time_verified=False)
+
+
 def bind_native_margin_period_extension(archive, text, amendment, facts):
     """Join one native numbered period amendment without changing older clocks.
 
@@ -1285,25 +1781,22 @@ def bind_native_margin_period_extension(archive, text, amendment, facts):
     the canonical completed-session evidence. Unmatched amounts, references,
     starts, dates or document numbers remain unresolved.
     """
+    if not amendment.get('extension_prior_notice_join_required'):
+        return bind_native_margin_period_replacement(archive,text,amendment,facts)
     if (not amendment.get('extension_prior_notice_join_required')
             or amendment.get('before_column_semantics')!='explicit_non_disposed_base'
             or amendment.get('margin_kind')!='notional_rate'
             or not amendment.get('issue_date_bound')):
         return None
     try:
-        check_publication(text,amendment['published_date'])
+        if not candidate_notice_clock(text, amendment['published_date'])['issue_date_bound']:
+            return None
         known=timestamp(date.fromisoformat(amendment['published_date']),'23:59:59')
         if amendment['known_at']!=known:return None
         if not re.fullmatch('[a-f0-9]{64}',amendment['source_content_sha256']):return None
     except (ValueError,KeyError,TypeError):
         return None
-    clause_pattern=(r'本次延長保證金調整期間之商品為[^。;；()]{1,48}'
-        r'\((?P<product>[A-Z][A-Z0-9]{1,2})\)[^。;；]{0,80}?本公司'
-        r'(?P<prior_day>'+ROC_DATE+r')[臺台]期結字第(?P<number>\d{9,12})號函'
-        r'[^。;；]{0,120}?延長至(?P<end>'+ROC_DATE+r')一般交易時段結束後[,，]'
-        r'恢復為(?P<reference>'+ROC_DATE+r')調整前之保證金')
-    matches=[m for m in re.finditer(clause_pattern,compact(text))
-             if m['product']==amendment['product']]
+    matches = numbered_margin_extension_clauses(text, amendment['product'])
     if len(matches)!=1:return None
     match=matches[0]
     day=lambda name:str(roc_date(re.search(ROC_DATE,match[name])))
@@ -1350,6 +1843,69 @@ def bind_native_margin_period_extension(archive, text, amendment, facts):
         extension_join_evidence=json.dumps(evidence,ensure_ascii=False),
         extraction='native_numbered_margin_period_extension',point_in_time_verified=False,
         candidate_only=True)
+
+
+def compose_bound_margin_extension_views(archive, facts):
+    """Bind incomplete amount views only to a proved extension of their own bytes."""
+    from copy import deepcopy
+    groups = {}
+    for row in facts:
+        if row.get('extraction') == 'observed_disposition_conditional_restoration':
+            continue
+        key = (row['product'], row.get('source_content_sha256'), row.get('published_date'),
+               row.get('known_at'), row.get('margin_kind'), tuple(row.get('after') or []))
+        groups.setdefault(key, []).append(row)
+    changes = []
+    for rows in groups.values():
+        anchors = [r for r in rows if r.get('extraction') == 'native_numbered_margin_period_extension'
+                   and r.get('extension_join_evidence') and r.get('issue_date_bound')]
+        identities = {(r['effective_date'], r['effective_phase'], tuple(r['before']),
+                       tuple(r.get('declared_non_disposed_margin') or []),
+                       r['temporary_end_evidence'], r['extension_join_evidence']) for r in anchors}
+        if len(identities) != 1:
+            continue
+        anchor = anchors[0]
+        proof = json.loads(anchor['extension_join_evidence'])
+        replacement=proof.get('rule')=='native_numbered_period_replacement_same_level'
+        for row in rows:
+            if row in anchors or not row.get('issue_date_bound'):
+                continue
+            if row.get('before') is not None and not (replacement
+                    and row['before']==proof['printed_restoration_base']):
+                continue
+            if (row.get('declared_non_disposed_margin') is not None
+                    and row['declared_non_disposed_margin'] != anchor['declared_non_disposed_margin']):
+                continue
+            if row.get('before_column_semantics') not in (None, 'explicit_non_disposed_base',
+                    anchor.get('before_column_semantics')):
+                continue
+            if row.get('effective_date') not in (None, proof['prior_effective_date'], anchor['effective_date']):
+                continue
+            doc = archive.document(row['source_url'])
+            if doc['content_sha256'] != row['source_content_sha256']:
+                raise ValueError('extension amount view original SHA mismatch')
+            clauses = numbered_margin_extension_clauses(doc['text'], row['product'])
+            clause_bound=(compact(proof['clause']) in compact(doc['text']) if replacement else
+                len(clauses)==1 and clauses[0]['number']==proof['prior_notice_number'])
+            if (not clause_bound
+                    or not candidate_notice_clock(doc['text'], row['published_date'])['issue_date_bound']):
+                continue
+            original = dict(effective_date=row.get('effective_date'), effective_phase=row.get('effective_phase'),
+                            extraction=row.get('extraction'),before=row.get('before'))
+            for field in ('effective_date', 'effective_phase', 'before', 'event_type', 'clock_error',
+                          'chronological', 'extension_prior_notice_join_required', 'requires_reversion_review',
+                          'temporary_end_evidence', 'extension_join_evidence', 'extraction',
+                          'declared_non_disposed_margin', 'before_column_semantics'):
+                row[field] = deepcopy(anchor[field])
+            if replacement:
+                for field in ('restoration_target','restoration_rule','restoration_reference_evidence'):
+                    row[field]=deepcopy(anchor[field])
+            row['extension_view_composition_evidence'] = json.dumps(dict(
+                original_view=original, own_source_content_sha256=row['source_content_sha256'],
+                composition='same_original_amount_and_numbered_extension'), ensure_ascii=False)
+            changes.append(dict(product=row['product'], source_content_sha256=row['source_content_sha256'],
+                                effective_date=row['effective_date']))
+    return changes
 
 
 def bind_single_session_margin_clocks(archive, facts, path):
@@ -1429,6 +1985,224 @@ def bind_retained_single_session_margin_clocks(archive, facts, explicit=None):
     return changed
 
 
+def repair_native_restoration_period_revisions(archive, facts, path):
+    """Apply a dated period-only revision without making a new margin raise.
+
+    Original amounts and knowledge clocks stay intact. The only new financial
+    event is the observed restoration, after the newly announced cash sessions
+    have completed. A later annotation alone never rewrites an earlier period.
+    """
+    from bs4 import BeautifulSoup
+    payload = json.loads(path.read_text())
+    laws = payload.get('restoration_period_revision_laws', [])
+    if not laws:
+        return facts, []
+    law_hashes = []
+    for law in laws:
+        file = Path(law['path'])
+        if sha256_file(file) != law['sha256']:
+            raise ValueError('restoration period law source SHA mismatch')
+        text = compact(BeautifulSoup(file.read_bytes(), 'html.parser').get_text(' ', strip=True))
+        if not all(compact(c) in text for c in law['required_clauses']):
+            raise ValueError('restoration period law clause mismatch')
+        known = datetime.fromisoformat(law['known_at'])
+        issued = {str(roc_date(m)) for m in re.finditer(
+            r'(?:發文日期|修正日期)[:：](?:中華)?民國'+ROC_DATE, text)}
+        if (known.tzinfo is None or known.date().isoformat() != law['published_date']
+                or law['published_date'] >= law['effective_date'] or issued != {law['published_date']}):
+            raise ValueError('restoration period law publication mismatch')
+        archive.copy(file, law['sha256'], url=law['url'], kind='restoration_period_revision_law')
+        law_hashes.append(law['sha256'])
+    loaded = {}
+    for key in ('universe', 'dispositions', 'observations'):
+        src = payload[key]
+        file = Path(src['path'])
+        if sha256_file(file) != src['sha256']:
+            raise ValueError('restoration period input SHA mismatch')
+        loaded[key] = pl.read_csv(file, infer_schema=False) if key == 'universe' else pl.read_parquet(file)
+    securities = dict(loaded['universe'].select('product', 'underlying_symbol').iter_rows())
+    def annex(text, product):
+        blocks = re.findall(re.escape(product)+r'\([^()]{1,24}期貨\)(.*?)(?=單位[:：]|$)', compact(text))
+        ends = [m for b in blocks for m in re.finditer(r'※'+ROC_DATE+
+            r'一般交易時段結束後恢復為'+ROC_DATE+r'標的證券未經處置前保證金', b)]
+        identities = {(str(roc_date(list(re.finditer(ROC_DATE, m[0]))[0])),
+                       str(roc_date(list(re.finditer(ROC_DATE, m[0]))[1]))) for m in ends}
+        return next(iter(identities)) if len(identities) == 1 else None
+    def revised_period(measure):
+        match = re.search(r'(?:調整為|修正後處置期間為)'
+            r'(\d{2,4})/(\d{1,2})/(\d{1,2})[~～](\d{2,4})/(\d{1,2})/(\d{1,2})', measure)
+        if match is None:
+            return None
+        parts = list(map(int, match.groups()))
+        days = []
+        for year, month, day in (parts[:3], parts[3:]):
+            days.append(str(date(year + 1911 if year < 1911 else year, month, day)))
+        return (*days, match[0])
+    result = list(facts)
+    repairs = []
+    done = set()
+    for candidate in facts:
+        if (candidate.get('before_column_semantics') != 'explicit_non_disposed_base'
+                or candidate.get('margin_kind') != 'notional_rate'
+                or not candidate.get('issue_date_bound') or candidate['product'] in done
+                or candidate.get('extraction') == 'observed_disposition_conditional_restoration'
+                or not any(l['published_date'] <= candidate['published_date'] < l['effective_date'] for l in laws)):
+            continue
+        document = archive.document(candidate['source_url'])
+        if document['content_sha256'] != candidate['source_content_sha256']:
+            raise ValueError('restoration period amendment original SHA mismatch')
+        text = compact(document['text'])
+        if not all(c in text for c in ('保證金適用比例調整之期間', '自即日起停止適用',
+                                      '調整期間如遇休市、有價證券停止買賣、全日暫停交易')):
+            continue
+        applicable = [l for l in laws if l['published_date'] <= candidate['published_date'] < l['effective_date']
+                      and l['effective_date'] in {str(roc_date(m)) for m in re.finditer(ROC_DATE, text)}]
+        if not applicable:
+            continue
+        check_publication(document['text'], candidate['published_date'])
+        expected_known = timestamp(date.fromisoformat(candidate['published_date']), '23:59:59')
+        if candidate.get('known_at') != expected_known:
+            raise ValueError('restoration period amendment clock mismatch')
+        pair = annex(text, candidate['product'])
+        if pair is None:
+            continue
+        end, reference = pair
+        if (not candidate['published_date'] < end
+                or reference >= candidate['published_date']):
+            continue
+        numbers = set(re.findall(r'[臺台]期結字第(\d{9,12})號函', text))
+        priors = []
+        for prior in result:
+            if (prior['product'] != candidate['product'] or not prior.get('issue_date_bound')
+                    or not prior.get('requires_reversion_review')
+                    or prior.get('after') != candidate['after']
+                    or prior.get('margin_kind') != candidate['margin_kind']
+                    or not prior.get('effective_date') or prior['effective_date'] > candidate['published_date']
+                    or prior.get('known_at', '9999') >= expected_known):
+                continue
+            old_ends = json.loads(prior.get('temporary_end_evidence') or '[]')
+            if not old_ends or any(e['boundary'] != 'after_regular_session' or e['date_iso'] <= end for e in old_ends):
+                continue
+            doc = archive.document(prior['source_url'])
+            if doc['content_sha256'] != prior['source_content_sha256']:
+                raise ValueError('period amendment prior source SHA mismatch')
+            own_numbers = set(re.findall(r'發文字號[:：][臺台]期結字第(\d{9,12})號', compact(doc['text'])))
+            if own_numbers & numbers:
+                priors.append(prior)
+        if not priors or len({p['effective_date'] for p in priors}) != 1:
+            continue
+        # The formal amendment supersedes the same financial event in its
+        # own press counterpart as well. Match the complete event identity;
+        # a similar amount in another period is not revocation evidence.
+        def prior_identity(row):
+            if not row.get('before') or not row.get('requires_reversion_review') or not row.get('issue_date_bound'):
+                return None
+            ends = json.loads(row.get('temporary_end_evidence') or '[]')
+            return (row['product'], row.get('margin_kind'), tuple(row['before']), tuple(row.get('after') or []),
+                    row.get('effective_date'), row.get('effective_phase'), row.get('published_date'), row.get('known_at'),
+                    tuple(sorted({(e['date_iso'], e['boundary']) for e in ends})))
+        identities = {prior_identity(p) for p in priors}
+        for row in result:
+            if row in priors or prior_identity(row) not in identities:
+                continue
+            own = archive.document(row['source_url'])
+            if own['content_sha256'] != row['source_content_sha256']:
+                raise ValueError('period amendment counterpart source SHA mismatch')
+            if candidate_notice_clock(own['text'], row['published_date'])['issue_date_bound']:
+                priors.append(row)
+        start = priors[0]['effective_date']
+        references = [r for r in result if r['product'] == candidate['product']
+                 and r.get('effective_date') == reference and r.get('before')
+                 and r.get('issue_date_bound') and r.get('margin_kind') == candidate['margin_kind']
+                 and r.get('known_at', '9999') < expected_known]
+        bases = {tuple(r['before']) for r in references}
+        if bases != {tuple(candidate['declared_non_disposed_margin'])}:
+            continue
+        pseudo = dict(candidate, effective_date=start, effective_phase='after_product_regular_close',
+            before=candidate['declared_non_disposed_margin'], requires_reversion_review=True,
+            temporary_end_evidence=json.dumps([dict(date_iso=end, boundary='after_regular_session')]))
+        target = dict(restoration_target=candidate['declared_non_disposed_margin'],
+                      restoration_rule='return_to_declared_before')
+        if reference < start:
+            target.update(restoration_rule='return_to_referenced_before', restoration_reference_evidence=json.dumps(dict(
+                referenced_effective_date=reference, reference_clauses=[pair],
+                source_content_sha256s=sorted({r['source_content_sha256'] for r in references}),
+                known_at=max(r['known_at'] for r in references)), ensure_ascii=False))
+        pseudo.update(target)
+        stock = securities.get(candidate['product'])
+        periods = loaded['dispositions'].filter((pl.col('stock_id') == stock)
+            & (pl.col('period_start') <= start) & (pl.col('period_end') > end)
+            & (pl.col('date') <= candidate['published_date'])).to_dicts()
+        periods = [p for p in periods if revised_period(p['measure'])
+                   and revised_period(p['measure'])[:2] == (p['period_start'], end)]
+        if not periods:
+            continue
+        latest = max(p['date'] for p in periods)
+        periods = [p for p in periods if p['date'] == latest]
+        if len({(p['period_start'], p['period_end'], p['measure']) for p in periods}) != 1:
+            continue
+        period = periods[0]
+        from downloader.taifex_rule_parsing import _integer
+        counts = {_integer(m[1]) for m in re.finditer(r'(?:起|[﹝〔（(\[])'
+            r'([0-9零〇一二三四五六七八九十]+)個營業日', compact(period['measure']))}
+        if counts not in ({10}, {12}):
+            continue
+        count = 5 if counts == {10} else 7
+        # The own exchange annotation supplies the revised endpoints. Its
+        # historical duration comes from the dated 10->5 / 12->7 revision;
+        # observations must independently prove exactly those cash sessions.
+        period_start = period['period_start']
+        revised_clause = revised_period(period['measure'])[2]
+        proof = dict(product=candidate['product'], amendment_source_sha256=candidate['source_content_sha256'],
+            amendment_known_at=expected_known, prior_source_sha256s=sorted({p['source_content_sha256'] for p in priors}),
+            original_disposition_source_sha256s=sorted({p['source_sha256'] for p in periods}),
+            original_disposition_date=latest, disposition_start=period_start, restore_date=end,
+            original_required_sessions=next(iter(counts)), revised_required_sessions=count,
+            law_source_sha256s=law_hashes, law_effective_dates=sorted({l['effective_date'] for l in applicable}),
+            revised_clause=revised_clause, financial_values_inferred=False)
+        proof_path = archive.bundle / 'restoration_period_revision_proof.json'
+        atomic_write_json(proof_path, proof)
+        proof_sha = sha256_file(proof_path)
+        archive.copy(proof_path, proof_sha, url='', kind='restoration_period_revision_proof')
+        amended = dict(period, period_end=end, measure=f'起{count}個營業日', source_sha256=proof_sha)
+        # The revised latest disposition supersedes its earlier overlapping
+        # period views. Later declarations remain and still block restoration.
+        own_periods = [p for p in loaded['dispositions'].filter(pl.col('stock_id') == stock).to_dicts()
+                       if p['date'] > latest]
+        disp = pl.from_dicts([amended, *own_periods], schema=loaded['dispositions'].schema)
+        prior_hashes = set(proof['prior_source_sha256s'])
+        def replaced(row):
+            if row['product'] != candidate['product']:
+                return False
+            if row.get('extraction') == 'observed_disposition_conditional_restoration':
+                return (row['source_content_sha256'] in prior_hashes and row['effective_date'] >= end
+                        and row.get('original_rule_known_at') in {p['known_at'] for p in priors}
+                        and row.get('before') == candidate['after']
+                        and row.get('after') == candidate['declared_non_disposed_margin'])
+            if (row.get('published_date') != candidate['published_date'] or row.get('after') != candidate['after']
+                    or row.get('declared_non_disposed_margin') != candidate['declared_non_disposed_margin']):
+                return False
+            doc = archive.document(row['source_url'])
+            return doc['content_sha256'] == row['source_content_sha256'] and annex(doc['text'], row['product']) == pair
+        kept = [r for r in result if not replaced(r)]
+        own_facts = [r for r in kept if r['product'] == candidate['product']]
+        restored, _ = disposal_margin_restorations([*own_facts, pseudo], loaded['universe'], disp,
+            loaded['observations'].filter(pl.col('symbol') == stock), market_closures=payload.get('market_closures', []),
+            security_full_day_halts=payload.get('security_full_day_halts', []))
+        restored = [r for r in restored if r['product'] == candidate['product']
+                    and r['source_content_sha256'] == candidate['source_content_sha256']
+                    and r['effective_date'] == end]
+        if len(restored) != 1:
+            continue
+        restored[0]['period_revision_proof_sha256'] = proof_sha
+        replaced_count = len(result) - len(kept)
+        result = kept + restored
+        repairs.append(dict(proof, proof_sha256=proof_sha, replaced_financial_candidates=replaced_count))
+        done.add(candidate['product'])
+    atomic_write_json(archive.bundle / 'restoration_period_revision_repairs.json', repairs)
+    return result, repairs
+
+
 def retained_document_table_views(archive, url, document, sources):
     """Read retained cell grids only with their matching original-source receipt."""
     for table in sources:
@@ -1456,18 +2230,24 @@ def retained_document_table_views(archive, url, document, sources):
         yield json.loads(path.read_text())['pages'], table['kind'] + ':' + table['sha256']
 
 
-def reextract_retained_margin_text(archive):
+def reextract_retained_margin_text(archive, *, source_urls=None):
     """Read all retained amount text again after a parser fix, preserving sources."""
     retained={}
     for source in archive.sources.values():
         retained.setdefault(source['url'], []).append(source)
     rows=[]
+    scope = None if source_urls is None else sorted(set(source_urls))
+    if scope == []:
+        return []
     query='''SELECT DISTINCT d.url,a.published_date,a.url announcement_url
         FROM announcements a JOIN (SELECT url parent,url child FROM announcements
             UNION SELECT parent,child FROM links) l ON l.parent=a.url
-        JOIN documents d ON d.url=l.child WHERE d.state='complete'
-        ORDER BY a.published_date,d.url'''
-    for notice in archive.conn.execute(query):
+        JOIN documents d ON d.url=l.child WHERE d.state='complete' '''
+    if scope is not None:
+        query += 'AND d.url IN (' + ','.join('?' for _ in scope) + ') '
+    query += 'ORDER BY a.published_date,d.url'
+    cursor = archive.conn.execute(query) if scope is None else archive.conn.execute(query, scope)
+    for notice in cursor:
         doc=archive.document(notice['url'])
         source_views = retained.get(notice['url'], [])
         grid_facts = []
@@ -1517,9 +2297,23 @@ def has_local_before_restoration(views, effective_date):
     return any(re.search(r'恢復為(?:'+ROC_DATE+r')?調整前(?:之)?保證金', text) for text in views)
 
 
-def preceding_restoration_products(prefix):
+def preceding_restoration_products(prefix, aliases=None):
     """The latest named subject owns the clause; retain a connected code list."""
     mentions = list(re.finditer(r'\(([A-Z]{2}F)\)', prefix))
+    if aliases:
+        names = list(re.finditer('|'.join(re.escape(n) for n in sorted(aliases, key=len, reverse=True)), prefix))
+        if names and (not mentions or names[-1].end() > mentions[-1].end()):
+            right = names[-1]
+            # An unrecognized later subject cannot inherit a previous name.
+            if re.search(r'[\u4e00-\u9fff]{1,24}期貨(?:契約)?$', prefix[right.end():]):
+                return set()
+            products = {aliases[right[0]]}
+            for left in reversed(names[:-1]):
+                if not re.fullmatch(r'(?:契約)?(?:[、,，]+(?:及|與|和)?|及|與|和)',
+                                    prefix[left.end():right.start()]):
+                    break
+                products.add(aliases[left[0]]);right=left
+            return products
     if not mentions:
         return set()
     products = {mentions[-1][1]}
@@ -1539,6 +2333,7 @@ def referenced_before_restoration(views, fact, facts):
     references=set(); clauses=[]
     pattern=r'恢復為(?P<ref>(?:\d{2,3}年)?\d{1,2}月\d{1,2}日)?(?:調整前|標的證券未經處置前)(?:之)?保證金'
     for text in views:
+        aliases=margin_notice_product_aliases(text)
         assigned=named_margin_restoration_clauses(text,publication_bound=bool(fact.get('issue_date_bound')))
         if assigned is not None:
             for clause in assigned:
@@ -1564,7 +2359,7 @@ def referenced_before_restoration(views, fact, facts):
         count=len(list(re.finditer(pattern,text)))
         for m in re.finditer(pattern,text):
             prefix=text[:m.start()]
-            products=preceding_restoration_products(prefix)
+            products=preceding_restoration_products(prefix,aliases)
             if fact['product'] not in products:
                 if products or count!=1:
                     continue
@@ -1609,6 +2404,146 @@ def referenced_before_restoration(views, fact, facts):
 def has_closed_cash_postponement_clause(views):
     clause=compact('調整期間如遇休市、有價證券停止買賣、全日暫停交易，則恢復日順延執行')
     return any(clause in compact(text) for text in views)
+
+
+def independent_boundary_disposition_proof(archive, fact, facts, security, dispositions, observations):
+    """Distinguish a new cash disposition from an extension of this margin.
+
+    Amounts still come from this original's own restoration instruction. A
+    later TAIFEX original is only a retrospective consistency check; it never
+    changes the historical publication clock or supplies an earlier amount.
+    """
+    if (not fact.get('requires_reversion_review') or not fact.get('issue_date_bound')
+            or fact.get('restoration_rule') not in
+                ('return_to_declared_before', 'return_to_referenced_before')
+            or fact.get('effective_phase') != 'after_product_regular_close'):
+        return None
+    declared = json.loads(fact.get('temporary_end_evidence') or '[]')
+    ends = {(r.get('date_iso'), r.get('boundary')) for r in declared}
+    if len(ends) != 1:
+        return None
+    end, boundary = next(iter(ends))
+    if not end or boundary not in ('after_regular_session', 'after_trading_session'):
+        return None
+    target = fact.get('restoration_target') or fact.get('before')
+    if not target:
+        return None
+    own = dispositions.filter(pl.col('stock_id') == security).to_dicts()
+    matches = [r for r in own if r['period_end'] == end
+        and r['period_start'] <= fact['effective_date'] and r['date'] <= fact['published_date']]
+    overlaps = [r for r in own if r['period_start'] <= end <= r['period_end'] and r not in matches]
+    if not matches or not overlaps or any(r['period_start'] != end
+            or r['period_end'] <= end or r['date'] <= fact['published_date'] for r in overlaps):
+        return None
+    next_days = observations.filter((pl.col('symbol') == security) & (pl.col('date').cast(pl.String) > end)
+        & pl.col('volume').is_finite() & (pl.col('volume') > 0)
+        & pl.col('source_sha256').str.contains(r'^[a-f0-9]{64}$'))['date'].cast(pl.String)
+    if not len(next_days):
+        return None
+    next_day = next_days.min()
+    successors = [r for r in facts if r.get('product') == fact['product']
+        and end < str(r.get('effective_date') or '') <= next_day
+        and r.get('extraction') != 'observed_disposition_conditional_restoration']
+    if not successors:
+        return None
+    if len({(r.get('effective_date'), r.get('margin_kind'), tuple(r.get('before') or []),
+            tuple(r.get('after') or [])) for r in successors}) != 1:
+        return None
+    signatures = set()
+    source_proofs = []
+    periods = {(r['period_start'], r['period_end']) for r in overlaps}
+    covered = set()
+    for row in successors:
+        try:
+            known = datetime.fromisoformat(row.get('known_at') or '')
+            ends = {(r.get('date_iso'), r.get('boundary')) for r in
+                json.loads(row.get('temporary_end_evidence') or '[]')}
+        except (TypeError, ValueError):
+            return None
+        after = row.get('after') or []
+        if (row.get('effective_date') != next_day
+                or row.get('effective_phase') != 'after_product_regular_close'
+                or row.get('margin_kind') != fact.get('margin_kind') or row.get('before') != list(target)
+                or not row.get('issue_date_bound') or not row.get('source_url')
+                or not re.fullmatch('[a-f0-9]{64}', row.get('source_content_sha256') or '')
+                or known.tzinfo is None or known < datetime.fromisoformat(fact['known_at'])
+                or known >= datetime.fromisoformat(timestamp(date.fromisoformat(next_day), '00:00:00'))
+                or len(ends) != 1 or len(after) != 3
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v) and v > 0 for v in after)
+                or not after[0] >= after[1] >= after[2]
+                or (row.get('margin_kind') == 'notional_rate' and after[0] > 1)):
+            return None
+        future_end, future_boundary = next(iter(ends))
+        if future_boundary not in ('after_regular_session', 'after_trading_session'):
+            return None
+        matched = [r for r in overlaps if r['period_end'] == future_end
+            and r['date'] <= row.get('published_date', '')]
+        if not matched:
+            return None
+        doc = archive.document(row['source_url'])
+        if doc['content_sha256'] != row['source_content_sha256']:
+            raise ValueError('independent disposition successor source SHA mismatch')
+        if not candidate_notice_clock(doc['text'], row['published_date'])['issue_date_bound']:
+            return None
+        signatures.add((next_day, future_end, tuple(after)))
+        covered.update((r['period_start'], r['period_end']) for r in matched)
+        source_proofs.append(dict(source_url=row['source_url'],
+            source_content_sha256=row['source_content_sha256'], known_at=row['known_at'],
+            effective_date=next_day, effective_phase=row['effective_phase'],
+            before=row['before'], after=after, disposition_end=future_end))
+    if len(signatures) != 1 or covered != periods:
+        return None
+    return dict(proof_contract='own_restoration_and_independent_next_cash_disposition_v1',
+        stock_id=security, nominal_restore_date=end, next_margin_effective_date=next_day,
+        original_rule_known_at=fact['known_at'], restoration_target=list(target),
+        excluded_disposition_rows=overlaps, successor_sources=source_proofs,
+        later_original_usage='retrospective_consistency_only_not_amount_or_publication_authority',
+        point_in_time_verified=False)
+
+
+def restore_independent_boundary_dispositions(archive, facts, universe, dispositions, observations,
+                                            rows, issues, **context):
+    """Retry only exact overlap failures, retaining every intervening margin."""
+    if not {'stock_id', 'period_start', 'period_end', 'date', 'source_sha256'} <= set(dispositions.columns):
+        return rows, issues
+    securities = dict(universe.select('product', 'underlying_symbol').iter_rows())
+    retained_issues = []
+    for issue in issues:
+        if issue.get('reasons') != 'overlapping_extended_disposition':
+            retained_issues.append(issue)
+            continue
+        originals = [r for r in facts if r.get('product') == issue['product']
+            and r.get('effective_date') == issue['effective_date'] and r.get('requires_reversion_review')
+            and any(e.get('date_iso') == issue['restore_date']
+                for e in json.loads(r.get('temporary_end_evidence') or '[]'))]
+        repaired = []
+        for original in originals:
+            proof = independent_boundary_disposition_proof(archive, original, facts,
+                securities.get(original['product']), dispositions, observations)
+            if proof is None:
+                continue
+            # Only this original sees the independently proved cash-period
+            # distinction. Other restorations keep their original context.
+            excluded = {json.dumps(r, sort_keys=True) for r in proof['excluded_disposition_rows']}
+            scoped_dispositions = pl.from_dicts([r for r in dispositions.to_dicts()
+                if json.dumps(r, sort_keys=True) not in excluded], schema=dispositions.schema)
+            scoped_facts = [r if r is original else dict(r, requires_reversion_review=False) for r in facts]
+            observed, failures = disposal_margin_restorations(scoped_facts, universe,
+                scoped_dispositions, observations, **context)
+            if failures or len(observed) != 1:
+                continue
+            observed[0]['restoration_evidence'] = json.dumps(dict(
+                json.loads(observed[0]['restoration_evidence']),
+                independent_boundary_disposition=proof), ensure_ascii=False)
+            repaired.extend(observed)
+        if repaired:
+            rows.extend(repaired)
+        else:
+            retained_issues.append(issue)
+    # One issue can correspond to several extraction views of one original.
+    unique = {json.dumps(r, sort_keys=True, ensure_ascii=False): r for r in rows}
+    return list(unique.values()), retained_issues
 
 
 def verified_disposal_restorations(archive, facts, path, *, source_urls=None):
@@ -1717,8 +2652,27 @@ def verified_disposal_restorations(archive, facts, path, *, source_urls=None):
                 composition='exact_same_product_amount_phase_publication_and_nominal_end',
                 source_content_sha256s=sorted({r['source_content_sha256'] for r in matching}),
                 source_urls=sorted({r['source_url'] for r in matching}),known_at=row['known_at']),ensure_ascii=False)
-    rows,issues=disposal_margin_restorations(verified,loaded['universe'],loaded['dispositions'],loaded['observations'],
+    dispositions, observations = loaded['dispositions'], loaded['observations']
+    if source_urls is not None:
+        # Only these rules can produce a new restoration in a bounded repair.
+        # Keep every fact for intervening-event checks, but do not repeatedly
+        # aggregate millions of unrelated positive cash observations.
+        products = {r['product'] for r in verified if r.get('requires_reversion_review')}
+        symbols = set(loaded['universe'].filter(pl.col('product').is_in(products))[
+            'underlying_symbol'].drop_nulls())
+        dispositions = dispositions.filter(pl.col('stock_id').is_in(symbols))
+        observations = observations.filter(pl.col('symbol').is_in(symbols))
+        atomic_write_json(archive.bundle/'restoration_cash_scope.json', dict(
+            restoration_context_sha256=sha256_file(path), products=sorted(products), symbols=sorted(symbols),
+            full_observation_rows=loaded['observations'].height, observed_rows_processed=observations.height,
+            full_disposition_rows=loaded['dispositions'].height, disposition_rows_processed=dispositions.height,
+            retained_intervening_facts=len(verified), input_sha256s={k:evidence[k]['sha256'] for k in loaded},
+            scope='exact_affected_securities_after_full_input_sha_verification'))
+    rows,issues=disposal_margin_restorations(verified,loaded['universe'],dispositions,observations,
         market_closures=evidence.get('market_closures',[]),
+        security_full_day_halts=evidence.get('security_full_day_halts',[]))
+    rows,issues=restore_independent_boundary_dispositions(archive,verified,loaded['universe'],
+        dispositions,observations,rows,issues,market_closures=evidence.get('market_closures',[]),
         security_full_day_halts=evidence.get('security_full_day_halts',[]))
     changes=[];halt_changes=[]
     for restored in rows:
@@ -1877,6 +2831,100 @@ def refresh_candidate_clocks(archive, facts, positions, corporate=()):
     return len(clocks)
 
 
+def compose_same_notice_margin_clocks(archive, facts):
+    """Join independently bound views of one product's same financial event.
+
+    An undated scan, a numbered extension, a conflicting explicit start, or a
+    different amount/publication never inherits a sibling clock. Keep both
+    original identities in the event evidence.
+    """
+    phases = {'product_regular_open', 'new_contract_listing', 'after_product_regular_close'}
+    grouped = {}
+    for row in facts:
+        if (not row.get('issue_date_bound') or row.get('extension_prior_notice_join_required')
+                or row.get('extraction') == 'observed_disposition_conditional_restoration'):
+            continue
+        if row.get('before') is not None:
+            before = ('transition_before', tuple(row['before']))
+        elif (row.get('before_column_semantics') == 'explicit_non_disposed_base'
+              and row.get('declared_non_disposed_margin')):
+            before = ('non_disposed_reference', tuple(row['declared_non_disposed_margin']))
+        else:
+            continue
+        key = (row['product'], row.get('margin_kind'), tuple(row.get('after') or []), before,
+               row.get('published_date'), row.get('known_at'))
+        grouped.setdefault(key, []).append(row)
+    repaired = []
+    for rows in grouped.values():
+        anchors = []
+        for row in rows:
+            ends = json.loads(row.get('temporary_end_evidence') or '[]')
+            if (row.get('effective_date') and row.get('effective_phase') in phases
+                    and all(e['boundary'] == 'after_regular_session' and e['date_iso'] > row['effective_date'] for e in ends)
+                    and (not row.get('requires_reversion_review') or len({e['date_iso'] for e in ends}) == 1)):
+                anchors.append(row)
+        signatures = {(r['effective_date'], r['effective_phase'], r.get('requires_reversion_review', False),
+                       tuple(sorted({(e['date_iso'], e['boundary']) for e in json.loads(r.get('temporary_end_evidence') or '[]')})))
+                      for r in anchors}
+        if len(signatures) != 1:
+            continue
+        for anchor in anchors:
+            if archive.document(anchor['source_url'])['content_sha256'] != anchor['source_content_sha256']:
+                raise ValueError('same-notice margin anchor original SHA mismatch')
+        day, phase, reversion, ends = next(iter(signatures))
+        for row in rows:
+            if row in anchors or row.get('extraction') == 'source_bound_visual_transcription':
+                continue
+            if (row.get('effective_date') and row['effective_date'] != day
+                    or row.get('effective_phase') in phases and row['effective_phase'] != phase):
+                continue
+            document = archive.document(row['source_url'])
+            if document['content_sha256'] != row['source_content_sha256']:
+                raise ValueError('same-notice margin clock original SHA mismatch')
+            views = retained_document_text_views(archive, row['source_url'], document)
+            mentions = [m for text,_ in views for m in temporal_mentions(text)]
+            own_starts = {m['date_iso'] for m in mentions if m['role'] == 'effective_start'}
+            if day not in own_starts:
+                continue
+            own_ends = {m['date_iso'] for m in mentions if m['role'] == 'effective_end'}
+            for text,_ in views:
+                own_clock=product_margin_restoration_clock(text,row['product'],
+                    candidate_notice_clock(text,row['published_date']))
+                own_ends.update(e['date_iso'] for e in json.loads(own_clock['temporary_end_evidence']))
+            parent_proof = None
+            if ends and not {e[0] for e in ends} <= own_ends:
+                # A formal counterpart can name the disposition's close
+                # without repeating its calendar dates. Its own verified
+                # start, financial columns and issuing notice must agree.
+                parent = row.get('announcement_url')
+                same_parent = [a for a in anchors if a.get('announcement_url') == parent]
+                conditional = any(re.search(r'證券市場處置期間結束後[,，]?於(?:該(?:股票)?契約)?'
+                    r'(?:一般)?交易時段結束後[,，]?恢復為', compact(t)) for t,_ in views)
+                if (own_ends or not parent or not same_parent or not conditional
+                        or not hasattr(archive, 'conn') or not hasattr(archive, 'children')):
+                    continue
+                notice = archive.conn.execute('SELECT published_date FROM announcements WHERE url=?',
+                                              (parent,)).fetchone()
+                children = set(archive.children(parent)) | {parent}
+                if (not notice or notice['published_date'] != row['published_date']
+                        or row['source_url'] not in children
+                        or not any(a['source_url'] in children for a in same_parent)):
+                    continue
+                original = archive.document(parent)
+                parent_proof = dict(announcement_url=parent,
+                                    announcement_content_sha256=original['content_sha256'])
+            proof = dict(composition='exact_same_product_financial_levels_roles_and_publication',
+                source_content_sha256s=sorted({r['source_content_sha256'] for r in [row, *anchors]}),
+                effective_date=day, effective_phase=phase, known_at=row['known_at'])
+            if parent_proof:proof['same_announced_financial_event'] = parent_proof
+            row.update(effective_date=day, effective_phase=phase, requires_reversion_review=reversion,
+                temporary_end_evidence=json.dumps([dict(date_iso=d, boundary=b) for d, b in ends]),
+                clock_error=None, chronological=row['published_date'] < day,
+                same_notice_clock_evidence=json.dumps(proof, ensure_ascii=False))
+            repaired.append(dict(product=row['product'], source_content_sha256=row['source_content_sha256'], **proof))
+    return repaired
+
+
 def repair_missing_margin_source_context(archive, facts):
     """Bind incomplete table clocks to the other verified views of that original.
 
@@ -1998,6 +3046,138 @@ def retained_document_text_views(archive, url, document, *, sources=None):
     return list(dict.fromkeys(views))
 
 
+def corporate_numeric_anomalies(facts):
+    """Diagnose magnitude and unit contradictions; never infer a replacement.
+
+    Small counts can be genuine mini/adjusted units. The threshold only selects
+    source review. Combinations, grades, rates and zero cash are not counts.
+    """
+    result=[]
+    for index,row in enumerate(facts):
+        reasons=[]
+        multiplier=row.get('contract_multiplier');quantity=row.get('deliverable_security_quantity')
+        positive=lambda v:isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0
+        if positive(multiplier) and multiplier<100:reasons.append('small_contract_multiplier_review')
+        if positive(quantity) and quantity<100:reasons.append('small_deliverable_quantity_review')
+        if positive(multiplier) and positive(quantity) and multiplier!=quantity:
+            reasons.append('multiplier_deliverable_quantity_disagree')
+        for name in ('contract_multiplier','deliverable_security_quantity','deliverable_cash_twd'):
+            value=row.get(name)
+            if value is not None and (not isinstance(value,(int,float)) or isinstance(value,bool)
+                    or not math.isfinite(value) or value<0 or (name!='deliverable_cash_twd' and value==0)):
+                reasons.append(name+'_invalid')
+        if reasons:
+            result.append(dict(candidate_index=index,product=row.get('product'),
+                source_url=row.get('source_url'),source_content_sha256=row.get('source_content_sha256'),
+                effective_date=row.get('effective_date'),contract_months=row.get('contract_months'),
+                contract_multiplier=multiplier,deliverable_security_quantity=quantity,
+                extraction_method=row.get('extraction_method'),reasons=reasons,
+                numeric_repair_evidence=row.get('numeric_repair_evidence')))
+    return result
+
+
+def reconcile_corporate_numeric_views(facts):
+    """Correct inconsistent numeric views only from one exact coherent event.
+
+    This is not a magnitude-based multiplication. The replacement already
+    exists in another bound view of the same original, person/product, date,
+    complete month scope and publication. Genuine conflicting coherent views
+    remain conflicts. Preserve the original values and the proof in each row.
+    """
+    from collections import defaultdict
+    from stockagent.data.tw_futures_margin_preparation import corporate_deliverable_components
+    fields=('product','from_product','to_product','effective_date','source_content_sha256',
+            'published_date','known_at')
+    def key(row):
+        values=tuple(row.get(k) for k in fields)
+        months=tuple(sorted(set(row.get('contract_months') or [])))
+        if (not all(values) or not months or not row.get('issue_date_bound')
+                or not re.fullmatch('[a-f0-9]{64}',row.get('source_content_sha256') or '')):return None
+        return (*values,months)
+    coherent=defaultdict(list)
+    for row in facts:
+        scope=key(row);amount=row.get('contract_multiplier');quantity=row.get('deliverable_security_quantity')
+        if (scope is not None and isinstance(amount,(int,float)) and math.isfinite(amount) and amount>0
+                and amount==quantity):coherent[scope].append(row)
+    repaired=[];report=[]
+    for row in facts:
+        scope=key(row);amount=row.get('contract_multiplier');quantity=row.get('deliverable_security_quantity')
+        peers=coherent.get(scope,[])
+        values={peer['contract_multiplier'] for peer in peers}
+        # An internally coherent low value is not a proven OCR error. An
+        # absent quantity likewise cannot select between numeric alternatives.
+        inconsistent=(isinstance(amount,(int,float)) and isinstance(quantity,(int,float))
+                      and math.isfinite(amount) and math.isfinite(quantity) and amount!=quantity)
+        if not inconsistent or len(values)!=1:
+            repaired.append(row);continue
+        replacement=next(iter(values))
+        # Neither disagreeing field may be overwritten by a third value.
+        # At least one independent field already agrees with the complete peer.
+        if replacement!=max(amount,quantity):repaired.append(row);continue
+        matching=[p for p in peers if p.get('deliverable_text') and p.get('numeric_source_cells_evidence')]
+        def bound_cells(peer):
+            proof=json.loads(peer['numeric_source_cells_evidence'])
+            return (proof.get('source_content_sha256')==peer['source_content_sha256']
+                and re.fullmatch('[a-f0-9]{64}',proof.get('sha256') or '')
+                and bool(proof.get('path')))
+        matching=[p for p in matching if bound_cells(p)]
+        components={json.dumps({k:p.get(k) for k in ('deliverable_cash_twd',
+            'subscription_rights_at_final_settlement','requires_rights_valuation')},sort_keys=True) for p in matching}
+        if len(components)!=1 or not matching:repaired.append(row);continue
+        peer=sorted(matching,key=lambda p:json.dumps(p,sort_keys=True,ensure_ascii=False))[0]
+        # Do not repair a quantity while silently changing a cash/right clause.
+        if any(row.get(k) is not None and row.get(k)!=peer.get(k) for k in
+               ('deliverable_cash_twd','subscription_rights_at_final_settlement','requires_rights_valuation')):
+            repaired.append(row);continue
+        evidence=dict(contract='same_original_exact_event_coherent_numeric_view_v1',
+            source_content_sha256=row['source_content_sha256'],scope=dict(zip(fields,scope[:-1])),
+            contract_months=list(scope[-1]),replacement=replacement,
+            peer_extraction_method=peer.get('extraction_method'),peer_page=peer.get('page'),
+            peer_table_index=peer.get('table_index'),peer_visual_review_sha256=peer.get('visual_review_sha256'),
+            peer_retained_publication_views=peer.get('retained_publication_views'),
+            peer_numeric_source_cells_evidence=peer['numeric_source_cells_evidence'])
+        new=dict(row,contract_multiplier=replacement,deliverable_text=peer['deliverable_text'],
+            original_contract_multiplier=amount,original_deliverable_security_quantity=quantity,
+            original_deliverable_text=row.get('deliverable_text'),
+            numeric_repair_evidence=json.dumps(evidence,sort_keys=True,ensure_ascii=False))
+        new.update(corporate_deliverable_components(peer['deliverable_text'],replacement))
+        repaired.append(new)
+        report.append(dict(product=row['product'],effective_date=row['effective_date'],
+            source_content_sha256=row['source_content_sha256'],contract_months=list(scope[-1]),
+            before_multiplier=amount,before_quantity=quantity,after_multiplier=replacement,
+            after_quantity=new['deliverable_security_quantity'],evidence=evidence))
+    return repaired,report
+
+
+def reviewed_small_corporate_units(facts):
+    """Native/inspected matching fields support a true small adjusted unit."""
+    return {(r.get('product'),r.get('effective_date'),r.get('contract_multiplier'),
+             r.get('source_content_sha256')) for r in facts
+        if r.get('contract_multiplier')==r.get('deliverable_security_quantity')
+        and r.get('issue_date_bound')
+        and re.fullmatch('[a-f0-9]{64}',r.get('source_content_sha256') or '')
+        and (r.get('extraction_method')=='native_cell_grid'
+             or ((r.get('extraction_method') or '').startswith('source_bound_visual')
+                 and re.fullmatch('[a-f0-9]{64}',r.get('visual_review_sha256') or '')))}
+
+
+def require_reviewed_small_unit_intervals(facts,intervals):
+    """Unproved tiny OCR units cannot become published interval inputs.
+
+    The threshold requests evidence, not a numeric floor. Native or inspected
+    small units pass unchanged; rejected candidates remain available for review.
+    """
+    supported=reviewed_small_corporate_units(facts)
+    unresolved=[r for r in intervals if isinstance(r.get('contract_multiplier'),(int,float))
+        and 0<r['contract_multiplier']<100 and not any(
+            (r['product'],r['effective_date'],r['contract_multiplier'],digest) in supported
+            for digest in r.get('source_content_sha256s') or [])]
+    if unresolved:
+        raise ValueError('small OCR contract unit requires source review before interval publication: '+
+            json.dumps([dict(product=r['product'],date=r['effective_date'],contract=r.get('contract'),
+                value=r['contract_multiplier']) for r in unresolved],ensure_ascii=False))
+
+
 def next_nearby_position_date(product, published, lifetimes, market_dates):
     """Resolve a literal next-nearby expiry clause from observed contract lives.
 
@@ -2015,14 +3195,43 @@ def next_nearby_position_date(product, published, lifetimes, market_dates):
     if len(months) < 2:
         return None
     near = active.filter(pl.col('contract').is_in(months[:2]))
-    if near.height != 2 or near['official_expiry'].null_count():
+    if near.height != 2:
         return None
+    calendar_proofs=[]
+    for row in near.filter(pl.col('official_expiry').is_null()).iter_rows(named=True):
+        # A corporate transfer splits a physical instance, not its listed
+        # nominal month. Use calendar identity only; never copy a later
+        # generation's valuation or terms into the earlier instance.
+        boundary=row.get('corporate_boundary')
+        if (row.get('asset_class')!='stock_future'
+                or row.get('lifetime_status')!='corporate_transfer_candidate'
+                or not row.get('corporate_transfer_target') or boundary is None
+                or not row.get('corporate_boundary_sources')
+                or any(not isinstance(s,str) or not re.fullmatch(r'[a-f0-9]{64}',s)
+                       for s in row['corporate_boundary_sources'])):
+            return None
+        finals=lifetimes.filter((pl.col('product')==product)
+            & (pl.col('contract')==row['contract']) & pl.col('official_expiry').is_not_null())
+        expiries=set(finals['official_expiry'])
+        if (len(expiries)!=1 or next(iter(expiries))<=boundary
+                or not finals['lifetime_status'].eq('official_final').fill_null(False).all()
+                or not finals['final_fixing_origin'].eq('official_product_final').fill_null(False).all()):
+            return None
+        nominal=next(iter(expiries))
+        near=near.with_columns(pl.when(pl.col('contract')==row['contract'])
+            .then(pl.lit(nominal)).otherwise(pl.col('official_expiry')).alias('official_expiry'))
+        calendar_proofs.append(dict(product=product,contract=row['contract'],
+            official_nominal_expiry=str(nominal),transfer_boundary=str(boundary),
+            transfer_source_sha256s=row['corporate_boundary_sources'],
+            scope='same_product_and_already_listed_nominal_month_calendar_only'))
     expiry = near.filter(pl.col('contract') == months[1])['official_expiry'].item()
     later = [d for d in market_dates if d > expiry]
     if not later:
         return None
-    return dict(effective_date=str(min(later)), next_nearby_contract=months[1],
+    result=dict(effective_date=str(min(later)), next_nearby_contract=months[1],
                 next_nearby_expiry=str(expiry), publication_cutoff='end_of_day')
+    if calendar_proofs:result['nominal_month_calendar_proofs']=calendar_proofs
+    return result
 
 
 def repair_position_source_context(archive, facts, lifetimes, market_dates):
@@ -2144,12 +3353,32 @@ def repair_position_source_context(archive, facts, lifetimes, market_dates):
     return changes
 
 
-def repair_same_day_position_grade(archive, facts):
-    """Compose a latest-grade clause with a same-day or later cap notice.
+def _position_grade_levels_known_at(absolute, product, known):
+    """Build only the grade boundaries observable at the original clock.
 
-    This bounded case requires the corporate table to have returned to the
-    standard share basis on the exact grade-change date. Temporary enlarged
-    caps, ambiguous prior grades and unrelated publication orders stay gaps.
+    Later publication can supersede an anticipated future grade. Its end
+    boundary is unavailable when proving the original's printed arithmetic;
+    actual admission separately uses the complete, dated grade history.
+    Explicit ends printed in already known originals remain intact.
+    """
+    observable=[dict(r) for r in absolute if r.get('product')==product
+        and r.get('known_at') and r['known_at']<=known]
+    for row in observable:
+        if row.get('notice_revocation_known_at') and row['notice_revocation_known_at']>known:
+            # A future legal amendment cannot rewrite the arithmetic which
+            # the original corporate notice could already prove at issuance.
+            for field in tuple(row):
+                if field.startswith(('notice_revocation_','notice_revoked_','legal_position_regime_')):
+                    row.pop(field)
+    return position_candidate_intervals(observable)[0]
+
+
+def repair_same_day_position_grade(archive, facts):
+    """Compose a latest-grade clause at its own dated share-cap period start.
+
+    The active grade can have changed between publication and this period's
+    start. Its exact standard-share basis, literal applicability clause and
+    publication clock must all be proved. Enlarged caps remain separate.
     """
     from fractions import Fraction
     absolute = [r for r in facts if r.get('event_type') in (None, 'absolute_level')
@@ -2178,24 +3407,40 @@ def repair_same_day_position_grade(archive, facts):
         known = next(iter(knowns)); amount = next(iter(amounts)); unit = next(iter(units))
         if not amount or not unit or any(r.get('unit') != 'shares' for r in rows):
             continue
-        before = [r for r in levels if r['product'] == base and r['effective_date'] <= known[:10]
+        observable=_position_grade_levels_known_at(absolute,base,known)
+        before = [r for r in observable if r['product'] == base and r['effective_date'] <= known[:10]
                   and (not r['valid_until_date_exclusive'] or known[:10] < r['valid_until_date_exclusive'])
                   and r['known_at'] <= known and not r['legal_date_only']]
-        after = [r for r in levels if r['product'] == base and r['effective_date'] == day
+        after = [r for r in levels if r['product'] == base and r['effective_date'] <= day
+                 and (not r['valid_until_date_exclusive'] or day < r['valid_until_date_exclusive'])
                  and r['known_at'] < timestamp(date.fromisoformat(day), '00:00:00')
-                 and not r['legal_date_only']]
+                 and not r['legal_date_only']
+                 and (r['effective_date'] < day or r['effective_phase'] == 0)]
         if len(before) != 1 or len(after) != 1:
             continue
         old, new = before[0], after[0]
-        if old['monthly_position_limit'] is not None or new['monthly_position_limit'] is not None:
+        if new['effective_date'] < day and {r['product'] for r in rows} != set(members):
             continue
-        if Fraction(str(amount)) != Fraction(str(old['position_limit'])) * Fraction(str(unit)):
+        if old['monthly_position_limit'] is not None or new['monthly_position_limit'] is not None:
             continue
         doc = archive.document(standards[0]['source_url'])
         if doc['content_sha256'] != digest:
             raise ValueError('corporate grade source identity mismatch')
         views = [compact(t) for t, _ in retained_document_text_views(archive, standards[0]['source_url'], doc)]
         clause = '部位限制數應依本契約最新適用部位限制級數計算'
+        basis_scope='grade_at_original_publication';basis_day=known[:10]
+        if Fraction(str(amount)) != Fraction(str(old['position_limit'])) * Fraction(str(unit)):
+            # A second printed period can anticipate a future grade already
+            # announced at publication. Require its own standard-size exact
+            # arithmetic and corporate clause; never scale an enlarged cap.
+            if unit!=2000 or {r['product'] for r in rows}!=set(members) or not any(clause in text for text in views):
+                continue
+            anticipated=[r for r in observable if r['effective_date']<=day
+                and (not r['valid_until_date_exclusive'] or day<r['valid_until_date_exclusive'])
+                and r['monthly_position_limit'] is None and not r['legal_date_only']
+                and Fraction(str(amount))==Fraction(str(r['position_limit']))*Fraction(str(unit))]
+            if len(anticipated)!=1:continue
+            old=anticipated[0];basis_scope='announced_grade_at_original_period_start';basis_day=day
         clause_scope='corporate_notice';grade_urls=[]
         if not any(clause in text for text in views):
             # A quarterly notice can explicitly replace the adjusted cap's
@@ -2213,9 +3458,15 @@ def repair_same_day_position_grade(archive, facts):
             if not grade_urls:continue
             clause_scope='quarterly_notice'
         corrected = float(Fraction(str(new['position_limit'])) * Fraction(str(unit)))
+        if corrected == amount:
+            continue
         combined_known = max(known, new['known_at'])
         sources = sorted({digest, *old['source_content_sha256s'], *new['source_content_sha256s']})
         evidence = dict(product=base, effective_date=day, original_share_limit=amount,
+            basis_scope=basis_scope,basis_date=basis_day,basis_original_known_at=known,
+            printed_origin_share_limit=amount,
+            grade_effective_date=new['effective_date'],
+            grade_start_contract='dated_active_grade_at_period_start_v2',
             standard_position_units=unit, prior_contract_limit=old['position_limit'],
             new_contract_limit=new['position_limit'], corrected_share_limit=corrected,
             corporate_known_at=known, grade_known_at=new['known_at'], source_content_sha256s=sources,
@@ -2257,8 +3508,8 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
         and row.get('known_at') and row.get('effective_date')
         and row['known_at'][:10]<row['effective_date']}
     formula_sources={row['source_url'] for row in facts
-        if row.get('event_type')=='combined_position_formula'
-        and row.get('combined_position_ratio')=='1/1'
+        if (row.get('event_type')=='combined_position_formula' and row.get('combined_position_ratio')=='1/1'
+            or row.get('event_type')=='combined_securities_position_formula')
         and row.get('issue_date_bound') and row.get('known_at') and row.get('effective_date')
         and row['known_at'][:10]<row['effective_date']}
     literal_sources=prospective|formula_sources
@@ -2329,14 +3580,17 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
         # pair wording and provenance labels cannot prove that whole group.
         keys=('product','effective_date','effective_phase','known_at','source_url','source_content_sha256',
               'event_type','unit','natural_person_limit','combined_position_base_product',
-              'combined_position_ratio','extraction_method','position_group_unit_evidence')
-        return any(proof.get('event_type')=='combined_position_formula'
+              'combined_position_ratio','extraction_method','position_group_unit_evidence','combined_products')
+        return any(proof.get('event_type') in ('combined_position_formula','combined_securities_position_formula')
             and all(row.get(k)==proof.get(k) for k in keys) for proof in literal_rows)
     for row in facts:
-        if (row.get('event_type')!='combined_position_formula'
-                or not (row.get('extraction_method')=='explicit_unchanged_unit_corporate_combination'
-                        or reviewed_formula(row) or retained_formula(row))
-                or row.get('combined_position_ratio')!='1/1' or not row.get('issue_date_bound')
+        securities=row.get('event_type')=='combined_securities_position_formula'
+        verified=(retained_formula(row) if securities else
+            row.get('extraction_method')=='explicit_unchanged_unit_corporate_combination'
+            or reviewed_formula(row) or retained_formula(row))
+        if (row.get('event_type') not in ('combined_position_formula','combined_securities_position_formula')
+                or not verified
+                or (not securities and row.get('combined_position_ratio')!='1/1') or not row.get('issue_date_bound')
                 or row.get('effective_phase')!='product_regular_open'):
             continue
         product=row.get('product') or '';base=row.get('combined_position_base_product') or ''
@@ -2351,6 +3605,10 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
                 or base+'與'+product+'部位合併計算' in t for t in views):continue
         evidence={k:row[k] for k in ('product','effective_date','known_at','source_url',
                                    'source_content_sha256','combined_position_base_product')}
+        if securities:
+            evidence.update(successor_kind='source_declared_securities_transfer',
+                combined_position_ratio=row['combined_position_ratio'],
+                position_group_unit_evidence=row['position_group_unit_evidence'])
         if evidence not in successors.setdefault(product,[]):successors[product].append(evidence)
     def successor(product,start,digest):
         applicable=[r for r in successors.get(product,[]) if r['effective_date']>start
@@ -2457,7 +3715,8 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
         unit=next(iter(units));known=next(iter(original_knowns));original_amount=next(iter(original_amounts))
         if not unit or not known or not original_amount:continue
         def known_basis(basis_day):
-            return [r for r in levels if r['product']==base and r['effective_date']<=basis_day
+            observable=_position_grade_levels_known_at(absolute,base,known)
+            return [r for r in observable if r['product']==base and r['effective_date']<=basis_day
                 and (not r['valid_until_date_exclusive'] or basis_day<r['valid_until_date_exclusive'])
                 and r['known_at']<=known
                 and (not r['admission_not_before'] or r['admission_not_before'][:10]<basis_day)
@@ -2527,9 +3786,11 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
                 continue
             corrected=float(Fraction(str(grade['position_limit']))*grade_basis_unit)
             source_ids=sorted({digest,*prior['source_content_sha256s'],*grade['source_content_sha256s'],*current_sources})
-            if corrected==current and not unproved:
-                current_known=joined_known;current_sources=set(source_ids)
-                continue
+            # Even an unchanged number needs its dated applicability proof.
+            # Otherwise the later product-day binder sees only the old
+            # corporate source and cannot establish that it follows this
+            # quarter's grade. Keep the numeric allowance exact while
+            # emitting the same source/clock boundary as a changed grade.
             evidence=dict(product=base,effective_date=day,origin_effective_date=start,
                 original_share_limit=current,printed_origin_share_limit=original_amount,
                 basis_original_known_at=known,
@@ -2583,6 +3844,48 @@ def repair_active_position_grade_boundaries(archive, facts, corporate=()):
     facts.extend(added)
     atomic_write_json(archive.bundle/'position_active_grade_boundary_repairs.json',changes)
     return changes
+
+
+def load_named_position_termination_context(path, *, termination_products):
+    """Read immutable lifecycle dependencies through the shared source contract."""
+    import gzip,hashlib
+    from stockagent.data.tw_futures_margin_release import read_bound_output
+    context=json.loads(path.read_text())
+    required={'physical_lifetimes','original_daily_source','official_final_source',
+              'calendar_source','dated_group_law'}
+    if set(context['sources'])!=required or not set(termination_products)<=set(context['selected_products']):
+        raise ValueError('incomplete or out-of-scope named termination context')
+    sources={str(path):sha256_file(path)}
+    items=context['sources']
+    for item in items.values():
+        source=Path(item['path'])
+        if sha256_file(source)!=item['sha256']:
+            raise ValueError('named termination source SHA mismatch')
+        sources[str(source)]=item['sha256']
+    pred=pl.col('product').is_in(termination_products)
+    life,receipt=read_bound_output(Path(items['physical_lifetimes']['path']),predicate=pred)
+    raw,_=read_bound_output(Path(items['original_daily_source']['path']),
+        columns=['date','product','contract','open_interest'],predicate=pred)
+    calendar,_=read_bound_output(Path(items['calendar_source']['path']),columns=['date'])
+    retained={str(Path(k).resolve()):v for k,v in receipt['source_sha256s'].items()}
+    for name in ('original_daily_source','official_final_source','calendar_source'):
+        if retained.get(str(Path(items[name]['path']).resolve()))!=items[name]['sha256']:
+            raise ValueError('named termination lifetime dependency mismatch')
+    law_path=Path(items['dated_group_law']['path']);law=json.loads(law_path.read_text());raw_hashes=set()
+    if law.get('review_kind')!='source_bound_position_family_rules':
+        raise ValueError('named termination requires a dated position family review')
+    for item in law['sources']:
+        source=law_path.parent/item['path']
+        if not source.resolve().is_relative_to(law_path.parent.resolve()) or sha256_file(source)!=item['sha256']:
+            raise ValueError('named termination law source SHA mismatch')
+        sources[str(source)]=item['sha256']
+        if item['kind']=='raw_gzip':raw_hashes.add(hashlib.sha256(gzip.decompress(source.read_bytes())).hexdigest())
+    if any(rule[key] not in raw_hashes for rule in law['rules']
+           for key in ('source_content_sha256','effectiveness_source_content_sha256')):
+        raise ValueError('named termination law lacks its retained original')
+    return dict(lifetimes=life,observations=raw,market_dates=calendar['date'].unique().to_list(),
+        termination_proof_sha256s={k:v['sha256'] for k,v in items.items()},
+        termination_group_rules=law['rules']),sources
 
 
 def _named_position_expiry_restoration(caps, identities, lifetimes, observations,
@@ -2715,7 +4018,26 @@ def repair_original_position_restorations(archive, facts, corporate, *,
             retained=''.join(compact(text).replace('|','') for text,_ in
                             retained_document_text_views(archive,url,doc))
             if literal not in retained:
-                raise ValueError('conditional position restoration lacks its retained literal clause')
+                # An already inspected, byte-bound grid can preserve a clause
+                # that the retained OCR did not read. Revalidate that same
+                # complete original and its exact numeric/member cells.
+                verified=False
+                review_ids={r.get('visual_review_sha256') for r in caps}
+                for source in list(archive.sources.values()):
+                    if (source['kind']!='visual_corporate_cell_review'
+                            or source['sha256'] not in review_ids):continue
+                    path=archive.bundle/source['path']
+                    if sha256_file(path)!=source['sha256']:
+                        raise ValueError('conditional position visual review SHA mismatch')
+                    _,reviewed,_=corporate_source_review_candidates(archive,path,source_urls={url})
+                    fields=('product','effective_date','position_unit','natural_person_limit',
+                            'combined_products','termination_product','conditional_restoration_clause')
+                    same=lambda row:tuple(json.dumps(row.get(k),sort_keys=True) for k in fields)
+                    expected={same(r) for r in caps}
+                    if expected and expected=={same(r) for r in reviewed}:
+                        verified=True
+                if not verified:
+                    raise ValueError('conditional position restoration lacks its retained literal clause')
             matches[(conditional['effective_date'],conditional['combined_products'])]=literal
         if not matches:continue
         if len(matches)!=1:
@@ -2888,12 +4210,24 @@ def retained_corporate_position_text_candidates(archive, corporate, *, source_ur
     reviewed_grids={}
     wanted=set(grouped) if source_urls is None else set(grouped)&set(source_urls)
     for source in retained_sources:
-        if source['kind']!='visual_corporate_cell_review':continue
+        if source['kind'] not in ('visual_corporate_cell_review','visual_position_cell_review'):continue
         path=archive.bundle/source['path']
         if sha256_file(path)!=source['sha256']:
             raise ValueError('retained corporate visual review SHA mismatch')
         payload=json.loads(path.read_text());reviews=payload.get('reviews',[payload])
         if not any(r.get('source_url') in wanted for r in reviews):continue
+        if source['kind']=='visual_position_cell_review':
+            group_urls={r['source_url'] for r in reviews
+                if r.get('review_kind')=='source_bound_visual_corporate_position_group'} & wanted
+            if not group_urls:continue
+            # Reuse the position-only reader's source, date, pages and own
+            # financial identity checks. A stored method label is insufficient.
+            positions=position_source_review_candidates(archive,path,corporate,source_urls=group_urls)
+            for fact in positions:
+                if fact.get('extraction_method')=='source_bound_visual_corporate_position_group':
+                    reviewed_grids.setdefault(fact['source_url'],[]).append(
+                        (fact,'visual_position_cell_review:'+source['sha256']))
+            continue
         financial,positions,_=corporate_source_review_candidates(archive,path,source_urls=wanted)
         proven={f['source_url'] for f in financial if (
             f['source_content_sha256'],f['from_product'],f['product'],
@@ -2914,6 +4248,21 @@ def retained_corporate_position_text_candidates(archive, corporate, *, source_ur
             continue
         views=source_views.get(url,[])
         grid_facts=list(reviewed_grids.get(url,[]))
+        # Completed table views and older retained text views can preserve
+        # different parts of the SAME original. Restore only explicit group
+        # clauses, never numeric cells, dates or an OCR-corrected product code.
+        # The archive reader verifies every supplemental view's SHA first.
+        group_views=[]
+        group_code=r'[A-Z]{2}[F1-9]'
+        group_pattern=(r'(?<![A-Z0-9])'+group_code+
+            r'(?:(?:、|與|及|暨)'+group_code+r')+(?:期貨)?部位合併計算')
+        for source_text, source_kind in retained_document_text_views(
+                archive,url,doc,sources=views):
+            dense=compact(source_text)
+            clauses=sorted(set(re.findall(group_pattern,dense)))
+            grade='部位限制數應依本契約最新適用部位限制級數計算'
+            if grade in dense:clauses.append(grade)
+            if clauses:group_views.append((source_kind,clauses))
         for table in views:
             if table['kind'] not in ('native_table_tables.json','ocr_table_tables.json'):
                 continue
@@ -2934,8 +4283,16 @@ def retained_corporate_position_text_candidates(archive, corporate, *, source_ur
                     bound=True
             if not bound:raise ValueError('retained corporate position grid lacks matching source receipt')
             pages=json.loads(path.read_text())['pages']
+            if group_views and pages:
+                # Retain existing page text too: an inconsistent group stays
+                # inconsistent. Cell row/column ownership remains untouched.
+                pages=[dict(page) for page in pages]
+                first=pages[0]
+                first['ocr_text']=(first.get('ocr_text') or first['native_text'])+'\n'+\
+                    '\n'.join(clause for _,clauses in group_views for clause in clauses)
             reviewed_owned={(fact['product'],fact['effective_date']) for fact,_ in grid_facts}
-            grid_facts.extend((fact,table['kind']+':'+table['sha256'])
+            grid_facts.extend((dict(fact,position_group_text_views=json.dumps(
+                group_views,ensure_ascii=False)),table['kind']+':'+table['sha256'])
                 for fact in corporate_position_table_candidates(pages,corporate=facts)
                 if (fact['product'],fact['effective_date']) not in reviewed_owned)
         owned={(fact['product'],fact['effective_date']) for fact,_ in grid_facts}
@@ -2947,6 +4304,13 @@ def retained_corporate_position_text_candidates(archive, corporate, *, source_ur
                 views_to_add.extend((fact,'retained_corporate_position_native_word')
                     for fact in native if (fact['product'],fact['effective_date']) not in owned)
                 owned.update((fact['product'],fact['effective_date']) for fact in native)
+            standards=tuple(fact for fact,_ in grid_facts if
+                fact.get('extraction_method')=='source_bound_visual_corporate_position_group')
+            if standards:
+                views_to_add.extend((fact,'retained_corporate_position_text:'+extraction)
+                    for fact in unchanged_quantity_securities_position_groups(text,facts,
+                        reviewed_standard_groups=standards)
+                    if (fact['product'],fact['effective_date']) not in owned)
             # A source-bound grid preserves row and date-column ownership.
             # Flattened views cannot override those same source coordinates.
             views_to_add.extend((fact,'retained_corporate_position_text:'+extraction)
@@ -3065,7 +4429,8 @@ def verified_margin_ratio_reviews(archive, paths):
 
 def main():
     code_paths=[Path(__file__),Path(__file__).resolve().parents[1]/'downloader/taifex_rule_parsing.py',
-                Path(__file__).resolve().parents[1]/'stockagent/data/tw_futures_margin_preparation.py']
+                Path(__file__).resolve().parents[1]/'stockagent/data/tw_futures_margin_preparation.py',
+                Path(__file__).resolve().parents[1]/'stockagent/data/tw_futures_rule_workspace.py']
     code_sha={str(path):sha256_file(path) for path in code_paths}
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--archive',type=Path,default=Path('data_taifex_public_history/rules'))
@@ -3106,6 +4471,8 @@ def main():
                    help='Exact source/page/cap/underlying-bound position code corrections')
     p.add_argument('--margin-restoration-inputs',type=Path,
                    help='SHA-bound disposition session counts and official cash prints for conditional restores')
+    p.add_argument('--position-termination-context',type=Path,
+                   help='SHA-bound official expiry, original OI, calendar and dated group law for named cap restores')
     p.add_argument('--margin-restoration-source-scope',type=Path,
                    help='Replace restorations only for these SHA-bound originals, retaining other parent facts')
     p.add_argument('--margin-session-review',type=Path,
@@ -3128,8 +4495,16 @@ def main():
                    help='Compose explicit latest-grade clauses at same-day restored share-cap boundaries')
     p.add_argument('--position-lifetimes', type=Path,
                    help='Receipted contract lives required for next-nearby position clock resolution')
-    p.add_argument('--output-dir',type=Path,required=True)
+    p.add_argument('--output-dir',type=Path,default=DEFAULT_CURRENT)
+    p.add_argument('--update-current',action='store_true',
+                   help='Atomically update the one maintained rule bundle; no numbered copy')
     a=p.parse_args()
+    try:
+        check_rule_output_path(a.output_dir)
+    except ValueError as exc:
+        p.error(str(exc))
+    if a.update_current and (a.output_dir/'manifest.json').exists() and a.base_candidates is None:
+        a.base_candidates=a.output_dir
     if a.corporate_position_source_scope and not a.extract_corporate_position_text:
         p.error('--corporate-position-source-scope requires --extract-corporate-position-text')
     if a.margin_restoration_source_scope and not a.margin_restoration_inputs:
@@ -3150,7 +4525,13 @@ def main():
         p.error('--reextract-native-corporate requires --base-candidates and --native-tables')
     if a.reextract_margins and (not a.base_candidates or not a.native_tables):
         p.error('--reextract-margins requires --base-candidates and --native-tables')
-    if (a.output_dir/'manifest.json').exists(): raise FileExistsError('use a new immutable output directory')
+    with maintained_rule_build(a,repo_root=Path(__file__).resolve().parents[1]):
+        return compile_candidate_bundle(a,code_sha)
+
+
+def compile_candidate_bundle(a,code_sha):
+    if (a.output_dir/'manifest.json').exists():
+        raise FileExistsError('use --update-current to update the maintained rule directory')
     archive=RuleArchive(a.archive,a.output_dir)
     margin_restoration_scope=None
     if a.margin_restoration_source_scope:
@@ -3296,7 +4677,9 @@ def main():
         proof=json.loads((root/'manifest.json').read_text())
         if proof['profile'] not in ('source_ruled_ocr_cell_grid_v1',
                                     'source_ruled_ocr_cell_grid_v2',
-                                    'source_ruled_ocr_cell_grid_v3') or proof['status']!='complete':
+                                    'source_ruled_ocr_cell_grid_v3',
+                                    'source_ruled_ocr_cell_grid_v4',
+                                    'source_ruled_ocr_cell_grid_v5') or proof['status']!='complete':
             raise ValueError('OCR grid bundle must have a complete source-bound receipt')
         corporate_facts.extend(native_position_candidates(archive,root,corporate=True))
         position_facts.extend(native_position_candidates(archive,root,market_dates=position_dates))
@@ -3352,10 +4735,12 @@ def main():
     for path in a.position_notice_amendments:
         position_facts=apply_position_notice_amendments(archive,position_facts,path)
     bind_retained_single_session_margin_clocks(archive, facts, a.margin_session_review)
+    if a.repair_margin_context or a.reextract_margins:
+        compose_same_notice_margin_clocks(archive, facts)
     # A native period amendment needs all prior sources and clocks before it
     # can add coverage; restoration remains independently evidence-bound.
     for index,row in enumerate(facts):
-        if not row.get('extension_prior_notice_join_required'):
+        if not row.get('extension_prior_notice_join_required') and not row.get('prior_notice_revocation_evidence'):
             continue
         document=archive.document(row['source_url'])
         if document['content_sha256']!=row['source_content_sha256']:
@@ -3363,9 +4748,11 @@ def main():
         joined=bind_native_margin_period_extension(archive,document['text'],row,facts)
         if joined is not None:
             facts[index]=joined
+    compose_bound_margin_extension_views(archive, facts)
     if a.margin_restoration_inputs:
         facts=rebuild_disposal_restorations(archive,facts,a.margin_restoration_inputs,
                                           source_urls=margin_restoration_scope)
+        facts,_=repair_native_restoration_period_revisions(archive,facts,a.margin_restoration_inputs)
     # Re-extraction cannot supersede exact cells already inspected on the same
     # immutable original. Other products and source notices remain independent.
     corporate_facts=replace_reviewed_corporate_facts(corporate_facts,
@@ -3384,13 +4771,24 @@ def main():
     if a.repair_position_grade_boundaries:
         repair_same_day_position_grade(archive, position_facts)
         repair_active_position_grade_boundaries(archive, position_facts, corporate_facts)
-    if a.repair_position_context:
-        repair_original_position_restorations(archive, position_facts, corporate_facts)
+    termination_sources={}
+    if a.repair_position_context or a.position_termination_context:
+        kwargs={}
+        if a.position_termination_context:
+            terminal=sorted({r['termination_product'] for r in position_facts if r.get('termination_product')})
+            kwargs,termination_sources=load_named_position_termination_context(
+                a.position_termination_context,termination_products=terminal)
+        repair_original_position_restorations(archive, position_facts, corporate_facts,**kwargs)
     a.output_dir.mkdir(parents=True,exist_ok=True)
     # Re-extraction can find the same evidence through multiple archive links.
     # Keep distinct contradictory facts, but do not grow exact duplicates.
     facts,position_facts,corporate_facts=[list({json.dumps(row,sort_keys=True,ensure_ascii=False):row
         for row in group}.values()) for group in (facts,position_facts,corporate_facts)]
+    corporate_facts,numeric_repairs=reconcile_corporate_numeric_views(corporate_facts)
+    atomic_write_json(a.output_dir/'numeric_rule_diagnostics.json',dict(
+        contract='same_original_exact_event_coherent_numeric_view_v1',repairs=numeric_repairs,
+        corporate_candidates=corporate_numeric_anomalies(corporate_facts),
+        threshold_is_diagnostic_only=True,financial_values_inferred=False))
     frame=pl.DataFrame(facts,infer_schema_length=None)
     atomic_write_parquet(a.output_dir/'margin_event_candidates.parquet',frame)
     for name,rows in [('position_event_candidates',position_facts),('corporate_event_candidates',corporate_facts)]:
@@ -3398,6 +4796,7 @@ def main():
         atomic_write_parquet(a.output_dir/(name+'.parquet'),other)
     intervals,term_issues=corporate_terms_intervals(corporate_facts)
     unit_intervals,unit_issues=corporate_terms_intervals(corporate_facts,unit_only=True)
+    require_reviewed_small_unit_intervals(corporate_facts,[*intervals,*unit_intervals])
     if unit_intervals:
         atomic_write_parquet(a.output_dir/'corporate_unit_intervals.parquet',
                              pl.DataFrame(unit_intervals,infer_schema_length=None))
@@ -3456,6 +4855,8 @@ def main():
         position_level_intervals=len(position_intervals),
         position_interval_products=len({f['product'] for f in position_intervals}),
         position_interval_issues=len(position_issues),
+        position_restoration_contract_version=2 if a.position_termination_context else 1,
+        named_position_termination_source_sha256s=termination_sources,
         candidate_interval_contract_version=3 if margin_ratio_laws else 2,
         corporate_candidate_facts=len(corporate_facts),
         corporate_candidate_products=len({f['product'] for f in corporate_facts}),

@@ -1,0 +1,7 @@
+name: stockagent-backup
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - restic=0.19.1
+  - psycopg=3.3.4

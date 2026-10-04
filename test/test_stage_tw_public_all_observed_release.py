@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from scripts.stage_tw_public_all_observed_release import (
     MODEL_CHANNELS,
@@ -8,12 +9,15 @@ from scripts.stage_tw_public_all_observed_release import (
     SOURCE,
     SOURCE_RECEIPT,
     STOCK_VALUE_CHANNELS,
+    WIDE_SOURCE,
     _validated_contract,
 )
 from stockagent.data_sync.desync_snapshots import sha256_file
 
 
 def test_all_observed_release_contract_matches_current_feature_table() -> None:
+    if not any(path.exists() for path in (SOURCE, SOURCE_RECEIPT, WIDE_SOURCE)):
+        pytest.skip("integration requires the retained all-observed research release")
     receipt, metadata, source_hash, wide_hash = _validated_contract()
     assert source_hash == sha256_file(SOURCE)
     assert source_hash == receipt["output_sha256"]

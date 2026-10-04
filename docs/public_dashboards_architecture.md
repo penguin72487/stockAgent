@@ -40,7 +40,7 @@ services/public_dashboards/dashboard-core.js
 | `/tw-overnight/` | `/tw-overnight/api/*` | 隔日沖獨立帳本；共用畫面但保留集合競價事件時間粒度 |
 | `/shioaji/` | `/shioaji/api/status` | 永豐資料流程、配額、流量與儲存量 |
 | `/finlab/` | `/finlab/api/status` | FinLab 帳號流量與研究來源下載 |
-| `/finmind/` | `/finmind/api/status` | FinMind 免費來源回補、本站請求流量與原始資料容量；新聞不排程 |
+| `/finmind/` | `/finmind/api/status` | FinMind 共用帳號來源回補、新聞、本站請求流量及原始資料容量；九類歷史依明確順序，US 分鐘最後 |
 | `/openbb/` | `/openbb/api/status`, `/openbb/api/history` | OpenBB 封存與歷史進度 |
 | `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`, `/data-monitor/api/features`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋、freshness 與實存 Parquet 逐欄位清冊 |
 | `/traffic/` | `/traffic/api/status`, `/traffic/api/history` | 匿名請求延遲、分階段耗時、吞吐、錯誤率、快取容量及 90 天趨勢 |
@@ -64,8 +64,20 @@ services/public_dashboards/dashboard-core.js
 
 瀏覽器排版依 CSS pixel 與可用 viewport，不依面板的物理像素名稱猜裝置。HiDPI／2K
 螢幕由 `devicePixelRatio` 提高銳利度，但相同 CSS viewport 應維持相同資訊層級。
-`dashboard-responsive.css` 是十頁最後載入的共用響應式層；頁面專屬 CSS 只保留品牌、
+`dashboard-responsive.css` 是各頁共用的響應式層；抓取頁之後只加
+`dashboard-acquisition.css` 的共用資訊層級補強。頁面專屬 CSS 只保留品牌、
 圖表與領域元件差異，不得各自複製全站導覽、觸控目標或表格窄版規則。
+
+抓取相關頁透過 `body[data-acquisition-page]` 選擇 `dashboard-acquisition.js`
+的宣告式欄位映射：狀態／工作、進度、配額、估時或吞吐四張摘要在前，完整清冊、
+分階段預估、曲線、容量與口徑使用原生 `details` 在後。只移動既有 DOM，不複製
+DTO 計算或新增 fetch／輪詢；少量已渲染欄位的變更合併到一個 rAF，同步原始值與
+未知進度。警示仍在前，原 ID、事件處理、搜尋、分頁與開啟狀態保留。
+舊深連結與程式化跳轉使用 `StockAgentAcquisition.reveal()` 展開祖先，開啟區塊使用
+真實 section 高度，避免 `content-visibility` 的預估高度把目標移出 viewport。
+全資料的明細與特徵仍接近 viewport 才載入；閉合節點的零尺寸不能當成可見。
+provider 子頁共用同一版型，配額未知不冒充零；交易策略頁不套抓取摘要。
+本次規劃、機制差異與驗收見 [抓取面板資訊層級](acquisition_pages_hierarchy_2026-10-03.md)。
 
 - `dashboard-core.js` 建立同一套可收合全站導覽，手機預設關閉，Escape 與選取連結會收合；
   導覽與表單在觸控 viewport 至少保留 40px，主要控制至少 44px。
@@ -351,6 +363,49 @@ HTML 原文按 SHA256 保存在同層 `stock_futures_catalog_sources/`。
   兩種表示與 304 均攜帶 `Vary: Accept-Encoding`；GET/HEAD conditional request
   支援 weak comparison、ETag list 與 `*`。304 不傳輸本文，也不附錯誤的零長度表示。
   規範依據：[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8.3.3)。
+
+## 抓取頁的請求與呈現邊界（2026-10-03）
+
+完整先行方案、逐頁清冊與本次證據見
+[抓取網頁全鏈工程檢查](acquisition_pages_engineering_2026-10-03.md)。
+既有 gateway、背景公開快照、領域 renderer 與來源進度分母保持同一條責任鏈。
+
+- 首頁逐一隔離獨立摘要讀取；失敗來源回未知值和固定來源標籤，不回 exception
+  message，也不把失敗補成 0。五個 peer 共用 8 秒等待預算；這不是全部本機
+  builder 的總工時保證。正常 cache TTL 與來源 API 限額不變。
+- 分頁只有當 request、目前篩選、offset／limit、筆數／has-more、安全旗標與
+  快照身分相符時才能提交。相同範圍失敗保留最近成功觀測；換範圍立即清楚
+  區隔，不能混用舊頁或曲線。清冊選項消失時保留所選 scope 並註明，不能
+  默默切回全部。
+- `dashboard-core.js` 的 `observeVisibility` 和 `createDeferredRenderer` 共用
+  展開、捲動、視野及前背景事件，收合時只保留最新參數。摘要照原節奏更新；
+  大型表格／曲線在可見時處理，重新展開仍可取得最新資料。observer 不是
+  provider 抓取排程，不得藉此更改下載、配額或資料發布規則。
+- TEJ features、OpenBB history、全資料 details／feature page、網站 history
+  的明細查詢依視圖需求啟動；沒有 IntersectionObserver 時也保留相同行為。
+  流量頁首屏第四個指標改為最近一分鐘本站錯誤率；所選期間歷史錯誤率仍在
+  歷史區，避免為了顯示摘要而讀取隱藏的歷史曲線。
+- provider 的 `waiting_publication` 與全資料、合法 query、文字／顏色一致。
+  FinMind 帳號用量的時間依 provider 觀測，不偷用本站請求紀錄的時間；TEJ
+  沒有可供該配額格顯示的 HTTP quota，不多讀一份無用途的 status。
+- 抓取頁共用快速導覽維持正常文流，不沿用舊來源頁的 sticky 規則；否則
+  捲到明細時可能遮住原生折疊標題。響應式驗收必須先展開並捲到可見位置
+  才等待按需資料，不得以隱藏表格沒有預先建立當作故障；未知頁名必須拒絕，
+  不能悄悄縮小驗收範圍。
+
+架構／請求回歸：
+
+```bash
+node --test test/test_dashboard_core.mjs test/test_acquisition_requests.mjs \
+  test/test_tej_dashboard_requests.mjs test/js/data_monitor_feature_refresh.test.cjs
+source scripts/runtime_env.sh
+run_fintech_python -m scripts.verify_acquisition_dashboards \
+  --base-url http://127.0.0.1:8770 --provider-examples --all-providers --engineering \
+  --output-dir artifacts/operations/acquisition-ui-acceptance
+```
+
+這些是公開 UI、API、安全與工作量驗收；不代表 156 個來源標籤的底層歷史資料
+全部抓齊，也不代表交易或訓練就緒。
 
 ## 修改與驗收清單
 

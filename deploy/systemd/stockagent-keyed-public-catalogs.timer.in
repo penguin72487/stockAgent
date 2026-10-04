@@ -2,7 +2,7 @@
 Description=Bounded metadata discovery and hourly public snapshots, including holidays
 
 [Timer]
-OnBootSec=10min
+OnActiveSec=10min
 OnUnitInactiveSec=1h
 RandomizedDelaySec=30s
 AccuracySec=30s

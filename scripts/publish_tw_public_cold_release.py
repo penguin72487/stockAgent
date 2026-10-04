@@ -153,7 +153,10 @@ def _check_training_receipts(live_root: Path) -> None:
         )
 
 
-def _publish_while_source_stable(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+def _publish_while_source_stable(
+    command: list[str], timeout: float, *,
+    result_receipt: Path | None = None, defer_scan: bool = False,
+) -> subprocess.CompletedProcess[str]:
     """Exclude the canonical source monitor while packing one immutable release."""
 
     lock_path = _live_root().parent / ".locks" / "tw-public-refresh.lock"
@@ -164,6 +167,13 @@ def _publish_while_source_stable(command: list[str], timeout: float) -> subproce
         except BlockingIOError as exc:
             raise SourceRefreshBusy("canonical TW public refresh is active; retry publication") from exc
         _check_training_receipts(_live_root())
+        if result_receipt is not None:
+            command = [*command, "--source-lock-fd", str(lock_handle.fileno()),
+                       "--result-receipt", str(result_receipt)]
+            if defer_scan:
+                command.append("--defer-scan")
+        elif defer_scan:
+            raise ValueError("deferred scan requires a unique local commit receipt")
         return subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -171,7 +181,47 @@ def _publish_while_source_stable(command: list[str], timeout: float) -> subproce
             capture_output=True,
             text=True,
             timeout=timeout,
+            **({"pass_fds": (lock_handle.fileno(),)} if result_receipt is not None else {}),
         )
+
+
+def _committed_release(
+    result_receipt: Path, stdout: str, *, defer_scan: bool,
+) -> dict[str, Any]:
+    """Require the canonical child's new receipt and exact stdout agreement."""
+    if result_receipt.is_symlink() or not result_receipt.is_file():
+        raise ValueError("cold publication lacks a regular unique commit receipt")
+    release = _parse_output(result_receipt.read_text(encoding="utf-8"))
+    if release is None or release != _parse_output(stdout):
+        raise ValueError("cold publication commit receipt differs from command output")
+    published = release.get("published")
+    if (
+        not isinstance(published, list) or len(published) != 1
+        or not isinstance(published[0], dict)
+        or published[0].get("dataset") != "tw-public"
+        or not isinstance(published[0].get("snapshot_id"), str)
+        or not published[0]["snapshot_id"]
+        or published[0].get("scan_policy") != ("durably_queued" if defer_scan else "immediate")
+        or release.get("skipped") != []
+    ):
+        raise ValueError("cold publication commit receipt has an unexpected release scope")
+    return release
+
+
+def _start_scan_retry() -> dict[str, Any]:
+    """Wake the installed outbox consumer; process admission is not delivery."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "start", "--no-block", "stockagent-d-cold-scan-retry.service"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "wake_failed", "error": str(exc)}
+    return {
+        "status": "retry_service_requested" if result.returncode == 0 else "wake_failed",
+        "return_code": int(result.returncode),
+        "error": None if result.returncode == 0 else result.stderr.strip()[-1000:],
+    }
 
 
 def _persist_receipt(
@@ -248,13 +298,29 @@ def main() -> int:
     stale_derived_receipts = False
     blocking_findings: list[str] = []
     blocking_checks: dict[str, list[str]] = {}
+    sync_root = Path(os.environ.get("STOCKAGENT_PACKED_SYNC_ROOT", "/srv/stockagent-packed"))
+    defer_scan = (sync_root / ".stockagent-d-primary").is_file()
+    commit_receipt = receipt.parent / "commits" / f"{started.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+    commit_receipt.parent.mkdir(parents=True, exist_ok=True)
+    local_publication_committed: bool | None = None
+    notification: dict[str, Any] = {"status": "not_attempted"}
     try:
-        completed = _publish_while_source_stable(command, args.timeout_seconds)
+        completed = _publish_while_source_stable(
+            command, args.timeout_seconds, result_receipt=commit_receipt,
+            defer_scan=defer_scan,
+        )
         return_code = int(completed.returncode)
         stdout = completed.stdout.strip()
         stderr = completed.stderr.strip()
         release = _parse_output(stdout)
         error = None if return_code == 0 else (stderr or stdout)[-4000:]
+        if return_code == 0:
+            release = _committed_release(commit_receipt, stdout, defer_scan=defer_scan)
+            local_publication_committed = True
+            # The inherited source lease has closed before this call. The
+            # durable outbox owns scan failures and retries, without repacking
+            # the source or blocking official acquisition on a network wait.
+            notification = _start_scan_retry() if defer_scan else {"status": "scan_request_acknowledged"}
     except subprocess.TimeoutExpired as exc:
         return_code = 124
         release = None
@@ -318,7 +384,8 @@ def main() -> int:
     completed_at = datetime.now(TAIPEI)
     payload = {
         "schema_version": 1,
-        "status": "ok" if return_code == 0 and release is not None else "failed",
+        "status": ("committed_scan_pending" if defer_scan else "ok")
+            if return_code == 0 and local_publication_committed is True else "failed",
         "started_at_taipei": started.isoformat(),
         "completed_at_taipei": completed_at.isoformat(),
         "elapsed_seconds": (completed_at - started).total_seconds(),
@@ -329,6 +396,10 @@ def main() -> int:
         "materialization_performed": False,
         "return_code": return_code,
         "release": release,
+        "local_publication_committed": local_publication_committed,
+        "commit_receipt": str(commit_receipt) if local_publication_committed else None,
+        "scan_notification": notification,
+        "peer_convergence": "not_checked",
         "error": error,
         "blocking_findings": blocking_findings,
         "blocking_checks": blocking_checks,
@@ -338,7 +409,7 @@ def main() -> int:
     # Input freshness is a durable publication gate, not a crashed worker.
     # The systemd unit suppresses only this exit status until a source receipt
     # changes or the next scheduled backup; other failures still retry.
-    return 0 if payload["status"] == "ok" else 75 if stale_derived_receipts else 1
+    return 0 if payload["status"] in {"ok", "committed_scan_pending"} else 75 if stale_derived_receipts else 1
 
 
 if __name__ == "__main__":

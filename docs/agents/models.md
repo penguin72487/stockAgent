@@ -47,6 +47,13 @@ strategy or the user explicitly overrides a field. Product-specific data,
 execution, eligibility, settlement, and accounting contracts remain
 authoritative and must not be replaced by Taiwan stock-day-trade semantics.
 
+For the 2026-10-03 futures-margin handoff, the user requires a rendered loss
+plot after every epoch: `record_epoch_curve: true`, `curve_plot_interval: 1`,
+`defer_epoch_curve_plot_until_end: false`, and `curve_plot_async: false`.
+Reuse the canonical plotter and include `plot_epoch_curves.py` in the exact
+source/wheel release. Preserve this output policy when optimizing speed;
+JSONL rows alone do not prove that images were rendered.
+
 For new single-target Taiwan stock day-trade training, the historical
 `projection_l1` output is no longer the active policy contract. Use
 `portfolio_output_mode: learned_cash` with
@@ -58,8 +65,10 @@ volume capacity—chooses long gross, short gross, net exposure, total gross, an
 cash. Candidate count and arbitrary stock-logit scale therefore cannot force
 gross to one. Do not substitute legacy `cash_l1`: its one cash score still
 competes against an unscaled sum over S stocks. Preserve old projection/cash-L1
-code and configs only for exact historical artifact replay;
-do not start new stock day-trade experiments from them. Product-specific models
+code and configs for exact historical artifact replay. New stock day-trade
+configs default to learned cash; an explicitly selected legacy-policy experiment
+may use its declared action ABI with a compatible artifact root and validation.
+Do not silently substitute that experiment for the default. Product-specific models
 whose validated action ABI still requires projection-L1 are not silently
 migrated by this stock-policy rule.
 

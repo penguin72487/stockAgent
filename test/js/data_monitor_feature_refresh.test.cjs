@@ -29,6 +29,12 @@ test("feature pages stay viewport-bounded, searchable, and preserve expanded row
       return elements.get(id);
     },
     createJsonFetcher() { return async () => ({}); },
+    createLatestRequest() {
+      let sequence = 0;
+      return {begin() { const current = ++sequence; return {signal:new AbortController().signal,
+        isCurrent:() => current === sequence, finish() {}}; }, abort() {sequence += 1;}};
+    },
+    observeVisibility(_target, callback) { observer = {callback:entries => callback(entries.some(e => e.isIntersecting))}; },
     async fetchWithTimeout(url) {
       requests += 1;
       urls.push(url);
@@ -47,6 +53,7 @@ test("feature pages stay viewport-bounded, searchable, and preserve expanded row
         revision, reset_required: resetRequired,
         offset: responseOffset,
         limit, matching_total: filtered.length,
+        has_more: responseOffset + Math.min(limit, Math.max(0, filtered.length-responseOffset)) < filtered.length,
         rows: filtered.slice(responseOffset, responseOffset + limit),
         summary: {fields: sourceRows.length},
         filters: {categories: [{id: "taiwan_equity", label: "台股"}],
@@ -62,7 +69,7 @@ test("feature pages stay viewport-bounded, searchable, and preserve expanded row
   const context = vm.createContext({
     window: {StockAgentDashboard: dashboard, IntersectionObserver: Observer, innerWidth: 1200},
     document: {hidden: false}, IntersectionObserver: Observer,
-    performance: {now: () => now}, Option: class {}, URLSearchParams,
+    performance: {now: () => now}, Option: class {}, URLSearchParams, AbortController,
   });
   vm.runInContext(app.slice(0, boot), context, {filename: appPath});
   let renderCount = 0;

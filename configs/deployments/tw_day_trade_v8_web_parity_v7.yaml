@@ -1,6 +1,6 @@
 # Candidate: do not promote or call this web-parity certified until the
 # acceptance receipt includes real-data DDP and independent paper replay.
-base_config: tw_day_trade_v8_v5_frozen_training_snapshot.yaml
+base_config: ../historical/tw_futures_v17_20261003/deployments/tw_day_trade_v8_v5_frozen_training_snapshot.yaml
 experiment_name: tw-day-trade-v8-web-parity-v7
 
 runner:

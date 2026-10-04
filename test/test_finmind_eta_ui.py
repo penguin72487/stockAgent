@@ -75,6 +75,25 @@ def test_three_scenarios_preserve_backend_numbers_and_taipei_completion_dates() 
     assert "阻塞 7 個任務" in view["exclusions"]
     assert "未排程 17 類" in view["exclusions"]
     assert "佇列未能盤點 2 類" in view["exclusions"]
+
+
+def test_retry_condition_is_labeled_and_never_claims_success_or_reliable_countdown():
+    payload = _estimate()
+    modeled = payload['scenarios']
+    payload.update(schema_version=7, state='waiting_retry',
+                   scenarios={key: {'state': 'waiting_retry', 'remaining_seconds': None} for key in modeled},
+                   retry_condition={'basis': 'next_retry_succeeds_no_additional_failures',
+                                    'retry_tasks': 131, 'scenarios': modeled})
+    payload['workload']['retry_tasks'] = 131
+    view = _view(payload)
+    assert view['stateLabel'] == '尚未完成：等待成功重試'
+    assert all(row['value'].startswith('條件試算') for row in view['scenarios'])
+    assert all(row['conditional'] for row in view['scenarios'])
+    assert all('若下次重試成功' in row['complete'] for row in view['scenarios'])
+    assert all('不是可靠倒數' in row['detail'] for row in view['scenarios'])
+    stale = _view(payload, now='2026-09-27T04:06:00+00:00')
+    assert all(row['value'] == '觀測已過期' for row in stale['scenarios'])
+    assert not any(row['conditional'] for row in stale['scenarios'])
     assert "未清點的歷史代號與未來新增工作另計" in view["exclusions"]
     assert view["blockers"][0]["reason"] == "來源權限未滿足"
     assert "共 500 次" in view["workload"]
@@ -95,6 +114,59 @@ def test_expired_snapshot_is_not_presented_as_a_current_countdown() -> None:
     assert view["stateLabel"] == "估算觀測已過期"
     assert all(row["value"] == "觀測已過期" for row in view["scenarios"])
     assert "2026/09/27 12:00" in " ".join(view["observed"].split())
+
+
+def test_nine_stage_contract_preserves_valid_scenarios_when_one_rate_is_unknown():
+    payload = _estimate()
+    payload.update(schema_version=6, state='warming_up')
+    payload['scenarios']['slowest'].update(state='unknown', remaining_seconds=None,
+                                          estimated_complete_at_utc=None)
+    view = _view(payload)
+    assert view['scenarios'][0]['value'] == '約 1 小時'
+    assert view['scenarios'][1]['value'] == '約 24 小時'
+    assert view['scenarios'][2]['value'] == '未知'
+
+
+def test_candidate_requests_are_separate_from_materialized_work():
+    payload = _estimate()
+    payload['workload']['candidate_requests'] = 300
+    assert '歷史搜尋候選 300 次（尚未建入佇列，非缺漏筆數）' in _view(payload)['workload']
+
+
+def test_exhausted_only_stage_is_a_gap_not_an_instant_completion():
+    payload = _estimate()
+    payload['workload'].update(planned_requests=0, retry_tasks=0, retry_exhausted_tasks=131)
+    for scenario in payload['scenarios'].values():
+        scenario.update(remaining_seconds=0, estimated_complete_at_utc=NOW, request_count=0)
+    view = _view(payload)
+    assert '重試耗盡 131 個' in view['exclusions']
+    assert all(row['value'] == '重試耗盡，待人工修復' for row in view['scenarios'])
+    assert all(row['complete'] == '完成日期尚無法估算' for row in view['scenarios'])
+
+
+def test_zero_work_stage_never_claims_current_when_expired_or_unscheduled():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node runtime not installed')
+    script = r"""
+const fs = require('fs'), vm = require('vm');
+const source = fs.readFileSync(process.argv[1], 'utf8').split('function svgNode')[0];
+const context = {window: {StockAgentDashboard: {createJsonFetcher: () => () => {}, byId: () => {}}}};
+vm.createContext(context);
+vm.runInContext(source + '\nglobalThis.clearStage = stageHasNoPendingWork;', context);
+const item = {state:'current', valid_until_utc:'2026-09-27T04:05:00+00:00', workload:{planned_requests:0}};
+const raw = {forecast_arrival_requests:0}, now = Date.parse('2026-09-27T04:00:00+00:00');
+const outputs = [context.clearStage(item, raw, now),
+  context.clearStage(item, raw, now + 300000),
+  context.clearStage({...item, state:'stale'}, raw, now),
+  context.clearStage({...item, valid_until_utc:null}, raw, now),
+  ...['retry_tasks','blocked_tasks','unknown_datasets','unscheduled_datasets','inflight_tasks']
+    .map(key => context.clearStage({...item, workload:{planned_requests:0, [key]:1}}, raw, now))];
+process.stdout.write(JSON.stringify(outputs));
+"""
+    result = subprocess.run([node, '-e', script, str(ROOT / 'services/finmind_dashboard/app.js')],
+                            check=True, capture_output=True, text=True, timeout=10)
+    assert json.loads(result.stdout) == [True] + [False] * 8
 
 
 def test_deadline_passes_before_snapshot_expiry_and_stops_one_minute_display():
@@ -269,8 +341,8 @@ def test_scenario_card_and_important_caveats_are_visible_in_markup() -> None:
     assert "不是保證完成期限或統計信賴區間" in html
     assert 'id="download-eta-exclusions" class="estimate-exclusions"' in html
     assert 'styles.css?v=3' in html
-    assert 'app.js?v=13' in html
-    assert 'href="styles.css?v=7"' in html
+    assert 'app.js?v=21' in html
+    assert 'href="styles.css?v=10"' in html
     assert '流量與估時對帳' in html
     assert '階段／已知剩餘請求' in html
 
@@ -291,9 +363,16 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
     estimate['rate_evidence'] = staged['rate_evidence']
     for item in estimate['stages']:
         item['valid_until_utc'] = '2099-01-01T00:00:00+00:00'
+    from downloader.finmind_history_order import HISTORY_STAGES, metadata
     payload = {
         "read_only": True, "production_control_possible": False, "health": "waiting",
-        "generated_at_utc": NOW, "datasets": [], "acquisition": {"completion_estimate": estimate},
+        "generated_at_utc": NOW,
+        "datasets": [dict(id=stage.dataset, label=stage.label, kind='symbol_history', state='backfilling',
+                          history_rank=rank, checked_partitions=50, complete_partitions=40,
+                          target_partitions=100, unseeded_partition_candidates=25, rows=400,
+                          local_bytes=1000, first_data_date='2021-06-30', last_data_date='2026-09-25')
+                     for rank, stage in enumerate(HISTORY_STAGES, 1)],
+        "acquisition": {"completion_estimate": estimate, 'history_order': {**metadata(), 'applied': True}},
     }
     asset_roots = {
         "finmind": ROOT / "services/finmind_dashboard",
@@ -333,6 +412,7 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.route("**/*", respond)
             page.goto("http://finmind-eta.test/finmind/", wait_until="networkidle", timeout=10000)
+            page.evaluate("window.StockAgentAcquisition.reveal('download-global-eta')")
             page.locator("#download-global-eta").scroll_into_view_if_needed(timeout=5000)
             page.evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))")
             playwright.expect(page.locator("#download-global-eta")).to_have_text("條件式三情境估算")
@@ -341,7 +421,13 @@ def test_three_estimates_render_without_overflow_in_real_browser(width: int) -> 
             playwright.expect(page.locator("#download-eta-exclusions")).to_contain_text("阻塞 7 個任務")
             playwright.expect(page.locator("#download-eta-blockers")).to_contain_text("來源權限未滿足")
             assert page.locator(".completion-estimate").count() == 3
-            assert page.locator('#download-eta-milestones tr').count() == 5
+            assert page.locator('#download-eta-milestones tr').count() == 12
+            assert page.locator('.estimate-stage-progress').count() == 9
+            assert page.locator('.estimate-stage-progress').evaluate_all('(els) => els.every(el => el.value === 0.5)')
+            assert page.locator('#download-eta-milestones tr[data-history-rank]').evaluate_all(
+                '(els) => els.map(el => el.dataset.sourceDataset)') == [stage.dataset for stage in HISTORY_STAGES]
+            playwright.expect(page.locator('#history-sequence')).to_contain_text('期貨價差 tick → 美股分鐘 K')
+            playwright.expect(page.locator('#history-sequence')).to_contain_text('下載器已套用')
             playwright.expect(page.locator('#download-eta-rate-bridge')).to_contain_text('5,600')
             playwright.expect(page.locator('#download-eta-milestones')).to_contain_text('本階段')
             playwright.expect(page.locator('#download-eta-milestones')).to_contain_text('新增日分區模型')

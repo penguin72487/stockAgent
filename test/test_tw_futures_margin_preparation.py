@@ -159,6 +159,67 @@ def test_numbered_native_extension_owns_prior_expiry_and_preserves_old_clocks():
     assert bind_native_margin_period_extension(archive,text.replace('11503003891','11503009999'),amendment,[prior]) is None
 
 
+def _same_level_period_replacement():
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock,product_margin_restoration_clock
+    text=('發文日期：中華民國115年6月2日。發文字號：台期結字第11503011611號。'
+        '主旨：公告調整力積電期貨契約(QZF)及延長合晶期貨契約(PLF)保證金調整期間。'
+        '本次調整自115年6月3日一般交易時段結束後起實施。'
+        '115年6月15日一般交易時段結束後，合晶期貨恢復為115年5月29日調整前之保證金。'
+        '本公司115年5月28日台期結字第11503011071號函有關合晶期貨保證金之規定，'
+        '自115年6月3日一般交易時段結束後停止適用。PLF(合晶期貨)')
+    prior=dict(product='PLF',published_date='2026-05-28',effective_date='2026-05-29',
+        effective_phase='after_product_regular_close',known_at='2026-05-28T23:59:59+08:00',
+        margin_kind='notional_rate',issue_date_bound=True,source_url='prior',
+        source_content_sha256='a'*64,after=[.324,.2484,.24],before=[.162,.1242,.12],
+        requires_reversion_review=True,
+        temporary_end_evidence=json.dumps([dict(date_iso='2026-06-10',boundary='after_regular_session')]))
+    clock=product_margin_restoration_clock(text,'PLF',candidate_notice_clock(text,'2026-06-02'))
+    row=dict(clock,product='PLF',published_date='2026-06-02',
+        known_at='2026-06-02T23:59:59+08:00',source_url='own',source_content_sha256='b'*64,
+        margin_kind='notional_rate',after=[.324,.2484,.24],before=[.162,.1242,.12])
+    docs={'prior':dict(content_sha256='a'*64,text=
+        '發文日期：中華民國115年5月28日。發文字號：台期結字第11503011071號。'),
+        'own':dict(content_sha256='b'*64,text=text)}
+    return SimpleNamespace(document=docs.__getitem__),text,prior,row
+
+
+def test_same_level_period_replacement_keeps_live_amount_and_named_restoration_base():
+    from copy import deepcopy
+    from scripts.build_tw_futures_margin_event_candidates import (
+        bind_native_margin_period_extension,compose_bound_margin_extension_views,margin_candidate_intervals)
+    archive,text,prior,row=_same_level_period_replacement()
+    original=deepcopy([prior,row]);bound=bind_native_margin_period_extension(archive,text,row,[prior])
+    assert [prior,row]==original
+    assert bound['before']==prior['after'] and bound['after']==prior['after']
+    assert bound['restoration_target']==prior['before']
+    assert bound['effective_date']=='2026-06-03' and bound['known_at']==row['known_at']
+    assert json.loads(bound['extension_join_evidence'])['printed_restoration_base']==row['before']
+    peer=dict(row,extraction='another_same_original_table')
+    assert len(compose_bound_margin_extension_views(archive,[prior,bound,peer]))==1
+    assert peer['before']==prior['after'] and peer['restoration_target']==prior['before']
+    intervals,issues=margin_candidate_intervals([prior,bound,peer])
+    assert not issues
+    assert [(r['effective_date'],r['valid_until_date_exclusive'],r['initial']) for r in intervals]==[
+        ('2026-05-29','2026-06-03',.324),('2026-06-03','2026-06-15',.324)]
+    wrong=dict(row,source_content_sha256='c'*64)
+    assert not compose_bound_margin_extension_views(archive,[bound,wrong])
+    assert wrong['before']==row['before']
+
+
+@pytest.mark.parametrize('change',[
+    {'product':'QZF'},{'before':[.135,.1035,.1]},{'after':[.243,.1863,.18]},
+    {'source_content_sha256':'c'*64},{'known_at':'2026-06-01T23:59:59+08:00'},
+    {'effective_date':'2026-06-04'},{'issue_date_bound':False},
+    {'prior_notice_revocation_evidence':'[]'},
+])
+def test_period_replacement_rejects_unbound_product_amount_clock_or_revocation(change):
+    from scripts.build_tw_futures_margin_event_candidates import bind_native_margin_period_extension
+    archive,text,prior,row=_same_level_period_replacement()
+    assert bind_native_margin_period_extension(archive,text,dict(row,**change),[prior]) is None
+    if 'prior_notice_revocation_evidence' not in change:
+        assert bind_native_margin_period_extension(archive,text,row,[dict(prior,**change)]) is None
+
+
 def test_prior_notice_revocation_does_not_end_replacement_at_its_start():
     from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
     text=('發文日期：中華民國115年3月24日。發文字號：台期結字第11503005871號。'
@@ -171,6 +232,321 @@ def test_prior_notice_revocation_does_not_end_replacement_at_its_start():
     assert {e['date_iso'] for e in json.loads(clock['temporary_end_evidence'])}=={'2026-04-08'}
     revoked=json.loads(clock['prior_notice_revocation_evidence'])
     assert len(revoked)==1 and revoked[0]['revoked_notice_number']=='11503005501'
+
+
+@pytest.mark.parametrize('change', ['', 'ambiguous_period', 'no_period_close_rule'])
+def test_nominal_restoration_uses_only_own_explicit_disposition_period(change):
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
+    text = ('臺灣期貨交易所 新聞稿\n中華民國105年11月25日\n'
+        '玉晶光期貨契約(LEF)，處置期間為105年11月25日至12月8日。'
+        '自105年11月28日該股票期貨契約交易時段結束後起實施，'
+        '並於證券市場處置期間結束後，於該契約交易時段結束後恢復為調整前之保證金。')
+    if change == 'ambiguous_period':text += '另一處置期間為105年11月25日至12月9日。'
+    if change == 'no_period_close_rule':text = text.replace('證券市場處置期間結束後', '另行公告後')
+    clock = candidate_notice_clock(text, '2016-11-25')
+    assert clock['effective_date'] == '2016-11-28' and clock['requires_reversion_review']
+    ends = json.loads(clock['temporary_end_evidence'])
+    if change:
+        assert ends == []
+    else:
+        assert len(ends) == 1 and ends[0]['date_iso'] == '2016-12-08'
+        assert ends[0]['derivation'] == 'own_disposition_period_and_explicit_period_close_restoration'
+        assert ends[0]['boundary'] == 'after_regular_session'
+
+
+@pytest.mark.parametrize('ambiguous', ['', 'mixed_year', 'conflicting_close', 'unbound_issue'])
+def test_native_margin_start_short_date_requires_own_unique_publication_year(ambiguous):
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
+    text = ('臺灣期貨交易所新聞稿部門：結算部中華民國115年8月27日。'
+        '處置期間為115年8月27日至9月2日。期交所依規定自8月28日'
+        '(證券市場處置生效日次一營業日)一般交易時段結束後起調高保證金，'
+        '並於9月2日一般交易時段結束後恢復為調整前之保證金。')
+    if ambiguous == 'mixed_year':text += '另參照114年1月1日公告。'
+    if ambiguous == 'conflicting_close':text += '另自115年8月29日一般交易時段結束後起實施。'
+    if ambiguous == 'unbound_issue':text = text.replace('中華民國115年8月27日', '未載發布日期')
+    clock = candidate_notice_clock(text, '2026-08-27')
+    if ambiguous:
+        assert clock['effective_date'] != '2026-08-28'
+    else:
+        assert clock['effective_date'] == '2026-08-28'
+        assert clock['effective_phase'] == 'after_product_regular_close'
+        assert {e['date_iso'] for e in json.loads(clock['temporary_end_evidence'])} == {'2026-09-02'}
+
+
+def test_margin_close_and_same_day_underlying_suspension_keep_distinct_clocks():
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
+    text = ('臺灣期貨交易所新聞稿中華民國105年5月16日。'
+        '處置期間為105年5月16日至5月27日。'
+        '期交所依規定自105年5月17日(證券市場處置生效日次一營業日)'
+        '該股票期貨契約交易時段結束後起實施，並於證券市場處置期間結束後，'
+        '於該契約交易時段結束後恢復為調整前之保證金。'
+        '櫃買中心另公告該普通股自105年5月17日起停止買賣，恢復日將順延。')
+    clock = candidate_notice_clock(text, '2016-05-16')
+    assert clock['effective_date'] == '2016-05-17'
+    assert clock['effective_phase'] == 'after_product_trading_session_unspecified'
+    assert {e['date_iso'] for e in json.loads(clock['temporary_end_evidence'])} == {'2016-05-27'}
+    assert clock['requires_reversion_review']
+
+
+def test_comma_at_restoration_and_unpunctuated_prior_revocation_are_distinct():
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
+    text = ('發文日期：中華民國110年10月29日。發文字號：台期結字第11003015001號。'
+        '本次調整自110年11月1日一般交易時段結束後起實施，'
+        '並於110年11月11日一般交易時段結束後，恢復為10月27日調整前之保證金。'
+        '原110年10月26日公告之台期結字第1100301469號函自110年11月1日'
+        '旨揭契約交易時段結束後停止適用。')
+    clock = candidate_notice_clock(text, '2021-10-29')
+    assert clock['effective_date'] == '2021-11-01'
+    assert {e['date_iso'] for e in json.loads(clock['temporary_end_evidence'])} == {'2021-11-11'}
+    assert {e['revoked_notice_number'] for e in json.loads(clock['prior_notice_revocation_evidence'])} == {'1100301469'}
+
+
+@pytest.mark.parametrize('view', ['formal', 'press'])
+def test_period_only_numbered_extension_is_not_a_retroactive_new_raise(view):
+    from copy import deepcopy
+    from scripts.build_tw_futures_margin_event_candidates import (
+        candidate_notice_clock, product_margin_restoration_clock, bind_native_margin_period_extension,
+        compose_bound_margin_extension_views, margin_candidate_intervals)
+    formal = ('發文日期：中華民國115年2月4日。'
+        '本公司115年1月30日台期結字第11503002331號函，公告調整聯亞期貨之保證金為'
+        '標的證券未經處置前所屬級距2倍之期間，延長至115年2月26日一般交易時段結束後，'
+        '恢復為115年2月2日調整前之保證金。OTF(聯亞期貨)')
+    press = ('臺灣期貨交易所 新聞稿\n中華民國115年2月4日\n'
+        '原期交所115年1月30日台期結字第11503002331號函公告自115年2月2日至2月23日'
+        '一般交易時段止，調整聯亞期貨保證金適用比例為標的證券未經處置前2倍之期間，'
+        '延長至2月26日。115年2月26日一般交易時段結束後，聯亞期貨契約(OTF)'
+        '恢復為115年2月2日調整前之保證金。OTF(聯亞期貨)')
+    text = formal if view == 'formal' else press
+    clock = product_margin_restoration_clock(text, 'OTF', candidate_notice_clock(text, '2026-02-04'))
+    assert clock['extension_prior_notice_join_required'] and clock['effective_date'] is None
+    prior = dict(product='OTF', published_date='2026-01-30', effective_date='2026-02-02',
+        effective_phase='after_product_regular_close', known_at='2026-01-30T23:59:59+08:00',
+        margin_kind='notional_rate', issue_date_bound=True, source_url='prior',
+        source_content_sha256='a'*64, after=[.459,.3519,.34], before=[.2295,.176,.17],
+        temporary_end_evidence=json.dumps([dict(date_iso='2026-02-23', boundary='after_regular_session')]))
+    row = dict(clock, product='OTF', published_date='2026-02-04', known_at='2026-02-04T23:59:59+08:00',
+        margin_kind='notional_rate', source_url='extension', source_content_sha256='b'*64, after=prior['after'],
+        declared_non_disposed_margin=prior['before'], before_column_semantics='explicit_non_disposed_base')
+    archive = SimpleNamespace(document=lambda url: dict(content_sha256='a'*64,
+        text='發文日期：中華民國115年1月30日。發文字號：台期結字第11503002331號。')
+        if url == 'prior' else dict(content_sha256='b'*64, text=text))
+    bound = bind_native_margin_period_extension(archive, text, row, [prior])
+    assert bound['effective_date'] == '2026-02-23'
+    assert bound['before'] == bound['after'] == prior['after']
+    assert bound['known_at'] == row['known_at'] and prior['effective_date'] == '2026-02-02'
+    assert bind_native_margin_period_extension(archive, text, dict(row, after=[.432,.3312,.32]), [prior]) is None
+    assert bind_native_margin_period_extension(archive, text.replace('11503002331', '11503009999'), row, [prior]) is None
+    partial = dict(row, before=None, before_column_semantics=None, declared_non_disposed_margin=None,
+        effective_date='2026-02-02', effective_phase='date_only_requires_phase_review')
+    assert len(compose_bound_margin_extension_views(archive, [prior, bound, partial])) == 1
+    assert partial['effective_date'] == '2026-02-23' and partial['known_at'] == row['known_at']
+    assert partial['before'] == prior['after'] and partial['after'] == row['after']
+    levels, _ = margin_candidate_intervals([prior, bound, partial])
+    assert [(r['effective_date'], r['valid_until_date_exclusive']) for r in levels] == [
+        ('2026-02-02', '2026-02-23'), ('2026-02-23', '2026-02-26')]
+    for change in [dict(published_date='2026-02-05'), dict(after=[.432,.3312,.32]),
+                   dict(before=[.216,.1656,.16]), dict(declared_non_disposed_margin=[.216,.1656,.16]),
+                   dict(effective_date='2026-02-06'), dict(source_content_sha256='c'*64)]:
+        wrong = dict(row, before=None, before_column_semantics=None, declared_non_disposed_margin=None)
+        wrong.update(change)
+        old = deepcopy(wrong)
+        assert not compose_bound_margin_extension_views(archive, [prior, bound, wrong])
+        assert wrong == old
+
+
+@pytest.mark.parametrize('change', ['', 'missing_cash', 'zero_cash', 'wrong_prior_number',
+                                  'wrong_base', 'wrong_annotation', 'future_law',
+                                  'sibling_exact', 'sibling_before', 'sibling_clock', 'sibling_end'])
+def test_shortened_period_requires_own_revision_and_complete_observed_cash_sessions(tmp_path, change):
+    from copy import deepcopy
+    from scripts.build_tw_futures_margin_event_candidates import (
+        repair_native_restoration_period_revisions, margin_candidate_intervals)
+    law = tmp_path/'law.html'
+    law.write_text('發文日期：中華民國115年8月3日。並自115年8月10日起實施。'
+                   '累積處置日數已達修正後規定之5(或7)個營業日者解除處置。')
+    prior_text = '發文日期：中華民國115年8月3日。發文字號：台期結字第11503017001號。'
+    amendment_text = ('發文日期：中華民國115年8月6日。公告調整保證金適用比例調整之期間。'
+        '自修正條文施行日(115年8月10日)起實施。'
+        '本公司115年8月3日台期結字第11503017001號函自即日起停止適用。'
+        '調整期間如遇休市、有價證券停止買賣、全日暫停交易則恢復日順延執行。'
+        '單位：比例(%)LYF(南電期貨)'
+        '※115年8月11日一般交易時段結束後恢復為115年8月4日標的證券未經處置前保證金。')
+    if change == 'wrong_prior_number':
+        prior_text = prior_text.replace('11503017001', '11503009999')
+    documents = {}
+    for name, text in [('prior', prior_text), ('amendment', amendment_text)]:
+        file = tmp_path/(name+'.txt');file.write_text(text)
+        documents[name] = dict(text=text, content_sha256=sha256_file(file))
+    base, raised = [.216,.1656,.16], [.324,.2484,.24]
+    prior = dict(product='LYF', margin_kind='notional_rate', published_date='2026-08-03',
+        effective_date='2026-08-04', effective_phase='after_product_regular_close',
+        known_at='2026-08-03T23:59:59+08:00', issue_date_bound=True, before=base, after=raised,
+        requires_reversion_review=True, source_url='prior', source_content_sha256=documents['prior']['content_sha256'],
+        temporary_end_evidence=json.dumps([dict(date_iso='2026-08-18', boundary='after_regular_session')]))
+    amendment = dict(prior, published_date='2026-08-06', effective_date=None, effective_phase='unresolved',
+        known_at='2026-08-06T23:59:59+08:00', source_url='amendment',
+        source_content_sha256=documents['amendment']['content_sha256'], before=None,
+        before_column_semantics='explicit_non_disposed_base', declared_non_disposed_margin=base)
+    old_restore = dict(prior, effective_date='2026-08-18', known_at='2026-08-18T13:35:00+08:00',
+        before=raised, after=base, requires_reversion_review=False, temporary_end_evidence='[]',
+        original_rule_known_at=prior['known_at'], extraction='observed_disposition_conditional_restoration')
+    if change == 'wrong_base':
+        amendment['declared_non_disposed_margin'] = [.243,.1863,.18]
+    period = dict(date='2026-07-31', stock_id='8046', period_start='2026-08-03', period_end='2026-08-18',
+        measure='期間自115年8月3日起至8月18日〔十二個營業日〕。'
+                '註：配合115年8月10日處置新規定，期間調整為115/08/03~115/08/11。', source_sha256='d'*64)
+    if change == 'wrong_annotation':
+        period['measure'] = period['measure'].replace('08/11', '08/12')
+    dates = ['2026-08-03','2026-08-04','2026-08-05','2026-08-06','2026-08-07','2026-08-10','2026-08-11']
+    if change == 'missing_cash':
+        dates.remove('2026-08-05')
+    observations = [dict(date=d, symbol='8046', volume=0. if change == 'zero_cash' and d=='2026-08-05'
+                         else 100., source_sha256='e'*64) for d in dates]
+    inputs = {}
+    for key, frame in [('universe', pl.DataFrame(dict(product=['LYF'], underlying_symbol=['8046']))),
+                       ('dispositions', pl.from_dicts([period])), ('observations', pl.from_dicts(observations))]:
+        file = tmp_path/(key+('.csv' if key=='universe' else '.parquet'))
+        frame.write_csv(file) if key=='universe' else frame.write_parquet(file)
+        inputs[key] = dict(path=str(file), sha256=sha256_file(file))
+    law_spec = dict(path=str(law), sha256=sha256_file(law), url='law', published_date='2026-08-03',
+        known_at='2026-08-03T23:59:59+08:00', effective_date='2026-08-10',
+        required_clauses=['中華民國115年8月3日', '並自115年8月10日起實施', '5(或7)個營業日'])
+    if change == 'future_law':
+        law_spec.update(published_date='2026-08-07', known_at='2026-08-07T23:59:59+08:00')
+    path = tmp_path/'context.json';path.write_text(json.dumps(dict(inputs, restoration_period_revision_laws=[law_spec])))
+    bundle = tmp_path/'delta';bundle.mkdir()
+    archive = SimpleNamespace(bundle=bundle, copy=lambda *a, **k: None, document=lambda url: documents[url])
+    original = deepcopy([prior, amendment, old_restore])
+    siblings = []
+    if change.startswith('sibling_'):
+        news_text = '臺灣期貨交易所 新聞稿\n中華民國115年8月3日\n南電期貨。'
+        news_file = tmp_path/'press.txt';news_file.write_text(news_text)
+        documents['press'] = dict(text=news_text, content_sha256=sha256_file(news_file))
+        news = dict(prior, source_url='press', source_content_sha256=documents['press']['content_sha256'])
+        if change == 'sibling_before':news['before'] = [.243,.1863,.18]
+        if change == 'sibling_clock':news['known_at'] = '2026-08-03T22:00:00+08:00'
+        if change == 'sibling_end':news['temporary_end_evidence'] = json.dumps([
+            dict(date_iso='2026-08-19', boundary='after_regular_session')])
+        siblings = [news, dict(old_restore, source_url='press',
+            original_rule_known_at=news['known_at'], source_content_sha256=news['source_content_sha256'])]
+        original.extend(deepcopy(siblings))
+    untouched = deepcopy(original)
+    if change == 'future_law':
+        with pytest.raises(ValueError, match='law publication mismatch'):
+            repair_native_restoration_period_revisions(archive, original, path)
+        return
+    result, repairs = repair_native_restoration_period_revisions(archive, original, path)
+    assert original == untouched
+    if change and (not change.startswith('sibling_') or change == 'sibling_before'):
+        assert not repairs and result == original
+    else:
+        assert len(repairs) == 1
+        assert result[0] == prior
+        restored = result[-1]
+        assert restored['effective_date'] == '2026-08-11'
+        assert restored['known_at'] == '2026-08-11T13:35:00+08:00'
+        assert restored['before'] == raised and restored['after'] == base
+        assert json.loads(restored['restoration_evidence'])['completed_cash_dates'] == dates
+        assert repairs[0]['revised_required_sessions'] == 7 and repairs[0]['financial_values_inferred'] is False
+        if change == 'sibling_exact':
+            assert len(result) == 3 and result[1] == siblings[0]
+            assert all(r.get('effective_date') != '2026-08-18' for r in result)
+            levels, _ = margin_candidate_intervals(result)
+            assert any(r['effective_date'] == '2026-08-11' for r in levels)
+        elif change.startswith('sibling_'):
+            assert all(r in result for r in siblings)
+        else:
+            assert len(result) == 2
+
+
+@pytest.mark.parametrize('retained_proof', [True, False])
+def test_visual_generic_close_requires_retained_dated_single_session_proof(tmp_path, retained_proof):
+    from scripts.build_tw_futures_margin_event_candidates import source_review_candidates
+    conn=sqlite3.connect(':memory:');conn.row_factory=sqlite3.Row
+    conn.executescript("CREATE TABLE announcements(url,published_date);"
+                      "INSERT INTO announcements VALUES('source','2018-05-15');")
+    image=tmp_path/'page.png';image.write_bytes(b'inspected page')
+    universe=tmp_path/'products.csv'
+    pl.DataFrame(dict(product=['LXF'],underlying_security_type=['stock'])).write_csv(universe)
+    session=tmp_path/'session.json'
+    session.write_text(json.dumps(dict(review_kind='source_bound_single_regular_session',
+        effective_date='2010-01-25',valid_until_exclusive='2024-01-22',known_at='2010-01-08T23:59:59+08:00',
+        sources=[dict(source_url='law',content_sha256='b'*64,required_clauses=['日盤時段'])],
+        universe=dict(path=str(universe),sha256=sha256_file(universe)),products=['LXF'])))
+    sources={'session':dict(path=session.name,sha256=sha256_file(session),kind='single_session_rule_review')}
+    archive=SimpleNamespace(conn=conn,bundle=tmp_path,copy=lambda *a,**kw:None,
+        sources=sources if retained_proof else {},
+        document=lambda url:dict(content_sha256='b'*64,text='日盤時段') if url=='law'
+        else dict(content_sha256='a'*64,text=''))
+    review=dict(review_kind='source_bound_visual_transcription',source_url='source',content_sha256='a'*64,
+        published_date='2018-05-15',known_at='2018-05-15T23:59:59+08:00',effective_date='2018-05-16',
+        effective_phase='after_product_regular_close',margin_kind='notional_rate',
+        transcribed_text='發文日期：中華民國107年5月15日。本次保證金調整自107年5月16日'
+          '該股票期貨契約交易時段結束後起實施，並於5月28日該契約交易時段結束後'
+          '恢復為5月16日調整前之保證金。',
+        temporary_end_evidence=[dict(date_iso='2018-05-28',boundary='after_regular_session')],
+        pages=[dict(page=1,path=image.name,sha256=sha256_file(image))],
+        rows=[dict(product='LXF',page=1,after=dict(initial=.2025,maintenance=.1553,clearing=.15),
+                   before=dict(initial=.135,maintenance=.1035,clearing=.1))])
+    path=tmp_path/'review.json';path.write_text(json.dumps(review))
+    if not retained_proof:
+        with pytest.raises(ValueError,match='temporary clock differs'):
+            source_review_candidates(archive,path)
+    else:
+        facts,_=source_review_candidates(archive,path)
+        assert facts[0]['effective_phase']=='after_product_regular_close'
+        assert json.loads(facts[0]['temporary_end_evidence'])[0]['boundary']=='after_regular_session'
+        assert facts[0]['single_session_rule_review_sha256']==sha256_file(session)
+
+
+@pytest.mark.parametrize('change', ['', 'wrong_before', 'wrong_publication', 'unbound_publication',
+                                  'wrong_product', 'explicit_conflict', 'wrong_own_start', 'tampered_anchor',
+                                  'shared_parent', 'unrelated_parent', 'unproved_parent'])
+def test_same_notice_margin_clock_composition_keeps_event_identity(change):
+    from scripts.build_tw_futures_margin_event_candidates import compose_same_notice_margin_clocks
+    anchor=dict(product='PQF',margin_kind='notional_rate',before=[.162,.1242,.12],after=[.324,.2484,.24],
+        published_date='2025-11-26',known_at='2025-11-26T23:59:59+08:00',issue_date_bound=True,
+        effective_date='2025-11-27',effective_phase='after_product_regular_close',
+        source_url='formal',source_content_sha256='a'*64,requires_reversion_review=True,
+        temporary_end_evidence=json.dumps([dict(date_iso='2025-12-09',boundary='after_regular_session')]))
+    incomplete=dict(anchor,source_url='press',source_content_sha256='b'*64,effective_date=None,
+        effective_phase='unresolved',temporary_end_evidence='[]')
+    if change=='wrong_before':incomplete['before']=[.216,.1656,.16]
+    if change=='wrong_publication':incomplete.update(published_date='2025-11-25',known_at='2025-11-25T23:59:59+08:00')
+    if change=='unbound_publication':incomplete['issue_date_bound']=False
+    if change=='wrong_product':incomplete['product']='LYF'
+    if change=='explicit_conflict':incomplete['effective_date']='2025-11-28'
+    text='發文日期：中華民國114年11月26日。調整自114年11月27日一般交易時段結束後起實施，於114年12月9日一般交易時段結束後恢復為調整前保證金。'
+    if change=='wrong_own_start':text=text.replace('11月27日','11月28日')
+    documents={'formal':dict(text=text,content_sha256='c'*64 if change=='tampered_anchor' else 'a'*64),
+               'press':dict(text=text,content_sha256='b'*64)}
+    archive=SimpleNamespace(sources={},document=lambda url:documents[url]);original=dict(anchor)
+    if change.endswith('parent'):
+        import sqlite3
+        anchor['announcement_url'] = 'notice'
+        incomplete['announcement_url'] = 'other' if change == 'unrelated_parent' else 'notice'
+        documents['press']['text'] = text.replace('於114年12月9日一般交易時段結束後恢復為',
+            '並於證券市場處置期間結束後，於該契約一般交易時段結束後恢復為')
+        documents['notice'] = dict(content_sha256='c'*64, text='官方同事件公告')
+        archive.conn = sqlite3.connect(':memory:');archive.conn.row_factory = sqlite3.Row
+        archive.conn.execute('CREATE TABLE announcements(url TEXT, published_date TEXT)')
+        archive.conn.execute('INSERT INTO announcements VALUES (?,?)',('notice','2025-11-26'))
+        archive.children = lambda _: ['formal'] if change == 'unproved_parent' else ['formal','press']
+        original = dict(anchor)
+    if change=='tampered_anchor':
+        with pytest.raises(ValueError,match='anchor original SHA'):
+            compose_same_notice_margin_clocks(archive,[anchor,incomplete])
+        return
+    repaired=compose_same_notice_margin_clocks(archive,[anchor,incomplete])
+    assert anchor==original
+    if change and change != 'shared_parent':
+        assert not repaired and incomplete['effective_phase']=='unresolved'
+    else:
+        assert len(repaired)==1 and incomplete['known_at']==anchor['known_at']
+        assert incomplete['effective_date']==anchor['effective_date']
+        assert incomplete['effective_phase']==anchor['effective_phase']
+        assert incomplete['before']==anchor['before'] and incomplete['after']==anchor['after']
+        assert json.loads(incomplete['same_notice_clock_evidence'])['source_content_sha256s']==['a'*64,'b'*64]
 
 
 def test_native_non_disposed_restoration_still_requires_own_dated_reference():
@@ -533,6 +909,75 @@ def test_reviewed_temporary_margin_keeps_product_ends_and_no_invented_before(tmp
     assert json.loads(bound['restoration_reference_evidence'])['source_content_sha256s']==['b'*64]
     assert referenced_before_restoration([compact(text)],facts[1],facts) is None
     assert referenced_before_restoration([compact(text)],facts[1],[dict(prior,before=[.216,.1656,.16])]) is None
+
+
+@pytest.mark.parametrize('problem', [None, 'missing_issuing_page', 'wrong_day', 'tampered_page',
+                                    'unbound_attachment', 'amendment_without_issuing_date'])
+def test_scanned_margin_issuing_page_owns_only_its_bound_attachment_clock(tmp_path, problem):
+    from scripts.build_tw_futures_margin_event_candidates import source_review_candidates
+    from downloader.artifact_io import sha256_file
+    c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
+    c.executescript("CREATE TABLE announcements(url,published_date);"
+                   "INSERT INTO announcements VALUES('notice','2025-12-23'),('amended','2025-12-24');")
+    image = tmp_path / 'issuing.png'; image.write_bytes(b'inspected issuing page')
+    def document(url):
+        return dict(content_sha256=('a' if url == 'attachment' else 'b') * 64,
+                    text='native financial annex with no issuing date')
+    def copy(path, digest, **kwargs):
+        if sha256_file(path) != digest:
+            raise ValueError('review page SHA mismatch')
+    archive = SimpleNamespace(conn=c, document=document, copy=copy,
+                              children=lambda url: [] if problem == 'unbound_attachment' else ['attachment'])
+    review = dict(review_kind='source_bound_visual_transcription', source_url='attachment',
+        announcement_url='notice', content_sha256='a' * 64, published_date='2025-12-23',
+        known_at='2025-12-23T23:59:59+08:00', effective_date='2025-12-25',
+        effective_phase='after_product_regular_close', margin_kind='notional_rate',
+        transcribed_text='發文日期：中華民國114年12月23日。',
+        pages=[dict(page=1, path=image.name, sha256=sha256_file(image))],
+        rows=[dict(product='OTF', page=1, after=dict(initial=.432, maintenance=.3312, clearing=.32))])
+    if problem == 'missing_issuing_page': review['pages'][0]['page'] = 2
+    if problem == 'wrong_day': review['transcribed_text'] = '發文日期：中華民國114年12月29日。'
+    if problem == 'tampered_page': image.write_bytes(b'different issuing page')
+    if problem == 'amendment_without_issuing_date':
+        review['known_at'] = '2025-12-24T23:59:59+08:00'
+        review['amendments'] = [dict(source_url='amendment_attachment', announcement_url='amended',
+            content_sha256='b' * 64, published_date='2025-12-24')]
+        archive.children = lambda url: ['attachment', 'amendment_attachment']
+    path = tmp_path / 'review.json'; path.write_text(json.dumps(review))
+    if problem:
+        with pytest.raises(ValueError): source_review_candidates(archive, path)
+    else:
+        margins, positions = source_review_candidates(archive, path)
+        assert not positions and margins[0]['known_at'] == review['known_at']
+        assert margins[0]['after'] == [.432, .3312, .32]
+
+
+def test_bounded_margin_reextraction_never_opens_an_unselected_original():
+    from scripts.build_tw_futures_margin_event_candidates import reextract_retained_margin_text
+    c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
+    c.executescript('CREATE TABLE announcements(url,published_date);'
+                   'CREATE TABLE documents(url,state);CREATE TABLE links(parent,child);')
+    own = "source-with-'quote"
+    c.executemany('INSERT INTO announcements VALUES (?,?)', [(own, '2026-05-01'),
+                                                           ('unselected', '2026-05-01')])
+    c.executemany('INSERT INTO documents VALUES (?,?)', [(own, 'complete'), ('unselected', 'complete')])
+    text = ('發文日期：中華民國115年5月1日。自115年5月4日一般交易時段結束後起實施。\n'
+            '單位：比例(%)\nHBF\n調高2倍後保證金適用比例 標的證券未經處置前保證金適用比例\n'
+            '原始保證金 維持保證金 結算保證金 原始保證金 維持保證金 結算保證金\n'
+            '保證金 32.40% 24.84% 24.00% 16.20% 12.42% 12.00%\n')
+    opened = []
+    def document(url):
+        assert url == own, 'an unrelated original must not be opened'
+        opened.append(url)
+        return dict(text=text, content_sha256='a' * 64)
+    archive = SimpleNamespace(conn=c, sources={}, document=document)
+    assert reextract_retained_margin_text(archive, source_urls=[]) == [] and not opened
+    facts = reextract_retained_margin_text(archive, source_urls=[own, own])
+    assert opened == [own] and len(facts) == 1
+    assert facts[0]['product'] == 'HBF' and facts[0]['before'] is None
+    assert facts[0]['declared_non_disposed_margin'] == [.162, .1242, .12]
+    assert facts[0]['effective_date'] == '2026-05-04'
+    assert facts[0]['issue_date_bound']
 
 
 def test_candidate_reuse_preserves_provenance_and_rejects_tampering(tmp_path):

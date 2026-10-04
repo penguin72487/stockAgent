@@ -10,8 +10,9 @@ import requests
 
 from downloader.common import load_env_file
 from downloader.artifact_io import atomic_write_json
-from downloader.finmind_account import verified_account
+from downloader.finmind_account import backfill_budget, verified_account
 from downloader.finmind_eta import snapshot_finmind_estimate
+from downloader.finmind_scheduling import incremental_reservation
 
 
 ETA_ERROR_CODES = frozenset({
@@ -19,6 +20,27 @@ ETA_ERROR_CODES = frozenset({
     'priority_override_must_be_subset_of_required_history',
     'stage_request_counts_do_not_reconcile',
 })
+
+
+def sample_local_dispatch(root: Path, account: dict, *, now: datetime | None = None) -> dict:
+    """One minute-sampled scheduling receipt, independent of ETA success.
+
+    The gateway displays this decision's timestamp; it does not reimplement
+    worker admission or open the active WAL ledger to invent a newer balance.
+    No token, raw provider message, queue mutation or additional API call.
+    """
+    now = now or datetime.now(UTC)
+    from stockagent.live.finmind_dashboard import _traffic
+    plan = incremental_reservation(root, now)
+    budget = backfill_budget(account, root, fixed_incremental_requests=plan['reserve_requests'],
+                             now=now, prioritize_due=True, reservation_plan=plan)
+    receipt = {'schema_version': 2, 'observed_at_utc': now.isoformat(),
+               'account_observed_at_utc': account.get('observed_at_utc'),
+               'official_requests_per_hour': account['official_requests_per_hour'],
+               'allocation': budget, 'traffic': _traffic(root, now, account['official_requests_per_hour']),
+               'extra_provider_calls': 0}
+    atomic_write_json(root / 'dispatch_status.json', receipt)
+    return receipt
 
 
 def sample_local_eta(root: Path) -> dict | None:
@@ -67,6 +89,7 @@ def main() -> int:
         account = verified_account(session, token, repo_root / "data_finmind")
     print(f"FinMind {account['tier']}: {account['provider_used_in_hour']}/"
           f"{account['official_requests_per_hour']} requests in provider hour")
+    sample_local_dispatch(repo_root / 'data_finmind', account)
     # One bounded local snapshot per existing quota observation, not per browser
     # refresh. Estimation cannot trigger a market-data API or alter a queue.
     # Bootstrap missing estimates too; a removed/never-created ETA file must

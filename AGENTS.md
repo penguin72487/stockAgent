@@ -15,6 +15,8 @@ Paths written as `stockagent/...`, `scripts/...`, `configs/...`, `test/...` or
 - Inspect Git state before editing. Preserve unrelated and overlapping dirty
   work. Use `apply_patch` for manual edits; use `rg` for discovery. Do not use
   destructive Git commands without explicit authorization.
+- For multi-step implementation/operations, use the [agent workflow](docs/agents/runtime.md#agent-workflow)
+  to inspect current state, retain the original task and record milestone evidence.
 - Source `scripts/runtime_env.sh` and use `run_fintech_python`; do not hard-code
   a Python environment path. Before expensive GPU jobs run
   `run_fintech_python scripts/check_environment.py --require-cuda --strict`.

@@ -1034,9 +1034,8 @@ def test_candle_encoder_jointly_embeds_categorical_features() -> None:
     assert not torch.equal(base_aux["candle_embedding"], changed_aux["candle_embedding"])
 
 
-def test_active_financial_transformers_match_shared_non_output_contract() -> None:
+def test_financial_transformer_baseline_matches_shared_non_output_contract() -> None:
     config_paths = [Path("configs/experiment_baseline.yaml")]
-    config_paths.extend(sorted(Path("configs/markets").glob("*.yaml")))
 
     for path in config_paths:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -1060,10 +1059,16 @@ def test_active_financial_transformers_match_shared_non_output_contract() -> Non
                 "projection_l1_scale_by_active_count",
             }:
                 # Direction and output representation are legitimate
-                # experiment-level overrides for the active Financial
-                # Transformer head. All encoder/runtime fields stay shared.
+                # experiment-level overrides for the baseline head.
                 continue
             assert getattr(financial, config_field.name) == getattr(
                 transformer_base,
                 config_field.name,
             ), (path, config_field.name)
+
+
+def test_selected_encoder_experiment_does_not_mutate_inactive_model_defaults() -> None:
+    config = load_config("configs/markets/tw_futures_v8_general.yaml")
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.financial_transformer.temporal_pooling == "last"
+    assert config.training.transformer_base_portfolio.temporal_pooling == "attention"

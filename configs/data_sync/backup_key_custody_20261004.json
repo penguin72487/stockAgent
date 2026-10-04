@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "state": "user_confirmed_controlled_usb_custody",
+  "evidence_origin": "explicit_user_confirmation",
+  "confirmed_on_local_date": "2026-10-04",
+  "method": "controlled_removable_usb",
+  "user_confirmation": "USB 金鑰保管已經保管好了不要再問了",
+  "request_further_confirmation": false,
+  "contains_key_material_or_private_location": false
+}

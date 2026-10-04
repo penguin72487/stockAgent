@@ -439,7 +439,7 @@ def test_open_order_requires_current_session_quote_and_missed_open_is_visible(
 
 
 def test_dashboard_uses_explicit_discord_status_for_overnight_ack(
-    tmp_path: Path,
+    tmp_path: Path, verified_dashboard_calendar,
 ) -> None:
     spec = _spec(tmp_path)
     engine = TwOvernightSimulationEngine(tmp_path / "state")

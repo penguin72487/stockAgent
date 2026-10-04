@@ -68,6 +68,43 @@ def test_legacy_archive_rejects_source_change_after_staging(tmp_path: Path) -> N
         prepare_archive(spec, artifact_root)
 
 
+def test_cli_cold_only_verifies_retired_archive_and_still_rejects_corrupt_objects(tmp_path, monkeypatch, capsys):
+    import sys
+    from scripts import manage_legacy_artifact_archives as cli
+
+    spec, artifact_root, source = _fixture(tmp_path)
+    sync_root = tmp_path / "packed"
+    release = publish_archive(spec, artifact_root, sync_root, repo_root=tmp_path)
+    source.rename(source.with_name("retired-test-source"))
+    monkeypatch.setattr(cli, "load_legacy_specs", lambda _path: {spec.dataset: spec})
+    args = ["manage_legacy_artifact_archives.py", "verify", spec.dataset,
+            "--artifact-root", str(artifact_root), "--sync-root", str(sync_root)]
+    monkeypatch.setattr(sys, "argv", args)
+    assert cli.main() == 2
+    assert "source file missing" in capsys.readouterr().err
+    monkeypatch.setattr(sys, "argv", args + ["--cold-only"])
+    assert cli.main() == 0
+    proof = json.loads(capsys.readouterr().out)
+    assert proof["snapshot_id"] == release["snapshot_id"]
+    assert proof["cold_verified"] is proof["decoded_originals_verified"] is True
+    assert proof["source_comparison"] == "not_requested_cold_only"
+    assert proof["deployable"] is False
+    resolved = resolve_latest_packed(sync_root, spec.dataset)
+    object_path = sync_root / resolved.manifest["archive"]["objects"][0]["relpath"]
+    object_path.write_bytes(b"corrupt cold object")
+    assert cli.main() == 2
+    assert "mismatch" in capsys.readouterr().err
+
+
+def test_cli_refuses_cold_only_option_for_publication(monkeypatch, capsys):
+    import sys
+    from scripts import manage_legacy_artifact_archives as cli
+
+    monkeypatch.setattr(sys, "argv", ["manage_legacy_artifact_archives.py", "publish", "example", "--cold-only"])
+    assert cli.main() == 2
+    assert "requires verify" in capsys.readouterr().err
+
+
 def test_guarded_stage_refuses_missing_d_mount_before_writes(tmp_path: Path, monkeypatch):
     import stockagent.data_sync.cold_primary as cold_primary
 

@@ -99,9 +99,11 @@ def registry() -> dict[str, dict[str, Any]]:
                                  historical_universe_verified_complete=False)
         elif dataset in complement.supplemental.SOURCES:
             source = complement.supplemental.SOURCES[dataset]
-            contract = _contract('derived_no_api' if source.grain == 'derived' else
-                                 'whole_market_date_range' if source.universe == 'market' else f'per_{source.universe}_{source.grain}', source.first.isoformat(),
-                                 'full_market_history' if source.universe == 'market' else
+            shape = ('derived_no_api' if source.grain == 'derived' else
+                     ('whole_market_day' if source.grain == 'day' else 'whole_market_date_range')
+                     if source.universe == 'market' else f'per_{source.universe}_{source.grain}')
+            contract = _contract(shape, source.first.isoformat(),
+                                 'full_market_history' if source.universe == 'market' and source.grain == 'history' else
                                  'full_id_history' if source.grain == 'history' else f'one_{source.grain}',
                                  endpoint=source.endpoint, storage_grain=source.grain,
                                  historical_universe_verified_complete=False,
@@ -109,6 +111,8 @@ def registry() -> dict[str, dict[str, Any]]:
                                  decoded_response_byte_limit=complement.BULK_MAX_RESPONSE_BYTES,
                                  release_hour_taipei=source.release_hour,
                                  contract_version=complement.supplemental.CONTRACT_VERSION)
+            if source.universe == 'market' and source.grain == 'day':
+                contract['contract_evidence'] = complement.supplemental.MARKET_DAY_PROOF
         elif dataset in PRODUCT_HISTORY_STARTS:
             contract = _contract('per_product_history', PRODUCT_HISTORY_STARTS[dataset].isoformat(),
                                  'one_product_documented_start_through_today_inclusive',

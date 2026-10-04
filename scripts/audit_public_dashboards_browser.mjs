@@ -19,11 +19,16 @@ const allPages = [
   ["shioaji", "/shioaji/"],
   ["finlab", "/finlab/"],
   ["finmind", "/finmind/"],
+  ["tej", "/tej/"],
   ["openbb", "/openbb/"],
   ["data-monitor", "/data-monitor/"],
+  ["data-provider", "/data-monitor/providers/FinMind/"],
   ["traffic", "/traffic/"],
 ];
-const requestedPages = new Set(String(process.argv[7] || "").split(",").filter(Boolean));
+const requestedPages = new Set(String(process.argv[7] || "").split(",").filter(Boolean)
+  .map(name => name === "provider" ? "data-provider" : name));
+const unknownPages = [...requestedPages].filter(name => !allPages.some(([known]) => known === name));
+if (unknownPages.length) throw new Error(`Unknown dashboard audit pages: ${unknownPages.join(", ")}`);
 const pages = requestedPages.size
   ? allPages.filter(([name]) => requestedPages.has(name))
   : allPages;
@@ -34,6 +39,7 @@ const representativeControls = {
   finmind: {selector: "button[data-pipeline-filter='session_history']"},
   openbb: {selector: "button[data-range='1h']", apiPath: "/openbb/api/history"},
   "data-monitor": {selector: "#status-filter", value: "complete"},
+  "data-provider": {selector: "#provider-status-filter", value: "complete"},
   traffic: {selector: "#browser-kind-filter", value: "interaction"},
 };
 
@@ -230,6 +236,13 @@ const expression = `(() => {
     .filter(([, count]) => count > 1)
     .map(([id, count]) => ({id, count}));
   const globalNavigation = document.querySelector("header nav[aria-label*='公開面板']");
+  const expectedRoutes = window.StockAgentDashboard?.NAV_ITEMS?.map(item =>
+    item.slug ? '/' + item.slug + '/' : '/');
+  const links = [...(globalNavigation?.querySelectorAll('a') || [])];
+  const navigationRouteErrors = !expectedRoutes || links.length !== expectedRoutes.length
+    ? [{error:'incomplete canonical navigation'}] : links.flatMap((link, index) =>
+      new URL(link.href).pathname === expectedRoutes[index] ? []
+        : [{label:link.textContent, expected:expectedRoutes[index], actual:new URL(link.href).pathname}]);
   const unlabeledFields = [...document.querySelectorAll("input,select,textarea")]
     .filter(visible)
     .filter((element) => !(
@@ -298,6 +311,7 @@ const expression = `(() => {
     h1Count: document.querySelectorAll("h1").length,
     duplicateIds,
     globalNavLinkCount: globalNavigation?.querySelectorAll("a").length || 0,
+    navigationRouteErrors,
     currentPageLinkCount: globalNavigation?.querySelectorAll('[aria-current="page"]').length || 0,
     unlabeledFields,
     inaccessibleTableRegions,
@@ -388,6 +402,14 @@ for (const [name, suffix] of pages) {
       returnByValue: true,
     });
     interactionLatency = interaction.result?.value || null;
+    await send("Runtime.evaluate", {
+      expression: `new Promise(resolve => {
+        window.StockAgentAcquisition?.reveal('browser-performance-title');
+        document.getElementById('browser-performance-title')?.scrollIntoView({behavior:'instant',block:'start'});
+        requestAnimationFrame(()=>requestAnimationFrame(resolve));
+      })`,
+      awaitPromise: true,
+    });
     const performancePanel = await send("Runtime.evaluate", {
       expression: `new Promise(resolve => {
         const started=performance.now();
@@ -404,13 +426,6 @@ for (const [name, suffix] of pages) {
       returnByValue: true,
     });
     interactionLatency = {...interactionLatency, ...(performancePanel.result?.value || {error:"performance panel evaluation failed"})};
-    await send("Runtime.evaluate", {
-      expression: `new Promise(resolve => {
-        document.getElementById('browser-performance-title')?.scrollIntoView({behavior:'instant',block:'start'});
-        requestAnimationFrame(()=>requestAnimationFrame(resolve));
-      })`,
-      awaitPromise: true,
-    });
     const performanceScreenshot = await send("Page.captureScreenshot", {
       format: "png",
       captureBeyondViewport: false,
@@ -419,6 +434,14 @@ for (const [name, suffix] of pages) {
       path.join(outputDir, `traffic-performance-${width}x${height}.png`),
       Buffer.from(performanceScreenshot.data, "base64"),
     );
+    await send("Runtime.evaluate", {
+      expression: `new Promise(resolve => {
+        window.StockAgentAcquisition?.reveal('history-title');
+        document.getElementById('history-title')?.scrollIntoView({behavior:'instant',block:'start'});
+        requestAnimationFrame(()=>requestAnimationFrame(resolve));
+      })`,
+      awaitPromise: true,
+    });
     const historyPanel = await send("Runtime.evaluate", {
       expression: `new Promise(resolve => {
         const started=performance.now();
@@ -441,13 +464,6 @@ for (const [name, suffix] of pages) {
     const historyPanelValue = historyPanel.result?.value || {error:"persistent history panel evaluation failed"};
     interactionLatency = {...interactionLatency, historyPanel:historyPanelValue};
     if (historyPanelValue.error) interactionLatency.error = historyPanelValue.error;
-    await send("Runtime.evaluate", {
-      expression: `new Promise(resolve => {
-        document.getElementById('history-title')?.scrollIntoView({behavior:'instant',block:'start'});
-        requestAnimationFrame(()=>requestAnimationFrame(resolve));
-      })`,
-      awaitPromise: true,
-    });
     const historyScreenshot = await send("Page.captureScreenshot", {
       format: "png",
       captureBeyondViewport: false,
@@ -478,6 +494,7 @@ for (const [name, suffix] of pages) {
           detailRows:document.querySelectorAll('#source-rows tr').length,
         };
         const start=performance.now();
+        window.StockAgentAcquisition?.reveal(target);
         target.scrollIntoView({behavior:'instant',block:'start'});
         const check=()=>{
           const rows=document.querySelectorAll('#source-rows tr').length;
@@ -586,13 +603,16 @@ for (const [name, suffix] of pages) {
   const representative = representativeControls[name];
   if (representative) {
     const tested = await send("Runtime.evaluate", {
-      expression: `new Promise(resolve => {
+      expression: `new Promise(async resolve => {
         let target=document.querySelector(${JSON.stringify(representative.selector)});
         if(!target) return resolve({error:'missing representative control'});
+        window.StockAgentAcquisition?.reveal(target);
         if(target.matches('button[data-range]')&&target.getAttribute('aria-pressed')==='true') {
           target=[...target.parentElement.querySelectorAll('button[data-range]')]
             .find(button=>button.getAttribute('aria-pressed')!=='true')||target;
         }
+        target.scrollIntoView({behavior:'instant',block:'center'});
+        await new Promise(paint=>requestAnimationFrame(()=>requestAnimationFrame(paint)));
         const startedAt=Date.now(); const started=performance.now();
         ${representative.value
           ? `target.value=${JSON.stringify(representative.value)}; target.dispatchEvent(new Event('change',{bubbles:true}));`
@@ -646,8 +666,12 @@ console.log(JSON.stringify({reportPath, results:results.map(row=>({url:row.url,h
   apiRequests:row.requestTimings?.length,interactionLatency:row.interactionLatency,
   representativeAction:row.representativeAction,consoleErrors:row.consoleErrors,auditError:row.auditError}))}, null, 2));
 if(results.some(row=>row.auditError || row.horizontalOverflow || row.laptopTableOverflow?.length
+  || row.navigationRouteErrors?.length || row.currentPageLinkCount !== 1
+  || row.duplicateIds?.length || row.unlabeledFields?.length || row.unnamedTargets?.length
+  || row.inaccessibleTableRegions?.length
   || row.navigationOverflow?.length || row.smallTargets?.length || row.clippedInteractive?.length
   || row.overlappingTargets?.length || row.consoleErrors.length || row.failedApi?.length
   || row.apiTimingErrors?.length || row.interactionLatency?.error
+  || row.interactionLatency?.fullHistory?.error
   || (emulateMobile && row.touchTargetRisks?.length)
   || row.interactionLatency?.eventActivation?.error || row.representativeAction?.error)) process.exitCode=1;

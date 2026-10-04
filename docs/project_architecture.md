@@ -24,10 +24,10 @@ flowchart LR
   M --> I[訊號推論]
   I --> E[模擬執行引擎與帳戶 ledger]
   E --> U[Discord / 唯讀 Dashboard]
-  D --> C[審核後 C current CAS]
+  D --> C[審核後 immutable packed release]
   M --> C
-  C --> A[D additive 歷史 archive]
-  C --> H[明確 use 後的本機唯讀熱快取]
+  C --> A[Penguin D 冷庫與受驗 peer]
+  A --> H[明確 use 後的本機唯讀熱快取]
   H --> P
 ```
 
@@ -43,9 +43,10 @@ flowchart LR
 | `stockagent/backtest/` | 損益、交易成本、限制與帳戶狀態；必須與訓練 loss、線上輸出語意對齊 |
 | `stockagent/live/` | 資料就緒、訊號與 paper engine、服務狀態、唯讀 dashboard |
 | `services/discord_bot/markets/`、`services/discord_bot/models/` | 已部署的模式與模型選擇，連到 config、fold 與 checkpoint |
-| `stockagent/data_sync/` | 增量冷庫發布、C rolling retention、D archive、materialization、lease、GC、完成 artifact 維護 |
+| `stockagent/data_sync/` | 增量冷庫發布、Penguin D 冷庫、受驗 peer、materialization、lease、GC、完成 artifact 維護 |
 | `stockagent/research/`、`stockagent/evaluation/`、`explainability*.py` | 研究比較、評估、可解釋性；不另建帳務或 checkpoint 權威 |
 | `scripts/`、`deploy/systemd/` | 編排、修復、稽核與部署模板；服務成功仍要核對成果 receipt |
+| `stockagent/control/` | opt-in 跨節點工程 work 身分、依賴、PostgreSQL claim／lease／attempt；第一個 action 重用 frozen-code verifier |
 | `stockagent/strategies/` | 目前只是保留的 package，並非策略 registry；策略身分由上述 config/model/fold/模式共同定義 |
 
 模式清單直接取自 `TRAINING_MODE_SPECS`，不要在文件維護第二份硬編碼清單。
@@ -79,3 +80,11 @@ run_fintech_python scripts/audit_project_architecture.py \
 
 修改時依序定位「事實來源 → 轉換 → 決策 → 執行 → receipt」，先在擁有該責任的
 組件修正，再使用相同路徑的回歸測試。不要因檔案名稱相近就新建平行框架。
+
+第一性原理現代化開發與逐項驗收見
+[2026-10-03 架構計畫](architecture_modernization_2026-10-03.md)。
+目標架構的後續真實節點試行與版本驗收見
+[目標架構實作](target_architecture_execution_2026-10-03.md)與
+[工程控制 runbook](control_plane_workflow.md)。
+各項候選引擎、真實資料布局與 Miniforge／Mamba 重建的驗收見
+[技術實測](architecture_technology_trials_2026-10-03.md)。

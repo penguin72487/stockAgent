@@ -1,0 +1,9 @@
+[Unit]
+Description=Budget for non-intraday shared work coordination
+
+[Slice]
+CPUWeight=20
+MemoryAccounting=true
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=512

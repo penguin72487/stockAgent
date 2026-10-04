@@ -125,11 +125,17 @@ seconds_until_next_quota_window() {
   run_fintech_python - <<'PY'
 from datetime import datetime
 from pathlib import Path
+import sys
 from stockagent.live.shioaji_schedule import TAIPEI, next_postreset_historical_window
 
 now = datetime.now(TAIPEI)
-target = next_postreset_historical_window(now, parquet_root=Path("data_tw_public"))
-print(max(60, int((target - now).total_seconds())))
+try:
+    target = next_postreset_historical_window(now, parquet_root=Path("data_tw_public"))
+except RuntimeError as exc:
+    print(f"[shioaji-minute-runner] calendar_unverified: {exc}; retry_in_seconds=3600", file=sys.stderr)
+    print(3600)
+else:
+    print(max(60, int((target - now).total_seconds())))
 PY
 }
 

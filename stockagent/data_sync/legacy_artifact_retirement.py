@@ -139,10 +139,13 @@ def plan_legacy_retirement(
     peer_probe: Callable[[], Mapping[str, Any]] | None = None,
     bridge_inactive: bool,
     manual_immediate: bool = False,
+    manual_capture: bool = False,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
     if type(manual_immediate) is not bool:
         raise SnapshotError("manual immediate retirement must be an explicit boolean")
+    if manual_capture and not manual_immediate:
+        raise SnapshotError("manual capture retirement requires manual immediate authorization")
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     repo_root = repo_root.resolve()
     artifact_root = artifact_root.resolve()
@@ -173,7 +176,8 @@ def plan_legacy_retirement(
     ):
         raise SnapshotError("cold release does not match legacy quarantine source")
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive)
-    proof = verify_archive_directory(archive, source)
+    proof = verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
+                                     artifact_root=artifact_root)
     cold_proof = verify_cold_resilience(sync_root, resolved, backup_config)
     original_inventory = [
         {"kind": "file", "path": row["path"], "size": row["source"]["size"], "sha256": row["original_sha256"]}
@@ -234,11 +238,12 @@ def plan_legacy_retirement(
         "snapshot_id": resolved.manifest["snapshot_id"],
         "manifest_sha256": resolved.manifest_sha256,
         "source_fingerprint": hashlib.sha256(
-            json.dumps(source_plan(source, spec), sort_keys=True).encode()
+            json.dumps(source_plan(source, spec, manual_capture=manual_capture), sort_keys=True).encode()
         ).hexdigest(),
         "hot_fingerprint": mirror["fingerprint"],
         "last_used_ns": last_used_ns,
         "manual_immediate": manual_immediate,
+        "manual_capture": manual_capture,
     }
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     return {
@@ -302,6 +307,7 @@ def apply_legacy_retirement(
                 "last_used_at": _utc_iso_from_ns(now_ns),
             }
         state.update(manual_immediate=plan["manual_immediate"],
+                     manual_capture=plan["manual_capture"],
                      plan_fingerprint=plan["plan_fingerprint"])
         atomic_write_json(state_path, state)
         source = Path(plan["source"])
@@ -332,7 +338,9 @@ def apply_legacy_retirement(
             os.replace(hot_tree, quarantine / "hot")
         os.replace(source, quarantine / "source")
         archive = spec.stage_root / spec.dataset / "archive"
-        verify_archive_directory(archive, quarantine / "source")
+        verify_archive_directory(archive, quarantine / "source", spec=spec,
+                                 manual_capture=plan["manual_capture"],
+                                 artifact_root=Path(options["artifact_root"]))
         if (quarantine / "hot").is_dir():
             proof = json.loads((archive / "legacy_archive_manifest.json").read_text())
             inventory = [

@@ -9,6 +9,125 @@ import pytest
 from stockagent.data.tw_futures_margin_preparation import align_product_margin_intervals
 
 
+def securities_transfer_case():
+    text=('調整生效日：109年2月3日。加掛標準契約：契約代號AAF約定標的物2,000股標的證券。'
+          '部位限制：AAF、AA1與AA2部位合併計算。AA2契約乘數不調整（仍為2,100）')
+    own=[dict(product='AA1',from_product='AAF',effective_date='2020-02-03',
+              contract_multiplier=2000.,deliverable_security_quantity=2000.,
+              contract_months=['202006'],issue_date_bound=True),
+         dict(product='AA2',from_product='AA1',effective_date='2020-02-03',
+              contract_multiplier=2100.,deliverable_security_quantity=2100.,
+              contract_months=['202006'],issue_date_bound=True,subscription_rights_at_final_settlement=True)]
+    return text,own
+
+
+@pytest.mark.parametrize('problem',[None,'source','publication','known','review','method','ratio',
+    'standard_quantity','target_source','target_month','literal_group','literal_units'])
+def test_securities_transfer_reuses_only_same_original_revalidated_standard_cells(problem):
+    from stockagent.data.tw_futures_margin_preparation import unchanged_quantity_securities_position_groups
+    text,own=securities_transfer_case()
+    text=text.replace('2,000股','2.000股')
+    provenance=dict(source_content_sha256='a'*64,source_url='official',published_date='2020-01-20',
+        known_at='2020-01-20T23:59:59+08:00')
+    for row in own:row.update(provenance)
+    reviewed=dict(provenance,product='AA1',combined_position_base_product='AAF',effective_date='2020-02-03',
+        effective_phase='product_regular_open',issue_date_bound=True,unit='contracts',
+        event_type='combined_position_formula',combined_position_ratio='1/1',
+        combined_position_evidence='AAF、AA1與AA2部位合併計算',
+        extraction_method='source_bound_visual_corporate_position_group',visual_review_sha256='b'*64)
+    if problem=='source':reviewed['source_content_sha256']='c'*64
+    if problem=='publication':reviewed['published_date']='2020-01-19'
+    if problem=='known':reviewed['known_at']='2020-01-19T23:59:59+08:00'
+    if problem=='review':reviewed['visual_review_sha256']=None
+    if problem=='method':reviewed['extraction_method']='unchecked_visual'
+    if problem=='ratio':reviewed['combined_position_ratio']='2/1'
+    if problem=='standard_quantity':own[0]['contract_multiplier']=2100.
+    if problem=='target_source':own[1]['source_content_sha256']='c'*64
+    if problem=='target_month':own[1]['contract_months']=[]
+    if problem=='literal_group':text=text.replace('AAF、AA1與AA2','AAF、AA1與AA3')
+    if problem=='literal_units':text=text.replace('2.000股','2,100股')
+    assert not unchanged_quantity_securities_position_groups(text,own)
+    rows=unchanged_quantity_securities_position_groups(text,own,reviewed_standard_groups=(reviewed,))
+    if problem:assert not rows
+    else:
+        (row,)=rows;assert row['combined_position_ratio']=='21/20'
+        proof=json.loads(row['position_group_unit_evidence'])
+        assert proof['standard_cells_source_sha256']=='a'*64
+        assert proof['standard_cells_review_sha256']=='b'*64
+
+
+@pytest.mark.parametrize('problem',[None,'missing_clause','changed','punctuation','options_group',
+    'other_root','wrong_origin','missing_month','missing_rights','quantity','unbound','standard_changed'])
+def test_securities_transfer_parser_needs_own_literal_group_and_unchanged_units(problem):
+    from stockagent.data.tw_futures_margin_preparation import unchanged_quantity_securities_position_groups
+    text,own=securities_transfer_case()
+    if problem=='missing_clause':text=text.split('AA2契約乘數')[0]
+    if problem=='changed':text=text.replace('不調整','調整')
+    if problem=='punctuation':text=text.replace('2,100','2.100')
+    if problem=='options_group':text=text.replace('AAF、AA1與AA2部位','AAO、AAA與AAB部位')
+    if problem=='other_root':own[1]['product']='BB2'
+    if problem=='wrong_origin':own[1]['from_product']='AAF'
+    if problem=='missing_month':own[1]['contract_months']=[]
+    if problem=='missing_rights':own[1]['subscription_rights_at_final_settlement']=False
+    if problem=='quantity':own[1]['deliverable_security_quantity']=2200.
+    if problem=='unbound':own[1]['issue_date_bound']=False
+    if problem=='standard_changed':own[0]['contract_multiplier']=2100.
+    parsed=unchanged_quantity_securities_position_groups(text,own)
+    if problem:assert not parsed
+    else:
+        (row,)=parsed
+        assert row['event_type']=='combined_securities_position_formula'
+        assert row['combined_position_ratio']=='21/20' and row['natural_person_limit'] is None
+        assert row['combined_products']==['AA1','AA2','AAF']
+        assert json.loads(row['position_group_unit_evidence'])['contract_months']==['202006']
+
+
+@pytest.mark.parametrize('problem',[None,'contracts','wrong_base_units','missing_old_member','ended_base',
+    'unpublished_base','own_source','own_month','own_quantity','reuse_same_quantity','missing_law'])
+def test_securities_transfer_only_binds_existing_share_pool_and_own_physical_month(problem):
+    from stockagent.data.tw_futures_margin_preparation import (unchanged_quantity_securities_position_groups,
+        position_candidate_intervals,bind_equity_position_families,bind_physical_position_inputs)
+    text,own=securities_transfer_case();(formula,)=unchanged_quantity_securities_position_groups(text,own)
+    d=date(2020,2,4);prod='AA2';month='202006'
+    proof=dict(issue_date_bound=True,source_content_sha256='a'*64,source_url='old',
+        effective_date='2020-01-01',effective_phase='product_regular_open',
+        known_at='2019-12-20T23:59:59+08:00')
+    base=dict(proof,product='AAF',event_type='corporate_securities_unit_limit',unit='shares',
+        natural_person_limit=4_000_000.,position_unit=2000.,combined_products=['AA1','AAF'])
+    if problem=='contracts':base.update(event_type='absolute_level',unit='contracts',natural_person_limit=2000.)
+    if problem=='wrong_base_units':base['position_unit']=2100.
+    if problem=='missing_old_member':base['combined_products']=['AAF','AA3']
+    if problem=='ended_base':base['valid_until_date_inclusive']='2020-02-02'
+    if problem=='unpublished_base':base['known_at']='2020-02-04T23:59:59+08:00'
+    formula.update(proof,source_content_sha256='b'*64,source_url='new',effective_date='2020-02-03',
+        known_at='2020-01-20T23:59:59+08:00')
+    levels,issues=position_candidate_intervals([base,formula]);assert not issues
+    ints=pl.DataFrame(levels,infer_schema_length=None,schema_overrides={
+        'admission_not_before':pl.String,'valid_until_date_exclusive':pl.String,'monthly_position_limit':pl.Float64})
+    u=pl.DataFrame(dict(product=['AAF','AA1','AA2','AA3'],product_name=['甲期貨']*4,
+        underlying_symbol=['1000']*4,asset_class=['stock_future']*4))
+    ds=pl.DataFrame(dict(date=[d],product=[prod],contract=[month]))
+    unit_source='b'*64 if problem not in ('own_source','reuse_same_quantity') else 'c'*64
+    units=ds.with_columns(pl.lit('bound_prior_publication').alias('terms_binding_status'),
+        pl.lit(2200. if problem=='own_quantity' else 2100.).alias('contract_multiplier'),
+        pl.lit('2020-01-20T23:59:59+08:00').alias('known_at'),
+        pl.lit([unit_source]).alias('source_content_sha256s'))
+    declarations=pl.DataFrame(dict(product=[prod],contract=['202003' if problem=='own_month' else month],
+        source_content_sha256s=[['b'*64]]))
+    law=dict(effective_date='2010-01-01',known_at='2009-12-01T23:59:59+08:00',standard_units=2000.,
+        mini_units=None,asset_class='stock_future',source_content_sha256='f'*64)
+    laws=[] if problem=='missing_law' else [law]
+    pos=bind_equity_position_families(ds,ints,u,units,laws)
+    bound=bind_physical_position_inputs(ds,pos,units,u,laws,corporate_unit_intervals=declarations)
+    assert bound['position_numeric_inputs_resolved'].to_list()==[problem is None]
+    assert bound['position_limit'].to_list()==([4_000_000.] if problem is None else [None])
+    if problem is None:
+        assert bound['position_unit'][0]==2100.
+        assert set(bound['source_content_sha256s'][0])=={'a'*64,'b'*64}
+        assert bound['position_base_interval_id'][0] is not None
+
+
+
 def test_same_code_dividend_does_not_require_an_identity_transfer():
     from stockagent.data.tw_futures_margin_preparation import corporate_identity_boundaries
     facts = pl.DataFrame([dict(product='CCF', from_product='CCF',
@@ -1243,6 +1362,73 @@ def test_security_position_family_never_guesses_changed_share_caps():
     assert bound.filter(pl.col('product')=='BB1')['position_binding_status'][0]=='bound_same_security_position'
 
 
+@pytest.mark.parametrize('problem', [None, 'ended', 'unknown_end', 'future_publication',
+    'unreviewed_law', 'future_law', 'latest_grade_clause', 'conflicting_group',
+    'active_original', 'reused_code', 'changed_unit', 'future_unit_clock',
+    'finite_same_original', 'finite_reused_code','stale_donor_grade','composed_donor_grade'])
+def test_named_corporate_group_retains_literal_share_axis_after_standalone_grade(problem):
+    from stockagent.data.tw_futures_margin_preparation import bind_equity_position_families,position_candidate_intervals
+    d=date(2020,2,3)
+    universe=pl.DataFrame(dict(product=['AAF','AA1','AA2'],product_name=['甲期貨']*3,
+        underlying_symbol=['1000']*3,asset_class=['stock_future']*3))
+    proof=dict(issue_date_bound=True,source_content_sha256='a'*64,source_url='corporate-original',
+        known_at='2019-12-20T23:59:59+08:00',effective_date='2020-01-01',
+        effective_phase='product_regular_open')
+    until='2020-06-17' if problem!='ended' else '2020-01-31'
+    corporate=dict(proof,product='AA1',event_type='corporate_securities_unit_limit',unit='shares',
+        position_unit=2100.,natural_person_limit=6_000_000.,combined_products=['AAF','AA1'],
+        valid_until_date_inclusive=until)
+    if problem in ['stale_donor_grade','composed_donor_grade']:
+        corporate['limit_follows_applicable_grade']=True
+        if problem=='composed_donor_grade':corporate['position_grade_source_sha256s']=['b'*64]
+    if problem in ['unknown_end','active_original','reused_code','changed_unit','future_unit_clock']:
+        corporate.pop('valid_until_date_inclusive')
+    if problem=='future_publication':corporate['known_at']='2020-02-03T23:59:59+08:00'
+    grade=dict(proof,product='AAF',source_content_sha256='b'*64,source_url='quarter-original',
+        effective_date='2020-02-01',known_at='2020-01-30T23:59:59+08:00',
+        event_type='absolute_level',unit='contracts',natural_person_limit=2500.,
+        limit_follows_applicable_grade=problem=='latest_grade_clause')
+    facts=[corporate,grade]
+    if problem=='conflicting_group':
+        facts.append(dict(corporate,product='AA2',natural_person_limit=5_000_000.,position_unit=2200.,
+            combined_products=['AAF','AA2']))
+    rows,_=position_candidate_intervals(facts)
+    intervals=pl.DataFrame(rows,infer_schema_length=None,schema_overrides={
+        'admission_not_before':pl.String,'combined_position_base_product':pl.String,
+        'valid_until_date_exclusive':pl.String,'monthly_position_limit':pl.Float64,
+        'independent_contract_limit':pl.Float64})
+    # No adjusted quote is present in this request. A finite, source-bound
+    # group interval still owns the standard member; it creates no peer quote.
+    days=pl.DataFrame(dict(date=[d],product=['AAF']))
+    terms=pl.DataFrame(schema={'date':pl.Date,'product':pl.String,'contract':pl.String,
+        'terms_binding_status':pl.String,'contract_multiplier':pl.Float64,
+        'source_content_sha256s':pl.List(pl.String)})
+    if problem in ['active_original','reused_code','changed_unit','future_unit_clock',
+                   'finite_same_original','finite_reused_code']:
+        terms=pl.DataFrame([dict(date=d,product='AA1',contract='202006',
+            terms_binding_status='bound_prior_publication',
+            contract_multiplier=2200. if problem=='changed_unit' else 2100.,
+            source_content_sha256s=['c'*64 if problem in ['reused_code','finite_reused_code'] else 'a'*64],
+            known_at='2020-02-03T23:59:59+08:00' if problem=='future_unit_clock' else proof['known_at'])])
+    law=dict(effective_date='2020-01-01',known_at=proof['known_at'],standard_units=2000,
+        mini_units=None,asset_class='stock_future',source_content_sha256='f'*64,
+        rule='same_security_same_direction; unchanged_units_or_explicit_securities_cap_only')
+    if problem=='unreviewed_law':law.pop('rule')
+    if problem=='future_law':law['effective_date']='2020-03-01'
+    bound=bind_equity_position_families(days,intervals,universe,terms,[law])
+    assert bound.height==1 and bound['product'][0]=='AAF'
+    if problem not in [None,'active_original','finite_same_original','composed_donor_grade']:
+        assert bound['position_limit'][0]==2500. and bound['unit'][0]=='contracts'
+    else:
+        assert bound['position_limit'][0]==6_000_000. and bound['unit'][0]=='shares'
+        assert bound['position_unit'][0]==2000.
+        assert bound['combined_products'][0].to_list()==['AA1','AAF']
+        assert bound['position_binding_status'][0]=='bound_named_securities_position'
+        assert set(bound['source_content_sha256s'][0])=={'a'*64,'b'*64,'f'*64}
+        assert bound['known_at'][0]=='2020-01-30T15:59:59+00:00'
+        assert bound['valid_until_date_exclusive'][0]==(None if problem=='active_original' else '2020-06-18')
+
+
 def test_reused_adjusted_code_cannot_keep_old_one_for_one_position_units():
     from stockagent.data.tw_futures_margin_preparation import bind_equity_position_families,position_candidate_intervals
     u=pl.DataFrame(dict(product=['AAF','AA1'],product_name=['甲期貨']*2,
@@ -1551,6 +1737,130 @@ def test_unchanged_member_bundle_rechecks_original_review_and_derived_scope(tmp_
     else:
         actual,proofs=load_unchanged_position_member_scopes(paths[0])
         assert actual.equals(scope) and str(original) in proofs and str(review) in proofs
+
+
+def incumbent_position_fixture():
+    fact=dict(product='AA1',source_content_sha256='a'*64,visual_review_sha256='c'*64,
+        source_url='printed-cap',published_date='2020-01-20',known_at='2020-01-20T23:59:59+08:00',
+        issue_date_bound=True,position_unit_review_scope='all_named_members_in_inspected_grid',
+        extraction='source_bound_visual_corporate_cells',unit='shares',event_type='corporate_securities_unit_limit',
+        effective_date='2020-02-03',effective_phase='product_regular_open',valid_until_date_inclusive='2020-03-18',
+        position_unit=2162.,natural_person_limit=25806400.,combined_products=['AAF','AA1','AA2'])
+    declarations=pl.DataFrame([dict(product='AA1',contract='202003',contract_multiplier=2162.,
+        effective_date='2020-01-02',known_at='2019-12-20T23:59:59+08:00',
+        source_content_sha256s=['b'*64],valid_until_exclusive=None)],
+        schema_overrides={'valid_until_exclusive':pl.String})
+    return fact,declarations
+
+
+@pytest.mark.parametrize('problem',[None,'later_same_units','same_day_terms','same_day_effective',
+    'wrong_quantity','wrong_member','wrong_base','no_numeric_cap','no_review','naive_clock','expired_terms'])
+def test_reviewed_incumbent_grid_binds_only_previously_declared_own_months(problem):
+    from stockagent.data.tw_futures_margin_preparation import reviewed_incumbent_position_member_scopes
+    fact,units=incumbent_position_fixture()
+    changes={'later_same_units':('known_at','2020-03-01T23:59:59+08:00'),
+        'same_day_terms':('known_at',fact['known_at']),
+        'same_day_effective':('effective_date',fact['published_date']),
+        'wrong_quantity':('contract_multiplier',2100.),'expired_terms':('valid_until_exclusive','2020-02-03')}
+    if problem in changes:
+        key,value=changes[problem];units=units.with_columns(pl.lit(value).alias(key))
+    if problem in ['wrong_member','wrong_base']:
+        fact['combined_products']=['AAF','AA2'] if problem=='wrong_member' else ['AA1','AA2']
+    if problem=='no_numeric_cap':fact['natural_person_limit']=None
+    if problem=='no_review':fact['visual_review_sha256']=None
+    if problem=='naive_clock':fact['known_at']='2020-01-20T23:59:59'
+    if problem in ['wrong_member','wrong_base','no_numeric_cap','no_review','naive_clock']:
+        with pytest.raises(ValueError):reviewed_incumbent_position_member_scopes([fact],units)
+        return
+    scopes=reviewed_incumbent_position_member_scopes([fact],units)
+    if problem:assert scopes.is_empty()
+    else:
+        assert scopes['contract'].to_list()==['202003']
+        assert scopes['position_source_sha256'].to_list()==['a'*64]
+        assert scopes['unit_source_sha256'].to_list()==['b'*64]
+        assert scopes['contract_multiplier'].to_list()==[2162.]
+        assert scopes['valid_until_date_exclusive'].to_list()==['2020-03-19']
+
+
+@pytest.mark.parametrize('problem',[None,'no_proof','wrong_month','later_generation_same_quantity',
+    'different_quantity','different_cap_original','different_unit_clock','before_cap','ended_proof',
+    'unresolved_terms','unresolved_cap','missing_law','missing_group_member'])
+def test_incumbent_physical_binding_preserves_numeric_clock_and_generation_checks(problem):
+    from stockagent.data.tw_futures_margin_preparation import (reviewed_incumbent_position_member_scopes,
+        bind_equity_position_families,bind_physical_position_inputs,position_candidate_intervals)
+    fact,declarations=incumbent_position_fixture()
+    scopes=reviewed_incumbent_position_member_scopes([fact],declarations)
+    facts=[fact,dict(fact,product='AAF',position_unit=2000.)]
+    if problem=='different_cap_original':facts=[dict(f,source_content_sha256='d'*64) for f in facts]
+    rows,_=position_candidate_intervals(facts)
+    intervals=pl.DataFrame(rows,infer_schema_length=None,schema_overrides={
+        'admission_not_before':pl.String,'valid_until_date_exclusive':pl.String,
+        'combined_position_base_product':pl.String})
+    day=date(2020,2,4) if problem!='before_cap' else date(2020,1,31)
+    days=pl.DataFrame(dict(date=[day]*2,product=['AA1','AAF'],contract=['202003']*2))
+    units=days.with_columns(pl.lit('bound_prior_publication').alias('terms_binding_status'),
+        pl.Series('contract_multiplier',[2100. if problem=='different_quantity' else 2162.,2000.]),
+        pl.Series('known_at',['2019-12-21T23:59:59+08:00' if problem=='different_unit_clock'
+            else '2019-12-20T23:59:59+08:00']*2),
+        pl.Series('source_content_sha256s',[['e'*64 if problem=='later_generation_same_quantity' else 'b'*64],['f'*64]]))
+    if problem=='unresolved_terms':units=units.with_columns(pl.lit('no_prior_terms').alias('terms_binding_status'))
+    universe=pl.DataFrame(dict(product=['AAF','AA1'],product_name=['甲期貨']*2,
+        underlying_symbol=['1000']*2,asset_class=['stock_future']*2))
+    law=dict(effective_date='2010-01-01',known_at='2009-12-20T23:59:59+08:00',standard_units=2000,
+        mini_units=None,asset_class='stock_future',source_content_sha256='f'*64)
+    laws=[] if problem=='missing_law' else [law]
+    product=bind_equity_position_families(days,intervals,universe,units,laws)
+    if problem=='unresolved_cap':product=product.with_columns(pl.lit(False).alias('position_numeric_inputs_resolved'))
+    if problem=='missing_group_member':product=product.with_columns(pl.lit(['AAF','AA2']).alias('combined_products'))
+    if problem=='wrong_month':scopes=scopes.with_columns(pl.lit('202006').alias('contract'))
+    if problem=='ended_proof':scopes=scopes.with_columns(pl.lit('2020-02-04').alias('valid_until_date_exclusive'))
+    result=bind_physical_position_inputs(days,product,units,universe,laws,
+        corporate_unit_intervals=declarations,
+        reviewed_incumbent_member_scopes=None if problem=='no_proof' else scopes)
+    row=result.filter(pl.col('product')=='AA1').row(0,named=True)
+    assert row['position_numeric_inputs_resolved'] is (problem is None)
+    if problem is None:
+        assert row['position_limit']==25806400. and row['position_unit']==2162.
+        assert row['position_corporate_month_scope_bound']
+        assert row['source_content_sha256s']==['a'*64]
+    else:assert row['position_limit'] is None
+    assert not result['training_admitted'].any()
+
+
+@pytest.mark.parametrize('problem',[None,'changed_scope','changed_units','missing_cap_original',
+    'missing_own_original','missing_review','corrupt_source'])
+def test_incumbent_scope_bundle_verifies_both_originals_and_exact_derived_months(tmp_path,problem):
+    import gzip
+    from downloader.artifact_io import sha256_file
+    from stockagent.data.tw_futures_margin_preparation import (
+        reviewed_incumbent_position_member_scopes,load_reviewed_incumbent_position_member_scopes)
+    cap=tmp_path/'cap.gz';cap.write_bytes(gzip.compress(b'printed incumbent grid'))
+    own=tmp_path/'own.gz';own.write_bytes(gzip.compress(b'prior own monthly declaration'))
+    review=tmp_path/'review.json';review.write_text('{"source_verified":true}')
+    fact,units=incumbent_position_fixture()
+    fact.update(source_content_sha256=hashlib.sha256(gzip.decompress(cap.read_bytes())).hexdigest(),
+        visual_review_sha256=sha256_file(review))
+    units=units.with_columns(pl.lit([hashlib.sha256(gzip.decompress(own.read_bytes())).hexdigest()]).alias('source_content_sha256s'))
+    scopes=reviewed_incumbent_position_member_scopes([fact],units)
+    if problem=='changed_scope':scopes=scopes.with_columns(pl.lit('202006').alias('contract'))
+    if problem=='changed_units':units=units.with_columns(pl.lit(2100.).alias('contract_multiplier'))
+    paths=[tmp_path/'incumbent_member_scopes.parquet',tmp_path/'source_bound_unit_intervals.parquet',
+        tmp_path/'reparsed_incumbent_position_facts.json']
+    scopes.write_parquet(paths[0]);units.write_parquet(paths[1]);paths[2].write_text(json.dumps([fact]))
+    sources=[dict(path=p.name,sha256=sha256_file(p),kind='raw_gzip' if p!=review else 'visual_position_cell_review')
+        for p in [cap,own,review]]
+    if problem=='missing_cap_original':sources=sources[1:]
+    if problem=='missing_own_original':sources=[s for s in sources if s['path']!=own.name]
+    if problem=='missing_review':sources=sources[:2]
+    (tmp_path/'manifest.json').write_text(json.dumps(dict(schema_version=1,
+        status='source_verified_incumbent_physical_member_scopes',numeric_position_caps_added=0,
+        financial_events_added=0,sources=sources,outputs={p.name:dict(sha256=sha256_file(p)) for p in paths})))
+    if problem=='corrupt_source':own.write_bytes(b'corrupt')
+    if problem:
+        with pytest.raises(ValueError):load_reviewed_incumbent_position_member_scopes(paths[0])
+    else:
+        actual,proofs=load_reviewed_incumbent_position_member_scopes(paths[0])
+        assert actual.equals(scopes) and str(own) in proofs and str(cap) in proofs
 
 
 def interval(**changes):

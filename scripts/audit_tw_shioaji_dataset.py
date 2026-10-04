@@ -10,6 +10,12 @@ from typing import Any
 
 import polars as pl
 
+from downloader.shioaji_daily_calendar import (
+    DAILY_CALENDAR_CONTRACT,
+    calendar_prefix_matches,
+    load_daily_calendar,
+)
+
 
 SHIOAJI_SOURCE = "shioaji_kbars_1m"
 STORAGE_FREQUENCY = "daily"
@@ -45,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root", type=Path, default=Path("data_tw_public/shioaji/stocks")
     )
+    parser.add_argument("--calendar-root", type=Path, default=Path("data_tw_public"))
     parser.add_argument(
         "--output",
         type=Path,
@@ -250,6 +257,7 @@ def audit(
     shioaji_root: Path,
     dataset_root: Path,
     verify_chunk_checksums: bool,
+    calendar_root: Path | None = None,
 ) -> dict[str, Any]:
     legacy_raw_root = shioaji_root / "raw"
     if legacy_raw_root.is_dir() and any(path.is_file() for path in legacy_raw_root.rglob("*")):
@@ -275,7 +283,22 @@ def audit(
     materialization_mode = str(download_summary.get("materialization_mode") or "")
     local_materialization = materialization_mode == "verified_local_minute"
     source_minute_summary_receipt_verified = False
+    official_sessions: set[date] = set()
+    official_calendar: dict[str, Any] | None = None
     if local_materialization:
+        start = date.fromisoformat(str(download_summary["start_date"]))
+        end = date.fromisoformat(str(download_summary["end_date"]))
+        official_sessions, official_calendar = load_daily_calendar(
+            calendar_root or base_stock_root.parent, start, end
+        )
+        if not (
+            download_summary.get("daily_calendar_contract") == DAILY_CALENDAR_CONTRACT
+            and calendar_prefix_matches(
+                download_summary.get("official_calendar"), official_sessions,
+                official_calendar, end,
+            )
+        ):
+            raise RuntimeError("local daily summary lacks verified calendar admission")
         if int(download_summary.get("api_requests_started", -1)) != 0:
             raise RuntimeError("local daily materialization started Shioaji API requests")
         source_receipt = download_summary.get("source_minute_summary_receipt")
@@ -299,6 +322,15 @@ def audit(
     dataset_summary = _read_json(dataset_root / "shioaji_dataset_summary.json")
     if dataset_summary.get("source") != HYBRID_SOURCE:
         raise RuntimeError("hybrid dataset summary source mismatch")
+    if local_materialization and not (
+        dataset_summary.get("daily_calendar_contract") == DAILY_CALENDAR_CONTRACT
+        and dataset_summary.get("official_calendar") == official_calendar
+        and _receipt_matches(
+            shioaji_root / "download_summary.json",
+            dataset_summary.get("download_summary_receipt"), checksum=True,
+        )
+    ):
+        raise RuntimeError("hybrid summary lacks current calendar and download lineage")
     base_build_receipt = dataset_summary.get("base_symbol_build_receipt")
     if base_build_receipt is not None and not _receipt_matches(
         base_stock_root / "official_symbol_build_summary.json",
@@ -327,6 +359,7 @@ def audit(
     hybrid_rows = 0
     shioaji_rows = 0
     public_rows = 0
+    quarantined_source_rows = 0
     for symbol in sorted(base_symbols):
         download_status = str(download_report[symbol]["status"])
         build_status = str(build_report[symbol]["status"])
@@ -390,6 +423,10 @@ def audit(
                     checksum=True,
                 )
                 and int(daily_summary.get("source_minute_chunks_verified", 0)) > 0
+                and calendar_prefix_matches(
+                    daily_summary.get("official_calendar"), official_sessions,
+                    official_calendar, end,
+                )
             ):
                 raise RuntimeError(f"{symbol}: invalid local minute lineage")
             receipt_count = int(daily_summary["source_minute_chunks_verified"])
@@ -405,7 +442,7 @@ def audit(
         daily_chunk_ok_receipts += ok_count
         daily = pl.read_parquet(
             daily_path,
-            columns=["date", *QUOTE_COLUMNS],
+            columns=["date", *QUOTE_COLUMNS, *(["shioaji_minute_bars"] if local_materialization else [])],
         ).sort("date")
         output = pl.read_parquet(
             output_path,
@@ -419,6 +456,24 @@ def audit(
         ).sort("date")
         if daily.height != int(daily_summary.get("daily_rows", -1)) or daily.is_empty():
             raise RuntimeError(f"{symbol}: invalid daily row count")
+        if local_materialization:
+            if not set(daily["date"]) <= official_sessions:
+                raise RuntimeError(f"{symbol}: daily contains non-session dates")
+            output_shioaji_dates = set(output.filter(pl.col("data_source") == SHIOAJI_SOURCE)["date"])
+            if not output_shioaji_dates <= official_sessions:
+                raise RuntimeError(f"{symbol}: hybrid contains non-session Shioaji dates")
+            quarantine = daily_summary.get("quarantined_non_session_source_rows")
+            if not isinstance(quarantine, dict) or any(
+                date.fromisoformat(day) in official_sessions
+                or not start <= date.fromisoformat(day) <= end
+                or not isinstance(count, int) or count <= 0
+                for day, count in quarantine.items()
+            ):
+                raise RuntimeError(f"{symbol}: invalid non-session quarantine counts")
+            quarantined = sum(quarantine.values())
+            if int(daily["shioaji_minute_bars"].sum()) + quarantined != int(daily_summary["source_minute_rows"]):
+                raise RuntimeError(f"{symbol}: admitted/quarantined source rows do not reconcile")
+            quarantined_source_rows += quarantined
         first_shioaji = daily["date"].min()
         output_after = output.filter(pl.col("date") >= first_shioaji)
         output_before = output.filter(pl.col("date") < first_shioaji)
@@ -503,8 +558,13 @@ def audit(
                 f"dataset summary reconciliation failed {key}: "
                 f"summary={dataset_summary.get(key)} actual={value}"
             )
+    if local_materialization and any(
+        int(summary.get("quarantined_non_session_source_rows", -1)) != quarantined_source_rows
+        for summary in (download_summary, dataset_summary)
+    ):
+        raise RuntimeError("non-session quarantine summary does not reconcile")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "ok",
         **expected,
         "storage_frequency": STORAGE_FREQUENCY,
@@ -525,6 +585,10 @@ def audit(
         "source_minute_summary_receipt_verified": (
             source_minute_summary_receipt_verified
         ),
+        "daily_calendar_contract": DAILY_CALENDAR_CONTRACT if local_materialization else None,
+        "official_calendar": official_calendar,
+        "non_session_admission_verified": local_materialization,
+        "quarantined_non_session_source_rows": quarantined_source_rows,
         "written_at_utc": datetime.now(timezone.utc)
         .replace(microsecond=0)
         .isoformat(),
@@ -538,6 +602,7 @@ def main() -> None:
         shioaji_root=args.shioaji_root,
         dataset_root=args.dataset_root,
         verify_chunk_checksums=not bool(args.skip_chunk_checksums),
+        calendar_root=args.calendar_root,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

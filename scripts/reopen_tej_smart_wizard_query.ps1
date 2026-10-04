@@ -64,29 +64,52 @@ try {
         original_workbook_activated=$activatedOriginalWorkbook}
     if($AllowRestartAddin){$payload.addin_process_restart_authorized=$true}
     if($Action -in @('inspect-addin','stop-addin')) {
-        $root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$ExpectedWindow)
-        if($root.Current.Name -cne $ExpectedTitle -or $root.Current.ProcessId -ne $TejProcessId){throw 'Original query identity changed'}
+        # A hung application's UIA element can describe Windows' ghost/proxy
+        # instead of the pinned real HWND. Do not weaken the process/window
+        # pin or rebind to that proxy; verify the original native owner/title.
+        $nativeOwner=[uint32]0
+        [void][TejBridgeNative]::GetWindowThreadProcessId([IntPtr]$ExpectedWindow,[ref]$nativeOwner)
+        if(-not [TejBridgeNative]::IsWindow([IntPtr]$ExpectedWindow) -or $nativeOwner -ne $TejProcessId -or
+           [TejBridgeNative]::WindowTitle($ExpectedWindow) -cne $ExpectedTitle -or
+           -not [TejBridgeNative]::WindowClass($ExpectedWindow).StartsWith('WindowsForms10.Window.',[StringComparison]::Ordinal)) {
+            throw 'Original native query identity changed'
+        }
         $process=Get-Process -Id $TejProcessId
         if($process.ProcessName -cne 'TEJAddin'){throw 'Only the exact independent TEJAddin may be restarted'}
         $processStart=$process.StartTime.ToUniversalTime().ToString('o')
         $image=$process.MainModule.FileName
         $imageHash=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash
-        $windows=@([TejBridgeNative]::VisibleProcessWindows($ExpectedWindow))
-        $connectors=@(foreach($handle in $windows) {
-            $candidate=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
-            if($candidate.Current.Name -ceq 'TEJProConnector' -and $candidate.Current.ClassName -ceq '#32770' -and
-               $candidate.Current.ProcessId -eq $TejProcessId){$handle}
+        # Include hidden application forms/dialogs; ignore framework-only
+        # IME, tooltip, dropdown and broadcast helper windows. This catches a
+        # second hidden Wizard or auth notice before stopping the process.
+        $windows=@([TejBridgeNative]::ProcessWindows($ExpectedWindow,$false)|Where-Object {
+            [TejBridgeNative]::IsWindowVisible([IntPtr]$_) -or
+            [TejBridgeNative]::WindowClass($_) -ceq '#32770' -or
+            [TejBridgeNative]::WindowClass($_).StartsWith('WindowsForms10.Window.',[StringComparison]::Ordinal)
         })
-        if($connectors.Count -ne 1){throw 'Exact independent add-in connector identity unavailable'}
+        # Ghosting can natively hide the original HWND. It remains the exact
+        # process-pinned recovery target, never a reason to adopt another form.
+        if($ExpectedWindow -notin $windows){$windows+=,$ExpectedWindow}
+        $connectors=@(foreach($handle in $windows) {
+            $owner=[uint32]0
+            [void][TejBridgeNative]::GetWindowThreadProcessId([IntPtr]$handle,[ref]$owner)
+            if([TejBridgeNative]::WindowTitle($handle) -ceq 'TEJProConnector' -and
+               [TejBridgeNative]::WindowClass($handle) -ceq '#32770' -and $owner -eq $TejProcessId){$handle}
+        })
+        $soleHungQuery=$connectors.Count -eq 0 -and $windows.Count -eq 1 -and
+            $windows[0] -eq $ExpectedWindow -and [TejBridgeNative]::IsHungAppWindow([IntPtr]$ExpectedWindow)
+        if($connectors.Count -ne 1 -and -not $soleHungQuery){throw 'Exact independent add-in connector identity unavailable'}
+        $payload.connector_identity_basis=$(if($soleHungQuery){'sole_native_hung_query_no_other_application_windows_v1'}else{'exact_native_tej_pro_connector_v1'})
         $emptyConnectorDialogs=0;$scratchCloseConfirmations=0
         foreach($handle in $windows) {
-            $window=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
-            if($window.Current.ProcessId -ne $TejProcessId){throw 'Add-in window owner changed'}
+            $owner=[uint32]0
+            [void][TejBridgeNative]::GetWindowThreadProcessId([IntPtr]$handle,[ref]$owner)
+            if($owner -ne $TejProcessId){throw 'Add-in window owner changed'}
             if($handle -eq $ExpectedWindow -or $handle -eq $connectors[0]){continue}
             # Legacy connector UIA can report unnamed Pane controls despite
             # populated native Static/Button captions. Inspect exact native
             # children instead of inferring a genuinely empty notice.
-            if($window.Current.Name -cne '' -or $window.Current.ClassName -cne '#32770' -or
+            if([TejBridgeNative]::WindowTitle($handle) -cne '' -or [TejBridgeNative]::WindowClass($handle) -cne '#32770' -or
                [TejBridgeNative]::GetWindow([IntPtr]$handle,4).ToInt64() -ne $connectors[0]){throw 'Another query or unreviewed notice shares the add-in; restart refused'}
             $nativeChildren=@([TejBridgeNative]::Children($handle,''))
             if($nativeChildren.Count -eq 0){$emptyConnectorDialogs++;continue}
@@ -105,7 +128,9 @@ try {
         if($emptyConnectorDialogs+$scratchCloseConfirmations -gt 1){throw 'Unreviewed connector-dialog multiplicity; restart refused'}
         $payload.process_name=$process.ProcessName;$payload.process_id=$TejProcessId
         $payload.process_start_utc=$processStart;$payload.image_sha256=$imageHash
-        $payload.root_enabled=$root.Current.IsEnabled
+        $payload.root_enabled=[TejBridgeNative]::IsWindowEnabled([IntPtr]$ExpectedWindow)
+        $payload.root_hung=[TejBridgeNative]::IsHungAppWindow([IntPtr]$ExpectedWindow)
+        $payload.root_identity_contract='native_original_hwnd_owner_caption_class_v1'
         $payload.empty_connector_owned_dialogs=$emptyConnectorDialogs
         $payload.connector_owned_scratch_close_confirmations=$scratchCloseConfirmations
         if($Action -eq 'stop-addin') {

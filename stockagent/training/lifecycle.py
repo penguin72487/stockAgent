@@ -23,6 +23,8 @@ from stockagent.training.mode_adapter import (
     training_mode_spec,
     write_training_json,
 )
+from stockagent.runtime_identity import training_runtime_provenance
+from stockagent.backtest.return_metrics import RETURN_METRICS_CONTRACT_VERSION
 
 
 TRAINING_LIFECYCLE_SCHEMA_VERSION = 1
@@ -249,7 +251,13 @@ def validate_completed_training_artifacts(
 
     manifest = read_json(layout.run_manifest_path)
     manifest_execution_mode: str | None = None
+    manifest_metrics_version = None
     if isinstance(manifest, dict):
+        manifest_metrics_version = manifest.get("metrics_contract_version")
+        if manifest_metrics_version is not None and (
+            type(manifest_metrics_version) is not int or manifest_metrics_version < 1
+        ):
+            invalid.append(f"{layout.run_manifest_path}: invalid metrics contract version")
         if manifest.get("schema_version") != TRAINING_LIFECYCLE_SCHEMA_VERSION:
             invalid.append(f"{layout.run_manifest_path}: manifest schema mismatch")
         if (
@@ -366,6 +374,10 @@ def validate_completed_training_artifacts(
         contract_path = layout.fold_dir(fold_id) / "mode_artifact_contract.json"
         contract = read_json(contract_path)
         if isinstance(contract, dict):
+            if manifest_metrics_version is not None and contract.get(
+                "metrics_contract_version"
+            ) != manifest_metrics_version:
+                invalid.append(f"{contract_path}: metrics contract disagrees with run manifest")
             if contract.get("schema_version") != TRAINING_LIFECYCLE_SCHEMA_VERSION:
                 invalid.append(f"{contract_path}: lifecycle schema mismatch")
             if (
@@ -572,6 +584,7 @@ def canonical_mode_artifact_contract(
     payload: dict[str, Any] = {
         "schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
         "artifact_layout_version": TRAINING_ARTIFACT_LAYOUT_VERSION,
+        "metrics_contract_version": RETURN_METRICS_CONTRACT_VERSION,
         "execution_mode": spec.execution_mode,
         "product_family": spec.product_family,
         "frequency": spec.frequency,
@@ -735,6 +748,7 @@ class TrainingRunLifecycle:
             "schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
             "lifecycle_schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
             "artifact_layout_version": TRAINING_ARTIFACT_LAYOUT_VERSION,
+            "metrics_contract_version": RETURN_METRICS_CONTRACT_VERSION,
             "execution_mode": self.spec.execution_mode,
             "run_mode": self.run_mode,
             "strategy": self.strategy,
@@ -743,6 +757,7 @@ class TrainingRunLifecycle:
             "selected_fold_ids": selected_fold_ids,
             "dataset_fingerprint": dataset_fingerprint,
             "configuration_fingerprint": configuration_fingerprint,
+            "runtime_provenance": training_runtime_provenance(),
             "contract_versions": dict(contract_versions or {}),
             "data_summary": dict(data_summary or {}),
             "configuration": dict(configuration or {}),

@@ -1,0 +1,8 @@
+# Corrected physical-contract backward with the measured v4 throughput setup.
+# Margin backward contract 4 rejects the old Adam state; use this fresh root.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_throughput_v4.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-physical-gradient-v5
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_physical_gradient_v5
+  start_fold: 1

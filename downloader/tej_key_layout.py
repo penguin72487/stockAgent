@@ -36,6 +36,34 @@ def parquet_relative(task: dict, payload: dict) -> Path:
     return base / task['table_id'] / (task['task_id'] + '.parquet')
 
 
+def verified_empty_scope(root: Path, done: dict) -> tuple[dict,dict]:
+    """Planning-only absence proof; never relabel old-grain observations.
+
+    Shared by the original key-layout repair and later capacity retiling. An
+    explicit empty query is grain-independent for the exact fields/company/
+    period scope; a missing/sparse/nonempty capture does NOT qualify.
+    """
+    from downloader.tej_history import task_request, validate_download_evidence
+    req_done=task_request(root,done)
+    receipt_path=root/done['receipt_path'];raw=root/done['output_path']
+    if (receipt_path.resolve().parent!=(root/'receipts').resolve()
+            or raw.resolve().parent!=(root/'raw').resolve() or not raw.is_file()
+            or receipt_path.stat().st_size>1024**2 or raw.stat().st_size>64*1024**2):
+        raise ValueError('Exact bounded old empty-scope evidence required')
+    receipt=json.loads(receipt_path.read_text(encoding='utf-8-sig'))
+    payload=json.loads(raw.read_text(encoding='utf-8-sig'))
+    _,rows,_=validate_download_evidence(req_done,payload)
+    if (rows or done['actual_rows']!=0 or receipt.get('source_outcome')!='explicit_empty_scope'
+            or receipt.get('exported_rows')!=0 or receipt.get('task_id')!=done['task_id']
+            or receipt.get('table_id')!=done['table_id']
+            or receipt.get('requested_query_rows')!=done['expected_rows']
+            or payload.get('task_id')!=done['task_id']
+            or receipt.get('raw_sha256')!=hashlib.sha256(raw.read_bytes()).hexdigest()):
+        raise ValueError('Old empty query was not independently verified; no inferred emptiness')
+    return req_done,{'task_id':done['task_id'],'receipt_sha256':hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                     'raw_sha256':receipt['raw_sha256']}
+
+
 def repair_source_key_plan(root: Path, task_id: str, bridge, *, only_mode: int | None = None) -> dict:
     """Replan an exact rejected/unsent scope from independently read source keys.
 
@@ -81,22 +109,8 @@ def repair_source_key_plan(root: Path, task_id: str, bridge, *, only_mode: int |
         request['frequency']='snapshot'
     empty_scopes=[]; empty_proofs=[]; weights=[]
     for done in completed:
-        req_done=task_request(root,done)
-        receipt_path=root/done['receipt_path']; raw=root/done['output_path']
-        if (receipt_path.resolve().parent!=(root/'receipts').resolve()
-                or raw.resolve().parent!=(root/'raw').resolve() or not raw.is_file()
-                or receipt_path.stat().st_size>1024**2 or raw.stat().st_size>64*1024**2):
-            raise ValueError('Exact bounded old empty-scope evidence required')
-        receipt=json.loads(receipt_path.read_text(encoding='utf-8-sig'))
-        payload=json.loads(raw.read_text(encoding='utf-8-sig'))
-        _,rows,_=validate_download_evidence(req_done,payload)
-        if (rows or receipt.get('source_outcome')!='explicit_empty_scope' or receipt.get('exported_rows')!=0
-                or receipt.get('task_id')!=done['task_id'] or receipt.get('table_id')!=done['table_id']
-                or receipt.get('requested_query_rows')!=done['expected_rows']
-                or payload.get('task_id')!=done['task_id'] or receipt.get('raw_sha256')!=hashlib.sha256(raw.read_bytes()).hexdigest()):
-            raise ValueError('Old empty query was not independently verified; no inferred emptiness')
-        empty_proofs.append({'task_id':done['task_id'],'receipt_sha256':hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
-                             'raw_sha256':receipt['raw_sha256']})
+        req_done,empty_proof=verified_empty_scope(root,done)
+        empty_proofs.append(empty_proof)
         if mode==3:
             empty_scopes.append({**req_done,'source_key_mode':3,'key_layout_contract':KEY3_CONTRACT})
             # Count only whole new field partitions proved empty by this

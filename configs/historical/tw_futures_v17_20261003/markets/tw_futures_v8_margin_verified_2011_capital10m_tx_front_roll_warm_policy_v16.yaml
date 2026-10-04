@@ -1,0 +1,34 @@
+# Full-model ordinary fine-tuning from the causally matching v10 policy.
+# Only model weights transfer: no old optimizer, benchmark gate or exposure rule.
+# Epoch zero is revalued in the current TWD 10M exact account before training.
+base_config: tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_feasible_gradient_v14.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital10m-tx-front-roll-warm-policy-v16
+
+training:
+  epochs: 1000
+  val_interval_epochs: 1
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  learning_rate: 0.00001
+  enable_lr_scheduler: true
+  lr_scheduler: plateau
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 10
+  lr_scheduler_threshold: 0.0001
+  lr_scheduler_eta_min: 0.000001
+  pretrained_initialization_root: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_benchmark_risk_v10
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: identity_by_feature_name
+  pretrained_initialization_symbol_adapter: exact
+  pretrained_initialization_require_exact_backbone: true
+  pretrained_initialization_validation_guard: true
+  pretrained_initialization_require_improvement_over_flat_cash: false
+  pretrained_initialization_trainable_parameter_prefixes: []
+  financial_transformer:
+    futures_flat_action_initialization: false
+    futures_notional_score_coordinates: false
+    futures_margin_amount_context: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_warm_policy_v16
+  start_fold: 14

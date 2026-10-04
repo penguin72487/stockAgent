@@ -1,5 +1,10 @@
 # TW day-trade physical-FIFO training hot-path optimization (2026-09-14)
 
+2026-10-03 保存註記：本報告四個被拒絕候選的原 YAML 與完整繼承鏈已移至
+[歷史 bundle](../configs/historical/tw_day_trade_hotpath_20261003/manifest.json)，
+逐檔保留原始 SHA。其已退役設定欄位仍由目前 strict config ABI 拒絕，
+以下量測與採用／拒絕決定維持原意；原檔保存不代表重新啟用候選。
+
 ## 1. 執行進度與驗收標準
 
 - 效能驗收標準固定為 vastai1T 的雙卡 DDP 完整生命週期；單卡只可用於除錯與語意測試，不可作為加速結論。

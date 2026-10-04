@@ -1,0 +1,58 @@
+base_config: ../deployments/tw_day_trade.yaml
+
+# 純日頻日當沖：每日只使用一次開盤訊號與同日收盤標籤；不讀分鐘 K。
+# 股票部位每日結清，但含費稅的淨差額進 T+2 queue：T+2 收盤後入帳，
+# T+3 開盤才可用於新 sizing。收盤受限的殘部可無限轉融資／融券，
+# 只補收一般交易稅費與保守融資融券費用；不模擬追繳或違約。
+experiment_name: tw-day-trade-daily-tplus2-close-no-default-commission20-v3
+
+runner:
+  # 二折手續費會改變 canonical loss；使用新 root，避免續接舊費率 optimizer。
+  output_dir: artifacts/markets/tw_day_trade_daily_tplus2_close_commission20_v3
+  resume: true
+  post_train_infer: false
+  # Expanding folds grow from 2014 onward.  A fresh process per fold releases
+  # Inductor/DDP graphs and CUDA allocator state while resume assets stay intact.
+  isolate_train_folds: true
+
+data:
+  # 點時正確的買進先／賣出先資格從 2014 年開始；第一個可執行買進先
+  # 交易日是 2014-01-06，賣出先完整規則從 2014-06-30 才開始。
+  panel_start_date: '2014-01-01'
+  day_trade_minute_execution_root: null
+
+walk_forward:
+  expected_first_year: 2014
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
+  require_contiguous_years: true
+
+trading:
+  execution_mode: tw_day_trade
+  frequency: daily
+  volume_participation_equity: 1000000.0
+  tw_short_capacity_limit_enabled: false
+  # 牌告手續費 0.1425%，假設券商二折：每腿最終有效率 0.0285%。
+  # 執行器先收牌告率，再於當日 loss 沖回 80% 折讓；交易稅不打折。
+  tw_commission_discount: 0.2
+  # 不保留月中回饋應收狀態；折讓於當日 loss 直接沖回。
+  tw_commission_rebate_timing: daily_close
+  tw_day_trade_unlimited_margin_conversion: true
+  # 融資利率沒有全市場法定最高值，16% 是保守壓力值；融券費採公開規則
+  # 上緣年率 20%，一次融券手續費採 0.10%。
+  tw_day_trade_margin_financing_ratio: 0.60
+  tw_day_trade_margin_financing_annual_rate: 0.16
+  tw_day_trade_margin_short_handling_fee_rate: 0.001
+  tw_day_trade_margin_short_annual_borrow_rate: 0.20
+
+training:
+  epochs: 1000
+  # RTX 5090、T=128、S=2744 的相同 forward+backward 實測：16-row
+  # 穩態 27.0ms，優於 4/8/32-row 的 46.8/38.9/33.6ms。這只改變
+  # CUDA 圖的切塊方式，不改變 T+2 queue、T+3 可用現金或梯度 horizon。
+  tw_continuous_compile_chunk_rows: 16
+  # 每個 epoch 仍完整寫入 JSONL 並執行 val/test；圖只在 Fold 訓練
+  # 結束後畫一次，避免 1000 次重複啟動 Matplotlib 子程序。
+  defer_epoch_curve_plot_until_end: true
+  save_integer_share_holdings_table: false

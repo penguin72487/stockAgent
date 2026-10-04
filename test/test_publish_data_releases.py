@@ -149,6 +149,46 @@ def test_catalog_publish_rechecks_writer_after_acquiring_lock(tmp_path, monkeypa
     assert status["active_blockers"][0]["pid"] == 123
 
 
+def test_source_parent_lock_binds_external_live_root_and_borrowed_descriptor(tmp_path, monkeypatch):
+    module = _module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = tmp_path / "live/data_tw_public"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(module, "REPO_ROOT", repo)
+    entry = {"dataset": "tw-public", "source": str(source),
+             "source_coordination_lock": ".locks/tw-public-refresh.lock",
+             "source_coordination_lock_scope": "source_parent"}
+    lock_path = source.parent / entry["source_coordination_lock"]
+    with module._source_coordination_lock(entry) as fd:
+        with module._source_coordination_lock(entry, inherited_fd=fd) as borrowed:
+            assert borrowed == fd
+            assert os.fstat(fd).st_ino == lock_path.stat().st_ino
+        with lock_path.open("a+b") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with lock_path.open("a+b") as other:
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert not (repo / ".locks").exists()
+
+
+def test_source_parent_lock_rejects_redirected_path_and_unknown_scope(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path / "repo")
+    source = tmp_path / "live/data_tw_public"
+    source.mkdir(parents=True)
+    (source.parent / ".locks").symlink_to(tmp_path, target_is_directory=True)
+    entry = {"dataset": "tw-public", "source": str(source),
+             "source_coordination_lock": ".locks/tw-public-refresh.lock",
+             "source_coordination_lock_scope": "source_parent"}
+    with pytest.raises(SnapshotError, match="leaves source_parent"):
+        with module._source_coordination_lock(entry):
+            pytest.fail("redirected lock")
+    with pytest.raises(SnapshotError, match="invalid.*scope"):
+        with module._source_coordination_lock({**entry, "source_coordination_lock_scope": "unknown"}):
+            pytest.fail("unknown lock scope")
+
+
 def test_catalog_publish_uses_inherited_lock_without_reacquiring(tmp_path, monkeypatch):
     module = _module()
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
