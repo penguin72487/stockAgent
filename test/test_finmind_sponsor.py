@@ -246,6 +246,15 @@ def test_partition_end_is_exclusive_and_seed_is_idempotent(tmp_path: Path) -> No
 def test_verified_sessions_skip_only_session_facts_and_reopen_revised_dates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This test owns both calendar proofs. A clean checkout has no live
+    # data_tw_public receipt for the current holiday, so do not read one.
+    monkeypatch.setattr(
+        sponsor, "tw_stock_day_decision",
+        lambda day, **_kwargs: sponsor.TwStockDayDecision(
+            "closed" if day == date(2026, 9, 28) else "unknown",
+            "fixture current holiday" if day == date(2026, 9, 28) else "fixture calendar missing",
+        ),
+    )
     monkeypatch.setattr(sponsor, "SOURCES", (
         sponsor._s("TaiwanStockPrice", "2026-09-23", "day", 1),
         sponsor._s("TaiwanStockDividend", "2026-09-23", "day", 1),

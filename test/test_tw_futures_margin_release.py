@@ -71,6 +71,29 @@ def test_scoped_materialization_keeps_parent_calendar_gaps_visible():
             materialize_margin_market_rows(source,raw,universe,market_dates=invalid)
 
 
+def test_affected_product_replay_preserves_full_portfolio_coordinates_and_features():
+    source, raw, universe = source_rows()
+    whole, _ = materialize_margin_market_rows(source, raw, universe)
+    lives = source.group_by('product', 'contract', 'physical_instance').agg(
+        pl.col('date').min().alias('first_observed_date'),
+        pl.col('date').max().alias('last_observed_date'))
+    # The second product would otherwise be assigned the first product's slot
+    # and product ID. Every date and value must match its full-market result.
+    scoped, _ = materialize_margin_market_rows(source.filter(pl.col('product') == 'ZZ1'), raw,
+        universe.filter(pl.col('product') == 'ZZ1'), market_dates=source.select('date').unique(),
+        portfolio_lifetimes=lives, portfolio_universe=universe)
+    assert scoped.equals(whole.filter(pl.col('product') == 'ZZ1'))
+    for bad_lives in [lives.filter(pl.col('product') == 'ZZ1'),
+                      lives.with_columns(pl.col('last_observed_date') - timedelta(days=1)),
+                      pl.concat([lives, lives.head(1)])]:
+        with pytest.raises(ValueError):
+            materialize_margin_market_rows(source.filter(pl.col('product') == 'ZZ1'), raw,
+                universe.filter(pl.col('product') == 'ZZ1'), market_dates=source.select('date').unique(),
+                portfolio_lifetimes=bad_lives, portfolio_universe=universe)
+    with pytest.raises(ValueError, match='together'):
+        materialize_margin_market_rows(source, raw, universe, portfolio_lifetimes=lives)
+
+
 def test_future_price_perturbation_cannot_change_earlier_features():
     source, raw, universe = source_rows()
     first, _ = materialize_margin_market_rows(source, raw, universe)
@@ -167,6 +190,66 @@ def test_corporate_first_day_must_inherit_old_inventory(broken):
         validate_accounting_continuation(frame, rules)
 
 
+def test_component_selection_keeps_proved_empty_origins_needed_by_publication(tmp_path):
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    from stockagent.data.tw_futures_margin_release import (
+        omit_unreachable_account_prefix, select_complete_margin_components,
+        validate_context_only_prefix_sources, CONTEXT_ONLY_PREFIX_CONTRACT)
+    days=[date(2026,1,2),date(2026,1,5),date(2026,1,6)]
+    keys=['date','physical_contract']
+    frame=pl.DataFrame(dict(date=days,physical_contract=['OLD','NEW','NEW'],product=['AA1','AAF','AAF'],
+        next_market_date=pl.Series(days[1:]+[None],dtype=pl.Date),cash_settlement=[False]*3,
+        executable=[False,False,True],volume=[0.,0.,10.],lifetime_status=['observed_at_dataset_boundary']*3))
+    original=frame.select(*keys,'product').with_columns(pl.lit('mark_only').alias('terminal_event'),
+        pl.Series('carry_from_date',[None,days[0],days[1]],dtype=pl.Date),
+        pl.Series('carry_from_physical_contract',['','OLD','NEW']),pl.lit(False).alias('inventory_origin_unresolved'),
+        pl.lit(1,dtype=pl.Int64).alias('carry_quantity_numerator'),pl.lit(1,dtype=pl.Int64).alias('carry_quantity_denominator'),
+        pl.lit(0.).alias('carry_cash_twd'),
+        *[pl.lit(0.).alias(c) for c in ('carry_previous_value_twd','carry_previous_initial_twd','carry_previous_maintenance_twd')],
+        pl.lit(None,dtype=pl.String).alias('carry_known_at'),pl.lit(None,dtype=pl.String).alias('carry_effective_at'))
+    original=original.join(inventory_entry_reachability(frame,original),on=keys)
+    flags=frame.select(keys).with_columns(pl.lit(False).alias('is_warmup'),pl.lit(False).alias('has_blocker'))
+    admitted,flags,empty,suppressed=omit_unreachable_account_prefix(frame,original,flags)
+
+    def prove(selected,rules):
+        sources=[]; proof=dict(contract=CONTEXT_ONLY_PREFIX_CONTRACT)
+        for name,data in [('excluded_rules',empty),('suppressed_carries',suppressed)]:
+            data=data.join(selected.select(keys),on=keys,how='semi')
+            path=tmp_path/(name+'.parquet');data.write_parquet(path)
+            receipt=dict(path=path.name,sha256=sha256_file(path));proof[name]=receipt;sources.append(receipt)
+            if name=='excluded_rules':proof['rows']=data.height
+        return validate_context_only_prefix_sources(selected,rules,dict(context_only_prefix=proof,sources=sources),tmp_path)
+
+    narrowed,chosen,_=select_complete_margin_components(frame,admitted,flags,start=days[0],end=days[-1])
+    assert set(narrowed['physical_contract'])=={'NEW'}
+    with pytest.raises(ValueError,match='causal entries and carry edges'):
+        prove(narrowed,chosen)
+    selected,chosen,coverage=select_complete_margin_components(frame,admitted,flags,start=days[0],end=days[-1],
+        context_only_keys=empty.select(keys))
+    assert set(selected['physical_contract'])=={'OLD','NEW'}
+    assert prove(selected,chosen).height==2
+    assert coverage.filter(pl.col('physical_contract')=='OLD')['context_only_rows'][0]==1
+    with pytest.raises(ValueError,match='proved warmup'):
+        select_complete_margin_components(frame,admitted,flags,start=days[0],end=days[-1],context_only_keys=frame.select(keys))
+
+
+@pytest.mark.parametrize('problem',[None,'entry','unknown','missing_capacity','fabricated','null_proof'])
+def test_accounting_continuation_recomputes_proven_empty_inventory(problem):
+    d1,d2=date(2026,1,2),date(2026,1,5)
+    frame=pl.DataFrame(dict(date=[d1],physical_contract=['OLD'],next_market_date=[d2],
+        cash_settlement=[False],executable=[problem=='entry'],volume=[1. if problem=='entry' else 0.]))
+    rules=pl.DataFrame(dict(date=[d1],physical_contract=['OLD'],terminal_event=['mark_only'],
+        carry_from_date=pl.Series([None],dtype=pl.Date),carry_from_physical_contract=[''],
+        inventory_origin_unresolved=[problem=='unknown'],inventory_entry_reachable=[False]))
+    if problem=='missing_capacity':frame=frame.drop('volume')
+    if problem=='fabricated':frame=frame.with_columns(pl.lit(True).alias('executable'),pl.lit(10.).alias('volume'))
+    if problem=='null_proof':rules=rules.with_columns(pl.lit(None,dtype=pl.Boolean).alias('inventory_entry_reachable'))
+    if problem:
+        with pytest.raises(ValueError,match='inventory reachability proof'):
+            validate_accounting_continuation(frame,rules)
+    else:validate_accounting_continuation(frame,rules)
+
+
 def test_training_rejects_market_only_materialization_before_loading_prices(tmp_path):
     data = tmp_path/'continuous_daily.parquet'
     data.write_bytes(b'not even a price file')
@@ -195,11 +278,14 @@ def test_publisher_rejects_candidate_terms_and_does_not_publish(tmp_path):
 
 
 @pytest.mark.parametrize('product', ['TX', 'MTX'])
-def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, product):
+@pytest.mark.parametrize('research', [False, True, 'valuation'])
+@pytest.mark.parametrize('empty_prefix', [False, True, 'whole'])
+def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, product, research, empty_prefix):
     """Synthetic integration proof, deliberately not historical admission."""
     from stockagent.data.tw_futures_margin_preparation import index_margin_corporate_execution_rules
     from stockagent.data.tw_futures_margin import attach_futures_margin_rules, TERMINAL_CAPACITY
     from stockagent.backtest.tw_futures_portfolio import run_tw_futures_portfolio_integer_torch
+    from pathlib import Path
     import torch
     source, raw, universe = source_rows()
     source = source.filter(pl.col('product') == 'TX')
@@ -211,6 +297,11 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, produ
             pl.col('physical_instance').str.replace('TX',product))
         raw = raw.with_columns(pl.lit(product).alias('product'))
         universe = universe.with_columns(pl.lit(product).alias('product'))
+    if empty_prefix:
+        prefix = pl.col('date') <= date(2026, 1, 3)
+        source = source.with_columns(pl.when(prefix).then(0).otherwise(pl.col('outright_volume'))
+            .alias('outright_volume'), *[pl.when(prefix).then(None).otherwise(pl.col(c)).alias(c)
+                for c in ('official_open', 'official_close', 'official_high', 'official_low')])
     daily, _ = materialize_margin_market_rows(source, raw, universe)
     material = tmp_path/'material'; material.mkdir()
     daily.write_parquet(material/'continuous_daily.parquet')
@@ -238,14 +329,94 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, produ
         pl.col('settlement_contract_value_twd').alias('settlement_margin_value_twd'),
         pl.col('known_margin_contract_value_twd').alias('known_margin_value_twd'))
     terms_dir = tmp_path/'terms'; terms_dir.mkdir()
+    context_proof = None
+    context_sources = []
+    if research == 'valuation':
+        from stockagent.data.tw_futures_valuation_research import VALUATION_RESEARCH_COLUMNS
+        rules = rules.with_columns(*[pl.lit(False if t == pl.Boolean else None,dtype=t).alias(c)
+            for c,t in VALUATION_RESEARCH_COLUMNS.items()])
+        last = pl.col('date') == rules['date'].max()
+        rules = rules.with_columns(
+            last.alias('valuation_research_applied'),last.alias('valuation_research_terminal_assumption'),
+            pl.when(last).then(pl.lit('termination_cash_conversion_at_frozen_full_value')).alias('valuation_research_method'),
+            pl.when(last).then(pl.col('date')).alias('valuation_research_seed_date'),
+            pl.when(last).then(pl.col('physical_contract')).alias('valuation_research_seed_identity'),
+            *[pl.when(last).then(pl.col('settlement_contract_value_twd')).alias(c)
+                for c in ('valuation_research_seed_value_twd','valuation_research_value_twd')],
+            pl.when(last).then(pl.lit('research_cash_conversion')).otherwise(pl.col('terminal_event')).alias('terminal_event'),
+            pl.when(last).then(pl.col('settlement_contract_value_twd')).otherwise(pl.col('terminal_contract_value_twd')).alias('terminal_contract_value_twd'),
+            pl.when(last).then(0.).otherwise(pl.col('terminal_tax_twd')).alias('terminal_tax_twd'))
+    if empty_prefix:
+        from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+        from stockagent.data.tw_futures_margin_release import (
+            CONTEXT_ONLY_PREFIX_CONTRACT, WHOLE_CONTRACT_PREFIX_CONTRACT,
+            omit_unreachable_account_prefix, omit_whole_contract_empty_prefix)
+        if research:
+            from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
+            rules = rules.with_columns(pl.lit(False).alias(POSITION_RESEARCH_COLUMNS[0]),
+                pl.lit(None, dtype=pl.String).alias(POSITION_RESEARCH_COLUMNS[1]),
+                pl.lit(None, dtype=pl.Date).alias(POSITION_RESEARCH_COLUMNS[2]),
+                pl.lit(None, dtype=pl.String).alias(POSITION_RESEARCH_COLUMNS[3]))
+        rules = rules.with_columns(pl.lit(False).alias('inventory_origin_unresolved'))
+        rules = rules.join(inventory_entry_reachability(daily, rules), on=['date', 'physical_contract'])
+        flags = daily.select('date', 'physical_contract').with_columns(pl.lit(False).alias('is_warmup'))
+        if empty_prefix == 'whole':
+            rules, _, empty, suppressed = omit_whole_contract_empty_prefix(daily, rules, flags,
+                maximum_volume_participation=.5)
+            context_proof = dict(contract=WHOLE_CONTRACT_PREFIX_CONTRACT, rows=empty.height,
+                maximum_volume_participation=.5)
+        else:
+            rules, _, empty, suppressed = omit_unreachable_account_prefix(daily, rules, flags)
+            context_proof = dict(contract=CONTEXT_ONLY_PREFIX_CONTRACT, rows=empty.height)
+        assert empty.height == (2 if empty_prefix == 'whole' else 1) and suppressed.height == 1
+        for key, rows in [('excluded_rules', empty), ('suppressed_carries', suppressed)]:
+            path = terms_dir / (key + '.parquet')
+            rows.write_parquet(path)
+            receipt = dict(path=path.name, sha256=sha256_file(path))
+            context_sources.append(receipt); context_proof[key] = receipt
     rules.write_parquet(terms_dir/'rules.parquet')
     pl.DataFrame(schema={'point_in_time_verified': pl.Boolean}).write_parquet(terms_dir/'corporate.parquet')
     corporate_proof = dict(path='corporate.parquet', sha256=sha256_file(terms_dir/'corporate.parquet'))
     (terms_dir/'manifest.json').write_text(json.dumps(dict(dataset='taifex_futures_margin_execution_terms',
         schema_version=6, status='complete', point_in_time_verified=True,
         source_materialization_sha256=sha256_file(material/'manifest.json'),
-        outputs={'rules': {'sha256': sha256_file(terms_dir/'rules.parquet')}}, sources=[corporate_proof],
-        adjusted_terminal_components=dict(status='admitted', corporate_terms=corporate_proof))))
+        outputs={'rules': {'sha256': sha256_file(terms_dir/'rules.parquet')}}, sources=[corporate_proof, *context_sources],
+        adjusted_terminal_components=dict(status='admitted', corporate_terms=corporate_proof),
+        **({'context_only_prefix': context_proof} if context_proof is not None else {}))))
+    if research:
+        from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
+        policy_path = terms_dir/'sources/position_research_policy.json'
+        policy_path.parent.mkdir()
+        policy = (Path(__file__).parents[1]/'configs/markets/tw_futures_position_research_v1.json').read_text()
+        policy_path.write_text(policy)
+        rules = rules.with_columns(pl.lit(False).alias(POSITION_RESEARCH_COLUMNS[0]),
+            pl.lit(None,dtype=pl.String).alias(POSITION_RESEARCH_COLUMNS[1]),
+            pl.lit(None,dtype=pl.Date).alias(POSITION_RESEARCH_COLUMNS[2]),
+            pl.lit(None,dtype=pl.String).alias(POSITION_RESEARCH_COLUMNS[3]))
+        rules.write_parquet(terms_dir/'rules.parquet')
+        proof = json.loads((terms_dir/'manifest.json').read_text())
+        policy_proof = dict(path='sources/position_research_policy.json',sha256=sha256_file(policy_path))
+        proof.update(schema_version=7,point_in_time_verified=False,research_only=True,
+            financial_point_in_time_verified=True,position_research_policy=policy_proof,
+            position_research_contract=json.loads(policy)['contract'],
+            position_research_policy_sha256=policy_proof['sha256'])
+        proof['sources'].append(policy_proof)
+        if research == 'valuation':
+            valuation_policy_path = terms_dir/'sources/valuation_research_policy.json'
+            valuation_policy = dict(contract='frozen_contract_value_research_v1',research_only=True,
+                financial_point_in_time_verified=False,products=[product],physical_instances=[],
+                continuation_transfers=[],terminal_cash_conversion_authorized=True,
+                **{c:'a'*64 for c in ('source_manifest_sha256','rule_delta_manifest_sha256',
+                                     'prior_replay_manifest_sha256','prior_gap_worklist_sha256')})
+            valuation_policy_path.write_text(json.dumps(valuation_policy))
+            receipt = dict(path='sources/valuation_research_policy.json',sha256=sha256_file(valuation_policy_path))
+            rules.write_parquet(terms_dir/'rules.parquet')
+            proof.update(schema_version=8, financial_point_in_time_verified=False,
+                valuation_research_contract=valuation_policy['contract'],valuation_research_policy=receipt,
+                valuation_research_policy_sha256=receipt['sha256'])
+            proof['sources'].append(receipt)
+        proof['outputs']['rules']['sha256'] = sha256_file(terms_dir/'rules.parquet')
+        (terms_dir/'manifest.json').write_text(json.dumps(proof))
     final_dir=tmp_path/'final'; final_dir.mkdir()
     receipt=final_dir/'source.json'; receipt.write_text('{"synthetic_test_only":true}')
     final=final_dir/'final.parquet'
@@ -256,14 +427,41 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, produ
         requires_product_specific_settlement_clock=True, receipts=[dict(path='source.json',sha256=sha256_file(receipt))],
         outputs={'futures_final_settlement_history':{'sha256':sha256_file(final)}})))
     output=tmp_path/'release'
+    if empty_prefix:
+        proof_path = terms_dir/'manifest.json'
+        proof = json.loads(proof_path.read_text())
+        without_prefix = dict(proof)
+        without_prefix.pop('context_only_prefix')
+        proof_path.write_text(json.dumps(without_prefix))
+        with pytest.raises(ValueError, match='intermediate account day'):
+            publish_all_twd_margin_release(materialization=material, execution_terms=terms_dir/'rules.parquet',
+                final_settlement=final, output=output)
+        proof_path.write_text(json.dumps(proof))
     result=publish_all_twd_margin_release(materialization=material,execution_terms=terms_dir/'rules.parquet',
                                          final_settlement=final,output=output)
     assert result['runtime_training_verified'] is False
+    if research == 'valuation':
+        with pytest.raises(ValueError, match='research valuation opt-in'):
+            attach_stock_context_futures_portfolio_daily(_stock_panel(rows=4), result['daily'],
+                fee_per_side_twd_by_group={'standard':40.},integer_contracts=True,
+                denomination_context_basis='prior_settlement',max_volume_participation=.5,
+                futures_slot_count=2816,margin_rules_path=result['rules'],final_settlement_path=final)
+    if empty_prefix == 'whole':
+        daily_proof = json.loads(Path(result['daily']).with_name('manifest.json').read_text())
+        assert daily_proof['context_only_prefix_contract'] == WHOLE_CONTRACT_PREFIX_CONTRACT
+        assert daily_proof['maximum_volume_participation'] == .5
+        for wrong_integer, wrong_participation in [(False, .5), (True, 1.), (True, 0.), (True, float('nan'))]:
+            with pytest.raises(ValueError, match='admitted entry capacity'):
+                attach_stock_context_futures_portfolio_daily(_stock_panel(rows=4), result['daily'],
+                    fee_per_side_twd_by_group={'standard':40.}, integer_contracts=wrong_integer,
+                    max_volume_participation=wrong_participation, futures_slot_count=2816,
+                    margin_rules_path=result['rules'], final_settlement_path=final)
     panel=_stock_panel(rows=4)
     attached=attach_stock_context_futures_portfolio_daily(panel, result['daily'],
         fee_per_side_twd_by_group={'standard':40.},integer_contracts=True,
         denomination_context_basis='prior_settlement',max_volume_participation=.5,
-        futures_slot_count=2816,margin_rules_path=result['rules'],final_settlement_path=final)
+        futures_slot_count=2816,margin_rules_path=result['rules'],final_settlement_path=final,
+        valuation_research_contract='frozen_contract_value_research_v1' if research == 'valuation' else None)
     attached=attach_futures_margin_rules(attached,result['rules'])
     assert not attached.stock_context_futures_portfolio_daily.benchmark_log_returns.any()
     execution=torch.from_numpy(attached.stock_context_futures_portfolio_daily.integer_execution[1:, :1])
@@ -274,3 +472,23 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, produ
     assert torch.isfinite(backtest.strategy_returns).all()
     backtest.strategy_returns.sum().backward()
     assert torch.isfinite(weights.grad).all()
+    if research:
+        from stockagent.data.tw_futures_margin import validate_margin_rule_source
+        proof_path = output/'rules/manifest.json'
+        proof = json.loads(proof_path.read_text())
+        assert proof['point_in_time_verified'] is False
+        assert proof['financial_point_in_time_verified'] is (research != 'valuation')
+        assert attached.stock_context_futures_portfolio_daily.margin_contract_version == (8 if research == 'valuation' else 7)
+        # Neither relabelling the research tape as official nor changing the
+        # portable policy after release can cross the source admission gate.
+        proof['schema_version'] = 6
+        proof['point_in_time_verified'] = True
+        proof_path.write_text(json.dumps(proof))
+        with pytest.raises(ValueError,match='separate schema-[78]'):
+            validate_margin_rule_source(result['rules'],result['daily'])
+        proof['schema_version'] = 8 if research == 'valuation' else 7
+        proof['point_in_time_verified'] = False
+        proof_path.write_text(json.dumps(proof))
+        (output/'rules/sources/position_research_policy.json').write_text('{}')
+        with pytest.raises(ValueError,match='policy SHA'):
+            validate_margin_rule_source(result['rules'],result['daily'])

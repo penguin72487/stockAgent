@@ -54,3 +54,45 @@ def test_subset_pack_restored_with_original_inventory(tmp_path, monkeypatch):
     assert result["restored"][0]["original_member_count"] == 2
     assert head.read_bytes() == before
     verify_packed_snapshot(cold, latest)
+
+
+def test_fixed_historical_release_is_repaired_without_republishing_latest(tmp_path, monkeypatch):
+    source, cold = tmp_path / "source", tmp_path / "cold"
+    source.mkdir()
+    (source / "old.bin").write_bytes(b"retained authentic vintage" * 20)
+    (source / "shared.txt").write_text("unchanged source\n")
+    initialize_packed_layout(cold, node_id="test")
+    old = publish_packed_snapshot(cold, "fixture", source, loose_file_threshold_bytes=100)
+    latest = publish_packed_snapshot(cold, "fixture", source, loose_file_threshold_bytes=100, excluded_subtrees=("old.bin",))
+    old_object = next(o for o in old.manifest["archive"]["objects"] if o["kind"] == "blob")
+    target = cold / old_object["relpath"]
+    target.unlink()
+    head = cold / "heads/fixture/test.json"
+    before = head.read_bytes()
+    monkeypatch.setattr(repair, "_load_catalog", lambda _: [{"dataset": "fixture", "publish": True,
+        "source": str(source), "active_process_substrings": []}])
+    result = repair.repair("fixture", cold, apply=True, receipt=tmp_path / "old-recovery.json",
+                           snapshot_id=old.manifest["snapshot_id"])
+    assert result["snapshot_id"] == old.manifest["snapshot_id"]
+    assert len(result["restored"]) == 1 and not result["unresolved"]
+    assert head.read_bytes() == before
+    verify_packed_snapshot(cold, old)
+    verify_packed_snapshot(cold, latest)
+
+
+def test_source_writer_start_during_reconstruction_prevents_install(tmp_path, monkeypatch):
+    source, cold = tmp_path / "source", tmp_path / "cold"
+    source.mkdir()
+    (source / "x.bin").write_bytes(b"exact original" * 30)
+    initialize_packed_layout(cold, node_id="test")
+    release = publish_packed_snapshot(cold, "fixture", source, loose_file_threshold_bytes=100)
+    target = cold / release.manifest["archive"]["objects"][0]["relpath"]
+    target.unlink()
+    monkeypatch.setattr(repair, "_load_catalog", lambda _: [{"dataset": "fixture", "publish": True,
+        "source": str(source), "active_process_substrings": ["synthetic-source-writer"]}])
+    observations = iter(([], [(999999, "synthetic-source-writer")]))
+    monkeypatch.setattr(repair, "_running_commands", lambda: next(observations))
+    result = repair.repair("fixture", cold, apply=True, receipt=tmp_path / "blocked.json")
+    assert not result["restored"]
+    assert result["unresolved"][0]["reason"] == "source_writer_started_before_install"
+    assert not target.exists()

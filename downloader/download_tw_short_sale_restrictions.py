@@ -980,7 +980,13 @@ def _download_twse_legacy_month(
     year: int,
     month: int,
     timeout: int,
+    *,
+    kind: str = "s",
 ) -> _AnnouncementDownloadBatch:
+    # The official form separates delisting (s) from halt/resumption (t).
+    # Keep the collector's existing default; bounded rule repairs select t.
+    if kind not in {"s", "t"}:
+        raise ValueError("unsupported TWSE legacy announcement category")
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     search = _rate_limited_call(session.get, TWSE_LEGACY_SEARCH, timeout=timeout)
@@ -998,7 +1004,7 @@ def _download_twse_legacy_month(
             "SYNCHRONIZER_URI": "/announcement/official",
             "queryby": "category",
             "startDate": f"{year:04d}{month:02d}01",
-            "kind": "s",
+            "kind": kind,
         },
         timeout=timeout,
     )

@@ -23,6 +23,8 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from stockagent import private_json
+
 
 # Footer/cache row semantics remain v10 for already-running read-only readers.
 # The new, independently versioned membership proof is an additive extension.
@@ -64,6 +66,18 @@ class InventorySnapshot:
     def check_root(self, root: Path) -> None:
         if self.root.resolve() != root.resolve():
             raise ValueError("inventory snapshot belongs to another repository")
+
+
+class SourceRevisionChanged(ValueError):
+    """A projection cannot bind to the inventory generation being published."""
+
+
+def require_coherent_feature_source(summary: Mapping[str, Any], expected_root: str | None) -> None:
+    if expected_root is not None and (
+        summary.get("source_observation_root") != expected_root
+        or summary.get("source_observation_matches_cache") is not True
+    ):
+        raise SourceRevisionChanged("source identities changed before feature publication")
 
 
 class _SourceObservation:
@@ -194,7 +208,7 @@ PHYSICAL_FAMILIES: dict[str, tuple[str, str, str, bool]] = {
 
 def _read_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_bytes())
+        return private_json.loads(path.read_bytes())
     except (OSError, ValueError, UnicodeError):
         return None
 
@@ -1097,10 +1111,7 @@ def _build_record_inventory_unlocked(
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
         try:
-            temporary.write_text(
-                json.dumps(current_payload, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            temporary.write_bytes(private_json.dumps(current_payload))
             os.replace(temporary, cache_path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -1348,6 +1359,7 @@ class FeatureInventoryScan:
             "files_total": files_total,
             "files_with_schema": self.files_with_schema,
             "source_observation_root": self.observation.root(),
+            "source_observation_matches_cache": self.observation.matches_cache,
             "state": "complete" if files_total and self.files_with_schema == files_total else "empty" if not files_total else "partial",
             "basis": "Parquet schema 與 row-group null_count；不代表歷史完整、發布時間或訓練可用性。",
         }

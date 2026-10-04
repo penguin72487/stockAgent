@@ -6,6 +6,45 @@ import pytest
 from scripts.audit_tw_futures_rule_coverage import coverage_table, expiry_worklist,expand_raw_universe
 
 
+@pytest.mark.parametrize('problem',['damaged_unit','verified_mini','tampered_input'])
+def test_numeric_rule_audit_separates_candidates_intervals_rates_and_source_identity(tmp_path,problem):
+    from downloader.artifact_io import atomic_write_json,sha256_file
+    from scripts.audit_tw_futures_rule_coverage import audit_numeric_rules
+    root=tmp_path/'rules';root.mkdir()
+    amount=79.5925 if problem=='verified_mini' else 2.
+    tables=dict(
+        corporate_event_candidates=pl.DataFrame([dict(product='AA1',effective_date='2020-01-02',
+            contract_months=['202003'],contract_multiplier=amount,deliverable_security_quantity=amount,
+            deliverable_cash_twd=0.,source_content_sha256='a'*64,issue_date_bound=True,
+            extraction_method='native_cell_grid' if problem=='verified_mini' else 'source_ruled_ocr_cell_grid')]),
+        corporate_unit_intervals=pl.DataFrame([dict(product='AA1',effective_date='2020-01-02',contract='202003',
+            contract_multiplier=amount,source_content_sha256s=['a'*64])]),
+        corporate_terms_intervals=pl.DataFrame(schema={'product':pl.String}),
+        position_event_candidates=pl.DataFrame([dict(product='AAF',natural_person_limit=2000.,
+            natural_person_monthly_limit=1000.,unit='contracts')]),
+        position_level_intervals=pl.DataFrame([dict(product='DN2',unit='shares',position_unit=1.,
+            event_type='combined_securities_position_formula',conversion_numerator=21,conversion_denominator=20)]),
+        margin_event_candidates=pl.DataFrame([dict(product='AAF',margin_kind='notional_rate',
+            after=[.135,.1035,.10],before=None)]),
+        margin_level_intervals=pl.DataFrame(schema={'product':pl.String}))
+    outputs={}
+    for name,frame in tables.items():
+        path=root/(name+'.parquet');frame.write_parquet(path);outputs[path.name]=dict(sha256=sha256_file(path))
+    atomic_write_json(root/'manifest.json',dict(outputs=outputs))
+    if problem=='tampered_input':
+        (root/'corporate_event_candidates.parquet').write_bytes(b'corrupt after receipt')
+        with pytest.raises(ValueError,match='SHA|hash|changed'):
+            audit_numeric_rules(root,tmp_path/'audit')
+        return
+    assert audit_numeric_rules(root,tmp_path/'audit')==(0 if problem=='verified_mini' else 2)
+    import json
+    report=json.loads((tmp_path/'audit/manifest.json').read_text())
+    assert report['source_review_interval_rows']==(0 if problem=='verified_mini' else 1)
+    diagnostics=json.loads((tmp_path/'audit/numeric_rule_diagnostics.json').read_text())['diagnostics']
+    assert all(row['table'].startswith('corporate_') for row in diagnostics)
+    assert report['new_accounting_builds']==0 and not report['training_release_approved']
+
+
 def frames():
     daily = pl.DataFrame({
         'date': [date(2011, 1, 3), date(2011, 1, 4), date(2011, 1, 3)],
@@ -20,6 +59,18 @@ def frames():
     final = pl.DataFrame({'settlement_date': [date(2011, 1, 4)], 'product': ['TX'],
                           'contract': ['201101'], 'final_settlement_price': [8100.125]})
     return daily, verified, final
+
+
+def test_terminal_numeric_audit_includes_already_valued_subscription_rights():
+    from scripts.audit_tw_futures_rule_coverage import corporate_final_value_diagnostics
+    terms=pl.DataFrame([dict(product='AA1',contract='202003',effective_date='2020-01-02',
+        valid_until_exclusive=None,contract_multiplier=2000.,deliverable_cash_twd=0.,
+        fixed_subscription_rights_twd=50.,subscription_rights_at_final_settlement=False)])
+    final=pl.DataFrame([dict(product='AA1',contract='202003',settlement_date=date(2020,3,18),
+        final_settlement_price=10.,final_settlement_value=20050.)])
+    result=corporate_final_value_diagnostics(terms,final)
+    assert result['candidate_formula_value_twd'][0]==20050.
+    assert result['diagnostic_status'][0]=='within_rounding_envelope_not_rule_approval'
 
 
 def test_terminal_diagnostic_does_not_infer_quantities_or_ignore_interval_ends():

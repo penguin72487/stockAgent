@@ -2,9 +2,37 @@
 
 Use for environment, Windows supervision, test selection, or GPU job setup. Commands below are examples for the affected surface, not a requirement to run the full suite for documentation edits.
 
+## Agent workflow
+
+For multi-step implementation/operations, start with `stockagent-agent status`
+and a task record. Update its next action and evidence at milestones; resume the
+same task after interruption. Use `status --architecture` only when the task needs
+the full configuration inventory. Read a task-relevant summary of status rather
+than loading every task's Git baseline and run history into context; the filtered
+example in the workflow document preserves access to the full records.
+Small text edits do not require this setup.
+
+The launcher sources the canonical runtime. Long foreground commands may use
+its tmux/systemd supervision; GPU jobs, training acceptance, source receipts and
+production services keep their existing owners. Run success alone does not prove
+their acceptance. Installation, commands and recovery boundaries are documented
+in [Agent workflow](../agent_workflow.md).
+
+The opt-in cross-node engineering role is documented in
+[Control workflow](../control_plane_workflow.md). Its PostgreSQL and Mamba Python role
+are independent of acquisition, CUDA and intraday services. Runtime discovery
+recognizes a venv's `pyvenv.cfg` before resolving its Python symlink to the base
+interpreter, so an explicitly selected legacy role keeps its own dependency set.
+New engineering roles use Miniforge/mamba declarations plus platform-specific
+explicit locks; create fresh prefixes and retain native runtime before/after
+proof. Setup and measured engine trials are in
+[Technology trials](../architecture_technology_trials_2026-10-03.md).
+
 ## Workspace And Environment
 
-- Repo root is the directory containing this file; its absolute path differs across machines.
+- Repo root contains `AGENTS.md`, `train.py` and `scripts/`; this file is under
+  `docs/agents/`. Resolve the current checkout root, for example with
+  `git rev-parse --show-toplevel`; its absolute path differs across machines.
 - Preferred Python runtime is the `fintech` Conda/Mamba environment, whose absolute
   path differs across machines. Source `scripts/runtime_env.sh` and use
   `run_fintech_python`; `FINTECH_ENV_PATH` or `PYTHON_BIN` may override discovery.
@@ -74,4 +102,3 @@ run_fintech_python -m pytest -q -s \
   test/test_backtest_tensor_consistency.py \
   test/test_pure_rank_loss.py
 ```
-

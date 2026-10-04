@@ -24,7 +24,7 @@ from concurrent.futures import (
     wait,
 )
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import lru_cache
@@ -47,6 +47,13 @@ from tqdm import tqdm
 
 try:
     from downloader.common import SharedRateLimiter
+    from downloader.openbb_archive_types import (
+        AssetRecord, DownloadTask, TaskResult, ColumnarTaskPayload, CoverageDecision, PlannerContext,
+    )
+    from downloader.openbb_archive_serialization import _json_default, _canonical_json, _write_json_atomic
+    from downloader.openbb_request_checkpoints import (
+        _request_checkpoint_path, _load_request_checkpoint, _save_request_checkpoint, _clear_request_checkpoints,
+    )
     from downloader.openbb_credentials import apply_openbb_environment_credentials
     from downloader.openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
@@ -59,6 +66,13 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from downloader/.
     from common import SharedRateLimiter
+    from openbb_archive_types import (
+        AssetRecord, DownloadTask, TaskResult, ColumnarTaskPayload, CoverageDecision, PlannerContext,
+    )
+    from openbb_archive_serialization import _json_default, _canonical_json, _write_json_atomic
+    from openbb_request_checkpoints import (
+        _request_checkpoint_path, _load_request_checkpoint, _save_request_checkpoint, _clear_request_checkpoints,
+    )
     from openbb_credentials import apply_openbb_environment_credentials
     from openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
@@ -1030,101 +1044,6 @@ def _provider_has_dns_error(error: str, provider: str) -> bool:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class AssetRecord:
-    symbol: str
-    name: str
-    market: str
-    security_type: str
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadTask:
-    task_id: str
-    endpoint: str
-    category: str
-    scope_key: str
-    kwargs: dict[str, Any]
-    providers: tuple[str, ...]
-    output_path: str
-    # Durable per-provider terminal outcomes let a fallback chain make forward
-    # progress even when another provider is cooling down.  Without this, a
-    # task such as SEC -> FMP either has to wait for FMP before trying SEC, or
-    # repeat an authoritative SEC empty response after every FMP cooldown.
-    provider_outcomes: dict[str, str] = field(default_factory=dict, compare=False)
-    # Terminal capability claims need their positive evidence to survive
-    # fallback deferrals and process restarts.  A categorical ``unavailable``
-    # outcome alone cannot distinguish a stable subscription restriction from
-    # a transient request failure.
-    provider_evidence: dict[str, str] = field(default_factory=dict, compare=False)
-    # These scheduling fields are observations, not part of task identity.
-    # ``attempts`` remains the lifetime request audit counter, while
-    # ``transient_failures`` is the consecutive task-local failure streak used
-    # exclusively for durable exponential backoff.
-    attempts: int = field(default=0, compare=False)
-    transient_failures: int = field(default=0, compare=False)
-
-
-@dataclass(slots=True)
-class TaskResult:
-    task: DownloadTask
-    status: str
-    provider: str | None
-    rows: int
-    output_path: str | None
-    attempts: int
-    error: str | None = None
-    records: list[dict[str, Any]] = field(default_factory=list, repr=False)
-    followups: list[DownloadTask] = field(default_factory=list, repr=False)
-    provider_outcomes: dict[str, str] = field(default_factory=dict, repr=False)
-    provider_evidence: dict[str, str] = field(default_factory=dict, repr=False)
-    retry_not_before: str | None = None
-    transient_failures: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class ColumnarTaskPayload:
-    """A provider result already normalized as an Arrow table.
-
-    Keeping this marker distinct from ordinary OpenBB results prevents the
-    worker from materializing a large Python ``list[dict]`` only to convert it
-    back to Arrow during Parquet publication.
-    """
-
-    table: pa.Table
-
-
-@dataclass(slots=True)
-class CoverageDecision:
-    endpoint: str
-    category: str
-    available_providers: str
-    selected_providers: str
-    decision: str
-    reason: str
-    initial_task_count: int = 0
-
-
-@dataclass(slots=True)
-class PlannerContext:
-    schemas: Mapping[str, Mapping[str, Any]]
-    commands: Mapping[str, Sequence[str]]
-    output_dir: Path
-    start_date: str
-    end_date: str
-    assets: list[AssetRecord]
-    etfs: list[AssetRecord]
-    currencies: list[str]
-    indices: list[str]
-    countries: list[str]
-    allowed_providers: set[str] | None
-    disabled_providers: set[str]
-    endpoint_filters: tuple[str, ...]
-    categories: set[str] | None
-    metadata_only: bool = True
-    show_progress: bool = False
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1620,135 +1539,6 @@ def select_providers(
 def _command_providers(context: PlannerContext, endpoint: str) -> Sequence[str]:
     """Use the same registry lookup for initial and dynamically discovered tasks."""
     return context.commands.get(f".{endpoint}", context.commands.get(endpoint, ()))
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    return str(value)
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        default=_json_default,
-    )
-
-
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    """Publish small runtime state without exposing a partial JSON document."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _request_checkpoint_path(checkpoint_dir: Path, url: str) -> tuple[Path, str]:
-    """Return a credential-free content-addressed path for one GET request."""
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-    split = urlsplit(url)
-    safe_query = [
-        (key, value)
-        for key, value in parse_qsl(split.query, keep_blank_values=True)
-        if key.lower() not in {"api_key", "apikey", "token"}
-    ]
-    safe_url = urlunsplit(
-        (
-            split.scheme.lower(),
-            split.netloc.lower(),
-            split.path,
-            urlencode(sorted(safe_query)),
-            "",
-        )
-    )
-    fingerprint = hashlib.sha256(safe_url.encode("utf-8")).hexdigest()
-    return checkpoint_dir / f"{fingerprint}.json", fingerprint
-
-
-def _load_request_checkpoint(
-    checkpoint_dir: Path | None,
-    url: str,
-) -> dict[str, Any] | None:
-    """Load a proven complete subrequest or quarantine a damaged checkpoint."""
-    if checkpoint_dir is None:
-        return None
-    path, fingerprint = _request_checkpoint_path(checkpoint_dir, url)
-    if not path.is_file():
-        return None
-    try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(envelope, Mapping)
-            or int(envelope.get("schema_version") or 0) != 1
-            or str(envelope.get("request_fingerprint") or "") != fingerprint
-            or not isinstance(envelope.get("payload"), Mapping)
-        ):
-            raise ValueError("invalid request checkpoint envelope")
-        return dict(envelope["payload"])
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        quarantine = path.with_name(f"{path.name}.corrupt.{time.time_ns()}")
-        try:
-            path.replace(quarantine)
-        except OSError:
-            pass
-        return None
-
-
-def _save_request_checkpoint(
-    checkpoint_dir: Path | None,
-    url: str,
-    payload: Mapping[str, Any],
-) -> None:
-    """Atomically persist one successful provider subrequest for task resume."""
-    if checkpoint_dir is None:
-        return
-    path, fingerprint = _request_checkpoint_path(checkpoint_dir, url)
-    _write_json_atomic(
-        path,
-        {
-            "schema_version": 1,
-            "request_fingerprint": fingerprint,
-            "payload": dict(payload),
-        },
-    )
-
-
-def _clear_request_checkpoints(checkpoint_dir: Path | None) -> None:
-    """Remove one exact task's generated request checkpoints after publication."""
-    if checkpoint_dir is None or not checkpoint_dir.is_dir():
-        return
-    for path in checkpoint_dir.iterdir():
-        if path.is_file() and (
-            path.name.endswith(".json") or ".json.corrupt." in path.name
-        ):
-            path.unlink(missing_ok=True)
-    try:
-        checkpoint_dir.rmdir()
-    except OSError:
-        # Unknown files are preserved; never recursively delete a broad or
-        # user-controlled directory merely because cleanup was incomplete.
-        pass
 
 
 def _safe_scope(value: str) -> str:

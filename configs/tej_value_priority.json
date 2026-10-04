@@ -1,0 +1,18 @@
+{
+  "contract": "tej_local_gap_value_priority_v1",
+  "target_start": "2014-01-01",
+  "refresh_seconds": 900,
+  "api_catalog": "artifacts/data_quality/tej_trial_api_inventory_2026-10-04/catalog.json",
+  "purpose": "Taiwan equity and futures research; engineering acquisition value, not measured predictive alpha",
+  "family_values": {
+    "futures": 91, "options": 90, "financial": 86,
+    "corporate_actions": 94, "events": 92, "company_lifecycle": 76,
+    "monthly_revenue": 84, "stock_lending": 83, "stock_margin": 82,
+    "stock_flow": 81, "stock_daytrade": 77,
+    "segments_subsidiaries": 73, "governance_investments": 72,
+    "audit_report": 74, "macro_banking": 70, "fx": 68,
+    "stock_daily": 65, "stock_adjusted": 62,
+    "global_indices": 58, "funds_bonds": 45, "real_estate": 36,
+    "reference": 40, "other": 38
+  }
+}

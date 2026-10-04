@@ -16,6 +16,92 @@ from scripts.build_tw_futures_margin_event_candidates import (
 from downloader.artifact_io import sha256_file
 
 
+@pytest.mark.parametrize('edge',['left','right','both','partial','interior','ragged'])
+def test_position_grid_removes_only_completely_empty_edge_columns(edge):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+    cells=[['適用期間','自115.7.16起至115.9.16止'],
+           ['自然人','8,400,800股'],['法人機構','25,202,400股'],['造市者','63,006,000股']]
+    if edge in ('left','both','partial','ragged'):cells=[[None,*row] for row in cells]
+    if edge in ('right','both'):cells=[[*row,''] for row in cells]
+    if edge=='partial':cells[0][0]='另一欄'
+    if edge=='interior':cells=[[row[0],'',*row[1:]] for row in cells]
+    if edge=='ragged':cells[-1]=cells[-1][1:]
+    original=deepcopy(cells)
+    page=dict(page=2,native_text='HH1與HHF部位合併計算。',tables=[
+        dict(cells=[['持有部位','HH1','HHF'],['每口折算股數','2,100.2','2,000']]),
+        dict(cells=cells)])
+    own=dict(product='HH1',from_product='HHF',effective_date='2026-07-16',contract_multiplier=2100.2)
+    rows=corporate_position_table_candidates([page],corporate=[own])
+    assert page['tables'][1]['cells']==original
+    if edge in ('partial','ragged'):assert not rows
+    else:
+        assert {r['product'] for r in rows}=={'HH1','HHF'}
+        assert all(r['natural_person_limit']==8400800 and r['effective_date']=='2026-07-16' for r in rows)
+        if edge=='interior':assert all('position_empty_edge_columns' not in r for r in rows)
+        else:assert all(json.loads(r['position_empty_edge_columns'])['original_cells']==original for r in rows)
+
+
+@pytest.mark.parametrize('problem',[None,'missing_category','category_first','extra_number',
+    'missing_unit','different_unit','unlabelled_row','duplicate_category','interleaved'])
+def test_complete_vertical_text_rows_preserve_both_natural_person_amounts(problem):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_flat_table_candidates
+    text=('三、部位限制：\n持有部位\nAAO\nAAA\nAAF\nAA1\n每口折算股數\n'
+          '2,000\n2,100\n2,000\n2,100\n(二)部位合併計算：AA1與AAF部位合併計算。\n'
+          '(三)部位限制數：\n適用期間\n自107.07.26起至107.09.19止\n'
+          '自107.09.20起至AA1契約終止掛牌前一營業日止\n自然人\n'
+          '4,400,000股\n4,000,000股\n法人機構\n13,200,000股\n12,000,000股\n'
+          '造市者\n33,000,000股\n30,000,000股\n'
+          '註：部位限制數應依本契約最新適用部位限制級數計算。')
+    if problem=='missing_category':text=text.replace('造市者\n33,000,000股\n30,000,000股\n','')
+    if problem=='category_first':text=text.replace('自然人\n','自然人\n法人機構\n造市者\n').replace('股\n法人機構\n','股\n').replace('股\n造市者\n','股\n')
+    if problem=='extra_number':text=text.replace('4,000,000股\n','4,000,000股\n1,000股\n')
+    if problem=='missing_unit':text=text.replace('4,400,000股','4,400,000')
+    if problem=='different_unit':text=text.replace('30,000,000股','30,000,000口')
+    if problem=='unlabelled_row':text=text.replace('自然人\n','不明列\n')
+    if problem=='duplicate_category':text+='\n自然人\n'
+    if problem=='interleaved':text=text.replace('4,400,000股\n4,000,000股','4,400,000股\n法人機構\n4,000,000股')
+    own=dict(product='AA1',from_product='AAF',effective_date='2018-07-26',
+             contract_multiplier=2100.,issue_date_bound=True)
+    rows=corporate_position_flat_table_candidates(text,[own])
+    if problem:assert not rows
+    else:
+        assert {(r['product'],r['effective_date'],r['natural_person_limit']) for r in rows}=={
+            (c,day,amount) for c in ('AAF','AA1') for day,amount in
+            [('2018-07-26',4400000.),('2018-09-20',4000000.)]}
+        assert all(r['limit_follows_applicable_grade'] for r in rows)
+
+
+@pytest.mark.parametrize('printed,day,end',[
+    ('100.0729','2011-07-29','100.09.21'),
+    ('102.0827','2013-08-27','102.10.16'),
+])
+def test_printed_compact_mmdd_period_start_uses_its_own_adjustment_date(printed,day,end):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+    period=f'自{printed}起至{end}止'
+    page=dict(page=2,native_text='AAF與AA1部位合併計算。',tables=[
+        dict(cells=[['持有部位','AAF','AA1'],['每口折算股數','2,000','2,100']]),
+        dict(cells=[['適用期間',period],['自然人','2,100,000股']])])
+    own=dict(product='AA1',from_product='AAF',effective_date=day,contract_multiplier=2100.)
+    rows=corporate_position_table_candidates([page],corporate=[own])
+    assert {r['product'] for r in rows}=={'AAF','AA1'}
+    assert all(r['effective_date']==day and r['source_period_text']==period for r in rows)
+    for row in rows:
+        assert json.loads(row['position_compact_date_evidence'])==dict(
+            notation='ROC_year.MMDD',literal_start=printed,same_original_adjustment_date=day)
+    assert corporate_position_table_candidates([page],corporate=[dict(own,effective_date='2010-01-01')])==[]
+    assert corporate_position_table_candidates([page],corporate=[own,dict(own,effective_date=None)])==[]
+
+
+@pytest.mark.parametrize('printed',['100.729','100.07299','100.0732','100.1329','100.0000','100.0729.07'])
+def test_compact_period_date_does_not_repair_missing_or_invalid_digits(printed):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+    page=dict(page=2,native_text='AAF與AA1部位合併計算。',tables=[
+        dict(cells=[['持有部位','AAF','AA1'],['每口折算股數','2,000','2,100']]),
+        dict(cells=[['適用期間',f'自{printed}起至100.09.21止'],['自然人','2,100,000股']])])
+    own=dict(product='AA1',from_product='AAF',effective_date='2011-07-29',contract_multiplier=2100.)
+    assert corporate_position_table_candidates([page],corporate=[own])==[]
+
+
 @pytest.mark.parametrize('same_cap',[False,True])
 def test_inclusive_corporate_period_boundary_does_not_invent_an_opening_cap(same_cap):
     from stockagent.data.tw_futures_margin_preparation import (
@@ -116,6 +202,99 @@ def test_retained_visual_position_grids_reuse_verified_reader_and_preserve_missi
     path.write_text('{}')
     with pytest.raises(ValueError,match='review SHA mismatch'):
         builder.retained_corporate_position_text_candidates(archive,[own],source_urls={url})
+
+
+@pytest.mark.parametrize('review_kind',['visual_corporate_cell_review','visual_position_cell_review'])
+@pytest.mark.parametrize('problem',[None,'unreviewed','different_quantity','missing_unchanged_clause'])
+def test_retained_standard_review_joins_literal_unchanged_member_without_repairing_text(tmp_path,monkeypatch,problem,review_kind):
+    url='official';content='a'*64
+    provenance=dict(source_url=url,announcement_url=url,source_content_sha256=content,
+        published_date='2020-01-20',known_at='2020-01-20T23:59:59+08:00',issue_date_bound=True)
+    first=dict(provenance,product='AA1',from_product='AAF',effective_date='2020-02-03',
+        contract_multiplier=2000.,deliverable_security_quantity=2000.,contract_months=['202006'])
+    second=dict(provenance,product='AA2',from_product='AA1',effective_date='2020-02-03',
+        contract_multiplier=2100.,deliverable_security_quantity=2100.,contract_months=['202006'],
+        subscription_rights_at_final_settlement=True)
+    if problem=='different_quantity':first['contract_multiplier']=2200.
+    own=[first,second];original=deepcopy(own)
+    text=('加掛標準契約：契約代號AAF約定標的物2.000股標的證券。'
+        '部位限制：AAF、AA1與AA2部位合併計算。調整約定標的物2,100股標的證券。'
+        'AA2契約乘數不調整（仍為2,100）')
+    if problem=='missing_unchanged_clause':text=text.split('AA2契約乘數')[0]
+    path=tmp_path/'review.json';path.write_text(json.dumps(dict(reviews=[dict(source_url=url,
+        review_kind='source_bound_visual_corporate_position_group')])))
+    source=dict(path=path.name,sha256=sha256_file(path),url='',kind=review_kind)
+    archive=SimpleNamespace(bundle=tmp_path,sources={} if problem=='unreviewed' else {path.name:source},
+        document=lambda u:dict(content_sha256=content,text=text,format='pdf'))
+    standard=dict(provenance,product='AA1',effective_date='2020-02-03',unit='contracts',
+        event_type='combined_position_formula',combined_position_base_product='AAF',
+        combined_position_ratio='1/1',combined_position_evidence='AAF、AA1與AA2部位合併計算',
+        extraction_method='source_bound_visual_corporate_position_group',visual_review_sha256='b'*64)
+    called=[]
+    def verified(a,p,*,source_urls=None):
+        assert a is archive and p==path and source_urls=={url}
+        called.append(p);return own,[standard],{content}
+    monkeypatch.setattr(builder,'corporate_source_review_candidates',verified)
+    def verified_position(a,p,financial,*,source_urls=None):
+        assert financial==own
+        return verified(a,p,source_urls=source_urls)[1]
+    monkeypatch.setattr(builder,'position_source_review_candidates',verified_position)
+    rows=builder.retained_corporate_position_text_candidates(archive,own,source_urls={url})
+    formulas=[r for r in rows if r.get('event_type')=='combined_securities_position_formula']
+    if problem:assert not formulas
+    else:
+        (formula,)=formulas
+        assert formula['product']=='AA2' and formula['combined_position_ratio']=='21/20'
+        assert formula['natural_person_limit'] is None
+        assert formula['source_content_sha256']==content
+        assert called==[path] and '2.000股' in text
+    assert own==original
+
+
+@pytest.mark.parametrize('problem',[None,'foreign_view','changed_view','conflicting_group','missing_cap'])
+def test_same_original_retained_group_text_recovers_only_grid_owned_position_cells(tmp_path,problem):
+    from stockagent.data.tw_futures_margin_preparation import corporate_grid_candidates
+    url='official';content='a'*64
+    own=corporate_grid_candidates([
+        ['調整生效日','104年10月2日'],['調整契約月份','104年10月到期契約'],
+        ['契約代號','AAF調整為AA1'],['約定標的物','2,100股標的證券'],
+        ['契約乘數','AA1契約乘數調整為2,100']])[0]
+    own.update(source_url=url,announcement_url=url,source_content_sha256=content,
+        published_date='2015-09-14',known_at='2015-09-14T23:59:59+08:00',issue_date_bound=True)
+    original=deepcopy(own)
+    pages=[dict(page=2,native_text='AAF與AB1部位合併計算。' if problem=='conflicting_group' else '',tables=[
+        dict(cells=[['持有部位','AAF','AA1'],['每口折算股數','2,000','2,100']]),
+        dict(cells=[['適用期間','自104.10.2起至104.11.18止'],
+                    ['自然人',None if problem=='missing_cap' else '4,200,000股']])])]
+    table=tmp_path/'tables.json';table.write_text(json.dumps(dict(pages=pages)))
+    receipt=tmp_path/'receipt.json';receipt.write_text(json.dumps(dict(status='complete',
+        content_sha256=content,files=[dict(path='tables.json',sha256=sha256_file(table))])))
+    text=tmp_path/'text.txt';text.write_text('AA1與AAF部位合併計算。'
+        '部位限制數應依本契約最新適用部位限制級數計算。自然人999,000,000股。')
+    text_receipt=tmp_path/'text_receipt.json';text_receipt.write_text(json.dumps(dict(
+        status='complete',content_sha256=content,
+        files=[dict(path='candidate.txt',sha256=sha256_file(text))])))
+    sources={p.name:dict(path=p.name,sha256=sha256_file(p),url=url,kind=k)
+        for p,k in [(table,'ocr_table_tables.json'),(receipt,'ocr_table_receipt.json'),
+                     (text,'review_pages_including_ocr'),(text_receipt,'page_extraction_receipt')]}
+    if problem=='foreign_view':sources[text.name]['url']='other_original'
+    if problem=='changed_view':text.write_text('different bytes')
+    archive=SimpleNamespace(bundle=tmp_path,sources=sources,
+        document=lambda u:dict(content_sha256=content,text='',format='pdf'))
+    if problem=='changed_view':
+        with pytest.raises(ValueError,match='SHA mismatch'):
+            builder.retained_corporate_position_text_candidates(archive,[own],source_urls={url})
+        return
+    rows=builder.retained_corporate_position_text_candidates(archive,[own],source_urls={url})
+    if problem:
+        assert not rows
+    else:
+        assert {r['product'] for r in rows}=={'AAF','AA1'}
+        assert all(r['natural_person_limit']==4200000. and r['effective_date']=='2015-10-02'
+                   and r['limit_follows_applicable_grade'] and r['known_at']==own['known_at'] for r in rows)
+        assert {r['position_unit'] for r in rows}=={2000.,2100.}
+        assert all('review_pages_including_ocr' in r['position_group_text_views'] for r in rows)
+    assert own==original
 
 
 
@@ -257,6 +436,58 @@ def test_next_nearby_uses_post_publication_month_and_next_actual_session():
     assert next_nearby_position_date('HSF', '2020-01-15', lives(), [date(2020, 3, 18)]) is None
     duplicates = pl.concat([lives(), lives().filter(pl.col('contract') == '202002')])
     assert next_nearby_position_date('HSF', '2020-01-15', duplicates, [date(2020, 3, 19)]) is None
+
+
+def split_near_lives():
+    rows=[]
+    for row in lives().to_dicts():
+        row.update(asset_class='stock_future',lifetime_status='official_final',
+                   final_fixing_origin='official_product_final',corporate_boundary=None,
+                   corporate_transfer_target=None,corporate_boundary_sources=[])
+        if row['contract'] in ('202002','202003'):
+            future=dict(row,first_observed_date=date(2020,2,11))
+            rows.append(future)
+            row.update(official_expiry=None,last_observed_date=date(2020,2,9),
+                calendar_end=date(2020,2,9),corporate_boundary=date(2020,2,10),
+                corporate_transfer_target='HS1',corporate_boundary_sources=['a'*64],
+                lifetime_status='corporate_transfer_candidate',final_fixing_origin=None)
+        rows.append(row)
+    return pl.DataFrame(rows)
+
+
+def test_next_nearby_split_instance_uses_exact_nominal_calendar_only():
+    result=next_nearby_position_date('HSF','2020-01-15',split_near_lives(),[date(2020,3,19)])
+    assert result['next_nearby_contract']=='202003'
+    assert result['next_nearby_expiry']=='2020-03-18'
+    assert result['effective_date']=='2020-03-19'
+    proofs=result['nominal_month_calendar_proofs']
+    assert {p['contract'] for p in proofs}=={'202002','202003'}
+    assert all(p['scope']=='same_product_and_already_listed_nominal_month_calendar_only' for p in proofs)
+    assert not any('price' in k or 'multiplier' in k for p in proofs for k in p)
+
+
+@pytest.mark.parametrize('problem',['missing_calendar','wrong_product','wrong_month','conflicting_date',
+    'duplicate_active','missing_transfer_source','wrong_transfer_sha','missing_target','non_stock',
+    'expiry_before_transfer','unlisted_old_month','nonofficial_final','null_final_origin','null_final_status'])
+def test_next_nearby_split_calendar_rejects_unproved_identities(problem):
+    frame=split_near_lives();rows=frame.to_dicts()
+    old=next(r for r in rows if r['contract']=='202002' and r['official_expiry'] is None)
+    final=next(r for r in rows if r['contract']=='202002' and r['official_expiry'] is not None)
+    if problem=='missing_calendar':rows.remove(final)
+    elif problem=='wrong_product':final['product']='CJF'
+    elif problem=='wrong_month':final['contract']='202012'
+    elif problem=='conflicting_date':rows.append(dict(final,official_expiry=date(2020,2,20)))
+    elif problem=='duplicate_active':rows.append(dict(old))
+    elif problem=='missing_transfer_source':old['corporate_boundary_sources']=[]
+    elif problem=='wrong_transfer_sha':old['corporate_boundary_sources']=['not-a-sha']
+    elif problem=='missing_target':old['corporate_transfer_target']=None
+    elif problem=='non_stock':old['asset_class']='index_future'
+    elif problem=='expiry_before_transfer':old['corporate_boundary']=date(2020,2,20)
+    elif problem=='unlisted_old_month':old['first_observed_date']=date(2020,1,16)
+    elif problem=='nonofficial_final':final['final_fixing_origin']='estimated'
+    elif problem=='null_final_origin':final['final_fixing_origin']=None
+    elif problem=='null_final_status':final['lifetime_status']=None
+    assert next_nearby_position_date('HSF','2020-01-15',pl.DataFrame(rows),[date(2020,3,19)]) is None
 
 
 def archive(tmp_path, docs, covers=()):
@@ -529,6 +760,112 @@ def test_same_day_grade_change_keeps_combined_share_constraint_and_source_chain(
         [old,new,dict(corporate,natural_person_limit=16000000)])
 
 
+def initial_period_grade_case(tmp_path, grade_known='2014-07-17T23:59:59+08:00'):
+    old = dict(product='DDF', effective_date='2013-02-20', effective_phase='product_regular_open',
+        event_type='absolute_level', unit='contracts', natural_person_limit=8000.,
+        known_at='2013-02-20T23:59:59+08:00', issue_date_bound=True,
+        source_content_sha256='a'*64, source_url='prior_grade')
+    new = dict(old, effective_date='2014-09-18', natural_person_limit=4000.,
+        known_at=grade_known, source_content_sha256='b'*64, source_url='active_grade')
+    standard = dict(old, effective_date='2014-11-20', unit='shares',
+        event_type='corporate_securities_unit_limit', natural_person_limit=16000000.,
+        position_unit=2000., combined_products=['DD1', 'DDF'],
+        known_at='2014-09-17T23:59:59+08:00', source_content_sha256='c'*64,
+        source_url='corporate', requires_delisting_clock=True)
+    adjusted = dict(standard, product='DD1', position_unit=2108.4675)
+    docs = dict(corporate=dict(content_sha256='c'*64,
+        text='部位限制數應依本契約最新適用部位限制級數計算'))
+    a = SimpleNamespace(bundle=tmp_path, sources={}, document=lambda url: docs[url])
+    return a, [old, new, standard, adjusted], docs
+
+
+@pytest.mark.parametrize('grade_known', ['2014-07-17T23:59:59+08:00', '2014-10-05T23:59:59+08:00'])
+def test_active_grade_before_second_period_uses_own_start_without_backdating(tmp_path, grade_known):
+    a, rows, _ = initial_period_grade_case(tmp_path, grade_known)
+    before = deepcopy(rows)
+    repairs = builder.repair_same_day_position_grade(a, rows)
+    assert len(repairs) == 1
+    assert repairs[0]['effective_date'] == '2014-11-20'
+    assert repairs[0]['grade_effective_date'] == '2014-09-18'
+    assert repairs[0]['grade_start_contract'] == 'dated_active_grade_at_period_start_v2'
+    assert rows[:2] == before[:2]
+    assert [r['position_unit'] for r in rows[2:]] == [2000., 2108.4675]
+    assert all(r['natural_person_limit'] == 8000000. for r in rows[2:])
+    assert all(r['known_at'] == max(grade_known, '2014-09-17T23:59:59+08:00') for r in rows[2:])
+    assert all(r['effective_date'] == '2014-11-20' for r in rows[2:])
+    assert all(r['position_grade_source_sha256s'] == ['a'*64, 'b'*64, 'c'*64] for r in rows[2:])
+    assert not builder.position_candidate_intervals(rows)[1]
+    repaired = deepcopy(rows)
+    assert not builder.repair_same_day_position_grade(a, rows)
+    assert rows == repaired
+
+
+def test_original_future_grade_basis_excludes_later_unpublished_end_boundary(tmp_path):
+    a,rows,docs=active_grade_case(tmp_path)
+    docs['corporate']['text']='部位限制數應依本契約最新適用部位限制級數計算。'
+    rows[1]['known_at']='2019-12-20T23:59:59+08:00'
+    for row in rows[3:]:
+        row['effective_date']='2020-02-10';row['natural_person_limit']=1000000
+    replacement=dict(rows[1],effective_date='2020-02-05',natural_person_limit=600,
+        known_at='2020-01-20T23:59:59+08:00',source_url='replacement',source_content_sha256='e'*64)
+    docs['replacement']=dict(content_sha256='e'*64,text=docs['quarter1']['text'])
+    rows.append(replacement)
+    repairs=builder.repair_same_day_position_grade(a,rows)
+    assert len(repairs)==1 and repairs[0]['corrected_share_limit']==1200000
+    assert repairs[0]['basis_scope']=='announced_grade_at_original_period_start'
+    assert repairs[0]['basis_original_known_at']=='2020-01-02T23:59:59+08:00'
+    assert all(r['known_at']=='2020-01-20T23:59:59+08:00' for r in rows[3:5])
+    assert all(r['effective_date']=='2020-02-10' for r in rows[3:5])
+    changes=builder.repair_active_position_grade_boundaries(a,rows)
+    assert len(changes)==1 and changes[0]['basis_contract_limit']==500
+    assert changes[0]['new_contract_limit']==750 and changes[0]['corrected_share_limit']==1500000
+    assert changes[0]['effective_date']=='2020-03-01'
+
+
+@pytest.mark.parametrize('problem',['known_supersession','explicit_end','late_actual_grade','no_clause','enlarged'])
+def test_announced_grade_basis_preserves_real_ends_and_unproved_period_starts(tmp_path,problem):
+    a,rows,docs=active_grade_case(tmp_path)
+    docs['corporate']['text']='部位限制數應依本契約最新適用部位限制級數計算。'
+    rows[1]['known_at']='2019-12-20T23:59:59+08:00'
+    for row in rows[3:]:row.update(effective_date='2020-02-10',natural_person_limit=1000000)
+    replacement=dict(rows[1],effective_date='2020-02-05',natural_person_limit=600,
+        known_at='2020-01-20T23:59:59+08:00',source_url='replacement',source_content_sha256='e'*64)
+    docs['replacement']=dict(content_sha256='e'*64,text=docs['quarter1']['text'])
+    if problem=='known_supersession':replacement['known_at']='2019-12-21T23:59:59+08:00'
+    elif problem=='explicit_end':rows[1]['valid_until_date_inclusive']='2020-02-09'
+    elif problem=='late_actual_grade':replacement['known_at']='2020-02-10T23:59:59+08:00'
+    elif problem=='no_clause':docs['corporate']['text']='固定股數，不隨最新級數調整。'
+    else:
+        for row in rows[3:]:row['natural_person_limit']=1050000
+    rows.append(replacement);original=deepcopy(rows)
+    assert not builder.repair_same_day_position_grade(a,rows) and rows==original
+
+
+@pytest.mark.parametrize('problem', ['missing_clause', 'enlarged_cap', 'incomplete_group',
+    'expired_grade', 'future_grade', 'late_grade', 'monthly_cap', 'ambiguous_grade',
+    'wrong_standard_units', 'same_day_close', 'same_day_unknown_phase'])
+def test_active_grade_period_start_preserves_unproved_constraints(tmp_path, problem):
+    a, rows, docs = initial_period_grade_case(tmp_path)
+    if problem == 'missing_clause': docs['corporate']['text'] = '部位限制'
+    elif problem == 'enlarged_cap':
+        for row in rows[2:]: row['natural_person_limit'] = 16867740.
+    elif problem == 'incomplete_group': rows.pop()
+    elif problem == 'expired_grade': rows[1]['valid_until_date_inclusive'] = '2014-11-19'
+    elif problem == 'future_grade': rows[1]['effective_date'] = '2014-11-21'
+    elif problem == 'late_grade': rows[1]['known_at'] = '2014-11-20T00:00:00+08:00'
+    elif problem == 'monthly_cap': rows[1]['natural_person_monthly_limit'] = 2000.
+    elif problem == 'ambiguous_grade': rows.insert(2, dict(rows[1], natural_person_limit=5000.,
+                                                         source_content_sha256='d'*64))
+    elif problem == 'wrong_standard_units': rows[2]['position_unit'] = 2001.
+    else:
+        rows[1]['effective_date'] = '2014-11-20'
+        rows[1]['effective_phase'] = ('regular_close' if problem == 'same_day_close'
+                                     else 'date_only_requires_phase_review')
+    original = deepcopy(rows)
+    assert not builder.repair_same_day_position_grade(a, rows)
+    assert rows == original
+
+
 @pytest.mark.parametrize('grade_known', ['2013-07-19T23:59:59+08:00',
     '2013-08-12T23:59:59+08:00', '2013-09-01T23:59:59+08:00'])
 def test_announced_future_grade_uses_effective_day_and_later_input_clock(tmp_path, grade_known):
@@ -626,6 +963,37 @@ def active_grade_case(tmp_path):
     archive=SimpleNamespace(bundle=tmp_path,sources={},document=lambda url:docs[url])
     rows=[old,first,second,corporate,dict(corporate,product='AA1',position_unit=2100)]
     return archive,rows,docs
+
+
+@pytest.mark.parametrize('problem',[None,'no_reparse','different_weight','different_group','late'])
+def test_securities_member_successor_retires_only_its_reparsed_old_grade(tmp_path,monkeypatch,problem):
+    a,rows,docs=active_grade_case(tmp_path)
+    for row in rows[3:]:
+        row['combined_products']=['AA2','AAF']
+        if row['product']=='AA1':row['product']='AA2'
+    originals=deepcopy(rows)
+    replacement=dict(product='AA2',effective_date='2020-02-15',effective_phase='product_regular_open',
+        known_at='2020-02-10T23:59:59+08:00',issue_date_bound=True,
+        source_content_sha256='e'*64,source_url='new_member',unit='shares',
+        event_type='combined_securities_position_formula',natural_person_limit=None,
+        combined_products=['AA1','AA2','AAF'],combined_position_base_product='AAF',
+        combined_position_ratio='21/20',position_group_unit_evidence='exact unchanged transfer units',
+        extraction_method='explicit_unchanged_quantity_securities_combination')
+    if problem=='late':replacement['known_at']='2020-02-15T23:59:59+08:00'
+    docs['new_member']=dict(content_sha256='e'*64,text='AAF、AA1與AA2部位合併計算。')
+    proof=deepcopy(replacement)
+    if problem=='different_weight':proof['combined_position_ratio']='11/10'
+    if problem=='different_group':proof['combined_products']=['AA1','AA3','AAF']
+    monkeypatch.setattr(builder,'retained_corporate_position_text_candidates',
+        lambda *args,**kwargs:[] if problem=='no_reparse' else [proof])
+    rows.append(replacement)
+    builder.repair_active_position_grade_boundaries(a,rows,corporate=[dict(own='source-bound')])
+    assert rows[:5]==originals and replacement in rows
+    future=[r for r in rows if r.get('extraction')=='source_composed_position_grade_boundary'
+        and r['product']=='AA2' and r['effective_date']=='2020-03-01']
+    assert bool(future)==(problem is not None)
+    assert any(r.get('extraction')=='source_composed_position_grade_boundary'
+        and r['product']=='AAF' and r['effective_date']=='2020-03-01' for r in rows)
 
 
 @pytest.mark.parametrize('problem',[None,'late_grade','missing_clause','enlarged_cap',
@@ -739,6 +1107,32 @@ def test_active_grade_composition_rejects_unproved_or_inapplicable_boundaries(tm
     else:
         assert not builder.repair_active_position_grade_boundaries(a,rows)
     assert rows==before
+
+
+@pytest.mark.parametrize('same_day',[False,True])
+def test_unchanged_active_grade_retains_new_source_and_its_opening_clock(tmp_path,same_day):
+    from stockagent.data.tw_futures_margin_preparation import bind_dated_position_combinations
+    a,rows,_=active_grade_case(tmp_path)
+    rows[1]['natural_person_limit']=rows[0]['natural_person_limit']
+    if same_day:rows[1]['known_at']='2020-02-01T23:59:59+08:00'
+    before=deepcopy(rows)
+    changes=builder.repair_active_position_grade_boundaries(a,rows)
+    assert len(changes)==2 and changes[0]['corrected_share_limit']==2000000.
+    assert rows[:len(before)]==before
+    same_amount=[r for r in rows[len(before):] if r['effective_date']=='2020-02-01']
+    assert {r['product'] for r in same_amount}=={'AAF','AA1'}
+    assert all(r['natural_person_limit']==2000000. for r in same_amount)
+    assert all('b'*64 in r['position_grade_source_sha256s'] for r in same_amount)
+    assert all(r['known_at']==rows[1]['known_at'] for r in same_amount)
+    levels,issues=builder.position_candidate_intervals(rows)
+    assert not issues
+    queries=pl.DataFrame({'date':[date(2020,2,1),date(2020,2,2)],'product':['AA1']*2})
+    bound=bind_dated_position_combinations(queries,pl.DataFrame(levels,
+        schema_overrides={'admission_not_before':pl.String}))
+    assert bound['position_numeric_inputs_resolved'].to_list()==[not same_day,True]
+    assert 'b'*64 in bound['source_content_sha256s'][1]
+    identical=deepcopy(rows)
+    assert not builder.repair_active_position_grade_boundaries(a,rows) and rows==identical
 
 
 def test_active_grade_reentry_emits_a_boundary_even_if_unproved_amount_matches(tmp_path):
@@ -1221,6 +1615,169 @@ def test_original_position_restoration_joins_prior_cap_and_unchanged_units(tmp_p
         builder.repair_original_position_restorations(a,rows,corporate)
 
 
+def named_position_restoration_case(tmp_path):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+    clause=('CJ2契約終止掛牌前，部位限制依下列股數標準辦理；'
+            'CJ2契約終止掛牌後，恢復以部位限制契約數控管。')
+    page=dict(page=4,native_text=('CJ1、CJ2與CJF部位合併計算；'
+        'CJA與CJO同方向選擇權部位合併計算。'+clause),tables=[dict(cells=[
+            ['持有部位','CJF','CJ1','CJ2','CJO','CJA'],
+            ['每口折算股數','2,000','2,000','2,120','2,000','2,000'],
+            ['自然人','2,500,000股'],['法人機構','7,500,000股'],['造市者','18,700,000股']])])
+    provenance=dict(source_url='adjustment',source_content_sha256='b'*64,
+        issue_date_bound=True,published_date='2011-10-31',known_at='2011-10-31T23:59:59+08:00')
+    corporate=[dict(provenance,from_product=old,product=code,effective_date='2011-11-07',
+        contract_months=months,contract_multiplier=units,deliverable_security_quantity=units,
+        deliverable_components_resolved=True,deliverable_has_subscription_rights=True)
+        for code,old,units,months in [('CJ1','CJF',2000.,['201111','201112','201203','201206','201209']),
+                                    ('CJ2','CJ1',2120.,['201112'])]]
+    caps=[dict(r,**provenance) for r in corporate_position_table_candidates([page],corporate=corporate)]
+    old=dict(product='CJF',effective_date='2010-01-25',effective_phase='new_contract_listing',
+        natural_person_limit=1250.,unit='contracts',event_type='absolute_level',
+        source_url='listing',source_content_sha256='a'*64,issue_date_bound=True,
+        published_date='2010-01-15',known_at='2010-01-15T23:59:59+08:00')
+    docs={'listing':dict(content_sha256='a'*64,text='原上市公告自然人1250口'),
+          'adjustment':dict(content_sha256='b'*64,text=page['native_text'])}
+    archive=SimpleNamespace(bundle=tmp_path,sources={},document=lambda url:docs[url])
+    days=[date(2011,11,7),date(2011,11,8),date(2011,12,21),date(2011,12,22)]
+    life=pl.DataFrame([dict(product='CJ2',contract='201112',
+        first_observed_date=days[0],last_observed_date=days[2],official_expiry=days[2],
+        calendar_end=days[2],first_zero_oi_date=None,final_settlement_price=16.86,
+        lifetime_status='official_final',final_fixing_origin='official_product_final',
+        settlement_method='cash_settlement')])
+    raw=pl.DataFrame(dict(product=['CJ2']*3,contract=['201112']*3,date=days[:3],open_interest=[9.,6.,6.]))
+    proof={key:'c'*64 for key in ['physical_lifetimes','original_daily_source',
+        'official_final_source','calendar_source','dated_group_law']}
+    law=dict(asset_class='stock_future',standard_units=2000,effective_date='2010-01-25',
+        known_at='2010-01-08T23:59:59+08:00',source_content_sha256='d'*64,
+        rule='same_security_same_direction; unchanged_units_or_explicit_securities_cap_only')
+    kwargs=dict(lifetimes=life,observations=raw,market_dates=days,
+        termination_proof_sha256s=proof,termination_group_rules=[law])
+    return archive,[old,*caps],corporate,kwargs,page,docs
+
+
+def test_named_termination_parser_preserves_literal_cap_and_defers_its_end(tmp_path):
+    _,rows,_,_,_,_=named_position_restoration_case(tmp_path)
+    caps=rows[1:]
+    assert {r['product']:r['position_unit'] for r in caps}=={'CJF':2000.,'CJ1':2000.,'CJ2':2120.}
+    assert all(r['natural_person_limit']==2500000. and r['requires_delisting_clock'] for r in caps)
+    assert all(r['termination_product']=='CJ2' and r['valid_until_date_inclusive'] is None for r in caps)
+    intervals,issues=builder.position_candidate_intervals(rows)
+    assert len(intervals)==1 and intervals[0]['product']=='CJF'
+    assert {r['product'] for r in issues if r['reasons']=='named_position_termination_clock_unresolved'}=={'CJF','CJ1','CJ2'}
+
+
+@pytest.mark.parametrize('change',['missing_option_group','missing_clause','wrong_unit','zero_unit',
+                                   'wrong_member','missing_person','ambiguous_group'])
+def test_named_termination_parser_does_not_guess_ragged_grid_ownership(tmp_path,change):
+    from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
+    _,_,corporate,_,page,_=named_position_restoration_case(tmp_path)
+    cells=page['tables'][0]['cells']
+    if change=='missing_option_group':page['native_text']=page['native_text'].replace('CJA與CJO同方向選擇權部位合併計算。','')
+    elif change=='missing_clause':page['native_text']=page['native_text'].replace('恢复','').replace('恢復','不確定')
+    elif change=='wrong_unit':cells[1][2]='2,001'
+    elif change=='zero_unit':cells[1][2]='0'
+    elif change=='wrong_member':cells[0][-1]='XYZ'
+    elif change=='missing_person':cells[3][0]='其他'
+    else:page['native_text']+='IA1與IAF部位合併計算。'
+    assert not corporate_position_table_candidates([page],corporate=corporate)
+
+
+def test_named_termination_composes_dated_cap_only_after_complete_official_end(tmp_path):
+    a,rows,corporate,kwargs,_,_=named_position_restoration_case(tmp_path)
+    repairs=builder.repair_original_position_restorations(a,rows,corporate,**kwargs)
+    assert len(repairs)==1 and repairs[0]['effective_date']=='2011-12-22'
+    assert repairs[0]['conditional_terminal_date']=='2011-12-21'
+    assert repairs[0]['restored_contract_limit']==1250.
+    assert repairs[0]['combined_products']==['CJ1','CJF']
+    assert repairs[0]['known_at']=='2011-12-21T23:59:59+08:00'
+    assert all(r['valid_until_date_inclusive']=='2011-12-21' and not r['requires_delisting_clock']
+               for r in rows if r.get('termination_product')=='CJ2')
+    intervals,issues=builder.position_candidate_intervals(rows)
+    assert not issues
+    restored=[r for r in intervals if r['effective_date']=='2011-12-22']
+    assert {r['product'] for r in restored}=={'CJF','CJ1'}
+    assert all(r['known_at']=='2011-12-21T23:59:59+08:00' for r in restored)
+    expected=deepcopy(rows)
+    assert builder.repair_original_position_restorations(a,rows,corporate,**kwargs)==repairs
+    assert rows==expected
+    # Losing the bound terminal proof on reuse revokes the derived clock.
+    assert not builder.repair_original_position_restorations(a,rows,corporate)
+    assert all(r['requires_delisting_clock'] and r['valid_until_date_inclusive'] is None
+               for r in rows if r.get('termination_product')=='CJ2')
+    assert not any(r.get('extraction')=='source_composed_original_position_restoration' for r in rows)
+
+
+@pytest.mark.parametrize('change',['missing_observation','duplicate_observation','null_oi','early_zero_oi',
+    'wrong_month','quote_only_end','early_last_quote','no_following_session','missing_final_price',
+    'wrong_units','later_known_base','different_base_capacity','missing_law','future_law','ambiguous_law',
+    'missing_clause'])
+def test_named_termination_keeps_incomplete_source_chains_blocked(tmp_path,change):
+    a,rows,corporate,kwargs,_,docs=named_position_restoration_case(tmp_path)
+    if change=='missing_observation':kwargs['observations']=kwargs['observations'].slice(1)
+    elif change=='duplicate_observation':kwargs['observations']=pl.concat([kwargs['observations'],kwargs['observations'].head(1)])
+    elif change=='null_oi':kwargs['observations']=kwargs['observations'].with_columns(pl.lit(None).cast(pl.Float64).alias('open_interest'))
+    elif change=='early_zero_oi':kwargs['observations']=kwargs['observations'].with_columns(pl.lit(0.).alias('open_interest'))
+    elif change=='wrong_month':corporate[1]['contract_months']=['201203']
+    elif change=='quote_only_end':kwargs['lifetimes']=kwargs['lifetimes'].with_columns(pl.lit('last_quote').alias('final_fixing_origin'))
+    elif change=='early_last_quote':kwargs['lifetimes']=kwargs['lifetimes'].with_columns(pl.lit(date(2011,12,20)).alias('last_observed_date'))
+    elif change=='no_following_session':kwargs['market_dates']=kwargs['market_dates'][:-1]
+    elif change=='missing_final_price':kwargs['lifetimes']=kwargs['lifetimes'].with_columns(pl.lit(None).cast(pl.Float64).alias('final_settlement_price'))
+    elif change=='wrong_units':corporate[0]['contract_multiplier']=2001.
+    elif change=='later_known_base':rows[0]['known_at']='2011-11-01T23:59:59+08:00'
+    elif change=='different_base_capacity':rows[0]['natural_person_limit']=350.
+    elif change=='missing_law':kwargs['termination_group_rules']=None
+    elif change=='future_law':kwargs['termination_group_rules'][0]['effective_date']='2012-01-01'
+    elif change=='ambiguous_law':kwargs['termination_group_rules']*=2
+    else:docs['adjustment']['text']=docs['adjustment']['text'].replace('恢復','不確定')
+    if change=='missing_clause':
+        with pytest.raises(ValueError,match='retained literal clause'):
+            builder.repair_original_position_restorations(a,rows,corporate,**kwargs)
+    else:
+        assert not builder.repair_original_position_restorations(a,rows,corporate,**kwargs)
+    assert not any(r.get('extraction')=='source_composed_original_position_restoration' for r in rows)
+    assert all(r['requires_delisting_clock'] for r in rows if r.get('termination_product')=='CJ2')
+
+
+@pytest.mark.parametrize('change',['valid','source_drift','lifetime_dependency','law_original','unsafe_law_path','out_of_scope'])
+def test_named_termination_context_verifies_source_ownership_before_composition(tmp_path,monkeypatch,change):
+    import gzip,hashlib
+    _,_,_,kwargs,_,_=named_position_restoration_case(tmp_path)
+    names=['physical_lifetimes','original_daily_source','official_final_source','calendar_source']
+    paths={name:tmp_path/(name+'.parquet') for name in names}
+    for name,path in paths.items():path.write_bytes(name.encode())
+    raw=tmp_path/'law.body.gz';content=b'dated original stock futures rule';raw.write_bytes(gzip.compress(content))
+    original=hashlib.sha256(content).hexdigest()
+    rule=dict(kwargs['termination_group_rules'][0],source_content_sha256=original,
+              effectiveness_source_content_sha256=original)
+    law=dict(review_kind='source_bound_position_family_rules',rules=[rule],
+        sources=[dict(path=raw.name,sha256=sha256_file(raw),kind='raw_gzip')])
+    if change=='law_original':law['rules'][0]['source_content_sha256']='e'*64
+    if change=='unsafe_law_path':law['sources'][0]['path']='../law.body.gz'
+    paths['dated_group_law']=tmp_path/'law.json';paths['dated_group_law'].write_text(json.dumps(law))
+    context=tmp_path/'context.json';context.write_text(json.dumps(dict(selected_products=['CJ2'],
+        sources={k:dict(path=str(v),sha256=sha256_file(v)) for k,v in paths.items()})))
+    dependencies={str(paths[k]):sha256_file(paths[k]) for k in names[1:]}
+    if change=='lifetime_dependency':dependencies[str(paths['official_final_source'])]='f'*64
+    def read(path,**_):
+        if path==paths['physical_lifetimes']:return kwargs['lifetimes'],dict(source_sha256s=dependencies)
+        if path==paths['original_daily_source']:return kwargs['observations'],{}
+        assert path==paths['calendar_source']
+        return pl.DataFrame({'date':kwargs['market_dates']}),{}
+    monkeypatch.setattr('stockagent.data.tw_futures_margin_release.read_bound_output',read)
+    if change=='source_drift':paths['original_daily_source'].write_bytes(b'changed original')
+    terminal=['IA1'] if change=='out_of_scope' else ['CJ2']
+    if change!='valid':
+        with pytest.raises(ValueError,match='SHA mismatch|dependency mismatch|retained original|out-of-scope'):
+            builder.load_named_position_termination_context(context,termination_products=terminal)
+    else:
+        loaded,sources=builder.load_named_position_termination_context(context,termination_products=terminal)
+        assert loaded['lifetimes'].equals(kwargs['lifetimes'])
+        assert loaded['observations'].equals(kwargs['observations'])
+        assert sorted(loaded['market_dates'])==kwargs['market_dates']
+        assert sources[str(context)]==sha256_file(context) and sources[str(raw)]==sha256_file(raw)
+
+
 def test_margin_only_extension_retains_dated_position_compositions(tmp_path):
     a, rows, corporate, _ = original_position_restoration_case(tmp_path)
     builder.repair_original_position_restorations(a, rows, corporate)
@@ -1683,11 +2240,15 @@ def test_reextraction_reuses_exact_observed_closure_postponement_once(tmp_path,m
     'effective_date', 'effective_phase', 'published_date', 'known_at', 'end_date',
     'end_phase', 'unbound_issue', 'unselected_instruction'])
 def test_abbreviated_restoration_borrows_only_exact_verified_event_instruction(tmp_path, monkeypatch, difference):
-    frame=tmp_path/'inputs.parquet';pl.DataFrame(dict(date=['2018-05-29'])).write_parquet(frame)
-    universe=tmp_path/'universe.csv';pl.DataFrame(dict(product=['LXF'])).write_csv(universe)
+    observations=tmp_path/'observations.parquet'
+    pl.DataFrame(dict(symbol=['2327'],date=['2018-05-29'])).write_parquet(observations)
+    dispositions=tmp_path/'dispositions.parquet'
+    pl.DataFrame(dict(stock_id=['2327'],date=['2018-05-29'])).write_parquet(dispositions)
+    universe=tmp_path/'universe.csv'
+    pl.DataFrame(dict(product=['LXF'],underlying_symbol=['2327'])).write_csv(universe)
     source=lambda p:dict(path=str(p),sha256=sha256_file(p))
     manifest=tmp_path/'inputs.json';manifest.write_text(json.dumps(dict(universe=source(universe),
-        dispositions=source(frame),observations=source(frame),sources=[])))
+        dispositions=source(dispositions),observations=source(observations),sources=[])))
     formal_text=('國巨期貨(LXF)於107年5月28日恢復為107年5月16日調整前之保證金。'
         '調整期間如遇休市、有價證券停止買賣、全日暫停交易，則恢復日順延執行。')
     abbreviated='國巨期貨(LXF)恢復為調整前之保證金。'
@@ -1795,6 +2356,28 @@ def test_single_session_clock_review_is_stock_only_dated_and_source_bound(tmp_pa
     universe.write_text('modified')
     with pytest.raises(ValueError,match='scope SHA'):
         builder.bind_single_session_margin_clocks(a,[row],path)
+
+
+@pytest.mark.parametrize('product', ['OEF', 'HBF', 'QSF'])
+def test_common_close_restoration_reference_uses_own_annex_names(product):
+    text = ('發文日期：中華民國115年6月4日。自115年6月5日一般交易時段結束後起實施。'
+        '115年6月17日一般交易時段結束後，彩晶期貨恢復為115年6月2日標的證券未經處置前之保證金，'
+        '華新科期貨恢復為115年5月18日標的證券未經處置前之保證金，'
+        '小型南電期貨恢復為115年6月1日調整前之保證金。'
+        '單位：比例(%)OEF(彩晶期貨)單位：比例(%)HBF(華新科期貨)'
+        '單位：比例(%)LYF(南電期貨)單位：比例(%)QSF(小型南電期貨)')
+    days = dict(OEF='2026-06-02', HBF='2026-05-18', QSF='2026-06-01')
+    amounts = dict(OEF=[.135,.1035,.1], HBF=[.162,.1242,.12], QSF=[.216,.1656,.16])
+    priors = [dict(product=p, effective_date=d, before=amounts[p], margin_kind='notional_rate',
+        known_at='2026-05-01T23:59:59+08:00', issue_date_bound=True, source_content_sha256='a'*64)
+        for p,d in days.items()]
+    fact = dict(product=product, effective_date='2026-06-05', margin_kind='notional_rate', before=None,
+        declared_non_disposed_margin=amounts[product], issue_date_bound=True, known_at='2026-06-04T23:59:59+08:00')
+    result = builder.referenced_before_restoration([text],fact,priors)
+    assert result['restoration_target'] == amounts[product]
+    assert json.loads(result['restoration_reference_evidence'])['referenced_effective_date'] == days[product]
+    assert builder.referenced_before_restoration([text],dict(fact, product='LYF'),priors) is None
+    assert builder.referenced_before_restoration([text],dict(fact, declared_non_disposed_margin=[.243,.1863,.18]),priors) is None
 
 
 def test_reextracted_clock_reapplies_retained_session_review_with_portable_scope(tmp_path):
@@ -1943,7 +2526,8 @@ def test_after_only_restoration_uses_exact_retained_review_and_prior_amount(tmp_
     proof={}
     for key in ['universe','dispositions','observations']:
         file=tmp_path/(key+('.csv' if key=='universe' else '.parquet'))
-        frame=pl.DataFrame(dict(product=['SAF'],underlying_symbol=['1795']))
+        frame=pl.DataFrame(dict(product=['SAF'],underlying_symbol=['1795']) if key=='universe'
+            else {'stock_id' if key=='dispositions' else 'symbol':['1795']})
         if key=='universe':frame.write_csv(file)
         else:frame.write_parquet(file)
         proof[key]=dict(path=str(file),sha256=sha256_file(file))
@@ -1998,3 +2582,210 @@ def test_scoped_restoration_rebuild_keeps_other_verified_history(monkeypatch):
     result=builder.rebuild_disposal_restorations(None,original,None,source_urls={'owned'})
     assert result[1] is unrelated and result[-1]['restoration_evidence']=='new owned-source proof'
     assert original==[before,owned,unrelated]
+
+
+@pytest.mark.parametrize('problem', [None, 'missing_session', 'different_product', 'different_before',
+    'different_kind', 'opening_phase', 'same_day_margin', 'late_publication', 'unbound_issue',
+    'different_period_end', 'earlier_overlap', 'different_notice_day', 'source_sha',
+    'conflicting_successor', 'intervening_amount', 'no_own_restoration'])
+def test_independent_cash_disposition_does_not_extend_the_previous_futures_margin(problem):
+    from stockagent.data.tw_futures_margin_preparation import disposal_margin_restorations, margin_candidate_intervals
+    fact = dict(product='AAF', margin_kind='notional_rate', before=[.2,.15,.14], after=[.3,.23,.22],
+        effective_date='2023-07-26', effective_phase='after_product_regular_close',
+        published_date='2023-07-25', known_at='2023-07-25T23:59:59+08:00', issue_date_bound=True,
+        source_content_sha256='a'*64, source_url='https://www.taifex.com.tw/old.pdf',
+        requires_reversion_review=True, restoration_rule='return_to_declared_before',
+        temporary_end_evidence=json.dumps([dict(date_iso='2023-08-07',boundary='after_regular_session')]))
+    successor = dict(fact, before=fact['before'], after=[.4,.3,.28], effective_date='2023-08-08',
+        published_date='2023-08-07', known_at='2023-08-07T23:59:59+08:00',
+        source_content_sha256='e'*64, source_url='https://www.taifex.com.tw/new.pdf',
+        requires_reversion_review=False, temporary_end_evidence=json.dumps([
+            dict(date_iso='2023-08-21',boundary='after_regular_session')]))
+    own = dict(date='2023-07-24',stock_id='1000',period_start='2023-07-25',period_end='2023-08-07',
+        measure='處置期間（十個營業日）',source_sha256='b'*64)
+    overlap = dict(own,date='2023-08-04',period_start='2023-08-07',period_end='2023-08-21',source_sha256='d'*64)
+    changes = dict(different_product=dict(product='BBF'), different_before=dict(before=[.21,.16,.15]),
+        different_kind=dict(margin_kind='fixed_twd'), opening_phase=dict(effective_phase='product_regular_open'),
+        same_day_margin=dict(effective_date='2023-08-07'),
+        late_publication=dict(known_at='2023-08-08T00:00:00+08:00'), unbound_issue=dict(issue_date_bound=False),
+        different_period_end=dict(temporary_end_evidence=json.dumps([
+            dict(date_iso='2023-08-22',boundary='after_regular_session')])))
+    successor.update(changes.get(problem,{}))
+    if problem=='earlier_overlap':overlap['period_start']='2023-08-04'
+    if problem=='no_own_restoration':fact.pop('restoration_rule')
+    facts=[fact,successor]
+    if problem=='conflicting_successor':facts.append(dict(successor,after=[.45,.34,.32],source_content_sha256='f'*64))
+    if problem=='intervening_amount':facts.append(dict(successor,effective_date='2023-08-04'))
+    days=['2023-07-25','2023-07-26','2023-07-27','2023-07-28','2023-07-31',
+        '2023-08-01','2023-08-02','2023-08-03','2023-08-04','2023-08-07','2023-08-08']
+    if problem=='missing_session':days.remove('2023-08-02')
+    obs=pl.DataFrame(dict(date=days,symbol=['1000']*len(days),volume=[1.]*len(days),source_sha256=['c'*64]*len(days)))
+    dispositions=pl.DataFrame([own,overlap])
+    universe=pl.DataFrame(dict(product=['AAF','BBF'],underlying_symbol=['1000','2000']))
+    rows,issues=disposal_margin_restorations(facts,universe,dispositions,obs)
+    assert not rows
+    text='發文日期：中華民國112年8月7日。'
+    if problem=='different_notice_day':text='發文日期：中華民國112年8月8日。'
+    archive=SimpleNamespace(document=lambda url:dict(content_sha256='0'*64 if problem=='source_sha'
+        else 'e'*64 if url.endswith('new.pdf') else 'a'*64,text=text))
+    if problem=='source_sha':
+        with pytest.raises(ValueError,match='successor source SHA mismatch'):
+            builder.restore_independent_boundary_dispositions(archive,facts,universe,dispositions,obs,rows,issues)
+        return
+    restored,remaining=builder.restore_independent_boundary_dispositions(
+        archive,facts,universe,dispositions,obs,rows,issues)
+    if problem:
+        assert not restored
+        assert remaining or problem=='no_own_restoration'
+        return
+    assert len(restored)==1 and not remaining
+    assert restored[0]['after']==fact['before'] and restored[0]['before']==fact['after']
+    assert restored[0]['known_at']=='2023-08-07T13:35:00+08:00'
+    proof=json.loads(restored[0]['restoration_evidence'])
+    assert proof['completed_cash_dates']==days[:-1]
+    separate=proof['independent_boundary_disposition']
+    assert separate['excluded_disposition_rows']==[overlap]
+    assert separate['restoration_target']==fact['before'] and separate['point_in_time_verified'] is False
+    assert separate['successor_sources'][0]['known_at']==successor['known_at']
+    levels,errors=margin_candidate_intervals([fact,*restored,successor])
+    assert not errors
+    gap_day=next(r for r in levels if r['effective_date']=='2023-08-07')
+    assert gap_day['initial']==.2 and gap_day['valid_until_date_exclusive']=='2023-08-08'
+    assert gap_day['source_content_sha256s']==['a'*64]
+    assert dispositions.height==2 and facts==[fact,successor]
+
+
+@pytest.mark.parametrize('problem', ['status', 'parent', 'worklist', 'output_sha', 'escaped_source', 'product_scope'])
+def test_bounded_margin_continuation_rejects_unbound_seed_and_scope(tmp_path, monkeypatch, problem):
+    import scripts.repair_tw_futures_margin_source_intervals as repair
+    from downloader.artifact_io import atomic_write_json
+    current=tmp_path/'current';current.mkdir()
+    atomic_write_json(current/'manifest.json',dict(identity='retained_parent'))
+    worklist=tmp_path/'gaps.csv'
+    pl.DataFrame(dict(product=['AAF'],missing_opening_margin=[True],missing_settlement_margin=[True])).write_csv(worklist)
+    seed=tmp_path/'pending';seed.mkdir()
+    outputs={}
+    for name in ['margin_event_candidates.parquet','margin_level_intervals.parquet','margin_interval_issues.json']:
+        if name.endswith('.parquet'):pl.DataFrame(dict(product=['AAF'])).write_parquet(seed/name)
+        else:atomic_write_json(seed/name,[])
+        outputs[name]=dict(sha256=sha256_file(seed/name))
+    proof=dict(status='bounded_margin_restoration_sources_prepared',
+        parent_manifest_sha256=sha256_file(current/'manifest.json'),
+        worklist_sha256=sha256_file(worklist),outputs=outputs,sources=[])
+    if problem=='status':proof['status']='unverified'
+    if problem=='parent':proof['parent_manifest_sha256']='a'*64
+    if problem=='worklist':proof['worklist_sha256']='b'*64
+    if problem=='output_sha':proof['outputs']['margin_event_candidates.parquet']['sha256']='c'*64
+    if problem=='escaped_source':proof['sources']=[dict(path='../outside.json',sha256='d'*64,url='',kind='raw')]
+    atomic_write_json(seed/'manifest.json',proof)
+    monkeypatch.setattr(repair,'read_bound_output',lambda path:(pl.DataFrame(dict(product=['AAF'])),dict(sources=[])))
+    expected=('source/worklist parent' if problem in ('status','parent','worklist') else
+        'output SHA mismatch' if problem=='output_sha' else 'escapes its bundle' if problem=='escaped_source'
+        else 'exceed the retained gap scope')
+    with pytest.raises(ValueError,match=expected):
+        repair.prepare_margin_repairs(current,worklist,tmp_path/'output',tmp_path/'receipt.json',
+            archive_root=tmp_path/'not_opened',selected_products=['BBF'] if problem=='product_scope' else ['AAF'],
+            continue_delta=seed)
+    assert not (tmp_path/'output').exists() and sha256_file(seed/'manifest.json')
+
+
+def grade_regime_case(tmp_path):
+    from downloader.artifact_io import atomic_write_json
+    conn=sqlite3.connect(':memory:')
+    conn.row_factory=sqlite3.Row
+    conn.execute('CREATE TABLE announcements(url TEXT,published_date TEXT)')
+    docs={};sources={};proofs={}
+    for name,digest,published,pages in [('original','a'*64,'2012-04-19',[1,2]),
+            ('law','b'*64,'2013-02-20',[1,26,27,28,29,30]),
+            ('replacement','c'*64,'2013-02-20',[1,2,3,4,5])]:
+        conn.execute('INSERT INTO announcements VALUES (?,?)',(name,published))
+        docs[name]=dict(content_sha256=digest,text='')
+        count={'original':2,'law':55,'replacement':5}[name]
+        receipt=tmp_path/f'{name}-receipt.json'
+        atomic_write_json(receipt,dict(url=name,content_sha256=digest,status='complete',
+            document_pages=count,extracted_pages=count,pages=[dict(page=n) for n in range(1,count+1)]))
+        images=[]
+        for page in pages:
+            image=tmp_path/f'{name}-{page}.png';image.write_bytes(f'{name} page {page}'.encode())
+            images.append(dict(page=page,path=image.name,sha256=sha256_file(image)))
+        text=('發文日期：中華民國101年4月19日。' if name=='original' else
+            '發文日期：中華民國102年2月20日。')
+        proofs[name]=dict(source_url=name,content_sha256=digest,published_date=published,
+            transcribed_text=text,complete_original_receipt=receipt.name,
+            complete_original_receipt_sha256=sha256_file(receipt),pages=images)
+        if name!='law':
+            numeric=tmp_path/f'{name}-numeric.json'
+            atomic_write_json(numeric,dict(reviews=[dict(source_url=name,content_sha256=digest,published_date=published)]))
+            proofs[name]['numeric_review_sha256']=sha256_file(numeric)
+            sources[name]=dict(path=numeric.name,sha256=sha256_file(numeric),url='',kind='visual_position_cell_review')
+    proofs['law'].update(transcribed_text=proofs['law']['transcribed_text']+
+        '台期交字第10202001810號。股票期貨契約交易規則，第十六條，除本公司另有規定外，並自102年2月20日起實施。',
+        old_natural_person_grade_limits=[5000,3750,2500,1250,350],new_natural_person_grade_limits=[8000,4000,2000])
+    proofs['replacement']['transcribed_text']+='公告放寬本公司股票期貨交易人部位限制數，並自102年2月20日起實施。'
+    review=dict(review_kind='source_bound_stock_futures_grade_regime_replacement_v1',
+        effective_date='2013-02-20',replacement_is_complete_futures_roster=True,**proofs,
+        rows=[dict(product='DPF',underlying_symbol='2892',old_natural_person_limit=3750.,
+            old_effective_date='2013-03-21',new_natural_person_limit=4000.,
+            new_effective_date='2013-02-20',named_listing_exception=False)])
+    old=dict(product='DPF',underlying_symbol='2892',effective_date='2013-03-21',
+        natural_person_limit=3750.,event_type='absolute_level',unit='contracts',
+        effective_phase='product_regular_open',source_url='original',source_content_sha256='a'*64,
+        known_at='2012-04-19T23:59:59+08:00',published_date='2012-04-19',issue_date_bound=True,
+        visual_review_sha256=proofs['original']['numeric_review_sha256'])
+    new=dict(old,effective_date='2013-02-20',natural_person_limit=4000.,source_url='replacement',
+        source_content_sha256='c'*64,known_at='2013-02-20T23:59:59+08:00',published_date='2013-02-20',
+        effective_phase='date_only_requires_phase_review',futures_eligible=True,
+        visual_review_sha256=proofs['replacement']['numeric_review_sha256'])
+    class Archive:
+        bundle=tmp_path
+        def __init__(self):self.conn=conn;self.sources=sources
+        def document(self,url):return docs[url]
+        def copy(self,path,digest,**kwargs):assert sha256_file(path)==digest
+    path=tmp_path/'review.json';atomic_write_json(path,dict(reviews=[review]))
+    return Archive(),[old,new],review,path
+
+
+@pytest.mark.parametrize('problem',[None,'wrong_source','incomplete_original','missing_law_page',
+    'missing_numeric_review','wrong_new_cap','other_ticker','already_effective','named_exception',
+    'not_futures','new_regime_cap','later_roster'])
+def test_dated_three_grade_law_requires_both_numeric_originals_and_full_roster(tmp_path,problem):
+    a,rows,review,path=grade_regime_case(tmp_path)
+    original=deepcopy(rows)
+    if problem=='wrong_source':review['law']['content_sha256']='d'*64
+    if problem=='incomplete_original':
+        receipt=tmp_path/review['law']['complete_original_receipt'];payload=json.loads(receipt.read_text())
+        payload['extracted_pages']=54;receipt.write_text(json.dumps(payload))
+        review['law']['complete_original_receipt_sha256']=sha256_file(receipt)
+    if problem=='missing_law_page':review['law']['pages']=review['law']['pages'][:-1]
+    if problem=='missing_numeric_review':a.sources.clear()
+    if problem=='wrong_new_cap':rows[1]['natural_person_limit']=8000.
+    if problem=='other_ticker':rows[1]['underlying_symbol']='2330'
+    if problem=='already_effective':review['rows'][0]['old_effective_date']='2013-02-19'
+    if problem=='named_exception':review['rows'][0]['named_listing_exception']=True
+    if problem=='not_futures':rows[1]['futures_eligible']=False
+    if problem=='new_regime_cap':review['rows'][0]['old_natural_person_limit']=2000.
+    if problem=='later_roster':review['replacement']['published_date']='2013-02-21'
+    if problem:
+        with pytest.raises(ValueError):builder.apply_stock_futures_grade_regime_review(a,rows,review,path)
+        return
+    result=builder.apply_stock_futures_grade_regime_review(a,rows,review,path)
+    assert rows==original and result[0]['natural_person_limit']==3750.
+    assert result[0]['effective_date']=='2013-03-21' and result[0]['notice_revoked_effective_date']=='2013-02-20'
+    from stockagent.data.tw_futures_margin_preparation import position_candidate_intervals
+    current,issues=position_candidate_intervals(result)
+    assert len(current)==1 and current[0]['position_limit']==4000.
+    assert current[0]['admission_not_before']=='2013-02-20T23:59:59+08:00'
+    assert current[0]['source_content_sha256s']==['a'*64,'b'*64,'c'*64]
+    assert any(i['reasons']=='notice_revoked_before_scheduled_effective_date' for i in issues)
+
+
+def test_future_grade_regime_law_does_not_rewrite_original_as_of_arithmetic(tmp_path):
+    a,rows,review,path=grade_regime_case(tmp_path)
+    amended=builder.apply_stock_futures_grade_regime_review(a,rows,review,path)
+    original=deepcopy(amended)
+    before=builder._position_grade_levels_known_at(amended,'DPF','2012-07-30T23:59:59+08:00')
+    after=builder._position_grade_levels_known_at(amended,'DPF','2013-07-24T23:59:59+08:00')
+    assert len(before)==1 and before[0]['position_limit']==3750.
+    assert before[0]['effective_date']=='2013-03-21'
+    assert len(after)==1 and after[0]['position_limit']==4000.
+    assert amended==original

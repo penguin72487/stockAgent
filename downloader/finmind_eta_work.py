@@ -34,7 +34,7 @@ COUNT_FIELDS = ("required_requests", "incremental_requests", "backfill_requests"
                 "unbatched_requests", "fastest_requests", "current_plan_requests", "batch_savings",
                 "completed_tasks", "pending_tasks", "blocked_tasks", "cooling_tasks", "inflight_tasks",
                 "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests",
-                "calendar_wait_tasks", "retry_tasks")
+                "calendar_wait_tasks", "retry_tasks", "retry_exhausted_tasks", "candidate_requests")
 
 
 def _registry() -> dict[str, dict[str, Any]]:
@@ -74,6 +74,8 @@ def _row(dataset: str, owner: str, contract: dict[str, Any]) -> dict[str, Any]:
 
 
 def _work_class(state: str, priority: int, due: bool) -> str:
+    if state == 'retry_exhausted':
+        return 'exhausted'
     if state in EXCLUDED_STATES:
         return "excluded"
     if state == "inflight":
@@ -170,11 +172,11 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                             item['unsupported_tasks'] += count
                     elif state == 'inflight':
                         item['inflight_tasks'] += count
-                    elif state not in EXCLUDED_STATES | DONE_STATES:
+                    elif state not in EXCLUDED_STATES | DONE_STATES | {'retry_exhausted'}:
                         item['blocked_tasks'] += count
             if owner == 'complement' and 'finmind_source_frontiers' in tables:
                 from downloader.finmind_supplemental import frontier_status
-                for dataset, frontier in frontier_status(conn).items():
+                for dataset, frontier in frontier_status(conn, now).items():
                     if dataset in aggregate:
                         aggregate[dataset]['frontier'] = frontier
                         aggregate[dataset]['classes']['backfill'] += frontier['unseeded_partition_candidates']
@@ -277,7 +279,8 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
     row.update(completed_tasks=sum(states[state] for state in DONE_STATES),
                pending_tasks=sum(states[state] for state in PENDING_STATES),
                blocked_tasks=sum(count for state, count in states.items()
-                                 if state not in EXCLUDED_STATES | DONE_STATES | PENDING_STATES | {"inflight"}),
+                                 if state not in EXCLUDED_STATES | DONE_STATES | PENDING_STATES | {"inflight", "retry_exhausted"}),
+               retry_exhausted_tasks=states['retry_exhausted'],
                excluded_tasks=sum(states[state] for state in EXCLUDED_STATES),
                calendar_wait_tasks=states['calendar_wait'],
                inflight_tasks=states["inflight"], inflight_requests=item["inflight_network"],
@@ -288,7 +291,8 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
                earliest_retry_at_utc=item["retry_first"], state_counts=dict(states))
     if item.get('frontier'):
         row['historical_frontier'] = item['frontier']
-        row['request_estimate_basis'] = 'includes_unseeded_calendar_candidates_not_verified_instrument_lifetimes'
+        row['candidate_requests'] = item['frontier']['unseeded_partition_candidates']
+        row['request_estimate_basis'] = 'disjoint_frontier_candidates_with_verified_cash_closures_not_verified_instrument_lifetimes'
     if item.get('priority_override'):
         row['priority_override'] = item['priority_override']
     latest = _stamp(item["retry_last"])

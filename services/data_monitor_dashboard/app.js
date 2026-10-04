@@ -14,6 +14,7 @@ const CATEGORY_ORDER = {
 };
 const Dashboard = window.StockAgentDashboard;
 const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store", expectedRoot: "object"});
+const featureRequest = Dashboard.createLatestRequest();
 const state = {
   data: null,
   sortedSources: [],
@@ -28,6 +29,7 @@ const state = {
   providerVisible: PROVIDER_PAGE_SIZE,
   pendingCategory: null,
   detailsActivated: false,
+  detailsInView: false,
   detailsQueued: false,
   featureRows: [],
   featureMatchingTotal: 0,
@@ -476,6 +478,7 @@ function renderMarketCategories(categories) {
         state.pendingCategory = null;
         renderRows({reset: true});
       }
+      window.StockAgentAcquisition?.reveal("source-list");
       $("source-list").scrollIntoView({behavior: "smooth", block: "start"});
     });
     fragment.append(button);
@@ -785,6 +788,12 @@ function populateFeatureFilters(filters) {
   const selectedSource = source.value;
   const categories = new Map((filters.categories || []).map((item) => [item.id, item.label]));
   const sources = new Map((filters.sources || []).map((item) => [item.id, item.label]));
+  if (selectedCategory !== "all" && !categories.has(selectedCategory)) {
+    categories.set(selectedCategory, `${selectedCategory}（本次清冊沒有此分類）`);
+  }
+  if (selectedSource !== "all" && !sources.has(selectedSource)) {
+    sources.set(selectedSource, `${selectedSource}（本次清冊沒有此來源）`);
+  }
   category.replaceChildren(new Option("全部分類", "all"), ...[...categories].sort((a, b) =>
     (CATEGORY_ORDER[a[0]] ?? 99) - (CATEGORY_ORDER[b[0]] ?? 99)).map(([id, label]) => new Option(label, id)));
   source.replaceChildren(new Option("全部來源", "all"), ...[...sources].map(([id, label]) => new Option(label, id)));
@@ -855,14 +864,33 @@ function renderFeatures({reset = false} = {}) {
   $("feature-count").textContent = `顯示 ${formatInteger(visible.length)}/${formatInteger(state.featureMatchingTotal)} 符合條件欄位 · 全部 ${formatInteger(summary.fields)} 欄位、${formatInteger(summary.datasets_with_schema)}/${formatInteger(summary.datasets_total)} 實體資料集已取得 schema · ${formatInteger(summary.files_with_schema)}/${formatInteger(summary.files_total)} 檔已取得欄位統計${summary.state === "complete" ? "" : "（仍有未核實檔案）"}`;
 }
 
+function featureScope() {
+  return JSON.stringify([$("feature-search").value.trim(), $("feature-category").value,
+    $("feature-source").value]);
+}
+
+function invalidateFeatureScope() {
+  featureRequest.abort();
+  state.featureRequestSeq += 1;
+  state.featureInFlight = false;
+  state.featureNextRefreshAt = 0;
+  state.featureFilterKey = "";
+  state.featureRows = [];
+  $("feature-rows").replaceChildren();
+  $("feature-more").hidden = true;
+  $("feature-empty").hidden = true;
+  $("feature-count").textContent = "篩選已變更；等待符合目前條件的欄位，不沿用其他範圍。";
+}
+
+function validateFeaturePage(data, offset, limit) {
+  return window.StockAgentFeaturePage.validateFeaturePage(data, offset, limit);
+}
+
 async function refreshFeatures({force = false, append = false} = {}) {
   if (!state.featureActivated || !state.featureInView || document.hidden
       || (!force && performance.now() < state.featureNextRefreshAt)
       || (append && state.featureInFlight)) return;
-  const filterKey = JSON.stringify([
-    $("feature-search").value.trim(), $("feature-category").value,
-    $("feature-source").value,
-  ]);
+  const filterKey = featureScope();
   const filtersChanged = filterKey !== state.featureFilterKey;
   const offset = append && !filtersChanged ? state.featureRows.length : 0;
   const limit = append ? featurePageSize() :
@@ -875,23 +903,25 @@ async function refreshFeatures({force = false, append = false} = {}) {
   });
   if (state.featureRevision) params.set("revision", state.featureRevision);
   const requestSeq = ++state.featureRequestSeq;
+  const request = featureRequest.begin();
   state.featureInFlight = true;
   state.featureNextRefreshAt = performance.now() + REFRESH_MS * FULL_REFRESH_TICKS;
   try {
     const response = await Dashboard.fetchWithTimeout(`api/features/page?${params}`, {
-      timeoutMs: 15000, cache: "no-store",
+      timeoutMs: 15000, cache: "no-store", signal: request.signal,
     });
     const data = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
-    if (!Array.isArray(data.rows) || !data.filters || !Number.isInteger(data.matching_total)
-        || !/^[0-9a-f]{32}$/.test(data.revision || "")) throw new Error("Invalid feature page");
-    if (requestSeq !== state.featureRequestSeq) return;
+    if (!request.isCurrent() || filterKey !== featureScope()) return;
+    validateFeaturePage(data, offset, limit);
     const reset = filtersChanged || data.reset_required || state.featureRevision !== data.revision;
     if (append && !reset) {
       if (data.offset !== state.featureRows.length) throw new Error("Feature page offset changed");
       state.featureRows.push(...data.rows);
       state.featureVisible = state.featureRows.length;
     } else {
-      state.featureRows = data.rows;
+      // Preserve already loaded suffix pages only within the same generation.
+      state.featureRows = !reset && !append && state.featureRows.length > limit
+        ? [...data.rows, ...state.featureRows.slice(limit)] : data.rows;
       if (filtersChanged || (append && reset)) state.featureVisible = featurePageSize();
     }
     state.featureFilterKey = filterKey;
@@ -901,12 +931,13 @@ async function refreshFeatures({force = false, append = false} = {}) {
     populateFeatureFilters(data.filters);
     renderFeatures();
   } catch (_error) {
-    if (requestSeq === state.featureRequestSeq) {
+    if (request.isCurrent() && filterKey === featureScope()) {
       state.featureNextRefreshAt = performance.now() + REFRESH_MS;
       $("feature-count").textContent = "欄位清冊 API 暫時無法讀取；來源總覽仍可使用。";
     }
   } finally {
     if (requestSeq === state.featureRequestSeq) state.featureInFlight = false;
+    request.finish();
   }
 }
 
@@ -995,14 +1026,15 @@ async function refresh({details = false} = {}) {
           $("category-filter").value = state.pendingCategory;
           state.pendingCategory = null;
         }
-        renderRows({reset: true});
+        renderRows();
       }
     }
   } catch (_error) {
-    setHealth($("overall-health"), "unavailable", "監控 API 暫時離線");
+    if (details) $("result-count").textContent = "來源明細更新失敗；保留上次清冊，摘要另行更新。";
+    else setHealth($("overall-health"), "unavailable", "摘要更新失敗 · 上次觀測");
   } finally {
     state.refreshInFlight = false;
-    if (state.detailsQueued && !document.hidden) {
+    if (state.detailsQueued && state.detailsInView && !document.hidden) {
       state.detailsQueued = false;
       void refresh({details: true});
     }
@@ -1016,47 +1048,21 @@ function activateDetails() {
 }
 
 function installDetailsActivation() {
-  const target = $("source-list");
-  if ("IntersectionObserver" in window && target) {
-    const activate = () => {
-      observer.disconnect();
-      window.removeEventListener("scroll", checkDistance);
-      activateDetails();
-    };
-    const checkDistance = () => {
-      const bounds = target.getBoundingClientRect();
-      if (bounds.top <= window.innerHeight + 160 && bounds.bottom >= -160) activate();
-    };
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      activate();
-    }, {rootMargin: "160px"});
-    observer.observe(target);
-    window.addEventListener("scroll", checkDistance, {passive: true});
-    return;
-  }
-  if ("requestIdleCallback" in window) {
-    window.requestIdleCallback(activateDetails, {timeout: 2000});
-  } else {
-    window.setTimeout(activateDetails, 1000);
-  }
+  Dashboard.observeVisibility("source-list", (visible) => {
+    state.detailsInView = visible;
+    if (!visible) return;
+    if (!state.detailsActivated) activateDetails();
+    else void refresh({details: true});
+  }, {marginPx: 160});
 }
 
 function installFeatureActivation() {
-  const target = $("feature-list");
-  if (!target) return;
-  if ("IntersectionObserver" in window) {
-    const observer = new IntersectionObserver((entries) => {
-      state.featureInView = entries.some((entry) => entry.isIntersecting);
-      if (!state.featureInView) return;
-      if (!state.featureActivated) activateFeatures();
-      else void refreshFeatures();
-    }, {rootMargin: "220px"});
-    observer.observe(target);
-  } else {
-    state.featureInView = true;
-    activateFeatures();
-  }
+  Dashboard.observeVisibility("feature-list", (visible) => {
+    state.featureInView = visible;
+    if (!visible) return;
+    if (!state.featureActivated) activateFeatures();
+    else void refreshFeatures();
+  }, {marginPx: 220});
 }
 
 for (const id of ["search", "provider-filter", "category-filter", "status-filter", "inventory-filter", "granularity-filter", "scope-filter"]) {
@@ -1074,11 +1080,12 @@ $("load-more").addEventListener("click", () => {
 $("filters").addEventListener("submit", (event) => event.preventDefault());
 let featureSearchTimer;
 $("feature-search").addEventListener("input", () => {
+  invalidateFeatureScope();
   window.clearTimeout(featureSearchTimer);
   featureSearchTimer = window.setTimeout(() => void refreshFeatures({force: true}), 180);
 });
 for (const id of ["feature-category", "feature-source"]) {
-  $(id).addEventListener("change", () => void refreshFeatures({force: true}));
+  $(id).addEventListener("change", () => { invalidateFeatureScope(); void refreshFeatures({force: true}); });
 }
 $("feature-more").addEventListener("click", () => {
   void refreshFeatures({force: true, append: true});
@@ -1086,13 +1093,15 @@ $("feature-more").addEventListener("click", () => {
 $("feature-filters").addEventListener("submit", (event) => event.preventDefault());
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    void refresh({details: state.detailsActivated});
+    void refresh({details: state.detailsInView});
     void refreshFeatures();
   }
 });
 // Install the viewport trigger only after summary groups have been painted.
 // Otherwise the initially empty group container leaves the detail section in
 // view and defeats the summary-first transfer boundary.
+renderProviderDirectory = Dashboard.createDeferredRenderer("provider-directory", renderProviderDirectory);
+renderGroups = Dashboard.createDeferredRenderer("groups-title", renderGroups);
 void refresh().finally(() => {
   installFeatureActivation();
   installDetailsActivation();
@@ -1100,5 +1109,5 @@ void refresh().finally(() => {
 Dashboard.scheduleRefresh(() => {
   state.refreshTick += 1;
   if (state.refreshTick % FULL_REFRESH_TICKS === 0) void refreshFeatures();
-  return refresh({details: state.detailsActivated && state.refreshTick % FULL_REFRESH_TICKS === 0});
+  return refresh({details: state.detailsInView && state.refreshTick % FULL_REFRESH_TICKS === 0});
 }, {intervalMs: REFRESH_MS, immediate: false, refreshOnVisible: false});

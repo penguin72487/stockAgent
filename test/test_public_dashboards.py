@@ -620,8 +620,8 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=11"' in html
-    assert 'src="public.js?v=13"' in html
+    assert 'src="dashboard-core.js?v=14"' in html
+    assert 'src="public.js?v=15"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -636,7 +636,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert "taifex/api/status" not in javascript
     assert "tw-day-trade/api/status" not in javascript
     assert "shioaji/api/status" not in javascript
-    assert '"流量保護"' in javascript
+    assert 'waiting: "等待資料／排程"' in javascript
     assert "renderOpenbb(data.openbb || {})" in javascript
     assert "renderFinlab(data.finlab || {})" in javascript
     assert "renderFinmind(data.finmind || {})" in javascript
@@ -947,10 +947,10 @@ def test_public_pages_share_visual_tokens() -> None:
     for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=6" in html
-        assert "dashboard-responsive.css?v=9" in html
+        assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=11" defer' in html
-        assert html.index("dashboard-core.js?v=11") < html.index(
+        assert 'dashboard-core.js?v=14" defer' in html
+        assert html.index("dashboard-core.js?v=14") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -1013,7 +1013,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="browser-page-filter"' in traffic_html
     assert "不上傳" in traffic_html
     assert 'href="performance.css?v=4"' in traffic_html
-    assert 'src="app.js?v=10"' in traffic_html
+    assert 'src="app.js?v=12"' in traffic_html
     assert 'id="history-range"' in traffic_html
     assert 'id="history-phase-rows"' in traffic_html
     assert 'id="history-route-rows"' in traffic_html
@@ -1130,6 +1130,87 @@ def _test_server() -> PublicDashboardServer:
     )
 
 
+def _stub_overview_sources(server, monkeypatch, *, failed=None, blocked=None):
+    from scripts import serve_public_dashboards as public_module
+
+    payload = {
+        "health": "active", "state": "running", "modes": [{"id": "paper"}],
+        "archive": {"accepted_tasks": 17, "total_tasks": 20},
+        "summary": {"registered_items": 9},
+        "catalog": {"tables": 3, "fields": 4},
+        "workload": {"exported_rows": 5},
+        "acquisition": {"complete_session_day_tasks": 6, "total_session_day_tasks": 8},
+    }
+
+    def source(name):
+        if name == "taifex" and blocked:
+            blocked.wait(5)
+        if name == failed:
+            raise OSError("Bearer PRIVATE_SECRET /private/account/source.json")
+        return payload.copy()
+
+    def response(name):
+        return public_module._prepared(
+            json.dumps(source(name)).encode(), content_type="application/json",
+            cache_control="no-store",
+        )
+
+    monkeypatch.setattr(server, "cached_json", lambda **kwargs: response("taifex"))
+    monkeypatch.setattr(server, "cached_local_json", lambda **kwargs:
+                        response("tw" if kwargs["cache_key"].startswith("tw-") else "overnight"))
+    monkeypatch.setattr(server, "shioaji_status", lambda: response("shioaji"))
+    monkeypatch.setattr(server, "openbb_status", lambda: response("openbb"))
+    monkeypatch.setattr(server, "data_monitor_status", lambda **kwargs: response("data_monitor"))
+    monkeypatch.setattr(public_module, "build_finmind_public_status", lambda root: source("finmind"))
+    monkeypatch.setattr(public_module, "build_tej_public_status", lambda root: source("tej"))
+
+
+@pytest.mark.parametrize("failed", ["taifex", "tw", "overnight", "shioaji", "openbb",
+                                   "data_monitor", "finmind", "tej"])
+def test_overview_source_failure_isolated_unknown_not_zero_and_no_secrets(monkeypatch, failed):
+    server = _test_server()
+    try:
+        _stub_overview_sources(server, monkeypatch, failed=failed)
+        result = server.public_overview()
+        assert result["unavailable_sources"] == [failed]
+        card = result[failed]
+        assert card.get("state" if failed == "tej" else "health") == "unavailable"
+        assert all(value is None for key, value in card.items() if key not in {"health", "state"})
+        for name in ["taifex", "tw", "overnight", "shioaji", "openbb", "data_monitor", "finmind"]:
+            if name != failed:
+                assert result[name]["health"] == "active"
+        if failed != "openbb":
+            assert result["openbb"]["accepted_tasks"] == 17
+        public = json.dumps(result)
+        assert "PRIVATE_SECRET" not in public and "/private" not in public and "Bearer" not in public
+    finally:
+        server.server_close()
+
+
+def test_overview_peer_deadline_does_not_wait_for_executor_cleanup(monkeypatch):
+    from scripts import serve_public_dashboards as public_module
+
+    server = _test_server()
+    release = threading.Event()
+    try:
+        _stub_overview_sources(server, monkeypatch, blocked=release)
+        monkeypatch.setattr(public_module, "OVERVIEW_PEER_WAIT_SECONDS", 0.05)
+        started = time.monotonic()
+        result = server.public_overview()
+        assert time.monotonic() - started < 1.0
+        assert result["unavailable_sources"] == ["taifex"]
+        assert result["openbb"]["accepted_tasks"] == 17
+        assert result["taifex"]["live_strategies"] is None
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_provider_waiting_publication_filter_matches_shared_operation_state():
+    query = PublicDashboardHandler._provider_query("name=FinMind&state=waiting_publication")
+    assert query["operation"] == "waiting_publication"
+
+
 def test_shioaji_status_reuses_recent_read_only_snapshot_and_falls_back(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -1210,6 +1291,7 @@ def test_shioaji_snapshot_rejects_unsafe_or_nonfinite_projection(
     [
         ("/time-axis.js", b"buildTimeAxis"),
         ("/dashboard-core.js", b"StockAgentDashboard"),
+        ("/dashboard-acquisition.js", b"StockAgentAcquisition"),
         ("/tw-day-trade/presentation.js", b"StockAgentTwPresentation"),
         ("/tw-day-trade/detail-components.js", b"StockAgentTwDetailComponents"),
         ("/tw-day-trade/chart-renderer.js", b"StockAgentTwChart"),
@@ -1248,7 +1330,7 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=15' in page
+        assert b'app.js?v=17' in page
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
     finally:
@@ -1335,13 +1417,18 @@ def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_ser
                         status=200, content_type="application/json", body=json.dumps(payload)))
                     page.goto(f"http://127.0.0.1:{protocol_server.port}/finmind/", wait_until="domcontentloaded")
                     page.locator("#finmind-health").get_by_text("歷史回補進行中").wait_for(timeout=5000)
-                    assert page.locator("#pipeline-grid .pipeline-card").count() == 4
+                    assert page.locator("#pipeline-grid .pipeline-card:not(.skeleton)").count() == 0
                     assert "11 / 202" in page.locator("#download-progress-label").text_content()
-                    assert page.locator("#dataset-rows tr").count() == 4
+                    page.evaluate("() => {StockAgentAcquisition.reveal('backfill');document.getElementById('backfill').scrollIntoView({block:'start',behavior:'instant'});}")
+                    page.wait_for_function("() => document.querySelectorAll('#dataset-rows tr').length === 4")
+                    page.evaluate("() => {StockAgentAcquisition.reveal('traffic');document.getElementById('quota-chart').scrollIntoView({block:'start',behavior:'instant'});}")
                     quota_series = page.locator("#quota-chart polyline.series")
+                    quota_series.wait_for()
                     assert quota_series.count() == 1
                     assert quota_series.get_attribute("points") == "58.00,218.69 926.00,212.16"
                     assert page.locator("#quota-chart-empty").is_hidden()
+                    page.evaluate("() => {StockAgentAcquisition.reveal('pipelines');document.getElementById('pipelines').scrollIntoView({block:'start',behavior:'instant'});}")
+                    page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card:not(.skeleton)').length === 4")
                     page.get_by_role("button", name="盤中歷史").click()
                     assert page.locator("#pipeline-grid .pipeline-card").count() == 2
                     page.get_by_role("button", name="主檔／日曆").click()
@@ -1404,9 +1491,12 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 page.locator("#finlab-health").get_by_text("資料觀測正常").wait_for(timeout=8000)
                 assert attempts >= 2
                 assert "前前" not in page.locator("#finlab-freshness").inner_text()
-                assert page.locator("#pipeline-grid .pipeline-card").count() == 5
+                assert page.locator("#pipeline-grid .pipeline-card:not(.skeleton)").count() == 0
+                page.evaluate("() => {StockAgentAcquisition.reveal('pipelines');document.getElementById('pipelines').scrollIntoView({block:'start',behavior:'instant'});}")
+                page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card:not(.skeleton)').length === 5")
                 assert page.locator("#volume-downloaded").text_content() == "60 MiB"
                 assert page.locator("#volume-total").text_content() == "約 120 MiB"
+                page.evaluate("window.StockAgentAcquisition.reveal('workload')")
                 assert page.locator("#volume-downloaded").is_visible()
                 # Read-only assertions must not depend on Chromium animation frames:
                 # headless WSL may suppress rAF, making scroll_into_view hang.
@@ -1607,7 +1697,8 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
         offset = int(query.get("offset", ["0"])[0])
         limit = int(query.get("limit", ["30"])[0])
         result = {
-            "read_only": True, "generated_at_utc": "2026-09-26T01:00:00Z", "provider": "FinLab",
+            "read_only": True, "production_control_possible": False,
+            "generated_at_utc": "2026-09-26T01:00:00Z", "provider": "FinLab",
             "summary": {"registered": 2, "active_endpoints": 0, "registry_aliases": 2,
                         "operation_state_counts": {"reference": 2},
                         "active_operation_state_counts": {},
@@ -1637,7 +1728,9 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
                               wait_until="domcontentloaded")
                     page.locator("#provider-name").get_by_text("FinLab").wait_for(timeout=8000)
                     assert page.locator("#provider-ratio").text_content() == "不適用"
-                    assert page.locator("#provider-source-rows tr").count() == 2
+                    assert page.locator("#provider-source-rows tr").count() == 0
+                    page.evaluate("() => {StockAgentAcquisition.reveal('provider-sources');document.getElementById('provider-sources').scrollIntoView({block:'start',behavior:'instant'});}")
+                    page.wait_for_function("() => document.querySelectorAll('#provider-source-rows tr').length === 2")
                     page.locator("#provider-source-search").fill("收盤")
                     page.get_by_text("1/1 項符合結果").wait_for(timeout=8000)
                     assert page.locator("#provider-source-rows tr").count() == 1
@@ -2677,6 +2770,19 @@ def test_http_respects_unaccepted_or_less_preferred_gzip(protocol_server, encodi
     assert response.getheader("Content-Encoding") is None
     assert response.getheader("Vary") == "Accept-Encoding"
     assert b"StockAgentDashboard" in body
+
+
+@pytest.mark.parametrize('route,marker',[
+    ('/feature-page-constraints.js',b'StockAgentFeaturePageConstraints'),
+    ('/feature-page-contract.js',b'validateFeaturePage'),
+])
+def test_feature_page_shared_contract_is_served_by_the_actual_gateway(protocol_server,route,marker):
+    protocol_server.request('GET',route,headers={'Accept-Encoding':'identity'})
+    response=protocol_server.getresponse();body=response.read()
+    assert response.status==200
+    assert response.getheader('Content-Type')=='text/javascript; charset=utf-8'
+    assert marker in body
+    assert b'CONTROL_PLANE_DSN' not in body
 
 
 def test_encoding_variants_have_distinct_validators_and_valid_304(protocol_server):

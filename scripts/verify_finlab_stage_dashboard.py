@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from scripts.download_finlab_history import _atomic_json  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
-    QUOTA_POLICY_VERSION, incremental_quota_exempt,
+    QUOTA_POLICY_VERSION, incremental_quota_exempt, WORKLOAD_CONTRACT_VERSION,
 )
 
 
@@ -41,7 +41,7 @@ def verify(url: str, output: Path) -> dict:
                 context.close()
             workload = status["workload"]
             assert workload["state"] == "available"
-            assert workload["contract_version"] == 3
+            assert workload["contract_version"] == WORKLOAD_CONTRACT_VERSION
             assert workload["quota_policy_version"] == QUOTA_POLICY_VERSION
             assert workload["incremental_quota_policy"] == "provider_enforced_no_local_reserve"
             rows = [row["workload"] for row in status["datasets"] if "workload" in row]
@@ -69,7 +69,8 @@ def verify(url: str, output: Path) -> dict:
                     document_width: document.documentElement.scrollWidth,
                     stage_count: document.querySelectorAll('#workload-stages article').length,
                     stage_labels: [...document.querySelectorAll('#workload-stages h4')].map(el => el.textContent),
-                    stage_estimates: [...document.querySelectorAll('#workload-stages dd')].map(el => el.textContent),
+                    stage_estimates: [...document.querySelectorAll('#workload-stages .finlab-current-eta dd')].map(el => el.textContent),
+                    next_wave_estimates: [...document.querySelectorAll('#workload-stages .finlab-next-wave dd')].map(el => el.textContent),
                     stage_states: state.latest.workload.stages.map(stage =>
                         ['fast', 'reference', 'slow'].map(name => stage.scenarios?.[name]?.state)),
                     progress: document.querySelector('#volume-progress-label').textContent,
@@ -82,6 +83,7 @@ def verify(url: str, output: Path) -> dict:
                 assert facts["document_width"] <= width, facts
                 assert facts["stage_count"] == 6
                 assert len(facts["stage_estimates"]) == 18
+                assert len(facts["next_wave_estimates"]) >= 3
                 assert "來源條件未解決" in facts["stage_estimates"]
                 assert "缺全市場樣本，未知" in facts["stage_estimates"]
                 assert "追新不受此本機門檻限制" in facts["quota_reserve_description"]

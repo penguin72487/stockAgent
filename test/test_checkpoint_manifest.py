@@ -2311,6 +2311,8 @@ def test_checkpoint_validation_rejects_malformed_or_unknown_manifest_schema(
 
 
 def test_tree_sidecar_makes_completed_fold_manifest_verifiable(tmp_path: Path) -> None:
+    from stockagent.training.trainer import _mode_artifact_contract_for_config
+
     panel = _panel()
     config = _config()
     manifest = _checkpoint_manifest(panel, config)
@@ -2333,6 +2335,9 @@ def test_tree_sidecar_makes_completed_fold_manifest_verifiable(tmp_path: Path) -
     (fold_dir / "model.pt").write_bytes(b"tree pickle placeholder")
     (fold_dir / "test_backtest.npz").write_bytes(b"backtest placeholder")
     (fold_dir / "deployment_test_backtest.npz").write_bytes(b"deployment placeholder")
+    (fold_dir / "mode_artifact_contract.json").write_text(
+        json.dumps(_mode_artifact_contract_for_config(config)), encoding="utf-8"
+    )
     (fold_dir / "fold_complete.json").write_text(
         json.dumps(
             {

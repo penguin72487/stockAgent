@@ -76,7 +76,6 @@ TARGET_WEIGHTS = {
     "tw_day_trade_100m": 0.01,
     "tw_day_trade_multi_basis": -0.10,
     "tw_day_trade_multi_basis_22": 0.10,
-    "tw_day_trade_multi_basis_projection_l1_gelu": 0.10,
 }
 
 
@@ -1218,10 +1217,8 @@ def run_two_phase_cold_test(
     _assert_check(
         checks,
         "phase3_1324_uses_best_bid_and_preserves_unquoted_short",
-        force_state["tw_day_trade_100m"] == 0
-        and force_state["tw_day_trade_multi_basis_22"] == 0
-        and force_state["tw_day_trade_multi_basis_projection_l1_gelu"] == 0
-        and force_state["tw_day_trade_multi_basis"] == -1_000,
+        all(force_state[market] == (0 if TARGET_WEIGHTS.get(market, 0.10) >= 0 else -1_000)
+            for market in markets),
         evidence=force_state,
     )
 
@@ -1267,11 +1264,16 @@ def run_two_phase_cold_test(
         spec.residual_margin_conversion
         for spec in specs if spec.market == "tw_day_trade_multi_basis"
     )
+    unlimited_close_enabled = next(
+        spec.terminal_liquidation_unlimited_capacity
+        for spec in specs if spec.market == "tw_day_trade_multi_basis"
+    )
     residual_positions = [
         position for position in (residual_mode.get("positions") or {}).values()
         if int(position.get("signed_shares") or 0)
     ]
     expected_residual_status = (
+        "waiting_valid_terminal_close_source" if unlimited_close_enabled else
         "margin_carried_waiting_next_signal" if margin_enabled
         else "critical_residual_carried_after_13_30"
     )
@@ -1279,13 +1281,18 @@ def run_two_phase_cold_test(
         len(residual_positions) == 1
         and int(residual_positions[0]["signed_shares"]) == -1_000
         and residual_positions[0].get("fill_guaranteed") is False
-        and residual_positions[0].get("carry_type") == (
+        and (residual_positions[0].get("closing_auction_order_status")
+             == "waiting_valid_terminal_close_source"
+             and not residual_positions[0].get("terminal_close_receipt")
+             if unlimited_close_enabled else
+             residual_positions[0].get("carry_type") == (
             "assumed_margin_short" if margin_enabled
             else "unresolved_day_trade_delivery_obligation"
-        )
+        ))
         and (
             residual_positions[0].get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
-            if margin_enabled else not residual_positions[0].get("margin_carry_contract")
+            if margin_enabled and not unlimited_close_enabled
+            else not residual_positions[0].get("margin_carry_contract")
         )
     )
     _assert_check(
@@ -1355,6 +1362,7 @@ def run_two_phase_cold_test(
         "close_at": close_at.isoformat(timespec="seconds"),
         "all_modes_flat": all_flat,
         "margin_conversion_enabled": margin_enabled,
+        "unlimited_close_enabled": unlimited_close_enabled,
         "residual_status": residual_mode.get("engine_status"),
         "residual_contract_valid": residual_contract_valid,
         "force_exit_fill_count": len(force_fills),

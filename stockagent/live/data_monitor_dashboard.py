@@ -4570,6 +4570,7 @@ def _finmind_complement_sources(storage: Path, *, now: datetime,
         failed = _integer(item.get("failed")) or 0
         blocked = _integer(item.get("not_entitled")) or 0
         invalid = _integer(item.get("invalid_request")) or 0
+        exhausted = _integer(item.get('retry_exhausted')) or 0
         latest = item.get("last_data_date")
         if dataset in delegated:
             row_state = "deferred"
@@ -4583,7 +4584,7 @@ def _finmind_complement_sources(storage: Path, *, now: datetime,
                 row_state = "complete"
         elif active and companion_fresh and companion_state == "running":
             row_state = "updating"
-        elif failed or invalid or companion_state in {"rate_limited", "not_entitled", "disk_guard", "ip_banned", "invalid_token"}:
+        elif failed or invalid or exhausted or companion_state in {"rate_limited", "not_entitled", "disk_guard", "ip_banned", "invalid_token"}:
             row_state = "degraded"
         else:
             row_state = "waiting"
@@ -4594,7 +4595,9 @@ def _finmind_complement_sources(storage: Path, *, now: datetime,
             "provider": "FinMind", "category": "cross_market_source",
             "status": row_state,
             "status_label": ("已讓渡給 Sponsor 全市場批量管線；保留既有收據" if dataset in delegated else
-                             f"已查驗 {checked:,}/{total:,} 分區（非空 {complete:,}、來源空回 {empty:,}）；失敗 {failed:,}；權限 {blocked:,}；無效請求 {invalid:,}"),
+                             f"已查驗 {checked:,}/{total:,} 分區（非空 {complete:,}、來源空回 {empty:,}）；失敗 {failed:,}；重試耗盡 {exhausted:,}（停止自動重試、舊資料保留）；權限 {blocked:,}；無效請求 {invalid:,}"),
+            "retry_exhausted_tasks": exhausted,
+            "retained_rows": _integer(item.get('retained_rows')) or 0,
             "cadence": ("本機由法人長表衍生，不呼叫 FinMind API" if dataset == FINMIND_DERIVED_WIDE
                         else "共用每小時額度；依標的／年份分區增量"),
             "update_owner": "FinMind 補充資料下載器",
@@ -4643,6 +4646,7 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
         empty = _integer(item.get("observed_empty")) or 0
         failed = _integer(item.get("failed")) or 0
         blocked = _integer(item.get("blocked")) or 0
+        exhausted = _integer(item.get('retry_exhausted')) or 0
         non_session = _integer(item.get("non_session")) or 0
         calendar_wait = _integer(item.get("calendar_wait")) or 0
         calendar_verified = session_policy.get("state") == "receipt_verified"
@@ -4651,7 +4655,7 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
         state = ("unavailable" if total and blocked == total else
                  "complete" if total and checked == total else
                  "updating" if running else
-                 "degraded" if blocked or failed else "waiting")
+                 "degraded" if blocked or failed or exhausted else "waiting")
         count = _integer(item.get("rows"))
         publication_hint = None
         checked_partition = str(item.get("last_checked_partition") or "")
@@ -4670,10 +4674,12 @@ def _finmind_sponsor_sources(storage: Path, *, now: datetime) -> list[dict[str, 
             "scope": "source_registry", "title": f"{spec.dataset}（Sponsor 全市場）",
             "provider": "FinMind", "category": "taiwan_market_sponsor",
             "status": state,
-            "status_label": (f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、受阻 {blocked:,}"
+            "status_label": (f"已查驗 {checked:,}/{total:,} 分區；非空 {complete:,}、空回 {empty:,}、失敗 {failed:,}、重試耗盡 {exhausted:,}（停止自動重試、舊資料保留）、受阻 {blocked:,}"
                              + (f"；已驗證非交易日排除 {non_session:,}" if calendar_verified and non_session else "")
                              + (f"；等待日曆重判 {calendar_wait:,}（不計下載完成）" if calendar_wait else "")),
             "cadence": "按官方實際帳號額度共用節流；全市場日期分區增量",
+            "retry_exhausted_tasks": exhausted,
+            "retained_rows": _integer(item.get('retained_rows')) or 0,
             "update_owner": ("FinMind Sponsor 長表本機衍生" if spec.dataset == FINMIND_DERIVED_WIDE
                              else "FinMind Sponsor 資料下載器"),
             "latest_at_utc": item.get("last_attempt_at_utc"), "data_through": latest,

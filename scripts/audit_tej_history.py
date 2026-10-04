@@ -34,7 +34,7 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def audit(root: Path, output: Path) -> dict:
+def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dict:
     """Audit only completed v4 scope receipts captured in one SQL snapshot.
 
     A collector may commit more work after that snapshot. Those later tasks
@@ -42,16 +42,32 @@ def audit(root: Path, output: Path) -> dict:
     """
     import pyarrow.parquet as pq
 
+    if task_ids is not None and (not task_ids or len(set(task_ids)) != len(task_ids)):
+        raise ValueError('A scoped receipt audit requires unique selected task IDs')
     if output.exists():
         raise FileExistsError('Refusing to overwrite TEJ audit evidence')
     root=root.resolve(); started=datetime.now(UTC)
     with closing(_read(root)) as con:
         con.execute('BEGIN')
         definitions={r['table_id']:dict(r) for r in con.execute('SELECT * FROM tables')}
-        tasks=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE kind='download' AND state='complete' AND scope_contract=?",(SOURCE_SCOPE_CONTRACT,))]
+        selected=None
+        if task_ids is not None:
+            placeholders=','.join('?' for _ in task_ids)
+            selected=[dict(r) for r in con.execute(f'SELECT * FROM tasks WHERE task_id IN ({placeholders})',task_ids)]
+            if (len(selected) != len(task_ids) or any(r['kind']!='download'
+                    or r['scope_contract']!=SOURCE_SCOPE_CONTRACT for r in selected)):
+                raise ValueError('Selected tasks must exist under the current download source contract')
+            tasks=[r for r in selected if r['state']=='complete']
+        else:
+            tasks=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE kind='download' AND state='complete' AND scope_contract=?",(SOURCE_SCOPE_CONTRACT,))]
         registry={(r['table_id'],r['name']):r['exported_non_null_cells'] or 0 for r in con.execute('SELECT table_id,name,exported_non_null_cells FROM features WHERE exported_non_null_cells>0')}
         states=[dict(r) for r in con.execute('SELECT kind,state,COUNT(*) AS tasks FROM tasks WHERE scope_contract=? GROUP BY kind,state',(SOURCE_SCOPE_CONTRACT,))]
         blocked=[dict(r) for r in con.execute("SELECT t.kind,b.name AS table_name,t.last_error_code FROM tasks t JOIN tables b USING(table_id) WHERE t.state='blocked' AND t.scope_contract=? ORDER BY b.name",(SOURCE_SCOPE_CONTRACT,))]
+        if selected is not None:
+            counts=Counter((r['kind'],r['state']) for r in selected)
+            states=[dict(kind=k,state=s,tasks=n) for (k,s),n in sorted(counts.items())]
+            blocked=[dict(kind=r['kind'],table_name=definitions[r['table_id']]['name'],last_error_code=r['last_error_code'])
+                     for r in selected if r['state']=='blocked']
         snapshot_at=datetime.now(UTC).isoformat()
     results=[]; cells=Counter(); failed=0; bound_attempts=0; key3_tasks=0; snapshot_tasks=0; header_mapping_tasks=0; month_key_tasks=0
     for task in tasks:
@@ -150,7 +166,11 @@ def audit(root: Path, output: Path) -> dict:
             failed+=1
         results.append(result)
     nonzero={key:count for key,count in cells.items() if count}
-    registry_mismatches=sum(registry.get(key,0) != nonzero.get(key,0) for key in registry.keys()|nonzero.keys())
+    # The feature registry counts every completed task. Comparing its global
+    # denominator with a selected batch would incorrectly reject valid receipts.
+    registry_mismatches=(sum(registry.get(key,0) != nonzero.get(key,0) for key in registry.keys()|nonzero.keys())
+                         if selected is None else None)
+    all_selected_completed=selected is None or len(tasks)==len(selected)
     worker=json.loads((root/'worker_status.json').read_text()) if (root/'worker_status.json').exists() else {}
     timings={}
     # Real read-only query benchmark: never call the writer's connect()/DDL.
@@ -170,7 +190,12 @@ def audit(root: Path, output: Path) -> dict:
             'versioned_month_period_key_tasks_audited':month_key_tasks,
             'preview_header_mapping_tasks_audited':header_mapping_tasks,
             'legacy_receipts_without_attempt_sha_binding':len(tasks)-bound_attempts,
-            'feature_count_mismatches':registry_mismatches,'accepted':bool(tasks) and failed==0 and registry_mismatches==0,
+            'feature_count_mismatches':registry_mismatches,
+            'feature_registry_checked':selected is None,
+            'audit_scope':'selected_tasks' if selected is not None else 'all_completed_current_contract_tasks',
+            'selected_task_ids':sorted(task_ids) if task_ids is not None else None,
+            'all_selected_tasks_completed':all_selected_completed,
+            'accepted':bool(tasks) and failed==0 and registry_mismatches in (None,0) and all_selected_completed,
             'exported_rows':sum(r['rows'] or 0 for r in results if r['accepted']),
             'exported_non_null_cells':sum(r['non_null_cells'] or 0 for r in results if r['accepted']),
             'queue_states_at_snapshot':states,'blocked_tasks_at_snapshot':blocked,
@@ -192,8 +217,21 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,default=ROOT/'data_tej')
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--task-registration',type=Path,
+                        help='Audit only the finite tasks in an existing source-bound priority registration')
     args=parser.parse_args(argv)
-    report=audit(args.root,args.output)
+    task_ids=None
+    if args.task_registration is not None:
+        from downloader.tej_priority import CONTRACT
+        registration=json.loads(args.task_registration.read_text())
+        if (registration.get('contract')!=CONTRACT
+                or _digest(Path(registration['plan_path']))!=registration['plan_sha256']):
+            raise ValueError('Priority registration no longer matches its source-bound plan')
+        task_ids=[r['task_id'] for r in registration['tasks']]
+    report=audit(args.root,args.output,task_ids=task_ids)
+    if args.task_registration is not None:
+        report['task_registration_sha256']=_digest(args.task_registration)
+        atomic_write_json(args.output/'audit.json',report)
     print(json.dumps(report,ensure_ascii=False))
     return 0 if report['accepted'] else 1
 

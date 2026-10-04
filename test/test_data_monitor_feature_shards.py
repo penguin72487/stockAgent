@@ -43,6 +43,49 @@ def _snapshot(root):
     return frame
 
 
+@pytest.mark.parametrize("prefer_shards", [True, False])
+def test_publisher_retains_prior_json_and_receipts_when_source_revision_moves(setup, prefer_shards):
+    from scripts import snapshot_data_refresh_services as producer
+
+    root, first, _second, status, output = setup
+    before = _snapshot(root)
+    producer.publish_feature_inventory_snapshot(
+        root, output, snapshot=before, public_status=status,
+        feature_revision=before.payload["feature_revision"], source_metadata_sha256="a" * 64,
+        expected_source_observation_root=before.payload["source_observation_root"],
+        prefer_shards=prefer_shards,
+    )
+    files = [output, producer._feature_reuse_receipt_path(output), producer._feature_source_pages_path(output)]
+    saved = {path: path.read_bytes() for path in files}
+    stale = _snapshot(root)
+    stale_payload = stale.payload or json.loads((root / "artifacts/live/data_monitor/record_inventory_cache.json").read_text())
+    expected_root = stale_payload["source_observation_root"]
+    _write(first, values=(3.0, 4.0))
+    with pytest.raises(inventory.SourceRevisionChanged, match="source identities changed"):
+        producer.publish_feature_inventory_snapshot(
+            root, output, snapshot=stale, public_status=status,
+            feature_revision=stale_payload["feature_revision"], source_metadata_sha256="a" * 64,
+            expected_source_observation_root=expected_root, prefer_shards=prefer_shards,
+        )
+    assert {path: path.read_bytes() for path in files} == saved
+    fresh = _snapshot(root)
+    root_after = fresh.payload["source_observation_root"]
+    result = producer.publish_feature_inventory_snapshot(
+        root, output, snapshot=fresh, public_status=status,
+        feature_revision=fresh.payload["feature_revision"], source_metadata_sha256="a" * 64,
+        expected_source_observation_root=root_after, prefer_shards=prefer_shards,
+    )
+    assert result["source_observation_root"] == root_after != expected_root
+    assert json.loads(producer._feature_reuse_receipt_path(output).read_text())["source_observation_root"] == root_after
+
+
+def test_projection_requires_fresh_footers_even_if_observed_roots_match():
+    with pytest.raises(inventory.SourceRevisionChanged):
+        inventory.require_coherent_feature_source(
+            {"source_observation_root": "same", "source_observation_matches_cache": False}, "same"
+        )
+
+
 def _publish(root, output, status, frame=None, **kwargs):
     frame = frame or _snapshot(root)
     result = shards.publish_feature_shards(root, output, snapshot=frame, monitor_status=status, **kwargs)

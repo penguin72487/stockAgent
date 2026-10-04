@@ -12,15 +12,17 @@ const PAGE_SIZE = 30;
 const MARKET_ORDER = {taiwan_equity: 0, taiwan_derivatives: 1, taiwan_public: 2,
   global_equity: 3, forex: 4, macro: 5, cross_market: 6, configuration: 7, crypto: 8};
 const OPERATION_LABEL = {catching_up: "正在抓／未最新", streaming: "正在串流",
+  waiting_publication: "等待發布證據",
   complete: "已完成／已最新", unable: "無法完成", deferred: "已延後",
   control: "設定閘門", reference: "清冊參照"};
 const DEDICATED = {FinLab: ["/finlab/", "/finlab/api/status"],
   FinMind: ["/finmind/", "/finmind/api/status"],
-  TEJ: ["/tej/", "/tej/api/status"],
+  TEJ: ["/tej/", null],
   "永豐 Shioaji": ["/shioaji/", "/shioaji/api/status"],
   OpenBB: ["/openbb/", null]};
 const state = {provider: null, rows: [], matched: 0, nextOffset: 0, snapshotAt: null,
   loaded: false, inFlight: false, pendingRefresh: null, quotaInFlight: false, lastQuotaAt: 0};
+const providerRequest = Dashboard.createLatestRequest();
 
 function numeric(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -106,7 +108,8 @@ function renderHeadline(data) {
   const active = numeric(summary.active_endpoints) || 0;
   const ratio = numeric(summary.active_current_ratio);
   const status = operations.unable ? "unable" : operations.catching_up ? "catching_up"
-    : operations.streaming ? "streaming" : operations.complete ? "complete" : "reference";
+    : operations.streaming ? "streaming" : operations.waiting_publication ? "waiting_publication"
+    : operations.complete ? "complete" : "reference";
   const badge = $("provider-health");
   badge.className = `status-pill ${status}`;
   badge.textContent = OPERATION_LABEL[status];
@@ -146,6 +149,7 @@ function renderMarkets(options) {
   const select = $("provider-market-filter");
   const previous = select.value;
   const choices = new Map(Object.entries(options || {}));
+  if (previous !== "all" && !choices.has(previous)) choices.set(previous, `${previous}（本次清冊沒有此市場）`);
   select.replaceChildren(new Option("全部市場", "all"), ...[...choices].sort((a, b) =>
     (MARKET_ORDER[a[0]] ?? 99) - (MARKET_ORDER[b[0]] ?? 99)).map(([key, label]) => new Option(label || key, key)));
   if (choices.has(previous)) select.value = previous;
@@ -195,7 +199,8 @@ async function refreshQuota() {
   state.quotaInFlight = true;
   try {
     const data = await fetchJson(dedicated[1]);
-    const observed = data.quota?.observed_at_utc || data.quota?.provider_observed_at_utc || data.traffic?.observed_at_utc;
+    const observed = state.provider === "FinMind" ? data.quota?.provider_observed_at_utc
+      : data.quota?.observed_at_utc || data.traffic?.observed_at_utc;
     if (state.provider === "FinMind") {
       const quota = data.quota || {};
       $("provider-quota").textContent = numeric(quota.provider_used_in_hour) !== null
@@ -217,9 +222,35 @@ async function refreshQuota() {
     }
     state.lastQuotaAt = Date.now();
   } catch (_error) {
-    $("provider-quota-basis").textContent = "專用配額收據暫時無法讀取；未把未知值當作零。";
+    $("provider-quota-basis").textContent = state.lastQuotaAt
+      ? "配額更新失敗；保留上次觀測，不代表現在用量或剩餘額度。"
+      : "專用配額收據暫時無法讀取；未知值不當作零。";
   } finally { state.quotaInFlight = false; }
 }
+function invalidateProviderScope() {
+  providerRequest.abort();
+  state.rows = [];
+  state.nextOffset = 0;
+  $("provider-source-rows").replaceChildren();
+  $("provider-result-count").textContent = "篩選已變更；等待相符的來源項目。";
+  $("provider-source-more").hidden = true;
+  $("provider-source-empty").hidden = true;
+}
+
+function validateProviderPage(data, offset, limit) {
+  const page = data.page;
+  if (data.provider !== state.provider || data.read_only !== true
+      || data.production_control_possible !== false || !Array.isArray(data.sources)
+      || !page || page.offset !== offset || page.limit !== limit
+      || !Number.isSafeInteger(page.matched_total) || page.matched_total < 0
+      || data.sources.length !== Math.min(limit, Math.max(0, page.matched_total - offset))
+      || page.has_more !== (offset + data.sources.length < page.matched_total)
+      || data.sources.some(row => !row || typeof row.id !== "string")
+      || new Set(data.sources.map(row => row.id)).size !== data.sources.length) {
+    throw new Error("Invalid provider page");
+  }
+}
+
 async function refresh({reset = false, append = false} = {}) {
   if (document.hidden || !state.provider) return;
   if (state.inFlight) {
@@ -227,24 +258,26 @@ async function refresh({reset = false, append = false} = {}) {
     return;
   }
   state.inFlight = true;
+  const request = providerRequest.begin();
   const search = $("provider-source-search").value.trim();
   const operation = $("provider-status-filter").value;
   const market = $("provider-market-filter").value;
   const offset = append && !reset ? state.nextOffset : 0;
-  const limit = append ? PAGE_SIZE : reset ? PAGE_SIZE : Math.max(PAGE_SIZE, state.rows.length);
+  const limit = append ? PAGE_SIZE : reset ? PAGE_SIZE : Math.min(1500, Math.max(PAGE_SIZE, state.rows.length));
   try {
     const params = new URLSearchParams({name: state.provider, offset: String(offset),
       limit: String(limit), q: search, state: operation, market});
-    const data = await fetchJson(`/data-monitor/api/provider?${params}`);
-    if (!Array.isArray(data.sources) || data.read_only !== true) throw new Error("Invalid provider snapshot");
+    const data = await fetchJson(`/data-monitor/api/provider?${params}`, {signal: request.signal});
+    if (!request.isCurrent()) return;
     if (search !== $("provider-source-search").value.trim()
         || operation !== $("provider-status-filter").value
         || market !== $("provider-market-filter").value) {
       state.pendingRefresh = {reset: true};
       return;
     }
+    validateProviderPage(data, offset, limit);
     if (append && state.snapshotAt && data.generated_at_utc !== state.snapshotAt) {
-      state.pendingRefresh = {reset: true};
+      state.pendingRefresh = {reset: false};
       return;
     }
     renderHeadline(data);
@@ -252,10 +285,11 @@ async function refresh({reset = false, append = false} = {}) {
       const seen = new Set(state.rows.map((row) => row.id));
       state.rows.push(...data.sources.filter((row) => !seen.has(row.id)));
     } else {
-      state.rows = data.sources;
+      state.rows = !reset && data.generated_at_utc === state.snapshotAt && state.rows.length > limit
+        ? [...data.sources, ...state.rows.slice(limit)] : data.sources;
     }
     state.matched = numeric(data.page?.matched_total) || 0;
-    state.nextOffset = offset + data.sources.length;
+    state.nextOffset = state.rows.length;
     state.snapshotAt = data.generated_at_utc || null;
     renderMarkets(data.summary?.market_category_options);
     renderRows();
@@ -263,10 +297,13 @@ async function refresh({reset = false, append = false} = {}) {
     clearError();
     void refreshQuota();
   } catch (_error) {
+    if (!request.isCurrent() || search !== $("provider-source-search").value.trim()
+        || operation !== $("provider-status-filter").value || market !== $("provider-market-filter").value) return;
     showError(state.loaded
       ? "更新暫時失敗；下方保留上次快照，不代表目前仍然最新。"
       : "來源頁面暫時無法讀取，或此來源標籤不存在。請回到全資料監控檢查。 ");
   } finally {
+    request.finish();
     state.inFlight = false;
     if (state.pendingRefresh) {
       const next = state.pendingRefresh;
@@ -284,13 +321,15 @@ if (!state.provider) showError("網址沒有有效的來源標籤。請從全資
 else void refresh();
 let searchTimer = null;
 $("provider-source-search").addEventListener("input", () => {
+  invalidateProviderScope();
   window.clearTimeout(searchTimer);
   searchTimer = window.setTimeout(() => void refresh({reset: true}), 180);
 });
 for (const id of ["provider-status-filter", "provider-market-filter"]) {
-  $(id).addEventListener("change", () => void refresh({reset: true}));
+  $(id).addEventListener("change", () => { invalidateProviderScope(); void refresh({reset: true}); });
 }
 $("provider-source-more").addEventListener("click", () => void refresh({append: true}));
 $("provider-filters").addEventListener("submit", (event) => event.preventDefault());
+renderRows = Dashboard.createDeferredRenderer("provider-sources", renderRows);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
 Dashboard.scheduleRefresh(refresh, {intervalMs: 30000, immediate: false, refreshOnVisible: false});

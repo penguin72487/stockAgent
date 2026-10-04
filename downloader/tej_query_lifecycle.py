@@ -32,7 +32,16 @@ def verify_interface(root: Path, task_id: str, bridge) -> dict:
         if row is None or con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
                 "(kind='download' AND state='blocked' AND last_error_code='unknown_outcome_no_auto_retry') LIMIT 1").fetchone():
             raise ValueError('Quiescent interface and no unresolved Preview required')
-    task=dict(row); request=task_request(root,task)
+    return _verify_stable_interface(root, dict(row), bridge)
+
+
+def _verify_stable_interface(root: Path, task: dict, bridge) -> dict:
+    """Only caller-verified quiescent/restarted interfaces reach this readback.
+
+    A restarted old unknown query stays unknown; this proves only that the new
+    interface is usable, never that the original download succeeded or was free.
+    """
+    task_id=task['task_id']; request=task_request(root,task)
     request['action']='confirm_metadata_error_cleared'
     payload,evidence,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
     if (payload.get('contract_version')!=4 or payload.get('provider')!='tej_smart_wizard'
@@ -49,6 +58,27 @@ def verify_interface(root: Path, task_id: str, bridge) -> dict:
         con.execute('DELETE FROM meta WHERE key=?',(BARRIER,))
     atomic_write_json(root/'worker_status.json',{'contract_version':4,**audit})
     return {'state':audit['state'],'data_query_repeated':False,'failed_tasks_reset':False}
+
+
+def _unknown_download(root: Path, task_id: str, prepared: Path) -> dict:
+    """Exact unadopted active attempt for explicit operator reset/replay only."""
+    from downloader.tej_desktop_attempts import query_stage
+    with closing(connect(root)) as con:
+        row=con.execute('SELECT * FROM tasks WHERE task_id=?',(task_id,)).fetchone()
+        if (row is None or row['kind']!='download' or row['state']!='blocked'
+                or row['last_error_code']!='unknown_outcome_no_auto_retry'
+                or con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
+                    "(state='blocked' AND last_error_code='unknown_outcome_no_auto_retry' AND task_id!=?) LIMIT 1",
+                    (task_id,)).fetchone()):
+            raise ValueError('One exact quiescent unknown download required for operator restart')
+    task=dict(row);attempt=task.get('active_attempt_id')
+    if (not isinstance(attempt,str) or not attempt.startswith(task_id+'-')
+            or any(task.get(key) is not None for key in ('actual_rows','receipt_path','completed_at_utc'))
+            or (root/'raw'/(attempt+'.json')).exists()
+            or (root/'receipts'/(task_id+'.json')).exists()):
+        raise ValueError('Saved/adopted response must be recovered before operator restart')
+    query_stage(root,task,task_request(root,task),prepared)
+    return task
 
 
 def _execute_phase(bridge, root: Path, phase: str, output: Path, *, restart_pins: dict | None = None,
@@ -174,7 +204,8 @@ def adopt_open_query(root: Path, task_id: str, bridge, session_path: Path, previ
 
 
 def restart_addin(root: Path, task_id: str, bridge, session_path: Path, *, allow_restart: bool,
-                  allow_discard: bool, recovery_run: Path | None = None) -> dict:
+                  allow_discard: bool, recovery_run: Path | None = None,
+                  unknown_prepared: Path | None = None, acknowledge_unknown_usage: bool = False) -> dict:
     """Extra operator permission; exact process only, preserving Excel/source.
 
     No scheduler calls this path. Pin a live process before stopping it, then
@@ -186,11 +217,17 @@ def restart_addin(root: Path, task_id: str, bridge, session_path: Path, *, allow
             or session_path.resolve()!=(root/'desktop_session.json').resolve()
             or json.loads(session_path.read_text())!=bridge.session):
         raise ValueError('Exact private session and separate process-restart/discard authorization required')
+    if acknowledge_unknown_usage is not False and (acknowledge_unknown_usage is not True or unknown_prepared is None):
+        raise ValueError('Exact unknown prepared request and explicit usage acknowledgement required')
+    if unknown_prepared is not None and acknowledge_unknown_usage is not True:
+        raise ValueError('Unknown query reset requires explicit usage acknowledgement')
+    unknown=_unknown_download(root,task_id,unknown_prepared) if unknown_prepared is not None else None
     with closing(connect(root)) as con:
         if con.execute('SELECT 1 FROM tasks WHERE task_id=?',(task_id,)).fetchone() is None:
             raise ValueError('Exact registered interface-verification task required')
         if con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
-                "(kind='download' AND state='blocked' AND last_error_code='unknown_outcome_no_auto_retry') LIMIT 1").fetchone():
+                "(kind='download' AND state='blocked' AND last_error_code='unknown_outcome_no_auto_retry' AND task_id!=?) LIMIT 1",
+                (task_id if unknown is not None else '',)).fetchone():
             raise ValueError('Recover unresolved Preview before restarting the add-in')
     resumed={}
     if recovery_run is not None:
@@ -262,5 +299,75 @@ def restart_addin(root: Path, task_id: str, bridge, session_path: Path, *, allow
         raise ValueError('Restarted query session identity not verified; no session replacement')
     atomic_write_json(session_path,new);session_path.chmod(0o600)
     bridge.session=new
-    result=verify_interface(root,task_id,bridge)
-    return {**result,'addin_restarted':True,'scratch_query_reopened':True,'workbook_closed':False,'raw_source_changed':False}
+    if unknown is not None:
+        if _unknown_download(root,task_id,unknown_prepared)!=unknown:
+            raise ValueError('Unknown download changed during exact restart; no replay')
+        result=_verify_stable_interface(root,unknown,bridge)
+    else:
+        result=verify_interface(root,task_id,bridge)
+    return {**result,'addin_restarted':True,'scratch_query_reopened':True,'workbook_closed':False,
+            'raw_source_changed':False,'recovery_run':str(run.relative_to(root))}
+
+
+def restart_unknown_download(root: Path, task_id: str, bridge, session_path: Path, prepared: Path, *,
+                             allow_restart: bool, allow_discard: bool, acknowledge_unknown_usage: bool,
+                             record_density_prior: int | None = None) -> dict:
+    """Operator-only exact add-in reset plus one canonical authorized replay.
+
+    Never called by supervision. All old unknown evidence is retained, and an
+    immutable, consumed-once authorization uses the existing replay mechanism.
+    The old result is NOT relabelled unsent, empty or completed.
+    """
+    from downloader.tej_desktop_attempts import OPERATOR_REPLAY_CONTRACT, query_stage
+    from downloader.tej_history import run_one
+    if acknowledge_unknown_usage is not True:
+        raise ValueError('Explicit unknown usage acknowledgement required')
+    if record_density_prior is not None and (type(record_density_prior) is not int or not 2<=record_density_prior<=10000):
+        raise ValueError('Explicit bounded native-record density prior required')
+    task=_unknown_download(root,task_id,prepared)
+    request=task_request(root,task);_,stage_path=query_stage(root,task,request,prepared)
+    if record_density_prior is not None:
+        from downloader.tej_planning import CONTRACT
+        with closing(connect(root)) as con:
+            row=con.execute('SELECT contract,plan_json FROM download_plans WHERE table_id=?',(task['table_id'],)).fetchone()
+        if (request.get('source_key_mode')!=3 or row is None or row['contract']!=CONTRACT
+                or record_density_prior<=json.loads(row['plan_json'])['request'].get('native_record_density_hint',1)):
+            raise ValueError('Existing native-record plan and strictly larger density prior required before restart')
+    original_hashes={name:hashlib.sha256(path.read_bytes()).hexdigest()
+                     for name,path in (('request',prepared),('stage',stage_path))}
+    restored=restart_addin(root,task_id,bridge,session_path,allow_restart=allow_restart,
+        allow_discard=allow_discard,unknown_prepared=prepared,acknowledge_unknown_usage=True)
+    if (_unknown_download(root,task_id,prepared)!=task or
+            any(hashlib.sha256(path.read_bytes()).hexdigest()!=original_hashes[name]
+                for name,path in (('request',prepared),('stage',stage_path)))):
+        raise ValueError('Original unknown evidence changed during restart; no replay')
+    if record_density_prior is not None:
+        from downloader.tej_preview_capacity import replan_restarted_unknown
+        return {**restored,**replan_restarted_unknown(root,task_id,prepared,root/restored['recovery_run'],
+                    record_density_prior=record_density_prior),'automatic_retry':False,
+                'possible_additional_provider_usage':True}
+    run=root/restored['recovery_run'];authorization=uuid.uuid4().hex
+    audit_path=root/'operator_replays'/(task_id+'-'+authorization+'.json')
+    audit={'contract':OPERATOR_REPLAY_CONTRACT,'recovery_contract':'explicit_restart_unknown_download_v1',
+        'authorization_id':authorization,'task_id':task_id,'observed_at_utc':datetime.now(UTC).isoformat(),
+        'original_attempted_at_utc':task['attempted_at_utc'],'original_attempt_id':task['active_attempt_id'],
+        'original_request_path':str(prepared.resolve().relative_to(root.resolve())),
+        'original_request_sha256':original_hashes['request'],
+        'original_stage_path':str(stage_path.relative_to(root)),'original_stage_sha256':original_hashes['stage'],
+        'restart_evidence_sha256':{phase:hashlib.sha256((run/(phase+'.json')).read_bytes()).hexdigest()
+                                  for phase in ('inspect-addin','stop-addin','open')},
+        'recovery_run':restored['recovery_run'],'original_outcome':'unknown_retained_not_claimed_unsent',
+        'automatic_retry':False,'possible_additional_provider_usage':True,'source_rows_adopted':False}
+    atomic_write_json(audit_path,audit)
+    with closing(connect(root)) as con,con:
+        if dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(task_id,)).fetchone())!=task:
+            raise ValueError('Unknown task changed before operator authorization; no replay')
+        con.execute('INSERT INTO desktop_replays VALUES(?,?,?,?,?,?,?)',
+            (authorization,task_id,task['attempted_at_utc'],str(audit_path.relative_to(root)),
+             hashlib.sha256(audit_path.read_bytes()).hexdigest(),None,None))
+    state=run_one(root,bridge,retry_authorization_id=authorization)
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE desktop_replays SET outcome=? WHERE authorization_id=?',(state,authorization))
+    return {**restored,'state':state,'operator_replay':True,'automatic_retry':False,
+            'original_unknown_evidence_retained':True,'authorization_id':authorization,
+            'possible_additional_provider_usage':True}

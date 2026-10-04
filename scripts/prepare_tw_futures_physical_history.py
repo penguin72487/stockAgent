@@ -13,7 +13,7 @@ import polars as pl
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from stockagent.data.tw_futures_margin_preparation import (physical_lifetime_calendar,
     load_preparation_final_settlements, derive_adjusted_final_fixings, load_same_security_final_fixing_rule,
-    load_adjusted_zero_oi_rule)
+    load_adjusted_zero_oi_rule, load_loss_reduction_halt_review, apply_loss_reduction_halt_values)
 from stockagent.data.tw_stock_futures_repair import official_day_evidence
 
 
@@ -49,6 +49,8 @@ def main():
                    help='Dated original stock fixing rule; derive a separate missing-adjusted-price input, never an exchange row')
     p.add_argument('--adjusted-lifecycle-review',type=Path,
                    help='Original rule and commencement evidence for zero-open-interest adjusted contract delisting')
+    p.add_argument('--loss-reduction-halt-review',type=Path,action='append',default=[],
+                   help='Source-bound pure loss-reduction halt: legal nonexpiry values only; no executable prices')
     p.add_argument('--output-dir',type=Path,required=True)
     a=p.parse_args(); started=time.monotonic()
     a.output_dir.mkdir(parents=True,exist_ok=True)
@@ -127,6 +129,26 @@ def main():
         pl.when(cash_event).then(pl.col('final_settlement_price'))
         .otherwise(pl.col('daily_mark')).alias('valuation_price'),
         cash_event.fill_null(False).alias('cash_settlement'))
+    halt_values=None
+    if a.loss_reduction_halt_review:
+        import shutil
+        if corporate is None:p.error('halt value review requires --corporate-candidates')
+        all_halt_values=[]
+        for i,review_path in enumerate(a.loss_reduction_halt_review):
+            if a.output_dir.resolve().is_relative_to(review_path.parent.resolve()):
+                raise ValueError('halt review/output directories must not be nested')
+            episode=load_loss_reduction_halt_review(review_path)
+            own=corporate.filter((pl.col('source_content_sha256')==episode['source_content_sha256'])
+                &(pl.col('from_product')==episode['product'])
+                &(pl.col('effective_date')==episode['resumption_date']))
+            if own.height!=1 or own['contract_multiplier'][0]!=float(episode['after_units']):
+                raise ValueError('halt review is not owned by the selected corporate source')
+            joined,values=apply_loss_reduction_halt_values(joined,parent.select('date').unique(),episode)
+            all_halt_values.append(values)
+            folder='loss_reduction_halt_rule' if len(a.loss_reduction_halt_review)==1 else f'loss_reduction_halt_rules/{i}'
+            shutil.copytree(review_path.parent,a.output_dir/folder)
+        halt_values=pl.concat(all_halt_values,how='vertical')
+        atomic_write_parquet(a.output_dir/'legal_halt_valuation_inputs.parquet',halt_values)
     bad=joined.filter(pl.col('valuation_price').is_null()|~pl.col('valuation_price').is_finite()
                       |(pl.col('valuation_price')<=0))
     atomic_write_parquet(a.output_dir/'physical_daily_marks.parquet',joined)
@@ -140,7 +162,7 @@ def main():
         ((pl.col('valuation_price')>0)&pl.col('valuation_price').is_finite()).sum().alias('priced_rows')),
         on='product',how='left').sort('product')
     products.write_csv(a.output_dir/'product_physical_coverage.csv')
-    result=dict(schema_version=5 if delisting_rule is not None else (4 if derived is not None else (3 if corporate is not None else (2 if mixed_semantics else 1))),status='prepared_physical_evidence_requires_rule_and_accounting_admission',
+    result=dict(schema_version=7 if halt_values is not None else (5 if delisting_rule is not None else (4 if derived is not None else (3 if corporate is not None else (2 if mixed_semantics else 1)))),status='prepared_physical_evidence_requires_rule_and_accounting_admission',
         builder_source_sha256=sha256_file(Path(__file__)),
         preparation_source_sha256=sha256_file(Path(__file__).resolve().parents[1]/'stockagent/data/tw_futures_margin_preparation.py'),
         all_products_training_ready=False,created_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -151,6 +173,11 @@ def main():
         underlying_final_fixing_rule_sha256=sha256_file(a.underlying_fixing_review) if a.underlying_fixing_review else None,
         derived_fixing_corporate_terms_sha256=sha256_file(terms_path) if derived is not None else None,
         adjusted_lifecycle_rule_sha256=sha256_file(a.adjusted_lifecycle_review) if a.adjusted_lifecycle_review else None,
+        loss_reduction_halt_review_sha256=sha256_file(a.loss_reduction_halt_review[0]) if len(a.loss_reduction_halt_review)==1 else None,
+        loss_reduction_halt_review_sha256s=[sha256_file(p) for p in a.loss_reduction_halt_review],
+        legal_halt_value_contract='source_bound_loss_reduction_halt_value_v2' if halt_values is not None else None,
+        legal_halt_valuation_rows=halt_values.height if halt_values is not None else 0,
+        legal_halt_values_are_observed_quotes=False,
         zero_open_interest_delisted_lives=lives.filter(pl.col('lifetime_status')=='zero_open_interest_delisting').height,
         products=products.height,calendar_rows=calendar.height,physical_lives=lives.height,
         missing_valuation_rows=bad.height,elapsed_s=time.monotonic()-started,

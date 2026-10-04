@@ -17,10 +17,13 @@ from stockagent.data_sync.desync_snapshots import SnapshotError  # noqa: E402
 from stockagent.data_sync.desync_snapshots import sha256_file  # noqa: E402
 from stockagent.data_sync.legacy_artifact_archive import (  # noqa: E402
     load_legacy_specs,
+    apply_archive_stage_prune,
+    plan_archive_stage_prune,
     prepare_archive,
     publish_archive,
     restore_archive,
     verify_archive_directory,
+    verify_cold_archive,
 )
 from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     resolve_latest_packed,
@@ -42,7 +45,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("plan", "prepare", "publish", "verify", "restore", "enroll", "renew", "retire-plan", "retire-apply"),
+        choices=("plan", "prepare", "publish", "verify", "restore", "enroll", "renew", "retire-plan", "retire-apply", "prune-stage-plan", "prune-stage-apply"),
     )
     parser.add_argument("dataset")
     parser.add_argument(
@@ -52,6 +55,14 @@ def main() -> int:
     parser.add_argument("--sync-root", type=Path, default=Path("/srv/stockagent-packed"))
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--plan-fingerprint")
+    parser.add_argument(
+        "--cold-only", action="store_true",
+        help="Verify encoded/decoded archive bytes and the selected cold release without comparing a retired hot source.",
+    )
+    parser.add_argument(
+        "--manual-capture", action="store_true",
+        help="explicit allowlisted exact-capture stability contract; never used by timers",
+    )
     parser.add_argument(
         "--manual-immediate", action="store_true",
         help="one-shot user-authorized lease-age bypass for retire-plan/retire-apply only",
@@ -71,8 +82,12 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if args.cold_only and args.command != "verify":
+            raise SnapshotError("--cold-only requires verify")
         if args.manual_immediate and args.command not in {"retire-plan", "retire-apply"}:
             raise SnapshotError("--manual-immediate requires retire-plan or retire-apply")
+        if args.manual_capture and args.command not in {"plan", "prepare", "publish", "verify", "retire-plan", "retire-apply"}:
+            raise SnapshotError("--manual-capture is not supported by this command")
         specs = load_legacy_specs(args.catalog)
         if args.dataset not in specs:
             raise SnapshotError(f"legacy dataset is not allowlisted: {args.dataset}")
@@ -86,7 +101,7 @@ def main() -> int:
         if args.command == "plan":
             from stockagent.data_sync.legacy_artifact_archive import source_plan
 
-            rows = source_plan(source, spec)
+            rows = source_plan(source, spec, manual_capture=args.manual_capture)
             result = {
                 "dataset": spec.dataset,
                 "relative_root": spec.relative_root,
@@ -94,10 +109,12 @@ def main() -> int:
                 "files": len(rows),
                 "source_bytes": sum(row["source"]["size"] for row in rows),
                 "stage": str(archive),
-                "source_unchanged_days": spec.minimum_stable_days,
+                "source_unchanged_days": None if args.manual_capture else spec.minimum_stable_days,
+                "source_stability_mode": "manual-exact-capture-v1" if args.manual_capture else "seven-day-stable",
+                "minimum_stable_hours": spec.manual_capture_min_stable_hours if args.manual_capture else spec.minimum_stable_days * 24,
             }
         elif args.command == "prepare":
-            result = prepare_archive(spec, args.artifact_root)
+            result = prepare_archive(spec, args.artifact_root, manual_capture=args.manual_capture)
             result = {
                 "dataset": spec.dataset,
                 "files": len(result["files"]),
@@ -107,10 +124,21 @@ def main() -> int:
             }
         elif args.command == "publish":
             result = publish_archive(
-                spec, args.artifact_root, args.sync_root, repo_root=REPO_ROOT
+                spec, args.artifact_root, args.sync_root, repo_root=REPO_ROOT,
+                manual_capture=args.manual_capture,
             )
         elif args.command == "verify":
-            result = verify_archive_directory(archive, source, spec=spec)
+            if args.cold_only and not archive.is_dir():
+                result = verify_cold_archive(spec, args.sync_root)
+                result.pop("manifest")
+                result.update(source_comparison="not_requested_cold_only", deployable=False)
+                print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
+            result = verify_archive_directory(
+                archive, None if args.cold_only else source, spec=spec,
+                manual_capture=args.manual_capture,
+                artifact_root=args.artifact_root,
+            )
             result.pop("manifest")
             resolved = resolve_latest_packed(args.sync_root, spec.dataset)
             metadata = resolved.manifest.get("metadata", {})
@@ -124,6 +152,20 @@ def main() -> int:
                 raise SnapshotError("cold release does not match the allowlisted legacy archive")
             verify_packed_snapshot(args.sync_root, resolved, materialized_path=archive)
             result.update(snapshot_id=resolved.manifest["snapshot_id"], cold_verified=True)
+            result.update(
+                decoded_originals_verified=True,
+                source_comparison="not_requested_cold_only" if args.cold_only else "exact_bytes_and_portable_metadata",
+                deployable=False,
+            )
+        elif args.command in {"prune-stage-plan", "prune-stage-apply"}:
+            options = {"artifact_root": args.artifact_root, "state_root": args.retirement_state_root}
+            if args.command == "prune-stage-apply":
+                if not args.plan_fingerprint:
+                    raise SnapshotError("prune-stage-apply requires --plan-fingerprint")
+                result = apply_archive_stage_prune(spec, args.sync_root,
+                                                  expected_fingerprint=args.plan_fingerprint, **options)
+            else:
+                result = plan_archive_stage_prune(spec, args.sync_root, **options)
         elif args.command == "enroll":
             result = enroll_legacy_lease(
                 spec, artifact_root=args.artifact_root, state_root=args.retirement_state_root
@@ -156,6 +198,7 @@ def main() -> int:
                 "peer_probe": lambda: _syncthing(cfg),
                 "bridge_inactive": _bridge_inactive(Path("/srv/stockagent-artifacts-hot")),
                 "manual_immediate": args.manual_immediate,
+                "manual_capture": args.manual_capture,
             }
             result = (
                 apply_legacy_retirement(

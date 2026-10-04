@@ -2,7 +2,7 @@
 Description=Resume bounded public economic histories including closed-market days
 
 [Timer]
-OnBootSec=5min
+OnActiveSec=5min
 OnUnitInactiveSec=1h
 RandomizedDelaySec=60
 Persistent=true

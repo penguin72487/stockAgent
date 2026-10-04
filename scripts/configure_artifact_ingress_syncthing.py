@@ -41,7 +41,9 @@ def credentials() -> tuple[str, str]:
     return candidates.pop()
 
 
-def request(base: str, key: str, path: str, query=None, *, method="GET", payload=None):
+def request(base: str, key: str, path: str, query=None, *, method="GET", payload=None, timeout=30):
+    if type(timeout) not in {int, float} or not 1 <= timeout <= 1800:
+        raise ValueError("Syncthing request timeout must be bounded")
     url = base.rstrip("/") + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
@@ -52,7 +54,7 @@ def request(base: str, key: str, path: str, query=None, *, method="GET", payload
         method=method,
         headers={"X-API-Key": key, "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         body = response.read()
         return json.loads(body) if body else None
 

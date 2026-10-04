@@ -6,6 +6,13 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+from downloader.finmind_eta import SNAPSHOT_CONTRACT_VERSION
+from downloader.finmind_history_order import HISTORY_STAGES, STAGES, metadata as history_order_metadata
+
+
+ORDERED_SNAPSHOT_VERSIONS = frozenset({6, 7, 8, SNAPSHOT_CONTRACT_VERSION})
+RETRY_SNAPSHOT_VERSIONS = frozenset({7, 8, SNAPSHOT_CONTRACT_VERSION})
+PUBLIC_SNAPSHOT_VERSIONS = frozenset({3, 4, 5}) | ORDERED_SNAPSHOT_VERSIONS
 
 
 def _number(value: Any) -> int | float | None:
@@ -34,6 +41,15 @@ def public_completion_estimate(root: Path, now: datetime) -> dict[str, Any]:
                 payload = value['estimate']
     except (OSError, ValueError):
         pass
+    if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS:
+        children = payload.get('stages')
+        keys = [item.get('key') for item in children if isinstance(item, dict)] if isinstance(children, list) else []
+        if (payload.get('history_order') != history_order_metadata()
+                or keys != [key for key, _ in STAGES]):
+            # Reordering an old estimate's rows would retain the OLD predecessor
+            # times. The minute sampler must recompute the new actual sequence.
+            return _public_estimate({**payload, 'state': 'unavailable',
+                                     'basis': '排程順序已變更，等待符合目前九類順序的每分鐘估算。'}, now)
     result = _public_estimate(payload, now)
     children = payload.get('milestones')
     if isinstance(children, dict):
@@ -42,13 +58,18 @@ def public_completion_estimate(root: Path, now: datetime) -> dict[str, Any]:
     stages = payload.get('stages')
     if isinstance(stages, list):
         result['stages'] = []
-        for key in ('priority', 'core', 'detail', 'tick', 'validation'):
+        stage_keys = tuple(key for key, _ in STAGES) if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS else (
+            'priority', 'core', 'detail', 'tick', 'validation')
+        for key in stage_keys:
             raw = next((item for item in stages if isinstance(item, dict) and item.get('key') == key), None)
             if raw is not None:
                 # A child cannot outlive the evidence envelope that owns it.
                 item = _public_estimate({**raw, 'observed_at_utc': payload.get('observed_at_utc'),
                                          'valid_until_utc': payload.get('valid_until_utc')}, now)
-                item.update(key=key, cumulative_planned_requests=_number(raw.get('cumulative_planned_requests')))
+                history = next((stage for stage in HISTORY_STAGES if stage.key == key), None)
+                item.update(key=key, dataset=history.dataset if history else None,
+                            history_rank=HISTORY_STAGES.index(history) + 1 if history else None,
+                            cumulative_planned_requests=_number(raw.get('cumulative_planned_requests')))
                 result['stages'].append(item)
     return result
 
@@ -65,7 +86,7 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         state = 'stale'
     usable = fresh and state not in {'unavailable', 'stale'}
     result = {
-        'schema_version': payload['schema_version'] if payload.get('schema_version') in {3, 4} else 2,
+        'schema_version': payload['schema_version'] if payload.get('schema_version') in PUBLIC_SNAPSHOT_VERSIONS else 2,
         'state': state, 'observed_at_utc': observed.isoformat() if observed else None,
         'valid_until_utc': expiry.isoformat() if expiry else None,
         'scope_label': str(payload.get('scope_label', 'FinMind 已排程工作'))[:160],
@@ -78,7 +99,7 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         result['workload'] = {key: _number(work.get(key)) for key in (
             'required_requests', 'validation_requests', 'planned_requests', 'unbatched_requests',
             'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-            'batch_savings', 'calendar_wait_tasks', 'retry_tasks')}
+            'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests')}
     result['retry_wait_seconds'] = _number(payload.get('retry_wait_seconds')) if usable else None
     scenarios = payload.get('scenarios')
     for key in ('fastest', 'central', 'slowest'):
@@ -137,5 +158,20 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             {'code': item['code'], 'count': _number(item.get('count')), 'reason': item['reason'][:400]}
             for item in blockers[:10] if isinstance(item, dict) and isinstance(item.get('reason'), str)
             and item.get('code') in {'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets',
-                                     'secondary_admission', 'unmeasured_tail', 'quota_pause', 'retry_tasks'}]
+                                     'secondary_admission', 'unmeasured_tail', 'quota_pause', 'retry_tasks', 'retry_exhausted_tasks'}]
+    condition = payload.get('retry_condition')
+    if (usable and payload.get('schema_version') in RETRY_SNAPSHOT_VERSIONS and isinstance(condition, dict)
+            and condition.get('schema_version') == 1
+            and condition.get('basis') == 'next_retry_succeeds_no_additional_failures'
+            and (_number(condition.get('retry_tasks')) or 0) > 0):
+        # Reuse the exact freshness/deadline allowlist. Never release arbitrary
+        # nested provider text, source paths, or stale modeled deadlines.
+        projected = _public_estimate({**payload, 'state': 'conditional',
+                                      'scenarios': condition.get('scenarios'), 'retry_condition': None}, now)
+        result['retry_condition'] = {
+            'schema_version': 1, 'basis': condition['basis'], 'is_guaranteed': False,
+            'retry_tasks': _number(condition.get('retry_tasks')),
+            'known_retry_wait_seconds': _number(condition.get('known_retry_wait_seconds')),
+            'scenarios': projected['scenarios'],
+        }
     return result

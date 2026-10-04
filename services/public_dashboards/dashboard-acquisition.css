@@ -1,0 +1,172 @@
+/* Shared acquisition hierarchy; source cards/graphs keep their mechanisms. */
+body[data-acquisition-page] {
+  background: radial-gradient(ellipse at 10% 0%, rgba(67, 215, 255, .05), transparent 45%), var(--dashboard-bg);
+}
+body[data-acquisition-page] > main,
+body[data-acquisition-page] > .site-header,
+body[data-acquisition-page] > .public-nav,
+body[data-acquisition-page] > footer {
+  width: min(1520px, calc(100% - 48px));
+  margin-inline: auto;
+}
+body[data-acquisition-page] > main { padding-top: 0; }
+body[data-acquisition-page] .hero,
+body[data-acquisition-page] .provider-hero {
+  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  align-items: center;
+  padding-block: 28px 20px;
+  margin-bottom: 0;
+}
+body[data-acquisition-page] .hero h1,
+body[data-acquisition-page] .provider-hero h1 {
+  font-size: clamp(26px, 2.8vw, 38px);
+  line-height: 1.25;
+  letter-spacing: -.025em;
+  margin: 8px 0 10px;
+  overflow-wrap: anywhere;
+}
+body[data-acquisition-page] .hero .lead,
+body[data-acquisition-page] .hero .subtitle,
+body[data-acquisition-page] .provider-hero .lead {
+  font-size: 14px;
+  line-height: 1.65;
+  max-width: 62em;
+  margin: 0;
+}
+body[data-acquisition-page] .health-panel,
+body[data-acquisition-page] .health-card,
+body[data-acquisition-page] .live-card,
+body[data-acquisition-page] .hero-status {
+  padding: 14px 16px;
+  min-width: 0;
+  gap: 6px;
+  min-height: 0;
+}
+.acq-health-compact > progress,
+.acq-health-compact > strong,
+.acq-health-compact > p { display: none; }
+.acq-overview { margin: 12px 0 14px; scroll-margin-top: 20px; }
+.acq-overview-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-bottom: 12px;
+}
+.acq-overview-heading h2 { font-size: 17px; margin: 0; }
+.acq-overview-heading > span { color: var(--dashboard-muted); font-size: 12px; }
+.acq-overview-heading button { margin-left: auto; min-height: 44px; }
+.acq-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.acq-metric {
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--dashboard-line);
+  border-radius: 12px;
+  background: var(--dashboard-surface);
+}
+.acq-metric-label { display: block; font-size: 12px; color: var(--dashboard-muted); }
+.acq-metric-value {
+  display: block;
+  font-size: clamp(20px, 1.8vw, 28px);
+  line-height: 1.35;
+  margin: 8px 0 6px;
+  color: var(--dashboard-text);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.acq-metric-note,
+.acq-progress-basis { display: block; font-size: 12px; line-height: 1.6; color: var(--dashboard-muted); overflow-wrap: anywhere; }
+.acq-progress { padding: 14px 18px; margin-top: 12px; border: 1px solid var(--dashboard-line); border-radius: 12px; }
+.acq-progress-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; font-size: 13px; }
+.acq-progress-header strong { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+body[data-acquisition-page] .acq-progress-bar { width: 100%; display: block; height: 9px; margin: 10px 0 8px; accent-color: var(--dashboard-accent, #58dfbb); }
+body[data-acquisition-page] .acq-progress-bar { border: 0; border-radius: 999px; overflow: hidden; }
+body[data-acquisition-page] .acq-progress-bar::-webkit-progress-bar { background: #152b3a; border-radius: 999px; }
+body[data-acquisition-page] .acq-progress-bar::-webkit-progress-value { background: linear-gradient(90deg, var(--dashboard-cyan), var(--dashboard-green)); border-radius: 999px; }
+body[data-acquisition-page] .acq-progress-bar::-moz-progress-bar { background: linear-gradient(90deg, var(--dashboard-cyan), var(--dashboard-green)); border-radius: 999px; }
+.acq-next { margin: 10px 0 0; font-size: 13px; line-height: 1.6; color: var(--dashboard-muted); overflow-wrap: anywhere; }
+.acq-next strong { color: var(--dashboard-text); }
+/* Provider-specific legacy sticky bars obscure native disclosure headings
+ * after a jump. Keep this shared navigator in normal flow on every viewport. */
+body[data-acquisition-page] .jump-nav { position: static; margin: 0 0 18px; gap: 6px; display: flex; flex-wrap: wrap; }
+body[data-acquisition-page] .jump-nav a {
+  min-height: 44px; padding: 10px 14px; display: inline-flex; align-items: center;
+  border: 1px solid var(--dashboard-line); border-radius: 999px; background: var(--dashboard-surface);
+  font-size: 12px; font-weight: 650; color: var(--dashboard-text); text-decoration: none;
+}
+body[data-acquisition-page] .jump-nav a:hover { border-color: var(--dashboard-cyan); }
+body[data-acquisition-page] .alert,
+body[data-acquisition-page] .runtime-alert { margin: 12px 0; padding: 14px 16px; }
+body[data-acquisition-page] .alert strong,
+body[data-acquisition-page] .runtime-alert strong { font-size: 16px; }
+body[data-acquisition-page] .alert p,
+body[data-acquisition-page] .runtime-alert p { margin-block: 6px 0; font-size: 12px; line-height: 1.7; }
+.acq-details { border: 1px solid var(--dashboard-line); border-radius: 12px; margin: 0 0 12px; background: var(--dashboard-surface); scroll-margin-top: 18px; }
+.acq-details > summary {
+  min-height: 72px;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  cursor: pointer;
+  padding: 16px 18px;
+}
+.acq-details > summary::-webkit-details-marker { display: none; }
+.acq-details > summary::after { content: "+"; font-size: 24px; margin-left: auto; color: var(--dashboard-muted); }
+.acq-details[open] > summary::after { content: "−"; }
+.acq-details[open] > summary { border-bottom: 1px solid var(--dashboard-line); }
+.acq-section-number { color: var(--dashboard-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.acq-disclosure-copy { min-width: 0; }
+.acq-disclosure-copy strong { display: block; font-size: 15px; line-height: 1.5; }
+.acq-disclosure-copy small { display: block; color: var(--dashboard-muted); font-size: 12px; line-height: 1.6; margin-top: 3px; }
+.acq-detail-body { padding: 20px; min-width: 0; }
+/* Closed native content must not retain ghost hit/measurement boxes when a
+ * late quota response unhides a link inside a content-visibility subtree. */
+.acq-details:not([open]) > .acq-detail-body { display: none; }
+body[data-acquisition-page] .acq-detail-body > .section-block,
+body[data-acquisition-page] .acq-detail-body > .kpi-grid,
+body[data-acquisition-page] .acq-detail-body > .kpis { margin: 0 0 22px; padding-top: 0; }
+body[data-acquisition-page] .acq-detail-body > :last-child { margin-bottom: 0; }
+/* Native disclosure already avoids closed-section layout. When opened, use
+ * actual section heights so old deep links don't land on 420px placeholders. */
+body[data-acquisition-page] .acq-details[open] .section-block {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
+body[data-acquisition-page] .acq-detail-body .section-heading > span:first-child { display: none; }
+body[data-acquisition-page] .acq-detail-body .section-heading h2 { font-size: 19px; }
+body[data-acquisition-page] .acq-detail-body .section-heading p { font-size: 13px; line-height: 1.7; }
+body[data-acquisition-page] .acq-detail-body [id] { scroll-margin-top: 20px; }
+.acq-hub-title { font-size: 20px; margin: 24px 0 14px; }
+body[data-acquisition-page="overview"] .hero { display: block; }
+body[data-acquisition-page="overview"] .trust-row { margin-top: 16px; }
+body[data-acquisition-page="overview"] .cards { margin-top: 0; }
+
+@media (max-width: 1100px) {
+  .acq-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* Multi-child cells belong to the value column, not subsequent label rows. */
+  body[data-acquisition-page] table.dashboard-responsive-table td > * { grid-column: 2; min-width: 0; max-width: 100%; }
+  body[data-acquisition-page] table.dashboard-responsive-table td[colspan] > * { grid-column: auto; }
+}
+@media (max-width: 600px) {
+  body[data-acquisition-page] > main,
+  body[data-acquisition-page] > .site-header,
+  body[data-acquisition-page] > .public-nav,
+  body[data-acquisition-page] > footer { width: calc(100% - 24px); }
+  body[data-acquisition-page] .hero,
+  body[data-acquisition-page] .provider-hero { grid-template-columns: minmax(0, 1fr); padding-block: 18px 12px; gap: 14px; }
+  body[data-acquisition-page] .hero .eyebrow,
+  body[data-acquisition-page] .provider-hero .eyebrow { font-size: 10px; }
+  .acq-metrics { gap: 8px; }
+  .acq-metric { padding: 12px; }
+  .acq-metric-value { font-size: 20px; }
+  .acq-metric-note { font-size: 11px; }
+  body[data-acquisition-page] .health-panel p { margin-block: 4px; }
+  .acq-overview-heading > span { font-size: 11px; }
+  .acq-progress { padding: 12px; }
+  .acq-details > summary { padding: 14px 12px; gap: 10px; }
+  .acq-detail-body { padding: 14px 10px; }
+  .acq-disclosure-copy small { font-size: 11px; }
+  body[data-acquisition-page] .jump-nav a { padding: 8px 10px; font-size: 12px; }
+}

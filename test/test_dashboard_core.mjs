@@ -48,7 +48,7 @@ function fakeDocument(current = "tw-day-trade") {
   return {document, nav, listeners};
 }
 
-function loadCore({current = "tw-day-trade", fetchImpl, localStorage} = {}) {
+function loadCore({current = "tw-day-trade", fetchImpl, localStorage, globals = {}, beforeInstall} = {}) {
   const {document, nav, listeners} = fakeDocument(current);
   const requests = [];
   const sandbox = {
@@ -66,27 +66,129 @@ function loadCore({current = "tw-day-trade", fetchImpl, localStorage} = {}) {
     localStorage,
     setInterval,
     setTimeout,
+    ...globals,
   };
+  beforeInstall?.(sandbox);
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox, {filename: "dashboard-core.js"});
   return {core: sandbox.StockAgentDashboard, document, listeners, nav, requests, sandbox};
 }
 
+test("deferred rendering keeps only the latest hidden snapshot and flushes on reveal without fetching", async () => {
+  let closed = true;
+  let top = 20;
+  const target = {closest: () => closed ? {} : null, getClientRects: () => closed ? [] : [{}],
+    getBoundingClientRect: () => ({top, bottom: top + 100, left: 0, right: 200})};
+  const {core, document, requests, listeners} = loadCore({globals: {innerHeight: 768, innerWidth: 1366}});
+  const rendered = [];
+  const render = core.createDeferredRenderer(target, value => rendered.push(value));
+  render("old"); render("latest");
+  assert.deepEqual(rendered, []);
+  closed = false;
+  document.dispatchEvent({type: "toggle"}); await new Promise(setImmediate);
+  assert.deepEqual(rendered, ["latest"]);
+  top = 2000;
+  document.dispatchEvent({type: "acquisition:reveal"}); await new Promise(setImmediate);
+  render("offscreen"); render("newest");
+  assert.equal(rendered.length, 1);
+  top = 20;
+  document.dispatchEvent({type: "acquisition:reveal"}); await new Promise(setImmediate);
+  assert.deepEqual(rendered, ["latest", "newest"]);
+  document.hidden = true;
+  document.dispatchEvent({type: "visibilitychange"}); await new Promise(setImmediate);
+  render("foreground");
+  document.hidden = false;
+  document.dispatchEvent({type: "visibilitychange"}); await new Promise(setImmediate);
+  assert.deepEqual(rendered, ["latest", "newest", "foreground"]);
+  render.dispose();
+  core.observeVisibility(target, () => {});
+  assert.equal(listeners.get("toggle").size, 1, "visibility event handling is shared");
+  assert.equal(requests.length, 0);
+});
+
+test("intersection hints cannot override a closed ancestor, and loading DOM waits until ready", async () => {
+  let hint;
+  const target = {closest: () => null, getClientRects: () => [{}],
+    getBoundingClientRect: () => ({top: 20, bottom: 100, left: 0, right: 200})};
+  const {core, document} = loadCore({globals: {innerHeight: 768, innerWidth: 1366,
+    IntersectionObserver: class {constructor(callback) { hint = callback; } observe() {} disconnect() {}}}});
+  document.readyState = "loading";
+  const changes = [];
+  const observer = core.observeVisibility(target, visible => changes.push(visible));
+  hint([{isIntersecting: true}]);
+  assert.deepEqual(changes, [false]);
+  document.readyState = "complete";
+  document.dispatchEvent({type: "DOMContentLoaded"}); await new Promise(setImmediate);
+  assert.deepEqual(changes, [false, true]);
+  target.closest = () => ({});
+  hint([{isIntersecting: true}]);
+  assert.deepEqual(changes, [false, true, false]);
+  observer.dispose();
+});
+
+test("one broken disclosure callback cannot prevent other visibility consumers updating", async () => {
+  let closed = true;
+  const target = {closest:() => closed ? {} : null, getClientRects:() => [{}],
+    getBoundingClientRect:() => ({top:20,bottom:100,left:0,right:200})};
+  const errors = [], changes = [];
+  const {core, document} = loadCore({globals:{innerHeight:768,innerWidth:1366,
+    console:{error:value => errors.push(value)}}});
+  core.observeVisibility(target, visible => {if (visible) throw new Error("private details must not leak");});
+  core.observeVisibility(target, visible => changes.push(visible));
+  closed=false;document.dispatchEvent({type:"toggle"});await new Promise(setImmediate);
+  assert.deepEqual(changes, [false,true]);
+  assert.deepEqual(errors, ["Dashboard visibility callback failed"]);
+});
+
 test("shared navigation renders one canonical route list and current page", () => {
   const {core, nav} = loadCore({current: "tw-day-trade"});
-  assert.equal(core.NAV_ITEMS.length, 10);
-  assert.equal(nav.children.length, 10);
+  assert.equal(core.NAV_ITEMS.length, 11);
+  assert.equal(nav.children.length, 11);
   assert.deepEqual(nav.children.map((link) => link.textContent), [
-    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "FinLab", "FinMind", "OpenBB", "全資料", "流量",
+    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "FinLab", "FinMind", "TEJ", "OpenBB", "全資料", "流量",
   ]);
-  assert.equal(nav.children[0].href, "../");
-  assert.equal(nav.children[2].href, "./");
+  assert.equal(nav.children[0].href, "/");
+  assert.equal(nav.children[2].href, "/tw-day-trade/");
   assert.equal(nav.children[2].attributes["aria-current"], "page");
-  assert.equal(nav.children[6].href, "../finmind/");
-  assert.equal(nav.children[8].href, "../data-monitor/");
+  assert.equal(nav.children[6].href, "/finmind/");
+  assert.equal(nav.children[9].href, "/data-monitor/");
   assert.equal(nav.dataset.dashboardNavMounted, "true");
   assert.ok(Object.isFrozen(core));
   assert.ok(Object.isFrozen(core.NAV_ITEMS));
+});
+
+test("provider detail navigation resolves to canonical root routes, not nested siblings", () => {
+  const {core, nav, sandbox} = loadCore({current: "data-monitor", beforeInstall(context) {
+    context.location.href = "https://dashboard.example/data-monitor/providers/finmind/";
+    context.location.pathname = "/data-monitor/providers/finmind/";
+  }});
+  const resolved = nav.children.map(link => new URL(link.href, sandbox.location.href).pathname);
+  assert.deepEqual(resolved, Array.from(core.NAV_ITEMS, item => item.slug ? `/${item.slug}/` : "/"));
+  assert.equal(nav.children[9].attributes["aria-current"], "page");
+});
+
+test("Escape closes the expanded menu when focus remains on its toggle", () => {
+  const headerEvents = new Map(), navEvents = new Map();
+  let toggle, focused = false;
+  const {nav} = loadCore({beforeInstall(sandbox) {
+    const target = sandbox.document.querySelectorAll("nav[data-dashboard-nav]")[0];
+    target.addEventListener = (name, listener) => navEvents.set(name, listener);
+    target.parentElement = {
+      querySelector() { return null; },
+      addEventListener(name, listener) { headerEvents.set(name, listener); },
+      insertBefore(node) {
+        toggle = node;
+        node.focus = () => { focused = true; };
+        node.addEventListener = (name, listener) => { node[name] = listener; };
+      },
+    };
+  }});
+  toggle.click();
+  assert.equal(nav.dataset.expanded, "true");
+  headerEvents.get("keydown")?.({key: "Escape", target: toggle});
+  assert.equal(nav.dataset.expanded, "false");
+  assert.equal(toggle.attributes["aria-expanded"], "false");
+  assert.equal(focused, true);
 });
 
 test("shared formatters cap visible precision and escape unsafe strings", () => {
@@ -316,6 +418,22 @@ test("browser performance history bounds a noisy metric series", async () => {
   assert.equal(core.PERFORMANCE_SCHEMA_VERSION, 1);
 });
 
+test("keyboard control latency is measured without persisting the pressed key or field value", async () => {
+  const {core, document} = loadCore();
+  const target = {tagName: "BUTTON", id: "menu", dataset: {}, value: "DO-NOT-STORE",
+    getAttribute() { return null; },
+    closest(selector) { return selector === "[data-performance-ignore]" ? null : this; }};
+  document.dispatchEvent({type: "keydown", key: "Escape", target, timeStamp: Date.now()});
+  document.dispatchEvent({type: "keydown", key: "private-character", target, timeStamp: Date.now()});
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const history = core.performanceHistorySnapshot();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].eventType, "keydown");
+  assert.equal(history[0].action, "button:menu");
+  assert.equal("key" in history[0], false);
+  assert.doesNotMatch(JSON.stringify(history), /DO-NOT-STORE|private-character|Escape/);
+});
+
 test("explicit chart rendering metrics preserve bounded phase and size evidence", () => {
   const {core} = loadCore();
   const metric = core.recordPerformanceMetric({
@@ -340,4 +458,177 @@ test("explicit chart rendering metrics preserve bounded phase and size evidence"
   assert.equal(recorded.length, 1);
   assert.equal(recorded[0].kind, metric.kind);
   assert.equal(recorded[0].pointCount, metric.pointCount);
+});
+
+test("missing performance observations stay unknown, while actual zeros and full point counts survive", () => {
+  const {core} = loadCore();
+  const metric = core.recordPerformanceMetric({
+    kind: "api", action: "unknown_phases", durationMs: 0, headersMs: 0,
+    serverMs: null, inputDelayMs: null, fcpMs: "", lcpMs: false,
+    bodyMs: "   ", parseMs: [], paintMs: {}, pointCount: 1200000, seriesCount: 8,
+  });
+  for (const field of ["serverMs", "inputDelayMs", "fcpMs", "lcpMs", "bodyMs", "parseMs", "paintMs"]) {
+    assert.equal(field in metric, false, `${field} is not an observation`);
+  }
+  assert.equal(metric.durationMs, 0);
+  assert.equal(metric.headersMs, 0);
+  assert.equal(metric.pointCount, 1200000);
+});
+
+test("API history without Server-Timing does not invent a zero server duration", async () => {
+  const {core} = loadCore();
+  await core.fetchJson("/api/status");
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const metric = core.performanceHistorySnapshot().find(row => row.kind === "api");
+  assert.ok(metric);
+  assert.equal("serverMs" in metric, false);
+  assert.equal(core.performanceSnapshot().at(-1).serverMs, null);
+});
+
+test("refresh scheduler catches synchronous errors and remains usable", async () => {
+  const errors = [];
+  let callback, calls = 0;
+  const {core} = loadCore({globals: {
+    setInterval(fn) { callback = fn; return 1; }, clearInterval() {},
+  }});
+  let scheduler;
+  assert.doesNotThrow(() => {
+    scheduler = core.scheduleRefresh(() => {
+      calls += 1;
+      if (calls === 1) throw new Error("synthetic refresh failure");
+    }, {intervalMs: 1000, onError: error => errors.push(error.message)});
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await callback();
+  assert.equal(calls, 2);
+  assert.deepEqual(errors, ["synthetic refresh failure"]);
+  scheduler.dispose();
+});
+
+test("refresh scheduler coalesces slow ticks without delaying the initial invocation", async () => {
+  let tick, release, calls = 0, clears = 0;
+  const {core} = loadCore({globals: {
+    setInterval(fn) { tick = fn; return 1; }, clearInterval() { clears += 1; },
+  }});
+  const scheduler = core.scheduleRefresh(() => {
+    calls += 1;
+    return new Promise(resolve => { release = resolve; });
+  }, {intervalMs: 1000});
+  assert.equal(calls, 1);
+  tick(); tick(); tick();
+  assert.equal(calls, 1);
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  tick();
+  assert.equal(calls, 2);
+  release();
+  scheduler.dispose();
+  tick();
+  assert.equal(calls, 2);
+  assert.equal(clears, 1);
+});
+
+function responsiveFixture(rows = 100, columns = 4) {
+  const counts = {reads: 0, writes: 0};
+  const headers = Array.from({length: columns}, (_, i) => ({textContent: `Header ${i}`}));
+  const table = {
+    nodeType: 1, dataset: {}, classList: {contains() { return false; }, add() {}},
+    matches(selector) { return selector === "table"; },
+    closest(selector) { return selector === ".table-scroll,.table-wrap" ? {} : null; },
+    querySelectorAll(selector) {
+      if (selector === "thead th") return headers;
+      if (selector === "tbody tr") return this.rows;
+      return [];
+    },
+  };
+  table.rows = Array.from({length: rows}, () => {
+    const row = {
+      nodeType: 1, tagName: "TR", closest(selector) {
+        return selector === "table" ? table : selector === "tr" ? this : null;
+      },
+      matches(selector) { return selector === "tr"; }, querySelectorAll() { return []; },
+    };
+    row.children = Array.from({length: columns}, () => ({
+      tagName: "TD", nodeType: 1, attributes: {},
+      closest(selector) { return selector === "table" ? table : selector === "tr" ? row : null; },
+      getAttribute(name) { counts.reads += 1; return this.attributes[name] ?? null; },
+      setAttribute(name, value) { counts.writes += 1; this.attributes[name] = value; },
+    }));
+    return row;
+  });
+  return {table, headers, counts};
+}
+
+test("responsive labels are idempotent for unchanged table headers and rows", () => {
+  const {core} = loadCore();
+  const {table, counts} = responsiveFixture();
+  assert.equal(core.enhanceResponsiveTable(table), true);
+  assert.equal(counts.writes, 400);
+  counts.writes = 0;
+  core.enhanceResponsiveTable(table);
+  assert.equal(counts.writes, 0);
+});
+
+test("a single-cell mutation visits only its responsive row, while a header change updates all rows", () => {
+  let observe;
+  const {core} = loadCore({
+    globals: {MutationObserver: class {
+      constructor(fn) { observe = fn; } observe() {}
+    }},
+    beforeInstall(sandbox) { sandbox.document.body = {}; },
+  });
+  const {table, headers, counts} = responsiveFixture();
+  core.enhanceResponsiveTable(table);
+  counts.reads = counts.writes = 0;
+  const cell = table.rows[5].children[1];
+  observe([{target: cell, addedNodes: [{nodeType: 3}]}]);
+  assert.equal(counts.reads, 4);
+  assert.equal(counts.writes, 0);
+  counts.reads = counts.writes = 0;
+  headers[0].textContent = "Changed header";
+  const thead = {closest(selector) { return selector === "table" ? table : selector === "thead" ? this : null; }};
+  observe([{target: thead, addedNodes: []}]);
+  assert.equal(counts.reads, 400);
+  assert.equal(counts.writes, 100);
+  assert.equal(table.rows[99].children[0].attributes["data-label"], "Changed header");
+});
+
+test("responsive observer labels inserted rows without revisiting the existing tbody", () => {
+  let observe;
+  const {core} = loadCore({
+    globals: {MutationObserver: class { constructor(fn) { observe = fn; } observe() {} }},
+    beforeInstall(sandbox) { sandbox.document.body = {}; },
+  });
+  const {table, counts} = responsiveFixture();
+  core.enhanceResponsiveTable(table);
+  const inserted = table.rows[99];
+  for (const cell of inserted.children) cell.attributes = {};
+  counts.reads = counts.writes = 0;
+  const tbody = {closest(selector) { return selector === "table" ? table : null; }};
+  observe([{target: tbody, addedNodes: [inserted]}]);
+  assert.equal(counts.reads, 4);
+  assert.equal(counts.writes, 4);
+});
+
+test("one refresh queued by visibility resumes after the active request, and disposal cancels it", async () => {
+  const {core, document} = loadCore({globals: {setInterval() { return 1; }, clearInterval() {}}});
+  let calls = 0, release;
+  const scheduler = core.scheduleRefresh(() => {
+    calls += 1;
+    return new Promise(resolve => { release = resolve; });
+  }, {intervalMs: 1000});
+  document.hidden = true;
+  document.dispatchEvent({type: "visibilitychange"});
+  document.hidden = false;
+  document.dispatchEvent({type: "visibilitychange"});
+  document.dispatchEvent({type: "visibilitychange"});
+  assert.equal(calls, 1);
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(calls, 2);
+  document.dispatchEvent({type: "visibilitychange"});
+  scheduler.dispose();
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(calls, 2);
 });

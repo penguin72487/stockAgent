@@ -1,0 +1,17 @@
+[Unit]
+Description=Bind guarded D volume backup transport for lab203
+Requires=stockagent-d-cold-mount.service
+BindsTo=stockagent-d-cold-mount.service
+After=stockagent-d-cold-mount.service
+Before=syncthing@root.service stockagent-backup-stream.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/mount_backup_transport.sh --mount
+ExecStop=/usr/bin/bash __REPO_ROOT__/scripts/mount_backup_transport.sh --unmount
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

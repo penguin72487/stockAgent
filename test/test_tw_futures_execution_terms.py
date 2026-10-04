@@ -71,6 +71,86 @@ def inputs():
         specifications=pl.DataFrame([specification()],schema=SPEC_FIELDS), terminal_values=terminal)
 
 
+@pytest.mark.parametrize('executable,volume,unknown,expected', [
+    (False,100.,False,False),(True,0.,False,False),(True,1.,False,True),
+    (True,None,False,True),(True,float('nan'),False,True),
+    (None,1.,False,True),(False,0.,True,True)])
+def test_inventory_reachability_bounds_entry_capacity_and_unknown_origins(executable,volume,unknown,expected):
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    frame=pl.DataFrame({'date':[DAYS[0]],'physical_contract':['A'],
+        'executable':pl.Series([executable],dtype=pl.Boolean),
+        'volume':pl.Series([volume],dtype=pl.Float64)})
+    rules=frame.select('date','physical_contract').with_columns(
+        pl.lit(None,dtype=pl.Date).alias('carry_from_date'),
+        pl.lit('').alias('carry_from_physical_contract'),
+        pl.lit(unknown).alias('inventory_origin_unresolved'))
+    result=inventory_entry_reachability(frame,rules)
+    assert result['inventory_entry_reachable'].to_list()==[expected]
+
+
+@pytest.mark.parametrize('missing_origin',[False,True])
+def test_inventory_reachability_propagates_multi_step_carry_causally(missing_origin):
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    frame=pl.DataFrame({'date':[DAYS[0],DAYS[1],DAYS[2],DAYS[0],DAYS[3]],
+        'physical_contract':['A','B','C','D','D'],'executable':[True,False,False,False,True],
+        'volume':[1.,0.,0.,0.,1.]})
+    rules=frame.select('date','physical_contract').with_columns(
+        pl.Series('carry_from_date',[None,DAYS[0],DAYS[1],None,DAYS[0]],dtype=pl.Date),
+        pl.Series('carry_from_physical_contract',['','ABSENT' if missing_origin else 'A','B','','D']),
+        pl.lit(False).alias('inventory_origin_unresolved'))
+    result=inventory_entry_reachability(frame,rules)
+    expected=frame.select('date','physical_contract').with_columns(
+        pl.Series('inventory_entry_reachable',[True,True,True,False,True])).sort(['date','physical_contract'])
+    assert result.equals(expected)
+    changed=frame.with_columns(pl.when(pl.col('date')==DAYS[3]).then(0.).otherwise(pl.col('volume')).alias('volume'))
+    earlier=pl.col('date')<DAYS[3]
+    assert inventory_entry_reachability(changed,rules).filter(earlier).equals(result.filter(earlier))
+
+
+def test_inventory_reachability_does_not_conflate_reused_generation_or_missing_same_identity():
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    frame=pl.DataFrame({'date':[DAYS[0],DAYS[1],DAYS[2]],
+        'physical_contract':['ABC:202603#g0','ABC:202603#g1','MISSING_PAST'],
+        'executable':[True,False,False],'volume':[1.,0.,0.]})
+    rules=frame.select('date','physical_contract').with_columns(
+        pl.Series('carry_from_date',[None,None,DAYS[1]],dtype=pl.Date),
+        pl.Series('carry_from_physical_contract',['','','MISSING_PAST']),
+        pl.lit(False).alias('inventory_origin_unresolved'))
+    assert inventory_entry_reachability(frame,rules)['inventory_entry_reachable'].to_list()==[True,False,True]
+
+
+@pytest.mark.parametrize('problem',['same_day','future','duplicate','no_volume','no_origin_proof'])
+def test_inventory_reachability_rejects_bad_graph_and_keeps_unproven_capacity(problem):
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    frame=pl.DataFrame({'date':[DAYS[0]],'physical_contract':['A'],'executable':[False],'volume':[0.]})
+    rules=frame.select('date','physical_contract').with_columns(
+        pl.lit(None,dtype=pl.Date).alias('carry_from_date'),pl.lit('').alias('carry_from_physical_contract'),
+        pl.lit(False).alias('inventory_origin_unresolved'))
+    if problem in ['same_day','future']:
+        rules=rules.with_columns(pl.lit(DAYS[0] if problem=='same_day' else DAYS[1]).alias('carry_from_date'),
+            pl.lit('B').alias('carry_from_physical_contract'))
+    elif problem=='duplicate':frame=pl.concat([frame,frame])
+    elif problem=='no_volume':frame=frame.drop('volume')
+    else:rules=rules.drop('inventory_origin_unresolved')
+    if problem in ['no_volume','no_origin_proof']:
+        assert inventory_entry_reachability(frame,rules)['inventory_entry_reachable'].all()
+    else:
+        with pytest.raises(ValueError):inventory_entry_reachability(frame,rules)
+
+
+@pytest.mark.parametrize('volume',[0.,1.])
+def test_compiler_requires_lost_owner_only_for_possible_inventory(volume):
+    kwargs=inputs();last=DAYS[-1]
+    kwargs['frame']=kwargs['frame'].with_columns(pl.lit(volume).alias('volume'),
+        pl.when(pl.col('date')==last).then(pl.lit(last+timedelta(days=1)))
+          .otherwise(pl.col('next_market_date')).alias('next_market_date'))
+    rules,flags=compile_execution_terms(**kwargs)
+    assert rules['inventory_entry_reachable'].eq(volume>0).all()
+    assert flags.filter(pl.col('date')==last)['lost_inventory_continuation'].item()==(volume>0)
+    assert not flags.filter(~pl.col('is_warmup')).drop('lost_inventory_continuation','has_blocker').select(
+        pl.any_horizontal(pl.col(c) for c in flags.columns if c.startswith('missing_'))).to_series().any()
+
+
 def test_rate_margin_and_carry_keep_different_account_instants():
     rules, blockers = compile_execution_terms(**inputs())
     assert rules.height == 3

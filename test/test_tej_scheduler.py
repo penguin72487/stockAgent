@@ -9,6 +9,34 @@ from downloader.tej_history import connect
 from downloader.tej_scheduler import CONTRACT, WatchPolicy, watch_queue
 
 
+@pytest.mark.parametrize('duration,expected',[(30,0),(2,0),(.5,1.5)])
+def test_start_interval_counts_complete_query_time_without_fixed_finish_sleep(queue,monkeypatch,duration,expected):
+    root,config=queue;config={**config,'query_interval_contract':'minimum_query_start_interval_v1'}
+    readings=iter([100,100+duration])
+    from types import SimpleNamespace
+    monkeypatch.setattr('downloader.tej_scheduler.time',SimpleNamespace(monotonic=lambda:next(readings)))
+    stop=InstantWait()
+    watch_queue(root,None,config,stop=stop,runner=lambda *_:'completed_task',max_cycles=1,emit=emit)
+    assert sum(stop.waits)==expected
+    assert json.loads((root/'scheduler_status.json').read_text())['query_interval_contract']==config['query_interval_contract']
+
+
+@pytest.mark.parametrize('field,value',[('query_interval_contract','unreviewed'),
+    ('minimum_export_interval_seconds',True),('minimum_export_interval_seconds',float('nan')),
+    ('minimum_export_interval_seconds',-2)])
+def test_invalid_limiter_is_rejected_before_source_actions(queue,field,value):
+    from downloader.tej_history import configure_runtime_policy
+    root,config=queue
+    with pytest.raises(ValueError):configure_runtime_policy(root,{**config,field:value})
+
+
+def test_proved_table_quarantine_does_not_pause_unrelated_worker(queue):
+    root,config=queue;add_task(root,error='source_validation_failed_deferred')
+    stop=InstantWait()
+    watch_queue(root,None,config,stop=stop,runner=lambda *_:'completed_task',max_cycles=1,emit=emit)
+    assert stop.waits==[2]
+
+
 class InstantWait(Event):
     def __init__(self, *, limit=100):
         super().__init__()
@@ -80,6 +108,27 @@ def test_foreground_availability_is_waited_without_spin_or_unknown_retry(queue):
     assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks'] == 1
 
 
+def test_metadata_contention_waits_locally_and_never_resets_unknown_source_action(queue):
+    import sqlite3
+    root,config=queue;calls=[]
+    def runner(*_):
+        calls.append(1)
+        if len(calls)==1:raise sqlite3.OperationalError('database is locked')
+        return 'completed_task'
+    stop=InstantWait()
+    watch_queue(root,None,config,stop=stop,runner=runner,max_cycles=1,emit=emit)
+    assert calls==[1,1] and stop.waits==[5,2]
+    assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks']==1
+
+
+def test_metadata_corruption_is_not_treated_as_retryable_contention(queue):
+    import sqlite3
+    root,config=queue
+    def corrupted(*_):raise sqlite3.OperationalError('database disk image is malformed')
+    with pytest.raises(sqlite3.OperationalError):
+        watch_queue(root,None,config,stop=InstantWait(),runner=corrupted,emit=emit)
+
+
 def test_shutdown_finishes_current_bounded_task_before_leaving_queue(queue):
     root, config = queue
     stop = Event()
@@ -105,7 +154,8 @@ def test_explicit_private_pins_are_reloaded_only_at_safe_task_boundary(queue):
 
 
 @pytest.mark.parametrize("error", ["unknown_outcome_no_auto_retry", "source_validation_failed", "local_storage_failed",
-    "date_input_prequery_needs_review", "list_selection_prequery_needs_review", "query_activation_prequery_needs_review"])
+    "date_input_prequery_needs_review", "list_selection_prequery_needs_review", "query_activation_prequery_needs_review",
+    "source_capacity_requires_review"])
 def test_restart_retains_durable_safety_pause_and_never_calls_provider(queue, error):
     root, config = queue
     add_task(root, error=error)

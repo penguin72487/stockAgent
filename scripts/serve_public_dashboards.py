@@ -59,6 +59,7 @@ from stockagent.live.finmind_dashboard import (  # noqa: E402
     build_finmind_public_status,
 )
 from stockagent.live.tej_dashboard import (  # noqa: E402
+    STATUS_CACHE_SECONDS as TEJ_STATUS_CACHE_SECONDS,
     build_tej_public_status,
     build_tej_feature_page,
 )
@@ -75,6 +76,7 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     project_data_monitor_summary,
 )
 from stockagent.live.data_monitor_providers import project_provider_detail  # noqa: E402
+from stockagent.live.data_monitor_api_contract import FeaturePageQuery  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
     trusted_feature_preview,
     trusted_feature_snapshot,
@@ -114,6 +116,7 @@ MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
 MAX_SHIOAJI_SNAPSHOT_BYTES: Final[int] = 1024 * 1024
 MAX_SHIOAJI_SNAPSHOT_AGE_SECONDS: Final[float] = 60.0
 OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 5 * 60.0
+OVERVIEW_PEER_WAIT_SECONDS: Final[float] = 8.0
 HISTORY_STALE_GRACE_SECONDS: Final[float] = 15 * 60.0
 IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = "public, max-age=31536000, immutable"
 _OPENER = build_opener(ProxyHandler({}))
@@ -2768,13 +2771,32 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self._measured_build(build)
 
     def public_overview(self) -> Mapping[str, Any]:
+        unavailable_sources: list[str] = []
+
+        def read_source(
+            name: str, reader: Callable[[], Mapping[str, Any]]
+        ) -> Mapping[str, Any]:
+            """A failed peer must not hide unrelated, verified landing cards."""
+            try:
+                return reader()
+            except Exception as error:
+                unavailable_sources.append(name)
+                # Neither upstream messages nor local paths belong in the DTO.
+                sys.stderr.write(
+                    f"public-dashboard overview_source_failed source={name} "
+                    f"error={type(error).__name__}\n"
+                )
+                return {"health": "unavailable", "state": "unavailable"}
+
         # These sources are independent.  Build their verified snapshots on
         # the critical path concurrently, then reuse Shioaji/OpenBB in the
         # dependent all-data projection instead of reading them twice.
-        with ThreadPoolExecutor(
+        executor = ThreadPoolExecutor(
             max_workers=5,
             thread_name_prefix="public-overview",
-        ) as executor:
+        )
+        deadline = time.monotonic() + OVERVIEW_PEER_WAIT_SECONDS
+        try:
             taifex_future = executor.submit(
                 self.cached_json,
                 cache_key="taifex-status",
@@ -2808,16 +2830,25 @@ class PublicDashboardServer(ThreadingHTTPServer):
             )
             shioaji_future = executor.submit(self.shioaji_status)
             openbb_future = executor.submit(self.openbb_status)
-            taifex = _response_json(taifex_future.result())
-            tw = _response_json(tw_future.result())
-            overnight = _response_json(overnight_future.result())
-            shioaji = _response_json(shioaji_future.result())
-            openbb = _response_json(openbb_future.result())
-        data_monitor = _response_json(
-            self.data_monitor_status(
-                shioaji_status=shioaji,
-                openbb_status=openbb,
-            )
+            def peer_result(future: Any) -> Mapping[str, Any]:
+                return _response_json(future.result(
+                    timeout=max(0.0, deadline - time.monotonic())
+                ))
+
+            taifex = read_source("taifex", lambda: peer_result(taifex_future))
+            tw = read_source("tw", lambda: peer_result(tw_future))
+            overnight = read_source("overnight", lambda: peer_result(overnight_future))
+            shioaji = read_source("shioaji", lambda: peer_result(shioaji_future))
+            openbb = read_source("openbb", lambda: peer_result(openbb_future))
+        finally:
+            # A timed-out peer remains bounded by its upstream timeout; do not
+            # make unrelated landing cards wait for executor context cleanup.
+            executor.shutdown(wait=False, cancel_futures=True)
+        data_monitor = read_source(
+            "data_monitor",
+            lambda: _response_json(self.data_monitor_status(
+                shioaji_status=shioaji, openbb_status=openbb,
+            )),
         )
         try:
             finlab_quota = json.loads(
@@ -2827,7 +2858,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             )
         except (OSError, ValueError):
             finlab_quota = {}
-        return build_public_overview(
+        result = build_public_overview(
             taifex,
             tw,
             shioaji,
@@ -2836,9 +2867,18 @@ class PublicDashboardServer(ThreadingHTTPServer):
             self.traffic_observer.snapshot(),
             overnight=overnight,
             finlab_quota=finlab_quota,
-            finmind_status=build_finmind_public_status(self.repo_root),
-            tej_status=build_tej_public_status(self.repo_root),
+            finmind_status=read_source("finmind", lambda: build_finmind_public_status(self.repo_root)),
+            tej_status=read_source("tej", lambda: build_tej_public_status(self.repo_root)),
         )
+        for name in unavailable_sources:
+            # A source read failure is unknown, not an observed zero inventory.
+            result[name] = {key: None for key in result[name]}
+            if name == "tej":
+                result[name]["state"] = "unavailable"
+            else:
+                result[name]["health"] = "unavailable"
+        result["unavailable_sources"] = unavailable_sources
+        return result
 
     def prewarm_overview(self) -> None:
         try:
@@ -3177,8 +3217,28 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/css; charset=utf-8",
                 IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
+            "/dashboard-acquisition.css": (
+                self.server.public_static_root / "dashboard-acquisition.css",
+                "text/css; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
+            "/dashboard-acquisition.js": (
+                self.server.public_static_root / "dashboard-acquisition.js",
+                "text/javascript; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
             "/time-axis.js": (
                 self.server.public_static_root / "time-axis.js",
+                "text/javascript; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
+            "/feature-page-constraints.js": (
+                self.server.public_static_root / "feature-page-constraints.js",
+                "text/javascript; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
+            "/feature-page-contract.js": (
+                self.server.public_static_root / "feature-page-contract.js",
                 "text/javascript; charset=utf-8",
                 IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
@@ -3311,7 +3371,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         market = query.get("market", ["all"])[0]
         if (not 0 <= offset <= 10000 or not 1 <= limit <= 1500 or len(search) > 120 or
                 any(ord(char) < 32 for char in search) or
-                operation not in {"all", "catching_up", "streaming", "complete", "unable",
+                operation not in {"all", "catching_up", "streaming", "waiting_publication", "complete", "unable",
                                   "deferred", "control", "reference"} or
                 not re.fullmatch(r"all|[a-z_]{1,40}", market)):
             raise InvalidPublicRequest("invalid provider filters")
@@ -3319,7 +3379,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "search": search, "operation": operation, "market": market}
 
     @staticmethod
-    def _feature_page_query(raw_query: str) -> dict[str, Any]:
+    def _feature_page_query(raw_query: str) -> "FeaturePageQuery":
         try:
             query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=6)
             allowed = {"offset", "limit", "q", "category", "source", "revision"}
@@ -3837,15 +3897,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
         if path == "/tej/api/status":
             return self.server.cached_local_json(
-                cache_key="tej-status", ttl_seconds=20.0, cache_control="no-store",
-                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                cache_key="tej-status", ttl_seconds=TEJ_STATUS_CACHE_SECONDS, cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=lambda: build_tej_public_status(self.server.repo_root),
             )
         if path == "/tej/api/features":
             filters = self._tej_feature_query(raw_query)
             key = json.dumps(filters, sort_keys=True)
             return self.server.cached_local_json(
-                cache_key=f"tej-features:{key}", ttl_seconds=20.0, cache_control="no-store",
+                cache_key=f"tej-features:{key}", ttl_seconds=TEJ_STATUS_CACHE_SECONDS, cache_control="no-store",
                 stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
                 builder=lambda: build_tej_feature_page(self.server.repo_root, **filters),
             )

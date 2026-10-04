@@ -11,6 +11,8 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+from stockagent.live.data_monitor_api_contract import FeaturePagePayload
+
 
 _SEARCH_FIELDS = (
     "field", "dataset_id", "source_title", "provider", "market_category_label",
@@ -154,7 +156,7 @@ def page_from_source_rows(
     *, rows: list[Mapping[str, Any]], preview: Mapping[str, Any],
     revision: str, requested_revision: str | None, offset: int, limit: int,
     search: str, category: str,
-) -> dict[str, Any]:
+) -> FeaturePagePayload:
     """Project exactly the normal page contract from one complete source."""
 
     reset_required = requested_revision is not None and requested_revision != revision
@@ -239,7 +241,7 @@ class FeaturePageIndex:
         self, *, offset: int, limit: int, search: str = "",
         category: str = "all", source: str = "all",
         requested_revision: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> FeaturePagePayload:
         reset_required = requested_revision is not None and requested_revision != self.revision
         if reset_required:
             offset = 0

@@ -33,6 +33,7 @@ from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, release_detail
 from downloader.finmind_updates import read_summary, queued_next_checks, CONTRACT_VERSION as UPDATE_CONTRACT_VERSION
 from downloader.finmind_runtime import idle_heartbeat
 from stockagent.live.finmind_eta_projection import public_completion_estimate
+from downloader.finmind_history_order import HISTORY_STAGES, metadata as history_order_metadata
 
 
 LABELS = {
@@ -63,6 +64,67 @@ def _stamp(value: object) -> datetime | None:
 
 def _nonnegative_int(value: object) -> int | None:
     return value if type(value) is int and value >= 0 else None
+
+
+def _dispatch_snapshot(root: Path, now: datetime, limit: int, *,
+                       receipt: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """Allowlisted minute receipt; an expired decision is not current headroom."""
+    path = root / 'dispatch_status.json'
+    if not path.is_file():
+        return None  # Compatibility with workers not yet running the sampler.
+    value = receipt if receipt is not None else _read_json(path)
+    stamp = _stamp(value.get('observed_at_utc'))
+    raw = value.get('allocation')
+    valid = (value.get('schema_version') in {1, 2} and stamp and 0 <= (now - stamp).total_seconds() <= 180
+             and value.get('official_requests_per_hour') == limit and isinstance(raw, Mapping))
+    if not valid:
+        return {'basis': 'dispatch_snapshot_stale', 'allowed': False, 'snapshot_state': 'stale',
+                'observed_at_utc': stamp.isoformat() if stamp else None}
+    result = {key: _nonnegative_int(raw.get(key)) for key in (
+        'remaining', 'reserve', 'ready_incremental_requests', 'used_estimate')}
+    result.update({key: raw.get(key) is True for key in ('allowed', 'priority_wait', 'schedule_verified')})
+    bases = {'provider_observation_plus_local_starts', 'provider_usage_unverified', 'provider_usage_stale',
+             'local_traffic_unverified'}
+    result.update(basis=raw.get('basis') if raw.get('basis') in bases else 'dispatch_snapshot_unverified',
+                  observed_at_utc=stamp.isoformat(), snapshot_state='observed')
+    return result
+
+
+def _sampled_traffic(root: Path, now: datetime, limit: int, *,
+                     receipt: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """Minute samples keep active WAL access and 25-hour aggregation off the web path."""
+    receipt = receipt if receipt is not None else _read_json(root / 'dispatch_status.json')
+    if receipt.get('schema_version') != 2:
+        return None  # Compatibility until the existing minute timer publishes v2.
+    stamp = _stamp(receipt.get('observed_at_utc'))
+    raw = receipt.get('traffic')
+    valid = (stamp and 0 <= (now - stamp).total_seconds() <= 180
+             and receipt.get('official_requests_per_hour') == limit and isinstance(raw, Mapping))
+    if not valid:
+        return {'state': 'stale', 'official_requests_per_hour': limit, 'observed_requests_60m': None,
+                'worker_headroom_60m': None, 'history': [], 'tracking_started_at_utc': None,
+                'observed_at_utc': stamp.isoformat() if stamp else None, 'snapshot_state': 'stale'}
+    history = []
+    for item in raw.get('history', [])[:4096] if isinstance(raw.get('history'), list) else []:
+        at = _stamp(item.get('at_utc')) if isinstance(item, Mapping) else None
+        count = _nonnegative_int(item.get('observed_requests_60m')) if isinstance(item, Mapping) else None
+        if at and at <= stamp and count is not None:
+            history.append({'at_utc': at.isoformat(), 'observed_requests_60m': count})
+    states = {'complete_worker_window', 'partial_worker_window', 'not_started', 'unavailable'}
+    return {'state': raw.get('state') if raw.get('state') in states else 'unavailable',
+            'official_requests_per_hour': limit,
+            'observed_requests_60m': _nonnegative_int(raw.get('observed_requests_60m')),
+            'worker_headroom_60m': _nonnegative_int(raw.get('worker_headroom_60m')),
+            'tracking_started_at_utc': raw.get('tracking_started_at_utc') if _stamp(raw.get('tracking_started_at_utc')) else None,
+            'history': history, 'observed_at_utc': stamp.isoformat(), 'snapshot_state': 'observed',
+            'basis': 'All local worker request starts; minute-sampled independently of provider account usage.'}
+
+
+def _public_task(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or not isinstance(value.get('dataset'), str):
+        return None
+    return {key: value.get(key) for key in ('dataset', 'data_id', 'partition', 'date', 'status', 'rows',
+                                           'error_code', 'observed_at_utc') if key in value}
 
 
 def _worker_liveness(root: Path, status: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -118,7 +180,7 @@ def _traffic(root: Path, now: datetime, limit: int) -> dict[str, Any]:
     """All local workers' observed requests, not the provider account balance."""
     path = root / "request_traffic.sqlite3"
     if not path.is_file():
-        return {"state": "not_started", "observed_requests_60m": None,
+        return {"state": "not_started", "official_requests_per_hour": limit, "observed_requests_60m": None,
                 "history": [], "tracking_started_at_utc": None}
     cutoff = now - timedelta(hours=25)
     try:
@@ -130,7 +192,7 @@ def _traffic(root: Path, now: datetime, limit: int) -> dict[str, Any]:
                 (cutoff.isoformat(), now.isoformat()),
             ).fetchall()
     except (sqlite3.Error, OSError):
-        return {"state": "unavailable", "observed_requests_60m": None,
+        return {"state": "unavailable", "official_requests_per_hour": limit, "observed_requests_60m": None,
                 "history": [], "tracking_started_at_utc": None}
     first = _stamp(first_row[0]) if first_row else None
     events = [stamp for (value,) in raw if (stamp := _stamp(value)) is not None]
@@ -177,8 +239,9 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     account_fresh = bool(account_stamp and observed - account_stamp <= timedelta(minutes=30))
     official_limit = account.get("official_requests_per_hour") if account_fresh else status.get("official_requests_per_hour")
     limit = official_limit if type(official_limit) is int and 1 <= official_limit <= 100_000 else 300
-    allocation: dict[str, Any] | None = None
-    if account_fresh:
+    minute_receipt = _read_json(root / 'dispatch_status.json')
+    allocation = _dispatch_snapshot(root, observed, limit, receipt=minute_receipt)
+    if account_fresh and allocation is None:
         try:
             allocation = backfill_budget(
                 account, root,
@@ -264,13 +327,14 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     complement_age = max(0, (observed - complement_stamp).total_seconds()) if complement_stamp else None
     companion_series = complement.get("series") if isinstance(complement.get("series"), Mapping) else {}
     delegated = set(complement.get("delegated_to_sponsor", [])) if isinstance(complement.get("delegated_to_sponsor"), list) else set()
-    companion_total = companion_complete = companion_empty = companion_failed = companion_blocked = companion_invalid = 0
+    companion_total = companion_complete = companion_empty = companion_failed = companion_blocked = companion_invalid = companion_exhausted = 0
     for dataset in COMPLEMENT_DATASETS:
         item = companion_series.get(dataset) if isinstance(companion_series.get(dataset), Mapping) else {}
         total = _nonnegative_int(item.get("target")) or 0
         complete = _nonnegative_int(item.get("complete")) or 0
         empty = _nonnegative_int(item.get("observed_empty")) or 0
         failed = _nonnegative_int(item.get("failed")) or 0
+        exhausted = _nonnegative_int(item.get('retry_exhausted')) or 0
         blocked = _nonnegative_int(item.get("not_entitled")) or 0
         invalid = _nonnegative_int(item.get("invalid_request")) or 0
         if dataset not in delegated:
@@ -280,18 +344,22 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             companion_failed += failed
             companion_blocked += blocked
             companion_invalid += invalid
+            companion_exhausted += exhausted
         kind = ("derived" if dataset == 'TaiwanStockTradingDailyReportSecIdAgg' else
                 "snapshot" if dataset in COMPLEMENT_SNAPSHOTS else
                 "global_history" if dataset in GLOBAL_HISTORY or dataset in FIXED_ID_HISTORY or dataset == 'TaiwanStockNews' else
                 "global_equity_history" if dataset in GLOBAL_EQUITY_HISTORY else
                 "symbol_history")
-        pending = max(0, total - complete - empty - blocked - invalid) if total else None
+        pending = max(0, total - complete - empty - blocked - invalid - exhausted) if total else None
         checked = complete + empty
         frontiers = complement.get('historical_frontiers', {})
         raw_frontier = frontiers.get(dataset, {}) if isinstance(frontiers, Mapping) else {}
         frontier = {key: _nonnegative_int(raw_frontier.get(key)) for key in (
             'known_identifiers','identifiers_with_unseeded_history','unseeded_partition_candidates',
-            'materialized_working_set_limit','catalog_contract_version')
+            'materialized_working_set_limit','catalog_contract_version',
+            'unseeded_history_candidates','unseeded_forward_candidates','frontier_estimate_contract_version',
+            'raw_unseeded_calendar_candidates','excluded_calendar_candidates','already_materialized_candidates',
+            'materialized_history_limit','materialized_forward_batch_limit')
         } if isinstance(raw_frontier, Mapping) and raw_frontier else {}
         unseeded = _nonnegative_int(frontier.get('unseeded_partition_candidates')) or 0
         if unseeded:
@@ -302,6 +370,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                  "backfilling" if unseeded else
                  "pending" if not total else
                  "unavailable" if blocked + invalid == total else
+                 "retry_exhausted" if exhausted and not pending else
                  "complete" if checked == total else
                  "backfilling" if complete or empty or failed or blocked else "pending")
         datasets.append({
@@ -316,6 +385,9 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "all_history_complete_claim": False,
             "pending_partitions": pending,
             "deferred_partitions": failed,
+            "retry_exhausted_partitions": exhausted,
+            "retained_rows": _nonnegative_int(item.get('retained_rows')) or 0,
+            "retained_bytes": _nonnegative_int(item.get('retained_bytes')) or 0,
             "observed_empty_partitions": empty,
             "not_entitled_partitions": blocked,
             "invalid_request_partitions": invalid,
@@ -327,7 +399,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             **_network_time_projection(pending, limit, excluded=(
                 "delegated_owner_no_independent_request_estimate" if dataset in delegated else
                 "local_derivation_parent_acquisition_excluded" if dataset in {WIDE_INSTITUTIONAL, 'TaiwanStockTradingDailyReportSecIdAgg'} else
-                "source_request_unavailable" if blocked or invalid else None)),
+                "source_request_unavailable" if blocked or invalid or exhausted else None)),
             "source_status": ("locally_derived_from_institutional_long"
                               if dataset == WIDE_INSTITUTIONAL else
                               "locally_derived_from_broker_detail_not_independent_provider_response"
@@ -339,7 +411,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     sponsor_stamp = _stamp(sponsor.get("observed_at_utc"))
     sponsor_age = max(0, (observed - sponsor_stamp).total_seconds()) if sponsor_stamp else None
     sponsor_series = sponsor.get("series") if isinstance(sponsor.get("series"), Mapping) else {}
-    sponsor_total = sponsor_complete = sponsor_empty = sponsor_failed = sponsor_blocked = 0
+    sponsor_total = sponsor_complete = sponsor_empty = sponsor_failed = sponsor_blocked = sponsor_exhausted = 0
     for spec in SPONSOR_SOURCES:
         item = sponsor_series.get(spec.dataset) if isinstance(sponsor_series.get(spec.dataset), Mapping) else {}
         total = _nonnegative_int(item.get("target")) or 0
@@ -347,6 +419,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
         empty = _nonnegative_int(item.get("observed_empty")) or 0
         failed = _nonnegative_int(item.get("failed")) or 0
         blocked = _nonnegative_int(item.get("blocked")) or 0
+        exhausted = _nonnegative_int(item.get('retry_exhausted')) or 0
         # Stale pre-migration receipts remain visible on the legacy alias, but
         # must not inflate the current owner's acquisition denominator.
         if spec.dataset not in PRODUCT_HISTORY_STARTS:
@@ -355,12 +428,14 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             sponsor_empty += empty
             sponsor_failed += failed
             sponsor_blocked += blocked
-        remaining = max(0, total - complete - empty - blocked)
+            sponsor_exhausted += exhausted
+        remaining = max(0, total - complete - empty - blocked - exhausted)
         datasets.append({
             "id": f"{spec.dataset}:all_market", "label": f"{spec.dataset}（Sponsor 全市場）",
             "kind": "sponsor_" + spec.grain,
             "state": "delegated" if spec.dataset in PRODUCT_HISTORY_STARTS else
                      "unavailable" if blocked and blocked == total else
+                     "retry_exhausted" if exhausted and remaining == 0 else
                      "complete" if total and remaining == 0 else
                      "backfilling" if complete or empty or failed else "pending",
             "target_partitions": total or None,
@@ -368,6 +443,9 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "checked_partitions": complete + empty,
             "pending_partitions": remaining if total else None,
             "deferred_partitions": failed,
+            "retry_exhausted_partitions": exhausted,
+            "retained_rows": _nonnegative_int(item.get('retained_rows')) or 0,
+            "retained_bytes": _nonnegative_int(item.get('retained_bytes')) or 0,
             "observed_empty_partitions": empty,
             "not_entitled_partitions": blocked,
             "rows": _nonnegative_int(item.get("rows")),
@@ -378,7 +456,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             **_network_time_projection(remaining if total else None, limit, excluded=(
                 "delegated_owner_no_independent_request_estimate" if spec.dataset in PRODUCT_HISTORY_STARTS else
                 "local_derivation_parent_acquisition_excluded" if spec.dataset == WIDE_INSTITUTIONAL else
-                "source_request_unavailable" if blocked else None)),
+                "source_request_unavailable" if blocked or exhausted else None)),
             "source_status": ("delegated_to_complement_product_history"
                               if spec.dataset in PRODUCT_HISTORY_STARTS else
                               "observed_sponsor_market_response_not_provider_completeness"),
@@ -432,7 +510,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     all_total = session_total + 2 + companion_total + sponsor_total if session_total is not None else None
     all_complete = session_complete + int(calendar_complete) + int(master_complete) + companion_complete + sponsor_complete if session_complete is not None else None
     all_checked = all_complete + companion_empty + sponsor_empty if all_complete is not None else None
-    all_pending = max(0, all_total - all_complete - companion_empty - sponsor_empty - companion_blocked - companion_invalid - sponsor_blocked) if all_total is not None and all_complete is not None else None
+    all_pending = max(0, all_total - all_complete - companion_empty - sponsor_empty - companion_blocked - companion_invalid - sponsor_blocked - companion_exhausted - sponsor_exhausted) if all_total is not None and all_complete is not None else None
     state = str(status.get("state") or "not_started")
     known_states = {"running", "backfilling", "current", "protected_opening", "waiting_retry",
                     "rate_limited", "not_entitled", "not_started"}
@@ -455,8 +533,42 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                       (fresh_sponsor and sponsor.get("state") == "running") else
         "waiting"
     )
-    traffic = _traffic(root, observed, limit)
+    # Free only owns two session series; its "current" cannot stand for every
+    # Sponsor/Complement history. Liveness, backlog and completeness are distinct.
+    free_state = state
+    if health == 'updating':
+        state = 'running'
+    elif health in {'stale', 'unavailable'}:
+        state = health
+    elif health == 'degraded':
+        state = 'degraded'
+    elif all_pending:
+        state = 'waiting_retry' if companion_failed + sponsor_failed else 'backfilling'
+    else:
+        state = 'waiting'
+    latest_results = []
+    for name, worker_status in (('free', status), ('complement', complement), ('sponsor', sponsor)):
+        task = _public_task(worker_status.get('last_task'))
+        if task:
+            stamp = _stamp(task.get('observed_at_utc')) or _stamp(worker_status.get('observed_at_utc'))
+            if stamp and stamp <= observed + timedelta(seconds=60):
+                latest_results.append((stamp, {**task, 'owner': name}))
+    latest_result = max(latest_results, key=lambda item: item[0])[1] if latest_results else None
+    candidate_tasks = sum(row.get('unseeded_partition_candidates', 0) for row in datasets
+                          if row['state'] != 'delegated')
+    traffic = _sampled_traffic(root, observed, limit, receipt=minute_receipt)
+    if traffic is None:
+        traffic = _traffic(root, observed, limit)
     local_bytes = sum(item["local_bytes"] or 0 for item in datasets)
+    history_order = history_order_metadata()
+    history_order['applied'] = (complement.get('dispatch_contract_version', 0) >= 3
+                                and complement.get('history_order') == history_order_metadata())
+    ranks = {stage.dataset: (rank, stage) for rank, stage in enumerate(HISTORY_STAGES, 1)}
+    for row in datasets:
+        if row['id'] in ranks:
+            rank, stage = ranks[row['id']]
+            row.update(history_rank=rank, history_stage_key=stage.key, label=stage.label)
+    datasets.sort(key=lambda row: row.get('history_rank', len(HISTORY_STAGES) + 1))
     try:
         filesystem_free = shutil.disk_usage(root).free
     except OSError:
@@ -471,9 +583,16 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             if age is not None or complement_age is not None or sponsor_age is not None else None,
         "acquisition": {
             "workers": workers,
+            "history_order": history_order,
             "calendar_wait_tasks": sum(row.get('calendar_wait_partitions', 0) for row in datasets),
             "completion_estimate": public_completion_estimate(root, observed),
             "state": state,
+            "free_state": free_state,
+            "latest_result": latest_result,
+            "unseeded_candidate_tasks": candidate_tasks,
+            "materialized_tasks": max(0, all_total - candidate_tasks) if all_total is not None else None,
+            "materialized_pending_tasks": max(0, all_pending - candidate_tasks) if all_pending is not None else None,
+            "target_is_calendar_candidate_estimate": candidate_tasks > 0,
             "observed_at_utc": status.get("observed_at_utc"),
             "total_session_day_tasks": session_total,
             "complete_session_day_tasks": session_complete,
@@ -484,6 +603,8 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "pending_tasks": all_pending,
             "observed_empty_tasks": companion_empty + sponsor_empty,
             "failed_tasks": companion_failed + sponsor_failed,
+            "retry_exhausted_tasks": companion_exhausted + sponsor_exhausted,
+            "retained_rows": sum(row.get('retained_rows', 0) for row in datasets if row['state'] != 'delegated'),
             "not_entitled_tasks": companion_blocked + sponsor_blocked,
             "invalid_request_tasks": companion_invalid,
             "unknown_universe_datasets": sum(1 for row in datasets if row["target_partitions"] is None),
@@ -496,7 +617,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "sponsor_state": sponsor.get("state") if sponsor else "not_started",
             "sponsor_observed_at_utc": sponsor.get("observed_at_utc"),
             "sponsor_active_tasks": sponsor.get("active_tasks", [])[:8] if isinstance(sponsor.get("active_tasks"), list) else [],
-            "sponsor_last_task": sponsor.get("last_task") if isinstance(sponsor.get("last_task"), Mapping) else None,
+            "sponsor_last_task": _public_task(sponsor.get("last_task")),
             "complement_observed_at_utc": complement.get("observed_at_utc"),
             "complement_status_age_seconds": round(complement_age) if complement_age is not None else None,
             "complement_active_task": {
@@ -507,10 +628,7 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                 key: complement.get("next_task", {}).get(key)
                 for key in ("dataset", "data_id", "partition")
             } if isinstance(complement.get("next_task"), Mapping) else None,
-            "complement_last_task": {
-                key: complement.get("last_task", {}).get(key)
-                for key in ("dataset", "data_id", "partition", "status", "rows", "error_code")
-            } if isinstance(complement.get("last_task"), Mapping) else None,
+            "complement_last_task": _public_task(complement.get('last_task')),
             "retry_deferred_tasks": (_nonnegative_int(status.get("retry_deferred_tasks")) or 0) + companion_failed + sponsor_failed,
             **_network_time_projection(all_pending, limit, excluded=(
                 "global_contracts_or_entitlements_unresolved" if companion_blocked or companion_invalid or sponsor_blocked else None)),

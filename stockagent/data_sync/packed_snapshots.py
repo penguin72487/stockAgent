@@ -941,16 +941,37 @@ def publish_packed_snapshot(
         for entry in large_files:
             source_path = source.joinpath(*PurePosixPath(entry.path).parts)
             _ensure_source_stat(source_path, entry)
-            temporary = staging_root / f"blob-{uuid.uuid4().hex}.partial"
-            digest = _copy_and_hash(source_path, temporary)
-            _ensure_source_stat(source_path, entry)
-            if digest != entry.sha256:
-                raise SnapshotError(f"source file changed while packing: {source_path}")
+            digest = str(entry.sha256)
             relpath = _object_relpath("blobs", digest, ".blob")
             destination = sync_root.joinpath(*relpath.parts)
-            already_present = _install_immutable_object(
-                sync_root, temporary, destination, expected_sha256=digest
-            )
+            _ensure_shared_packed_directory(sync_root, destination.parent)
+            if destination.is_symlink():
+                raise SnapshotError(f"content-addressed object is redirected: {destination}")
+            if destination.exists():
+                # The source has already been fully hashed under its stability
+                # signature. Verify the existing immutable bytes BEFORE reuse;
+                # copying an identical blob to D scratch only to unlink it
+                # afterwards adds no recovery proof and wastes a full write.
+                observed = destination.lstat()
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_size != entry.size
+                    or sha256_file(destination) != digest
+                ):
+                    raise SnapshotError(f"content-addressed object is corrupt: {destination}")
+                if _source_stat(destination.lstat()) != _source_stat(observed):
+                    raise SnapshotError(f"content-addressed object changed during reuse: {destination}")
+                _ensure_source_stat(source_path, entry)
+                already_present = True
+            else:
+                temporary = staging_root / f"blob-{uuid.uuid4().hex}.partial"
+                copied_digest = _copy_and_hash(source_path, temporary)
+                _ensure_source_stat(source_path, entry)
+                if copied_digest != digest:
+                    raise SnapshotError(f"source file changed while packing: {source_path}")
+                already_present = _install_immutable_object(
+                    sync_root, temporary, destination, expected_sha256=digest
+                )
             if not already_present:
                 newly_installed_hashes.add(digest)
             entry.sha256 = digest

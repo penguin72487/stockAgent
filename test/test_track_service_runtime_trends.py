@@ -85,6 +85,10 @@ def test_snapshot_main_isolates_journal_framing_from_status_publication(
     monkeypatch.setattr(snapshot, "build_data_monitor_public_status", lambda *_, **__: {"sources": []})
     monkeypatch.setattr(snapshot, "feature_source_metadata_sha256", lambda *_: "a" * 64)
     monkeypatch.setattr(snapshot, "_current_feature_snapshot", lambda *_, **__: 0)
+    monkeypatch.setattr(snapshot, "publish_feature_inventory_snapshot", lambda *_, **__: {
+        "fields": 0, "source_observation_root": None, "stages_ms": {},
+        "inventory_timing_ms": {}, "projection_cache": {"state": "fixture"},
+    })
     monkeypatch.setattr(snapshot, "_write_public_summary_snapshot", lambda *_: None)
     writes = []
     monkeypatch.setattr(snapshot, "_atomic_json", lambda path, *_, **__: writes.append(path.name))

@@ -32,6 +32,13 @@
 [專案架構與修改導航](docs/project_architecture.md)。該頁也提供從現行 registry、
 configs、Git refs 與 systemd 產生 AI 可讀清單的唯讀命令。
 
+Agent 的狀態查詢、任務紀錄與長命令操作使用
+[Agent 工作流程](docs/agent_workflow.md)：安裝後先執行 `stockagent-agent status`。
+
+[架構現代化分析與開發證據](docs/architecture_modernization_2026-10-03.md) 記錄
+實際比較與採用界線；[程式發布與節點環境](docs/packaging_and_runtime_releases.md)
+說明角色依賴、固定 code/runtime 身分、GPU admission 和型別契約驗證。
+
 ### 要解決的限制
 
 1. Git 適合程式與小型設定，不適合數十 GB 資料或模型產物。
@@ -745,8 +752,8 @@ run_fintech_python scripts/manage_cold_artifacts.py retire ARTIFACT_DATASET \
 checkpoint。唯一例外是登錄於 `configs/data_sync/legacy_artifact_archives.json`
 的「僅保全位元組」封存：大型 CSV 逐檔壓縮、其餘逐檔保留，原始與編碼後
 SHA-256 均記錄。它同步的是 D 主冷庫的不可變 release；不再有 C→D 獨立
-備份服務。D 槽的 `stockagent-legacy-archive-stage` 是可續跑的工作暫存，
-目前透過 `/srv/stockagent-d-volume/stockagent-legacy-archive-stage` 的
+備份服務。工作暫存位置以 catalog 的 `stage_root` 為準；原有 D 槽
+`stockagent-legacy-archive-stage` 可透過 `/srv/stockagent-d-volume/stockagent-legacy-archive-stage` 的
 受保護 8 KiB DrvFs 掛載存取；不再直接使用 `/mnt/d` 的大請求掛載。
 在熱資料退役前不可清除，因為退役還要逐檔比對原始與壓縮內容。
 查詢與恢復指令如下；`restore` 只寫新的目標路徑，不覆蓋服務目錄：
@@ -791,6 +798,46 @@ run_fintech_python scripts/manage_legacy_artifact_archives.py retire-apply LEGAC
 run_fintech_python scripts/retire_enrolled_artifacts.py --manual-immediate --apply \
   --dataset LEGACY_DATASET --receipt-dir artifacts/operations/EXACT_MANUAL_CLEANUP
 ```
+
+舊成果最近只有報表重寫、但需要本次立即冷保存時，僅允許 catalog 中明確登錄
+`manual_capture_min_stable_hours` 的根目錄使用 `--manual-capture`（至少 12 小時
+未修改）。這不會改變任何七日自動政策：全樹簽章與路徑、無服務／程序引用、
+原始及壓縮後雜湊、獨立解碼和 D 冷庫驗證仍要通過；過程有任何變動即停止。
+回收須同時指定兩個手動旗標，計畫指紋會綁定它們。只有 `--manual-immediate`
+不能略過原本的來源穩定門檻；timer 永遠不帶 `--manual-capture`。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/manage_legacy_artifact_archives.py plan legacy-markets-forex --manual-capture
+run_fintech_python scripts/manage_legacy_artifact_archives.py publish legacy-markets-forex --manual-capture
+run_fintech_python scripts/manage_legacy_artifact_archives.py verify legacy-markets-forex --manual-capture
+run_fintech_python scripts/manage_legacy_artifact_archives.py retire-plan legacy-markets-forex \
+  --manual-capture --manual-immediate
+# 先閱讀 plan，只有 apply_ready=true 才套用該次輸出的完整指紋。
+run_fintech_python scripts/manage_legacy_artifact_archives.py retire-apply legacy-markets-forex \
+  --manual-capture --manual-immediate --plan-fingerprint MANUAL_PLAN_FINGERPRINT
+# 已回收後校驗／恢復：不會重建熱資料，除非明確執行 restore。
+run_fintech_python scripts/manage_legacy_artifact_archives.py verify legacy-markets-forex --cold-only
+run_fintech_python scripts/manage_legacy_artifact_archives.py restore legacy-markets-forex \
+  --destination /srv/stockagent-legacy-restore/forex
+```
+
+2026-10-03 的四個手動目錄改用 `/var/lib/stockagent-legacy-archive-stage` 作
+**C 槽限量壓縮工作暫存**，不是第二份冷庫：準備前仍驗 D 掛載，預留原始資料
+大小加 32 GiB；封存時只有大包寫入 D。熱資料已透過完整退役回收後，再清理
+這個 dataset 的暫存，避免常態 C 存一份編碼副本：
+
+```bash
+run_fintech_python scripts/manage_legacy_artifact_archives.py prune-stage-plan legacy-markets-forex
+run_fintech_python scripts/manage_legacy_artifact_archives.py prune-stage-apply legacy-markets-forex \
+  --plan-fingerprint STAGE_PLAN_FINGERPRINT
+run_fintech_python scripts/manage_legacy_artifact_archives.py verify legacy-markets-forex --cold-only
+```
+
+暫存回收會獨立驗證 D 中所有原始解碼結果、控制收據和簽章；有未知檔案、pin、
+程序引用、D 缺失或 dry-run 變動即停止。不能用來刪 D 工作暫存、冷物件或來源。
+暫存已回收時 `verify --cold-only` 會用私有、有空間上限的短期驗證目錄從冷庫
+重建、核對後回收，不會展開到 `artifacts`；失敗會保留現場並指出路徑。
 
 2026-10-01 的 US 封存補發布安排在 14:05 非交易時段；這是一次性工作，
 不代表已完成冷庫發布或已回收來源。查看進度與正式冷庫驗證：

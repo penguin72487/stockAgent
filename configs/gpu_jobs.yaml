@@ -4,16 +4,24 @@ state_dir: artifacts/gpu_jobs
 allow_gpu_sharing: false
 
 defaults:
-  enabled: true
+  # Activate the selected experiment explicitly. A checkout must not start a
+  # large training job merely because a sample spec is present.
+  enabled: false
 
 jobs:
   - name: us
     config: configs/markets/us.yaml
     gpus: [0]
 
-  - name: us
-    config: configs/markets/us.yaml
-    gpus: [1]
+  - name: crypto
+    config: configs/markets/crypto.yaml
+    gpus: [0]
+
+  # Validated runtime profile for the dual-RTX-5090 node. It remains disabled
+  # on a fresh checkout; enable this named job on that node to run it.
+  - name: tw_day_trade_cpu16
+    config: configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full_cpu16.yaml
+    gpus: [0, 1]
 
   # Multi-GPU/DDP example (enable only when the referenced market config uses DDP):
   # - name: tw_parallel

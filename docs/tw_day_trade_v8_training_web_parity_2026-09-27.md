@@ -89,6 +89,11 @@
 - `configs/deployments/tw_day_trade_v8_web_parity_v7_inference.yaml`：直接繼承新訓練合約，只換即時 producer 路徑及本機 cache；尚未切換 active selector。
 - `configs/deployments/tw_day_trade_v8_web_parity_v7_smoke.yaml`：完整 fold、3 epochs，獨立 smoke 產物。
 
+2026-10-03 保存註記：上述 v5 frozen snapshot 的原始 bytes、SHA 與繼承鏈已移至
+[歷史 bundle](../configs/historical/tw_futures_v17_20261003/manifest.json)；
+web-parity 設定的 base reference 指向同一份保存原檔，沒有重寫其參數。
+此段描述 9/27 的實驗身分，不表示整份舊鏈已符合目前 strict config ABI。
+
 遠端交易服務模組比 penguin 舊，不把遠端的舊 paper 程式當作新網頁規則證據。紙上帳戶獨立比對在 penguin 完成，遠端負責新的實體 executor／正式資料／DDP 驗證；不覆寫遠端其他研究更動。
 
 ## 4. 固定來源與量測

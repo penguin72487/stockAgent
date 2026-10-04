@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from http.client import IncompleteRead
+import re
 import time
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -39,7 +40,9 @@ def sanitized_url(url: str) -> str:
     """Remove query/fragment data so API keys never reach errors or receipts."""
 
     parts = urlsplit(str(url))
-    return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
+    # TEJ's documented account endpoint puts the credential in the path.
+    path = re.sub(r"(/api/apiKeyInfo/)[^/]+", r"\1[REDACTED]", parts.path, flags=re.IGNORECASE)
+    return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], path, "", ""))
 
 
 def _sanitized_error_body(body: bytes, url: str) -> bytes:
@@ -55,6 +58,7 @@ def _sanitized_error_body(body: bytes, url: str) -> bytes:
         if name.casefold() not in _PUBLIC_QUERY_FIELDS
     }
     secrets.update(unquote(value) for value in (parts.username, parts.password) if value)
+    secrets.update(unquote(value) for value in re.findall(r"/api/apiKeyInfo/([^/]+)", parts.path, flags=re.IGNORECASE))
     variants = {variant for value in secrets if value
                 for variant in (value, quote(value, safe=""), quote_plus(value, safe=""))}
     variants.update(value for part in parts.query.split("&")

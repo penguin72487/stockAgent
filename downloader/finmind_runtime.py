@@ -5,6 +5,7 @@ counts, provider usage or data timestamps, and never makes a provider request.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import UTC, datetime, time as wall_time, timedelta
 import json
 from pathlib import Path
@@ -14,6 +15,37 @@ from typing import Any, Callable, Iterable
 
 from downloader.artifact_io import atomic_write_json
 from downloader.finmind_scheduling import TAIPEI, Source, calendar_next_check
+
+
+def optimize_queue(connection: sqlite3.Connection) -> None:
+    """Maintain bounded planner statistics, without touching acquisition rows.
+
+    A freshly opened owner connection has no query history. The 0x10000 bit
+    considers existing indexes too; a warm call is normally a no-op. SQLite
+    3.46+ bounds analysis internally. Preserve older runtimes' caller settings
+    while explicitly bounding their analysis. This is NOT a full ANALYZE,
+    VACUUM, durability change, or maintenance performed by read-only readers.
+    """
+    if sqlite3.sqlite_version_info >= (3, 46, 0):
+        connection.execute('PRAGMA optimize=0x10002').fetchall()
+        return
+    previous = connection.execute('PRAGMA analysis_limit').fetchone()[0]
+    limit = min(previous, 1000) if previous > 0 else 1000
+    try:
+        connection.execute(f'PRAGMA analysis_limit={limit}')
+        connection.execute('PRAGMA optimize=0x10002').fetchall()
+    finally:
+        connection.execute(f'PRAGMA analysis_limit={previous}')
+
+
+def retryable_queue_error(error: sqlite3.OperationalError) -> bool:
+    """Retry contention, not corrupt databases, invalid SQL or arbitrary I/O.
+
+    SQLite extended codes have the primary error in their low byte. Do not
+    persist exception strings: they may include local paths or request text.
+    """
+    code = getattr(error, 'sqlite_errorcode', None)
+    return isinstance(code, int) and (code & 0xff) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
 
 
 def _stamp(value: Any) -> datetime | None:
@@ -63,7 +95,7 @@ def next_cycle_delay(root: Path, now: datetime, maximum: float, *,
     path = root / 'queue.sqlite3'
     if path.is_file():
         try:
-            with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2) as conn:
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
                 row = conn.execute(
                     "SELECT MIN(next_attempt_at_utc) FROM tasks WHERE "
                     "state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc>?",
@@ -120,7 +152,7 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
             pass
     # Backoff deadlines for bans/rate errors must not be shortened by ordinary
     # publication clocks. The shared account limiter remains authoritative too.
-    delay = (seconds if result.get('state') in {'rate_limited', 'ip_banned'} else
+    delay = (seconds if seconds == 0 or result.get('state') in {'rate_limited', 'ip_banned', 'queue_busy'} else
              next_cycle_delay(root, now, seconds, sources=sources, snapshot_hours=snapshot_hours))
     until = now + timedelta(seconds=delay)
     stop = monotonic() + delay

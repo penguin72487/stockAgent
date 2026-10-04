@@ -1,0 +1,13 @@
+base_config: tw_day_trade_daily_multi_basis_tplus2_close.yaml
+
+# Capital is part of the canonical execution/loss contract.  This fresh root
+# must not resume the historical TWD 1M multi-basis optimizer trajectory.
+experiment_name: tw-day-trade-daily-multi-basis-tplus2-close-commission20-capital10m-v2
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_tplus2_close_commission20_capital10m_v2
+  resume: true
+  post_train_infer: false
+
+trading:
+  volume_participation_equity: 10000000.0

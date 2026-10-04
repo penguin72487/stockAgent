@@ -150,7 +150,9 @@ def test_query_only_reset_never_kills_and_addin_stop_has_separate_exact_identity
     assert '$ExpectedProcessStartUtc -cne $processStart -or $ExpectedImageSha256 -cne $imageHash' in script
     assert 'Stop-Process -Name' not in script and 'Stop-Process -Id' not in script
     assert '$emptyConnectorDialogs+$scratchCloseConfirmations -gt 1' in script
-    assert '$window.Current.Name -cne' in script and '$window.Current.ClassName -cne' in script
+    assert '[TejBridgeNative]::WindowTitle($handle) -cne' in script
+    assert '[TejBridgeNative]::WindowClass($handle) -cne' in script
+    assert '$owner -ne $TejProcessId' in script
     assert '$nativeChildren.Count -ne 3' in script and '$nativeTexts.Count -ne 1' in script
     assert '$question -cne' in script and '$nativeButtons.Count -ne 2' in script
     assert script.count('PostMessageW([IntPtr]$ExpectedWindow,0x10')==1

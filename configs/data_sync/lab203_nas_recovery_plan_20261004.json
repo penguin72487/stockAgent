@@ -1,0 +1,50 @@
+{
+  "contract": "fixed_nas_semantic_recovery_plan_v1",
+  "producer_device_id": "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW",
+  "receiver_device_id": "TLOI2HH-6EZOSBC-H6YMGVW-APQOGFW-P2A7FZT-EKX6IUP-2HMRKS6-LBDHOQM",
+  "repository_id": "c717a3d315e20a5a3314c595e66607fcb7d6646cb73ad4412cc2cccb22abb798",
+  "jobs": [
+    {
+      "job_id": "cftc",
+      "kind": "packed",
+      "nas_snapshot_id": "2145243446a4b6b3a29523cbfd3efa8d4001f378a1196d296bb377a33ef25444",
+      "envelope_identity_sha256": "350a50881fdf7ae082c77e03671c6ae61bdcb0d92ea1bfa4206f64c415c0803f",
+      "envelope_file_sha256": "5203589218fb11e5a5871b4f94add37a9f4869f5cee15d0be92e5adc26dec415",
+      "complete_files": 13,
+      "complete_bytes": 63166382,
+      "dataset": "cftc-legacy-pre2000",
+      "source_snapshot_id": "cftc-legacy-pre2000-20260902T164739014992260Z-l0-penguin-d53c80bf8d88e2e9",
+      "manifest_sha256": "efc966614610dbb35d1d7078e97fca7144bff337eebbcda75621d5d9f8f46322",
+      "source_fingerprint_sha256": "9069d037cf15525b36eb3bd5f729b40aae6e9789292fd031aae51f6d7df307da"
+    },
+    {
+      "job_id": "taifex",
+      "kind": "packed",
+      "nas_snapshot_id": "d9cf528ac01b42408e00ad41cc3891f7d82ab924c6361dea0ba539836ce32317",
+      "envelope_identity_sha256": "470e7fcbe03d26223007e280cc13aa42fd22bc8dc0d85d546f4c33d121672ede",
+      "envelope_file_sha256": "2a1ce4618261f0607c8e057b2c42869eea4677e084b0134b652a18afb8f7cae0",
+      "complete_files": 401,
+      "complete_bytes": 409347973,
+      "dataset": "taifex-public-history",
+      "source_snapshot_id": "taifex-public-history-20261002T093824628950032Z-l0-penguin-4fc6d275c2162861",
+      "manifest_sha256": "c14a9148e86761958ea0d8860e52f10c21e7879d8bef2a51397868dc55f95702",
+      "source_fingerprint_sha256": "86908842b69f0863fefe397acf09324a185f70ddd5df286be449fa74a4765d2a"
+    },
+    {
+      "job_id": "control",
+      "kind": "control",
+      "nas_snapshot_id": "54e0b3fbdd8e1e558aa7dc29026b3de283ca17dc22e33cc0e615743b003a1ee8",
+      "envelope_identity_sha256": "5bdb7e6cb0853b130ac01d24884dab640090f189ef575130a4ebbfbce4bee6cb",
+      "envelope_file_sha256": "2a2cf7d59412ea1a0949955d7c7b721a86281f00928f04d9dbd03b62e990d7eb",
+      "complete_files": 7,
+      "complete_bytes": 12425117,
+      "logical_state_identity_sha256": "85b75c8b6d15de5bd00f9eb8871eb065d9dd3802206e08864c0b745eae76065f",
+      "table_count": 50,
+      "row_count": 60
+    }
+  ],
+  "minimum_free_bytes": 68719476736,
+  "maximum_restore_bytes": 4294967296,
+  "full_history_backup_verified": false,
+  "identity_sha256": "46a06550de246c7a9cf7aad97251c524d1df2faf0b470891e03868e522b25a89"
+}

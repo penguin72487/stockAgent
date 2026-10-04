@@ -6,7 +6,62 @@ amount and the bar's price range is usable. Candidate ordering is not evidence.
 
 from __future__ import annotations
 
+from pathlib import Path
+from collections.abc import Sequence
+
 import polars as pl
+
+
+STOCK_MINUTE_RAW_COLUMNS = (
+    "ts", "Open", "High", "Low", "Close", "Volume", "Amount",
+    "date", "symbol", "market", "contract_unit",
+)
+STOCK_MINUTE_READER_CONTRACT = "required_raw_schema_grouped_nullable_metadata_v1"
+
+
+def scan_stock_minute_sources(paths: Sequence[str | Path]) -> pl.LazyFrame:
+    """Scan receipt-selected raw chunks while retaining optional source fields.
+
+    A missing provider value cannot become an inserted NULL. Only additional
+    metadata may be absent in older chunks. Equal schemas share a bulk scan,
+    avoiding thousands of separate lazy scans; incompatible types fail closed.
+    Source files remain unchanged and volume is interpreted by the caller's
+    existing amount/OHLC contract.
+    """
+    if not paths:
+        raise ValueError("stock minute source scan requires selected chunks")
+    groups: dict[tuple, list[str]] = {}
+    union: dict[str, pl.DataType] = {}
+    for raw_path in paths:
+        path = str(raw_path)
+        schema = pl.read_parquet_schema(path)
+        missing = set(STOCK_MINUTE_RAW_COLUMNS) - set(schema)
+        if missing:
+            raise ValueError(f"minute source lacks required raw fields {sorted(missing)}: {path}")
+        for name, dtype in schema.items():
+            previous = union.get(name)
+            if (name == "ts" and isinstance(dtype, pl.Datetime)
+                    and isinstance(previous, pl.Datetime) and previous.time_zone == dtype.time_zone):
+                union[name] = pl.Datetime("ns", time_zone=dtype.time_zone)
+                continue
+            if previous is not None and previous != dtype and previous != pl.Null and dtype != pl.Null:
+                raise pl.exceptions.SchemaError(
+                    f"minute source field {name} has incompatible types {previous} / {dtype}: {path}"
+                )
+            if previous is None or previous == pl.Null:
+                union[name] = dtype
+        groups.setdefault(tuple(schema.items()), []).append(path)
+    columns = [*STOCK_MINUTE_RAW_COLUMNS, *sorted(set(union)-set(STOCK_MINUTE_RAW_COLUMNS))]
+    frames = []
+    for items, selected in groups.items():
+        schema = dict(items)
+        frame = pl.scan_parquet(selected, schema=schema)
+        additions = [pl.lit(None, dtype=union[name]).alias(name) for name in columns if name not in schema]
+        safe_casts = [pl.col(name).cast(union[name]) for name in schema
+                      if schema[name] != union[name] and (
+                          schema[name] == pl.Null or name == "ts" and isinstance(schema[name], pl.Datetime))]
+        frames.append(frame.with_columns(*additions, *safe_casts).select(columns))
+    return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
 
 
 def stock_volume_multiplier_expr(*, tolerance: float) -> pl.Expr:

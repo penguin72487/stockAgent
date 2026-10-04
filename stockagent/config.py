@@ -1857,6 +1857,7 @@ class TradingConfig:
     tw_futures_portfolio_minute_data_path: str | None = None
     tw_futures_portfolio_capital_basis: str = "notional"
     tw_futures_portfolio_margin_rules_path: str | None = None
+    tw_futures_portfolio_valuation_research_contract: str | None = None
     tw_futures_portfolio_broker_margin_multiplier: float = 1.0
     tw_futures_portfolio_margin_liquidation_ratio: float = 0.25
     # Full cash-stock feature universe, but only causally known nearby
@@ -4265,6 +4266,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("futures funding fusion requires futures_cuda_graph and an eager outer ledger")
     capital_basis = trading["tw_futures_portfolio_capital_basis"]
+    valuation_research = trading["tw_futures_portfolio_valuation_research_contract"]
+    if valuation_research not in (None, "frozen_contract_value_research_v1"):
+        raise ValueError("unsupported futures research valuation contract")
+    if valuation_research is not None and capital_basis != 'initial_margin':
+        raise ValueError("frozen valuation research currently requires the exact futures margin account")
     if capital_basis not in {"notional", "initial_margin"}:
         raise ValueError("futures capital basis must be notional or initial_margin")
     if (data["tw_futures_denomination_context_basis"] == "prior_settlement"

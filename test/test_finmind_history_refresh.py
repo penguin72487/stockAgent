@@ -102,7 +102,7 @@ def test_supplemental_special_routes_and_signed_spread():
     assert params == {'data_id': '2330', 'date': '2026-09-29'}
     with pytest.raises(ValueError, match='derived_from_verified'):
         supplemental.request_contract('TaiwanStockTradingDailyReportSecIdAgg', '2330', '2021-06-01', NOW.date())
-    supplemental.validate_response('TaiwanFuturesSpreadTick', 'TX', '2026-09-29', NOW.date(),
+    supplemental.validate_response('TaiwanFuturesSpreadTick', '', '2026-09-29', NOW.date(),
                                    [{'date': '2026-09-29', 'futures_id': 'TX', 'price': -123}])
 
 

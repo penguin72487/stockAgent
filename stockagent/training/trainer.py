@@ -42,6 +42,10 @@ from stockagent.backtest.futures_data_validity import FuturesCarryDataError
 from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 
 from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+from stockagent.backtest.return_metrics import (
+    RETURN_METRICS_CONTRACT_VERSION,
+    clean_log_returns_torch,
+)
 from stockagent.backtest.report import (
     reporting_weight_history,
     compute_metrics,
@@ -97,7 +101,10 @@ from stockagent.backtest.tw_day_trade_minute import (
     COMPILED_BLOCK_ROWS as TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS,
     get_tw_day_trade_minute_compile_stats,
 )
-from stockagent.backtest.tw_day_trade_carry import DayTradeCarryState
+from stockagent.backtest.tw_day_trade_carry import (
+    DayTradeCarryState,
+    get_day_trade_carry_compile_stats,
+)
 from stockagent.training.day_trade_carry_bridge import (
     PreparedDayTradeCarrySource,
     bind_physical_carry_backtest,
@@ -6701,6 +6708,8 @@ def _timing_curve_payload(
     backtest_compile_stats: dict[str, int] | None = None,
     backtest_prep_compile_stats: dict[str, int] | None = None,
     tw_dual_session_compile_stats: dict[str, int] | None = None,
+    day_trade_carry_compile_stats: dict[str, int] | None = None,
+    train_day_trade_carry_compile_stats: dict[str, int] | None = None,
     backtest_runtime_stats: dict[str, float] | None = None,
     train_backtest_runtime_stats: dict[str, float] | None = None,
     loss_runtime_stats: dict[str, float] | None = None,
@@ -7029,6 +7038,14 @@ def _timing_curve_payload(
         "bt_finalize_ms_per_call": _bt_avg_ms("finalize_s"),
         "bt_finalize_cuda_ms_per_call": _bt_avg_ms("finalize_cuda_s"),
         "bt_compiled_runner_calls": int(backtest_runtime_stats.get("compiled_runner_calls", 0.0)),
+        **({
+            "day_trade_carry_telemetry_schema_version": 1,
+            "day_trade_carry_telemetry_process_rank": dist.get_rank() if dist.is_initialized() else 0,
+            **{f"day_trade_carry_{key}": int(value)
+               for key, value in day_trade_carry_compile_stats.items()},
+            **{f"train_loss_day_trade_carry_{key}": int(value)
+               for key, value in (train_day_trade_carry_compile_stats or {}).items()},
+        } if day_trade_carry_compile_stats is not None else {}),
         "bt_eager_runner_calls": int(backtest_runtime_stats.get("eager_runner_calls", 0.0)),
         "bt_stateful_calls": int(backtest_runtime_stats.get("stateful_calls", 0.0)),
         "bt_stateful_compiled_runner_calls": int(backtest_runtime_stats.get("stateful_compiled_runner_calls", 0.0)),
@@ -15118,9 +15135,9 @@ def _compute_eval_metrics_like_legacy_online(
     *,
     periods_per_year: float = 252.0,
 ) -> dict[str, float]:
-    r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-    b = torch.nan_to_num(benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-    t = torch.nan_to_num(turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    r = clean_log_returns_torch(strategy_returns)
+    b = clean_log_returns_torch(benchmark_returns)
+    t = torch.nan_to_num(turnovers.to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
     if r.numel() == 0:
         return {
             "cumulative_return": 0.0,
@@ -18744,6 +18761,19 @@ def _load_completed_fold_result(
         and backtest_path.exists()
     ):
         if expected_manifest is not None:
+            # Reporting upgrades do not invalidate checkpoint/optimizer state.
+            # They do invalidate reuse of old scalar metrics: the canonical
+            # resume/inference path must regenerate them from the selected run.
+            try:
+                report_contract = json.loads(
+                    (fold_dir / "mode_artifact_contract.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                return None
+            if not isinstance(report_contract, dict) or report_contract.get(
+                "metrics_contract_version"
+            ) != RETURN_METRICS_CONTRACT_VERSION:
+                return None
             checkpoint_path = _best_checkpoint_path(fold_dir)
             if not checkpoint_path.exists():
                 return None
@@ -21900,9 +21930,9 @@ def _compute_metrics_from_tensors(
     periods_per_year: float = 252.0,
 ) -> dict[str, float]:
     """Compute performance metrics directly from tensors to avoid repeated numpy conversions."""
-    r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-    b = torch.nan_to_num(benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-    t = torch.nan_to_num(turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    r = clean_log_returns_torch(strategy_returns)
+    b = clean_log_returns_torch(benchmark_returns)
+    t = torch.nan_to_num(turnovers.to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
     if r.numel() == 0:
         return {
@@ -27408,9 +27438,14 @@ def _run_training_impl(
             get_backtest_prep_compile_stats(reset=True)
             get_backtest_runtime_stats(reset=True)
             get_loss_runtime_stats(reset=True)
+            carry_compile_before = get_day_trade_carry_compile_stats()
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
             train_bt_runtime_after = get_backtest_runtime_stats()
             train_loss_runtime_after = get_loss_runtime_stats()
+            train_carry_compile_delta = {
+                key: value - carry_compile_before.get(key, 0)
+                for key, value in get_day_trade_carry_compile_stats().items()
+            }
 
             should_validate = (
                 epoch == start_epoch
@@ -27536,6 +27571,11 @@ def _run_training_impl(
                                 get_tw_dual_session_compile_stats()
                             ),
                             backtest_runtime_stats=bt_runtime_after,
+                            day_trade_carry_compile_stats={
+                                key: value - carry_compile_before.get(key, 0)
+                                for key, value in get_day_trade_carry_compile_stats().items()
+                            },
+                            train_day_trade_carry_compile_stats=train_carry_compile_delta,
                             train_backtest_runtime_stats=train_bt_runtime_after,
                             loss_runtime_stats=train_loss_runtime_after,
                         ),
@@ -28193,6 +28233,11 @@ def _run_training_impl(
                                 get_tw_dual_session_compile_stats()
                             ),
                             backtest_runtime_stats=bt_runtime_after,
+                            day_trade_carry_compile_stats={
+                                key: value - carry_compile_before.get(key, 0)
+                                for key, value in get_day_trade_carry_compile_stats().items()
+                            },
+                            train_day_trade_carry_compile_stats=train_carry_compile_delta,
                             train_backtest_runtime_stats=train_bt_runtime_after,
                             loss_runtime_stats=train_loss_runtime_after,
                         ),

@@ -17,8 +17,17 @@ _runtime_resolve_executable() {
 }
 
 _runtime_python_prefix() {
-  local python_path
+  local python_path virtual_prefix
   python_path="$(_runtime_resolve_executable "${1:-}")" || return 1
+  # A venv interpreter usually links to its base Python. Resolve the venv's
+  # directory before following that executable link, or explicit role selection
+  # loses pyvenv.cfg/site-packages and silently re-enters the native environment.
+  virtual_prefix="$(dirname "$(dirname "$python_path")")"
+  if [[ "$(basename "$(dirname "$python_path")")" == "bin" \
+      && -f "$virtual_prefix/pyvenv.cfg" ]]; then
+    (cd "$virtual_prefix" && pwd -P)
+    return 0
+  fi
   if command -v readlink >/dev/null 2>&1; then
     python_path="$(readlink -f "$python_path" 2>/dev/null || printf "%s" "$python_path")"
   fi
@@ -28,7 +37,9 @@ _runtime_python_prefix() {
 
 detect_mamba_or_conda_bin() {
   local candidate
-  for candidate in "${FINTECH_MAMBA_BIN:-}" micromamba mamba conda; do
+  for candidate in "${FINTECH_MAMBA_BIN:-}" mamba \
+      "${HOME:-}/miniforge3/condabin/mamba" \
+      /opt/stockagent/miniforge3/condabin/mamba micromamba conda; do
     [[ -n "$candidate" ]] || continue
     if _runtime_resolve_executable "$candidate" >/dev/null 2>&1; then
       _runtime_resolve_executable "$candidate"

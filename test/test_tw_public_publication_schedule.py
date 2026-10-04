@@ -5,6 +5,7 @@ from datetime import date, datetime
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -1130,7 +1131,7 @@ def test_source_only_job_can_defer_stale_cold_receipts_without_hiding_them(
         ),
     )
 
-    def stale(*args: object) -> None:
+    def stale(*args: object, **kwargs: object) -> None:
         raise cold_publication.StaleDerivedReceipts(
             ["stale_feature_build_receipt", "stale_official_symbol_build_receipt"],
             failed_checks={"public_features": ["source_bytes"]},
@@ -1172,7 +1173,7 @@ def test_source_only_cold_defer_does_not_suppress_other_publish_errors(
         ),
     )
 
-    def fail(*args: object) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
         raise RuntimeError("unrelated publish failure")
 
     monkeypatch.setattr(cold_publication, "_publish_while_source_stable", fail)
@@ -1180,6 +1181,65 @@ def test_source_only_cold_defer_does_not_suppress_other_publish_errors(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == "failed"
     assert receipt["error"] == "unrelated publish failure"
+
+
+@pytest.mark.parametrize("damaged_receipt", [False, True])
+def test_cold_commit_releases_source_lease_before_waking_scan_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damaged_receipt: bool,
+) -> None:
+    live_root = tmp_path / "live/data_tw_public"
+    live_root.mkdir(parents=True)
+    sync_root = tmp_path / "cold"
+    sync_root.mkdir()
+    (sync_root / ".stockagent-d-primary").touch()
+    monkeypatch.setenv("STOCKAGENT_PACKED_SYNC_ROOT", str(sync_root))
+    monkeypatch.setattr(cold_publication, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(cold_publication, "_live_root", lambda: live_root)
+    monkeypatch.setattr(cold_publication, "_check_training_receipts", lambda *_: None)
+    receipt_path = tmp_path / "operations/latest.json"
+    args = type("Args", (), {"receipt": receipt_path, "timeout_seconds": 30.0,
+                            "defer_stale_derived_receipts": False})()
+    monkeypatch.setattr(cold_publication, "parse_args", lambda: args)
+    lock_path = live_root.parent / ".locks/tw-public-refresh.lock"
+    release = {"published": [{"dataset": "tw-public", "snapshot_id": "tw-public-fixed",
+                              "scan_policy": "durably_queued"}], "skipped": []}
+    wake_calls = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "publish-status" in command:
+            return subprocess.CompletedProcess(command, 0, stdout='{"datasets":[]}', stderr="")
+        fd = int(command[command.index("--source-lock-fd") + 1])
+        assert kwargs["pass_fds"] == (fd,)
+        assert os.fstat(fd).st_ino == lock_path.stat().st_ino
+        with lock_path.open("a+") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert "--defer-scan" in command
+        result_path = Path(command[command.index("--result-receipt") + 1])
+        assert not result_path.exists()
+        result_path.write_text(json.dumps({} if damaged_receipt else release))
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(release), stderr="")
+
+    def wake() -> dict[str, object]:
+        with lock_path.open("a+") as other:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        wake_calls.append("source_lease_released")
+        return {"status": "retry_service_requested"}
+
+    monkeypatch.setattr(cold_publication.subprocess, "run", run)
+    monkeypatch.setattr(cold_publication, "_start_scan_retry", wake)
+    assert cold_publication.main() == (1 if damaged_receipt else 0)
+    receipt = json.loads(receipt_path.read_text())
+    if damaged_receipt:
+        assert receipt["status"] == "failed" and receipt["local_publication_committed"] is None
+        assert wake_calls == []
+    else:
+        assert receipt["status"] == "committed_scan_pending"
+        assert receipt["local_publication_committed"] is True
+        assert receipt["peer_convergence"] == "not_checked"
+        assert receipt["release"] == release
+        assert wake_calls == ["source_lease_released"]
+        assert receipt["runtime_link_changed"] is receipt["materialization_performed"] is False
 
 
 def test_source_event_registry_covers_all_official_datasets() -> None:

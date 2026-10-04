@@ -1797,6 +1797,7 @@ def main() -> None:
             futures_slot_count=config.data.tw_futures_portfolio_slot_count,
             margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
                                if config.trading.tw_futures_portfolio_capital_basis == 'initial_margin' else None),
+            valuation_research_contract=config.trading.tw_futures_portfolio_valuation_research_contract,
             require_prior_capacity=config.data.tw_futures_require_prior_capacity,
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return

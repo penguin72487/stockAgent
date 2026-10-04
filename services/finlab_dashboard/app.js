@@ -53,9 +53,13 @@ function renderQuota(data) {
   } else {
     text("quota-chart-empty", "累積兩筆帳號觀測後顯示趨勢。");
   }
+  renderQuotaRows(state.quotaHistory);
+}
+
+function renderQuotaRows(rows) {
   const body = $("quota-history-body");
   body.replaceChildren();
-  for (const row of state.quotaHistory.slice(-30).reverse()) {
+  for (const row of rows.slice(-30).reverse()) {
     const tr = document.createElement("tr");
     [timeLabel(row.observed_at_utc), mb(row.used_mb), mb(n(row.limit_mb) - n(row.used_mb)), pct(n(row.used_mb) / n(row.limit_mb))].forEach((value) => { const td = document.createElement("td"); td.textContent = value; tr.append(td); });
     body.append(tr);
@@ -178,7 +182,8 @@ function renderWorkload(info) {
   }
   const scenarios = valid ? info.scenarios || {} : {}, reference = scenarios.reference || {};
   const eta = (scenario) => scenario?.state === "complete" ? "本次已查核" : scenario?.finish_at_utc ? timeLabel(scenario.finish_at_utc) : ({object_exceeds_daily_budget: "單表超過可用日額度", capacity_constrained: "新增追新排擠；容量受限", insufficient_samples: "耗時／流量樣本不足", scheduler_unverified: "排程未核實", quota_unverified: "額度觀測待更新", unscheduled_work: "有未排入的待辦", not_required: "目前沒有待辦", blocked: "來源條件未解決"}[scenario?.state] || "暫無可估時間");
-  text("download-global-eta", eta(reference));
+  text("download-global-eta", valid && info.actionable_complete && info.blocked_count > 0
+    ? `可執行工作已查核；另有 ${count(info.blocked_count)} 個來源問題` : eta(reference));
   text("workload-time-left", reference.finish_at_utc ? `距現在約 ${durationLabel(reference.remaining_seconds)}；包含插隊的高優先新到期，不是所有未來追新或來源問題的完成日。` : "保留未知，不顯示假倒數。");
   text("workload-processing", durationLabel(reference.processing_seconds));
   text("workload-wait", durationLabel(reference.total_wait_seconds ?? reference.quota_opening_wait_seconds));
@@ -205,13 +210,27 @@ function renderWorkload(info) {
     if (stageRatio !== null) bar.value = Math.max(0, Math.min(1, stageRatio));
     const records = (stage.records || []).map(r => `${count(r.count)} ${units[r.unit] || "待確認單位"}`).join("；");
     detail.textContent = `待辦 ${count(stage.pending_keys)} 鍵 · 預估下載 ${bytes(stage.remaining_bytes_estimate)} · 工作 ${durationLabel(stage.remaining_work_seconds_estimate)}${records ? `；需查核 ${records}` : ""}。${stageRatio === null ? "工作量無可信百分比。" : `來源大小加權 ${pct(stageRatio)}，不是帳號累計流量。`}`;
+    times.className = "finlab-current-eta";
     for (const [name, label] of [["fast", "快速"], ["reference", "參考"], ["slow", "較慢"]]) {
       const dt = document.createElement("dt"), dd = document.createElement("dd");
       dt.textContent = label; dd.textContent = stage.state === "unmeasured" ? "缺全市場樣本，未知" : !valid ? "快照待更新" : eta(stage.scenarios?.[name]);
       times.append(dt, dd);
     }
-    note.textContent = stage.reason || (stage.next_check_at_utc ? `下次檢查 ${timeLabel(stage.next_check_at_utc)}；這是排程，不是發布證明。` : stage.state === "not_required" ? "不以目錄存在推論可取得歷史。" : `未知傳輸量 ${count(stage.unknown_transfer_keys)} 鍵、未知耗時 ${count(stage.unknown_time_keys)} 鍵。`);
+    note.textContent = [stage.reason,
+      stage.next_retry_at_utc ? `下次重試 ${timeLabel(stage.next_retry_at_utc)}；冷卻 ${count(stage.cooldown_keys)} 鍵。` : "",
+      stage.next_check_at_utc ? `下次來源檢查 ${timeLabel(stage.next_check_at_utc)}；不是發布證明。` : "",
+      !stage.reason && !stage.next_check_at_utc ? `未知傳輸量 ${count(stage.unknown_transfer_keys)} 鍵、未知耗時 ${count(stage.unknown_time_keys)} 鍵。` : ""].filter(Boolean).join(" ");
     card.append(title, state, bar, detail, times, note); stageContainer.append(card);
+    if (valid && stage.next_wave) {
+      const wave = stage.next_wave, caption = document.createElement("p"), estimates = document.createElement("dl");
+      caption.textContent = `下一波 ${timeLabel(wave.check_at_utc)} · ${count(wave.keys)} 鍵；以下只估這波查核，不是所有未來資料。`;
+      estimates.className = "finlab-next-wave";
+      for (const [name, label] of [["fast", "下一波快速"], ["reference", "下一波參考"], ["slow", "下一波較慢"]]) {
+        const dt = document.createElement("dt"), dd = document.createElement("dd");
+        dt.textContent = label; dd.textContent = eta(wave.scenarios?.[name]); estimates.append(dt, dd);
+      }
+      card.append(caption, estimates);
+    }
   }
 }
 
@@ -237,7 +256,8 @@ function renderPipelines(data) {
   const gate = data.release_gate || {}, acquired = data.acquisition || {}, training = data.training || {};
   const pipelines = [
     {category: "reference", title: "FinLab SDK 目錄", api: "data.search()", status: gate.catalog_fresh ? "ready" : "waiting", detail: `${count(gate.catalog_total)} 個目錄鍵；目錄清點時間 ${timeLabel(gate.catalog_observed_at_utc)}`, progress: gate.catalog_fresh ? 1 : null, note: "目錄存在不代表帳號可下載。"},
-    {category: "historical", title: "一般歷史追新", api: "SDK checked .recent merge / full fallback", status: acquired.service_active ? "active" : gate.ready ? "ready" : "partial", detail: `已查新工作量 ${bytes(data.workload?.transfer?.completed_bytes)}；預估待辦傳輸 ${bytes(data.workload?.expected_pending_payload_bytes)}`, progress: data.workload?.state === "available" ? n(data.workload?.transfer?.ratio) : null, note: "按原始來源大小加權；實際增量與帳號計費另外觀測。"},
+    {category: "historical", title: "一般歷史追新", api: "SDK checked .recent merge / full fallback", status: data.execution?.phase === "general" ? "active" : gate.ready ? "ready" : "partial", detail: `已查新工作量 ${bytes(data.workload?.transfer?.completed_bytes)}；預估待辦傳輸 ${bytes(data.workload?.expected_pending_payload_bytes)}`, progress: data.workload?.state === "available" ? n(data.workload?.transfer?.ratio) : null, note: "按原始來源大小加權；實際增量與帳號計費另外觀測。"},
+    {category: "historical", title: "剩餘配額 Tick 與本機分鐘", api: "tw_tick + local minute derivation", status: data.execution?.phase === "tick" ? "active" : "partial", detail: `Tick 已有 ${count(data.workload?.tick?.local_rows)} 筆；全歷史可得範圍仍待來源發布證據`, progress: null, note: "最低優先級；逐分區收據確認，候選總數不是已發布總數。"},
     {category: "derived", title: "研究特徵建表", api: "local research overlay", status: training.local_rows ? (gate.ready ? "ready" : "partial") : "waiting", detail: `${count(training.local_rows)} 列，${count(training.local_finlab_channels)} 個 FinLab 欄位`, progress: training.local_rows ? 1 : 0, note: "只映射已驗證語義的來源，非嚴格歷史 PIT。"},
     {category: "derived", title: "私人冷庫版本", api: "stockagent-data publish", status: training.cold_publication === "verified_exact_release" ? (gate.ready ? "ready" : "partial") : "waiting", detail: training.cold_snapshot_id || "尚無可核驗 release", progress: training.cold_publication === "verified_exact_release" ? 1 : 0, note: gate.ready ? "精確版已驗證；遠端仍須 READY。" : "既有版本可保留，新版須全目錄追新才打包。"},
     {category: "derived", title: "遠端訓練準備", api: "exact release + READY", status: training.remote_materialization === "verified_ready" ? "ready" : "waiting", detail: training.remote_materialization === "verified_ready" ? "遠端 READY 已核驗" : "遠端 READY 未核驗", progress: training.remote_materialization === "verified_ready" ? 1 : null, note: "本機冷庫完成不等於遠端可訓練。"},
@@ -269,9 +289,9 @@ function renderPipelines(data) {
 
 function renderCapture(data) {
   const acquired = data.acquisition || {}, gate = data.release_gate || {};
-  const running = acquired.service_active === true;
-  text("capture-state", running ? "正在下載" : acquired.state === "waiting_quota" ? "等待額度重置" : acquired.timer_active ? "等待排程" : "排程未啟用／未知");
-  text("capture-freshness", running ? `開始 ${timeLabel(data.current_fetch?.started_at_utc)}` : "無即時串流；下次 timer 啟動才會查來源");
+  const phase = data.execution?.phase, running = phase === "general" || phase === "tick";
+  text("capture-state", phase === "tick" ? "剩餘配額抓 Tick" : phase === "general" ? "一般資料查核／抓取" : phase === "transition" ? "管線切換／後處理（非下載證明）" : acquired.state === "waiting_quota" ? "等待額度重置" : acquired.timer_active ? "等待排程" : "排程未啟用／未知");
+  text("capture-freshness", running ? `開始 ${timeLabel(data.current_fetch?.started_at_utc)}` : phase === "transition" ? "服務仍活動，但沒有下載 worker 收據；不當成正在下載" : "無即時串流；依到期與重試排程查來源");
   text("capture-key", data.current_fetch?.key || "目前無單鍵請求");
   text("capture-last", timeLabel(acquired.last_receipt_at_utc));
   text("capture-next", timeLabel(acquired.next_run_at_utc));
@@ -388,7 +408,11 @@ function renderMarket(data) {
     else progress.removeAttribute("value");
   }
   text("market-eta", "無可信 ETA");
-  text("market-state", market.state ? `本輪 ${market.state}；成功 ${count(market.successes_this_run)}/${count(market.attempted_this_run)}；${timeLabel(market.observed_at_utc)} 更新` : "等待逐檔排程收據");
+  const worker = data?.execution?.tick || {};
+  text("market-state", worker.state === "running" && worker.owner_alive
+    ? `正在抓 ${worker.active_key || "下個分區"} ${worker.active_trade_date || ""}；本批成功 ${count(worker.successful)}／已試 ${count(worker.attempted)}，上限 ${count(worker.attempt_limit)}；${timeLabel(worker.observed_at_utc)} 更新。${worker.estimated_batch_finish_at_utc ? `本批參考完成 ${timeLabel(worker.estimated_batch_finish_at_utc)}（非全歷史）。` : worker.batch_eta_state === "time_budget_limited" ? "本批受執行時間上限約束，剩餘下批續抓。" : "本批耗時樣本尚不足或已超時；不顯示假倒數。"}`
+    : worker.state === "interrupted" ? "上次 worker 已中斷；保留收據與游標，下次排程續抓。"
+    : market.state ? `本輪 ${market.state}；成功 ${count(market.successes_this_run)}/${count(market.attempted_this_run)}；${timeLabel(market.observed_at_utc)} 更新` : "等待逐檔排程收據");
   const search = state.marketSearch.toLocaleLowerCase("zh-TW");
   const matches = rows.filter((row) => `${row.key || ""} ${row.market || ""}`.toLocaleLowerCase("zh-TW").includes(search));
   matches.sort((a, b) => {
@@ -415,6 +439,10 @@ function renderMarket(data) {
 }
 
 function render(data) {
+  if (data.datasets != null && (!Array.isArray(data.datasets)
+      || data.datasets.some(row => !row || typeof row !== "object" || Array.isArray(row)))) {
+    throw new Error("Invalid FinLab dataset metadata");
+  }
   const health = data.health || "unavailable";
   const labels = {active: "資料觀測正常", waiting: "執行中但暫無新收據", stale: "面板快照逾時", degraded: "觀測需注意", unavailable: "暫時無資料"};
   renderQuota(data);
@@ -486,4 +514,9 @@ $("market-search").addEventListener("input", (event) => { state.marketSearch = e
 $("market-more").addEventListener("click", () => { state.marketVisible += 100; if (state.latest) renderMarket(state.latest); });
 document.querySelectorAll("[data-pipeline-filter]").forEach((button) => button.addEventListener("click", () => { state.pipelineFilter = button.dataset.pipelineFilter; document.querySelectorAll("[data-pipeline-filter]").forEach((other) => { const active = other === button; other.classList.toggle("active", active); other.setAttribute("aria-pressed", String(active)); }); if (state.latest) renderPipelines(state.latest); }));
 document.querySelectorAll("#quota-time-range button").forEach((button) => button.addEventListener("click", () => { state.quotaRange = button.dataset.range; drawQuotaHistory(state.quotaHistory); }));
+drawQuotaHistory = Dashboard.createDeferredRenderer("quota-chart", drawQuotaHistory);
+renderQuotaRows = Dashboard.createDeferredRenderer("quota-history-body", renderQuotaRows);
+renderRows = Dashboard.createDeferredRenderer("dataset-rows", renderRows);
+renderMarket = Dashboard.createDeferredRenderer("market-rows", renderMarket);
+renderPipelines = Dashboard.createDeferredRenderer("pipelines", renderPipelines);
 Dashboard.scheduleRefresh(refresh, {intervalMs: 60000});

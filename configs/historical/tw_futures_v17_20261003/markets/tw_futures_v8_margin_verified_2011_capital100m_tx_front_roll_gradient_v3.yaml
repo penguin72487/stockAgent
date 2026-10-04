@@ -1,0 +1,12 @@
+# Corrected margin backward, same exact account/data/architecture/objective.
+# Fresh optimizer state is required by margin gradient contract v3.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_v2.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-gradient-v3
+
+training:
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_gradient_v3
+  start_fold: 1
